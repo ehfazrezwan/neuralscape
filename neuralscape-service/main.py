@@ -86,6 +86,10 @@ def _get_async_memory():
     return _async_memory
 
 
+# MCP HTTP session manager (initialized when MCP_TRANSPORT=http)
+_mcp_session_manager = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting Neuralscape Service...")
@@ -93,7 +97,17 @@ async def lifespan(app: FastAPI):
     _service._get_memory()
     # Connect task manager to Redis
     await _task_manager.connect()
-    yield
+
+    # Start MCP HTTP session manager if enabled and connect its task manager
+    if _mcp_session_manager is not None:
+        from mcp_server import _task_manager as mcp_task_manager
+        await mcp_task_manager.connect()
+        async with _mcp_session_manager.run():
+            yield
+        await mcp_task_manager.close()
+    else:
+        yield
+
     await _task_manager.close()
     _service.close()
     if _async_memory and hasattr(_async_memory, "graph") and hasattr(_async_memory.graph, "graphiti"):
@@ -721,7 +735,8 @@ app.include_router(v1_router)
 # Mount MCP HTTP transport at /mcp/ for remote agent access
 if settings.mcp_transport == "http":
     from mcp_server import create_mcp_http_app
-    app.mount("/mcp", create_mcp_http_app())
+    mcp_app, _mcp_session_manager = create_mcp_http_app()
+    app.mount("/mcp", mcp_app)
 
 
 if __name__ == "__main__":

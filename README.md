@@ -194,19 +194,58 @@ curl "http://localhost:8199/v1/graph/communities?user_id=ehfaz"
 
 ### Transport
 
-- **stdio** (default): For local Claude Code. Configure in Claude Code's MCP settings.
+- **stdio** (default): For local Claude Code — see [MCP Server Setup](#mcp-server-setup).
 - **Streamable HTTP**: Set `MCP_TRANSPORT=http` to mount at `/mcp/` on port 8199 for remote agents.
 
 ### Claude Code Configuration
 
-Add to your Claude Code MCP settings:
+**Local dev (stdio)** — runs the MCP server as a subprocess:
+
+```bash
+claude mcp add neuralscape-memory -- uv run --directory /absolute/path/to/neuralscape-service python mcp_server.py
+```
+
+Or add manually to your Claude Code MCP settings:
 
 ```json
 {
   "mcpServers": {
     "neuralscape-memory": {
       "command": "uv",
-      "args": ["run", "--directory", "/path/to/neuralscape-service", "python", "mcp_server.py"]
+      "args": ["run", "--directory", "/absolute/path/to/neuralscape-service", "python", "mcp_server.py"]
+    }
+  }
+}
+```
+
+> Requires the ARQ worker running separately: `uv run arq worker.WorkerSettings`
+
+**Docker (Streamable HTTP)** — connects to the containerized service over HTTP:
+
+First, add `MCP_TRANSPORT=http` to the neuralscape service in `docker-compose.yml`:
+
+```yaml
+neuralscape:
+  environment:
+    MCP_TRANSPORT: http
+    # ... other env vars
+```
+
+Then restart the stack and add the MCP server:
+
+```bash
+docker compose up -d
+claude mcp add neuralscape-memory --transport http http://localhost:8199/mcp/
+```
+
+Or manually:
+
+```json
+{
+  "mcpServers": {
+    "neuralscape-memory": {
+      "type": "streamable-http",
+      "url": "http://localhost:8199/mcp/"
     }
   }
 }
@@ -313,6 +352,77 @@ uv run pytest tests/test_service.py -v
 
 # Run integration tests (requires all services running)
 uv run pytest tests/test_async_pipeline.py -v -s
+```
+
+## MCP Server Setup
+
+The MCP server exposes all 7 memory tools over stdio or HTTP transport, letting AI agents read/write memories directly.
+
+### Claude Code (stdio)
+
+Add to your Claude Code MCP settings (`.claude/settings.json` or project settings):
+
+```json
+{
+  "mcpServers": {
+    "neuralscape-memory": {
+      "command": "uv",
+      "args": ["run", "--directory", "/absolute/path/to/neuralscape-service", "python", "mcp_server.py"]
+    }
+  }
+}
+```
+
+The MCP server connects to the same Redis, Qdrant, and Neo4j backends as the REST API. Write operations (`remember`, `remember_conversation`) are enqueued to the ARQ worker — make sure the worker is running:
+
+```bash
+cd neuralscape-service
+uv run arq worker.WorkerSettings
+```
+
+### Remote Agents (Streamable HTTP)
+
+For agents that can't use stdio (remote clients, web-based agents), set `MCP_TRANSPORT=http` in your `.env`. The MCP endpoint mounts at `/mcp/` on the same port as the REST API:
+
+```bash
+MCP_TRANSPORT=http uv run python main.py
+# MCP endpoint at http://localhost:8199/mcp/
+```
+
+### Testing with mcp-cli
+
+You can verify the MCP server independently using [mcp-cli](https://github.com/philschmid/mcp-cli), a lightweight Bun-based CLI:
+
+```bash
+# Install
+bun install -g https://github.com/philschmid/mcp-cli
+
+# Create mcp_servers.json in the project root
+cat > mcp_servers.json << 'EOF'
+{
+  "mcpServers": {
+    "neuralscape": {
+      "command": "uv",
+      "args": ["run", "--directory", "/absolute/path/to/neuralscape-service", "python", "mcp_server.py"]
+    }
+  }
+}
+EOF
+
+# List all tools
+mcp-cli
+
+# Inspect a tool's schema
+mcp-cli info neuralscape recall_memories
+
+# Call a read tool
+mcp-cli call neuralscape recall_memories '{"query": "testing", "user_id": "ehfaz"}'
+
+# Call a write tool (fire-and-forget)
+mcp-cli call neuralscape remember '{"content": "test fact", "user_id": "ehfaz", "category": "interaction"}'
+
+# Call a write tool (blocking)
+mcp-cli call neuralscape remember '{"content": "test fact", "user_id": "ehfaz", "category": "interaction", "wait": true}'
 ```
 
 ## Configuration
