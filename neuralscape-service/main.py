@@ -4,9 +4,7 @@ Provides both legacy endpoints (root) and new v1 endpoints with scoping,
 categories, and a shared MemoryService business logic layer.
 """
 
-import asyncio
 import logging
-import uuid as uuid_mod
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -27,16 +25,19 @@ from schemas import (
     SearchMemoryResponse,
     StoreMemoryRequest,
     StoreMemoryResponse,
+    TaskAcceptedResponse,
+    TaskStatusResponse,
     UpdateMemoryRequest,
 )
+from task_manager import TaskManager
 
 logger = logging.getLogger(__name__)
 
 # Shared service instance
 _service = MemoryService()
 
-# Background task store: {task_id: {status, created_at, result, error}}
-_tasks: dict[str, dict] = {}
+# Redis-backed task manager (initialized in lifespan)
+_task_manager = TaskManager()
 
 # Legacy lazy-init globals (kept for backward compat with old endpoints + tests)
 _memory = None
@@ -90,7 +91,10 @@ async def lifespan(app: FastAPI):
     logger.info("Starting Neuralscape Service...")
     # Initialize the service (this also initializes mem0 + Graphiti)
     _service._get_memory()
+    # Connect task manager to Redis
+    await _task_manager.connect()
     yield
+    await _task_manager.close()
     _service.close()
     if _async_memory and hasattr(_async_memory, "graph") and hasattr(_async_memory.graph, "graphiti"):
         _async_memory.graph._bridge.run(_async_memory.graph.graphiti.close())
@@ -222,48 +226,25 @@ async def delete_memories(
 @app.post("/memories/async")
 async def add_memory_async(req: LegacyAddMemoryRequest):
     """Add a memory in the background (non-blocking). Returns a task_id to poll."""
-    task_id = str(uuid_mod.uuid4())
-    _tasks[task_id] = {
-        "status": "processing",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "result": None,
-        "error": None,
-    }
-
-    async def _process(tid: str):
-        try:
-            am = _get_async_memory()
-            result = await am.add(
-                messages=req.messages,
-                user_id=req.user_id or settings.default_user_id,
-                agent_id=req.agent_id,
-                run_id=req.run_id,
-                metadata=req.metadata,
-            )
-            _tasks[tid]["status"] = "completed"
-            _tasks[tid]["result"] = result
-        except Exception as e:
-            logger.exception("async add_memory failed")
-            _tasks[tid]["status"] = "failed"
-            _tasks[tid]["error"] = str(e)
-
-    asyncio.create_task(_process(task_id))
-    return {"status": "accepted", "task_id": task_id}
+    task_id = await _task_manager.enqueue_store(
+        messages=req.messages,
+        user_id=req.user_id or settings.default_user_id,
+        agent_id=req.agent_id,
+        run_id=req.run_id,
+    )
+    return TaskAcceptedResponse(
+        task_id=task_id,
+        poll_url=f"/memories/status/{task_id}",
+    )
 
 
 @app.get("/memories/status/{task_id}")
 async def get_task_status(task_id: str):
     """Check the status of an async memory addition task."""
-    task = _tasks.get(task_id)
-    if task is None:
+    result = await _task_manager.get_status(task_id)
+    if result["status"] == "not_found":
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    return {
-        "task_id": task_id,
-        "status": task["status"],
-        "created_at": task["created_at"],
-        "result": task["result"],
-        "error": task["error"],
-    }
+    return result
 
 
 # Legacy graph endpoints
@@ -479,93 +460,63 @@ v1_router = APIRouter(prefix="/v1", tags=["v1"])
 # ── Remember ──────────────────────────────────
 
 
-@v1_router.post("/memories", response_model=StoreMemoryResponse)
+@v1_router.post("/memories", response_model=TaskAcceptedResponse, status_code=202)
 async def v1_store_memories(req: StoreMemoryRequest):
-    """Store memories from conversation via LLM extraction.
+    """Store memories from conversation via LLM extraction (async).
 
-    Extracts facts from conversation messages using Gemini, categorizes them,
-    and stores each with appropriate scope and category metadata.
+    Enqueues the extraction task to a background worker and returns immediately
+    with a task_id that can be polled via GET /v1/memories/status/{task_id}.
     """
-    try:
-        memories = _service.extract_and_store(
-            messages=req.messages,
-            user_id=req.user_id,
-            project_id=req.project_id,
-            agent_id=req.agent_id,
-            run_id=req.run_id,
-        )
-        return StoreMemoryResponse(memories=memories)
-    except Exception as e:
-        logger.exception("v1 store_memories failed")
-        raise HTTPException(status_code=500, detail=str(e))
+    task_id = await _task_manager.enqueue_store(
+        messages=req.messages,
+        user_id=req.user_id,
+        project_id=req.project_id,
+        agent_id=req.agent_id,
+        run_id=req.run_id,
+    )
+    return TaskAcceptedResponse(
+        task_id=task_id,
+        poll_url=f"/v1/memories/status/{task_id}",
+    )
 
 
-@v1_router.post("/memories/async")
-async def v1_store_memories_async(req: StoreMemoryRequest):
-    """Non-blocking version of memory storage. Returns task_id to poll."""
-    task_id = str(uuid_mod.uuid4())
-    _tasks[task_id] = {
-        "status": "processing",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "result": None,
-        "error": None,
-    }
-
-    async def _process(tid: str):
-        try:
-            memories = _service.extract_and_store(
-                messages=req.messages,
-                user_id=req.user_id,
-                project_id=req.project_id,
-                agent_id=req.agent_id,
-                run_id=req.run_id,
-            )
-            _tasks[tid]["status"] = "completed"
-            _tasks[tid]["result"] = [m.model_dump() for m in memories]
-        except Exception as e:
-            logger.exception("v1 async store_memories failed")
-            _tasks[tid]["status"] = "failed"
-            _tasks[tid]["error"] = str(e)
-
-    asyncio.create_task(_process(task_id))
-    return {"status": "accepted", "task_id": task_id}
-
-
-@v1_router.post("/memories/raw", response_model=StoreMemoryResponse)
+@v1_router.post("/memories/raw", response_model=TaskAcceptedResponse, status_code=202)
 async def v1_store_raw_memory(req: RawMemoryRequest):
-    """Store a single pre-categorized fact (no LLM extraction)."""
-    try:
-        memories = _service.store_raw(
-            content=req.content,
-            user_id=req.user_id,
-            category=req.category,
-            scope=req.scope,
-            project_id=req.project_id,
-            tags=req.tags,
-            agent_id=req.agent_id,
-            run_id=req.run_id,
+    """Store a single pre-categorized fact (async, no LLM extraction).
+
+    Enqueues the storage task to a background worker and returns immediately.
+    """
+    if req.category not in MEMORY_CATEGORIES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid category: {req.category}. Must be one of: {list(MEMORY_CATEGORIES.keys())}",
         )
-        return StoreMemoryResponse(memories=memories)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.exception("v1 store_raw failed")
-        raise HTTPException(status_code=500, detail=str(e))
+    if req.scope == "project" and not req.project_id:
+        raise HTTPException(status_code=400, detail="project_id is required when scope='project'")
+
+    task_id = await _task_manager.enqueue_raw(
+        content=req.content,
+        user_id=req.user_id,
+        category=req.category,
+        scope=req.scope,
+        project_id=req.project_id,
+        tags=req.tags,
+        agent_id=req.agent_id,
+        run_id=req.run_id,
+    )
+    return TaskAcceptedResponse(
+        task_id=task_id,
+        poll_url=f"/v1/memories/status/{task_id}",
+    )
 
 
-@v1_router.get("/memories/status/{task_id}")
+@v1_router.get("/memories/status/{task_id}", response_model=TaskStatusResponse)
 async def v1_get_task_status(task_id: str):
     """Poll async task status."""
-    task = _tasks.get(task_id)
-    if task is None:
+    result = await _task_manager.get_status(task_id)
+    if result["status"] == "not_found":
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    return {
-        "task_id": task_id,
-        "status": task["status"],
-        "created_at": task["created_at"],
-        "result": task["result"],
-        "error": task["error"],
-    }
+    return result
 
 
 # ── Recall ────────────────────────────────────

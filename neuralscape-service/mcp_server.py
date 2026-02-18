@@ -16,6 +16,7 @@ from mcp.types import TextContent, Tool
 from config import settings
 from memory_service import MemoryService
 from schemas import MEMORY_CATEGORIES
+from task_manager import TaskManager
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,9 @@ server = Server("neuralscape-memory")
 
 # Shared service instance
 _service = MemoryService()
+
+# Task manager for async memory operations (initialized at startup)
+_task_manager = TaskManager()
 
 
 @server.list_tools()
@@ -106,6 +110,10 @@ async def list_tools() -> list[Tool]:
                         "items": {"type": "string"},
                         "description": "Optional free-form tags for additional organization",
                     },
+                    "wait": {
+                        "type": "boolean",
+                        "description": "If true, wait for memory to be fully stored before returning. Default: false (fire-and-forget).",
+                    },
                 },
                 "required": ["content", "user_id", "category"],
             },
@@ -139,6 +147,10 @@ async def list_tools() -> list[Tool]:
                     "project_id": {
                         "type": "string",
                         "description": "Project ID if conversation is project-specific",
+                    },
+                    "wait": {
+                        "type": "boolean",
+                        "description": "If true, wait for memories to be fully stored before returning. Default: false (fire-and-forget).",
                     },
                 },
                 "required": ["messages", "user_id"],
@@ -290,15 +302,16 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         elif name == "remember":
             # Determine scope from category
-            from schemas import default_scope_for_category, PROJECT_CATEGORIES
+            from schemas import default_scope_for_category, GLOBAL_CATEGORIES
             category = arguments["category"]
             project_id = arguments.get("project_id")
+            wait = arguments.get("wait", False)
 
             scope = default_scope_for_category(category).value
-            if project_id and category not in {"preference", "personal_fact", "technical_skill", "domain_knowledge"}:
+            if project_id and category not in GLOBAL_CATEGORIES:
                 scope = "project"
 
-            results = _service.store_raw(
+            task_id = await _task_manager.enqueue_raw(
                 content=arguments["content"],
                 user_id=user_id,
                 category=category,
@@ -306,17 +319,27 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 project_id=project_id,
                 tags=arguments.get("tags"),
             )
-            output = [r.model_dump(exclude_none=True) for r in results]
-            return [TextContent(type="text", text=json.dumps({"status": "stored", "memories": output}, default=str))]
+
+            if wait:
+                result = await _task_manager.wait_for_result(task_id)
+                return [TextContent(type="text", text=json.dumps({"status": result["status"], "task_id": task_id, "result": result.get("result")}, default=str))]
+
+            return [TextContent(type="text", text=json.dumps({"status": "accepted", "task_id": task_id}, default=str))]
 
         elif name == "remember_conversation":
-            results = _service.extract_and_store(
+            wait = arguments.get("wait", False)
+
+            task_id = await _task_manager.enqueue_store(
                 messages=arguments["messages"],
                 user_id=user_id,
                 project_id=arguments.get("project_id"),
             )
-            output = [r.model_dump(exclude_none=True) for r in results]
-            return [TextContent(type="text", text=json.dumps({"status": "stored", "count": len(output), "memories": output}, default=str))]
+
+            if wait:
+                result = await _task_manager.wait_for_result(task_id)
+                return [TextContent(type="text", text=json.dumps({"status": result["status"], "task_id": task_id, "result": result.get("result")}, default=str))]
+
+            return [TextContent(type="text", text=json.dumps({"status": "accepted", "task_id": task_id}, default=str))]
 
         elif name == "get_project_context":
             context = _service.get_project_context(
@@ -379,6 +402,8 @@ def create_mcp_http_app():
     """Create a Starlette ASGI app for Streamable HTTP MCP transport.
 
     This is mounted on the FastAPI app at /mcp/ for remote agent access.
+    When mounted under FastAPI, the TaskManager is already initialized
+    in main.py's lifespan via the shared _task_manager instance.
     """
     from starlette.applications import Starlette
     from starlette.routing import Mount
@@ -391,8 +416,11 @@ def create_mcp_http_app():
     )
 
     async def lifespan(app):
+        # Connect task manager for HTTP MCP mode
+        await _task_manager.connect()
         async with session_manager.run():
             yield
+        await _task_manager.close()
 
     mcp_app = Starlette(
         lifespan=lifespan,
@@ -403,8 +431,13 @@ def create_mcp_http_app():
 
 async def run_stdio():
     """Run MCP server over stdio transport."""
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, server.create_initialization_options())
+    # Initialize task manager for stdio mode
+    await _task_manager.connect()
+    try:
+        async with stdio_server() as (read_stream, write_stream):
+            await server.run(read_stream, write_stream, server.create_initialization_options())
+    finally:
+        await _task_manager.close()
 
 
 if __name__ == "__main__":
