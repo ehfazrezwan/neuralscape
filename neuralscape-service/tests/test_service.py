@@ -79,12 +79,13 @@ def client():
 
 
 class TestHealthEndpoint:
-    def test_returns_200_with_status_ok(self, client):
+    def test_returns_200_with_service_name(self, client):
         resp = client.get("/health")
         assert resp.status_code == 200
         data = resp.json()
-        assert data["status"] == "ok"
-        assert "service" in data
+        assert data["status"] in ("ok", "degraded")
+        assert data["service"] == "neuralscape-memory"
+        assert "checks" in data
 
 
 # ──────────────────────────────────────────────

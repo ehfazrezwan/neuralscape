@@ -84,42 +84,53 @@ def default_scope_for_category(category: str) -> MemoryScope:
 # ──────────────────────────────────────────────
 
 
+# Reusable field constraints
+_ID_PATTERN = r"^[a-zA-Z0-9_.\-]+$"
+
+
 class StoreMemoryRequest(BaseModel):
     """Store memories from conversation via LLM extraction."""
-    messages: list[dict] = Field(description="Messages to extract memories from (list of {role, content} dicts)")
-    user_id: str
-    project_id: str | None = None
-    agent_id: str | None = None
-    run_id: str | None = None
+    messages: list[dict] = Field(
+        description="Messages to extract memories from (list of {role, content} dicts)",
+        max_length=500,
+    )
+    user_id: str = Field(min_length=1, max_length=100, pattern=_ID_PATTERN)
+    project_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+    agent_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+    run_id: str | None = Field(default=None, max_length=100)
 
 
 class RawMemoryRequest(BaseModel):
     """Store a single pre-categorized fact (no LLM extraction)."""
-    content: str = Field(description="The memory content to store")
-    user_id: str
+    content: str = Field(
+        description="The memory content to store",
+        min_length=1,
+        max_length=10000,
+    )
+    user_id: str = Field(min_length=1, max_length=100, pattern=_ID_PATTERN)
     category: str = Field(description="Memory category (must be one of MEMORY_CATEGORIES)")
     scope: str = Field(default="global", description="'global' or 'project'")
-    project_id: str | None = None
-    tags: list[str] | None = None
-    agent_id: str | None = None
-    run_id: str | None = None
+    project_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+    tags: list[str] | None = Field(default=None, max_length=20)
+    agent_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+    run_id: str | None = Field(default=None, max_length=100)
 
 
 class SearchMemoryRequest(BaseModel):
     """Semantic search across memories."""
-    query: str
-    user_id: str
-    project_id: str | None = None
-    categories: list[str] | None = None
+    query: str = Field(min_length=1, max_length=2000)
+    user_id: str = Field(min_length=1, max_length=100, pattern=_ID_PATTERN)
+    project_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+    categories: list[str] | None = Field(default=None, max_length=13)
     scope: str | None = None
     limit: int = Field(default=10, ge=1, le=100)
 
 
 class GraphSearchRequest(BaseModel):
     """Knowledge graph search."""
-    query: str
-    user_id: str
-    project_id: str | None = None
+    query: str = Field(min_length=1, max_length=2000)
+    user_id: str = Field(min_length=1, max_length=100, pattern=_ID_PATTERN)
+    project_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
     limit: int = Field(default=10, ge=1, le=100)
     search_config: dict | None = Field(
         default=None,
@@ -129,17 +140,17 @@ class GraphSearchRequest(BaseModel):
 
 class UpdateMemoryRequest(BaseModel):
     """Update a memory's content or category."""
-    content: str | None = None
+    content: str | None = Field(default=None, max_length=10000)
     category: str | None = None
-    tags: list[str] | None = None
+    tags: list[str] | None = Field(default=None, max_length=20)
 
 
 class BulkDeleteRequest(BaseModel):
     """Bulk delete memories with filters."""
-    user_id: str
+    user_id: str = Field(min_length=1, max_length=100, pattern=_ID_PATTERN)
     scope: str | None = None
     category: str | None = None
-    project_id: str | None = None
+    project_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
 
 
 # ──────────────────────────────────────────────
@@ -158,6 +169,7 @@ class MemoryResponse(BaseModel):
     score: float | None = None
     created_at: str | None = None
     updated_at: str | None = None
+    source: str | None = None
 
 
 class StoreMemoryResponse(BaseModel):

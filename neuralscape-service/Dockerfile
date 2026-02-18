@@ -43,6 +43,11 @@ ENV NEO4J_URI=neo4j://neo4j:7687 \
 
 WORKDIR /app/neuralscape-service
 
+# Run as non-root user
+RUN useradd -m -u 1000 appuser && \
+    mkdir -p /data/qdrant && chown -R appuser:appuser /data /app
+USER appuser
+
 EXPOSE 8199
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8199"]

@@ -5,6 +5,7 @@ Both REST endpoints and MCP tools call into this same MemoryService.
 
 import json
 import logging
+import threading
 from datetime import datetime, timezone
 
 from google import genai
@@ -30,7 +31,7 @@ logger = logging.getLogger(__name__)
 def _build_group_id(scope: str, project_id: str | None = None) -> str:
     """Build a Graphiti group_id from scope and project_id."""
     if scope == MemoryScope.PROJECT and project_id:
-        return f"project:{project_id}"
+        return f"project--{project_id}"
     return "global"
 
 
@@ -38,7 +39,7 @@ def _get_group_ids(project_id: str | None = None) -> list[str]:
     """Get group_ids to search across (always includes global)."""
     group_ids = ["global"]
     if project_id:
-        group_ids.append(f"project:{project_id}")
+        group_ids.append(f"project--{project_id}")
     return group_ids
 
 
@@ -53,18 +54,25 @@ class MemoryService:
         self._graphiti = None
         self._bridge = None
         self._genai_model = None
+        self._init_lock = threading.Lock()
 
     def _get_memory(self):
-        """Lazy-initialize mem0 Memory with Graphiti backend."""
+        """Lazy-initialize mem0 Memory with Graphiti backend.
+
+        Thread-safe: uses a lock to prevent double-initialization on
+        concurrent cold-start requests.
+        """
         if self._memory is None:
-            from mem0 import Memory
+            with self._init_lock:
+                if self._memory is None:
+                    from mem0 import Memory
 
-            config = settings.get_mem0_config()
-            self._memory = Memory.from_config(config)
+                    config = settings.get_mem0_config()
+                    self._memory = Memory.from_config(config)
 
-            if hasattr(self._memory, "graph") and hasattr(self._memory.graph, "graphiti"):
-                self._graphiti = self._memory.graph.graphiti
-                self._bridge = self._memory.graph._bridge
+                    if hasattr(self._memory, "graph") and hasattr(self._memory.graph, "graphiti"):
+                        self._graphiti = self._memory.graph.graphiti
+                        self._bridge = self._memory.graph._bridge
 
         return self._memory
 
@@ -73,16 +81,39 @@ class MemoryService:
         self._get_memory()
         return self._graphiti
 
-    def _run_on_bridge(self, coro):
-        """Run an async coroutine on the Graphiti adapter's event loop."""
+    def _run_on_bridge(self, coro, timeout: float = 30.0):
+        """Run an async coroutine on the Graphiti adapter's event loop.
+
+        Args:
+            coro: The coroutine to run.
+            timeout: Maximum seconds to wait for the result (default 30s).
+
+        Raises:
+            RuntimeError: If the bridge is not initialized.
+            TimeoutError: If the operation exceeds the timeout.
+        """
         if self._bridge is None:
             raise RuntimeError("Graphiti bridge not initialized")
-        return self._bridge.run(coro)
+        import asyncio as _asyncio
+        import concurrent.futures
+
+        future = _asyncio.run_coroutine_threadsafe(coro, self._bridge._loop)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            logger.error(f"Bridge call timed out after {timeout}s")
+            raise TimeoutError(f"Graph operation timed out after {timeout}s")
 
     def _get_genai_client(self):
-        """Get a Gemini client for fact extraction."""
+        """Get a Gemini client for fact extraction.
+
+        Thread-safe: reuses _init_lock to prevent double-initialization.
+        """
         if self._genai_model is None:
-            self._genai_model = genai.Client(api_key=settings.google_api_key)
+            with self._init_lock:
+                if self._genai_model is None:
+                    self._genai_model = genai.Client(api_key=settings.google_api_key)
         return self._genai_model
 
     def close(self):
@@ -121,9 +152,14 @@ class MemoryService:
         client = self._get_genai_client()
 
         try:
+            from google.genai.types import GenerateContentConfig, HttpOptions
+
             response = client.models.generate_content(
                 model=settings.gemini_llm_model,
                 contents=extraction_messages[0]["content"],
+                config=GenerateContentConfig(
+                    http_options=HttpOptions(timeout=60),
+                ),
             )
             parsed_facts = parse_extraction_response(response.text)
         except Exception as e:
@@ -327,7 +363,7 @@ class MemoryService:
 
             # Merge by score, deduplicate by ID
             all_results = self._merge_results(project_results, global_results)
-            return self._results_to_responses(all_results[:limit])
+            vector_responses = self._results_to_responses(all_results[:limit])
         else:
             if project_id:
                 filters["project_id"] = project_id
@@ -338,7 +374,31 @@ class MemoryService:
                 limit=limit,
                 filters=filters if filters else None,
             )
-            return self._results_to_responses(results)
+            vector_responses = self._results_to_responses(results)
+
+        # Also query the knowledge graph and merge edge facts
+        graph_responses: list[MemoryResponse] = []
+        try:
+            graph_results = self.search_graph(
+                query=query,
+                user_id=user_id,
+                project_id=project_id,
+                limit=limit,
+            )
+            for edge in graph_results.get("edges", []):
+                graph_responses.append(
+                    MemoryResponse(
+                        id=edge.get("uuid", ""),
+                        memory=edge.get("fact", edge.get("name", "")),
+                        source="graph",
+                    )
+                )
+        except Exception as e:
+            logger.warning(f"Graph search failed during recall (non-critical): {e}")
+
+        # Deduplicate and enforce caller's limit
+        combined = self._deduplicate_responses(vector_responses, graph_responses)
+        return combined[:limit]
 
     def search_graph(
         self,
@@ -370,7 +430,11 @@ class MemoryService:
         group_ids = _get_group_ids(project_id)
 
         if search_config:
-            config = SearchConfig(**search_config)
+            try:
+                config = SearchConfig(**search_config)
+            except (TypeError, ValueError) as e:
+                logger.warning(f"Invalid search_config, falling back to default: {e}")
+                config = EDGE_HYBRID_SEARCH_RRF
         else:
             config = EDGE_HYBRID_SEARCH_RRF
 
@@ -554,9 +618,21 @@ class MemoryService:
         return {"message": "Memory updated successfully"}
 
     def delete_memory(self, memory_id: str) -> dict:
-        """Delete a single memory by ID."""
+        """Delete a single memory by ID from both vector store and graph."""
         m = self._get_memory()
-        return m.delete(memory_id)
+
+        # First, get the memory content to find related graph edges
+        mem = m.get(memory_id)
+        result = m.delete(memory_id)
+
+        # Expire related graph edges (soft-delete, non-critical)
+        if mem and self._graphiti and self._bridge:
+            try:
+                self._expire_graph_edges_for_memory(mem)
+            except Exception as e:
+                logger.warning(f"Graph edge expiration failed for {memory_id} (non-critical): {e}")
+
+        return result
 
     def delete_memories(
         self,
@@ -565,11 +641,14 @@ class MemoryService:
         category: str | None = None,
         project_id: str | None = None,
     ) -> dict:
-        """Bulk delete memories with filters."""
+        """Bulk delete memories with filters from both vector store and graph."""
         m = self._get_memory()
 
         if not scope and not category and not project_id:
-            # Delete all for user
+            # Delete all for user — also expire all graph edges in user's groups
+            if self._graphiti and self._bridge:
+                group_ids = _get_group_ids(project_id)
+                self._expire_graph_edges_for_groups(group_ids)
             m.delete_all(user_id=user_id)
             return {"message": "All memories deleted"}
 
@@ -584,7 +663,11 @@ class MemoryService:
         deleted_count = 0
         for mem in memories:
             try:
+                # Get full memory for graph cleanup before deleting
+                full_mem = m.get(mem.id)
                 m.delete(mem.id)
+                if full_mem and self._graphiti and self._bridge:
+                    self._expire_graph_edges_for_memory(full_mem)
                 deleted_count += 1
             except Exception as e:
                 logger.warning(f"Failed to delete memory {mem.id}: {e}")
@@ -622,7 +705,8 @@ class MemoryService:
                 }
                 for n in nodes
             ]
-        except Exception:
+        except Exception as e:
+            logger.warning("get_graph_nodes failed: %s", e)
             return []
 
     def get_graph_edges(
@@ -657,7 +741,8 @@ class MemoryService:
                 }
                 for e in edges
             ]
-        except Exception:
+        except Exception as e:
+            logger.warning("get_graph_edges failed: %s", e)
             return []
 
     def get_graph_episodes(
@@ -691,7 +776,8 @@ class MemoryService:
                 }
                 for ep in episodes
             ]
-        except Exception:
+        except Exception as e:
+            logger.warning("get_graph_episodes failed: %s", e)
             return []
 
     def get_graph_communities(
@@ -720,7 +806,8 @@ class MemoryService:
                 }
                 for c in communities
             ]
-        except Exception:
+        except Exception as e:
+            logger.warning("get_graph_communities failed: %s", e)
             return []
 
     # ──────────────────────────────────────────────
@@ -748,6 +835,7 @@ class MemoryService:
             score=mem.get("score"),
             created_at=mem.get("created_at"),
             updated_at=mem.get("updated_at"),
+            source="vector",
         )
 
     def _result_to_responses(
@@ -769,6 +857,94 @@ class MemoryService:
         """Convert mem0 search/get_all results to MemoryResponse list."""
         memories = self._extract_memory_list(results)
         return [self._mem_to_response(mem) for mem in memories]
+
+    def _deduplicate_responses(
+        self,
+        vector_responses: list[MemoryResponse],
+        graph_responses: list[MemoryResponse],
+    ) -> list[MemoryResponse]:
+        """Deduplicate and interleave vector and graph results.
+
+        Removes graph results whose content closely matches a vector result,
+        then interleaves the remaining results (vector-1, graph-1, vector-2, ...).
+        """
+        seen_content: set[str] = set()
+        unique_graph: list[MemoryResponse] = []
+
+        # Index vector content for fuzzy matching
+        for vr in vector_responses:
+            seen_content.add(vr.memory.strip().lower())
+
+        for gr in graph_responses:
+            normalized = gr.memory.strip().lower()
+            # Skip if exact or substring match with any vector result
+            is_duplicate = False
+            for vc in seen_content:
+                if normalized == vc or normalized in vc or vc in normalized:
+                    is_duplicate = True
+                    break
+            if not is_duplicate:
+                unique_graph.append(gr)
+                seen_content.add(normalized)
+
+        # Interleave: vector-1, graph-1, vector-2, graph-2, ...
+        interleaved: list[MemoryResponse] = []
+        vi, gi = 0, 0
+        while vi < len(vector_responses) or gi < len(unique_graph):
+            if vi < len(vector_responses):
+                interleaved.append(vector_responses[vi])
+                vi += 1
+            if gi < len(unique_graph):
+                interleaved.append(unique_graph[gi])
+                gi += 1
+
+        return interleaved
+
+    def _expire_graph_edges_for_memory(self, mem: dict) -> None:
+        """Soft-delete graph edges related to a memory by setting expired_at."""
+        content = mem.get("memory", "")
+        if not content:
+            return
+        try:
+            from graphiti_core.search.search_config_recipes import EDGE_HYBRID_SEARCH_RRF
+
+            config = EDGE_HYBRID_SEARCH_RRF
+            config.limit = 5
+
+            metadata = mem.get("metadata", {}) or {}
+            group_ids = _get_group_ids(metadata.get("project_id"))
+
+            results = self._run_on_bridge(
+                self._graphiti.search_(
+                    query=content,
+                    config=config,
+                    group_ids=group_ids,
+                )
+            )
+            now = datetime.now(timezone.utc)
+            for edge in results.edges:
+                if edge.fact and content.lower() in edge.fact.lower():
+                    edge.expired_at = now
+                    self._run_on_bridge(edge.save(self._graphiti.driver))
+        except Exception as e:
+            logger.warning(f"Graph edge expiration failed (non-critical): {e}")
+
+    def _expire_graph_edges_for_groups(self, group_ids: list[str]) -> None:
+        """Expire all graph edges in the given groups (bulk soft-delete)."""
+        try:
+            from graphiti_core.edges import EntityEdge
+
+            edges = self._run_on_bridge(
+                EntityEdge.get_by_group_ids(
+                    self._graphiti.driver, group_ids=group_ids, limit=1000
+                )
+            )
+            now = datetime.now(timezone.utc)
+            for edge in edges:
+                edge.expired_at = now
+                self._run_on_bridge(edge.save(self._graphiti.driver))
+        except Exception as e:
+            logger.warning(f"Bulk graph edge expiration failed (non-critical): {e}")
 
     def _merge_results(self, *result_sets) -> list[dict]:
         """Merge multiple result sets, deduplicate by ID, sort by score descending."""

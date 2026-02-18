@@ -1,6 +1,7 @@
-import os
 from pathlib import Path
+from urllib.parse import urlparse
 
+from arq.connections import RedisSettings
 from pydantic_settings import BaseSettings
 
 
@@ -40,6 +41,26 @@ class Settings(BaseSettings):
     mcp_transport: str = "stdio"  # "stdio" or "http"
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+
+    def validate_required(self) -> None:
+        """Validate that all required configuration fields are set.
+
+        Raises:
+            ValueError: If any required field is empty or missing.
+        """
+        errors = []
+        if not self.google_api_key:
+            errors.append("GOOGLE_API_KEY is required but not set")
+        if not self.neo4j_password:
+            errors.append("NEO4J_PASSWORD is required but not set")
+        if not self.neo4j_uri:
+            errors.append("NEO4J_URI is required but not set")
+        if not self.redis_url:
+            errors.append("REDIS_URL is required but not set")
+        if errors:
+            raise ValueError(
+                "Missing required configuration:\n  - " + "\n  - ".join(errors)
+            )
 
     def get_mem0_config(self) -> dict:
         """Build mem0 config dict for Memory(config=...)."""
@@ -97,3 +118,22 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def parse_redis_settings() -> RedisSettings:
+    """Parse redis_url into ARQ RedisSettings using urllib.parse for robustness.
+
+    Handles formats: redis://host:port/db, redis://user:password@host:port/db
+    """
+    parsed = urlparse(settings.redis_url)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 6379
+    database = int(parsed.path.lstrip("/")) if parsed.path and parsed.path.strip("/") else 0
+    password = parsed.password
+
+    return RedisSettings(
+        host=host,
+        port=port,
+        database=database,
+        password=password,
+    )
