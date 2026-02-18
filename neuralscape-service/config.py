@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     arq_max_retries: int = 3
     arq_job_timeout: int = 300  # 5 min max per task
 
+    # Dedup cron
+    dedup_similarity_threshold: float = 0.95
+    dedup_batch_size: int = 100
+    dedup_cron_hours: set = {0, 6, 12, 18}
+
     # Service
     host: str = "0.0.0.0"
     port: int = 8199

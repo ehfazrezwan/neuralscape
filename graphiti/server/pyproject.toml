@@ -9,7 +9,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.115.0",
-    "graphiti-core[google-genai]",
+    "graphiti-core",
     "pydantic-settings>=2.4.0",
     "uvicorn>=0.30.6",
     "httpx>=0.28.1",
@@ -26,9 +26,6 @@ dev = [
     "ruff>=0.6.2",
     "fastapi-cli>=0.0.5",
 ]
-
-[tool.uv.sources]
-graphiti-core = { path = "..", editable = true }
 
 [build-system]
 requires = ["hatchling"]

@@ -4,96 +4,182 @@ A production-grade memory system for AI coding assistants and personal agents. N
 
 Built on [mem0](https://github.com/mem0ai/mem0) (vector storage + LLM deduplication) and [Graphiti](https://github.com/getzep/graphiti) (temporal knowledge graph), exposed via REST API and MCP server. Memory writes are processed asynchronously by background workers via [ARQ](https://github.com/python-arq/arq) + Redis.
 
-## How It Works
+## Prerequisites
 
+- **Python 3.10+** and **uv** (for local development)
+- **Docker** + **Docker Compose** (for containerized deployment)
+- **Google API key** with Gemini access (for LLM extraction + embeddings)
+- **Neo4j** — included in Docker Compose, or use Neo4j Desktop for local dev
+- **Redis** — included in Docker Compose, or run locally
+- **Qdrant** — included in Docker Compose as a server, or run locally
+
+## Quick Start (Docker)
+
+```bash
+# 1. Copy env template and add your Gemini API key
+cp .env.example .env
+# Edit .env: set GOOGLE_API_KEY=your-key
+
+# 2. Start the full stack
+docker compose up --build -d
+
+# 3. Verify
+docker compose ps
+# Should show: neo4j, redis, qdrant, neuralscape, neuralscape-worker
+
+curl http://localhost:8199/health
+# → {"status":"ok","service":"neuralscape-memory","checks":{"redis":"ok","vector_store":"ok","graph_store":"ok"}}
+
+# 4. Test async memory storage
+curl -X POST http://localhost:8199/v1/memories/raw \
+  -H "Content-Type: application/json" \
+  -d '{"content": "Prefers dark mode", "user_id": "test", "category": "preference"}'
+# → {"status":"accepted","task_id":"...","poll_url":"/v1/memories/status/..."}
+
+# Stop with: docker compose down
 ```
-                    ┌──────────────────────────────────────────────┐
-                    │           neuralscape-service                │
-                    │                                              │
-  Claude Code ────► │  MCP Server (7 tools)   REST API (/v1)      │
-  Any Agent ──────► │       stdio / HTTP         FastAPI           │
-                    │              │                │              │
-                    │              └──────┬─────────┘              │
-                    │                     │                        │
-                    │  ┌─── reads ────────┤                        │
-                    │  │            writes │                        │
-                    │  ▼                  ▼                         │
-                    │  MemoryService    Redis                      │
-                    │  (sync reads)    (task queue)                │
-                    └──────┬──────────────┬────────────────────────┘
-                           │              │
-              ┌────────────┤              │
-              │            │              ▼
-              │            │     ┌─────────────────┐
-              │            │     │  ARQ Worker      │
-              │            │     │  (separate proc) │
-              │            │     │  MemoryService   │
-              │            │     │  (async writes)  │
-              │            │     └────────┬─────────┘
-              │            │              │
-    ┌─────────▼──┐    ┌────▼──────┐       │
-    │   Qdrant   │    │   Neo4j   │◄──────┘
-    │  (vectors) │    │ (Graphiti │
-    │   server   │    │   graph)  │
-    └────────────┘    └───────────┘
+
+## Local Setup (without Docker)
+
+```bash
+# Start Redis and Qdrant (via Docker or locally)
+docker run -d --name redis -p 6379:6379 redis:7-alpine
+docker run -d --name qdrant -p 6333:6333 qdrant/qdrant:v1.13.2
+
+cd neuralscape-service
+
+# Create .env file
+cat > .env << 'EOF'
+GOOGLE_API_KEY=your-gemini-api-key
+NEO4J_URI=neo4j://127.0.0.1:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=your-neo4j-password
+NEO4J_DATABASE=memory
+QDRANT_URL=http://localhost:6333
+EOF
+
+# Install dependencies
+uv sync
+
+# Start the ARQ worker (terminal 1)
+uv run arq worker.WorkerSettings
+
+# Start the API server (terminal 2)
+uv run python main.py
+# → Listening on http://0.0.0.0:8199
+
+# Run unit tests (no external services needed)
+uv run pytest tests/test_service.py -v
+
+# Run integration tests (requires all services running)
+uv run pytest tests/test_async_pipeline.py -v -s
 ```
 
-**Write path**: Client -> API/MCP -> enqueue to Redis -> 202 Accepted -> ARQ Worker picks up -> Gemini extraction + Qdrant + Neo4j writes -> result stored in Redis -> client polls status.
+## MCP Server
 
-**Read path**: Client -> API/MCP -> MemoryService -> Qdrant + Neo4j -> 200 OK with results (synchronous, no queue).
+7 tools exposed via MCP for direct use by AI agents:
 
-Every memory is stored **twice**: as a vector embedding in Qdrant (for semantic search) and as entities/relationships in a Neo4j knowledge graph via Graphiti (for structured reasoning). Both paths are queried on every search and results are merged.
-
-## Core Concepts
-
-### Two-Scope Namespace
-
-Memories live in one of two scopes:
-
-| Scope | Graphiti group_id | Purpose |
+| Tool | Mode | Purpose |
 |---|---|---|
-| **Global** | `"global"` | Cross-project facts: user preferences, skills, personal details |
-| **Project** | `"project:{slug}"` | Project-specific: tech stack, conventions, architecture decisions |
+| `recall_memories` | sync | Semantic search across global + project memories. Agents should call this before starting work. |
+| `remember` | async | Store a single categorized fact. Set `wait: true` to block until stored. |
+| `remember_conversation` | async | Bulk extract from conversation messages via LLM. Set `wait: true` to block. |
+| `get_project_context` | sync | Bootstrap: load all user prefs + project context organized by category. |
+| `search_knowledge_graph` | sync | Graph-based entity/relationship search. |
+| `list_memories` | sync | List/inspect stored memories with filters. |
+| `delete_memories` | sync | Delete by ID or by filters. |
 
-When you search with a `project_id`, Neuralscape searches **both** scopes and merges results by relevance score. An agent working on `neuralscape-graphiti` sees your global "prefers 4-space indentation" preference alongside the project-specific "uses FastAPI with Graphiti backend" fact.
+### Claude Code (stdio)
 
-### 13 Memory Categories
+The quickest way to connect — runs the MCP server as a subprocess:
 
-Since self-hosted mem0 has no native category system, every memory gets a `category` metadata field that controls scope defaults and enables filtered retrieval:
+```bash
+claude mcp add neuralscape-memory -- uv run --directory /absolute/path/to/neuralscape-service python mcp_server.py
+```
 
-| Group | Categories | Default Scope |
-|---|---|---|
-| **Semantic** | `preference`, `personal_fact`, `technical_skill`, `domain_knowledge` | Global |
-| **Project** | `tech_stack`, `convention`, `architecture`, `dependency` | Project |
-| **Episodic** | `decision`, `interaction` | Flexible |
-| **Procedural** | `workflow`, `procedure` | Flexible |
-| **Working** | `task_context` | Flexible |
+Or add manually to your Claude Code MCP settings (`.claude/settings.json` or project settings):
 
-### Custom LLM Extraction
+```json
+{
+  "mcpServers": {
+    "neuralscape-memory": {
+      "command": "uv",
+      "args": ["run", "--directory", "/absolute/path/to/neuralscape-service", "python", "mcp_server.py"]
+    }
+  }
+}
+```
 
-When an agent sends a conversation to `POST /v1/memories`, Neuralscape doesn't just pass it through to mem0. Instead:
+> Requires the ARQ worker running separately: `uv run arq worker.WorkerSettings`
 
-1. The request is enqueued to Redis and the API returns 202 immediately
-2. An ARQ worker picks up the task and calls Gemini with a specialized extraction prompt
-3. The LLM returns facts tagged with categories: `[preference] Prefers tabs over spaces`
-4. Each fact is parsed and stored with proper scope/category metadata via `mem0.add(infer=False)`
-5. The raw conversation is also fed to Graphiti's knowledge graph for entity/relationship extraction
-6. Results are stored in Redis and available via status polling
+### Docker (Streamable HTTP)
 
-This gives you categorized vector memories **and** a rich knowledge graph from the same input.
+For remote agents or containerized setups, set `MCP_TRANSPORT=http`. The MCP endpoint mounts at `/mcp/` on the same port as the REST API.
 
-### Async Processing
+Add `MCP_TRANSPORT=http` to the neuralscape service in `docker-compose.yml`:
 
-All memory write operations are processed asynchronously via ARQ (async Redis queue):
+```yaml
+neuralscape:
+  environment:
+    MCP_TRANSPORT: http
+    # ... other env vars
+```
 
-- **API writes** (`POST /v1/memories`, `POST /v1/memories/raw`) return 202 Accepted with a `task_id`
-- **MCP writes** (`remember`, `remember_conversation`) return a `task_id` by default, or block with `wait: true`
-- **Workers** run in a separate process, processing tasks from the Redis queue
-- **Status polling** via `GET /v1/memories/status/{task_id}` returns `queued`, `processing`, `completed`, or `failed`
+Then restart the stack and add the MCP server:
 
-### Agent Isolation
+```bash
+docker compose up -d
+claude mcp add neuralscape-memory --transport http http://localhost:8199/mcp/
+```
 
-`agent_id` is metadata for provenance tracking, not a scope boundary. All agents (Claude Code, a Cursor plugin, a custom bot) share the same memory space for a given user. Conflicts are handled by Graphiti's temporal edge invalidation (old facts get `invalid_at` timestamps) and mem0's LLM-based deduplication.
+Or manually:
+
+```json
+{
+  "mcpServers": {
+    "neuralscape-memory": {
+      "type": "streamable-http",
+      "url": "http://localhost:8199/mcp/"
+    }
+  }
+}
+```
+
+### Testing with mcp-cli
+
+You can verify the MCP server independently using [mcp-cli](https://github.com/philschmid/mcp-cli), a lightweight Bun-based CLI:
+
+```bash
+# Install
+bun install -g https://github.com/philschmid/mcp-cli
+
+# Create mcp_servers.json in the project root
+cat > mcp_servers.json << 'EOF'
+{
+  "mcpServers": {
+    "neuralscape": {
+      "command": "uv",
+      "args": ["run", "--directory", "/absolute/path/to/neuralscape-service", "python", "mcp_server.py"]
+    }
+  }
+}
+EOF
+
+# List all tools
+mcp-cli
+
+# Inspect a tool's schema
+mcp-cli info neuralscape recall_memories
+
+# Call a read tool
+mcp-cli call neuralscape recall_memories '{"query": "testing", "user_id": "ehfaz"}'
+
+# Call a write tool (fire-and-forget)
+mcp-cli call neuralscape remember '{"content": "test fact", "user_id": "ehfaz", "category": "interaction"}'
+
+# Call a write tool (blocking)
+mcp-cli call neuralscape remember '{"content": "test fact", "user_id": "ehfaz", "category": "interaction", "wait": true}'
+```
 
 ## REST API
 
@@ -178,252 +264,128 @@ curl "http://localhost:8199/v1/graph/episodes?user_id=ehfaz"
 curl "http://localhost:8199/v1/graph/communities?user_id=ehfaz"
 ```
 
-## MCP Tools
+---
 
-7 tools exposed via MCP for direct use by AI agents:
+## How It Works
 
-| Tool | Mode | Purpose |
+```
+                    ┌──────────────────────────────────────────────┐
+                    │           neuralscape-service                │
+                    │                                              │
+  Claude Code ────► │  MCP Server (7 tools)   REST API (/v1)      │
+  Any Agent ──────► │       stdio / HTTP         FastAPI           │
+                    │              │                │              │
+                    │              └──────┬─────────┘              │
+                    │                     │                        │
+                    │  ┌─── reads ────────┤                        │
+                    │  │            writes │                        │
+                    │  ▼                  ▼                         │
+                    │  MemoryService    Redis                      │
+                    │  (sync reads)    (task queue)                │
+                    └──────┬──────────────┬────────────────────────┘
+                           │              │
+              ┌────────────┤              │
+              │            │              ▼
+              │            │     ┌─────────────────┐
+              │            │     │  ARQ Worker      │
+              │            │     │  (separate proc) │
+              │            │     │  MemoryService   │
+              │            │     │  (async writes)  │
+              │            │     └────────┬─────────┘
+              │            │              │
+    ┌─────────▼──┐    ┌────▼──────┐       │
+    │   Qdrant   │    │   Neo4j   │◄──────┘
+    │  (vectors) │    │ (Graphiti │
+    │   server   │    │   graph)  │
+    └────────────┘    └───────────┘
+```
+
+**Write path**: Client -> API/MCP -> enqueue to Redis -> 202 Accepted -> ARQ Worker picks up -> Gemini extraction + Qdrant + Neo4j writes -> result stored in Redis -> client polls status.
+
+**Read path**: Client -> API/MCP -> MemoryService -> Qdrant + Neo4j -> 200 OK with results (synchronous, no queue).
+
+**Maintenance path**: ARQ cron job runs every 6 hours -> scrolls all users -> removes exact duplicates by hash -> removes semantic near-duplicates above cosine threshold -> expires related graph edges.
+
+Every memory is stored **twice**: as a vector embedding in Qdrant (for semantic search) and as entities/relationships in a Neo4j knowledge graph via Graphiti (for structured reasoning). Both paths are queried on every search and results are merged.
+
+## Philosophy
+
+Neuralscape is an opinionated agentic memory layer. It pairs vector search with a temporal knowledge graph so agents get both semantic recall and structured entity/relationship reasoning in a single call. It is opinionated about three things: **categories** (13 predefined types that control scope defaults), **scopes** (global vs. project namespace isolation), and **dual-backend architecture** (every search queries both Qdrant and Graphiti, deduplicates, and returns a merged result set). The goal is a single `/v1/search` call that gives an agent everything it needs to remember — no manual backend selection required.
+
+## Core Concepts
+
+### Two-Scope Namespace
+
+Memories live in one of two scopes:
+
+| Scope | Graphiti group_id | Purpose |
 |---|---|---|
-| `recall_memories` | sync | Semantic search across global + project memories. Agents should call this before starting work. |
-| `remember` | async | Store a single categorized fact. Set `wait: true` to block until stored. |
-| `remember_conversation` | async | Bulk extract from conversation messages via LLM. Set `wait: true` to block. |
-| `get_project_context` | sync | Bootstrap: load all user prefs + project context organized by category. |
-| `search_knowledge_graph` | sync | Graph-based entity/relationship search. |
-| `list_memories` | sync | List/inspect stored memories with filters. |
-| `delete_memories` | sync | Delete by ID or by filters. |
+| **Global** | `"global"` | Cross-project facts: user preferences, skills, personal details |
+| **Project** | `"project--{slug}"` | Project-specific: tech stack, conventions, architecture decisions |
 
-### Transport
+When you search with a `project_id`, Neuralscape searches **both** scopes and merges results by relevance score. An agent working on `neuralscape-graphiti` sees your global "prefers 4-space indentation" preference alongside the project-specific "uses FastAPI with Graphiti backend" fact.
 
-- **stdio** (default): For local Claude Code — see [MCP Server Setup](#mcp-server-setup).
-- **Streamable HTTP**: Set `MCP_TRANSPORT=http` to mount at `/mcp/` on port 8199 for remote agents.
+### 13 Memory Categories
 
-### Claude Code Configuration
+Since self-hosted mem0 has no native category system, every memory gets a `category` metadata field that controls scope defaults and enables filtered retrieval:
 
-**Local dev (stdio)** — runs the MCP server as a subprocess:
+| Group | Categories | Default Scope |
+|---|---|---|
+| **Semantic** | `preference`, `personal_fact`, `technical_skill`, `domain_knowledge` | Global |
+| **Project** | `tech_stack`, `convention`, `architecture`, `dependency` | Project |
+| **Episodic** | `decision`, `interaction` | Flexible |
+| **Procedural** | `workflow`, `procedure` | Flexible |
+| **Working** | `task_context` | Flexible |
 
-```bash
-claude mcp add neuralscape-memory -- uv run --directory /absolute/path/to/neuralscape-service python mcp_server.py
-```
+### Dual-Backend Search
 
-Or add manually to your Claude Code MCP settings:
+Every call to `recall_memories` (MCP) or `POST /v1/search` (REST) queries **both** backends in a single operation:
 
-```json
-{
-  "mcpServers": {
-    "neuralscape-memory": {
-      "command": "uv",
-      "args": ["run", "--directory", "/absolute/path/to/neuralscape-service", "python", "mcp_server.py"]
-    }
-  }
-}
-```
+1. **Qdrant** (vector search) — finds semantically similar memories by embedding distance
+2. **Graphiti** (knowledge graph) — finds related entity/relationship edges from Neo4j
 
-> Requires the ARQ worker running separately: `uv run arq worker.WorkerSettings`
+Results are deduplicated (graph facts that closely match a vector result are removed), then interleaved (vector-1, graph-1, vector-2, graph-2, ...) and returned with a `source` field on each result (`"vector"` or `"graph"`) so agents can see where each fact came from.
 
-**Docker (Streamable HTTP)** — connects to the containerized service over HTTP:
+If the graph search fails (e.g. Neo4j is temporarily unreachable), vector results are still returned — graph search is non-critical.
 
-First, add `MCP_TRANSPORT=http` to the neuralscape service in `docker-compose.yml`:
+### Custom LLM Extraction
 
-```yaml
-neuralscape:
-  environment:
-    MCP_TRANSPORT: http
-    # ... other env vars
-```
+When an agent sends a conversation to `POST /v1/memories`, Neuralscape doesn't just pass it through to mem0. Instead:
 
-Then restart the stack and add the MCP server:
+1. The request is enqueued to Redis and the API returns 202 immediately
+2. An ARQ worker picks up the task and calls Gemini with a specialized extraction prompt
+3. The LLM returns facts tagged with categories: `[preference] Prefers tabs over spaces`
+4. Each fact is parsed and stored with proper scope/category metadata via `mem0.add(infer=False)`
+5. The raw conversation is also fed to Graphiti's knowledge graph for entity/relationship extraction
+6. Results are stored in Redis and available via status polling
 
-```bash
-docker compose up -d
-claude mcp add neuralscape-memory --transport http http://localhost:8199/mcp/
-```
+This gives you categorized vector memories **and** a rich knowledge graph from the same input.
 
-Or manually:
+### Async Processing
 
-```json
-{
-  "mcpServers": {
-    "neuralscape-memory": {
-      "type": "streamable-http",
-      "url": "http://localhost:8199/mcp/"
-    }
-  }
-}
-```
+All memory write operations are processed asynchronously via ARQ (async Redis queue):
 
-## Project Structure
+- **API writes** (`POST /v1/memories`, `POST /v1/memories/raw`) return 202 Accepted with a `task_id`
+- **MCP writes** (`remember`, `remember_conversation`) return a `task_id` by default, or block with `wait: true`
+- **Workers** run in a separate process, processing tasks from the Redis queue
+- **Status polling** via `GET /v1/memories/status/{task_id}` returns `queued`, `processing`, `completed`, or `failed`
 
-```
-neuralscape-graphiti/
-├── docker-compose.yml            # Redis + Qdrant + API + Worker orchestration
-├── .dockerignore                 # Build context filters
-├── .env.example                  # Env template (copy to .env)
-├── neuralscape-service/          # The service (what you deploy)
-│   ├── Dockerfile                # Multi-stage build with uv
-│   ├── main.py                   # FastAPI app: legacy + v1 endpoints
-│   ├── memory_service.py         # Business logic layer (MemoryService class)
-│   ├── mcp_server.py             # MCP server: 7 tools, stdio + HTTP
-│   ├── worker.py                 # ARQ worker: background task processing
-│   ├── task_manager.py           # Redis-backed task enqueuing + status
-│   ├── schemas.py                # Enums, category taxonomy, Pydantic models
-│   ├── prompts.py                # LLM extraction prompt, category parser
-│   ├── config.py                 # Pydantic settings (env-driven)
-│   ├── pyproject.toml            # Dependencies
-│   └── tests/
-│       ├── test_service.py       # REST endpoint unit tests (mocked, no services needed)
-│       ├── test_async_pipeline.py # Integration tests (requires running services)
-│       ├── test_memory_service.py # Business logic tests
-│       └── test_mcp_tools.py     # MCP tool tests
-├── mem0/                         # mem0 fork (local editable)
-│   └── mem0/memory/
-│       └── graphiti_memory.py    # Graphiti adapter (modified for scoping)
-└── graphiti/                     # graphiti-core fork (local editable)
-```
+### Automatic Deduplication
 
-## Prerequisites
+Since `mem0.add(infer=False)` creates new vectors without checking for existing similar ones, Qdrant accumulates duplicates over time. A periodic dedup cron job (every 6 hours via ARQ) keeps the vector store clean in two phases:
 
-- **Python 3.10+** and **uv** (for local development)
-- **Docker** + **Docker Compose** (for containerized deployment)
-- **Google API key** with Gemini access (for LLM extraction + embeddings)
-- **Neo4j** — included in Docker Compose (commented out by default), or use Neo4j Desktop for local dev
-- **Redis** — included in Docker Compose, or run locally
-- **Qdrant** — included in Docker Compose as a server, or run locally
+1. **Exact dedup** — Groups memories by their `hash` field (MD5 of content stored by mem0). Keeps the newest in each group, deletes the rest.
+2. **Semantic dedup** — For each remaining memory, searches Qdrant for near-duplicates above a cosine similarity threshold (default 0.95). Deletes the older memory in each pair.
 
-## Quick Start (Docker)
+Both phases expire related Graphiti graph edges on delete. Graph cleanup is non-critical — failures are logged but don't block dedup.
 
-```bash
-# 1. Copy env template and add your Gemini API key
-cp .env.example .env
-# Edit .env: set GOOGLE_API_KEY=your-key
+### Graph Re-ingestion on Update
 
-# 2. Start the full stack (Redis + Qdrant + API + Worker)
-# If using Neo4j Desktop locally:
-docker compose up --build -d
+When a memory's content is updated via `PUT /v1/memories/{id}` or `update_memory`, the new content is automatically re-ingested into the Graphiti knowledge graph. This allows Graphiti's contradiction detection to expire stale edges and create new ones reflecting the updated fact — no manual delete-and-recreate required.
 
-# If you need Neo4j in Docker too, uncomment the neo4j service in docker-compose.yml first
+### Agent Isolation
 
-# 3. Verify
-docker compose ps
-# Should show: redis, qdrant, neuralscape, neuralscape-worker
-
-curl http://localhost:8199/health
-# → {"status":"ok","service":"neuralscape-memory"}
-
-# 4. Test async memory storage
-curl -X POST http://localhost:8199/v1/memories/raw \
-  -H "Content-Type: application/json" \
-  -d '{"content": "Prefers dark mode", "user_id": "test", "category": "preference"}'
-# → {"status":"accepted","task_id":"...","poll_url":"/v1/memories/status/..."}
-
-# Stop with: docker compose down
-```
-
-## Local Setup (without Docker)
-
-```bash
-# Start Redis and Qdrant (via Docker or locally)
-docker run -d --name redis -p 6379:6379 redis:7-alpine
-docker run -d --name qdrant -p 6333:6333 qdrant/qdrant:latest
-
-cd neuralscape-service
-
-# Create .env file
-cat > .env << 'EOF'
-GOOGLE_API_KEY=your-gemini-api-key
-NEO4J_URI=neo4j://127.0.0.1:7687
-NEO4J_USER=neo4j
-NEO4J_PASSWORD=your-neo4j-password
-NEO4J_DATABASE=memory
-QDRANT_URL=http://localhost:6333
-EOF
-
-# Install dependencies
-uv sync
-
-# Start the ARQ worker (terminal 1)
-uv run arq worker.WorkerSettings
-
-# Start the API server (terminal 2)
-uv run python main.py
-# → Listening on http://0.0.0.0:8199
-
-# Run unit tests (no external services needed)
-uv run pytest tests/test_service.py -v
-
-# Run integration tests (requires all services running)
-uv run pytest tests/test_async_pipeline.py -v -s
-```
-
-## MCP Server Setup
-
-The MCP server exposes all 7 memory tools over stdio or HTTP transport, letting AI agents read/write memories directly.
-
-### Claude Code (stdio)
-
-Add to your Claude Code MCP settings (`.claude/settings.json` or project settings):
-
-```json
-{
-  "mcpServers": {
-    "neuralscape-memory": {
-      "command": "uv",
-      "args": ["run", "--directory", "/absolute/path/to/neuralscape-service", "python", "mcp_server.py"]
-    }
-  }
-}
-```
-
-The MCP server connects to the same Redis, Qdrant, and Neo4j backends as the REST API. Write operations (`remember`, `remember_conversation`) are enqueued to the ARQ worker — make sure the worker is running:
-
-```bash
-cd neuralscape-service
-uv run arq worker.WorkerSettings
-```
-
-### Remote Agents (Streamable HTTP)
-
-For agents that can't use stdio (remote clients, web-based agents), set `MCP_TRANSPORT=http` in your `.env`. The MCP endpoint mounts at `/mcp/` on the same port as the REST API:
-
-```bash
-MCP_TRANSPORT=http uv run python main.py
-# MCP endpoint at http://localhost:8199/mcp/
-```
-
-### Testing with mcp-cli
-
-You can verify the MCP server independently using [mcp-cli](https://github.com/philschmid/mcp-cli), a lightweight Bun-based CLI:
-
-```bash
-# Install
-bun install -g https://github.com/philschmid/mcp-cli
-
-# Create mcp_servers.json in the project root
-cat > mcp_servers.json << 'EOF'
-{
-  "mcpServers": {
-    "neuralscape": {
-      "command": "uv",
-      "args": ["run", "--directory", "/absolute/path/to/neuralscape-service", "python", "mcp_server.py"]
-    }
-  }
-}
-EOF
-
-# List all tools
-mcp-cli
-
-# Inspect a tool's schema
-mcp-cli info neuralscape recall_memories
-
-# Call a read tool
-mcp-cli call neuralscape recall_memories '{"query": "testing", "user_id": "ehfaz"}'
-
-# Call a write tool (fire-and-forget)
-mcp-cli call neuralscape remember '{"content": "test fact", "user_id": "ehfaz", "category": "interaction"}'
-
-# Call a write tool (blocking)
-mcp-cli call neuralscape remember '{"content": "test fact", "user_id": "ehfaz", "category": "interaction", "wait": true}'
-```
+`agent_id` is metadata for provenance tracking, not a scope boundary. All agents (Claude Code, a Cursor plugin, a custom bot) share the same memory space for a given user. Conflicts are handled by Graphiti's temporal edge invalidation (old facts get `invalid_at` timestamps) and mem0's LLM-based deduplication.
 
 ## Configuration
 
@@ -443,8 +405,72 @@ All settings are environment variables (loaded from `.env`):
 | `QDRANT_ON_DISK` | `true` | Persist Qdrant to disk (only used when `QDRANT_URL` is not set) |
 | `QDRANT_PATH` | `~/.neuralscape/qdrant` | Qdrant local storage path (only used when `QDRANT_URL` is not set) |
 | `QDRANT_COLLECTION` | `neuralscape_memories` | Qdrant collection name |
+| `HOST` | `0.0.0.0` | Service bind address |
 | `PORT` | `8199` | Service port |
+| `DEFAULT_USER_ID` | `default_user` | Fallback user ID when none provided |
 | `MCP_TRANSPORT` | `stdio` | MCP transport: `stdio` or `http` |
+| `ARQ_QUEUE_NAME` | `neuralscape:queue` | Redis queue key for ARQ workers |
+| `ARQ_MAX_RETRIES` | `3` | Max retry attempts per background task |
+| `ARQ_JOB_TIMEOUT` | `300` | Max seconds per background task (5 min) |
+| `DEDUP_SIMILARITY_THRESHOLD` | `0.95` | Cosine similarity threshold for semantic dedup |
+| `DEDUP_BATCH_SIZE` | `100` | Qdrant scroll page size during dedup |
+| `DEDUP_CRON_HOURS` | `{0,6,12,18}` | Hours (UTC) when the dedup cron runs |
+
+## Tests
+
+150 tests across 6 files:
+
+| File | What it covers | Services needed |
+|---|---|---|
+| `test_service.py` | REST endpoint unit tests | None (mocked) |
+| `test_memory_service.py` | Business logic (MemoryService) | None (mocked) |
+| `test_mcp_tools.py` | MCP tool interface | None (mocked) |
+| `test_production_readiness.py` | Config, health check, error handling | None (mocked) |
+| `test_dedup.py` | Qdrant dedup (exact, semantic, cron) | None (mocked) |
+| `test_async_pipeline.py` | End-to-end async pipeline | Redis, Qdrant, Neo4j |
+
+```bash
+# Run all unit tests (no services needed)
+cd neuralscape-service
+uv run pytest tests/ --ignore=tests/test_async_pipeline.py -v
+
+# Run integration tests (requires running services)
+uv run pytest tests/test_async_pipeline.py -v -s
+```
+
+## Project Structure
+
+```
+neuralscape-graphiti/
+├── docker-compose.yml            # Redis + Qdrant + Neo4j + API + Worker orchestration
+├── .dockerignore                 # Build context filters
+├── .env.example                  # Env template (copy to .env)
+├── neuralscape-service/          # The service (what you deploy)
+│   ├── Dockerfile                # Multi-stage build with uv
+│   ├── main.py                   # FastAPI app: legacy + v1 endpoints
+│   ├── memory_service.py         # Business logic layer (MemoryService class)
+│   ├── mcp_server.py             # MCP server: 7 tools, stdio + HTTP
+│   ├── worker.py                 # ARQ worker: background task processing + dedup cron
+│   ├── task_manager.py           # Redis-backed task enqueuing + status
+│   ├── schemas.py                # Enums, category taxonomy, Pydantic models
+│   ├── prompts.py                # LLM extraction prompt, category parser
+│   ├── config.py                 # Pydantic settings (env-driven)
+│   ├── logging_config.py         # Structured logging setup
+│   ├── pyproject.toml            # Dependencies
+│   └── tests/
+│       ├── test_service.py             # REST endpoint unit tests (mocked)
+│       ├── test_async_pipeline.py      # Integration tests (requires running services)
+│       ├── test_memory_service.py      # Business logic tests
+│       ├── test_mcp_tools.py           # MCP tool tests
+│       ├── test_production_readiness.py # Config, health, and error handling tests
+│       └── test_dedup.py               # Qdrant dedup tests (exact, semantic, cron)
+├── scripts/
+│   └── sync-upstream.sh          # Pull upstream changes for git subtree deps
+├── mem0/                         # mem0 (git subtree from upstream)
+│   └── mem0/memory/
+│       └── graphiti_memory.py    # Graphiti adapter (local patches applied)
+└── graphiti/                     # graphiti-core (git subtree from upstream)
+```
 
 ## Architecture Decisions
 
@@ -458,6 +484,10 @@ All settings are environment variables (loaded from `.env`):
 
 **Why two storage backends?** Vector search (Qdrant) is for "find memories similar to this query." Knowledge graph (Graphiti/Neo4j) is for "what entities are related to X?" and handles temporal fact invalidation (when facts change over time). Together they provide comprehensive recall.
 
-**Why group_id-based scoping instead of separate databases?** Graphiti partitions data by `group_id` within a single Neo4j database. Using composite IDs (`"global"`, `"project:my-app"`) keeps the infrastructure simple while providing proper namespace isolation. Multi-scope search just queries multiple group_ids.
+**Why group_id-based scoping instead of separate databases?** Graphiti partitions data by `group_id` within a single Neo4j database. Using composite IDs (`"global"`, `"project--my-app"`) keeps the infrastructure simple while providing proper namespace isolation. Multi-scope search just queries multiple group_ids.
 
 **Why not use agent_id as a scope boundary?** Multiple agents (Claude Code, a Slack bot, a CI pipeline) should all benefit from the same memory. Agent isolation would fragment knowledge. Instead, `agent_id` is provenance metadata — you can see *who* learned a fact but everyone can use it.
+
+**Why a periodic dedup cron instead of dedup-on-write?** `mem0.add(infer=False)` bypasses mem0's built-in LLM dedup because we do our own extraction. Checking for duplicates on every write would add latency to the async write path and require embedding + search per write. A periodic batch job is simpler, runs during low-traffic hours, and can use higher thresholds without blocking user-facing operations.
+
+**Why git subtrees for mem0 and graphiti?** Both dependencies have local patches (Graphiti adapter scoping, Neo4j driver fixes). Git subtrees keep the full upstream history, allow pulling upstream changes with `scripts/sync-upstream.sh`, and let local patches live as normal commits — no submodule headaches or fork maintenance.

@@ -92,6 +92,7 @@ services:
       REDIS_URL: redis://redis:6379
       GEMINI_LLM_MODEL: ${SMALL_MODEL_NAME:-gemini-3-flash-preview}
       GEMINI_EMBEDDER_MODEL: ${EMBEDDING_MODEL_NAME:-gemini-embedding-001}
+      MCP_TRANSPORT: http
     restart: unless-stopped
     deploy:
       resources:

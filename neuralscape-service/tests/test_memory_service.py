@@ -201,9 +201,52 @@ class TestCRUD:
         assert call_kwargs["filters"]["project_id"] == "my-project"
 
     def test_update_memory(self, service):
+        service._memory.get.return_value = {
+            "id": "m1",
+            "memory": "Old content",
+            "user_id": "ehfaz",
+            "metadata": {"scope": "global", "category": "preference"},
+        }
         service._memory.update.return_value = {"message": "Memory updated successfully!"}
         result = service.update_memory(memory_id="m1", content="Updated content")
         service._memory.update.assert_called_once_with("m1", "Updated content")
+
+    def test_update_memory_reingests_into_graph(self, service):
+        """When content is updated, the new content should be re-ingested into
+        the knowledge graph so Graphiti can expire contradicting edges."""
+        service._memory.get.return_value = {
+            "id": "m1",
+            "memory": "User prefers dark mode",
+            "user_id": "ehfaz",
+            "metadata": {"scope": "project", "category": "preference", "project_id": "p1"},
+        }
+        service._memory.update.return_value = {"message": "Memory updated successfully!"}
+
+        service.update_memory(memory_id="m1", content="User prefers light mode")
+
+        service._memory.graph.add.assert_called_once_with(
+            data="User prefers light mode",
+            filters={"user_id": "ehfaz", "group_id": "project--p1"},
+        )
+
+    def test_update_memory_skips_graph_for_metadata_only(self, service):
+        """Metadata-only updates (no content) should not trigger graph re-ingestion."""
+        service.update_memory(memory_id="m1", category="preference")
+        service._memory.graph.add.assert_not_called()
+
+    def test_update_memory_graph_failure_noncritical(self, service):
+        """Graph re-ingestion failure should not prevent the update from succeeding."""
+        service._memory.get.return_value = {
+            "id": "m1",
+            "memory": "Old content",
+            "user_id": "ehfaz",
+            "metadata": {"scope": "global"},
+        }
+        service._memory.update.return_value = {"message": "Memory updated successfully!"}
+        service._memory.graph.add.side_effect = Exception("Neo4j connection refused")
+
+        result = service.update_memory(memory_id="m1", content="New content")
+        assert result["message"] == "Memory updated successfully"
 
     def test_update_memory_rejects_invalid_category(self, service):
         with pytest.raises(ValueError, match="Invalid category"):
