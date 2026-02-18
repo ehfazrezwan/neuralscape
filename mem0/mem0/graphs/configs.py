@@ -5,6 +5,33 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from mem0.llms.configs import LlmConfig
 
 
+class GraphitiConfig(BaseModel):
+    url: str = Field(description="Neo4j URI (e.g., neo4j://127.0.0.1:7687)")
+    username: str = Field(description="Neo4j username")
+    password: str = Field(description="Neo4j password")
+    database: str = Field(default="neo4j", description="Neo4j database name")
+    graphiti_llm_provider: str = Field(default="gemini", description="LLM provider for Graphiti extraction")
+    graphiti_llm_model: Optional[str] = Field(default=None, description="LLM model name")
+    graphiti_llm_api_key: Optional[str] = Field(default=None, description="LLM API key")
+    graphiti_embedder_provider: str = Field(default="gemini", description="Embedder provider for Graphiti")
+    graphiti_embedder_model: Optional[str] = Field(default=None, description="Embedder model name")
+    graphiti_embedder_api_key: Optional[str] = Field(default=None, description="Embedder API key")
+    graphiti_reranker_provider: Optional[str] = Field(default=None, description="Reranker provider (gemini, openai, bge)")
+    store_raw_episode_content: bool = Field(default=True, description="Whether to store raw episode content")
+    update_communities: bool = Field(default=False, description="Whether to update communities on add")
+
+    @model_validator(mode="before")
+    def check_required_fields(cls, values):
+        url, username, password = (
+            values.get("url"),
+            values.get("username"),
+            values.get("password"),
+        )
+        if not url or not username or not password:
+            raise ValueError("Please provide 'url', 'username' and 'password' for Graphiti config.")
+        return values
+
+
 class Neo4jConfig(BaseModel):
     url: Optional[str] = Field(None, description="Host address for the graph database")
     username: Optional[str] = Field(None, description="Username for the graph database")
@@ -79,10 +106,10 @@ class KuzuConfig(BaseModel):
 
 class GraphStoreConfig(BaseModel):
     provider: str = Field(
-        description="Provider of the data store (e.g., 'neo4j', 'memgraph', 'neptune', 'kuzu')",
+        description="Provider of the data store (e.g., 'neo4j', 'memgraph', 'neptune', 'kuzu', 'graphiti')",
         default="neo4j",
     )
-    config: Union[Neo4jConfig, MemgraphConfig, NeptuneConfig, KuzuConfig] = Field(
+    config: Union[GraphitiConfig, Neo4jConfig, MemgraphConfig, NeptuneConfig, KuzuConfig] = Field(
         description="Configuration for the specific data store", default=None
     )
     llm: Optional[LlmConfig] = Field(description="LLM configuration for querying the graph store", default=None)
@@ -110,5 +137,7 @@ class GraphStoreConfig(BaseModel):
             return NeptuneConfig(**v.model_dump())
         elif provider == "kuzu":
             return KuzuConfig(**v.model_dump())
+        elif provider == "graphiti":
+            return GraphitiConfig(**v.model_dump())
         else:
             raise ValueError(f"Unsupported graph store provider: {provider}")

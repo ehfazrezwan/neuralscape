@@ -216,6 +216,7 @@ class GraphStoreFactory:
         "neptune": "mem0.graphs.neptune.neptunegraph.MemoryGraph",
         "neptunedb": "mem0.graphs.neptune.neptunedb.MemoryGraph",
         "kuzu": "mem0.memory.kuzu_memory.MemoryGraph",
+        "graphiti": "mem0.memory.graphiti_memory.MemoryGraph",
         "default": "mem0.memory.graph_memory.MemoryGraph",
     }
 
