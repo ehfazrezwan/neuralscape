@@ -5,11 +5,12 @@ services:
       - "7474:7474"
       - "7687:7687"
     environment:
-      NEO4J_AUTH: neo4j/neuralscape
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-neuralscape}
+      NEO4J_initial_dbms_default__database: ${NEO4J_DATABASE:-memory}
     volumes:
       - neo4j_data:/data
     healthcheck:
-      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "neuralscape", "RETURN 1"]
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "${NEO4J_PASSWORD:-neuralscape}", "RETURN 1"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -34,7 +35,7 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/localhost/6333'"]
       interval: 5s
       timeout: 3s
       retries: 5
