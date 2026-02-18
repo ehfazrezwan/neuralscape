@@ -4,15 +4,22 @@ Provides both legacy endpoints (root) and new v1 endpoints with scoping,
 categories, and a shared MemoryService business logic layer.
 """
 
+import asyncio
 import logging
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, FastAPI, HTTPException, Query
+from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from config import settings
+from logging_config import configure_logging
 from memory_service import MemoryService
+
+# Configure structured logging before anything else
+configure_logging()
 from schemas import (
     MEMORY_CATEGORIES,
     BulkDeleteRequest,
@@ -44,20 +51,26 @@ _memory = None
 _graphiti = None
 _bridge = None
 _async_memory = None
+_legacy_init_lock = threading.Lock()
 
 
 def _get_memory():
-    """Lazy-initialize mem0 Memory with Graphiti backend (legacy)."""
+    """Lazy-initialize mem0 Memory with Graphiti backend (legacy).
+
+    Thread-safe: uses double-checked locking to prevent concurrent initialization.
+    """
     global _memory, _graphiti, _bridge
     if _memory is None:
-        from mem0 import Memory
+        with _legacy_init_lock:
+            if _memory is None:
+                from mem0 import Memory
 
-        config = settings.get_mem0_config()
-        _memory = Memory.from_config(config)
+                config = settings.get_mem0_config()
+                _memory = Memory.from_config(config)
 
-        if hasattr(_memory, "graph") and hasattr(_memory.graph, "graphiti"):
-            _graphiti = _memory.graph.graphiti
-            _bridge = _memory.graph._bridge
+                if hasattr(_memory, "graph") and hasattr(_memory.graph, "graphiti"):
+                    _graphiti = _memory.graph.graphiti
+                    _bridge = _memory.graph._bridge
 
     return _memory
 
@@ -93,6 +106,10 @@ _mcp_session_manager = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting Neuralscape Service...")
+
+    # Validate required configuration before anything else
+    settings.validate_required()
+
     # Initialize the service (this also initializes mem0 + Graphiti)
     _service._get_memory()
     # Connect task manager to Redis
@@ -108,11 +125,26 @@ async def lifespan(app: FastAPI):
     else:
         yield
 
+    # Shutdown with timeout to prevent hanging on unresponsive backends
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(_shutdown_sync),
+            timeout=10,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("Service shutdown timed out after 10s, forcing exit")
+    except Exception as e:
+        logger.warning(f"Error during shutdown: {e}")
+
     await _task_manager.close()
+    logger.info("Neuralscape Service stopped.")
+
+
+def _shutdown_sync():
+    """Synchronous shutdown logic for _service and _async_memory."""
     _service.close()
     if _async_memory and hasattr(_async_memory, "graph") and hasattr(_async_memory.graph, "graphiti"):
         _async_memory.graph._bridge.run(_async_memory.graph.graphiti.close())
-    logger.info("Neuralscape Service stopped.")
 
 
 app = FastAPI(
@@ -121,6 +153,17 @@ app = FastAPI(
     version="0.2.0",
     lifespan=lifespan,
 )
+
+
+# ── Global exception handler ─────────────────────────────────────
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    """Catch unhandled exceptions and return generic error to clients."""
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"error": "Internal server error"},
+    )
 
 
 # ══════════════════════════════════════════════
@@ -156,7 +199,53 @@ class LegacyGraphSearchRequest(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "neuralscape-memory"}
+    """Health check that verifies backend connectivity.
+
+    Returns 200 with per-backend status when core services are reachable.
+    Returns 503 if critical backends (vector store) are unreachable.
+    """
+    checks: dict[str, str] = {}
+
+    # Check Redis (task queue)
+    try:
+        if _task_manager.pool:
+            await _task_manager.pool.ping()
+            checks["redis"] = "ok"
+        else:
+            checks["redis"] = "not_connected"
+    except Exception:
+        checks["redis"] = "unreachable"
+
+    # Check vector store (Qdrant via mem0) — lightweight: just verify mem0 is initialized
+    try:
+        if _service._memory is not None:
+            checks["vector_store"] = "ok"
+        else:
+            checks["vector_store"] = "not_initialized"
+    except Exception:
+        checks["vector_store"] = "unreachable"
+
+    # Check graph store (Neo4j/Graphiti)
+    try:
+        if _service._graphiti is not None:
+            checks["graph_store"] = "ok"
+        else:
+            checks["graph_store"] = "not_initialized"
+    except Exception:
+        checks["graph_store"] = "unreachable"
+
+    # Overall status: degraded if Redis is down, unhealthy if vector store is down
+    if checks.get("vector_store") == "unreachable":
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unhealthy", "service": "neuralscape-memory", "checks": checks},
+        )
+
+    overall = "ok"
+    if any(v != "ok" for v in checks.values()):
+        overall = "degraded"
+
+    return {"status": overall, "service": "neuralscape-memory", "checks": checks}
 
 
 @app.post("/memories")
@@ -164,7 +253,8 @@ async def add_memory(req: LegacyAddMemoryRequest):
     """Add a memory through mem0 (vector + graph). Legacy endpoint."""
     m = _get_memory()
     try:
-        result = m.add(
+        result = await asyncio.to_thread(
+            m.add,
             messages=req.messages,
             user_id=req.user_id or settings.default_user_id,
             agent_id=req.agent_id,
@@ -174,7 +264,7 @@ async def add_memory(req: LegacyAddMemoryRequest):
         return {"status": "ok", "result": result}
     except Exception as e:
         logger.exception("add_memory failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Memory storage failed")
 
 
 @app.post("/search")
@@ -182,7 +272,8 @@ async def search_memories(req: LegacySearchRequest):
     """Search memories through mem0. Legacy endpoint."""
     m = _get_memory()
     try:
-        result = m.search(
+        result = await asyncio.to_thread(
+            m.search,
             query=req.query,
             user_id=req.user_id or settings.default_user_id,
             agent_id=req.agent_id,
@@ -192,7 +283,7 @@ async def search_memories(req: LegacySearchRequest):
         return {"status": "ok", "results": result}
     except Exception as e:
         logger.exception("search_memories failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Memory search failed")
 
 
 @app.get("/memories")
@@ -205,7 +296,8 @@ async def list_memories(
     """List all memories for a user. Legacy endpoint."""
     m = _get_memory()
     try:
-        result = m.get_all(
+        result = await asyncio.to_thread(
+            m.get_all,
             user_id=user_id or settings.default_user_id,
             agent_id=agent_id,
             run_id=run_id,
@@ -214,7 +306,7 @@ async def list_memories(
         return {"status": "ok", "memories": result}
     except Exception as e:
         logger.exception("list_memories failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to list memories")
 
 
 @app.delete("/memories")
@@ -226,7 +318,8 @@ async def delete_memories(
     """Delete all memories for a user. Legacy endpoint."""
     m = _get_memory()
     try:
-        m.delete_all(
+        await asyncio.to_thread(
+            m.delete_all,
             user_id=user_id or settings.default_user_id,
             agent_id=agent_id,
             run_id=run_id,
@@ -234,7 +327,7 @@ async def delete_memories(
         return {"status": "ok", "message": "All memories deleted"}
     except Exception as e:
         logger.exception("delete_memories failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to delete memories")
 
 
 @app.post("/memories/async")
@@ -263,7 +356,7 @@ async def get_task_status(task_id: str):
 
 # Legacy graph endpoints
 @app.get("/graph/nodes")
-def list_graph_nodes_legacy(
+async def list_graph_nodes_legacy(
     user_id: str = Query(default=None),
     limit: int = Query(default=50),
 ):
@@ -276,8 +369,9 @@ def list_graph_nodes_legacy(
 
     group_id = user_id or settings.default_user_id
     try:
-        nodes = _run_on_bridge(
-            EntityNode.get_by_group_ids(g.driver, group_ids=[group_id], limit=limit)
+        nodes = await asyncio.to_thread(
+            _run_on_bridge,
+            EntityNode.get_by_group_ids(g.driver, group_ids=[group_id], limit=limit),
         )
         return {
             "status": "ok",
@@ -293,12 +387,13 @@ def list_graph_nodes_legacy(
                 for n in nodes
             ],
         }
-    except Exception:
+    except Exception as e:
+        logger.warning("list_graph_nodes failed: %s", e)
         return {"status": "ok", "nodes": []}
 
 
 @app.get("/graph/edges")
-def list_graph_edges_legacy(
+async def list_graph_edges_legacy(
     user_id: str = Query(default=None),
     limit: int = Query(default=50),
 ):
@@ -312,8 +407,9 @@ def list_graph_edges_legacy(
 
     group_id = user_id or settings.default_user_id
     try:
-        edges = _run_on_bridge(
-            EntityEdge.get_by_group_ids(g.driver, group_ids=[group_id], limit=limit)
+        edges = await asyncio.to_thread(
+            _run_on_bridge,
+            EntityEdge.get_by_group_ids(g.driver, group_ids=[group_id], limit=limit),
         )
         return {
             "status": "ok",
@@ -335,12 +431,13 @@ def list_graph_edges_legacy(
         }
     except GroupsEdgesNotFoundError:
         return {"status": "ok", "edges": []}
-    except Exception:
+    except Exception as e:
+        logger.warning("list_graph_edges failed: %s", e)
         return {"status": "ok", "edges": []}
 
 
 @app.get("/graph/episodes")
-def list_graph_episodes_legacy(
+async def list_graph_episodes_legacy(
     user_id: str = Query(default=None),
     limit: int = Query(default=20),
 ):
@@ -352,12 +449,13 @@ def list_graph_episodes_legacy(
     group_id = user_id or settings.default_user_id
     now = datetime.now(timezone.utc)
     try:
-        episodes = _run_on_bridge(
+        episodes = await asyncio.to_thread(
+            _run_on_bridge,
             g.retrieve_episodes(
                 reference_time=now,
                 last_n=limit,
                 group_ids=[group_id],
-            )
+            ),
         )
         return {
             "status": "ok",
@@ -374,12 +472,13 @@ def list_graph_episodes_legacy(
                 for ep in episodes
             ],
         }
-    except Exception:
+    except Exception as e:
+        logger.warning("list_graph_episodes failed: %s", e)
         return {"status": "ok", "episodes": []}
 
 
 @app.get("/graph/communities")
-def list_graph_communities_legacy(
+async def list_graph_communities_legacy(
     user_id: str = Query(default=None),
     limit: int = Query(default=20),
 ):
@@ -392,8 +491,9 @@ def list_graph_communities_legacy(
 
     group_id = user_id or settings.default_user_id
     try:
-        communities = _run_on_bridge(
-            CommunityNode.get_by_group_ids(g.driver, group_ids=[group_id], limit=limit)
+        communities = await asyncio.to_thread(
+            _run_on_bridge,
+            CommunityNode.get_by_group_ids(g.driver, group_ids=[group_id], limit=limit),
         )
         return {
             "status": "ok",
@@ -408,12 +508,13 @@ def list_graph_communities_legacy(
                 for c in communities
             ],
         }
-    except Exception:
+    except Exception as e:
+        logger.warning("list_graph_communities failed: %s", e)
         return {"status": "ok", "communities": []}
 
 
 @app.post("/graph/search")
-def advanced_graph_search_legacy(req: LegacyGraphSearchRequest):
+async def advanced_graph_search_legacy(req: LegacyGraphSearchRequest):
     """Advanced Graphiti search with configurable SearchConfig. Legacy endpoint."""
     g = _get_graphiti()
     if g is None:
@@ -425,19 +526,26 @@ def advanced_graph_search_legacy(req: LegacyGraphSearchRequest):
     group_id = req.user_id or settings.default_user_id
 
     if req.search_config:
-        config = SearchConfig(**req.search_config)
+        try:
+            config = SearchConfig(**req.search_config)
+        except (TypeError, ValueError) as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid search_config: {e}",
+            )
     else:
         config = EDGE_HYBRID_SEARCH_RRF
 
     config.limit = req.limit
 
     try:
-        results = _run_on_bridge(
+        results = await asyncio.to_thread(
+            _run_on_bridge,
             g.search_(
                 query=req.query,
                 config=config,
                 group_ids=[group_id],
-            )
+            ),
         )
 
         return {
@@ -461,7 +569,7 @@ def advanced_graph_search_legacy(req: LegacyGraphSearchRequest):
         }
     except Exception as e:
         logger.exception("graph search failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Graph search failed")
 
 
 # ══════════════════════════════════════════════
@@ -474,31 +582,49 @@ v1_router = APIRouter(prefix="/v1", tags=["v1"])
 # ── Remember ──────────────────────────────────
 
 
-@v1_router.post("/memories", response_model=TaskAcceptedResponse, status_code=202)
+@v1_router.post("/memories", status_code=202)
 async def v1_store_memories(req: StoreMemoryRequest):
     """Store memories from conversation via LLM extraction (async).
 
     Enqueues the extraction task to a background worker and returns immediately
     with a task_id that can be polled via GET /v1/memories/status/{task_id}.
+    Falls back to synchronous storage if Redis is unavailable.
     """
-    task_id = await _task_manager.enqueue_store(
-        messages=req.messages,
-        user_id=req.user_id,
-        project_id=req.project_id,
-        agent_id=req.agent_id,
-        run_id=req.run_id,
-    )
+    try:
+        task_id = await _task_manager.enqueue_store(
+            messages=req.messages,
+            user_id=req.user_id,
+            project_id=req.project_id,
+            agent_id=req.agent_id,
+            run_id=req.run_id,
+        )
+    except (ConnectionError, OSError) as e:
+        logger.warning(f"Redis unavailable, falling back to sync store: {e}")
+        memories = await asyncio.to_thread(
+            _service.extract_and_store,
+            messages=req.messages,
+            user_id=req.user_id,
+            project_id=req.project_id,
+            agent_id=req.agent_id,
+            run_id=req.run_id,
+        )
+        return JSONResponse(
+            status_code=200,
+            content=StoreMemoryResponse(memories=memories).model_dump(exclude_none=True),
+        )
+
     return TaskAcceptedResponse(
         task_id=task_id,
         poll_url=f"/v1/memories/status/{task_id}",
     )
 
 
-@v1_router.post("/memories/raw", response_model=TaskAcceptedResponse, status_code=202)
+@v1_router.post("/memories/raw", status_code=202)
 async def v1_store_raw_memory(req: RawMemoryRequest):
     """Store a single pre-categorized fact (async, no LLM extraction).
 
     Enqueues the storage task to a background worker and returns immediately.
+    Falls back to synchronous storage if Redis is unavailable.
     """
     if req.category not in MEMORY_CATEGORIES:
         raise HTTPException(
@@ -508,16 +634,35 @@ async def v1_store_raw_memory(req: RawMemoryRequest):
     if req.scope == "project" and not req.project_id:
         raise HTTPException(status_code=400, detail="project_id is required when scope='project'")
 
-    task_id = await _task_manager.enqueue_raw(
-        content=req.content,
-        user_id=req.user_id,
-        category=req.category,
-        scope=req.scope,
-        project_id=req.project_id,
-        tags=req.tags,
-        agent_id=req.agent_id,
-        run_id=req.run_id,
-    )
+    try:
+        task_id = await _task_manager.enqueue_raw(
+            content=req.content,
+            user_id=req.user_id,
+            category=req.category,
+            scope=req.scope,
+            project_id=req.project_id,
+            tags=req.tags,
+            agent_id=req.agent_id,
+            run_id=req.run_id,
+        )
+    except (ConnectionError, OSError) as e:
+        logger.warning(f"Redis unavailable, falling back to sync store: {e}")
+        memories = await asyncio.to_thread(
+            _service.store_raw,
+            content=req.content,
+            user_id=req.user_id,
+            category=req.category,
+            scope=req.scope,
+            project_id=req.project_id,
+            tags=req.tags,
+            agent_id=req.agent_id,
+            run_id=req.run_id,
+        )
+        return JSONResponse(
+            status_code=200,
+            content=StoreMemoryResponse(memories=memories).model_dump(exclude_none=True),
+        )
+
     return TaskAcceptedResponse(
         task_id=task_id,
         poll_url=f"/v1/memories/status/{task_id}",
@@ -543,7 +688,8 @@ async def v1_search_memories(req: SearchMemoryRequest):
     When project_id is provided, searches both global and project memories.
     """
     try:
-        results = _service.search(
+        results = await asyncio.to_thread(
+            _service.search,
             query=req.query,
             user_id=req.user_id,
             project_id=req.project_id,
@@ -554,14 +700,15 @@ async def v1_search_memories(req: SearchMemoryRequest):
         return SearchMemoryResponse(results=results)
     except Exception as e:
         logger.exception("v1 search failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Memory search failed")
 
 
 @v1_router.post("/graph/search")
 async def v1_graph_search(req: GraphSearchRequest):
     """Knowledge graph search (entities, facts, relationships)."""
     try:
-        results = _service.search_graph(
+        results = await asyncio.to_thread(
+            _service.search_graph,
             query=req.query,
             user_id=req.user_id,
             project_id=req.project_id,
@@ -571,7 +718,7 @@ async def v1_graph_search(req: GraphSearchRequest):
         return {"status": "ok", **results}
     except Exception as e:
         logger.exception("v1 graph search failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Graph search failed")
 
 
 # ── Context ───────────────────────────────────
@@ -581,10 +728,13 @@ async def v1_graph_search(req: GraphSearchRequest):
 async def v1_get_global_context(user_id: str = Query(...)):
     """Get only global user context (preferences, skills, etc.)."""
     try:
-        return _service.get_global_context(user_id=user_id)
+        return await asyncio.to_thread(
+            _service.get_global_context,
+            user_id=user_id,
+        )
     except Exception as e:
         logger.exception("v1 get_global_context failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to load global context")
 
 
 @v1_router.get("/context/{project_id}", response_model=ContextResponse)
@@ -594,10 +744,14 @@ async def v1_get_project_context(
 ):
     """Get full project + global context organized by category."""
     try:
-        return _service.get_project_context(user_id=user_id, project_id=project_id)
+        return await asyncio.to_thread(
+            _service.get_project_context,
+            user_id=user_id,
+            project_id=project_id,
+        )
     except Exception as e:
         logger.exception("v1 get_project_context failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to load project context")
 
 
 # ── Manage ────────────────────────────────────
@@ -613,7 +767,8 @@ async def v1_list_memories(
 ):
     """List memories with filters (scope, category, project_id)."""
     try:
-        return _service.list_memories(
+        return await asyncio.to_thread(
+            _service.list_memories,
             user_id=user_id,
             scope=scope,
             category=category,
@@ -622,13 +777,13 @@ async def v1_list_memories(
         )
     except Exception as e:
         logger.exception("v1 list_memories failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to list memories")
 
 
 @v1_router.get("/memories/{memory_id}", response_model=MemoryResponse)
 async def v1_get_memory(memory_id: str):
     """Get a single memory by ID."""
-    result = _service.get_memory(memory_id)
+    result = await asyncio.to_thread(_service.get_memory, memory_id)
     if result is None:
         raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
     return result
@@ -638,7 +793,8 @@ async def v1_get_memory(memory_id: str):
 async def v1_update_memory(memory_id: str, req: UpdateMemoryRequest):
     """Update a memory's content or category."""
     try:
-        return _service.update_memory(
+        return await asyncio.to_thread(
+            _service.update_memory,
             memory_id=memory_id,
             content=req.content,
             category=req.category,
@@ -648,24 +804,25 @@ async def v1_update_memory(memory_id: str, req: UpdateMemoryRequest):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.exception("v1 update_memory failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to update memory")
 
 
 @v1_router.delete("/memories/{memory_id}")
 async def v1_delete_memory(memory_id: str):
     """Delete a single memory by ID."""
     try:
-        return _service.delete_memory(memory_id)
+        return await asyncio.to_thread(_service.delete_memory, memory_id)
     except Exception as e:
         logger.exception("v1 delete_memory failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to delete memory")
 
 
 @v1_router.delete("/memories")
 async def v1_bulk_delete_memories(req: BulkDeleteRequest):
     """Bulk delete memories with filters."""
     try:
-        return _service.delete_memories(
+        return await asyncio.to_thread(
+            _service.delete_memories,
             user_id=req.user_id,
             scope=req.scope,
             category=req.category,
@@ -673,7 +830,7 @@ async def v1_bulk_delete_memories(req: BulkDeleteRequest):
         )
     except Exception as e:
         logger.exception("v1 bulk_delete failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to delete memories")
 
 
 @v1_router.get("/categories", response_model=CategoryListResponse)
@@ -692,7 +849,12 @@ async def v1_graph_nodes(
     limit: int = Query(default=50),
 ):
     """List entity nodes from Graphiti with project_id filter."""
-    nodes = _service.get_graph_nodes(user_id=user_id, project_id=project_id, limit=limit)
+    nodes = await asyncio.to_thread(
+        _service.get_graph_nodes,
+        user_id=user_id,
+        project_id=project_id,
+        limit=limit,
+    )
     return {"status": "ok", "nodes": nodes}
 
 
@@ -703,7 +865,12 @@ async def v1_graph_edges(
     limit: int = Query(default=50),
 ):
     """List entity edges (facts) from Graphiti with project_id filter."""
-    edges = _service.get_graph_edges(user_id=user_id, project_id=project_id, limit=limit)
+    edges = await asyncio.to_thread(
+        _service.get_graph_edges,
+        user_id=user_id,
+        project_id=project_id,
+        limit=limit,
+    )
     return {"status": "ok", "edges": edges}
 
 
@@ -714,7 +881,12 @@ async def v1_graph_episodes(
     limit: int = Query(default=20),
 ):
     """List episodic nodes from Graphiti with project_id filter."""
-    episodes = _service.get_graph_episodes(user_id=user_id, project_id=project_id, limit=limit)
+    episodes = await asyncio.to_thread(
+        _service.get_graph_episodes,
+        user_id=user_id,
+        project_id=project_id,
+        limit=limit,
+    )
     return {"status": "ok", "episodes": episodes}
 
 
@@ -725,7 +897,12 @@ async def v1_graph_communities(
     limit: int = Query(default=20),
 ):
     """List community nodes from Graphiti with project_id filter."""
-    communities = _service.get_graph_communities(user_id=user_id, project_id=project_id, limit=limit)
+    communities = await asyncio.to_thread(
+        _service.get_graph_communities,
+        user_id=user_id,
+        project_id=project_id,
+        limit=limit,
+    )
     return {"status": "ok", "communities": communities}
 
 

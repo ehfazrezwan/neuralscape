@@ -311,14 +311,28 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if project_id and category not in GLOBAL_CATEGORIES:
                 scope = "project"
 
-            task_id = await _task_manager.enqueue_raw(
-                content=arguments["content"],
-                user_id=user_id,
-                category=category,
-                scope=scope,
-                project_id=project_id,
-                tags=arguments.get("tags"),
-            )
+            try:
+                task_id = await _task_manager.enqueue_raw(
+                    content=arguments["content"],
+                    user_id=user_id,
+                    category=category,
+                    scope=scope,
+                    project_id=project_id,
+                    tags=arguments.get("tags"),
+                )
+            except (ConnectionError, OSError) as e:
+                # Redis unavailable — fall back to synchronous storage
+                logger.warning(f"Redis unavailable, falling back to sync store: {e}")
+                memories = _service.store_raw(
+                    content=arguments["content"],
+                    user_id=user_id,
+                    category=category,
+                    scope=scope,
+                    project_id=project_id,
+                    tags=arguments.get("tags"),
+                )
+                output = [m.model_dump(exclude_none=True) for m in memories]
+                return [TextContent(type="text", text=json.dumps({"status": "completed", "result": {"memories": output}, "fallback": "sync"}, default=str))]
 
             if wait:
                 result = await _task_manager.wait_for_result(task_id)
@@ -329,11 +343,22 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         elif name == "remember_conversation":
             wait = arguments.get("wait", False)
 
-            task_id = await _task_manager.enqueue_store(
-                messages=arguments["messages"],
-                user_id=user_id,
-                project_id=arguments.get("project_id"),
-            )
+            try:
+                task_id = await _task_manager.enqueue_store(
+                    messages=arguments["messages"],
+                    user_id=user_id,
+                    project_id=arguments.get("project_id"),
+                )
+            except (ConnectionError, OSError) as e:
+                # Redis unavailable — fall back to synchronous storage
+                logger.warning(f"Redis unavailable, falling back to sync store: {e}")
+                memories = _service.extract_and_store(
+                    messages=arguments["messages"],
+                    user_id=user_id,
+                    project_id=arguments.get("project_id"),
+                )
+                output = [m.model_dump(exclude_none=True) for m in memories]
+                return [TextContent(type="text", text=json.dumps({"status": "completed", "result": {"memories": output}, "fallback": "sync"}, default=str))]
 
             if wait:
                 result = await _task_manager.wait_for_result(task_id)
