@@ -1,0 +1,68 @@
+# Virtual environments
+**/.venv/
+
+# Python cache
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+# Environment files (secrets passed at runtime)
+**/.env
+
+# Version control
+**/.git/
+.gitignore
+
+# Node
+**/node_modules/
+
+# graphiti — keep only graphiti_core/ and pyproject.toml
+graphiti/.github/
+graphiti/examples/
+graphiti/tests/
+graphiti/docs/
+graphiti/images/
+graphiti/mcp_server/
+graphiti/server/
+graphiti/spec/
+graphiti/signatures/
+graphiti/AGENTS.md
+graphiti/CLAUDE.md
+graphiti/CODE_OF_CONDUCT.md
+graphiti/CONTRIBUTING.md
+graphiti/OTEL_TRACING.md
+graphiti/SECURITY.md
+graphiti/Zep-CLA.md
+graphiti/Makefile
+graphiti/Dockerfile
+graphiti/docker-compose*.yml
+graphiti/ellipsis.yaml
+graphiti/depot.json
+graphiti/conftest.py
+graphiti/pytest.ini
+
+# mem0 — keep only mem0/mem0/ and pyproject.toml
+mem0/embedchain/
+mem0/openmemory/
+mem0/openclaw/
+mem0/docs/
+mem0/tests/
+mem0/examples/
+mem0/cookbooks/
+mem0/evaluation/
+mem0/mem0-ts/
+mem0/server/
+mem0/CLAUDE.md
+mem0/CONTRIBUTING.md
+mem0/LLM.md
+mem0/MIGRATION_GUIDE_v1.0.md
+mem0/Makefile
+
+# neuralscape-service caches
+neuralscape-service/.venv/
+neuralscape-service/.pytest_cache/
+neuralscape-service/tests/
+neuralscape-service/__pycache__/
+
+# docs
+docs/
