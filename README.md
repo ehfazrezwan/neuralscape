@@ -4,6 +4,10 @@ A production-grade memory system for AI coding assistants and personal agents. N
 
 Built on [mem0](https://github.com/mem0ai/mem0) (vector storage + LLM deduplication) and [Graphiti](https://github.com/getzep/graphiti) (temporal knowledge graph), exposed via REST API and MCP server. Memory writes are processed asynchronously by background workers via [ARQ](https://github.com/python-arq/arq) + Redis.
 
+## Philosophy
+
+Neuralscape is an opinionated agentic memory layer. It pairs vector search with a temporal knowledge graph so agents get both semantic recall and structured entity/relationship reasoning in a single call. It is opinionated about three things: **categories** (13 predefined types that control scope defaults), **scopes** (global vs. project namespace isolation), and **dual-backend architecture** (every search queries both Qdrant and Graphiti, deduplicates, and returns a merged result set). The goal is a single `/v1/search` call that gives an agent everything it needs to remember — no manual backend selection required.
+
 ## How It Works
 
 ```
@@ -53,7 +57,7 @@ Memories live in one of two scopes:
 | Scope | Graphiti group_id | Purpose |
 |---|---|---|
 | **Global** | `"global"` | Cross-project facts: user preferences, skills, personal details |
-| **Project** | `"project:{slug}"` | Project-specific: tech stack, conventions, architecture decisions |
+| **Project** | `"project--{slug}"` | Project-specific: tech stack, conventions, architecture decisions |
 
 When you search with a `project_id`, Neuralscape searches **both** scopes and merges results by relevance score. An agent working on `neuralscape-graphiti` sees your global "prefers 4-space indentation" preference alongside the project-specific "uses FastAPI with Graphiti backend" fact.
 
@@ -68,6 +72,17 @@ Since self-hosted mem0 has no native category system, every memory gets a `categ
 | **Episodic** | `decision`, `interaction` | Flexible |
 | **Procedural** | `workflow`, `procedure` | Flexible |
 | **Working** | `task_context` | Flexible |
+
+### Dual-Backend Search
+
+Every call to `recall_memories` (MCP) or `POST /v1/search` (REST) queries **both** backends in a single operation:
+
+1. **Qdrant** (vector search) — finds semantically similar memories by embedding distance
+2. **Graphiti** (knowledge graph) — finds related entity/relationship edges from Neo4j
+
+Results are deduplicated (graph facts that closely match a vector result are removed), then interleaved (vector-1, graph-1, vector-2, graph-2, ...) and returned with a `source` field on each result (`"vector"` or `"graph"`) so agents can see where each fact came from.
+
+If the graph search fails (e.g. Neo4j is temporarily unreachable), vector results are still returned — graph search is non-critical.
 
 ### Custom LLM Extraction
 
@@ -255,7 +270,7 @@ Or manually:
 
 ```
 neuralscape-graphiti/
-├── docker-compose.yml            # Redis + Qdrant + API + Worker orchestration
+├── docker-compose.yml            # Redis + Qdrant + Neo4j + API + Worker orchestration
 ├── .dockerignore                 # Build context filters
 ├── .env.example                  # Env template (copy to .env)
 ├── neuralscape-service/          # The service (what you deploy)
@@ -268,12 +283,14 @@ neuralscape-graphiti/
 │   ├── schemas.py                # Enums, category taxonomy, Pydantic models
 │   ├── prompts.py                # LLM extraction prompt, category parser
 │   ├── config.py                 # Pydantic settings (env-driven)
+│   ├── logging_config.py         # Structured logging setup
 │   ├── pyproject.toml            # Dependencies
 │   └── tests/
-│       ├── test_service.py       # REST endpoint unit tests (mocked, no services needed)
-│       ├── test_async_pipeline.py # Integration tests (requires running services)
-│       ├── test_memory_service.py # Business logic tests
-│       └── test_mcp_tools.py     # MCP tool tests
+│       ├── test_service.py             # REST endpoint unit tests (mocked)
+│       ├── test_async_pipeline.py      # Integration tests (requires running services)
+│       ├── test_memory_service.py      # Business logic tests
+│       ├── test_mcp_tools.py           # MCP tool tests
+│       └── test_production_readiness.py # Config, health, and error handling tests
 ├── mem0/                         # mem0 fork (local editable)
 │   └── mem0/memory/
 │       └── graphiti_memory.py    # Graphiti adapter (modified for scoping)
@@ -285,7 +302,7 @@ neuralscape-graphiti/
 - **Python 3.10+** and **uv** (for local development)
 - **Docker** + **Docker Compose** (for containerized deployment)
 - **Google API key** with Gemini access (for LLM extraction + embeddings)
-- **Neo4j** — included in Docker Compose (commented out by default), or use Neo4j Desktop for local dev
+- **Neo4j** — included in Docker Compose, or use Neo4j Desktop for local dev
 - **Redis** — included in Docker Compose, or run locally
 - **Qdrant** — included in Docker Compose as a server, or run locally
 
@@ -296,18 +313,15 @@ neuralscape-graphiti/
 cp .env.example .env
 # Edit .env: set GOOGLE_API_KEY=your-key
 
-# 2. Start the full stack (Redis + Qdrant + API + Worker)
-# If using Neo4j Desktop locally:
+# 2. Start the full stack
 docker compose up --build -d
-
-# If you need Neo4j in Docker too, uncomment the neo4j service in docker-compose.yml first
 
 # 3. Verify
 docker compose ps
-# Should show: redis, qdrant, neuralscape, neuralscape-worker
+# Should show: neo4j, redis, qdrant, neuralscape, neuralscape-worker
 
 curl http://localhost:8199/health
-# → {"status":"ok","service":"neuralscape-memory"}
+# → {"status":"ok","service":"neuralscape-memory","checks":{"redis":"ok","vector_store":"ok","graph_store":"ok"}}
 
 # 4. Test async memory storage
 curl -X POST http://localhost:8199/v1/memories/raw \
@@ -323,7 +337,7 @@ curl -X POST http://localhost:8199/v1/memories/raw \
 ```bash
 # Start Redis and Qdrant (via Docker or locally)
 docker run -d --name redis -p 6379:6379 redis:7-alpine
-docker run -d --name qdrant -p 6333:6333 qdrant/qdrant:latest
+docker run -d --name qdrant -p 6333:6333 qdrant/qdrant:v1.13.2
 
 cd neuralscape-service
 
@@ -351,6 +365,27 @@ uv run python main.py
 uv run pytest tests/test_service.py -v
 
 # Run integration tests (requires all services running)
+uv run pytest tests/test_async_pipeline.py -v -s
+```
+
+## Tests
+
+142 tests across 5 files:
+
+| File | What it covers | Services needed |
+|---|---|---|
+| `test_service.py` | REST endpoint unit tests | None (mocked) |
+| `test_memory_service.py` | Business logic (MemoryService) | None (mocked) |
+| `test_mcp_tools.py` | MCP tool interface | None (mocked) |
+| `test_production_readiness.py` | Config, health check, error handling | None (mocked) |
+| `test_async_pipeline.py` | End-to-end async pipeline | Redis, Qdrant, Neo4j |
+
+```bash
+# Run all unit tests (no services needed)
+cd neuralscape-service
+uv run pytest tests/ --ignore=tests/test_async_pipeline.py -v
+
+# Run integration tests (requires running services)
 uv run pytest tests/test_async_pipeline.py -v -s
 ```
 
@@ -443,8 +478,13 @@ All settings are environment variables (loaded from `.env`):
 | `QDRANT_ON_DISK` | `true` | Persist Qdrant to disk (only used when `QDRANT_URL` is not set) |
 | `QDRANT_PATH` | `~/.neuralscape/qdrant` | Qdrant local storage path (only used when `QDRANT_URL` is not set) |
 | `QDRANT_COLLECTION` | `neuralscape_memories` | Qdrant collection name |
+| `HOST` | `0.0.0.0` | Service bind address |
 | `PORT` | `8199` | Service port |
+| `DEFAULT_USER_ID` | `default_user` | Fallback user ID when none provided |
 | `MCP_TRANSPORT` | `stdio` | MCP transport: `stdio` or `http` |
+| `ARQ_QUEUE_NAME` | `neuralscape:queue` | Redis queue key for ARQ workers |
+| `ARQ_MAX_RETRIES` | `3` | Max retry attempts per background task |
+| `ARQ_JOB_TIMEOUT` | `300` | Max seconds per background task (5 min) |
 
 ## Architecture Decisions
 
@@ -458,6 +498,6 @@ All settings are environment variables (loaded from `.env`):
 
 **Why two storage backends?** Vector search (Qdrant) is for "find memories similar to this query." Knowledge graph (Graphiti/Neo4j) is for "what entities are related to X?" and handles temporal fact invalidation (when facts change over time). Together they provide comprehensive recall.
 
-**Why group_id-based scoping instead of separate databases?** Graphiti partitions data by `group_id` within a single Neo4j database. Using composite IDs (`"global"`, `"project:my-app"`) keeps the infrastructure simple while providing proper namespace isolation. Multi-scope search just queries multiple group_ids.
+**Why group_id-based scoping instead of separate databases?** Graphiti partitions data by `group_id` within a single Neo4j database. Using composite IDs (`"global"`, `"project--my-app"`) keeps the infrastructure simple while providing proper namespace isolation. Multi-scope search just queries multiple group_ids.
 
 **Why not use agent_id as a scope boundary?** Multiple agents (Claude Code, a Slack bot, a CI pipeline) should all benefit from the same memory. Agent isolation would fragment knowledge. Instead, `agent_id` is provenance metadata — you can see *who* learned a fact but everyone can use it.
