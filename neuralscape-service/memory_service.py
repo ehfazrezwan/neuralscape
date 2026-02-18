@@ -605,15 +605,30 @@ class MemoryService:
         """Update a memory's content or metadata."""
         m = self._get_memory()
 
+        if category and category not in MEMORY_CATEGORIES:
+            raise ValueError(f"Invalid category: {category}")
+
+        # Fetch existing memory for user_id and metadata (needed for graph group_id)
+        existing = m.get(memory_id) if content else None
+
         if content:
             m.update(memory_id, content)
 
-        # For metadata updates (category, tags), we'd need to update the
-        # vector store metadata directly. mem0's update only handles content.
-        # For now, content updates go through mem0, metadata updates are
-        # noted but require direct vector store access.
-        if category and category not in MEMORY_CATEGORIES:
-            raise ValueError(f"Invalid category: {category}")
+        # Re-ingest updated content into the knowledge graph so Graphiti's
+        # contradiction detection can expire stale edges and create new ones.
+        if content and existing and self._graphiti and self._bridge:
+            try:
+                metadata = existing.get("metadata", {}) or {}
+                scope = metadata.get("scope", "global")
+                project_id = metadata.get("project_id")
+                user_id = existing.get("user_id", "")
+                group_id = _build_group_id(scope, project_id)
+                self._memory.graph.add(
+                    data=content,
+                    filters={"user_id": user_id, "group_id": group_id},
+                )
+            except Exception as e:
+                logger.warning(f"Graph re-ingestion failed for {memory_id} (non-critical): {e}")
 
         return {"message": "Memory updated successfully"}
 
@@ -945,6 +960,193 @@ class MemoryService:
                 self._run_on_bridge(edge.save(self._graphiti.driver))
         except Exception as e:
             logger.warning(f"Bulk graph edge expiration failed (non-critical): {e}")
+
+    # ──────────────────────────────────────────────
+    # Dedup operations
+    # ──────────────────────────────────────────────
+
+    def _scroll_all_user_memories(self, user_id: str, batch_size: int = 100) -> list[dict]:
+        """Paginate through Qdrant scroll() to collect all points for a user.
+
+        Bypasses mem0's wrapper which doesn't support pagination.
+
+        Returns:
+            List of {"id": str, "payload": dict} for every point matching user_id.
+        """
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+        client = self._memory.vector_store.client
+        collection = settings.qdrant_collection
+        scroll_filter = Filter(
+            must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))]
+        )
+
+        all_points: list[dict] = []
+        offset = None
+        while True:
+            points, next_offset = client.scroll(
+                collection_name=collection,
+                scroll_filter=scroll_filter,
+                limit=batch_size,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for pt in points:
+                all_points.append({"id": str(pt.id), "payload": pt.payload or {}})
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        return all_points
+
+    def _delete_qdrant_memory_with_graph_cleanup(self, memory_id: str, payload: dict) -> None:
+        """Delete a single memory from Qdrant and expire related graph edges.
+
+        Graph cleanup is non-critical — failures are logged but don't propagate.
+        """
+        self._memory.vector_store.delete(memory_id)
+
+        if self._graphiti and self._bridge:
+            try:
+                mem = {
+                    "memory": payload.get("data", ""),
+                    "metadata": payload.get("metadata", {}),
+                }
+                self._expire_graph_edges_for_memory(mem)
+            except Exception as e:
+                logger.warning(f"Graph cleanup failed for {memory_id} (non-critical): {e}")
+
+    def get_all_user_ids(self, batch_size: int = 100) -> list[str]:
+        """Scroll the entire Qdrant collection and return unique user_ids."""
+        client = self._memory.vector_store.client
+        collection = settings.qdrant_collection
+
+        user_ids: set[str] = set()
+        offset = None
+        while True:
+            points, next_offset = client.scroll(
+                collection_name=collection,
+                limit=batch_size,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for pt in points:
+                uid = (pt.payload or {}).get("user_id")
+                if uid:
+                    user_ids.add(uid)
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        return list(user_ids)
+
+    def dedup_memories(self, user_id: str) -> dict:
+        """Remove duplicate memories for a user in two phases.
+
+        Phase 1 — Exact: group by payload hash, keep newest, delete rest.
+        Phase 2 — Semantic: for each remaining memory, search for near-duplicates
+                  above the cosine threshold, delete the older one.
+
+        Returns:
+            Dict with user_id, exact_duplicates_removed, semantic_duplicates_removed,
+            total_checked.
+        """
+        m = self._get_memory()
+        threshold = settings.dedup_similarity_threshold
+        batch_size = settings.dedup_batch_size
+
+        memories = self._scroll_all_user_memories(user_id, batch_size=batch_size)
+        deleted_ids: set[str] = set()
+
+        # ── Phase 1: Exact dedup by hash ──
+        exact_removed = 0
+        hash_groups: dict[str, list[dict]] = {}
+        for mem in memories:
+            h = mem["payload"].get("hash")
+            if h:
+                hash_groups.setdefault(h, []).append(mem)
+
+        for h, group in hash_groups.items():
+            if len(group) < 2:
+                continue
+            # Sort by created_at descending — keep the first (newest)
+            group.sort(
+                key=lambda x: x["payload"].get("created_at", ""),
+                reverse=True,
+            )
+            for dup in group[1:]:
+                mid = dup["id"]
+                if mid in deleted_ids:
+                    continue
+                try:
+                    self._delete_qdrant_memory_with_graph_cleanup(mid, dup["payload"])
+                    deleted_ids.add(mid)
+                    exact_removed += 1
+                except Exception as e:
+                    logger.warning(f"Failed to delete exact dup {mid}: {e}")
+
+        # ── Phase 2: Semantic dedup ──
+        semantic_removed = 0
+        remaining = [mem for mem in memories if mem["id"] not in deleted_ids]
+
+        for mem in remaining:
+            mid = mem["id"]
+            if mid in deleted_ids:
+                continue
+
+            text = mem["payload"].get("data", "")
+            if not text:
+                continue
+
+            try:
+                embedding = m.embedding_model.embed(text)
+                hits = m.vector_store.search(
+                    query=embedding,
+                    limit=5,
+                    filters={"user_id": user_id},
+                )
+            except Exception as e:
+                logger.warning(f"Semantic search failed for {mid}: {e}")
+                continue
+
+            for hit in hits:
+                hit_id = str(hit["id"]) if isinstance(hit, dict) else str(hit.id)
+                hit_score = hit["score"] if isinstance(hit, dict) else hit.score
+                hit_payload = hit.get("payload", {}) if isinstance(hit, dict) else (hit.payload or {})
+
+                if hit_id == mid or hit_id in deleted_ids:
+                    continue
+                if hit_score < threshold:
+                    continue
+
+                # Delete the older one
+                mem_created = mem["payload"].get("created_at", "")
+                hit_created = hit_payload.get("created_at", "")
+                older_id, older_payload = (
+                    (hit_id, hit_payload) if hit_created <= mem_created else (mid, mem["payload"])
+                )
+
+                if older_id in deleted_ids:
+                    continue
+                try:
+                    self._delete_qdrant_memory_with_graph_cleanup(older_id, older_payload)
+                    deleted_ids.add(older_id)
+                    semantic_removed += 1
+                except Exception as e:
+                    logger.warning(f"Failed to delete semantic dup {older_id}: {e}")
+
+                # If we deleted ourselves, stop checking this memory
+                if older_id == mid:
+                    break
+
+        return {
+            "user_id": user_id,
+            "exact_duplicates_removed": exact_removed,
+            "semantic_duplicates_removed": semantic_removed,
+            "total_checked": len(memories),
+        }
 
     def _merge_results(self, *result_sets) -> list[dict]:
         """Merge multiple result sets, deduplicate by ID, sort by score descending."""
