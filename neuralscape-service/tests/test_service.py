@@ -4,7 +4,7 @@ Tests both legacy (root) and new v1 endpoints.
 """
 
 import asyncio
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -24,13 +24,11 @@ def mock_memory():
     original_graphiti = main._graphiti
     original_bridge = main._bridge
     original_async_memory = main._async_memory
-    original_tasks = main._tasks.copy()
 
     main._memory = mock_mem
     main._graphiti = mock_graphiti
     main._bridge = mock_bridge
     main._async_memory = None
-    main._tasks.clear()
 
     yield mock_mem
 
@@ -38,8 +36,6 @@ def mock_memory():
     main._graphiti = original_graphiti
     main._bridge = original_bridge
     main._async_memory = original_async_memory
-    main._tasks.clear()
-    main._tasks.update(original_tasks)
 
 
 @pytest.fixture
@@ -50,6 +46,26 @@ def mock_service():
     main._service = mock_svc
     yield mock_svc
     main._service = original
+
+
+@pytest.fixture(autouse=True)
+def mock_task_manager():
+    """Patch the TaskManager so tests don't need Redis."""
+    mock_tm = MagicMock(name="TaskManager")
+    mock_tm.connect = AsyncMock()
+    mock_tm.close = AsyncMock()
+    mock_tm.enqueue_store = AsyncMock(return_value="test-task-id-store")
+    mock_tm.enqueue_raw = AsyncMock(return_value="test-task-id-raw")
+    mock_tm.get_status = AsyncMock(return_value={
+        "task_id": "test-task-id",
+        "status": "completed",
+        "result": {"memories": []},
+        "error": None,
+    })
+    original = main._task_manager
+    main._task_manager = mock_tm
+    yield mock_tm
+    main._task_manager = original
 
 
 @pytest.fixture
@@ -178,15 +194,13 @@ class TestAsyncAddMemory:
         data = resp.json()
         assert data["status"] == "accepted"
         assert "task_id" in data
-        assert len(data["task_id"]) > 0
+        assert "poll_url" in data
 
-    def test_task_appears_in_store(self, client):
+    def test_enqueues_via_task_manager(self, client, mock_task_manager):
         resp = client.post("/memories/async", json={
             "messages": [{"role": "user", "content": "hello"}],
         })
-        task_id = resp.json()["task_id"]
-        assert task_id in main._tasks
-        assert main._tasks[task_id]["status"] in ("processing", "completed", "failed")
+        mock_task_manager.enqueue_store.assert_called_once()
 
 
 # ──────────────────────────────────────────────
@@ -195,36 +209,40 @@ class TestAsyncAddMemory:
 
 
 class TestAsyncTaskStatus:
-    def test_returns_completed_task(self, client):
-        task_id = "test-completed-task"
-        main._tasks[task_id] = {
+    def test_returns_completed_task(self, client, mock_task_manager):
+        mock_task_manager.get_status.return_value = {
+            "task_id": "test-completed-task",
             "status": "completed",
-            "created_at": "2026-01-01T00:00:00+00:00",
-            "result": {"results": []},
+            "result": {"memories": []},
             "error": None,
         }
-        resp = client.get(f"/memories/status/{task_id}")
+        resp = client.get("/memories/status/test-completed-task")
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "completed"
         assert data["result"] is not None
         assert data["error"] is None
 
-    def test_returns_failed_task(self, client):
-        task_id = "test-failed-task"
-        main._tasks[task_id] = {
+    def test_returns_failed_task(self, client, mock_task_manager):
+        mock_task_manager.get_status.return_value = {
+            "task_id": "test-failed-task",
             "status": "failed",
-            "created_at": "2026-01-01T00:00:00+00:00",
             "result": None,
             "error": "LLM timeout",
         }
-        resp = client.get(f"/memories/status/{task_id}")
+        resp = client.get("/memories/status/test-failed-task")
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "failed"
         assert data["error"] == "LLM timeout"
 
-    def test_returns_404_for_unknown(self, client):
+    def test_returns_404_for_unknown(self, client, mock_task_manager):
+        mock_task_manager.get_status.return_value = {
+            "task_id": "nonexistent-id",
+            "status": "not_found",
+            "result": None,
+            "error": None,
+        }
         resp = client.get("/memories/status/nonexistent-id")
         assert resp.status_code == 404
 
@@ -235,24 +253,20 @@ class TestAsyncTaskStatus:
 
 
 class TestV1StoreRawMemory:
-    def test_stores_raw_memory(self, client, mock_service):
-        from schemas import MemoryResponse
-        mock_service.store_raw.return_value = [
-            MemoryResponse(id="m1", memory="Prefers tabs", category="preference", scope="global")
-        ]
+    def test_enqueues_and_returns_202(self, client, mock_task_manager):
         resp = client.post("/v1/memories/raw", json={
             "content": "Prefers tabs over spaces",
             "user_id": "ehfaz",
             "category": "preference",
         })
-        assert resp.status_code == 200
+        assert resp.status_code == 202
         data = resp.json()
-        assert data["status"] == "ok"
-        assert len(data["memories"]) == 1
-        assert data["memories"][0]["category"] == "preference"
+        assert data["status"] == "accepted"
+        assert "task_id" in data
+        assert data["poll_url"].startswith("/v1/memories/status/")
+        mock_task_manager.enqueue_raw.assert_called_once()
 
-    def test_returns_400_for_invalid_category(self, client, mock_service):
-        mock_service.store_raw.side_effect = ValueError("Invalid category: bogus")
+    def test_returns_400_for_invalid_category(self, client):
         resp = client.post("/v1/memories/raw", json={
             "content": "test",
             "user_id": "ehfaz",
@@ -260,30 +274,28 @@ class TestV1StoreRawMemory:
         })
         assert resp.status_code == 400
 
+    def test_returns_400_for_project_scope_without_project_id(self, client):
+        resp = client.post("/v1/memories/raw", json={
+            "content": "test",
+            "user_id": "ehfaz",
+            "category": "tech_stack",
+            "scope": "project",
+        })
+        assert resp.status_code == 400
+
 
 class TestV1StoreMemories:
-    def test_extracts_and_stores(self, client, mock_service):
-        from schemas import MemoryResponse
-        mock_service.extract_and_store.return_value = [
-            MemoryResponse(id="m1", memory="Uses Python 3.12", category="technical_skill", scope="global"),
-            MemoryResponse(id="m2", memory="Uses FastAPI", category="tech_stack", scope="project"),
-        ]
+    def test_enqueues_and_returns_202(self, client, mock_task_manager):
         resp = client.post("/v1/memories", json={
             "messages": [{"role": "user", "content": "I use Python 3.12 with FastAPI"}],
             "user_id": "ehfaz",
             "project_id": "my-project",
         })
-        assert resp.status_code == 200
+        assert resp.status_code == 202
         data = resp.json()
-        assert len(data["memories"]) == 2
-
-    def test_returns_500_on_error(self, client, mock_service):
-        mock_service.extract_and_store.side_effect = Exception("LLM down")
-        resp = client.post("/v1/memories", json={
-            "messages": [{"role": "user", "content": "hello"}],
-            "user_id": "ehfaz",
-        })
-        assert resp.status_code == 500
+        assert data["status"] == "accepted"
+        assert "task_id" in data
+        mock_task_manager.enqueue_store.assert_called_once()
 
 
 class TestV1Search:
@@ -433,20 +445,25 @@ class TestV1Categories:
 
 
 class TestV1AsyncMemoryStatus:
-    def test_returns_completed_task(self, client):
-        task_id = "v1-test-task"
-        main._tasks[task_id] = {
+    def test_returns_completed_task(self, client, mock_task_manager):
+        mock_task_manager.get_status.return_value = {
+            "task_id": "v1-test-task",
             "status": "completed",
-            "created_at": "2026-01-01T00:00:00+00:00",
-            "result": [{"id": "m1", "memory": "test"}],
+            "result": {"memories": [{"id": "m1", "memory": "test"}]},
             "error": None,
         }
-        resp = client.get(f"/v1/memories/status/{task_id}")
+        resp = client.get("/v1/memories/status/v1-test-task")
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "completed"
 
-    def test_returns_404_for_unknown(self, client):
+    def test_returns_404_for_unknown(self, client, mock_task_manager):
+        mock_task_manager.get_status.return_value = {
+            "task_id": "nonexistent",
+            "status": "not_found",
+            "result": None,
+            "error": None,
+        }
         resp = client.get("/v1/memories/status/nonexistent")
         assert resp.status_code == 404
 
