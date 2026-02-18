@@ -1,18 +1,26 @@
 ---
 name: neuralscape-memory
-description: Use the Neuralscape memory layer to recall and store memories about the user and their projects. Use this at session start to load context, when you learn new facts, and when the user asks about preferences, conventions, or past decisions. Works via MCP tools or REST API at localhost:8199.
+description: Use the Neuralscape memory layer to recall and store memories about the user and their projects. Use this at session start to load context, when you learn new facts, and when the user asks about preferences, conventions, or past decisions. Works via MCP tools or REST API at localhost:8199. Memory writes are async (processed by background workers via ARQ + Redis).
 ---
 
 # Neuralscape Memory Layer
 
 Neuralscape provides persistent, categorized memory for AI agents. It remembers user preferences, project conventions, technical decisions, and learned facts across sessions. Every agent sharing the same `user_id` can read and write to the same memory.
 
+## Architecture
+
+Memory writes are **asynchronous**. When you store a memory (via MCP or REST), the request is enqueued to Redis and processed by a separate ARQ worker. This means:
+
+- `remember` and `remember_conversation` return immediately with a `task_id` (fire-and-forget by default)
+- Set `wait: true` to block until the memory is fully stored (useful for end-of-session memory dumps)
+- Read operations (`recall_memories`, `get_project_context`, `search_knowledge_graph`, `list_memories`) are **synchronous** and return results immediately
+
 ## When to Use Memory
 
 - **Session start**: Call `get_project_context` or `recall_memories` to load what you know about this user and project before doing any work.
 - **During work**: Call `recall_memories` when you need context about a specific topic (e.g., "what indentation style does this user prefer?").
-- **After learning something**: Call `remember` when the user tells you a preference, makes a decision, or reveals something about their project that future sessions should know.
-- **End of conversation**: Call `remember_conversation` to bulk-extract all notable facts from a productive conversation.
+- **After learning something**: Call `remember` when the user tells you a preference, makes a decision, or reveals something about their project that future sessions should know. Default fire-and-forget is fine here.
+- **End of conversation**: Call `remember_conversation` with `wait: true` to bulk-extract all notable facts and confirm they were stored.
 
 ## Identity
 
@@ -22,7 +30,7 @@ When calling any memory tool or endpoint, always pass:
 
 ## MCP Tools
 
-### 1. `recall_memories` - Search memories
+### 1. `recall_memories` - Search memories (sync)
 
 Search across global and project-specific memories. When `project_id` is provided, searches both scopes and merges results by relevance.
 
@@ -36,9 +44,9 @@ Search across global and project-specific memories. When `project_id` is provide
 }
 ```
 
-### 2. `remember` - Store a single fact
+### 2. `remember` - Store a single fact (async)
 
-Store one categorized fact. Pick the most specific category from the taxonomy below. The system auto-assigns scope based on category.
+Store one categorized fact. Pick the most specific category from the taxonomy below. The system auto-assigns scope based on category. Returns immediately with `task_id` by default.
 
 ```json
 {
@@ -46,6 +54,11 @@ Store one categorized fact. Pick the most specific category from the taxonomy be
   "user_id": "ehfaz",
   "category": "preference"
 }
+```
+
+Response (fire-and-forget):
+```json
+{"status": "accepted", "task_id": "abc123"}
 ```
 
 For project-specific facts, include `project_id`:
@@ -59,9 +72,25 @@ For project-specific facts, include `project_id`:
 }
 ```
 
-### 3. `remember_conversation` - Bulk extract from conversation
+To wait for confirmation, set `wait: true`:
 
-Pass conversation messages and the system uses Gemini to identify facts, categorize them, and store each one automatically.
+```json
+{
+  "content": "Prefers 4-space indentation",
+  "user_id": "ehfaz",
+  "category": "preference",
+  "wait": true
+}
+```
+
+Response (waited):
+```json
+{"status": "completed", "task_id": "abc123", "result": {"memories": [...]}}
+```
+
+### 3. `remember_conversation` - Bulk extract from conversation (async)
+
+Pass conversation messages and the system uses Gemini to identify facts, categorize them, and store each one automatically. Returns immediately with `task_id` by default.
 
 ```json
 {
@@ -70,11 +99,12 @@ Pass conversation messages and the system uses Gemini to identify facts, categor
     {"role": "assistant", "content": "I'll update the ORM queries to use PyMongo"}
   ],
   "user_id": "ehfaz",
-  "project_id": "my-project"
+  "project_id": "my-project",
+  "wait": true
 }
 ```
 
-### 4. `get_project_context` - Bootstrap session context
+### 4. `get_project_context` - Bootstrap session context (sync)
 
 Load all global user preferences plus project-specific memories, organized by category. Call this at session start.
 
@@ -96,7 +126,7 @@ Returns:
 }
 ```
 
-### 5. `search_knowledge_graph` - Entity/relationship search
+### 5. `search_knowledge_graph` - Entity/relationship search (sync)
 
 Search the Graphiti knowledge graph for structured relationships between entities.
 
@@ -109,7 +139,7 @@ Search the Graphiti knowledge graph for structured relationships between entitie
 }
 ```
 
-### 6. `list_memories` - Inspect stored memories
+### 6. `list_memories` - Inspect stored memories (sync)
 
 List memories with optional filters. Use to verify what's been stored or audit memory contents.
 
@@ -122,7 +152,7 @@ List memories with optional filters. Use to verify what's been stored or audit m
 }
 ```
 
-### 7. `delete_memories` - Remove memories
+### 7. `delete_memories` - Remove memories (sync)
 
 Delete by specific ID or by filter. Use with caution.
 
@@ -146,12 +176,18 @@ Or bulk delete:
 
 The service runs at `http://localhost:8199`. All v1 endpoints require `user_id`.
 
+**Write endpoints return 202 Accepted** with a `task_id` for polling:
+
+| Action | Method | Endpoint | Response |
+|---|---|---|---|
+| Store via LLM extraction | `POST` | `/v1/memories` | 202 `{task_id, poll_url}` |
+| Store single fact | `POST` | `/v1/memories/raw` | 202 `{task_id, poll_url}` |
+| Poll task status | `GET` | `/v1/memories/status/{task_id}` | `{status, result, error}` |
+
+**Read endpoints return 200 with results immediately:**
+
 | Action | Method | Endpoint |
 |---|---|---|
-| Store via LLM extraction | `POST` | `/v1/memories` |
-| Store single fact | `POST` | `/v1/memories/raw` |
-| Store async | `POST` | `/v1/memories/async` |
-| Poll async status | `GET` | `/v1/memories/status/{task_id}` |
 | Semantic search | `POST` | `/v1/search` |
 | Graph search | `POST` | `/v1/graph/search` |
 | Project + global context | `GET` | `/v1/context/{project_id}?user_id=...` |
@@ -166,6 +202,17 @@ The service runs at `http://localhost:8199`. All v1 endpoints require `user_id`.
 | Graph edges | `GET` | `/v1/graph/edges?user_id=...&project_id=...` |
 | Graph episodes | `GET` | `/v1/graph/episodes?user_id=...` |
 | Graph communities | `GET` | `/v1/graph/communities?user_id=...` |
+
+### Task status values
+
+When polling `/v1/memories/status/{task_id}`:
+
+| Status | Meaning |
+|---|---|
+| `queued` | Task is in the Redis queue, waiting for a worker |
+| `processing` | Worker is actively processing (LLM extraction, storage) |
+| `completed` | Done. `result` field contains stored memories |
+| `failed` | Error occurred. `error` field has details |
 
 ## Category Taxonomy
 
