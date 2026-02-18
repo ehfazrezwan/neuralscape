@@ -46,6 +46,8 @@ Neuralscape is an opinionated agentic memory layer. It pairs vector search with 
 
 **Read path**: Client -> API/MCP -> MemoryService -> Qdrant + Neo4j -> 200 OK with results (synchronous, no queue).
 
+**Maintenance path**: ARQ cron job runs every 6 hours -> scrolls all users -> removes exact duplicates by hash -> removes semantic near-duplicates above cosine threshold -> expires related graph edges.
+
 Every memory is stored **twice**: as a vector embedding in Qdrant (for semantic search) and as entities/relationships in a Neo4j knowledge graph via Graphiti (for structured reasoning). Both paths are queried on every search and results are merged.
 
 ## Core Concepts
@@ -105,6 +107,19 @@ All memory write operations are processed asynchronously via ARQ (async Redis qu
 - **MCP writes** (`remember`, `remember_conversation`) return a `task_id` by default, or block with `wait: true`
 - **Workers** run in a separate process, processing tasks from the Redis queue
 - **Status polling** via `GET /v1/memories/status/{task_id}` returns `queued`, `processing`, `completed`, or `failed`
+
+### Automatic Deduplication
+
+Since `mem0.add(infer=False)` creates new vectors without checking for existing similar ones, Qdrant accumulates duplicates over time. A periodic dedup cron job (every 6 hours via ARQ) keeps the vector store clean in two phases:
+
+1. **Exact dedup** — Groups memories by their `hash` field (MD5 of content stored by mem0). Keeps the newest in each group, deletes the rest.
+2. **Semantic dedup** — For each remaining memory, searches Qdrant for near-duplicates above a cosine similarity threshold (default 0.95). Deletes the older memory in each pair.
+
+Both phases expire related Graphiti graph edges on delete. Graph cleanup is non-critical — failures are logged but don't block dedup.
+
+### Graph Re-ingestion on Update
+
+When a memory's content is updated via `PUT /v1/memories/{id}` or `update_memory`, the new content is automatically re-ingested into the Graphiti knowledge graph. This allows Graphiti's contradiction detection to expire stale edges and create new ones reflecting the updated fact — no manual delete-and-recreate required.
 
 ### Agent Isolation
 
@@ -290,11 +305,14 @@ neuralscape-graphiti/
 │       ├── test_async_pipeline.py      # Integration tests (requires running services)
 │       ├── test_memory_service.py      # Business logic tests
 │       ├── test_mcp_tools.py           # MCP tool tests
-│       └── test_production_readiness.py # Config, health, and error handling tests
-├── mem0/                         # mem0 fork (local editable)
+│       ├── test_production_readiness.py # Config, health, and error handling tests
+│       └── test_dedup.py               # Qdrant dedup tests (exact, semantic, cron)
+├── scripts/
+│   └── sync-upstream.sh          # Pull upstream changes for git subtree deps
+├── mem0/                         # mem0 (git subtree from upstream)
 │   └── mem0/memory/
-│       └── graphiti_memory.py    # Graphiti adapter (modified for scoping)
-└── graphiti/                     # graphiti-core fork (local editable)
+│       └── graphiti_memory.py    # Graphiti adapter (local patches applied)
+└── graphiti/                     # graphiti-core (git subtree from upstream)
 ```
 
 ## Prerequisites
@@ -370,7 +388,7 @@ uv run pytest tests/test_async_pipeline.py -v -s
 
 ## Tests
 
-142 tests across 5 files:
+150 tests across 6 files:
 
 | File | What it covers | Services needed |
 |---|---|---|
@@ -378,6 +396,7 @@ uv run pytest tests/test_async_pipeline.py -v -s
 | `test_memory_service.py` | Business logic (MemoryService) | None (mocked) |
 | `test_mcp_tools.py` | MCP tool interface | None (mocked) |
 | `test_production_readiness.py` | Config, health check, error handling | None (mocked) |
+| `test_dedup.py` | Qdrant dedup (exact, semantic, cron) | None (mocked) |
 | `test_async_pipeline.py` | End-to-end async pipeline | Redis, Qdrant, Neo4j |
 
 ```bash
@@ -485,6 +504,9 @@ All settings are environment variables (loaded from `.env`):
 | `ARQ_QUEUE_NAME` | `neuralscape:queue` | Redis queue key for ARQ workers |
 | `ARQ_MAX_RETRIES` | `3` | Max retry attempts per background task |
 | `ARQ_JOB_TIMEOUT` | `300` | Max seconds per background task (5 min) |
+| `DEDUP_SIMILARITY_THRESHOLD` | `0.95` | Cosine similarity threshold for semantic dedup |
+| `DEDUP_BATCH_SIZE` | `100` | Qdrant scroll page size during dedup |
+| `DEDUP_CRON_HOURS` | `{0,6,12,18}` | Hours (UTC) when the dedup cron runs |
 
 ## Architecture Decisions
 
@@ -501,3 +523,7 @@ All settings are environment variables (loaded from `.env`):
 **Why group_id-based scoping instead of separate databases?** Graphiti partitions data by `group_id` within a single Neo4j database. Using composite IDs (`"global"`, `"project--my-app"`) keeps the infrastructure simple while providing proper namespace isolation. Multi-scope search just queries multiple group_ids.
 
 **Why not use agent_id as a scope boundary?** Multiple agents (Claude Code, a Slack bot, a CI pipeline) should all benefit from the same memory. Agent isolation would fragment knowledge. Instead, `agent_id` is provenance metadata — you can see *who* learned a fact but everyone can use it.
+
+**Why a periodic dedup cron instead of dedup-on-write?** `mem0.add(infer=False)` bypasses mem0's built-in LLM dedup because we do our own extraction. Checking for duplicates on every write would add latency to the async write path and require embedding + search per write. A periodic batch job is simpler, runs during low-traffic hours, and can use higher thresholds without blocking user-facing operations.
+
+**Why git subtrees for mem0 and graphiti?** Both dependencies have local patches (Graphiti adapter scoping, Neo4j driver fixes). Git subtrees keep the full upstream history, allow pulling upstream changes with `scripts/sync-upstream.sh`, and let local patches live as normal commits — no submodule headaches or fork maintenance.
