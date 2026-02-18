@@ -327,7 +327,7 @@ class MemoryService:
 
             # Merge by score, deduplicate by ID
             all_results = self._merge_results(project_results, global_results)
-            return self._results_to_responses(all_results[:limit])
+            vector_responses = self._results_to_responses(all_results[:limit])
         else:
             if project_id:
                 filters["project_id"] = project_id
@@ -338,7 +338,29 @@ class MemoryService:
                 limit=limit,
                 filters=filters if filters else None,
             )
-            return self._results_to_responses(results)
+            vector_responses = self._results_to_responses(results)
+
+        # Also query the knowledge graph and merge edge facts
+        graph_responses: list[MemoryResponse] = []
+        try:
+            graph_results = self.search_graph(
+                query=query,
+                user_id=user_id,
+                project_id=project_id,
+                limit=limit,
+            )
+            for edge in graph_results.get("edges", []):
+                graph_responses.append(
+                    MemoryResponse(
+                        id=edge.get("uuid", ""),
+                        memory=edge.get("fact", edge.get("name", "")),
+                        source="graph",
+                    )
+                )
+        except Exception as e:
+            logger.warning(f"Graph search failed during recall (non-critical): {e}")
+
+        return vector_responses + graph_responses
 
     def search_graph(
         self,
@@ -748,6 +770,7 @@ class MemoryService:
             score=mem.get("score"),
             created_at=mem.get("created_at"),
             updated_at=mem.get("updated_at"),
+            source="vector",
         )
 
     def _result_to_responses(

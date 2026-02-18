@@ -158,6 +158,7 @@ class MemoryResponse(BaseModel):
     score: float | None = None
     created_at: str | None = None
     updated_at: str | None = None
+    source: str | None = None
 
 
 class StoreMemoryResponse(BaseModel):
