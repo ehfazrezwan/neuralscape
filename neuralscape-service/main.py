@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import uuid as uuid_mod
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -16,6 +17,10 @@ logger = logging.getLogger(__name__)
 _memory = None
 _graphiti = None
 _bridge = None
+_async_memory = None
+
+# Background task store: {task_id: {status, created_at, result, error}}
+_tasks: dict[str, dict] = {}
 
 
 def _get_memory():
@@ -48,6 +53,17 @@ def _run_on_bridge(coro):
     return _bridge.run(coro)
 
 
+def _get_async_memory():
+    """Lazy-initialize an AsyncMemory instance for background processing."""
+    global _async_memory
+    if _async_memory is None:
+        from mem0 import AsyncMemory
+
+        config = settings.get_mem0_config()
+        _async_memory = AsyncMemory.from_config(config)
+    return _async_memory
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting Neuralscape Service...")
@@ -55,6 +71,8 @@ async def lifespan(app: FastAPI):
     yield
     if _graphiti and _bridge:
         _bridge.run(_graphiti.close())
+    if _async_memory and hasattr(_async_memory, "graph") and hasattr(_async_memory.graph, "graphiti"):
+        _async_memory.graph._bridge.run(_async_memory.graph.graphiti.close())
     logger.info("Neuralscape Service stopped.")
 
 
@@ -188,6 +206,58 @@ async def delete_memories(
     except Exception as e:
         logger.exception("delete_memories failed")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ──────────────────────────────────────────────
+# Async Memory Endpoints (non-blocking)
+# ──────────────────────────────────────────────
+
+
+@app.post("/memories/async")
+async def add_memory_async(req: AddMemoryRequest):
+    """Add a memory in the background (non-blocking). Returns a task_id to poll for status."""
+    task_id = str(uuid_mod.uuid4())
+    _tasks[task_id] = {
+        "status": "processing",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "result": None,
+        "error": None,
+    }
+
+    async def _process(tid: str):
+        try:
+            am = _get_async_memory()
+            result = await am.add(
+                messages=req.messages,
+                user_id=req.user_id or settings.default_user_id,
+                agent_id=req.agent_id,
+                run_id=req.run_id,
+                metadata=req.metadata,
+            )
+            _tasks[tid]["status"] = "completed"
+            _tasks[tid]["result"] = result
+        except Exception as e:
+            logger.exception("async add_memory failed")
+            _tasks[tid]["status"] = "failed"
+            _tasks[tid]["error"] = str(e)
+
+    asyncio.create_task(_process(task_id))
+    return {"status": "accepted", "task_id": task_id}
+
+
+@app.get("/memories/status/{task_id}")
+async def get_task_status(task_id: str):
+    """Check the status of an async memory addition task."""
+    task = _tasks.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    return {
+        "task_id": task_id,
+        "status": task["status"],
+        "created_at": task["created_at"],
+        "result": task["result"],
+        "error": task["error"],
+    }
 
 
 # ──────────────────────────────────────────────
