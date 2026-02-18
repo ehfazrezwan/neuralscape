@@ -194,8 +194,49 @@ class MemoryGraph:
                 self._indices_built = True
 
     def _get_group_id(self, filters: dict) -> str:
-        """Extract group_id from mem0 filters. Uses user_id as the partition key."""
+        """Build composite group_id from mem0 filters.
+
+        Supports namespace scoping:
+        - If filters contain an explicit 'group_id', use it directly.
+        - If filters contain 'project_id', returns 'project:{project_id}'.
+        - Otherwise returns 'global' (overarching/cross-project memories).
+
+        Falls back to user_id for backward compatibility with old callers
+        that don't use the new scoping model.
+        """
+        # Explicit group_id takes precedence (used by MemoryService)
+        if "group_id" in filters:
+            return filters["group_id"]
+
+        # New scoping model
+        project_id = filters.get("project_id")
+        if project_id:
+            return f"project:{project_id}"
+
+        # Default to global for new callers, user_id for legacy callers
+        scope = filters.get("scope")
+        if scope is not None:
+            return "global"
+
+        # Legacy: use user_id as group_id for backward compatibility
         return filters.get("user_id", "default")
+
+    def _get_group_ids(self, filters: dict) -> list[str]:
+        """Get list of group_ids for multi-scope search.
+
+        When project_id is provided, searches both global and project scope.
+        Otherwise returns single group_id.
+        """
+        # Explicit group_ids takes precedence
+        if "group_ids" in filters:
+            return filters["group_ids"]
+
+        project_id = filters.get("project_id")
+        if project_id:
+            return ["global", f"project:{project_id}"]
+
+        group_id = self._get_group_id(filters)
+        return [group_id]
 
     def _build_source_description(self, filters: dict) -> str:
         """Build a source description string from mem0 filters for episode metadata."""
@@ -292,19 +333,19 @@ class MemoryGraph:
 
         Args:
             query (str): Query to search for.
-            filters (dict): Filters with user_id, agent_id, run_id.
+            filters (dict): Filters with user_id, agent_id, run_id, project_id.
             limit (int): Maximum results.
 
         Returns:
             list[dict]: List of {"source", "relationship", "destination"} triples.
         """
         self._ensure_indices()
-        group_id = self._get_group_id(filters)
+        group_ids = self._get_group_ids(filters)
 
         async def _search():
             edges = await self.graphiti.search(
                 query=query,
-                group_ids=[group_id],
+                group_ids=group_ids,
                 num_results=limit,
             )
             return await self._resolve_edge_names(edges)
@@ -341,20 +382,20 @@ class MemoryGraph:
         """Retrieve all edges/facts from the graph for a group.
 
         Args:
-            filters (dict): Filters with user_id (used as group_id).
+            filters (dict): Filters with user_id, project_id (used for group_ids).
             limit (int): Maximum results.
 
         Returns:
             list[dict]: List of {"source", "relationship", "target"} triples.
         """
         self._ensure_indices()
-        group_id = self._get_group_id(filters)
+        group_ids = self._get_group_ids(filters)
 
         async def _get_all():
             try:
                 edges = await EntityEdge.get_by_group_ids(
                     self.graphiti.driver,
-                    group_ids=[group_id],
+                    group_ids=group_ids,
                     limit=limit,
                 )
             except GroupsEdgesNotFoundError:

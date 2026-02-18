@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 from pydantic_settings import BaseSettings
 
@@ -19,15 +20,24 @@ class Settings(BaseSettings):
     store_raw_episode_content: bool = True
     update_communities: bool = False
 
+    # Qdrant vector store
+    qdrant_on_disk: bool = True
+    qdrant_path: str = "~/.neuralscape/qdrant"
+    qdrant_collection: str = "neuralscape_memories"
+
     # Service
     host: str = "0.0.0.0"
     port: int = 8199
     default_user_id: str = "default_user"
+    default_project_id: str | None = None
+    mcp_transport: str = "stdio"  # "stdio" or "http"
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
     def get_mem0_config(self) -> dict:
         """Build mem0 config dict for Memory(config=...)."""
+        qdrant_path = str(Path(self.qdrant_path).expanduser())
+
         return {
             "llm": {
                 "provider": "gemini",
@@ -42,6 +52,15 @@ class Settings(BaseSettings):
                     "model": self.gemini_embedder_model,
                     "api_key": self.google_api_key,
                     "embedding_dims": 768,
+                },
+            },
+            "vector_store": {
+                "provider": "qdrant",
+                "config": {
+                    "collection_name": self.qdrant_collection,
+                    "path": qdrant_path,
+                    "on_disk": self.qdrant_on_disk,
+                    "embedding_model_dims": 768,
                 },
             },
             "graph_store": {
