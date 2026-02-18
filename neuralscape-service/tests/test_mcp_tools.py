@@ -1,7 +1,7 @@
 """Tests for MCP tools."""
 
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -17,6 +17,24 @@ def mock_mcp_service():
     mcp_server._service = mock_svc
     yield mock_svc
     mcp_server._service = original
+
+
+@pytest.fixture(autouse=True)
+def mock_task_manager():
+    """Patch the TaskManager in the MCP server module."""
+    mock_tm = MagicMock(name="TaskManager")
+    mock_tm.enqueue_raw = AsyncMock(return_value="task-123")
+    mock_tm.enqueue_store = AsyncMock(return_value="task-456")
+    mock_tm.wait_for_result = AsyncMock(return_value={
+        "task_id": "task-123",
+        "status": "completed",
+        "result": None,
+        "error": None,
+    })
+    original = mcp_server._task_manager
+    mcp_server._task_manager = mock_tm
+    yield mock_tm
+    mcp_server._task_manager = original
 
 
 # ──────────────────────────────────────────────
@@ -62,7 +80,7 @@ class TestRecallMemoriesTool:
     @pytest.mark.asyncio
     async def test_basic_search(self, mock_mcp_service):
         mock_mcp_service.search.return_value = [
-            MemoryResponse(id="m1", memory="Prefers tabs", score=0.95, category="preference")
+            MemoryResponse(id="m1", memory="Prefers tabs", score=0.95, category="preference", source="vector")
         ]
         result = await mcp_server.call_tool("recall_memories", {
             "query": "indentation preferences",
@@ -72,6 +90,22 @@ class TestRecallMemoriesTool:
         data = json.loads(result[0].text)
         assert len(data) == 1
         assert data[0]["memory"] == "Prefers tabs"
+        assert data[0]["source"] == "vector"
+
+    @pytest.mark.asyncio
+    async def test_search_includes_graph_source(self, mock_mcp_service):
+        mock_mcp_service.search.return_value = [
+            MemoryResponse(id="v1", memory="Prefers tabs", score=0.95, source="vector"),
+            MemoryResponse(id="g1", memory="User uses Python", source="graph"),
+        ]
+        result = await mcp_server.call_tool("recall_memories", {
+            "query": "Python",
+            "user_id": "ehfaz",
+        })
+        data = json.loads(result[0].text)
+        sources = [r["source"] for r in data]
+        assert "vector" in sources
+        assert "graph" in sources
 
     @pytest.mark.asyncio
     async def test_search_with_project(self, mock_mcp_service):
@@ -99,40 +133,33 @@ class TestRecallMemoriesTool:
 
 class TestRememberTool:
     @pytest.mark.asyncio
-    async def test_stores_fact(self, mock_mcp_service):
-        mock_mcp_service.store_raw.return_value = [
-            MemoryResponse(id="m1", memory="Prefers tabs", category="preference")
-        ]
+    async def test_stores_fact(self, mock_mcp_service, mock_task_manager):
         result = await mcp_server.call_tool("remember", {
             "content": "Prefers tabs over spaces",
             "user_id": "ehfaz",
             "category": "preference",
         })
         data = json.loads(result[0].text)
-        assert data["status"] == "stored"
-        mock_mcp_service.store_raw.assert_called_once()
+        assert data["status"] == "accepted"
+        assert data["task_id"] == "task-123"
+        mock_task_manager.enqueue_raw.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_project_category_sets_project_scope(self, mock_mcp_service):
-        mock_mcp_service.store_raw.return_value = []
+    async def test_project_category_sets_project_scope(self, mock_mcp_service, mock_task_manager):
         await mcp_server.call_tool("remember", {
             "content": "Uses FastAPI 0.115",
             "user_id": "ehfaz",
             "category": "tech_stack",
             "project_id": "my-project",
         })
-        call_kwargs = mock_mcp_service.store_raw.call_args[1]
+        call_kwargs = mock_task_manager.enqueue_raw.call_args[1]
         assert call_kwargs["scope"] == "project"
         assert call_kwargs["project_id"] == "my-project"
 
 
 class TestRememberConversationTool:
     @pytest.mark.asyncio
-    async def test_extracts_from_messages(self, mock_mcp_service):
-        mock_mcp_service.extract_and_store.return_value = [
-            MemoryResponse(id="m1", memory="Uses Python", category="technical_skill"),
-            MemoryResponse(id="m2", memory="Prefers tabs", category="preference"),
-        ]
+    async def test_extracts_from_messages(self, mock_mcp_service, mock_task_manager):
         result = await mcp_server.call_tool("remember_conversation", {
             "messages": [
                 {"role": "user", "content": "I use Python and prefer tabs"},
@@ -140,8 +167,9 @@ class TestRememberConversationTool:
             "user_id": "ehfaz",
         })
         data = json.loads(result[0].text)
-        assert data["status"] == "stored"
-        assert data["count"] == 2
+        assert data["status"] == "accepted"
+        assert data["task_id"] == "task-456"
+        mock_task_manager.enqueue_store.assert_called_once()
 
 
 class TestGetProjectContextTool:
