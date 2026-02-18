@@ -9,6 +9,16 @@ services:
       NEO4J_initial_dbms_default__database: ${NEO4J_DATABASE:-memory}
     volumes:
       - neo4j_data:/data
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     healthcheck:
       test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "${NEO4J_PASSWORD:-neuralscape}", "RETURN 1"]
       interval: 10s
@@ -21,6 +31,16 @@ services:
       - "6379:6379"
     volumes:
       - redis_data:/data
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -28,12 +48,22 @@ services:
       retries: 5
 
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:v1.13.2
     ports:
       - "6333:6333"
       - "6334:6334"
     volumes:
       - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     healthcheck:
       test: ["CMD-SHELL", "bash -c ':> /dev/tcp/localhost/6333'"]
       interval: 5s
@@ -62,6 +92,21 @@ services:
       REDIS_URL: redis://redis:6379
       GEMINI_LLM_MODEL: ${SMALL_MODEL_NAME:-gemini-3-flash-preview}
       GEMINI_EMBEDDER_MODEL: ${EMBEDDING_MODEL_NAME:-gemini-embedding-001}
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8199/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   neuralscape-worker:
     build:
@@ -84,6 +129,21 @@ services:
       REDIS_URL: redis://redis:6379
       GEMINI_LLM_MODEL: ${SMALL_MODEL_NAME:-gemini-3-flash-preview}
       GEMINI_EMBEDDER_MODEL: ${EMBEDDING_MODEL_NAME:-gemini-embedding-001}
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import sys; sys.exit(0)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
 volumes:
   neo4j_data:
