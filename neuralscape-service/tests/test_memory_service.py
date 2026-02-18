@@ -18,7 +18,7 @@ class TestBuildGroupId:
         assert _build_group_id("global") == "global"
 
     def test_project_scope_with_id(self):
-        assert _build_group_id("project", "my-project") == "project:my-project"
+        assert _build_group_id("project", "my-project") == "project--my-project"
 
     def test_project_scope_without_id_falls_back_to_global(self):
         assert _build_group_id("project", None) == "global"
@@ -31,7 +31,7 @@ class TestGetGroupIds:
     def test_with_project_returns_both(self):
         ids = _get_group_ids("my-project")
         assert "global" in ids
-        assert "project:my-project" in ids
+        assert "project--my-project" in ids
         assert len(ids) == 2
 
 

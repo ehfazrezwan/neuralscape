@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 def _build_group_id(scope: str, project_id: str | None = None) -> str:
     """Build a Graphiti group_id from scope and project_id."""
     if scope == MemoryScope.PROJECT and project_id:
-        return f"project:{project_id}"
+        return f"project--{project_id}"
     return "global"
 
 
@@ -38,7 +38,7 @@ def _get_group_ids(project_id: str | None = None) -> list[str]:
     """Get group_ids to search across (always includes global)."""
     group_ids = ["global"]
     if project_id:
-        group_ids.append(f"project:{project_id}")
+        group_ids.append(f"project--{project_id}")
     return group_ids
 
 
