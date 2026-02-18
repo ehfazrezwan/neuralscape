@@ -21,9 +21,16 @@ class Settings(BaseSettings):
     update_communities: bool = False
 
     # Qdrant vector store
+    qdrant_url: str | None = None  # e.g. "http://localhost:6333" — if set, uses Qdrant server mode
     qdrant_on_disk: bool = True
-    qdrant_path: str = "~/.neuralscape/qdrant"
+    qdrant_path: str = "~/.neuralscape/qdrant"  # only used when qdrant_url is not set
     qdrant_collection: str = "neuralscape_memories"
+
+    # Redis / ARQ
+    redis_url: str = "redis://localhost:6379"
+    arq_queue_name: str = "neuralscape:queue"
+    arq_max_retries: int = 3
+    arq_job_timeout: int = 300  # 5 min max per task
 
     # Service
     host: str = "0.0.0.0"
@@ -36,7 +43,16 @@ class Settings(BaseSettings):
 
     def get_mem0_config(self) -> dict:
         """Build mem0 config dict for Memory(config=...)."""
-        qdrant_path = str(Path(self.qdrant_path).expanduser())
+        # Qdrant: server mode (url) or local on-disk mode (path)
+        qdrant_config: dict = {
+            "collection_name": self.qdrant_collection,
+            "embedding_model_dims": 768,
+        }
+        if self.qdrant_url:
+            qdrant_config["url"] = self.qdrant_url
+        else:
+            qdrant_config["path"] = str(Path(self.qdrant_path).expanduser())
+            qdrant_config["on_disk"] = self.qdrant_on_disk
 
         return {
             "llm": {
@@ -56,12 +72,7 @@ class Settings(BaseSettings):
             },
             "vector_store": {
                 "provider": "qdrant",
-                "config": {
-                    "collection_name": self.qdrant_collection,
-                    "path": qdrant_path,
-                    "on_disk": self.qdrant_on_disk,
-                    "embedding_model_dims": 768,
-                },
+                "config": qdrant_config,
             },
             "graph_store": {
                 "provider": "graphiti",

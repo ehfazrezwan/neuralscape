@@ -2,7 +2,7 @@
 
 A production-grade memory system for AI coding assistants and personal agents. Neuralscape gives any LLM-powered agent persistent, structured memory across sessions and projects — remembering user preferences, project conventions, technical decisions, and learned facts.
 
-Built on [mem0](https://github.com/mem0ai/mem0) (vector storage + LLM deduplication) and [Graphiti](https://github.com/getzep/graphiti) (temporal knowledge graph), exposed via REST API and MCP server.
+Built on [mem0](https://github.com/mem0ai/mem0) (vector storage + LLM deduplication) and [Graphiti](https://github.com/getzep/graphiti) (temporal knowledge graph), exposed via REST API and MCP server. Memory writes are processed asynchronously by background workers via [ARQ](https://github.com/python-arq/arq) + Redis.
 
 ## How It Works
 
@@ -14,17 +14,33 @@ Built on [mem0](https://github.com/mem0ai/mem0) (vector storage + LLM deduplicat
   Any Agent ──────► │       stdio / HTTP         FastAPI           │
                     │              │                │              │
                     │              └──────┬─────────┘              │
-                    │                    │                         │
-                    │             MemoryService                    │
-                    │          (business logic layer)              │
-                    └──────────────┬──────────────┬────────────────┘
-                                   │              │
-                        ┌──────────▼──┐    ┌──────▼───────┐
-                        │   Qdrant    │    │    Neo4j     │
-                        │  (vectors)  │    │  (Graphiti   │
-                        │  on-disk    │    │   graph)     │
-                        └─────────────┘    └──────────────┘
+                    │                     │                        │
+                    │  ┌─── reads ────────┤                        │
+                    │  │            writes │                        │
+                    │  ▼                  ▼                         │
+                    │  MemoryService    Redis                      │
+                    │  (sync reads)    (task queue)                │
+                    └──────┬──────────────┬────────────────────────┘
+                           │              │
+              ┌────────────┤              │
+              │            │              ▼
+              │            │     ┌─────────────────┐
+              │            │     │  ARQ Worker      │
+              │            │     │  (separate proc) │
+              │            │     │  MemoryService   │
+              │            │     │  (async writes)  │
+              │            │     └────────┬─────────┘
+              │            │              │
+    ┌─────────▼──┐    ┌────▼──────┐       │
+    │   Qdrant   │    │   Neo4j   │◄──────┘
+    │  (vectors) │    │ (Graphiti │
+    │   server   │    │   graph)  │
+    └────────────┘    └───────────┘
 ```
+
+**Write path**: Client -> API/MCP -> enqueue to Redis -> 202 Accepted -> ARQ Worker picks up -> Gemini extraction + Qdrant + Neo4j writes -> result stored in Redis -> client polls status.
+
+**Read path**: Client -> API/MCP -> MemoryService -> Qdrant + Neo4j -> 200 OK with results (synchronous, no queue).
 
 Every memory is stored **twice**: as a vector embedding in Qdrant (for semantic search) and as entities/relationships in a Neo4j knowledge graph via Graphiti (for structured reasoning). Both paths are queried on every search and results are merged.
 
@@ -57,12 +73,23 @@ Since self-hosted mem0 has no native category system, every memory gets a `categ
 
 When an agent sends a conversation to `POST /v1/memories`, Neuralscape doesn't just pass it through to mem0. Instead:
 
-1. It calls Gemini with a specialized extraction prompt
-2. The LLM returns facts tagged with categories: `[preference] Prefers tabs over spaces`
-3. Each fact is parsed and stored with proper scope/category metadata via `mem0.add(infer=False)`
-4. The raw conversation is also fed to Graphiti's knowledge graph for entity/relationship extraction
+1. The request is enqueued to Redis and the API returns 202 immediately
+2. An ARQ worker picks up the task and calls Gemini with a specialized extraction prompt
+3. The LLM returns facts tagged with categories: `[preference] Prefers tabs over spaces`
+4. Each fact is parsed and stored with proper scope/category metadata via `mem0.add(infer=False)`
+5. The raw conversation is also fed to Graphiti's knowledge graph for entity/relationship extraction
+6. Results are stored in Redis and available via status polling
 
 This gives you categorized vector memories **and** a rich knowledge graph from the same input.
+
+### Async Processing
+
+All memory write operations are processed asynchronously via ARQ (async Redis queue):
+
+- **API writes** (`POST /v1/memories`, `POST /v1/memories/raw`) return 202 Accepted with a `task_id`
+- **MCP writes** (`remember`, `remember_conversation`) return a `task_id` by default, or block with `wait: true`
+- **Workers** run in a separate process, processing tasks from the Redis queue
+- **Status polling** via `GET /v1/memories/status/{task_id}` returns `queued`, `processing`, `completed`, or `failed`
 
 ### Agent Isolation
 
@@ -72,7 +99,7 @@ This gives you categorized vector memories **and** a rich knowledge graph from t
 
 All new endpoints live under `/v1`. Legacy endpoints at root are preserved for backward compatibility.
 
-### Remember
+### Remember (async — returns 202)
 
 ```bash
 # Extract and store from conversation (LLM-powered)
@@ -83,6 +110,7 @@ curl -X POST http://localhost:8199/v1/memories \
     "user_id": "ehfaz",
     "project_id": "neuralscape-graphiti"
   }'
+# → {"status": "accepted", "task_id": "abc123", "poll_url": "/v1/memories/status/abc123"}
 
 # Store a single pre-categorized fact (no LLM)
 curl -X POST http://localhost:8199/v1/memories/raw \
@@ -92,17 +120,14 @@ curl -X POST http://localhost:8199/v1/memories/raw \
     "user_id": "ehfaz",
     "category": "preference"
   }'
+# → {"status": "accepted", "task_id": "def456", "poll_url": "/v1/memories/status/def456"}
 
-# Non-blocking version (returns task_id)
-curl -X POST http://localhost:8199/v1/memories/async \
-  -H "Content-Type: application/json" \
-  -d '{"messages": [...], "user_id": "ehfaz"}'
-
-# Poll async status
+# Poll task status
 curl http://localhost:8199/v1/memories/status/{task_id}
+# → {"task_id": "abc123", "status": "completed", "result": {"memories": [...]}, "error": null}
 ```
 
-### Recall
+### Recall (sync — returns 200)
 
 ```bash
 # Semantic search (searches global + project when project_id given)
@@ -122,7 +147,7 @@ curl -X POST http://localhost:8199/v1/graph/search \
   -d '{"query": "FastAPI", "user_id": "ehfaz"}'
 ```
 
-### Context Loading
+### Context Loading (sync)
 
 ```bash
 # Full project context (global prefs + project facts, organized by category)
@@ -157,15 +182,15 @@ curl "http://localhost:8199/v1/graph/communities?user_id=ehfaz"
 
 7 tools exposed via MCP for direct use by AI agents:
 
-| Tool | Purpose |
-|---|---|
-| `recall_memories` | Semantic search across global + project memories. Agents should call this before starting work. |
-| `remember` | Store a single categorized fact (agent provides content + category). |
-| `remember_conversation` | Bulk extract from conversation messages via LLM. |
-| `get_project_context` | Bootstrap: load all user prefs + project context organized by category. |
-| `search_knowledge_graph` | Graph-based entity/relationship search. |
-| `list_memories` | List/inspect stored memories with filters. |
-| `delete_memories` | Delete by ID or by filters. |
+| Tool | Mode | Purpose |
+|---|---|---|
+| `recall_memories` | sync | Semantic search across global + project memories. Agents should call this before starting work. |
+| `remember` | async | Store a single categorized fact. Set `wait: true` to block until stored. |
+| `remember_conversation` | async | Bulk extract from conversation messages via LLM. Set `wait: true` to block. |
+| `get_project_context` | sync | Bootstrap: load all user prefs + project context organized by category. |
+| `search_knowledge_graph` | sync | Graph-based entity/relationship search. |
+| `list_memories` | sync | List/inspect stored memories with filters. |
+| `delete_memories` | sync | Delete by ID or by filters. |
 
 ### Transport
 
@@ -191,17 +216,23 @@ Add to your Claude Code MCP settings:
 
 ```
 neuralscape-graphiti/
+├── docker-compose.yml            # Redis + Qdrant + API + Worker orchestration
+├── .dockerignore                 # Build context filters
+├── .env.example                  # Env template (copy to .env)
 ├── neuralscape-service/          # The service (what you deploy)
+│   ├── Dockerfile                # Multi-stage build with uv
 │   ├── main.py                   # FastAPI app: legacy + v1 endpoints
 │   ├── memory_service.py         # Business logic layer (MemoryService class)
 │   ├── mcp_server.py             # MCP server: 7 tools, stdio + HTTP
+│   ├── worker.py                 # ARQ worker: background task processing
+│   ├── task_manager.py           # Redis-backed task enqueuing + status
 │   ├── schemas.py                # Enums, category taxonomy, Pydantic models
 │   ├── prompts.py                # LLM extraction prompt, category parser
 │   ├── config.py                 # Pydantic settings (env-driven)
-│   ├── .env                      # Environment variables
 │   ├── pyproject.toml            # Dependencies
 │   └── tests/
-│       ├── test_service.py       # REST endpoint tests (legacy + v1)
+│       ├── test_service.py       # REST endpoint unit tests (mocked, no services needed)
+│       ├── test_async_pipeline.py # Integration tests (requires running services)
 │       ├── test_memory_service.py # Business logic tests
 │       └── test_mcp_tools.py     # MCP tool tests
 ├── mem0/                         # mem0 fork (local editable)
@@ -212,15 +243,49 @@ neuralscape-graphiti/
 
 ## Prerequisites
 
-- **Python 3.10+**
-- **Neo4j** running at `neo4j://127.0.0.1:7687` (for Graphiti knowledge graph)
+- **Python 3.10+** and **uv** (for local development)
+- **Docker** + **Docker Compose** (for containerized deployment)
 - **Google API key** with Gemini access (for LLM extraction + embeddings)
+- **Neo4j** — included in Docker Compose (commented out by default), or use Neo4j Desktop for local dev
+- **Redis** — included in Docker Compose, or run locally
+- **Qdrant** — included in Docker Compose as a server, or run locally
 
-Qdrant runs embedded (on-disk at `~/.neuralscape/qdrant`) — no separate server needed.
-
-## Setup
+## Quick Start (Docker)
 
 ```bash
+# 1. Copy env template and add your Gemini API key
+cp .env.example .env
+# Edit .env: set GOOGLE_API_KEY=your-key
+
+# 2. Start the full stack (Redis + Qdrant + API + Worker)
+# If using Neo4j Desktop locally:
+docker compose up --build -d
+
+# If you need Neo4j in Docker too, uncomment the neo4j service in docker-compose.yml first
+
+# 3. Verify
+docker compose ps
+# Should show: redis, qdrant, neuralscape, neuralscape-worker
+
+curl http://localhost:8199/health
+# → {"status":"ok","service":"neuralscape-memory"}
+
+# 4. Test async memory storage
+curl -X POST http://localhost:8199/v1/memories/raw \
+  -H "Content-Type: application/json" \
+  -d '{"content": "Prefers dark mode", "user_id": "test", "category": "preference"}'
+# → {"status":"accepted","task_id":"...","poll_url":"/v1/memories/status/..."}
+
+# Stop with: docker compose down
+```
+
+## Local Setup (without Docker)
+
+```bash
+# Start Redis and Qdrant (via Docker or locally)
+docker run -d --name redis -p 6379:6379 redis:7-alpine
+docker run -d --name qdrant -p 6333:6333 qdrant/qdrant:latest
+
 cd neuralscape-service
 
 # Create .env file
@@ -230,17 +295,24 @@ NEO4J_URI=neo4j://127.0.0.1:7687
 NEO4J_USER=neo4j
 NEO4J_PASSWORD=your-neo4j-password
 NEO4J_DATABASE=memory
+QDRANT_URL=http://localhost:6333
 EOF
 
 # Install dependencies
 uv sync
 
-# Run the service
+# Start the ARQ worker (terminal 1)
+uv run arq worker.WorkerSettings
+
+# Start the API server (terminal 2)
 uv run python main.py
 # → Listening on http://0.0.0.0:8199
 
-# Run tests
-uv run python -m pytest tests/ -v
+# Run unit tests (no external services needed)
+uv run pytest tests/test_service.py -v
+
+# Run integration tests (requires all services running)
+uv run pytest tests/test_async_pipeline.py -v -s
 ```
 
 ## Configuration
@@ -256,13 +328,21 @@ All settings are environment variables (loaded from `.env`):
 | `NEO4J_USER` | `neo4j` | Neo4j username |
 | `NEO4J_PASSWORD` | | Neo4j password |
 | `NEO4J_DATABASE` | `memory` | Neo4j database name |
-| `QDRANT_ON_DISK` | `true` | Persist Qdrant to disk |
-| `QDRANT_PATH` | `~/.neuralscape/qdrant` | Qdrant storage path |
+| `REDIS_URL` | `redis://localhost:6379` | Redis connection for ARQ task queue |
+| `QDRANT_URL` | (none) | Qdrant server URL (e.g. `http://localhost:6333`). If set, uses server mode. |
+| `QDRANT_ON_DISK` | `true` | Persist Qdrant to disk (only used when `QDRANT_URL` is not set) |
+| `QDRANT_PATH` | `~/.neuralscape/qdrant` | Qdrant local storage path (only used when `QDRANT_URL` is not set) |
 | `QDRANT_COLLECTION` | `neuralscape_memories` | Qdrant collection name |
 | `PORT` | `8199` | Service port |
 | `MCP_TRANSPORT` | `stdio` | MCP transport: `stdio` or `http` |
 
 ## Architecture Decisions
+
+**Why ARQ over Celery?** ARQ is async-native (both API and workers are `async def`), matching FastAPI + Graphiti's async Neo4j driver. Simple setup (~50 lines of config), built-in retries and result storage in Redis. Celery is designed for CPU-bound distributed workloads at massive scale — overkill for I/O-bound LLM calls and DB writes.
+
+**Why async writes?** Memory storage involves sequential LLM calls (Gemini extraction, embeddings) and database writes (Qdrant vectors, Neo4j graph via Graphiti) taking 5-30s total. Async processing returns control to the client in <50ms while the worker handles the heavy lifting.
+
+**Why Qdrant server mode?** The ARQ worker runs as a separate process from the API server. On-disk Qdrant only supports single-process access. Qdrant server mode (via Docker or standalone) allows both processes to connect concurrently.
 
 **Why custom extraction instead of mem0's built-in?** Self-hosted mem0 doesn't support categories. By doing extraction in our service layer, we tag each fact with a category *before* storage, enabling filtered retrieval and organized context loading.
 

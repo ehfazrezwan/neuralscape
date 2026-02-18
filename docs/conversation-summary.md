@@ -10,7 +10,10 @@ This repository (`neuralscape-graphiti`) is a fork/working copy of [Graphiti](ht
 neuralscape-graphiti/
   .git/
   .gitignore              # Root-level gitignore (covers .env, .venv, etc.)
+  .dockerignore           # Excludes tests, docs, unused subpackages from Docker build
   .env                    # Root-level env (NEO4J + GOOGLE_API_KEY credentials)
+  .env.example            # Template for users to copy to .env
+  docker-compose.yml      # Neo4j + neuralscape-service orchestration
   docs/
     conversation-summary.md       # This file
     graphiti-mem0-implementation.md  # Graphiti-mem0 integration plan
@@ -32,6 +35,7 @@ neuralscape-graphiti/
       test_graphiti_integration.py  # Integration tests (3, skipped without env)
     pyproject.toml
   neuralscape-service/        # FastAPI service wrapping mem0 + Graphiti
+    Dockerfile                # Multi-stage build using uv
     main.py                   # REST endpoints (sync + async memory, graph queries)
     config.py                 # pydantic-settings config
     mcp_server.py             # MCP server (Model Context Protocol)
@@ -47,7 +51,8 @@ The entire upstream graphiti codebase was moved into the `graphiti/` subdirector
 
 - `bootstrap/setting-up` — initial setup (merged to `dev`)
 - `dev` — integration branch
-- `feature/agentic-memory-layer` — current working branch
+- `feature/agentic-memory-layer` — v1 API, MCP, MemoryService (merged to `dev` via PR #2)
+- `feature/dockerizing-neuralscape` — Docker containerization (merged to `dev` via PR #4)
 - `main` — stable
 
 ## What Was Done
@@ -144,7 +149,27 @@ Lightweight FastAPI service wrapping mem0 with Graphiti backend. Endpoints:
 
 **Async architecture**: `POST /memories/async` uses `AsyncMemory` (mem0's async variant) with `asyncio.create_task()`. The chain: FastAPI loop -> `create_task(_process())` -> `await async_mem.add()` -> `asyncio.to_thread(self.graph.add, ...)` -> `_bridge.run(coro)` (runs on the bridge's independent loop). No event loop conflicts.
 
-### 9. Test Coverage
+### 9. Docker Containerization
+
+**New files**: `.dockerignore`, `neuralscape-service/Dockerfile`, `docker-compose.yml`, `.env.example`
+
+The full stack can now be started with `docker compose up`. Key design:
+
+- **Multi-stage Dockerfile** — Stage 1 (builder) uses `python:3.12-slim` + `uv` to install all deps via `uv sync --frozen --no-dev`. Stage 2 (runtime) copies only the venv and source code, keeping the image lean.
+- **Build context is the project root** — the Dockerfile lives in `neuralscape-service/` but the build context is `.` so it can `COPY` the sibling `graphiti/` and `mem0/` directories for editable installs.
+- **`.dockerignore`** — excludes `.venv/`, `__pycache__/`, `.env`, tests, docs, and unused subpackages (`mem0/embedchain/`, `mem0/openmemory/`, `graphiti/examples/`, etc.) to minimize build context (~4MB instead of ~500MB+).
+- **Docker Compose** — two services: `neo4j` (5-community with `cypher-shell` healthcheck) and `neuralscape` (waits for healthy Neo4j via `depends_on` + `service_healthy`).
+- **Qdrant** — persisted via named volume at `/data/qdrant` inside the container.
+- **Neo4j** — community edition with `NEO4J_AUTH=neo4j/neuralscape` for initial password. Data persisted via `neo4j_data` named volume.
+- **Env var mapping** — `GEMINI_LLM_MODEL` and `GEMINI_EMBEDDER_MODEL` are mapped from the root `.env`'s `SMALL_MODEL_NAME` and `EMBEDDING_MODEL_NAME` via compose variable substitution with defaults.
+- **`.env.example`** — template with `GOOGLE_API_KEY` and `NEO4J_PASSWORD` for users to copy.
+
+**Build gotchas encountered**:
+- Both `graphiti/` and `mem0/` pyproject.toml files reference `README.md` (hatchling/poetry `readme` field). These must be copied into the build context or the editable install fails with "Readme file does not exist".
+- `mem0/pyproject.toml` also has `license-files = ["LICENSE"]`, requiring the LICENSE file in the build context.
+- `config.py` uses `GEMINI_EMBEDDER_MODEL` (pydantic-settings auto-maps from field name), but the root `.env` uses `EMBEDDING_MODEL_NAME`. The compose `environment:` block bridges this with `GEMINI_EMBEDDER_MODEL: ${EMBEDDING_MODEL_NAME:-gemini-embedding-001}`.
+
+### 10. Test Coverage
 
 | File | Tests | Status |
 |------|-------|--------|
@@ -169,7 +194,20 @@ NEO4J_URI=neo4j://127.0.0.1:7687 NEO4J_PASSWORD=... GOOGLE_API_KEY=... \
 ## Commit History
 
 ```
-# bootstrap/setting-up branch (merged to dev)
+# feature/dockerizing-neuralscape branch (merged to dev via PR #4)
+f4b0208 feat: add docker-compose orchestration and env template
+6e8245e feat: add Dockerfile and build context filters for neuralscape service
+
+# feature/agentic-memory-layer branch (merged to dev via PR #2)
+07d7091 docs: add project README, memory layer skill, and conversation summary
+1417e76 test: add comprehensive tests for v1 API, MemoryService, and MCP tools
+897eb69 feat: rewrite MCP server with 7 tools and dual transport
+d32a314 feat: add v1 REST API with scoped memory endpoints
+136a339 feat: add MemoryService business logic layer
+bf4b7eb feat: add Qdrant vector store config and composite group_id scoping
+21631a7 feat: add category taxonomy, scoping enums, and extraction prompt
+
+# bootstrap/setting-up branch (merged to dev via PR #1)
 2004f8b test: add endpoint tests for neuralscape-service
 2e8db95 feat: add non-blocking POST /memories/async endpoint
 e296895 test: add unit and integration tests for Graphiti adapter
@@ -191,7 +229,8 @@ ab7f316 fix: route execute_query to correct database when using custom db name  
 
 - **Python 3.12** (managed by uv)
 - **uv** package manager (`~/.local/bin/uv`)
-- **Neo4j Desktop** with a database named `memory` running on `neo4j://127.0.0.1:7687`
+- **Docker** + **Docker Compose** (for containerized deployment)
+- **Neo4j Desktop** with a database named `memory` running on `neo4j://127.0.0.1:7687` (for local dev; Docker Compose includes its own Neo4j)
 - **Google API Key** for Gemini (AI Studio)
 
 ### .env Files
@@ -264,7 +303,30 @@ uv sync --dev    # includes pytest, pytest-asyncio, httpx
 - MCP server: `graphiti/mcp_server/.venv/bin/python`
 - Neuralscape service: `cd neuralscape-service && uv run ...`
 
-### Running the Servers
+### Running with Docker
+
+```bash
+# Copy env template and fill in your API key
+cp .env.example .env
+# Edit .env: set GOOGLE_API_KEY=your-key
+
+# Start full stack (Neo4j + neuralscape service)
+docker compose up --build -d
+
+# Verify
+docker compose ps
+curl http://localhost:8199/health
+# → {"status":"ok","service":"neuralscape-memory"}
+
+# Neo4j browser at http://localhost:7474
+
+# Stop
+docker compose down
+```
+
+To use a local Neo4j Desktop instead of the containerized one, comment out the `neo4j` service in `docker-compose.yml` and change `NEO4J_URI` to `neo4j://host.docker.internal:7687`.
+
+### Running the Servers (Local, without Docker)
 
 Both graphiti servers default to port 8000. Neuralscape service runs on port 8199.
 
@@ -336,6 +398,12 @@ curl http://localhost:8199/memories/status/<task_id>
 
 14. **neuralscape-service uv venv** — the venv is uv-managed (no `pip` binary). Install dev dependencies with `uv add --dev <pkg>` or `uv sync --dev`, not `pip install`.
 
+15. **Docker build requires README.md and LICENSE for editable packages** — hatchling (graphiti) and poetry (mem0) validate metadata files during editable installs. If `.dockerignore` excludes `README.md` or `LICENSE`, `uv sync` fails with "Readme file does not exist". Both must be explicitly copied in the Dockerfile.
+
+16. **`host.docker.internal` for local development** — when running neuralscape in Docker against a host-machine Neo4j (e.g. Neo4j Desktop), the compose `NEO4J_URI` must use `neo4j://host.docker.internal:7687`, not `127.0.0.1` (which resolves to the container itself). The compose file defaults to `neo4j://neo4j:7687` (the compose service name) for the full-stack setup.
+
+17. **Env var name mismatch between root .env and config.py** — the root `.env` uses `EMBEDDING_MODEL_NAME` and `SMALL_MODEL_NAME` (matching graphiti server conventions), but `neuralscape-service/config.py` pydantic-settings expects `GEMINI_EMBEDDER_MODEL` and `GEMINI_LLM_MODEL`. The docker-compose `environment:` block bridges this with `GEMINI_EMBEDDER_MODEL: ${EMBEDDING_MODEL_NAME:-gemini-embedding-001}`.
+
 ## TODOs
 
 ### Vector Store: Switch from Default Qdrant to Production Store
@@ -384,3 +452,7 @@ curl http://localhost:8199/memories/status/<task_id>
 | `mem0/mem0/utils/factory.py` | Registered "graphiti" in GraphStoreFactory |
 | `neuralscape-service/main.py` | New — FastAPI service with sync/async memory endpoints + graph endpoints |
 | `neuralscape-service/config.py` | New — pydantic-settings config for Gemini + Neo4j |
+| `neuralscape-service/Dockerfile` | New — multi-stage Docker build with uv |
+| `docker-compose.yml` | New — Neo4j + neuralscape service orchestration |
+| `.dockerignore` | New — build context filters |
+| `.env.example` | New — env template for Docker users |
