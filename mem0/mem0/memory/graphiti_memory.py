@@ -94,27 +94,27 @@ def _create_cross_encoder(provider: str | None, api_key: str | None):
         raise ValueError(f"Unsupported Graphiti reranker provider: {provider}")
 
 
-class _EventLoopThread:
-    """Manages a dedicated event loop in a background thread for sync-to-async bridging.
+class _AsyncBridge:
+    """Runs a dedicated event loop in a background thread.
 
-    mem0's Memory class calls graph methods synchronously from a ThreadPoolExecutor.
-    Each thread gets its own event loop instance to avoid conflicts.
+    All Graphiti async operations (including the Neo4j driver) are executed
+    on this single loop, avoiding the 'Future attached to a different loop'
+    error that occurs when mixing event loops.
     """
 
-    _local = threading.local()
+    def __init__(self):
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
 
-    @classmethod
-    def get_loop(cls) -> asyncio.AbstractEventLoop:
-        loop = getattr(cls._local, "loop", None)
-        if loop is None or loop.is_closed():
-            loop = asyncio.new_event_loop()
-            cls._local.loop = loop
-        return loop
+    def _run_loop(self):
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
 
-    @classmethod
-    def run(cls, coro):
-        loop = cls.get_loop()
-        return loop.run_until_complete(coro)
+    def run(self, coro):
+        """Submit a coroutine to the background loop and wait for the result."""
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result()
 
 
 class MemoryGraph:
@@ -134,6 +134,9 @@ class MemoryGraph:
         self.config = config
         graph_config = self.config.graph_store.config
 
+        # Create a dedicated async bridge (background thread + event loop)
+        self._bridge = _AsyncBridge()
+
         # Build Graphiti clients from config
         llm_client = _create_llm_client(
             provider=graph_config.graphiti_llm_provider,
@@ -152,32 +155,39 @@ class MemoryGraph:
             api_key=graph_config.graphiti_llm_api_key,
         )
 
-        # Create Neo4j driver directly for database param support
-        driver = Neo4jDriver(
-            uri=graph_config.url,
-            user=graph_config.username,
-            password=graph_config.password,
-            database=graph_config.database,
-        )
+        # Create Neo4j driver and Graphiti instance ON the bridge loop
+        # so the async neo4j driver is bound to the correct event loop
+        def _init_graphiti():
+            driver = Neo4jDriver(
+                uri=graph_config.url,
+                user=graph_config.username,
+                password=graph_config.password,
+                database=graph_config.database,
+            )
 
-        self.graphiti = Graphiti(
-            llm_client=llm_client,
-            embedder=embedder,
-            cross_encoder=cross_encoder,
-            graph_driver=driver,
-            store_raw_episode_content=graph_config.store_raw_episode_content,
-        )
+            return Graphiti(
+                llm_client=llm_client,
+                embedder=embedder,
+                cross_encoder=cross_encoder,
+                graph_driver=driver,
+                store_raw_episode_content=graph_config.store_raw_episode_content,
+            )
+
+        # Run the sync init parts on the bridge loop so the neo4j driver
+        # attaches to that loop
+        async def _async_init():
+            return _init_graphiti()
+
+        self.graphiti = self._bridge.run(_async_init())
 
         self._update_communities = graph_config.update_communities
-
-        # Build indices on first init
         self._indices_built = False
 
     def _ensure_indices(self):
         """Build Neo4j indices/constraints on first use."""
         if not self._indices_built:
             try:
-                _EventLoopThread.run(self.graphiti.build_indices_and_constraints())
+                self._bridge.run(self.graphiti.build_indices_and_constraints())
                 self._indices_built = True
             except Exception as e:
                 logger.warning(f"Failed to build Graphiti indices (may already exist): {e}")
@@ -200,13 +210,11 @@ class MemoryGraph:
 
     async def _resolve_edge_names(self, edges: list[EntityEdge]) -> list[dict]:
         """Convert EntityEdge objects to triple dicts with resolved node names."""
-        # Collect unique node UUIDs
         node_uuids = set()
         for edge in edges:
             node_uuids.add(edge.source_node_uuid)
             node_uuids.add(edge.target_node_uuid)
 
-        # Batch fetch nodes
         uuid_to_name = {}
         if node_uuids:
             try:
@@ -254,13 +262,11 @@ class MemoryGraph:
                 update_communities=self._update_communities,
             )
 
-            # Convert results to mem0's expected format
             added = []
             for edge in result.edges:
                 source_name = edge.source_node_uuid
                 target_name = edge.target_node_uuid
 
-                # Try to resolve names from the result nodes
                 for node in result.nodes:
                     if node.uuid == edge.source_node_uuid:
                         source_name = node.name
@@ -276,7 +282,7 @@ class MemoryGraph:
             return {"deleted_entities": [], "added_entities": added}
 
         try:
-            return _EventLoopThread.run(_add())
+            return self._bridge.run(_add())
         except Exception as e:
             logger.error(f"Graphiti add_episode failed: {e}")
             raise
@@ -304,7 +310,7 @@ class MemoryGraph:
             return await self._resolve_edge_names(edges)
 
         try:
-            results = _EventLoopThread.run(_search())
+            results = self._bridge.run(_search())
             logger.info(f"Graphiti search returned {len(results)} results")
             return results
         except Exception as e:
@@ -325,7 +331,7 @@ class MemoryGraph:
             await Node.delete_by_group_id(self.graphiti.driver, group_id)
 
         try:
-            _EventLoopThread.run(_delete())
+            self._bridge.run(_delete())
             logger.info(f"Deleted all Graphiti data for group_id={group_id}")
         except Exception as e:
             logger.error(f"Graphiti delete_all failed: {e}")
@@ -355,7 +361,6 @@ class MemoryGraph:
                 return []
 
             resolved = await self._resolve_edge_names(edges)
-            # Match mem0's expected key format (uses "target" not "destination")
             return [
                 {
                     "source": r["source"],
@@ -366,7 +371,7 @@ class MemoryGraph:
             ]
 
         try:
-            results = _EventLoopThread.run(_get_all())
+            results = self._bridge.run(_get_all())
             logger.info(f"Graphiti get_all returned {len(results)} relationships")
             return results
         except Exception as e:
