@@ -191,14 +191,17 @@ Add to your Claude Code MCP settings:
 
 ```
 neuralscape-graphiti/
+├── docker-compose.yml            # Neo4j + neuralscape orchestration
+├── .dockerignore                 # Build context filters
+├── .env.example                  # Env template (copy to .env)
 ├── neuralscape-service/          # The service (what you deploy)
+│   ├── Dockerfile                # Multi-stage build with uv
 │   ├── main.py                   # FastAPI app: legacy + v1 endpoints
 │   ├── memory_service.py         # Business logic layer (MemoryService class)
 │   ├── mcp_server.py             # MCP server: 7 tools, stdio + HTTP
 │   ├── schemas.py                # Enums, category taxonomy, Pydantic models
 │   ├── prompts.py                # LLM extraction prompt, category parser
 │   ├── config.py                 # Pydantic settings (env-driven)
-│   ├── .env                      # Environment variables
 │   ├── pyproject.toml            # Dependencies
 │   └── tests/
 │       ├── test_service.py       # REST endpoint tests (legacy + v1)
@@ -212,13 +215,34 @@ neuralscape-graphiti/
 
 ## Prerequisites
 
-- **Python 3.10+**
-- **Neo4j** running at `neo4j://127.0.0.1:7687` (for Graphiti knowledge graph)
+- **Python 3.10+** and **uv** (for local development)
+- **Docker** + **Docker Compose** (for containerized deployment)
 - **Google API key** with Gemini access (for LLM extraction + embeddings)
+- **Neo4j** — included in Docker Compose, or use Neo4j Desktop for local dev
 
-Qdrant runs embedded (on-disk at `~/.neuralscape/qdrant`) — no separate server needed.
+Qdrant runs embedded (on-disk) — no separate server needed.
 
-## Setup
+## Quick Start (Docker)
+
+```bash
+# 1. Copy env template and add your Gemini API key
+cp .env.example .env
+# Edit .env: set GOOGLE_API_KEY=your-key
+
+# 2. Start the full stack (Neo4j + Neuralscape)
+docker compose up --build -d
+
+# 3. Verify
+curl http://localhost:8199/health
+# → {"status":"ok","service":"neuralscape-memory"}
+
+# Neo4j browser available at http://localhost:7474
+# Stop with: docker compose down
+```
+
+To use a local Neo4j Desktop instead of the containerized one, comment out the `neo4j` service in `docker-compose.yml` and change `NEO4J_URI` to `neo4j://host.docker.internal:7687`.
+
+## Local Setup (without Docker)
 
 ```bash
 cd neuralscape-service
