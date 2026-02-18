@@ -402,8 +402,11 @@ def create_mcp_http_app():
     """Create a Starlette ASGI app for Streamable HTTP MCP transport.
 
     This is mounted on the FastAPI app at /mcp/ for remote agent access.
-    When mounted under FastAPI, the TaskManager is already initialized
-    in main.py's lifespan via the shared _task_manager instance.
+    The session manager's run() context must be managed by the parent app's
+    lifespan (FastAPI doesn't trigger lifespan for mounted sub-apps).
+
+    Returns (mcp_app, session_manager) so main.py can start the session
+    manager in its own lifespan.
     """
     from starlette.applications import Starlette
     from starlette.routing import Mount
@@ -415,18 +418,10 @@ def create_mcp_http_app():
         stateless=True,
     )
 
-    async def lifespan(app):
-        # Connect task manager for HTTP MCP mode
-        await _task_manager.connect()
-        async with session_manager.run():
-            yield
-        await _task_manager.close()
-
     mcp_app = Starlette(
-        lifespan=lifespan,
         routes=[Mount("/", app=session_manager.handle_request)],
     )
-    return mcp_app
+    return mcp_app, session_manager
 
 
 async def run_stdio():
