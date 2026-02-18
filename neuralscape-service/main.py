@@ -15,20 +15,22 @@ logger = logging.getLogger(__name__)
 # Lazy-init globals
 _memory = None
 _graphiti = None
+_bridge = None
 
 
 def _get_memory():
     """Lazy-initialize mem0 Memory with Graphiti backend."""
-    global _memory, _graphiti
+    global _memory, _graphiti, _bridge
     if _memory is None:
         from mem0 import Memory
 
         config = settings.get_mem0_config()
         _memory = Memory.from_config(config)
 
-        # Extract the Graphiti instance from the graph store for advanced endpoints
+        # Extract the Graphiti instance and async bridge from the graph store
         if hasattr(_memory, "graph") and hasattr(_memory.graph, "graphiti"):
             _graphiti = _memory.graph.graphiti
+            _bridge = _memory.graph._bridge
 
     return _memory
 
@@ -39,13 +41,20 @@ def _get_graphiti():
     return _graphiti
 
 
+def _run_on_bridge(coro):
+    """Run an async coroutine on the Graphiti adapter's event loop."""
+    if _bridge is None:
+        raise HTTPException(status_code=503, detail="Graphiti bridge not initialized")
+    return _bridge.run(coro)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting Neuralscape Service...")
     _get_memory()
     yield
-    if _graphiti:
-        await _graphiti.close()
+    if _graphiti and _bridge:
+        _bridge.run(_graphiti.close())
     logger.info("Neuralscape Service stopped.")
 
 
@@ -187,7 +196,7 @@ async def delete_memories(
 
 
 @app.get("/graph/nodes")
-async def list_graph_nodes(
+def list_graph_nodes(
     user_id: str = Query(default=None),
     limit: int = Query(default=50),
 ):
@@ -200,7 +209,9 @@ async def list_graph_nodes(
 
     group_id = user_id or settings.default_user_id
     try:
-        nodes = await EntityNode.get_by_group_ids(g.driver, group_ids=[group_id], limit=limit)
+        nodes = _run_on_bridge(
+            EntityNode.get_by_group_ids(g.driver, group_ids=[group_id], limit=limit)
+        )
         return {
             "status": "ok",
             "nodes": [
@@ -220,7 +231,7 @@ async def list_graph_nodes(
 
 
 @app.get("/graph/edges")
-async def list_graph_edges(
+def list_graph_edges(
     user_id: str = Query(default=None),
     limit: int = Query(default=50),
 ):
@@ -234,7 +245,9 @@ async def list_graph_edges(
 
     group_id = user_id or settings.default_user_id
     try:
-        edges = await EntityEdge.get_by_group_ids(g.driver, group_ids=[group_id], limit=limit)
+        edges = _run_on_bridge(
+            EntityEdge.get_by_group_ids(g.driver, group_ids=[group_id], limit=limit)
+        )
         return {
             "status": "ok",
             "edges": [
@@ -260,7 +273,7 @@ async def list_graph_edges(
 
 
 @app.get("/graph/episodes")
-async def list_graph_episodes(
+def list_graph_episodes(
     user_id: str = Query(default=None),
     limit: int = Query(default=20),
 ):
@@ -272,10 +285,12 @@ async def list_graph_episodes(
     group_id = user_id or settings.default_user_id
     now = datetime.now(timezone.utc)
     try:
-        episodes = await g.retrieve_episodes(
-            reference_time=now,
-            last_n=limit,
-            group_ids=[group_id],
+        episodes = _run_on_bridge(
+            g.retrieve_episodes(
+                reference_time=now,
+                last_n=limit,
+                group_ids=[group_id],
+            )
         )
         return {
             "status": "ok",
@@ -297,7 +312,7 @@ async def list_graph_episodes(
 
 
 @app.get("/graph/communities")
-async def list_graph_communities(
+def list_graph_communities(
     user_id: str = Query(default=None),
     limit: int = Query(default=20),
 ):
@@ -310,8 +325,8 @@ async def list_graph_communities(
 
     group_id = user_id or settings.default_user_id
     try:
-        communities = await CommunityNode.get_by_group_ids(
-            g.driver, group_ids=[group_id], limit=limit
+        communities = _run_on_bridge(
+            CommunityNode.get_by_group_ids(g.driver, group_ids=[group_id], limit=limit)
         )
         return {
             "status": "ok",
@@ -331,7 +346,7 @@ async def list_graph_communities(
 
 
 @app.post("/graph/search")
-async def advanced_graph_search(req: GraphSearchRequest):
+def advanced_graph_search(req: GraphSearchRequest):
     """Advanced Graphiti search with configurable SearchConfig."""
     g = _get_graphiti()
     if g is None:
@@ -350,10 +365,12 @@ async def advanced_graph_search(req: GraphSearchRequest):
     config.limit = req.limit
 
     try:
-        results = await g.search_(
-            query=req.query,
-            config=config,
-            group_ids=[group_id],
+        results = _run_on_bridge(
+            g.search_(
+                query=req.query,
+                config=config,
+                group_ids=[group_id],
+            )
         )
 
         return {

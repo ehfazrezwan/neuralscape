@@ -29,6 +29,21 @@ class Settings(BaseSettings):
     def get_mem0_config(self) -> dict:
         """Build mem0 config dict for Memory(config=...)."""
         return {
+            "llm": {
+                "provider": "gemini",
+                "config": {
+                    "model": self.gemini_llm_model,
+                    "api_key": self.google_api_key,
+                },
+            },
+            "embedder": {
+                "provider": "gemini",
+                "config": {
+                    "model": self.gemini_embedder_model,
+                    "api_key": self.google_api_key,
+                    "embedding_dims": 768,
+                },
+            },
             "graph_store": {
                 "provider": "graphiti",
                 "config": {

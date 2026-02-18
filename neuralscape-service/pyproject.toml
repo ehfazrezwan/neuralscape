@@ -16,6 +16,9 @@ dependencies = [
     "python-dotenv>=1.0.0",
 ]
 
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
 [project.optional-dependencies]
 dev = [
     "httpx>=0.27.0",
