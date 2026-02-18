@@ -12,7 +12,8 @@ neuralscape-graphiti/
   .gitignore              # Root-level gitignore (covers .env, .venv, etc.)
   .env                    # Root-level env (NEO4J + GOOGLE_API_KEY credentials)
   docs/
-    conversation-summary.md   # This file
+    conversation-summary.md       # This file
+    graphiti-mem0-implementation.md  # Graphiti-mem0 integration plan
   graphiti/                   # All upstream graphiti source lives here
     graphiti_core/            # Core library (the Python package)
     server/                   # REST API server (FastAPI)
@@ -21,13 +22,33 @@ neuralscape-graphiti/
     tests/                    # Test suite
     pyproject.toml            # Root package config for graphiti-core
     Makefile, README.md, etc.
+  mem0/                       # Fork of mem0 with Graphiti graph memory adapter
+    mem0/                     # Core library (the Python package)
+      memory/graphiti_memory.py  # MemoryGraph adapter + _AsyncBridge
+      configs/base.py            # MemoryConfig (top-level Pydantic config)
+    tests/
+      test_graphiti_config.py    # Config + factory unit tests (10 tests)
+      test_graphiti_memory.py    # Adapter unit tests (19 tests)
+      test_graphiti_integration.py  # Integration tests (3, skipped without env)
+    pyproject.toml
+  neuralscape-service/        # FastAPI service wrapping mem0 + Graphiti
+    main.py                   # REST endpoints (sync + async memory, graph queries)
+    config.py                 # pydantic-settings config
+    mcp_server.py             # MCP server (Model Context Protocol)
+    tests/
+      conftest.py             # Adds parent dir to sys.path
+      test_service.py         # Endpoint tests (13 tests)
+    pyproject.toml
 ```
 
-The entire upstream graphiti codebase was moved into the `graphiti/` subdirectory to allow for a monorepo structure.
+The entire upstream graphiti codebase was moved into the `graphiti/` subdirectory to allow for a monorepo structure. `mem0/` is a fork of the mem0 library with a custom Graphiti adapter. `neuralscape-service/` is the application layer.
 
-## Branch
+## Branches
 
-All work is on the `bootstrap/setting-up` branch (forked from `main`).
+- `bootstrap/setting-up` — initial setup (merged to `dev`)
+- `dev` — integration branch
+- `feature/agentic-memory-layer` — current working branch
+- `main` — stable
 
 ## What Was Done
 
@@ -94,9 +115,69 @@ The `google-genai` extra was also added to both dependency specs:
 
 All files moved from repo root into `graphiti/` subdirectory via `git mv`. A copy of `.gitignore` remains at the repo root.
 
+### 7. mem0 Subproject with Graphiti Graph Memory Adapter
+
+**New directory**: `mem0/`
+
+A fork of [mem0](https://github.com/mem0ai/mem0) with a custom `MemoryGraph` adapter (`mem0/mem0/memory/graphiti_memory.py`) that delegates all graph operations to Graphiti's temporal knowledge graph engine.
+
+Key components:
+- **`_AsyncBridge`** — runs a dedicated `asyncio` event loop in a background thread, so Graphiti's async operations (including the Neo4j driver) don't conflict with the caller's event loop.
+- **`MemoryGraph`** — implements mem0's graph store interface (`add`, `search`, `get_all`, `delete_all`), translating mem0 `filters` to Graphiti `group_id` and delegating to `graphiti.add_episode()`, `graphiti.search()`, etc.
+- **`GraphitiConfig`** (`mem0/mem0/graphs/configs.py`) — Pydantic config for Graphiti-specific fields (Neo4j connection, LLM/embedder/reranker provider settings).
+- **`GraphStoreFactory`** (`mem0/mem0/utils/factory.py`) — registers `"graphiti"` provider mapping to `mem0.memory.graphiti_memory.MemoryGraph`.
+
+### 8. neuralscape-service: FastAPI + MCP Service
+
+**New directory**: `neuralscape-service/`
+
+Lightweight FastAPI service wrapping mem0 with Graphiti backend. Endpoints:
+- `GET /health` — health check
+- `POST /memories` — sync memory addition (blocks during Graphiti entity extraction, 5-15s)
+- `POST /memories/async` — non-blocking memory addition, returns task_id immediately
+- `GET /memories/status/{task_id}` — poll for async task result (`processing`/`completed`/`failed`)
+- `POST /search` — semantic memory search
+- `GET /memories` — list all memories for a user
+- `DELETE /memories` — delete all memories for a user
+- `GET /graph/nodes`, `GET /graph/edges`, `GET /graph/episodes`, `GET /graph/communities` — direct Graphiti graph queries
+- `POST /graph/search` — advanced Graphiti search with configurable `SearchConfig`
+
+**Async architecture**: `POST /memories/async` uses `AsyncMemory` (mem0's async variant) with `asyncio.create_task()`. The chain: FastAPI loop -> `create_task(_process())` -> `await async_mem.add()` -> `asyncio.to_thread(self.graph.add, ...)` -> `_bridge.run(coro)` (runs on the bridge's independent loop). No event loop conflicts.
+
+### 9. Test Coverage
+
+| File | Tests | Status |
+|------|-------|--------|
+| `mem0/tests/test_graphiti_config.py` | 10 — config validation, defaults, factory registration | passing |
+| `mem0/tests/test_graphiti_memory.py` | 19 — `_AsyncBridge`, init, add, search, get_all, delete_all, group_id mapping, source description | passing |
+| `mem0/tests/test_graphiti_integration.py` | 3 — full cycle (direct + via Memory), temporal edge invalidation | skipped without `NEO4J_URI`/`GOOGLE_API_KEY` |
+| `neuralscape-service/tests/test_service.py` | 13 — health, sync add, search, list, delete, async add, task status | passing |
+
+Run tests:
+```bash
+# mem0 unit tests (from neuralscape-service, using its venv)
+uv run python -m pytest ../mem0/tests/test_graphiti_config.py ../mem0/tests/test_graphiti_memory.py -v
+
+# Service tests
+cd neuralscape-service && uv run python -m pytest tests/ -v
+
+# Integration tests (requires Neo4j + Gemini)
+NEO4J_URI=neo4j://127.0.0.1:7687 NEO4J_PASSWORD=... GOOGLE_API_KEY=... \
+  uv run python -m pytest ../mem0/tests/test_graphiti_integration.py -v
+```
+
 ## Commit History
 
 ```
+# bootstrap/setting-up branch (merged to dev)
+2004f8b test: add endpoint tests for neuralscape-service
+2e8db95 feat: add non-blocking POST /memories/async endpoint
+e296895 test: add unit and integration tests for Graphiti adapter
+30203a7 fix: configure mem0 LLM/embedder for Gemini and route graph endpoints through bridge
+4bfaa1f fix: replace per-thread event loop with single async bridge
+5188634 docs: add Graphiti-mem0 integration implementation plan
+c46a16b feat: add neuralscape-service with REST and MCP interfaces
+ae1e20a feat: add mem0 subproject with Graphiti graph memory adapter
 e0cd131 refactor: move all repository contents into graphiti/ subdirectory
 232a4a5 chore: switch to Gemini + Neo4j and use local graphiti-core
 174e166 feat: add multi-provider LLM, embedder, and cross-encoder support to REST server
@@ -149,9 +230,20 @@ NEO4J_PASSWORD=<password>
 NEO4J_DATABASE=memory
 ```
 
+**`neuralscape-service/.env`**:
+```env
+GOOGLE_API_KEY=<key>
+GEMINI_LLM_MODEL=gemini-2.5-flash
+GEMINI_EMBEDDER_MODEL=text-embedding-004
+NEO4J_URI=neo4j://127.0.0.1:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=<password>
+NEO4J_DATABASE=memory
+```
+
 ### Setting Up Virtual Environments
 
-Each server has its own `.venv`. From the repo root:
+Each server/service has its own `.venv`. From the repo root:
 
 ```bash
 # REST server
@@ -161,17 +253,22 @@ uv sync --extra dev
 # MCP server
 cd graphiti/mcp_server
 uv sync
+
+# Neuralscape service
+cd neuralscape-service
+uv sync --dev    # includes pytest, pytest-asyncio, httpx
 ```
 
 **Important**: Always use each server's own `.venv` when running commands:
 - REST server: `graphiti/server/.venv/bin/python`, `graphiti/server/.venv/bin/uvicorn`
 - MCP server: `graphiti/mcp_server/.venv/bin/python`
+- Neuralscape service: `cd neuralscape-service && uv run ...`
 
 ### Running the Servers
 
-Both default to port 8000, so run one at a time unless you override the port.
+Both graphiti servers default to port 8000. Neuralscape service runs on port 8199.
 
-**REST Server**:
+**REST Server** (Graphiti direct):
 ```bash
 cd graphiti/server
 .venv/bin/uvicorn graph_service.main:app --host 127.0.0.1 --port 8000 --reload
@@ -179,13 +276,30 @@ cd graphiti/server
 # Returns: {"status":"healthy"}
 ```
 
-**MCP Server**:
+**MCP Server** (Graphiti MCP):
 ```bash
 cd graphiti/mcp_server
 .venv/bin/python main.py
 # Healthcheck: curl http://localhost:8000/health
 # Returns: {"status":"healthy","service":"graphiti-mcp"}
 # MCP endpoint: http://localhost:8000/mcp/
+```
+
+**Neuralscape Service** (mem0 + Graphiti):
+```bash
+cd neuralscape-service
+uv run uvicorn main:app --host 127.0.0.1 --port 8199 --reload
+# Healthcheck: curl http://127.0.0.1:8199/health
+# Returns: {"status":"ok","service":"neuralscape-memory"}
+
+# Async memory addition:
+curl -X POST http://localhost:8199/memories/async \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "I work at Acme"}], "user_id": "test"}'
+# Returns: {"status": "accepted", "task_id": "..."}
+
+curl http://localhost:8199/memories/status/<task_id>
+# Returns: {"status": "completed", "result": {...}}
 ```
 
 ## Key Learnings / Gotchas
@@ -206,6 +320,54 @@ cd graphiti/mcp_server
 
 7. **Quickstart reference**: `graphiti/examples/quickstart/quickstart_memory.py` demonstrates the correct Gemini + Neo4j pattern with all components wired up properly.
 
+## Key Learnings / Gotchas (continued)
+
+8. **mem0 always creates a vector store** — `Memory.__init__` unconditionally creates an embedder and vector store (defaults to Qdrant in local/in-memory mode at `~/.mem0/`). The graph store is additive, not a replacement. When `add()` runs, it executes two parallel pipelines: (1) LLM extracts facts -> embeds -> stores in vector DB, and (2) raw text -> Graphiti entity extraction. This means LLM fact extraction runs twice (once per pipeline). If you only want the knowledge graph, use `MemoryGraph` directly (which is what the `/graph/*` endpoints do).
+
+9. **`_AsyncBridge` pattern** — Graphiti's Neo4j driver binds to whichever event loop is active during its creation. The `_AsyncBridge` creates a dedicated background thread with its own event loop, initializes the Neo4j driver on that loop, and routes all async operations through it via `run_coroutine_threadsafe`. This avoids "Future attached to a different loop" errors when FastAPI or mem0's `AsyncMemory` try to use the driver from their own event loops.
+
+10. **`AsyncMemory.from_config()` is sync** — despite the class name, `AsyncMemory.__init__` is synchronous. It creates its own `MemoryGraph` which spawns its own `_AsyncBridge`. The async methods (`add()`, `search()`, etc.) use `asyncio.to_thread()` internally to delegate to the sync graph adapter.
+
+11. **Graphiti supports 4 graph DB backends** — Neo4j, FalkorDB, Kuzu, Neptune. FalkorDB is a first-class, actively maintained backend (not experimental). The driver lives at `graphiti_core/driver/falkordb_driver.py` with full implementations of all 11 operation interfaces. Install via `pip install graphiti-core[falkordb]`.
+
+12. **FalkorDB vector search is brute-force in Graphiti** — FalkorDB has HNSW vector indexes, but Graphiti's FalkorDB driver doesn't use them. Instead, it computes cosine similarity inline via `vec.cosineDistance()` (exact but O(n) per query, vs O(log n) with HNSW). Fine for small graphs, degrades at scale.
+
+13. **FalkorDB lacks multi-statement transactions** — single-query atomicity only. If an `add_episode` fails mid-way, you could get orphaned nodes/edges. Neo4j provides full ACID rollback.
+
+14. **neuralscape-service uv venv** — the venv is uv-managed (no `pip` binary). Install dev dependencies with `uv add --dev <pkg>` or `uv sync --dev`, not `pip install`.
+
+## TODOs
+
+### Vector Store: Switch from Default Qdrant to Production Store
+
+**Priority**: High (before any production deployment)
+
+**Current state**: mem0 defaults to local Qdrant (in-memory/file-based at `~/.mem0/`). This works for development but:
+- Data is ephemeral (cleared on restart unless `on_disk=True`)
+- Not accessible from other services
+- No backup/replication
+- Performance uncharacterized at scale
+
+**Options to evaluate**:
+1. **Qdrant server** (self-hosted or Qdrant Cloud) — simplest migration, same client library
+2. **pgvector** — if we already run Postgres, avoids adding another service
+3. **Pinecone** — managed, zero-ops, good for serverless workloads
+4. **Disable vector store entirely** — if we decide Graphiti's hybrid search (fulltext + vector via Neo4j/FalkorDB) is sufficient and we don't need mem0's separate fact extraction pipeline. This would require bypassing `Memory` and using `MemoryGraph` directly, losing mem0's LLM-based fact deduplication and update logic.
+
+**Decision needed**: Do we want both pipelines (vector + graph), or should we rely solely on Graphiti's knowledge graph for storage and search? The dual pipeline means double LLM calls per `add()` but provides both semantic similarity search (vector) and structured relational queries (graph).
+
+### Graph Database: Neo4j vs FalkorDB
+
+**Priority**: Medium (evaluate before scaling to multiple concurrent users)
+
+**Current state**: Neo4j Desktop with local database `memory`.
+
+**FalkorDB advantages**: In-memory speed (~10x+ faster queries), horizontal write scaling via Redis Cluster, open source multi-tenancy.
+
+**FalkorDB risks**: No multi-statement ACID transactions, brute-force vector search in Graphiti's driver (O(n) vs O(log n)), weaker persistence guarantees (Redis AOF), smaller community.
+
+**Recommendation**: Stay with Neo4j for now. The async endpoint solves the blocking UX problem. Switching to FalkorDB is a config change (Graphiti already has the driver), so defer until write throughput becomes a bottleneck.
+
 ## Files Modified (from upstream)
 
 | File | What Changed |
@@ -217,3 +379,8 @@ cd graphiti/mcp_server
 | `graphiti/server/graph_service/config.py` | Added provider fields, made openai_api_key optional |
 | `graphiti/server/graph_service/zep_graphiti.py` | Multi-provider support, graph_driver param, Neo4jDriver |
 | `graphiti/server/pyproject.toml` | Added google-genai extra + uv source override |
+| `mem0/mem0/memory/graphiti_memory.py` | New — Graphiti MemoryGraph adapter + _AsyncBridge |
+| `mem0/mem0/graphs/configs.py` | Added GraphitiConfig Pydantic model |
+| `mem0/mem0/utils/factory.py` | Registered "graphiti" in GraphStoreFactory |
+| `neuralscape-service/main.py` | New — FastAPI service with sync/async memory endpoints + graph endpoints |
+| `neuralscape-service/config.py` | New — pydantic-settings config for Gemini + Neo4j |
