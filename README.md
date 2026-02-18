@@ -1,776 +1,273 @@
-<p align="center">
-  <a href="https://www.getzep.com/">
-    <img src="https://github.com/user-attachments/assets/119c5682-9654-4257-8922-56b7cb8ffd73" width="150" alt="Zep Logo">
-  </a>
-</p>
+# Neuralscape - Agentic Memory Layer
 
-<h1 align="center">
-Graphiti
-</h1>
-<h2 align="center"> Build Real-Time Knowledge Graphs for AI Agents</h2>
-<div align="center">
+A production-grade memory system for AI coding assistants and personal agents. Neuralscape gives any LLM-powered agent persistent, structured memory across sessions and projects — remembering user preferences, project conventions, technical decisions, and learned facts.
 
-[![Lint](https://github.com/getzep/Graphiti/actions/workflows/lint.yml/badge.svg?style=flat)](https://github.com/getzep/Graphiti/actions/workflows/lint.yml)
-[![Unit Tests](https://github.com/getzep/Graphiti/actions/workflows/unit_tests.yml/badge.svg)](https://github.com/getzep/Graphiti/actions/workflows/unit_tests.yml)
-[![MyPy Check](https://github.com/getzep/Graphiti/actions/workflows/typecheck.yml/badge.svg)](https://github.com/getzep/Graphiti/actions/workflows/typecheck.yml)
+Built on [mem0](https://github.com/mem0ai/mem0) (vector storage + LLM deduplication) and [Graphiti](https://github.com/getzep/graphiti) (temporal knowledge graph), exposed via REST API and MCP server.
 
-![GitHub Repo stars](https://img.shields.io/github/stars/getzep/graphiti)
-[![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?&logo=discord&logoColor=white)](https://discord.com/invite/W8Kw6bsgXQ)
-[![arXiv](https://img.shields.io/badge/arXiv-2501.13956-b31b1b.svg?style=flat)](https://arxiv.org/abs/2501.13956)
-[![Release](https://img.shields.io/github/v/release/getzep/graphiti?style=flat&label=Release&color=limegreen)](https://github.com/getzep/graphiti/releases)
+## How It Works
 
-</div>
-<div align="center">
+```
+                    ┌──────────────────────────────────────────────┐
+                    │           neuralscape-service                │
+                    │                                              │
+  Claude Code ────► │  MCP Server (7 tools)   REST API (/v1)      │
+  Any Agent ──────► │       stdio / HTTP         FastAPI           │
+                    │              │                │              │
+                    │              └──────┬─────────┘              │
+                    │                    │                         │
+                    │             MemoryService                    │
+                    │          (business logic layer)              │
+                    └──────────────┬──────────────┬────────────────┘
+                                   │              │
+                        ┌──────────▼──┐    ┌──────▼───────┐
+                        │   Qdrant    │    │    Neo4j     │
+                        │  (vectors)  │    │  (Graphiti   │
+                        │  on-disk    │    │   graph)     │
+                        └─────────────┘    └──────────────┘
+```
 
-<a href="https://trendshift.io/repositories/12986" target="_blank"><img src="https://trendshift.io/api/badge/repositories/12986" alt="getzep%2Fgraphiti | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
+Every memory is stored **twice**: as a vector embedding in Qdrant (for semantic search) and as entities/relationships in a Neo4j knowledge graph via Graphiti (for structured reasoning). Both paths are queried on every search and results are merged.
 
-</div>
+## Core Concepts
 
-:star: _Help us reach more developers and grow the Graphiti community. Star this repo!_
+### Two-Scope Namespace
 
-<br />
+Memories live in one of two scopes:
 
-> [!TIP]
-> Check out the new [MCP server for Graphiti](mcp_server/README.md)! Give Claude, Cursor, and other MCP clients powerful
-> Knowledge Graph-based memory.
+| Scope | Graphiti group_id | Purpose |
+|---|---|---|
+| **Global** | `"global"` | Cross-project facts: user preferences, skills, personal details |
+| **Project** | `"project:{slug}"` | Project-specific: tech stack, conventions, architecture decisions |
 
-Graphiti is a framework for building and querying temporally-aware knowledge graphs, specifically tailored for AI agents
-operating in dynamic environments. Unlike traditional retrieval-augmented generation (RAG) methods, Graphiti
-continuously integrates user interactions, structured and unstructured enterprise data, and external information into a
-coherent, queryable graph. The framework supports incremental data updates, efficient retrieval, and precise historical
-queries without requiring complete graph recomputation, making it suitable for developing interactive, context-aware AI
-applications.
+When you search with a `project_id`, Neuralscape searches **both** scopes and merges results by relevance score. An agent working on `neuralscape-graphiti` sees your global "prefers 4-space indentation" preference alongside the project-specific "uses FastAPI with Graphiti backend" fact.
 
-Use Graphiti to:
+### 13 Memory Categories
 
-- Integrate and maintain dynamic user interactions and business data.
-- Facilitate state-based reasoning and task automation for agents.
-- Query complex, evolving data with semantic, keyword, and graph-based search methods.
+Since self-hosted mem0 has no native category system, every memory gets a `category` metadata field that controls scope defaults and enables filtered retrieval:
 
-<br />
+| Group | Categories | Default Scope |
+|---|---|---|
+| **Semantic** | `preference`, `personal_fact`, `technical_skill`, `domain_knowledge` | Global |
+| **Project** | `tech_stack`, `convention`, `architecture`, `dependency` | Project |
+| **Episodic** | `decision`, `interaction` | Flexible |
+| **Procedural** | `workflow`, `procedure` | Flexible |
+| **Working** | `task_context` | Flexible |
 
-<p align="center">
-    <img src="images/graphiti-graph-intro.gif" alt="Graphiti temporal walkthrough" width="700px">
-</p>
+### Custom LLM Extraction
 
-<br />
+When an agent sends a conversation to `POST /v1/memories`, Neuralscape doesn't just pass it through to mem0. Instead:
 
-A knowledge graph is a network of interconnected facts, such as _"Kendra loves Adidas shoes."_ Each fact is a "triplet"
-represented by two entities, or
-nodes ("Kendra", "Adidas shoes"), and their relationship, or edge ("loves"). Knowledge Graphs have been explored
-extensively for information retrieval. What makes Graphiti unique is its ability to autonomously build a knowledge graph
-while handling changing relationships and maintaining historical context.
+1. It calls Gemini with a specialized extraction prompt
+2. The LLM returns facts tagged with categories: `[preference] Prefers tabs over spaces`
+3. Each fact is parsed and stored with proper scope/category metadata via `mem0.add(infer=False)`
+4. The raw conversation is also fed to Graphiti's knowledge graph for entity/relationship extraction
 
-## Graphiti and Zep's Context Engineering Platform.
+This gives you categorized vector memories **and** a rich knowledge graph from the same input.
 
-Graphiti powers the core of [Zep's context engineering platform](https://www.getzep.com) for AI Agents. Zep
-offers agent memory, Graph RAG for dynamic data, and context retrieval and assembly.
+### Agent Isolation
 
-Using Graphiti, we've demonstrated Zep is
-the [State of the Art in Agent Memory](https://blog.getzep.com/state-of-the-art-agent-memory/).
+`agent_id` is metadata for provenance tracking, not a scope boundary. All agents (Claude Code, a Cursor plugin, a custom bot) share the same memory space for a given user. Conflicts are handled by Graphiti's temporal edge invalidation (old facts get `invalid_at` timestamps) and mem0's LLM-based deduplication.
 
-Read our paper: [Zep: A Temporal Knowledge Graph Architecture for Agent Memory](https://arxiv.org/abs/2501.13956).
+## REST API
 
-We're excited to open-source Graphiti, believing its potential reaches far beyond AI memory applications.
+All new endpoints live under `/v1`. Legacy endpoints at root are preserved for backward compatibility.
 
-<p align="center">
-    <a href="https://arxiv.org/abs/2501.13956"><img src="images/arxiv-screenshot.png" alt="Zep: A Temporal Knowledge Graph Architecture for Agent Memory" width="700px"></a>
-</p>
-
-## Zep vs Graphiti
-
-| Aspect | Zep | Graphiti |
-|--------|-----|----------|
-| **What they are** | Fully managed platform for context engineering and AI memory | Open-source graph framework |
-| **User & conversation management** | Built-in users, threads, and message storage | Build your own |
-| **Retrieval & performance** | Pre-configured, production-ready retrieval with sub-200ms performance at scale | Custom implementation required; performance depends on your setup |
-| **Developer tools** | Dashboard with graph visualization, debug logs, API logs; SDKs for Python, TypeScript, and Go | Build your own tools |
-| **Enterprise features** | SLAs, support, security guarantees | Self-managed |
-| **Deployment** | Fully managed or in your cloud | Self-hosted only |
-
-### When to choose which
-
-**Choose Zep** if you want a turnkey, enterprise-grade platform with security, performance, and support baked in.
-
-**Choose Graphiti** if you want a flexible OSS core and you're comfortable building/operating the surrounding system.
-
-## Why Graphiti?
-
-Traditional RAG approaches often rely on batch processing and static data summarization, making them inefficient for
-frequently changing data. Graphiti addresses these challenges by providing:
-
-- **Real-Time Incremental Updates:** Immediate integration of new data episodes without batch recomputation.
-- **Bi-Temporal Data Model:** Explicit tracking of event occurrence and ingestion times, allowing accurate point-in-time
-  queries.
-- **Efficient Hybrid Retrieval:** Combines semantic embeddings, keyword (BM25), and graph traversal to achieve
-  low-latency queries without reliance on LLM summarization.
-- **Custom Entity Definitions:** Flexible ontology creation and support for developer-defined entities through
-  straightforward Pydantic models.
-- **Scalability:** Efficiently manages large datasets with parallel processing, suitable for enterprise environments.
-
-<p align="center">
-    <img src="/images/graphiti-intro-slides-stock-2.gif" alt="Graphiti structured + unstructured demo" width="700px">
-</p>
-
-## Graphiti vs. GraphRAG
-
-| Aspect                     | GraphRAG                              | Graphiti                                         |
-|----------------------------|---------------------------------------|--------------------------------------------------|
-| **Primary Use**            | Static document summarization         | Dynamic data management                          |
-| **Data Handling**          | Batch-oriented processing             | Continuous, incremental updates                  |
-| **Knowledge Structure**    | Entity clusters & community summaries | Episodic data, semantic entities, communities    |
-| **Retrieval Method**       | Sequential LLM summarization          | Hybrid semantic, keyword, and graph-based search |
-| **Adaptability**           | Low                                   | High                                             |
-| **Temporal Handling**      | Basic timestamp tracking              | Explicit bi-temporal tracking                    |
-| **Contradiction Handling** | LLM-driven summarization judgments    | Temporal edge invalidation                       |
-| **Query Latency**          | Seconds to tens of seconds            | Typically sub-second latency                     |
-| **Custom Entity Types**    | No                                    | Yes, customizable                                |
-| **Scalability**            | Moderate                              | High, optimized for large datasets               |
-
-Graphiti is specifically designed to address the challenges of dynamic and frequently updated datasets, making it
-particularly suitable for applications requiring real-time interaction and precise historical queries.
-
-## Installation
-
-Requirements:
-
-- Python 3.10 or higher
-- Neo4j 5.26 / FalkorDB 1.1.2 / Kuzu 0.11.2 / Amazon Neptune Database Cluster or Neptune Analytics Graph + Amazon
-  OpenSearch Serverless collection (serves as the full text search backend)
-- OpenAI API key (Graphiti defaults to OpenAI for LLM inference and embedding)
-
-> [!IMPORTANT]
-> Graphiti works best with LLM services that support Structured Output (such as OpenAI and Gemini).
-> Using other services may result in incorrect output schemas and ingestion failures. This is particularly
-> problematic when using smaller models.
-
-Optional:
-
-- Google Gemini, Anthropic, or Groq API key (for alternative LLM providers)
-
-> [!TIP]
-> The simplest way to install Neo4j is via [Neo4j Desktop](https://neo4j.com/download/). It provides a user-friendly
-> interface to manage Neo4j instances and databases.
-> Alternatively, you can use FalkorDB on-premises via Docker and instantly start with the quickstart example:
+### Remember
 
 ```bash
-docker run -p 6379:6379 -p 3000:3000 -it --rm falkordb/falkordb:latest
+# Extract and store from conversation (LLM-powered)
+curl -X POST http://localhost:8199/v1/memories \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "I use Python 3.12 with FastAPI"}],
+    "user_id": "ehfaz",
+    "project_id": "neuralscape-graphiti"
+  }'
 
+# Store a single pre-categorized fact (no LLM)
+curl -X POST http://localhost:8199/v1/memories/raw \
+  -H "Content-Type: application/json" \
+  -d '{
+    "content": "Prefers 4-space indentation",
+    "user_id": "ehfaz",
+    "category": "preference"
+  }'
+
+# Non-blocking version (returns task_id)
+curl -X POST http://localhost:8199/v1/memories/async \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [...], "user_id": "ehfaz"}'
+
+# Poll async status
+curl http://localhost:8199/v1/memories/status/{task_id}
 ```
+
+### Recall
 
 ```bash
-pip install graphiti-core
+# Semantic search (searches global + project when project_id given)
+curl -X POST http://localhost:8199/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "indentation style",
+    "user_id": "ehfaz",
+    "project_id": "neuralscape-graphiti",
+    "categories": ["preference", "convention"],
+    "limit": 10
+  }'
+
+# Knowledge graph search
+curl -X POST http://localhost:8199/v1/graph/search \
+  -H "Content-Type: application/json" \
+  -d '{"query": "FastAPI", "user_id": "ehfaz"}'
 ```
 
-or
+### Context Loading
 
 ```bash
-uv add graphiti-core
+# Full project context (global prefs + project facts, organized by category)
+curl "http://localhost:8199/v1/context/neuralscape-graphiti?user_id=ehfaz"
+
+# Global-only context
+curl "http://localhost:8199/v1/context/global?user_id=ehfaz"
 ```
 
-### Installing with FalkorDB Support
-
-If you plan to use FalkorDB as your graph database backend, install with the FalkorDB extra:
+### Manage
 
 ```bash
-pip install graphiti-core[falkordb]
+# List with filters
+curl "http://localhost:8199/v1/memories?user_id=ehfaz&scope=global&category=preference"
 
-# or with uv
-uv add graphiti-core[falkordb]
+# Get/update/delete single memory
+curl http://localhost:8199/v1/memories/{id}
+curl -X PUT http://localhost:8199/v1/memories/{id} -d '{"content": "..."}'
+curl -X DELETE http://localhost:8199/v1/memories/{id}
+
+# List available categories
+curl http://localhost:8199/v1/categories
+
+# Graph introspection
+curl "http://localhost:8199/v1/graph/nodes?user_id=ehfaz&project_id=neuralscape-graphiti"
+curl "http://localhost:8199/v1/graph/edges?user_id=ehfaz"
+curl "http://localhost:8199/v1/graph/episodes?user_id=ehfaz"
+curl "http://localhost:8199/v1/graph/communities?user_id=ehfaz"
 ```
 
-### Installing with Kuzu Support
+## MCP Tools
 
-If you plan to use Kuzu as your graph database backend, install with the Kuzu extra:
+7 tools exposed via MCP for direct use by AI agents:
+
+| Tool | Purpose |
+|---|---|
+| `recall_memories` | Semantic search across global + project memories. Agents should call this before starting work. |
+| `remember` | Store a single categorized fact (agent provides content + category). |
+| `remember_conversation` | Bulk extract from conversation messages via LLM. |
+| `get_project_context` | Bootstrap: load all user prefs + project context organized by category. |
+| `search_knowledge_graph` | Graph-based entity/relationship search. |
+| `list_memories` | List/inspect stored memories with filters. |
+| `delete_memories` | Delete by ID or by filters. |
+
+### Transport
+
+- **stdio** (default): For local Claude Code. Configure in Claude Code's MCP settings.
+- **Streamable HTTP**: Set `MCP_TRANSPORT=http` to mount at `/mcp/` on port 8199 for remote agents.
+
+### Claude Code Configuration
+
+Add to your Claude Code MCP settings:
+
+```json
+{
+  "mcpServers": {
+    "neuralscape-memory": {
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/neuralscape-service", "python", "mcp_server.py"]
+    }
+  }
+}
+```
+
+## Project Structure
+
+```
+neuralscape-graphiti/
+├── neuralscape-service/          # The service (what you deploy)
+│   ├── main.py                   # FastAPI app: legacy + v1 endpoints
+│   ├── memory_service.py         # Business logic layer (MemoryService class)
+│   ├── mcp_server.py             # MCP server: 7 tools, stdio + HTTP
+│   ├── schemas.py                # Enums, category taxonomy, Pydantic models
+│   ├── prompts.py                # LLM extraction prompt, category parser
+│   ├── config.py                 # Pydantic settings (env-driven)
+│   ├── .env                      # Environment variables
+│   ├── pyproject.toml            # Dependencies
+│   └── tests/
+│       ├── test_service.py       # REST endpoint tests (legacy + v1)
+│       ├── test_memory_service.py # Business logic tests
+│       └── test_mcp_tools.py     # MCP tool tests
+├── mem0/                         # mem0 fork (local editable)
+│   └── mem0/memory/
+│       └── graphiti_memory.py    # Graphiti adapter (modified for scoping)
+└── graphiti/                     # graphiti-core fork (local editable)
+```
+
+## Prerequisites
+
+- **Python 3.10+**
+- **Neo4j** running at `neo4j://127.0.0.1:7687` (for Graphiti knowledge graph)
+- **Google API key** with Gemini access (for LLM extraction + embeddings)
+
+Qdrant runs embedded (on-disk at `~/.neuralscape/qdrant`) — no separate server needed.
+
+## Setup
 
 ```bash
-pip install graphiti-core[kuzu]
+cd neuralscape-service
 
-# or with uv
-uv add graphiti-core[kuzu]
+# Create .env file
+cat > .env << 'EOF'
+GOOGLE_API_KEY=your-gemini-api-key
+NEO4J_URI=neo4j://127.0.0.1:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=your-neo4j-password
+NEO4J_DATABASE=memory
+EOF
+
+# Install dependencies
+uv sync
+
+# Run the service
+uv run python main.py
+# → Listening on http://0.0.0.0:8199
+
+# Run tests
+uv run python -m pytest tests/ -v
 ```
 
-### Installing with Amazon Neptune Support
+## Configuration
 
-If you plan to use Amazon Neptune as your graph database backend, install with the Amazon Neptune extra:
+All settings are environment variables (loaded from `.env`):
 
-```bash
-pip install graphiti-core[neptune]
+| Variable | Default | Description |
+|---|---|---|
+| `GOOGLE_API_KEY` | | Gemini API key |
+| `GEMINI_LLM_MODEL` | `gemini-2.5-flash` | Model for LLM extraction |
+| `GEMINI_EMBEDDER_MODEL` | `text-embedding-004` | Model for embeddings |
+| `NEO4J_URI` | `neo4j://127.0.0.1:7687` | Neo4j connection |
+| `NEO4J_USER` | `neo4j` | Neo4j username |
+| `NEO4J_PASSWORD` | | Neo4j password |
+| `NEO4J_DATABASE` | `memory` | Neo4j database name |
+| `QDRANT_ON_DISK` | `true` | Persist Qdrant to disk |
+| `QDRANT_PATH` | `~/.neuralscape/qdrant` | Qdrant storage path |
+| `QDRANT_COLLECTION` | `neuralscape_memories` | Qdrant collection name |
+| `PORT` | `8199` | Service port |
+| `MCP_TRANSPORT` | `stdio` | MCP transport: `stdio` or `http` |
 
-# or with uv
-uv add graphiti-core[neptune]
-```
+## Architecture Decisions
 
-### You can also install optional LLM providers as extras:
+**Why custom extraction instead of mem0's built-in?** Self-hosted mem0 doesn't support categories. By doing extraction in our service layer, we tag each fact with a category *before* storage, enabling filtered retrieval and organized context loading.
 
-```bash
-# Install with Anthropic support
-pip install graphiti-core[anthropic]
+**Why two storage backends?** Vector search (Qdrant) is for "find memories similar to this query." Knowledge graph (Graphiti/Neo4j) is for "what entities are related to X?" and handles temporal fact invalidation (when facts change over time). Together they provide comprehensive recall.
 
-# Install with Groq support
-pip install graphiti-core[groq]
+**Why group_id-based scoping instead of separate databases?** Graphiti partitions data by `group_id` within a single Neo4j database. Using composite IDs (`"global"`, `"project:my-app"`) keeps the infrastructure simple while providing proper namespace isolation. Multi-scope search just queries multiple group_ids.
 
-# Install with Google Gemini support
-pip install graphiti-core[google-genai]
-
-# Install with multiple providers
-pip install graphiti-core[anthropic,groq,google-genai]
-
-# Install with FalkorDB and LLM providers
-pip install graphiti-core[falkordb,anthropic,google-genai]
-
-# Install with Amazon Neptune
-pip install graphiti-core[neptune]
-```
-
-## Default to Low Concurrency; LLM Provider 429 Rate Limit Errors
-
-Graphiti's ingestion pipelines are designed for high concurrency. By default, concurrency is set low to avoid LLM
-Provider 429 Rate Limit Errors. If you find Graphiti slow, please increase concurrency as described below.
-
-Concurrency controlled by the `SEMAPHORE_LIMIT` environment variable. By default, `SEMAPHORE_LIMIT` is set to `10`
-concurrent operations to help prevent `429` rate limit errors from your LLM provider. If you encounter such errors, try
-lowering this value.
-
-If your LLM provider allows higher throughput, you can increase `SEMAPHORE_LIMIT` to boost episode ingestion
-performance.
-
-## Quick Start
-
-> [!IMPORTANT]
-> Graphiti defaults to using OpenAI for LLM inference and embedding. Ensure that an `OPENAI_API_KEY` is set in your
-> environment.
-> Support for Anthropic and Groq LLM inferences is available, too. Other LLM providers may be supported via OpenAI
-> compatible APIs.
-
-For a complete working example, see the [Quickstart Example](./examples/quickstart/README.md) in the examples directory.
-The quickstart demonstrates:
-
-1. Connecting to a Neo4j, Amazon Neptune, FalkorDB, or Kuzu database
-2. Initializing Graphiti indices and constraints
-3. Adding episodes to the graph (both text and structured JSON)
-4. Searching for relationships (edges) using hybrid search
-5. Reranking search results using graph distance
-6. Searching for nodes using predefined search recipes
-
-The example is fully documented with clear explanations of each functionality and includes a comprehensive README with
-setup instructions and next steps.
-
-### Running with Docker Compose
-
-You can use Docker Compose to quickly start the required services:
-
-- **Neo4j Docker:**
-  ```sh
-  docker compose up
-  ```
-  This will start the Neo4j Docker service and related components.
-
-- **FalkorDB Docker:**
-  ```sh
-  docker compose --profile falkordb up
-  ```
-  This will start the FalkorDB Docker service and related components.
-
-## MCP Server
-
-The `mcp_server` directory contains a Model Context Protocol (MCP) server implementation for Graphiti. This server
-allows AI assistants to interact with Graphiti's knowledge graph capabilities through the MCP protocol.
-
-Key features of the MCP server include:
-
-- Episode management (add, retrieve, delete)
-- Entity management and relationship handling
-- Semantic and hybrid search capabilities
-- Group management for organizing related data
-- Graph maintenance operations
-
-The MCP server can be deployed using Docker with Neo4j, making it easy to integrate Graphiti into your AI assistant
-workflows.
-
-For detailed setup instructions and usage examples, see the [MCP server README](./mcp_server/README.md).
-
-## REST Service
-
-The `server` directory contains an API service for interacting with the Graphiti API. It is built using FastAPI.
-
-Please see the [server README](./server/README.md) for more information.
-
-## Optional Environment Variables
-
-In addition to the Neo4j and OpenAi-compatible credentials, Graphiti also has a few optional environment variables.
-If you are using one of our supported models, such as Anthropic or Voyage models, the necessary environment variables
-must be set.
-
-### Database Configuration
-
-Database names are configured directly in the driver constructors:
-
-- **Neo4j**: Database name defaults to `neo4j` (hardcoded in Neo4jDriver)
-- **FalkorDB**: Database name defaults to `default_db` (hardcoded in FalkorDriver)
-
-As of v0.17.0, if you need to customize your database configuration, you can instantiate a database driver and pass it
-to the Graphiti constructor using the `graph_driver` parameter.
-
-#### Neo4j with Custom Database Name
-
-```python
-from graphiti_core import Graphiti
-from graphiti_core.driver.neo4j_driver import Neo4jDriver
-
-# Create a Neo4j driver with custom database name
-driver = Neo4jDriver(
-    uri="bolt://localhost:7687",
-    user="neo4j",
-    password="password",
-    database="my_custom_database"  # Custom database name
-)
-
-# Pass the driver to Graphiti
-graphiti = Graphiti(graph_driver=driver)
-```
-
-#### FalkorDB with Custom Database Name
-
-```python
-from graphiti_core import Graphiti
-from graphiti_core.driver.falkordb_driver import FalkorDriver
-
-# Create a FalkorDB driver with custom database name
-driver = FalkorDriver(
-    host="localhost",
-    port=6379,
-    username="falkor_user",  # Optional
-    password="falkor_password",  # Optional
-    database="my_custom_graph"  # Custom database name
-)
-
-# Pass the driver to Graphiti
-graphiti = Graphiti(graph_driver=driver)
-```
-
-#### Kuzu
-
-```python
-from graphiti_core import Graphiti
-from graphiti_core.driver.kuzu_driver import KuzuDriver
-
-# Create a Kuzu driver
-driver = KuzuDriver(db="/tmp/graphiti.kuzu")
-
-# Pass the driver to Graphiti
-graphiti = Graphiti(graph_driver=driver)
-```
-
-#### Amazon Neptune
-
-```python
-from graphiti_core import Graphiti
-from graphiti_core.driver.neptune_driver import NeptuneDriver
-
-# Create a FalkorDB driver with custom database name
-driver = NeptuneDriver(
-    host= < NEPTUNE
-ENDPOINT >,
-aoss_host = < Amazon
-OpenSearch
-Serverless
-Host >,
-port = < PORT >  # Optional, defaults to 8182,
-         aoss_port = < PORT >  # Optional, defaults to 443
-)
-
-driver = NeptuneDriver(host=neptune_uri, aoss_host=aoss_host, port=neptune_port)
-
-# Pass the driver to Graphiti
-graphiti = Graphiti(graph_driver=driver)
-```
-
-## Graph Driver Architecture
-
-Graphiti uses a pluggable driver architecture so the core framework is backend-agnostic. All database-specific logic
-is encapsulated in driver implementations, allowing you to swap backends or add new ones without modifying the rest of
-the framework.
-
-### How Drivers are Integrated
-
-The driver layer is organized into three tiers:
-
-1. **`GraphDriver` ABC** (`graphiti_core/driver/driver.py`) — the core interface every backend must implement. It
-   defines query execution, session management, index lifecycle, and exposes 11 operations interfaces as `@property`
-   accessors.
-
-2. **`GraphProvider` enum** — identifies the backend (`NEO4J`, `FALKORDB`, `KUZU`, `NEPTUNE`). Query builders use this
-   enum in `match/case` statements to return dialect-specific query strings.
-
-3. **11 Operations ABCs** (`graphiti_core/driver/operations/`) — abstract interfaces covering all CRUD and search
-   operations for every graph element type:
-   - **Node ops:** `EntityNodeOperations`, `EpisodeNodeOperations`, `CommunityNodeOperations`, `SagaNodeOperations`
-   - **Edge ops:** `EntityEdgeOperations`, `EpisodicEdgeOperations`, `CommunityEdgeOperations`,
-     `HasEpisodeEdgeOperations`, `NextEpisodeEdgeOperations`
-   - **Search & maintenance:** `SearchOperations`, `GraphMaintenanceOperations`
-
-Each backend provides a concrete driver class and a matching `operations/` directory with implementations of all 11
-ABCs. The key directories and files are shown below (simplified; see source for complete structure):
-
-```
-graphiti_core/driver/
-├── driver.py                        # GraphDriver ABC, GraphProvider enum
-├── query_executor.py                # QueryExecutor protocol
-├── record_parsers.py                # Shared record → model conversion
-├── operations/                      # 11 operation ABCs
-│   ├── entity_node_ops.py
-│   ├── episode_node_ops.py
-│   ├── community_node_ops.py
-│   ├── saga_node_ops.py
-│   ├── entity_edge_ops.py
-│   ├── episodic_edge_ops.py
-│   ├── community_edge_ops.py
-│   ├── has_episode_edge_ops.py
-│   ├── next_episode_edge_ops.py
-│   ├── search_ops.py
-│   ├── graph_ops.py
-│   └── graph_utils.py              # Shared algorithms (e.g., label propagation)
-├── graph_operations/                # Legacy graph operations interface
-├── search_interface/                # Legacy search interface
-├── neo4j_driver.py                  # Neo4jDriver
-├── neo4j/operations/                # 11 Neo4j implementations
-├── falkordb_driver.py               # FalkorDriver
-├── falkordb/operations/             # 11 FalkorDB implementations
-├── kuzu_driver.py                   # KuzuDriver
-├── kuzu/operations/                 # 11 Kuzu implementations + record_parsers.py
-├── neptune_driver.py                # NeptuneDriver
-└── neptune/operations/              # 11 Neptune implementations
-```
-
-Operations are decoupled from the driver itself — each operation method receives an `executor: QueryExecutor` parameter
-(a protocol for running queries) rather than a concrete `GraphDriver`, which makes operations testable and
-driver-agnostic. The driver class instantiates all 11 operation classes in its `__init__` and exposes them as
-properties. The base `GraphDriver` ABC defines each property with an optional return type (`| None`, defaulting to
-`None`); concrete drivers override these to return their implementations:
-
-```python
-# In your concrete driver (e.g., Neo4jDriver):
-@property
-def entity_node_ops(self) -> EntityNodeOperations:
-    return self._entity_node_ops
-```
-
-Provider-specific query strings are generated by shared query builders in `graphiti_core/models/nodes/node_db_queries.py`
-and `graphiti_core/models/edges/edge_db_queries.py`, which use `match/case` on the `GraphProvider` enum to return the
-correct dialect for each backend.
-
-### Adding a New Graph Driver
-
-To integrate a new graph database backend, follow these steps:
-
-1. **Add to `GraphProvider`** — add your enum value in `graphiti_core/driver/driver.py`:
-   ```python
-   class GraphProvider(Enum):
-       NEO4J = 'neo4j'
-       FALKORDB = 'falkordb'
-       KUZU = 'kuzu'
-       NEPTUNE = 'neptune'
-       MY_BACKEND = 'my_backend'  # New backend
-   ```
-
-2. **Create directory structure** — create `graphiti_core/driver/<backend>/operations/` with an `__init__.py` exporting
-   all 11 operation classes.
-
-3. **Implement `GraphDriver` subclass** — create `graphiti_core/driver/<backend>_driver.py`:
-   - Set `provider = GraphProvider.<BACKEND>`
-   - Implement the abstract methods: `execute_query()`, `session()`, `close()`,
-     `build_indices_and_constraints()`, `delete_all_indexes()`
-   - Instantiate all 11 operation classes in `__init__` and return them via `@property` overrides
-
-4. **Implement all 11 operation ABCs** — one file per ABC in `<backend>/operations/`, each inheriting from the
-   corresponding ABC in `graphiti_core/driver/operations/`.
-
-5. **Add query variants** — add `case GraphProvider.<BACKEND>:` branches to
-   `graphiti_core/models/nodes/node_db_queries.py` and `graphiti_core/models/edges/edge_db_queries.py` for your
-   database's query dialect.
-
-6. **Implement `GraphDriverSession`** — if your backend needs session or connection management, subclass
-   `GraphDriverSession` from `driver.py` and implement `run()`, `close()`, and `execute_write()`.
-
-7. **Register as optional dependency** — add an extras group in `pyproject.toml`:
-   ```toml
-   [project.optional-dependencies]
-   my_backend = ["my-backend-client>=1.0.0"]
-   ```
-
-For reference implementations, look at:
-- **Neo4j** — the most straightforward, full-featured reference
-- **FalkorDB** — a lightweight client-server alternative
-- **Kuzu** — example of an embedded/in-process database with dialect differences
-- **Neptune** — example of a cloud backend with an external search index (OpenSearch)
-
-## Using Graphiti with Azure OpenAI
-
-Graphiti supports Azure OpenAI for both LLM inference and embeddings using Azure's OpenAI v1 API compatibility layer.
-
-### Quick Start
-
-```python
-from openai import AsyncOpenAI
-from graphiti_core import Graphiti
-from graphiti_core.llm_client.azure_openai_client import AzureOpenAILLMClient
-from graphiti_core.llm_client.config import LLMConfig
-from graphiti_core.embedder.azure_openai import AzureOpenAIEmbedderClient
-
-# Initialize Azure OpenAI client using the standard OpenAI client
-# with Azure's v1 API endpoint
-azure_client = AsyncOpenAI(
-    base_url="https://your-resource-name.openai.azure.com/openai/v1/",
-    api_key="your-api-key",
-)
-
-# Create LLM and Embedder clients
-llm_client = AzureOpenAILLMClient(
-    azure_client=azure_client,
-    config=LLMConfig(model="gpt-5-mini", small_model="gpt-5-mini")  # Your Azure deployment name
-)
-embedder_client = AzureOpenAIEmbedderClient(
-    azure_client=azure_client,
-    model="text-embedding-3-small"  # Your Azure embedding deployment name
-)
-
-# Initialize Graphiti with Azure OpenAI clients
-graphiti = Graphiti(
-    "bolt://localhost:7687",
-    "neo4j",
-    "password",
-    llm_client=llm_client,
-    embedder=embedder_client,
-)
-
-# Now you can use Graphiti with Azure OpenAI
-```
-
-**Key Points:**
-- Use the standard `AsyncOpenAI` client with Azure's v1 API endpoint format: `https://your-resource-name.openai.azure.com/openai/v1/`
-- The deployment names (e.g., `gpt-5-mini`, `text-embedding-3-small`) should match your Azure OpenAI deployment names
-- See `examples/azure-openai/` for a complete working example
-
-Make sure to replace the placeholder values with your actual Azure OpenAI credentials and deployment names.
-
-## Using Graphiti with Google Gemini
-
-Graphiti supports Google's Gemini models for LLM inference, embeddings, and cross-encoding/reranking. To use Gemini,
-you'll need to configure the LLM client, embedder, and the cross-encoder with your Google API key.
-
-Install Graphiti:
-
-```bash
-uv add "graphiti-core[google-genai]"
-
-# or
-
-pip install "graphiti-core[google-genai]"
-```
-
-```python
-from graphiti_core import Graphiti
-from graphiti_core.llm_client.gemini_client import GeminiClient, LLMConfig
-from graphiti_core.embedder.gemini import GeminiEmbedder, GeminiEmbedderConfig
-from graphiti_core.cross_encoder.gemini_reranker_client import GeminiRerankerClient
-
-# Google API key configuration
-api_key = "<your-google-api-key>"
-
-# Initialize Graphiti with Gemini clients
-graphiti = Graphiti(
-    "bolt://localhost:7687",
-    "neo4j",
-    "password",
-    llm_client=GeminiClient(
-        config=LLMConfig(
-            api_key=api_key,
-            model="gemini-2.0-flash"
-        )
-    ),
-    embedder=GeminiEmbedder(
-        config=GeminiEmbedderConfig(
-            api_key=api_key,
-            embedding_model="embedding-001"
-        )
-    ),
-    cross_encoder=GeminiRerankerClient(
-        config=LLMConfig(
-            api_key=api_key,
-            model="gemini-2.5-flash-lite"
-        )
-    )
-)
-
-# Now you can use Graphiti with Google Gemini for all components
-```
-
-The Gemini reranker uses the `gemini-2.5-flash-lite` model by default, which is optimized for
-cost-effective and low-latency classification tasks. It uses the same boolean classification approach as the OpenAI
-reranker, leveraging Gemini's log probabilities feature to rank passage relevance.
-
-## Using Graphiti with Ollama (Local LLM)
-
-Graphiti supports Ollama for running local LLMs and embedding models via Ollama's OpenAI-compatible API. This is ideal
-for privacy-focused applications or when you want to avoid API costs.
-
-**Note:** Use `OpenAIGenericClient` (not `OpenAIClient`) for Ollama and other OpenAI-compatible providers like LM Studio. The `OpenAIGenericClient` is optimized for local models with a higher default max token limit (16K vs 8K) and full support for structured outputs.
-
-Install the models:
-
-```bash
-ollama pull deepseek-r1:7b # LLM
-ollama pull nomic-embed-text # embeddings
-```
-
-```python
-from graphiti_core import Graphiti
-from graphiti_core.llm_client.config import LLMConfig
-from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
-from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
-from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
-
-# Configure Ollama LLM client
-llm_config = LLMConfig(
-    api_key="ollama",  # Ollama doesn't require a real API key, but some placeholder is needed
-    model="deepseek-r1:7b",
-    small_model="deepseek-r1:7b",
-    base_url="http://localhost:11434/v1",  # Ollama's OpenAI-compatible endpoint
-)
-
-llm_client = OpenAIGenericClient(config=llm_config)
-
-# Initialize Graphiti with Ollama clients
-graphiti = Graphiti(
-    "bolt://localhost:7687",
-    "neo4j",
-    "password",
-    llm_client=llm_client,
-    embedder=OpenAIEmbedder(
-        config=OpenAIEmbedderConfig(
-            api_key="ollama",  # Placeholder API key
-            embedding_model="nomic-embed-text",
-            embedding_dim=768,
-            base_url="http://localhost:11434/v1",
-        )
-    ),
-    cross_encoder=OpenAIRerankerClient(client=llm_client, config=llm_config),
-)
-
-# Now you can use Graphiti with local Ollama models
-```
-
-Ensure Ollama is running (`ollama serve`) and that you have pulled the models you want to use.
-
-## Documentation
-
-- [Guides and API documentation](https://help.getzep.com/graphiti).
-- [Quick Start](https://help.getzep.com/graphiti/graphiti/quick-start)
-- [Building an agent with LangChain's LangGraph and Graphiti](https://help.getzep.com/graphiti/integrations/lang-graph-agent)
-
-## Telemetry
-
-Graphiti collects anonymous usage statistics to help us understand how the framework is being used and improve it for
-everyone. We believe transparency is important, so here's exactly what we collect and why.
-
-### What We Collect
-
-When you initialize a Graphiti instance, we collect:
-
-- **Anonymous identifier**: A randomly generated UUID stored locally in `~/.cache/graphiti/telemetry_anon_id`
-- **System information**: Operating system, Python version, and system architecture
-- **Graphiti version**: The version you're using
-- **Configuration choices**:
-    - LLM provider type (OpenAI, Azure, Anthropic, etc.)
-    - Database backend (Neo4j, FalkorDB, Kuzu, Amazon Neptune Database or Neptune Analytics)
-    - Embedder provider (OpenAI, Azure, Voyage, etc.)
-
-### What We Don't Collect
-
-We are committed to protecting your privacy. We **never** collect:
-
-- Personal information or identifiers
-- API keys or credentials
-- Your actual data, queries, or graph content
-- IP addresses or hostnames
-- File paths or system-specific information
-- Any content from your episodes, nodes, or edges
-
-### Why We Collect This Data
-
-This information helps us:
-
-- Understand which configurations are most popular to prioritize support and testing
-- Identify which LLM and database providers to focus development efforts on
-- Track adoption patterns to guide our roadmap
-- Ensure compatibility across different Python versions and operating systems
-
-By sharing this anonymous information, you help us make Graphiti better for everyone in the community.
-
-### View the Telemetry Code
-
-The Telemetry code [may be found here](graphiti_core/telemetry/telemetry.py).
-
-### How to Disable Telemetry
-
-Telemetry is **opt-out** and can be disabled at any time. To disable telemetry collection:
-
-**Option 1: Environment Variable**
-
-```bash
-export GRAPHITI_TELEMETRY_ENABLED=false
-```
-
-**Option 2: Set in your shell profile**
-
-```bash
-# For bash users (~/.bashrc or ~/.bash_profile)
-echo 'export GRAPHITI_TELEMETRY_ENABLED=false' >> ~/.bashrc
-
-# For zsh users (~/.zshrc)
-echo 'export GRAPHITI_TELEMETRY_ENABLED=false' >> ~/.zshrc
-```
-
-**Option 3: Set for a specific Python session**
-
-```python
-import os
-
-os.environ['GRAPHITI_TELEMETRY_ENABLED'] = 'false'
-
-# Then initialize Graphiti as usual
-from graphiti_core import Graphiti
-
-graphiti = Graphiti(...)
-```
-
-Telemetry is automatically disabled during test runs (when `pytest` is detected).
-
-### Technical Details
-
-- Telemetry uses PostHog for anonymous analytics collection
-- All telemetry operations are designed to fail silently - they will never interrupt your application or affect Graphiti
-  functionality
-- The anonymous ID is stored locally and is not tied to any personal information
-
-## Status and Roadmap
-
-Graphiti is under active development. We aim to maintain API stability while working on:
-
-- [x] Supporting custom graph schemas:
-    - Allow developers to provide their own defined node and edge classes when ingesting episodes
-    - Enable more flexible knowledge representation tailored to specific use cases
-- [x] Enhancing retrieval capabilities with more robust and configurable options
-- [x] Graphiti MCP Server
-- [ ] Expanding test coverage to ensure reliability and catch edge cases
-
-## Contributing
-
-We encourage and appreciate all forms of contributions, whether it's code, documentation, addressing GitHub Issues, or
-answering questions in the Graphiti Discord channel. For detailed guidelines on code contributions, please refer
-to [CONTRIBUTING](CONTRIBUTING.md).
-
-## Support
-
-Join the [Zep Discord server](https://discord.com/invite/W8Kw6bsgXQ) and make your way to the **#Graphiti** channel!
+**Why not use agent_id as a scope boundary?** Multiple agents (Claude Code, a Slack bot, a CI pipeline) should all benefit from the same memory. Agent isolation would fragment knowledge. Instead, `agent_id` is provenance metadata — you can see *who* learned a fact but everyone can use it.

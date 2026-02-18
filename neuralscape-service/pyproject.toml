@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "neuralscape-service"
+version = "0.1.0"
+description = "Lightweight mem0 + Graphiti memory service with REST and MCP interfaces"
+requires-python = ">=3.10"
+dependencies = [
+    "mem0ai[graphiti]",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
+    "mcp>=1.0.0",
+    "pydantic-settings>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "google-genai>=1.0.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.27.0",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[tool.uv.sources]
+graphiti-core = { path = "../graphiti", editable = true }
+mem0ai = { path = "../mem0", editable = true }
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
+]
