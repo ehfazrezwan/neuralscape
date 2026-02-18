@@ -3,41 +3,20 @@ from typing import Annotated
 
 from fastapi import Depends, HTTPException
 from graphiti_core import Graphiti  # type: ignore
-from graphiti_core.cross_encoder.client import CrossEncoderClient  # type: ignore
-from graphiti_core.driver.driver import GraphDriver  # type: ignore
-from graphiti_core.driver.neo4j_driver import Neo4jDriver  # type: ignore
 from graphiti_core.edges import EntityEdge  # type: ignore
-from graphiti_core.embedder import EmbedderClient  # type: ignore
 from graphiti_core.errors import EdgeNotFoundError, GroupsEdgesNotFoundError, NodeNotFoundError
 from graphiti_core.llm_client import LLMClient  # type: ignore
 from graphiti_core.nodes import EntityNode, EpisodicNode  # type: ignore
 
-from graph_service.config import Settings, ZepEnvDep
+from graph_service.config import ZepEnvDep
 from graph_service.dto import FactResult
 
 logger = logging.getLogger(__name__)
 
 
 class ZepGraphiti(Graphiti):
-    def __init__(
-        self,
-        uri: str | None = None,
-        user: str | None = None,
-        password: str | None = None,
-        llm_client: LLMClient | None = None,
-        embedder: EmbedderClient | None = None,
-        cross_encoder: CrossEncoderClient | None = None,
-        graph_driver: GraphDriver | None = None,
-    ):
-        super().__init__(
-            uri=uri,
-            user=user,
-            password=password,
-            llm_client=llm_client,
-            embedder=embedder,
-            cross_encoder=cross_encoder,
-            graph_driver=graph_driver,
-        )
+    def __init__(self, uri: str, user: str, password: str, llm_client: LLMClient | None = None):
+        super().__init__(uri, user, password, llm_client)
 
     async def save_entity_node(self, name: str, uuid: str, group_id: str, summary: str = ''):
         new_node = EntityNode(
@@ -92,129 +71,30 @@ class ZepGraphiti(Graphiti):
             raise HTTPException(status_code=404, detail=e.message) from e
 
 
-def _create_llm_client(settings: Settings) -> LLMClient | None:
-    provider = settings.llm_provider.lower()
-
-    if provider == 'gemini':
-        from graphiti_core.llm_client.config import LLMConfig
-        from graphiti_core.llm_client.gemini_client import GeminiClient
-
-        if not settings.google_api_key:
-            raise ValueError('GOOGLE_API_KEY is required when llm_provider is gemini')
-
-        llm_config = LLMConfig(
-            api_key=settings.google_api_key,
-            model=settings.model_name,
-            small_model=settings.small_model_name,
-        )
-        return GeminiClient(config=llm_config)
-
-    elif provider == 'openai':
-        from graphiti_core.llm_client import OpenAIClient
-        from graphiti_core.llm_client.config import LLMConfig
-
-        if not settings.openai_api_key:
-            raise ValueError('OPENAI_API_KEY is required when llm_provider is openai')
-
-        llm_config = LLMConfig(
-            api_key=settings.openai_api_key,
-            model=settings.model_name,
-            base_url=settings.openai_base_url,
-            small_model=settings.small_model_name,
-        )
-        return OpenAIClient(config=llm_config)
-
-    else:
-        raise ValueError(f'Unsupported llm_provider: {provider}')
-
-
-def _create_embedder(settings: Settings) -> EmbedderClient | None:
-    provider = settings.embedding_provider.lower()
-
-    if provider == 'gemini':
-        from graphiti_core.embedder.gemini import GeminiEmbedder, GeminiEmbedderConfig
-
-        if not settings.google_api_key:
-            raise ValueError('GOOGLE_API_KEY is required when embedding_provider is gemini')
-
-        config = GeminiEmbedderConfig(
-            api_key=settings.google_api_key,
-            embedding_model=settings.embedding_model_name or 'gemini-embedding-001',
-        )
-        return GeminiEmbedder(config=config)
-
-    elif provider == 'openai':
-        from graphiti_core.embedder import OpenAIEmbedder
-        from graphiti_core.embedder.openai import OpenAIEmbedderConfig
-
-        config = OpenAIEmbedderConfig(
-            api_key=settings.openai_api_key,
-            embedding_model=settings.embedding_model_name or 'text-embedding-3-small',
-            base_url=settings.openai_base_url,
-        )
-        return OpenAIEmbedder(config=config)
-
-    else:
-        raise ValueError(f'Unsupported embedding_provider: {provider}')
-
-
-def _create_cross_encoder(settings: Settings) -> CrossEncoderClient:
-    provider = settings.llm_provider.lower()
-
-    if provider == 'gemini':
-        from graphiti_core.cross_encoder.gemini_reranker_client import GeminiRerankerClient
-        from graphiti_core.llm_client.config import LLMConfig
-
-        config = LLMConfig(api_key=settings.google_api_key)
-        return GeminiRerankerClient(config=config)
-
-    else:
-        from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
-
-        return OpenAIRerankerClient()
-
-
 async def get_graphiti(settings: ZepEnvDep):
-    llm_client = _create_llm_client(settings)
-    embedder = _create_embedder(settings)
-    cross_encoder = _create_cross_encoder(settings)
-
-    driver = Neo4jDriver(
+    client = ZepGraphiti(
         uri=settings.neo4j_uri,
         user=settings.neo4j_user,
         password=settings.neo4j_password,
-        database=settings.neo4j_database,
     )
+    if settings.openai_base_url is not None:
+        client.llm_client.config.base_url = settings.openai_base_url
+    if settings.openai_api_key is not None:
+        client.llm_client.config.api_key = settings.openai_api_key
+    if settings.model_name is not None:
+        client.llm_client.model = settings.model_name
 
-    client = ZepGraphiti(
-        graph_driver=driver,
-        llm_client=llm_client,
-        embedder=embedder,
-        cross_encoder=cross_encoder,
-    )
     try:
         yield client
     finally:
         await client.close()
 
 
-async def initialize_graphiti(settings: Settings):
-    llm_client = _create_llm_client(settings)
-    embedder = _create_embedder(settings)
-    cross_encoder = _create_cross_encoder(settings)
-
-    driver = Neo4jDriver(
+async def initialize_graphiti(settings: ZepEnvDep):
+    client = ZepGraphiti(
         uri=settings.neo4j_uri,
         user=settings.neo4j_user,
         password=settings.neo4j_password,
-        database=settings.neo4j_database,
-    )
-
-    client = ZepGraphiti(
-        graph_driver=driver,
-        llm_client=llm_client,
-        embedder=embedder,
-        cross_encoder=cross_encoder,
     )
     await client.build_indices_and_constraints()
 

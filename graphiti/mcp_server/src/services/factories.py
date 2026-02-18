@@ -392,7 +392,8 @@ class DatabaseDriverFactory:
                     'uri': uri,
                     'user': username,
                     'password': password,
-                    'database': neo4j_config.database,
+                    # Note: database and use_parallel_runtime would need to be passed
+                    # to the driver after initialization if supported
                 }
 
             case 'falkordb':

@@ -39,7 +39,10 @@ async def list_tools() -> list[Tool]:
                 "ALWAYS call this tool before starting work on a task to load relevant context about "
                 "user preferences, project conventions, tech stack, and past decisions. "
                 "When project_id is provided, searches both global user memories and project-specific memories, "
-                "returning the most relevant results sorted by relevance score."
+                "returning the most relevant results sorted by relevance score. "
+                "Results include a 'source' field: 'graph' results come from the knowledge graph and reflect "
+                "the latest contradiction-resolved state; 'vector' results come from the vector store. "
+                "When vector and graph results conflict, prefer graph-sourced results as authoritative."
             ),
             inputSchema={
                 "type": "object",
@@ -79,7 +82,10 @@ async def list_tools() -> list[Tool]:
                 "Store a single categorized fact about the user or project. Use this when you learn "
                 "something important during a conversation that should be remembered for future sessions. "
                 "Examples: user preferences, coding style choices, project decisions, tech stack info. "
-                "Each memory must be assigned a category for proper organization."
+                "Each memory must be assigned a category for proper organization. "
+                "To correct or update an existing fact, simply store the new version — the knowledge graph "
+                "will automatically detect the contradiction and expire the old fact. "
+                "No need to delete the old memory first."
             ),
             inputSchema={
                 "type": "object",
