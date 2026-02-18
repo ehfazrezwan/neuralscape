@@ -187,6 +187,30 @@ class GraphitiService:
             except Exception as e:
                 logger.warning(f'Failed to create embedder client: {e}')
 
+            # Create cross-encoder based on LLM provider
+            cross_encoder_client = None
+            try:
+                provider = self.config.llm.provider.lower()
+                if provider == 'gemini' and self.config.llm.providers.gemini:
+                    from graphiti_core.cross_encoder.gemini_reranker_client import (
+                        GeminiRerankerClient,
+                    )
+                    from graphiti_core.llm_client.config import LLMConfig as CoreLLMConfig
+
+                    cross_encoder_client = GeminiRerankerClient(
+                        config=CoreLLMConfig(
+                            api_key=self.config.llm.providers.gemini.api_key,
+                        )
+                    )
+                else:
+                    from graphiti_core.cross_encoder.openai_reranker_client import (
+                        OpenAIRerankerClient,
+                    )
+
+                    cross_encoder_client = OpenAIRerankerClient()
+            except Exception as e:
+                logger.warning(f'Failed to create cross-encoder client: {e}')
+
             # Get database configuration
             db_config = DatabaseDriverFactory.create_config(self.config.database)
 
@@ -226,16 +250,25 @@ class GraphitiService:
                         graph_driver=falkor_driver,
                         llm_client=llm_client,
                         embedder=embedder_client,
+                        cross_encoder=cross_encoder_client,
                         max_coroutines=self.semaphore_limit,
                     )
                 else:
-                    # For Neo4j (default), use the original approach
-                    self.client = Graphiti(
+                    # For Neo4j, create a Neo4jDriver instance directly (like FalkorDB pattern)
+                    from graphiti_core.driver.neo4j_driver import Neo4jDriver
+
+                    neo4j_driver = Neo4jDriver(
                         uri=db_config['uri'],
                         user=db_config['user'],
                         password=db_config['password'],
+                        database=db_config.get('database', 'neo4j'),
+                    )
+
+                    self.client = Graphiti(
+                        graph_driver=neo4j_driver,
                         llm_client=llm_client,
                         embedder=embedder_client,
+                        cross_encoder=cross_encoder_client,
                         max_coroutines=self.semaphore_limit,
                     )
             except Exception as db_error:
