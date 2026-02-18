@@ -166,7 +166,7 @@ class Neo4jDriver(GraphDriver):
         params = kwargs.pop('params', None)
         if params is None:
             params = {}
-        params.setdefault('database_', self._database)
+        kwargs.setdefault('database_', self._database)
 
         try:
             result = await self.client.execute_query(cypher_query_, parameters_=params, **kwargs)
