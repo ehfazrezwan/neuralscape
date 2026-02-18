@@ -6,6 +6,8 @@ Run with: arq worker.WorkerSettings
 import hashlib
 import logging
 
+from arq.cron import cron
+
 from config import parse_redis_settings, settings
 from memory_service import MemoryService
 
@@ -80,6 +82,36 @@ def _generate_job_id(content: str, user_id: str) -> str:
     return f"raw-{h}"
 
 
+async def dedup_all_memories(ctx: dict) -> dict:
+    """Cron job: deduplicate Qdrant memories for every user."""
+    service: MemoryService = ctx["service"]
+    user_ids = service.get_all_user_ids(batch_size=settings.dedup_batch_size)
+    logger.info(f"Dedup cron: found {len(user_ids)} users")
+
+    results = []
+    for uid in user_ids:
+        try:
+            result = service.dedup_memories(uid)
+            results.append(result)
+            removed = result["exact_duplicates_removed"] + result["semantic_duplicates_removed"]
+            if removed:
+                logger.info(f"Dedup [{uid}]: removed {removed} duplicates")
+        except Exception as e:
+            logger.error(f"Dedup failed for user {uid}: {e}")
+            results.append({"user_id": uid, "error": str(e)})
+
+    total_exact = sum(r.get("exact_duplicates_removed", 0) for r in results)
+    total_semantic = sum(r.get("semantic_duplicates_removed", 0) for r in results)
+    summary = {
+        "users_processed": len(user_ids),
+        "total_exact_removed": total_exact,
+        "total_semantic_removed": total_semantic,
+        "per_user": results,
+    }
+    logger.info(f"Dedup cron complete: {total_exact} exact + {total_semantic} semantic removed")
+    return summary
+
+
 async def startup(ctx: dict) -> None:
     """Worker startup: initialize MemoryService + connections."""
     logger.info("ARQ worker starting up...")
@@ -100,6 +132,17 @@ async def shutdown(ctx: dict) -> None:
 
 class WorkerSettings:
     functions = [process_memory_store, process_memory_raw]
+    cron_jobs = [
+        cron(
+            dedup_all_memories,
+            hour=settings.dedup_cron_hours,
+            minute=0,
+            timeout=1800,
+            unique=True,
+            max_tries=1,
+            run_at_startup=False,
+        ),
+    ]
     on_startup = startup
     on_shutdown = shutdown
     redis_settings = parse_redis_settings()
