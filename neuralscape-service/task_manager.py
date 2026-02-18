@@ -3,12 +3,13 @@
 Centralizes task enqueuing and status tracking, replacing the in-memory _tasks dict.
 """
 
+import hashlib
 import logging
 
-from arq.connections import ArqRedis, RedisSettings, create_pool
+from arq.connections import ArqRedis, create_pool
 from arq.jobs import Job, JobStatus
 
-from config import settings
+from config import parse_redis_settings, settings
 
 logger = logging.getLogger(__name__)
 
@@ -22,24 +23,6 @@ _STATUS_MAP = {
 }
 
 
-def _parse_redis_settings() -> RedisSettings:
-    """Parse redis_url into ARQ RedisSettings."""
-    url = settings.redis_url
-    url = url.replace("redis://", "")
-    parts = url.split("/")
-    host_port = parts[0]
-    database = int(parts[1]) if len(parts) > 1 else 0
-
-    if ":" in host_port:
-        host, port = host_port.rsplit(":", 1)
-        port = int(port)
-    else:
-        host = host_port
-        port = 6379
-
-    return RedisSettings(host=host, port=port, database=database)
-
-
 class TaskManager:
     """Redis-backed task status tracking + ARQ job enqueuing."""
 
@@ -49,7 +32,7 @@ class TaskManager:
     async def connect(self) -> None:
         """Initialize the ARQ Redis connection pool."""
         self.pool = await create_pool(
-            _parse_redis_settings(),
+            parse_redis_settings(),
             default_queue_name=settings.arq_queue_name,
         )
         logger.info("TaskManager connected to Redis")
@@ -62,7 +45,17 @@ class TaskManager:
         agent_id: str | None = None,
         run_id: str | None = None,
     ) -> str:
-        """Enqueue memory extraction task. Returns task_id (job_id)."""
+        """Enqueue memory extraction task. Returns task_id (job_id).
+
+        Uses a deterministic job ID based on content hash to prevent
+        duplicate enqueues of the same conversation.
+        """
+        # Generate deterministic job ID from message content
+        content_str = "|".join(
+            m.get("content", "") for m in messages
+        )
+        job_id = _generate_job_id(f"store:{content_str}", user_id)
+
         job = await self.pool.enqueue_job(
             "process_memory_store",
             messages,
@@ -70,6 +63,7 @@ class TaskManager:
             project_id,
             agent_id,
             run_id,
+            _job_id=job_id,
         )
         return job.job_id
 
@@ -84,7 +78,13 @@ class TaskManager:
         agent_id: str | None = None,
         run_id: str | None = None,
     ) -> str:
-        """Enqueue raw memory storage task. Returns task_id (job_id)."""
+        """Enqueue raw memory storage task. Returns task_id (job_id).
+
+        Uses a deterministic job ID based on content hash to prevent
+        duplicate enqueues of the same fact.
+        """
+        job_id = _generate_job_id(f"raw:{content}", user_id)
+
         job = await self.pool.enqueue_job(
             "process_memory_raw",
             content,
@@ -95,6 +95,7 @@ class TaskManager:
             tags,
             agent_id,
             run_id,
+            _job_id=job_id,
         )
         return job.job_id
 
@@ -155,3 +156,9 @@ class TaskManager:
         if self.pool:
             await self.pool.aclose()
             logger.info("TaskManager disconnected from Redis")
+
+
+def _generate_job_id(content: str, user_id: str) -> str:
+    """Generate a deterministic job ID from content + user_id."""
+    h = hashlib.sha256(f"{user_id}:{content}".encode()).hexdigest()[:16]
+    return f"ns-{h}"

@@ -17,6 +17,7 @@ dependencies = [
     "google-genai>=1.0.0",
     "arq>=0.26.0",
     "redis[hiredis]>=5.0.0",
+    "structlog>=24.0.0",
 ]
 
 [tool.hatch.build.targets.wheel]

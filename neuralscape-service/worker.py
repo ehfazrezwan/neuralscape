@@ -3,11 +3,10 @@
 Run with: arq worker.WorkerSettings
 """
 
+import hashlib
 import logging
 
-from arq.connections import RedisSettings
-
-from config import settings
+from config import parse_redis_settings, settings
 from memory_service import MemoryService
 
 logger = logging.getLogger(__name__)
@@ -44,8 +43,24 @@ async def process_memory_raw(
     agent_id: str | None = None,
     run_id: str | None = None,
 ) -> dict:
-    """Background task: direct fact storage."""
+    """Background task: direct fact storage with idempotency check."""
     service: MemoryService = ctx["service"]
+
+    # Idempotency: check if identical content already exists for this user
+    try:
+        existing = service.search(
+            query=content,
+            user_id=user_id,
+            project_id=project_id,
+            limit=3,
+        )
+        for mem in existing:
+            if mem.memory.strip().lower() == content.strip().lower():
+                logger.info(f"Skipping duplicate memory for user {user_id}: {content[:50]}...")
+                return {"memories": [mem.model_dump(exclude_none=True)], "deduplicated": True}
+    except Exception as e:
+        logger.warning(f"Idempotency check failed (proceeding with store): {e}")
+
     memories = service.store_raw(
         content=content,
         user_id=user_id,
@@ -57,6 +72,12 @@ async def process_memory_raw(
         run_id=run_id,
     )
     return {"memories": [m.model_dump(exclude_none=True) for m in memories]}
+
+
+def _generate_job_id(content: str, user_id: str) -> str:
+    """Generate a deterministic job ID from content + user_id."""
+    h = hashlib.sha256(f"{user_id}:{content}".encode()).hexdigest()[:16]
+    return f"raw-{h}"
 
 
 async def startup(ctx: dict) -> None:
@@ -77,30 +98,11 @@ async def shutdown(ctx: dict) -> None:
     logger.info("ARQ worker stopped.")
 
 
-def _parse_redis_settings() -> RedisSettings:
-    """Parse redis_url into ARQ RedisSettings."""
-    url = settings.redis_url
-    # redis://host:port/db or redis://host:port
-    url = url.replace("redis://", "")
-    parts = url.split("/")
-    host_port = parts[0]
-    database = int(parts[1]) if len(parts) > 1 else 0
-
-    if ":" in host_port:
-        host, port = host_port.rsplit(":", 1)
-        port = int(port)
-    else:
-        host = host_port
-        port = 6379
-
-    return RedisSettings(host=host, port=port, database=database)
-
-
 class WorkerSettings:
     functions = [process_memory_store, process_memory_raw]
     on_startup = startup
     on_shutdown = shutdown
-    redis_settings = _parse_redis_settings()
+    redis_settings = parse_redis_settings()
     queue_name = settings.arq_queue_name
     max_jobs = 10
     job_timeout = settings.arq_job_timeout
