@@ -180,6 +180,21 @@ class ContextResponse(BaseModel):
     categories: dict[str, list[MemoryResponse]] = Field(default_factory=dict)
 
 
+class TaskAcceptedResponse(BaseModel):
+    """Response for async write endpoints (202 Accepted)."""
+    status: str = "accepted"
+    task_id: str
+    poll_url: str
+
+
+class TaskStatusResponse(BaseModel):
+    """Response for task status polling."""
+    task_id: str
+    status: str  # "queued", "processing", "completed", "failed", "not_found"
+    result: dict | None = None
+    error: str | None = None
+
+
 class CategoryListResponse(BaseModel):
     status: str = "ok"
     categories: dict[str, str] = Field(default_factory=dict)
