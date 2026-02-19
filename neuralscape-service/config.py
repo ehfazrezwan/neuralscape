@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     # Gemini
     google_api_key: str = ""
     gemini_llm_model: str = "gemini-3-flash-preview"
+    gemini_llm_fallback_model: str = "gemini-2.5-flash"
     gemini_embedder_model: str = "gemini-embedding-001"
 
     # Neo4j
@@ -114,6 +115,7 @@ class Settings(BaseSettings):
                     "database": self.neo4j_database,
                     "graphiti_llm_provider": "gemini",
                     "graphiti_llm_model": self.gemini_llm_model,
+                    "graphiti_llm_fallback_model": self.gemini_llm_fallback_model,
                     "graphiti_llm_api_key": self.google_api_key,
                     "graphiti_embedder_provider": "gemini",
                     "graphiti_embedder_model": self.gemini_embedder_model,

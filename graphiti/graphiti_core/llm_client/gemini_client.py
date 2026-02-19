@@ -47,6 +47,15 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL = 'gemini-3-flash-preview'
 DEFAULT_SMALL_MODEL = 'gemini-2.5-flash-lite'
 
+# Error patterns indicating the model is temporarily overloaded
+_TRANSIENT_PATTERNS = ('503', 'unavailable', 'overloaded', 'capacity', 'high demand')
+
+
+def _is_transient_error(exc: Exception) -> bool:
+    """Check if an exception indicates a transient model availability issue."""
+    msg = str(exc).lower()
+    return any(p in msg for p in _TRANSIENT_PATTERNS)
+
 # Maximum output tokens for different Gemini models
 GEMINI_MODEL_MAX_TOKENS = {
     # Gemini 3 (preview) models
@@ -116,6 +125,7 @@ class GeminiClient(LLMClient):
         super().__init__(config, cache)
 
         self.model = config.model
+        self.fallback_model = config.fallback_model
 
         if client is None:
             self.client = genai.Client(api_key=config.api_key)
@@ -455,7 +465,43 @@ class GeminiClient(LLMClient):
                         f'Retrying after application error (attempt {retry_count}/{self.MAX_RETRIES}): {e}'
                     )
 
-            # If we exit the loop without returning, all retries are exhausted
+            # If we exit the loop without returning, all retries are exhausted.
+            # Try fallback model if the error is transient (503/overloaded).
+            if (
+                self.fallback_model
+                and last_error
+                and _is_transient_error(last_error)
+            ):
+                primary = self._get_model_for_size(model_size)
+                if primary != self.fallback_model:
+                    logger.warning(
+                        f'Primary model {primary} unavailable for {prompt_name or "unknown"}, '
+                        f'falling back to {self.fallback_model}'
+                    )
+                    # Temporarily swap models and make one more attempt
+                    original_model = self.model
+                    self.model = self.fallback_model
+                    try:
+                        response, input_tokens, output_tokens = await self._generate_response(
+                            messages=messages,
+                            response_model=response_model,
+                            max_tokens=max_tokens,
+                            model_size=model_size,
+                        )
+                        total_input_tokens += input_tokens
+                        total_output_tokens += output_tokens
+                        self.token_tracker.record(
+                            prompt_name, total_input_tokens, total_output_tokens
+                        )
+                        return response
+                    except Exception as fallback_error:
+                        logger.error(
+                            f'Fallback model {self.fallback_model} also failed: {fallback_error}'
+                        )
+                        last_error = fallback_error
+                    finally:
+                        self.model = original_model
+
             logger.error('🦀 LLM generation failed and retries are exhausted.')
             logger.error(self._get_failed_generation_log(messages, last_output))
             logger.error(f'Max retries ({self.MAX_RETRIES}) exceeded. Last error: {last_error}')
