@@ -146,4 +146,8 @@ def parse_redis_settings() -> RedisSettings:
         port=port,
         database=database,
         password=password,
+        conn_timeout=10,
+        conn_retries=5,
+        conn_retry_delay=2,
+        retry_on_timeout=True,
     )
