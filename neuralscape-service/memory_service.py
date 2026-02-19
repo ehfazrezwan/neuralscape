@@ -32,11 +32,17 @@ def retry_transient(
     base_delay: float | None = None,
     max_delay: float | None = None,
     operation: str = "operation",
+    fallback_model: str | None = None,
+    model_kwarg: str = "model",
     **kwargs,
 ):
     """Call fn(*args, **kwargs) with exponential backoff on transient errors.
 
     Non-transient exceptions are raised immediately.
+
+    If fallback_model is provided and the primary model exhausts all retries
+    on transient errors, the function is retried once more with the model kwarg
+    swapped to the fallback model.
     """
     if max_retries is None:
         max_retries = settings.llm_max_retries
@@ -51,15 +57,35 @@ def retry_transient(
             return fn(*args, **kwargs)
         except Exception as e:
             last_exc = e
-            if not _is_transient(e) or attempt == max_retries:
+            if not _is_transient(e):
                 raise
+            if attempt == max_retries:
+                break  # exhausted retries — try fallback below
             delay = min(base_delay * (2 ** attempt) + random.uniform(0, 1), max_delay)
             logger.warning(
                 f"Transient error in {operation} (attempt {attempt + 1}/{max_retries + 1}), "
                 f"retrying in {delay:.1f}s: {e}"
             )
             time.sleep(delay)
-    raise last_exc  # unreachable, but satisfies type checkers
+
+    # Primary model exhausted retries — try fallback model if configured
+    if fallback_model and model_kwarg in kwargs:
+        primary_model = kwargs[model_kwarg]
+        if primary_model != fallback_model:
+            logger.warning(
+                f"Primary model {primary_model} exhausted retries for {operation}, "
+                f"falling back to {fallback_model}"
+            )
+            kwargs[model_kwarg] = fallback_model
+            try:
+                return fn(*args, **kwargs)
+            except Exception as e:
+                logger.error(
+                    f"Fallback model {fallback_model} also failed for {operation}: {e}"
+                )
+                raise
+
+    raise last_exc  # type: ignore[misc]
 from prompts import (
     build_extraction_messages,
     parse_extraction_response,
@@ -211,6 +237,7 @@ class MemoryService:
                     http_options=HttpOptions(timeout=60),
                 ),
                 operation="LLM extraction",
+                fallback_model=settings.gemini_llm_fallback_model,
             )
             parsed_facts = parse_extraction_response(response.text)
         except Exception as e:
@@ -1166,7 +1193,8 @@ class MemoryService:
             try:
                 embedding = m.embedding_model.embed(text)
                 hits = m.vector_store.search(
-                    query=embedding,
+                    query=text,
+                    vectors=embedding,
                     limit=5,
                     filters={"user_id": user_id},
                 )

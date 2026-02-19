@@ -1,0 +1,15 @@
+{
+  "name": "neuralscape-plugins",
+  "owner": {
+    "name": "Ehfaz Rezwan",
+    "email": "ehfaz.rezwan@optimizely.com"
+  },
+  "plugins": [
+    {
+      "name": "neuralscape",
+      "source": "./neuralscape-plugin",
+      "description": "Persistent memory for Claude Code — automatic context capture and retrieval via Neuralscape",
+      "version": "1.0.0"
+    }
+  ]
+}

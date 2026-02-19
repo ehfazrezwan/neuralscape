@@ -1,0 +1,15 @@
+{
+  "name": "neuralscape-plugin",
+  "version": "1.0.0",
+  "description": "Claude Code plugin for Neuralscape persistent memory",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node esbuild.config.js",
+    "watch": "node esbuild.config.js --watch"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0",
+    "typescript": "^5.7.0"
+  }
+}

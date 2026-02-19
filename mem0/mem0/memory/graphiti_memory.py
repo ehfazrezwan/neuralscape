@@ -22,27 +22,32 @@ except ImportError:
     )
 
 
-def _create_llm_client(provider: str, model: str | None, api_key: str | None):
+def _create_llm_client(
+    provider: str,
+    model: str | None,
+    api_key: str | None,
+    fallback_model: str | None = None,
+):
     """Create a Graphiti LLM client based on provider name."""
     if provider == "gemini":
         from graphiti_core.llm_client.gemini_client import GeminiClient
 
-        config = LLMConfig(api_key=api_key, model=model)
+        config = LLMConfig(api_key=api_key, model=model, fallback_model=fallback_model)
         return GeminiClient(config=config)
     elif provider == "openai":
         from graphiti_core.llm_client.openai_client import OpenAIClient
 
-        config = LLMConfig(api_key=api_key, model=model)
+        config = LLMConfig(api_key=api_key, model=model, fallback_model=fallback_model)
         return OpenAIClient(config=config)
     elif provider == "anthropic":
         from graphiti_core.llm_client.anthropic_client import AnthropicClient
 
-        config = LLMConfig(api_key=api_key, model=model)
+        config = LLMConfig(api_key=api_key, model=model, fallback_model=fallback_model)
         return AnthropicClient(config=config)
     elif provider == "groq":
         from graphiti_core.llm_client.groq_client import GroqClient
 
-        config = LLMConfig(api_key=api_key, model=model)
+        config = LLMConfig(api_key=api_key, model=model, fallback_model=fallback_model)
         return GroqClient(config=config)
     else:
         raise ValueError(f"Unsupported Graphiti LLM provider: {provider}")
@@ -142,6 +147,7 @@ class MemoryGraph:
             provider=graph_config.graphiti_llm_provider,
             model=graph_config.graphiti_llm_model,
             api_key=graph_config.graphiti_llm_api_key,
+            fallback_model=getattr(graph_config, "graphiti_llm_fallback_model", None),
         )
 
         embedder = _create_embedder(
