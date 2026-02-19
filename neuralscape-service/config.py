@@ -8,8 +8,8 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     # Gemini
     google_api_key: str = ""
-    gemini_llm_model: str = "gemini-2.5-flash"
-    gemini_embedder_model: str = "text-embedding-004"
+    gemini_llm_model: str = "gemini-3-flash-preview"
+    gemini_embedder_model: str = "gemini-embedding-001"
 
     # Neo4j
     neo4j_uri: str = "neo4j://127.0.0.1:7687"

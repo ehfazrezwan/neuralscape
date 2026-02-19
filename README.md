@@ -181,6 +181,99 @@ mcp-cli call neuralscape remember '{"content": "test fact", "user_id": "ehfaz", 
 mcp-cli call neuralscape remember '{"content": "test fact", "user_id": "ehfaz", "category": "interaction", "wait": true}'
 ```
 
+## Enabling Memory Globally (Claude Code)
+
+To give Claude Code persistent memory across **all** projects and sessions, you need two things: the MCP server in your global settings and instructions in your global `CLAUDE.md`.
+
+### 1. Add the MCP server to global settings
+
+Add `neuralscape-memory` to the `mcpServers` key in `~/.claude.json` (the user-scoped Claude Code config):
+
+**Option A: Streamable HTTP** (requires the API server running — Docker or local):
+
+```jsonc
+// ~/.claude.json
+{
+  // ... existing keys ...
+  "mcpServers": {
+    "neuralscape-memory": {
+      "type": "http",
+      "url": "http://localhost:8199/mcp"
+    }
+  }
+}
+```
+
+Make sure `MCP_TRANSPORT=http` is set in the neuralscape service environment (already enabled in `docker-compose.yml`).
+
+**Option B: stdio** (spawns the MCP server as a subprocess per session):
+
+```jsonc
+// ~/.claude.json
+{
+  // ... existing keys ...
+  "mcpServers": {
+    "neuralscape-memory": {
+      "command": "uv",
+      "args": ["run", "--directory", "/absolute/path/to/neuralscape-service", "python", "mcp_server.py"]
+    }
+  }
+}
+```
+
+> HTTP is recommended for global use since it shares a single server process across all sessions. stdio spawns a new MCP server per Claude Code session, each with its own MemoryService initialization overhead.
+
+### 2. Add memory instructions to global CLAUDE.md
+
+Create or append to `~/.claude/CLAUDE.md` so Claude Code knows how to use the memory tools proactively:
+
+```markdown
+## Neuralscape Memory Layer
+
+Use the `/neuralscape-memory` skill and the `neuralscape-memory` MCP tools to maintain persistent memory across sessions.
+
+### Session Start
+
+At the beginning of every session, load the `/neuralscape-memory` skill, then call `get_project_context` (if working in a project) or `recall_memories` (with a broad query like "user preferences and context") to load known context about the user and current project. Use the recalled information to inform your behavior throughout the session.
+
+### When to Store Memories
+
+Proactively call `remember` (fire-and-forget, `wait: false`) when the user:
+- Reveals a preference (tools, style, communication, workflow)
+- Shares a personal fact (name, location, role, team)
+- Makes a technical decision with rationale
+- Discusses project architecture, conventions, or tech stack
+- Explains a workflow or procedure
+- Mentions a dependency, constraint, or compatibility issue
+
+### What NOT to Store
+
+- Greetings, acknowledgments, or transient dialogue
+- Vague or non-actionable statements ("use good code")
+- Information that is not standalone (requires conversation context to understand)
+- Duplicate facts already in memory (check before storing)
+
+### Identity
+
+Always pass `user_id: "your-user-id"` on every memory call. Include `project_id` (use the project directory name) when working in a project context.
+
+### Categories
+
+Use the most specific category from the taxonomy (13 categories across semantic, project, episodic, procedural, and working types). Key rules:
+- `preference` = how the user wants things done; `convention` = how a project actually does things
+- `decision` should include rationale ("chose X because Y")
+- `task_context` is ephemeral (current state, not permanent facts)
+- Global categories (`preference`, `personal_fact`, `technical_skill`, `domain_knowledge`) are always `scope=global`
+- Project categories (`tech_stack`, `convention`, `architecture`, `dependency`) require `project_id`
+- Flexible categories default to global but switch to project when `project_id` is provided
+
+### Memory Content Quality
+
+Each memory must be a standalone, specific, factual sentence that makes sense without conversation context.
+```
+
+With both pieces in place, Claude Code will automatically recall your preferences and project context at session start, and proactively store new learnings as you work — across every project.
+
 ## REST API
 
 All new endpoints live under `/v1`. Legacy endpoints at root are preserved for backward compatibility.
@@ -394,8 +487,8 @@ All settings are environment variables (loaded from `.env`):
 | Variable | Default | Description |
 |---|---|---|
 | `GOOGLE_API_KEY` | | Gemini API key |
-| `GEMINI_LLM_MODEL` | `gemini-2.5-flash` | Model for LLM extraction |
-| `GEMINI_EMBEDDER_MODEL` | `text-embedding-004` | Model for embeddings |
+| `GEMINI_LLM_MODEL` | `gemini-3-flash-preview` | Model for LLM extraction |
+| `GEMINI_EMBEDDER_MODEL` | `gemini-embedding-001` | Model for embeddings |
 | `NEO4J_URI` | `neo4j://127.0.0.1:7687` | Neo4j connection |
 | `NEO4J_USER` | `neo4j` | Neo4j username |
 | `NEO4J_PASSWORD` | | Neo4j password |
