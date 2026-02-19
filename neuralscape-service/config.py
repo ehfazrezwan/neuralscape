@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     arq_max_retries: int = 3
     arq_job_timeout: int = 300  # 5 min max per task
 
+    # LLM retry (exponential backoff for transient 503/429 errors)
+    llm_max_retries: int = 3
+    llm_retry_base_delay: float = 1.0  # seconds
+    llm_retry_max_delay: float = 30.0  # seconds
+
     # Dedup cron
     dedup_similarity_threshold: float = 0.95
     dedup_batch_size: int = 100
