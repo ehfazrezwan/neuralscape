@@ -2,13 +2,19 @@ services:
   neo4j:
     image: neo4j:5-community
     ports:
-      - "7474:7474"
-      - "7687:7687"
+      - target: 7474
+        published: ${NEO4J_HTTP_PORT:-7481}
+        protocol: tcp
+      - target: 7687
+        published: ${NEO4J_BOLT_PORT:-7694}
+        protocol: tcp
     environment:
       NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-neuralscape}
       NEO4J_initial_dbms_default__database: ${NEO4J_DATABASE:-memory}
     volumes:
-      - neo4j_data:/data
+      - type: volume
+        source: neo4j_data
+        target: /data
     restart: unless-stopped
     deploy:
       resources:
@@ -28,9 +34,13 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - target: 6379
+        published: ${REDIS_PORT:-6386}
+        protocol: tcp
     volumes:
-      - redis_data:/data
+      - type: volume
+        source: redis_data
+        target: /data
     restart: unless-stopped
     deploy:
       resources:
@@ -50,10 +60,16 @@ services:
   qdrant:
     image: qdrant/qdrant:v1.15.0
     ports:
-      - "6333:6333"
-      - "6334:6334"
+      - target: 6333
+        published: ${QDRANT_HTTP_PORT:-6340}
+        protocol: tcp
+      - target: 6334
+        published: ${QDRANT_GRPC_PORT:-6341}
+        protocol: tcp
     volumes:
-      - qdrant_data:/qdrant/storage
+      - type: volume
+        source: qdrant_data
+        target: /qdrant/storage
     restart: unless-stopped
     deploy:
       resources:
@@ -75,7 +91,9 @@ services:
       context: .
       dockerfile: neuralscape-service/Dockerfile
     ports:
-      - "8199:8199"
+      - target: 8199
+        published: ${NEURALSCAPE_PORT:-8199}
+        protocol: tcp
     depends_on:
       neo4j:
         condition: service_healthy

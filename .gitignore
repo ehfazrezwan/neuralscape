@@ -172,3 +172,6 @@ mcp_servers.json
 
 # Docker Compose override (machine-specific)
 docker-compose.override.yml
+
+# oh-my-claudecode state
+.omc/
