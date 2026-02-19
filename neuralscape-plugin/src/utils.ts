@@ -163,10 +163,11 @@ export function outputContinue(): void {
   outputHookResult({ continue: true, suppressOutput: true });
 }
 
-export function outputWithContext(context: string): void {
+export function outputWithContext(context: string, hookEventName: string = "SessionStart"): void {
   outputHookResult({
     continue: true,
     hookSpecificOutput: {
+      hookEventName,
       additionalContext: context,
     },
   });

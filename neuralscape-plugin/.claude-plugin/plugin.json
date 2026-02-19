@@ -5,6 +5,5 @@
   "author": {
     "name": "Ehfaz Rezwan",
     "email": "ehfaz.rezwan@gmail.com"
-  },
-  "hooks": "./hooks/hooks.json"
+  }
 }
