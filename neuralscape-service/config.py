@@ -8,8 +8,8 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     # Gemini
     google_api_key: str = ""
-    gemini_llm_model: str = "gemini-2.5-flash"
-    gemini_embedder_model: str = "text-embedding-004"
+    gemini_llm_model: str = "gemini-3-flash-preview"
+    gemini_embedder_model: str = "gemini-embedding-001"
 
     # Neo4j
     neo4j_uri: str = "neo4j://127.0.0.1:7687"
@@ -32,6 +32,11 @@ class Settings(BaseSettings):
     arq_queue_name: str = "neuralscape:queue"
     arq_max_retries: int = 3
     arq_job_timeout: int = 300  # 5 min max per task
+
+    # LLM retry (exponential backoff for transient 503/429 errors)
+    llm_max_retries: int = 3
+    llm_retry_base_delay: float = 1.0  # seconds
+    llm_retry_max_delay: float = 30.0  # seconds
 
     # Dedup cron
     dedup_similarity_threshold: float = 0.95
@@ -141,4 +146,8 @@ def parse_redis_settings() -> RedisSettings:
         port=port,
         database=database,
         password=password,
+        conn_timeout=10,
+        conn_retries=5,
+        conn_retry_delay=2,
+        retry_on_timeout=True,
     )

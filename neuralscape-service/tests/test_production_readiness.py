@@ -2,7 +2,8 @@
 
 Covers: config validation, Redis URL parser, search dedup/limit,
 delete graph cleanup, bridge timeout, Redis fallback, input validation,
-global exception handler, thread-safe init, and worker idempotency.
+global exception handler, thread-safe init, worker idempotency,
+and LLM retry with exponential backoff.
 """
 
 import concurrent.futures
@@ -17,7 +18,7 @@ from fastapi.testclient import TestClient
 import main
 import mcp_server
 from config import Settings, parse_redis_settings
-from memory_service import MemoryService
+from memory_service import MemoryService, _is_transient, retry_transient
 from schemas import MemoryResponse
 from task_manager import _generate_job_id
 
@@ -911,3 +912,79 @@ class TestThreadSafeInit:
                     t.join()
 
                 assert init_count == 1
+
+
+# ══════════════════════════════════════════════
+# LLM retry with exponential backoff
+# ══════════════════════════════════════════════
+
+
+class TestIsTransient:
+    def test_503_is_transient(self):
+        assert _is_transient(Exception("503 UNAVAILABLE"))
+
+    def test_429_is_transient(self):
+        assert _is_transient(Exception("429 Too Many Requests"))
+
+    def test_resource_exhausted_is_transient(self):
+        assert _is_transient(Exception("RESOURCE_EXHAUSTED: quota exceeded"))
+
+    def test_rate_limit_is_transient(self):
+        assert _is_transient(Exception("rate limit exceeded"))
+
+    def test_overloaded_is_transient(self):
+        assert _is_transient(Exception("model is overloaded"))
+
+    def test_400_is_not_transient(self):
+        assert not _is_transient(Exception("400 Bad Request"))
+
+    def test_auth_error_is_not_transient(self):
+        assert not _is_transient(Exception("401 UNAUTHENTICATED: invalid API key"))
+
+    def test_generic_error_is_not_transient(self):
+        assert not _is_transient(ValueError("invalid input"))
+
+
+class TestRetryTransient:
+    def test_succeeds_on_first_try(self):
+        fn = MagicMock(return_value="ok")
+        result = retry_transient(fn, "arg1", max_retries=3, base_delay=0, operation="test")
+        assert result == "ok"
+        assert fn.call_count == 1
+
+    def test_retries_on_transient_then_succeeds(self):
+        fn = MagicMock(side_effect=[
+            Exception("503 UNAVAILABLE"),
+            Exception("429 rate limit"),
+            "ok",
+        ])
+        result = retry_transient(fn, max_retries=3, base_delay=0, operation="test")
+        assert result == "ok"
+        assert fn.call_count == 3
+
+    def test_raises_immediately_on_non_transient(self):
+        fn = MagicMock(side_effect=ValueError("bad input"))
+        with pytest.raises(ValueError, match="bad input"):
+            retry_transient(fn, max_retries=3, base_delay=0, operation="test")
+        assert fn.call_count == 1
+
+    def test_raises_after_max_retries_exhausted(self):
+        fn = MagicMock(side_effect=Exception("503 UNAVAILABLE"))
+        with pytest.raises(Exception, match="503"):
+            retry_transient(fn, max_retries=2, base_delay=0, operation="test")
+        assert fn.call_count == 3  # initial + 2 retries
+
+    def test_passes_kwargs_through(self):
+        fn = MagicMock(return_value="ok")
+        retry_transient(fn, "a", "b", key="val", max_retries=1, base_delay=0, operation="test")
+        fn.assert_called_once_with("a", "b", key="val")
+
+    @patch("memory_service.settings")
+    def test_uses_config_defaults(self, mock_settings):
+        mock_settings.llm_max_retries = 1
+        mock_settings.llm_retry_base_delay = 0
+        mock_settings.llm_retry_max_delay = 1
+        fn = MagicMock(side_effect=[Exception("503 UNAVAILABLE"), "ok"])
+        result = retry_transient(fn, operation="test")
+        assert result == "ok"
+        assert fn.call_count == 2

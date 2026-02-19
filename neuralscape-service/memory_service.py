@@ -5,12 +5,61 @@ Both REST endpoints and MCP tools call into this same MemoryService.
 
 import json
 import logging
+import random
 import threading
+import time
 from datetime import datetime, timezone
 
 from google import genai
 
 from config import settings
+
+
+# HTTP status codes / error substrings that indicate transient failures
+_TRANSIENT_PATTERNS = ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "rate limit", "overloaded", "capacity")
+
+
+def _is_transient(exc: Exception) -> bool:
+    """Check if an exception looks like a transient/retryable API error."""
+    msg = str(exc)
+    return any(p.lower() in msg.lower() for p in _TRANSIENT_PATTERNS)
+
+
+def retry_transient(
+    fn,
+    *args,
+    max_retries: int | None = None,
+    base_delay: float | None = None,
+    max_delay: float | None = None,
+    operation: str = "operation",
+    **kwargs,
+):
+    """Call fn(*args, **kwargs) with exponential backoff on transient errors.
+
+    Non-transient exceptions are raised immediately.
+    """
+    if max_retries is None:
+        max_retries = settings.llm_max_retries
+    if base_delay is None:
+        base_delay = settings.llm_retry_base_delay
+    if max_delay is None:
+        max_delay = settings.llm_retry_max_delay
+
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_exc = e
+            if not _is_transient(e) or attempt == max_retries:
+                raise
+            delay = min(base_delay * (2 ** attempt) + random.uniform(0, 1), max_delay)
+            logger.warning(
+                f"Transient error in {operation} (attempt {attempt + 1}/{max_retries + 1}), "
+                f"retrying in {delay:.1f}s: {e}"
+            )
+            time.sleep(delay)
+    raise last_exc  # unreachable, but satisfies type checkers
 from prompts import (
     build_extraction_messages,
     parse_extraction_response,
@@ -154,22 +203,26 @@ class MemoryService:
         try:
             from google.genai.types import GenerateContentConfig, HttpOptions
 
-            response = client.models.generate_content(
+            response = retry_transient(
+                client.models.generate_content,
                 model=settings.gemini_llm_model,
                 contents=extraction_messages[0]["content"],
                 config=GenerateContentConfig(
                     http_options=HttpOptions(timeout=60),
                 ),
+                operation="LLM extraction",
             )
             parsed_facts = parse_extraction_response(response.text)
         except Exception as e:
-            logger.error(f"LLM extraction failed: {e}")
+            logger.error(f"LLM extraction failed after retries: {e}")
             # Fallback: store the raw conversation through mem0's pipeline
-            result = m.add(
+            result = retry_transient(
+                m.add,
                 messages=messages,
                 user_id=user_id,
                 agent_id=agent_id,
                 run_id=run_id,
+                operation="mem0 fallback add",
             )
             return self._result_to_responses(result)
 
@@ -204,18 +257,20 @@ class MemoryService:
             }
 
             try:
-                result = m.add(
+                result = retry_transient(
+                    m.add,
                     messages=[{"role": "user", "content": fact_content}],
                     user_id=user_id,
                     agent_id=agent_id,
                     run_id=run_id,
                     metadata=metadata,
                     infer=False,
+                    operation=f"store fact '{fact_content[:30]}...'",
                 )
                 responses = self._result_to_responses(result, category=category, scope=scope.value)
                 stored.extend(responses)
             except Exception as e:
-                logger.error(f"Failed to store fact '{fact_content[:50]}...': {e}")
+                logger.error(f"Failed to store fact '{fact_content[:50]}...' after retries: {e}")
 
         # Step 3: In parallel, add raw conversation text to knowledge graph
         group_id = _build_group_id(
@@ -228,9 +283,11 @@ class MemoryService:
         )
         try:
             if self._graphiti and self._bridge:
-                self._memory.graph.add(
+                retry_transient(
+                    self._memory.graph.add,
                     data=raw_text,
                     filters={"user_id": user_id, "group_id": group_id},
+                    operation="graph storage (extract_and_store)",
                 )
         except Exception as e:
             logger.warning(f"Graph storage failed (non-critical): {e}")
@@ -282,22 +339,26 @@ class MemoryService:
         if tags:
             metadata["tags"] = tags
 
-        result = m.add(
+        result = retry_transient(
+            m.add,
             messages=[{"role": "user", "content": content}],
             user_id=user_id,
             agent_id=agent_id,
             run_id=run_id,
             metadata=metadata,
             infer=False,
+            operation="store_raw vector add",
         )
 
         # Also add to knowledge graph
         group_id = _build_group_id(scope, project_id)
         try:
             if self._graphiti and self._bridge:
-                self._memory.graph.add(
+                retry_transient(
+                    self._memory.graph.add,
                     data=content,
                     filters={"user_id": user_id, "group_id": group_id},
+                    operation="store_raw graph add",
                 )
         except Exception as e:
             logger.warning(f"Graph storage failed (non-critical): {e}")
@@ -623,9 +684,11 @@ class MemoryService:
                 project_id = metadata.get("project_id")
                 user_id = existing.get("user_id", "")
                 group_id = _build_group_id(scope, project_id)
-                self._memory.graph.add(
+                retry_transient(
+                    self._memory.graph.add,
                     data=content,
                     filters={"user_id": user_id, "group_id": group_id},
+                    operation=f"graph re-ingestion for {memory_id}",
                 )
             except Exception as e:
                 logger.warning(f"Graph re-ingestion failed for {memory_id} (non-critical): {e}")
