@@ -36,6 +36,12 @@ curl -X POST http://localhost:8199/v1/memories/raw \
   -d '{"content": "Prefers dark mode", "user_id": "test", "category": "preference"}'
 # → {"status":"accepted","task_id":"...","poll_url":"/v1/memories/status/..."}
 
+# 5. Install the Claude Code plugin (optional but recommended)
+cd neuralscape-plugin && npm install && npm run build && cd ..
+# Then inside Claude Code:
+#   /plugin marketplace add /path/to/neuralscape
+#   /plugin install neuralscape@neuralscape-plugins --scope user
+
 # Stop with: docker compose down
 ```
 
@@ -74,6 +80,65 @@ uv run pytest tests/test_service.py -v
 # Run integration tests (requires all services running)
 uv run pytest tests/test_async_pipeline.py -v -s
 ```
+
+## Claude Code Plugin
+
+The **neuralscape plugin** gives Claude Code automatic, persistent memory without any LLM involvement at the capture layer. It uses Claude Code's lifecycle hooks to inject stored context at session start and capture tool observations in the background as you work.
+
+### How It Works
+
+```
+[Claude Code]
+    ↓ SessionStart hook (sync — injects stored context)
+    ↓ PostToolUse hook (async — captures tool observations)
+    ↓ Stop hook (async — stores session marker)
+[neuralscape-plugin/]  ← TypeScript plugin (thin capture layer)
+    ↓ HTTP calls
+[neuralscape-service/]  ← Python service (storage, extraction, graph)
+```
+
+| Hook | When | What it does | Blocking? |
+|------|------|-------------|-----------|
+| **SessionStart** | Session start/resume | Fetches context from `/v1/context/{projectId}`, injects as `additionalContext` | Yes (sync, ~1s) |
+| **PostToolUse** | After Write, Edit, Bash, WebFetch, WebSearch, Task, NotebookEdit | Summarizes the tool action, fire-and-forget POST to `/v1/memories/raw` | No (async) |
+| **Stop** | Session end | Stores a session-end marker as an `interaction` memory | No (async) |
+
+Noisy tools (Glob, Grep, Read, AskUserQuestion) are excluded via the hook matcher.
+
+### Installation
+
+```bash
+# 1. Build the plugin
+cd neuralscape-plugin
+npm install && npm run build
+cd ..
+
+# 2. Add the local marketplace (inside Claude Code)
+/plugin marketplace add /path/to/neuralscape
+
+# 3. Install the plugin
+/plugin install neuralscape@neuralscape-plugins --scope user
+
+# 4. Restart Claude Code — context will be injected automatically
+```
+
+The plugin is cached at `~/.claude/plugins/cache/` and loads on every session. After updating the plugin source, re-run steps 1 and 3.
+
+### Configuration
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `NEURALSCAPE_URL` | `http://localhost:8199` | Neuralscape API URL |
+| `NEURALSCAPE_USER_ID` | `ehfaz` | User ID for memory operations |
+
+### Plugin + MCP Coexistence
+
+The plugin and MCP server complement each other:
+
+- **Plugin hooks** handle automatic capture (PostToolUse observations) and automatic injection (SessionStart context) — no LLM involvement
+- **MCP tools** remain available for explicit operations: targeted search (`recall_memories`), manual storage (`remember`), knowledge graph queries (`search_knowledge_graph`)
+
+Both can run simultaneously. The plugin captures breadcrumbs in the background; MCP tools let you or the agent interact with memory directly.
 
 ## MCP Server
 
@@ -183,18 +248,25 @@ mcp-cli call neuralscape remember '{"content": "test fact", "user_id": "ehfaz", 
 
 ## Enabling Memory Globally (Claude Code)
 
-To give Claude Code persistent memory across **all** projects and sessions, you need two things: the MCP server in your global settings and instructions in your global `CLAUDE.md`.
+There are two approaches to giving Claude Code persistent memory. Use either or both.
 
-### 1. Add the MCP server to global settings
+### Approach 1: Plugin (recommended)
 
-Add `neuralscape-memory` to the `mcpServers` key in `~/.claude.json` (the user-scoped Claude Code config):
+The neuralscape plugin handles context injection and observation capture automatically via lifecycle hooks. See the [Claude Code Plugin](#claude-code-plugin) section above for installation.
 
-**Option A: Streamable HTTP** (requires the API server running — Docker or local):
+Once installed, the plugin loads on every session across all projects. Add the MCP server (below) alongside it for explicit memory operations like targeted search and manual storage.
+
+### Approach 2: MCP server + CLAUDE.md instructions
+
+For setups where you can't or don't want to use the plugin, you can rely on MCP tools and CLAUDE.md instructions to drive memory behavior.
+
+**Step 1: Add the MCP server to global settings**
+
+Add `neuralscape-memory` to the `mcpServers` key in `~/.claude.json`:
 
 ```jsonc
-// ~/.claude.json
+// ~/.claude.json — Streamable HTTP (recommended, shares a single server process)
 {
-  // ... existing keys ...
   "mcpServers": {
     "neuralscape-memory": {
       "type": "http",
@@ -204,75 +276,32 @@ Add `neuralscape-memory` to the `mcpServers` key in `~/.claude.json` (the user-s
 }
 ```
 
-Make sure `MCP_TRANSPORT=http` is set in the neuralscape service environment (already enabled in `docker-compose.yml`).
+> Make sure `MCP_TRANSPORT=http` is set in the neuralscape service environment.
 
-**Option B: stdio** (spawns the MCP server as a subprocess per session):
+**Step 2: Add memory instructions to global CLAUDE.md**
 
-```jsonc
-// ~/.claude.json
-{
-  // ... existing keys ...
-  "mcpServers": {
-    "neuralscape-memory": {
-      "command": "uv",
-      "args": ["run", "--directory", "/absolute/path/to/neuralscape-service", "python", "mcp_server.py"]
-    }
-  }
-}
-```
-
-> HTTP is recommended for global use since it shares a single server process across all sessions. stdio spawns a new MCP server per Claude Code session, each with its own MemoryService initialization overhead.
-
-### 2. Add memory instructions to global CLAUDE.md
-
-Create or append to `~/.claude/CLAUDE.md` so Claude Code knows how to use the memory tools proactively:
+Create or append to `~/.claude/CLAUDE.md`:
 
 ```markdown
 ## Neuralscape Memory Layer
 
-Use the `/neuralscape-memory` skill and the `neuralscape-memory` MCP tools to maintain persistent memory across sessions.
+Context is automatically injected at session start and tool observations are captured
+via the neuralscape plugin hooks. The MCP tools remain available for explicit memory operations.
 
-### Session Start
-
-At the beginning of every session, load the `/neuralscape-memory` skill, then call `get_project_context` (if working in a project) or `recall_memories` (with a broad query like "user preferences and context") to load known context about the user and current project. Use the recalled information to inform your behavior throughout the session.
-
-### When to Store Memories
+### When to Store Memories (via MCP tools)
 
 Proactively call `remember` (fire-and-forget, `wait: false`) when the user:
-- Reveals a preference (tools, style, communication, workflow)
-- Shares a personal fact (name, location, role, team)
-- Makes a technical decision with rationale
-- Discusses project architecture, conventions, or tech stack
-- Explains a workflow or procedure
+- Reveals a preference, shares a personal fact, or makes a technical decision
+- Discusses project architecture, conventions, tech stack, or workflows
 - Mentions a dependency, constraint, or compatibility issue
-
-### What NOT to Store
-
-- Greetings, acknowledgments, or transient dialogue
-- Vague or non-actionable statements ("use good code")
-- Information that is not standalone (requires conversation context to understand)
-- Duplicate facts already in memory (check before storing)
 
 ### Identity
 
-Always pass `user_id: "your-user-id"` on every memory call. Include `project_id` (use the project directory name) when working in a project context.
-
-### Categories
-
-Use the most specific category from the taxonomy (13 categories across semantic, project, episodic, procedural, and working types). Key rules:
-- `preference` = how the user wants things done; `convention` = how a project actually does things
-- `decision` should include rationale ("chose X because Y")
-- `task_context` is ephemeral (current state, not permanent facts)
-- Global categories (`preference`, `personal_fact`, `technical_skill`, `domain_knowledge`) are always `scope=global`
-- Project categories (`tech_stack`, `convention`, `architecture`, `dependency`) require `project_id`
-- Flexible categories default to global but switch to project when `project_id` is provided
-
-### Memory Content Quality
-
-Each memory must be a standalone, specific, factual sentence that makes sense without conversation context.
+Always pass `user_id: "your-user-id"` on every memory call.
+Include `project_id` (use the project directory name) when working in a project context.
 ```
 
-With both pieces in place, Claude Code will automatically recall your preferences and project context at session start, and proactively store new learnings as you work — across every project.
+With both the plugin and MCP server in place, Claude Code will automatically inject stored context at session start, capture tool observations in the background, and have MCP tools available for explicit memory operations — across every project.
 
 ## REST API
 
@@ -362,42 +391,61 @@ curl "http://localhost:8199/v1/graph/communities?user_id=ehfaz"
 ## How It Works
 
 ```
-                    ┌──────────────────────────────────────────────┐
-                    │           neuralscape-service                │
-                    │                                              │
-  Claude Code ────► │  MCP Server (7 tools)   REST API (/v1)      │
-  Any Agent ──────► │       stdio / HTTP         FastAPI           │
-                    │              │                │              │
-                    │              └──────┬─────────┘              │
-                    │                     │                        │
-                    │  ┌─── reads ────────┤                        │
-                    │  │            writes │                        │
-                    │  ▼                  ▼                         │
-                    │  MemoryService    Redis                      │
-                    │  (sync reads)    (task queue)                │
-                    └──────┬──────────────┬────────────────────────┘
-                           │              │
-              ┌────────────┤              │
-              │            │              ▼
-              │            │     ┌─────────────────┐
-              │            │     │  ARQ Worker      │
-              │            │     │  (separate proc) │
-              │            │     │  MemoryService   │
-              │            │     │  (async writes)  │
-              │            │     └────────┬─────────┘
-              │            │              │
-    ┌─────────▼──┐    ┌────▼──────┐       │
-    │   Qdrant   │    │   Neo4j   │◄──────┘
-    │  (vectors) │    │ (Graphiti │
-    │   server   │    │   graph)  │
-    └────────────┘    └───────────┘
+  [Claude Code]
+       │
+       ├─── SessionStart hook ──► neuralscape-plugin ──► GET /v1/context/{id}
+       │                              (inject context)        │
+       ├─── PostToolUse hook ───► neuralscape-plugin ──► POST /v1/memories/raw
+       │                          (async, background)         │
+       ├─── Stop hook ──────────► neuralscape-plugin ──► POST /v1/memories/raw
+       │                          (async, background)         │
+       │                                                      │
+       │    ┌─────────────────────────────────────────────────┘
+       │    │
+       │    ▼
+       │  ┌──────────────────────────────────────────────┐
+       │  │           neuralscape-service                │
+       │  │                                              │
+       ├─►│  MCP Server (7 tools)   REST API (/v1)      │
+       │  │       stdio / HTTP         FastAPI           │
+       │  │              │                │              │
+       │  │              └──────┬─────────┘              │
+       │  │                     │                        │
+       │  │  ┌─── reads ────────┤                        │
+       │  │  │            writes │                        │
+       │  │  ▼                  ▼                         │
+       │  │  MemoryService    Redis                      │
+       │  │  (sync reads)    (task queue)                │
+       │  └──────┬──────────────┬────────────────────────┘
+       │         │              │
+       │    ┌────┤              │
+       │    │    │              ▼
+       │    │    │     ┌─────────────────┐
+       │    │    │     │  ARQ Worker      │
+       │    │    │     │  (separate proc) │
+       │    │    │     │  MemoryService   │
+       │    │    │     │  (async writes)  │
+       │    │    │     └────────┬─────────┘
+       │    │    │              │
+    ┌──▼────▼──┐ │  ┌───────────┘
+    │  Qdrant  │ │  │
+    │ (vectors)│ │  ▼
+    └──────────┘ │ ┌───────────┐
+                 └►│   Neo4j   │
+                   │ (Graphiti │
+                   │   graph)  │
+                   └───────────┘
 ```
 
-**Write path**: Client -> API/MCP -> enqueue to Redis -> 202 Accepted -> ARQ Worker picks up -> Gemini extraction + Qdrant + Neo4j writes -> result stored in Redis -> client polls status.
+**Plugin capture path**: Claude Code → PostToolUse hook → neuralscape-plugin summarizes tool action → fire-and-forget POST to `/v1/memories/raw` → Redis queue → ARQ Worker → Qdrant + Neo4j. Runs async in the background, never blocks Claude.
 
-**Read path**: Client -> API/MCP -> MemoryService -> Qdrant + Neo4j -> 200 OK with results (synchronous, no queue).
+**Plugin injection path**: Claude Code → SessionStart hook → neuralscape-plugin calls `GET /v1/context/{projectId}` → formats as markdown → injected as `additionalContext`. Sync, runs once at session start (~1s).
 
-**Maintenance path**: ARQ cron job runs every 6 hours -> scrolls all users -> removes exact duplicates by hash -> removes semantic near-duplicates above cosine threshold -> expires related graph edges.
+**MCP/API write path**: Client → API/MCP → enqueue to Redis → 202 Accepted → ARQ Worker → Gemini extraction + Qdrant + Neo4j → result stored in Redis → client polls status.
+
+**Read path**: Client → API/MCP → MemoryService → Qdrant + Neo4j → 200 OK with results (synchronous, no queue).
+
+**Maintenance path**: ARQ cron job runs every 6 hours → scrolls all users → removes exact duplicates by hash → removes semantic near-duplicates above cosine threshold → expires related graph edges.
 
 Every memory is stored **twice**: as a vector embedding in Qdrant (for semantic search) and as entities/relationships in a Neo4j knowledge graph via Graphiti (for structured reasoning). Both paths are queried on every search and results are merged.
 
@@ -488,6 +536,7 @@ All settings are environment variables (loaded from `.env`):
 |---|---|---|
 | `GOOGLE_API_KEY` | | Gemini API key |
 | `GEMINI_LLM_MODEL` | `gemini-3-flash-preview` | Model for LLM extraction |
+| `GEMINI_LLM_FALLBACK_MODEL` | `gemini-2.5-flash` | Fallback model when primary returns 503 |
 | `GEMINI_EMBEDDER_MODEL` | `gemini-embedding-001` | Model for embeddings |
 | `NEO4J_URI` | `neo4j://127.0.0.1:7687` | Neo4j connection |
 | `NEO4J_USER` | `neo4j` | Neo4j username |
@@ -511,7 +560,7 @@ All settings are environment variables (loaded from `.env`):
 
 ## Tests
 
-150 tests across 6 files:
+164 tests across 6 files:
 
 | File | What it covers | Services needed |
 |---|---|---|
@@ -534,14 +583,30 @@ uv run pytest tests/test_async_pipeline.py -v -s
 ## Project Structure
 
 ```
-neuralscape-graphiti/
+neuralscape/
 ├── docker-compose.yml            # Redis + Qdrant + Neo4j + API + Worker orchestration
 ├── .dockerignore                 # Build context filters
 ├── .env.example                  # Env template (copy to .env)
+├── .claude-plugin/
+│   └── marketplace.json          # Local marketplace for plugin distribution
+├── neuralscape-plugin/           # Claude Code plugin (TypeScript)
+│   ├── .claude-plugin/
+│   │   └── plugin.json           # Plugin manifest
+│   ├── hooks/
+│   │   └── hooks.json            # Lifecycle hook definitions
+│   ├── src/
+│   │   ├── session-start.ts      # SessionStart: context injection
+│   │   ├── post-tool-use.ts      # PostToolUse: observation capture
+│   │   ├── stop.ts               # Stop: session marker
+│   │   └── utils.ts              # Shared HTTP client, config, helpers
+│   ├── scripts/                  # Built JS (generated by esbuild)
+│   ├── package.json
+│   └── tsconfig.json
 ├── neuralscape-service/          # The service (what you deploy)
 │   ├── Dockerfile                # Multi-stage build with uv
 │   ├── main.py                   # FastAPI app: legacy + v1 endpoints
 │   ├── memory_service.py         # Business logic layer (MemoryService class)
+│   ├── context_formatter.py      # Format memories as markdown for hook injection
 │   ├── mcp_server.py             # MCP server: 7 tools, stdio + HTTP
 │   ├── worker.py                 # ARQ worker: background task processing + dedup cron
 │   ├── task_manager.py           # Redis-backed task enqueuing + status

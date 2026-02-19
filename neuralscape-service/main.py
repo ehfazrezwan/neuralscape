@@ -20,6 +20,7 @@ from memory_service import MemoryService
 
 # Configure structured logging before anything else
 configure_logging()
+from context_formatter import format_context_for_injection
 from schemas import (
     MEMORY_CATEGORIES,
     BulkDeleteRequest,
@@ -735,6 +736,40 @@ async def v1_get_global_context(user_id: str = Query(...)):
     except Exception as e:
         logger.exception("v1 get_global_context failed")
         raise HTTPException(status_code=500, detail="Failed to load global context")
+
+
+@v1_router.get("/context/inject")
+async def v1_inject_context(
+    user_id: str = Query(...),
+    project_id: str | None = Query(default=None),
+    max_chars: int = Query(default=8000, ge=500, le=32000),
+):
+    """Return formatted markdown context for lifecycle hook injection.
+
+    Optimized for Claude Code SessionStart hooks — returns concise markdown
+    organized by category, suitable for additionalContext injection.
+    """
+    try:
+        if project_id:
+            context = await asyncio.to_thread(
+                _service.get_project_context,
+                user_id=user_id,
+                project_id=project_id,
+            )
+        else:
+            context = await asyncio.to_thread(
+                _service.get_global_context,
+                user_id=user_id,
+            )
+
+        formatted = format_context_for_injection(
+            context.categories,
+            max_chars=max_chars,
+        )
+        return {"additionalContext": formatted}
+    except Exception as e:
+        logger.exception("v1 inject_context failed")
+        raise HTTPException(status_code=500, detail="Failed to generate injection context")
 
 
 @v1_router.get("/context/{project_id}", response_model=ContextResponse)

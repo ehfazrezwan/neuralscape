@@ -16,14 +16,14 @@ sync_graphiti() {
     echo "==> Syncing graphiti with upstream..."
     git subtree pull --prefix=graphiti upstream-graphiti main --squash \
         -m "chore: sync graphiti with upstream"
-    echo "    graphiti synced."
+    echo "    graphiti synced (check for merge conflicts in llm_client/config.py / gemini_client.py)."
 }
 
 sync_mem0() {
     echo "==> Syncing mem0 with upstream..."
     git subtree pull --prefix=mem0 upstream-mem0 main --squash \
         -m "chore: sync mem0 with upstream"
-    echo "    mem0 synced (check for merge conflicts in configs.py / factory.py)."
+    echo "    mem0 synced (check for merge conflicts in configs.py / factory.py / graphiti_memory.py)."
 }
 
 case "$TARGET" in
