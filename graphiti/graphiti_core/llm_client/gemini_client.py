@@ -48,7 +48,7 @@ DEFAULT_MODEL = 'gemini-3-flash-preview'
 DEFAULT_SMALL_MODEL = 'gemini-2.5-flash-lite'
 
 # Error patterns indicating the model is temporarily overloaded
-_TRANSIENT_PATTERNS = ('503', 'unavailable', 'overloaded', 'capacity', 'high demand')
+_TRANSIENT_PATTERNS = ('503', 'unavailable', 'overloaded', 'capacity', 'high demand', 'timed out', 'timeout')
 
 
 def _is_transient_error(exc: Exception) -> bool:
