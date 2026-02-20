@@ -16,7 +16,7 @@ from config import settings
 
 
 # HTTP status codes / error substrings that indicate transient failures
-_TRANSIENT_PATTERNS = ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "rate limit", "overloaded", "capacity")
+_TRANSIENT_PATTERNS = ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "rate limit", "overloaded", "capacity", "timed out", "timeout")
 
 
 def _is_transient(exc: Exception) -> bool:
@@ -234,7 +234,7 @@ class MemoryService:
                 model=settings.gemini_llm_model,
                 contents=extraction_messages[0]["content"],
                 config=GenerateContentConfig(
-                    http_options=HttpOptions(timeout=60),
+                    http_options=HttpOptions(timeout=60_000),  # milliseconds
                 ),
                 operation="LLM extraction",
                 fallback_model=settings.gemini_llm_fallback_model,

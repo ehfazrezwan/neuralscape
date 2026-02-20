@@ -65,6 +65,10 @@ class TaskManager:
             run_id,
             _job_id=job_id,
         )
+        if job is None:
+            # Duplicate job ID — ARQ already has this job. Return the ID
+            # so the caller can poll the existing job's status.
+            return job_id
         return job.job_id
 
     async def enqueue_raw(
@@ -97,6 +101,8 @@ class TaskManager:
             run_id,
             _job_id=job_id,
         )
+        if job is None:
+            return job_id
         return job.job_id
 
     async def get_status(self, task_id: str) -> dict:
