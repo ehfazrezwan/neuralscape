@@ -29,3 +29,15 @@ class EmbeddingBase(ABC):
             list: The embedding vector.
         """
         pass
+
+    def embed_batch(self, texts: list[str], memory_action: Optional[Literal["add", "search", "update"]] = None) -> list[list]:
+        """Get embeddings for multiple texts. Subclasses may override with a native batch API.
+
+        Args:
+            texts: List of texts to embed.
+            memory_action: Optional embedding type hint.
+
+        Returns:
+            List of embedding vectors, one per input text.
+        """
+        return [self.embed(text, memory_action=memory_action) for text in texts]
