@@ -3,11 +3,13 @@
 Both REST endpoints and MCP tools call into this same MemoryService.
 """
 
+import hashlib
 import json
 import logging
 import random
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 
 from google import genai
@@ -257,49 +259,21 @@ class MemoryService:
             logger.info("No facts extracted from conversation")
             return []
 
-        # Step 2: Store each fact with category metadata
-        stored = []
-        for category, fact_content in parsed_facts:
-            scope = default_scope_for_category(category)
+        # Step 2: Batch-store all facts (single embed + single Qdrant upsert)
+        try:
+            stored = self._batch_store_facts(
+                facts=parsed_facts,
+                user_id=user_id,
+                project_id=project_id,
+                agent_id=agent_id,
+                run_id=run_id,
+                source="conversation",
+            )
+        except Exception as e:
+            logger.error(f"Batch store failed: {e}")
+            stored = []
 
-            # Override scope if project_id provided and category allows it
-            if project_id and category not in GLOBAL_CATEGORIES:
-                scope = MemoryScope.PROJECT
-
-            # Validate: project categories require project_id
-            if category in PROJECT_CATEGORIES and not project_id:
-                scope = MemoryScope.GLOBAL
-                logger.warning(
-                    f"Category '{category}' typically requires project_id, "
-                    f"storing as global"
-                )
-
-            metadata = {
-                "scope": scope.value,
-                "category": category,
-                "project_id": project_id,
-                "agent_id": agent_id,
-                "run_id": run_id,
-                "source": "conversation",
-            }
-
-            try:
-                result = retry_transient(
-                    m.add,
-                    messages=[{"role": "user", "content": fact_content}],
-                    user_id=user_id,
-                    agent_id=agent_id,
-                    run_id=run_id,
-                    metadata=metadata,
-                    infer=False,
-                    operation=f"store fact '{fact_content[:30]}...'",
-                )
-                responses = self._result_to_responses(result, category=category, scope=scope.value)
-                stored.extend(responses)
-            except Exception as e:
-                logger.error(f"Failed to store fact '{fact_content[:50]}...' after retries: {e}")
-
-        # Step 3: In parallel, add raw conversation text to knowledge graph
+        # Step 3: Add raw conversation text to knowledge graph
         group_id = _build_group_id(
             MemoryScope.PROJECT.value if project_id else MemoryScope.GLOBAL.value,
             project_id,
@@ -354,30 +328,43 @@ class MemoryService:
             raise ValueError("project_id is required when scope='project'")
 
         m = self._get_memory()
+        now_iso = datetime.now(timezone.utc).isoformat()
 
-        metadata = {
-            "scope": scope,
-            "category": category,
-            "project_id": project_id,
+        # ── Direct embed + Qdrant insert (bypass m.add) ──
+        mid = str(uuid.uuid4())
+        embedding = m.embedding_model.embed(content, memory_action="add")
+
+        payload = {
+            "data": content,
+            "hash": hashlib.md5(content.encode()).hexdigest(),
+            "created_at": now_iso,
+            "user_id": user_id,
             "agent_id": agent_id,
             "run_id": run_id,
-            "source": "explicit",
+            "metadata": {
+                "scope": scope,
+                "category": category,
+                "project_id": project_id,
+                "agent_id": agent_id,
+                "run_id": run_id,
+                "source": "explicit",
+            },
         }
         if tags:
-            metadata["tags"] = tags
+            payload["metadata"]["tags"] = tags
 
-        result = retry_transient(
-            m.add,
-            messages=[{"role": "user", "content": content}],
-            user_id=user_id,
-            agent_id=agent_id,
-            run_id=run_id,
-            metadata=metadata,
-            infer=False,
-            operation="store_raw vector add",
+        m.vector_store.insert(
+            vectors=[embedding],
+            ids=[mid],
+            payloads=[payload],
         )
 
-        # Also add to knowledge graph
+        try:
+            m.db.add_history(mid, None, content, "ADD", created_at=now_iso)
+        except Exception as e:
+            logger.warning(f"History record failed for {mid}: {e}")
+
+        # ── Add to knowledge graph ──
         group_id = _build_group_id(scope, project_id)
         try:
             if self._graphiti and self._bridge:
@@ -390,7 +377,128 @@ class MemoryService:
         except Exception as e:
             logger.warning(f"Graph storage failed (non-critical): {e}")
 
-        return self._result_to_responses(result, category=category, scope=scope)
+        return [
+            MemoryResponse(
+                id=mid,
+                memory=content,
+                category=category,
+                scope=scope,
+                project_id=project_id,
+                source="vector",
+                created_at=now_iso,
+            )
+        ]
+
+    def _batch_store_facts(
+        self,
+        facts: list[tuple[str, str]],
+        user_id: str,
+        project_id: str | None = None,
+        agent_id: str | None = None,
+        run_id: str | None = None,
+        source: str = "conversation",
+    ) -> list[MemoryResponse]:
+        """Store multiple categorized facts via a single batch embed + single Qdrant upsert.
+
+        Bypasses mem0's per-fact m.add() pipeline which triggers per-fact graph
+        ingestion.  The caller is responsible for a separate graph.add() call
+        with the full conversation text.
+
+        Args:
+            facts: List of (category, content) tuples.
+            user_id: User identifier.
+            project_id: Optional project identifier.
+            agent_id: Optional agent identifier.
+            run_id: Optional run/session identifier.
+            source: Provenance tag for metadata.
+
+        Returns:
+            List of MemoryResponse objects for stored facts.
+        """
+        if not facts:
+            return []
+
+        m = self._get_memory()
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        # ── Build per-fact metadata, IDs, and texts ──
+        texts: list[str] = []
+        memory_ids: list[str] = []
+        payloads: list[dict] = []
+        fact_meta: list[tuple[str, str]] = []  # (category, scope) per fact
+
+        for category, content in facts:
+            scope = default_scope_for_category(category)
+
+            if project_id and category not in GLOBAL_CATEGORIES:
+                scope = MemoryScope.PROJECT
+
+            if category in PROJECT_CATEGORIES and not project_id:
+                scope = MemoryScope.GLOBAL
+                logger.warning(
+                    f"Category '{category}' typically requires project_id, storing as global"
+                )
+
+            mid = str(uuid.uuid4())
+            payload = {
+                "data": content,
+                "hash": hashlib.md5(content.encode()).hexdigest(),
+                "created_at": now_iso,
+                "user_id": user_id,
+                "agent_id": agent_id,
+                "run_id": run_id,
+                "metadata": {
+                    "scope": scope.value if isinstance(scope, MemoryScope) else scope,
+                    "category": category,
+                    "project_id": project_id,
+                    "agent_id": agent_id,
+                    "run_id": run_id,
+                    "source": source,
+                },
+            }
+
+            texts.append(content)
+            memory_ids.append(mid)
+            payloads.append(payload)
+            fact_meta.append((category, scope.value if isinstance(scope, MemoryScope) else scope))
+
+        # ── Single batch embed ──
+        embeddings = m.embedding_model.embed_batch(texts, memory_action="add")
+
+        # ── Single Qdrant upsert ──
+        m.vector_store.insert(
+            vectors=embeddings,
+            ids=memory_ids,
+            payloads=payloads,
+        )
+
+        # ── Record history entries ──
+        for mid, content in zip(memory_ids, texts):
+            try:
+                m.db.add_history(mid, None, content, "ADD", created_at=now_iso)
+            except Exception as e:
+                logger.warning(f"History record failed for {mid}: {e}")
+
+        # ── Build responses ──
+        responses: list[MemoryResponse] = []
+        for mid, content, (category, scope_val) in zip(memory_ids, texts, fact_meta):
+            responses.append(
+                MemoryResponse(
+                    id=mid,
+                    memory=content,
+                    category=category,
+                    scope=scope_val,
+                    project_id=project_id,
+                    source="vector",
+                    created_at=now_iso,
+                )
+            )
+
+        logger.info(
+            f"Batch-stored {len(responses)} facts for user={user_id} "
+            f"(1 embed call, 1 Qdrant upsert)"
+        )
+        return responses
 
     # ──────────────────────────────────────────────
     # Search operations
