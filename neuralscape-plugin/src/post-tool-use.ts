@@ -2,9 +2,8 @@
  * PostToolUse hook — captures tool observations and fires them to Neuralscape
  * as raw memories. Runs async (fire-and-forget) so it never blocks Claude.
  *
- * Smart filtering: only captures state-changing actions (file writes, builds,
- * deploys, installs). Skips diagnostic/debug commands (docker logs, curl,
- * git status, redis-cli, etc.) to avoid flooding the queue.
+ * Filtering: captures all tool observations except known diagnostic/read-only
+ * commands (git status, docker logs, curl localhost, ls, grep, etc.).
  */
 
 import {
@@ -46,23 +45,7 @@ const SKIP_TOOLS = new Set([
 // ── Bash command filtering ──────────────────────────────────────────
 // Only capture commands that change state. Skip read-only/diagnostic commands.
 
-// Commands that ARE worth capturing (state-changing)
-const BASH_CAPTURE_PATTERNS = [
-  /^(npm|yarn|pnpm|bun)\s+(install|run\s+build|run\s+test|run\s+lint|publish|add|remove)/,
-  /^(uv|pip|poetry)\s+(sync|install|add|remove|run\s+(pytest|arq))/,
-  /^docker\s+compose\s+(up|down|build|restart)/,
-  /^docker\s+build/,
-  /^git\s+(commit|push|merge|rebase|cherry-pick|tag)/,
-  /^(make|cmake)\s+/,
-  /^(cargo|go)\s+(build|test|install|run)/,
-  /^npx\s+/,
-  /^(mkdir|rm|mv|cp)\s+/,
-  /^chmod\s+/,
-  /^ln\s+/,
-  /^curl\s+.*-X\s+(POST|PUT|PATCH|DELETE)/i,  // Only mutating HTTP requests
-];
-
-// Commands to always skip (diagnostic/read-only)
+// Commands to skip (diagnostic/read-only). Everything else is captured.
 const BASH_SKIP_PATTERNS = [
   /^(cat|head|tail|less|more)\s+/,
   /^(ls|ll|find|tree|wc|du|df)\s+/,
@@ -86,18 +69,12 @@ function shouldCaptureBashCommand(command: string): boolean {
   // Skip empty or very short commands
   if (trimmed.length < 3) return false;
 
-  // Check skip patterns first (deny list)
+  // Check skip patterns (deny list) — everything else is captured
   for (const pattern of BASH_SKIP_PATTERNS) {
     if (pattern.test(trimmed)) return false;
   }
 
-  // Check capture patterns (allow list)
-  for (const pattern of BASH_CAPTURE_PATTERNS) {
-    if (pattern.test(trimmed)) return true;
-  }
-
-  // Default: skip. Only capture what we explicitly recognize as state-changing.
-  return false;
+  return true;
 }
 
 // ── File path filtering ─────────────────────────────────────────────
