@@ -862,6 +862,7 @@ async def v1_bulk_delete_memories(req: BulkDeleteRequest):
             scope=req.scope,
             category=req.category,
             project_id=req.project_id,
+            filter_null_category=req.filter_null_category,
         )
     except Exception as e:
         logger.exception("v1 bulk_delete failed")
@@ -923,6 +924,47 @@ async def v1_graph_episodes(
         limit=limit,
     )
     return {"status": "ok", "episodes": episodes}
+
+
+@v1_router.delete("/graph/episodes/junk")
+async def v1_delete_junk_episodes(
+    user_id: str = Query(...),
+    project_id: str | None = Query(default=None),
+    dry_run: bool = Query(default=False),
+):
+    """Delete junk episodic nodes (raw event logs, assistant message dumps).
+
+    Use dry_run=true to preview what would be deleted.
+    """
+    try:
+        result = await asyncio.to_thread(
+            _service.delete_junk_episodes,
+            user_id=user_id,
+            project_id=project_id,
+            dry_run=dry_run,
+        )
+        return {"status": "ok", **result}
+    except Exception as e:
+        logger.exception("v1 delete_junk_episodes failed")
+        raise HTTPException(status_code=500, detail="Failed to delete junk episodes")
+
+
+@v1_router.delete("/graph/episodes/{episode_uuid}")
+async def v1_delete_episode(episode_uuid: str):
+    """Delete a single episodic node by UUID."""
+    try:
+        result = await asyncio.to_thread(
+            _service.delete_episode,
+            episode_uuid=episode_uuid,
+        )
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result["error"])
+        return {"status": "ok", **result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("v1 delete_episode failed")
+        raise HTTPException(status_code=500, detail="Failed to delete episode")
 
 
 @v1_router.get("/graph/communities")
