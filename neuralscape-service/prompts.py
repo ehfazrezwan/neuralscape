@@ -49,6 +49,8 @@ Rules:
 4. Deduplicate — don't extract the same fact twice with different wording.
 5. If a fact could belong to multiple categories, pick the most specific one.
 6. For project-specific facts (tech_stack, convention, architecture, dependency), mention the project name if known.
+7. NEVER extract raw tool operations, shell commands run, files edited/read/written, git operations, terminal output, or build/test execution logs — these are ephemeral actions, not reusable knowledge.
+8. NEVER extract information only meaningful in the current session context (e.g., "currently running tests", "just fixed a bug in X file").
 
 Respond with a JSON object:
 {
