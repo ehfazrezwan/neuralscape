@@ -504,9 +504,8 @@ class MemoryService:
                 else:
                     scope = MemoryScope.GLOBAL
                     logger.warning(
-                        f"Category '{category}' requires project_id but none provided. "
-                        f"Content: '{content[:80]}...'. Storing as global. "
-                        "Pass project_id to route memories to the correct project scope."
+                        f"Category '{category}' requires project_id but none provided and could not be inferred. "
+                        f"Content snippet: '{content[:80]}'. Storing as global scope."
                     )
 
             mid = str(uuid.uuid4())
