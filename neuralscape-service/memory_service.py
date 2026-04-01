@@ -54,6 +54,28 @@ def _is_junk_fact(content: str) -> bool:
     return bool(_JUNK_RE.search(stripped))
 
 
+def _clean_conversation_for_graph(messages: list[dict]) -> list[dict]:
+    """Filter junk lines from conversation messages before graph ingestion.
+
+    Removes lines matching _JUNK_RE from each message's content.
+    Messages that become empty after filtering are dropped entirely.
+    """
+    cleaned = []
+    for msg in messages:
+        content = msg.get("content", "")
+        if not content:
+            cleaned.append(msg)
+            continue
+        clean_lines = [
+            line for line in content.splitlines()
+            if not _JUNK_RE.match(line.strip())
+        ]
+        clean_content = "\n".join(clean_lines).strip()
+        if clean_content:
+            cleaned.append({**msg, "content": clean_content})
+    return cleaned
+
+
 # Known project slugs for project_id inference
 _KNOWN_PROJECT_SLUGS = [
     "svc-utility-belt",
