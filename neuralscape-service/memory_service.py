@@ -342,32 +342,18 @@ class MemoryService:
             logger.error(f"Batch store failed: {e}")
             stored = []
 
-        # Step 3: Add raw conversation text to knowledge graph (with junk lines stripped)
+        # Step 3: Add cleaned conversation text to knowledge graph
         group_id = _build_group_id(
             MemoryScope.PROJECT.value if project_id else MemoryScope.GLOBAL.value,
             project_id,
         )
+        cleaned_messages = _clean_conversation_for_graph(messages)
         raw_text = "\n".join(
             f"{msg.get('role', 'user')}: {msg.get('content', '')}"
-            for msg in messages
-        )
-        # Strip tool output / event log lines before graph ingestion.
-        # Lines may be prefixed with "role: " so also check after stripping the prefix.
-        def _is_junk_line(line: str) -> bool:
-            if _JUNK_RE.search(line):
-                return True
-            # Strip common role prefixes and recheck
-            for prefix in ("user: ", "assistant: ", "system: ", "tool: "):
-                if line.lower().startswith(prefix):
-                    return _JUNK_RE.search(line[len(prefix):]) is not None
-            return False
-
-        raw_text = "\n".join(
-            line for line in raw_text.split("\n")
-            if not _is_junk_line(line)
+            for msg in cleaned_messages
         )
         try:
-            if self._graphiti and self._bridge:
+            if self._graphiti and self._bridge and raw_text.strip():
                 retry_transient(
                     self._memory.graph.add,
                     data=raw_text,
