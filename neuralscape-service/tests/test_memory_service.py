@@ -7,6 +7,7 @@ import pytest
 from memory_service import (
     MemoryService,
     _build_group_id,
+    _clean_conversation_for_graph,
     _get_group_ids,
     _infer_project_id,
     _is_junk_fact,
@@ -497,6 +498,69 @@ class TestIsJunkFact:
         assert _is_junk_fact("edited FILE: foo.py") is True
 
 
+class TestCleanConversationForGraph:
+    def test_removes_junk_lines_from_content(self):
+        messages = [
+            {"role": "assistant", "content": "Ran command: git status\nGot it, here's the status."},
+        ]
+        cleaned = _clean_conversation_for_graph(messages)
+        assert len(cleaned) == 1
+        assert "Ran command:" not in cleaned[0]["content"]
+        assert "Got it" in cleaned[0]["content"]
+
+    def test_drops_message_that_becomes_empty(self):
+        messages = [
+            {"role": "user", "content": "I prefer dark mode"},
+            {"role": "assistant", "content": "Ran command: echo ok"},
+        ]
+        cleaned = _clean_conversation_for_graph(messages)
+        assert len(cleaned) == 1
+        assert cleaned[0]["content"] == "I prefer dark mode"
+
+    def test_preserves_clean_messages(self):
+        messages = [
+            {"role": "user", "content": "I prefer tabs over spaces"},
+            {"role": "assistant", "content": "Noted, storing that preference."},
+        ]
+        cleaned = _clean_conversation_for_graph(messages)
+        assert len(cleaned) == 2
+        assert cleaned[0]["content"] == "I prefer tabs over spaces"
+        assert cleaned[1]["content"] == "Noted, storing that preference."
+
+    def test_preserves_empty_content_messages(self):
+        messages = [{"role": "system", "content": ""}]
+        cleaned = _clean_conversation_for_graph(messages)
+        assert len(cleaned) == 1
+
+    def test_filters_multiple_junk_patterns(self):
+        messages = [
+            {"role": "assistant", "content": "Edited file: src/main.py\nWrote file: /tmp/out.txt\nTool result: success\nDone with the changes."},
+        ]
+        cleaned = _clean_conversation_for_graph(messages)
+        assert len(cleaned) == 1
+        assert cleaned[0]["content"] == "Done with the changes."
+
+    def test_empty_messages_list(self):
+        assert _clean_conversation_for_graph([]) == []
+
+    def test_preserves_role_and_other_keys(self):
+        messages = [
+            {"role": "user", "content": "hello", "name": "ehfaz"},
+        ]
+        cleaned = _clean_conversation_for_graph(messages)
+        assert cleaned[0]["role"] == "user"
+        assert cleaned[0]["name"] == "ehfaz"
+
+    def test_case_insensitive_junk_detection(self):
+        messages = [
+            {"role": "assistant", "content": "RAN COMMAND: ls -la\nHere are the files."},
+        ]
+        cleaned = _clean_conversation_for_graph(messages)
+        assert len(cleaned) == 1
+        assert "RAN COMMAND:" not in cleaned[0]["content"]
+        assert "Here are the files." in cleaned[0]["content"]
+
+
 class TestExtractAndStoreJunkFilter:
     def test_junk_facts_filtered_from_extraction(self, service):
         mock_client = MagicMock()
@@ -537,6 +601,40 @@ class TestExtractAndStoreJunkFilter:
         graph_text = call_args[1]["data"] if "data" in call_args[1] else call_args[0][0]
         assert "Ran command:" not in graph_text
         assert "dark mode" in graph_text
+
+    def test_graph_add_skipped_when_all_messages_are_junk(self, service):
+        """If _clean_conversation_for_graph removes all content, graph.add() should not be called."""
+        mock_client = MagicMock()
+        service._genai_model = mock_client
+        mock_client.models.generate_content.return_value = MagicMock(
+            text='{"facts": ["[preference] Prefers dark mode"]}'
+        )
+        service._memory.embedding_model.embed_batch.return_value = [[0.1] * 768]
+
+        service.extract_and_store(
+            messages=[
+                {"role": "assistant", "content": "Ran command: git status"},
+                {"role": "assistant", "content": "Tool result: success"},
+            ],
+            user_id="ehfaz",
+        )
+
+        service._memory.graph.add.assert_not_called()
+
+    def test_store_raw_does_not_filter_graph_content(self, service):
+        """store_raw() graph path should NOT apply conversation junk filter."""
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+
+        service.store_raw(
+            content="Ran command: git status\nImportant context.",
+            user_id="ehfaz",
+            category="task_context",
+        )
+
+        # store_raw passes content directly to graph.add without filtering
+        call_args = service._memory.graph.add.call_args
+        graph_text = call_args[1]["data"] if "data" in call_args[1] else call_args[0][0]
+        assert "Ran command:" in graph_text
 
 
 # ──────────────────────────────────────────────

@@ -54,6 +54,28 @@ def _is_junk_fact(content: str) -> bool:
     return bool(_JUNK_RE.search(stripped))
 
 
+def _clean_conversation_for_graph(messages: list[dict]) -> list[dict]:
+    """Filter junk lines from conversation messages before graph ingestion.
+
+    Removes lines matching _JUNK_RE from each message's content.
+    Messages that become empty after filtering are dropped entirely.
+    """
+    cleaned = []
+    for msg in messages:
+        content = msg.get("content", "")
+        if not content:
+            cleaned.append(msg)
+            continue
+        clean_lines = [
+            line for line in content.splitlines()
+            if not _JUNK_RE.match(line.strip())
+        ]
+        clean_content = "\n".join(clean_lines).strip()
+        if clean_content:
+            cleaned.append({**msg, "content": clean_content})
+    return cleaned
+
+
 # Known project slugs for project_id inference
 _KNOWN_PROJECT_SLUGS = [
     "svc-utility-belt",
@@ -320,32 +342,18 @@ class MemoryService:
             logger.error(f"Batch store failed: {e}")
             stored = []
 
-        # Step 3: Add raw conversation text to knowledge graph (with junk lines stripped)
+        # Step 3: Add cleaned conversation text to knowledge graph
         group_id = _build_group_id(
             MemoryScope.PROJECT.value if project_id else MemoryScope.GLOBAL.value,
             project_id,
         )
+        cleaned_messages = _clean_conversation_for_graph(messages)
         raw_text = "\n".join(
             f"{msg.get('role', 'user')}: {msg.get('content', '')}"
-            for msg in messages
-        )
-        # Strip tool output / event log lines before graph ingestion.
-        # Lines may be prefixed with "role: " so also check after stripping the prefix.
-        def _is_junk_line(line: str) -> bool:
-            if _JUNK_RE.search(line):
-                return True
-            # Strip common role prefixes and recheck
-            for prefix in ("user: ", "assistant: ", "system: ", "tool: "):
-                if line.lower().startswith(prefix):
-                    return _JUNK_RE.search(line[len(prefix):]) is not None
-            return False
-
-        raw_text = "\n".join(
-            line for line in raw_text.split("\n")
-            if not _is_junk_line(line)
+            for msg in cleaned_messages
         )
         try:
-            if self._graphiti and self._bridge:
+            if self._graphiti and self._bridge and raw_text.strip():
                 retry_transient(
                     self._memory.graph.add,
                     data=raw_text,
