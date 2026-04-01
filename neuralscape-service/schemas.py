@@ -151,6 +151,10 @@ class BulkDeleteRequest(BaseModel):
     scope: str | None = None
     category: str | None = None
     project_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+    filter_null_category: bool = Field(
+        default=False,
+        description="When True, delete only memories with null/missing category instead of all",
+    )
 
 
 # ──────────────────────────────────────────────

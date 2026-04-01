@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import random
+import re
 import threading
 import time
 import uuid
@@ -25,6 +26,50 @@ def _is_transient(exc: Exception) -> bool:
     """Check if an exception looks like a transient/retryable API error."""
     msg = str(exc)
     return any(p.lower() in msg.lower() for p in _TRANSIENT_PATTERNS)
+
+
+# Patterns matching raw tool/event log lines that should not be stored as memories
+_JUNK_PATTERNS = [
+    r"^Ran command:",
+    r"^Edited file[:\s]",
+    r"^Wrote file[:\s]",
+    r"^Read file[:\s]",
+    r"^Created file[:\s]",
+    r"^Deleted file[:\s]",
+    r"^Launched \w+ task:",
+    r"^Tool result:",
+    r"^Command output:",
+]
+_JUNK_RE = re.compile("|".join(_JUNK_PATTERNS), re.IGNORECASE | re.MULTILINE)
+
+# All known project group IDs for multi-group episode cleanup
+ALL_KNOWN_PROJECTS = ["svc-utility-belt", "lightpath", "neuralscape", "openclaw"]
+
+
+def _is_junk_fact(content: str) -> bool:
+    """Return True if an extracted fact is a raw event log rather than contextual knowledge."""
+    stripped = content.strip()
+    if len(stripped) < 10:
+        return True
+    return bool(_JUNK_RE.search(stripped))
+
+
+# Known project slugs for project_id inference
+_KNOWN_PROJECT_SLUGS = [
+    "svc-utility-belt",
+    "lightpath",
+    "neuralscape",
+    "openclaw",
+]
+
+
+def _infer_project_id(content: str) -> str | None:
+    """Try to infer a project_id from memory content by matching known project slugs."""
+    content_lower = content.lower()
+    for slug in _KNOWN_PROJECT_SLUGS:
+        if slug in content_lower:
+            return slug
+    return None
 
 
 def retry_transient(
@@ -243,17 +288,19 @@ class MemoryService:
             )
             parsed_facts = parse_extraction_response(response.text)
         except Exception as e:
-            logger.error(f"LLM extraction failed after retries: {e}")
-            # Fallback: store the raw conversation through mem0's pipeline
-            result = retry_transient(
-                m.add,
-                messages=messages,
-                user_id=user_id,
-                agent_id=agent_id,
-                run_id=run_id,
-                operation="mem0 fallback add",
+            logger.error(f"LLM extraction failed for user {user_id}: {e}")
+            return []
+
+        # Filter out junk facts from extraction
+        pre_filter_count = len(parsed_facts)
+        parsed_facts = [
+            (cat, content) for cat, content in parsed_facts
+            if not _is_junk_fact(content)
+        ]
+        if pre_filter_count != len(parsed_facts):
+            logger.info(
+                f"Filtered {pre_filter_count - len(parsed_facts)} junk facts from extraction"
             )
-            return self._result_to_responses(result)
 
         if not parsed_facts:
             logger.info("No facts extracted from conversation")
@@ -273,7 +320,7 @@ class MemoryService:
             logger.error(f"Batch store failed: {e}")
             stored = []
 
-        # Step 3: Add raw conversation text to knowledge graph
+        # Step 3: Add raw conversation text to knowledge graph (with junk lines stripped)
         group_id = _build_group_id(
             MemoryScope.PROJECT.value if project_id else MemoryScope.GLOBAL.value,
             project_id,
@@ -281,6 +328,21 @@ class MemoryService:
         raw_text = "\n".join(
             f"{msg.get('role', 'user')}: {msg.get('content', '')}"
             for msg in messages
+        )
+        # Strip tool output / event log lines before graph ingestion.
+        # Lines may be prefixed with "role: " so also check after stripping the prefix.
+        def _is_junk_line(line: str) -> bool:
+            if _JUNK_RE.search(line):
+                return True
+            # Strip common role prefixes and recheck
+            for prefix in ("user: ", "assistant: ", "system: ", "tool: "):
+                if line.lower().startswith(prefix):
+                    return _JUNK_RE.search(line[len(prefix):]) is not None
+            return False
+
+        raw_text = "\n".join(
+            line for line in raw_text.split("\n")
+            if not _is_junk_line(line)
         )
         try:
             if self._graphiti and self._bridge:
@@ -425,19 +487,29 @@ class MemoryService:
         texts: list[str] = []
         memory_ids: list[str] = []
         payloads: list[dict] = []
-        fact_meta: list[tuple[str, str]] = []  # (category, scope) per fact
+        fact_meta: list[tuple[str, str, str | None]] = []  # (category, scope, project_id) per fact
 
         for category, content in facts:
             scope = default_scope_for_category(category)
+            fact_project_id = project_id
 
-            if project_id and category not in GLOBAL_CATEGORIES:
+            if fact_project_id and category not in GLOBAL_CATEGORIES:
                 scope = MemoryScope.PROJECT
 
-            if category in PROJECT_CATEGORIES and not project_id:
-                scope = MemoryScope.GLOBAL
-                logger.warning(
-                    f"Category '{category}' typically requires project_id, storing as global"
-                )
+            if category in PROJECT_CATEGORIES and not fact_project_id:
+                inferred = _infer_project_id(content)
+                if inferred:
+                    fact_project_id = inferred
+                    scope = MemoryScope.PROJECT
+                    logger.info(
+                        f"Inferred project_id='{inferred}' from content for category '{category}'"
+                    )
+                else:
+                    scope = MemoryScope.GLOBAL
+                    logger.warning(
+                        f"Category '{category}' requires project_id but none provided and could not be inferred. "
+                        f"Content snippet: '{content[:80]}'. Storing as global scope."
+                    )
 
             mid = str(uuid.uuid4())
             payload = {
@@ -450,7 +522,7 @@ class MemoryService:
                 "metadata": {
                     "scope": scope.value if isinstance(scope, MemoryScope) else scope,
                     "category": category,
-                    "project_id": project_id,
+                    "project_id": fact_project_id,
                     "agent_id": agent_id,
                     "run_id": run_id,
                     "source": source,
@@ -460,7 +532,7 @@ class MemoryService:
             texts.append(content)
             memory_ids.append(mid)
             payloads.append(payload)
-            fact_meta.append((category, scope.value if isinstance(scope, MemoryScope) else scope))
+            fact_meta.append((category, scope.value if isinstance(scope, MemoryScope) else scope, fact_project_id))
 
         # ── Single batch embed ──
         embeddings = m.embedding_model.embed_batch(texts, memory_action="add")
@@ -481,14 +553,14 @@ class MemoryService:
 
         # ── Build responses ──
         responses: list[MemoryResponse] = []
-        for mid, content, (category, scope_val) in zip(memory_ids, texts, fact_meta):
+        for mid, content, (category, scope_val, fact_pid) in zip(memory_ids, texts, fact_meta):
             responses.append(
                 MemoryResponse(
                     id=mid,
                     memory=content,
                     category=category,
                     scope=scope_val,
-                    project_id=project_id,
+                    project_id=fact_pid,
                     source="vector",
                     created_at=now_iso,
                 )
@@ -853,17 +925,40 @@ class MemoryService:
         scope: str | None = None,
         category: str | None = None,
         project_id: str | None = None,
+        filter_null_category: bool = False,
     ) -> dict:
         """Bulk delete memories with filters from both vector store and graph."""
         m = self._get_memory()
 
-        if not scope and not category and not project_id:
+        has_any_filter = scope or category or project_id or filter_null_category
+        if not has_any_filter:
             # Delete all for user — also expire all graph edges in user's groups
+            logger.warning(
+                f"Deleting ALL memories for user={user_id} (no filters specified)"
+            )
             if self._graphiti and self._bridge:
                 group_ids = _get_group_ids(project_id)
                 self._expire_graph_edges_for_groups(group_ids)
             m.delete_all(user_id=user_id)
             return {"message": "All memories deleted"}
+
+        if filter_null_category:
+            memories_to_delete = self._list_null_category_memories(
+                user_id=user_id, scope=scope, project_id=project_id,
+            )
+            deleted_count = 0
+            for mem_info in memories_to_delete:
+                mid = mem_info["id"]
+                try:
+                    m.vector_store.delete(mid)
+                    if self._graphiti and self._bridge:
+                        self._expire_graph_edges_for_memory(
+                            {"memory": mem_info.get("data", ""), "metadata": mem_info.get("metadata", {})}
+                        )
+                    deleted_count += 1
+                except Exception as e:
+                    logger.warning(f"Failed to delete null-category memory {mid}: {e}")
+            return {"message": f"Deleted {deleted_count} null-category memories"}
 
         # For filtered deletes, we need to list then delete individually
         memories = self.list_memories(
@@ -886,6 +981,63 @@ class MemoryService:
                 logger.warning(f"Failed to delete memory {mem.id}: {e}")
 
         return {"message": f"Deleted {deleted_count} memories"}
+
+    def _list_null_category_memories(
+        self,
+        user_id: str,
+        scope: str | None = None,
+        project_id: str | None = None,
+        limit: int = 500,
+    ) -> list[dict]:
+        """List memories where metadata.category is null/missing using Qdrant's IsNullCondition."""
+        from qdrant_client.models import (
+            FieldCondition,
+            Filter,
+            IsNullCondition,
+            MatchValue,
+            PayloadField,
+        )
+
+        client = self._memory.vector_store.client
+        collection = settings.qdrant_collection
+
+        must_conditions = [
+            FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+            IsNullCondition(is_null=PayloadField(key="metadata.category")),
+        ]
+        if scope:
+            must_conditions.append(
+                FieldCondition(key="metadata.scope", match=MatchValue(value=scope))
+            )
+        if project_id:
+            must_conditions.append(
+                FieldCondition(key="metadata.project_id", match=MatchValue(value=project_id))
+            )
+
+        scroll_filter = Filter(must=must_conditions)
+        all_points: list[dict] = []
+        offset = None
+        while len(all_points) < limit:
+            points, next_offset = client.scroll(
+                collection_name=collection,
+                scroll_filter=scroll_filter,
+                limit=min(100, limit - len(all_points)),
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for pt in points:
+                payload = pt.payload or {}
+                all_points.append({
+                    "id": str(pt.id),
+                    "data": payload.get("data", ""),
+                    "metadata": payload.get("metadata", {}),
+                })
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        return all_points
 
     # ──────────────────────────────────────────────
     # Graph introspection
@@ -1022,6 +1174,111 @@ class MemoryService:
         except Exception as e:
             logger.warning("get_graph_communities failed: %s", e)
             return []
+
+    def delete_episode(self, episode_uuid: str) -> dict:
+        """Delete a single episodic node from the graph by UUID."""
+        g = self._get_graphiti()
+        if g is None:
+            return {"error": "Graphiti not initialized"}
+
+        try:
+            self._run_on_bridge(
+                g.driver.execute_query(
+                    "MATCH (e:EpisodicNode {uuid: $uuid}) DETACH DELETE e",
+                    parameters_={"uuid": episode_uuid},
+                )
+            )
+            return {"message": f"Episode {episode_uuid} deleted"}
+        except Exception as e:
+            logger.error(f"Failed to delete episode {episode_uuid}: {e}")
+            return {"error": str(e)}
+
+    def _find_junk_episodes(self, episodes: list[dict]) -> list[dict]:
+        """Filter a list of episodes to only those matching junk patterns."""
+        junk = []
+        for ep in episodes:
+            content = ep.get("content", "")
+            is_assistant_log = content.strip().startswith("assistant:")
+            is_junk_pattern = bool(_JUNK_RE.search(content))
+            if is_assistant_log or is_junk_pattern:
+                junk.append(ep)
+        return junk
+
+    def delete_junk_episodes(
+        self,
+        user_id: str,
+        project_id: str | None = None,
+        dry_run: bool = False,
+    ) -> dict:
+        """Find and delete junk episodic nodes whose content matches raw event patterns.
+
+        Junk episodes are those with content starting with 'assistant:' (raw conversation
+        logs) or matching _JUNK_PATTERNS.
+
+        When project_id is provided, only that group is cleaned.
+        When omitted, ALL known groups are cleaned (global + all projects).
+
+        Args:
+            user_id: User identifier (maps to group_id for filtering).
+            project_id: Optional project scope. If None, cleans all known groups.
+            dry_run: If True, list junk episodes without deleting.
+
+        Returns:
+            Dict with per-group breakdown of junk counts / deletions.
+        """
+        # Determine which project_ids to scan
+        if project_id is not None:
+            project_ids_to_scan = [project_id]
+        else:
+            # None = global group, then all known projects
+            project_ids_to_scan = [None] + ALL_KNOWN_PROJECTS
+
+        breakdown = {}
+        total_junk = 0
+        total_deleted = 0
+        all_samples = []
+
+        for pid in project_ids_to_scan:
+            group_label = pid if pid else "global"
+            episodes = self.get_graph_episodes(user_id=user_id, project_id=pid, limit=500)
+            junk_episodes = self._find_junk_episodes(episodes)
+            total_junk += len(junk_episodes)
+
+            if dry_run:
+                breakdown[group_label] = {"junk_count": len(junk_episodes)}
+                all_samples.extend(
+                    {"uuid": ep["uuid"], "group": group_label, "content": ep["content"][:120]}
+                    for ep in junk_episodes[:5]
+                )
+            else:
+                deleted_uuids = []
+                for ep in junk_episodes:
+                    result = self.delete_episode(ep["uuid"])
+                    if "error" not in result:
+                        deleted_uuids.append(ep["uuid"])
+                breakdown[group_label] = {
+                    "deleted_count": len(deleted_uuids),
+                    "deleted_uuids": deleted_uuids,
+                }
+                total_deleted += len(deleted_uuids)
+                all_samples.extend(
+                    {"uuid": ep["uuid"], "group": group_label, "content": ep["content"][:120]}
+                    for ep in junk_episodes[:3]
+                )
+
+        if dry_run:
+            return {
+                "dry_run": True,
+                "junk_count": total_junk,
+                "breakdown": breakdown,
+                "samples": all_samples[:15],
+            }
+
+        return {
+            "deleted_count": total_deleted,
+            "breakdown": breakdown,
+            "samples": all_samples[:15],
+        }
 
     # ──────────────────────────────────────────────
     # Helpers

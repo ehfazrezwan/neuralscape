@@ -283,6 +283,10 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Delete memories for this project",
                     },
+                    "filter_null_category": {
+                        "type": "boolean",
+                        "description": "When True, delete only memories with null/missing category instead of all",
+                    },
                 },
                 "required": ["user_id"],
             },
@@ -418,6 +422,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     scope=arguments.get("scope"),
                     category=arguments.get("category"),
                     project_id=arguments.get("project_id"),
+                    filter_null_category=arguments.get("filter_null_category", False),
                 )
             return [TextContent(type="text", text=json.dumps(result, default=str))]
 

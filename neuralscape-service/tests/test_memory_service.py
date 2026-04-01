@@ -4,7 +4,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from memory_service import MemoryService, _build_group_id, _get_group_ids
+from memory_service import (
+    MemoryService,
+    _build_group_id,
+    _get_group_ids,
+    _infer_project_id,
+    _is_junk_fact,
+)
 from schemas import MemoryResponse, MemoryScope
 
 
@@ -316,20 +322,19 @@ class TestExtractAndStore:
         # Returns 2 MemoryResponse objects
         assert len(results) == 2
 
-    def test_extraction_falls_back_on_llm_error(self, service):
+    def test_extraction_returns_empty_on_llm_error(self, service):
         mock_client = MagicMock()
         service._genai_model = mock_client
         mock_client.models.generate_content.side_effect = Exception("API error")
 
-        service._memory.add.return_value = {"results": []}
-
-        service.extract_and_store(
+        results = service.extract_and_store(
             messages=[{"role": "user", "content": "hello"}],
             user_id="ehfaz",
         )
 
-        # Should fall back to basic mem0 add
-        service._memory.add.assert_called_once()
+        # Should return empty list instead of falling back to m.add()
+        assert results == []
+        service._memory.add.assert_not_called()
 
     def test_extraction_still_calls_graph_add(self, service):
         mock_client = MagicMock()
@@ -447,3 +452,307 @@ class TestMergeResults:
         result2 = {"results": [{"id": "m2", "memory": "high", "score": 0.9}]}
         merged = svc._merge_results(result1, result2)
         assert merged[0]["id"] == "m2"
+
+
+# ──────────────────────────────────────────────
+# Junk filter tests
+# ──────────────────────────────────────────────
+
+
+class TestIsJunkFact:
+    def test_short_content_is_junk(self):
+        assert _is_junk_fact("hi") is True
+        assert _is_junk_fact("") is True
+        assert _is_junk_fact("   ab   ") is True
+
+    def test_ran_command_is_junk(self):
+        assert _is_junk_fact("Ran command: git status") is True
+
+    def test_edited_file_is_junk(self):
+        assert _is_junk_fact("Edited file: src/main.py") is True
+        assert _is_junk_fact("Edited file src/main.py line 42") is True
+
+    def test_wrote_file_is_junk(self):
+        assert _is_junk_fact("Wrote file: /tmp/output.txt") is True
+
+    def test_read_file_is_junk(self):
+        assert _is_junk_fact("Read file: config.json") is True
+
+    def test_tool_result_is_junk(self):
+        assert _is_junk_fact("Tool result: success, 3 files changed") is True
+
+    def test_command_output_is_junk(self):
+        assert _is_junk_fact("Command output: npm install completed") is True
+
+    def test_launched_task_is_junk(self):
+        assert _is_junk_fact("Launched background task: test-runner") is True
+
+    def test_real_fact_is_not_junk(self):
+        assert _is_junk_fact("Ehfaz prefers tabs over spaces") is False
+        assert _is_junk_fact("The neuralscape project uses FastAPI with Qdrant") is False
+        assert _is_junk_fact("User prefers dark mode in all editors") is False
+
+    def test_case_insensitive(self):
+        assert _is_junk_fact("RAN COMMAND: ls -la") is True
+        assert _is_junk_fact("edited FILE: foo.py") is True
+
+
+class TestExtractAndStoreJunkFilter:
+    def test_junk_facts_filtered_from_extraction(self, service):
+        mock_client = MagicMock()
+        service._genai_model = mock_client
+        mock_client.models.generate_content.return_value = MagicMock(
+            text='{"facts": ["[preference] Prefers tabs over spaces", "[interaction] Ran command: git status"]}'
+        )
+
+        service._memory.embedding_model.embed_batch.return_value = [[0.1] * 768]
+
+        results = service.extract_and_store(
+            messages=[{"role": "user", "content": "I prefer tabs"}],
+            user_id="ehfaz",
+        )
+
+        # Only 1 fact should remain after filtering
+        assert len(results) == 1
+        assert results[0].memory == "Prefers tabs over spaces"
+
+    def test_graph_text_has_junk_lines_stripped(self, service):
+        mock_client = MagicMock()
+        service._genai_model = mock_client
+        mock_client.models.generate_content.return_value = MagicMock(
+            text='{"facts": ["[preference] Prefers dark mode"]}'
+        )
+        service._memory.embedding_model.embed_batch.return_value = [[0.1] * 768]
+
+        service.extract_and_store(
+            messages=[
+                {"role": "user", "content": "I prefer dark mode"},
+                {"role": "assistant", "content": "Ran command: echo ok\nGot it, storing preference."},
+            ],
+            user_id="ehfaz",
+        )
+
+        # Graph add should be called with text that doesn't contain the junk line
+        call_args = service._memory.graph.add.call_args
+        graph_text = call_args[1]["data"] if "data" in call_args[1] else call_args[0][0]
+        assert "Ran command:" not in graph_text
+        assert "dark mode" in graph_text
+
+
+# ──────────────────────────────────────────────
+# Null-category bulk delete tests
+# ──────────────────────────────────────────────
+
+
+class TestBulkDeleteNullCategory:
+    def test_null_category_does_not_trigger_delete_all(self, service):
+        """Passing category=None should NOT delete all memories."""
+        service._memory.get_all.return_value = {"results": []}
+        service._memory.delete.return_value = {"message": "deleted"}
+
+        # Without filter_null_category, category=None + no other filters = delete all
+        service.delete_memories(user_id="ehfaz")
+        service._memory.delete_all.assert_called_once()
+
+        service._memory.reset_mock()
+
+        # With filter_null_category=True, should NOT call delete_all
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.scroll.return_value = ([], None)
+        service.delete_memories(user_id="ehfaz", filter_null_category=True)
+        service._memory.delete_all.assert_not_called()
+
+    def test_filter_null_category_uses_qdrant_scroll(self, service):
+        """filter_null_category should use IsNullCondition scroll."""
+        mock_client = MagicMock()
+        service._memory.vector_store.client = mock_client
+
+        mock_point = MagicMock()
+        mock_point.id = "point-1"
+        mock_point.payload = {"data": "some uncategorized memory", "metadata": {}}
+        mock_client.scroll.return_value = ([mock_point], None)
+
+        result = service.delete_memories(user_id="ehfaz", filter_null_category=True)
+
+        # Should have called scroll with IsNullCondition
+        mock_client.scroll.assert_called_once()
+        # Should have deleted the found point
+        service._memory.vector_store.delete.assert_called_once_with("point-1")
+        assert "1 null-category" in result["message"]
+
+
+# ──────────────────────────────────────────────
+# project_id inference tests
+# ──────────────────────────────────────────────
+
+
+class TestInferProjectId:
+    def test_infers_known_slug(self):
+        assert _infer_project_id("The neuralscape project uses FastAPI") == "neuralscape"
+        assert _infer_project_id("Lightpath uses Three.js") == "lightpath"
+        assert _infer_project_id("OpenClaw agent framework") == "openclaw"
+        assert _infer_project_id("svc-utility-belt deploys on GKE") == "svc-utility-belt"
+
+    def test_returns_none_for_unknown(self):
+        assert _infer_project_id("User prefers dark mode") is None
+        assert _infer_project_id("Some random project") is None
+
+    def test_case_insensitive(self):
+        assert _infer_project_id("NEURALSCAPE uses Qdrant") == "neuralscape"
+
+    def test_batch_store_infers_project_id(self, service):
+        service._memory.embedding_model.embed_batch.return_value = [[0.1] * 768]
+
+        facts = [("tech_stack", "Neuralscape uses FastAPI with Qdrant for vector search")]
+        results = service._batch_store_facts(facts=facts, user_id="ehfaz")
+
+        assert results[0].scope == "project"
+        assert results[0].project_id == "neuralscape"
+
+
+# ──────────────────────────────────────────────
+# Graph episode deletion tests
+# ──────────────────────────────────────────────
+
+
+class TestDeleteEpisode:
+    def test_delete_episode_calls_cypher(self, service):
+        service._bridge.run = MagicMock(return_value=None)
+        # Mock run_coroutine_threadsafe + future
+        import asyncio
+        import concurrent.futures
+
+        mock_future = MagicMock()
+        mock_future.result.return_value = None
+        with patch("asyncio.run_coroutine_threadsafe", return_value=mock_future):
+            result = service.delete_episode("some-uuid")
+
+        assert result["message"] == "Episode some-uuid deleted"
+
+    def test_delete_episode_handles_error(self, service):
+        import asyncio
+
+        mock_future = MagicMock()
+        mock_future.result.side_effect = Exception("Neo4j down")
+        with patch("asyncio.run_coroutine_threadsafe", return_value=mock_future):
+            result = service.delete_episode("bad-uuid")
+
+        assert "error" in result
+
+
+class TestDeleteJunkEpisodes:
+    def _mock_episodes_by_project(self, user_id=None, project_id=None, limit=500):
+        """Return test episodes keyed by project_id (None = global)."""
+        data = {
+            None: [
+                {"uuid": "g-1", "content": "Ehfaz prefers dark mode", "group_id": "global"},
+                {"uuid": "g-2", "content": "assistant: Got it, I'll fix that bug now.", "group_id": "global"},
+                {"uuid": "g-3", "content": "Ran command: git status", "group_id": "global"},
+            ],
+            "svc-utility-belt": [
+                {"uuid": "su-1", "content": "assistant: Sure, deploying now.", "group_id": "project--svc-utility-belt"},
+                {"uuid": "su-2", "content": "Uses FastAPI for microservices", "group_id": "project--svc-utility-belt"},
+            ],
+            "lightpath": [],
+            "neuralscape": [
+                {"uuid": "ns-1", "content": "Wrote file: main.py", "group_id": "project--neuralscape"},
+                {"uuid": "ns-2", "content": "Neo4j is the graph backend", "group_id": "project--neuralscape"},
+            ],
+            "openclaw": [
+                {"uuid": "oc-1", "content": "Tool result: success", "group_id": "project--openclaw"},
+            ],
+        }
+        return data.get(project_id, [])
+
+    def test_dry_run_single_project(self, service):
+        """dry_run with explicit project_id only scans that group."""
+        service.get_graph_episodes = MagicMock(return_value=[
+            {"uuid": "ep-1", "content": "Ehfaz prefers dark mode", "group_id": "global"},
+            {"uuid": "ep-2", "content": "assistant: Got it, fixing.", "group_id": "global"},
+            {"uuid": "ep-3", "content": "Ran command: git status", "group_id": "global"},
+            {"uuid": "ep-4", "content": "User uses Python 3.12", "group_id": "global"},
+        ])
+
+        result = service.delete_junk_episodes(user_id="ehfaz", project_id="neuralscape", dry_run=True)
+
+        assert result["dry_run"] is True
+        assert result["junk_count"] == 2
+        assert "breakdown" in result
+        assert "neuralscape" in result["breakdown"]
+        assert len(result["breakdown"]) == 1
+        service.get_graph_episodes.assert_called_once_with(user_id="ehfaz", project_id="neuralscape", limit=500)
+
+    def test_dry_run_all_groups(self, service):
+        """dry_run without project_id scans all known groups."""
+        service.get_graph_episodes = MagicMock(side_effect=self._mock_episodes_by_project)
+
+        result = service.delete_junk_episodes(user_id="ehfaz", dry_run=True)
+
+        assert result["dry_run"] is True
+        # g-2, g-3 (global) + su-1 (svc-utility-belt) + ns-1 (neuralscape) + oc-1 (openclaw) = 5
+        assert result["junk_count"] == 5
+        assert "breakdown" in result
+        assert result["breakdown"]["global"]["junk_count"] == 2
+        assert result["breakdown"]["svc-utility-belt"]["junk_count"] == 1
+        assert result["breakdown"]["lightpath"]["junk_count"] == 0
+        assert result["breakdown"]["neuralscape"]["junk_count"] == 1
+        assert result["breakdown"]["openclaw"]["junk_count"] == 1
+        # Should have called get_graph_episodes 5 times (global + 4 projects)
+        assert service.get_graph_episodes.call_count == 5
+
+    def test_delete_all_groups(self, service):
+        """Actual delete without project_id cleans all groups."""
+        service.get_graph_episodes = MagicMock(side_effect=self._mock_episodes_by_project)
+        service.delete_episode = MagicMock(return_value={"message": "deleted"})
+
+        result = service.delete_junk_episodes(user_id="ehfaz", dry_run=False)
+
+        assert "dry_run" not in result
+        assert result["deleted_count"] == 5
+        assert "breakdown" in result
+        assert result["breakdown"]["global"]["deleted_count"] == 2
+        assert result["breakdown"]["svc-utility-belt"]["deleted_count"] == 1
+        assert result["breakdown"]["neuralscape"]["deleted_count"] == 1
+        assert result["breakdown"]["openclaw"]["deleted_count"] == 1
+        # Verify delete_episode was called for each junk episode
+        deleted_uuids = [call.args[0] for call in service.delete_episode.call_args_list]
+        assert "g-2" in deleted_uuids
+        assert "g-3" in deleted_uuids
+        assert "su-1" in deleted_uuids
+        assert "ns-1" in deleted_uuids
+        assert "oc-1" in deleted_uuids
+        # Non-junk should NOT be deleted
+        assert "g-1" not in deleted_uuids
+        assert "su-2" not in deleted_uuids
+        assert "ns-2" not in deleted_uuids
+
+    def test_delete_single_project(self, service):
+        """Actual delete with explicit project_id only cleans that group."""
+        service.get_graph_episodes = MagicMock(return_value=[
+            {"uuid": "ns-1", "content": "Wrote file: main.py", "group_id": "project--neuralscape"},
+            {"uuid": "ns-2", "content": "Neo4j is the graph backend", "group_id": "project--neuralscape"},
+        ])
+        service.delete_episode = MagicMock(return_value={"message": "deleted"})
+
+        result = service.delete_junk_episodes(user_id="ehfaz", project_id="neuralscape", dry_run=False)
+
+        assert result["deleted_count"] == 1
+        assert len(result["breakdown"]) == 1
+        assert result["breakdown"]["neuralscape"]["deleted_count"] == 1
+        service.delete_episode.assert_called_once_with("ns-1")
+
+    def test_delete_handles_partial_failures(self, service):
+        """If some deletes fail, only successful ones are counted."""
+        service.get_graph_episodes = MagicMock(return_value=[
+            {"uuid": "ep-1", "content": "assistant: hello", "group_id": "global"},
+            {"uuid": "ep-2", "content": "Ran command: ls", "group_id": "global"},
+        ])
+        service.delete_episode = MagicMock(side_effect=[
+            {"message": "deleted"},
+            {"error": "Neo4j timeout"},
+        ])
+
+        result = service.delete_junk_episodes(user_id="ehfaz", project_id="global-only", dry_run=False)
+
+        assert result["deleted_count"] == 1
+        assert len(result["breakdown"]["global-only"]["deleted_uuids"]) == 1
