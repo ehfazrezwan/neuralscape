@@ -42,6 +42,9 @@ _JUNK_PATTERNS = [
 ]
 _JUNK_RE = re.compile("|".join(_JUNK_PATTERNS), re.IGNORECASE | re.MULTILINE)
 
+# All known project group IDs for multi-group episode cleanup
+ALL_KNOWN_PROJECTS = ["svc-utility-belt", "lightpath", "neuralscape", "openclaw"]
+
 
 def _is_junk_fact(content: str) -> bool:
     """Return True if an extracted fact is a raw event log rather than contextual knowledge."""
@@ -1190,6 +1193,17 @@ class MemoryService:
             logger.error(f"Failed to delete episode {episode_uuid}: {e}")
             return {"error": str(e)}
 
+    def _find_junk_episodes(self, episodes: list[dict]) -> list[dict]:
+        """Filter a list of episodes to only those matching junk patterns."""
+        junk = []
+        for ep in episodes:
+            content = ep.get("content", "")
+            is_assistant_log = content.strip().startswith("assistant:")
+            is_junk_pattern = bool(_JUNK_RE.search(content))
+            if is_assistant_log or is_junk_pattern:
+                junk.append(ep)
+        return junk
+
     def delete_junk_episodes(
         self,
         user_id: str,
@@ -1201,49 +1215,69 @@ class MemoryService:
         Junk episodes are those with content starting with 'assistant:' (raw conversation
         logs) or matching _JUNK_PATTERNS.
 
+        When project_id is provided, only that group is cleaned.
+        When omitted, ALL known groups are cleaned (global + all projects).
+
         Args:
             user_id: User identifier (maps to group_id for filtering).
-            project_id: Optional project scope.
+            project_id: Optional project scope. If None, cleans all known groups.
             dry_run: If True, list junk episodes without deleting.
 
         Returns:
-            Dict with count, deleted UUIDs, and sample content.
+            Dict with per-group breakdown of junk counts / deletions.
         """
-        group_ids = _get_group_ids(project_id)
-        episodes = self.get_graph_episodes(user_id=user_id, project_id=project_id, limit=500)
+        # Determine which project_ids to scan
+        if project_id is not None:
+            project_ids_to_scan = [project_id]
+        else:
+            # None = global group, then all known projects
+            project_ids_to_scan = [None] + ALL_KNOWN_PROJECTS
 
-        junk_episodes = []
-        for ep in episodes:
-            content = ep.get("content", "")
-            # Raw assistant message logs that got ingested as episodes
-            is_assistant_log = content.strip().startswith("assistant:")
-            is_junk_pattern = bool(_JUNK_RE.search(content))
-            if is_assistant_log or is_junk_pattern:
-                junk_episodes.append(ep)
+        breakdown = {}
+        total_junk = 0
+        total_deleted = 0
+        all_samples = []
+
+        for pid in project_ids_to_scan:
+            group_label = pid if pid else "global"
+            episodes = self.get_graph_episodes(user_id=user_id, project_id=pid, limit=500)
+            junk_episodes = self._find_junk_episodes(episodes)
+            total_junk += len(junk_episodes)
+
+            if dry_run:
+                breakdown[group_label] = {"junk_count": len(junk_episodes)}
+                all_samples.extend(
+                    {"uuid": ep["uuid"], "group": group_label, "content": ep["content"][:120]}
+                    for ep in junk_episodes[:5]
+                )
+            else:
+                deleted_uuids = []
+                for ep in junk_episodes:
+                    result = self.delete_episode(ep["uuid"])
+                    if "error" not in result:
+                        deleted_uuids.append(ep["uuid"])
+                breakdown[group_label] = {
+                    "deleted_count": len(deleted_uuids),
+                    "deleted_uuids": deleted_uuids,
+                }
+                total_deleted += len(deleted_uuids)
+                all_samples.extend(
+                    {"uuid": ep["uuid"], "group": group_label, "content": ep["content"][:120]}
+                    for ep in junk_episodes[:3]
+                )
 
         if dry_run:
             return {
                 "dry_run": True,
-                "junk_count": len(junk_episodes),
-                "samples": [
-                    {"uuid": ep["uuid"], "content": ep["content"][:120]}
-                    for ep in junk_episodes[:10]
-                ],
+                "junk_count": total_junk,
+                "breakdown": breakdown,
+                "samples": all_samples[:15],
             }
 
-        deleted_uuids = []
-        for ep in junk_episodes:
-            result = self.delete_episode(ep["uuid"])
-            if "error" not in result:
-                deleted_uuids.append(ep["uuid"])
-
         return {
-            "deleted_count": len(deleted_uuids),
-            "deleted_uuids": deleted_uuids,
-            "samples": [
-                {"uuid": ep["uuid"], "content": ep["content"][:120]}
-                for ep in junk_episodes[:5]
-            ],
+            "deleted_count": total_deleted,
+            "breakdown": breakdown,
+            "samples": all_samples[:15],
         }
 
     # ──────────────────────────────────────────────
