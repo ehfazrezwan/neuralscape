@@ -727,6 +727,26 @@ class TestDeleteEpisode:
 
         assert result["message"] == "Episode some-uuid deleted"
 
+    def test_delete_episode_passes_uuid_as_kwarg(self, service):
+        """Regression: uuid must be a direct kwarg, not inside parameters_.
+
+        The graphiti driver wrapper already passes parameters_= to the
+        Neo4j driver, so passing parameters_={"uuid": ...} from the
+        caller causes 'multiple values for keyword argument parameters_'.
+        """
+        import asyncio
+
+        mock_future = MagicMock()
+        mock_future.result.return_value = None
+        with patch("asyncio.run_coroutine_threadsafe", return_value=mock_future) as mock_rcts:
+            service.delete_episode("test-uuid-123")
+
+        # execute_query should have been called with uuid as a direct kwarg
+        service._graphiti.driver.execute_query.assert_called_once_with(
+            "MATCH (e:Episodic {uuid: $uuid}) DETACH DELETE e",
+            uuid="test-uuid-123",
+        )
+
     def test_delete_episode_handles_error(self, service):
         import asyncio
 
