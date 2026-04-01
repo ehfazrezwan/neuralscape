@@ -641,24 +641,118 @@ class TestDeleteEpisode:
 
 
 class TestDeleteJunkEpisodes:
-    def test_identifies_assistant_logs_as_junk(self, service):
-        import asyncio
+    def _mock_episodes_by_project(self, user_id=None, project_id=None, limit=500):
+        """Return test episodes keyed by project_id (None = global)."""
+        data = {
+            None: [
+                {"uuid": "g-1", "content": "Ehfaz prefers dark mode", "group_id": "global"},
+                {"uuid": "g-2", "content": "assistant: Got it, I'll fix that bug now.", "group_id": "global"},
+                {"uuid": "g-3", "content": "Ran command: git status", "group_id": "global"},
+            ],
+            "svc-utility-belt": [
+                {"uuid": "su-1", "content": "assistant: Sure, deploying now.", "group_id": "project--svc-utility-belt"},
+                {"uuid": "su-2", "content": "Uses FastAPI for microservices", "group_id": "project--svc-utility-belt"},
+            ],
+            "lightpath": [],
+            "neuralscape": [
+                {"uuid": "ns-1", "content": "Wrote file: main.py", "group_id": "project--neuralscape"},
+                {"uuid": "ns-2", "content": "Neo4j is the graph backend", "group_id": "project--neuralscape"},
+            ],
+            "openclaw": [
+                {"uuid": "oc-1", "content": "Tool result: success", "group_id": "project--openclaw"},
+            ],
+        }
+        return data.get(project_id, [])
 
-        service._graphiti = MagicMock()
-        # Mock get_graph_episodes to return test data
+    def test_dry_run_single_project(self, service):
+        """dry_run with explicit project_id only scans that group."""
         service.get_graph_episodes = MagicMock(return_value=[
             {"uuid": "ep-1", "content": "Ehfaz prefers dark mode", "group_id": "global"},
-            {"uuid": "ep-2", "content": "assistant: Got it, I'll fix that bug now.", "group_id": "global"},
+            {"uuid": "ep-2", "content": "assistant: Got it, fixing.", "group_id": "global"},
             {"uuid": "ep-3", "content": "Ran command: git status", "group_id": "global"},
             {"uuid": "ep-4", "content": "User uses Python 3.12", "group_id": "global"},
         ])
 
-        result = service.delete_junk_episodes(user_id="ehfaz", dry_run=True)
+        result = service.delete_junk_episodes(user_id="ehfaz", project_id="neuralscape", dry_run=True)
 
         assert result["dry_run"] is True
         assert result["junk_count"] == 2
-        junk_uuids = [s["uuid"] for s in result["samples"]]
-        assert "ep-2" in junk_uuids
-        assert "ep-3" in junk_uuids
-        assert "ep-1" not in junk_uuids
-        assert "ep-4" not in junk_uuids
+        assert "breakdown" in result
+        assert "neuralscape" in result["breakdown"]
+        assert len(result["breakdown"]) == 1
+        service.get_graph_episodes.assert_called_once_with(user_id="ehfaz", project_id="neuralscape", limit=500)
+
+    def test_dry_run_all_groups(self, service):
+        """dry_run without project_id scans all known groups."""
+        service.get_graph_episodes = MagicMock(side_effect=self._mock_episodes_by_project)
+
+        result = service.delete_junk_episodes(user_id="ehfaz", dry_run=True)
+
+        assert result["dry_run"] is True
+        # g-2, g-3 (global) + su-1 (svc-utility-belt) + ns-1 (neuralscape) + oc-1 (openclaw) = 5
+        assert result["junk_count"] == 5
+        assert "breakdown" in result
+        assert result["breakdown"]["global"]["junk_count"] == 2
+        assert result["breakdown"]["svc-utility-belt"]["junk_count"] == 1
+        assert result["breakdown"]["lightpath"]["junk_count"] == 0
+        assert result["breakdown"]["neuralscape"]["junk_count"] == 1
+        assert result["breakdown"]["openclaw"]["junk_count"] == 1
+        # Should have called get_graph_episodes 5 times (global + 4 projects)
+        assert service.get_graph_episodes.call_count == 5
+
+    def test_delete_all_groups(self, service):
+        """Actual delete without project_id cleans all groups."""
+        service.get_graph_episodes = MagicMock(side_effect=self._mock_episodes_by_project)
+        service.delete_episode = MagicMock(return_value={"message": "deleted"})
+
+        result = service.delete_junk_episodes(user_id="ehfaz", dry_run=False)
+
+        assert "dry_run" not in result
+        assert result["deleted_count"] == 5
+        assert "breakdown" in result
+        assert result["breakdown"]["global"]["deleted_count"] == 2
+        assert result["breakdown"]["svc-utility-belt"]["deleted_count"] == 1
+        assert result["breakdown"]["neuralscape"]["deleted_count"] == 1
+        assert result["breakdown"]["openclaw"]["deleted_count"] == 1
+        # Verify delete_episode was called for each junk episode
+        deleted_uuids = [call.args[0] for call in service.delete_episode.call_args_list]
+        assert "g-2" in deleted_uuids
+        assert "g-3" in deleted_uuids
+        assert "su-1" in deleted_uuids
+        assert "ns-1" in deleted_uuids
+        assert "oc-1" in deleted_uuids
+        # Non-junk should NOT be deleted
+        assert "g-1" not in deleted_uuids
+        assert "su-2" not in deleted_uuids
+        assert "ns-2" not in deleted_uuids
+
+    def test_delete_single_project(self, service):
+        """Actual delete with explicit project_id only cleans that group."""
+        service.get_graph_episodes = MagicMock(return_value=[
+            {"uuid": "ns-1", "content": "Wrote file: main.py", "group_id": "project--neuralscape"},
+            {"uuid": "ns-2", "content": "Neo4j is the graph backend", "group_id": "project--neuralscape"},
+        ])
+        service.delete_episode = MagicMock(return_value={"message": "deleted"})
+
+        result = service.delete_junk_episodes(user_id="ehfaz", project_id="neuralscape", dry_run=False)
+
+        assert result["deleted_count"] == 1
+        assert len(result["breakdown"]) == 1
+        assert result["breakdown"]["neuralscape"]["deleted_count"] == 1
+        service.delete_episode.assert_called_once_with("ns-1")
+
+    def test_delete_handles_partial_failures(self, service):
+        """If some deletes fail, only successful ones are counted."""
+        service.get_graph_episodes = MagicMock(return_value=[
+            {"uuid": "ep-1", "content": "assistant: hello", "group_id": "global"},
+            {"uuid": "ep-2", "content": "Ran command: ls", "group_id": "global"},
+        ])
+        service.delete_episode = MagicMock(side_effect=[
+            {"message": "deleted"},
+            {"error": "Neo4j timeout"},
+        ])
+
+        result = service.delete_junk_episodes(user_id="ehfaz", project_id="global-only", dry_run=False)
+
+        assert result["deleted_count"] == 1
+        assert len(result["breakdown"]["global-only"]["deleted_uuids"]) == 1
