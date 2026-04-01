@@ -1192,7 +1192,7 @@ class MemoryService:
         try:
             self._run_on_bridge(
                 g.driver.execute_query(
-                    "MATCH (e:EpisodicNode {uuid: $uuid}) DETACH DELETE e",
+                    "MATCH (e:Episodic {uuid: $uuid}) DETACH DELETE e",
                     uuid=episode_uuid,
                 )
             )
