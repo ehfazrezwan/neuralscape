@@ -7,9 +7,19 @@
 const NEURALSCAPE_URL =
   process.env.NEURALSCAPE_URL?.replace(/\/$/, "") || "http://localhost:8199";
 
+const NEURALSCAPE_API_KEY = process.env.NEURALSCAPE_API_KEY || "";
+
 const DEFAULT_USER_ID = process.env.NEURALSCAPE_USER_ID || "ehfaz";
 
 const REQUEST_TIMEOUT_MS = 8000;
+
+function authHeaders(): Record<string, string> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (NEURALSCAPE_API_KEY) {
+    headers["Authorization"] = `Bearer ${NEURALSCAPE_API_KEY}`;
+  }
+  return headers;
+}
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -116,7 +126,7 @@ export async function neuralscapeGet(
   try {
     const response = await fetch(url.toString(), {
       method: "GET",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders(),
       signal: controller.signal,
     });
     if (!response.ok) {
@@ -140,7 +150,7 @@ export async function neuralscapePost(
   try {
     const response = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders(),
       body: JSON.stringify(body),
       signal: controller.signal,
     });
