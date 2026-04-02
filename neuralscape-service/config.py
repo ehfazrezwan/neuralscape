@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     dedup_batch_size: int = 100
     dedup_cron_hours: set = {0, 6, 12, 18}
 
+    # Auth
+    neuralscape_api_key: str = ""  # If set, enables Bearer token auth on all endpoints (except /health)
+
     # Service
     host: str = "0.0.0.0"
     port: int = 8199

@@ -155,6 +155,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Register Bearer token auth middleware (no-op when NEURALSCAPE_API_KEY is unset)
+from auth import BearerAuthMiddleware
+
+app.add_middleware(BearerAuthMiddleware)
+
 
 # ── Global exception handler ─────────────────────────────────────
 @app.exception_handler(Exception)
