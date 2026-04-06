@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from config import settings
+from extensions import ExtensionRegistry
 from logging_config import configure_logging
 from memory_service import MemoryService
 
@@ -46,6 +47,9 @@ _service = MemoryService()
 
 # Redis-backed task manager (initialized in lifespan)
 _task_manager = TaskManager()
+
+# Extension registry (discovered + started in lifespan)
+_extension_registry = ExtensionRegistry()
 
 # Legacy lazy-init globals (kept for backward compat with old endpoints + tests)
 _memory = None
@@ -116,6 +120,11 @@ async def lifespan(app: FastAPI):
     # Connect task manager to Redis
     await _task_manager.connect()
 
+    # Discover and start extensions
+    await _extension_registry.discover()
+    await _extension_registry.startup_all()
+    _extension_registry.mount_routes(app)
+
     # Start MCP HTTP session manager if enabled and connect its task manager
     if _mcp_session_manager is not None:
         from mcp_server import _task_manager as mcp_task_manager
@@ -125,6 +134,9 @@ async def lifespan(app: FastAPI):
         await mcp_task_manager.close()
     else:
         yield
+
+    # Shutdown extensions
+    await _extension_registry.shutdown_all()
 
     # Shutdown with timeout to prevent hanging on unresponsive backends
     try:
@@ -986,6 +998,38 @@ async def v1_graph_communities(
         limit=limit,
     )
     return {"status": "ok", "communities": communities}
+
+
+# ── Extensions ─────────────────────────────────
+
+
+class EmitEventRequest(BaseModel):
+    """Request body for posting events to the extension registry."""
+
+    event_type: str = Field(description="Event type (e.g. 'memory_stored', 'session_start')")
+    payload: dict = Field(default_factory=dict, description="Event payload data")
+
+
+@v1_router.get("/extensions")
+async def v1_list_extensions():
+    """List all registered extensions with their status."""
+    return {"status": "ok", "extensions": _extension_registry.list_extensions()}
+
+
+@v1_router.post("/extensions/events")
+async def v1_emit_extension_event(req: EmitEventRequest):
+    """Post an event to all registered extensions.
+
+    Broadcasts the event to extensions whose manifest.hooks includes
+    the given event_type. Useful for external callers (e.g. OpenClaw hooks).
+    """
+    responses = await _extension_registry.emit_event(req.event_type, req.payload)
+    return {
+        "status": "ok",
+        "event_type": req.event_type,
+        "extensions_notified": len(responses),
+        "responses": responses,
+    }
 
 
 # Mount v1 router
