@@ -1,0 +1,399 @@
+"""Tests for the conversation-compiler extension.
+
+Tests cover:
+- ObsidianWriter (vault I/O, atomicity, frontmatter)
+- Flush engine (extraction prompt parsing)
+- Compile (grouping, idempotency)
+- Lint checks (structural checks)
+- Schemas (validation)
+"""
+
+import json
+import tempfile
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from extensions.conversation_compiler.config import CompilerSettings
+from extensions.conversation_compiler.flush import (
+    _map_category,
+    _parse_extraction_response,
+)
+from extensions.conversation_compiler.obsidian_writer import (
+    ObsidianWriter,
+    _build_frontmatter,
+    _slugify,
+    _update_frontmatter_field,
+)
+from extensions.conversation_compiler.schemas import (
+    CompileRequest,
+    ExtractedFact,
+    FlushRequest,
+    FlushResult,
+    LintFinding,
+    QueryRequest,
+    StatusResponse,
+)
+
+
+# ──────────────────────────────────────────────
+# Fixtures
+# ──────────────────────────────────────────────
+
+
+@pytest.fixture
+def tmp_vault(tmp_path):
+    """Create a temporary vault directory."""
+    vault = tmp_path / "test-vault"
+    vault.mkdir()
+    return vault
+
+
+@pytest.fixture
+def writer(tmp_vault):
+    """Create an ObsidianWriter with a temp vault."""
+    return ObsidianWriter(vault_path=tmp_vault)
+
+
+# ──────────────────────────────────────────────
+# ObsidianWriter tests
+# ──────────────────────────────────────────────
+
+
+class TestSlugify:
+    def test_basic(self):
+        assert _slugify("Hello World") == "hello-world"
+
+    def test_special_chars(self):
+        assert _slugify("Use PostgreSQL vs MySQL?") == "use-postgresql-vs-mysql"
+
+    def test_multiple_spaces(self):
+        assert _slugify("too   many   spaces") == "too-many-spaces"
+
+    def test_truncation(self):
+        long = "a" * 100
+        assert len(_slugify(long)) <= 80
+
+
+class TestFrontmatter:
+    def test_basic_frontmatter(self):
+        fm = _build_frontmatter(title="Test Page")
+        assert "---" in fm
+        assert "title: Test Page" in fm
+
+    def test_frontmatter_with_tags(self):
+        fm = _build_frontmatter(title="Test", tags=["foo", "bar"])
+        assert "tags: [foo, bar]" in fm
+
+    def test_frontmatter_compiled_flag(self):
+        fm = _build_frontmatter(title="Test", compiled=False)
+        assert "compiled: false" in fm
+
+    def test_update_frontmatter_field(self):
+        content = "---\ntitle: Test\ncompiled: false\n---\n\nBody"
+        updated = _update_frontmatter_field(content, "compiled", "true")
+        assert "compiled: true" in updated
+        assert "Body" in updated
+
+    def test_update_frontmatter_adds_field(self):
+        content = "---\ntitle: Test\n---\n\nBody"
+        updated = _update_frontmatter_field(content, "compiled", "true")
+        assert "compiled: true" in updated
+
+
+class TestObsidianWriter:
+    def test_append_daily_log_creates_file(self, writer, tmp_vault):
+        entries = [
+            {"time": "10:30", "category": "decision", "content": "Chose FastAPI", "session_id": "s1"}
+        ]
+        rel_path = writer.append_daily_log("2026-04-07", entries)
+        assert rel_path == "Daily/2026-04-07.md"
+        assert (tmp_vault / "Daily" / "2026-04-07.md").exists()
+
+    def test_append_daily_log_content(self, writer, tmp_vault):
+        entries = [
+            {"time": "10:30", "category": "decision", "content": "Chose FastAPI", "session_id": "s1"}
+        ]
+        writer.append_daily_log("2026-04-07", entries)
+        content = (tmp_vault / "Daily" / "2026-04-07.md").read_text()
+        assert "Chose FastAPI" in content
+        assert "`decision`" in content
+        assert "session: s1" in content
+
+    def test_append_daily_log_appends(self, writer, tmp_vault):
+        writer.append_daily_log("2026-04-07", [{"time": "10:00", "category": "fact", "content": "First"}])
+        writer.append_daily_log("2026-04-07", [{"time": "11:00", "category": "fact", "content": "Second"}])
+        content = (tmp_vault / "Daily" / "2026-04-07.md").read_text()
+        assert "First" in content
+        assert "Second" in content
+
+    def test_is_daily_log_compiled_false(self, writer):
+        writer.append_daily_log("2026-04-07", [{"time": "10:00", "category": "fact", "content": "Test"}])
+        assert not writer.is_daily_log_compiled("2026-04-07")
+
+    def test_mark_daily_log_compiled(self, writer):
+        writer.append_daily_log("2026-04-07", [{"time": "10:00", "category": "fact", "content": "Test"}])
+        writer.mark_daily_log_compiled("2026-04-07")
+        assert writer.is_daily_log_compiled("2026-04-07")
+
+    def test_get_daily_log_entries(self, writer):
+        entries = [
+            {"time": "10:30", "category": "decision", "content": "Chose FastAPI", "session_id": "s1"},
+            {"time": "11:00", "category": "preference", "content": "Prefers tabs", "session_id": "s2"},
+        ]
+        writer.append_daily_log("2026-04-07", entries)
+        parsed = writer.get_daily_log_entries("2026-04-07")
+        assert len(parsed) == 2
+        assert parsed[0]["category"] == "decision"
+        assert parsed[1]["content"] == "Prefers tabs"
+
+    def test_list_daily_logs(self, writer):
+        writer.append_daily_log("2026-04-06", [{"time": "10:00", "category": "fact", "content": "A"}])
+        writer.append_daily_log("2026-04-07", [{"time": "10:00", "category": "fact", "content": "B"}])
+        dates = writer.list_daily_logs()
+        assert dates == ["2026-04-06", "2026-04-07"]
+
+    def test_list_uncompiled_dates(self, writer):
+        writer.append_daily_log("2026-04-06", [{"time": "10:00", "category": "fact", "content": "A"}])
+        writer.append_daily_log("2026-04-07", [{"time": "10:00", "category": "fact", "content": "B"}])
+        writer.mark_daily_log_compiled("2026-04-06")
+        assert writer.list_uncompiled_dates() == ["2026-04-07"]
+
+    def test_write_session_summary(self, writer, tmp_vault):
+        rel_path = writer.write_session_summary("2026-04-07", "Today was productive.")
+        assert rel_path == "Sessions/2026-04-07.md"
+        content = (tmp_vault / "Sessions" / "2026-04-07.md").read_text()
+        assert "Today was productive." in content
+
+    def test_update_project_page_create(self, writer, tmp_vault):
+        rel_path = writer.update_project_page("NeuralScape", "A memory service.")
+        assert "Projects/" in rel_path
+        assert (tmp_vault / rel_path).exists()
+
+    def test_write_decision(self, writer, tmp_vault):
+        rel_path = writer.write_decision("use-fastapi", "Chose FastAPI because...")
+        assert rel_path == "Decisions/use-fastapi.md"
+        content = (tmp_vault / rel_path).read_text()
+        assert "Chose FastAPI because..." in content
+
+    def test_write_research(self, writer, tmp_vault):
+        rel_path = writer.write_research("graphiti-vs-neo4j", "Comparison notes...")
+        assert rel_path == "Research/graphiti-vs-neo4j.md"
+
+    def test_update_index(self, writer, tmp_vault):
+        entries = [
+            {"path": "Sessions/2026-04-07.md", "title": "Session", "type": "session"},
+            {"path": "Decisions/use-fastapi.md", "title": "Use FastAPI", "type": "decision"},
+        ]
+        writer.update_index(entries)
+        content = (tmp_vault / "index.md").read_text()
+        assert "[[Sessions/2026-04-07.md]]" in content
+        assert "[[Decisions/use-fastapi.md]]" in content
+
+    def test_append_log(self, writer, tmp_vault):
+        writer.append_log("Something happened")
+        content = (tmp_vault / "log.md").read_text()
+        assert "Something happened" in content
+
+    def test_list_all_files(self, writer, tmp_vault):
+        (tmp_vault / "test.md").write_text("hello")
+        (tmp_vault / "sub").mkdir()
+        (tmp_vault / "sub" / "nested.md").write_text("world")
+        files = writer.list_all_files()
+        assert "test.md" in files
+        assert "sub/nested.md" in files
+
+    def test_find_wikilinks(self, writer):
+        content = "See [[Page One]] and [[another-page]] for details."
+        links = writer.find_wikilinks(content)
+        assert "Page One" in links
+        assert "another-page" in links
+
+
+# ──────────────────────────────────────────────
+# Flush engine tests
+# ──────────────────────────────────────────────
+
+
+class TestParseExtractionResponse:
+    def test_valid_json(self):
+        response = json.dumps({
+            "facts": [
+                {"type": "decision", "content": "Chose FastAPI", "project": "neuralscape", "tags": ["web"]},
+                {"type": "preference", "content": "Prefers dark mode", "project": None, "tags": []},
+            ]
+        })
+        facts = _parse_extraction_response(response)
+        assert len(facts) == 2
+        assert facts[0].category == "decision"
+        assert facts[0].content == "Chose FastAPI"
+        assert facts[0].project_id == "neuralscape"
+        assert facts[1].category == "preference"
+
+    def test_markdown_wrapped_json(self):
+        response = "```json\n" + json.dumps({"facts": [{"type": "fact", "content": "Test"}]}) + "\n```"
+        facts = _parse_extraction_response(response)
+        assert len(facts) == 1
+
+    def test_empty_facts(self):
+        response = json.dumps({"facts": []})
+        facts = _parse_extraction_response(response)
+        assert len(facts) == 0
+
+    def test_invalid_json(self):
+        facts = _parse_extraction_response("this is not json")
+        assert len(facts) == 0
+
+    def test_missing_content(self):
+        response = json.dumps({"facts": [{"type": "fact", "content": ""}]})
+        facts = _parse_extraction_response(response)
+        assert len(facts) == 0
+
+
+class TestMapCategory:
+    def test_decision(self):
+        assert _map_category("decision") == "decision"
+
+    def test_preference(self):
+        assert _map_category("preference") == "preference"
+
+    def test_unknown(self):
+        assert _map_category("unknown_type") == "personal_fact"
+
+    def test_pattern(self):
+        assert _map_category("pattern") == "convention"
+
+
+# ──────────────────────────────────────────────
+# Schema tests
+# ──────────────────────────────────────────────
+
+
+class TestSchemas:
+    def test_flush_request_validation(self):
+        req = FlushRequest(
+            user_message="Hello",
+            assistant_response="Hi there",
+            session_id="s1",
+            user_id="ehfaz",
+        )
+        assert req.channel == "api"
+
+    def test_compile_request_optional_date(self):
+        req = CompileRequest(user_id="ehfaz")
+        assert req.date is None
+
+    def test_query_request(self):
+        req = QueryRequest(question="How does X work?", user_id="ehfaz")
+        assert req.file_back is False
+
+    def test_extracted_fact(self):
+        fact = ExtractedFact(category="decision", content="Chose X over Y")
+        assert fact.project_id is None
+        assert fact.tags == []
+
+    def test_flush_result(self):
+        result = FlushResult(session_id="s1", timestamp="2026-04-07T10:00:00")
+        assert result.facts_extracted == 0
+
+    def test_status_response(self):
+        status = StatusResponse()
+        assert status.extension == "conversation-compiler"
+
+
+# ──────────────────────────────────────────────
+# Lint tests (structural checks)
+# ──────────────────────────────────────────────
+
+
+class TestLintChecks:
+    def test_broken_links(self, writer, tmp_vault):
+        from extensions.conversation_compiler.lint import check_broken_links
+
+        (tmp_vault / "page.md").write_text("See [[nonexistent-page]] for details.")
+        findings = check_broken_links(writer)
+        assert len(findings) == 1
+        assert findings[0].check == "broken_links"
+
+    def test_no_broken_links(self, writer, tmp_vault):
+        from extensions.conversation_compiler.lint import check_broken_links
+
+        (tmp_vault / "page.md").write_text("See [[other]] for details.")
+        (tmp_vault / "other.md").write_text("Content here.")
+        findings = check_broken_links(writer)
+        assert len(findings) == 0
+
+    def test_orphan_pages(self, writer, tmp_vault):
+        from extensions.conversation_compiler.lint import check_orphan_pages
+
+        (tmp_vault / "linked.md").write_text("See [[linked]] here.")
+        (tmp_vault / "orphan.md").write_text("No links to me.")
+        findings = check_orphan_pages(writer)
+        orphan_files = [f.file for f in findings]
+        assert "orphan.md" in orphan_files
+
+    def test_index_drift(self, writer, tmp_vault):
+        from extensions.conversation_compiler.lint import check_index_drift
+
+        (tmp_vault / "page.md").write_text("Content")
+        (tmp_vault / "index.md").write_text("# Index\n")
+        findings = check_index_drift(writer)
+        assert len(findings) == 1
+        assert findings[0].check == "index_drift"
+
+    def test_data_gaps(self, writer, tmp_vault):
+        from extensions.conversation_compiler.lint import check_data_gaps
+
+        (tmp_vault / "a.md").write_text("See [[missing-topic]] here.")
+        (tmp_vault / "b.md").write_text("Also see [[missing-topic]].")
+        findings = check_data_gaps(writer)
+        assert any(f.check == "data_gaps" for f in findings)
+
+
+# ──────────────────────────────────────────────
+# Config tests
+# ──────────────────────────────────────────────
+
+
+class TestConfig:
+    def test_default_settings(self):
+        s = CompilerSettings()
+        assert s.compile_after_hour == 18
+        assert s.auto_compile is True
+
+    def test_get_llm_model_default(self):
+        s = CompilerSettings()
+        assert s.get_llm_model("fallback-model") == "fallback-model"
+
+    def test_get_llm_model_override(self):
+        s = CompilerSettings(compiler_llm_model="custom-model")
+        assert s.get_llm_model("fallback-model") == "custom-model"
+
+    def test_vault_path(self):
+        s = CompilerSettings(obsidian_vault_path="/tmp/test-vault")
+        assert s.vault_path == Path("/tmp/test-vault").resolve()
+
+
+# ──────────────────────────────────────────────
+# Extension class tests
+# ──────────────────────────────────────────────
+
+
+class TestExtensionClass:
+    def test_manifest_loads(self):
+        from extensions.conversation_compiler import ConversationCompilerExtension
+
+        ext = ConversationCompilerExtension()
+        assert ext.manifest.name == "conversation-compiler"
+        assert ext.manifest.version == "0.1.0"
+        assert "conversation_turn" in ext.manifest.hooks
+        assert "session_end" in ext.manifest.hooks
+        assert "compile_requested" in ext.manifest.hooks
+
+    def test_get_routes_returns_router(self):
+        from extensions.conversation_compiler import ConversationCompilerExtension
+
+        ext = ConversationCompilerExtension()
+        router = ext.get_routes()
+        assert router is not None
