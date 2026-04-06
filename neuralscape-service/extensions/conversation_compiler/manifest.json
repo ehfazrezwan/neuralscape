@@ -1,0 +1,7 @@
+{
+  "name": "conversation-compiler",
+  "version": "0.1.0",
+  "description": "Automatic memory capture from conversations. Extracts facts, decisions, and patterns from conversation turns, writes to daily logs, and compiles into structured knowledge articles.",
+  "author": "ehfaz",
+  "hooks": ["conversation_turn", "session_end", "compile_requested"]
+}
