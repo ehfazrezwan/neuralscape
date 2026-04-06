@@ -183,6 +183,45 @@ export function outputWithContext(context: string, hookEventName: string = "Sess
   });
 }
 
+// ── Message Filtering ───────────────────────────────────────────
+
+const HEARTBEAT_PATTERNS = [
+  /^\s*\.{1,3}\s*$/,
+  /^heartbeat$/i,
+  /^ping$/i,
+  /^keepalive$/i,
+  /^\/heartbeat$/i,
+  /^\s*$/,
+];
+
+export function isHeartbeat(message: string): boolean {
+  const trimmed = message.trim();
+  if (trimmed.length === 0) return true;
+  return HEARTBEAT_PATTERNS.some((p) => p.test(trimmed));
+}
+
+export function isNoReply(response: string): boolean {
+  const trimmed = response.trim();
+  return (
+    trimmed === "NO_REPLY" ||
+    trimmed === "[NO_REPLY]" ||
+    trimmed === "(no reply)" ||
+    trimmed.length === 0
+  );
+}
+
+const SYSTEM_MESSAGE_PATTERNS = [
+  /^\[system\]/i,
+  /^\[auto[-_]?reply\]/i,
+  /^\[heartbeat\]/i,
+  /^\[status\]/i,
+  /^\[internal\]/i,
+];
+
+export function isSystemMessage(message: string): boolean {
+  return SYSTEM_MESSAGE_PATTERNS.some((p) => p.test(message.trim()));
+}
+
 // ── Logging ──────────────────────────────────────────────────────
 
 export function logError(message: string, error?: unknown): void {
