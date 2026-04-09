@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from config import settings
 from extensions import ExtensionRegistry
+from extensions.events import EventType, EVENT_PAYLOAD_MODELS
 from logging_config import configure_logging
 from memory_service import MemoryService
 
@@ -135,8 +136,16 @@ async def lifespan(app: FastAPI):
     else:
         yield
 
-    # Shutdown extensions
-    await _extension_registry.shutdown_all()
+    # Shutdown extensions with timeout to prevent hanging on misbehaving extensions
+    try:
+        await asyncio.wait_for(
+            _extension_registry.shutdown_all(),
+            timeout=10,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("Extension shutdown timed out after 10s, continuing shutdown")
+    except Exception as e:
+        logger.warning(f"Error during extension shutdown: {e}")
 
     # Shutdown with timeout to prevent hanging on unresponsive backends
     try:
@@ -1022,7 +1031,23 @@ async def v1_emit_extension_event(req: EmitEventRequest):
 
     Broadcasts the event to extensions whose manifest.hooks includes
     the given event_type. Useful for external callers (e.g. OpenClaw hooks).
+    For known event types, validates the payload against the expected schema.
     """
+    # Validate payload for known event types
+    try:
+        event_enum = EventType(req.event_type)
+        payload_model = EVENT_PAYLOAD_MODELS.get(event_enum)
+        if payload_model is not None:
+            try:
+                payload_model.model_validate(req.payload)
+            except Exception as e:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Invalid payload for event type '{req.event_type}': {e}",
+                )
+    except ValueError:
+        pass  # Unknown/custom event type — allow pass-through
+
     responses = await _extension_registry.emit_event(req.event_type, req.payload)
     return {
         "status": "ok",
