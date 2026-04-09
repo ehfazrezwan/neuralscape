@@ -297,7 +297,7 @@ class TestDiscovery:
     async def test_discover_empty(self):
         """Discovery with no local extensions and no env var should succeed."""
         registry = ExtensionRegistry()
-        with patch.dict("os.environ", {}, clear=False):
+        with patch.dict("os.environ", {"NEURALSCAPE_EXTENSIONS": ""}, clear=False):
             # Patch _discover_local to avoid scanning real filesystem
             with patch.object(registry, "_discover_local"):
                 await registry.discover()
