@@ -83,7 +83,7 @@ class CompileRequestedEvent(BaseModel):
 
 
 # Map event types to their payload models for validation
-EVENT_PAYLOAD_MODELS: dict[str, type[BaseModel]] = {
+EVENT_PAYLOAD_MODELS: dict[EventType, type[BaseModel]] = {
     EventType.CONVERSATION_TURN: ConversationTurnEvent,
     EventType.SESSION_START: SessionStartEvent,
     EventType.SESSION_END: SessionEndEvent,
