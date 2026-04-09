@@ -97,10 +97,13 @@ function normalizeInput(raw: ConversationTurnInput): NormalizedTurn {
 // ── Filtering ────────────────────────────────────────────────────
 
 function shouldSkipTurn(userMessage: string, assistantResponse: string): boolean {
+  const trimmedAssistantResponse = assistantResponse.trim();
+
   if (isHeartbeat(userMessage)) return true;
   if (isNoReply(assistantResponse)) return true;
   if (isSystemMessage(userMessage)) return true;
-  if (assistantResponse.length < MIN_RESPONSE_LENGTH) return true;
+  if (isSystemMessage(assistantResponse)) return true;
+  if (trimmedAssistantResponse.length < MIN_RESPONSE_LENGTH) return true;
   return false;
 }
 
