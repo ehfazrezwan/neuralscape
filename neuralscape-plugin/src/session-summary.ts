@@ -53,10 +53,11 @@ async function main(): Promise<void> {
     if (messageCount !== undefined && messageCount < 2) return;
 
     const userId = raw.user_id || getUserId();
+    const timestampDate = raw.timestamp ? new Date(raw.timestamp) : null;
     const date =
       raw.date ||
-      (raw.timestamp
-        ? new Date(raw.timestamp).toISOString().split("T")[0]
+      (timestampDate && !Number.isNaN(timestampDate.getTime())
+        ? timestampDate.toISOString().split("T")[0]
         : new Date().toISOString().split("T")[0]);
 
     await neuralscapePost("/v1/extensions/conversation-compiler/compile", {
