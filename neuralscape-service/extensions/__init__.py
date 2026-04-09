@@ -41,8 +41,8 @@ class ExtensionEntry:
 class ExtensionRegistry:
     """Manages discovery, lifecycle, and event dispatch for NeuralScape extensions.
 
-    Thread-safe for event dispatch. Extension failures are logged and do not
-    propagate — a single broken extension cannot take down the service.
+    Extension failures are logged and do not propagate — a single broken
+    extension cannot take down the service.
     """
 
     def __init__(self) -> None:
@@ -145,8 +145,8 @@ class ExtensionRegistry:
         Args:
             extension: An object implementing the NeuralscapeExtension protocol.
 
-        Raises:
-            ValueError: If an extension with the same name is already registered.
+        Note:
+            If an extension with the same name is already registered, logs a warning and skips the duplicate.
         """
         name = extension.manifest.name
         if name in self._extensions:
