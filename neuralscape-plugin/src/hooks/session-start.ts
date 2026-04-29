@@ -13,40 +13,9 @@ import {
   outputContinue,
   outputWithContext,
   parseStdin,
-} from "./utils.js";
+} from "../utils.js";
 
-// Category display order (most important first)
-const CATEGORY_ORDER = [
-  "preference",
-  "convention",
-  "architecture",
-  "tech_stack",
-  "dependency",
-  "workflow",
-  "procedure",
-  "decision",
-  "personal_fact",
-  "technical_skill",
-  "domain_knowledge",
-  "interaction",
-  "task_context",
-];
-
-const CATEGORY_LABELS: Record<string, string> = {
-  preference: "Preferences",
-  personal_fact: "Personal",
-  technical_skill: "Skills",
-  domain_knowledge: "Domain Knowledge",
-  tech_stack: "Tech Stack",
-  convention: "Conventions",
-  architecture: "Architecture",
-  dependency: "Dependencies",
-  decision: "Decisions",
-  interaction: "Interactions",
-  workflow: "Workflows",
-  procedure: "Procedures",
-  task_context: "Recent Context",
-};
+import { CATEGORY_LABELS, CATEGORY_ORDER } from "../types.js";
 
 // Target max tokens for injection (~4 chars per token)
 const MAX_CHARS = 8000;

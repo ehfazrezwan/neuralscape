@@ -1,5 +1,5 @@
 {
-  "description": "Neuralscape memory hooks — automatic context injection and observation capture",
+  "description": "Neuralscape memory hooks — automatic context injection and conversation capture",
   "hooks": {
     "SessionStart": [
       {
@@ -14,26 +14,13 @@
         ]
       }
     ],
-    "PostToolUse": [
-      {
-        "matcher": "Write|Edit|Bash|WebFetch|WebSearch|Task|NotebookEdit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/post-tool-use.js\"",
-            "timeout": 10,
-            "async": true
-          }
-        ]
-      }
-    ],
     "Stop": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/stop.js\"",
-            "timeout": 30,
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/session-end.js\"",
+            "timeout": 60,
             "async": true
           }
         ]
