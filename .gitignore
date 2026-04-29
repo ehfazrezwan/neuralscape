@@ -171,4 +171,4 @@ cache.db*
 mcp_servers.json
 
 # Docker Compose override (machine-specific)
-docker-compose.override.yml
+docker-compose.override.ymlvault/
