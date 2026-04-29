@@ -12,7 +12,7 @@ import pytest
 from fastapi import APIRouter, FastAPI
 from fastapi.testclient import TestClient
 
-from extensions import ExtensionRegistry
+from extensions import EmitResult, ExtensionRegistry
 from extensions.base import ExtensionManifest, NeuralscapeExtension
 from extensions.events import EventType
 
@@ -190,9 +190,11 @@ class TestEventDispatch:
         registry.register(ext)
         await registry.startup_all()
 
-        responses = await registry.emit_event("memory_stored", {"memory_id": "abc"})
-        assert len(responses) == 1
-        assert responses[0] == {"handled_by": "listener"}
+        result = await registry.emit_event("memory_stored", {"memory_id": "abc"})
+        assert isinstance(result, EmitResult)
+        assert len(result.responses) == 1
+        assert result.responses[0] == {"handled_by": "listener"}
+        assert result.notified_count == 1
         assert ext.events_received == [("memory_stored", {"memory_id": "abc"})]
 
     @pytest.mark.asyncio
@@ -202,8 +204,9 @@ class TestEventDispatch:
         registry.register(ext)
         await registry.startup_all()
 
-        responses = await registry.emit_event("memory_stored", {"memory_id": "abc"})
-        assert len(responses) == 0
+        result = await registry.emit_event("memory_stored", {"memory_id": "abc"})
+        assert len(result.responses) == 0
+        assert result.notified_count == 0
         assert ext.events_received == []
 
     @pytest.mark.asyncio
@@ -213,8 +216,9 @@ class TestEventDispatch:
         registry.register(ext)
         await registry.startup_all()
 
-        responses = await registry.emit_event("memory_stored", {"memory_id": "abc"})
-        assert len(responses) == 0
+        result = await registry.emit_event("memory_stored", {"memory_id": "abc"})
+        assert len(result.responses) == 0
+        assert result.notified_count == 0
 
     @pytest.mark.asyncio
     async def test_event_failure_doesnt_block_others(self):
@@ -225,10 +229,11 @@ class TestEventDispatch:
         registry.register(good)
         await registry.startup_all()
 
-        responses = await registry.emit_event("memory_stored", {"memory_id": "abc"})
-        # Only good handler's response
-        assert len(responses) == 1
-        assert responses[0] == {"handled_by": "good-handler"}
+        result = await registry.emit_event("memory_stored", {"memory_id": "abc"})
+        # Only good handler's response, but both were notified
+        assert len(result.responses) == 1
+        assert result.responses[0] == {"handled_by": "good-handler"}
+        assert result.notified_count == 2
 
     @pytest.mark.asyncio
     async def test_multiple_extensions_receive_event(self):
@@ -239,10 +244,47 @@ class TestEventDispatch:
         registry.register(ext2)
         await registry.startup_all()
 
-        responses = await registry.emit_event("session_start", {"session_id": "s1"})
-        assert len(responses) == 2
+        result = await registry.emit_event("session_start", {"session_id": "s1"})
+        assert len(result.responses) == 2
+        assert result.notified_count == 2
         assert ext1.events_received == [("session_start", {"session_id": "s1"})]
         assert ext2.events_received == [("session_start", {"session_id": "s1"})]
+
+    @pytest.mark.asyncio
+    async def test_notified_count_includes_none_responders(self):
+        """Extension returning None is still counted as notified."""
+
+        class NoneResponder:
+            def __init__(self):
+                self.manifest = ExtensionManifest(
+                    name="none-responder",
+                    version="1.0.0",
+                    description="Returns None",
+                    hooks=["memory_stored"],
+                )
+
+            async def startup(self) -> None:
+                pass
+
+            async def shutdown(self) -> None:
+                pass
+
+            async def on_event(self, event_type: str, payload: dict) -> Optional[dict]:
+                return None
+
+            def get_routes(self) -> Optional[APIRouter]:
+                return None
+
+        registry = ExtensionRegistry()
+        responder = DummyExtension(name="responder", hooks=["memory_stored"])
+        none_ext = NoneResponder()
+        registry.register(responder)
+        registry.register(none_ext)
+        await registry.startup_all()
+
+        result = await registry.emit_event("memory_stored", {"memory_id": "abc"})
+        assert result.notified_count == 2
+        assert len(result.responses) == 1  # Only DummyExtension returns non-None
 
 
 # ── Route Mounting ───────────────────────────────
@@ -297,7 +339,7 @@ class TestDiscovery:
     async def test_discover_empty(self):
         """Discovery with no local extensions and no env var should succeed."""
         registry = ExtensionRegistry()
-        with patch.dict("os.environ", {}, clear=False):
+        with patch.dict("os.environ", {"NEURALSCAPE_EXTENSIONS": ""}, clear=False):
             # Patch _discover_local to avoid scanning real filesystem
             with patch.object(registry, "_discover_local"):
                 await registry.discover()
@@ -428,7 +470,10 @@ class TestExtensionsEndpoint:
 
         resp = client.post(
             "/v1/extensions/events",
-            json={"event_type": "memory_stored", "payload": {"memory_id": "m1"}},
+            json={
+                "event_type": "memory_stored",
+                "payload": {"user_id": "u1", "memory_id": "m1", "content": "test fact"},
+            },
         )
         assert resp.status_code == 200
         data = resp.json()
@@ -442,7 +487,10 @@ class TestExtensionsEndpoint:
 
         resp = client.post(
             "/v1/extensions/events",
-            json={"event_type": "memory_stored", "payload": {}},
+            json={
+                "event_type": "memory_stored",
+                "payload": {"user_id": "u1", "memory_id": "m1", "content": "test"},
+            },
         )
         assert resp.status_code == 200
         data = resp.json()
@@ -498,3 +546,48 @@ class TestProtocolCompliance:
         )
         assert manifest.name == "test"
         assert manifest.hooks == ["memory_stored", "session_start"]
+
+
+# ── Manifest Name Validation ───────────────────
+
+
+class TestManifestNameValidation:
+    def test_valid_lowercase(self):
+        m = ExtensionManifest(name="my-ext", version="1.0.0", description="test")
+        assert m.name == "my-ext"
+
+    def test_valid_with_digits(self):
+        m = ExtensionManifest(name="ext-2", version="1.0.0", description="test")
+        assert m.name == "ext-2"
+
+    def test_valid_single_char(self):
+        m = ExtensionManifest(name="x", version="1.0.0", description="test")
+        assert m.name == "x"
+
+    def test_valid_all_digits(self):
+        m = ExtensionManifest(name="42", version="1.0.0", description="test")
+        assert m.name == "42"
+
+    def test_invalid_uppercase(self):
+        with pytest.raises(ValueError):
+            ExtensionManifest(name="MyExtension", version="1.0.0", description="test")
+
+    def test_invalid_spaces(self):
+        with pytest.raises(ValueError):
+            ExtensionManifest(name="my extension", version="1.0.0", description="test")
+
+    def test_invalid_starts_with_hyphen(self):
+        with pytest.raises(ValueError):
+            ExtensionManifest(name="-bad", version="1.0.0", description="test")
+
+    def test_invalid_special_chars(self):
+        with pytest.raises(ValueError):
+            ExtensionManifest(name="ext@foo", version="1.0.0", description="test")
+
+    def test_invalid_underscore(self):
+        with pytest.raises(ValueError):
+            ExtensionManifest(name="my_ext", version="1.0.0", description="test")
+
+    def test_invalid_empty(self):
+        with pytest.raises(ValueError):
+            ExtensionManifest(name="", version="1.0.0", description="test")
