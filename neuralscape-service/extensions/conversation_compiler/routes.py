@@ -112,10 +112,10 @@ def create_router(
 
         # Fallback: run synchronously
         if request.date:
-            result = await compile_date(request.date, service, writer)
+            result = await compile_date(request.date, service, writer, user_id=request.user_id)
             return {"status": "completed", "result": result.model_dump()}
         else:
-            results = await compile_all_pending(service, writer)
+            results = await compile_all_pending(service, writer, user_id=request.user_id)
             return {
                 "status": "completed",
                 "results": [r.model_dump() for r in results],

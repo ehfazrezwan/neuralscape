@@ -4,17 +4,14 @@ Checks for broken links, orphan pages, stale content, missing cross-references,
 contradictions (LLM-powered), data gaps, and index drift.
 """
 
+import json
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
 import structlog
-from google import genai
 
-from config import settings as core_settings
-
-from .config import compiler_settings
 from .obsidian_writer import ObsidianWriter
 from .schemas import LintFinding, LintResult
 
@@ -158,8 +155,10 @@ def check_missing_cross_references(writer: ObsidianWriter) -> list[LintFinding]:
     return findings
 
 
-def check_contradictions(writer: ObsidianWriter) -> list[LintFinding]:
+async def check_contradictions(writer: ObsidianWriter) -> list[LintFinding]:
     """LLM-powered check for contradictions between related pages."""
+    from .compile import _async_call_gemini
+
     findings = []
     all_files = writer.list_all_files()
 
@@ -187,9 +186,6 @@ def check_contradictions(writer: ObsidianWriter) -> list[LintFinding]:
                 related_pairs.append(pair)
 
     # LLM check on related pairs (limit to avoid excessive API calls)
-    model = compiler_settings.get_llm_model(core_settings.gemini_llm_model)
-    client = genai.Client(api_key=core_settings.google_api_key)
-
     for p1, p2 in related_pairs[:5]:
         content1 = writer.read_file(p1)
         content2 = writer.read_file(p2)
@@ -208,12 +204,11 @@ def check_contradictions(writer: ObsidianWriter) -> list[LintFinding]:
         )
 
         try:
-            response = client.models.generate_content(model=model, contents=prompt)
-            text = (response.text or "").strip()
+            text = (await _async_call_gemini(prompt)).strip()
             if text.startswith("```"):
                 text = re.sub(r"^```(?:json)?\s*", "", text)
                 text = re.sub(r"\s*```$", "", text)
-            data = __import__("json").loads(text)
+            data = json.loads(text)
             for c in data.get("contradictions", []):
                 findings.append(
                     LintFinding(
@@ -342,7 +337,7 @@ async def run_lint(
     # LLM-powered checks
     if not structural_only:
         try:
-            results = check_contradictions(writer)
+            results = await check_contradictions(writer)
             all_findings.extend(results)
             checks_run += 1
         except Exception:

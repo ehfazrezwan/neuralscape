@@ -443,6 +443,13 @@ class ObsidianWriter:
 
     # ── Utility methods ──────────────────────────
 
+    def _safe_resolve(self, rel_path: str) -> Path:
+        """Resolve a relative path within the vault, preventing path traversal."""
+        resolved = (self.vault / rel_path).resolve()
+        if not resolved.is_relative_to(self.vault.resolve()):
+            raise ValueError(f"Path traversal detected: {rel_path}")
+        return resolved
+
     def list_all_files(self) -> list[str]:
         """List all markdown files in the vault (relative paths)."""
         if not self.vault.exists():
@@ -455,11 +462,11 @@ class ObsidianWriter:
 
     def read_file(self, rel_path: str) -> str:
         """Read a file from the vault by relative path."""
-        return _read_file(self.vault / rel_path)
+        return _read_file(self._safe_resolve(rel_path))
 
     def file_exists(self, rel_path: str) -> bool:
         """Check if a file exists in the vault."""
-        return (self.vault / rel_path).exists()
+        return self._safe_resolve(rel_path).exists()
 
     def find_wikilinks(self, content: str) -> list[str]:
         """Extract all [[wikilink]] targets from content."""

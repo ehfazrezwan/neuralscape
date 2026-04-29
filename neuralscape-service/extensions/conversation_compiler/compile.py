@@ -5,6 +5,7 @@ calls Gemini to synthesize into structured articles, and writes them to the vaul
 Idempotent: running twice on the same day updates rather than duplicates.
 """
 
+import asyncio
 import json
 import re
 from datetime import datetime
@@ -17,7 +18,7 @@ from config import settings as core_settings
 from memory_service import MemoryService
 
 from .config import compiler_settings
-from .obsidian_writer import ObsidianWriter
+from .obsidian_writer import ObsidianWriter, _slugify
 from .schemas import CompileResult, CompiledArticle
 
 logger = structlog.get_logger(__name__)
@@ -94,11 +95,16 @@ ENTRIES:
 
 
 def _call_gemini(prompt: str) -> str:
-    """Call Gemini with the given prompt and return the response text."""
+    """Call Gemini synchronously (for use via asyncio.to_thread)."""
     model = compiler_settings.get_llm_model(core_settings.gemini_llm_model)
     client = genai.Client(api_key=core_settings.google_api_key)
     response = client.models.generate_content(model=model, contents=prompt)
     return response.text or ""
+
+
+async def _async_call_gemini(prompt: str) -> str:
+    """Call Gemini without blocking the event loop."""
+    return await asyncio.to_thread(_call_gemini, prompt)
 
 
 def _group_entries(entries: list[dict]) -> dict[str, list[dict]]:
@@ -189,6 +195,7 @@ async def compile_date(
     date: str,
     service: MemoryService,
     writer: ObsidianWriter,
+    user_id: str = "ehfaz",
 ) -> CompileResult:
     """Compile all daily log entries for a given date into structured articles.
 
@@ -199,6 +206,7 @@ async def compile_date(
         date: ISO date string (YYYY-MM-DD).
         service: MemoryService instance for dedup.
         writer: ObsidianWriter for vault I/O.
+        user_id: User ID for post-compile dedup.
 
     Returns:
         CompileResult with details of what was compiled.
@@ -223,14 +231,16 @@ async def compile_date(
     # 1. Session summary (always produced if there are entries)
     all_text = _entries_to_text(entries)
     try:
-        summary_content = _call_gemini(SESSION_SUMMARY_PROMPT + all_text)
-        summary_path = writer.write_session_summary(date, summary_content)
+        summary_path = f"Sessions/{date}.md"
+        is_new = not writer.file_exists(summary_path)
+        summary_content = await _async_call_gemini(SESSION_SUMMARY_PROMPT + all_text)
+        writer.write_session_summary(date, summary_content)
         articles.append(
             CompiledArticle(
                 path=summary_path,
                 title=f"Session Summary — {date}",
                 article_type="session",
-                created=not writer.file_exists(summary_path),
+                created=is_new,
             )
         )
         entries_compiled += len(entries)
@@ -241,16 +251,18 @@ async def compile_date(
     projects: dict[str, list[dict]] = grouped.get("projects", {})
     for project_name, project_entries in projects.items():
         try:
+            project_path = f"Projects/{_slugify(project_name)}/README.md"
+            is_new = not writer.file_exists(project_path)
             prompt = PROJECT_SYNTHESIS_PROMPT.format(project=project_name)
             prompt += _entries_to_text(project_entries)
-            project_content = _call_gemini(prompt)
-            project_path = writer.update_project_page(project_name, project_content)
+            project_content = await _async_call_gemini(prompt)
+            writer.update_project_page(project_name, project_content)
             articles.append(
                 CompiledArticle(
                     path=project_path,
                     title=project_name,
                     article_type="project",
-                    created=not writer.file_exists(project_path),
+                    created=is_new,
                 )
             )
         except Exception:
@@ -261,15 +273,17 @@ async def compile_date(
     if decision_entries:
         try:
             slug = _extract_decision_slug(decision_entries)
+            decision_path = f"Decisions/{_slugify(slug)}.md"
+            is_new = not writer.file_exists(decision_path)
             prompt = DECISION_SYNTHESIS_PROMPT + _entries_to_text(decision_entries)
-            decision_content = _call_gemini(prompt)
-            decision_path = writer.write_decision(slug, decision_content)
+            decision_content = await _async_call_gemini(prompt)
+            writer.write_decision(slug, decision_content)
             articles.append(
                 CompiledArticle(
                     path=decision_path,
                     title=slug.replace("-", " ").title(),
                     article_type="decision",
-                    created=not writer.file_exists(decision_path),
+                    created=is_new,
                 )
             )
         except Exception:
@@ -280,16 +294,18 @@ async def compile_date(
     if research_entries:
         try:
             topic = _extract_research_topic(research_entries)
+            research_path = f"Research/{_slugify(topic)}.md"
+            is_new = not writer.file_exists(research_path)
             prompt = RESEARCH_SYNTHESIS_PROMPT.format(topic=topic)
             prompt += _entries_to_text(research_entries)
-            research_content = _call_gemini(prompt)
-            research_path = writer.write_research(topic, research_content)
+            research_content = await _async_call_gemini(prompt)
+            writer.write_research(topic, research_content)
             articles.append(
                 CompiledArticle(
                     path=research_path,
                     title=topic.replace("-", " ").title(),
                     article_type="research",
-                    created=not writer.file_exists(research_path),
+                    created=is_new,
                 )
             )
         except Exception:
@@ -314,7 +330,7 @@ async def compile_date(
     # 8. Trigger dedup
     dedup_triggered = False
     try:
-        service.dedup_memories("ehfaz")
+        service.dedup_memories(user_id)
         dedup_triggered = True
     except Exception:
         logger.warning("Post-compile dedup failed (non-critical)")
@@ -339,6 +355,7 @@ async def compile_date(
 async def compile_all_pending(
     service: MemoryService,
     writer: ObsidianWriter,
+    user_id: str = "ehfaz",
 ) -> list[CompileResult]:
     """Compile all uncompiled daily logs.
 
@@ -354,7 +371,7 @@ async def compile_all_pending(
     results = []
     for date in uncompiled:
         try:
-            result = await compile_date(date, service, writer)
+            result = await compile_date(date, service, writer, user_id=user_id)
             results.append(result)
         except Exception:
             logger.exception("Failed to compile date", date=date)

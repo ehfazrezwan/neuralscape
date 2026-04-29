@@ -163,7 +163,7 @@ class ConversationCompilerExtension:
 
         logger.info("Auto-compile triggered on session end", date=today)
         try:
-            result = await compile_date(today, self.service, self.writer)
+            result = await compile_date(today, self.service, self.writer, user_id=user_id)
             self.writer.append_log(f"Auto-compiled {today} on session end")
             return result.model_dump()
         except Exception:
@@ -173,11 +173,12 @@ class ConversationCompilerExtension:
     async def _handle_compile_requested(self, payload: dict) -> Optional[dict]:
         """Handle explicit compile request."""
         date = payload.get("date")
+        user_id = payload.get("user_id", "")
         if date:
-            result = await compile_date(date, self.service, self.writer)
+            result = await compile_date(date, self.service, self.writer, user_id=user_id)
             return result.model_dump()
         else:
-            results = await compile_all_pending(self.service, self.writer)
+            results = await compile_all_pending(self.service, self.writer, user_id=user_id)
             return {"dates_compiled": len(results), "results": [r.model_dump() for r in results]}
 
     def get_routes(self) -> Optional[APIRouter]:

@@ -9,11 +9,7 @@ import re
 from typing import Optional
 
 import structlog
-from google import genai
 
-from config import settings as core_settings
-
-from .config import compiler_settings
 from .obsidian_writer import ObsidianWriter
 from .schemas import QueryResult
 
@@ -116,12 +112,11 @@ async def query_knowledge_base(
 
     # Step 3: Query Gemini
     prompt = QUERY_PROMPT.format(question=question) + pages_context
-    model = compiler_settings.get_llm_model(core_settings.gemini_llm_model)
 
     try:
-        client = genai.Client(api_key=core_settings.google_api_key)
-        response = client.models.generate_content(model=model, contents=prompt)
-        answer = response.text or "No answer generated."
+        from .compile import _async_call_gemini
+
+        answer = await _async_call_gemini(prompt) or "No answer generated."
     except Exception:
         logger.exception("Knowledge base query failed")
         return QueryResult(

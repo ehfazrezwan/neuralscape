@@ -129,10 +129,10 @@ async def process_conversation_compile(
     ctx.setdefault("compiler_writer", writer)
 
     if date:
-        result = await compile_date(date, service, writer)
+        result = await compile_date(date, service, writer, user_id=user_id)
         return result.model_dump()
     else:
-        results = await compile_all_pending(service, writer)
+        results = await compile_all_pending(service, writer, user_id=user_id)
         return {"dates_compiled": len(results), "results": [r.model_dump() for r in results]}
 
 
@@ -153,7 +153,7 @@ async def auto_compile_check(ctx: dict) -> dict | None:
     writer: ObsidianWriter = ctx.get("compiler_writer") or ObsidianWriter()
     ctx.setdefault("compiler_writer", writer)
 
-    results = await compile_all_pending(service, writer)
+    results = await compile_all_pending(service, writer, user_id=settings.default_user_id)
     if results:
         writer.append_log(f"Auto-compiled {len(results)} date(s) via cron")
         logger.info(f"Auto-compile cron: compiled {len(results)} dates")

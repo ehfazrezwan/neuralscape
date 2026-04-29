@@ -11,9 +11,7 @@ from datetime import datetime
 from typing import Optional
 
 import structlog
-from google import genai
 
-from config import settings as core_settings
 from memory_service import MemoryService
 
 from .config import compiler_settings
@@ -173,15 +171,11 @@ async def flush_conversation_turn(
 
     # Step 1: Call Gemini for extraction
     prompt = _build_extraction_prompt(user_message, assistant_response, channel)
-    model = compiler_settings.get_llm_model(core_settings.gemini_llm_model)
 
     try:
-        client = genai.Client(api_key=core_settings.google_api_key)
-        response = client.models.generate_content(
-            model=model,
-            contents=prompt,
-        )
-        response_text = response.text or ""
+        from .compile import _async_call_gemini
+
+        response_text = await _async_call_gemini(prompt)
     except Exception:
         logger.exception("Gemini extraction failed")
         return FlushResult(session_id=session_id, timestamp=ts)

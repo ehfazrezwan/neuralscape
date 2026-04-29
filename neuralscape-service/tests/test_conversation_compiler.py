@@ -397,3 +397,172 @@ class TestExtensionClass:
         ext = ConversationCompilerExtension()
         router = ext.get_routes()
         assert router is not None
+
+
+# ──────────────────────────────────────────────
+# Path traversal protection
+# ──────────────────────────────────────────────
+
+
+class TestPathTraversal:
+    def test_read_file_traversal_blocked(self, writer):
+        with pytest.raises(ValueError, match="Path traversal"):
+            writer.read_file("../../etc/passwd")
+
+    def test_file_exists_traversal_blocked(self, writer):
+        with pytest.raises(ValueError, match="Path traversal"):
+            writer.file_exists("../../etc/passwd")
+
+    def test_read_file_absolute_traversal_blocked(self, writer):
+        with pytest.raises(ValueError, match="Path traversal"):
+            writer.read_file("../../../tmp/secret")
+
+    def test_read_file_valid_nested_path(self, writer, tmp_vault):
+        sub = tmp_vault / "sub"
+        sub.mkdir()
+        (sub / "test.md").write_text("content")
+        assert writer.read_file("sub/test.md") == "content"
+
+    def test_file_exists_valid_path(self, writer, tmp_vault):
+        (tmp_vault / "test.md").write_text("content")
+        assert writer.file_exists("test.md") is True
+        assert writer.file_exists("nonexistent.md") is False
+
+
+# ──────────────────────────────────────────────
+# Created flag correctness
+# ──────────────────────────────────────────────
+
+
+class TestCreatedFlag:
+    @pytest.mark.asyncio
+    async def test_created_true_for_new_session(self, writer, tmp_vault):
+        """created should be True when session summary doesn't exist yet."""
+        from extensions.conversation_compiler.compile import compile_date
+
+        # Set up a daily log
+        writer.append_daily_log("2026-04-07", [
+            {"time": "10:00", "category": "fact", "content": "Test fact", "session_id": "s1"}
+        ])
+
+        mock_service = MagicMock()
+        mock_service.dedup_memories = MagicMock()
+
+        with patch(
+            "extensions.conversation_compiler.compile._async_call_gemini",
+            new_callable=AsyncMock,
+            return_value="Summary text",
+        ):
+            result = await compile_date("2026-04-07", mock_service, writer, user_id="test")
+
+        session_articles = [a for a in result.articles if a.article_type == "session"]
+        assert len(session_articles) == 1
+        assert session_articles[0].created is True
+
+    @pytest.mark.asyncio
+    async def test_created_false_for_existing_session(self, writer, tmp_vault):
+        """created should be False when session summary already exists."""
+        from extensions.conversation_compiler.compile import compile_date
+
+        # Pre-create the session summary
+        writer.write_session_summary("2026-04-07", "Old summary")
+        writer.append_daily_log("2026-04-07", [
+            {"time": "10:00", "category": "fact", "content": "Test fact", "session_id": "s1"}
+        ])
+
+        mock_service = MagicMock()
+        mock_service.dedup_memories = MagicMock()
+
+        with patch(
+            "extensions.conversation_compiler.compile._async_call_gemini",
+            new_callable=AsyncMock,
+            return_value="New summary text",
+        ):
+            result = await compile_date("2026-04-07", mock_service, writer, user_id="test")
+
+        session_articles = [a for a in result.articles if a.article_type == "session"]
+        assert len(session_articles) == 1
+        assert session_articles[0].created is False
+
+
+# ──────────────────────────────────────────────
+# User ID threading
+# ──────────────────────────────────────────────
+
+
+class TestUserIdThreading:
+    @pytest.mark.asyncio
+    async def test_compile_date_passes_user_id_to_dedup(self, writer, tmp_vault):
+        """compile_date should pass user_id to service.dedup_memories."""
+        from extensions.conversation_compiler.compile import compile_date
+
+        writer.append_daily_log("2026-04-07", [
+            {"time": "10:00", "category": "fact", "content": "Test", "session_id": "s1"}
+        ])
+        mock_service = MagicMock()
+        mock_service.dedup_memories = MagicMock()
+
+        with patch(
+            "extensions.conversation_compiler.compile._async_call_gemini",
+            new_callable=AsyncMock,
+            return_value="Summary",
+        ):
+            result = await compile_date("2026-04-07", mock_service, writer, user_id="alice")
+
+        mock_service.dedup_memories.assert_called_once_with("alice")
+        assert result.dedup_triggered is True
+
+    @pytest.mark.asyncio
+    async def test_compile_date_default_user_id(self, writer, tmp_vault):
+        """compile_date should use default user_id when not specified."""
+        from extensions.conversation_compiler.compile import compile_date
+
+        writer.append_daily_log("2026-04-07", [
+            {"time": "10:00", "category": "fact", "content": "Test", "session_id": "s1"}
+        ])
+        mock_service = MagicMock()
+        mock_service.dedup_memories = MagicMock()
+
+        with patch(
+            "extensions.conversation_compiler.compile._async_call_gemini",
+            new_callable=AsyncMock,
+            return_value="Summary",
+        ):
+            result = await compile_date("2026-04-07", mock_service, writer)
+
+        mock_service.dedup_memories.assert_called_once_with("ehfaz")
+
+
+# ──────────────────────────────────────────────
+# Async Gemini wrapper
+# ──────────────────────────────────────────────
+
+
+class TestAsyncGeminiWrapper:
+    @pytest.mark.asyncio
+    async def test_returns_text(self):
+        from extensions.conversation_compiler.compile import _async_call_gemini
+
+        mock_response = MagicMock()
+        mock_response.text = "Generated text"
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = mock_response
+
+        with patch("extensions.conversation_compiler.compile.genai.Client", return_value=mock_client):
+            result = await _async_call_gemini("Test prompt")
+
+        assert result == "Generated text"
+
+    @pytest.mark.asyncio
+    async def test_handles_none_text(self):
+        from extensions.conversation_compiler.compile import _async_call_gemini
+
+        mock_response = MagicMock()
+        mock_response.text = None
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = mock_response
+
+        with patch("extensions.conversation_compiler.compile.genai.Client", return_value=mock_client):
+            result = await _async_call_gemini("Test prompt")
+
+        assert result == ""
