@@ -566,3 +566,134 @@ class TestAsyncGeminiWrapper:
             result = await _async_call_gemini("Test prompt")
 
         assert result == ""
+
+
+# ──────────────────────────────────────────────
+# Category entry writer
+# ──────────────────────────────────────────────
+
+
+class TestCategoryEntryWriter:
+    def test_creates_file_with_frontmatter(self, writer, tmp_vault):
+        """First write to a category creates the file with frontmatter."""
+        path = writer.append_category_entry(
+            category="preference",
+            content="Prefers dark mode",
+            project_id=None,
+            session_id="s1",
+            timestamp="2026-04-29T10:30:00",
+        )
+        assert path == "Semantic/Preferences/entries.md"
+        full_path = tmp_vault / path
+        assert full_path.exists()
+        content = full_path.read_text()
+        assert "title: Preferences" in content
+        assert "preference" in content
+        assert "Prefers dark mode" in content
+
+    def test_appends_to_existing_file(self, writer, tmp_vault):
+        """Subsequent writes append to the existing file."""
+        writer.append_category_entry(
+            category="preference", content="Fact one",
+            project_id=None, session_id="s1", timestamp="2026-04-29T10:00:00",
+        )
+        writer.append_category_entry(
+            category="preference", content="Fact two",
+            project_id=None, session_id="s2", timestamp="2026-04-29T11:00:00",
+        )
+        content = (tmp_vault / "Semantic/Preferences/entries.md").read_text()
+        assert "Fact one" in content
+        assert "Fact two" in content
+
+    def test_project_scoped_uses_project_filename(self, writer, tmp_vault):
+        """Project-scoped categories use project slug as filename."""
+        path = writer.append_category_entry(
+            category="tech_stack",
+            content="Uses FastAPI for REST endpoints",
+            project_id="neuralscape",
+            session_id="s1",
+            timestamp="2026-04-29T10:00:00",
+        )
+        assert path == "Project/Tech-Stack/neuralscape.md"
+        assert (tmp_vault / path).exists()
+
+    def test_global_scoped_uses_entries_file(self, writer, tmp_vault):
+        """Global categories always use entries.md regardless of project_id."""
+        path = writer.append_category_entry(
+            category="personal_fact",
+            content="Based in Dhaka",
+            project_id=None,
+            session_id="s1",
+            timestamp="2026-04-29T10:00:00",
+        )
+        assert path == "Semantic/Personal-Facts/entries.md"
+
+    def test_unknown_category_fallback(self, writer, tmp_vault):
+        """Unknown categories fall back to Uncategorized/ folder."""
+        path = writer.append_category_entry(
+            category="invented_category",
+            content="Some fact",
+            project_id=None,
+            session_id="s1",
+            timestamp="2026-04-29T10:00:00",
+        )
+        assert path.startswith("Uncategorized/")
+        assert (tmp_vault / path).exists()
+
+
+# ──────────────────────────────────────────────
+# Category index
+# ──────────────────────────────────────────────
+
+
+class TestCategoryIndex:
+    def test_empty_vault(self, writer, tmp_vault):
+        """Empty vault produces a minimal index."""
+        path = writer.update_category_index()
+        assert path == "category-index.md"
+        content = (tmp_vault / path).read_text()
+        assert "Category Index" in content
+
+    def test_with_entries(self, writer, tmp_vault):
+        """Index correctly counts entries in category files."""
+        writer.append_category_entry(
+            category="preference", content="Fact A",
+            project_id=None, session_id="s1", timestamp="2026-04-29T10:00:00",
+        )
+        writer.append_category_entry(
+            category="preference", content="Fact B",
+            project_id=None, session_id="s2", timestamp="2026-04-29T11:00:00",
+        )
+        writer.update_category_index()
+        content = (tmp_vault / "category-index.md").read_text()
+        assert "2 entries" in content
+        assert "Semantic/Preferences/entries.md" in content
+
+    def test_multiple_projects(self, writer, tmp_vault):
+        """Project-scoped categories list multiple project files."""
+        writer.append_category_entry(
+            category="tech_stack", content="Uses FastAPI",
+            project_id="neuralscape", session_id="s1", timestamp="2026-04-29T10:00:00",
+        )
+        writer.append_category_entry(
+            category="tech_stack", content="Uses grammY",
+            project_id="openclaw", session_id="s2", timestamp="2026-04-29T11:00:00",
+        )
+        writer.update_category_index()
+        content = (tmp_vault / "category-index.md").read_text()
+        assert "neuralscape.md" in content
+        assert "openclaw.md" in content
+
+
+# ──────────────────────────────────────────────
+# Vault path coverage
+# ──────────────────────────────────────────────
+
+
+class TestVaultPaths:
+    def test_all_categories_have_vault_paths(self):
+        """Every MemoryCategory enum value has a CATEGORY_VAULT_PATHS entry."""
+        from schemas import CATEGORY_VAULT_PATHS, MemoryCategory
+
+        for cat in MemoryCategory:
+            assert cat.value in CATEGORY_VAULT_PATHS, f"Missing vault path for {cat.value}"
