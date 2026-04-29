@@ -1048,12 +1048,12 @@ async def v1_emit_extension_event(req: EmitEventRequest):
     except ValueError:
         pass  # Unknown/custom event type — allow pass-through
 
-    responses = await _extension_registry.emit_event(req.event_type, req.payload)
+    result = await _extension_registry.emit_event(req.event_type, req.payload)
     return {
         "status": "ok",
         "event_type": req.event_type,
-        "extensions_notified": len(responses),
-        "responses": responses,
+        "extensions_notified": result.notified_count,
+        "responses": result.responses,
     }
 
 
