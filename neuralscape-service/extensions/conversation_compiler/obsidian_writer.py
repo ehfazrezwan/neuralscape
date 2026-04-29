@@ -441,6 +441,138 @@ class ObsidianWriter:
         _atomic_append(path, f"- **{timestamp}** — {entry}\n")
         return rel_path
 
+    # ── Category entries ─────────────────────────
+
+    def append_category_entry(
+        self,
+        category: str,
+        content: str,
+        project_id: str | None,
+        session_id: str,
+        timestamp: str,
+    ) -> str:
+        """Append a fact to the category-specific file in the vault.
+
+        For project-scoped categories (tech_stack, convention, architecture,
+        dependency), the file is named after the project. For global/flexible
+        categories, the file is entries.md.
+
+        Args:
+            category: NeuralScape category (e.g. 'preference', 'tech_stack').
+            content: The extracted fact text.
+            project_id: Optional project slug for project-scoped categories.
+            session_id: Session identifier.
+            timestamp: ISO timestamp string.
+
+        Returns:
+            Relative path within the vault.
+        """
+        from schemas import CATEGORY_VAULT_PATHS, PROJECT_CATEGORIES
+
+        vault_folder = CATEGORY_VAULT_PATHS.get(category, f"Uncategorized/{_slugify(category)}")
+
+        if category in PROJECT_CATEGORIES and project_id:
+            filename = f"{_slugify(project_id)}.md"
+        else:
+            filename = "entries.md"
+
+        rel_path = f"{vault_folder}/{filename}"
+        path = self.vault / rel_path
+        existing = _read_file(path)
+
+        if not existing:
+            # Determine a human-readable title
+            folder_name = vault_folder.split("/")[-1]
+            title = folder_name.replace("-", " ")
+            if category in PROJECT_CATEGORIES and project_id:
+                title = f"{title} — {project_id}"
+
+            tags = [category, "auto-generated"]
+            if category in PROJECT_CATEGORIES:
+                tags.append("project")
+
+            header = _build_frontmatter(
+                title=title,
+                date=timestamp[:10],
+                tags=tags,
+            )
+            _atomic_write(path, header)
+
+        time_str = timestamp[11:16] if len(timestamp) > 16 else datetime.now().strftime("%H:%M")
+        _atomic_append(path, f"- **[{time_str}]** {content} _(session: {session_id})_\n")
+        return rel_path
+
+    def update_category_index(self) -> str:
+        """Rebuild category-index.md from vault category folders.
+
+        Scans all type folders and builds an index page listing each category,
+        its files, and entry counts.
+
+        Returns:
+            Relative path to category-index.md.
+        """
+        from schemas import CATEGORY_VAULT_PATHS
+
+        # Group paths by type (first path component)
+        types_order = ["Semantic", "Project", "Episodic", "Procedural", "Working"]
+        type_scope = {
+            "Semantic": "Global",
+            "Project": "Project-Scoped",
+            "Episodic": "Flexible",
+            "Procedural": "Flexible",
+            "Working": "Flexible",
+        }
+
+        # Build type → category → files mapping from what exists on disk
+        type_categories: dict[str, dict[str, list[tuple[str, int]]]] = {}
+        for category, vault_folder in CATEGORY_VAULT_PATHS.items():
+            parts = vault_folder.split("/")
+            type_name = parts[0]
+            category_label = parts[1] if len(parts) > 1 else category
+
+            folder_path = self.vault / vault_folder
+            if not folder_path.exists():
+                continue
+
+            files_with_counts = []
+            for md_file in sorted(folder_path.glob("*.md")):
+                if md_file.name.startswith("."):
+                    continue
+                content = _read_file(md_file)
+                entry_count = content.count("\n- **[")
+                rel = str(md_file.relative_to(self.vault))
+                files_with_counts.append((rel, entry_count))
+
+            if files_with_counts:
+                type_categories.setdefault(type_name, {})[category_label] = files_with_counts
+
+        # Build the index content
+        lines = [
+            _build_frontmatter(
+                title="Category Index",
+                date=datetime.now().strftime("%Y-%m-%d"),
+                tags=["index", "auto-generated", "categories"],
+            ),
+            "# Category Index\n",
+        ]
+
+        for type_name in types_order:
+            categories = type_categories.get(type_name)
+            if not categories:
+                continue
+            scope = type_scope.get(type_name, "")
+            lines.append(f"## {type_name} ({scope})\n")
+            for category_label, files in sorted(categories.items()):
+                lines.append(f"### {category_label.replace('-', ' ')}\n")
+                for rel_path, count in files:
+                    label = "entry" if count == 1 else "entries"
+                    lines.append(f"- [[{rel_path}]] — {count} {label}")
+                lines.append("")
+
+        rel_path = "category-index.md"
+        _atomic_write(self.vault / rel_path, "\n".join(lines) + "\n")
+        return rel_path
+
     # ── Utility methods ──────────────────────────
 
     def _safe_resolve(self, rel_path: str) -> Path:

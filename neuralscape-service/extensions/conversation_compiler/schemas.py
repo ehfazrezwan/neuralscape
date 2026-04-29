@@ -28,6 +28,7 @@ class FlushResult(BaseModel):
     facts_extracted: int = 0
     facts: list[ExtractedFact] = Field(default_factory=list)
     daily_log_path: Optional[str] = None
+    category_paths: list[str] = Field(default_factory=list)
     memories_stored: int = 0
 
 

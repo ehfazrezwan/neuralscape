@@ -79,6 +79,24 @@ def default_scope_for_category(category: str) -> MemoryScope:
     return MemoryScope.GLOBAL
 
 
+# Vault folder paths for each category (mirrors neuralscape-plugin/src/types.ts)
+CATEGORY_VAULT_PATHS: dict[str, str] = {
+    "preference": "Semantic/Preferences",
+    "personal_fact": "Semantic/Personal-Facts",
+    "technical_skill": "Semantic/Technical-Skills",
+    "domain_knowledge": "Semantic/Domain-Knowledge",
+    "tech_stack": "Project/Tech-Stack",
+    "convention": "Project/Conventions",
+    "architecture": "Project/Architecture",
+    "dependency": "Project/Dependencies",
+    "decision": "Episodic/Decisions",
+    "interaction": "Episodic/Interactions",
+    "workflow": "Procedural/Workflows",
+    "procedure": "Procedural/Procedures",
+    "task_context": "Working/Task-Context",
+}
+
+
 # ──────────────────────────────────────────────
 # Request Models
 # ──────────────────────────────────────────────

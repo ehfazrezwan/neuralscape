@@ -209,6 +209,27 @@ async def flush_conversation_turn(
                 category=category,
             )
 
+    # Step 3.5: Write to category folders (dual write)
+    category_paths: list[str] = []
+    for fact in facts:
+        category = _map_category(fact.category)
+        fact_project = fact.project_id or project_id
+        try:
+            cat_path = writer.append_category_entry(
+                category=category,
+                content=fact.content,
+                project_id=fact_project,
+                session_id=session_id,
+                timestamp=ts,
+            )
+            category_paths.append(cat_path)
+        except Exception:
+            logger.exception(
+                "Failed to write category entry",
+                fact=fact.content[:80],
+                category=category,
+            )
+
     # Step 4: Append to daily log
     log_entries = [
         {
@@ -221,11 +242,18 @@ async def flush_conversation_turn(
     ]
     daily_log_path = writer.append_daily_log(date, log_entries)
 
+    # Step 4.5: Update category index
+    try:
+        writer.update_category_index()
+    except Exception:
+        logger.exception("Failed to update category index")
+
     logger.info(
         "Flush complete",
         session_id=session_id,
         facts_extracted=len(facts),
         memories_stored=memories_stored,
+        category_paths=len(category_paths),
     )
 
     return FlushResult(
@@ -234,5 +262,6 @@ async def flush_conversation_turn(
         facts_extracted=len(facts),
         facts=facts,
         daily_log_path=daily_log_path,
+        category_paths=category_paths,
         memories_stored=memories_stored,
     )

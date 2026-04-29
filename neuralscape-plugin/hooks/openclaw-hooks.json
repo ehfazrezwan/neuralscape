@@ -20,7 +20,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${PLUGIN_ROOT}/scripts/session-summary.js\"",
+            "command": "node \"${PLUGIN_ROOT}/scripts/session-end.js\"",
             "timeout": 15,
             "async": true
           }
