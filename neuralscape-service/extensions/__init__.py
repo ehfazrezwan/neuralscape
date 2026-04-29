@@ -17,7 +17,6 @@ Usage in main.py:
 import importlib
 import logging
 import os
-import pkgutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -38,11 +37,19 @@ class ExtensionEntry:
     status: str = "registered"  # registered | started | failed | stopped
 
 
+@dataclass
+class EmitResult:
+    """Result of broadcasting an event to extensions."""
+
+    responses: list[dict] = field(default_factory=list)
+    notified_count: int = 0
+
+
 class ExtensionRegistry:
     """Manages discovery, lifecycle, and event dispatch for NeuralScape extensions.
 
-    Thread-safe for event dispatch. Extension failures are logged and do not
-    propagate — a single broken extension cannot take down the service.
+    Extension failures are logged and do not propagate — a single broken
+    extension cannot take down the service.
     """
 
     def __init__(self) -> None:
@@ -145,8 +152,8 @@ class ExtensionRegistry:
         Args:
             extension: An object implementing the NeuralscapeExtension protocol.
 
-        Raises:
-            ValueError: If an extension with the same name is already registered.
+        Note:
+            If an extension with the same name is already registered, logs a warning and skips the duplicate.
         """
         name = extension.manifest.name
         if name in self._extensions:
@@ -227,7 +234,7 @@ class ExtensionRegistry:
                     extra={"extension": name},
                 )
 
-    async def emit_event(self, event_type: str, payload: dict) -> list[dict]:
+    async def emit_event(self, event_type: str, payload: dict) -> EmitResult:
         """Broadcast an event to all extensions whose manifest.hooks includes the event type.
 
         Args:
@@ -235,14 +242,16 @@ class ExtensionRegistry:
             payload: Event payload as a dictionary.
 
         Returns:
-            List of non-None responses from extensions that handled the event.
+            EmitResult with non-None responses and the count of extensions notified.
         """
         responses: list[dict] = []
+        notified_count = 0
         for name, entry in self._extensions.items():
             if entry.status != "started":
                 continue
             if event_type not in entry.manifest.hooks:
                 continue
+            notified_count += 1
             try:
                 result = await entry.instance.on_event(event_type, payload)
                 if result is not None:
@@ -252,7 +261,7 @@ class ExtensionRegistry:
                     "Extension event handler failed",
                     extra={"extension": name, "event_type": event_type},
                 )
-        return responses
+        return EmitResult(responses=responses, notified_count=notified_count)
 
     def list_extensions(self) -> list[dict]:
         """Return a summary of all registered extensions.

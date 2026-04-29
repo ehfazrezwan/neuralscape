@@ -14,7 +14,10 @@ from pydantic import BaseModel, Field
 class ExtensionManifest(BaseModel):
     """Metadata describing a NeuralScape extension."""
 
-    name: str = Field(description="Unique extension identifier (lowercase, hyphens ok)")
+    name: str = Field(
+        pattern=r'^[a-z0-9][a-z0-9-]*$',
+        description="Unique extension identifier (lowercase, hyphens ok)",
+    )
     version: str = Field(description="Semantic version string (e.g. '0.1.0')")
     description: str = Field(description="Human-readable description of the extension")
     author: Optional[str] = Field(default=None, description="Extension author name or org")

@@ -24,7 +24,7 @@ class ExtensionManifest(BaseModel):
     version: str       # semantic version
     description: str   # human-readable description
     author: str | None = None
-    hooks: list[str] = []  # event types to listen to
+    hooks: list[str] = Field(default_factory=list)  # event types to listen to
 
 @runtime_checkable
 class NeuralscapeExtension(Protocol):
