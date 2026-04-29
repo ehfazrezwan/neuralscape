@@ -15,6 +15,7 @@ COPY neuralscape-service/pyproject.toml neuralscape-service/uv.lock neuralscape-
 COPY graphiti/graphiti_core/ graphiti/graphiti_core/
 COPY mem0/mem0/ mem0/mem0/
 COPY neuralscape-service/*.py neuralscape-service/
+COPY neuralscape-service/extensions/ neuralscape-service/extensions/
 
 # Install all dependencies using uv from the neuralscape-service project
 RUN cd neuralscape-service && uv sync --frozen --no-dev
@@ -33,6 +34,7 @@ COPY graphiti/pyproject.toml graphiti/
 COPY mem0/mem0/ mem0/mem0/
 COPY mem0/pyproject.toml mem0/
 COPY neuralscape-service/*.py neuralscape-service/
+COPY neuralscape-service/extensions/ neuralscape-service/extensions/
 
 # Put venv on PATH
 ENV PATH="/app/neuralscape-service/.venv/bin:$PATH"
