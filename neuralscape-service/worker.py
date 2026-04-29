@@ -15,6 +15,18 @@ from memory_service import MemoryService
 logger = logging.getLogger(__name__)
 
 
+def _rebuild_category_index(registry) -> None:
+    """Rebuild the Obsidian category index via the conversation-compiler extension."""
+    try:
+        for ext in registry._extensions:
+            writer = getattr(ext, "_writer", None)
+            if writer is not None:
+                writer.update_category_index()
+                break
+    except Exception:
+        logger.warning("Failed to rebuild category index (non-critical)", exc_info=True)
+
+
 async def process_memory_store(
     ctx: dict,
     messages: list[dict],
@@ -42,10 +54,14 @@ async def process_memory_store(
                 "memory_id": getattr(mem, "id", ""),
                 "content": mem.memory,
                 "category": getattr(mem, "category", "") or "",
+                "scope": getattr(mem, "scope", None),
                 "project_id": project_id,
                 "agent_id": agent_id,
                 "run_id": run_id,
+                "source": "worker",
             })
+        # Rebuild category index once after all vault writes (not per-fact)
+        _rebuild_category_index(registry)
 
     return {"memories": [m.model_dump(exclude_none=True) for m in memories]}
 
@@ -98,10 +114,14 @@ async def process_memory_raw(
             "memory_id": memories[0].id if memories else "",
             "content": content,
             "category": category,
+            "scope": scope,
             "project_id": project_id,
             "agent_id": agent_id,
             "run_id": run_id,
+            "source": "worker",
         })
+        # Rebuild category index once after vault write
+        _rebuild_category_index(registry)
 
     return {"memories": [m.model_dump(exclude_none=True) for m in memories]}
 

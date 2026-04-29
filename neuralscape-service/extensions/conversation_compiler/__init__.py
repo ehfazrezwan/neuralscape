@@ -186,10 +186,6 @@ class ConversationCompilerExtension:
                     "session_id": session_id,
                 }
             ])
-            try:
-                self.writer.update_category_index()
-            except Exception:
-                logger.warning("Failed to update category index (non-critical)")
             return {"vault_path": cat_path}
         except Exception:
             logger.exception("Failed to write memory to vault")
