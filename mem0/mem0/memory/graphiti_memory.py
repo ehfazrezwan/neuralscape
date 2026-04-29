@@ -204,7 +204,7 @@ class MemoryGraph:
 
         Supports namespace scoping:
         - If filters contain an explicit 'group_id', use it directly.
-        - If filters contain 'project_id', returns 'project:{project_id}'.
+        - If filters contain 'project_id', returns 'project--{project_id}'.
         - Otherwise returns 'global' (overarching/cross-project memories).
 
         Falls back to user_id for backward compatibility with old callers
@@ -214,10 +214,10 @@ class MemoryGraph:
         if "group_id" in filters:
             return filters["group_id"]
 
-        # New scoping model
+        # New scoping model — must match memory_service._build_group_id format
         project_id = filters.get("project_id")
         if project_id:
-            return f"project:{project_id}"
+            return f"project--{project_id}"
 
         # Default to global for new callers, user_id for legacy callers
         scope = filters.get("scope")
@@ -239,7 +239,7 @@ class MemoryGraph:
 
         project_id = filters.get("project_id")
         if project_id:
-            return ["global", f"project:{project_id}"]
+            return ["global", f"project--{project_id}"]
 
         group_id = self._get_group_id(filters)
         return [group_id]
