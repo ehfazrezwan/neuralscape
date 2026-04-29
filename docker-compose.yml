@@ -93,7 +93,7 @@ services:
       GEMINI_LLM_MODEL: ${SMALL_MODEL_NAME:-gemini-3-flash-preview}
       GEMINI_EMBEDDER_MODEL: ${EMBEDDING_MODEL_NAME:-gemini-embedding-001}
       MCP_TRANSPORT: http
-      OBSIDIAN_VAULT_PATH: ${OBSIDIAN_VAULT_PATH:-/data/vault}
+      OBSIDIAN_VAULT_PATH: /data/vault
     volumes:
       - ${OBSIDIAN_VAULT_PATH:-./vault}:/data/vault
     restart: unless-stopped
@@ -133,7 +133,7 @@ services:
       REDIS_URL: redis://redis:6379
       GEMINI_LLM_MODEL: ${SMALL_MODEL_NAME:-gemini-3-flash-preview}
       GEMINI_EMBEDDER_MODEL: ${EMBEDDING_MODEL_NAME:-gemini-embedding-001}
-      OBSIDIAN_VAULT_PATH: ${OBSIDIAN_VAULT_PATH:-/data/vault}
+      OBSIDIAN_VAULT_PATH: /data/vault
     volumes:
       - ${OBSIDIAN_VAULT_PATH:-./vault}:/data/vault
     restart: unless-stopped
