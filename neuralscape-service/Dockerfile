@@ -47,7 +47,7 @@ WORKDIR /app/neuralscape-service
 
 # Run as non-root user
 RUN useradd -m -u 1000 appuser && \
-    mkdir -p /data/qdrant && chown -R appuser:appuser /data /app
+    mkdir -p /data/qdrant /data/vault && chown -R appuser:appuser /data /app
 USER appuser
 
 EXPOSE 8199

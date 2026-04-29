@@ -42,8 +42,10 @@ class ConversationCompilerExtension:
     daily logs into structured knowledge articles.
     """
 
+    # Declare manifest at class level so issubclass_safe() detects it
+    manifest: ExtensionManifest = ExtensionManifest(**_manifest_data)
+
     def __init__(self) -> None:
-        self.manifest = ExtensionManifest(**_manifest_data)
         self._service: Optional[MemoryService] = None
         self._writer: Optional[ObsidianWriter] = None
         self._task_manager = None

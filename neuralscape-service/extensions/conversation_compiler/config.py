@@ -14,11 +14,8 @@ class CompilerSettings(BaseSettings):
     """
 
     obsidian_vault_path: str = Field(
-        default_factory=lambda: os.environ.get(
-            "OBSIDIAN_VAULT_PATH",
-            str(Path.home() / "Documents" / "Obsidian" / "KITT" / "K.I.T.T."),
-        ),
-        description="Root path to the Obsidian vault",
+        default="/data/vault",
+        description="Root path to the Obsidian vault (set via OBSIDIAN_VAULT_PATH env var)",
     )
 
     compiler_llm_model: str = Field(
