@@ -103,6 +103,8 @@ class ConversationCompilerExtension:
             return await self._handle_session_end(payload)
         elif event_type == "compile_requested":
             return await self._handle_compile_requested(payload)
+        elif event_type == "memory_stored":
+            return await self._handle_memory_stored(payload)
         return None
 
     async def _handle_conversation_turn(self, payload: dict) -> Optional[dict]:
@@ -143,6 +145,51 @@ class ConversationCompilerExtension:
         )
 
         return result.model_dump() if result.facts_extracted > 0 else None
+
+    async def _handle_memory_stored(self, payload: dict) -> Optional[dict]:
+        """Handle memory_stored: write to vault category folder + daily log.
+
+        This ensures ALL memory writes (API, MCP, plugin) get recorded
+        in the Obsidian vault, not just those from the flush endpoint.
+        Skips writes from the flush path to avoid double-writing.
+        """
+        # Skip if this memory was stored by the flush path (it already wrote to vault)
+        if payload.get("source") == "conversation-compiler":
+            return None
+
+        content = payload.get("content", "")
+        category = payload.get("category", "")
+        user_id = payload.get("user_id", "")
+        project_id = payload.get("project_id")
+        session_id = payload.get("run_id") or payload.get("agent_id") or "api"
+
+        if not content or not category:
+            return None
+
+        ts = datetime.now().isoformat()
+        date = ts[:10]
+        time_str = ts[11:16]
+
+        try:
+            cat_path = self.writer.append_category_entry(
+                category=category,
+                content=content,
+                project_id=project_id,
+                session_id=session_id,
+                timestamp=ts,
+            )
+            self.writer.append_daily_log(date, [
+                {
+                    "time": time_str,
+                    "category": category,
+                    "content": content,
+                    "session_id": session_id,
+                }
+            ])
+            return {"vault_path": cat_path}
+        except Exception:
+            logger.exception("Failed to write memory to vault")
+            return None
 
     async def _handle_session_end(self, payload: dict) -> Optional[dict]:
         """Handle session end: check if auto-compile is needed."""

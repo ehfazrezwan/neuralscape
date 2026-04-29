@@ -32,6 +32,21 @@ async def process_memory_store(
         agent_id=agent_id,
         run_id=run_id,
     )
+
+    # Emit memory_stored events so extensions (e.g. conversation-compiler) can write to vault
+    registry = ctx.get("extension_registry")
+    if registry:
+        for mem in memories:
+            await registry.emit_event("memory_stored", {
+                "user_id": user_id,
+                "memory_id": getattr(mem, "id", ""),
+                "content": mem.memory,
+                "category": getattr(mem, "category", "") or "",
+                "project_id": project_id,
+                "agent_id": agent_id,
+                "run_id": run_id,
+            })
+
     return {"memories": [m.model_dump(exclude_none=True) for m in memories]}
 
 
@@ -74,6 +89,20 @@ async def process_memory_raw(
         agent_id=agent_id,
         run_id=run_id,
     )
+
+    # Emit memory_stored event so extensions can write to vault
+    registry = ctx.get("extension_registry")
+    if registry:
+        await registry.emit_event("memory_stored", {
+            "user_id": user_id,
+            "memory_id": memories[0].id if memories else "",
+            "content": content,
+            "category": category,
+            "project_id": project_id,
+            "agent_id": agent_id,
+            "run_id": run_id,
+        })
+
     return {"memories": [m.model_dump(exclude_none=True) for m in memories]}
 
 
@@ -192,17 +221,28 @@ async def dedup_all_memories(ctx: dict) -> dict:
 
 
 async def startup(ctx: dict) -> None:
-    """Worker startup: initialize MemoryService + connections."""
+    """Worker startup: initialize MemoryService + extension registry."""
     logger.info("ARQ worker starting up...")
     service = MemoryService()
     service._get_memory()  # warm up connections
     ctx["service"] = service
+
+    # Initialize extension registry so worker can emit events
+    from extensions import ExtensionRegistry
+
+    registry = ExtensionRegistry()
+    await registry.discover()
+    await registry.startup_all()
+    ctx["extension_registry"] = registry
     logger.info("ARQ worker ready.")
 
 
 async def shutdown(ctx: dict) -> None:
     """Worker shutdown: close connections."""
     logger.info("ARQ worker shutting down...")
+    registry = ctx.get("extension_registry")
+    if registry:
+        await registry.shutdown_all()
     service: MemoryService = ctx.get("service")
     if service:
         service.close()
