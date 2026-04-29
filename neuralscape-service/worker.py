@@ -5,6 +5,7 @@ Run with: arq worker.WorkerSettings
 
 import hashlib
 import logging
+from datetime import datetime
 
 from arq.cron import cron
 
@@ -82,6 +83,84 @@ def _generate_job_id(content: str, user_id: str) -> str:
     return f"raw-{h}"
 
 
+async def process_conversation_flush(
+    ctx: dict,
+    user_message: str,
+    assistant_response: str,
+    session_id: str,
+    channel: str,
+    timestamp: str | None,
+    project_id: str | None,
+    user_id: str,
+) -> dict:
+    """Background task: extract facts from a conversation turn."""
+    from extensions.conversation_compiler.flush import flush_conversation_turn
+    from extensions.conversation_compiler.obsidian_writer import ObsidianWriter
+
+    service: MemoryService = ctx["service"]
+    writer: ObsidianWriter = ctx.get("compiler_writer") or ObsidianWriter()
+    ctx.setdefault("compiler_writer", writer)
+
+    result = await flush_conversation_turn(
+        user_message=user_message,
+        assistant_response=assistant_response,
+        session_id=session_id,
+        channel=channel,
+        timestamp=timestamp,
+        project_id=project_id,
+        user_id=user_id,
+        service=service,
+        writer=writer,
+    )
+    return result.model_dump()
+
+
+async def process_conversation_compile(
+    ctx: dict,
+    date: str | None,
+    user_id: str,
+) -> dict:
+    """Background task: compile daily logs into structured articles."""
+    from extensions.conversation_compiler.compile import compile_all_pending, compile_date
+    from extensions.conversation_compiler.obsidian_writer import ObsidianWriter
+
+    service: MemoryService = ctx["service"]
+    writer: ObsidianWriter = ctx.get("compiler_writer") or ObsidianWriter()
+    ctx.setdefault("compiler_writer", writer)
+
+    if date:
+        result = await compile_date(date, service, writer, user_id=user_id)
+        return result.model_dump()
+    else:
+        results = await compile_all_pending(service, writer, user_id=user_id)
+        return {"dates_compiled": len(results), "results": [r.model_dump() for r in results]}
+
+
+async def auto_compile_check(ctx: dict) -> dict | None:
+    """Cron job: check if auto-compilation should run after COMPILE_AFTER_HOUR."""
+    from extensions.conversation_compiler.compile import compile_all_pending
+    from extensions.conversation_compiler.config import compiler_settings
+    from extensions.conversation_compiler.obsidian_writer import ObsidianWriter
+
+    if not compiler_settings.auto_compile:
+        return None
+
+    now = datetime.now()
+    if now.hour < compiler_settings.compile_after_hour:
+        return None
+
+    service: MemoryService = ctx["service"]
+    writer: ObsidianWriter = ctx.get("compiler_writer") or ObsidianWriter()
+    ctx.setdefault("compiler_writer", writer)
+
+    results = await compile_all_pending(service, writer, user_id=settings.default_user_id)
+    if results:
+        writer.append_log(f"Auto-compiled {len(results)} date(s) via cron")
+        logger.info(f"Auto-compile cron: compiled {len(results)} dates")
+        return {"dates_compiled": len(results)}
+    return None
+
+
 async def dedup_all_memories(ctx: dict) -> dict:
     """Cron job: deduplicate Qdrant memories for every user."""
     service: MemoryService = ctx["service"]
@@ -131,13 +210,27 @@ async def shutdown(ctx: dict) -> None:
 
 
 class WorkerSettings:
-    functions = [process_memory_store, process_memory_raw]
+    functions = [
+        process_memory_store,
+        process_memory_raw,
+        process_conversation_flush,
+        process_conversation_compile,
+    ]
     cron_jobs = [
         cron(
             dedup_all_memories,
             hour=settings.dedup_cron_hours,
             minute=0,
             timeout=1800,
+            unique=True,
+            max_tries=1,
+            run_at_startup=False,
+        ),
+        cron(
+            auto_compile_check,
+            hour={18, 19, 20, 21, 22, 23},
+            minute=30,
+            timeout=600,
             unique=True,
             max_tries=1,
             run_at_startup=False,
