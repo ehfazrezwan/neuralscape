@@ -697,3 +697,127 @@ class TestVaultPaths:
 
         for cat in MemoryCategory:
             assert cat.value in CATEGORY_VAULT_PATHS, f"Missing vault path for {cat.value}"
+
+
+# ──────────────────────────────────────────────
+# _handle_memory_stored tests
+# ──────────────────────────────────────────────
+
+
+class TestHandleMemoryStored:
+    """Tests for the ConversationCompilerExtension._handle_memory_stored handler."""
+
+    @pytest.fixture
+    def extension(self, tmp_vault):
+        from extensions.conversation_compiler import ConversationCompilerExtension
+        from extensions.conversation_compiler.obsidian_writer import ObsidianWriter
+
+        ext = ConversationCompilerExtension()
+        ext._writer = ObsidianWriter(vault_path=tmp_vault)
+        ext._service = MagicMock()
+        return ext
+
+    @pytest.mark.asyncio
+    async def test_skips_conversation_compiler_source(self, extension):
+        """Events from the conversation-compiler flush path should be skipped."""
+        result = await extension._handle_memory_stored({
+            "source": "conversation-compiler",
+            "content": "some fact",
+            "category": "preference",
+            "user_id": "ehfaz",
+        })
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_skips_empty_content(self, extension):
+        """Events with empty content should be skipped."""
+        result = await extension._handle_memory_stored({
+            "source": "worker",
+            "content": "",
+            "category": "preference",
+            "user_id": "ehfaz",
+        })
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_skips_empty_category(self, extension):
+        """Events with empty category should be skipped."""
+        result = await extension._handle_memory_stored({
+            "source": "worker",
+            "content": "some fact",
+            "category": "",
+            "user_id": "ehfaz",
+        })
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_writes_to_vault(self, extension, tmp_vault):
+        """Worker-sourced events should write to category folder and daily log."""
+        result = await extension._handle_memory_stored({
+            "source": "worker",
+            "content": "Prefers dark mode",
+            "category": "preference",
+            "user_id": "ehfaz",
+            "project_id": None,
+            "run_id": "sess-123",
+        })
+        assert result is not None
+        assert "vault_path" in result
+
+        # Verify category file was created
+        cat_file = tmp_vault / "Semantic" / "Preferences" / "entries.md"
+        assert cat_file.exists()
+        content = cat_file.read_text()
+        assert "Prefers dark mode" in content
+        assert "sess-123" in content
+
+        # Verify daily log was created
+        daily_files = list((tmp_vault / "Daily").glob("*.md"))
+        assert len(daily_files) == 1
+        daily_content = daily_files[0].read_text()
+        assert "Prefers dark mode" in daily_content
+
+    @pytest.mark.asyncio
+    async def test_writes_project_scoped(self, extension, tmp_vault):
+        """Project-scoped categories should use project slug as filename."""
+        result = await extension._handle_memory_stored({
+            "source": "worker",
+            "content": "Uses FastAPI for API layer",
+            "category": "tech_stack",
+            "user_id": "ehfaz",
+            "project_id": "neuralscape",
+            "run_id": "sess-456",
+        })
+        assert result is not None
+
+        cat_file = tmp_vault / "Project" / "Tech-Stack" / "neuralscape.md"
+        assert cat_file.exists()
+        content = cat_file.read_text()
+        assert "Uses FastAPI for API layer" in content
+
+    @pytest.mark.asyncio
+    async def test_handles_writer_exception(self, extension):
+        """Writer exceptions should be caught and return None."""
+        extension._writer = MagicMock()
+        extension._writer.append_category_entry.side_effect = OSError("disk full")
+
+        result = await extension._handle_memory_stored({
+            "source": "worker",
+            "content": "some fact",
+            "category": "preference",
+            "user_id": "ehfaz",
+        })
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_worker_source_passes_through(self, extension, tmp_vault):
+        """Events with source='worker' should NOT be skipped."""
+        result = await extension._handle_memory_stored({
+            "source": "worker",
+            "content": "A fact from the worker",
+            "category": "personal_fact",
+            "user_id": "ehfaz",
+        })
+        assert result is not None
+        cat_file = tmp_vault / "Semantic" / "Personal-Facts" / "entries.md"
+        assert cat_file.exists()

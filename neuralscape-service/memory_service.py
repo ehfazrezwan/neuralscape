@@ -610,17 +610,18 @@ class MemoryService:
         """
         m = self._get_memory()
 
-        # Build metadata filters
+        # Build metadata filters — these fields are nested under "metadata"
+        # in the Qdrant payload, so prefix keys with "metadata." for filtering.
         filters = {}
         if categories:
-            filters["category"] = {"in": categories}
+            filters["metadata.category"] = {"in": categories}
         if scope:
-            filters["scope"] = scope
+            filters["metadata.scope"] = scope
 
         # If project_id is given and no explicit scope, search both scopes
         if project_id and not scope:
             # Search project-scoped memories
-            project_filters = {**filters, "project_id": project_id}
+            project_filters = {**filters, "metadata.project_id": project_id}
             project_results = m.search(
                 query=query,
                 user_id=user_id,
@@ -629,7 +630,7 @@ class MemoryService:
             )
 
             # Search global memories
-            global_filters = {**filters, "scope": "global"}
+            global_filters = {**filters, "metadata.scope": "global"}
             global_results = m.search(
                 query=query,
                 user_id=user_id,
@@ -642,7 +643,7 @@ class MemoryService:
             vector_responses = self._results_to_responses(all_results[:limit])
         else:
             if project_id:
-                filters["project_id"] = project_id
+                filters["metadata.project_id"] = project_id
 
             results = m.search(
                 query=query,
@@ -769,14 +770,14 @@ class MemoryService:
         # Get global memories
         global_result = m.get_all(
             user_id=user_id,
-            filters={"scope": "global"},
+            filters={"metadata.scope": "global"},
             limit=200,
         )
 
         # Get project memories
         project_result = m.get_all(
             user_id=user_id,
-            filters={"project_id": project_id},
+            filters={"metadata.project_id": project_id},
             limit=200,
         )
 
@@ -812,7 +813,7 @@ class MemoryService:
 
         result = m.get_all(
             user_id=user_id,
-            filters={"scope": "global"},
+            filters={"metadata.scope": "global"},
             limit=200,
         )
 
@@ -856,11 +857,11 @@ class MemoryService:
 
         filters = {}
         if scope:
-            filters["scope"] = scope
+            filters["metadata.scope"] = scope
         if category:
-            filters["category"] = category
+            filters["metadata.category"] = category
         if project_id:
-            filters["project_id"] = project_id
+            filters["metadata.project_id"] = project_id
 
         result = m.get_all(
             user_id=user_id,

@@ -15,6 +15,18 @@ from memory_service import MemoryService
 logger = logging.getLogger(__name__)
 
 
+def _rebuild_category_index(registry) -> None:
+    """Rebuild the Obsidian category index via the conversation-compiler extension."""
+    try:
+        for ext in registry._extensions:
+            writer = getattr(ext, "_writer", None)
+            if writer is not None:
+                writer.update_category_index()
+                break
+    except Exception:
+        logger.warning("Failed to rebuild category index (non-critical)", exc_info=True)
+
+
 async def process_memory_store(
     ctx: dict,
     messages: list[dict],
@@ -32,6 +44,25 @@ async def process_memory_store(
         agent_id=agent_id,
         run_id=run_id,
     )
+
+    # Emit memory_stored events so extensions (e.g. conversation-compiler) can write to vault
+    registry = ctx.get("extension_registry")
+    if registry:
+        for mem in memories:
+            await registry.emit_event("memory_stored", {
+                "user_id": user_id,
+                "memory_id": getattr(mem, "id", ""),
+                "content": mem.memory,
+                "category": getattr(mem, "category", "") or "",
+                "scope": getattr(mem, "scope", None),
+                "project_id": project_id,
+                "agent_id": agent_id,
+                "run_id": run_id,
+                "source": "worker",
+            })
+        # Rebuild category index once after all vault writes (not per-fact)
+        _rebuild_category_index(registry)
+
     return {"memories": [m.model_dump(exclude_none=True) for m in memories]}
 
 
@@ -74,6 +105,24 @@ async def process_memory_raw(
         agent_id=agent_id,
         run_id=run_id,
     )
+
+    # Emit memory_stored event so extensions can write to vault
+    registry = ctx.get("extension_registry")
+    if registry:
+        await registry.emit_event("memory_stored", {
+            "user_id": user_id,
+            "memory_id": memories[0].id if memories else "",
+            "content": content,
+            "category": category,
+            "scope": scope,
+            "project_id": project_id,
+            "agent_id": agent_id,
+            "run_id": run_id,
+            "source": "worker",
+        })
+        # Rebuild category index once after vault write
+        _rebuild_category_index(registry)
+
     return {"memories": [m.model_dump(exclude_none=True) for m in memories]}
 
 
@@ -192,17 +241,28 @@ async def dedup_all_memories(ctx: dict) -> dict:
 
 
 async def startup(ctx: dict) -> None:
-    """Worker startup: initialize MemoryService + connections."""
+    """Worker startup: initialize MemoryService + extension registry."""
     logger.info("ARQ worker starting up...")
     service = MemoryService()
     service._get_memory()  # warm up connections
     ctx["service"] = service
+
+    # Initialize extension registry so worker can emit events
+    from extensions import ExtensionRegistry
+
+    registry = ExtensionRegistry()
+    await registry.discover()
+    await registry.startup_all()
+    ctx["extension_registry"] = registry
     logger.info("ARQ worker ready.")
 
 
 async def shutdown(ctx: dict) -> None:
     """Worker shutdown: close connections."""
     logger.info("ARQ worker shutting down...")
+    registry = ctx.get("extension_registry")
+    if registry:
+        await registry.shutdown_all()
     service: MemoryService = ctx.get("service")
     if service:
         service.close()

@@ -149,7 +149,7 @@ class TestSearch:
             categories=["preference", "convention"],
         )
         call_kwargs = service._memory.search.call_args[1]
-        assert call_kwargs["filters"]["category"] == {"in": ["preference", "convention"]}
+        assert call_kwargs["filters"]["metadata.category"] == {"in": ["preference", "convention"]}
 
 
 class TestGetContext:
@@ -209,9 +209,9 @@ class TestCRUD:
             project_id="my-project",
         )
         call_kwargs = service._memory.get_all.call_args[1]
-        assert call_kwargs["filters"]["scope"] == "global"
-        assert call_kwargs["filters"]["category"] == "preference"
-        assert call_kwargs["filters"]["project_id"] == "my-project"
+        assert call_kwargs["filters"]["metadata.scope"] == "global"
+        assert call_kwargs["filters"]["metadata.category"] == "preference"
+        assert call_kwargs["filters"]["metadata.project_id"] == "my-project"
 
     def test_update_memory(self, service):
         service._memory.get.return_value = {

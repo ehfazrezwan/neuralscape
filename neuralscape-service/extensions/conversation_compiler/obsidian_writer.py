@@ -138,7 +138,7 @@ class ObsidianWriter:
             Path to the daily log file (relative to vault).
         """
         rel_path = f"Daily/{date}.md"
-        path = self.vault / rel_path
+        path = self._safe_resolve(rel_path)
         existing = _read_file(path)
 
         if not existing:
@@ -173,7 +173,7 @@ class ObsidianWriter:
 
     def is_daily_log_compiled(self, date: str) -> bool:
         """Check if a daily log has already been compiled."""
-        path = self.vault / f"Daily/{date}.md"
+        path = self._safe_resolve(f"Daily/{date}.md")
         content = _read_file(path)
         if not content:
             return False
@@ -181,7 +181,7 @@ class ObsidianWriter:
 
     def mark_daily_log_compiled(self, date: str) -> None:
         """Mark a daily log as compiled by updating its frontmatter."""
-        path = self.vault / f"Daily/{date}.md"
+        path = self._safe_resolve(f"Daily/{date}.md")
         content = _read_file(path)
         if not content:
             return
@@ -197,7 +197,7 @@ class ObsidianWriter:
         Returns:
             List of dicts with 'time', 'category', 'content', 'session_id'.
         """
-        path = self.vault / f"Daily/{date}.md"
+        path = self._safe_resolve(f"Daily/{date}.md")
         content = _read_file(path)
         if not content:
             return []
@@ -245,7 +245,7 @@ class ObsidianWriter:
             Relative path within the vault.
         """
         rel_path = f"Sessions/{date}.md"
-        path = self.vault / rel_path
+        path = self._safe_resolve(rel_path)
         content = _build_frontmatter(
             title=f"Session Summary — {date}",
             tags=["session-summary", "auto-generated"],
@@ -266,7 +266,7 @@ class ObsidianWriter:
         """
         slug = _slugify(project)
         rel_path = f"Projects/{slug}/README.md"
-        path = self.vault / rel_path
+        path = self._safe_resolve(rel_path)
         existing = _read_file(path)
 
         if existing:
@@ -303,7 +303,7 @@ class ObsidianWriter:
         """
         safe_slug = _slugify(slug)
         rel_path = f"Decisions/{safe_slug}.md"
-        path = self.vault / rel_path
+        path = self._safe_resolve(rel_path)
         existing = _read_file(path)
 
         if existing:
@@ -338,7 +338,7 @@ class ObsidianWriter:
         """
         safe_slug = _slugify(topic)
         rel_path = f"Research/{safe_slug}.md"
-        path = self.vault / rel_path
+        path = self._safe_resolve(rel_path)
         existing = _read_file(path)
 
         if existing:
@@ -374,7 +374,7 @@ class ObsidianWriter:
             Relative path to the index file.
         """
         rel_path = "index.md"
-        path = self.vault / rel_path
+        path = self._safe_resolve(rel_path)
         existing = _read_file(path)
 
         # Parse existing index entries into a dict keyed by path
@@ -427,7 +427,7 @@ class ObsidianWriter:
             Relative path to the log file.
         """
         rel_path = "log.md"
-        path = self.vault / rel_path
+        path = self._safe_resolve(rel_path)
 
         if not path.exists():
             header = _build_frontmatter(
@@ -477,7 +477,7 @@ class ObsidianWriter:
             filename = "entries.md"
 
         rel_path = f"{vault_folder}/{filename}"
-        path = self.vault / rel_path
+        path = self._safe_resolve(rel_path)
         existing = _read_file(path)
 
         if not existing:

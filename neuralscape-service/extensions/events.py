@@ -69,6 +69,12 @@ class MemoryStoredEvent(BaseModel):
     category: Optional[str] = None
     scope: Optional[str] = None
     project_id: Optional[str] = None
+    agent_id: Optional[str] = None
+    run_id: Optional[str] = None
+    source: Optional[str] = Field(
+        default=None,
+        description="Origin of the memory write: 'worker', 'conversation-compiler', 'sync-fallback'",
+    )
 
 
 class CompileRequestedEvent(BaseModel):
