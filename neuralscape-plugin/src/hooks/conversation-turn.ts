@@ -10,10 +10,17 @@
 
 import { detectClient, getTurnExtractor } from "../adapters/detect.js";
 import { flushTurns } from "../core/flush.js";
-import { logError, outputContinue, parseStdin } from "../utils.js";
+import { hasUserId, logError, outputContinue, parseStdin } from "../utils.js";
 
 async function main(): Promise<void> {
   outputContinue();
+
+  if (!hasUserId()) {
+    logError(
+      "missing user_id — set NEURALSCAPE_USER_ID via /plugin config or env var; skipping turn capture",
+    );
+    return;
+  }
 
   try {
     const raw = (await parseStdin()) as Record<string, unknown>;

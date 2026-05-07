@@ -2,14 +2,31 @@
  * Shared utilities for Neuralscape Claude Code plugin hooks.
  */
 
+import { parse as parsePath } from "node:path";
+
 // ── Configuration ────────────────────────────────────────────────
+//
+// Plugin reads config from `userConfig` prompts the user fills in at install
+// time; Claude Code/Cowork expose those values as CLAUDE_PLUGIN_OPTION_<KEY>
+// env vars. Legacy NEURALSCAPE_<KEY> env vars stay supported for one release.
 
-const NEURALSCAPE_URL =
-  process.env.NEURALSCAPE_URL?.replace(/\/$/, "") || "http://localhost:8199";
+function readConfig(key: string, fallback = ""): string {
+  const modern = process.env[`CLAUDE_PLUGIN_OPTION_${key}`]?.trim();
+  if (modern) return modern;
+  const legacy = process.env[`NEURALSCAPE_${key}`]?.trim();
+  if (legacy) return legacy;
+  return fallback;
+}
 
-const NEURALSCAPE_API_KEY = process.env.NEURALSCAPE_API_KEY || "";
+const NEURALSCAPE_URL = readConfig("URL", "http://localhost:8199").replace(/\/$/, "");
 
-const DEFAULT_USER_ID = process.env.NEURALSCAPE_USER_ID || "ehfaz";
+const NEURALSCAPE_API_KEY = readConfig("API_KEY", "");
+
+const NEURALSCAPE_USER_ID =
+  readConfig("USER_ID", "") ||
+  process.env.USER?.trim() ||
+  process.env.USERNAME?.trim() ||
+  "";
 
 const REQUEST_TIMEOUT_MS = 8000;
 
@@ -97,14 +114,30 @@ export async function parseStdin(): Promise<HookInput> {
 // ── Identity ─────────────────────────────────────────────────────
 
 export function getUserId(): string {
-  return DEFAULT_USER_ID;
+  return NEURALSCAPE_USER_ID;
 }
 
+export function hasUserId(): boolean {
+  return NEURALSCAPE_USER_ID.length > 0;
+}
+
+export function getServiceUrl(): string {
+  return NEURALSCAPE_URL;
+}
+
+export function hasApiKey(): boolean {
+  return NEURALSCAPE_API_KEY.length > 0;
+}
+
+/**
+ * Project ID is the basename of the working directory.
+ * Uses path.parse so it handles both POSIX (/home/foo/bar) and
+ * Windows (C:\Users\foo\bar) path separators.
+ */
 export function getProjectId(cwd?: string): string | undefined {
   const dir = cwd || process.cwd();
-  // Use the last component of the path as project_id
-  const parts = dir.split("/").filter(Boolean);
-  return parts.length > 0 ? parts[parts.length - 1] : undefined;
+  const name = parsePath(dir).name;
+  return name || undefined;
 }
 
 // ── HTTP Client ──────────────────────────────────────────────────

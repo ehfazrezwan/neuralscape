@@ -12,6 +12,13 @@ import type { ConversationTurn, SessionEndInput } from "../core/types.js";
 
 const OFFSET_SUFFIX = ".neuralscape-offset";
 
+/**
+ * Offsets staged by extractClaudeCodeTurns are written to disk only after
+ * the caller confirms a successful flush, so a failed flush leaves the
+ * cursor at its prior position and we re-flush next session.
+ */
+const pendingOffsets = new Map<string, number>();
+
 interface TranscriptMessage {
   type: string; // "user" | "assistant" | "tool_use" | "tool_result" | ...
   content?: string | Array<{ type: string; text?: string }>;
@@ -138,7 +145,9 @@ export async function extractClaudeCodeTurns(
       const { turns, newOffset } = parseTranscript(content, offset);
 
       if (turns.length > 0) {
-        await writeFlushOffset(transcriptPath, newOffset);
+        // Stage the new offset; commitClaudeCodeFlush() persists it
+        // only after the caller confirms a successful flush.
+        pendingOffsets.set(transcriptPath, newOffset);
 
         return turns.map((t) => ({
           userMessage: t.user,
@@ -187,4 +196,30 @@ export function extractClaudeCodeSessionEnd(
     userId: getUserId(),
     shouldCompile: true,
   };
+}
+
+/**
+ * Persist the offset staged by extractClaudeCodeTurns().
+ *
+ * Call this AFTER a successful flush so the cursor advances only when
+ * the turns have actually been delivered. If the hook crashes between
+ * extract and commit, the on-disk offset stays at its prior value and
+ * the next session re-flushes (the backend is expected to dedup).
+ */
+export async function commitClaudeCodeFlush(
+  raw: Record<string, unknown>
+): Promise<void> {
+  const transcriptPath = raw.transcript_path as string | undefined;
+  if (!transcriptPath) return;
+
+  const newOffset = pendingOffsets.get(transcriptPath);
+  if (newOffset === undefined) return;
+
+  try {
+    await writeFlushOffset(transcriptPath, newOffset);
+  } catch (error) {
+    logError("Failed to commit transcript flush offset", error);
+  } finally {
+    pendingOffsets.delete(transcriptPath);
+  }
 }
