@@ -1,6 +1,6 @@
 {
   "name": "neuralscape-plugin",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Persistent agentic memory plugin for Claude Code and Claude Cowork",
   "private": true,
   "type": "module",

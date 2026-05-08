@@ -4,6 +4,15 @@ All notable changes to the `neuralscape` Claude plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.0.1] - 2026-05-08
+
+### Fixed
+- Drop the explicit `"hooks": "./hooks/hooks.json"` reference from
+  `plugin.json`. Claude Code 2.1+ auto-loads the standard
+  `hooks/hooks.json` from the plugin root; declaring it explicitly causes
+  a "Duplicate hooks file detected" load error in `/doctor`. Hooks still
+  fire identically — this is a manifest-only correction.
+
 ## [2.0.0] - 2026-05-07
 
 ### Breaking
