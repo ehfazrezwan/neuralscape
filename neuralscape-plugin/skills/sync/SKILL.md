@@ -42,4 +42,4 @@ Trigger an immediate flush + compile of the current session, mid-conversation ra
 
 - The Stop hook does this automatically at session end — only run `sync` manually for "save this conversation right now" cases.
 - Flush requests return `202 Accepted` with a task_id; you do not need to poll. The compile request returns immediately too.
-- The full pipeline is documented at `[[Reference/neuralscape/09-plugin-system#conversation-compiler-extension]]`.
+- The full pipeline is documented at `docs/neuralscape/09-plugin-system.md#conversation-compiler-extension` in the Neuralscape repo.

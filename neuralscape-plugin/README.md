@@ -23,7 +23,7 @@ Claude Code prompts you for three values at install time:
 
 That's it. Open a new session — the SessionStart hook will pull your prior context and inject it as `additionalContext`.
 
-> **First time on Neuralscape?** Set up the service first. The 8-step walkthrough is in [`Reference/neuralscape/01-getting-started`](https://github.com/ehfazrezwan/neuralscape) (Obsidian vault) or `01-getting-started.md` in your service docs.
+> **First time on Neuralscape?** Set up the service first. The full 8-step walkthrough is at [`docs/neuralscape/01-getting-started.md`](../docs/neuralscape/01-getting-started.md) in this repo.
 
 ## Claude Cowork install
 
@@ -140,7 +140,7 @@ To run a hook locally for testing:
 echo '{"user_message":"hello","assistant_response":"Hi there. How can I help today?","session_id":"test","channel":"cli"}' | node scripts/conversation-turn.js
 ```
 
-Architecture, adapter contracts, and "adding a new client" walkthrough live in [`Reference/neuralscape/09-plugin-system`](https://github.com/ehfazrezwan/neuralscape).
+Architecture, adapter contracts, and "adding a new client" walkthrough live in [`docs/neuralscape/09-plugin-system.md`](../docs/neuralscape/09-plugin-system.md).
 
 ## License
 

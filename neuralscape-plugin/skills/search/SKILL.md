@@ -42,5 +42,5 @@ Run this skill when the user wants to recall stored memories on a topic.
 ## Notes
 
 - Read-only. Never store or modify memories from this skill.
-- The Neuralscape `/v1/search` endpoint is documented at `[[Reference/neuralscape/04-memory-service-core#hybrid-search]]`.
-- Categories and scopes (13 total) are documented at `[[Reference/neuralscape/03-memory-model]]`.
+- The Neuralscape `/v1/search` endpoint is documented at `docs/neuralscape/04-memory-service-core.md#hybrid-search` in the Neuralscape repo.
+- Categories and scopes (13 total) are documented at `docs/neuralscape/03-memory-model.md` in the Neuralscape repo.

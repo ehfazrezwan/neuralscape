@@ -26,7 +26,7 @@ Run this skill when the user wants to confirm the Neuralscape service is reachab
        graph_store:  ok
    ```
 
-   If the health call fails (timeout, 5xx, connection refused), report the error verbatim and suggest the user check `[[Reference/neuralscape/01-getting-started]]` Step 4.
+   If the health call fails (timeout, 5xx, connection refused), report the error verbatim and suggest the user check `docs/neuralscape/01-getting-started.md` Step 4 in the Neuralscape repo.
 
 ## Notes
 

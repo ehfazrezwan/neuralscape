@@ -18,7 +18,7 @@ All via environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OBSIDIAN_VAULT_PATH` | `~/Documents/Obsidian/KITT/K.I.T.T.` | Root path to the Obsidian vault |
+| `OBSIDIAN_VAULT_PATH` | `./vault` (or `/data/vault` in Docker) | Root path to the Obsidian vault. The maintainer's local default is `~/Documents/Obsidian/<vault-name>`; pick whatever works for you. |
 | `COMPILER_LLM_MODEL` | (NeuralScape default) | Gemini model for extraction/compilation |
 | `COMPILE_AFTER_HOUR` | `18` | Hour (24h) after which auto-compilation runs |
 | `AUTO_COMPILE` | `true` | Whether to auto-compile daily logs |
