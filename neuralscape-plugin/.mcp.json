@@ -2,9 +2,9 @@
   "mcpServers": {
     "neuralscape": {
       "type": "http",
-      "url": "${CLAUDE_PLUGIN_OPTION_URL}/mcp/",
+      "url": "${user_config.URL}/mcp/",
       "headers": {
-        "Authorization": "Bearer ${CLAUDE_PLUGIN_OPTION_API_KEY}"
+        "Authorization": "Bearer ${user_config.API_KEY}"
       }
     }
   }

@@ -4,6 +4,21 @@ All notable changes to the `neuralscape` Claude plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.0.2] - 2026-05-08
+
+### Fixed
+- `.mcp.json` now uses `${user_config.URL}` and `${user_config.API_KEY}`
+  for substitution instead of `${CLAUDE_PLUGIN_OPTION_URL}` and
+  `${CLAUDE_PLUGIN_OPTION_API_KEY}`. The `CLAUDE_PLUGIN_OPTION_*` form
+  is an environment-variable reference resolved when Claude Code spawns
+  a subprocess (stdio MCP servers, hook scripts). HTTP MCP servers are
+  invoked directly by Claude Code with no subprocess, so that form
+  never resolved — the validator reported "Missing environment
+  variables" even though the userConfig values were present in
+  `~/.claude/settings.json` and `~/.claude/.credentials.json`. The
+  `${user_config.<KEY>}` form is the documented substitution for
+  declarative manifest fields and resolves correctly from pluginConfigs.
+
 ## [2.0.1] - 2026-05-08
 
 ### Fixed
