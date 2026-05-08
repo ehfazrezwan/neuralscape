@@ -1,9 +1,48 @@
 {
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "neuralscape",
-  "version": "1.0.0",
-  "description": "Persistent memory for Claude Code — automatic context capture and retrieval via Neuralscape",
+  "version": "2.0.2",
+  "description": "Persistent agentic memory for Claude. Auto-captures conversations, recalls relevant context on every session start, and exposes 7 MCP tools (recall, remember, search, project context, graph search, list, delete).",
   "author": {
     "name": "Ehfaz Rezwan",
     "email": "ehfaz.rezwan@gmail.com"
+  },
+  "homepage": "https://github.com/ehfazrezwan/neuralscape",
+  "repository": "https://github.com/ehfazrezwan/neuralscape",
+  "license": "MIT",
+  "keywords": [
+    "memory",
+    "context",
+    "rag",
+    "knowledge-graph",
+    "mem0",
+    "graphiti",
+    "neuralscape",
+    "agent",
+    "claude-code",
+    "claude-cowork"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "userConfig": {
+    "URL": {
+      "type": "string",
+      "title": "Neuralscape service URL",
+      "description": "Base URL of your Neuralscape API (e.g. https://neuralscape.example.com or http://localhost:8199).",
+      "required": true,
+      "default": "http://localhost:8199"
+    },
+    "API_KEY": {
+      "type": "string",
+      "title": "API key (optional)",
+      "description": "Bearer token for authenticated deployments. Leave empty for local dev with no NEURALSCAPE_API_KEY set.",
+      "sensitive": true
+    },
+    "USER_ID": {
+      "type": "string",
+      "title": "Your user ID",
+      "description": "Stable identifier used to scope memories to you. Pick something short and unique (e.g. your username).",
+      "required": true
+    }
   }
 }

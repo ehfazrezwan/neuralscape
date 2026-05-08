@@ -8,6 +8,7 @@ import {
   type NeuralscapeMemory,
   getUserId,
   getProjectId,
+  hasUserId,
   logError,
   neuralscapeGet,
   outputContinue,
@@ -52,6 +53,14 @@ function formatMemories(categories: Record<string, NeuralscapeMemory[]>): string
 
 async function main(): Promise<void> {
   try {
+    if (!hasUserId()) {
+      logError(
+        "missing user_id — run `/plugin config neuralscape@neuralscape-plugins` to set USER_ID (or set NEURALSCAPE_USER_ID env var as legacy fallback); skipping context injection",
+      );
+      outputContinue();
+      return;
+    }
+
     const input = await parseStdin();
     const userId = getUserId();
     const projectId = getProjectId(input.cwd);

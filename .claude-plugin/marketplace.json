@@ -1,15 +1,28 @@
 {
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
   "name": "neuralscape-plugins",
   "owner": {
     "name": "Ehfaz Rezwan",
-    "email": "ehfaz.rezwan@optimizely.com"
+    "email": "ehfaz.rezwan@gmail.com"
+  },
+  "metadata": {
+    "description": "Plugins for the Neuralscape memory layer — works with Claude Code and Claude Cowork.",
+    "homepage": "https://github.com/ehfazrezwan/neuralscape"
   },
   "plugins": [
     {
       "name": "neuralscape",
       "source": "./neuralscape-plugin",
-      "description": "Persistent memory for Claude Code — automatic context capture and retrieval via Neuralscape",
-      "version": "1.0.0"
+      "description": "Persistent agentic memory for Claude (Code + Cowork). Auto-captures conversations, recalls relevant context on every session start, and exposes 7 MCP tools.",
+      "version": "2.0.2",
+      "license": "MIT",
+      "keywords": [
+        "memory",
+        "context",
+        "rag",
+        "knowledge-graph",
+        "agent"
+      ]
     }
   ]
 }

@@ -1302,8 +1302,18 @@ class MemoryService:
         return []
 
     def _mem_to_response(self, mem: dict) -> MemoryResponse:
-        """Convert a mem0 memory dict to a MemoryResponse."""
+        """Convert a mem0 memory dict to a MemoryResponse.
+
+        mem0's _search_vector_store / _get_all_from_vector_store helpers lift
+        every non-promoted payload field into a top-level "metadata" dict.
+        Because our Qdrant payload already nests our fields under a literal
+        "metadata" key, the returned shape is {"metadata": {"metadata": {...}}}.
+        Unwrap one level if we see that pattern so category/scope/project_id/
+        tags/source resolve to their real values.
+        """
         metadata = mem.get("metadata", {}) or {}
+        if isinstance(metadata.get("metadata"), dict):
+            metadata = metadata["metadata"]
         return MemoryResponse(
             id=mem.get("id", ""),
             memory=mem.get("memory", ""),

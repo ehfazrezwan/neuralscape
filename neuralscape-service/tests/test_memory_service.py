@@ -874,3 +874,115 @@ class TestDeleteJunkEpisodes:
 
         assert result["deleted_count"] == 1
         assert len(result["breakdown"]["global-only"]["deleted_uuids"]) == 1
+
+
+# ──────────────────────────────────────────────
+# Response shaping (mem0 metadata unwrap)
+# ──────────────────────────────────────────────
+
+
+class TestMemToResponse:
+    """Regression coverage for the mem0 metadata-double-wrap fix.
+
+    mem0's `_search_vector_store` and `_get_all_from_vector_store` lift every
+    payload field that isn't on a hardcoded promoted-keys list into a
+    top-level `metadata` dict. Because our Qdrant payload nests our domain
+    fields under a literal `metadata` key, the result that reaches
+    `_mem_to_response` is shaped like
+    `{"metadata": {"metadata": {"scope": ..., "category": ...}}}`.
+
+    Without the unwrap, `metadata.get("category")` resolves to None and
+    every search/list response loses category, scope, project_id, and tags.
+    """
+
+    def test_unwraps_double_nested_metadata(self, service):
+        """The shape mem0 actually produces — must unwrap once."""
+        mem = {
+            "id": "abc-123",
+            "memory": "Prefers TypeScript over JavaScript",
+            "score": 0.85,
+            "created_at": "2026-05-08T19:38:47Z",
+            "updated_at": None,
+            "metadata": {
+                "metadata": {
+                    "scope": "global",
+                    "category": "preference",
+                    "project_id": None,
+                    "tags": ["editor"],
+                    "source": "explicit",
+                }
+            },
+        }
+
+        resp = service._mem_to_response(mem)
+
+        assert resp.id == "abc-123"
+        assert resp.memory == "Prefers TypeScript over JavaScript"
+        assert resp.category == "preference"
+        assert resp.scope == "global"
+        assert resp.project_id is None
+        assert resp.tags == ["editor"]
+        assert resp.score == 0.85
+        assert resp.created_at == "2026-05-08T19:38:47Z"
+        assert resp.source == "vector"
+
+    def test_handles_flat_metadata(self, service):
+        """Defensive: if mem0 ever flattens, our code must still resolve."""
+        mem = {
+            "id": "def-456",
+            "memory": "Uses FastAPI",
+            "score": 0.72,
+            "metadata": {
+                "scope": "project",
+                "category": "tech_stack",
+                "project_id": "neuralscape",
+                "tags": None,
+            },
+        }
+
+        resp = service._mem_to_response(mem)
+
+        assert resp.category == "tech_stack"
+        assert resp.scope == "project"
+        assert resp.project_id == "neuralscape"
+
+    def test_missing_metadata_returns_null_fields(self, service):
+        """No metadata key at all — fields stay None, response still valid."""
+        mem = {"id": "ghi-789", "memory": "Bare memory", "score": 0.5}
+
+        resp = service._mem_to_response(mem)
+
+        assert resp.id == "ghi-789"
+        assert resp.category is None
+        assert resp.scope is None
+        assert resp.project_id is None
+        assert resp.tags is None
+        assert resp.source == "vector"
+
+    def test_empty_metadata_returns_null_fields(self, service):
+        """Metadata is an empty dict — same behavior as missing."""
+        mem = {"id": "jkl-012", "memory": "Empty md", "metadata": {}}
+
+        resp = service._mem_to_response(mem)
+
+        assert resp.category is None
+        assert resp.scope is None
+
+    def test_inner_metadata_dict_takes_precedence_over_outer(self, service):
+        """When both layers present, the inner (real) one wins."""
+        mem = {
+            "id": "mno-345",
+            "memory": "Layered",
+            "metadata": {
+                "category": "should-be-ignored",  # outer wrapper level
+                "metadata": {
+                    "category": "preference",  # real, inner level
+                    "scope": "global",
+                },
+            },
+        }
+
+        resp = service._mem_to_response(mem)
+
+        assert resp.category == "preference"
+        assert resp.scope == "global"

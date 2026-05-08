@@ -16,6 +16,7 @@ const buildOptions = {
   format: "esm",
   outdir: "scripts",
   outbase: "src/hooks",
+  minify: true,
   banner: {
     js: '#!/usr/bin/env node',
   },

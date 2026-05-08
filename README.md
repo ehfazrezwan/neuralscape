@@ -4,6 +4,8 @@ A production-grade memory system for AI coding assistants and personal agents. N
 
 Built on [mem0](https://github.com/mem0ai/mem0) (vector storage + LLM deduplication) and [Graphiti](https://github.com/getzep/graphiti) (temporal knowledge graph), exposed via REST API and MCP server. Memory writes are processed asynchronously by background workers via [ARQ](https://github.com/python-arq/arq) + Redis.
 
+> **Looking for the comprehensive reference?** See [`docs/neuralscape/`](./docs/neuralscape/) for 12 pages covering architecture, schemas, plugin internals, deployment, and more. Start at [`00-overview.md`](./docs/neuralscape/00-overview.md) or jump straight to [`01-getting-started.md`](./docs/neuralscape/01-getting-started.md) for the full setup walkthrough.
+
 ## Prerequisites
 
 - **Python 3.10+** and **uv** (for local development)
@@ -36,11 +38,12 @@ curl -X POST http://localhost:8199/v1/memories/raw \
   -d '{"content": "Prefers dark mode", "user_id": "test", "category": "preference"}'
 # → {"status":"accepted","task_id":"...","poll_url":"/v1/memories/status/..."}
 
-# 5. Install the Claude Code plugin (optional but recommended)
-cd neuralscape-plugin && npm install && npm run build && cd ..
-# Then inside Claude Code:
-#   /plugin marketplace add /path/to/neuralscape
-#   /plugin install neuralscape@neuralscape-plugins --scope user
+# 5. Install the Claude Code / Cowork plugin (optional but recommended)
+# From inside Claude Code:
+#   /plugin marketplace add ehfazrezwan/neuralscape
+#   /plugin install neuralscape@neuralscape-plugins
+# Cowork: Customize → Browse plugins → Install. Same catalog, GUI flow.
+# The plugin will prompt for your service URL, API key (optional), and user_id.
 
 # Stop with: docker compose down
 ```
@@ -81,55 +84,67 @@ uv run pytest tests/test_service.py -v
 uv run pytest tests/test_async_pipeline.py -v -s
 ```
 
-## Claude Code Plugin
+## Claude Code / Cowork Plugin
 
-The **neuralscape plugin** gives Claude Code automatic, persistent memory without any LLM involvement at the capture layer. It uses Claude Code's lifecycle hooks to inject stored context at session start and capture tool observations in the background as you work.
+The **neuralscape plugin** gives Claude Code (and Claude Cowork — same plugin, same marketplace) automatic, persistent memory. Two lifecycle hooks plus four discoverable slash commands plus the seven Neuralscape MCP tools auto-wired on install.
 
 ### How It Works
 
 ```
-[Claude Code]
-    ↓ SessionStart hook (sync — injects stored context)
-    ↓ PostToolUse hook (async — captures tool observations)
-    ↓ Stop hook (async — stores session marker)
-[neuralscape-plugin/]  ← TypeScript plugin (thin capture layer)
+[Claude Code or Cowork]
+    ↓ SessionStart hook (sync — pulls context from /v1/context/, injects as additionalContext)
+    ↓ Stop hook        (async — flushes new turns, commits offset, triggers compile)
+[neuralscape-plugin/]  ← TypeScript plugin (auto-detects Claude Code / Cowork / OpenClaw / generic)
     ↓ HTTP calls
-[neuralscape-service/]  ← Python service (storage, extraction, graph)
+[neuralscape-service/] ← Python service (extraction, storage, graph, vault dual-write)
 ```
 
 | Hook | When | What it does | Blocking? |
-|------|------|-------------|-----------|
-| **SessionStart** | Session start/resume | Fetches context from `/v1/context/{projectId}`, injects as `additionalContext` | Yes (sync, ~1s) |
-| **PostToolUse** | After Write, Edit, Bash, WebFetch, WebSearch, Task, NotebookEdit | Summarizes the tool action, fire-and-forget POST to `/v1/memories/raw` | No (async) |
-| **Stop** | Session end | Stores a session-end marker as an `interaction` memory | No (async) |
+|------|------|--------------|-----------|
+| **SessionStart** | Session start / resume / clear | Calls `/v1/context/{projectId}` (or `/v1/context/global`), formats the response by category, injects as `additionalContext` | Yes (sync, ~1s, 30s timeout) |
+| **Stop** | Session ends | Reads transcript since last offset, POSTs each new turn to `/flush`, commits offset only after success, then triggers `/compile` | No (async, 60s timeout) |
 
-Noisy tools (Glob, Grep, Read, AskUserQuestion) are excluded via the hook matcher.
+Slash commands (auto-discovered from `skills/`):
 
-### Installation
+| Command | Use |
+|---|---|
+| `/neuralscape:status` | Health check + config display |
+| `/neuralscape:search` | Inline memory recall via `/v1/search` |
+| `/neuralscape:sync` | Manually flush the current conversation |
+| `/neuralscape:config` | Show URL / user_id / API-key state without leaking secrets |
 
-```bash
-# 1. Build the plugin
-cd neuralscape-plugin
-npm install && npm run build
-cd ..
+### Installation (60 seconds)
 
-# 2. Add the local marketplace (inside Claude Code)
-/plugin marketplace add /path/to/neuralscape
-
-# 3. Install the plugin
-/plugin install neuralscape@neuralscape-plugins --scope user
-
-# 4. Restart Claude Code — context will be injected automatically
+```text
+/plugin marketplace add ehfazrezwan/neuralscape
+/plugin install neuralscape@neuralscape-plugins
 ```
 
-The plugin is cached at `~/.claude/plugins/cache/` and loads on every session. After updating the plugin source, re-run steps 1 and 3.
+Claude Code / Cowork prompts you for three values from the manifest's `userConfig`:
+
+| Prompt | Notes |
+|---|---|
+| Neuralscape service URL | e.g. `https://neuralscape.example.com` or `http://localhost:8199` |
+| API key (optional) | Bearer token if your deployment is authenticated; sensitive, stored in keychain |
+| Your user ID | Stable identifier so memories are scoped to you (e.g. your username) |
+
+That's it. The plugin builds itself via `postinstall`, registers hooks, and the next session you open fires `SessionStart` and injects context.
+
+**Cowork users:** Customize → Browse plugins → Install — same prompts, same outcome.
+
+**OpenClaw users:** see `neuralscape-plugin/README.md` for the manual `~/.openclaw/hooks/` install path (no marketplace there).
 
 ### Configuration
 
-| Env Var | Default | Description |
-|---------|---------|-------------|
-| `NEURALSCAPE_URL` | `http://localhost:8199` | Neuralscape API URL |
-| `NEURALSCAPE_USER_ID` | `ehfaz` | User ID for memory operations |
+The plugin reads from manifest-supplied `userConfig` (modern) or env vars (legacy fallback for one release):
+
+| Setting | Modern (set by `userConfig`) | Legacy fallback |
+|---|---|---|
+| Service URL | `CLAUDE_PLUGIN_OPTION_URL` | `NEURALSCAPE_URL` |
+| API key | `CLAUDE_PLUGIN_OPTION_API_KEY` (sensitive) | `NEURALSCAPE_API_KEY` |
+| User ID | `CLAUDE_PLUGIN_OPTION_USER_ID` | `NEURALSCAPE_USER_ID` |
+
+To change settings after install: `/plugin config neuralscape@neuralscape-plugins`.
 
 ### Plugin + MCP Coexistence
 
@@ -252,9 +267,9 @@ There are two approaches to giving Claude Code persistent memory. Use either or 
 
 ### Approach 1: Plugin (recommended)
 
-The neuralscape plugin handles context injection and observation capture automatically via lifecycle hooks. See the [Claude Code Plugin](#claude-code-plugin) section above for installation.
+The neuralscape plugin handles context injection and conversation capture automatically via lifecycle hooks. See the [Claude Code / Cowork Plugin](#claude-code--cowork-plugin) section above for installation.
 
-Once installed, the plugin loads on every session across all projects. Add the MCP server (below) alongside it for explicit memory operations like targeted search and manual storage.
+Once installed, the plugin loads on every session across all projects. The plugin's `.mcp.json` also auto-wires the seven Neuralscape MCP tools, so the manual MCP setup below is redundant if you've installed the plugin. The MCP-only path remains documented for setups that can't run a plugin.
 
 ### Approach 2: MCP server + CLAUDE.md instructions
 
@@ -285,8 +300,9 @@ Create or append to `~/.claude/CLAUDE.md`:
 ```markdown
 ## Neuralscape Memory Layer
 
-Context is automatically injected at session start and tool observations are captured
-via the neuralscape plugin hooks. The MCP tools remain available for explicit memory operations.
+Context is automatically injected at session start and conversations are flushed
+on Stop via the neuralscape plugin hooks. The MCP tools remain available for explicit
+memory operations.
 
 ### When to Store Memories (via MCP tools)
 
@@ -391,14 +407,12 @@ curl "http://localhost:8199/v1/graph/communities?user_id=ehfaz"
 ## How It Works
 
 ```
-  [Claude Code]
+  [Claude Code or Cowork]
        │
        ├─── SessionStart hook ──► neuralscape-plugin ──► GET /v1/context/{id}
        │                              (inject context)        │
-       ├─── PostToolUse hook ───► neuralscape-plugin ──► POST /v1/memories/raw
-       │                          (async, background)         │
-       ├─── Stop hook ──────────► neuralscape-plugin ──► POST /v1/memories/raw
-       │                          (async, background)         │
+       ├─── Stop hook ──────────► neuralscape-plugin ──► POST /v1/extensions/conversation-compiler/flush
+       │                          (async, background)    POST /v1/extensions/conversation-compiler/compile
        │                                                      │
        │    ┌─────────────────────────────────────────────────┘
        │    │
@@ -437,9 +451,9 @@ curl "http://localhost:8199/v1/graph/communities?user_id=ehfaz"
                    └───────────┘
 ```
 
-**Plugin capture path**: Claude Code → PostToolUse hook → neuralscape-plugin summarizes tool action → fire-and-forget POST to `/v1/memories/raw` → Redis queue → ARQ Worker → Qdrant + Neo4j. Runs async in the background, never blocks Claude.
+**Plugin capture path**: Claude Code / Cowork → Stop hook → neuralscape-plugin reads the transcript since the last offset, POSTs each new turn to `/v1/extensions/conversation-compiler/flush`, commits the offset only after success, then triggers `/compile` for daily synthesis. Runs async in the background, never blocks the session.
 
-**Plugin injection path**: Claude Code → SessionStart hook → neuralscape-plugin calls `GET /v1/context/{projectId}` → formats as markdown → injected as `additionalContext`. Sync, runs once at session start (~1s).
+**Plugin injection path**: Claude Code / Cowork → SessionStart hook → neuralscape-plugin calls `GET /v1/context/{projectId}` → formats as markdown grouped by category → injected as `additionalContext`. Sync, runs once at session start (~1s).
 
 **MCP/API write path**: Client → API/MCP → enqueue to Redis → 202 Accepted → ARQ Worker → Gemini extraction + Qdrant + Neo4j → result stored in Redis → client polls status.
 
@@ -589,19 +603,26 @@ neuralscape/
 ├── .env.example                  # Env template (copy to .env)
 ├── .claude-plugin/
 │   └── marketplace.json          # Local marketplace for plugin distribution
-├── neuralscape-plugin/           # Claude Code plugin (TypeScript)
+├── neuralscape-plugin/           # Claude Code + Cowork plugin (TypeScript)
 │   ├── .claude-plugin/
-│   │   └── plugin.json           # Plugin manifest
+│   │   └── plugin.json           # Manifest with userConfig prompts
+│   ├── .mcp.json                 # Remote HTTP MCP at <URL>/mcp/
 │   ├── hooks/
-│   │   └── hooks.json            # Lifecycle hook definitions
+│   │   ├── hooks.json            # Claude Code: SessionStart, Stop
+│   │   └── openclaw-hooks.json   # OpenClaw: message:sent, session:end
+│   ├── skills/                   # Slash command skills (status, search, sync, config)
 │   ├── src/
-│   │   ├── session-start.ts      # SessionStart: context injection
-│   │   ├── post-tool-use.ts      # PostToolUse: observation capture
-│   │   ├── stop.ts               # Stop: session marker
-│   │   └── utils.ts              # Shared HTTP client, config, helpers
-│   ├── scripts/                  # Built JS (generated by esbuild)
+│   │   ├── adapters/             # claude-code, openclaw, generic, detect
+│   │   ├── core/                 # types, flush, compile
+│   │   ├── hooks/                # session-start, conversation-turn, session-end
+│   │   ├── types.ts              # 13-category taxonomy mirror
+│   │   └── utils.ts              # Shared HTTP client, config helper
+│   ├── scripts/                  # Built JS (generated by esbuild on postinstall)
+│   ├── LICENSE                   # MIT
+│   ├── CHANGELOG.md
 │   ├── package.json
 │   └── tsconfig.json
+├── docs/neuralscape/             # Comprehensive reference docs (12 pages)
 ├── neuralscape-service/          # The service (what you deploy)
 │   ├── Dockerfile                # Multi-stage build with uv
 │   ├── main.py                   # FastAPI app: legacy + v1 endpoints

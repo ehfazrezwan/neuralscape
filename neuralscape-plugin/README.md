@@ -1,162 +1,147 @@
-# NeuralScape Plugin
+# Neuralscape Plugin
 
-Persistent memory hooks for AI agent platforms. Automatically captures context and observations during sessions and sends them to [NeuralScape](https://github.com/ehfazrezwan/neuralscape) for long-term memory storage.
+Persistent agentic memory for **Claude Code** and **Claude Cowork**. The plugin auto-captures your conversations, recalls relevant context on every session start, and exposes the 7 Neuralscape MCP tools — all backed by your own Neuralscape service (FastAPI + mem0 + Graphiti).
 
-## Supported Platforms
+- **What you get:** memory injection on `SessionStart`, conversation flush + compile on `Stop`, four slash command skills (`status`, `search`, `sync`, `config`), and the Neuralscape MCP toolkit auto-wired via `.mcp.json`.
+- **Where it stores:** in your own Neuralscape deployment. The plugin never sends data anywhere else.
+- **Cost:** zero additional. The plugin is a thin client over your service.
 
-| Platform   | Hooks                                          |
-|------------|-------------------------------------------------|
-| Claude Code | SessionStart, PostToolUse, Stop                |
-| OpenClaw   | message:sent (conversation turn), session:end  |
+## 60-second install (Claude Code)
 
-## Setup
+```text
+/plugin marketplace add ehfazrezwan/neuralscape
+/plugin install neuralscape@neuralscape-plugins
+```
 
-### Prerequisites
+Claude Code prompts you for three values at install time:
 
-- Node.js 18+
-- A running NeuralScape instance (default: `http://localhost:8199`)
+| Prompt | Notes |
+|---|---|
+| Neuralscape service URL | e.g. `https://neuralscape.example.com` or `http://localhost:8199` |
+| API key (optional) | bearer token if your deployment is authenticated; leave empty for local dev |
+| Your user ID | a stable identifier so memories are scoped to you (e.g. your username) |
 
-### Install & Build
+That's it. Open a new session — the SessionStart hook will pull your prior context and inject it as `additionalContext`.
+
+> **First time on Neuralscape?** Set up the service first. The full 8-step walkthrough is at [`docs/neuralscape/01-getting-started.md`](../docs/neuralscape/01-getting-started.md) in this repo.
+
+## Claude Cowork install
+
+Cowork uses the same plugin model and same marketplace. Install path:
+
+1. Open the **Cowork** tab in Claude.
+2. Click **Customize → Browse plugins**.
+3. Search for `neuralscape` (or paste `ehfazrezwan/neuralscape` if your workspace allows direct marketplace add).
+4. Click **Install**, fill in the same three prompts.
+
+Cowork blocks `npm` and `pip` MCP sources, but Neuralscape's MCP runs over HTTP at the configured service URL — no npm package needed.
+
+## What gets installed
+
+```
+.claude/plugins/cache/neuralscape-plugins/neuralscape/2.0.0/
+├── .claude-plugin/plugin.json    manifest with userConfig prompts
+├── .mcp.json                      remote HTTP MCP at <URL>/mcp/
+├── hooks/hooks.json               SessionStart + Stop
+├── skills/{status,search,sync,config}/SKILL.md
+├── scripts/                       built hook bundles
+└── LICENSE / CHANGELOG.md
+```
+
+The plugin reaches your service via three calls:
+
+| Trigger | Endpoint | Purpose |
+|---|---|---|
+| SessionStart | `GET /v1/context/{project_id}` or `/v1/context/global` | Fetch stored memories, format by category, inject as `additionalContext` |
+| Stop (per turn) | `POST /v1/extensions/conversation-compiler/flush` | Stream each user/assistant pair to Gemini extraction |
+| Stop (after flush) | `POST /v1/extensions/conversation-compiler/compile` | Synthesize the day's facts into Sessions/Decisions/Research articles |
+
+## Slash commands
+
+Once installed, ask Claude any of:
+
+- "Is neuralscape working?" → `/neuralscape:status`
+- "What do I know about X?" → `/neuralscape:search`
+- "Save this conversation to memory now" → `/neuralscape:sync`
+- "What's my neuralscape config?" → `/neuralscape:config`
+
+Claude can also invoke them automatically when it judges them relevant.
+
+## MCP tools (auto-wired)
+
+Installing the plugin enables seven MCP tools backed by your Neuralscape service:
+
+| Tool | Purpose |
+|---|---|
+| `recall_memories` | Hybrid vector + graph search across global + project scopes |
+| `remember` | Store a single categorized fact (async write, returns task_id) |
+| `remember_conversation` | Extract facts from a list of `{role, content}` messages |
+| `get_project_context` | Load all memories for a project, organized by category |
+| `search_knowledge_graph` | Graph-only structured search (entities, relationships, episodes) |
+| `list_memories` | List with filters (scope, category, project_id) |
+| `delete_memories` | Bulk delete by ID or filters |
+
+These are reachable from any MCP client that picks up your plugin's `.mcp.json`. The transport is Streamable HTTP at `<URL>/mcp/`; the API key (if set) is sent as a Bearer token.
+
+## OpenClaw integration (manual)
+
+OpenClaw doesn't share Claude Code's marketplace. Install the OpenClaw hook manifest at `~/.openclaw/hooks/neuralscape/`:
+
+1. Build the plugin from source (see **Development** below).
+2. Copy `hooks/openclaw-hooks.json` and the `scripts/` directory into `~/.openclaw/hooks/neuralscape/`.
+3. Set `NEURALSCAPE_URL`, `NEURALSCAPE_USER_ID`, and (optional) `NEURALSCAPE_API_KEY` in OpenClaw's hook env.
+4. Restart OpenClaw — `message:sent` and `session:end` will start firing.
+
+> **Note:** the OpenClaw hook manifest still uses `${PLUGIN_ROOT}` rather than `${CLAUDE_PLUGIN_ROOT}` because OpenClaw's expansion convention hasn't been confirmed against the Claude Code spec. If your OpenClaw build complains, swap to whichever variable it does export — the rest of the script is platform-agnostic.
+
+## Configuration
+
+The plugin reads from `userConfig` prompts (modern) or env vars (legacy fallback for one release):
+
+| Setting | Modern (manifest) | Legacy fallback |
+|---|---|---|
+| Service URL | `CLAUDE_PLUGIN_OPTION_URL` | `NEURALSCAPE_URL` |
+| API key | `CLAUDE_PLUGIN_OPTION_API_KEY` (sensitive — keychain-stored) | `NEURALSCAPE_API_KEY` |
+| User ID | `CLAUDE_PLUGIN_OPTION_USER_ID` | `NEURALSCAPE_USER_ID` |
+
+To change settings after install:
+
+```text
+/plugin config neuralscape@neuralscape-plugins
+```
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| SessionStart silently skips context | `USER_ID` not set | Run `/plugin config neuralscape@neuralscape-plugins` and fill in the `Your user ID` prompt |
+| `/neuralscape:status` returns 503 | Vector store (Qdrant) unreachable | See `01-getting-started.md` Step 4 in the service docs |
+| 202s become 200s on writes | Redis disconnected — plugin falls back to sync | Check `docker compose logs redis`; `/neuralscape:status` will report `redis: degraded` |
+| `429` from Gemini in compile | Free-tier quota | Service auto-retries with `gemini-2.5-flash` fallback; tune `LLM_RETRY_MAX_DELAY` if it exhausts |
+| Project memories not found | Old `group_id` format | Run `cypher-shell -u neo4j -p $NEO4J_PASSWORD < neuralscape-service/scripts/migrate-group-ids.cypher` once |
+| Plugin not updating after `/plugin update` | Plugin cache stale | `/reload-plugins` or remove `~/.claude/plugins/cache/neuralscape-plugins/neuralscape/<old-version>/` |
+
+For verbose diagnostics: ask Claude to run `/neuralscape:status` — it returns the resolved URL, user_id, API-key state, and a live `/health` probe of all three backends.
+
+## Development
 
 ```bash
 cd neuralscape-plugin
-npm install
-npm run build
+npm install        # also runs the postinstall build
+npm run build      # rebuild bundles
+npm run watch      # rebuild on save
 ```
 
-This generates bundled scripts in `scripts/`.
+The TypeScript source lives in `src/`. esbuild bundles three entry points (`session-start.ts`, `conversation-turn.ts`, `session-end.ts`) into `scripts/*.js` (ESM, Node 18+, minified). Built scripts are gitignored — `npm install` regenerates them.
 
-### Environment Variables
+To run a hook locally for testing:
 
-| Variable              | Default                  | Description                        |
-|-----------------------|--------------------------|------------------------------------|
-| `NEURALSCAPE_URL`     | `http://localhost:8199`  | NeuralScape API base URL           |
-| `NEURALSCAPE_API_KEY` | *(empty)*                | Bearer token for authenticated APIs |
-| `NEURALSCAPE_USER_ID` | `ehfaz`                  | Default user ID for memory storage |
-
-## Claude Code Integration
-
-Install the plugin via Claude Code's plugin system. The hooks manifest at `hooks/hooks.json` registers three hooks:
-
-- **SessionStart** — Fetches stored memories and injects them as context
-- **PostToolUse** — Captures tool observations (writes, edits, commands) as raw memories
-- **Stop** — Marks session boundaries
-
-## OpenClaw Integration
-
-The OpenClaw hooks capture conversation turns and trigger end-of-session memory compilation via NeuralScape's `conversation-compiler` extension.
-
-### Hook Manifest
-
-The `hooks/openclaw-hooks.json` manifest defines two hooks:
-
-- **message:sent** — Fires after every assistant response. Sends the conversation turn (user message + assistant response) to the conversation-compiler flush endpoint.
-- **session:end** — Fires when a session ends. Triggers compilation of the day's captured turns into durable memories.
-
-### Installing as OpenClaw Managed Hooks
-
-OpenClaw discovers hooks from `~/.openclaw/hooks/`. To install the conversation-turn hook as a managed hook, create a directory with a `HOOK.md` and `handler.ts`:
-
-```
-~/.openclaw/hooks/neuralscape-conversation-turn/
-├── HOOK.md
-└── handler.ts
+```bash
+echo '{"user_message":"hello","assistant_response":"Hi there. How can I help today?","session_id":"test","channel":"cli"}' | node scripts/conversation-turn.js
 ```
 
-**HOOK.md:**
-```markdown
----
-name: neuralscape-conversation-turn
-description: "Sends conversation turns to NeuralScape conversation-compiler"
-metadata:
-  openclaw:
-    events: ["message:sent"]
-    requires:
-      env: ["NEURALSCAPE_URL"]
-    always: true
----
-```
+Architecture, adapter contracts, and "adding a new client" walkthrough live in [`docs/neuralscape/09-plugin-system.md`](../docs/neuralscape/09-plugin-system.md).
 
-**handler.ts** — Wrap the built script or inline the logic:
-```typescript
-import { execFile } from "node:child_process";
-import { resolve } from "node:path";
+## License
 
-const SCRIPT = resolve(
-  process.env.HOME || "~",
-  "path/to/neuralscape-plugin/scripts/conversation-turn.js"
-);
-
-export default async (event: any) => {
-  if (event.type !== "message" || event.action !== "sent") return;
-
-  const child = execFile("node", [SCRIPT], { timeout: 15000 });
-  child.stdin?.write(JSON.stringify(event));
-  child.stdin?.end();
-};
-```
-
-Repeat for `session-summary` with event `session:end`.
-
-### Stdin Payload
-
-When invoked, the scripts read JSON from stdin. They accept two formats:
-
-**Direct invocation (for testing):**
-```json
-{
-  "user_message": "What is the weather?",
-  "assistant_response": "I don't have access to weather data...",
-  "session_id": "session-abc123",
-  "channel": "telegram",
-  "timestamp": "2026-04-07T05:00:00.000Z",
-  "project_id": null,
-  "user_id": "ehfaz"
-}
-```
-
-**OpenClaw InternalHookEvent:**
-```json
-{
-  "type": "message",
-  "action": "sent",
-  "sessionKey": "session-abc123",
-  "timestamp": "2026-04-07T05:00:00.000Z",
-  "context": {
-    "content": "I don't have access to weather data...",
-    "channelId": "telegram",
-    "userMessage": "What is the weather?"
-  }
-}
-```
-
-### Filtering
-
-The conversation-turn hook skips trivial exchanges to avoid noise:
-
-- **Heartbeats** — Messages like `.`, `ping`, `heartbeat`, `/heartbeat`
-- **NO_REPLY responses** — `NO_REPLY`, `[NO_REPLY]`, empty responses
-- **System messages** — Prefixed with `[system]`, `[auto_reply]`, `[internal]`, etc.
-- **Short responses** — Responses under 20 characters
-
-### Verifying It Works
-
-1. Start NeuralScape: `cd neuralscape-service && python main.py`
-2. Send a test turn:
-   ```bash
-   echo '{"user_message":"hello","assistant_response":"Hi! How can I help you today? Let me know what you need.","session_id":"test","channel":"cli"}' | node scripts/conversation-turn.js
-   ```
-3. Check NeuralScape logs for the flush request
-4. Trigger compilation:
-   ```bash
-   echo '{"date":"2026-04-07","user_id":"ehfaz"}' | node scripts/session-summary.js
-   ```
-
-### API Endpoints Used
-
-| Endpoint                                          | Method | Purpose                          |
-|--------------------------------------------------|--------|----------------------------------|
-| `/v1/extensions/conversation-compiler/flush`     | POST   | Send a single conversation turn  |
-| `/v1/extensions/conversation-compiler/compile`   | POST   | Trigger end-of-session compilation |
-| `/v1/context/{project_id}`                       | GET    | Fetch stored context (Claude Code) |
-| `/v1/memories/raw`                               | POST   | Store raw observations (Claude Code) |
+MIT — see [`LICENSE`](./LICENSE).
