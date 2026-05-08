@@ -17,7 +17,7 @@ async function main(): Promise<void> {
 
   if (!hasUserId()) {
     logError(
-      "missing user_id — set NEURALSCAPE_USER_ID via /plugin config or env var; skipping turn capture",
+      "missing user_id — run `/plugin config neuralscape@neuralscape-plugins` to set USER_ID (or set NEURALSCAPE_USER_ID env var as legacy fallback); skipping turn capture",
     );
     return;
   }

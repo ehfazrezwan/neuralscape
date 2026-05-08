@@ -98,9 +98,8 @@ The v2 plugin manifest (`neuralscape-plugin/.claude-plugin/plugin.json`) is no l
 ```json
 {
   "name": "neuralscape",
-  "version": "2.0.0",
+  "version": "2.0.2",
   "skills": "./skills/",
-  "hooks": "./hooks/hooks.json",
   "mcpServers": "./.mcp.json",
   "userConfig": {
     "URL":     { "type": "string", "title": "Neuralscape service URL", "required": true },
@@ -110,7 +109,9 @@ The v2 plugin manifest (`neuralscape-plugin/.claude-plugin/plugin.json`) is no l
 }
 ```
 
-At runtime the plugin reads these as `process.env.CLAUDE_PLUGIN_OPTION_URL`, `CLAUDE_PLUGIN_OPTION_API_KEY`, and `CLAUDE_PLUGIN_OPTION_USER_ID`. The legacy `NEURALSCAPE_*` env vars from v1 still work as a fallback for one release of overlap; they will be dropped in v3. The `sensitive: true` flag on `API_KEY` routes the value to the OS keychain rather than `settings.json`.
+The manifest deliberately omits a `hooks` field — Claude Code 2.1+ auto-loads `hooks/hooks.json` from the plugin root, and declaring it explicitly produces a "Duplicate hooks file detected" error in `/doctor`.
+
+Hook scripts read these values as `process.env.CLAUDE_PLUGIN_OPTION_URL`, `CLAUDE_PLUGIN_OPTION_API_KEY`, and `CLAUDE_PLUGIN_OPTION_USER_ID` because Claude Code spawns them as subprocesses and injects the env vars at exec time. The legacy `NEURALSCAPE_*` env vars from v1 still work as a fallback for one release of overlap; they will be dropped in v3. The `sensitive: true` flag on `API_KEY` routes the value to the OS keychain (or `~/.claude/.credentials.json`'s `pluginSecrets` block) rather than `settings.json`.
 
 The repo-root `marketplace.json` (`name: neuralscape-plugins`) lists exactly one plugin and points `source: "./neuralscape-plugin"` at the subdirectory. That naming is why the install string is `neuralscape@neuralscape-plugins` rather than `neuralscape@neuralscape`.
 
@@ -121,12 +122,14 @@ Bundled MCP lives in `neuralscape-plugin/.mcp.json`, a tiny config that points a
   "mcpServers": {
     "neuralscape": {
       "type": "http",
-      "url": "${CLAUDE_PLUGIN_OPTION_URL}/mcp/",
-      "headers": { "Authorization": "Bearer ${CLAUDE_PLUGIN_OPTION_API_KEY}" }
+      "url": "${user_config.URL}/mcp/",
+      "headers": { "Authorization": "Bearer ${user_config.API_KEY}" }
     }
   }
 }
 ```
+
+The `${user_config.<KEY>}` form (declarative manifest substitution) is what HTTP MCP servers use, **not** `${CLAUDE_PLUGIN_OPTION_<KEY>}` (env-var reference). The two forms map to two different runtime contexts: env-var references resolve only when Claude Code spawns a subprocess, which an HTTP MCP server never is. Hook scripts and stdio MCP servers ARE spawned subprocesses and DO use the env-var form. Mixing these up surfaces as "Missing environment variables" in `/doctor` even when the userConfig values are correctly stored.
 
 When the plugin is enabled, the user's MCP-capable clients (Claude Code, Cowork) automatically pick up the seven Neuralscape tools — `recall_memories`, `remember`, `remember_conversation`, `get_project_context`, `search_knowledge_graph`, `list_memories`, `delete_memories` — without separate Claude Desktop config. See [08-mcp-server](./08-mcp-server.md) for the full tool surface.
 

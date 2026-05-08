@@ -51,12 +51,14 @@ Neuralscape is a production-grade agentic memory layer that fuses **mem0** (vect
 
 ## Repo pointers
 
-- Project root: `C:\Users\aydin_gb3tlqh\Documents\projects\neuralscape`
-- Project guide: `C:\Users\aydin_gb3tlqh\Documents\projects\neuralscape\CLAUDE.md`
-- Service code: `C:\Users\aydin_gb3tlqh\Documents\projects\neuralscape\neuralscape-service\`
-- Plugin code: `C:\Users\aydin_gb3tlqh\Documents\projects\neuralscape\neuralscape-plugin\`
-- Compose stack: `C:\Users\aydin_gb3tlqh\Documents\projects\neuralscape\docker-compose.yml`
-- Subtree deps: `C:\Users\aydin_gb3tlqh\Documents\projects\neuralscape\mem0\` and `...\graphiti\`
+All paths are repo-relative from the project root.
+
+- Project guide: `CLAUDE.md`
+- Service code: `neuralscape-service/`
+- Plugin code: `neuralscape-plugin/`
+- Compose stack: `docker-compose.yml`
+- Production compose + reverse proxy: `docker-compose.prod.yml`, `Caddyfile`
+- Subtree deps: `mem0/` and `graphiti/`
 
 ## Related
 

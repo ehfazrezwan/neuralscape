@@ -4,12 +4,12 @@ date: 2026-05-06
 tags: [reference, neuralscape, gemini, prompts, embeddings]
 source: handwritten
 ---
-3
+
 # LLM Extraction & Prompts
 
 ## Overview
 
-The extraction layer is what converts free-form conversation messages into structured, categorised memory rows. It is intentionally minimal: a single Gemini call against one master prompt, a JSON-first response parser with a regex fallback, a junk filter that drops raw tool-log noise, and a batched embed-and-upsert into Qdrant. Graph re-ingestion via Graphiti runs once per conversation, not per fact. There is no prompt versioning subdirectory, no function-calling schema, and no JSON-mode flag forced on the model — Gemini is steered purely by prompt engineering. The whole pipeline lives in two files: [prompts.py](./05-llm-extraction.md) for the prompt and parsers, and [memory_service.py](./04-memory-service-core.md) for the Gemini client wiring, retry helper, junk filter, and batch storage. Failures are absorbed (an extraction error returns `[]` rather than raising), so the async write pipeline degrades gracefully when the LLM is unavailable.
+The extraction layer is what converts free-form conversation messages into structured, categorised memory rows. It is intentionally minimal: a single Gemini call against one master prompt, a JSON-first response parser with a regex fallback, a junk filter that drops raw tool-log noise, and a batched embed-and-upsert into Qdrant. Graph re-ingestion via Graphiti runs once per conversation, not per fact. There is no prompt versioning subdirectory, no function-calling schema, and no JSON-mode flag forced on the model — Gemini is steered purely by prompt engineering. The whole pipeline lives in two files: [`neuralscape-service/prompts.py`](../../neuralscape-service/prompts.py) for the prompt and parsers, and [`neuralscape-service/memory_service.py`](../../neuralscape-service/memory_service.py) for the Gemini client wiring, retry helper, junk filter, and batch storage. Failures are absorbed (an extraction error returns `[]` rather than raising), so the async write pipeline degrades gracefully when the LLM is unavailable.
 
 ## The extraction prompt
 

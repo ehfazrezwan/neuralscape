@@ -7,7 +7,7 @@ source: handwritten
 
 # Async Write Pipeline
 
-Neuralscape splits memory operations along a sharp boundary: **writes are asynchronous**, **reads are synchronous**. A POST to `/v1/memories` returns `202 Accepted` with a `task_id`; the actual LLM extraction, embedding, vector upsert, and graph ingestion happen later in a separate ARQ worker process. A GET to `/v1/memories/search` runs synchronously against Qdrant and Neo4j and returns `200 OK`. This page documents the full write-side machinery: the queue lifecycle, the worker, deterministic deduplication of enqueues, the status-polling protocol, retry behaviour, and failure modes.
+Neuralscape splits memory operations along a sharp boundary: **writes are asynchronous**, **reads are synchronous**. A POST to `/v1/memories` returns `202 Accepted` with a `task_id`; the actual LLM extraction, embedding, vector upsert, and graph ingestion happen later in a separate ARQ worker process. A POST to `/v1/search` runs synchronously against Qdrant and Neo4j and returns `200 OK`. This page documents the full write-side machinery: the queue lifecycle, the worker, deterministic deduplication of enqueues, the status-polling protocol, retry behaviour, and failure modes.
 
 ## Overview
 
