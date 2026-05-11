@@ -45,7 +45,16 @@ class Settings(BaseSettings):
     dedup_cron_hours: set = {0, 6, 12, 18}
 
     # Auth
-    neuralscape_api_key: str = ""  # If set, enables Bearer token auth on all endpoints (except /health)
+    # Legacy single shared API key. When set without `neuralscape_user_token_secret`,
+    # all requests must present this exact token in `Authorization: Bearer ...` and
+    # user_id is taken from the request body (trust-based, single-team or single-user).
+    neuralscape_api_key: str = ""
+    # Multi-user HMAC-signed tokens. When set, the server also accepts tokens of the
+    # form `{base64url(payload)}.{hmac_sha256(secret, payload)}` where payload is
+    # `{"user_id": "...", "exp": <unix-ts>}`. The verified user_id is attached to
+    # `request.state.user_id` so routes don't need to trust the request body.
+    # Generate tokens via `python scripts/issue_user_token.py --user <name>`.
+    neuralscape_user_token_secret: str = ""
 
     # Service
     host: str = "0.0.0.0"

@@ -671,3 +671,171 @@ class TestV1SearchV2:
         assert kwargs["domain"] == "research"
         assert kwargs["observation_type"] == "discovery"
         assert kwargs["concepts"] == ["gotcha", "pattern"]
+
+
+# ══════════════════════════════════════════════
+# Multi-user identity resolution (token vs body)
+# ══════════════════════════════════════════════
+
+
+class TestV1MultiUserIdentityResolution:
+    """Routes prefer request.state.user_id (token-derived) over body user_id.
+
+    The TestClient bypasses the actual auth middleware, so for these tests
+    we monkey-patch `_resolve_user_id` or simulate a verified token by
+    pushing user_id into request state via a small middleware override.
+    """
+
+    def _push_token_user_id(self, app_user_id: str):
+        """Return a starlette middleware that sets request.state.user_id."""
+        from starlette.middleware.base import BaseHTTPMiddleware
+
+        class _UserIdInjector(BaseHTTPMiddleware):
+            async def dispatch(self, request, call_next):
+                request.state.user_id = app_user_id
+                return await call_next(request)
+
+        return _UserIdInjector
+
+    def test_route_prefers_token_user_id_over_body(self, mock_service, mock_task_manager):
+        """When a token attaches user_id=alice and the body says nothing,
+        the route uses alice."""
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        import main
+        # Build a fresh app with our identity-injecting middleware in front.
+        injector = self._push_token_user_id("alice-from-token")
+        sub_app = FastAPI()
+        sub_app.add_middleware(injector)
+        sub_app.include_router(main.v1_router)
+        client = TestClient(sub_app, raise_server_exceptions=False)
+
+        resp = client.post("/v1/memories/raw", json={
+            "content": "hello",
+            "category": "preference",
+            # No user_id in body — route should use the token's
+        })
+        assert resp.status_code in (200, 202)
+        kwargs = mock_task_manager.enqueue_raw.call_args[1]
+        assert kwargs["user_id"] == "alice-from-token"
+
+    def test_token_body_mismatch_returns_400(self, mock_service, mock_task_manager):
+        """If body has user_id=bob but the token says alice, reject."""
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        import main
+        injector = self._push_token_user_id("alice-from-token")
+        sub_app = FastAPI()
+        sub_app.add_middleware(injector)
+        sub_app.include_router(main.v1_router)
+        client = TestClient(sub_app, raise_server_exceptions=False)
+
+        resp = client.post("/v1/memories/raw", json={
+            "content": "hello",
+            "user_id": "bob-impersonator",
+            "category": "preference",
+        })
+        assert resp.status_code == 400
+        assert "does not match" in resp.json()["detail"]
+
+    def test_token_body_match_passes(self, mock_service, mock_task_manager):
+        """body user_id == token user_id is fine."""
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        import main
+        injector = self._push_token_user_id("alice-from-token")
+        sub_app = FastAPI()
+        sub_app.add_middleware(injector)
+        sub_app.include_router(main.v1_router)
+        client = TestClient(sub_app, raise_server_exceptions=False)
+
+        resp = client.post("/v1/memories/raw", json={
+            "content": "hello",
+            "user_id": "alice-from-token",
+            "category": "preference",
+        })
+        assert resp.status_code in (200, 202)
+
+    def test_legacy_no_token_falls_back_to_body(self, client, mock_task_manager):
+        """Without a token (legacy shared-key callers), body user_id wins."""
+        resp = client.post("/v1/memories/raw", json={
+            "content": "hello",
+            "user_id": "legacy-alice",
+            "category": "preference",
+        })
+        assert resp.status_code in (200, 202)
+        kwargs = mock_task_manager.enqueue_raw.call_args[1]
+        assert kwargs["user_id"] == "legacy-alice"
+
+    def test_search_token_body_mismatch_returns_400(self, mock_service):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        import main
+        injector = self._push_token_user_id("alice")
+        sub_app = FastAPI()
+        sub_app.add_middleware(injector)
+        sub_app.include_router(main.v1_router)
+        client = TestClient(sub_app, raise_server_exceptions=False)
+
+        resp = client.post("/v1/search", json={
+            "query": "anything",
+            "user_id": "bob",
+        })
+        assert resp.status_code == 400
+
+
+class TestV1SearchMultiUserFlags:
+    """Visibility + include_shared are forwarded to MemoryService.search."""
+
+    def test_visibility_private_forwarded(self, client, mock_service):
+        mock_service.search.return_value = []
+        resp = client.post("/v1/search", json={
+            "query": "x",
+            "user_id": "alice",
+            "visibility": "private",
+        })
+        assert resp.status_code == 200
+        kwargs = mock_service.search.call_args[1]
+        assert kwargs["visibility"] == "private"
+
+    def test_visibility_shared_forwarded(self, client, mock_service):
+        mock_service.search.return_value = []
+        resp = client.post("/v1/search", json={
+            "query": "x",
+            "user_id": "alice",
+            "visibility": "shared",
+        })
+        kwargs = mock_service.search.call_args[1]
+        assert kwargs["visibility"] == "shared"
+
+    def test_include_shared_false_forwarded(self, client, mock_service):
+        mock_service.search.return_value = []
+        resp = client.post("/v1/search", json={
+            "query": "x",
+            "user_id": "alice",
+            "include_shared": False,
+        })
+        kwargs = mock_service.search.call_args[1]
+        assert kwargs["include_shared"] is False
+
+    def test_invalid_visibility_value_rejected(self, client):
+        resp = client.post("/v1/search", json={
+            "query": "x",
+            "user_id": "alice",
+            "visibility": "not-a-real-vis",
+        })
+        # Pydantic enum validation produces 422
+        assert resp.status_code == 422
+
+    def test_raw_store_visibility_forwarded(self, client, mock_task_manager):
+        resp = client.post("/v1/memories/raw", json={
+            "content": "Project uses Postgres",
+            "user_id": "alice",
+            "category": "tech_stack",
+            "scope": "project",
+            "project_id": "neuralscape",
+            "visibility": "shared",
+        })
+        assert resp.status_code in (200, 202)
+        kwargs = mock_task_manager.enqueue_raw.call_args[1]
+        assert kwargs["visibility"] == "shared"

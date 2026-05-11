@@ -4,6 +4,50 @@ All notable changes to the `neuralscape` Claude plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.2.0] - 2026-05-11
+
+### Added
+
+- **Multi-user support (single-team model).** Each authenticated user has
+  a personal memory pool plus access to a shared team knowledge pool.
+  Private memories (preferences, personal facts, task context) stay
+  visible only to their writer; shared memories (tech_stack, convention,
+  architecture, decision, etc.) are visible to anyone authenticated to
+  the Neuralscape instance.
+- **HMAC-signed per-user tokens.** The API_KEY field now accepts either
+  a per-user token (issued via `scripts/issue_user_token.py --user
+  <name>` on the backend) or the legacy single-shared key. Per-user
+  tokens carry `user_id` in their signed claims, so the server can
+  enforce identity without trusting the request body.
+- **Default visibility per category.** The compile-observations skill
+  now defaults each new memory to private or shared based on its
+  category (personal categories private, team categories shared),
+  with an explicit override mechanism documented in `SKILL.md`.
+- **`visibility` field** on the `remember` MCP tool input schema.
+- **`include_shared` + `visibility` filters** on `recall_memories` to
+  scope retrieval to one pool or the other.
+
+### Changed
+
+- API_KEY userConfig description rewritten to describe both per-user
+  token and legacy shared-key formats.
+- USER_ID userConfig description notes it must match the token's
+  user_id when using per-user tokens.
+
+### Compatibility
+
+- All existing v2.1.x memories continue to work unchanged. They have no
+  `metadata.visibility` field, so the server treats them as **private**
+  to their original writer — no cross-user leakage. To bulk-promote a
+  category to the shared pool retroactively, run
+  `scripts/bulk_promote_visibility.py --owner <user_id> --category
+  <category> --to shared --apply`.
+- Graphiti graph entries written before v2.2.0 sit under the legacy
+  `group_id="global"` / `"project--..."` namespaces; the new search
+  doesn't see them until you run
+  `scripts/migrate_graph_groups.py --owner <user_id> --apply` once
+  per environment.
+
 ## [2.1.0] - 2026-05-09
 
 ### Added

@@ -145,7 +145,46 @@ curl -s -X POST http://localhost:8199/v1/search \
 
 The response merges Qdrant vector hits with Graphiti graph hits, dedup'd by content. See [04-memory-service-core](./04-memory-service-core.md) for the hybrid-search internals.
 
-## Step 8 (optional) — Install the Claude Code / Cowork plugin
+## Step 8 (multi-user) — Issue per-user tokens
+
+When you're ready to add a second user (or you want auth turned on at all for a single-user install), generate per-user HMAC tokens.
+
+1. **Pick a signing secret.** Add to `.env`:
+
+   ```
+   NEURALSCAPE_USER_TOKEN_SECRET=<32+ char random string>
+   ```
+
+   Restart the stack so the env var lands in the API container:
+
+   ```bash
+   docker compose up -d
+   ```
+
+2. **Issue tokens for each user.**
+
+   ```bash
+   cd neuralscape-service
+   NEURALSCAPE_USER_TOKEN_SECRET=<same secret> \
+     uv run python scripts/issue_user_token.py --user alice --days 30
+   ```
+
+   Output is a `base64url(payload).hmac` two-segment token. Give it to Alice; she sets it as `API_KEY` in her plugin config. Repeat for every user.
+
+3. **Verify with a request.**
+
+   ```bash
+   curl -H "Authorization: Bearer <alice-token>" \
+        http://localhost:8199/v1/context/global
+   ```
+
+   The server reads `user_id` from the token's signed claims (Alice), not from the body. Cross-user spoofing returns 400.
+
+Memory visibility now matters: see the [memory-model doc](./03-memory-model.md#multi-user-model-v22) for the per-category default visibility table (`preference` → private; `tech_stack` → shared; etc.). If you have legacy memories you'd like to make team-visible after the fact, run `scripts/bulk_promote_visibility.py` (dry-run by default) and `scripts/migrate_graph_groups.py` to rewrite the Graphiti group_ids.
+
+For a strictly single-user install you can skip this step entirely — `NEURALSCAPE_API_KEY` (legacy shared key, or no auth at all) keeps working.
+
+## Step 9 (optional) — Install the Claude Code / Cowork plugin
 
 The plugin ships through a marketplace catalog at the repo root, so installation is two commands. From inside Claude Code:
 
@@ -172,7 +211,7 @@ That's it — the post-install build runs automatically (`postinstall` script in
 
 Plugin internals (hooks, adapters for Claude Code/OpenClaw/generic, the `ConversationTurn` contract, the v2 manifest, slash commands): [09-plugin-system](./09-plugin-system.md).
 
-## Step 9 (optional) — Connect via MCP
+## Step 10 (optional) — Connect via MCP
 
 The MCP server runs in two modes:
 

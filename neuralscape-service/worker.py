@@ -127,6 +127,7 @@ async def process_memory_raw(
         related_memory_ids=v2_extras.get("related_memory_ids"),
         confidence=v2_extras.get("confidence"),
         expires_at=expires_at,
+        visibility=v2_extras.get("visibility"),
     )
 
     # Emit memory_stored event so extensions can write to vault

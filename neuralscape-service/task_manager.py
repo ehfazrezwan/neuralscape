@@ -90,12 +90,15 @@ class TaskManager:
         related_memory_ids: list[str] | None = None,
         confidence: float | None = None,
         expires_at: str | None = None,
+        # Multi-user model
+        visibility: str | None = None,
     ) -> str:
         """Enqueue raw memory storage task. Returns task_id (job_id).
 
         Uses a deterministic job ID based on content hash to prevent
-        duplicate enqueues of the same fact. v2 fields are forwarded
-        as a kwargs dict to the worker.
+        duplicate enqueues of the same fact. v2 + multi-user fields are
+        forwarded as a kwargs dict to the worker so the signature stays
+        backward-compatible.
         """
         job_id = _generate_job_id(f"raw:{content}", user_id)
 
@@ -107,6 +110,7 @@ class TaskManager:
             "related_memory_ids": related_memory_ids,
             "confidence": confidence,
             "expires_at": expires_at,
+            "visibility": visibility,
         }
         # Drop None values so the worker signature can default cleanly
         v2_extras = {k: v for k, v in v2_extras.items() if v is not None}

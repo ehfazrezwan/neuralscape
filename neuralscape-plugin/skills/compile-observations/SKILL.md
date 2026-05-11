@@ -79,6 +79,21 @@ Wiki entry, not log line. Lead with the substance, not the tooling.
 - `source_type` — always `tool_extraction`
 - `confidence` — your honest 0.0–1.0 self-assessment of memory quality
 - `related_memory_ids` — leave **unset** in this skill flow. The rule above is one memory per work unit, so there is no "second memory from the same work unit" to link. (The field exists for higher-level callers that knowingly emit multiple linked memories.)
+- `visibility` — `private` (only the writer reads) or `shared` (any teammate reads). **Defaults per-category**, so most of the time you can omit this field and the server will pick the right value. Override only when the per-category default is wrong for this specific memory.
+
+### Visibility rubric
+
+The category-level defaults are:
+
+- **Private** (default): `preference`, `personal_fact`, `technical_skill`, `domain_knowledge`, `task_context`. Personal taste, personal facts, personal WIP. Don't share with the team.
+- **Shared** (default): `tech_stack`, `convention`, `architecture`, `dependency`, `decision`, `interaction`, `workflow`, `procedure`. Project / team knowledge. Surface to all teammates by default.
+
+**When to override**:
+
+- *Force private on a normally-shared category*: the memory is sensitive (a discussion of internal politics in an `interaction`, a personal note in a `decision`), or it's a draft you want to revisit before sharing. Pass `visibility="private"`.
+- *Force shared on a normally-private category*: rare, but valid when a `technical_skill` is team-wide ("the platform team knows Rust") or a `domain_knowledge` should be canonical. Pass `visibility="shared"`.
+
+If you're unsure, **omit the field** and let the per-category default decide. The wrong call is silently more harmful for private→shared (leaks personal info) than shared→private (just hides team info from teammates), so when in doubt, default toward private.
 - `expires_at` — only for `task_context` entries that should auto-purge (e.g. set to 30 days from now)
 
 ## Throughput target
