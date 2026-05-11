@@ -494,3 +494,180 @@ class TestV1GraphIntrospection:
         mock_service.get_graph_communities.return_value = []
         resp = client.get("/v1/graph/communities", params={"user_id": "ehfaz"})
         assert resp.status_code == 200
+
+
+# ══════════════════════════════════════════════
+# V1 Memory model v2 endpoints
+# ══════════════════════════════════════════════
+
+
+class TestV1StoreRawMemoryV2:
+    """Memory-model v2 — POST /v1/memories/raw with v2 fields."""
+
+    def test_serializes_expires_at_datetime_for_enqueue(self, client, mock_task_manager):
+        """expires_at as datetime gets ISO-stringified before enqueue."""
+        resp = client.post("/v1/memories/raw", json={
+            "content": "Time-bound fact",
+            "user_id": "ehfaz",
+            "category": "task_context",
+            "domain": "coding",
+            "observation_type": "task_plan",
+            "concepts": ["next-step"],
+            "source_type": "tool_extraction",
+            "confidence": 0.85,
+            "expires_at": "2026-12-01T00:00:00+00:00",
+        })
+        assert resp.status_code == 202
+        kwargs = mock_task_manager.enqueue_raw.call_args[1]
+        assert kwargs["domain"] == "coding"
+        assert kwargs["observation_type"] == "task_plan"
+        assert kwargs["concepts"] == ["next-step"]
+        assert kwargs["source_type"] == "tool_extraction"
+        assert kwargs["confidence"] == 0.85
+        # ISO string survives the JSON-enqueue serialization
+        assert kwargs["expires_at"] == "2026-12-01T00:00:00+00:00"
+
+    def test_redis_unavailable_falls_back_to_sync(self, client, mock_task_manager, mock_service):
+        """When Redis is down, the route calls service.store_raw directly."""
+        from schemas import MemoryResponse
+
+        mock_task_manager.enqueue_raw.side_effect = ConnectionError("Redis down")
+        mock_service.store_raw.return_value = [
+            MemoryResponse(id="m1", memory="x", category="preference"),
+        ]
+        resp = client.post("/v1/memories/raw", json={
+            "content": "x",
+            "user_id": "ehfaz",
+            "category": "preference",
+            "expires_at": "2026-12-01T00:00:00+00:00",  # exercises ISO → datetime path
+        })
+        assert resp.status_code == 200
+        # store_raw was called with the deserialized datetime
+        call_kwargs = mock_service.store_raw.call_args[1]
+        from datetime import datetime
+        assert isinstance(call_kwargs["expires_at"], datetime)
+
+    def test_redis_unavailable_no_expires_sync_fallback(self, client, mock_task_manager, mock_service):
+        """When Redis is down and no expires_at is supplied, sync fallback still succeeds.
+
+        Note: Pydantic rejects malformed `expires_at` ISO strings at request
+        validation (422), so the route's defensive `except ValueError`
+        branch in the sync-fallback path is unreachable through the HTTP
+        contract. That branch is exercised by the unit test
+        `test_handles_iso_string_expires_at` against `store_raw_batch`.
+        """
+        from schemas import MemoryResponse
+        mock_task_manager.enqueue_raw.side_effect = OSError("Connection refused")
+        mock_service.store_raw.return_value = [MemoryResponse(id="m1", memory="x")]
+        resp = client.post("/v1/memories/raw", json={
+            "content": "x",
+            "user_id": "ehfaz",
+            "category": "preference",
+        })
+        assert resp.status_code == 200
+
+
+class TestV1StoreRawBatch:
+    """Memory-model v2 — POST /v1/memories/raw/batch."""
+
+    def test_enqueues_batch_returns_202(self, client, mock_task_manager):
+        mock_task_manager.enqueue_raw_batch = AsyncMock(return_value="batch-task-id")
+        resp = client.post("/v1/memories/raw/batch", json={
+            "memories": [
+                {"content": "Fact A", "user_id": "ehfaz", "category": "preference"},
+                {"content": "Fact B", "user_id": "ehfaz", "category": "personal_fact",
+                 "domain": "personal"},
+            ],
+        })
+        assert resp.status_code == 202
+        data = resp.json()
+        assert data["task_id"] == "batch-task-id"
+        mock_task_manager.enqueue_raw_batch.assert_called_once()
+        items = mock_task_manager.enqueue_raw_batch.call_args[1]["items"]
+        assert len(items) == 2
+        assert items[1]["domain"] == "personal"
+
+    def test_serializes_expires_at_in_each_item(self, client, mock_task_manager):
+        mock_task_manager.enqueue_raw_batch = AsyncMock(return_value="batch-task-id")
+        resp = client.post("/v1/memories/raw/batch", json={
+            "memories": [
+                {"content": "x", "user_id": "u", "category": "task_context",
+                 "expires_at": "2026-12-01T00:00:00+00:00"},
+            ],
+        })
+        assert resp.status_code == 202
+        items = mock_task_manager.enqueue_raw_batch.call_args[1]["items"]
+        # Stored as ISO string for JSON-enqueue safety
+        assert items[0]["expires_at"] == "2026-12-01T00:00:00+00:00"
+
+    def test_invalid_category_in_one_item_400s_whole_batch(self, client, mock_task_manager):
+        resp = client.post("/v1/memories/raw/batch", json={
+            "memories": [
+                {"content": "Fact A", "user_id": "ehfaz", "category": "preference"},
+                {"content": "Fact B", "user_id": "ehfaz", "category": "BOGUS"},
+            ],
+        })
+        assert resp.status_code == 400
+        assert "Item 1" in resp.json()["detail"]
+
+    def test_project_scope_without_project_id_400s(self, client):
+        resp = client.post("/v1/memories/raw/batch", json={
+            "memories": [
+                {"content": "Fact A", "user_id": "ehfaz", "category": "tech_stack",
+                 "scope": "project"},
+            ],
+        })
+        assert resp.status_code == 400
+        assert "Item 0" in resp.json()["detail"]
+
+    def test_redis_unavailable_falls_back_to_sync_batch(self, client, mock_task_manager, mock_service):
+        from schemas import MemoryResponse
+        mock_task_manager.enqueue_raw_batch = AsyncMock(side_effect=ConnectionError("Redis down"))
+        mock_service.store_raw_batch.return_value = [
+            MemoryResponse(id="m1", memory="A", category="preference"),
+            MemoryResponse(id="m2", memory="B", category="personal_fact"),
+        ]
+        resp = client.post("/v1/memories/raw/batch", json={
+            "memories": [
+                {"content": "A", "user_id": "ehfaz", "category": "preference"},
+                {"content": "B", "user_id": "ehfaz", "category": "personal_fact"},
+            ],
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "ok"
+        assert len(data["memories"]) == 2
+        mock_service.store_raw_batch.assert_called_once()
+
+    def test_empty_batch_422s(self, client):
+        """RawMemoryBatchRequest min_length=1 rejects empty memories list."""
+        resp = client.post("/v1/memories/raw/batch", json={"memories": []})
+        assert resp.status_code == 422  # Pydantic validation error
+
+    def test_oversized_batch_422s(self, client):
+        """RawMemoryBatchRequest max_length=50 rejects > 50 items."""
+        items = [
+            {"content": f"f{i}", "user_id": "u", "category": "preference"}
+            for i in range(51)
+        ]
+        resp = client.post("/v1/memories/raw/batch", json={"memories": items})
+        assert resp.status_code == 422
+
+
+class TestV1SearchV2:
+    """Memory-model v2 — search route honors new optional filters."""
+
+    def test_passes_v2_filters_through(self, client, mock_service):
+        mock_service.search.return_value = []
+        resp = client.post("/v1/search", json={
+            "query": "anything",
+            "user_id": "ehfaz",
+            "domain": "research",
+            "observation_type": "discovery",
+            "concepts": ["gotcha", "pattern"],
+        })
+        assert resp.status_code == 200
+        kwargs = mock_service.search.call_args[1]
+        assert kwargs["domain"] == "research"
+        assert kwargs["observation_type"] == "discovery"
+        assert kwargs["concepts"] == ["gotcha", "pattern"]

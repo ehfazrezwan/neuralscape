@@ -2,7 +2,7 @@
 
 Persistent agentic memory for **Claude Code** and **Claude Cowork**. The plugin auto-captures your conversations, recalls relevant context on every session start, and exposes the 7 Neuralscape MCP tools — all backed by your own Neuralscape service (FastAPI + mem0 + Graphiti).
 
-- **What you get:** memory injection on `SessionStart`, conversation flush + compile on `Stop`, four slash command skills (`status`, `search`, `sync`, `config`), and the Neuralscape MCP toolkit auto-wired via `.mcp.json`.
+- **What you get:** memory injection on `SessionStart`, conversation flush + compile on `Stop`, **incremental tool-observation capture on `PostToolUse` + threshold-driven compile on `UserPromptSubmit`** (no extra API cost — runs on your subscription), five slash command skills (`status`, `search`, `sync`, `config`, `capture`), and the Neuralscape MCP toolkit auto-wired via `.mcp.json`.
 - **Where it stores:** in your own Neuralscape deployment. The plugin never sends data anywhere else.
 - **Cost:** zero additional. The plugin is a thin client over your service.
 
@@ -39,22 +39,30 @@ Cowork blocks `npm` and `pip` MCP sources, but Neuralscape's MCP runs over HTTP 
 ## What gets installed
 
 ```
-.claude/plugins/cache/neuralscape-plugins/neuralscape/2.0.0/
+.claude/plugins/cache/neuralscape-plugins/neuralscape/2.1.0/
 ├── .claude-plugin/plugin.json    manifest with userConfig prompts
 ├── .mcp.json                      remote HTTP MCP at <URL>/mcp/
-├── hooks/hooks.json               SessionStart + Stop
-├── skills/{status,search,sync,config}/SKILL.md
+├── hooks/hooks.json               SessionStart, PostToolUse, UserPromptSubmit, Stop
+├── skills/{status,search,sync,config,capture,compile-observations}/SKILL.md
 ├── scripts/                       built hook bundles
 └── LICENSE / CHANGELOG.md
 ```
 
-The plugin reaches your service via three calls:
+The plugin reaches your service via these calls:
 
 | Trigger | Endpoint | Purpose |
 |---|---|---|
-| SessionStart | `GET /v1/context/{project_id}` or `/v1/context/global` | Fetch stored memories, format by category, inject as `additionalContext` |
-| Stop (per turn) | `POST /v1/extensions/conversation-compiler/flush` | Stream each user/assistant pair to Gemini extraction |
-| Stop (after flush) | `POST /v1/extensions/conversation-compiler/compile` | Synthesize the day's facts into Sessions/Decisions/Research articles |
+| SessionStart | `GET /v1/context/{project_id}` or `/v1/context/global` | Fetch stored memories, format by category, inject as `additionalContext`. Also flags any pending observation buffers from prior sessions. |
+| PostToolUse | (none — local file write) | Append `{tool, input, output, ts, project_id}` to per-session JSONL buffer. Filters read-only tools and trivial Bash commands; truncates large outputs. |
+| UserPromptSubmit | (none — local check) | When the buffer crosses the threshold (default 25 obs or 30 min old), prepends an `additionalContext` instruction asking Claude to compile the buffer using the `compile-observations` skill before responding. |
+| compile-observations skill | `POST /v1/memories/raw` (via `mcp__plugin_neuralscape_neuralscape__remember`) | Claude reads the buffer, applies the quality rubric, and submits one wiki-quality memory per significant work unit. Backend embeds and stores — **no Gemini call**. |
+| Stop (per turn) | `POST /v1/extensions/conversation-compiler/flush` | Stream each user/assistant pair to Gemini extraction (legacy conversation-driven memory). |
+| Stop (after flush) | `POST /v1/extensions/conversation-compiler/compile` | Synthesize the day's facts into Sessions/Decisions/Research articles. |
+| Stop (after compile) | (none — local marker) | Drop a `.stale` marker next to any non-empty observation buffer so the next SessionStart compiles it even if no further user prompts were sent. |
+
+### Where extraction happens
+
+The PostToolUse path is **client-LLM-extracted**: the hook records raw observations to disk (no LLM, sub-50ms), and Claude Code's own LLM compiles them on the next user turn using your existing subscription tokens. The backend never runs Gemini for tool-driven capture — it just receives pre-categorized memories and stores them. See [`docs/neuralscape/05-llm-extraction.md`](../docs/neuralscape/05-llm-extraction.md) for the full diagram.
 
 ## Slash commands
 
@@ -64,6 +72,7 @@ Once installed, ask Claude any of:
 - "What do I know about X?" → `/neuralscape:search`
 - "Save this conversation to memory now" → `/neuralscape:sync`
 - "What's my neuralscape config?" → `/neuralscape:config`
+- "Compile my tool observations now" → `/neuralscape:capture`
 
 Claude can also invoke them automatically when it judges them relevant.
 
@@ -103,6 +112,8 @@ The plugin reads from `userConfig` prompts (modern) or env vars (legacy fallback
 | Service URL | `CLAUDE_PLUGIN_OPTION_URL` | `NEURALSCAPE_URL` |
 | API key | `CLAUDE_PLUGIN_OPTION_API_KEY` (sensitive — keychain-stored) | `NEURALSCAPE_API_KEY` |
 | User ID | `CLAUDE_PLUGIN_OPTION_USER_ID` | `NEURALSCAPE_USER_ID` |
+| Compile threshold (obs) | `CLAUDE_PLUGIN_OPTION_COMPILE_THRESHOLD` (default `25`) | `NEURALSCAPE_COMPILE_THRESHOLD` |
+| Compile age (minutes) | `CLAUDE_PLUGIN_OPTION_COMPILE_AGE_MIN` (default `30`) | `NEURALSCAPE_COMPILE_AGE_MIN` |
 
 To change settings after install:
 
@@ -132,7 +143,7 @@ npm run build      # rebuild bundles
 npm run watch      # rebuild on save
 ```
 
-The TypeScript source lives in `src/`. esbuild bundles three entry points (`session-start.ts`, `conversation-turn.ts`, `session-end.ts`) into `scripts/*.js` (ESM, Node 18+, minified). Built scripts are gitignored — `npm install` regenerates them.
+The TypeScript source lives in `src/`. esbuild bundles five entry points (`session-start.ts`, `conversation-turn.ts`, `session-end.ts`, `post-tool-use.ts`, `user-prompt-submit.ts`) into `scripts/*.js` (ESM, Node 18+, minified). Built scripts are gitignored — `npm install` regenerates them.
 
 To run a hook locally for testing:
 

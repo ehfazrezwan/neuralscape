@@ -1,5 +1,5 @@
 {
-  "description": "Neuralscape memory hooks — automatic context injection and conversation capture",
+  "description": "Neuralscape memory hooks — automatic context injection, conversation capture, and PostToolUse observation buffering",
   "hooks": {
     "SessionStart": [
       {
@@ -10,6 +10,31 @@
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/session-start.js\"",
             "timeout": 30,
             "statusMessage": "Loading memory context..."
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/post-tool-use.js\"",
+            "timeout": 10,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/user-prompt-submit.js\"",
+            "timeout": 10
           }
         ]
       }

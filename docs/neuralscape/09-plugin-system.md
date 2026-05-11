@@ -304,12 +304,99 @@ The contributor checklist for, say, a Cursor adapter is short because the contra
 
 That is the entire surface. There is **no** server change required because the `/flush` and `/compile` endpoints already accept the normalized `ConversationTurn` shape; once `cursor.ts` produces that shape, every downstream component — Gemini extraction, Qdrant write, Neo4j ingestion, vault dual-write, daily log, compilation — works without modification. This is the core architectural payoff of the adapter pattern: the radius of change for a new client is bounded inside `neuralscape-plugin/src/adapters/`.
 
+## PostToolUse incremental capture (v2.1)
+
+Released alongside memory model v2 on 2026-05-09. This is a *parallel* capture pipeline to the conversation-compiler flow described above — both write to the same Qdrant + Graphiti backend, distinguished only by `source_type` on the resulting memory. Conceptually it complements the conversation flow: chat-driven memories come from `Stop`, tool-driven memories come from `PostToolUse`.
+
+### New hook events
+
+The `hooks/hooks.json` manifest now declares **four** hook events (was two):
+
+| Event | Script | Purpose | Async |
+|---|---|---|---|
+| `SessionStart` | `scripts/session-start.js` | Pull stored memories + flag any pending observation buffers from prior sessions | No |
+| `PostToolUse` | `scripts/post-tool-use.js` | Append one JSONL row per significant tool invocation to the per-session buffer | Yes |
+| `UserPromptSubmit` | `scripts/user-prompt-submit.js` | Threshold-based trigger that asks Claude to compile the buffer before responding | No |
+| `Stop` | `scripts/session-end.js` | Conversation-compiler flush + drop a `.stale` marker on any non-empty observation buffer | Yes |
+
+### PostToolUse hook (`src/hooks/post-tool-use.ts`)
+
+Pure recorder. No HTTP, no LLM, fast. Filtering rules at the gate:
+
+- `DENY_TOOLS` set (read-only or already-managed): `Read`, `Glob`, `Grep`, `NotebookRead`, `TodoWrite`, `ListMcpResourcesTool`, `ReadMcpResourceTool`, `ExitPlanMode`, `EnterPlanMode`, `EnterWorktree`, `ExitWorktree`.
+- `BORING_BASH_RE`: skips `ls`, `pwd`, `cd`, `cat`, `head`, `tail`, `less`, `more`, `stat`, `file`, `which`, `where`, `tree`, `echo`, `date`, `whoami`, `uname`, `hostname`, `env`, `set`, `unset`, `history`.
+- Tool output is truncated to head 800 + tail 200 chars before persisting.
+- `pickRelevantInput()` keeps a per-tool whitelist of useful input fields (file_path, command, prompt, url, query) and drops everything else (full file contents, large patches).
+
+The hook always exits 0 — never blocks tool execution. Errors during stdin parsing or buffer write are logged to stderr but do not surface to the user.
+
+### Buffer location
+
+```text
+${CLAUDE_PLUGIN_DATA}/observations/{session_id}.jsonl
+```
+
+with fallback to `~/.neuralscape/observations/{session_id}.jsonl` for older Claude Code versions that don't set `CLAUDE_PLUGIN_DATA`. Helpers in `src/utils.ts`:
+
+| Function | Purpose |
+|---|---|
+| `getObservationDir()` | Resolves the per-plugin data directory (with home-dir fallback) |
+| `getBufferPath(sessionId)` | Path to the per-session JSONL buffer |
+| `getStaleMarkerPath(sessionId)` | Path to the `.stale` sentinel dropped by Stop |
+| `appendObservation(row)` | Atomic single-row append; creates dir on first call |
+| `getBufferStats(path)` | Returns `{lineCount, oldestTs, isStale}` |
+| `listPendingBuffers(currentSessionId)` | All non-empty buffers from *other* sessions |
+| `truncateBuffer(path)` | Empty the file (preserves inode); also unlinks the `.stale` marker |
+| `markBufferStale(sessionId)` | Drop the `.stale` sentinel (Stop hook) |
+| `truncateOutput(text, head, tail)` | Head + tail truncation with marker |
+| `pickRelevantInput(toolName, input)` | Per-tool input whitelisting |
+
+### UserPromptSubmit threshold trigger
+
+The `user-prompt-submit.js` hook fires on every user message. It computes `getBufferStats` for the current session and decides:
+
+```typescript
+if (stats.lineCount >= HARD_CAP /*500*/) compile = true;          // safety
+else if (stats.lineCount >= COMPILE_THRESHOLD /*25*/) compile = true;
+else if (oldestTs is ≥ COMPILE_AGE_MIN /*30*/ minutes ago) compile = true;
+else compile = false;
+```
+
+When `compile === true`, the hook returns `{ continue: true, hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: "..." } }`. The `additionalContext` instructs Claude to invoke the `compile-observations` skill on the buffer before responding to the user's message.
+
+Both thresholds are tunable via `userConfig` prompts (`COMPILE_THRESHOLD` and `COMPILE_AGE_MIN` in `plugin.json`) and surface as `CLAUDE_PLUGIN_OPTION_COMPILE_THRESHOLD` / `CLAUDE_PLUGIN_OPTION_COMPILE_AGE_MIN` env vars to the hook.
+
+### compile-observations skill
+
+`neuralscape-plugin/skills/compile-observations/SKILL.md` is the rubric Claude follows. Headline contract:
+
+1. Read each buffer JSONL row.
+2. Group consecutive ops on the same target into work units.
+3. Apply the quality rubric (decision / discovery / gotcha / pattern / bugfix / convention / architecture / outcome — keep; routine reads/edits/searches — skip; `<private>` and API-key shapes — skip).
+4. For each significant work unit, submit ONE memory via `mcp__plugin_neuralscape_neuralscape__remember` with v2 fields (`domain`, `observation_type`, `concepts`, `source_type: "tool_extraction"`, `confidence`, optionally `related_memory_ids`).
+5. Truncate every processed buffer file (preserves inode for next writes).
+
+Throughput target: 50–100 captured rows yield 3–10 memories. The skill explicitly errs on the side of fewer, denser memories.
+
+### `/neuralscape:capture` slash command
+
+Manual trigger for the same skill. Lives at `neuralscape-plugin/skills/capture/SKILL.md`. Useful when the user wants to flush mid-session before context grows further or before stepping away.
+
+### Coexistence with the conversation-compiler
+
+Both pipelines write to the same backend. `source_type` distinguishes them on read:
+
+- `"conversation"` — written by the conversation-compiler at `Stop` time (Gemini-extracted from chat).
+- `"tool_extraction"` — written by the compile-observations skill (Claude-extracted from PostToolUse buffer).
+
+Content-hash dedup in `service.store_raw()` ensures that even if both paths land on the same fact, only one row is created. See [05-llm-extraction](./05-llm-extraction.md) for the cost/architecture comparison.
+
 ## Related
 
 - [01-getting-started](./01-getting-started.md) — Step 8 walks through the marketplace install
-- [03-memory-model](./03-memory-model.md) — the 13-category taxonomy that adapters serve and the vault organizes
+- [03-memory-model](./03-memory-model.md) — the 13-category taxonomy and v2 vocabularies
 - [02-service-architecture](./02-service-architecture.md) — how the conversation_compiler extension mounts into the FastAPI app
 - [07-async-pipeline](./07-async-pipeline.md) — what happens after `/flush` returns 202
 - [08-mcp-server](./08-mcp-server.md) — the seven MCP tools the plugin auto-wires via `.mcp.json`
-- [05-llm-extraction](./05-llm-extraction.md) — the Gemini prompts used by `flush.py` to derive facts from turns
+- [05-llm-extraction](./05-llm-extraction.md) — server-side Gemini prompts and the parallel client-side extraction path
 - [06-storage-backends](./06-storage-backends.md) — Qdrant and Neo4j, the shared sinks for all client adapters

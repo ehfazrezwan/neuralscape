@@ -4,6 +4,62 @@ All notable changes to the `neuralscape` Claude plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.1.0] - 2026-05-09
+
+### Added
+- **Incremental memory capture (PostToolUse hook).** A new `post-tool-use.js`
+  hook fires after every tool invocation, filters read-only tools (Read, Glob,
+  Grep, NotebookRead, etc.) and trivial Bash commands at the gate, truncates
+  large `tool_output` (head 800 + tail 200), and appends one JSONL row to a
+  per-session buffer at `${CLAUDE_PLUGIN_DATA}/observations/{session_id}.jsonl`.
+  Pure recorder — zero LLM calls in the hook itself, sub-50ms typical.
+- **Client-side extraction (compile-observations skill).** A new
+  `skills/compile-observations/SKILL.md` instructs Claude to read the buffer,
+  group consecutive ops into work units, apply a quality rubric (decision /
+  discovery / gotcha / pattern / bugfix / convention / architecture / outcome),
+  and submit each significant work unit as a single memory via the
+  `mcp__plugin_neuralscape_neuralscape__remember` MCP tool. Runs on the user's
+  Claude Code subscription tokens — backend Gemini is bypassed entirely for
+  capture.
+- **UserPromptSubmit trigger.** A new `user-prompt-submit.js` hook checks the
+  per-session buffer on every user message; when it reaches the configured
+  threshold (default 25 observations) or age (default 30 minutes), it injects
+  `additionalContext` asking Claude to invoke the compile-observations skill
+  before responding. Long-running sessions get fresh memories without waiting
+  for a session boundary.
+- **SessionStart fallback.** The session-start hook now scans for unprocessed
+  buffers from prior sessions and prepends a compile prompt to its
+  `additionalContext` so short sessions that didn't hit the threshold still
+  flush on the next opening.
+- **Stop-time stale marker.** session-end now writes a `.stale` sentinel next
+  to any non-empty buffer so the next SessionStart picks it up even if the
+  user closes Claude Code without sending another prompt.
+- **`/neuralscape:capture` slash command** for on-demand compilation.
+- **userConfig prompts**: `COMPILE_THRESHOLD` and `COMPILE_AGE_MIN` for
+  tuning the in-session compile cadence (defaults 25 / 30).
+
+### Changed
+- **Memory model v2** (backend, additive). The plugin now passes 7 new
+  optional fields through to Neuralscape on every `remember` call: `domain`,
+  `observation_type`, `concepts`, `source_type`, `related_memory_ids`,
+  `confidence`, `expires_at`. Existing v1 memories continue to render
+  unchanged with these fields as null. See
+  `docs/neuralscape/03-memory-model.md` for the full vocabulary tables.
+- **Domain-neutral category descriptions.** All 13 category descriptions
+  rewritten to apply equally to coding, research, meetings, writing, and
+  ops work — the team uses Claude Code for more than just code.
+- `readConfig` is now exported from `utils.ts` so the new hooks can read
+  user-configurable thresholds.
+
+### Notes
+- No migration required. v1 memories continue to work as-is; v2 fields
+  populate only on new writes that supply them.
+- The 13 memory categories are unchanged — only their descriptions and
+  surrounding metadata gained domain-neutrality.
+- Backend additions to support the new flow: `POST /v1/memories/raw/batch`,
+  content-hash dedup on insert (idempotent re-flushes), and an
+  `expire_old_memories` cron.
+
 ## [2.0.2] - 2026-05-08
 
 ### Fixed

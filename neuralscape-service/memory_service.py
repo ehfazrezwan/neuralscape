@@ -46,6 +46,34 @@ _JUNK_RE = re.compile("|".join(_JUNK_PATTERNS), re.IGNORECASE | re.MULTILINE)
 ALL_KNOWN_PROJECTS = ["svc-utility-belt", "lightpath", "neuralscape", "openclaw"]
 
 
+def _parse_expires_at(value) -> datetime | None:
+    """Parse an `expires_at` payload value to an aware UTC datetime.
+
+    Accepts ISO-8601 strings (with or without a trailing `Z`), `datetime`
+    instances (naive treated as UTC), or anything else returns None. Used by
+    the expiry cron — comparing raw strings is unsafe across mixed offsets
+    (`Z` vs `+00:00` vs `-05:00` won't sort lexicographically).
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if not s:
+        return None
+    # datetime.fromisoformat doesn't accept the literal 'Z' suffix until
+    # Python 3.11 fully; normalize defensively.
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
 def _is_junk_fact(content: str) -> bool:
     """Return True if an extracted fact is a raw event log rather than contextual knowledge."""
     stripped = content.strip()
@@ -375,8 +403,21 @@ class MemoryService:
         tags: list[str] | None = None,
         agent_id: str | None = None,
         run_id: str | None = None,
+        # Memory-model v2 fields (all optional, all additive)
+        domain: str | None = None,
+        observation_type: str | None = None,
+        concepts: list[str] | None = None,
+        source_type: str | None = None,
+        related_memory_ids: list[str] | None = None,
+        confidence: float | None = None,
+        expires_at: datetime | None = None,
     ) -> list[MemoryResponse]:
         """Store a single pre-categorized fact directly (no LLM extraction).
+
+        Performs content-hash dedup before insert: if a memory with the same
+        md5(content) + user_id + scope already exists, the existing memory is
+        returned instead of creating a duplicate. This makes hook-driven
+        re-flushes idempotent.
 
         Args:
             content: The fact to store
@@ -387,9 +428,20 @@ class MemoryService:
             tags: Optional free-form tags
             agent_id: Optional agent identifier
             run_id: Optional session identifier
+            domain: Memory-model v2 — life-context domain
+            observation_type: Memory-model v2 — shape of observation
+            concepts: Memory-model v2 — controlled-vocab cross-cutting tags
+            source_type: Memory-model v2 — provenance
+            related_memory_ids: Memory-model v2 — graph linkage
+            confidence: Memory-model v2 — extractor's self-rated 0.0-1.0
+            expires_at: Memory-model v2 — optional expiry timestamp
 
         Returns:
-            List of stored memory responses.
+            List of stored memory responses (always exactly one item). When the
+            content-hash dedup short-circuits, the returned `id`/`created_at`
+            will match the existing memory; otherwise they reflect the new row.
+            Both paths use `source="vector"`; callers that need to distinguish
+            should compare the returned `id` against their expected new UUID.
         """
         if category not in MEMORY_CATEGORIES:
             raise ValueError(f"Invalid category: {category}. Must be one of: {list(MEMORY_CATEGORIES.keys())}")
@@ -399,29 +451,58 @@ class MemoryService:
 
         m = self._get_memory()
         now_iso = datetime.now(timezone.utc).isoformat()
+        content_hash = hashlib.md5(content.encode()).hexdigest()
+
+        # ── Content-hash dedup ──
+        # Skip insert if this exact (user_id, scope, hash) already exists.
+        existing = self._find_by_content_hash(
+            user_id=user_id, content_hash=content_hash, scope=scope, project_id=project_id
+        )
+        if existing is not None:
+            logger.info(
+                f"Dedup hit for user={user_id} hash={content_hash[:8]}... — returning existing id={existing.id}"
+            )
+            return [existing]
 
         # ── Direct embed + Qdrant insert (bypass m.add) ──
         mid = str(uuid.uuid4())
         embedding = m.embedding_model.embed(content, memory_action="add")
 
+        metadata: dict = {
+            "scope": scope,
+            "category": category,
+            "project_id": project_id,
+            "agent_id": agent_id,
+            "run_id": run_id,
+            "source": "explicit",
+        }
+        if tags:
+            metadata["tags"] = tags
+        # Memory-model v2 metadata (only stored when set)
+        if domain is not None:
+            metadata["domain"] = domain
+        if observation_type is not None:
+            metadata["observation_type"] = observation_type
+        if concepts:
+            metadata["concepts"] = concepts
+        if source_type is not None:
+            metadata["source_type"] = source_type
+        if related_memory_ids:
+            metadata["related_memory_ids"] = related_memory_ids
+        if confidence is not None:
+            metadata["confidence"] = confidence
+        if expires_at is not None:
+            metadata["expires_at"] = expires_at.isoformat() if hasattr(expires_at, "isoformat") else str(expires_at)
+
         payload = {
             "data": content,
-            "hash": hashlib.md5(content.encode()).hexdigest(),
+            "hash": content_hash,
             "created_at": now_iso,
             "user_id": user_id,
             "agent_id": agent_id,
             "run_id": run_id,
-            "metadata": {
-                "scope": scope,
-                "category": category,
-                "project_id": project_id,
-                "agent_id": agent_id,
-                "run_id": run_id,
-                "source": "explicit",
-            },
+            "metadata": metadata,
         }
-        if tags:
-            payload["metadata"]["tags"] = tags
 
         m.vector_store.insert(
             vectors=[embedding],
@@ -454,10 +535,190 @@ class MemoryService:
                 category=category,
                 scope=scope,
                 project_id=project_id,
+                tags=tags,
                 source="vector",
                 created_at=now_iso,
+                domain=domain,
+                observation_type=observation_type,
+                concepts=concepts,
+                source_type=source_type,
+                related_memory_ids=related_memory_ids,
+                confidence=confidence,
+                expires_at=expires_at.isoformat() if expires_at and hasattr(expires_at, "isoformat") else None,
             )
         ]
+
+    def _find_by_content_hash(
+        self,
+        user_id: str,
+        content_hash: str,
+        scope: str,
+        project_id: str | None = None,
+    ) -> MemoryResponse | None:
+        """Look up a memory by (user_id, hash, scope) for dedup.
+
+        Returns the existing MemoryResponse on hit, or None if not found.
+        Failures here are non-fatal — we'd rather risk a duplicate than
+        block an insert.
+        """
+        try:
+            from qdrant_client.models import FieldCondition, Filter, MatchValue
+            client = self._memory.vector_store.client
+            collection = settings.qdrant_collection
+            must = [
+                FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                FieldCondition(key="hash", match=MatchValue(value=content_hash)),
+                FieldCondition(key="metadata.scope", match=MatchValue(value=scope)),
+            ]
+            if scope == "project" and project_id:
+                must.append(FieldCondition(key="metadata.project_id", match=MatchValue(value=project_id)))
+            points, _ = client.scroll(
+                collection_name=collection,
+                scroll_filter=Filter(must=must),
+                limit=1,
+                with_payload=True,
+                with_vectors=False,
+            )
+            if not points:
+                return None
+            pt = points[0]
+            payload = pt.payload or {}
+            metadata = payload.get("metadata", {}) or {}
+            return MemoryResponse(
+                id=str(pt.id),
+                memory=payload.get("data", ""),
+                category=metadata.get("category"),
+                scope=metadata.get("scope"),
+                project_id=metadata.get("project_id"),
+                tags=metadata.get("tags"),
+                source="vector",
+                created_at=payload.get("created_at"),
+                domain=metadata.get("domain"),
+                observation_type=metadata.get("observation_type"),
+                concepts=metadata.get("concepts"),
+                source_type=metadata.get("source_type"),
+                related_memory_ids=metadata.get("related_memory_ids"),
+                confidence=metadata.get("confidence"),
+                expires_at=metadata.get("expires_at"),
+            )
+        except Exception as e:
+            logger.warning(f"Content-hash dedup lookup failed (non-fatal): {e}")
+            return None
+
+    def store_raw_batch(
+        self,
+        items: list[dict],
+    ) -> list[MemoryResponse]:
+        """Store multiple pre-categorized facts (memory-model v2).
+
+        Each item is a dict matching RawMemoryRequest's shape. Reuses
+        ``store_raw`` per item so dedup, validation, and graph ingestion
+        stay consistent. Single network round-trip from the caller.
+
+        Args:
+            items: list of dicts with at least content/user_id/category, plus
+                any v2 optional fields. Each item is independent; one bad item
+                won't block the others (we collect errors but continue).
+
+        Returns:
+            Flattened list of MemoryResponse objects across all successful items.
+        """
+        results: list[MemoryResponse] = []
+        for idx, item in enumerate(items):
+            try:
+                # Convert ISO string -> datetime if needed (came in via JSON)
+                expires_at = item.get("expires_at")
+                if expires_at and isinstance(expires_at, str):
+                    try:
+                        from datetime import datetime as _dt
+                        expires_at = _dt.fromisoformat(expires_at.replace("Z", "+00:00"))
+                    except ValueError:
+                        expires_at = None
+                stored = self.store_raw(
+                    content=item["content"],
+                    user_id=item["user_id"],
+                    category=item["category"],
+                    scope=item.get("scope", "global"),
+                    project_id=item.get("project_id"),
+                    tags=item.get("tags"),
+                    agent_id=item.get("agent_id"),
+                    run_id=item.get("run_id"),
+                    domain=item.get("domain"),
+                    observation_type=item.get("observation_type"),
+                    concepts=item.get("concepts"),
+                    source_type=item.get("source_type"),
+                    related_memory_ids=item.get("related_memory_ids"),
+                    confidence=item.get("confidence"),
+                    expires_at=expires_at,
+                )
+                results.extend(stored)
+            except Exception as e:
+                logger.warning(f"Batch item {idx} failed (continuing): {e}")
+        logger.info(f"store_raw_batch: stored {len(results)} memories from {len(items)} items")
+        return results
+
+    def expire_old_memories(self, batch_size: int = 100) -> dict:
+        """Delete memories whose expires_at is in the past (memory-model v2 cron).
+
+        Qdrant doesn't have a direct datetime range filter on string fields,
+        so we scroll the whole collection and filter in Python by parsing
+        each memory's `expires_at` to an aware UTC datetime. For larger
+        deployments we'd switch to a numeric epoch field.
+
+        Returns:
+            Dict with deleted_count and per-user breakdown.
+        """
+        # Ensure mem0/Qdrant client is initialized — the nightly cron can
+        # fire on a cold-started worker before any request has touched
+        # _memory, which would otherwise raise AttributeError.
+        m = self._get_memory()
+        client = m.vector_store.client
+        collection = settings.qdrant_collection
+        now_dt = datetime.now(timezone.utc)
+
+        deleted_count = 0
+        per_user: dict[str, int] = {}
+        offset = None
+        while True:
+            points, next_offset = client.scroll(
+                collection_name=collection,
+                limit=batch_size,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            if not points:
+                break
+            for pt in points:
+                payload = pt.payload or {}
+                metadata = payload.get("metadata", {}) or {}
+                expires_at = metadata.get("expires_at")
+                if not expires_at:
+                    continue
+                expires_dt = _parse_expires_at(expires_at)
+                if expires_dt is None:
+                    # Malformed timestamp — log and skip rather than risk
+                    # deleting on an unparseable value.
+                    logger.warning(
+                        f"Memory {pt.id} has unparseable expires_at={expires_at!r}; skipping"
+                    )
+                    continue
+                if expires_dt >= now_dt:
+                    continue  # not yet expired
+                try:
+                    self._delete_qdrant_memory_with_graph_cleanup(str(pt.id), payload)
+                    uid = payload.get("user_id", "unknown")
+                    per_user[uid] = per_user.get(uid, 0) + 1
+                    deleted_count += 1
+                except Exception as e:
+                    logger.warning(f"Failed to expire memory {pt.id}: {e}")
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        if deleted_count:
+            logger.info(f"expire_old_memories: deleted {deleted_count} expired memories")
+        return {"deleted_count": deleted_count, "per_user": per_user}
 
     def _batch_store_facts(
         self,
@@ -592,6 +853,10 @@ class MemoryService:
         categories: list[str] | None = None,
         scope: str | None = None,
         limit: int = 10,
+        # Memory-model v2 filters
+        domain: str | None = None,
+        observation_type: str | None = None,
+        concepts: list[str] | None = None,
     ) -> list[MemoryResponse]:
         """Semantic search across memories with scope/category filters.
 
@@ -604,6 +869,9 @@ class MemoryService:
             categories: Optional category filter
             scope: Optional scope filter ("global" or "project")
             limit: Maximum results
+            domain: Memory-model v2 — filter by domain
+            observation_type: Memory-model v2 — filter by observation_type
+            concepts: Memory-model v2 — filter by any of these concept tags
 
         Returns:
             List of matching memory responses sorted by score.
@@ -617,6 +885,13 @@ class MemoryService:
             filters["metadata.category"] = {"in": categories}
         if scope:
             filters["metadata.scope"] = scope
+        if domain:
+            filters["metadata.domain"] = domain
+        if observation_type:
+            filters["metadata.observation_type"] = observation_type
+        if concepts:
+            # any-match: at least one of the supplied concepts in metadata.concepts
+            filters["metadata.concepts"] = {"in": concepts}
 
         # If project_id is given and no explicit scope, search both scopes
         if project_id and not scope:
@@ -673,9 +948,149 @@ class MemoryService:
         except Exception as e:
             logger.warning(f"Graph search failed during recall (non-critical): {e}")
 
+        # Memory-model v2: enrich graph results with v2 metadata from their
+        # nearest source memory, then apply the same v2 filters to graph rows.
+        # Graphiti's edge schema doesn't carry v2 fields natively — we recover
+        # them by semantic match against the Qdrant store.
+        v2_filter_active = bool(domain or observation_type or concepts)
+        if graph_responses and (v2_filter_active or any([domain, observation_type, concepts])):
+            graph_responses = self._enrich_and_filter_graph(
+                graph_responses,
+                user_id=user_id,
+                project_id=project_id,
+                domain=domain,
+                observation_type=observation_type,
+                concepts=concepts,
+            )
+        elif graph_responses:
+            # No v2 filter active, but still enrich so callers see v2 fields
+            # surfaced on graph rows when their source memory has them.
+            graph_responses = self._enrich_graph_with_v2(
+                graph_responses, user_id=user_id, project_id=project_id
+            )
+
         # Deduplicate and enforce caller's limit
         combined = self._deduplicate_responses(vector_responses, graph_responses)
         return combined[:limit]
+
+    # Minimum vector similarity for graph→source enrichment to be trusted.
+    # Below this, the "source" is just the nearest unrelated memory and we
+    # leave v2 fields as None rather than propagating wrong metadata.
+    _GRAPH_ENRICH_THRESHOLD: float = 0.7
+
+    def _enrich_graph_with_v2(
+        self,
+        graph_responses: list[MemoryResponse],
+        user_id: str,
+        project_id: str | None,
+    ) -> list[MemoryResponse]:
+        """For each graph edge, find its nearest Qdrant source memory and
+        copy that source's v2 metadata onto the graph response — only when
+        the similarity score clears _GRAPH_ENRICH_THRESHOLD.
+
+        Memory-model v2 augmentation: Graphiti edges don't carry domain /
+        observation_type / concepts natively, but they're derived from
+        source memories that do. We do a top-1 vector search per edge to
+        recover those fields. ~10ms per edge at typical limits.
+
+        When project_id is supplied, the lookup is scoped to that project
+        so a graph edge can't inherit metadata from a semantically similar
+        memory in a different project (which would break v2 filter parity).
+        """
+        m = self._get_memory()
+        # Build a search filter that scopes the enrichment lookup correctly.
+        # - user_id is always required so we never enrich from another user's
+        #   memories.
+        # - When the caller specified a project, restrict to that project to
+        #   avoid cross-project metadata bleed.
+        base_filter: dict = {}
+        if user_id:
+            base_filter["user_id"] = user_id
+        if project_id:
+            base_filter["metadata.project_id"] = project_id
+        for resp in graph_responses:
+            if not resp.memory:
+                continue
+            try:
+                # Embed the edge fact and run a direct Qdrant search so we
+                # have access to the similarity score (mem0's wrapper hides it
+                # for some backends).
+                embedding = m.embedding_model.embed(resp.memory, memory_action="search")
+                hits = m.vector_store.search(
+                    query=resp.memory,
+                    vectors=embedding,
+                    limit=1,
+                    filters=base_filter if base_filter else None,
+                )
+                if not hits:
+                    continue
+                hit = hits[0]
+                # qdrant-client returns ScoredPoint objects (id, score, payload)
+                score = getattr(hit, "score", None)
+                if score is None and isinstance(hit, dict):
+                    score = hit.get("score")
+                if score is not None and score < self._GRAPH_ENRICH_THRESHOLD:
+                    continue  # too weak a match to trust the metadata link
+
+                payload = getattr(hit, "payload", None)
+                if payload is None and isinstance(hit, dict):
+                    payload = hit.get("payload", {})
+                payload = payload or {}
+                src_metadata = payload.get("metadata", {}) or {}
+                if isinstance(src_metadata.get("metadata"), dict):
+                    src_metadata = src_metadata["metadata"]
+
+                # Copy v2 fields when source has them and graph response doesn't
+                if resp.domain is None:
+                    resp.domain = src_metadata.get("domain")
+                if resp.observation_type is None:
+                    resp.observation_type = src_metadata.get("observation_type")
+                if resp.concepts is None:
+                    resp.concepts = src_metadata.get("concepts")
+                if resp.source_type is None:
+                    resp.source_type = src_metadata.get("source_type")
+                if resp.confidence is None:
+                    resp.confidence = src_metadata.get("confidence")
+                if resp.expires_at is None:
+                    resp.expires_at = src_metadata.get("expires_at")
+                if resp.category is None:
+                    resp.category = src_metadata.get("category")
+                if resp.scope is None:
+                    resp.scope = src_metadata.get("scope")
+                if resp.project_id is None:
+                    resp.project_id = src_metadata.get("project_id")
+            except Exception as e:
+                logger.debug(f"Graph enrichment skipped for {resp.id}: {e}")
+        return graph_responses
+
+    def _enrich_and_filter_graph(
+        self,
+        graph_responses: list[MemoryResponse],
+        user_id: str,
+        project_id: str | None,
+        domain: str | None,
+        observation_type: str | None,
+        concepts: list[str] | None,
+    ) -> list[MemoryResponse]:
+        """Enrich graph rows with v2 metadata, then drop rows that don't match
+        the supplied filter. Used when the caller passes domain/observation_type/
+        concepts in SearchMemoryRequest.
+        """
+        enriched = self._enrich_graph_with_v2(
+            graph_responses, user_id=user_id, project_id=project_id
+        )
+        out: list[MemoryResponse] = []
+        for resp in enriched:
+            if domain and resp.domain != domain:
+                continue
+            if observation_type and resp.observation_type != observation_type:
+                continue
+            if concepts:
+                resp_concepts = set(resp.concepts or [])
+                if not (resp_concepts & set(concepts)):
+                    continue
+            out.append(resp)
+        return out
 
     def search_graph(
         self,
@@ -1310,6 +1725,10 @@ class MemoryService:
         "metadata" key, the returned shape is {"metadata": {"metadata": {...}}}.
         Unwrap one level if we see that pattern so category/scope/project_id/
         tags/source resolve to their real values.
+
+        Memory-model v2 fields (domain, observation_type, concepts, source_type,
+        related_memory_ids, confidence, expires_at) surface as nulls for legacy
+        memories that didn't store them — no migration needed.
         """
         metadata = mem.get("metadata", {}) or {}
         if isinstance(metadata.get("metadata"), dict):
@@ -1325,6 +1744,13 @@ class MemoryService:
             created_at=mem.get("created_at"),
             updated_at=mem.get("updated_at"),
             source="vector",
+            domain=metadata.get("domain"),
+            observation_type=metadata.get("observation_type"),
+            concepts=metadata.get("concepts"),
+            source_type=metadata.get("source_type"),
+            related_memory_ids=metadata.get("related_memory_ids"),
+            confidence=metadata.get("confidence"),
+            expires_at=metadata.get("expires_at"),
         )
 
     def _result_to_responses(

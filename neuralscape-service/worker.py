@@ -3,6 +3,7 @@
 Run with: arq worker.WorkerSettings
 """
 
+import asyncio
 import hashlib
 import logging
 from datetime import datetime
@@ -76,9 +77,16 @@ async def process_memory_raw(
     tags: list[str] | None = None,
     agent_id: str | None = None,
     run_id: str | None = None,
+    v2_extras: dict | None = None,
 ) -> dict:
-    """Background task: direct fact storage with idempotency check."""
+    """Background task: direct fact storage with idempotency check.
+
+    Accepts memory-model v2 fields via the ``v2_extras`` kwargs dict (set by
+    the task manager). Content-hash dedup happens inside ``store_raw``;
+    the broader semantic-search idempotency check below catches near-dupes.
+    """
     service: MemoryService = ctx["service"]
+    v2_extras = v2_extras or {}
 
     # Idempotency: check if identical content already exists for this user
     try:
@@ -95,6 +103,14 @@ async def process_memory_raw(
     except Exception as e:
         logger.warning(f"Idempotency check failed (proceeding with store): {e}")
 
+    # Re-hydrate expires_at if it came in as ISO string
+    expires_at = v2_extras.get("expires_at")
+    if expires_at and isinstance(expires_at, str):
+        try:
+            expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        except ValueError:
+            expires_at = None
+
     memories = service.store_raw(
         content=content,
         user_id=user_id,
@@ -104,6 +120,13 @@ async def process_memory_raw(
         tags=tags,
         agent_id=agent_id,
         run_id=run_id,
+        domain=v2_extras.get("domain"),
+        observation_type=v2_extras.get("observation_type"),
+        concepts=v2_extras.get("concepts"),
+        source_type=v2_extras.get("source_type"),
+        related_memory_ids=v2_extras.get("related_memory_ids"),
+        confidence=v2_extras.get("confidence"),
+        expires_at=expires_at,
     )
 
     # Emit memory_stored event so extensions can write to vault
@@ -124,6 +147,56 @@ async def process_memory_raw(
         _rebuild_category_index(registry)
 
     return {"memories": [m.model_dump(exclude_none=True) for m in memories]}
+
+
+async def process_memory_raw_batch(ctx: dict, items: list[dict]) -> dict:
+    """Background task: store a batch of pre-categorized facts (memory-model v2).
+
+    Per-item dedup is handled inside ``store_raw`` (content-hash). One bad
+    item does not block the others. The returned ``memories`` list is in the
+    same order as the input ``items`` for successful stores; failed items
+    are dropped, so we re-align by content for event emission rather than
+    naively pairing by index.
+    """
+    service: MemoryService = ctx["service"]
+
+    memories = await asyncio.to_thread(service.store_raw_batch, items)
+
+    # Emit memory_stored events for each successful store so extensions can
+    # write to vault. We attribute each event to the originating item's
+    # user_id (mixed-user batches are supported), looked up by content match
+    # rather than by index — store_raw_batch may skip items that failed
+    # validation, so memories[i] does not necessarily correspond to items[i].
+    registry = ctx.get("extension_registry")
+    if registry:
+        # Build a content -> user_id map from the input batch.
+        item_user_by_content: dict[str, str] = {}
+        for item in items:
+            content = item.get("content")
+            if content and content not in item_user_by_content:
+                item_user_by_content[content] = item.get("user_id", "")
+        for mem in memories:
+            await registry.emit_event("memory_stored", {
+                "user_id": item_user_by_content.get(mem.memory, ""),
+                "memory_id": mem.id,
+                "content": mem.memory,
+                "category": mem.category or "",
+                "scope": mem.scope,
+                "project_id": mem.project_id,
+                "source": "worker",
+            })
+        _rebuild_category_index(registry)
+
+    return {"memories": [m.model_dump(exclude_none=True) for m in memories]}
+
+
+async def expire_old_memories_cron(ctx: dict) -> dict:
+    """Cron job: purge memories whose expires_at is in the past (memory-model v2)."""
+    service: MemoryService = ctx["service"]
+    result = await asyncio.to_thread(service.expire_old_memories)
+    if result.get("deleted_count"):
+        logger.info(f"Expiry cron: purged {result['deleted_count']} memories")
+    return result
 
 
 def _generate_job_id(content: str, user_id: str) -> str:
@@ -273,6 +346,7 @@ class WorkerSettings:
     functions = [
         process_memory_store,
         process_memory_raw,
+        process_memory_raw_batch,
         process_conversation_flush,
         process_conversation_compile,
     ]
@@ -290,6 +364,15 @@ class WorkerSettings:
             auto_compile_check,
             hour={18, 19, 20, 21, 22, 23},
             minute=30,
+            timeout=600,
+            unique=True,
+            max_tries=1,
+            run_at_startup=False,
+        ),
+        cron(
+            expire_old_memories_cron,
+            hour={3},
+            minute=15,
             timeout=600,
             unique=True,
             max_tries=1,

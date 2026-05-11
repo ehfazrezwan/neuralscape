@@ -4,6 +4,8 @@ const entryPoints = [
   "src/hooks/session-start.ts",
   "src/hooks/conversation-turn.ts",
   "src/hooks/session-end.ts",
+  "src/hooks/post-tool-use.ts",
+  "src/hooks/user-prompt-submit.ts",
 ];
 
 const isWatch = process.argv.includes("--watch");

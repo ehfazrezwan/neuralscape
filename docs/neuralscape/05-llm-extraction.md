@@ -179,6 +179,101 @@ Several deliberate choices keep token and call costs predictable:
 
 There is no prompt versioning, no `prompts/v1` subdirectory, and no AB harness — the prompt and junk patterns are edited inline. The presence of both rule 7 in the prompt and `_JUNK_RE` in code suggests the system has been hardened against prior overfitting to tool logs; the regex fallback in `parse_extraction_response` similarly looks like a response to observed Gemini output variability. See [07-async-pipeline](./07-async-pipeline.md) for how this extraction call is invoked from the ARQ worker.
 
+## Client-side extraction (memory model v2)
+
+Released 2026-05-09 alongside the plugin's PostToolUse capture pipeline. This is a *parallel* extraction path to the Gemini-driven flow described above — the two coexist and feed the same Qdrant + Graphiti backend.
+
+### Why a second extraction path
+
+The Gemini-driven flow is invoked by the conversation-compiler at `Stop` time. It is excellent for memories that surface in chat (preferences expressed verbally, decisions discussed, learnings explained). It is *poor* for memories that surface only through tool use — when most of a session is `Edit`/`Bash`/`Task`/`WebFetch` with terse user prompts, the conversation transcript captures almost nothing useful. It also costs Gemini API calls per conversation turn, which adds up under heavy use.
+
+The client-side extraction path solves both: a `PostToolUse` hook records raw tool I/O to a per-session JSONL buffer (no LLM, sub-50ms), and the user's existing Claude Code session itself extracts memories on the next user prompt — using subscription tokens, not Gemini API quota.
+
+### Pipeline
+
+```text
+Tool runs in Claude Code
+    │
+    ▼
+PostToolUse hook (post-tool-use.js)
+    │  Filters Read/Glob/Grep/NotebookRead/etc.
+    │  Truncates tool_output to head 800 + tail 200
+    │  Appends one JSONL row to:
+    │  ${CLAUDE_PLUGIN_DATA}/observations/{session_id}.jsonl
+    │  Exits 0 always — never blocks tool execution
+    ▼
+Buffer accumulates during session
+    │
+    ▼
+UserPromptSubmit hook (user-prompt-submit.js)
+    │  On every user message, checks buffer.
+    │  If lineCount ≥ COMPILE_THRESHOLD (default 25)
+    │     OR oldestTs is ≥ COMPILE_AGE_MIN minutes ago (default 30):
+    │  Inject `additionalContext` instructing Claude to run
+    │  the `compile-observations` skill on the buffer path
+    │  BEFORE responding to the user's prompt.
+    ▼
+compile-observations skill (Claude reads, applies rubric)
+    │  Group consecutive ops on same target → work units.
+    │  For each *significant* unit (decision/discovery/gotcha/
+    │  pattern/bugfix/convention/architecture/outcome):
+    │    Submit ONE wiki-quality memory via:
+    │      mcp__plugin_neuralscape_neuralscape__remember
+    │  Skip routine reads/edits/searches.
+    │  Skip <private> tags, API-key shapes, env-var values.
+    │  Truncate buffer file (preserve inode).
+    ▼
+mcp__remember tool → POST /v1/memories/raw
+    │
+    ▼
+service.store_raw()
+    │  Content-hash dedup (idempotent on retry)
+    │  Direct embed + Qdrant upsert (no Gemini)
+    │  Graph add via Graphiti
+    ▼
+Memory stored with v2 metadata
+    {domain, observation_type, concepts, source_type:"tool_extraction",
+     confidence, related_memory_ids, expires_at, ...}
+```
+
+### Where the LLM cost lands
+
+Three places it could have landed, and which we picked:
+
+| Path | Who pays | Used? |
+|---|---|---|
+| Backend Gemini per turn | Gemini API quota | No — this is what we wanted to avoid |
+| Hook calls Claude SDK | User's Anthropic API budget | No — Pro/Max subscriptions don't grant free SDK access |
+| In-session Claude Code LLM | User's existing subscription tokens | **Yes** — it's already running the user's session |
+
+The hook is a Node subprocess with no LLM access. The only way to reach the in-session LLM is to leave a trail (the buffer file) and prompt Claude to follow it on the next turn (the UserPromptSubmit `additionalContext` injection).
+
+### Triggers (in order of frequency)
+
+1. **UserPromptSubmit threshold** — primary. Active sessions hit this every ~25 tool uses or 30 minutes.
+2. **SessionStart fallback** — when a prior session left a non-empty buffer (short sessions or sessions closed without a final prompt).
+3. **Stop-time stale marker** — Stop hook drops `<buffer>.stale` so the next SessionStart picks it up.
+4. **Manual `/neuralscape:capture`** — user-invoked any time.
+
+### Quality rubric
+
+See `neuralscape-plugin/skills/compile-observations/SKILL.md` for the full rubric. Headlines:
+
+- **Keep**: decisions, discoveries, gotchas, patterns, bugfixes, conventions, architecture choices, meeting/conversation outcomes.
+- **Skip**: routine file edits/reads/searches, log-style entries, anything tied to *this* session that won't matter in 30 days.
+- **Tone**: wiki entry, not log line. ❌ "Edited utils.ts" ✓ "Switched the offset commit pattern to two-phase so a failed flush doesn't drop turns; uses `pendingOffsets` Map staged in extract."
+- **Privacy**: skip `<private>` tags, API-key-shaped strings (`sk-...`, `gsk_...`), passwords, env-var values.
+- **Throughput**: 50–100 raw rows should yield 3–10 memories, not 50.
+
+### Comparison
+
+| Path | Trigger | LLM | Cost | Best for |
+|---|---|---|---|---|
+| Conversation-compiler (legacy) | `Stop` (per turn) | Backend Gemini | Per-turn API call | Chat-driven memory: stated preferences, verbalized decisions |
+| Client-side (v2) | `PostToolUse` → `UserPromptSubmit` threshold | In-session Claude (subscription) | Existing tokens | Tool-driven memory: actual code changes, command outcomes, browsed docs |
+
+Both write to the same `service.store_raw()` (or `store_raw_batch`) → Qdrant + Graphiti. Memories from both paths surface together in `recall_memories` / `/v1/search`. `source_type` distinguishes them on read: `"conversation"` for the legacy path, `"tool_extraction"` for the new one.
+
 ## Related
 
 - [04-memory-service-core](./04-memory-service-core.md)
@@ -186,3 +281,4 @@ There is no prompt versioning, no `prompts/v1` subdirectory, and no AB harness �
 - [06-storage-backends](./06-storage-backends.md)
 - [07-async-pipeline](./07-async-pipeline.md)
 - [02-service-architecture](./02-service-architecture.md)
+- [09-plugin-system](./09-plugin-system.md)
