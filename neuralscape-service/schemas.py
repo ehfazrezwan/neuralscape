@@ -386,6 +386,14 @@ class BulkDeleteRequest(BaseModel):
         default=False,
         description="When True, delete only memories with null/missing category instead of all",
     )
+    include_shared: bool = Field(
+        default=False,
+        description=(
+            "When False (default), shared memories the caller authored are "
+            "preserved even on bulk delete — they're team artifacts. Set True "
+            "to also remove the caller's shared writes (admin-style nuke)."
+        ),
+    )
 
 
 # ──────────────────────────────────────────────

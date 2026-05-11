@@ -1650,41 +1650,72 @@ class MemoryService:
         category: str | None = None,
         project_id: str | None = None,
         filter_null_category: bool = False,
+        include_shared: bool = False,
     ) -> dict:
-        """Bulk delete memories with filters from both vector store and graph."""
+        """Bulk delete memories with filters from both vector store and graph.
+
+        By default this only removes the caller's PRIVATE writes. Shared
+        memories the caller authored survive even an unfiltered bulk
+        delete — they're team artifacts and one user shouldn't be able
+        to wipe team knowledge with a sweep call (which an LLM client
+        can trigger via the MCP tool). Pass ``include_shared=True`` to
+        also delete the caller's shared writes (admin-style nuke).
+
+        Single-memory delete by ID is unaffected — that path is always
+        an intentional action against a specific memory.
+        """
         m = self._get_memory()
 
         has_any_filter = scope or category or project_id or filter_null_category
         if not has_any_filter:
-            # Delete all for user — expire graph edges across every group the
-            # user actually wrote to, including project-scoped private groups
-            # and any shared-group edges this user authored. Other users'
-            # writes in the shared pool stay put.
+            if include_shared:
+                # Caller explicitly asked to remove everything they wrote,
+                # including shared. Use mem0's bulk delete + the full
+                # graph cleanup that touches per-memory edges in shared
+                # groups too.
+                logger.warning(
+                    f"Deleting ALL memories for user={user_id} including "
+                    f"shared writes (include_shared=True)"
+                )
+                if self._graphiti and self._bridge:
+                    self._expire_user_graph_writes(user_id)
+                m.delete_all(user_id=user_id)
+                return {"message": "All memories deleted (including shared)"}
+
+            # Default: remove only private writes. Shared memories stay.
             logger.warning(
-                f"Deleting ALL memories for user={user_id} (no filters specified)"
+                f"Deleting all PRIVATE memories for user={user_id} "
+                f"(shared writes preserved; pass include_shared=True to override)"
             )
-            if self._graphiti and self._bridge:
-                self._expire_user_graph_writes(user_id)
-            m.delete_all(user_id=user_id)
-            return {"message": "All memories deleted"}
+            return self._delete_private_only(user_id)
 
         if filter_null_category:
             memories_to_delete = self._list_null_category_memories(
                 user_id=user_id, scope=scope, project_id=project_id,
             )
             deleted_count = 0
+            skipped_shared = 0
             for mem_info in memories_to_delete:
+                meta = mem_info.get("metadata", {}) or {}
+                if isinstance(meta.get("metadata"), dict):
+                    meta = meta["metadata"]
+                if not include_shared and meta.get("visibility") == MemoryVisibility.SHARED.value:
+                    skipped_shared += 1
+                    continue
                 mid = mem_info["id"]
                 try:
                     m.vector_store.delete(mid)
                     if self._graphiti and self._bridge:
                         self._expire_graph_edges_for_memory(
-                            {"memory": mem_info.get("data", ""), "metadata": mem_info.get("metadata", {})}
+                            {"memory": mem_info.get("data", ""), "metadata": meta}
                         )
                     deleted_count += 1
                 except Exception as e:
                     logger.warning(f"Failed to delete null-category memory {mid}: {e}")
-            return {"message": f"Deleted {deleted_count} null-category memories"}
+            msg = f"Deleted {deleted_count} null-category memories"
+            if skipped_shared:
+                msg += f" (preserved {skipped_shared} shared)"
+            return {"message": msg}
 
         # For filtered deletes, we need to list then delete individually
         memories = self.list_memories(
@@ -1695,7 +1726,11 @@ class MemoryService:
         )
 
         deleted_count = 0
+        skipped_shared = 0
         for mem in memories:
+            if not include_shared and getattr(mem, "visibility", None) == MemoryVisibility.SHARED.value:
+                skipped_shared += 1
+                continue
             try:
                 # Get full memory for graph cleanup before deleting
                 full_mem = m.get(mem.id)
@@ -1706,7 +1741,63 @@ class MemoryService:
             except Exception as e:
                 logger.warning(f"Failed to delete memory {mem.id}: {e}")
 
-        return {"message": f"Deleted {deleted_count} memories"}
+        msg = f"Deleted {deleted_count} memories"
+        if skipped_shared:
+            msg += f" (preserved {skipped_shared} shared)"
+        return {"message": msg}
+
+    def _delete_private_only(self, user_id: str) -> dict:
+        """Delete every PRIVATE memory the user owns; leave shared writes alone.
+
+        Used by the default (non-include_shared) unfiltered bulk-delete
+        path. Scrolls the user's full set, partitions by visibility,
+        deletes the private rows one by one via Qdrant (mem0's
+        ``delete_all`` can't be filtered), then expires the per-user
+        private graph groups in bulk.
+        """
+        try:
+            all_memories = self._scroll_all_user_memories(user_id)
+        except Exception as e:
+            logger.warning(f"Failed to scroll memories for private-only delete: {e}")
+            return {"message": "No memories deleted (scroll failed)"}
+
+        private_ids: list[tuple[str, dict]] = []
+        private_groups: set[str] = set()
+        shared_preserved = 0
+        for mem in all_memories:
+            payload = mem.get("payload", {}) or {}
+            metadata = payload.get("metadata", {}) or {}
+            if isinstance(metadata.get("metadata"), dict):
+                metadata = metadata["metadata"]
+            visibility = metadata.get("visibility") or MemoryVisibility.PRIVATE.value
+            if visibility == MemoryVisibility.SHARED.value:
+                shared_preserved += 1
+                continue
+            private_ids.append((mem["id"], payload))
+            pid = metadata.get("project_id")
+            if pid:
+                private_groups.add(f"user--{user_id}--project--{pid}")
+            else:
+                private_groups.add(f"user--{user_id}")
+
+        if self._graphiti and self._bridge and private_groups:
+            try:
+                self._expire_graph_edges_for_groups(sorted(private_groups))
+            except Exception as e:
+                logger.warning(f"Graph cleanup for private groups failed: {e}")
+
+        deleted = 0
+        for mid, payload in private_ids:
+            try:
+                self._memory.vector_store.delete(mid)
+                deleted += 1
+            except Exception as e:
+                logger.warning(f"Failed to delete private memory {mid}: {e}")
+
+        msg = f"Deleted {deleted} private memories"
+        if shared_preserved:
+            msg += f" (preserved {shared_preserved} shared)"
+        return {"message": msg}
 
     def _list_null_category_memories(
         self,

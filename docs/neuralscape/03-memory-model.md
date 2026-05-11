@@ -121,7 +121,7 @@ Request models (`schemas.py:109-175`):
 - **`SearchMemoryRequest`** (137-144) — `query` (1-2000), `user_id`, optional `project_id`, `categories` (≤13), `scope`, `limit` (1-100, default 10).
 - **`GraphSearchRequest`** (147-156) — Graphiti-only search with optional `search_config` override.
 - **`UpdateMemoryRequest`** (159-163) — partial update of `content`/`category`/`tags`.
-- **`BulkDeleteRequest`** (166-175) — filtered bulk delete; `filter_null_category` restricts to memories missing a category.
+- **`BulkDeleteRequest`** (166-175) — filtered bulk delete; `filter_null_category` restricts to memories missing a category. `include_shared` (default `False`) gates whether the caller's *shared* writes are removed: by default shared memories are preserved on every bulk path (team artifacts shouldn't be wipeable by one user's sweep, including via the MCP `delete_memories` tool an LLM agent can trigger).
 
 Response models (`schemas.py:183-234`):
 

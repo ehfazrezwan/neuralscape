@@ -330,7 +330,10 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Delete memories by ID or by filters. Use with caution — deleted memories "
                 "cannot be recovered. Can delete a single memory by ID, or bulk delete by "
-                "scope, category, or project_id."
+                "scope, category, or project_id. Bulk deletes only remove the caller's "
+                "PRIVATE memories by default; shared (team) memories the caller authored "
+                "are preserved. Set include_shared=true to also remove shared writes "
+                "(rarely correct — confirm with the user first)."
             ),
             inputSchema={
                 "type": "object",
@@ -359,6 +362,15 @@ async def list_tools() -> list[Tool]:
                     "filter_null_category": {
                         "type": "boolean",
                         "description": "When True, delete only memories with null/missing category instead of all",
+                    },
+                    "include_shared": {
+                        "type": "boolean",
+                        "description": (
+                            "When True, also remove the caller's shared (team) "
+                            "writes. Default False — shared memories are team "
+                            "artifacts and one user's bulk delete shouldn't wipe "
+                            "them. Confirm with the user before enabling."
+                        ),
                     },
                 },
                 "required": ["user_id"],
@@ -522,6 +534,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     category=arguments.get("category"),
                     project_id=arguments.get("project_id"),
                     filter_null_category=arguments.get("filter_null_category", False),
+                    include_shared=arguments.get("include_shared", False),
                 )
             return [TextContent(type="text", text=json.dumps(result, default=str))]
 

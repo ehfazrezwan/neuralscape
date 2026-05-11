@@ -1031,6 +1031,7 @@ async def v1_bulk_delete_memories(req: BulkDeleteRequest, request: Request):
             category=req.category,
             project_id=req.project_id,
             filter_null_category=req.filter_null_category,
+            include_shared=req.include_shared,
         )
     except HTTPException:
         raise
