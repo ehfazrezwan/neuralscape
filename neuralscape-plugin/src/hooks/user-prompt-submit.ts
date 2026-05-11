@@ -62,7 +62,7 @@ The PostToolUse hook has captured **${stats.lineCount} tool observations** in th
    - \`concepts\`: 1-3 from how-it-works | why-it-exists | what-changed | problem-solution | gotcha | pattern | trade-off | open-question | next-step | blocker
    - \`source_type\`: "tool_extraction"
    - \`confidence\`: your 0.0-1.0 self-assessment
-3. After the calls succeed, truncate the buffer (write empty string with \`flag: "w"\`).
+3. After the calls succeed, truncate the buffer by writing an empty string to the same path with the \`Write\` tool.
 4. Then continue with the user's request.
 
 Throughput target: ${stats.lineCount} captured rows should yield ~3-10 dense memories, not ${stats.lineCount}. Skip routine file edits, reads, searches. Skip anything tied to *this* session that won't matter in 30 days. Never store API keys, tokens, or env vars.`;

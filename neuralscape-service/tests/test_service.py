@@ -547,8 +547,15 @@ class TestV1StoreRawMemoryV2:
         from datetime import datetime
         assert isinstance(call_kwargs["expires_at"], datetime)
 
-    def test_redis_unavailable_invalid_iso_drops_expires(self, client, mock_task_manager, mock_service):
-        """Malformed expires_at ISO drops cleanly during sync fallback."""
+    def test_redis_unavailable_no_expires_sync_fallback(self, client, mock_task_manager, mock_service):
+        """When Redis is down and no expires_at is supplied, sync fallback still succeeds.
+
+        Note: Pydantic rejects malformed `expires_at` ISO strings at request
+        validation (422), so the route's defensive `except ValueError`
+        branch in the sync-fallback path is unreachable through the HTTP
+        contract. That branch is exercised by the unit test
+        `test_handles_iso_string_expires_at` against `store_raw_batch`.
+        """
         from schemas import MemoryResponse
         mock_task_manager.enqueue_raw.side_effect = OSError("Connection refused")
         mock_service.store_raw.return_value = [MemoryResponse(id="m1", memory="x")]
@@ -557,7 +564,6 @@ class TestV1StoreRawMemoryV2:
             "user_id": "ehfaz",
             "category": "preference",
         })
-        # Pydantic accepts only valid ISO; we verify the no-expires case works
         assert resp.status_code == 200
 
 

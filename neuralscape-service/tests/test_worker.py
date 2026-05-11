@@ -197,6 +197,47 @@ class TestProcessMemoryRawBatch:
         await worker.process_memory_raw_batch(ctx_with_registry, items)
         ctx_with_registry["extension_registry"].emit_event.assert_awaited()
 
+    @pytest.mark.asyncio
+    async def test_mixed_user_batch_emits_correct_user_id_per_memory(self, ctx_with_registry):
+        """Regression for CR-15 / CP-01: events used to always attribute to
+        items[0]'s user_id, breaking mixed-user batches.
+        """
+        ctx_with_registry["service"].store_raw_batch.return_value = [
+            MemoryResponse(id="m-alice", memory="Alice fact", category="preference",
+                           scope="global"),
+            MemoryResponse(id="m-bob", memory="Bob fact", category="personal_fact",
+                           scope="global"),
+        ]
+        items = [
+            {"content": "Alice fact", "user_id": "alice", "category": "preference"},
+            {"content": "Bob fact", "user_id": "bob", "category": "personal_fact"},
+        ]
+        await worker.process_memory_raw_batch(ctx_with_registry, items)
+
+        registry = ctx_with_registry["extension_registry"]
+        calls = registry.emit_event.await_args_list
+        assert len(calls) == 2
+        # Map emitted user_id by content to be order-independent
+        emitted = {c.args[1]["content"]: c.args[1]["user_id"] for c in calls}
+        assert emitted["Alice fact"] == "alice"
+        assert emitted["Bob fact"] == "bob"
+
+    @pytest.mark.asyncio
+    async def test_missing_content_match_falls_back_to_empty_user(self, ctx_with_registry):
+        """If a stored memory's text doesn't match any input item (shouldn't
+        normally happen but is a defensive fallback), emit with empty user_id
+        rather than crashing.
+        """
+        ctx_with_registry["service"].store_raw_batch.return_value = [
+            MemoryResponse(id="m-1", memory="surprise fact", category="preference",
+                           scope="global"),
+        ]
+        items = [{"content": "different content", "user_id": "alice", "category": "preference"}]
+        await worker.process_memory_raw_batch(ctx_with_registry, items)
+        emitted = ctx_with_registry["extension_registry"].emit_event.await_args.args[1]
+        assert emitted["user_id"] == ""
+        assert emitted["memory_id"] == "m-1"
+
 
 # ──────────────────────────────────────────────
 # expire_old_memories_cron

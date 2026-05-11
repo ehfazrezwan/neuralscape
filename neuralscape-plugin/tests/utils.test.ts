@@ -54,9 +54,11 @@ describe("getObservationDir", () => {
     expect(dir.endsWith(join(".neuralscape", "observations"))).toBe(true);
   });
 
-  it("trims whitespace from CLAUDE_PLUGIN_DATA", () => {
+  it("falls back when CLAUDE_PLUGIN_DATA is whitespace-only", () => {
+    // Keep the env var set to whitespace so getObservationDir() actually
+    // exercises the .trim() branch (deleting it would just hit the unset
+    // case the previous test already covers).
     process.env.CLAUDE_PLUGIN_DATA = "   ";
-    delete process.env.CLAUDE_PLUGIN_DATA; // empty string also falls back
     const dir = getObservationDir();
     expect(dir.endsWith(join(".neuralscape", "observations"))).toBe(true);
   });

@@ -46,6 +46,34 @@ _JUNK_RE = re.compile("|".join(_JUNK_PATTERNS), re.IGNORECASE | re.MULTILINE)
 ALL_KNOWN_PROJECTS = ["svc-utility-belt", "lightpath", "neuralscape", "openclaw"]
 
 
+def _parse_expires_at(value) -> datetime | None:
+    """Parse an `expires_at` payload value to an aware UTC datetime.
+
+    Accepts ISO-8601 strings (with or without a trailing `Z`), `datetime`
+    instances (naive treated as UTC), or anything else returns None. Used by
+    the expiry cron — comparing raw strings is unsafe across mixed offsets
+    (`Z` vs `+00:00` vs `-05:00` won't sort lexicographically).
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if not s:
+        return None
+    # datetime.fromisoformat doesn't accept the literal 'Z' suffix until
+    # Python 3.11 fully; normalize defensively.
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
 def _is_junk_fact(content: str) -> bool:
     """Return True if an extracted fact is a raw event log rather than contextual knowledge."""
     stripped = content.strip()
@@ -409,8 +437,11 @@ class MemoryService:
             expires_at: Memory-model v2 — optional expiry timestamp
 
         Returns:
-            List of stored memory responses (one item; len==1 indicates either
-            new insert or dedup-hit. Inspect `source` to distinguish).
+            List of stored memory responses (always exactly one item). When the
+            content-hash dedup short-circuits, the returned `id`/`created_at`
+            will match the existing memory; otherwise they reflect the new row.
+            Both paths use `source="vector"`; callers that need to distinguish
+            should compare the returned `id` against their expected new UUID.
         """
         if category not in MEMORY_CATEGORIES:
             raise ValueError(f"Invalid category: {category}. Must be one of: {list(MEMORY_CATEGORIES.keys())}")
@@ -629,31 +660,21 @@ class MemoryService:
     def expire_old_memories(self, batch_size: int = 100) -> dict:
         """Delete memories whose expires_at is in the past (memory-model v2 cron).
 
+        Qdrant doesn't have a direct datetime range filter on string fields,
+        so we scroll the whole collection and filter in Python by parsing
+        each memory's `expires_at` to an aware UTC datetime. For larger
+        deployments we'd switch to a numeric epoch field.
+
         Returns:
             Dict with deleted_count and per-user breakdown.
         """
-        from qdrant_client.models import (
-            FieldCondition,
-            Filter,
-            MatchExcept,
-            Range,
-        )
-
-        client = self._memory.vector_store.client
+        # Ensure mem0/Qdrant client is initialized — the nightly cron can
+        # fire on a cold-started worker before any request has touched
+        # _memory, which would otherwise raise AttributeError.
+        m = self._get_memory()
+        client = m.vector_store.client
         collection = settings.qdrant_collection
-        now_iso = datetime.now(timezone.utc).isoformat()
-
-        # Scroll for memories with metadata.expires_at < now.
-        # Qdrant doesn't have a direct datetime range filter on string fields,
-        # so we scroll any memory with a non-null expires_at and check in Python.
-        # For a higher-volume deployment we'd switch to a numeric epoch field.
-        scroll_filter = Filter(
-            must=[
-                # Trick: MatchExcept with empty list gives us "any non-null value"
-                # but qdrant_client doesn't support that directly. We just scroll
-                # everything and filter in-Python — fine at our memory scale.
-            ]
-        )
+        now_dt = datetime.now(timezone.utc)
 
         deleted_count = 0
         per_user: dict[str, int] = {}
@@ -674,7 +695,15 @@ class MemoryService:
                 expires_at = metadata.get("expires_at")
                 if not expires_at:
                     continue
-                if str(expires_at) >= now_iso:
+                expires_dt = _parse_expires_at(expires_at)
+                if expires_dt is None:
+                    # Malformed timestamp — log and skip rather than risk
+                    # deleting on an unparseable value.
+                    logger.warning(
+                        f"Memory {pt.id} has unparseable expires_at={expires_at!r}; skipping"
+                    )
+                    continue
+                if expires_dt >= now_dt:
                     continue  # not yet expired
                 try:
                     self._delete_qdrant_memory_with_graph_cleanup(str(pt.id), payload)
@@ -963,8 +992,22 @@ class MemoryService:
         observation_type / concepts natively, but they're derived from
         source memories that do. We do a top-1 vector search per edge to
         recover those fields. ~10ms per edge at typical limits.
+
+        When project_id is supplied, the lookup is scoped to that project
+        so a graph edge can't inherit metadata from a semantically similar
+        memory in a different project (which would break v2 filter parity).
         """
         m = self._get_memory()
+        # Build a search filter that scopes the enrichment lookup correctly.
+        # - user_id is always required so we never enrich from another user's
+        #   memories.
+        # - When the caller specified a project, restrict to that project to
+        #   avoid cross-project metadata bleed.
+        base_filter: dict = {}
+        if user_id:
+            base_filter["user_id"] = user_id
+        if project_id:
+            base_filter["metadata.project_id"] = project_id
         for resp in graph_responses:
             if not resp.memory:
                 continue
@@ -977,7 +1020,7 @@ class MemoryService:
                     query=resp.memory,
                     vectors=embedding,
                     limit=1,
-                    filters={"user_id": user_id} if user_id else None,
+                    filters=base_filter if base_filter else None,
                 )
                 if not hits:
                     continue

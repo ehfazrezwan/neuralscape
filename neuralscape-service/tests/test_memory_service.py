@@ -11,6 +11,7 @@ from memory_service import (
     _get_group_ids,
     _infer_project_id,
     _is_junk_fact,
+    _parse_expires_at,
 )
 from schemas import MemoryResponse, MemoryScope
 
@@ -1411,6 +1412,38 @@ class TestSchemaV2Validators:
         with pytest.raises(ValidationError):
             SearchMemoryRequest(query="hi", user_id="u", observation_type="bogus")
 
+    def test_search_unknown_concept_rejected(self):
+        """Mirror RawMemoryRequest so typos surface as 422, not silent misses.
+        Regression for CR-12."""
+        from pydantic import ValidationError
+        from schemas import SearchMemoryRequest
+
+        with pytest.raises(ValidationError):
+            SearchMemoryRequest(query="hi", user_id="u", concepts=["definitely-not-a-concept"])
+
+    def test_search_known_concept_passes(self):
+        from schemas import SearchMemoryRequest
+
+        req = SearchMemoryRequest(query="hi", user_id="u", concepts=["gotcha", "trade-off"])
+        assert req.concepts == ["gotcha", "trade-off"]
+
+    def test_search_concepts_capped_at_5(self):
+        from pydantic import ValidationError
+        from schemas import SearchMemoryRequest
+
+        with pytest.raises(ValidationError):
+            SearchMemoryRequest(
+                query="hi", user_id="u",
+                concepts=["how-it-works", "why-it-exists", "what-changed",
+                          "problem-solution", "gotcha", "pattern"],  # 6 > 5
+            )
+
+    def test_search_concepts_none_allowed(self):
+        from schemas import SearchMemoryRequest
+
+        req = SearchMemoryRequest(query="hi", user_id="u", concepts=None)
+        assert req.concepts is None
+
     def test_store_request_invalid_domain(self):
         from pydantic import ValidationError
         from schemas import StoreMemoryRequest
@@ -1589,6 +1622,94 @@ class TestExpireOldMemories:
         assert result["deleted_count"] == 0
         assert result["per_user"] == {}
 
+    def test_skips_unparseable_expires_at(self, service):
+        """A memory whose expires_at is malformed must be skipped, not deleted."""
+        pt = MagicMock()
+        pt.id = "bad-1"
+        pt.payload = {
+            "data": "x", "user_id": "alice",
+            "metadata": {"expires_at": "not-a-timestamp"},
+        }
+        mock_client = MagicMock()
+        service._memory.vector_store.client = mock_client
+        mock_client.scroll.side_effect = [([pt], None)]
+        service._delete_qdrant_memory_with_graph_cleanup = MagicMock()
+
+        result = service.expire_old_memories()
+        assert result["deleted_count"] == 0
+        service._delete_qdrant_memory_with_graph_cleanup.assert_not_called()
+
+    def test_cold_start_initializes_memory(self, service):
+        """expire_old_memories must call _get_memory() before touching client.
+
+        Regression for the cold-start AttributeError CodeRabbit flagged: the
+        cron can fire on a worker that hasn't served any request yet.
+        """
+        # Pretend memory hasn't been initialized — _get_memory should be invoked
+        with patch.object(service, "_get_memory", return_value=service._memory) as mock_get:
+            mock_client = MagicMock()
+            service._memory.vector_store.client = mock_client
+            mock_client.scroll.return_value = ([], None)
+            service.expire_old_memories()
+        mock_get.assert_called_once()
+
+
+class TestParseExpiresAt:
+    """Memory-model v2 — robust ISO-8601 parsing used by the expiry cron."""
+
+    def test_parses_z_suffix_as_utc(self):
+        from datetime import timezone
+        dt = _parse_expires_at("2026-12-01T00:00:00Z")
+        assert dt is not None
+        assert dt.tzinfo == timezone.utc
+        assert dt.year == 2026
+
+    def test_parses_offset(self):
+        dt = _parse_expires_at("2026-12-01T00:00:00-05:00")
+        assert dt is not None
+        # Should be tz-aware regardless of offset
+        assert dt.tzinfo is not None
+
+    def test_naive_string_treated_as_utc(self):
+        from datetime import timezone
+        dt = _parse_expires_at("2026-12-01T00:00:00")
+        assert dt is not None
+        assert dt.tzinfo == timezone.utc
+
+    def test_returns_none_for_malformed(self):
+        assert _parse_expires_at("not-a-date") is None
+        assert _parse_expires_at("") is None
+        assert _parse_expires_at("   ") is None
+
+    def test_returns_none_for_none(self):
+        assert _parse_expires_at(None) is None
+
+    def test_returns_none_for_non_string_non_datetime(self):
+        assert _parse_expires_at(42) is None
+        assert _parse_expires_at(["x"]) is None
+
+    def test_datetime_input_passes_through(self):
+        from datetime import datetime, timezone
+        aware = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        assert _parse_expires_at(aware) is aware
+
+    def test_naive_datetime_treated_as_utc(self):
+        from datetime import datetime, timezone
+        naive = datetime(2026, 1, 1)
+        dt = _parse_expires_at(naive)
+        assert dt is not None
+        assert dt.tzinfo == timezone.utc
+
+    def test_mixed_offset_comparison_ordering(self):
+        """Strings that sort wrong lexicographically still compare correctly
+        once parsed — regression for CR-10 / CP-02.
+        """
+        # "Z" sorts before "-" but Z is UTC noon, -05:00 is later actual time.
+        earlier = _parse_expires_at("2026-01-01T12:00:00Z")
+        later = _parse_expires_at("2026-01-01T08:00:00-05:00")  # = 13:00 UTC
+        assert earlier is not None and later is not None
+        assert earlier < later
+
 
 # ──────────────────────────────────────────────
 # Memory model v2: graph result enrichment + filtering
@@ -1705,6 +1826,37 @@ class TestGraphEnrichment:
         graph_responses = [MemoryResponse(id="g1", memory="x", source="graph")]
         result = service._enrich_graph_with_v2(graph_responses, user_id="u", project_id=None)
         assert result[0].domain == "writing"
+
+    def test_project_scope_added_to_lookup_filter(self, service):
+        """When project_id is supplied, the enrichment lookup must constrain
+        to that project so a graph edge can't inherit metadata from a
+        semantically similar memory in another project — regression for
+        CR-11 / CP-05.
+        """
+        from schemas import MemoryResponse
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.search.return_value = []
+        graph_responses = [MemoryResponse(id="g1", memory="x", source="graph")]
+        service._enrich_graph_with_v2(
+            graph_responses, user_id="ehfaz", project_id="neuralscape",
+        )
+        # Inspect the filter the lookup actually used
+        call_kwargs = service._memory.vector_store.search.call_args[1]
+        filters = call_kwargs["filters"]
+        assert filters["user_id"] == "ehfaz"
+        assert filters["metadata.project_id"] == "neuralscape"
+
+    def test_global_scope_uses_user_filter_only(self, service):
+        """Without project_id, the lookup filter only has user_id."""
+        from schemas import MemoryResponse
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.search.return_value = []
+        graph_responses = [MemoryResponse(id="g1", memory="x", source="graph")]
+        service._enrich_graph_with_v2(
+            graph_responses, user_id="ehfaz", project_id=None,
+        )
+        filters = service._memory.vector_store.search.call_args[1]["filters"]
+        assert filters == {"user_id": "ehfaz"}
 
 
 class TestGraphFilterByV2:

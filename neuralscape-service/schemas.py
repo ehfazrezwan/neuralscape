@@ -254,6 +254,21 @@ class SearchMemoryRequest(BaseModel):
             )
         return v
 
+    @field_validator("concepts")
+    @classmethod
+    def _validate_concepts(cls, v: list[str] | None) -> list[str] | None:
+        # Mirror RawMemoryRequest's validation so the search filter contract
+        # is symmetric with the write contract — typos surface as 422, not
+        # silent misses.
+        if v is None:
+            return v
+        unknown = [c for c in v if c not in CONCEPT_VOCAB]
+        if unknown:
+            raise ValueError(
+                f"Unknown concepts: {unknown}. Must be from: {sorted(CONCEPT_VOCAB)}"
+            )
+        return v
+
 
 class GraphSearchRequest(BaseModel):
     """Knowledge graph search."""

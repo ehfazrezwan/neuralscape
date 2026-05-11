@@ -153,18 +153,31 @@ async def process_memory_raw_batch(ctx: dict, items: list[dict]) -> dict:
     """Background task: store a batch of pre-categorized facts (memory-model v2).
 
     Per-item dedup is handled inside ``store_raw`` (content-hash). One bad
-    item does not block the others.
+    item does not block the others. The returned ``memories`` list is in the
+    same order as the input ``items`` for successful stores; failed items
+    are dropped, so we re-align by content for event emission rather than
+    naively pairing by index.
     """
     service: MemoryService = ctx["service"]
 
     memories = await asyncio.to_thread(service.store_raw_batch, items)
 
-    # Emit memory_stored events for each successful store so extensions can write to vault
+    # Emit memory_stored events for each successful store so extensions can
+    # write to vault. We attribute each event to the originating item's
+    # user_id (mixed-user batches are supported), looked up by content match
+    # rather than by index — store_raw_batch may skip items that failed
+    # validation, so memories[i] does not necessarily correspond to items[i].
     registry = ctx.get("extension_registry")
     if registry:
+        # Build a content -> user_id map from the input batch.
+        item_user_by_content: dict[str, str] = {}
+        for item in items:
+            content = item.get("content")
+            if content and content not in item_user_by_content:
+                item_user_by_content[content] = item.get("user_id", "")
         for mem in memories:
             await registry.emit_event("memory_stored", {
-                "user_id": mem.scope and items[0].get("user_id") or "",
+                "user_id": item_user_by_content.get(mem.memory, ""),
                 "memory_id": mem.id,
                 "content": mem.memory,
                 "category": mem.category or "",

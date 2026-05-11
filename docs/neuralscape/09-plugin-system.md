@@ -332,7 +332,7 @@ The hook always exits 0 — never blocks tool execution. Errors during stdin par
 
 ### Buffer location
 
-```
+```text
 ${CLAUDE_PLUGIN_DATA}/observations/{session_id}.jsonl
 ```
 

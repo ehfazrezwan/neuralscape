@@ -157,6 +157,54 @@ class TestEnqueueRawBatch:
         job_id = tm.pool.enqueue_job.call_args[1]["_job_id"]
         assert job_id.startswith("ns-")
 
+    @pytest.mark.asyncio
+    async def test_pipe_in_content_does_not_collide(self, tm):
+        """Distinct batches with `|` in content must produce distinct job IDs.
+
+        Regression for CR-13: the old `"|".join(...)` made
+        `["a", "b|c"]` and `["a|b", "c"]` indistinguishable.
+        """
+        mock_job = MagicMock()
+        mock_job.job_id = "x"
+        tm.pool.enqueue_job.return_value = mock_job
+        captured_ids: list[str] = []
+
+        async def capture(*args, **kwargs):
+            captured_ids.append(kwargs["_job_id"])
+            return mock_job
+
+        tm.pool.enqueue_job.side_effect = capture
+
+        await tm.enqueue_raw_batch(items=[
+            {"content": "a", "user_id": "u", "category": "preference"},
+            {"content": "b|c", "user_id": "u", "category": "preference"},
+        ])
+        await tm.enqueue_raw_batch(items=[
+            {"content": "a|b", "user_id": "u", "category": "preference"},
+            {"content": "c", "user_id": "u", "category": "preference"},
+        ])
+        assert len(captured_ids) == 2
+        assert captured_ids[0] != captured_ids[1]
+
+    @pytest.mark.asyncio
+    async def test_same_items_produce_same_job_id(self, tm):
+        """Determinism: re-submitting the identical batch must still dedup."""
+        mock_job = MagicMock()
+        mock_job.job_id = "x"
+        tm.pool.enqueue_job.return_value = mock_job
+        captured: list[str] = []
+
+        async def capture(*args, **kwargs):
+            captured.append(kwargs["_job_id"])
+            return mock_job
+
+        tm.pool.enqueue_job.side_effect = capture
+
+        items = [{"content": "a", "user_id": "u", "category": "preference"}]
+        await tm.enqueue_raw_batch(items=items)
+        await tm.enqueue_raw_batch(items=items)
+        assert captured[0] == captured[1]
+
 
 # ──────────────────────────────────────────────
 # enqueue_store

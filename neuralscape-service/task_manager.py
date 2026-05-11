@@ -4,6 +4,7 @@ Centralizes task enqueuing and status tracking, replacing the in-memory _tasks d
 """
 
 import hashlib
+import json
 import logging
 
 from arq.connections import ArqRedis, create_pool
@@ -131,12 +132,18 @@ class TaskManager:
         """Enqueue a batch of raw memory storage tasks (memory-model v2).
 
         Items are dispatched as a single ARQ job. Job ID is deterministic
-        based on the concatenated content of all items.
+        based on a canonical JSON encoding of the items so distinct batches
+        cannot collide even when item content includes delimiter characters
+        like ``|`` or quotes.
         """
-        content_str = "|".join(item.get("content", "") for item in items)
-        # Use the first item's user_id for the job ID, fall back to "batch"
-        user_id = items[0].get("user_id", "batch") if items else "batch"
-        job_id = _generate_job_id(f"raw_batch:{content_str}", user_id)
+        # Canonical JSON gives us a representation that's stable across
+        # re-orderings of dict keys (sort_keys=True) and unambiguous w.r.t.
+        # special characters — far safer than join(delimiter, ...).
+        canonical = json.dumps(items, sort_keys=True, separators=(",", ":"))
+        # Keep the deterministic-id key partitioned by the first item's user
+        # so two users batching the same content still get distinct job ids.
+        partition_user = items[0].get("user_id", "batch") if items else "batch"
+        job_id = _generate_job_id(f"raw_batch:{canonical}", partition_user)
 
         job = await self.pool.enqueue_job(
             "process_memory_raw_batch",

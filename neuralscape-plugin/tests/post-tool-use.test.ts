@@ -277,13 +277,16 @@ describe("buildObservationRow", () => {
   });
 
   it("serializes object output via JSON.stringify", () => {
+    // Pass an actual object so asString's JSON.stringify branch is exercised
+    // (a JSON string would just round-trip as-is and miss the coercion path).
     const row = buildObservationRow({
       tool_name: "Bash",
       tool_input: { command: "x" },
-      // Non-string output (will be coerced via asString)
-      tool_output: '{"stdout":"hello"}',
+      // @ts-expect-error — runtime coercion of non-string tool_output
+      tool_output: { stdout: "hello", exit: 0 },
     });
-    expect(row.output).toBe('{"stdout":"hello"}');
+    // asString → JSON.stringify produces canonical key order from object literal
+    expect(row.output).toBe('{"stdout":"hello","exit":0}');
   });
 
   it("ts is ISO 8601", () => {

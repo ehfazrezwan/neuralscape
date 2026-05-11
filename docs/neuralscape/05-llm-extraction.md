@@ -191,7 +191,7 @@ The client-side extraction path solves both: a `PostToolUse` hook records raw to
 
 ### Pipeline
 
-```
+```text
 Tool runs in Claude Code
     │
     ▼

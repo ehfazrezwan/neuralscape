@@ -2,7 +2,7 @@
  * Shared utilities for Neuralscape Claude Code plugin hooks.
  */
 
-import { appendFile, mkdir, readdir, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join as pathJoin, parse as parsePath } from "node:path";
 
@@ -334,7 +334,6 @@ export async function getBufferStats(path: string): Promise<BufferStats> {
   let lineCount = 0;
   let oldestTs: string | null = null;
   try {
-    const { readFile } = await import("node:fs/promises");
     const content = await readFile(path, "utf-8");
     const lines = content.split("\n").filter((l) => l.trim());
     lineCount = lines.length;
@@ -392,7 +391,6 @@ export async function truncateBuffer(path: string): Promise<void> {
   try {
     await writeFile(path, "", "utf-8");
     try {
-      const { unlink } = await import("node:fs/promises");
       await unlink(path + ".stale");
     } catch {
       // no marker — fine

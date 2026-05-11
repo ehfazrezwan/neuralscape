@@ -25,7 +25,7 @@ The trigger always supplies the path(s) to one or more JSONL files to process.
 2. **Group consecutive rows that work on the same target** (same file, same topic, same command intent). One *work unit* per group.
 3. **For each work unit, decide: is this *significant*?** Apply the quality rubric below. If not, skip.
 4. **For each significant work unit, write ONE memory** and submit it via `mcp__plugin_neuralscape_neuralscape__remember` with the v2 fields filled in.
-5. **After all calls succeed, truncate every buffer file that was processed** by writing an empty string (preserves the inode for next writes). Use the `Write` tool with the buffer's absolute path and content `""`.
+5. **After all calls succeed, truncate every buffer file that was processed** by using the `Write` tool with the buffer's absolute path and content `""`. (This preserves the file for next session writes; the `Write` tool accepts only `file_path` and `content`.)
 
 ## Quality rubric — keep these
 
@@ -78,7 +78,7 @@ Wiki entry, not log line. Lead with the substance, not the tooling.
 - `tags` — free-form, ≤5 items (keep them short and specific)
 - `source_type` — always `tool_extraction`
 - `confidence` — your honest 0.0–1.0 self-assessment of memory quality
-- `related_memory_ids` — only set this on the *second and later* memories from the same work unit, referencing the first call's returned `id`
+- `related_memory_ids` — leave **unset** in this skill flow. The rule above is one memory per work unit, so there is no "second memory from the same work unit" to link. (The field exists for higher-level callers that knowingly emit multiple linked memories.)
 - `expires_at` — only for `task_context` entries that should auto-purge (e.g. set to 30 days from now)
 
 ## Throughput target
