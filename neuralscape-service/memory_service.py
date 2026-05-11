@@ -1100,14 +1100,21 @@ class MemoryService:
         deduped.sort(key=lambda r: r.score or 0.0, reverse=True)
         vector_responses = deduped[:limit]
 
-        # Also query the knowledge graph and merge edge facts
+        # Also query the knowledge graph and merge edge facts.
+        # Multi-user: when caller restricted the visibility, restrict the
+        # graph search's group_ids to match — otherwise the graph would
+        # walk the full read-set (caller's private + shared) and we'd
+        # have to retroactively filter, which is unreliable for graph
+        # rows whose enriched visibility ends up as None.
         graph_responses: list[MemoryResponse] = []
         try:
-            graph_results = self.search_graph(
+            graph_results = self._search_graph_for_visibility(
                 query=query,
                 user_id=user_id,
                 project_id=project_id,
                 limit=limit,
+                visibility=visibility,
+                include_shared=include_shared,
             )
             for edge in graph_results.get("edges", []):
                 graph_responses.append(
@@ -1141,20 +1148,18 @@ class MemoryService:
                 graph_responses, user_id=user_id, project_id=project_id
             )
 
-        # Multi-user model: apply the visibility filter to graph rows AFTER
-        # enrichment (the enrichment sets each row's visibility from its
-        # nearest source memory). When the caller explicitly asked for one
-        # pool, drop rows whose enriched visibility disagrees.
+        # Multi-user model: post-filter graph rows by enriched visibility.
+        # The Graphiti search above already scopes by group_ids, so most
+        # rows arrive in the right pool. This pass mops up the edge case
+        # where enrichment couldn't find a source memory: when the caller
+        # asked for `private`, an unenriched row (visibility=None) is
+        # treated as private — it came from the private group_id range
+        # we just scoped to. When they asked for `shared`, an unenriched
+        # row could only have come from a shared group_id, so we keep it.
         if visibility and graph_responses:
             graph_responses = [
                 r for r in graph_responses
-                # Allow rows where visibility matches OR is unknown (None) only
-                # when the caller asked for shared (legacy/unenriched edges are
-                # treated as private and dropped from shared-only searches);
-                # for private-only searches, allow None too since legacy edges
-                # are de-facto private.
-                if (r.visibility == visibility)
-                or (r.visibility is None and visibility == MemoryVisibility.PRIVATE.value)
+                if r.visibility == visibility or r.visibility is None
             ]
 
         # Deduplicate and enforce caller's limit
@@ -1302,6 +1307,82 @@ class MemoryService:
                     continue
             out.append(resp)
         return out
+
+    def _search_graph_for_visibility(
+        self,
+        query: str,
+        user_id: str,
+        project_id: str | None,
+        limit: int,
+        visibility: str | None,
+        include_shared: bool,
+    ) -> dict:
+        """search_graph with multi-user visibility scoping.
+
+        When the caller restricts visibility to one pool, narrow the
+        Graphiti `group_ids` to that pool's namespace. This is
+        load-bearing for cross-user isolation: if we walked the full
+        group_id set and then filtered by enriched visibility, an
+        unenriched row from the shared pool could slip into a
+        private-only response.
+        """
+        if visibility == MemoryVisibility.PRIVATE.value:
+            group_ids = [f"user--{user_id}"]
+            if project_id:
+                group_ids.append(f"user--{user_id}--project--{project_id}")
+        elif visibility == MemoryVisibility.SHARED.value:
+            group_ids = ["shared"]
+            if project_id:
+                group_ids.append(f"shared--project--{project_id}")
+        elif not include_shared:
+            # No explicit visibility, but caller opted out of shared pool.
+            group_ids = [f"user--{user_id}"]
+            if project_id:
+                group_ids.append(f"user--{user_id}--project--{project_id}")
+        else:
+            # Default: full read-set (caller's private + shared pool).
+            group_ids = _get_group_ids(user_id, project_id)
+
+        return self._do_graph_search(query=query, group_ids=group_ids, limit=limit)
+
+    def _do_graph_search(
+        self,
+        query: str,
+        group_ids: list[str],
+        limit: int,
+        search_config: dict | None = None,
+    ) -> dict:
+        """Internal: run a graph search across the given group_ids."""
+        g = self._get_graphiti()
+        if g is None:
+            return {"edges": [], "nodes": [], "episodes": [], "communities": []}
+
+        from graphiti_core.search.search_config import SearchConfig
+        from graphiti_core.search.search_config_recipes import EDGE_HYBRID_SEARCH_RRF
+
+        if search_config:
+            try:
+                config = SearchConfig(**search_config)
+            except (TypeError, ValueError) as e:
+                logger.warning(f"Invalid search_config, falling back to default: {e}")
+                config = EDGE_HYBRID_SEARCH_RRF
+        else:
+            config = EDGE_HYBRID_SEARCH_RRF
+        config.limit = limit
+
+        try:
+            results = self._run_on_bridge(
+                g.search_(query=query, config=config, group_ids=group_ids)
+            )
+            return {
+                "edges": [{"uuid": e.uuid, "name": e.name, "fact": e.fact} for e in results.edges],
+                "nodes": [{"uuid": n.uuid, "name": n.name, "summary": n.summary} for n in results.nodes],
+                "episodes": [{"uuid": ep.uuid, "name": ep.name, "content": ep.content} for ep in results.episodes],
+                "communities": [{"uuid": c.uuid, "name": c.name} for c in results.communities],
+            }
+        except Exception as e:
+            logger.error(f"Graph search failed: {e}")
+            return {"edges": [], "nodes": [], "episodes": [], "communities": []}
 
     def search_graph(
         self,
@@ -1575,23 +1656,15 @@ class MemoryService:
 
         has_any_filter = scope or category or project_id or filter_null_category
         if not has_any_filter:
-            # Delete all for user — expire graph edges in this user's namespace
-            # only. Shared-pool edges authored by other users are NOT touched
-            # even though they're readable; only the calling user's writes are
-            # destroyed. (Their own writes that they shared are still removed
-            # because the dedicated personal graph_ids carry those, and shared
-            # group cleanup only happens via explicit admin tooling.)
+            # Delete all for user — expire graph edges across every group the
+            # user actually wrote to, including project-scoped private groups
+            # and any shared-group edges this user authored. Other users'
+            # writes in the shared pool stay put.
             logger.warning(
                 f"Deleting ALL memories for user={user_id} (no filters specified)"
             )
             if self._graphiti and self._bridge:
-                # Caller-scoped groups: the caller's private namespace only.
-                # We avoid blanket-deleting the "shared" group because that
-                # holds team-wide knowledge from many users.
-                group_ids = [f"user--{user_id}"]
-                if project_id:
-                    group_ids.append(f"user--{user_id}--project--{project_id}")
-                self._expire_graph_edges_for_groups(group_ids)
+                self._expire_user_graph_writes(user_id)
             m.delete_all(user_id=user_id)
             return {"message": "All memories deleted"}
 
@@ -2061,13 +2134,15 @@ class MemoryService:
             # Unwrap mem0's potential double-wrap
             if isinstance(metadata.get("metadata"), dict):
                 metadata = metadata["metadata"]
-            # Use the memory's own owner_user_id (or fall back to caller's
-            # user_id field on the payload) so edge expiration is scoped
-            # to the memory's namespace — never touches another user's
-            # private edges, never touches shared-pool unless the memory
-            # itself was shared.
+            # Scope edge expiration to the memory's exact namespace.
+            # `_get_group_ids` would return the owner's whole readable
+            # universe (their private + the shared pool), which means
+            # deleting a private memory could expire similarly-worded
+            # edges from the shared pool — wrong pool.
             owner = metadata.get("owner_user_id") or mem.get("user_id", "")
-            group_ids = _get_group_ids(owner, metadata.get("project_id"))
+            visibility = metadata.get("visibility") or MemoryVisibility.PRIVATE.value
+            group_id = _build_group_id(visibility, owner, metadata.get("project_id"))
+            group_ids = [group_id]
 
             results = self._run_on_bridge(
                 self._graphiti.search_(
@@ -2083,6 +2158,51 @@ class MemoryService:
                     self._run_on_bridge(edge.save(self._graphiti.driver))
         except Exception as e:
             logger.warning(f"Graph edge expiration failed (non-critical): {e}")
+
+    def _expire_user_graph_writes(self, user_id: str) -> None:
+        """Expire graph edges across every group_id this user authored.
+
+        Used by the unfiltered bulk-delete path. Private groups
+        (`user--{user_id}` and `user--{user_id}--project--*`) are
+        expired wholesale — they only contain this user's writes.
+        Shared groups (`shared`, `shared--project--*`) hold team
+        knowledge from many writers, so we only expire the specific
+        edges this user authored via per-memory cleanup.
+        """
+        try:
+            user_memories = self._scroll_all_user_memories(user_id)
+        except Exception as e:
+            logger.warning(f"Failed to scroll memories for graph cleanup (non-critical): {e}")
+            return
+
+        private_groups: set[str] = set()
+        shared_memories: list[dict] = []
+        for mem in user_memories:
+            payload = mem.get("payload", {}) or {}
+            metadata = payload.get("metadata", {}) or {}
+            # mem0 sometimes double-wraps metadata
+            if isinstance(metadata.get("metadata"), dict):
+                metadata = metadata["metadata"]
+            visibility = metadata.get("visibility") or MemoryVisibility.PRIVATE.value
+            pid = metadata.get("project_id")
+            if visibility == MemoryVisibility.SHARED.value:
+                # Don't touch the shared group_id — other users' edges live
+                # there too. Per-memory edge expiration narrows to just
+                # this user's specific facts.
+                shared_memories.append({"memory": payload.get("data", ""), "metadata": metadata})
+            else:
+                if pid:
+                    private_groups.add(f"user--{user_id}--project--{pid}")
+                else:
+                    private_groups.add(f"user--{user_id}")
+
+        if private_groups:
+            self._expire_graph_edges_for_groups(sorted(private_groups))
+        for mem in shared_memories:
+            try:
+                self._expire_graph_edges_for_memory(mem)
+            except Exception as e:
+                logger.warning(f"Per-shared-memory edge expiration failed (non-critical): {e}")
 
     def _expire_graph_edges_for_groups(self, group_ids: list[str]) -> None:
         """Expire all graph edges in the given groups (bulk soft-delete)."""

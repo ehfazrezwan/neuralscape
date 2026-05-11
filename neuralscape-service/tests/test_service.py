@@ -839,3 +839,95 @@ class TestV1SearchMultiUserFlags:
         assert resp.status_code in (200, 202)
         kwargs = mock_task_manager.enqueue_raw.call_args[1]
         assert kwargs["visibility"] == "shared"
+
+
+class TestV1BatchUserIdBypass:
+    """Regression for CR-05: a token-authenticated batch caller can NOT
+    sidestep their token's user_id by submitting `item.user_id=""`.
+
+    Pre-fix: items_payload was built via `d.setdefault("user_id", ...)`,
+    which preserved an explicitly-empty user_id from the request body.
+    Post-fix: when a token is present, every item's user_id is
+    overwritten with the token's user_id.
+    """
+
+    def _push_token_user_id(self, app_user_id: str):
+        from starlette.middleware.base import BaseHTTPMiddleware
+
+        class _UserIdInjector(BaseHTTPMiddleware):
+            async def dispatch(self, request, call_next):
+                request.state.user_id = app_user_id
+                return await call_next(request)
+
+        return _UserIdInjector
+
+    def _client_with_token(self, app_user_id: str):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        import main
+        injector = self._push_token_user_id(app_user_id)
+        sub_app = FastAPI()
+        sub_app.add_middleware(injector)
+        sub_app.include_router(main.v1_router)
+        return TestClient(sub_app, raise_server_exceptions=False)
+
+    def test_empty_user_id_in_item_rejected_at_schema(self, mock_task_manager):
+        """Empty user_id is rejected by schema validation (pattern requires
+        non-empty), so it can't reach the route — first line of defense."""
+        client = self._client_with_token("alice-from-token")
+        resp = client.post("/v1/memories/raw/batch", json={
+            "memories": [
+                {"content": "x", "user_id": "", "category": "preference"},
+            ],
+        })
+        assert resp.status_code == 422
+
+    def test_missing_user_id_in_item_filled_from_token(self, mock_task_manager):
+        from unittest.mock import AsyncMock
+        mock_task_manager.enqueue_raw_batch = AsyncMock(return_value="batch-task")
+        client = self._client_with_token("alice-from-token")
+        resp = client.post("/v1/memories/raw/batch", json={
+            "memories": [
+                {"content": "x", "category": "preference"},
+            ],
+        })
+        assert resp.status_code in (200, 202)
+        items = mock_task_manager.enqueue_raw_batch.call_args[1]["items"]
+        assert items[0]["user_id"] == "alice-from-token"
+
+    def test_matching_user_id_in_item_kept_as_token(self, mock_task_manager):
+        from unittest.mock import AsyncMock
+        mock_task_manager.enqueue_raw_batch = AsyncMock(return_value="batch-task")
+        client = self._client_with_token("alice-from-token")
+        resp = client.post("/v1/memories/raw/batch", json={
+            "memories": [
+                {"content": "x", "user_id": "alice-from-token", "category": "preference"},
+            ],
+        })
+        assert resp.status_code in (200, 202)
+        items = mock_task_manager.enqueue_raw_batch.call_args[1]["items"]
+        assert items[0]["user_id"] == "alice-from-token"
+
+    def test_mismatching_user_id_in_item_returns_400(self, mock_task_manager):
+        client = self._client_with_token("alice-from-token")
+        resp = client.post("/v1/memories/raw/batch", json={
+            "memories": [
+                {"content": "x", "user_id": "bob-impersonator", "category": "preference"},
+            ],
+        })
+        assert resp.status_code == 400
+        assert "does not match" in resp.json()["detail"]
+
+    def test_legacy_no_token_keeps_per_item_user_id(self, client, mock_task_manager):
+        """Without a token (legacy shared-key path), per-item body user_id
+        is trusted as before."""
+        from unittest.mock import AsyncMock
+        mock_task_manager.enqueue_raw_batch = AsyncMock(return_value="batch-task")
+        resp = client.post("/v1/memories/raw/batch", json={
+            "memories": [
+                {"content": "x", "user_id": "legacy-alice", "category": "preference"},
+            ],
+        })
+        assert resp.status_code in (200, 202)
+        items = mock_task_manager.enqueue_raw_batch.call_args[1]["items"]
+        assert items[0]["user_id"] == "legacy-alice"

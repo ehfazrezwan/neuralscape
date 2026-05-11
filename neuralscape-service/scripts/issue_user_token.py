@@ -42,7 +42,12 @@ def main(argv: list[str] | None = None) -> int:
         "-d",
         type=int,
         default=30,
-        help="Token lifetime in days (default: 30). Use 0 for no expiry — not recommended.",
+        help=(
+            "Token lifetime in days (default: 30). Pass 0 to issue a "
+            "non-expiring token (the `exp` claim is omitted). Non-expiring "
+            "tokens are powerful — prefer short TTLs with an automated "
+            "rotation flow for production."
+        ),
     )
     parser.add_argument(
         "--secret-env",
@@ -75,7 +80,9 @@ def main(argv: list[str] | None = None) -> int:
     # sign with the same algorithm the server verifies with.
     from tokens import issue_user_token  # noqa: E402
 
-    ttl = (args.days if args.days > 0 else 100 * 365) * 86400  # default to ~100y for "no expiry"
+    # `--days 0` → ttl=None, which makes issue_user_token omit the `exp`
+    # claim and verify_user_token treats the token as non-expiring.
+    ttl = args.days * 86400 if args.days > 0 else None
     token = issue_user_token(args.user.strip(), secret, ttl)
     print(token)
     return 0

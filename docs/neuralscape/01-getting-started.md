@@ -151,7 +151,7 @@ When you're ready to add a second user (or you want auth turned on at all for a 
 
 1. **Pick a signing secret.** Add to `.env`:
 
-   ```
+   ```bash
    NEURALSCAPE_USER_TOKEN_SECRET=<32+ char random string>
    ```
 

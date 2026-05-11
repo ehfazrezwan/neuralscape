@@ -754,18 +754,24 @@ async def v1_store_raw_batch(req: RawMemoryBatchRequest, request: Request):
                 detail=f"Item {idx}: project_id is required when scope='project'.",
             )
 
-    # Resolve identity once for the whole batch. Each item's optional body
-    # user_id must match (or be absent); the token wins.
+    # Resolve identity once for the whole batch. When a token is present,
+    # it's authoritative: every item must agree (or be absent / empty), and
+    # we overwrite each item's user_id with the token's. Without a token
+    # (legacy shared-key callers), per-item body user_id is trusted.
     token_user_id = getattr(request.state, "user_id", None)
-    for idx, item in enumerate(req.memories):
-        if token_user_id and item.user_id and item.user_id != token_user_id:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Item {idx}: body user_id ({item.user_id!r}) does not match "
-                    f"the auth token's user_id ({token_user_id!r})."
-                ),
-            )
+    if token_user_id:
+        for idx, item in enumerate(req.memories):
+            # Reject any item that explicitly tries to write under a
+            # different user_id. A blank or absent value is acceptable —
+            # we'll fill it from the token below.
+            if item.user_id and item.user_id != token_user_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Item {idx}: body user_id ({item.user_id!r}) does not match "
+                        f"the auth token's user_id ({token_user_id!r})."
+                    ),
+                )
 
     # Serialize datetimes so the batch survives JSON enqueue.
     items_payload: list[dict] = []
@@ -773,8 +779,14 @@ async def v1_store_raw_batch(req: RawMemoryBatchRequest, request: Request):
         d = item.model_dump(exclude_none=True)
         if "expires_at" in d and hasattr(d["expires_at"], "isoformat"):
             d["expires_at"] = d["expires_at"].isoformat()
-        # Fill in user_id from token when item didn't supply one
-        d.setdefault("user_id", token_user_id or settings.default_user_id)
+        if token_user_id:
+            # Token wins. Overwrite any per-item value (including empty
+            # strings, which `setdefault` would have preserved) so a
+            # caller can't submit `item.user_id=""` to sidestep the
+            # token's namespace.
+            d["user_id"] = token_user_id
+        else:
+            d.setdefault("user_id", settings.default_user_id)
         items_payload.append(d)
 
     try:

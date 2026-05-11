@@ -127,3 +127,92 @@ class TestVerifyUserToken:
         token = issue_user_token(long_id, "topsecret", 3600)
         p = verify_user_token(token, "topsecret")
         assert p is not None and p["user_id"] == long_id
+
+
+class TestExpClaimValidation:
+    """Regression for CP-03: `exp` must be a finite number or be absent.
+
+    Before the fix, a forged token with `exp` as a string / list / dict /
+    NaN / Infinity slipped through because the type check fell through
+    to "no exp → never expires". Now any non-numeric or non-finite `exp`
+    rejects the token.
+    """
+
+    def _sign(self, payload_dict, secret="topsecret"):
+        import base64, hmac, hashlib, json
+        payload = json.dumps(payload_dict).encode()
+        b64 = base64.urlsafe_b64encode(payload).rstrip(b"=").decode()
+        sig = hmac.new(secret.encode(), b64.encode(), hashlib.sha256).digest()
+        sig_b64 = base64.urlsafe_b64encode(sig).rstrip(b"=").decode()
+        return f"{b64}.{sig_b64}"
+
+    def test_string_exp_rejected(self):
+        tok = self._sign({"user_id": "alice", "exp": "never"})
+        assert verify_user_token(tok, "topsecret") is None
+
+    def test_list_exp_rejected(self):
+        tok = self._sign({"user_id": "alice", "exp": [9999999999]})
+        assert verify_user_token(tok, "topsecret") is None
+
+    def test_dict_exp_rejected(self):
+        tok = self._sign({"user_id": "alice", "exp": {"seconds": 9999999999}})
+        assert verify_user_token(tok, "topsecret") is None
+
+    def test_bool_exp_rejected(self):
+        """bool is a subclass of int — must not accidentally count as a timestamp."""
+        tok = self._sign({"user_id": "alice", "exp": True})
+        assert verify_user_token(tok, "topsecret") is None
+
+    def test_nan_exp_rejected(self):
+        import json
+        # NaN isn't valid JSON. Inject via a custom dump.
+        tok_body = '{"user_id":"alice","exp":NaN}'
+        import base64, hmac, hashlib
+        b64 = base64.urlsafe_b64encode(tok_body.encode()).rstrip(b"=").decode()
+        sig = hmac.new(b"topsecret", b64.encode(), hashlib.sha256).digest()
+        tok = f"{b64}.{base64.urlsafe_b64encode(sig).rstrip(b'=').decode()}"
+        # json.loads accepts NaN by default in Python; the verifier must reject.
+        assert verify_user_token(tok, "topsecret") is None
+
+    def test_infinity_exp_rejected(self):
+        tok_body = '{"user_id":"alice","exp":Infinity}'
+        import base64, hmac, hashlib
+        b64 = base64.urlsafe_b64encode(tok_body.encode()).rstrip(b"=").decode()
+        sig = hmac.new(b"topsecret", b64.encode(), hashlib.sha256).digest()
+        tok = f"{b64}.{base64.urlsafe_b64encode(sig).rstrip(b'=').decode()}"
+        assert verify_user_token(tok, "topsecret") is None
+
+    def test_missing_exp_accepts_non_expiring(self):
+        """Truly non-expiring tokens (no `exp` claim at all) still work."""
+        tok = self._sign({"user_id": "alice"})
+        p = verify_user_token(tok, "topsecret")
+        assert p is not None and p["user_id"] == "alice"
+        assert "exp" not in p
+
+
+class TestIssueTokenTtlNone:
+    """Regression for CP-05/06: ttl_seconds=None issues a non-expiring token."""
+
+    def test_none_ttl_omits_exp_claim(self):
+        import base64, json
+        tok = issue_user_token("alice", "topsecret", None)
+        payload_b64, _sig = tok.split(".", 1)
+        # Reconstruct padding
+        pad = "=" * (-len(payload_b64) % 4)
+        decoded = json.loads(base64.urlsafe_b64decode(payload_b64 + pad))
+        assert decoded == {"user_id": "alice"}
+        assert "exp" not in decoded
+
+    def test_none_ttl_token_verifies(self):
+        tok = issue_user_token("alice", "topsecret", None)
+        p = verify_user_token(tok, "topsecret")
+        assert p is not None and p["user_id"] == "alice"
+
+    def test_positive_ttl_includes_exp(self):
+        import base64, json, time
+        tok = issue_user_token("alice", "topsecret", 3600)
+        payload_b64, _sig = tok.split(".", 1)
+        pad = "=" * (-len(payload_b64) % 4)
+        decoded = json.loads(base64.urlsafe_b64decode(payload_b64 + pad))
+        assert "exp" in decoded
+        assert decoded["exp"] > time.time()

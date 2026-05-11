@@ -2268,6 +2268,175 @@ class TestSearchMultiUserIsolation:
         assert results[0].id == "shared-by-alice"
 
 
+class TestExpireUserGraphWrites:
+    """Regression for CR-06: bulk-delete cleans up every group_id the user authored.
+
+    Before the fix, only ``user--{user_id}`` (and optionally one
+    ``user--{user_id}--project--*``) got expired, leaving project-private
+    and shared-authored graph edges orphaned.
+    """
+
+    def _mem(self, mid: str, owner: str, visibility: str, project_id: str | None = None):
+        return {
+            "id": mid,
+            "payload": {
+                "data": f"{mid} content",
+                "user_id": owner,
+                "metadata": {
+                    "owner_user_id": owner,
+                    "visibility": visibility,
+                    "project_id": project_id,
+                },
+            },
+        }
+
+    def test_expires_all_private_project_groups(self, service):
+        """Bulk-delete must expire `user--alice--project--X` for every X
+        Alice wrote to, not just the one optionally passed in."""
+        service._scroll_all_user_memories = MagicMock(return_value=[
+            self._mem("m1", "alice", "private"),
+            self._mem("m2", "alice", "private", project_id="alpha"),
+            self._mem("m3", "alice", "private", project_id="beta"),
+        ])
+        service._expire_graph_edges_for_groups = MagicMock()
+        service._expire_graph_edges_for_memory = MagicMock()
+        service._expire_user_graph_writes("alice")
+        called_groups = set(service._expire_graph_edges_for_groups.call_args[0][0])
+        assert "user--alice" in called_groups
+        assert "user--alice--project--alpha" in called_groups
+        assert "user--alice--project--beta" in called_groups
+
+    def test_shared_authored_memories_use_per_memory_cleanup(self, service):
+        """Shared-pool edges authored by Alice get expired memory-by-memory
+        — we never blanket-expire the `shared` group_id because other
+        users' edges live there too."""
+        service._scroll_all_user_memories = MagicMock(return_value=[
+            self._mem("m1", "alice", "shared"),
+            self._mem("m2", "alice", "shared", project_id="alpha"),
+        ])
+        service._expire_graph_edges_for_groups = MagicMock()
+        service._expire_graph_edges_for_memory = MagicMock()
+        service._expire_user_graph_writes("alice")
+        # Groups-level expiration NOT called for shared
+        if service._expire_graph_edges_for_groups.called:
+            called_groups = set(service._expire_graph_edges_for_groups.call_args[0][0])
+            assert "shared" not in called_groups
+            assert "shared--project--alpha" not in called_groups
+        # Per-memory expiration called once per shared memory
+        assert service._expire_graph_edges_for_memory.call_count == 2
+
+    def test_mixed_visibility_user(self, service):
+        """A user with both private and shared writes triggers both code paths."""
+        service._scroll_all_user_memories = MagicMock(return_value=[
+            self._mem("priv-1", "alice", "private"),
+            self._mem("shar-1", "alice", "shared"),
+        ])
+        service._expire_graph_edges_for_groups = MagicMock()
+        service._expire_graph_edges_for_memory = MagicMock()
+        service._expire_user_graph_writes("alice")
+        groups = set(service._expire_graph_edges_for_groups.call_args[0][0])
+        assert "user--alice" in groups
+        assert "shared" not in groups
+        assert service._expire_graph_edges_for_memory.call_count == 1
+
+    def test_scroll_failure_is_non_fatal(self, service):
+        """If scrolling memories fails, expire returns quietly rather than
+        propagating — bulk delete must still succeed at the vector-store layer."""
+        service._scroll_all_user_memories = MagicMock(side_effect=Exception("Qdrant transient"))
+        # Should not raise
+        service._expire_user_graph_writes("alice")
+
+
+class TestExpireGraphEdgesForMemoryScope:
+    """Regression for CR-07: per-memory edge expiration uses the memory's
+    exact group_id, not the owner's full readable namespace.
+    """
+
+    def test_private_memory_only_expires_private_group(self, service):
+        """A private memory's edge cleanup should NEVER touch the shared pool."""
+        from graphiti_core.search.search_config_recipes import EDGE_HYBRID_SEARCH_RRF
+        # Mock the bridge call so we capture the group_ids actually passed
+        service._run_on_bridge = MagicMock(return_value=MagicMock(edges=[]))
+        service._graphiti = MagicMock()
+        service._graphiti.search_ = MagicMock()
+        mem = {
+            "memory": "alice's secret",
+            "metadata": {
+                "owner_user_id": "alice",
+                "visibility": "private",
+                "project_id": None,
+            },
+        }
+        service._expire_graph_edges_for_memory(mem)
+        # _graphiti.search_ should have been called with group_ids=["user--alice"]
+        call_kwargs = service._graphiti.search_.call_args[1]
+        assert call_kwargs["group_ids"] == ["user--alice"]
+
+    def test_shared_memory_only_expires_shared_group(self, service):
+        service._run_on_bridge = MagicMock(return_value=MagicMock(edges=[]))
+        service._graphiti = MagicMock()
+        service._graphiti.search_ = MagicMock()
+        mem = {
+            "memory": "shared fact",
+            "metadata": {
+                "owner_user_id": "alice",
+                "visibility": "shared",
+                "project_id": "myproj",
+            },
+        }
+        service._expire_graph_edges_for_memory(mem)
+        call_kwargs = service._graphiti.search_.call_args[1]
+        assert call_kwargs["group_ids"] == ["shared--project--myproj"]
+
+
+class TestSearchGraphForVisibility:
+    """Regression for CP-01/CP-02: graph search is scoped by visibility at
+    the group_ids level, not just post-filtered.
+    """
+
+    def test_private_only_scopes_to_user_groups(self, service):
+        service._do_graph_search = MagicMock(return_value={"edges": [], "nodes": [], "episodes": [], "communities": []})
+        service._search_graph_for_visibility(
+            query="x", user_id="alice", project_id=None, limit=10,
+            visibility="private", include_shared=True,
+        )
+        kwargs = service._do_graph_search.call_args[1]
+        assert kwargs["group_ids"] == ["user--alice"]
+        # CRITICALLY: 'shared' must NOT appear in the private-only group_ids
+        assert "shared" not in kwargs["group_ids"]
+
+    def test_shared_only_scopes_to_shared_groups(self, service):
+        service._do_graph_search = MagicMock(return_value={"edges": [], "nodes": [], "episodes": [], "communities": []})
+        service._search_graph_for_visibility(
+            query="x", user_id="alice", project_id="myproj", limit=10,
+            visibility="shared", include_shared=True,
+        )
+        kwargs = service._do_graph_search.call_args[1]
+        assert kwargs["group_ids"] == ["shared", "shared--project--myproj"]
+        # CRITICALLY: no 'user--alice' in shared-only group_ids
+        assert not any("user--alice" in g for g in kwargs["group_ids"])
+
+    def test_include_shared_false_scopes_to_user_only(self, service):
+        service._do_graph_search = MagicMock(return_value={"edges": [], "nodes": [], "episodes": [], "communities": []})
+        service._search_graph_for_visibility(
+            query="x", user_id="alice", project_id=None, limit=10,
+            visibility=None, include_shared=False,
+        )
+        kwargs = service._do_graph_search.call_args[1]
+        assert kwargs["group_ids"] == ["user--alice"]
+
+    def test_default_uses_full_read_set(self, service):
+        service._do_graph_search = MagicMock(return_value={"edges": [], "nodes": [], "episodes": [], "communities": []})
+        service._search_graph_for_visibility(
+            query="x", user_id="alice", project_id=None, limit=10,
+            visibility=None, include_shared=True,
+        )
+        kwargs = service._do_graph_search.call_args[1]
+        # Same as _get_group_ids — caller's private + shared
+        assert "user--alice" in kwargs["group_ids"]
+        assert "shared" in kwargs["group_ids"]
+
+
 class TestGraphEnrichmentMultiUser:
     """``_enrich_graph_with_v2`` allows shared-pool sources, not just user's own."""
 

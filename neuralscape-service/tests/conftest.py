@@ -25,8 +25,13 @@ def _disable_auth_for_tests():
     from config import settings
     saved_token_secret = settings.neuralscape_user_token_secret
     saved_api_key = settings.neuralscape_api_key
+    saved_default_user_id = settings.default_user_id
     settings.neuralscape_user_token_secret = ""
     settings.neuralscape_api_key = ""
+    # Pin to the Pydantic class default so route fallbacks are deterministic
+    # across deployment envs that set DEFAULT_USER_ID for production use.
+    settings.default_user_id = "default_user"
     yield
     settings.neuralscape_user_token_secret = saved_token_secret
     settings.neuralscape_api_key = saved_api_key
+    settings.default_user_id = saved_default_user_id

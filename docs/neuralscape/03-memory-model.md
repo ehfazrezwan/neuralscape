@@ -261,9 +261,12 @@ A search by user `alice` walks group_ids `["user--alice", "shared"]`
 1. **Personal pool**: `m.search(user_id=caller, filters=...)` — mem0
    enforces user_id at the Qdrant layer. Returns the caller's own
    memories (any visibility).
-2. **Shared pool**: direct `qdrant_client.search()` with
+2. **Shared pool**: direct `qdrant_client.query_points()` with
    `metadata.visibility=shared` — bypasses mem0's user_id namespacing
-   because shared memories span multiple writers.
+   because shared memories span multiple writers. (We use
+   `query_points()` rather than the deprecated `.search()` because
+   qdrant-client v1.13+ removed the latter; the response wraps hits
+   in a `.points` attribute.)
 
 Results are dedup'd by id (a caller's own shared write matches both
 pools) and sorted by score. Filters available:
@@ -276,7 +279,7 @@ pools) and sorted by score. Filters available:
 
 Authentication moves from a single shared API key to per-user HMAC tokens:
 
-```
+```text
 base64url({user_id, exp}).hmac_sha256(secret, payload_b64)
 ```
 

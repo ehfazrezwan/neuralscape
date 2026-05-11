@@ -391,8 +391,6 @@ Both pipelines write to the same backend. `source_type` distinguishes them on re
 
 Content-hash dedup in `service.store_raw()` ensures that even if both paths land on the same fact, only one row is created. See [05-llm-extraction](./05-llm-extraction.md) for the cost/architecture comparison.
 
-## Related
-
 ## Multi-user identity + auth (v2.2)
 
 Released alongside the memory model's multi-user visibility split (see [03-memory-model](./03-memory-model.md)). Two relevant changes for the plugin client:

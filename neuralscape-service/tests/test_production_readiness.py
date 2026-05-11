@@ -270,7 +270,13 @@ class TestDeleteGraphCleanup:
 
     def test_bulk_delete_all_attempts_graph_expiration(self, service):
         """delete_memories with no filters should expire graph edges for the user's groups."""
-        with patch.object(service, "_expire_graph_edges_for_groups") as mock_expire:
+        # Stub the scroll so _expire_user_graph_writes finds at least one private
+        # memory and reaches the _expire_graph_edges_for_groups call.
+        with patch.object(
+            service,
+            "_scroll_all_user_memories",
+            return_value=[{"payload": {"data": "x", "metadata": {"visibility": "private"}}}],
+        ), patch.object(service, "_expire_graph_edges_for_groups") as mock_expire:
             service.delete_memories(user_id="ehfaz")
             mock_expire.assert_called_once()
 
