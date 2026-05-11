@@ -30,6 +30,7 @@ from schemas import (
     ContextResponse,
     GraphSearchRequest,
     MemoryResponse,
+    RawMemoryBatchRequest,
     RawMemoryRequest,
     SearchMemoryRequest,
     SearchMemoryResponse,
@@ -652,6 +653,8 @@ async def v1_store_raw_memory(req: RawMemoryRequest):
 
     Enqueues the storage task to a background worker and returns immediately.
     Falls back to synchronous storage if Redis is unavailable.
+    Memory-model v2 fields (domain, observation_type, concepts, source_type,
+    related_memory_ids, confidence, expires_at) are all optional.
     """
     if req.category not in MEMORY_CATEGORIES:
         raise HTTPException(
@@ -661,30 +664,71 @@ async def v1_store_raw_memory(req: RawMemoryRequest):
     if req.scope == "project" and not req.project_id:
         raise HTTPException(status_code=400, detail="project_id is required when scope='project'")
 
+    # Build the kwargs once; passed through to both the queue path and the sync fallback.
+    raw_kwargs = req.model_dump(exclude_none=True)
+    # serialize datetime so it survives JSON enqueue
+    if "expires_at" in raw_kwargs and hasattr(raw_kwargs["expires_at"], "isoformat"):
+        raw_kwargs["expires_at"] = raw_kwargs["expires_at"].isoformat()
+
     try:
-        task_id = await _task_manager.enqueue_raw(
-            content=req.content,
-            user_id=req.user_id,
-            category=req.category,
-            scope=req.scope,
-            project_id=req.project_id,
-            tags=req.tags,
-            agent_id=req.agent_id,
-            run_id=req.run_id,
-        )
+        task_id = await _task_manager.enqueue_raw(**raw_kwargs)
     except (ConnectionError, OSError) as e:
         logger.warning(f"Redis unavailable, falling back to sync store: {e}")
-        memories = await asyncio.to_thread(
-            _service.store_raw,
-            content=req.content,
-            user_id=req.user_id,
-            category=req.category,
-            scope=req.scope,
-            project_id=req.project_id,
-            tags=req.tags,
-            agent_id=req.agent_id,
-            run_id=req.run_id,
+        # Sync path expects datetime, not ISO string
+        sync_kwargs = dict(raw_kwargs)
+        if "expires_at" in sync_kwargs and isinstance(sync_kwargs["expires_at"], str):
+            try:
+                sync_kwargs["expires_at"] = datetime.fromisoformat(
+                    sync_kwargs["expires_at"].replace("Z", "+00:00")
+                )
+            except ValueError:
+                sync_kwargs.pop("expires_at", None)
+        memories = await asyncio.to_thread(_service.store_raw, **sync_kwargs)
+        return JSONResponse(
+            status_code=200,
+            content=StoreMemoryResponse(memories=memories).model_dump(exclude_none=True),
         )
+
+    return TaskAcceptedResponse(
+        task_id=task_id,
+        poll_url=f"/v1/memories/status/{task_id}",
+    )
+
+
+@v1_router.post("/memories/raw/batch", status_code=202)
+async def v1_store_raw_batch(req: RawMemoryBatchRequest):
+    """Store multiple pre-categorized facts in one request (memory-model v2).
+
+    All items dispatched as a single ARQ task. Each item is independent —
+    a single bad item does not block the others. Falls back to synchronous
+    storage if Redis is unavailable.
+    """
+    # Per-item validation up front so we fail fast on bad input.
+    for idx, item in enumerate(req.memories):
+        if item.category not in MEMORY_CATEGORIES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Item {idx}: invalid category '{item.category}'.",
+            )
+        if item.scope == "project" and not item.project_id:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Item {idx}: project_id is required when scope='project'.",
+            )
+
+    # Serialize datetimes so the batch survives JSON enqueue.
+    items_payload: list[dict] = []
+    for item in req.memories:
+        d = item.model_dump(exclude_none=True)
+        if "expires_at" in d and hasattr(d["expires_at"], "isoformat"):
+            d["expires_at"] = d["expires_at"].isoformat()
+        items_payload.append(d)
+
+    try:
+        task_id = await _task_manager.enqueue_raw_batch(items=items_payload)
+    except (ConnectionError, OSError) as e:
+        logger.warning(f"Redis unavailable, falling back to sync batch store: {e}")
+        memories = await asyncio.to_thread(_service.store_raw_batch, items_payload)
         return JSONResponse(
             status_code=200,
             content=StoreMemoryResponse(memories=memories).model_dump(exclude_none=True),
@@ -713,6 +757,7 @@ async def v1_search_memories(req: SearchMemoryRequest):
     """Semantic search with scope/category filters.
 
     When project_id is provided, searches both global and project memories.
+    Memory-model v2 filters (domain, observation_type, concepts) are optional.
     """
     try:
         results = await asyncio.to_thread(
@@ -723,6 +768,9 @@ async def v1_search_memories(req: SearchMemoryRequest):
             categories=req.categories,
             scope=req.scope,
             limit=req.limit,
+            domain=req.domain,
+            observation_type=req.observation_type,
+            concepts=req.concepts,
         )
         return SearchMemoryResponse(results=results)
     except Exception as e:

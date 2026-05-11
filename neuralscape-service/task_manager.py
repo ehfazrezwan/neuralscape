@@ -81,13 +81,34 @@ class TaskManager:
         tags: list[str] | None = None,
         agent_id: str | None = None,
         run_id: str | None = None,
+        # Memory-model v2 fields
+        domain: str | None = None,
+        observation_type: str | None = None,
+        concepts: list[str] | None = None,
+        source_type: str | None = None,
+        related_memory_ids: list[str] | None = None,
+        confidence: float | None = None,
+        expires_at: str | None = None,
     ) -> str:
         """Enqueue raw memory storage task. Returns task_id (job_id).
 
         Uses a deterministic job ID based on content hash to prevent
-        duplicate enqueues of the same fact.
+        duplicate enqueues of the same fact. v2 fields are forwarded
+        as a kwargs dict to the worker.
         """
         job_id = _generate_job_id(f"raw:{content}", user_id)
+
+        v2_extras = {
+            "domain": domain,
+            "observation_type": observation_type,
+            "concepts": concepts,
+            "source_type": source_type,
+            "related_memory_ids": related_memory_ids,
+            "confidence": confidence,
+            "expires_at": expires_at,
+        }
+        # Drop None values so the worker signature can default cleanly
+        v2_extras = {k: v for k, v in v2_extras.items() if v is not None}
 
         job = await self.pool.enqueue_job(
             "process_memory_raw",
@@ -99,6 +120,27 @@ class TaskManager:
             tags,
             agent_id,
             run_id,
+            v2_extras,
+            _job_id=job_id,
+        )
+        if job is None:
+            return job_id
+        return job.job_id
+
+    async def enqueue_raw_batch(self, items: list[dict]) -> str:
+        """Enqueue a batch of raw memory storage tasks (memory-model v2).
+
+        Items are dispatched as a single ARQ job. Job ID is deterministic
+        based on the concatenated content of all items.
+        """
+        content_str = "|".join(item.get("content", "") for item in items)
+        # Use the first item's user_id for the job ID, fall back to "batch"
+        user_id = items[0].get("user_id", "batch") if items else "batch"
+        job_id = _generate_job_id(f"raw_batch:{content_str}", user_id)
+
+        job = await self.pool.enqueue_job(
+            "process_memory_raw_batch",
+            items,
             _job_id=job_id,
         )
         if job is None:

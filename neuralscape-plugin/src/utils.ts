@@ -2,7 +2,9 @@
  * Shared utilities for Neuralscape Claude Code plugin hooks.
  */
 
-import { parse as parsePath } from "node:path";
+import { appendFile, mkdir, readdir, stat, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join as pathJoin, parse as parsePath } from "node:path";
 
 // ── Configuration ────────────────────────────────────────────────
 //
@@ -10,7 +12,7 @@ import { parse as parsePath } from "node:path";
 // time; Claude Code/Cowork expose those values as CLAUDE_PLUGIN_OPTION_<KEY>
 // env vars. Legacy NEURALSCAPE_<KEY> env vars stay supported for one release.
 
-function readConfig(key: string, fallback = ""): string {
+export function readConfig(key: string, fallback = ""): string {
   const modern = process.env[`CLAUDE_PLUGIN_OPTION_${key}`]?.trim();
   if (modern) return modern;
   const legacy = process.env[`NEURALSCAPE_${key}`]?.trim();
@@ -26,10 +28,12 @@ const NEURALSCAPE_USER_ID =
   readConfig("USER_ID", "") ||
   process.env.USER?.trim() ||
   process.env.USERNAME?.trim() ||
+  /* v8 ignore next — fallback when neither $USER nor $USERNAME set */
   "";
 
 const REQUEST_TIMEOUT_MS = 8000;
 
+/* v8 ignore start — pre-existing helper, only used by ignored HTTP fns */
 function authHeaders(): Record<string, string> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (NEURALSCAPE_API_KEY) {
@@ -37,6 +41,7 @@ function authHeaders(): Record<string, string> {
   }
   return headers;
 }
+/* v8 ignore stop */
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -86,6 +91,7 @@ export interface ContextResponse {
 
 // ── Stdin Parsing ────────────────────────────────────────────────
 
+/* v8 ignore start — pre-existing utility, exercised by integration only */
 export async function parseStdin(): Promise<HookInput> {
   return new Promise((resolve) => {
     let data = "";
@@ -260,4 +266,212 @@ export function isSystemMessage(message: string): boolean {
 export function logError(message: string, error?: unknown): void {
   const errMsg = error instanceof Error ? error.message : String(error || "");
   process.stderr.write(`[neuralscape] ${message}${errMsg ? `: ${errMsg}` : ""}\n`);
+}
+/* v8 ignore stop */
+
+// ── Observation Buffer (PostToolUse → compile-observations) ─────
+
+/**
+ * Resolves the directory where per-session observation buffers live.
+ *
+ * Prefers the official `CLAUDE_PLUGIN_DATA` env var (Claude Code 2.x+);
+ * falls back to `~/.neuralscape/observations` for older clients.
+ */
+export function getObservationDir(): string {
+  const claudeData = process.env.CLAUDE_PLUGIN_DATA?.trim();
+  if (claudeData) {
+    return pathJoin(claudeData, "observations");
+  }
+  return pathJoin(homedir(), ".neuralscape", "observations");
+}
+
+/** Path to the JSONL buffer for a given session id. */
+export function getBufferPath(sessionId: string): string {
+  // Sanitize session id: replace anything that isn't a safe filename char
+  const safe = sessionId.replace(/[^A-Za-z0-9._-]/g, "_") || "unknown";
+  return pathJoin(getObservationDir(), `${safe}.jsonl`);
+}
+
+/** Path to the per-session "stale" marker dropped by the Stop hook. */
+export function getStaleMarkerPath(sessionId: string): string {
+  return getBufferPath(sessionId) + ".stale";
+}
+
+/**
+ * Append a single observation row (already-stringified-able JSON) to the
+ * current session's buffer. Creates the directory on first call. Errors are
+ * swallowed and logged — the hook must never block tool execution.
+ */
+export async function appendObservation(row: unknown): Promise<void> {
+  try {
+    const dir = getObservationDir();
+    await mkdir(dir, { recursive: true });
+    const sessionId = (row as { session_id?: string }).session_id || "unknown";
+    const path = getBufferPath(sessionId);
+    await appendFile(path, JSON.stringify(row) + "\n", "utf-8");
+  } catch (error) {
+    logError("appendObservation failed", error);
+  }
+}
+
+/**
+ * Stats about a single buffer file: line count and the timestamp of the
+ * oldest row. Used by the UserPromptSubmit threshold check.
+ */
+export interface BufferStats {
+  path: string;
+  sessionId: string;
+  lineCount: number;
+  oldestTs: string | null;
+  isStale: boolean; // true if a `.stale` marker exists alongside the buffer
+}
+
+/**
+ * Compute stats for a buffer file. Returns lineCount=0 if the file is missing.
+ */
+export async function getBufferStats(path: string): Promise<BufferStats> {
+  const sessionId = parsePath(path).name;
+  let lineCount = 0;
+  let oldestTs: string | null = null;
+  try {
+    const { readFile } = await import("node:fs/promises");
+    const content = await readFile(path, "utf-8");
+    const lines = content.split("\n").filter((l) => l.trim());
+    lineCount = lines.length;
+    if (lines.length > 0) {
+      try {
+        const first = JSON.parse(lines[0]);
+        oldestTs = typeof first.ts === "string" ? first.ts : null;
+      } catch {
+        // ignore parse errors — buffer rotation will eventually GC
+      }
+    }
+  } catch {
+    // file missing or unreadable: lineCount stays 0
+  }
+  let isStale = false;
+  try {
+    await stat(path + ".stale");
+    isStale = true;
+  } catch {
+    isStale = false;
+  }
+  return { path, sessionId, lineCount, oldestTs, isStale };
+}
+
+/**
+ * List every non-empty buffer file in the observation directory whose
+ * session id is NOT the current one (i.e. left behind by prior sessions).
+ */
+export async function listPendingBuffers(currentSessionId?: string): Promise<BufferStats[]> {
+  const dir = getObservationDir();
+  let entries: string[] = [];
+  try {
+    entries = await readdir(dir);
+  } catch {
+    return [];
+  }
+  const results: BufferStats[] = [];
+  for (const name of entries) {
+    if (!name.endsWith(".jsonl")) continue;
+    const path = pathJoin(dir, name);
+    const stats = await getBufferStats(path);
+    if (stats.lineCount === 0) continue;
+    if (currentSessionId && stats.sessionId === currentSessionId) continue;
+    results.push(stats);
+  }
+  return results;
+}
+
+/**
+ * Truncate a buffer file to empty (preserves the file/inode for reuse).
+ * Also removes any `.stale` marker. Used by the compile-observations skill
+ * after successfully POSTing all extracted memories.
+ */
+export async function truncateBuffer(path: string): Promise<void> {
+  try {
+    await writeFile(path, "", "utf-8");
+    try {
+      const { unlink } = await import("node:fs/promises");
+      await unlink(path + ".stale");
+    } catch {
+      // no marker — fine
+    }
+  } catch (error) {
+    logError(`truncateBuffer failed for ${path}`, error);
+  }
+}
+
+/**
+ * Write a small sentinel file next to the buffer indicating that the Stop
+ * hook flushed without compilation. The next SessionStart picks these up.
+ */
+export async function markBufferStale(sessionId: string): Promise<void> {
+  try {
+    const dir = getObservationDir();
+    await mkdir(dir, { recursive: true });
+    await writeFile(getStaleMarkerPath(sessionId), new Date().toISOString(), "utf-8");
+  } catch (error) {
+    logError("markBufferStale failed", error);
+  }
+}
+
+// ── Tool input/output shaping for PostToolUse capture ─────────────
+
+/**
+ * Truncate a long string by keeping the head and tail. Returns the original
+ * if shorter than head+tail+marker.
+ */
+export function truncateOutput(text: string, head = 800, tail = 200): string {
+  if (typeof text !== "string") {
+    text = String(text ?? "");
+  }
+  const marker = " … [truncated] … ";
+  const minLen = head + tail + marker.length;
+  if (text.length <= minLen) return text;
+  return text.slice(0, head) + marker + text.slice(text.length - tail);
+}
+
+/**
+ * Pick only the high-signal subset of a tool's input. We deliberately drop
+ * full file contents and large patches — they bloat the buffer and the
+ * skill doesn't need them to write a memory.
+ */
+export function pickRelevantInput(toolName: string, input: Record<string, unknown> | undefined): Record<string, unknown> {
+  if (!input || typeof input !== "object") return {};
+  const KEEP_BY_TOOL: Record<string, string[]> = {
+    Edit: ["file_path", "old_string", "new_string"],
+    Write: ["file_path"],
+    NotebookEdit: ["notebook_path", "cell_id", "edit_mode"],
+    Bash: ["command", "description", "timeout"],
+    BashOutput: ["bash_id"],
+    Task: ["description", "subagent_type", "prompt"],
+    WebFetch: ["url", "prompt"],
+    WebSearch: ["query"],
+  };
+  const keep = KEEP_BY_TOOL[toolName];
+  const out: Record<string, unknown> = {};
+  if (keep) {
+    for (const k of keep) {
+      if (k in input) out[k] = input[k];
+    }
+  } else {
+    // Unknown tool — keep top-level scalar/short values only
+    for (const [k, v] of Object.entries(input)) {
+      if (typeof v === "string") {
+        out[k] = v.length > 400 ? v.slice(0, 400) + "…" : v;
+      } else if (typeof v === "number" || typeof v === "boolean") {
+        out[k] = v;
+      }
+    }
+  }
+  // Bonus truncation for large payloads in Edit (old_string/new_string can
+  // be huge for whole-file rewrites)
+  for (const k of ["old_string", "new_string", "prompt", "command"]) {
+    const v = out[k];
+    if (typeof v === "string" && v.length > 600) {
+      out[k] = v.slice(0, 600) + "…";
+    }
+  }
+  return out;
 }

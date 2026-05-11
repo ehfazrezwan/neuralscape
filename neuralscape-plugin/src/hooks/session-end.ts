@@ -16,7 +16,15 @@ import {
 } from "../adapters/detect.js";
 import { triggerCompile } from "../core/compile.js";
 import { flushTurns } from "../core/flush.js";
-import { hasUserId, logError, outputContinue, parseStdin } from "../utils.js";
+import {
+  getBufferPath,
+  getBufferStats,
+  hasUserId,
+  logError,
+  markBufferStale,
+  outputContinue,
+  parseStdin,
+} from "../utils.js";
 
 async function main(): Promise<void> {
   outputContinue();
@@ -42,10 +50,23 @@ async function main(): Promise<void> {
       await commitClaudeCodeFlush(raw);
     }
 
-    // All clients: trigger compilation
+    // All clients: trigger compilation of conversation-compiler
     const sessionExtractor = getSessionEndExtractor(client);
     const input = await sessionExtractor(raw);
     await triggerCompile(input);
+
+    // Mark this session's PostToolUse observation buffer as stale so the
+    // next SessionStart picks it up if compile-observations didn't already
+    // flush it via the UserPromptSubmit threshold during this session.
+    try {
+      const sessionId = (raw.session_id as string | undefined) || "unknown";
+      const stats = await getBufferStats(getBufferPath(sessionId));
+      if (stats.lineCount > 0) {
+        await markBufferStale(sessionId);
+      }
+    } catch (error) {
+      logError("stale-marker write failed (non-critical)", error);
+    }
   } catch (error) {
     logError("session-end hook failed", error);
   }

@@ -116,6 +116,54 @@ async def list_tools() -> list[Tool]:
                         "items": {"type": "string"},
                         "description": "Optional free-form tags for additional organization",
                     },
+                    "domain": {
+                        "type": "string",
+                        "description": "Memory-model v2 — high-level life-context",
+                        "enum": ["coding", "research", "meeting", "writing", "ops", "personal", "general"],
+                    },
+                    "observation_type": {
+                        "type": "string",
+                        "description": "Memory-model v2 — shape of the observation, orthogonal to category",
+                        "enum": [
+                            "bugfix", "feature", "refactor", "decision", "discovery",
+                            "gotcha", "pattern", "trade_off", "research_note",
+                            "meeting_outcome", "task_plan", "fact",
+                        ],
+                    },
+                    "concepts": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": [
+                                "how-it-works", "why-it-exists", "what-changed",
+                                "problem-solution", "gotcha", "pattern", "trade-off",
+                                "open-question", "next-step", "blocker",
+                            ],
+                        },
+                        "maxItems": 5,
+                        "description": "Memory-model v2 — controlled-vocab cross-cutting tags (1-5 items)",
+                    },
+                    "source_type": {
+                        "type": "string",
+                        "description": "Memory-model v2 — provenance",
+                        "enum": ["conversation", "tool_extraction", "explicit", "imported", "compiler"],
+                    },
+                    "related_memory_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 10,
+                        "description": "Memory-model v2 — UUIDs of related memories (graph linkage)",
+                    },
+                    "confidence": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "description": "Memory-model v2 — extractor's self-rated 0.0-1.0",
+                    },
+                    "expires_at": {
+                        "type": "string",
+                        "description": "Memory-model v2 — ISO 8601 timestamp; memory is purged after this",
+                    },
                     "wait": {
                         "type": "boolean",
                         "description": "If true, wait for memory to be fully stored before returning. Default: false (fire-and-forget).",
@@ -321,6 +369,17 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if project_id and category not in GLOBAL_CATEGORIES:
                 scope = "project"
 
+            # Memory-model v2 fields (all optional)
+            v2_fields = {
+                "domain": arguments.get("domain"),
+                "observation_type": arguments.get("observation_type"),
+                "concepts": arguments.get("concepts"),
+                "source_type": arguments.get("source_type"),
+                "related_memory_ids": arguments.get("related_memory_ids"),
+                "confidence": arguments.get("confidence"),
+                "expires_at": arguments.get("expires_at"),
+            }
+
             try:
                 task_id = await _task_manager.enqueue_raw(
                     content=arguments["content"],
@@ -329,10 +388,21 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     scope=scope,
                     project_id=project_id,
                     tags=arguments.get("tags"),
+                    **v2_fields,
                 )
             except (ConnectionError, OSError) as e:
                 # Redis unavailable — fall back to synchronous storage
                 logger.warning(f"Redis unavailable, falling back to sync store: {e}")
+                # store_raw expects expires_at as datetime
+                sync_v2 = dict(v2_fields)
+                if sync_v2.get("expires_at") and isinstance(sync_v2["expires_at"], str):
+                    try:
+                        from datetime import datetime as _dt
+                        sync_v2["expires_at"] = _dt.fromisoformat(
+                            sync_v2["expires_at"].replace("Z", "+00:00")
+                        )
+                    except ValueError:
+                        sync_v2["expires_at"] = None
                 memories = _service.store_raw(
                     content=arguments["content"],
                     user_id=user_id,
@@ -340,6 +410,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     scope=scope,
                     project_id=project_id,
                     tags=arguments.get("tags"),
+                    **{k: v for k, v in sync_v2.items() if v is not None},
                 )
                 output = [m.model_dump(exclude_none=True) for m in memories]
                 return [TextContent(type="text", text=json.dumps({"status": "completed", "result": {"memories": output}, "fallback": "sync"}, default=str))]

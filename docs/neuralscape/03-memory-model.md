@@ -140,6 +140,66 @@ Write-path internals (extraction, dedup, persistence) live in [memory-service-co
 
 The FastAPI app exposes two parallel surfaces. Legacy root paths (`/memories`, `/search`) are thin mem0 passthroughs: no scoping, no categories, arbitrary metadata dicts. The `/v1/*` endpoints are the structured surface — explicit `category`, `scope`, `project_id`, typed metadata, and async-by-default writes returning `202` plus a `task_id` to poll. New integrations should target v1; see [service-architecture](./02-service-architecture.md) for routing details.
 
+## Memory model v2 (additive)
+
+Released 2026-05-09 alongside the plugin's PostToolUse capture pipeline. v2 adds **seven optional fields** to `RawMemoryRequest`, `StoreMemoryRequest`, `MemoryResponse`, and the `mcp__plugin_neuralscape_neuralscape__remember` MCP tool. Existing v1 memories continue to render unchanged with these fields as `null` — **no migration required**, no data loss.
+
+### v2 fields
+
+| Field | Type | Constraint | Purpose |
+|---|---|---|---|
+| `domain` | `str \| None` | enum `DOMAIN_VOCAB` (default `general`) | High-level life-context grouping. Lets a teammate filter to research / meeting / writing rather than just coding. |
+| `observation_type` | `str \| None` | enum `OBSERVATION_TYPE_VOCAB` | The *shape* of the memory, orthogonal to category. Most useful when the compile-observations skill writes it. |
+| `concepts` | `list[str] \| None` | controlled vocab `CONCEPT_VOCAB`, ≤5 items | Cross-cutting tags. Better than free-form `tags` for filtered queries. |
+| `source_type` | `str \| None` | enum `SOURCE_TYPE_VOCAB` | Provenance — `tool_extraction` for the new path, `conversation` for legacy compiler, `explicit` for direct API calls. |
+| `related_memory_ids` | `list[str] \| None` | UUIDs, ≤10 | Lightweight graph linkage. The compile skill chains related observations from one work session. |
+| `confidence` | `float \| None` | 0.0–1.0 | Extractor's self-rated confidence. Low-confidence memories deprioritized in search. |
+| `expires_at` | `datetime \| None` | ISO 8601 | Optional expiry for short-lived `task_context` entries. Cleanup cron purges expired memories nightly. |
+
+All seven are **optional** and stored under `metadata.<field>` in the Qdrant payload, matching the prefix convention from commit `6c94f20`. Validators in `schemas.py` reject unknown vocab values on write but accept null/missing on read.
+
+### Controlled vocabularies
+
+Defined in `neuralscape-service/schemas.py:104-126`:
+
+```python
+DOMAIN_VOCAB = {
+    "coding", "research", "meeting", "writing", "ops", "personal", "general",
+}
+
+OBSERVATION_TYPE_VOCAB = {
+    "bugfix", "feature", "refactor", "decision", "discovery",
+    "gotcha", "pattern", "trade_off", "research_note",
+    "meeting_outcome", "task_plan", "fact",
+}
+
+CONCEPT_VOCAB = {
+    "how-it-works", "why-it-exists", "what-changed",
+    "problem-solution", "gotcha", "pattern", "trade-off",
+    "open-question", "next-step", "blocker",
+}
+
+SOURCE_TYPE_VOCAB = {
+    "conversation", "tool_extraction", "explicit", "imported", "compiler",
+}
+```
+
+### Search filters (v2)
+
+`SearchMemoryRequest` gained three optional filters: `domain`, `observation_type`, `concepts`. The first two are exact-match; `concepts` does any-match (`metadata.concepts` ∩ supplied list). All three compose with the v1 `categories` and `scope` filters.
+
+### Batch endpoint
+
+`POST /v1/memories/raw/batch` accepts up to 50 `RawMemoryRequest` items in one call, dispatched as a single ARQ task. Reuses `service.store_raw()` per item so dedup and validation stay consistent. Useful for the compile-observations skill when a session yields multiple memories.
+
+### Content-hash dedup on insert
+
+`service.store_raw()` now performs a Qdrant scroll on `(user_id, metadata.scope, hash)` before insert. On hit, returns the existing memory unchanged — re-flushes from PostToolUse retries become idempotent. Lookup failures are non-fatal (the insert proceeds); a duplicate is preferred over a dropped write.
+
+### Expiry purge cron
+
+`expire_old_memories_cron` runs nightly at 03:15 (server time) and deletes memories whose `metadata.expires_at` is in the past. Matched memories are also cleaned from Graphiti via `_expire_graph_edges_for_memory`.
+
 ## Related
 
 - [memory-service-core](./04-memory-service-core.md)

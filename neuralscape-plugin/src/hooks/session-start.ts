@@ -9,6 +9,7 @@ import {
   getUserId,
   getProjectId,
   hasUserId,
+  listPendingBuffers,
   logError,
   neuralscapeGet,
   outputContinue,
@@ -83,10 +84,33 @@ async function main(): Promise<void> {
       return;
     }
 
+    // Detect any unprocessed observation buffers left behind by prior sessions
+    // and ask Claude to compile them before responding to the user.
+    let pendingNote = "";
+    try {
+      const pending = await listPendingBuffers(input.session_id);
+      if (pending.length > 0) {
+        const totalRows = pending.reduce((s, b) => s + b.lineCount, 0);
+        const paths = pending.map((b) => `\`${b.path}\``).join(", ");
+        pendingNote =
+          `\n\n# Neuralscape — Pending Observations\n\n` +
+          `${pending.length} buffer file(s) from prior sessions hold ` +
+          `${totalRows} unprocessed tool observations: ${paths}.\n\n` +
+          `**Before responding to the user's first prompt**, run the ` +
+          `\`compile-observations\` skill on each of these paths to extract ` +
+          `significant memories using the v2 memory model. Skip noise ` +
+          `(routine reads/edits/searches). After memories submit successfully, ` +
+          `truncate each buffer file. Then continue with the user's request.`;
+      }
+    } catch (error) {
+      logError("listPendingBuffers failed (non-critical)", error);
+    }
+
     // Format and inject
     const formatted = formatMemories(context.categories || {});
-    if (formatted) {
-      outputWithContext(formatted);
+    const combined = (formatted || "") + pendingNote;
+    if (combined.trim()) {
+      outputWithContext(combined);
     } else {
       outputContinue();
     }

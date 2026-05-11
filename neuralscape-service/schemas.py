@@ -1,8 +1,9 @@
 """Schemas for neuralscape-service: enums, category taxonomy, request/response models."""
 
+from datetime import datetime
 from enum import Enum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # ──────────────────────────────────────────────
@@ -41,23 +42,23 @@ class MemoryCategory(str, Enum):
 
 
 # ──────────────────────────────────────────────
-# Category taxonomy
+# Category taxonomy (descriptions are domain-neutral as of memory-model v2)
 # ──────────────────────────────────────────────
 
 MEMORY_CATEGORIES: dict[str, str] = {
-    "preference": "User preferences: language, editor, code style, communication style",
-    "personal_fact": "Personal details: name, timezone, role, team",
-    "technical_skill": "Known technologies, proficiency levels",
-    "domain_knowledge": "Industry/domain-specific knowledge",
-    "tech_stack": "Project technology choices",
-    "convention": "Coding conventions, naming, file structure",
-    "architecture": "Design decisions, module boundaries, API patterns",
-    "dependency": "Packages, versions, compatibility notes",
-    "decision": "Decisions made with rationale",
-    "interaction": "Notable past interactions/events",
-    "workflow": "Git flow, CI/CD, deployment, review process",
-    "procedure": "Step-by-step how-to patterns",
-    "task_context": "Current task, recent changes, blockers",
+    "preference": "Personal preferences: how the user likes to work, communicate, and consume information",
+    "personal_fact": "Personal details about the user: name, timezone, role, team, working hours",
+    "technical_skill": "Skills and proficiencies the user has, technical or otherwise",
+    "domain_knowledge": "Subject-matter knowledge the user has accumulated (industry, market, scientific, organizational)",
+    "tech_stack": "Tools, systems, or platforms used in this project",
+    "convention": "Norms and conventions adopted by this project (code style, communication, naming, process)",
+    "architecture": "Structural decisions about this project (system design, org structure, information architecture)",
+    "dependency": "External dependencies of this project (libraries, vendors, blocking teams, pinned versions)",
+    "decision": "Decisions made — with the why, not just the what",
+    "interaction": "Notable events: meetings, conversations, calls, demos",
+    "workflow": "Recurring multi-step processes (git flow, deployment, review, weekly rituals)",
+    "procedure": "Step-by-step how-tos for repeatable tasks",
+    "task_context": "Active work-in-progress: current goals, recent state, blockers — short-lived",
 }
 
 # Categories that default to global scope
@@ -98,6 +99,31 @@ CATEGORY_VAULT_PATHS: dict[str, str] = {
 
 
 # ──────────────────────────────────────────────
+# Memory model v2: controlled vocabularies
+# ──────────────────────────────────────────────
+
+DOMAIN_VOCAB: set[str] = {
+    "coding", "research", "meeting", "writing", "ops", "personal", "general",
+}
+
+OBSERVATION_TYPE_VOCAB: set[str] = {
+    "bugfix", "feature", "refactor", "decision", "discovery",
+    "gotcha", "pattern", "trade_off", "research_note",
+    "meeting_outcome", "task_plan", "fact",
+}
+
+CONCEPT_VOCAB: set[str] = {
+    "how-it-works", "why-it-exists", "what-changed",
+    "problem-solution", "gotcha", "pattern", "trade-off",
+    "open-question", "next-step", "blocker",
+}
+
+SOURCE_TYPE_VOCAB: set[str] = {
+    "conversation", "tool_extraction", "explicit", "imported", "compiler",
+}
+
+
+# ──────────────────────────────────────────────
 # Request Models
 # ──────────────────────────────────────────────
 
@@ -116,10 +142,23 @@ class StoreMemoryRequest(BaseModel):
     project_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
     agent_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
     run_id: str | None = Field(default=None, max_length=100)
+    domain: str | None = Field(default=None, description="High-level life-context domain (memory-model v2)")
+
+    @field_validator("domain")
+    @classmethod
+    def _validate_domain(cls, v: str | None) -> str | None:
+        if v is not None and v not in DOMAIN_VOCAB:
+            raise ValueError(f"Invalid domain '{v}'. Must be one of: {sorted(DOMAIN_VOCAB)}")
+        return v
 
 
 class RawMemoryRequest(BaseModel):
-    """Store a single pre-categorized fact (no LLM extraction)."""
+    """Store a single pre-categorized fact (no LLM extraction).
+
+    Memory-model v2 fields (domain, observation_type, concepts, source_type,
+    related_memory_ids, confidence, expires_at) are all optional and additive —
+    omitting them produces the same behavior as memory-model v1.
+    """
     content: str = Field(
         description="The memory content to store",
         min_length=1,
@@ -133,6 +172,57 @@ class RawMemoryRequest(BaseModel):
     agent_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
     run_id: str | None = Field(default=None, max_length=100)
 
+    # Memory-model v2 (all optional)
+    domain: str | None = Field(default=None, description="High-level life-context domain")
+    observation_type: str | None = Field(default=None, description="Shape of observation, orthogonal to category")
+    concepts: list[str] | None = Field(default=None, max_length=5, description="Cross-cutting controlled-vocab tags")
+    source_type: str | None = Field(default=None, description="Provenance of this memory")
+    related_memory_ids: list[str] | None = Field(default=None, max_length=10, description="UUIDs of related memories")
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0, description="Extractor's self-rated confidence")
+    expires_at: datetime | None = Field(default=None, description="Optional expiry for short-lived memories")
+
+    @field_validator("domain")
+    @classmethod
+    def _validate_domain(cls, v: str | None) -> str | None:
+        if v is not None and v not in DOMAIN_VOCAB:
+            raise ValueError(f"Invalid domain '{v}'. Must be one of: {sorted(DOMAIN_VOCAB)}")
+        return v
+
+    @field_validator("observation_type")
+    @classmethod
+    def _validate_observation_type(cls, v: str | None) -> str | None:
+        if v is not None and v not in OBSERVATION_TYPE_VOCAB:
+            raise ValueError(
+                f"Invalid observation_type '{v}'. Must be one of: {sorted(OBSERVATION_TYPE_VOCAB)}"
+            )
+        return v
+
+    @field_validator("concepts")
+    @classmethod
+    def _validate_concepts(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return v
+        unknown = [c for c in v if c not in CONCEPT_VOCAB]
+        if unknown:
+            raise ValueError(
+                f"Unknown concepts: {unknown}. Must be from: {sorted(CONCEPT_VOCAB)}"
+            )
+        return v
+
+    @field_validator("source_type")
+    @classmethod
+    def _validate_source_type(cls, v: str | None) -> str | None:
+        if v is not None and v not in SOURCE_TYPE_VOCAB:
+            raise ValueError(
+                f"Invalid source_type '{v}'. Must be one of: {sorted(SOURCE_TYPE_VOCAB)}"
+            )
+        return v
+
+
+class RawMemoryBatchRequest(BaseModel):
+    """Store multiple pre-categorized facts in one request (memory-model v2)."""
+    memories: list[RawMemoryRequest] = Field(min_length=1, max_length=50)
+
 
 class SearchMemoryRequest(BaseModel):
     """Semantic search across memories."""
@@ -142,6 +232,27 @@ class SearchMemoryRequest(BaseModel):
     categories: list[str] | None = Field(default=None, max_length=13)
     scope: str | None = None
     limit: int = Field(default=10, ge=1, le=100)
+
+    # Memory-model v2 filters (all optional)
+    domain: str | None = Field(default=None, description="Filter by domain")
+    observation_type: str | None = Field(default=None, description="Filter by observation_type")
+    concepts: list[str] | None = Field(default=None, max_length=5, description="Filter by concept tags (any-match)")
+
+    @field_validator("domain")
+    @classmethod
+    def _validate_domain(cls, v: str | None) -> str | None:
+        if v is not None and v not in DOMAIN_VOCAB:
+            raise ValueError(f"Invalid domain '{v}'. Must be one of: {sorted(DOMAIN_VOCAB)}")
+        return v
+
+    @field_validator("observation_type")
+    @classmethod
+    def _validate_observation_type(cls, v: str | None) -> str | None:
+        if v is not None and v not in OBSERVATION_TYPE_VOCAB:
+            raise ValueError(
+                f"Invalid observation_type '{v}'. Must be one of: {sorted(OBSERVATION_TYPE_VOCAB)}"
+            )
+        return v
 
 
 class GraphSearchRequest(BaseModel):
@@ -181,7 +292,10 @@ class BulkDeleteRequest(BaseModel):
 
 
 class MemoryResponse(BaseModel):
-    """Single memory in response."""
+    """Single memory in response.
+
+    Memory-model v2 fields render as nulls for legacy memories that didn't store them.
+    """
     id: str
     memory: str
     category: str | None = None
@@ -192,6 +306,15 @@ class MemoryResponse(BaseModel):
     created_at: str | None = None
     updated_at: str | None = None
     source: str | None = None
+
+    # Memory-model v2 (all optional, render as null for legacy memories)
+    domain: str | None = None
+    observation_type: str | None = None
+    concepts: list[str] | None = None
+    source_type: str | None = None
+    related_memory_ids: list[str] | None = None
+    confidence: float | None = None
+    expires_at: str | None = None
 
 
 class StoreMemoryResponse(BaseModel):

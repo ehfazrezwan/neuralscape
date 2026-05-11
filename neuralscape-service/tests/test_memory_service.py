@@ -986,3 +986,834 @@ class TestMemToResponse:
 
         assert resp.category == "preference"
         assert resp.scope == "global"
+
+
+# ──────────────────────────────────────────────
+# Memory model v2: store_raw v2 fields
+# ──────────────────────────────────────────────
+
+
+class TestStoreRawV2:
+    """Memory-model v2 — store_raw accepts and persists the new optional fields."""
+
+    def test_v2_fields_persisted_to_metadata(self, service):
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        # _find_by_content_hash uses client.scroll; mock empty result to avoid dedup hit
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.scroll.return_value = ([], None)
+
+        from datetime import datetime, timezone
+
+        result = service.store_raw(
+            content="Adopted feature flags via GrowthBook for the checkout flow",
+            user_id="ehfaz",
+            category="decision",
+            domain="coding",
+            observation_type="decision",
+            concepts=["why-it-exists", "trade-off"],
+            source_type="tool_extraction",
+            related_memory_ids=["mem-1", "mem-2"],
+            confidence=0.85,
+            expires_at=datetime(2026, 12, 1, tzinfo=timezone.utc),
+        )
+
+        assert len(result) == 1
+        resp = result[0]
+        assert resp.domain == "coding"
+        assert resp.observation_type == "decision"
+        assert resp.concepts == ["why-it-exists", "trade-off"]
+        assert resp.source_type == "tool_extraction"
+        assert resp.related_memory_ids == ["mem-1", "mem-2"]
+        assert resp.confidence == 0.85
+        assert resp.expires_at is not None
+
+        # Payload metadata should reflect every v2 field
+        insert_kwargs = service._memory.vector_store.insert.call_args[1]
+        metadata = insert_kwargs["payloads"][0]["metadata"]
+        assert metadata["domain"] == "coding"
+        assert metadata["observation_type"] == "decision"
+        assert metadata["concepts"] == ["why-it-exists", "trade-off"]
+        assert metadata["source_type"] == "tool_extraction"
+        assert metadata["related_memory_ids"] == ["mem-1", "mem-2"]
+        assert metadata["confidence"] == 0.85
+        assert "expires_at" in metadata
+
+    def test_v2_fields_optional(self, service):
+        """Calling store_raw with no v2 fields produces a v1-compatible memory."""
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.scroll.return_value = ([], None)
+
+        result = service.store_raw(
+            content="Prefers tabs over spaces",
+            user_id="ehfaz",
+            category="preference",
+        )
+        assert len(result) == 1
+        # All v2 fields stay null when not supplied
+        assert result[0].domain is None
+        assert result[0].observation_type is None
+        assert result[0].concepts is None
+        assert result[0].confidence is None
+
+        # Metadata should not contain any v2 keys when fields weren't supplied
+        insert_kwargs = service._memory.vector_store.insert.call_args[1]
+        metadata = insert_kwargs["payloads"][0]["metadata"]
+        for v2_key in ("domain", "observation_type", "concepts", "source_type",
+                       "related_memory_ids", "confidence", "expires_at"):
+            assert v2_key not in metadata, f"Unexpected v2 key '{v2_key}' in v1-style payload"
+
+
+# ──────────────────────────────────────────────
+# Memory model v2: content-hash dedup
+# ──────────────────────────────────────────────
+
+
+class TestContentHashDedup:
+    """Memory-model v2 — store_raw is idempotent via content-hash dedup."""
+
+    def test_dedup_hit_returns_existing(self, service):
+        """When the same (user_id, scope, hash) is found, return existing without insert."""
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        mock_client = MagicMock()
+        service._memory.vector_store.client = mock_client
+
+        # Configure scroll to return one matching point
+        existing_point = MagicMock()
+        existing_point.id = "existing-id"
+        existing_point.payload = {
+            "data": "Prefers tabs over spaces",
+            "created_at": "2026-01-01T00:00:00Z",
+            "metadata": {
+                "scope": "global",
+                "category": "preference",
+                "project_id": None,
+                "domain": "coding",
+            },
+        }
+        mock_client.scroll.return_value = ([existing_point], None)
+
+        result = service.store_raw(
+            content="Prefers tabs over spaces",
+            user_id="ehfaz",
+            category="preference",
+        )
+
+        # Should NOT have called insert (dedup hit)
+        service._memory.vector_store.insert.assert_not_called()
+        assert len(result) == 1
+        assert result[0].id == "existing-id"
+        assert result[0].domain == "coding"
+
+    def test_dedup_miss_inserts(self, service):
+        """When no matching hash found, proceed with normal insert."""
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        mock_client = MagicMock()
+        service._memory.vector_store.client = mock_client
+        mock_client.scroll.return_value = ([], None)
+
+        result = service.store_raw(
+            content="A novel fact never seen before",
+            user_id="ehfaz",
+            category="personal_fact",
+        )
+
+        # Should have called insert (dedup miss)
+        service._memory.vector_store.insert.assert_called_once()
+        assert len(result) == 1
+        assert result[0].id != "existing-id"
+
+    def test_dedup_lookup_failure_does_not_block_insert(self, service):
+        """Defensive: if the dedup lookup raises, store_raw should still insert."""
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        mock_client = MagicMock()
+        service._memory.vector_store.client = mock_client
+        mock_client.scroll.side_effect = Exception("Qdrant transient error")
+
+        result = service.store_raw(
+            content="A fact",
+            user_id="ehfaz",
+            category="personal_fact",
+        )
+
+        # Insert proceeds even when dedup query fails — safer to risk a dup.
+        service._memory.vector_store.insert.assert_called_once()
+        assert len(result) == 1
+
+
+# ──────────────────────────────────────────────
+# Memory model v2: store_raw_batch
+# ──────────────────────────────────────────────
+
+
+class TestStoreRawBatch:
+    """Memory-model v2 — batch storage of pre-categorized facts."""
+
+    def test_stores_each_item(self, service):
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.scroll.return_value = ([], None)
+
+        items = [
+            {"content": "Fact one", "user_id": "ehfaz", "category": "personal_fact",
+             "domain": "personal"},
+            {"content": "Fact two", "user_id": "ehfaz", "category": "preference",
+             "concepts": ["how-it-works"]},
+        ]
+        results = service.store_raw_batch(items)
+
+        assert len(results) == 2
+        assert results[0].domain == "personal"
+        assert results[1].concepts == ["how-it-works"]
+        # Two inserts, one per item
+        assert service._memory.vector_store.insert.call_count == 2
+
+    def test_continues_on_per_item_error(self, service):
+        """A bad item must not block the rest of the batch."""
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.scroll.return_value = ([], None)
+
+        items = [
+            {"content": "Good", "user_id": "ehfaz", "category": "preference"},
+            {"content": "Bad", "user_id": "ehfaz", "category": "INVALID-CATEGORY"},
+            {"content": "Also good", "user_id": "ehfaz", "category": "personal_fact"},
+        ]
+        results = service.store_raw_batch(items)
+
+        # Two stored, one skipped due to bad category
+        assert len(results) == 2
+
+    def test_handles_iso_string_expires_at(self, service):
+        """expires_at can arrive as ISO string after JSON enqueue — should round-trip."""
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.scroll.return_value = ([], None)
+
+        items = [
+            {"content": "Time-bound fact", "user_id": "ehfaz", "category": "task_context",
+             "expires_at": "2026-12-01T00:00:00+00:00"},
+        ]
+        results = service.store_raw_batch(items)
+
+        assert len(results) == 1
+        assert results[0].expires_at is not None
+
+
+# ──────────────────────────────────────────────
+# Memory model v2: search filters
+# ──────────────────────────────────────────────
+
+
+class TestSearchV2Filters:
+    """Memory-model v2 — search honors domain/observation_type/concepts filters."""
+
+    def test_domain_filter_applied(self, service):
+        service._memory.search.return_value = {"results": []}
+        service.search(
+            query="anything",
+            user_id="ehfaz",
+            scope="global",  # avoid the dual-scope merge path
+            domain="research",
+        )
+        call_kwargs = service._memory.search.call_args[1]
+        assert call_kwargs["filters"]["metadata.domain"] == "research"
+
+    def test_observation_type_filter_applied(self, service):
+        service._memory.search.return_value = {"results": []}
+        service.search(
+            query="anything",
+            user_id="ehfaz",
+            scope="global",
+            observation_type="bugfix",
+        )
+        call_kwargs = service._memory.search.call_args[1]
+        assert call_kwargs["filters"]["metadata.observation_type"] == "bugfix"
+
+    def test_concepts_filter_applied_as_in(self, service):
+        service._memory.search.return_value = {"results": []}
+        service.search(
+            query="anything",
+            user_id="ehfaz",
+            scope="global",
+            concepts=["gotcha", "trade-off"],
+        )
+        call_kwargs = service._memory.search.call_args[1]
+        assert call_kwargs["filters"]["metadata.concepts"] == {"in": ["gotcha", "trade-off"]}
+
+
+# ──────────────────────────────────────────────
+# Memory model v2: _mem_to_response surfaces new fields
+# ──────────────────────────────────────────────
+
+
+class TestMemToResponseV2:
+    def test_surfaces_v2_fields(self, service):
+        mem = {
+            "id": "v2-001",
+            "memory": "A v2 memory",
+            "metadata": {
+                "metadata": {
+                    "category": "decision",
+                    "scope": "project",
+                    "project_id": "neuralscape",
+                    "domain": "coding",
+                    "observation_type": "decision",
+                    "concepts": ["why-it-exists", "trade-off"],
+                    "source_type": "tool_extraction",
+                    "related_memory_ids": ["mem-1"],
+                    "confidence": 0.9,
+                    "expires_at": "2026-12-01T00:00:00+00:00",
+                }
+            },
+        }
+        resp = service._mem_to_response(mem)
+        assert resp.domain == "coding"
+        assert resp.observation_type == "decision"
+        assert resp.concepts == ["why-it-exists", "trade-off"]
+        assert resp.source_type == "tool_extraction"
+        assert resp.related_memory_ids == ["mem-1"]
+        assert resp.confidence == 0.9
+        assert resp.expires_at == "2026-12-01T00:00:00+00:00"
+
+    def test_legacy_memory_has_null_v2_fields(self, service):
+        """A v1-era memory without v2 metadata renders v2 fields as None."""
+        mem = {
+            "id": "v1-001",
+            "memory": "Legacy memory",
+            "metadata": {"metadata": {"category": "preference", "scope": "global"}},
+        }
+        resp = service._mem_to_response(mem)
+        assert resp.category == "preference"
+        assert resp.domain is None
+        assert resp.observation_type is None
+        assert resp.concepts is None
+        assert resp.confidence is None
+
+
+# ──────────────────────────────────────────────
+# Memory model v2: schema validation
+# ──────────────────────────────────────────────
+
+
+class TestSchemaV2Validators:
+    def test_invalid_domain_rejected(self):
+        from pydantic import ValidationError
+        from schemas import RawMemoryRequest
+
+        with pytest.raises(ValidationError):
+            RawMemoryRequest(
+                content="x", user_id="u", category="preference", domain="not-a-domain"
+            )
+
+    def test_invalid_observation_type_rejected(self):
+        from pydantic import ValidationError
+        from schemas import RawMemoryRequest
+
+        with pytest.raises(ValidationError):
+            RawMemoryRequest(
+                content="x", user_id="u", category="preference", observation_type="bogus"
+            )
+
+    def test_unknown_concept_rejected(self):
+        from pydantic import ValidationError
+        from schemas import RawMemoryRequest
+
+        with pytest.raises(ValidationError):
+            RawMemoryRequest(
+                content="x", user_id="u", category="preference",
+                concepts=["how-it-works", "definitely-not-a-concept"],
+            )
+
+    def test_concepts_capped_at_5(self):
+        from pydantic import ValidationError
+        from schemas import RawMemoryRequest
+
+        with pytest.raises(ValidationError):
+            RawMemoryRequest(
+                content="x", user_id="u", category="preference",
+                concepts=["how-it-works", "why-it-exists", "what-changed",
+                          "problem-solution", "gotcha", "pattern"],  # 6 > 5
+            )
+
+    def test_confidence_range_enforced(self):
+        from pydantic import ValidationError
+        from schemas import RawMemoryRequest
+
+        with pytest.raises(ValidationError):
+            RawMemoryRequest(
+                content="x", user_id="u", category="preference", confidence=1.5
+            )
+
+    def test_valid_v2_memory_passes(self):
+        from datetime import datetime, timezone
+        from schemas import RawMemoryRequest
+
+        req = RawMemoryRequest(
+            content="x",
+            user_id="u",
+            category="decision",
+            scope="project",
+            project_id="proj1",
+            domain="coding",
+            observation_type="decision",
+            concepts=["why-it-exists", "trade-off"],
+            source_type="tool_extraction",
+            confidence=0.7,
+            expires_at=datetime(2026, 12, 1, tzinfo=timezone.utc),
+        )
+        assert req.domain == "coding"
+        assert req.observation_type == "decision"
+        assert req.confidence == 0.7
+
+    def test_batch_request_caps_at_50(self):
+        from pydantic import ValidationError
+        from schemas import RawMemoryBatchRequest, RawMemoryRequest
+
+        small = RawMemoryRequest(content="x", user_id="u", category="preference")
+        with pytest.raises(ValidationError):
+            RawMemoryBatchRequest(memories=[small] * 51)
+
+    def test_batch_request_min_one(self):
+        from pydantic import ValidationError
+        from schemas import RawMemoryBatchRequest
+
+        with pytest.raises(ValidationError):
+            RawMemoryBatchRequest(memories=[])
+
+    def test_raw_invalid_source_type(self):
+        from pydantic import ValidationError
+        from schemas import RawMemoryRequest
+
+        with pytest.raises(ValidationError):
+            RawMemoryRequest(
+                content="x", user_id="u", category="preference", source_type="bogus"
+            )
+
+    def test_raw_concepts_none_passes(self):
+        """concepts=None must short-circuit validation, not iterate."""
+        from schemas import RawMemoryRequest
+
+        req = RawMemoryRequest(content="x", user_id="u", category="preference", concepts=None)
+        assert req.concepts is None
+
+    def test_search_invalid_domain(self):
+        from pydantic import ValidationError
+        from schemas import SearchMemoryRequest
+
+        with pytest.raises(ValidationError):
+            SearchMemoryRequest(query="hi", user_id="u", domain="not-a-domain")
+
+    def test_search_invalid_observation_type(self):
+        from pydantic import ValidationError
+        from schemas import SearchMemoryRequest
+
+        with pytest.raises(ValidationError):
+            SearchMemoryRequest(query="hi", user_id="u", observation_type="bogus")
+
+    def test_store_request_invalid_domain(self):
+        from pydantic import ValidationError
+        from schemas import StoreMemoryRequest
+
+        with pytest.raises(ValidationError):
+            StoreMemoryRequest(
+                messages=[{"role": "user", "content": "x"}],
+                user_id="u",
+                domain="not-a-domain",
+            )
+
+    def test_store_request_valid_domain(self):
+        from schemas import StoreMemoryRequest
+
+        req = StoreMemoryRequest(
+            messages=[{"role": "user", "content": "x"}],
+            user_id="u",
+            domain="research",
+        )
+        assert req.domain == "research"
+
+
+# ──────────────────────────────────────────────
+# Memory model v2: _find_by_content_hash project-scope branch
+# ──────────────────────────────────────────────
+
+
+class TestFindByContentHashProjectScope:
+    """Memory-model v2 — _find_by_content_hash adds project_id filter when scope='project'."""
+
+    def test_project_scope_appends_project_filter(self, service):
+        """When scope='project' AND project_id supplied, the Qdrant filter must include project_id."""
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+        mock_client = MagicMock()
+        service._memory.vector_store.client = mock_client
+        mock_client.scroll.return_value = ([], None)
+
+        service._find_by_content_hash(
+            user_id="ehfaz",
+            content_hash="abc123",
+            scope="project",
+            project_id="neuralscape",
+        )
+
+        mock_client.scroll.assert_called_once()
+        call_kwargs = mock_client.scroll.call_args[1]
+        scroll_filter = call_kwargs["scroll_filter"]
+        # 4 conditions when project scope: user_id, hash, scope, project_id
+        assert len(scroll_filter.must) == 4
+
+    def test_project_scope_without_project_id_skips_filter(self, service):
+        """scope='project' but project_id=None: no project_id filter appended."""
+        mock_client = MagicMock()
+        service._memory.vector_store.client = mock_client
+        mock_client.scroll.return_value = ([], None)
+
+        service._find_by_content_hash(
+            user_id="ehfaz",
+            content_hash="abc123",
+            scope="project",
+            project_id=None,
+        )
+
+        scroll_filter = mock_client.scroll.call_args[1]["scroll_filter"]
+        # 3 conditions when no project_id: user_id, hash, scope
+        assert len(scroll_filter.must) == 3
+
+
+# ──────────────────────────────────────────────
+# Memory model v2: expire_old_memories
+# ──────────────────────────────────────────────
+
+
+class TestExpireOldMemories:
+    """Memory-model v2 — nightly purge of memories with expired expires_at."""
+
+    def _make_point(self, pt_id, expires_at, user_id="ehfaz"):
+        pt = MagicMock()
+        pt.id = pt_id
+        pt.payload = {
+            "data": f"memory {pt_id}",
+            "user_id": user_id,
+            "metadata": {
+                "scope": "global",
+                "category": "task_context",
+                "expires_at": expires_at,
+            },
+        }
+        return pt
+
+    def test_deletes_expired_skips_future_and_null(self, service):
+        from datetime import datetime, timedelta, timezone
+
+        past = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        future = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+
+        expired = self._make_point("expired-1", past, user_id="alice")
+        future_pt = self._make_point("future-1", future, user_id="alice")
+        no_expiry = MagicMock()
+        no_expiry.id = "no-expiry-1"
+        no_expiry.payload = {
+            "data": "no expiry", "user_id": "alice",
+            "metadata": {"scope": "global"},  # no expires_at
+        }
+
+        mock_client = MagicMock()
+        service._memory.vector_store.client = mock_client
+        # Single page with all three; second call returns empty to terminate
+        mock_client.scroll.side_effect = [
+            ([expired, future_pt, no_expiry], None),  # next_offset=None terminates
+        ]
+        # Mock the delete + graph cleanup helper
+        service._delete_qdrant_memory_with_graph_cleanup = MagicMock()
+
+        result = service.expire_old_memories(batch_size=100)
+
+        assert result["deleted_count"] == 1
+        assert result["per_user"] == {"alice": 1}
+        # Only the expired one was deleted
+        service._delete_qdrant_memory_with_graph_cleanup.assert_called_once()
+        deleted_id = service._delete_qdrant_memory_with_graph_cleanup.call_args[0][0]
+        assert deleted_id == "expired-1"
+
+    def test_handles_per_point_delete_failure(self, service):
+        """A failed delete on one point doesn't abort the run."""
+        from datetime import datetime, timedelta, timezone
+
+        past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        p1 = self._make_point("p1", past, user_id="bob")
+        p2 = self._make_point("p2", past, user_id="bob")
+
+        mock_client = MagicMock()
+        service._memory.vector_store.client = mock_client
+        mock_client.scroll.side_effect = [([p1, p2], None)]
+
+        # First delete fails, second succeeds
+        service._delete_qdrant_memory_with_graph_cleanup = MagicMock(
+            side_effect=[Exception("Qdrant transient"), None]
+        )
+
+        result = service.expire_old_memories(batch_size=100)
+        assert result["deleted_count"] == 1
+        assert result["per_user"] == {"bob": 1}
+
+    def test_paginates_through_multiple_pages(self, service):
+        """When Qdrant returns next_offset, the cron continues to the next page."""
+        from datetime import datetime, timedelta, timezone
+
+        past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        p1 = self._make_point("p1", past, user_id="alice")
+        p2 = self._make_point("p2", past, user_id="bob")
+
+        mock_client = MagicMock()
+        service._memory.vector_store.client = mock_client
+        # First page has p1 with next_offset='cursor', second page has p2 with None
+        mock_client.scroll.side_effect = [
+            ([p1], "cursor"),
+            ([p2], None),
+        ]
+        service._delete_qdrant_memory_with_graph_cleanup = MagicMock()
+
+        result = service.expire_old_memories(batch_size=1)
+        assert result["deleted_count"] == 2
+        assert result["per_user"] == {"alice": 1, "bob": 1}
+        # Two scroll calls = paginated
+        assert mock_client.scroll.call_count == 2
+
+    def test_empty_collection(self, service):
+        """No points returned: terminates cleanly with zero deletions."""
+        mock_client = MagicMock()
+        service._memory.vector_store.client = mock_client
+        mock_client.scroll.return_value = ([], None)
+
+        result = service.expire_old_memories()
+        assert result["deleted_count"] == 0
+        assert result["per_user"] == {}
+
+
+# ──────────────────────────────────────────────
+# Memory model v2: graph result enrichment + filtering
+# ──────────────────────────────────────────────
+
+
+class TestGraphEnrichment:
+    """Memory-model v2 — _enrich_graph_with_v2 and _enrich_and_filter_graph.
+
+    Graphiti edges don't carry v2 fields natively; we recover them by top-1
+    semantic search against Qdrant, gated by a similarity threshold so we
+    never propagate metadata from an unrelated nearest neighbor.
+    """
+
+    def _hit(self, score: float, metadata: dict, data: str = "x"):
+        """Build a fake qdrant ScoredPoint-like object."""
+        h = MagicMock()
+        h.score = score
+        h.payload = {"data": data, "metadata": metadata}
+        return h
+
+    def test_high_similarity_match_copies_v2_fields(self, service):
+        from schemas import MemoryResponse
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.search.return_value = [
+            self._hit(0.95, {
+                "category": "decision", "scope": "global",
+                "domain": "meeting", "observation_type": "meeting_outcome",
+                "concepts": ["blocker"], "source_type": "tool_extraction",
+                "confidence": 0.8,
+            })
+        ]
+        graph_responses = [MemoryResponse(id="g1", memory="OKR was shifted", source="graph")]
+        result = service._enrich_graph_with_v2(graph_responses, user_id="u", project_id=None)
+        assert result[0].domain == "meeting"
+        assert result[0].observation_type == "meeting_outcome"
+        assert result[0].concepts == ["blocker"]
+        assert result[0].source_type == "tool_extraction"
+        assert result[0].confidence == 0.8
+        assert result[0].category == "decision"
+        assert result[0].scope == "global"
+
+    def test_below_threshold_does_not_enrich(self, service):
+        from schemas import MemoryResponse
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        # Score 0.5 is below default 0.7 threshold
+        service._memory.vector_store.search.return_value = [
+            self._hit(0.5, {"domain": "coding", "observation_type": "decision"})
+        ]
+        graph_responses = [MemoryResponse(id="g1", memory="unrelated graph fact", source="graph")]
+        result = service._enrich_graph_with_v2(graph_responses, user_id="u", project_id=None)
+        # Below threshold → fields stay None
+        assert result[0].domain is None
+        assert result[0].observation_type is None
+
+    def test_no_hits_skips_enrichment(self, service):
+        from schemas import MemoryResponse
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.search.return_value = []
+        graph_responses = [MemoryResponse(id="g1", memory="lonely graph fact", source="graph")]
+        result = service._enrich_graph_with_v2(graph_responses, user_id="u", project_id=None)
+        assert result[0].domain is None
+
+    def test_does_not_overwrite_existing_v2_fields(self, service):
+        from schemas import MemoryResponse
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.search.return_value = [
+            self._hit(0.95, {"domain": "research"})
+        ]
+        graph_responses = [
+            MemoryResponse(id="g1", memory="x", source="graph", domain="coding"),
+        ]
+        result = service._enrich_graph_with_v2(graph_responses, user_id="u", project_id=None)
+        # Existing domain="coding" preserved, not overwritten by enrichment "research"
+        assert result[0].domain == "coding"
+
+    def test_handles_double_wrapped_metadata(self, service):
+        """mem0 sometimes nests metadata under metadata.metadata — unwrap it."""
+        from schemas import MemoryResponse
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.search.return_value = [
+            self._hit(0.95, {"metadata": {"domain": "ops", "observation_type": "feature"}})
+        ]
+        graph_responses = [MemoryResponse(id="g1", memory="x", source="graph")]
+        result = service._enrich_graph_with_v2(graph_responses, user_id="u", project_id=None)
+        assert result[0].domain == "ops"
+        assert result[0].observation_type == "feature"
+
+    def test_skips_empty_memory_text(self, service):
+        from schemas import MemoryResponse
+        service._memory.vector_store.search.return_value = []
+        graph_responses = [MemoryResponse(id="g1", memory="", source="graph")]
+        result = service._enrich_graph_with_v2(graph_responses, user_id="u", project_id=None)
+        # Empty memory: never hits the search, fields stay None
+        assert result[0].domain is None
+        service._memory.embedding_model.embed.assert_not_called()
+
+    def test_swallows_per_row_errors(self, service):
+        """A failure on one row doesn't abort the whole enrichment pass."""
+        from schemas import MemoryResponse
+        service._memory.embedding_model.embed.side_effect = Exception("embed fail")
+        graph_responses = [MemoryResponse(id="g1", memory="x", source="graph")]
+        # Should not raise
+        result = service._enrich_graph_with_v2(graph_responses, user_id="u", project_id=None)
+        assert result[0].domain is None
+
+    def test_dict_hit_format_supported(self, service):
+        """Some Qdrant client versions return dicts instead of ScoredPoint."""
+        from schemas import MemoryResponse
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.search.return_value = [
+            {"score": 0.9, "payload": {"metadata": {"domain": "writing"}}}
+        ]
+        graph_responses = [MemoryResponse(id="g1", memory="x", source="graph")]
+        result = service._enrich_graph_with_v2(graph_responses, user_id="u", project_id=None)
+        assert result[0].domain == "writing"
+
+
+class TestGraphFilterByV2:
+    """Memory-model v2 — _enrich_and_filter_graph drops rows that don't match the filter."""
+
+    def _hit(self, score: float, metadata: dict):
+        h = MagicMock()
+        h.score = score
+        h.payload = {"data": "x", "metadata": metadata}
+        return h
+
+    def test_domain_filter_drops_non_match(self, service):
+        from schemas import MemoryResponse
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        # Two graph rows, one source has domain=coding, the other meeting
+        service._memory.vector_store.search.side_effect = [
+            [self._hit(0.9, {"domain": "coding", "observation_type": "decision"})],
+            [self._hit(0.9, {"domain": "meeting", "observation_type": "meeting_outcome"})],
+        ]
+        graph_responses = [
+            MemoryResponse(id="g1", memory="fact1", source="graph"),
+            MemoryResponse(id="g2", memory="fact2", source="graph"),
+        ]
+        result = service._enrich_and_filter_graph(
+            graph_responses, user_id="u", project_id=None,
+            domain="meeting", observation_type=None, concepts=None,
+        )
+        assert len(result) == 1
+        assert result[0].id == "g2"
+
+    def test_observation_type_filter_drops_non_match(self, service):
+        from schemas import MemoryResponse
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.search.side_effect = [
+            [self._hit(0.9, {"observation_type": "bugfix"})],
+            [self._hit(0.9, {"observation_type": "feature"})],
+        ]
+        graph_responses = [
+            MemoryResponse(id="g1", memory="fact1", source="graph"),
+            MemoryResponse(id="g2", memory="fact2", source="graph"),
+        ]
+        result = service._enrich_and_filter_graph(
+            graph_responses, user_id="u", project_id=None,
+            domain=None, observation_type="bugfix", concepts=None,
+        )
+        assert len(result) == 1
+        assert result[0].id == "g1"
+
+    def test_concepts_filter_keeps_overlap(self, service):
+        from schemas import MemoryResponse
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.search.side_effect = [
+            [self._hit(0.9, {"concepts": ["gotcha", "pattern"]})],
+            [self._hit(0.9, {"concepts": ["how-it-works"]})],
+            [self._hit(0.9, {})],  # no concepts at all
+        ]
+        graph_responses = [
+            MemoryResponse(id="g1", memory="a", source="graph"),
+            MemoryResponse(id="g2", memory="b", source="graph"),
+            MemoryResponse(id="g3", memory="c", source="graph"),
+        ]
+        result = service._enrich_and_filter_graph(
+            graph_responses, user_id="u", project_id=None,
+            domain=None, observation_type=None, concepts=["gotcha"],
+        )
+        # Only g1 has overlap with concepts=[gotcha]
+        assert [r.id for r in result] == ["g1"]
+
+    def test_below_threshold_falls_off_when_filtering(self, service):
+        """Rows whose source match is below threshold get None'd, then filter drops them."""
+        from schemas import MemoryResponse
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.search.side_effect = [
+            [self._hit(0.95, {"domain": "coding"})],  # passes threshold
+            [self._hit(0.4, {"domain": "coding"})],   # below threshold → not enriched
+        ]
+        graph_responses = [
+            MemoryResponse(id="g1", memory="related", source="graph"),
+            MemoryResponse(id="g2", memory="unrelated", source="graph"),
+        ]
+        result = service._enrich_and_filter_graph(
+            graph_responses, user_id="u", project_id=None,
+            domain="coding", observation_type=None, concepts=None,
+        )
+        assert [r.id for r in result] == ["g1"]
+
+    def test_combined_filters_all_must_match(self, service):
+        from schemas import MemoryResponse
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.search.side_effect = [
+            [self._hit(0.9, {"domain": "coding", "observation_type": "decision",
+                             "concepts": ["why-it-exists"]})],
+            [self._hit(0.9, {"domain": "coding", "observation_type": "bugfix",
+                             "concepts": ["why-it-exists"]})],
+        ]
+        graph_responses = [
+            MemoryResponse(id="g1", memory="a", source="graph"),
+            MemoryResponse(id="g2", memory="b", source="graph"),
+        ]
+        # Domain matches both; obs_type only matches g1
+        result = service._enrich_and_filter_graph(
+            graph_responses, user_id="u", project_id=None,
+            domain="coding", observation_type="decision", concepts=["why-it-exists"],
+        )
+        assert [r.id for r in result] == ["g1"]
+
+    def test_empty_graph_responses_returns_empty(self, service):
+        result = service._enrich_and_filter_graph(
+            [], user_id="u", project_id=None,
+            domain="coding", observation_type=None, concepts=None,
+        )
+        assert result == []

@@ -1,8 +1,8 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "neuralscape",
-  "version": "2.0.2",
-  "description": "Persistent agentic memory for Claude. Auto-captures conversations, recalls relevant context on every session start, and exposes 7 MCP tools (recall, remember, search, project context, graph search, list, delete).",
+  "version": "2.1.0",
+  "description": "Persistent agentic memory for Claude. Auto-captures conversations + per-tool observations, recalls relevant context on every session start, and exposes 7 MCP tools (recall, remember, search, project context, graph search, list, delete).",
   "author": {
     "name": "Ehfaz Rezwan",
     "email": "ehfaz.rezwan@gmail.com"
@@ -43,6 +43,18 @@
       "title": "Your user ID",
       "description": "Stable identifier used to scope memories to you. Pick something short and unique (e.g. your username).",
       "required": true
+    },
+    "COMPILE_THRESHOLD": {
+      "type": "string",
+      "title": "Compile threshold (observations)",
+      "description": "Buffer size that triggers in-session compilation via UserPromptSubmit. Default: 25.",
+      "default": "25"
+    },
+    "COMPILE_AGE_MIN": {
+      "type": "string",
+      "title": "Compile age (minutes)",
+      "description": "Buffer age (oldest entry) that triggers in-session compilation. Default: 30.",
+      "default": "30"
     }
   }
 }
