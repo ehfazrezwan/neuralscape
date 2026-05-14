@@ -88,11 +88,30 @@ def main(argv: list[str] | None = None) -> int:
     client = QdrantClient(url=settings.qdrant_url)
     collection = settings.qdrant_collection
 
+    # Historical mem0 writes used a double-wrapped payload shape
+    # (`metadata.metadata.category` instead of `metadata.category`). The
+    # read-side unwrap below handles both, but the server-side scroll
+    # filter must too — otherwise `--category` / `--project-id` silently
+    # skip legacy rows. Use `should` (OR) to match either key path.
     must: list = [FieldCondition(key="user_id", match=MatchValue(value=args.owner))]
     if args.category:
-        must.append(FieldCondition(key="metadata.category", match=MatchAny(any=args.category)))
+        must.append(
+            Filter(
+                should=[
+                    FieldCondition(key="metadata.category", match=MatchAny(any=args.category)),
+                    FieldCondition(key="metadata.metadata.category", match=MatchAny(any=args.category)),
+                ]
+            )
+        )
     if args.project_id:
-        must.append(FieldCondition(key="metadata.project_id", match=MatchValue(value=args.project_id)))
+        must.append(
+            Filter(
+                should=[
+                    FieldCondition(key="metadata.project_id", match=MatchValue(value=args.project_id)),
+                    FieldCondition(key="metadata.metadata.project_id", match=MatchValue(value=args.project_id)),
+                ]
+            )
+        )
 
     scroll_filter = Filter(must=must)
     candidates: list[tuple[str, dict]] = []

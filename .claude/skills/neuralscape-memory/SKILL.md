@@ -40,7 +40,9 @@ The default does the right thing ~80% of the time. Override `visibility` only wh
 
 ## Auth (when running against a deployed service)
 
-The server reads `user_id` from a per-user HMAC token in the `Authorization: Bearer …` header, NOT from the request body. If you pass a `user_id` in the body that disagrees with the token, the server returns 400. The simplest rule: always pass the same `user_id` you've been told to use; if it disagrees with the token's encoded user_id, fail fast.
+**When a per-user HMAC bearer token is provided** in `Authorization: Bearer …`, the server reads `user_id` from the token's verified payload. If you also pass `user_id` in the request body and it disagrees with the token, the server returns 400. Always pass the same `user_id` you've been told to use.
+
+**When no bearer token is provided** (or the legacy shared-API-key path is in use), the server falls back to reading `user_id` from the request body — same as the pre-multi-user behavior. The plugin's `.mcp.json` always sends the configured `API_KEY` as a bearer token, so MCP callers almost always hit the token path; only direct REST callers without `Authorization` end up on the body-fallback path.
 
 The plugin (when installed in Claude Code) handles auth transparently — your MCP tool calls just include `user_id` and the plugin's `.mcp.json` forwards the bearer token from the user's configured `API_KEY`.
 
@@ -270,7 +272,7 @@ The service runs at `http://localhost:8199`. All v1 endpoints accept `user_id` (
 | Get single memory | `GET` | `/v1/memories/{id}` |
 | Update memory | `PUT` | `/v1/memories/{id}` |
 | Delete memory | `DELETE` | `/v1/memories/{id}` |
-| Bulk delete | `DELETE` | `/v1/memories` (body: `{user_id, scope?, category?, project_id?}`) |
+| Bulk delete | `DELETE` | `/v1/memories` (body: `{user_id, scope?, category?, project_id?, filter_null_category?, include_shared?}` — default removes private writes only; `include_shared: true` also removes the caller's shared writes) |
 | List categories | `GET` | `/v1/categories` |
 | Graph nodes | `GET` | `/v1/graph/nodes?user_id=...&project_id=...` |
 | Graph edges | `GET` | `/v1/graph/edges?user_id=...&project_id=...` |

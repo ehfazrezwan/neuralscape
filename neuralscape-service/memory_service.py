@@ -1071,22 +1071,57 @@ class MemoryService:
         # which user_id wrote them. Only memories with explicit
         # `metadata.visibility=shared` are returned (legacy memories
         # without that field stay de-facto private until migration).
+        #
+        # Dual-scope merge: when `project_id` is set and `scope` is
+        # omitted, mirror the personal-pool's project+global merge —
+        # otherwise a project-context search would miss global shared
+        # memories that should still be visible (the graph read-set
+        # already covers both via `_get_group_ids`). The downstream
+        # dedup at line ~1094 collapses any overlap.
         want_shared = include_shared and visibility != MemoryVisibility.PRIVATE.value
         if want_shared:
             try:
-                vector_responses.extend(
-                    self._search_shared_pool(
-                        m=m,
-                        query=query,
-                        project_id=project_id,
-                        categories=categories,
-                        scope=scope,
-                        domain=domain,
-                        observation_type=observation_type,
-                        concepts=concepts,
-                        limit=limit,
+                if project_id and not scope:
+                    vector_responses.extend(
+                        self._search_shared_pool(
+                            m=m,
+                            query=query,
+                            project_id=project_id,
+                            categories=categories,
+                            scope=None,
+                            domain=domain,
+                            observation_type=observation_type,
+                            concepts=concepts,
+                            limit=limit,
+                        )
                     )
-                )
+                    vector_responses.extend(
+                        self._search_shared_pool(
+                            m=m,
+                            query=query,
+                            project_id=None,
+                            categories=categories,
+                            scope="global",
+                            domain=domain,
+                            observation_type=observation_type,
+                            concepts=concepts,
+                            limit=limit,
+                        )
+                    )
+                else:
+                    vector_responses.extend(
+                        self._search_shared_pool(
+                            m=m,
+                            query=query,
+                            project_id=project_id,
+                            categories=categories,
+                            scope=scope,
+                            domain=domain,
+                            observation_type=observation_type,
+                            concepts=concepts,
+                            limit=limit,
+                        )
+                    )
             except Exception as e:
                 logger.warning(f"Shared-pool search failed (non-critical): {e}")
 

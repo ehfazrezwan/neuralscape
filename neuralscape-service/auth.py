@@ -64,17 +64,18 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
         # Try the per-user HMAC token path first (preferred). The token
         # carries the user_id we attach to request.state for downstream
-        # routes to use authoritatively.
+        # routes to use authoritatively. If verification fails (bad
+        # signature, expired, malformed) we fall through to the legacy
+        # shared-key check rather than returning 401 — that protects
+        # legacy shared keys that happen to contain a `.` character
+        # (the only signal we use to detect token shape).
         if token_secret and "." in token:
             payload = verify_user_token(token, token_secret)
-            if payload is None:
-                return JSONResponse(
-                    status_code=401,
-                    content={"detail": "Invalid or expired token"},
-                )
-            request.state.user_id = payload["user_id"]
-            request.state.auth_mode = "user_token"
-            return await call_next(request)
+            if payload is not None:
+                request.state.user_id = payload["user_id"]
+                request.state.auth_mode = "user_token"
+                return await call_next(request)
+            # else: HMAC verify failed — fall through to legacy check.
 
         # Fall back to the legacy shared API key. user_id is NOT set on
         # request.state — routes must read it from the request body
@@ -87,5 +88,5 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
         return JSONResponse(
             status_code=401,
-            content={"detail": "Invalid API key"},
+            content={"detail": "Invalid or expired token"},
         )

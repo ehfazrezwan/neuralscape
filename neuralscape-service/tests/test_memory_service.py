@@ -2288,6 +2288,90 @@ class TestSearchMultiUserIsolation:
         assert results[0].id == "shared-by-alice"
 
 
+class TestSharedPoolDualScopeMerge:
+    """Regression for the post-review-fix #1/#2 bug: when `project_id` is set
+    and `scope` is omitted, the shared-pool search must do a project+global
+    merge — same as the personal pool. Otherwise a project-scoped search
+    misses global shared memories that should still be visible.
+
+    The graph read-set (via _get_group_ids) already covers both `shared`
+    AND `shared--project--{pid}`, so the vector path must match.
+    """
+
+    def test_project_id_without_scope_runs_two_shared_queries(self, service):
+        service._memory.search.return_value = {"results": []}
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.query_points.return_value = _qresult([])
+
+        service.search(
+            query="anything",
+            user_id="alice",
+            project_id="neuralscape",
+            # scope intentionally omitted — this is the dual-scope-merge case
+        )
+
+        # Personal pool already did project + global → 2 mem0 calls
+        assert service._memory.search.call_count == 2
+        # Shared pool must mirror that → 2 direct Qdrant calls
+        assert service._memory.vector_store.client.query_points.call_count == 2
+
+    def test_project_id_with_explicit_scope_runs_single_shared_query(self, service):
+        """When the caller passes `scope` explicitly, we honor it — no merge."""
+        service._memory.search.return_value = {"results": []}
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.query_points.return_value = _qresult([])
+
+        service.search(
+            query="anything",
+            user_id="alice",
+            project_id="neuralscape",
+            scope="project",
+        )
+        assert service._memory.vector_store.client.query_points.call_count == 1
+
+    def test_global_only_search_runs_single_shared_query(self, service):
+        """No project_id → single query, scope=global passed through."""
+        service._memory.search.return_value = {"results": []}
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.query_points.return_value = _qresult([])
+
+        service.search(query="anything", user_id="alice", scope="global")
+        assert service._memory.vector_store.client.query_points.call_count == 1
+
+    def test_dual_scope_first_call_filters_by_project_second_by_global(self, service):
+        """The two shared-pool calls must filter differently — one by
+        project_id, one by scope=global — otherwise we're just running
+        the same query twice."""
+        from qdrant_client.models import FieldCondition
+        service._memory.search.return_value = {"results": []}
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.query_points.return_value = _qresult([])
+
+        service.search(query="anything", user_id="alice", project_id="np")
+
+        calls = service._memory.vector_store.client.query_points.call_args_list
+        # Collect the metadata.* filter keys from each call
+        def keys_for_call(call):
+            qf = call[1]["query_filter"]
+            return {
+                c.key for c in qf.must
+                if isinstance(c, FieldCondition)
+            }
+
+        all_keys = [keys_for_call(c) for c in calls]
+        # One call filters on project_id, the other on scope
+        assert any("metadata.project_id" in keys for keys in all_keys), (
+            "project-scoped shared query missing"
+        )
+        assert any("metadata.scope" in keys for keys in all_keys), (
+            "global-scoped shared query missing"
+        )
+
+
 class TestExpireUserGraphWrites:
     """Regression for CR-06: bulk-delete cleans up every group_id the user authored.
 
