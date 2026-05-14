@@ -352,6 +352,15 @@ wheels = [
 ]
 
 [[package]]
+name = "diskcache"
+version = "5.6.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/3f/21/1c1ffc1a039ddcc459db43cc108658f32c57d271d7289a2794e401d0fdb6/diskcache-5.6.3.tar.gz", hash = "sha256:2c3a3fa2743d8535d832ec61c2054a1641f41775aa7c556758a109941e33e4fc", size = 67916, upload-time = "2023-08-31T06:12:00.316Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3f/27/4570e78fc0bf5ea0ca45eb1de3818a23787af9b390c0b0a0033a1b8236f9/diskcache-5.6.3-py3-none-any.whl", hash = "sha256:5e31b2d5fbad117cc363ebaf6b689474db18a1f6438bc82358b024abd4c2ca19", size = 45550, upload-time = "2023-08-31T06:11:58.822Z" },
+]
+
+[[package]]
 name = "distro"
 version = "1.9.0"
 source = { registry = "https://pypi.org/simple" }
@@ -430,9 +439,10 @@ wheels = [
 
 [[package]]
 name = "graphiti-core"
-version = "0.28.2"
+version = "0.28.0"
 source = { editable = "../graphiti" }
 dependencies = [
+    { name = "diskcache" },
     { name = "neo4j" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
@@ -455,9 +465,10 @@ requires-dist = [
     { name = "boto3", marker = "extra == 'dev'", specifier = ">=1.39.16" },
     { name = "boto3", marker = "extra == 'neo4j-opensearch'", specifier = ">=1.39.16" },
     { name = "boto3", marker = "extra == 'neptune'", specifier = ">=1.39.16" },
+    { name = "diskcache", specifier = ">=5.6.3" },
+    { name = "diskcache-stubs", marker = "extra == 'dev'", specifier = ">=5.6.3.6.20240818" },
     { name = "falkordb", marker = "extra == 'dev'", specifier = ">=1.1.2,<2.0.0" },
     { name = "falkordb", marker = "extra == 'falkordb'", specifier = ">=1.1.2,<2.0.0" },
-    { name = "gliner2", marker = "python_full_version >= '3.11' and extra == 'gliner2'", specifier = ">=1.2.0" },
     { name = "google-genai", marker = "extra == 'dev'", specifier = ">=1.8.0" },
     { name = "google-genai", marker = "extra == 'google-genai'", specifier = ">=1.62.0" },
     { name = "groq", marker = "extra == 'dev'", specifier = ">=0.2.0" },
@@ -470,7 +481,7 @@ requires-dist = [
     { name = "langchain-aws", marker = "extra == 'dev'", specifier = ">=0.2.29" },
     { name = "langchain-aws", marker = "extra == 'neptune'", specifier = ">=0.2.29" },
     { name = "langchain-openai", marker = "extra == 'dev'", specifier = ">=0.2.6" },
-    { name = "langgraph", marker = "extra == 'dev'", specifier = ">=1.0.10" },
+    { name = "langgraph", marker = "extra == 'dev'", specifier = ">=0.2.15" },
     { name = "langsmith", marker = "extra == 'dev'", specifier = ">=0.1.108" },
     { name = "neo4j", specifier = ">=5.26.0" },
     { name = "numpy", specifier = ">=1.0.0" },
@@ -496,7 +507,7 @@ requires-dist = [
     { name = "voyageai", marker = "extra == 'dev'", specifier = ">=0.2.3" },
     { name = "voyageai", marker = "extra == 'voyageai'", specifier = ">=0.2.3" },
 ]
-provides-extras = ["anthropic", "groq", "google-genai", "kuzu", "falkordb", "voyageai", "gliner2", "neo4j-opensearch", "sentence-transformers", "neptune", "tracing", "dev"]
+provides-extras = ["anthropic", "groq", "google-genai", "kuzu", "falkordb", "voyageai", "neo4j-opensearch", "sentence-transformers", "neptune", "tracing", "dev"]
 
 [[package]]
 name = "greenlet"
@@ -950,7 +961,7 @@ wheels = [
 
 [[package]]
 name = "mem0ai"
-version = "1.0.10"
+version = "2.0.2"
 source = { editable = "../mem0" }
 dependencies = [
     { name = "openai" },
@@ -969,7 +980,6 @@ graphiti = [
 
 [package.metadata]
 requires-dist = [
-    { name = "apache-age-python", marker = "extra == 'graph'", specifier = ">=0.0.6" },
     { name = "azure-identity", marker = "extra == 'vector-stores'", specifier = ">=1.24.0" },
     { name = "azure-search-documents", marker = "extra == 'vector-stores'", specifier = ">=11.4.0b8" },
     { name = "boto3", marker = "extra == 'extras'", specifier = ">=1.34.0" },
@@ -986,21 +996,18 @@ requires-dist = [
     { name = "graphiti-core", extras = ["google-genai"], marker = "extra == 'graphiti'", editable = "../graphiti" },
     { name = "groq", marker = "extra == 'llms'", specifier = ">=0.3.0" },
     { name = "isort", marker = "extra == 'dev'", specifier = ">=5.13.2" },
-    { name = "kuzu", marker = "extra == 'graph'", specifier = ">=0.11.0" },
-    { name = "langchain-aws", marker = "extra == 'graph'", specifier = ">=0.2.23" },
-    { name = "langchain-aws", marker = "extra == 'vector-stores'", specifier = ">=0.2.23" },
-    { name = "langchain-community", marker = "extra == 'extras'", specifier = ">=0.0.0" },
-    { name = "langchain-memgraph", marker = "extra == 'graph'", specifier = ">=0.1.0" },
-    { name = "langchain-neo4j", marker = "extra == 'graph'", specifier = ">=0.4.0" },
-    { name = "litellm", marker = "extra == 'llms'", specifier = ">=1.74.0" },
-    { name = "neo4j", marker = "extra == 'graph'", specifier = ">=5.23.1" },
+    { name = "langchain", marker = "extra == 'extras'", specifier = ">=0.3.0,<1.0.0" },
+    { name = "langchain-aws", marker = "extra == 'vector-stores'", specifier = ">=0.2.23,<0.3.0" },
+    { name = "langchain-community", marker = "extra == 'extras'", specifier = ">=0.3.0,<1.0.0" },
+    { name = "langchain-core", marker = "extra == 'extras'", specifier = ">=0.3.81,<1.0.0" },
+    { name = "litellm", marker = "extra == 'llms'", specifier = ">=1.83.7" },
     { name = "ollama", marker = "extra == 'llms'", specifier = ">=0.3.0" },
     { name = "openai", specifier = ">=1.90.0" },
     { name = "openai", marker = "extra == 'llms'", specifier = ">=1.90.0" },
     { name = "opensearch-py", marker = "extra == 'extras'", specifier = ">=2.0.0" },
     { name = "pinecone", marker = "extra == 'vector-stores'", specifier = "<=7.3.0" },
     { name = "pinecone-text", marker = "extra == 'vector-stores'", specifier = ">=0.10.0" },
-    { name = "posthog", specifier = ">=3.5.0" },
+    { name = "posthog", specifier = ">=4.5.0" },
     { name = "protobuf", specifier = ">=5.29.6,<7.0.0" },
     { name = "psycopg", marker = "extra == 'vector-stores'", specifier = ">=3.2.8" },
     { name = "psycopg-pool", marker = "extra == 'vector-stores'", specifier = ">=3.2.6,<4.0.0" },
@@ -1014,21 +1021,21 @@ requires-dist = [
     { name = "pytest-asyncio", marker = "extra == 'test'", specifier = ">=0.23.7" },
     { name = "pytest-mock", marker = "extra == 'test'", specifier = ">=3.14.0" },
     { name = "pytz", specifier = ">=2024.1" },
-    { name = "qdrant-client", specifier = ">=1.9.1" },
-    { name = "rank-bm25", marker = "extra == 'graph'", specifier = ">=0.2.2" },
+    { name = "qdrant-client", specifier = ">=1.12.0" },
     { name = "redis", marker = "extra == 'vector-stores'", specifier = ">=5.0.0,<6.0.0" },
     { name = "redisvl", marker = "extra == 'vector-stores'", specifier = ">=0.1.0,<1.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6.5" },
     { name = "sentence-transformers", marker = "extra == 'extras'", specifier = ">=5.0.0" },
+    { name = "spacy", marker = "extra == 'nlp'", specifier = ">=3.7.0" },
     { name = "sqlalchemy", specifier = ">=2.0.31" },
     { name = "together", marker = "extra == 'llms'", specifier = ">=0.2.10" },
-    { name = "upstash-vector", marker = "extra == 'vector-stores'", specifier = ">=0.1.0" },
+    { name = "upstash-vector", marker = "extra == 'vector-stores'", specifier = ">=0.6.0" },
     { name = "valkey", marker = "extra == 'vector-stores'", specifier = ">=6.0.0" },
     { name = "vecs", marker = "extra == 'vector-stores'", specifier = ">=0.4.0" },
     { name = "vertexai", marker = "extra == 'llms'", specifier = ">=0.1.0" },
-    { name = "weaviate-client", marker = "extra == 'vector-stores'", specifier = ">=4.4.0,<4.15.0" },
+    { name = "weaviate-client", marker = "extra == 'vector-stores'", specifier = ">=4.15.4,<5.0.0" },
 ]
-provides-extras = ["graph", "vector-stores", "llms", "graphiti", "extras", "test", "dev"]
+provides-extras = ["nlp", "vector-stores", "llms", "graphiti", "extras", "test", "dev"]
 
 [[package]]
 name = "neo4j"

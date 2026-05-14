@@ -83,11 +83,6 @@ class TestCLIIntegration:
         assert "add" in result.stdout
         assert "search" in result.stdout
 
-    def test_version_flag(self):
-        result = _run(["--version"])
-        assert result.returncode == 0
-        assert "0.1.0" in result.stdout
-
     def test_add_help(self):
         result = _run(["add", "--help"])
         assert result.returncode == 0
@@ -229,23 +224,12 @@ class TestCLIIsolated:
 
 
 class TestCLINewFeatures:
-    """Tests for MCP parity features: --graph, --limit, entities delete."""
+    """Tests for MCP parity features: --limit, entities delete."""
 
-    def test_add_help_has_graph(self):
-        result = _run(["add", "--help"])
-        assert result.returncode == 0
-        assert "--graph" in result.stdout
-
-    def test_search_help_has_graph_and_limit(self):
+    def test_search_help_has_limit(self):
         result = _run(["search", "--help"])
         assert result.returncode == 0
-        assert "--graph" in result.stdout
         assert "--limit" in result.stdout
-
-    def test_list_help_has_graph(self):
-        result = _run(["list", "--help"])
-        assert result.returncode == 0
-        assert "--graph" in result.stdout
 
     def test_delete_entity_via_delete_flag(self):
         """delete --entity should appear in help output."""
