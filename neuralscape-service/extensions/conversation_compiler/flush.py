@@ -13,6 +13,7 @@ from typing import Optional
 import structlog
 
 from memory_service import MemoryService
+from schemas import MemoryVisibility, default_visibility_for_category
 
 from .config import compiler_settings
 from .obsidian_writer import ObsidianWriter
@@ -209,10 +210,15 @@ async def flush_conversation_turn(
                 category=category,
             )
 
-    # Step 3.5: Write to category folders (dual write)
+    # Step 3.5: Write to category folders (dual write) — shared facts only.
+    # Private memories never reach the vault (multi-user privacy).
     category_paths: list[str] = []
+    shared_facts: list[ExtractedFact] = []
     for fact in facts:
         category = _map_category(fact.category)
+        if default_visibility_for_category(category) != MemoryVisibility.SHARED:
+            continue
+        shared_facts.append(fact)
         fact_project = fact.project_id or project_id
         try:
             cat_path = writer.append_category_entry(
@@ -230,17 +236,19 @@ async def flush_conversation_turn(
                 category=category,
             )
 
-    # Step 4: Append to daily log
-    log_entries = [
-        {
-            "time": time_str,
-            "category": f.category,
-            "content": f.content,
-            "session_id": session_id,
-        }
-        for f in facts
-    ]
-    daily_log_path = writer.append_daily_log(date, log_entries)
+    # Step 4: Append shared facts to daily log
+    daily_log_path: str | None = None
+    if shared_facts:
+        log_entries = [
+            {
+                "time": time_str,
+                "category": f.category,
+                "content": f.content,
+                "session_id": session_id,
+            }
+            for f in shared_facts
+        ]
+        daily_log_path = writer.append_daily_log(date, log_entries)
 
     # Step 4.5: Update category index
     try:

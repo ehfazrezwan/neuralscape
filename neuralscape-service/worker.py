@@ -56,6 +56,9 @@ async def process_memory_store(
                 "content": mem.memory,
                 "category": getattr(mem, "category", "") or "",
                 "scope": getattr(mem, "scope", None),
+                "visibility": getattr(mem, "visibility", None),
+                "owner_user_id": getattr(mem, "owner_user_id", None),
+                "created_at": getattr(mem, "created_at", None),
                 "project_id": project_id,
                 "agent_id": agent_id,
                 "run_id": run_id,
@@ -133,12 +136,16 @@ async def process_memory_raw(
     # Emit memory_stored event so extensions can write to vault
     registry = ctx.get("extension_registry")
     if registry:
+        first = memories[0] if memories else None
         await registry.emit_event("memory_stored", {
             "user_id": user_id,
-            "memory_id": memories[0].id if memories else "",
+            "memory_id": first.id if first else "",
             "content": content,
             "category": category,
             "scope": scope,
+            "visibility": getattr(first, "visibility", None) if first else None,
+            "owner_user_id": getattr(first, "owner_user_id", None) if first else None,
+            "created_at": getattr(first, "created_at", None) if first else None,
             "project_id": project_id,
             "agent_id": agent_id,
             "run_id": run_id,
@@ -183,6 +190,9 @@ async def process_memory_raw_batch(ctx: dict, items: list[dict]) -> dict:
                 "content": mem.memory,
                 "category": mem.category or "",
                 "scope": mem.scope,
+                "visibility": getattr(mem, "visibility", None),
+                "owner_user_id": getattr(mem, "owner_user_id", None),
+                "created_at": getattr(mem, "created_at", None),
                 "project_id": mem.project_id,
                 "source": "worker",
             })

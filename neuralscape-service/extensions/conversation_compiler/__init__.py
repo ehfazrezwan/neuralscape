@@ -34,6 +34,21 @@ _MANIFEST_PATH = Path(__file__).parent / "manifest.json"
 _manifest_data = json.loads(_MANIFEST_PATH.read_text(encoding="utf-8"))
 
 
+def _coerce_timestamp(value: object) -> Optional[str]:
+    """Coerce a memory's ``created_at`` value to an ISO-8601 string.
+
+    Accepts ``datetime`` or string. Returns ``None`` for anything else
+    so the caller can fall back to ``datetime.now()``.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
 class ConversationCompilerExtension:
     """NeuralScape extension for automatic memory capture and compilation.
 
@@ -147,28 +162,42 @@ class ConversationCompilerExtension:
         return result.model_dump() if result.facts_extracted > 0 else None
 
     async def _handle_memory_stored(self, payload: dict) -> Optional[dict]:
-        """Handle memory_stored: write to vault category folder + daily log.
+        """Handle memory_stored: write shared memories to vault category folder + daily log.
 
-        This ensures ALL memory writes (API, MCP, plugin) get recorded
-        in the Obsidian vault, not just those from the flush endpoint.
-        Skips writes from the flush path to avoid double-writing.
+        Private memories never reach the vault (multi-user privacy). For shared
+        memories, the entry's date/time is taken from the memory's actual
+        ``created_at`` so historical writes don't all collapse into today's log.
+        Writes from the flush path are skipped to avoid double-writing.
         """
-        # Skip if this memory was stored by the flush path (it already wrote to vault)
         if payload.get("source") == "conversation-compiler":
             return None
 
         content = payload.get("content", "")
         category = payload.get("category", "")
-        user_id = payload.get("user_id", "")
         project_id = payload.get("project_id")
         session_id = payload.get("run_id") or payload.get("agent_id") or "api"
 
         if not content or not category:
             return None
 
-        ts = datetime.now().isoformat()
+        from schemas import MemoryVisibility, default_visibility_for_category
+
+        visibility_raw = payload.get("visibility")
+        if visibility_raw is None:
+            resolved_visibility = default_visibility_for_category(category)
+        else:
+            resolved_visibility = (
+                visibility_raw
+                if isinstance(visibility_raw, MemoryVisibility)
+                else MemoryVisibility(visibility_raw)
+            )
+        if resolved_visibility != MemoryVisibility.SHARED:
+            return None
+
+        created_at_raw = payload.get("created_at")
+        ts = _coerce_timestamp(created_at_raw) or datetime.now().isoformat()
         date = ts[:10]
-        time_str = ts[11:16]
+        time_str = ts[11:16] if len(ts) >= 16 else datetime.now().strftime("%H:%M")
 
         try:
             cat_path = self.writer.append_category_entry(

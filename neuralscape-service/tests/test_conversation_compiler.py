@@ -752,11 +752,14 @@ class TestHandleMemoryStored:
 
     @pytest.mark.asyncio
     async def test_writes_to_vault(self, extension, tmp_vault):
-        """Worker-sourced events should write to category folder and daily log."""
+        """Worker-sourced shared events should write to category folder and daily log."""
+        # 'decision' defaults to SHARED visibility, so the privacy gate
+        # in _handle_memory_stored passes this through to the vault.
         result = await extension._handle_memory_stored({
             "source": "worker",
-            "content": "Prefers dark mode",
-            "category": "preference",
+            "content": "Chose dark mode as the default theme",
+            "category": "decision",
+            "visibility": "shared",
             "user_id": "ehfaz",
             "project_id": None,
             "run_id": "sess-123",
@@ -765,17 +768,17 @@ class TestHandleMemoryStored:
         assert "vault_path" in result
 
         # Verify category file was created
-        cat_file = tmp_vault / "Semantic" / "Preferences" / "entries.md"
+        cat_file = tmp_vault / "Episodic" / "Decisions" / "entries.md"
         assert cat_file.exists()
         content = cat_file.read_text()
-        assert "Prefers dark mode" in content
+        assert "Chose dark mode as the default theme" in content
         assert "sess-123" in content
 
         # Verify daily log was created
         daily_files = list((tmp_vault / "Daily").glob("*.md"))
         assert len(daily_files) == 1
         daily_content = daily_files[0].read_text()
-        assert "Prefers dark mode" in daily_content
+        assert "Chose dark mode as the default theme" in daily_content
 
     @pytest.mark.asyncio
     async def test_writes_project_scoped(self, extension, tmp_vault):
@@ -801,23 +804,28 @@ class TestHandleMemoryStored:
         extension._writer = MagicMock()
         extension._writer.append_category_entry.side_effect = OSError("disk full")
 
+        # SHARED category — the privacy gate lets this through, so the
+        # writer is actually invoked and its exception is what we test.
         result = await extension._handle_memory_stored({
             "source": "worker",
-            "content": "some fact",
-            "category": "preference",
+            "content": "Convention update",
+            "category": "convention",
+            "visibility": "shared",
             "user_id": "ehfaz",
         })
         assert result is None
 
     @pytest.mark.asyncio
     async def test_worker_source_passes_through(self, extension, tmp_vault):
-        """Events with source='worker' should NOT be skipped."""
+        """Events with source='worker' (and a shared category) should NOT be skipped."""
+        # Use a SHARED-default category so the privacy gate doesn't drop it;
+        # the source-skip logic only fires for source='conversation-compiler'.
         result = await extension._handle_memory_stored({
             "source": "worker",
-            "content": "A fact from the worker",
-            "category": "personal_fact",
+            "content": "Team uses Conventional Commits",
+            "category": "convention",
             "user_id": "ehfaz",
         })
         assert result is not None
-        cat_file = tmp_vault / "Semantic" / "Personal-Facts" / "entries.md"
+        cat_file = tmp_vault / "Project" / "Conventions" / "entries.md"
         assert cat_file.exists()
