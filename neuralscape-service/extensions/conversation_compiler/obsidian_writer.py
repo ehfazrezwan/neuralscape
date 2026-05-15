@@ -137,8 +137,7 @@ class ObsidianWriter:
         Returns:
             Path to the daily log file (relative to vault).
         """
-        rel_path = f"Daily/{date}.md"
-        path = self._safe_resolve(rel_path)
+        path, rel_path = self._write_target(f"Daily/{date}.md")
         existing = _read_file(path)
 
         if not existing:
@@ -173,7 +172,7 @@ class ObsidianWriter:
 
     def is_daily_log_compiled(self, date: str) -> bool:
         """Check if a daily log has already been compiled."""
-        path = self._safe_resolve(f"Daily/{date}.md")
+        path = self._raw_path(f"Daily/{date}.md")
         content = _read_file(path)
         if not content:
             return False
@@ -181,7 +180,7 @@ class ObsidianWriter:
 
     def mark_daily_log_compiled(self, date: str) -> None:
         """Mark a daily log as compiled by updating its frontmatter."""
-        path = self._safe_resolve(f"Daily/{date}.md")
+        path = self._raw_path(f"Daily/{date}.md")
         content = _read_file(path)
         if not content:
             return
@@ -197,7 +196,7 @@ class ObsidianWriter:
         Returns:
             List of dicts with 'time', 'category', 'content', 'session_id'.
         """
-        path = self._safe_resolve(f"Daily/{date}.md")
+        path = self._raw_path(f"Daily/{date}.md")
         content = _read_file(path)
         if not content:
             return []
@@ -221,7 +220,7 @@ class ObsidianWriter:
 
     def list_daily_logs(self) -> list[str]:
         """List all daily log dates (YYYY-MM-DD) in the vault."""
-        daily_dir = self.vault / "Daily"
+        daily_dir = self.vault / self._RAW_ROOT / "Daily"
         if not daily_dir.exists():
             return []
         dates = []
@@ -244,8 +243,7 @@ class ObsidianWriter:
         Returns:
             Relative path within the vault.
         """
-        rel_path = f"Sessions/{date}.md"
-        path = self._safe_resolve(rel_path)
+        path, rel_path = self._write_target(f"Sessions/{date}.md")
         content = _build_frontmatter(
             title=f"Session Summary — {date}",
             tags=["session-summary", "auto-generated"],
@@ -265,8 +263,7 @@ class ObsidianWriter:
             Relative path within the vault.
         """
         slug = _slugify(project)
-        rel_path = f"Projects/{slug}/README.md"
-        path = self._safe_resolve(rel_path)
+        path, rel_path = self._write_target(f"Projects/{slug}/README.md")
         existing = _read_file(path)
 
         if existing:
@@ -302,8 +299,7 @@ class ObsidianWriter:
             Relative path within the vault.
         """
         safe_slug = _slugify(slug)
-        rel_path = f"Decisions/{safe_slug}.md"
-        path = self._safe_resolve(rel_path)
+        path, rel_path = self._write_target(f"Decisions/{safe_slug}.md")
         existing = _read_file(path)
 
         if existing:
@@ -337,8 +333,7 @@ class ObsidianWriter:
             Relative path within the vault.
         """
         safe_slug = _slugify(topic)
-        rel_path = f"Research/{safe_slug}.md"
-        path = self._safe_resolve(rel_path)
+        path, rel_path = self._write_target(f"Research/{safe_slug}.md")
         existing = _read_file(path)
 
         if existing:
@@ -373,8 +368,7 @@ class ObsidianWriter:
         Returns:
             Relative path to the index file.
         """
-        rel_path = "index.md"
-        path = self._safe_resolve(rel_path)
+        path, rel_path = self._write_target("index.md")
         existing = _read_file(path)
 
         # Parse existing index entries into a dict keyed by path
@@ -426,8 +420,7 @@ class ObsidianWriter:
         Returns:
             Relative path to the log file.
         """
-        rel_path = "log.md"
-        path = self._safe_resolve(rel_path)
+        path, rel_path = self._write_target("log.md")
 
         if not path.exists():
             header = _build_frontmatter(
@@ -476,8 +469,7 @@ class ObsidianWriter:
         else:
             filename = "entries.md"
 
-        rel_path = f"{vault_folder}/{filename}"
-        path = self._safe_resolve(rel_path)
+        path, rel_path = self._write_target(f"{vault_folder}/{filename}")
         existing = _read_file(path)
 
         if not existing:
@@ -530,7 +522,7 @@ class ObsidianWriter:
             type_name = parts[0]
             category_label = parts[1] if len(parts) > 1 else category
 
-            folder_path = self.vault / vault_folder
+            folder_path = self.vault / self._RAW_ROOT / vault_folder
             if not folder_path.exists():
                 continue
 
@@ -540,6 +532,8 @@ class ObsidianWriter:
                     continue
                 content = _read_file(md_file)
                 entry_count = content.count("\n- **[")
+                # Wikilinks resolve relative to vault root, so we keep the
+                # path's `_raw/...` prefix so Obsidian opens the right file.
                 rel = str(md_file.relative_to(self.vault))
                 files_with_counts.append((rel, entry_count))
 
@@ -569,18 +563,60 @@ class ObsidianWriter:
                     lines.append(f"- [[{rel_path}]] — {count} {label}")
                 lines.append("")
 
-        rel_path = "category-index.md"
-        _atomic_write(self.vault / rel_path, "\n".join(lines) + "\n")
+        # The category-index itself is a rolled-up audit artifact, so it
+        # lives in _raw/ alongside the entries it indexes.
+        path, rel_path = self._write_target("category-index.md")
+        _atomic_write(path, "\n".join(lines) + "\n")
         return rel_path
 
     # ── Utility methods ──────────────────────────
 
+    # Every chronologically-rolled-up artifact this writer produces lives
+    # under this prefix. The vault root is reserved for the synthesized
+    # topical Wiki/ tree (added by the wiki_synthesizer extension). Keeping
+    # the two trees separate means a human browsing the vault sees the
+    # curated wiki first; the raw audit log is one folder away.
+    _RAW_ROOT = "_raw"
+
     def _safe_resolve(self, rel_path: str) -> Path:
-        """Resolve a relative path within the vault, preventing path traversal."""
+        """Resolve a vault-root-relative path, preventing path traversal.
+
+        Used by reads (``read_file``, ``file_exists``) and any caller that
+        already knows the full vault-root-relative path (e.g. paths
+        returned by writers or ``list_all_files``). No implicit ``_raw/``
+        prefixing — pass the prefixed path if that's where the file lives.
+        """
         resolved = (self.vault / rel_path).resolve()
         if not resolved.is_relative_to(self.vault.resolve()):
             raise ValueError(f"Path traversal detected: {rel_path}")
         return resolved
+
+    def _raw_path(self, rel_path: str) -> Path:
+        """Absolute path of ``{vault}/_raw/{rel_path}``, traversal-guarded.
+
+        Used both by writer methods (target) and by the writer's own
+        internal read helpers (e.g. ``is_daily_log_compiled``).
+        """
+        return self._safe_resolve(f"{self._RAW_ROOT}/{rel_path}")
+
+    def raw_file_exists(self, rel_path: str) -> bool:
+        """Check if ``{vault}/_raw/{rel_path}`` exists.
+
+        Use this for audit-trail artifacts the writer manages, instead
+        of composing the ``_raw/`` prefix at the call site. ``file_exists``
+        remains a generic vault-root check for arbitrary paths.
+        """
+        return self._raw_path(rel_path).exists()
+
+    def _write_target(self, rel_path: str) -> tuple[Path, str]:
+        """Compute the write target for an audit-trail file.
+
+        Returns ``(absolute_path, vault_root_relative_path)``. The
+        relative form includes the ``_raw/`` prefix so callers can return
+        it from API responses and embed it in ``[[wikilinks]]`` that
+        resolve in Obsidian.
+        """
+        return self._raw_path(rel_path), f"{self._RAW_ROOT}/{rel_path}"
 
     def list_all_files(self) -> list[str]:
         """List all markdown files in the vault (relative paths)."""

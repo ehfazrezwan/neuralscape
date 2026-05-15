@@ -137,7 +137,7 @@ class TestMemoryStoredUsesPayloadCreatedAt:
             "user_id": "alice",
         }
         await extension._handle_memory_stored(payload)
-        assert (tmp_vault / "Daily" / "2024-01-15.md").exists()
+        assert (tmp_vault / "_raw" / "Daily" / "2024-01-15.md").exists()
 
     @pytest.mark.asyncio
     async def test_datetime_object_created_at_is_coerced(self, extension, tmp_vault):
@@ -149,7 +149,7 @@ class TestMemoryStoredUsesPayloadCreatedAt:
             "user_id": "alice",
         }
         await extension._handle_memory_stored(payload)
-        assert (tmp_vault / "Daily" / "2023-06-30.md").exists()
+        assert (tmp_vault / "_raw" / "Daily" / "2023-06-30.md").exists()
 
     @pytest.mark.asyncio
     async def test_missing_created_at_falls_back_to_now(self, extension, tmp_vault):
@@ -162,7 +162,7 @@ class TestMemoryStoredUsesPayloadCreatedAt:
             "user_id": "alice",
         }
         await extension._handle_memory_stored(payload)
-        daily_files = list((tmp_vault / "Daily").glob("*.md"))
+        daily_files = list((tmp_vault / "_raw" / "Daily").glob("*.md"))
         assert len(daily_files) == 1
         # Filename matches today's date (allow either today or yesterday at
         # midnight boundaries — we just need it to be a valid YYYY-MM-DD).
@@ -185,8 +185,8 @@ class TestMemoryStoredUsesPayloadCreatedAt:
                     "user_id": "alice",
                 }
             )
-        assert (tmp_vault / "Daily" / "2024-03-01.md").exists()
-        assert (tmp_vault / "Daily" / "2024-04-02.md").exists()
+        assert (tmp_vault / "_raw" / "Daily" / "2024-03-01.md").exists()
+        assert (tmp_vault / "_raw" / "Daily" / "2024-04-02.md").exists()
 
 
 # ──────────────────────────────────────────────
@@ -253,13 +253,13 @@ class TestFlushSharedOnly:
         assert service.store_raw.call_count == 2
         # Vault writes are gated: only the shared 'decision' fact wrote.
         assert len(result.category_paths) == 1
-        decision_md = tmp_vault / "Episodic" / "Decisions" / "entries.md"
+        decision_md = tmp_vault / "_raw" / "Episodic" / "Decisions" / "entries.md"
         assert decision_md.exists()
         body = decision_md.read_text()
         assert "Use Qdrant." in body
         assert "Tabs." not in body
         # Daily log contains the decision but not the preference.
-        daily = tmp_vault / "Daily" / "2026-05-15.md"
+        daily = tmp_vault / "_raw" / "Daily" / "2026-05-15.md"
         assert daily.exists()
         daily_text = daily.read_text()
         assert "Use Qdrant." in daily_text
@@ -298,4 +298,4 @@ class TestFlushSharedOnly:
         assert service.store_raw.call_count == 2
         assert result.category_paths == []
         # No daily log either.
-        assert not (tmp_vault / "Daily" / "2026-05-15.md").exists()
+        assert not (tmp_vault / "_raw" / "Daily" / "2026-05-15.md").exists()
