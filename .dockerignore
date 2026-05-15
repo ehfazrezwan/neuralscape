@@ -61,8 +61,10 @@ mem0/Makefile
 # neuralscape-service caches
 neuralscape-service/.venv/
 neuralscape-service/.pytest_cache/
-neuralscape-service/tests/
 neuralscape-service/__pycache__/
+# tests/ are intentionally NOT excluded — the Dockerfile's `test` stage
+# copies them in for `docker compose --profile test`. The `runtime`
+# stage doesn't COPY tests/, so prod images stay slim.
 
 # docs
 docs/

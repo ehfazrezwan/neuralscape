@@ -74,6 +74,7 @@ services:
     build:
       context: .
       dockerfile: neuralscape-service/Dockerfile
+      target: runtime
     ports:
       - "8199:8199"
     depends_on:
@@ -116,6 +117,7 @@ services:
     build:
       context: .
       dockerfile: neuralscape-service/Dockerfile
+      target: runtime
     command: ["arq", "worker.WorkerSettings"]
     depends_on:
       neo4j:
@@ -152,7 +154,52 @@ services:
       timeout: 5s
       retries: 3
 
+  # ── Test runner ─────────────────────────────────────────────────
+  # Reproducible test runner. Gated behind the `test` compose profile
+  # so it never starts with `docker compose up`. Use:
+  #
+  #   docker compose --profile test run --rm neuralscape-test
+  #   docker compose --profile test run --rm neuralscape-test \
+  #       pytest tests/test_conversation_compiler_privacy_date.py -v
+  #
+  # The image bakes in dev deps + tests/ so it can run unit tests
+  # standalone; depends_on the backing services so integration tests
+  # in tests/test_async_pipeline.py (when invoked explicitly) work too.
+  neuralscape-test:
+    profiles: ["test"]
+    build:
+      context: .
+      dockerfile: neuralscape-service/Dockerfile
+      target: test
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      NEO4J_URI: neo4j://neo4j:7687
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-neuralscape}
+      NEO4J_DATABASE: ${NEO4J_DATABASE:-memory}
+      QDRANT_URL: http://qdrant:6333
+      REDIS_URL: redis://redis:6379
+      GEMINI_LLM_MODEL: ${SMALL_MODEL_NAME:-gemini-3-flash-preview}
+      GEMINI_EMBEDDER_MODEL: ${EMBEDDING_MODEL_NAME:-gemini-embedding-001}
+      OBSIDIAN_VAULT_PATH: /data/vault
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      # Bind-mount the live source tree so test iteration doesn't require
+      # rebuilds. The image's baked-in copy is the fallback when no host
+      # mount is available (e.g. CI). The .venv is preserved via the
+      # named volume below so the host (Windows) layout doesn't shadow
+      # the Linux venv built into the image.
+      - ./neuralscape-service:/app/neuralscape-service
+      - test_venv:/app/neuralscape-service/.venv
+
 volumes:
   neo4j_data:
   qdrant_data:
   redis_data:
+  test_venv:
