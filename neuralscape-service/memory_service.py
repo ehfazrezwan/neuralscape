@@ -338,6 +338,21 @@ class MemoryService:
         self._get_memory()
         return self._graphiti
 
+    async def _run_on_bridge_async(self, coro, timeout: float = 30.0):
+        """Async wrapper around :meth:`_run_on_bridge`.
+
+        Schedules ``coro`` on the Graphiti bridge's event loop without
+        blocking the caller's loop. Use this from any ``async def`` that
+        needs to make Graphiti / Neo4j calls — the synthesizer admin
+        endpoint, the worker cron, and any future async caller. Without
+        the ``asyncio.to_thread`` wrap, calling :meth:`_run_on_bridge`
+        from an async function would block its event loop for the whole
+        synthesis pass.
+        """
+        import asyncio as _asyncio
+
+        return await _asyncio.to_thread(self._run_on_bridge, coro, timeout)
+
     def _run_on_bridge(self, coro, timeout: float = 30.0):
         """Run an async coroutine on the Graphiti adapter's event loop.
 

@@ -31,7 +31,7 @@ class Community:
     member_memory_ids: list[str] = field(default_factory=list)
 
 
-async def load_communities(driver: Any, *, group_id: str) -> list[Community]:
+async def load_communities(service: Any, *, group_id: str) -> list[Community]:
     """Return every community within ``group_id`` with its member memory IDs.
 
     Members come from two hops:
@@ -45,8 +45,17 @@ async def load_communities(driver: Any, *, group_id: str) -> list[Community]:
     landed before the patcher was wired) are still listed under
     ``member_node_uuids`` — the synthesizer can decide whether to load
     their content via a fallback path or skip them.
+
+    Takes a ``MemoryService`` (not the raw driver) so the Cypher runs
+    on the Graphiti bridge's event loop via
+    ``service._run_on_bridge_async``. Calling ``driver.session()`` from
+    the wrong loop raises ``Future attached to a different loop``.
     """
     if not group_id:
+        return []
+    graphiti = getattr(service, "_graphiti", None)
+    driver = getattr(graphiti, "driver", None) if graphiti else None
+    if driver is None:
         return []
 
     cypher = """
@@ -57,10 +66,14 @@ async def load_communities(driver: Any, *, group_id: str) -> list[Community]:
            c.summary AS summary,
            collect({uuid: m.uuid, memory_id: m.memory_id}) AS members
     """
-    try:
+
+    async def _inner() -> list[dict]:
         async with driver.session() as session:
             result = await session.run(cypher, group_id=group_id)
-            records = await result.data()
+            return await result.data()
+
+    try:
+        records = await service._run_on_bridge_async(_inner(), timeout=30.0)
     except Exception:
         logger.warning(
             "load_communities failed for group_id=%s (non-fatal — synthesis will skip)",

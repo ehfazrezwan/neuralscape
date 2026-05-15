@@ -178,6 +178,30 @@ def _fake_driver(record_value):
     return _Driver()
 
 
+def _fake_service_with(driver):
+    """Build a minimal fake MemoryService wrapping ``driver``.
+
+    ``patch_wiki_path`` / ``load_communities`` now take a service and
+    dispatch via ``service._run_on_bridge_async``. For unit tests we
+    just await the inner coroutine on the calling loop — the bridge
+    indirection only matters when the real Graphiti driver is bound to
+    a separate loop.
+    """
+
+    class _FakeGraphiti:
+        pass
+
+    class _FakeService:
+        def __init__(self):
+            self._graphiti = _FakeGraphiti()
+            self._graphiti.driver = driver
+
+        async def _run_on_bridge_async(self, coro, timeout=30.0):
+            return await coro
+
+    return _FakeService()
+
+
 class TestGraphPatcher:
     @pytest.mark.asyncio
     async def test_attach_memory_id_returns_patched_count(self):
@@ -220,9 +244,15 @@ class TestGraphPatcher:
 
     @pytest.mark.asyncio
     async def test_patch_wiki_path_returns_patched_count(self):
+        # patch_wiki_path now takes a service, not the raw driver, so it
+        # can dispatch the Cypher onto Graphiti's bridge loop. The fake
+        # service exposes a synchronous `_run_on_bridge_async` that
+        # awaits the inner coroutine on the calling loop, which is
+        # equivalent for the test's purposes.
         driver = _fake_driver(record_value=2)
+        service = _fake_service_with(driver)
         n = await patch_wiki_path(
-            driver,
+            service,
             node_uuids=["u1", "u2"],
             wiki_path="Wiki/Semantic/Preferences/community-x.md",
         )
@@ -231,8 +261,9 @@ class TestGraphPatcher:
     @pytest.mark.asyncio
     async def test_patch_wiki_path_empty_uuids_short_circuits(self):
         driver = _fake_driver(record_value=99)  # would lie about count if called
+        service = _fake_service_with(driver)
         assert await patch_wiki_path(
-            driver,
+            service,
             node_uuids=[],
             wiki_path="Wiki/x.md",
         ) == 0
@@ -308,7 +339,7 @@ class TestSynthesizeAll:
 
         load_calls: list[str] = []
 
-        async def fake_load(driver, *, group_id):
+        async def fake_load(service_arg, *, group_id):
             load_calls.append(group_id)
             return []
 

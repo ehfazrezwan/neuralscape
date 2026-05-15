@@ -98,7 +98,7 @@ async def attach_memory_id(
 
 
 async def patch_wiki_path(
-    driver: Any,
+    service: Any,
     *,
     node_uuids: Iterable[str],
     wiki_path: str,
@@ -109,6 +109,10 @@ async def patch_wiki_path(
 
     Returns the number of nodes updated. Best-effort.
 
+    Takes a ``MemoryService`` (not the raw driver) and dispatches the
+    Cypher via ``service._run_on_bridge_async`` so it runs on the loop
+    Graphiti's async driver was created on.
+
     When ``group_id`` is supplied the patch is scoped to nodes in that
     group_id, guarding against (highly improbable) UUID collisions
     across groups and matching the data-isolation model the rest of
@@ -116,6 +120,10 @@ async def patch_wiki_path(
     """
     uuids = [u for u in node_uuids if u]
     if not uuids or not wiki_path:
+        return 0
+    graphiti = getattr(service, "_graphiti", None)
+    driver = getattr(graphiti, "driver", None) if graphiti else None
+    if driver is None:
         return 0
     ts = (synthesized_at or datetime.now(timezone.utc)).isoformat()
     if group_id:
@@ -145,11 +153,15 @@ async def patch_wiki_path(
             "wiki_path": wiki_path,
             "synthesized_at": ts,
         }
-    try:
+
+    async def _inner() -> int:
         async with driver.session() as session:
             result = await session.run(cypher, **params)
             record = await result.single()
             return int(record["patched"]) if record else 0
+
+    try:
+        return await service._run_on_bridge_async(_inner(), timeout=30.0)
     except Exception:
         logger.warning(
             "patch_wiki_path failed for %d uuids → %s (non-fatal)",
