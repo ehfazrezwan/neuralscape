@@ -312,6 +312,46 @@ class MemoryService:
             logger.error(f"Bridge call timed out after {timeout}s")
             raise TimeoutError(f"Graph operation timed out after {timeout}s")
 
+    def _attach_memory_id_to_graph_nodes(
+        self,
+        *,
+        group_id: str,
+        memory_id: str,
+        visibility: str,
+        owner_user_id: str,
+        write_started_at: datetime,
+    ) -> None:
+        """Stamp ``memory_id``/visibility/owner onto recently-created Graphiti nodes.
+
+        Called by every store path after the Graphiti write completes. The
+        wiki synthesizer uses these properties to walk community → source
+        memories. Failures here never fail the underlying write — the
+        helper logs and returns 0.
+        """
+        if not (self._graphiti and self._bridge):
+            return
+        try:
+            from extensions.wiki_synthesizer.graph_patcher import (
+                attach_memory_id,
+            )
+
+            self._run_on_bridge(
+                attach_memory_id(
+                    self._graphiti.driver,
+                    group_id=group_id,
+                    memory_id=memory_id,
+                    visibility=visibility,
+                    owner_user_id=owner_user_id,
+                    write_started_at=write_started_at,
+                ),
+                timeout=10.0,
+            )
+        except Exception:
+            logger.warning(
+                "attach_memory_id post-write hook failed (non-critical)",
+                exc_info=True,
+            )
+
     def _get_genai_client(self):
         """Get a Gemini client for fact extraction.
 
@@ -570,6 +610,7 @@ class MemoryService:
         # Group_id encodes visibility + user namespace so the graph search
         # can scope by allowed groups without re-leaking cross-user facts.
         group_id = _build_group_id(effective_visibility, user_id, project_id)
+        graph_write_started_at = datetime.now(timezone.utc)
         try:
             if self._graphiti and self._bridge:
                 retry_transient(
@@ -577,6 +618,17 @@ class MemoryService:
                     data=content,
                     filters={"user_id": user_id, "group_id": group_id},
                     operation="store_raw graph add",
+                )
+                # Best-effort: attach memory_id back-reference onto the entity
+                # nodes Graphiti just created in this group, so the wiki
+                # synthesizer can walk community → source memories. Failures
+                # here are logged but never fail the write.
+                self._attach_memory_id_to_graph_nodes(
+                    group_id=group_id,
+                    memory_id=mid,
+                    visibility=effective_visibility,
+                    owner_user_id=user_id,
+                    write_started_at=graph_write_started_at,
                 )
         except Exception as e:
             logger.warning(f"Graph storage failed (non-critical): {e}")
