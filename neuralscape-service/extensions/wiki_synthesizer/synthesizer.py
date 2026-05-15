@@ -71,6 +71,49 @@ class SynthesisResult:
             self.pages = []
 
 
+# In-process last-run state, surfaced by the admin `synthesize/status`
+# endpoint. Mutated only by ``synthesize_all`` at the end of a pass.
+# This is a process-local snapshot — when the API and worker are
+# separate processes (the usual deploy shape) each tracks its own last
+# run. For a single source of truth across processes, route status
+# through Redis (follow-up).
+@dataclass(slots=True)
+class LastRunSnapshot:
+    started_at: str | None = None
+    finished_at: str | None = None
+    duration_seconds: float = 0.0
+    pages_created: int = 0
+    pages_updated: int = 0
+    memories_processed: int = 0
+    communities_skipped_empty: int = 0
+    errors: list[str] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.errors is None:
+            self.errors = []
+
+
+_LAST_RUN = LastRunSnapshot()
+
+
+def get_last_run_snapshot() -> dict:
+    """Return the most recent synthesis run state as a plain dict.
+
+    Process-local. See LastRunSnapshot docstring for cross-process
+    caveats.
+    """
+    return {
+        "started_at": _LAST_RUN.started_at,
+        "finished_at": _LAST_RUN.finished_at,
+        "duration_seconds": _LAST_RUN.duration_seconds,
+        "pages_created": _LAST_RUN.pages_created,
+        "pages_updated": _LAST_RUN.pages_updated,
+        "memories_processed": _LAST_RUN.memories_processed,
+        "communities_skipped_empty": _LAST_RUN.communities_skipped_empty,
+        "errors": list(_LAST_RUN.errors),
+    }
+
+
 async def synthesize_all(
     *,
     service: MemoryService,
@@ -100,14 +143,17 @@ async def synthesize_all(
             patch Neo4j. The returned result still reports what would
             have happened.
     """
+    started = datetime.now(timezone.utc)
     result = SynthesisResult()
     if not settings.enabled:
         logger.info("wiki synthesizer disabled — skipping run")
+        _record_last_run(result, started)
         return result
 
     driver = _driver_from_service(service)
     if driver is None:
         result.errors.append("no Neo4j driver available on MemoryService")
+        _record_last_run(result, started)
         return result
 
     shared_group_ids = await _list_shared_group_ids(driver)
@@ -182,7 +228,21 @@ async def synthesize_all(
         result.memories_processed,
         len(result.errors),
     )
+    _record_last_run(result, started)
     return result
+
+
+def _record_last_run(result: SynthesisResult, started: datetime) -> None:
+    """Snapshot the just-finished synthesis into ``_LAST_RUN``."""
+    finished = datetime.now(timezone.utc)
+    _LAST_RUN.started_at = started.isoformat()
+    _LAST_RUN.finished_at = finished.isoformat()
+    _LAST_RUN.duration_seconds = (finished - started).total_seconds()
+    _LAST_RUN.pages_created = result.pages_created
+    _LAST_RUN.pages_updated = result.pages_updated
+    _LAST_RUN.memories_processed = result.memories_processed
+    _LAST_RUN.communities_skipped_empty = result.communities_skipped_empty
+    _LAST_RUN.errors = list(result.errors)
 
 
 async def _synthesize_community(
@@ -253,6 +313,7 @@ async def _synthesize_community(
             driver,
             node_uuids=community.member_node_uuids,
             wiki_path=rel_path,
+            group_id=group_id,
         )
 
     return PageResult(
@@ -418,18 +479,51 @@ def _safe_read_text(path) -> str:
 async def _call_gemini(prompt: str, *, settings: SynthesizerSettings) -> str:
     """Run the incremental-merge prompt through Gemini.
 
-    Reuses the conversation_compiler's Gemini helper so model selection,
-    retry, and error handling stay consistent across the two LLM-driven
-    extensions. The synthesizer can override the model via its own
-    ``WIKI_SYNTHESIZER_GEMINI_MODEL`` env var; an empty string inherits
-    the conversation_compiler's default.
+    Reuses the conversation_compiler's Gemini helper so model selection
+    stays consistent across the two LLM-driven extensions. Adds:
+
+    * ``WIKI_SYNTHESIZER_GEMINI_TIMEOUT_SECONDS`` hard timeout per
+      attempt (default 5 minutes) — a hung Gemini call won't stall the
+      whole cron.
+    * ``WIKI_SYNTHESIZER_GEMINI_MAX_RETRIES`` exponential-backoff
+      retries on transient failures or timeouts (default 2).
     """
     # Imported lazily to avoid a hard dependency between the two
     # extensions at import time.
+    import asyncio
+
     from extensions.conversation_compiler.compile import _async_call_gemini
 
-    try:
-        return await _async_call_gemini(prompt)
-    except Exception:
-        logger.exception("Gemini incremental-merge call failed")
-        return ""
+    last_exc: Exception | None = None
+    attempts = max(1, settings.gemini_max_retries + 1)
+    for attempt in range(attempts):
+        try:
+            return await asyncio.wait_for(
+                _async_call_gemini(prompt),
+                timeout=settings.gemini_timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            last_exc = exc
+            logger.warning(
+                "Gemini call timed out after %ds (attempt %d/%d)",
+                settings.gemini_timeout_seconds,
+                attempt + 1,
+                attempts,
+            )
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "Gemini call failed (attempt %d/%d): %s",
+                attempt + 1,
+                attempts,
+                exc.__class__.__name__,
+            )
+        if attempt + 1 < attempts:
+            await asyncio.sleep(2 ** attempt)  # 1s, 2s, 4s, ...
+
+    logger.error(
+        "Gemini incremental-merge call exhausted %d attempt(s): %s",
+        attempts,
+        last_exc,
+    )
+    return ""

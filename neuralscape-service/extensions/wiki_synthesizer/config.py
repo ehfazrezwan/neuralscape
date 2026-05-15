@@ -62,6 +62,42 @@ class SynthesizerSettings(BaseSettings):
         ),
     )
 
+    attach_window_seconds: int = Field(
+        default=120,
+        ge=10,
+        le=1800,
+        description=(
+            "Time window for the ``attach_memory_id`` post-write Cypher "
+            "patch. The patcher matches Graphiti nodes whose "
+            "``created_at >= write_started_at - this``. Bump it on "
+            "instances that see >2 minute graph writes (slow Gemini days, "
+            "very large episodes); shrink to reduce false positives in "
+            "high-concurrency settings."
+        ),
+    )
+
+    gemini_timeout_seconds: int = Field(
+        default=300,
+        ge=30,
+        le=1800,
+        description=(
+            "Hard timeout (seconds) on any single Gemini call inside the "
+            "wiki synthesizer. Calls exceeding this are aborted and the "
+            "community is recorded as an error in the synthesis result."
+        ),
+    )
+
+    gemini_max_retries: int = Field(
+        default=2,
+        ge=0,
+        le=5,
+        description=(
+            "Retry count for Gemini calls during synthesis. Each retry "
+            "uses 1s, 2s, 4s exponential backoff. 0 disables retries; "
+            "2 (default) gives one extra attempt after the first failure."
+        ),
+    )
+
     obsidian_vault_path: str = Field(
         default="/data/vault",
         description="Root of the Obsidian vault. Same value as the conversation_compiler.",

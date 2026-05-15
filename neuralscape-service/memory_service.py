@@ -380,14 +380,14 @@ class MemoryService:
         """
         if not (self._graphiti and self._bridge):
             return
+        from extensions.wiki_synthesizer.config import synthesizer_settings
         from extensions.wiki_synthesizer.graph_patcher import (
             attach_memory_id,
         )
 
-        # Build the coroutine separately so we can ``.close()`` it if
+        # Coroutine built separately so we can ``.close()`` it if
         # ``_run_on_bridge`` raises before awaiting — otherwise tests
-        # that exercise this path with a mocked bridge raise
-        # ``RuntimeWarning: coroutine 'attach_memory_id' was never
+        # with mocked bridges leak ``RuntimeWarning: coroutine never
         # awaited`` and slow the suite down with traceback collection.
         coro = attach_memory_id(
             self._graphiti.driver,
@@ -396,6 +396,7 @@ class MemoryService:
             visibility=visibility,
             owner_user_id=owner_user_id,
             write_started_at=write_started_at,
+            window_seconds=synthesizer_settings.attach_window_seconds,
         )
         try:
             self._run_on_bridge(coro, timeout=10.0)
@@ -1158,18 +1159,20 @@ class MemoryService:
         # Skip when caller restricted to shared-only.
         want_personal = visibility != MemoryVisibility.SHARED.value
         if want_personal and user_id:
+            # mem0 v2.0.2 rejects ``user_id`` (and ``agent_id``/``run_id``)
+            # as top-level kwargs on ``Memory.search``; entity-scoping
+            # parameters must go through ``filters``. We bake the user_id
+            # into each filter dict below so the warning stays silent.
             if project_id and not scope:
-                project_filters = {**common_filters, "metadata.project_id": project_id}
+                project_filters = {**common_filters, "user_id": user_id, "metadata.project_id": project_id}
                 project_results = m.search(
                     query=query,
-                    user_id=user_id,
                     limit=limit,
                     filters=project_filters,
                 )
-                global_filters = {**common_filters, "metadata.scope": "global"}
+                global_filters = {**common_filters, "user_id": user_id, "metadata.scope": "global"}
                 global_results = m.search(
                     query=query,
-                    user_id=user_id,
                     limit=limit,
                     filters=global_filters,
                 )
@@ -1178,14 +1181,13 @@ class MemoryService:
                     self._results_to_responses(all_results[:limit])
                 )
             else:
-                filters = {**common_filters}
+                filters = {**common_filters, "user_id": user_id}
                 if project_id:
                     filters["metadata.project_id"] = project_id
                 results = m.search(
                     query=query,
-                    user_id=user_id,
                     limit=limit,
-                    filters=filters if filters else None,
+                    filters=filters,
                 )
                 vector_responses.extend(self._results_to_responses(results))
 
@@ -1533,15 +1535,88 @@ class MemoryService:
             results = self._run_on_bridge(
                 g.search_(query=query, config=config, group_ids=group_ids)
             )
+            edges = [
+                {"uuid": e.uuid, "name": e.name, "fact": e.fact}
+                for e in results.edges
+            ]
+            nodes = [
+                {"uuid": n.uuid, "name": n.name, "summary": n.summary}
+                for n in results.nodes
+            ]
+            episodes = [
+                {"uuid": ep.uuid, "name": ep.name, "content": ep.content}
+                for ep in results.episodes
+            ]
+            communities = [
+                {"uuid": c.uuid, "name": c.name} for c in results.communities
+            ]
+            # Enrich nodes/edges/communities with the back-references the
+            # synthesizer set (memory_id, wiki_path). Best-effort; a
+            # failed enrichment leaves the result as-is.
+            self._enrich_graph_results(nodes, edges, communities)
             return {
-                "edges": [{"uuid": e.uuid, "name": e.name, "fact": e.fact} for e in results.edges],
-                "nodes": [{"uuid": n.uuid, "name": n.name, "summary": n.summary} for n in results.nodes],
-                "episodes": [{"uuid": ep.uuid, "name": ep.name, "content": ep.content} for ep in results.episodes],
-                "communities": [{"uuid": c.uuid, "name": c.name} for c in results.communities],
+                "edges": edges,
+                "nodes": nodes,
+                "episodes": episodes,
+                "communities": communities,
             }
         except Exception as e:
             logger.error(f"Graph search failed: {e}")
             return {"edges": [], "nodes": [], "episodes": [], "communities": []}
+
+    def _enrich_graph_results(
+        self,
+        nodes: list[dict],
+        edges: list[dict],
+        communities: list[dict],
+    ) -> None:
+        """Annotate graph search results with ``memory_id`` + ``wiki_path``.
+
+        Both fields are added by the wiki synthesizer's Cypher patchers
+        (``attach_memory_id`` and ``patch_wiki_path``) as top-level Neo4j
+        properties, but Graphiti's ORM doesn't rehydrate them. We do one
+        extra Cypher round-trip per result set to fetch the values by
+        UUID, then mutate the dicts in place. Failure logs and leaves
+        the original dicts unchanged.
+        """
+        all_uuids: list[str] = []
+        for collection in (nodes, edges, communities):
+            for item in collection:
+                u = item.get("uuid")
+                if u:
+                    all_uuids.append(u)
+        if not all_uuids:
+            return
+        if self._graphiti is None or self._bridge is None:
+            return
+        cypher = """
+        MATCH (n)
+        WHERE n.uuid IN $uuids
+        RETURN n.uuid AS uuid,
+               n.memory_id AS memory_id,
+               n.wiki_path AS wiki_path
+        """
+
+        async def _run():
+            async with self._graphiti.driver.session() as session:
+                result = await session.run(cypher, uuids=all_uuids)
+                return await result.data()
+
+        try:
+            records = self._run_on_bridge(_run(), timeout=10.0) or []
+        except Exception:
+            logger.warning("graph result enrichment failed (non-critical)", exc_info=True)
+            return
+        by_uuid = {r["uuid"]: r for r in records if r.get("uuid")}
+        for collection in (nodes, edges, communities):
+            for item in collection:
+                rec = by_uuid.get(item.get("uuid"))
+                if not rec:
+                    continue
+                if rec.get("memory_id"):
+                    item["memory_id"] = rec["memory_id"]
+                if rec.get("wiki_path"):
+                    item["wiki_path"] = rec["wiki_path"]
 
     def search_graph(
         self,

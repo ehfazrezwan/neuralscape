@@ -44,17 +44,25 @@ async def attach_memory_id(
     visibility: str | None,
     owner_user_id: str | None,
     write_started_at: datetime,
+    window_seconds: int | None = None,
 ) -> int:
     """Mark recently-created Graphiti nodes with their originating memory.
 
     Returns the number of nodes patched. Best-effort — never raises.
 
-    The match window is ``[write_started_at - WRITE_WINDOW_SECONDS, now]``
-    intersected with the given ``group_id``. Nodes that already carry a
-    ``memory_id`` are left alone (``coalesce``).
+    The match window is ``[write_started_at - window_seconds, now]``
+    intersected with the given ``group_id``. ``window_seconds`` defaults
+    to :data:`WRITE_WINDOW_SECONDS` (120s). Operators can override per
+    call (or globally via ``WIKI_SYNTHESIZER_ATTACH_WINDOW_SECONDS``) —
+    longer windows help on slow Gemini days where entity extraction
+    overruns the default 2-minute envelope.
+
+    Nodes that already carry a ``memory_id`` are left alone via
+    ``coalesce`` so we never overwrite an earlier attach.
     """
     if not memory_id or not group_id:
         return 0
+    window = window_seconds if window_seconds is not None else WRITE_WINDOW_SECONDS
     cypher = """
     MATCH (n)
     WHERE n.group_id = $group_id
@@ -65,8 +73,7 @@ async def attach_memory_id(
     RETURN count(n) AS patched
     """
     lower_bound = (
-        write_started_at.astimezone(timezone.utc)
-        - _delta_seconds(WRITE_WINDOW_SECONDS)
+        write_started_at.astimezone(timezone.utc) - _delta_seconds(window)
     ).isoformat()
     try:
         async with driver.session() as session:
@@ -95,31 +102,52 @@ async def patch_wiki_path(
     *,
     node_uuids: Iterable[str],
     wiki_path: str,
+    group_id: str | None = None,
     synthesized_at: datetime | None = None,
 ) -> int:
     """Stamp ``wiki_path`` onto every node whose UUID is in ``node_uuids``.
 
     Returns the number of nodes updated. Best-effort.
+
+    When ``group_id`` is supplied the patch is scoped to nodes in that
+    group_id, guarding against (highly improbable) UUID collisions
+    across groups and matching the data-isolation model the rest of
+    the service relies on. Pass ``None`` to skip the group_id check.
     """
     uuids = [u for u in node_uuids if u]
     if not uuids or not wiki_path:
         return 0
     ts = (synthesized_at or datetime.now(timezone.utc)).isoformat()
-    cypher = """
-    MATCH (n)
-    WHERE n.uuid IN $uuids
-    SET n.wiki_path = $wiki_path,
-        n.wiki_synthesized_at = datetime($synthesized_at)
-    RETURN count(n) AS patched
-    """
+    if group_id:
+        cypher = """
+        MATCH (n)
+        WHERE n.uuid IN $uuids AND n.group_id = $group_id
+        SET n.wiki_path = $wiki_path,
+            n.wiki_synthesized_at = datetime($synthesized_at)
+        RETURN count(n) AS patched
+        """
+        params: dict[str, Any] = {
+            "uuids": uuids,
+            "wiki_path": wiki_path,
+            "synthesized_at": ts,
+            "group_id": group_id,
+        }
+    else:
+        cypher = """
+        MATCH (n)
+        WHERE n.uuid IN $uuids
+        SET n.wiki_path = $wiki_path,
+            n.wiki_synthesized_at = datetime($synthesized_at)
+        RETURN count(n) AS patched
+        """
+        params = {
+            "uuids": uuids,
+            "wiki_path": wiki_path,
+            "synthesized_at": ts,
+        }
     try:
         async with driver.session() as session:
-            result = await session.run(
-                cypher,
-                uuids=uuids,
-                wiki_path=wiki_path,
-                synthesized_at=ts,
-            )
+            result = await session.run(cypher, **params)
             record = await result.single()
             return int(record["patched"]) if record else 0
     except Exception:
