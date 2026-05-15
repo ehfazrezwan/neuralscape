@@ -2,13 +2,18 @@
  * Token-budgeted, category-ranked recall engine.
  *
  * Replaces naive "dump all search results" with:
- * 1. Search with rerank + keyword_search
+ * 1. Search memories with threshold filtering
  * 2. Rank by category priority (identity first)
  * 3. Token-budget the results
  * 4. Format by category with importance scores
  */
 
-import type { Mem0Provider, MemoryItem, SkillsConfig, SearchOptions } from "./types.ts";
+import type {
+  Mem0Provider,
+  MemoryItem,
+  SkillsConfig,
+  SearchOptions,
+} from "./types.ts";
 
 // ============================================================================
 // Defaults
@@ -51,7 +56,10 @@ interface RecallResult {
 
 function getMemoryCategory(memory: MemoryItem): string {
   // Check metadata first (skill-stored memories have explicit category)
-  if (memory.metadata?.category && typeof memory.metadata.category === "string") {
+  if (
+    memory.metadata?.category &&
+    typeof memory.metadata.category === "string"
+  ) {
     return memory.metadata.category;
   }
   // Check categories array (mem0-extracted memories)
@@ -62,7 +70,10 @@ function getMemoryCategory(memory: MemoryItem): string {
 }
 
 function getMemoryImportance(memory: MemoryItem): number {
-  if (memory.metadata?.importance && typeof memory.metadata.importance === "number") {
+  if (
+    memory.metadata?.importance &&
+    typeof memory.metadata.importance === "number"
+  ) {
     return memory.metadata.importance;
   }
   // Default importance by category
@@ -70,15 +81,15 @@ function getMemoryImportance(memory: MemoryItem): number {
   const defaults: Record<string, number> = {
     identity: 0.95,
     configuration: 0.95,
-    rule: 0.90,
+    rule: 0.9,
     preference: 0.85,
-    decision: 0.80,
-    technical: 0.80,
+    decision: 0.8,
+    technical: 0.8,
     relationship: 0.75,
     project: 0.75,
-    operational: 0.60,
+    operational: 0.6,
   };
-  return defaults[cat] ?? 0.50;
+  return defaults[cat] ?? 0.5;
 }
 
 // ============================================================================
@@ -135,8 +146,9 @@ function budgetMemories(
     if (selected.length >= maxMemories) break;
 
     const memTokens = estimateTokens(memory.memory);
-    const isIdentity = getMemoryCategory(memory) === "identity" ||
-                       getMemoryCategory(memory) === "configuration";
+    const isIdentity =
+      getMemoryCategory(memory) === "identity" ||
+      getMemoryCategory(memory) === "configuration";
 
     // Identity/config always included if flag is set
     if (identityAlwaysInclude && isIdentity) {
@@ -188,7 +200,9 @@ function formatRecalledMemories(
     lines.push(`${label}:`);
     for (const mem of mems) {
       const imp = getMemoryImportance(mem);
-      const cats = mem.categories?.length ? ` [${mem.categories.join(", ")}]` : "";
+      const cats = mem.categories?.length
+        ? ` [${mem.categories.join(", ")}]`
+        : "";
       lines.push(`- ${mem.memory}${cats} (${Math.round(imp * 100)}%)`);
     }
     lines.push("");
@@ -209,7 +223,10 @@ function formatRecalledMemories(
  * via the skill protocol (the agent formulates search queries with context).
  */
 export function sanitizeQuery(raw: string): string {
-  let cleaned = raw.replace(/Sender\s*\(untrusted metadata\):\s*```json[\s\S]*?```\s*/gi, "");
+  let cleaned = raw.replace(
+    /Sender\s*\(untrusted metadata\):\s*```json[\s\S]*?```\s*/gi,
+    "",
+  );
   cleaned = cleaned.replace(/^\[.*?\]\s*/g, "");
   cleaned = cleaned.trim();
   return cleaned || raw;
@@ -236,17 +253,13 @@ export async function recall(
   const categoryOrder = recallConfig.categoryOrder ?? DEFAULT_CATEGORY_ORDER;
   const identityAlwaysInclude = recallConfig.identityAlwaysInclude !== false;
 
-  // Build search options with enhanced features
+  // Build search options (v3.0.0: keyword_search, reranking, filter_memories removed)
   const searchOpts: SearchOptions = {
     user_id: userId,
     top_k: maxMemories * 2, // Over-fetch for ranking
     threshold,
-    keyword_search: recallConfig.keywordSearch !== false, // Default on
-    reranking: recallConfig.rerank !== false, // Default on
+    source: "OPENCLAW",
   };
-  if (recallConfig.filterMemories) {
-    searchOpts.filter_memories = true;
-  }
 
   // Sanitize query: strip OpenClaw metadata prefix before searching
   const cleanQuery = sanitizeQuery(query);
@@ -257,7 +270,10 @@ export async function recall(
     longTermMemories = await provider.search(cleanQuery, searchOpts);
   } catch (err) {
     // Graceful degradation — recall failure shouldn't block the agent
-    console.warn("[mem0] Recall search failed:", err instanceof Error ? err.message : err);
+    console.warn(
+      "[mem0] Recall search failed:",
+      err instanceof Error ? err.message : err,
+    );
   }
 
   // Search session memories if we have a session
@@ -281,7 +297,12 @@ export async function recall(
   // Combine and rank
   const allMemories = [...longTermMemories, ...uniqueSession];
   const ranked = rankMemories(allMemories, categoryOrder);
-  const budgeted = budgetMemories(ranked, tokenBudget, maxMemories, identityAlwaysInclude);
+  const budgeted = budgetMemories(
+    ranked,
+    tokenBudget,
+    maxMemories,
+    identityAlwaysInclude,
+  );
 
   // Format for injection
   const context = formatRecalledMemories(budgeted, userId);
@@ -289,4 +310,3 @@ export async function recall(
 
   return { context, memories: budgeted, tokenEstimate };
 }
-

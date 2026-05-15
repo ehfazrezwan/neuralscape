@@ -1,14 +1,13 @@
 ---
 name: memory-triage
 description: >
-  ALWAYS USE THIS SKILL. Persistent long-term memory protocol powered by mem0.
-  After EVERY response, evaluate the conversation for durable facts worth storing
-  via memory_store. Handles identity, preferences, decisions, configurations, rules,
-  projects, and relationships. Use memory_store (NOT workspace files) for all user facts.
-  Read this skill at the start of every session.
+  Persistent long-term memory protocol powered by mem0.
+  Evaluate conversations for durable facts worth storing via memory_add.
+  Handles identity, preferences, decisions, configurations, rules,
+  projects, and relationships. Loaded by the openclaw-mem0 plugin when skills mode is active.
 user-invocable: false
 metadata:
-  {"openclaw": {"always": true, "emoji": "🧠"}}
+  {"openclaw": {"always": false, "injected": true, "emoji": "🧠", "requires": {"env": ["MEM0_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"], "bins": []}}}
 ---
 
 # Memory Protocol
@@ -18,6 +17,56 @@ You have persistent long-term memory powered by mem0. After responding to the us
 Your primary role is to extract relevant pieces of information from the conversation and organize them into distinct, manageable facts. This allows for easy retrieval and personalization in future interactions.
 
 **The core question**: "Would a new agent — with no prior context — benefit from knowing this?" If no → do nothing. Most turns produce zero memory operations. That is correct and expected.
+
+## Available Tools
+
+### memory_search
+Semantic search across stored memories.
+- `query` (required): search query
+- `limit`: max results (default: configured topK)
+- `userId`, `agentId`: scope overrides
+- `scope`: `"all"` (default), `"session"`, or `"long-term"`
+- `categories`: filter by category array
+- `filters`: advanced filter object
+
+### memory_add
+Store new facts in long-term memory.
+- `facts` (required): array of facts to store — ALL must share the same category
+- `text`: alternative single-fact string
+- `category`: `"identity"`, `"preference"`, `"decision"`, `"rule"`, `"project"`, `"configuration"`, `"technical"`, `"relationship"`
+- `importance`: 0.0–1.0 (omit for category default)
+- `userId`, `agentId`: scope overrides
+- `metadata`: additional key-value metadata
+- `longTerm`: true (default) for persistent, false for session-scoped
+
+### memory_get
+Retrieve a single memory by ID.
+- `memoryId` (required): the memory ID
+
+### memory_list
+List all stored memories for a user or agent.
+- `userId`, `agentId`: scope overrides
+- `scope`: `"all"` (default), `"session"`, or `"long-term"`
+
+### memory_update
+Update an existing memory's text in place. Atomic and preserves edit history.
+- `memoryId` (required): the memory ID to update
+- `text` (required): the new text (replaces old)
+
+### memory_delete
+Delete memories by ID, query, or bulk.
+- `memoryId`: specific memory ID to delete
+- `query`: search query to find and delete matching memories
+- `all`: delete ALL memories (requires `confirm: true`)
+- `confirm`: safety gate for bulk operations
+- `userId`, `agentId`: scope overrides
+
+### memory_event_list
+List recent background processing events (platform mode only).
+
+### memory_event_status
+Get status of a specific background event.
+- `event_id` (required): the event ID to check
 
 ## Decision Gate
 
@@ -29,7 +78,7 @@ Every candidate fact must pass ALL four gates:
 
 **Gate 2 — NOVELTY**: Check your recalled memories below — is this already known?
   - Already known and unchanged → SKIP
-  - Known but materially changed → UPDATE (find old → forget → store new)
+  - Known but materially changed → UPDATE (find old → update in place)
   - Genuinely new → proceed
   - **Material difference test**: Only UPDATE if new information adds real context, details, or changes meaning. Cosmetic differences (synonyms, rephrasing, punctuation) are NOT updates. "Loves daily walks" vs "enjoys daily walks" = no material change = SKIP.
 
@@ -38,9 +87,9 @@ Every candidate fact must pass ALL four gates:
   - Fail: vague impressions, questions, small talk, acknowledgments, generic assistant responses ("Sure, I can help") → SKIP
 
 **Gate 4 — SAFE**: Does this contain ANY credential, secret, or token?
-  - Scan for: `sk-`, `m0-`, `ghp_`, `AKIA`, `ak_`, `Bearer `, bot tokens (digits:alphanumeric), webhook URLs with tokens, pairing codes, long alphanumeric strings in config/env context, `password=`, `token=`, `secret=`, `.env` values
+  - Scan for known credential prefixes, auth tokens, webhook URLs with tokens, pairing codes, long alphanumeric strings in config/env context, and key-value assignment patterns. The plugin injects the full pattern list at runtime.
   - ANY match → NEVER STORE the value. Instead, store that the credential was configured:
-    - WRONG: "User's API key is sk-abc123..."
+    - WRONG: "User's API key is [redacted]"
     - RIGHT: "API key was configured for the service (as of 2026-03-30)"
   - When in doubt → SKIP. No exceptions.
 
@@ -108,26 +157,26 @@ Each memory you store must be a **self-contained, independently understandable f
 
 **ALWAYS group all information about the same entity, concept, event, or subject into a SINGLE unified memory.** If multiple pieces of information refer to the same entity (e.g., a conference, a project, a person, a system), they MUST be combined into one comprehensive memory.
 
-**DO NOT split requirements, specifications, or details about the same entity across multiple memory_store calls.** Even if information is phrased differently ("Budget for X", "X requires Y", "X needs Z"), if they all refer to the same entity, combine ALL into ONE call.
+**DO NOT split requirements, specifications, or details about the same entity across multiple memory_add calls.** Even if information is phrased differently ("Budget for X", "X requires Y", "X needs Z"), if they all refer to the same entity, combine ALL into ONE call.
 
 **WRONG** — fragmented into separate facts:
 ```
-memory_store(facts: ["Conference requires at least 4 breakout rooms", "Conference requires vegan options", "Conference requires parking"], category: "project")
+memory_add(facts: ["Conference requires at least 4 breakout rooms", "Conference requires vegan options", "Conference requires parking"], category: "project")
 ```
 
 **CORRECT** — grouped into one self-contained fact:
 ```
-memory_store(facts: ["Conference requires at least 4 breakout rooms for 30-40 people each, robust vegan and vegetarian options with allergen-free alternatives, parking for at least 100 vehicles, venue within walking distance of transit"], category: "project")
+memory_add(facts: ["Conference requires at least 4 breakout rooms for 30-40 people each, robust vegan and vegetarian options with allergen-free alternatives, parking for at least 100 vehicles, venue within walking distance of transit"], category: "project")
 ```
 
 **WRONG** — same entity split into separate facts:
 ```
-memory_store(facts: ["Budget is $150-175 per person for TechForward event", "TechForward event requires strong WiFi", "TechForward event requires hybrid capabilities"], category: "project")
+memory_add(facts: ["Budget is $150-175 per person for TechForward event", "TechForward event requires strong WiFi", "TechForward event requires hybrid capabilities"], category: "project")
 ```
 
 **CORRECT** — combined into one fact about TechForward:
 ```
-memory_store(facts: ["TechForward event has a budget of $150-175 per person per day including venue rental, standard AV setup, and catering. Requires strong WiFi and hybrid event capabilities for remote attendees."], category: "project")
+memory_add(facts: ["TechForward event has a budget of $150-175 per person per day including venue rental, standard AV setup, and catering. Requires strong WiFi and hybrid event capabilities for remote attendees."], category: "project")
 ```
 
 **Only create separate memories when information refers to genuinely different entities, concepts, or unrelated topics** (e.g., "TechForward event" vs "Marketing campaign" are separate).
@@ -151,10 +200,10 @@ Do not store characterizations from assistant messages (e.g., "user seems excite
 
 ## How to Store
 
-Use `memory_store` with the `facts` array. All facts in one call MUST share the same category because category determines retention policy (TTL, immutability).
+Use `memory_add` with the `facts` array. All facts in one call MUST share the same category because category determines retention policy (TTL, immutability).
 
 ```
-memory_store(
+memory_add(
   facts: ["fact one in third person", "fact two in third person"],
   category: "identity"
 )
@@ -163,8 +212,8 @@ memory_store(
 If a turn produces facts in different categories, make one call per category:
 
 ```
-memory_store(facts: ["User is Alex, senior engineer at Stripe, PST timezone"], category: "identity")
-memory_store(facts: ["As of 2026-04-01, user decided to migrate from Postgres to CockroachDB"], category: "decision")
+memory_add(facts: ["User is Alex, senior engineer at Stripe, PST timezone"], category: "identity")
+memory_add(facts: ["As of 2026-04-01, user decided to migrate from Postgres to CockroachDB"], category: "decision")
 ```
 
 Categories: `identity`, `configuration`, `rule`, `preference`, `decision`, `technical`, `relationship`, `project`
@@ -197,8 +246,9 @@ Categories: `identity`, `configuration`, `rule`, `preference`, `decision`, `tech
 
 When a recalled memory needs updating (fact changed, status changed, new detail added):
 1. `memory_search` to find the existing memory
-2. `memory_forget` on the old memory's ID
-3. `memory_store` with the corrected/expanded fact
+2. `memory_update` on the memory's ID with the corrected/expanded text
+
+`memory_update` is preferred over delete+add because it is **atomic and preserves edit history**.
 
 **Choose the MORE COMPLETE version.** When both old and new have unique context, COMBINE them into a unified memory using the user's stated words.
 
@@ -207,10 +257,10 @@ When a recalled memory needs updating (fact changed, status changed, new detail 
   - "User likes Python" → "User enjoys Python" = NOT material = SKIP
   - When both have unique context, combine: Old "Trip to Paris in September with Jack" + New "User can't wait to visit Eiffel Tower" → "Trip to Paris in September 2025 with friend Jack, user says they can't wait to visit the Eiffel Tower and try authentic French pastries"
 
-**Consolidation**: When a rich new fact encompasses multiple existing memories, update one to the comprehensive version and forget the others.
+**Consolidation**: When a rich new fact encompasses multiple existing memories, `memory_update` the best one to the comprehensive version and `memory_delete` the rest.
   - Old: "User has a dog" + "Dog's name is Poppy" + "User walks dog daily"
   - New: "User has a dog named Poppy and says taking him for walks is the best part of their day"
-  - Action: forget all three old memories, store one consolidated memory
+  - Action: `memory_update` the best version with consolidated text, `memory_delete` the redundant ones
 
 **Temporary vs permanent changes**: A temporary constraint (e.g., injury pausing a hobby) does NOT contradict the underlying preference. Store the constraint as a new memory; don't delete the preference.
   - Old: "User enjoys hiking on weekends"
@@ -219,7 +269,7 @@ When a recalled memory needs updating (fact changed, status changed, new detail 
 
 ## What NEVER to Store
 
-- **Credentials and secrets** — even embedded in config blocks, setup logs, or tool output. Includes sk-, m0-, ak_, ghp_, bot tokens, bearer tokens, webhook URLs with tokens, pairing codes, long alphanumeric strings in config/env contexts. Record that the credential was configured, never the value itself.
+- **Credentials and secrets** — even embedded in config blocks, setup logs, or tool output. Includes any known credential prefixes, auth tokens, bearer tokens, webhook URLs with tokens, pairing codes, and long alphanumeric strings in config/env contexts. Record that the credential was configured, never the value itself.
 - **Raw tool output** — bash results, file contents, API responses, logs, diffs, test output. Extract only the durable OUTCOME or ROOT CAUSE.
 - **One-time commands** — "stop the script", "continue where you left off", "run this"
 - **Acknowledgments and emotional reactions** — "ok", "sure", "sounds good", "sir", "got it", "thanks", "you're right"
@@ -240,7 +290,7 @@ When a recalled memory needs updating (fact changed, status changed, new detail 
 ```
 User: "I set up the research agent on Claude Sonnet with a 30-min cron. It checks HackerNews and sends summaries to #research-feed in Slack."
 Agent: [responds helpfully]
-→ memory_store(facts: ["User's research agent runs on Claude Sonnet, cron every 30 minutes, monitors HackerNews and posts summaries to Slack #research-feed"], category: "configuration")
+→ memory_add(facts: ["User's research agent runs on Claude Sonnet, cron every 30 minutes, monitors HackerNews and posts summaries to Slack #research-feed"], category: "configuration")
 ```
 
 ### Example 2: NOOP — tool output
@@ -260,7 +310,7 @@ User: "Hey Chris here again"
 ### Example 4: Rule with rationale (preserving user's words)
 ```
 User: "Never use Docker for local dev, it ate 40GB of disk last time and my Mac mini only has 256GB"
-→ memory_store(facts: ["User rule: avoid Docker for local dev. Reason: ate 40GB of disk on 256GB Mac mini"], category: "rule")
+→ memory_add(facts: ["User rule: avoid Docker for local dev. Reason: ate 40GB of disk on 256GB Mac mini"], category: "rule")
 ```
 
 ### Example 5: UPDATE — combining contexts from both versions
@@ -268,22 +318,21 @@ User: "Never use Docker for local dev, it ate 40GB of disk last time and my Mac 
 Recalled: ["As of 2026-03-15, user is planning trip to Paris in September with friend Jack"]
 User: "Can't wait for the Paris trip, definitely want to hit the Eiffel Tower and try authentic French pastries"
 → memory_search("Paris trip planning")
-→ memory_forget("mem-id-of-old")
-→ memory_store(facts: ["As of 2026-03-30, user is planning trip to Paris in September 2025 with friend Jack, says they can't wait to visit the Eiffel Tower and try authentic French pastries"], category: "project")
+→ memory_update(memoryId: "mem-id-of-old", text: "As of 2026-03-30, user is planning trip to Paris in September 2025 with friend Jack, says they can't wait to visit the Eiffel Tower and try authentic French pastries")
 ```
 
 ### Example 6: Outcome over intent
 ```
 User: "Update the call scripts sheet with the new truth-based templates"
 Agent: [updates the sheet successfully]
-→ memory_store(facts: ["Call scripts sheet (ID: 146Qbb...) was updated with truth-based templates (as of 2026-03-30)"], category: "configuration")
+→ memory_add(facts: ["Call scripts sheet (ID: 146Qbb...) was updated with truth-based templates (as of 2026-03-30)"], category: "configuration")
 ```
 
 ### Example 7: Credential — store the fact, not the value
 ```
-User: "Use this API key for the new service: sk-proj-abc123def456"
+User: "Use this API key for the new service: [credential value]"
 Agent: [configures the service]
-→ memory_store(facts: ["API key was configured for the new service (as of 2026-03-30)"], category: "configuration")
+→ memory_add(facts: ["API key was configured for the new service (as of 2026-03-30)"], category: "configuration")
 ```
 
 ### Example 8: NOOP — cosmetic difference, not material
@@ -296,7 +345,7 @@ User: "Yeah me and Poppy love our daily walks"
 ### Example 9: Entity grouping — single call, not fragmented
 ```
 User: "The budget for the offsite is $200 per head. We need a venue with WiFi, parking for 50 cars, and a projector."
-→ memory_store(facts: ["Team offsite budget is $200 per person. Venue requirements: WiFi, parking for 50 vehicles, and projector setup."], category: "project")
+→ memory_add(facts: ["Team offsite budget is $200 per person. Venue requirements: WiFi, parking for 50 vehicles, and projector setup."], category: "project")
 All details about the same entity (offsite) go in one fact, one call.
 ```
 
@@ -304,15 +353,15 @@ All details about the same entity (offsite) go in one fact, one call.
 ```
 Recalled: ["User enjoys hiking on weekends and finds it therapeutic"]
 User: "I hurt my knee last week, can't hike for a while"
-→ memory_store(facts: ["As of 2026-03-30, user has temporarily paused hiking due to knee injury"], category: "project")
+→ memory_add(facts: ["As of 2026-03-30, user has temporarily paused hiking due to knee injury"], category: "project")
 DO NOT delete the hiking preference. It is temporarily paused, not contradicted.
 ```
 
 ### Example 11: Mixed categories in one turn — separate calls
 ```
 User: "I'm Sarah, I work at Cloudflare. I just decided to switch our monitoring from Datadog to Grafana because of cost."
-→ memory_store(facts: ["User is Sarah, works at Cloudflare"], category: "identity")
-→ memory_store(facts: ["As of 2026-03-30, user decided to switch monitoring from Datadog to Grafana due to cost"], category: "decision")
+→ memory_add(facts: ["User is Sarah, works at Cloudflare"], category: "identity")
+→ memory_add(facts: ["As of 2026-03-30, user decided to switch monitoring from Datadog to Grafana due to cost"], category: "decision")
 Two calls because identity and decision have different retention policies.
 ```
 
@@ -328,8 +377,8 @@ Agent: "Hello! How can I help?"
 Recalled: ["User has a dog", "Dog's name is Poppy", "User walks dog daily"]
 User: "Poppy learned fetch! Our walks are even better now, honestly it's the best part of my day"
 → memory_search("dog Poppy walks") → find all three old memory IDs
-→ memory_forget(id-1), memory_forget(id-2), memory_forget(id-3)
-→ memory_store(facts: ["User has a dog named Poppy and says taking him for walks is the best part of their day. Poppy recently learned fetch, making walks more enjoyable."], category: "preference")
+→ memory_update(memoryId: "id-1", text: "User has a dog named Poppy and says taking him for walks is the best part of their day. Poppy recently learned fetch, making walks more enjoyable.")
+→ memory_delete(memoryId: "id-2"), memory_delete(memoryId: "id-3")
 ```
 
 ### Example 12: NOOP — generic greeting, nothing to store

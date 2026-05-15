@@ -367,51 +367,6 @@ class TestGroupIdMapping:
         mg = MemoryGraph(config)
         assert mg._get_group_id({}) == "default"
 
-    def test_project_id_maps_to_double_hyphen(self, mock_graphiti_imports):
-        from mem0.memory.graphiti_memory import MemoryGraph
-
-        config = _make_config()
-        mg = MemoryGraph(config)
-        assert mg._get_group_id({"project_id": "neuralscape"}) == "project--neuralscape"
-
-    def test_explicit_group_id_takes_precedence(self, mock_graphiti_imports):
-        from mem0.memory.graphiti_memory import MemoryGraph
-
-        config = _make_config()
-        mg = MemoryGraph(config)
-        assert mg._get_group_id({"group_id": "custom-id", "project_id": "ignored"}) == "custom-id"
-
-    def test_scope_without_project_returns_global(self, mock_graphiti_imports):
-        from mem0.memory.graphiti_memory import MemoryGraph
-
-        config = _make_config()
-        mg = MemoryGraph(config)
-        assert mg._get_group_id({"scope": "global"}) == "global"
-
-    def test_get_group_ids_with_project(self, mock_graphiti_imports):
-        from mem0.memory.graphiti_memory import MemoryGraph
-
-        config = _make_config()
-        mg = MemoryGraph(config)
-        result = mg._get_group_ids({"project_id": "neuralscape"})
-        assert result == ["global", "project--neuralscape"]
-
-    def test_get_group_ids_explicit_override(self, mock_graphiti_imports):
-        from mem0.memory.graphiti_memory import MemoryGraph
-
-        config = _make_config()
-        mg = MemoryGraph(config)
-        result = mg._get_group_ids({"group_ids": ["a", "b"]})
-        assert result == ["a", "b"]
-
-    def test_get_group_ids_no_project(self, mock_graphiti_imports):
-        from mem0.memory.graphiti_memory import MemoryGraph
-
-        config = _make_config()
-        mg = MemoryGraph(config)
-        result = mg._get_group_ids({"user_id": "alice"})
-        assert result == ["alice"]
-
 
 # ---------------------------------------------------------------------------
 # Source description builder

@@ -19,8 +19,8 @@ export const LOGO = `
 export const LOGO_MINI = "◆ mem0";
 export const TAGLINE = "The Memory Layer for AI Agents";
 
-export const BRAND_COLOR = "#F1C96C";
-export const ACCENT_COLOR = "#F5D78E";
+export const BRAND_COLOR = "#8b5cf6";
+export const ACCENT_COLOR = "#a78bfa";
 export const SUCCESS_COLOR = "#22c55e";
 export const ERROR_COLOR = "#ef4444";
 export const WARNING_COLOR = "#f59e0b";
@@ -96,7 +96,7 @@ export function printError(message: string, hint?: string): void {
 	const resolvedHint =
 		hint ??
 		(message.includes("Authentication failed")
-			? `Run ${brand("mem0 init")} to reconfigure your API key · https://app.mem0.ai/dashboard/api-keys`
+			? `Run ${brand("mem0 init")} to reconfigure your API key · https://app.mem0.ai/dashboard/api-keys?utm_source=oss&utm_medium=cli-node`
 			: undefined);
 	if (resolvedHint) {
 		console.error(`  ${dim(resolvedHint)}`);

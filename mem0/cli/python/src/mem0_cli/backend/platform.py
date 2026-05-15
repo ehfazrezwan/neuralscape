@@ -6,6 +6,7 @@ from typing import Any
 
 import httpx
 
+from mem0_cli import __version__
 from mem0_cli.backend.base import Backend
 from mem0_cli.config import PlatformConfig
 
@@ -21,11 +22,17 @@ class PlatformBackend(Backend):
             headers={
                 "Authorization": f"Token {config.api_key}",
                 "Content-Type": "application/json",
+                "X-Mem0-Source": "cli",
+                "X-Mem0-Client-Language": "python",
+                "X-Mem0-Client-Version": __version__,
             },
             timeout=30.0,
         )
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+        from mem0_cli.state import capture_notice, is_agent_mode
+
+        self._client.headers["X-Mem0-Caller-Type"] = "agent" if is_agent_mode() else "user"
         resp = self._client.request(method, path, **kwargs)
         if resp.status_code == 401:
             raise AuthError("Authentication failed. Your API key may be invalid or expired.")
@@ -41,7 +48,26 @@ class PlatformBackend(Backend):
         resp.raise_for_status()
         if resp.status_code == 204:
             return {}
-        return resp.json()
+        data = resp.json()
+
+        # Pull the unclaimed-Agent-Mode notice out of the body (or the header
+        # fallback for endpoints that return non-dict / non-dict-leading
+        # payloads) and stash it for end-of-command surfacing.
+        notice = None
+        if isinstance(data, dict) and "mem0_notice" in data:
+            notice = data.pop("mem0_notice")
+        elif (
+            isinstance(data, list)
+            and data
+            and isinstance(data[0], dict)
+            and "mem0_notice" in data[0]
+        ):
+            notice = data[0].pop("mem0_notice")
+        if notice is None:
+            notice = resp.headers.get("X-Mem0-Notice-Message") or None
+        capture_notice(notice)
+
+        return data
 
     def add(
         self,
@@ -57,7 +83,6 @@ class PlatformBackend(Backend):
         infer: bool = True,
         expires: str | None = None,
         categories: list[str] | None = None,
-        enable_graph: bool = False,
     ) -> dict:
         payload: dict[str, Any] = {}
 
@@ -84,10 +109,9 @@ class PlatformBackend(Backend):
             payload["expiration_date"] = expires
         if categories:
             payload["categories"] = categories
-        if enable_graph:
-            payload["enable_graph"] = True
+        payload["source"] = "CLI"
 
-        return self._request("POST", "/v1/memories/", json=payload)
+        return self._request("POST", "/v3/memories/add/", json=payload)
 
     def _build_filters(
         self,
@@ -98,7 +122,7 @@ class PlatformBackend(Backend):
         run_id: str | None = None,
         extra_filters: dict | None = None,
     ) -> dict | None:
-        """Build a filters dict for v2 API endpoints.
+        """Build a filters dict for v3 API endpoints.
 
         Entity IDs are ANDed (all provided IDs must match).
         Extra filters (date ranges, categories) are also ANDed.
@@ -144,7 +168,6 @@ class PlatformBackend(Backend):
         keyword: bool = False,
         filters: dict | None = None,
         fields: list[str] | None = None,
-        enable_graph: bool = False,
     ) -> list[dict]:
         payload: dict[str, Any] = {"query": query, "top_k": top_k, "threshold": threshold}
 
@@ -163,10 +186,9 @@ class PlatformBackend(Backend):
             payload["keyword_search"] = True
         if fields:
             payload["fields"] = fields
-        if enable_graph:
-            payload["enable_graph"] = True
+        payload["source"] = "CLI"
 
-        result = self._request("POST", "/v2/memories/search/", json=payload)
+        result = self._request("POST", "/v3/memories/search/", json=payload)
         return (
             result
             if isinstance(result, list)
@@ -174,7 +196,7 @@ class PlatformBackend(Backend):
         )
 
     def get(self, memory_id: str) -> dict:
-        return self._request("GET", f"/v1/memories/{memory_id}/")
+        return self._request("GET", f"/v1/memories/{memory_id}/", params={"source": "CLI"})
 
     def list_memories(
         self,
@@ -188,12 +210,11 @@ class PlatformBackend(Backend):
         category: str | None = None,
         after: str | None = None,
         before: str | None = None,
-        enable_graph: bool = False,
     ) -> list[dict]:
         payload: dict[str, Any] = {}
         params = {"page": str(page), "page_size": str(page_size)}
 
-        # Build filters for v2 API — entity IDs and date filters go inside "filters"
+        # Build filters — entity IDs and date filters go inside "filters"
         extra: dict[str, Any] = {}
         if category:
             extra["categories"] = {"contains": category}
@@ -211,10 +232,9 @@ class PlatformBackend(Backend):
         )
         if api_filters:
             payload["filters"] = api_filters
-        if enable_graph:
-            payload["enable_graph"] = True
+        payload["source"] = "CLI"
 
-        result = self._request("POST", "/v2/memories/", json=payload, params=params)
+        result = self._request("POST", "/v3/memories/", json=payload, params=params)
         return (
             result
             if isinstance(result, list)
@@ -229,6 +249,7 @@ class PlatformBackend(Backend):
             payload["text"] = content
         if metadata:
             payload["metadata"] = metadata
+        payload["source"] = "CLI"
         return self._request("PUT", f"/v1/memories/{memory_id}/", json=payload)
 
     def delete(
@@ -242,7 +263,7 @@ class PlatformBackend(Backend):
         run_id: str | None = None,
     ) -> dict:
         if all:
-            params: dict[str, str] = {}
+            params: dict[str, str] = {"source": "CLI"}
             if user_id:
                 params["user_id"] = user_id
             if agent_id:
@@ -253,7 +274,7 @@ class PlatformBackend(Backend):
                 params["run_id"] = run_id
             return self._request("DELETE", "/v1/memories/", params=params)
         elif memory_id:
-            return self._request("DELETE", f"/v1/memories/{memory_id}/")
+            return self._request("DELETE", f"/v1/memories/{memory_id}/", params={"source": "CLI"})
         else:
             raise ValueError("Either memory_id or --all is required")
 
@@ -278,8 +299,24 @@ class PlatformBackend(Backend):
         # Delete each provided entity via the v2 path-based endpoint
         result: dict = {}
         for entity_type, entity_id in entities.items():
-            result = self._request("DELETE", f"/v2/entities/{entity_type}/{entity_id}/")
+            result = self._request(
+                "DELETE", f"/v2/entities/{entity_type}/{entity_id}/", params={"source": "CLI"}
+            )
         return result
+
+    def ping(self, timeout: float | None = None) -> dict:
+        """Call the ping endpoint and return the raw response.
+
+        When *timeout* is given it overrides the client-level timeout so that
+        validation pings can fail fast without blocking the user.
+        """
+        if timeout is not None:
+            resp = self._client.get("/v1/ping/", timeout=timeout)
+            if resp.status_code == 401:
+                raise AuthError("Authentication failed. Your API key may be invalid or expired.")
+            resp.raise_for_status()
+            return resp.json()
+        return self._request("GET", "/v1/ping/")
 
     def status(
         self,
@@ -289,7 +326,7 @@ class PlatformBackend(Backend):
     ) -> dict[str, Any]:
         """Check connectivity using the ping endpoint."""
         try:
-            self._request("GET", "/v1/ping/")
+            self.ping()
             return {"connected": True, "backend": "platform", "base_url": self.base_url}
         except Exception as e:
             return {"connected": False, "backend": "platform", "error": str(e)}

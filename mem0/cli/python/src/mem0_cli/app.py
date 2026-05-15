@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json as _json
 import os
 import stat as _stat_mod
@@ -12,7 +13,7 @@ import typer
 from rich.console import Console
 
 from mem0_cli import __version__
-from mem0_cli.branding import BRAND_COLOR, print_error
+from mem0_cli.branding import BRAND_COLOR, print_error, print_warning
 
 console = Console()
 err_console = Console(stderr=True)
@@ -55,6 +56,44 @@ event_app = typer.Typer(
 # entity_app and event_app registered after Memory commands to control panel ordering
 
 
+# ── Validated user identity (set by _get_backend_and_config) ──────────────
+
+_validated_user_email: str | None = None
+
+# ── Telemetry helper ─────────────────────────────────────────────────────
+
+
+def _fire_telemetry(command_name: str, extra: dict | None = None) -> None:
+    """Fire a PostHog telemetry event (non-blocking, never fails)."""
+    try:
+        from mem0_cli.telemetry import capture_event
+
+        props = {"command": command_name}
+        if extra:
+            props.update(extra)
+        capture_event(f"cli.{command_name}", props, pre_resolved_email=_validated_user_email)
+    except Exception:
+        pass
+
+
+@config_app.callback(invoke_without_command=True)
+def _config_callback(ctx: typer.Context) -> None:
+    if ctx.invoked_subcommand:
+        _fire_telemetry(f"config.{ctx.invoked_subcommand}")
+
+
+@entity_app.callback(invoke_without_command=True)
+def _entity_callback(ctx: typer.Context) -> None:
+    if ctx.invoked_subcommand:
+        _fire_telemetry(f"entity.{ctx.invoked_subcommand}")
+
+
+@event_app.callback(invoke_without_command=True)
+def _event_callback(ctx: typer.Context) -> None:
+    if ctx.invoked_subcommand:
+        _fire_telemetry(f"event.{ctx.invoked_subcommand}")
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────
 
 
@@ -62,9 +101,16 @@ def _get_backend_and_config(
     api_key: str | None = None,
     base_url: str | None = None,
 ):
-    """Build and return the Platform backend plus the loaded config."""
+    """Build and return the Platform backend plus the loaded config.
+
+    Validates the API key upfront via ``/v1/ping/`` and caches the
+    resolved user email for telemetry.
+    """
+    global _validated_user_email
+
     from mem0_cli.backend import get_backend
-    from mem0_cli.config import load_config
+    from mem0_cli.backend.platform import AuthError
+    from mem0_cli.config import load_config, save_config
 
     config = load_config()
 
@@ -81,7 +127,29 @@ def _get_backend_and_config(
         )
         raise typer.Exit(1)
 
-    return get_backend(config), config
+    backend = get_backend(config)
+
+    # Validate the API key upfront with a fast timeout
+    try:
+        ping_data = backend.ping(timeout=5.0)
+        email = ping_data.get("user_email") if isinstance(ping_data, dict) else None
+        if email:
+            _validated_user_email = email
+            if config.platform.user_email != email:
+                config.platform.user_email = email
+                with contextlib.suppress(Exception):
+                    save_config(config)
+    except AuthError:
+        print_error(
+            err_console,
+            "Invalid or expired API key.",
+            hint="Run 'mem0 init' or set MEM0_API_KEY environment variable.",
+        )
+        raise typer.Exit(1) from None
+    except Exception:
+        print_warning(err_console, "Could not validate API key (network issue). Proceeding anyway.")
+
+    return backend, config
 
 
 def _get_backend(
@@ -165,8 +233,19 @@ def main_callback(
     if version:
         from mem0_cli.commands.utils import cmd_version
 
+        _fire_telemetry("version")
         cmd_version()
         raise typer.Exit()
+    if ctx.invoked_subcommand:
+        # Stash the active subcommand name so the JSON error envelope
+        # (print_error in agent mode) can report which command failed
+        # instead of an empty `"command": ""` field.
+        from mem0_cli.state import set_current_command
+
+        set_current_command(ctx.invoked_subcommand)
+    if ctx.invoked_subcommand and ctx.invoked_subcommand != "init":
+        # init fires its own telemetry from init_cmd.run_init with full M1-M6 props.
+        _fire_telemetry(ctx.invoked_subcommand)
 
 
 # ── Memory: add ───────────────────────────────────────────────────────────
@@ -196,8 +275,6 @@ def add(
     categories: str | None = typer.Option(
         None, "--categories", help="Categories (JSON array or comma-separated)."
     ),
-    graph: bool = typer.Option(False, "--graph", help="Enable graph memory extraction."),
-    no_graph: bool = typer.Option(False, "--no-graph", help="Disable graph memory extraction."),
     output: str = typer.Option(
         "text", "--output", "-o", help="Output format: text, json, quiet.", rich_help_panel="Output"
     ),
@@ -224,13 +301,6 @@ def add(
     backend, config = _get_backend_and_config(api_key, base_url)
     ids = _resolve_ids(config, user_id=user_id, agent_id=agent_id, app_id=app_id, run_id=run_id)
 
-    if no_graph:
-        graph_enabled = False
-    elif graph:
-        graph_enabled = True
-    else:
-        graph_enabled = config.defaults.enable_graph
-
     cmd_add(
         backend,
         text,
@@ -242,7 +312,6 @@ def add(
         no_infer=no_infer,
         expires=expires,
         categories=categories,
-        enable_graph=graph_enabled,
         output=output,
     )
 
@@ -286,12 +355,6 @@ def search(
         help="Specific fields to return (comma-separated).",
         rich_help_panel="Search",
     ),
-    graph: bool = typer.Option(
-        False, "--graph", help="Enable graph in search.", rich_help_panel="Search"
-    ),
-    no_graph: bool = typer.Option(
-        False, "--no-graph", help="Disable graph in search.", rich_help_panel="Search"
-    ),
     output: str = typer.Option(
         "text", "--output", "-o", help="Output: text, json, table.", rich_help_panel="Output"
     ),
@@ -325,13 +388,6 @@ def search(
     backend, config = _get_backend_and_config(api_key, base_url)
     ids = _resolve_ids(config, user_id=user_id, agent_id=agent_id, app_id=app_id, run_id=run_id)
 
-    if no_graph:
-        graph_enabled = False
-    elif graph:
-        graph_enabled = True
-    else:
-        graph_enabled = config.defaults.enable_graph
-
     cmd_search(
         backend,
         query,
@@ -342,7 +398,6 @@ def search(
         keyword=keyword,
         filter_json=filter_json,
         fields=fields,
-        enable_graph=graph_enabled,
         output=output,
     )
 
@@ -409,12 +464,6 @@ def list_cmd(
     before: str | None = typer.Option(
         None, "--before", help="Created before (YYYY-MM-DD).", rich_help_panel="Filters"
     ),
-    graph: bool = typer.Option(
-        False, "--graph", help="Enable graph in listing.", rich_help_panel="Filters"
-    ),
-    no_graph: bool = typer.Option(
-        False, "--no-graph", help="Disable graph in listing.", rich_help_panel="Filters"
-    ),
     output: str = typer.Option(
         "table", "--output", "-o", help="Output: text, json, table.", rich_help_panel="Output"
     ),
@@ -440,13 +489,6 @@ def list_cmd(
     backend, config = _get_backend_and_config(api_key, base_url)
     ids = _resolve_ids(config, user_id=user_id, agent_id=agent_id, app_id=app_id, run_id=run_id)
 
-    if no_graph:
-        graph_enabled = False
-    elif graph:
-        graph_enabled = True
-    else:
-        graph_enabled = config.defaults.enable_graph
-
     cmd_list(
         backend,
         **ids,
@@ -455,7 +497,6 @@ def list_cmd(
         category=category,
         after=after,
         before=before,
-        enable_graph=graph_enabled,
         output=output,
     )
 
@@ -571,12 +612,14 @@ def delete(
 
     # ── Dispatch ─────────────────────────────────────────────────────
     if memory_id is not None:
+        _fire_telemetry("delete", {"delete_mode": "single"})
         from mem0_cli.commands.memory import cmd_delete
 
         backend = _get_backend(api_key, base_url)
         cmd_delete(backend, memory_id, dry_run=dry_run, force=force, output=output)
 
     elif all_:
+        _fire_telemetry("delete", {"delete_mode": "all"})
         from mem0_cli.commands.memory import cmd_delete_all
 
         backend, config = _get_backend_and_config(api_key, base_url)
@@ -584,6 +627,7 @@ def delete(
         cmd_delete_all(backend, force=force, dry_run=dry_run, all_=project, **ids, output=output)
 
     else:  # --entity
+        _fire_telemetry("delete", {"delete_mode": "entity"})
         from mem0_cli.commands.entities import cmd_entities_delete
 
         backend = _get_backend(api_key, base_url)
@@ -815,6 +859,19 @@ def init(
     force: bool = typer.Option(
         False, "--force", help="Overwrite existing config without confirmation."
     ),
+    agent_signal: bool = typer.Option(
+        False, "--agent", help="Bootstrap an unattended Agent Mode account (no email required)."
+    ),
+    source: str | None = typer.Option(
+        None,
+        "--source",
+        help="Channel attribution for signup (e.g. github, hn, ph).",
+    ),
+    agent_caller: str | None = typer.Option(
+        None,
+        "--agent-caller",
+        help="Self-declared agent identity (e.g. claude-code, cursor). Used with --agent to attribute Agent Mode signups.",
+    ),
 ) -> None:
     """Interactive setup wizard for mem0 CLI.
 
@@ -823,10 +880,38 @@ def init(
       mem0 init --api-key m0-xxx --user-id alice
       mem0 init --email alice@company.com
       mem0 init --email alice@company.com --code 482901
+      mem0 init --agent --agent-caller claude-code   # AI agent self-identifies on Agent Mode bootstrap
+      mem0 init --email alice@company.com  # Claims an existing Agent Mode key when one is present
     """
     from mem0_cli.commands.init_cmd import run_init
 
-    run_init(api_key=api_key, user_id=user_id, email=email, code=code, force=force)
+    run_init(
+        api_key=api_key,
+        user_id=user_id,
+        email=email,
+        code=code,
+        force=force,
+        source=source,
+        agent=agent_signal,
+        agent_caller=agent_caller,
+    )
+
+
+@app.command(rich_help_panel="Setup")
+def identify(
+    name: str = typer.Argument(..., help="Agent identity (e.g. claude-code, cursor, my-bot)."),
+) -> None:
+    """Tag your active Agent Mode key with the AI agent that's using it.
+
+    Run this once after `mem0 init --agent` if you didn't pass --agent-caller.
+    Idempotent — re-running just overwrites the value.
+
+    Example:
+      mem0 identify claude-code
+    """
+    from mem0_cli.commands.identify_cmd import run_identify
+
+    run_identify(name)
 
 
 # (entity_app registered at module level, below sub-group definitions)
@@ -1162,11 +1247,28 @@ def main() -> None:
     import sys
 
     # Allow --json/--agent anywhere in the command line (not just before subcommand).
-    _json_flags = {"--json", "--agent"}
-    if any(a in _json_flags for a in sys.argv[1:]):
+    # Special case: `mem0 init --agent` is a subcommand flag (Agent Mode bootstrap)
+    # consumed by init_cmd, not a global JSON-output toggle — leave it in argv.
+    argv_rest = sys.argv[1:]
+    is_init = "init" in argv_rest
+    _global_flags = {"--json"} if is_init else {"--json", "--agent"}
+    if any(a in _global_flags for a in argv_rest):
         from mem0_cli.state import set_agent_mode
 
         set_agent_mode(True)
-        sys.argv = [sys.argv[0]] + [a for a in sys.argv[1:] if a not in _json_flags]
+        sys.argv = [sys.argv[0]] + [a for a in argv_rest if a not in _global_flags]
 
-    app()
+    try:
+        app()
+    finally:
+        # Surface any unclaimed Agent Mode notice once per command, after the
+        # primary output. In JSON/agent mode the notice is folded into the
+        # envelope by format_json_envelope, so skip the stderr banner there
+        # to avoid duplicate output.
+        from mem0_cli.state import is_agent_mode, take_notice
+
+        notice = take_notice()
+        if notice and not is_agent_mode():
+            from rich.console import Console
+
+            Console(stderr=True).print(f"\n[yellow]🔔 {notice}[/yellow]\n")

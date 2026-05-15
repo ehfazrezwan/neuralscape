@@ -15,7 +15,6 @@ export interface AddOptions {
 	infer?: boolean;
 	expires?: string;
 	categories?: string[];
-	enableGraph?: boolean;
 }
 
 export interface SearchOptions {
@@ -29,7 +28,6 @@ export interface SearchOptions {
 	keyword?: boolean;
 	filters?: Record<string, unknown>;
 	fields?: string[];
-	enableGraph?: boolean;
 }
 
 export interface ListOptions {
@@ -42,7 +40,6 @@ export interface ListOptions {
 	category?: string;
 	after?: string;
 	before?: string;
-	enableGraph?: boolean;
 }
 
 export interface DeleteOptions {
@@ -88,6 +85,8 @@ export interface Backend {
 	): Promise<Record<string, unknown>>;
 
 	deleteEntities(opts: EntityIds): Promise<Record<string, unknown>>;
+
+	ping(): Promise<Record<string, unknown>>;
 
 	status(opts?: { userId?: string; agentId?: string }): Promise<
 		Record<string, unknown>

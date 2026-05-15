@@ -220,7 +220,6 @@ class GraphStoreFactory:
         "neptune": "mem0.graphs.neptune.neptunegraph.MemoryGraph",
         "neptunedb": "mem0.graphs.neptune.neptunedb.MemoryGraph",
         "kuzu": "mem0.memory.kuzu_memory.MemoryGraph",
-        "apache_age": "mem0.memory.apache_age_memory.MemoryGraph",
         "graphiti": "mem0.memory.graphiti_memory.MemoryGraph",
         "default": "mem0.memory.graph_memory.MemoryGraph",
     }
@@ -233,6 +232,7 @@ class GraphStoreFactory:
         except (ImportError, AttributeError) as e:
             raise ImportError(f"Could not import MemoryGraph for provider '{provider_name}': {e}")
         return GraphClass(config)
+
 
 
 class RerankerFactory:

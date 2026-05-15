@@ -30,7 +30,6 @@ from mem0_cli.commands.memory import (
 from mem0_cli.commands.utils import (
     cmd_import,
     cmd_status,
-    cmd_version,
 )
 
 
@@ -742,15 +741,6 @@ class TestStatusCommand:
         assert '"status"' in output
 
 
-class TestVersionCommand:
-    def test_version(self):
-        console, buf = _make_console()
-        with patch("mem0_cli.commands.utils.console", console):
-            cmd_version()
-        output = buf.getvalue()
-        assert "0.1.0" in output
-
-
 class TestImportCommand:
     def test_import_json(self, mock_backend, tmp_path):
         file_path = tmp_path / "import.json"
@@ -1005,85 +995,6 @@ class TestEntitiesDeleteCommand:
         output = buf.getvalue()
         assert "dry run" in output.lower()
         mock_backend.delete_entities.assert_not_called()
-
-
-class TestEnableGraph:
-    def test_add_with_graph(self, mock_backend):
-        console, _buf = _make_console()
-        err_console, _err_buf = _make_err_console()
-        with (
-            patch("mem0_cli.commands.memory.console", console),
-            patch("mem0_cli.commands.memory.err_console", err_console),
-        ):
-            cmd_add(
-                mock_backend,
-                "test",
-                user_id="alice",
-                agent_id=None,
-                app_id=None,
-                run_id=None,
-                messages=None,
-                file=None,
-                metadata=None,
-                immutable=False,
-                no_infer=False,
-                expires=None,
-                categories=None,
-                enable_graph=True,
-                output="text",
-            )
-        call_kwargs = mock_backend.add.call_args
-        assert call_kwargs.kwargs.get("enable_graph") is True
-
-    def test_search_with_graph(self, mock_backend):
-        console, _buf = _make_console()
-        err_console, _err_buf = _make_err_console()
-        with (
-            patch("mem0_cli.commands.memory.console", console),
-            patch("mem0_cli.commands.memory.err_console", err_console),
-        ):
-            cmd_search(
-                mock_backend,
-                "test",
-                user_id="alice",
-                agent_id=None,
-                app_id=None,
-                run_id=None,
-                top_k=10,
-                threshold=0.3,
-                rerank=False,
-                keyword=False,
-                filter_json=None,
-                fields=None,
-                enable_graph=True,
-                output="text",
-            )
-        call_kwargs = mock_backend.search.call_args
-        assert call_kwargs.kwargs.get("enable_graph") is True
-
-    def test_list_with_graph(self, mock_backend):
-        console, _buf = _make_console()
-        err_console, _err_buf = _make_err_console()
-        with (
-            patch("mem0_cli.commands.memory.console", console),
-            patch("mem0_cli.commands.memory.err_console", err_console),
-        ):
-            cmd_list(
-                mock_backend,
-                user_id="alice",
-                agent_id=None,
-                app_id=None,
-                run_id=None,
-                page=1,
-                page_size=100,
-                category=None,
-                after=None,
-                before=None,
-                enable_graph=True,
-                output="table",
-            )
-        call_kwargs = mock_backend.list_memories.call_args
-        assert call_kwargs.kwargs.get("enable_graph") is True
 
 
 class TestEventCommands:

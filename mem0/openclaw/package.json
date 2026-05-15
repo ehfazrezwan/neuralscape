@@ -1,9 +1,14 @@
 {
   "name": "@mem0/openclaw-mem0",
-  "version": "1.0.0",
+  "version": "1.0.11",
   "type": "module",
   "description": "Mem0 memory backend for OpenClaw — platform or self-hosted open-source",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mem0ai/mem0",
+    "directory": "openclaw"
+  },
   "keywords": [
     "openclaw",
     "plugin",
@@ -30,19 +35,22 @@
   },
   "dependencies": {
     "@sinclair/typebox": "0.34.47",
-    "mem0ai": "^2.3.0"
+    "mem0ai": "3.0.2"
   },
   "openclaw": {
     "extensions": [
       "./dist/index.js"
     ],
     "compat": {
-      "pluginApi": ">=2026.3.24-beta.2",
-      "minGatewayVersion": "2026.3.24-beta.2"
+      "pluginApi": ">=2026.4.24",
+      "minGatewayVersion": ">=2026.4.24"
     },
     "build": {
-      "openclawVersion": "2026.3.24-beta.2",
-      "pluginSdkVersion": "2026.3.24-beta.2"
+      "openclawVersion": "2026.4.24",
+      "pluginSdkVersion": "2026.4.24"
+    },
+    "install": {
+      "npmSpec": "@mem0/openclaw-mem0"
     }
   },
   "devDependencies": {
@@ -51,5 +59,10 @@
     "tsup": "^8.5.0",
     "typescript": "^5.8.3",
     "vitest": "^4.0.18"
+  },
+  "pnpm": {
+    "overrides": {
+      "protobufjs@<7.5.5": "^7.5.5"
+    }
   }
 }
