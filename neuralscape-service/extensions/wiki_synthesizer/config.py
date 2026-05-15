@@ -51,6 +51,17 @@ class SynthesizerSettings(BaseSettings):
         ),
     )
 
+    auto_build_communities: bool = Field(
+        default=True,
+        description=(
+            "Before walking communities, call ``Graphiti.build_communities`` "
+            "for any shared group_id that has zero Community nodes. "
+            "Graphiti's incremental ``update_communities=True`` flag only "
+            "refreshes EXISTING communities; without this pre-build, "
+            "freshly populated groups would never produce synthesis output."
+        ),
+    )
+
     obsidian_vault_path: str = Field(
         default="/data/vault",
         description="Root of the Obsidian vault. Same value as the conversation_compiler.",

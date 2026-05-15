@@ -380,23 +380,27 @@ class MemoryService:
         """
         if not (self._graphiti and self._bridge):
             return
-        try:
-            from extensions.wiki_synthesizer.graph_patcher import (
-                attach_memory_id,
-            )
+        from extensions.wiki_synthesizer.graph_patcher import (
+            attach_memory_id,
+        )
 
-            self._run_on_bridge(
-                attach_memory_id(
-                    self._graphiti.driver,
-                    group_id=group_id,
-                    memory_id=memory_id,
-                    visibility=visibility,
-                    owner_user_id=owner_user_id,
-                    write_started_at=write_started_at,
-                ),
-                timeout=10.0,
-            )
+        # Build the coroutine separately so we can ``.close()`` it if
+        # ``_run_on_bridge`` raises before awaiting — otherwise tests
+        # that exercise this path with a mocked bridge raise
+        # ``RuntimeWarning: coroutine 'attach_memory_id' was never
+        # awaited`` and slow the suite down with traceback collection.
+        coro = attach_memory_id(
+            self._graphiti.driver,
+            group_id=group_id,
+            memory_id=memory_id,
+            visibility=visibility,
+            owner_user_id=owner_user_id,
+            write_started_at=write_started_at,
+        )
+        try:
+            self._run_on_bridge(coro, timeout=10.0)
         except Exception:
+            coro.close()
             logger.warning(
                 "attach_memory_id post-write hook failed (non-critical)",
                 exc_info=True,
@@ -508,6 +512,7 @@ class MemoryService:
             f"{msg.get('role', 'user')}: {msg.get('content', '')}"
             for msg in cleaned_messages
         )
+        graph_write_started_at = datetime.now(timezone.utc)
         try:
             if self._graphiti and self._bridge and raw_text.strip():
                 retry_transient(
@@ -516,6 +521,23 @@ class MemoryService:
                     filters={"user_id": user_id, "group_id": group_id},
                     operation="graph storage (extract_and_store)",
                 )
+                # 1-episode → N-memories shape: a single graph.add produces
+                # entities that could legitimately belong to any of the N
+                # extracted memories. We call attach_memory_id once per
+                # stored memory; the Cypher uses ``coalesce(memory_id,
+                # $memory_id)``, so the first call wins and later calls are
+                # no-ops on the same node. The result is each fresh entity
+                # carries one representative memory_id from the batch — not
+                # a perfect mapping, but enough for the wiki synthesizer
+                # to walk community → source memory.
+                for mem in stored:
+                    self._attach_memory_id_to_graph_nodes(
+                        group_id=group_id,
+                        memory_id=getattr(mem, "id", "") or "",
+                        visibility=MemoryVisibility.PRIVATE.value,
+                        owner_user_id=user_id,
+                        write_started_at=graph_write_started_at,
+                    )
         except Exception as e:
             logger.warning(f"Graph storage failed (non-critical): {e}")
 

@@ -270,12 +270,16 @@ class TestSynthesizeAll:
         settings = SynthesizerSettings(
             enabled=True,
             obsidian_vault_path=str(tmp_path),
+            auto_build_communities=False,
         )
         service = MagicMock()
         service._graphiti = MagicMock()
         service._graphiti.driver = MagicMock()
 
         with patch(
+            "extensions.wiki_synthesizer.synthesizer._list_shared_group_ids",
+            new=AsyncMock(return_value=["shared"]),
+        ), patch(
             "extensions.wiki_synthesizer.synthesizer.load_communities",
             new=AsyncMock(return_value=[empty_community]),
         ):
@@ -288,3 +292,94 @@ class TestSynthesizeAll:
         assert result.pages_created == 0
         assert result.pages_updated == 0
         assert result.communities_skipped_empty == 1
+
+    @pytest.mark.asyncio
+    async def test_walks_all_shared_group_ids(self, tmp_path):
+        # The fix: synthesizer walks `shared` AND `shared--project--<X>`.
+        # Confirm load_communities is invoked once per discovered group_id.
+        settings = SynthesizerSettings(
+            enabled=True,
+            obsidian_vault_path=str(tmp_path),
+            auto_build_communities=False,
+        )
+        service = MagicMock()
+        service._graphiti = MagicMock()
+        service._graphiti.driver = MagicMock()
+
+        load_calls: list[str] = []
+
+        async def fake_load(driver, *, group_id):
+            load_calls.append(group_id)
+            return []
+
+        with patch(
+            "extensions.wiki_synthesizer.synthesizer._list_shared_group_ids",
+            new=AsyncMock(return_value=[
+                "shared",
+                "shared--project--neuralscape",
+                "shared--project--lightpath",
+            ]),
+        ), patch(
+            "extensions.wiki_synthesizer.synthesizer.load_communities",
+            new=fake_load,
+        ):
+            await synthesize_all(service=service, settings=settings)
+
+        assert load_calls == [
+            "shared",
+            "shared--project--neuralscape",
+            "shared--project--lightpath",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_only_category_filters_inferred_category(self, tmp_path):
+        # only_category is now applied AFTER category inference, not
+        # used to drive an outer loop. Communities whose inferred
+        # category mismatches are skipped silently (not counted as
+        # empty).
+        community = Community(
+            uuid="c-tech",
+            name="Stack basics",
+            member_node_uuids=["u1"],
+            member_memory_ids=["mem-1", "mem-2"],
+        )
+
+        settings = SynthesizerSettings(
+            enabled=True,
+            obsidian_vault_path=str(tmp_path),
+            auto_build_communities=False,
+        )
+        service = MagicMock()
+        service._graphiti = MagicMock()
+        service._graphiti.driver = MagicMock()
+        # Both member memories report category=tech_stack.
+        service.get_memory = MagicMock(side_effect=lambda mid: MagicMock(
+            id=mid, memory="x", category="tech_stack",
+            domain=None, observation_type=None, confidence=None,
+            created_at=None, visibility="shared",
+        ))
+
+        with patch(
+            "extensions.wiki_synthesizer.synthesizer._list_shared_group_ids",
+            new=AsyncMock(return_value=["shared"]),
+        ), patch(
+            "extensions.wiki_synthesizer.synthesizer.load_communities",
+            new=AsyncMock(return_value=[community]),
+        ), patch(
+            "extensions.wiki_synthesizer.synthesizer._call_gemini",
+            new=AsyncMock(return_value="body"),
+        ):
+            # Wrong category filter — community is tech_stack, filter is preference
+            r1 = await synthesize_all(
+                service=service, settings=settings, only_category="preference"
+            )
+            assert r1.pages_created == 0
+            assert r1.pages_updated == 0
+
+            # Right category filter — should produce a page
+            r2 = await synthesize_all(
+                service=service, settings=settings,
+                only_category="tech_stack",
+                dry_run=True,
+            )
+            assert r2.pages_created + r2.pages_updated == 1

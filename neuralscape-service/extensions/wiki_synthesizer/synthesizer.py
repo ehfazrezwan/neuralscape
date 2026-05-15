@@ -78,14 +78,24 @@ async def synthesize_all(
     only_category: str | None = None,
     dry_run: bool = False,
 ) -> SynthesisResult:
-    """Run one full synthesis pass over every shared category.
+    """Run one full synthesis pass over every shared group_id.
+
+    Walks every group_id that starts with ``shared``: the team-wide
+    ``shared`` pool plus every ``shared--project--<pid>`` pool. The
+    earlier "one outer loop per category" design was wrong — categories
+    are a per-memory property, not a per-group property, so iterating
+    13 times per group produced 13 duplicate page attempts per community.
+    Now we iterate group_id → community → infer category from the
+    community's member memories. The ``only_category`` filter still works
+    but is applied after the category is inferred.
 
     Args:
         service: The shared MemoryService instance. Used to access the
             Neo4j driver and to fetch source memory content from Qdrant.
         settings: Synthesizer settings (cadence, vault path, model).
-        only_category: When set, restrict synthesis to a single
-            category (handy for manual triggers).
+        only_category: When set, only synthesize pages whose inferred
+            category matches. Communities that resolve to a different
+            category are skipped.
         dry_run: When True, do everything except write to the vault and
             patch Neo4j. The returned result still reports what would
             have happened.
@@ -100,46 +110,60 @@ async def synthesize_all(
         result.errors.append("no Neo4j driver available on MemoryService")
         return result
 
-    categories = [only_category] if only_category else list(CATEGORY_VAULT_PATHS.keys())
+    shared_group_ids = await _list_shared_group_ids(driver)
+    if not shared_group_ids:
+        logger.info("synthesis skipped: no shared group_ids in the graph")
+        return result
 
-    for category in categories:
-        # v1 synthesizes the team-wide shared pool only. Per-project
-        # shared groups (`shared--project--{pid}`) come in a follow-up.
-        group_id = _build_group_id(MemoryVisibility.SHARED.value, "", None)
+    # Make sure every group_id has at least one Community node before we
+    # try to walk it. Graphiti's incremental `update_communities=True`
+    # only updates EXISTING communities, so freshly-populated groups
+    # often have zero communities until we explicitly call build.
+    if settings.auto_build_communities:
+        await _ensure_communities_built(
+            service=service, group_ids=shared_group_ids, result=result
+        )
+
+    for group_id in shared_group_ids:
         try:
             communities = await load_communities(driver, group_id=group_id)
         except Exception as exc:
             logger.warning(
-                "load_communities raised for category=%s group_id=%s: %s",
-                category,
-                group_id,
-                exc,
+                "load_communities raised for group_id=%s: %s", group_id, exc
             )
-            result.errors.append(f"{category}: load_communities failed")
+            result.errors.append(f"{group_id}: load_communities failed")
             continue
 
         for community in communities:
             if not community.member_memory_ids:
                 result.communities_skipped_empty += 1
                 continue
+
+            inferred_category = _infer_category(service, community)
+            if inferred_category is None:
+                result.communities_skipped_empty += 1
+                continue
+            if only_category and inferred_category != only_category:
+                continue
+
             try:
                 page = await _synthesize_community(
                     service=service,
                     settings=settings,
                     driver=driver,
-                    category=category,
+                    category=inferred_category,
                     group_id=group_id,
                     community=community,
                     dry_run=dry_run,
                 )
             except Exception as exc:
                 logger.exception(
-                    "synthesis failed for category=%s community=%s",
-                    category,
+                    "synthesis failed for group_id=%s community=%s",
+                    group_id,
                     community.uuid,
                 )
                 result.errors.append(
-                    f"{category}/{community.uuid}: {exc.__class__.__name__}"
+                    f"{group_id}/{community.uuid}: {exc.__class__.__name__}"
                 )
                 continue
             if page is None:
@@ -241,6 +265,109 @@ async def _synthesize_community(
 
 
 # ── Helpers ────────────────────────────────────────────────────────
+
+
+async def _list_shared_group_ids(driver: Any) -> list[str]:
+    """Return every group_id that starts with ``shared``.
+
+    Covers the team-wide ``shared`` group plus per-project shared
+    groups (``shared--project--<pid>``). Private groups (``user--...``,
+    ``user--...--project--...``) and the legacy ``global`` namespace are
+    intentionally excluded — v1 vault content is shared-only.
+    """
+    cypher = """
+    MATCH (n)
+    WHERE n.group_id STARTS WITH 'shared'
+    RETURN DISTINCT n.group_id AS gid
+    ORDER BY gid
+    """
+    try:
+        async with driver.session() as session:
+            result = await session.run(cypher)
+            records = await result.data()
+        return [r["gid"] for r in records if r.get("gid")]
+    except Exception:
+        logger.warning("_list_shared_group_ids failed", exc_info=True)
+        return []
+
+
+async def _ensure_communities_built(
+    *,
+    service: MemoryService,
+    group_ids: list[str],
+    result: SynthesisResult,
+) -> None:
+    """Call ``Graphiti.build_communities`` for any group_id with none yet.
+
+    Graphiti's ``update_communities=True`` flag only refreshes EXISTING
+    communities on episode add — a group with zero communities stays at
+    zero. We check per-group_id and trigger build for the empty ones.
+    Best-effort: failures are logged but don't fail the synthesis run.
+    """
+    driver = service._graphiti.driver  # type: ignore[attr-defined]
+    graphiti = service._graphiti
+    bridge_runner = service._run_on_bridge
+    if not (graphiti and bridge_runner):
+        return
+
+    cypher = """
+    UNWIND $gids AS gid
+    OPTIONAL MATCH (c:Community {group_id: gid})
+    WITH gid, count(c) AS n
+    RETURN gid, n
+    """
+    needs_build: list[str] = []
+    try:
+        async with driver.session() as session:
+            cursor = await session.run(cypher, gids=group_ids)
+            records = await cursor.data()
+        for r in records:
+            if int(r.get("n") or 0) == 0:
+                needs_build.append(r["gid"])
+    except Exception:
+        logger.warning("could not check community counts (skipping pre-build)", exc_info=True)
+        return
+
+    if not needs_build:
+        return
+    logger.info(
+        "synthesizer pre-build: triggering build_communities for %d empty group(s): %s",
+        len(needs_build),
+        needs_build,
+    )
+    try:
+        bridge_runner(
+            graphiti.build_communities(group_ids=needs_build), timeout=600.0
+        )
+    except Exception as exc:
+        logger.warning("build_communities failed (continuing): %s", exc, exc_info=True)
+        result.errors.append(f"build_communities: {exc.__class__.__name__}")
+
+
+def _infer_category(service: MemoryService, community: Community) -> str | None:
+    """Return the most-common NeuralScape category among the community's members.
+
+    Walks the community's ``member_memory_ids``, looks up each memory in
+    Qdrant via ``service.get_memory``, and returns the modal category.
+    Returns ``None`` if no member resolved to a memory with a known
+    category — the synthesizer treats that as "skip this community".
+    """
+    if not community.member_memory_ids:
+        return None
+    counts: dict[str, int] = {}
+    # Cap the lookup; on huge communities we don't need to read all members
+    # just to pick a category.
+    for mid in community.member_memory_ids[:25]:
+        mem = _load_memory(service, mid)
+        if not mem:
+            continue
+        cat = (mem.get("category") or "").strip()
+        if cat and cat in CATEGORY_VAULT_PATHS:
+            counts[cat] = counts.get(cat, 0) + 1
+    if not counts:
+        return None
+    # Most common wins; ties broken by sort order (stable).
+    return max(counts.items(), key=lambda kv: kv[1])[0]
 
 
 def _driver_from_service(service: MemoryService) -> Any | None:

@@ -35,6 +35,11 @@ COPY mem0/mem0/ mem0/mem0/
 COPY mem0/pyproject.toml mem0/
 COPY neuralscape-service/*.py neuralscape-service/
 COPY neuralscape-service/extensions/ neuralscape-service/extensions/
+# Operator-facing scripts (relocate_vault_to_raw, issue_user_token,
+# migrate_graph_groups, bulk_promote_visibility). Production operators
+# invoke these in-container; without this copy they had to docker-cp
+# them in by hand.
+COPY neuralscape-service/scripts/ neuralscape-service/scripts/
 
 # Put venv on PATH
 ENV PATH="/app/neuralscape-service/.venv/bin:$PATH"
