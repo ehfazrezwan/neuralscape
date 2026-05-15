@@ -268,6 +268,17 @@ class MemoryService:
 
         Thread-safe: uses a lock to prevent double-initialization on
         concurrent cold-start requests.
+
+        mem0 v2.0.2 (upstream c9e8482a, merged in #38) removed auto-init
+        of ``Memory.graph`` from ``mem0/mem0/memory/main.py``. The
+        ``MemoryGraph`` adapter for Graphiti is still present in
+        ``mem0.memory.graphiti_memory`` and still selectable via
+        ``GraphStoreFactory``, but nothing wires it onto the ``Memory``
+        instance anymore. We re-attach it manually below so downstream
+        code (``store_raw``, ``extract_and_store``, the wiki synthesizer,
+        etc.) keeps using ``self._memory.graph.add(...)`` unchanged.
+        Without this re-attach every graph write is a silent no-op and
+        the health check reports ``graph_store: not_initialized``.
         """
         if self._memory is None:
             with self._init_lock:
@@ -276,6 +287,45 @@ class MemoryService:
 
                     config = settings.get_mem0_config()
                     self._memory = Memory.from_config(config)
+
+                    # Re-attach the Graphiti adapter mem0 v2.0.2 stopped
+                    # auto-creating. The MemoryGraph constructor in
+                    # ``mem0/mem0/memory/graphiti_memory.py`` reads
+                    # ``config.graph_store.config.<field>`` via attribute
+                    # access, but mem0 v2.0.2's ``MemoryConfig`` removed
+                    # the ``graph_store`` attribute alongside the graph
+                    # auto-init. We build a SimpleNamespace shim from
+                    # our own dict so MemoryGraph still finds what it
+                    # needs without us forking the mem0 subtree.
+                    # Best-effort: a failure here logs and leaves the
+                    # service running with vector-only memory.
+                    graph_store_cfg = (
+                        config.get("graph_store") if isinstance(config, dict) else None
+                    )
+                    if graph_store_cfg:
+                        try:
+                            from types import SimpleNamespace
+                            from mem0.utils.factory import GraphStoreFactory
+
+                            provider = graph_store_cfg.get("provider", "default")
+                            inner = graph_store_cfg.get("config", {})
+                            shim = SimpleNamespace(
+                                graph_store=SimpleNamespace(
+                                    provider=provider,
+                                    config=SimpleNamespace(**inner),
+                                )
+                            )
+                            self._memory.graph = GraphStoreFactory.create(provider, shim)
+                            logger.info(
+                                "Graphiti adapter attached manually "
+                                "(provider=%s) — mem0 v2.0.2 no longer "
+                                "auto-creates Memory.graph",
+                                provider,
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"Graphiti adapter init failed (non-critical): {e}"
+                            )
 
                     if hasattr(self._memory, "graph") and hasattr(self._memory.graph, "graphiti"):
                         self._graphiti = self._memory.graph.graphiti
