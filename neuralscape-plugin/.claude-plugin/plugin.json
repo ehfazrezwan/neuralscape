@@ -1,8 +1,8 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "neuralscape",
-  "version": "2.1.0",
-  "description": "Persistent agentic memory for Claude. Auto-captures conversations + per-tool observations, recalls relevant context on every session start, and exposes 7 MCP tools (recall, remember, search, project context, graph search, list, delete).",
+  "version": "2.2.0",
+  "description": "Persistent agentic memory for Claude. Multi-user support: each user has personal memory (only they can read it) plus access to a shared team knowledge pool. Auto-captures conversations + per-tool observations, recalls relevant context on every session start, and exposes 7 MCP tools (recall, remember, search, project context, graph search, list, delete).",
   "author": {
     "name": "Ehfaz Rezwan",
     "email": "ehfaz.rezwan@gmail.com"
@@ -34,14 +34,14 @@
     },
     "API_KEY": {
       "type": "string",
-      "title": "API key (optional)",
-      "description": "Bearer token for authenticated deployments. Leave empty for local dev with no NEURALSCAPE_API_KEY set.",
+      "title": "Bearer token (per-user) or legacy shared API key",
+      "description": "For multi-user deployments, this is your per-user token issued by the admin via `scripts/issue_user_token.py --user <name>`. The token encodes your user_id; the server reads it from the token, not from the body. For legacy single-user deployments, this is the shared NEURALSCAPE_API_KEY. Leave empty for local dev.",
       "sensitive": true
     },
     "USER_ID": {
       "type": "string",
       "title": "Your user ID",
-      "description": "Stable identifier used to scope memories to you. Pick something short and unique (e.g. your username).",
+      "description": "Stable identifier used to scope memories to you. When using a per-user token, this must match the user_id encoded in the token (or be left empty — the token wins). Required for legacy shared-key auth.",
       "required": true
     },
     "COMPILE_THRESHOLD": {

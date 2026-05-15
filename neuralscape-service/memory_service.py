@@ -194,24 +194,59 @@ from schemas import (
     ContextResponse,
     MemoryResponse,
     MemoryScope,
+    MemoryVisibility,
     default_scope_for_category,
+    default_visibility_for_category,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def _build_group_id(scope: str, project_id: str | None = None) -> str:
-    """Build a Graphiti group_id from scope and project_id."""
-    if scope == MemoryScope.PROJECT and project_id:
-        return f"project--{project_id}"
-    return "global"
+def _build_group_id(
+    visibility: str,
+    user_id: str,
+    project_id: str | None = None,
+) -> str:
+    """Build a Graphiti group_id for the multi-user model.
 
+    | visibility | project_id | group_id                          |
+    |------------|------------|-----------------------------------|
+    | private    | None       | user--{user_id}                   |
+    | private    | set        | user--{user_id}--project--{pid}   |
+    | shared     | None       | shared                            |
+    | shared     | set        | shared--project--{project_id}     |
 
-def _get_group_ids(project_id: str | None = None) -> list[str]:
-    """Get group_ids to search across (always includes global)."""
-    group_ids = ["global"]
+    The user namespace fixes the prior cross-user leak in Graphiti
+    (previously all users shared `"global"` / `"project--..."`). The
+    `shared` namespace is the team-wide knowledge pool readable by any
+    authenticated user.
+    """
+    vis = str(visibility or MemoryVisibility.PRIVATE.value)
+    if vis == MemoryVisibility.SHARED.value:
+        if project_id:
+            return f"shared--project--{project_id}"
+        return "shared"
+    # private
     if project_id:
-        group_ids.append(f"project--{project_id}")
+        return f"user--{user_id}--project--{project_id}"
+    return f"user--{user_id}"
+
+
+def _get_group_ids(caller_user_id: str, project_id: str | None = None) -> list[str]:
+    """Group ids the caller is permitted to read across.
+
+    Returns the caller's private namespace + the shared pool, plus the
+    project-scoped equivalents when `project_id` is given. A read
+    against this set returns the union of the caller's private memories
+    and all shared memories (no cross-user private leakage).
+    """
+    if not caller_user_id:
+        # Anonymous / unauthenticated readers see only the shared pool.
+        return ["shared"] + ([f"shared--project--{project_id}"] if project_id else [])
+    group_ids = [f"user--{caller_user_id}", "shared"]
+    if project_id:
+        group_ids.append(f"user--{caller_user_id}--project--{project_id}")
+        group_ids.append(f"shared--project--{project_id}")
     return group_ids
 
 
@@ -370,9 +405,12 @@ class MemoryService:
             logger.error(f"Batch store failed: {e}")
             stored = []
 
-        # Step 3: Add cleaned conversation text to knowledge graph
+        # Step 3: Add cleaned conversation text to knowledge graph.
+        # Conversation extractions are personal (private) by default — the
+        # caller's spoken context isn't team-shared automatically.
         group_id = _build_group_id(
-            MemoryScope.PROJECT.value if project_id else MemoryScope.GLOBAL.value,
+            MemoryVisibility.PRIVATE.value,
+            user_id,
             project_id,
         )
         cleaned_messages = _clean_conversation_for_graph(messages)
@@ -411,6 +449,8 @@ class MemoryService:
         related_memory_ids: list[str] | None = None,
         confidence: float | None = None,
         expires_at: datetime | None = None,
+        # Multi-user model (None → category default)
+        visibility: str | None = None,
     ) -> list[MemoryResponse]:
         """Store a single pre-categorized fact directly (no LLM extraction).
 
@@ -449,6 +489,14 @@ class MemoryService:
         if scope == "project" and not project_id:
             raise ValueError("project_id is required when scope='project'")
 
+        # Resolve visibility: explicit caller value > per-category default.
+        # Coerce enum → str for downstream filters.
+        effective_visibility = (
+            str(visibility)
+            if visibility is not None
+            else default_visibility_for_category(category).value
+        )
+
         m = self._get_memory()
         now_iso = datetime.now(timezone.utc).isoformat()
         content_hash = hashlib.md5(content.encode()).hexdigest()
@@ -475,6 +523,9 @@ class MemoryService:
             "agent_id": agent_id,
             "run_id": run_id,
             "source": "explicit",
+            # Multi-user model: who owns this memory + who can read it.
+            "owner_user_id": user_id,
+            "visibility": effective_visibility,
         }
         if tags:
             metadata["tags"] = tags
@@ -516,7 +567,9 @@ class MemoryService:
             logger.warning(f"History record failed for {mid}: {e}")
 
         # ── Add to knowledge graph ──
-        group_id = _build_group_id(scope, project_id)
+        # Group_id encodes visibility + user namespace so the graph search
+        # can scope by allowed groups without re-leaking cross-user facts.
+        group_id = _build_group_id(effective_visibility, user_id, project_id)
         try:
             if self._graphiti and self._bridge:
                 retry_transient(
@@ -545,8 +598,83 @@ class MemoryService:
                 related_memory_ids=related_memory_ids,
                 confidence=confidence,
                 expires_at=expires_at.isoformat() if expires_at and hasattr(expires_at, "isoformat") else None,
+                visibility=effective_visibility,
+                owner_user_id=user_id,
             )
         ]
+
+    def _search_shared_pool(
+        self,
+        m,
+        query: str,
+        project_id: str | None,
+        categories: list[str] | None,
+        scope: str | None,
+        domain: str | None,
+        observation_type: str | None,
+        concepts: list[str] | None,
+        limit: int,
+    ) -> list[MemoryResponse]:
+        """Search Qdrant for shared-pool memories (any writer).
+
+        Used by ``search()`` to deliver team-wide knowledge to all
+        authenticated callers. Bypasses mem0's wrapper because that
+        wrapper enforces user_id namespacing — for the shared pool we
+        explicitly want hits across writers, scoped by
+        ``metadata.visibility=shared`` plus any other supplied filters.
+        """
+        from qdrant_client.models import (
+            FieldCondition,
+            Filter,
+            MatchAny,
+            MatchValue,
+        )
+
+        client = m.vector_store.client
+        embedding = m.embedding_model.embed(query, memory_action="search")
+
+        must: list = [
+            FieldCondition(
+                key="metadata.visibility",
+                match=MatchValue(value=MemoryVisibility.SHARED.value),
+            )
+        ]
+        if categories:
+            must.append(FieldCondition(key="metadata.category", match=MatchAny(any=categories)))
+        if scope:
+            must.append(FieldCondition(key="metadata.scope", match=MatchValue(value=scope)))
+        if project_id:
+            must.append(FieldCondition(key="metadata.project_id", match=MatchValue(value=project_id)))
+        if domain:
+            must.append(FieldCondition(key="metadata.domain", match=MatchValue(value=domain)))
+        if observation_type:
+            must.append(FieldCondition(key="metadata.observation_type", match=MatchValue(value=observation_type)))
+        if concepts:
+            must.append(FieldCondition(key="metadata.concepts", match=MatchAny(any=concepts)))
+
+        # qdrant-client v1.13+ removed `.search()` in favor of `.query_points()`;
+        # the response wraps hits in a `.points` attribute.
+        result = client.query_points(
+            collection_name=settings.qdrant_collection,
+            query=embedding,
+            query_filter=Filter(must=must),
+            limit=limit,
+            with_payload=True,
+        )
+        hits = getattr(result, "points", result) or []
+
+        out: list[MemoryResponse] = []
+        for hit in hits:
+            payload = getattr(hit, "payload", None) or {}
+            mem_dict = {
+                "id": str(getattr(hit, "id", "")),
+                "memory": payload.get("data", ""),
+                "metadata": payload.get("metadata", {}),
+                "score": getattr(hit, "score", None),
+                "created_at": payload.get("created_at"),
+            }
+            out.append(self._mem_to_response(mem_dict))
+        return out
 
     def _find_by_content_hash(
         self,
@@ -600,6 +728,8 @@ class MemoryService:
                 related_memory_ids=metadata.get("related_memory_ids"),
                 confidence=metadata.get("confidence"),
                 expires_at=metadata.get("expires_at"),
+                visibility=metadata.get("visibility"),
+                owner_user_id=metadata.get("owner_user_id"),
             )
         except Exception as e:
             logger.warning(f"Content-hash dedup lookup failed (non-fatal): {e}")
@@ -650,6 +780,7 @@ class MemoryService:
                     related_memory_ids=item.get("related_memory_ids"),
                     confidence=item.get("confidence"),
                     expires_at=expires_at,
+                    visibility=item.get("visibility"),
                 )
                 results.extend(stored)
             except Exception as e:
@@ -857,85 +988,168 @@ class MemoryService:
         domain: str | None = None,
         observation_type: str | None = None,
         concepts: list[str] | None = None,
+        # Multi-user pool selection
+        visibility: str | None = None,
+        include_shared: bool = True,
     ) -> list[MemoryResponse]:
         """Semantic search across memories with scope/category filters.
 
-        When project_id is provided, searches both global and project memories.
+        Multi-user model: returns the union of two pools, dedup'd by id:
 
-        Args:
-            query: Search query
-            user_id: User identifier
-            project_id: Optional project identifier (searches global + project)
-            categories: Optional category filter
-            scope: Optional scope filter ("global" or "project")
-            limit: Maximum results
-            domain: Memory-model v2 — filter by domain
-            observation_type: Memory-model v2 — filter by observation_type
-            concepts: Memory-model v2 — filter by any of these concept tags
+        - **Personal pool**: memories owned by `user_id` (regardless of
+          visibility — you can always read what you wrote).
+        - **Shared pool**: memories with `metadata.visibility=shared`, written
+          by anyone in this Neuralscape instance.
+
+        Use ``visibility="private"`` to scope to the personal pool only;
+        ``visibility="shared"`` to scope to the shared pool only;
+        ``include_shared=False`` to skip the shared pool entirely.
+
+        When project_id is provided, both pools search project+global memories
+        for that project (existing dual-scope merge preserved per pool).
 
         Returns:
             List of matching memory responses sorted by score.
         """
         m = self._get_memory()
 
-        # Build metadata filters — these fields are nested under "metadata"
-        # in the Qdrant payload, so prefix keys with "metadata." for filtering.
-        filters = {}
+        # Build common metadata filters — these fields are nested under
+        # "metadata" in the Qdrant payload, so prefix keys with "metadata."
+        # for filtering.
+        common_filters: dict = {}
         if categories:
-            filters["metadata.category"] = {"in": categories}
+            common_filters["metadata.category"] = {"in": categories}
         if scope:
-            filters["metadata.scope"] = scope
+            common_filters["metadata.scope"] = scope
         if domain:
-            filters["metadata.domain"] = domain
+            common_filters["metadata.domain"] = domain
         if observation_type:
-            filters["metadata.observation_type"] = observation_type
+            common_filters["metadata.observation_type"] = observation_type
         if concepts:
-            # any-match: at least one of the supplied concepts in metadata.concepts
-            filters["metadata.concepts"] = {"in": concepts}
+            common_filters["metadata.concepts"] = {"in": concepts}
 
-        # If project_id is given and no explicit scope, search both scopes
-        if project_id and not scope:
-            # Search project-scoped memories
-            project_filters = {**filters, "metadata.project_id": project_id}
-            project_results = m.search(
-                query=query,
-                user_id=user_id,
-                limit=limit,
-                filters=project_filters,
-            )
+        vector_responses: list[MemoryResponse] = []
 
-            # Search global memories
-            global_filters = {**filters, "metadata.scope": "global"}
-            global_results = m.search(
-                query=query,
-                user_id=user_id,
-                limit=limit,
-                filters=global_filters,
-            )
+        # ── Personal pool: mem0's user_id namespacing ──────────────
+        # Skip when caller restricted to shared-only.
+        want_personal = visibility != MemoryVisibility.SHARED.value
+        if want_personal and user_id:
+            if project_id and not scope:
+                project_filters = {**common_filters, "metadata.project_id": project_id}
+                project_results = m.search(
+                    query=query,
+                    user_id=user_id,
+                    limit=limit,
+                    filters=project_filters,
+                )
+                global_filters = {**common_filters, "metadata.scope": "global"}
+                global_results = m.search(
+                    query=query,
+                    user_id=user_id,
+                    limit=limit,
+                    filters=global_filters,
+                )
+                all_results = self._merge_results(project_results, global_results)
+                vector_responses.extend(
+                    self._results_to_responses(all_results[:limit])
+                )
+            else:
+                filters = {**common_filters}
+                if project_id:
+                    filters["metadata.project_id"] = project_id
+                results = m.search(
+                    query=query,
+                    user_id=user_id,
+                    limit=limit,
+                    filters=filters if filters else None,
+                )
+                vector_responses.extend(self._results_to_responses(results))
 
-            # Merge by score, deduplicate by ID
-            all_results = self._merge_results(project_results, global_results)
-            vector_responses = self._results_to_responses(all_results[:limit])
-        else:
-            if project_id:
-                filters["metadata.project_id"] = project_id
+        # ── Shared pool: direct Qdrant, no user_id namespace ───────
+        # Bypass mem0's wrapper because shared memories span multiple
+        # writers; we need a search that returns hits regardless of
+        # which user_id wrote them. Only memories with explicit
+        # `metadata.visibility=shared` are returned (legacy memories
+        # without that field stay de-facto private until migration).
+        #
+        # Dual-scope merge: when `project_id` is set and `scope` is
+        # omitted, mirror the personal-pool's project+global merge —
+        # otherwise a project-context search would miss global shared
+        # memories that should still be visible (the graph read-set
+        # already covers both via `_get_group_ids`). The downstream
+        # dedup at line ~1094 collapses any overlap.
+        want_shared = include_shared and visibility != MemoryVisibility.PRIVATE.value
+        if want_shared:
+            try:
+                if project_id and not scope:
+                    vector_responses.extend(
+                        self._search_shared_pool(
+                            m=m,
+                            query=query,
+                            project_id=project_id,
+                            categories=categories,
+                            scope=None,
+                            domain=domain,
+                            observation_type=observation_type,
+                            concepts=concepts,
+                            limit=limit,
+                        )
+                    )
+                    vector_responses.extend(
+                        self._search_shared_pool(
+                            m=m,
+                            query=query,
+                            project_id=None,
+                            categories=categories,
+                            scope="global",
+                            domain=domain,
+                            observation_type=observation_type,
+                            concepts=concepts,
+                            limit=limit,
+                        )
+                    )
+                else:
+                    vector_responses.extend(
+                        self._search_shared_pool(
+                            m=m,
+                            query=query,
+                            project_id=project_id,
+                            categories=categories,
+                            scope=scope,
+                            domain=domain,
+                            observation_type=observation_type,
+                            concepts=concepts,
+                            limit=limit,
+                        )
+                    )
+            except Exception as e:
+                logger.warning(f"Shared-pool search failed (non-critical): {e}")
 
-            results = m.search(
-                query=query,
-                user_id=user_id,
-                limit=limit,
-                filters=filters if filters else None,
-            )
-            vector_responses = self._results_to_responses(results)
+        # Dedup across the two pools (caller's own shared writes match both).
+        seen_ids: set[str] = set()
+        deduped: list[MemoryResponse] = []
+        for r in vector_responses:
+            if r.id and r.id not in seen_ids:
+                seen_ids.add(r.id)
+                deduped.append(r)
+        deduped.sort(key=lambda r: r.score or 0.0, reverse=True)
+        vector_responses = deduped[:limit]
 
-        # Also query the knowledge graph and merge edge facts
+        # Also query the knowledge graph and merge edge facts.
+        # Multi-user: when caller restricted the visibility, restrict the
+        # graph search's group_ids to match — otherwise the graph would
+        # walk the full read-set (caller's private + shared) and we'd
+        # have to retroactively filter, which is unreliable for graph
+        # rows whose enriched visibility ends up as None.
         graph_responses: list[MemoryResponse] = []
         try:
-            graph_results = self.search_graph(
+            graph_results = self._search_graph_for_visibility(
                 query=query,
                 user_id=user_id,
                 project_id=project_id,
                 limit=limit,
+                visibility=visibility,
+                include_shared=include_shared,
             )
             for edge in graph_results.get("edges", []):
                 graph_responses.append(
@@ -953,7 +1167,7 @@ class MemoryService:
         # Graphiti's edge schema doesn't carry v2 fields natively — we recover
         # them by semantic match against the Qdrant store.
         v2_filter_active = bool(domain or observation_type or concepts)
-        if graph_responses and (v2_filter_active or any([domain, observation_type, concepts])):
+        if graph_responses and v2_filter_active:
             graph_responses = self._enrich_and_filter_graph(
                 graph_responses,
                 user_id=user_id,
@@ -968,6 +1182,20 @@ class MemoryService:
             graph_responses = self._enrich_graph_with_v2(
                 graph_responses, user_id=user_id, project_id=project_id
             )
+
+        # Multi-user model: post-filter graph rows by enriched visibility.
+        # The Graphiti search above already scopes by group_ids, so most
+        # rows arrive in the right pool. This pass mops up the edge case
+        # where enrichment couldn't find a source memory: when the caller
+        # asked for `private`, an unenriched row (visibility=None) is
+        # treated as private — it came from the private group_id range
+        # we just scoped to. When they asked for `shared`, an unenriched
+        # row could only have come from a shared group_id, so we keep it.
+        if visibility and graph_responses:
+            graph_responses = [
+                r for r in graph_responses
+                if r.visibility == visibility or r.visibility is None
+            ]
 
         # Deduplicate and enforce caller's limit
         combined = self._deduplicate_responses(vector_responses, graph_responses)
@@ -993,39 +1221,58 @@ class MemoryService:
         source memories that do. We do a top-1 vector search per edge to
         recover those fields. ~10ms per edge at typical limits.
 
-        When project_id is supplied, the lookup is scoped to that project
-        so a graph edge can't inherit metadata from a semantically similar
-        memory in a different project (which would break v2 filter parity).
+        Multi-user model: enrichment can use either the caller's private
+        memories OR shared-pool memories (a graph edge for a shared fact
+        should pick up the shared source's metadata). Restricts to the
+        active project_id when supplied so v2 filter parity holds.
         """
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+
         m = self._get_memory()
-        # Build a search filter that scopes the enrichment lookup correctly.
-        # - user_id is always required so we never enrich from another user's
-        #   memories.
-        # - When the caller specified a project, restrict to that project to
-        #   avoid cross-project metadata bleed.
-        base_filter: dict = {}
-        if user_id:
-            base_filter["user_id"] = user_id
-        if project_id:
-            base_filter["metadata.project_id"] = project_id
+        client = m.vector_store.client
         for resp in graph_responses:
             if not resp.memory:
                 continue
             try:
-                # Embed the edge fact and run a direct Qdrant search so we
-                # have access to the similarity score (mem0's wrapper hides it
-                # for some backends).
                 embedding = m.embedding_model.embed(resp.memory, memory_action="search")
-                hits = m.vector_store.search(
-                    query=resp.memory,
-                    vectors=embedding,
-                    limit=1,
-                    filters=base_filter if base_filter else None,
+                # Qdrant filter: (user_id=caller) OR (metadata.visibility=shared),
+                # both optionally constrained to the active project. Qdrant's
+                # `should` is OR-of-conditions; `must` AND's the rest.
+                should_conditions = []
+                if user_id:
+                    should_conditions.append(
+                        FieldCondition(key="user_id", match=MatchValue(value=user_id))
+                    )
+                should_conditions.append(
+                    FieldCondition(
+                        key="metadata.visibility",
+                        match=MatchValue(value=MemoryVisibility.SHARED.value),
+                    )
                 )
+                must_conditions = []
+                if project_id:
+                    must_conditions.append(
+                        FieldCondition(
+                            key="metadata.project_id",
+                            match=MatchValue(value=project_id),
+                        )
+                    )
+                qf = Filter(
+                    should=should_conditions,
+                    must=must_conditions if must_conditions else None,
+                )
+                # qdrant-client v1.13+ replaced `.search()` with `.query_points()`.
+                result = client.query_points(
+                    collection_name=settings.qdrant_collection,
+                    query=embedding,
+                    query_filter=qf,
+                    limit=1,
+                    with_payload=True,
+                )
+                hits = getattr(result, "points", result) or []
                 if not hits:
                     continue
                 hit = hits[0]
-                # qdrant-client returns ScoredPoint objects (id, score, payload)
                 score = getattr(hit, "score", None)
                 if score is None and isinstance(hit, dict):
                     score = hit.get("score")
@@ -1059,6 +1306,10 @@ class MemoryService:
                     resp.scope = src_metadata.get("scope")
                 if resp.project_id is None:
                     resp.project_id = src_metadata.get("project_id")
+                if resp.visibility is None:
+                    resp.visibility = src_metadata.get("visibility")
+                if resp.owner_user_id is None:
+                    resp.owner_user_id = src_metadata.get("owner_user_id")
             except Exception as e:
                 logger.debug(f"Graph enrichment skipped for {resp.id}: {e}")
         return graph_responses
@@ -1092,6 +1343,82 @@ class MemoryService:
             out.append(resp)
         return out
 
+    def _search_graph_for_visibility(
+        self,
+        query: str,
+        user_id: str,
+        project_id: str | None,
+        limit: int,
+        visibility: str | None,
+        include_shared: bool,
+    ) -> dict:
+        """search_graph with multi-user visibility scoping.
+
+        When the caller restricts visibility to one pool, narrow the
+        Graphiti `group_ids` to that pool's namespace. This is
+        load-bearing for cross-user isolation: if we walked the full
+        group_id set and then filtered by enriched visibility, an
+        unenriched row from the shared pool could slip into a
+        private-only response.
+        """
+        if visibility == MemoryVisibility.PRIVATE.value:
+            group_ids = [f"user--{user_id}"]
+            if project_id:
+                group_ids.append(f"user--{user_id}--project--{project_id}")
+        elif visibility == MemoryVisibility.SHARED.value:
+            group_ids = ["shared"]
+            if project_id:
+                group_ids.append(f"shared--project--{project_id}")
+        elif not include_shared:
+            # No explicit visibility, but caller opted out of shared pool.
+            group_ids = [f"user--{user_id}"]
+            if project_id:
+                group_ids.append(f"user--{user_id}--project--{project_id}")
+        else:
+            # Default: full read-set (caller's private + shared pool).
+            group_ids = _get_group_ids(user_id, project_id)
+
+        return self._do_graph_search(query=query, group_ids=group_ids, limit=limit)
+
+    def _do_graph_search(
+        self,
+        query: str,
+        group_ids: list[str],
+        limit: int,
+        search_config: dict | None = None,
+    ) -> dict:
+        """Internal: run a graph search across the given group_ids."""
+        g = self._get_graphiti()
+        if g is None:
+            return {"edges": [], "nodes": [], "episodes": [], "communities": []}
+
+        from graphiti_core.search.search_config import SearchConfig
+        from graphiti_core.search.search_config_recipes import EDGE_HYBRID_SEARCH_RRF
+
+        if search_config:
+            try:
+                config = SearchConfig(**search_config)
+            except (TypeError, ValueError) as e:
+                logger.warning(f"Invalid search_config, falling back to default: {e}")
+                config = EDGE_HYBRID_SEARCH_RRF
+        else:
+            config = EDGE_HYBRID_SEARCH_RRF
+        config.limit = limit
+
+        try:
+            results = self._run_on_bridge(
+                g.search_(query=query, config=config, group_ids=group_ids)
+            )
+            return {
+                "edges": [{"uuid": e.uuid, "name": e.name, "fact": e.fact} for e in results.edges],
+                "nodes": [{"uuid": n.uuid, "name": n.name, "summary": n.summary} for n in results.nodes],
+                "episodes": [{"uuid": ep.uuid, "name": ep.name, "content": ep.content} for ep in results.episodes],
+                "communities": [{"uuid": c.uuid, "name": c.name} for c in results.communities],
+            }
+        except Exception as e:
+            logger.error(f"Graph search failed: {e}")
+            return {"edges": [], "nodes": [], "episodes": [], "communities": []}
+
     def search_graph(
         self,
         query: str,
@@ -1119,7 +1446,10 @@ class MemoryService:
         from graphiti_core.search.search_config import SearchConfig
         from graphiti_core.search.search_config_recipes import EDGE_HYBRID_SEARCH_RRF
 
-        group_ids = _get_group_ids(project_id)
+        # Multi-user: search across the caller's private namespace + the
+        # shared pool, plus project-scoped variants. Replaces the prior
+        # cross-user `"global"`/`"project--..."` group_ids.
+        group_ids = _get_group_ids(user_id, project_id)
 
         if search_config:
             try:
@@ -1311,10 +1641,15 @@ class MemoryService:
         if content and existing and self._graphiti and self._bridge:
             try:
                 metadata = existing.get("metadata", {}) or {}
-                scope = metadata.get("scope", "global")
+                # mem0 sometimes double-wraps metadata; unwrap before reading
+                if isinstance(metadata.get("metadata"), dict):
+                    metadata = metadata["metadata"]
                 project_id = metadata.get("project_id")
-                user_id = existing.get("user_id", "")
-                group_id = _build_group_id(scope, project_id)
+                user_id = metadata.get("owner_user_id") or existing.get("user_id", "")
+                # Visibility defaults to private for legacy memories that
+                # don't have it set explicitly.
+                visibility = metadata.get("visibility") or MemoryVisibility.PRIVATE.value
+                group_id = _build_group_id(visibility, user_id, project_id)
                 retry_transient(
                     self._memory.graph.add,
                     data=content,
@@ -1350,39 +1685,72 @@ class MemoryService:
         category: str | None = None,
         project_id: str | None = None,
         filter_null_category: bool = False,
+        include_shared: bool = False,
     ) -> dict:
-        """Bulk delete memories with filters from both vector store and graph."""
+        """Bulk delete memories with filters from both vector store and graph.
+
+        By default this only removes the caller's PRIVATE writes. Shared
+        memories the caller authored survive even an unfiltered bulk
+        delete — they're team artifacts and one user shouldn't be able
+        to wipe team knowledge with a sweep call (which an LLM client
+        can trigger via the MCP tool). Pass ``include_shared=True`` to
+        also delete the caller's shared writes (admin-style nuke).
+
+        Single-memory delete by ID is unaffected — that path is always
+        an intentional action against a specific memory.
+        """
         m = self._get_memory()
 
         has_any_filter = scope or category or project_id or filter_null_category
         if not has_any_filter:
-            # Delete all for user — also expire all graph edges in user's groups
+            if include_shared:
+                # Caller explicitly asked to remove everything they wrote,
+                # including shared. Use mem0's bulk delete + the full
+                # graph cleanup that touches per-memory edges in shared
+                # groups too.
+                logger.warning(
+                    f"Deleting ALL memories for user={user_id} including "
+                    f"shared writes (include_shared=True)"
+                )
+                if self._graphiti and self._bridge:
+                    self._expire_user_graph_writes(user_id)
+                m.delete_all(user_id=user_id)
+                return {"message": "All memories deleted (including shared)"}
+
+            # Default: remove only private writes. Shared memories stay.
             logger.warning(
-                f"Deleting ALL memories for user={user_id} (no filters specified)"
+                f"Deleting all PRIVATE memories for user={user_id} "
+                f"(shared writes preserved; pass include_shared=True to override)"
             )
-            if self._graphiti and self._bridge:
-                group_ids = _get_group_ids(project_id)
-                self._expire_graph_edges_for_groups(group_ids)
-            m.delete_all(user_id=user_id)
-            return {"message": "All memories deleted"}
+            return self._delete_private_only(user_id)
 
         if filter_null_category:
             memories_to_delete = self._list_null_category_memories(
                 user_id=user_id, scope=scope, project_id=project_id,
             )
             deleted_count = 0
+            skipped_shared = 0
             for mem_info in memories_to_delete:
+                meta = mem_info.get("metadata", {}) or {}
+                if isinstance(meta.get("metadata"), dict):
+                    meta = meta["metadata"]
+                if not include_shared and meta.get("visibility") == MemoryVisibility.SHARED.value:
+                    skipped_shared += 1
+                    continue
                 mid = mem_info["id"]
                 try:
                     m.vector_store.delete(mid)
                     if self._graphiti and self._bridge:
                         self._expire_graph_edges_for_memory(
-                            {"memory": mem_info.get("data", ""), "metadata": mem_info.get("metadata", {})}
+                            {"memory": mem_info.get("data", ""), "metadata": meta}
                         )
                     deleted_count += 1
                 except Exception as e:
                     logger.warning(f"Failed to delete null-category memory {mid}: {e}")
-            return {"message": f"Deleted {deleted_count} null-category memories"}
+            msg = f"Deleted {deleted_count} null-category memories"
+            if skipped_shared:
+                msg += f" (preserved {skipped_shared} shared)"
+            return {"message": msg}
 
         # For filtered deletes, we need to list then delete individually
         memories = self.list_memories(
@@ -1393,7 +1761,11 @@ class MemoryService:
         )
 
         deleted_count = 0
+        skipped_shared = 0
         for mem in memories:
+            if not include_shared and getattr(mem, "visibility", None) == MemoryVisibility.SHARED.value:
+                skipped_shared += 1
+                continue
             try:
                 # Get full memory for graph cleanup before deleting
                 full_mem = m.get(mem.id)
@@ -1404,7 +1776,63 @@ class MemoryService:
             except Exception as e:
                 logger.warning(f"Failed to delete memory {mem.id}: {e}")
 
-        return {"message": f"Deleted {deleted_count} memories"}
+        msg = f"Deleted {deleted_count} memories"
+        if skipped_shared:
+            msg += f" (preserved {skipped_shared} shared)"
+        return {"message": msg}
+
+    def _delete_private_only(self, user_id: str) -> dict:
+        """Delete every PRIVATE memory the user owns; leave shared writes alone.
+
+        Used by the default (non-include_shared) unfiltered bulk-delete
+        path. Scrolls the user's full set, partitions by visibility,
+        deletes the private rows one by one via Qdrant (mem0's
+        ``delete_all`` can't be filtered), then expires the per-user
+        private graph groups in bulk.
+        """
+        try:
+            all_memories = self._scroll_all_user_memories(user_id)
+        except Exception as e:
+            logger.warning(f"Failed to scroll memories for private-only delete: {e}")
+            return {"message": "No memories deleted (scroll failed)"}
+
+        private_ids: list[tuple[str, dict]] = []
+        private_groups: set[str] = set()
+        shared_preserved = 0
+        for mem in all_memories:
+            payload = mem.get("payload", {}) or {}
+            metadata = payload.get("metadata", {}) or {}
+            if isinstance(metadata.get("metadata"), dict):
+                metadata = metadata["metadata"]
+            visibility = metadata.get("visibility") or MemoryVisibility.PRIVATE.value
+            if visibility == MemoryVisibility.SHARED.value:
+                shared_preserved += 1
+                continue
+            private_ids.append((mem["id"], payload))
+            pid = metadata.get("project_id")
+            if pid:
+                private_groups.add(f"user--{user_id}--project--{pid}")
+            else:
+                private_groups.add(f"user--{user_id}")
+
+        if self._graphiti and self._bridge and private_groups:
+            try:
+                self._expire_graph_edges_for_groups(sorted(private_groups))
+            except Exception as e:
+                logger.warning(f"Graph cleanup for private groups failed: {e}")
+
+        deleted = 0
+        for mid, payload in private_ids:
+            try:
+                self._memory.vector_store.delete(mid)
+                deleted += 1
+            except Exception as e:
+                logger.warning(f"Failed to delete private memory {mid}: {e}")
+
+        msg = f"Deleted {deleted} private memories"
+        if shared_preserved:
+            msg += f" (preserved {shared_preserved} shared)"
+        return {"message": msg}
 
     def _list_null_category_memories(
         self,
@@ -1477,7 +1905,7 @@ class MemoryService:
 
         from graphiti_core.nodes import EntityNode
 
-        group_ids = _get_group_ids(project_id)
+        group_ids = _get_group_ids(user_id, project_id)
 
         try:
             nodes = self._run_on_bridge(
@@ -1509,7 +1937,7 @@ class MemoryService:
         from graphiti_core.edges import EntityEdge
         from graphiti_core.errors import GroupsEdgesNotFoundError
 
-        group_ids = _get_group_ids(project_id)
+        group_ids = _get_group_ids(user_id, project_id)
 
         try:
             edges = self._run_on_bridge(
@@ -1542,7 +1970,7 @@ class MemoryService:
         if g is None:
             return []
 
-        group_ids = _get_group_ids(project_id)
+        group_ids = _get_group_ids(user_id, project_id)
         now = datetime.now(timezone.utc)
 
         try:
@@ -1579,7 +2007,7 @@ class MemoryService:
 
         from graphiti_core.nodes import CommunityNode
 
-        group_ids = _get_group_ids(project_id)
+        group_ids = _get_group_ids(user_id, project_id)
 
         try:
             communities = self._run_on_bridge(
@@ -1751,6 +2179,8 @@ class MemoryService:
             related_memory_ids=metadata.get("related_memory_ids"),
             confidence=metadata.get("confidence"),
             expires_at=metadata.get("expires_at"),
+            visibility=metadata.get("visibility"),
+            owner_user_id=metadata.get("owner_user_id"),
         )
 
     def _result_to_responses(
@@ -1827,7 +2257,18 @@ class MemoryService:
             config.limit = 5
 
             metadata = mem.get("metadata", {}) or {}
-            group_ids = _get_group_ids(metadata.get("project_id"))
+            # Unwrap mem0's potential double-wrap
+            if isinstance(metadata.get("metadata"), dict):
+                metadata = metadata["metadata"]
+            # Scope edge expiration to the memory's exact namespace.
+            # `_get_group_ids` would return the owner's whole readable
+            # universe (their private + the shared pool), which means
+            # deleting a private memory could expire similarly-worded
+            # edges from the shared pool — wrong pool.
+            owner = metadata.get("owner_user_id") or mem.get("user_id", "")
+            visibility = metadata.get("visibility") or MemoryVisibility.PRIVATE.value
+            group_id = _build_group_id(visibility, owner, metadata.get("project_id"))
+            group_ids = [group_id]
 
             results = self._run_on_bridge(
                 self._graphiti.search_(
@@ -1843,6 +2284,51 @@ class MemoryService:
                     self._run_on_bridge(edge.save(self._graphiti.driver))
         except Exception as e:
             logger.warning(f"Graph edge expiration failed (non-critical): {e}")
+
+    def _expire_user_graph_writes(self, user_id: str) -> None:
+        """Expire graph edges across every group_id this user authored.
+
+        Used by the unfiltered bulk-delete path. Private groups
+        (`user--{user_id}` and `user--{user_id}--project--*`) are
+        expired wholesale — they only contain this user's writes.
+        Shared groups (`shared`, `shared--project--*`) hold team
+        knowledge from many writers, so we only expire the specific
+        edges this user authored via per-memory cleanup.
+        """
+        try:
+            user_memories = self._scroll_all_user_memories(user_id)
+        except Exception as e:
+            logger.warning(f"Failed to scroll memories for graph cleanup (non-critical): {e}")
+            return
+
+        private_groups: set[str] = set()
+        shared_memories: list[dict] = []
+        for mem in user_memories:
+            payload = mem.get("payload", {}) or {}
+            metadata = payload.get("metadata", {}) or {}
+            # mem0 sometimes double-wraps metadata
+            if isinstance(metadata.get("metadata"), dict):
+                metadata = metadata["metadata"]
+            visibility = metadata.get("visibility") or MemoryVisibility.PRIVATE.value
+            pid = metadata.get("project_id")
+            if visibility == MemoryVisibility.SHARED.value:
+                # Don't touch the shared group_id — other users' edges live
+                # there too. Per-memory edge expiration narrows to just
+                # this user's specific facts.
+                shared_memories.append({"memory": payload.get("data", ""), "metadata": metadata})
+            else:
+                if pid:
+                    private_groups.add(f"user--{user_id}--project--{pid}")
+                else:
+                    private_groups.add(f"user--{user_id}")
+
+        if private_groups:
+            self._expire_graph_edges_for_groups(sorted(private_groups))
+        for mem in shared_memories:
+            try:
+                self._expire_graph_edges_for_memory(mem)
+            except Exception as e:
+                logger.warning(f"Per-shared-memory edge expiration failed (non-critical): {e}")
 
     def _expire_graph_edges_for_groups(self, group_ids: list[str]) -> None:
         """Expire all graph edges in the given groups (bulk soft-delete)."""

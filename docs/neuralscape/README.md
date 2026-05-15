@@ -16,6 +16,7 @@ Comprehensive reference for the Neuralscape codebase. Read in order or jump to w
 | 09 | [Plugin System](./09-plugin-system.md) | Claude Code + Cowork plugin, hook manifests, adapters, conversation_compiler extension, vault dual-write |
 | 10 | [Testing](./10-testing.md) | 11 test files, fixtures, mocking strategy, integration tests, run commands |
 | 11 | [Deployment](./11-deployment.md) | Docker compose stack, two-stage Dockerfile, env vars, structlog, helper scripts, gotchas |
+| 12 | [UI PRD](./12-ui-prd.md) | Product requirements for the human-facing web UI: features, audience, constraints, states, accessibility |
 
 ## Quick links by audience
 
@@ -25,6 +26,7 @@ Comprehensive reference for the Neuralscape codebase. Read in order or jump to w
 - **"I'm adding a new agent client (Cursor, Copilot, custom)."** → [09-plugin-system](./09-plugin-system.md) for the adapter pattern, then [03-memory-model](./03-memory-model.md) for the canonical category contract.
 - **"I'm interfacing via MCP from a client agent."** → [08-mcp-server](./08-mcp-server.md) for the 7 tools, [03-memory-model](./03-memory-model.md) for the category enums.
 - **"I'm debugging a stuck async write."** → [07-async-pipeline](./07-async-pipeline.md), then [06-storage-backends](./06-storage-backends.md), then [11-deployment](./11-deployment.md).
+- **"I'm building the web UI."** → [12-ui-prd](./12-ui-prd.md) for the feature scope, then [03-memory-model](./03-memory-model.md) and [02-service-architecture](./02-service-architecture.md) for the data shapes the UI consumes.
 
 ## Source of truth
 

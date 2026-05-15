@@ -1,11 +1,11 @@
 ---
 name: neuralscape-memory
-description: Use the Neuralscape memory layer to recall and store memories about the user and their projects. Use this at session start to load context, when you learn new facts, and when the user asks about preferences, conventions, or past decisions. Works via MCP tools or REST API at localhost:8199. Memory writes are async (processed by background workers via ARQ + Redis).
+description: Use the Neuralscape memory layer to recall and store memories about the user and their projects. Use this at session start to load context, when you learn new facts, and when the user asks about preferences, conventions, or past decisions. Works via MCP tools or REST API at localhost:8199. Memory writes are async (processed by background workers via ARQ + Redis). Multi-user: each authenticated user has a private memory pool plus a shared team pool — pick the right visibility per write.
 ---
 
 # Neuralscape Memory Layer
 
-Neuralscape provides persistent, categorized memory for AI agents. It remembers user preferences, project conventions, technical decisions, and learned facts across sessions. Every agent sharing the same `user_id` can read and write to the same memory.
+Neuralscape provides persistent, categorized memory for AI agents. It remembers user preferences, project conventions, technical decisions, and learned facts across sessions. Since v2.2 it's **multi-user**: each authenticated user has their own private memory pool plus access to a team-wide shared pool. The pool a memory lives in is determined by its `visibility` (private | shared), with sensible per-category defaults.
 
 ## Architecture
 
@@ -15,6 +15,37 @@ Memory writes are **asynchronous**. When you store a memory (via MCP or REST), t
 - Set `wait: true` to block until the memory is fully stored (useful for end-of-session memory dumps)
 - Read operations (`recall_memories`, `get_project_context`, `search_knowledge_graph`, `list_memories`) are **synchronous** and return results immediately
 
+## Multi-user model (v2.2+)
+
+Every memory carries a `visibility` and an `owner_user_id`:
+
+- **`private`** — only the writing user can read it. Personal preferences, identity facts, in-progress task context.
+- **`shared`** — every authenticated user in this Neuralscape instance can read it. Team knowledge: tech stack, conventions, architecture decisions.
+
+**Per-category defaults** (you almost never need to override):
+
+| Default | Categories |
+|---|---|
+| `private` | `preference`, `personal_fact`, `technical_skill`, `domain_knowledge`, `task_context` |
+| `shared` | `tech_stack`, `convention`, `architecture`, `dependency`, `decision`, `interaction`, `workflow`, `procedure` |
+
+The default does the right thing ~80% of the time. Override `visibility` only when:
+- A `preference` is actually a team norm worth sharing (rare) → `shared`
+- A team `decision` is sensitive WIP nobody else should see yet → `private`
+- A `task_context` you want a teammate to pick up → `shared`
+
+**Search by default** returns BOTH pools (the caller's private + the shared team pool), merged by relevance. Use `visibility: "private"` or `visibility: "shared"` to narrow, or `include_shared: false` to skip the shared pool entirely.
+
+**Identity in writes**: the `user_id` you pass becomes `owner_user_id` on the stored memory. Search results surface `owner_user_id` so clients can tell who authored a shared hit.
+
+## Auth (when running against a deployed service)
+
+**When a per-user HMAC bearer token is provided** in `Authorization: Bearer …`, the server reads `user_id` from the token's verified payload. If you also pass `user_id` in the request body and it disagrees with the token, the server returns 400. Always pass the same `user_id` you've been told to use.
+
+**When no bearer token is provided** (or the legacy shared-API-key path is in use), the server falls back to reading `user_id` from the request body — same as the pre-multi-user behavior. The plugin's `.mcp.json` always sends the configured `API_KEY` as a bearer token, so MCP callers almost always hit the token path; only direct REST callers without `Authorization` end up on the body-fallback path.
+
+The plugin (when installed in Claude Code) handles auth transparently — your MCP tool calls just include `user_id` and the plugin's `.mcp.json` forwards the bearer token from the user's configured `API_KEY`.
+
 ## When to Use Memory
 
 - **Session start**: Call `get_project_context` or `recall_memories` to load what you know about this user and project before doing any work.
@@ -22,17 +53,17 @@ Memory writes are **asynchronous**. When you store a memory (via MCP or REST), t
 - **After learning something**: Call `remember` when the user tells you a preference, makes a decision, or reveals something about their project that future sessions should know. Default fire-and-forget is fine here.
 - **End of conversation**: Call `remember_conversation` with `wait: true` to bulk-extract all notable facts and confirm they were stored.
 
-## Identity
+## Identifiers in every call
 
-When calling any memory tool or endpoint, always pass:
-- `user_id`: The user's identifier (e.g., `"ehfaz"`)
-- `project_id`: The current project slug when working in a project context (e.g., `"neuralscape-graphiti"`)
+Always pass:
+- `user_id` — the user's identifier (must match the bearer token's encoded user_id when auth is on).
+- `project_id` — the current project slug when working in a project context. Project-scoped categories (`tech_stack`, `convention`, `architecture`, `dependency`) **require** this.
 
 ## MCP Tools
 
 ### 1. `recall_memories` - Search memories (sync)
 
-Search across global and project-specific memories. When `project_id` is provided, searches both scopes and merges results by relevance.
+Search across the caller's private pool AND the shared team pool, dedup'd and merged by relevance. When `project_id` is provided, also searches project-scoped variants of both pools.
 
 ```json
 {
@@ -44,9 +75,17 @@ Search across global and project-specific memories. When `project_id` is provide
 }
 ```
 
+**Multi-user filters (optional):**
+
+- `visibility: "private"` — only the caller's own memories.
+- `visibility: "shared"` — only the team pool.
+- `include_shared: false` — skip the shared pool entirely (caller's private only). Default: `true`.
+
+Results include `owner_user_id` so you can tell who authored a shared hit, and `source: "graph" | "vector"` so you know which subsystem returned it (graph wins on conflict — it carries Graphiti's contradiction-resolved state).
+
 ### 2. `remember` - Store a single fact (async)
 
-Store one categorized fact. Pick the most specific category from the taxonomy below. The system auto-assigns scope based on category. Returns immediately with `task_id` by default.
+Store one categorized fact. Pick the most specific category from the taxonomy below. The system auto-assigns scope based on category AND visibility based on the per-category default (see Multi-user model above). Returns immediately with `task_id` by default.
 
 ```json
 {
@@ -71,6 +110,30 @@ For project-specific facts, include `project_id`:
   "project_id": "neuralscape-graphiti"
 }
 ```
+
+**Override visibility** when the default isn't what you want (rare):
+
+```json
+{
+  "content": "Team decision: defer the multi-team rollout until 2027",
+  "user_id": "ehfaz",
+  "category": "decision",
+  "project_id": "neuralscape",
+  "visibility": "private"
+}
+```
+
+**Memory-model v2 fields** (optional but recommended for richer recall):
+
+| Field | Purpose | Values |
+|---|---|---|
+| `domain` | High-level life context | `coding` \| `research` \| `meeting` \| `writing` \| `ops` \| `personal` \| `general` |
+| `observation_type` | Shape of the observation (orthogonal to category) | `bugfix` \| `feature` \| `refactor` \| `decision` \| `discovery` \| `gotcha` \| `pattern` \| `trade_off` \| `research_note` \| `meeting_outcome` \| `task_plan` \| `fact` |
+| `concepts` | Cross-cutting tags (1–5 items) | `how-it-works`, `why-it-exists`, `what-changed`, `problem-solution`, `gotcha`, `pattern`, `trade-off`, `open-question`, `next-step`, `blocker` |
+| `source_type` | Provenance | `conversation` \| `tool_extraction` \| `explicit` \| `imported` \| `compiler` |
+| `confidence` | Your 0.0–1.0 self-rating | float |
+| `expires_at` | ISO 8601; memory is purged after this | `"2026-12-31T00:00:00Z"` |
+| `related_memory_ids` | UUIDs of related memories (graph linkage) | array, max 10 |
 
 To wait for confirmation, set `wait: true`:
 
@@ -154,7 +217,7 @@ List memories with optional filters. Use to verify what's been stored or audit m
 
 ### 7. `delete_memories` - Remove memories (sync)
 
-Delete by specific ID or by filter. Use with caution.
+Delete a specific memory by ID, or bulk delete by filter. Use with caution.
 
 ```json
 {
@@ -172,9 +235,22 @@ Or bulk delete:
 }
 ```
 
+**Shared-pool safety default (v2.2+):** Bulk delete only removes the caller's **private** writes by default. Shared (team) memories the caller authored are preserved — they're team artifacts and one user's sweep shouldn't wipe team knowledge. The result message reports what was preserved: `"Deleted 12 memories (preserved 4 shared)"`.
+
+To also remove the caller's shared writes (admin-style nuke), opt in explicitly:
+
+```json
+{
+  "user_id": "ehfaz",
+  "include_shared": true
+}
+```
+
+**Always confirm with the user before passing `include_shared: true`** — it's destructive and irreversible. Single-memory delete by ID is unaffected by this default.
+
 ## REST API (alternative to MCP)
 
-The service runs at `http://localhost:8199`. All v1 endpoints require `user_id`.
+The service runs at `http://localhost:8199`. All v1 endpoints accept `user_id` (token-derived when an HMAC bearer token is present; body-derived otherwise). Token and body `user_id` must agree or the server returns 400. v1 endpoints also accept `visibility` and `include_shared` filters where they apply (search, list, bulk-delete) — same semantics as the MCP tools above.
 
 **Write endpoints return 202 Accepted** with a `task_id` for polling:
 
@@ -196,7 +272,7 @@ The service runs at `http://localhost:8199`. All v1 endpoints require `user_id`.
 | Get single memory | `GET` | `/v1/memories/{id}` |
 | Update memory | `PUT` | `/v1/memories/{id}` |
 | Delete memory | `DELETE` | `/v1/memories/{id}` |
-| Bulk delete | `DELETE` | `/v1/memories` (body: `{user_id, scope?, category?, project_id?}`) |
+| Bulk delete | `DELETE` | `/v1/memories` (body: `{user_id, scope?, category?, project_id?, filter_null_category?, include_shared?}` — default removes private writes only; `include_shared: true` also removes the caller's shared writes) |
 | List categories | `GET` | `/v1/categories` |
 | Graph nodes | `GET` | `/v1/graph/nodes?user_id=...&project_id=...` |
 | Graph edges | `GET` | `/v1/graph/edges?user_id=...&project_id=...` |

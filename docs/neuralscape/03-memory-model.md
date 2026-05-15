@@ -121,7 +121,7 @@ Request models (`schemas.py:109-175`):
 - **`SearchMemoryRequest`** (137-144) — `query` (1-2000), `user_id`, optional `project_id`, `categories` (≤13), `scope`, `limit` (1-100, default 10).
 - **`GraphSearchRequest`** (147-156) — Graphiti-only search with optional `search_config` override.
 - **`UpdateMemoryRequest`** (159-163) — partial update of `content`/`category`/`tags`.
-- **`BulkDeleteRequest`** (166-175) — filtered bulk delete; `filter_null_category` restricts to memories missing a category.
+- **`BulkDeleteRequest`** (166-175) — filtered bulk delete; `filter_null_category` restricts to memories missing a category. `include_shared` (default `False`) gates whether the caller's *shared* writes are removed: by default shared memories are preserved on every bulk path (team artifacts shouldn't be wipeable by one user's sweep, including via the MCP `delete_memories` tool an LLM agent can trigger).
 
 Response models (`schemas.py:183-234`):
 
@@ -199,6 +199,123 @@ SOURCE_TYPE_VOCAB = {
 ### Expiry purge cron
 
 `expire_old_memories_cron` runs nightly at 03:15 (server time) and deletes memories whose `metadata.expires_at` is in the past. Matched memories are also cleaned from Graphiti via `_expire_graph_edges_for_memory`.
+
+## Multi-user model (v2.2)
+
+Released 2026-05-11. Adds a `visibility` axis orthogonal to scope:
+
+- **`private`** (default): only the writing user (`owner_user_id`) reads it.
+- **`shared`**: every authenticated user in this Neuralscape instance reads it.
+
+This solves the personal-vs-team-knowledge split: each user has their own
+private memory pool that persists across their sessions, plus access to a
+shared knowledge pool that everyone on the team can contribute to.
+
+### Per-category default visibility
+
+When a write doesn't supply `visibility`, the server picks from this table:
+
+| Category | Default visibility | Rationale |
+|---|---|---|
+| `preference` | private | Personal taste |
+| `personal_fact` | private | Personal info |
+| `technical_skill` | private | About the user, not the project |
+| `domain_knowledge` | private | The user's accumulated learning |
+| `task_context` | private | WIP, kept private until shipped |
+| `tech_stack` | shared | Team should know what we use |
+| `convention` | shared | Team norms |
+| `architecture` | shared | Team structural decisions |
+| `dependency` | shared | Team-wide visibility |
+| `decision` | shared | Decisions affect the team |
+| `interaction` | shared | Meeting outcomes etc. |
+| `workflow` | shared | Team processes |
+| `procedure` | shared | Team how-tos |
+
+The map lives in `neuralscape-service/schemas.py:DEFAULT_VISIBILITY_FOR_CATEGORY`. Callers can always override via the explicit `visibility` field on write.
+
+### Graphiti `group_id` format (multi-user)
+
+The legacy `"global"` and `"project--{id}"` group_ids are replaced with:
+
+| Memory shape | `group_id` |
+|---|---|
+| Private, no project | `user--{user_id}` |
+| Private, project-scoped | `user--{user_id}--project--{project_id}` |
+| Shared, no project | `shared` |
+| Shared, project-scoped | `shared--project--{project_id}` |
+
+The user namespace prevents the cross-user graph leakage that v2.1 still
+had (Graphiti's group_id had no user component, so a search across
+`"global"` returned every user's facts). The new format scopes private
+facts to their writer while keeping shared facts in a single team-wide
+namespace.
+
+A search by user `alice` walks group_ids `["user--alice", "shared"]`
+(plus the project-scoped variants when the request supplies
+`project_id`).
+
+### Dual-pool search
+
+`MemoryService.search()` runs two queries and merges:
+
+1. **Personal pool**: `m.search(user_id=caller, filters=...)` — mem0
+   enforces user_id at the Qdrant layer. Returns the caller's own
+   memories (any visibility).
+2. **Shared pool**: direct `qdrant_client.query_points()` with
+   `metadata.visibility=shared` — bypasses mem0's user_id namespacing
+   because shared memories span multiple writers. (We use
+   `query_points()` rather than the deprecated `.search()` because
+   qdrant-client v1.13+ removed the latter; the response wraps hits
+   in a `.points` attribute.)
+
+Results are dedup'd by id (a caller's own shared write matches both
+pools) and sorted by score. Filters available:
+
+- `visibility="private"` → personal pool only
+- `visibility="shared"` → shared pool only
+- `include_shared=False` → personal pool only, even on broad queries
+
+### Auth: HMAC-signed per-user tokens
+
+Authentication moves from a single shared API key to per-user HMAC tokens:
+
+```text
+base64url({user_id, exp}).hmac_sha256(secret, payload_b64)
+```
+
+The signing secret is `NEURALSCAPE_USER_TOKEN_SECRET` (separate from the
+legacy `NEURALSCAPE_API_KEY`). Issue tokens via
+`scripts/issue_user_token.py --user <name> --days 30`. The
+middleware (`auth.py:BearerAuthMiddleware`) verifies the HMAC, extracts
+`user_id`, and attaches it to `request.state.user_id` — every v1 route
+prefers that over any `user_id` value in the request body.
+
+If a request supplies `user_id` in the body that disagrees with the
+token's `user_id`, the server returns 400 to prevent confusion.
+
+When `NEURALSCAPE_USER_TOKEN_SECRET` is unset but `NEURALSCAPE_API_KEY`
+is set, the legacy shared-key path still works (body `user_id` is
+trusted, a `X-Neuralscape-Deprecation` response header is added).
+
+### Migration from v2.1
+
+Existing memories have no `metadata.visibility` field, so the server
+treats them as **private to their owner_user_id**. No accidental cross-
+user reads. To make some categories visible to teammates after the fact:
+
+```bash
+python scripts/bulk_promote_visibility.py \
+  --owner ehfaz --category tech_stack --to shared --apply
+```
+
+Graph entries from pre-v2.2 sit under `"global"` / `"project--..."`
+and are invisible to the new search until you run:
+
+```bash
+python scripts/migrate_graph_groups.py --owner ehfaz --apply
+```
+
+Both scripts default to `--dry-run`; pass `--apply` to actually write.
 
 ## Related
 

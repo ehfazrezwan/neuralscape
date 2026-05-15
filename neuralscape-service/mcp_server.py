@@ -72,6 +72,21 @@ async def list_tools() -> list[Tool]:
                         "type": "integer",
                         "description": "Max results to return (default: 10)",
                     },
+                    "visibility": {
+                        "type": "string",
+                        "description": (
+                            "Multi-user: restrict to 'private' (caller's own memories only) "
+                            "or 'shared' (team-wide pool only). Default: both pools merged."
+                        ),
+                        "enum": ["private", "shared"],
+                    },
+                    "include_shared": {
+                        "type": "boolean",
+                        "description": (
+                            "When false, exclude the shared team pool entirely "
+                            "(search caller's private memories only). Default: true."
+                        ),
+                    },
                 },
                 "required": ["query", "user_id"],
             },
@@ -163,6 +178,16 @@ async def list_tools() -> list[Tool]:
                     "expires_at": {
                         "type": "string",
                         "description": "Memory-model v2 — ISO 8601 timestamp; memory is purged after this",
+                    },
+                    "visibility": {
+                        "type": "string",
+                        "description": (
+                            "Multi-user: 'private' (only the writer reads) or 'shared' "
+                            "(any authenticated user reads). Defaults per-category — "
+                            "preference/personal_fact/etc. default private; tech_stack/"
+                            "convention/architecture/decision/etc. default shared."
+                        ),
+                        "enum": ["private", "shared"],
                     },
                     "wait": {
                         "type": "boolean",
@@ -305,7 +330,10 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Delete memories by ID or by filters. Use with caution — deleted memories "
                 "cannot be recovered. Can delete a single memory by ID, or bulk delete by "
-                "scope, category, or project_id."
+                "scope, category, or project_id. Bulk deletes only remove the caller's "
+                "PRIVATE memories by default; shared (team) memories the caller authored "
+                "are preserved. Set include_shared=true to also remove shared writes "
+                "(rarely correct — confirm with the user first)."
             ),
             inputSchema={
                 "type": "object",
@@ -335,6 +363,15 @@ async def list_tools() -> list[Tool]:
                         "type": "boolean",
                         "description": "When True, delete only memories with null/missing category instead of all",
                     },
+                    "include_shared": {
+                        "type": "boolean",
+                        "description": (
+                            "When True, also remove the caller's shared (team) "
+                            "writes. Default False — shared memories are team "
+                            "artifacts and one user's bulk delete shouldn't wipe "
+                            "them. Confirm with the user before enabling."
+                        ),
+                    },
                 },
                 "required": ["user_id"],
             },
@@ -354,6 +391,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 project_id=arguments.get("project_id"),
                 categories=arguments.get("categories"),
                 limit=arguments.get("limit", 10),
+                visibility=arguments.get("visibility"),
+                include_shared=arguments.get("include_shared", True),
             )
             output = [r.model_dump(exclude_none=True) for r in results]
             return [TextContent(type="text", text=json.dumps(output, default=str))]
@@ -369,7 +408,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if project_id and category not in GLOBAL_CATEGORIES:
                 scope = "project"
 
-            # Memory-model v2 fields (all optional)
+            # Memory-model v2 + multi-user fields (all optional)
             v2_fields = {
                 "domain": arguments.get("domain"),
                 "observation_type": arguments.get("observation_type"),
@@ -378,6 +417,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "related_memory_ids": arguments.get("related_memory_ids"),
                 "confidence": arguments.get("confidence"),
                 "expires_at": arguments.get("expires_at"),
+                "visibility": arguments.get("visibility"),
             }
 
             try:
@@ -494,6 +534,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     category=arguments.get("category"),
                     project_id=arguments.get("project_id"),
                     filter_null_category=arguments.get("filter_null_category", False),
+                    include_shared=arguments.get("include_shared", False),
                 )
             return [TextContent(type="text", text=json.dumps(result, default=str))]
 

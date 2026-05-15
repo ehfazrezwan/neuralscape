@@ -607,21 +607,48 @@ async def advanced_graph_search_legacy(req: LegacyGraphSearchRequest):
 v1_router = APIRouter(prefix="/v1", tags=["v1"])
 
 
+def _resolve_user_id(request: Request, body_user_id: str | None) -> str:
+    """Resolve the authoritative user_id for a v1 request.
+
+    - When the auth middleware verified a per-user token, ``request.state.user_id``
+      is set; that wins. If the body also supplied ``user_id`` and they disagree,
+      reject with 400 to prevent token-vs-body identity confusion.
+    - Legacy shared-key callers don't have ``request.state.user_id``; we trust
+      the body's ``user_id`` as before.
+    - When neither path supplies an id, fall back to ``settings.default_user_id``.
+
+    Raises HTTPException(400) on token/body mismatch.
+    """
+    token_user_id = getattr(request.state, "user_id", None)
+    if token_user_id:
+        if body_user_id and body_user_id != token_user_id:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Request body user_id ({body_user_id!r}) does not match the "
+                    f"user_id encoded in the auth token ({token_user_id!r})."
+                ),
+            )
+        return token_user_id
+    return body_user_id or settings.default_user_id
+
+
 # ── Remember ──────────────────────────────────
 
 
 @v1_router.post("/memories", status_code=202)
-async def v1_store_memories(req: StoreMemoryRequest):
+async def v1_store_memories(req: StoreMemoryRequest, request: Request):
     """Store memories from conversation via LLM extraction (async).
 
     Enqueues the extraction task to a background worker and returns immediately
     with a task_id that can be polled via GET /v1/memories/status/{task_id}.
     Falls back to synchronous storage if Redis is unavailable.
     """
+    user_id = _resolve_user_id(request, req.user_id)
     try:
         task_id = await _task_manager.enqueue_store(
             messages=req.messages,
-            user_id=req.user_id,
+            user_id=user_id,
             project_id=req.project_id,
             agent_id=req.agent_id,
             run_id=req.run_id,
@@ -631,7 +658,7 @@ async def v1_store_memories(req: StoreMemoryRequest):
         memories = await asyncio.to_thread(
             _service.extract_and_store,
             messages=req.messages,
-            user_id=req.user_id,
+            user_id=user_id,
             project_id=req.project_id,
             agent_id=req.agent_id,
             run_id=req.run_id,
@@ -648,13 +675,17 @@ async def v1_store_memories(req: StoreMemoryRequest):
 
 
 @v1_router.post("/memories/raw", status_code=202)
-async def v1_store_raw_memory(req: RawMemoryRequest):
+async def v1_store_raw_memory(req: RawMemoryRequest, request: Request):
     """Store a single pre-categorized fact (async, no LLM extraction).
 
     Enqueues the storage task to a background worker and returns immediately.
     Falls back to synchronous storage if Redis is unavailable.
     Memory-model v2 fields (domain, observation_type, concepts, source_type,
     related_memory_ids, confidence, expires_at) are all optional.
+
+    Multi-user: when authenticated with a per-user token, the user_id is
+    taken from the token (authoritative). When sending user_id in the body
+    as well, it must match the token's user_id.
     """
     if req.category not in MEMORY_CATEGORIES:
         raise HTTPException(
@@ -664,8 +695,12 @@ async def v1_store_raw_memory(req: RawMemoryRequest):
     if req.scope == "project" and not req.project_id:
         raise HTTPException(status_code=400, detail="project_id is required when scope='project'")
 
+    # Resolve identity from token (preferred) or body (legacy). Raises 400 on mismatch.
+    resolved_user_id = _resolve_user_id(request, req.user_id)
+
     # Build the kwargs once; passed through to both the queue path and the sync fallback.
     raw_kwargs = req.model_dump(exclude_none=True)
+    raw_kwargs["user_id"] = resolved_user_id
     # serialize datetime so it survives JSON enqueue
     if "expires_at" in raw_kwargs and hasattr(raw_kwargs["expires_at"], "isoformat"):
         raw_kwargs["expires_at"] = raw_kwargs["expires_at"].isoformat()
@@ -696,12 +731,15 @@ async def v1_store_raw_memory(req: RawMemoryRequest):
 
 
 @v1_router.post("/memories/raw/batch", status_code=202)
-async def v1_store_raw_batch(req: RawMemoryBatchRequest):
+async def v1_store_raw_batch(req: RawMemoryBatchRequest, request: Request):
     """Store multiple pre-categorized facts in one request (memory-model v2).
 
     All items dispatched as a single ARQ task. Each item is independent —
     a single bad item does not block the others. Falls back to synchronous
     storage if Redis is unavailable.
+
+    Multi-user: when authenticated with a per-user token, all items inherit
+    the token's user_id (per-item user_id in the body must match if set).
     """
     # Per-item validation up front so we fail fast on bad input.
     for idx, item in enumerate(req.memories):
@@ -716,12 +754,39 @@ async def v1_store_raw_batch(req: RawMemoryBatchRequest):
                 detail=f"Item {idx}: project_id is required when scope='project'.",
             )
 
+    # Resolve identity once for the whole batch. When a token is present,
+    # it's authoritative: every item must agree (or be absent / empty), and
+    # we overwrite each item's user_id with the token's. Without a token
+    # (legacy shared-key callers), per-item body user_id is trusted.
+    token_user_id = getattr(request.state, "user_id", None)
+    if token_user_id:
+        for idx, item in enumerate(req.memories):
+            # Reject any item that explicitly tries to write under a
+            # different user_id. A blank or absent value is acceptable —
+            # we'll fill it from the token below.
+            if item.user_id and item.user_id != token_user_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Item {idx}: body user_id ({item.user_id!r}) does not match "
+                        f"the auth token's user_id ({token_user_id!r})."
+                    ),
+                )
+
     # Serialize datetimes so the batch survives JSON enqueue.
     items_payload: list[dict] = []
     for item in req.memories:
         d = item.model_dump(exclude_none=True)
         if "expires_at" in d and hasattr(d["expires_at"], "isoformat"):
             d["expires_at"] = d["expires_at"].isoformat()
+        if token_user_id:
+            # Token wins. Overwrite any per-item value (including empty
+            # strings, which `setdefault` would have preserved) so a
+            # caller can't submit `item.user_id=""` to sidestep the
+            # token's namespace.
+            d["user_id"] = token_user_id
+        else:
+            d.setdefault("user_id", settings.default_user_id)
         items_payload.append(d)
 
     try:
@@ -753,17 +818,23 @@ async def v1_get_task_status(task_id: str):
 
 
 @v1_router.post("/search", response_model=SearchMemoryResponse)
-async def v1_search_memories(req: SearchMemoryRequest):
+async def v1_search_memories(req: SearchMemoryRequest, request: Request):
     """Semantic search with scope/category filters.
 
     When project_id is provided, searches both global and project memories.
     Memory-model v2 filters (domain, observation_type, concepts) are optional.
+
+    Multi-user: results combine the caller's personal memories with the
+    shared pool. Pass `visibility="private"` to restrict to personal only,
+    `visibility="shared"` to restrict to the team pool, or
+    `include_shared=False` to skip the shared pool entirely.
     """
+    user_id = _resolve_user_id(request, req.user_id)
     try:
         results = await asyncio.to_thread(
             _service.search,
             query=req.query,
-            user_id=req.user_id,
+            user_id=user_id,
             project_id=req.project_id,
             categories=req.categories,
             scope=req.scope,
@@ -771,26 +842,33 @@ async def v1_search_memories(req: SearchMemoryRequest):
             domain=req.domain,
             observation_type=req.observation_type,
             concepts=req.concepts,
+            visibility=req.visibility.value if req.visibility else None,
+            include_shared=req.include_shared,
         )
         return SearchMemoryResponse(results=results)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("v1 search failed")
         raise HTTPException(status_code=500, detail="Memory search failed")
 
 
 @v1_router.post("/graph/search")
-async def v1_graph_search(req: GraphSearchRequest):
+async def v1_graph_search(req: GraphSearchRequest, request: Request):
     """Knowledge graph search (entities, facts, relationships)."""
+    user_id = _resolve_user_id(request, req.user_id)
     try:
         results = await asyncio.to_thread(
             _service.search_graph,
             query=req.query,
-            user_id=req.user_id,
+            user_id=user_id,
             project_id=req.project_id,
             limit=req.limit,
             search_config=req.search_config,
         )
         return {"status": "ok", **results}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("v1 graph search failed")
         raise HTTPException(status_code=500, detail="Graph search failed")
@@ -800,13 +878,16 @@ async def v1_graph_search(req: GraphSearchRequest):
 
 
 @v1_router.get("/context/global", response_model=ContextResponse)
-async def v1_get_global_context(user_id: str = Query(...)):
+async def v1_get_global_context(request: Request, user_id: str | None = Query(default=None)):
     """Get only global user context (preferences, skills, etc.)."""
+    resolved_user_id = _resolve_user_id(request, user_id)
     try:
         return await asyncio.to_thread(
             _service.get_global_context,
-            user_id=user_id,
+            user_id=resolved_user_id,
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("v1 get_global_context failed")
         raise HTTPException(status_code=500, detail="Failed to load global context")
@@ -814,7 +895,8 @@ async def v1_get_global_context(user_id: str = Query(...)):
 
 @v1_router.get("/context/inject")
 async def v1_inject_context(
-    user_id: str = Query(...),
+    request: Request,
+    user_id: str | None = Query(default=None),
     project_id: str | None = Query(default=None),
     max_chars: int = Query(default=8000, ge=500, le=32000),
 ):
@@ -823,17 +905,18 @@ async def v1_inject_context(
     Optimized for Claude Code SessionStart hooks — returns concise markdown
     organized by category, suitable for additionalContext injection.
     """
+    resolved_user_id = _resolve_user_id(request, user_id)
     try:
         if project_id:
             context = await asyncio.to_thread(
                 _service.get_project_context,
-                user_id=user_id,
+                user_id=resolved_user_id,
                 project_id=project_id,
             )
         else:
             context = await asyncio.to_thread(
                 _service.get_global_context,
-                user_id=user_id,
+                user_id=resolved_user_id,
             )
 
         formatted = format_context_for_injection(
@@ -841,6 +924,8 @@ async def v1_inject_context(
             max_chars=max_chars,
         )
         return {"additionalContext": formatted}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("v1 inject_context failed")
         raise HTTPException(status_code=500, detail="Failed to generate injection context")
@@ -849,15 +934,19 @@ async def v1_inject_context(
 @v1_router.get("/context/{project_id}", response_model=ContextResponse)
 async def v1_get_project_context(
     project_id: str,
-    user_id: str = Query(...),
+    request: Request,
+    user_id: str | None = Query(default=None),
 ):
     """Get full project + global context organized by category."""
+    resolved_user_id = _resolve_user_id(request, user_id)
     try:
         return await asyncio.to_thread(
             _service.get_project_context,
-            user_id=user_id,
+            user_id=resolved_user_id,
             project_id=project_id,
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("v1 get_project_context failed")
         raise HTTPException(status_code=500, detail="Failed to load project context")
@@ -868,22 +957,26 @@ async def v1_get_project_context(
 
 @v1_router.get("/memories", response_model=list[MemoryResponse])
 async def v1_list_memories(
-    user_id: str = Query(...),
+    request: Request,
+    user_id: str | None = Query(default=None),
     scope: str | None = Query(default=None),
     category: str | None = Query(default=None),
     project_id: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
 ):
     """List memories with filters (scope, category, project_id)."""
+    resolved_user_id = _resolve_user_id(request, user_id)
     try:
         return await asyncio.to_thread(
             _service.list_memories,
-            user_id=user_id,
+            user_id=resolved_user_id,
             scope=scope,
             category=category,
             project_id=project_id,
             limit=limit,
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("v1 list_memories failed")
         raise HTTPException(status_code=500, detail="Failed to list memories")
@@ -927,17 +1020,21 @@ async def v1_delete_memory(memory_id: str):
 
 
 @v1_router.delete("/memories")
-async def v1_bulk_delete_memories(req: BulkDeleteRequest):
+async def v1_bulk_delete_memories(req: BulkDeleteRequest, request: Request):
     """Bulk delete memories with filters."""
+    user_id = _resolve_user_id(request, req.user_id)
     try:
         return await asyncio.to_thread(
             _service.delete_memories,
-            user_id=req.user_id,
+            user_id=user_id,
             scope=req.scope,
             category=req.category,
             project_id=req.project_id,
             filter_null_category=req.filter_null_category,
+            include_shared=req.include_shared,
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("v1 bulk_delete failed")
         raise HTTPException(status_code=500, detail="Failed to delete memories")
@@ -954,14 +1051,16 @@ async def v1_list_categories():
 
 @v1_router.get("/graph/nodes")
 async def v1_graph_nodes(
-    user_id: str = Query(...),
+    request: Request,
+    user_id: str | None = Query(default=None),
     project_id: str | None = Query(default=None),
     limit: int = Query(default=50),
 ):
     """List entity nodes from Graphiti with project_id filter."""
+    resolved_user_id = _resolve_user_id(request, user_id)
     nodes = await asyncio.to_thread(
         _service.get_graph_nodes,
-        user_id=user_id,
+        user_id=resolved_user_id,
         project_id=project_id,
         limit=limit,
     )
@@ -970,14 +1069,16 @@ async def v1_graph_nodes(
 
 @v1_router.get("/graph/edges")
 async def v1_graph_edges(
-    user_id: str = Query(...),
+    request: Request,
+    user_id: str | None = Query(default=None),
     project_id: str | None = Query(default=None),
     limit: int = Query(default=50),
 ):
     """List entity edges (facts) from Graphiti with project_id filter."""
+    resolved_user_id = _resolve_user_id(request, user_id)
     edges = await asyncio.to_thread(
         _service.get_graph_edges,
-        user_id=user_id,
+        user_id=resolved_user_id,
         project_id=project_id,
         limit=limit,
     )
@@ -986,14 +1087,16 @@ async def v1_graph_edges(
 
 @v1_router.get("/graph/episodes")
 async def v1_graph_episodes(
-    user_id: str = Query(...),
+    request: Request,
+    user_id: str | None = Query(default=None),
     project_id: str | None = Query(default=None),
     limit: int = Query(default=20),
 ):
     """List episodic nodes from Graphiti with project_id filter."""
+    resolved_user_id = _resolve_user_id(request, user_id)
     episodes = await asyncio.to_thread(
         _service.get_graph_episodes,
-        user_id=user_id,
+        user_id=resolved_user_id,
         project_id=project_id,
         limit=limit,
     )
@@ -1002,7 +1105,8 @@ async def v1_graph_episodes(
 
 @v1_router.delete("/graph/episodes/junk")
 async def v1_delete_junk_episodes(
-    user_id: str = Query(...),
+    request: Request,
+    user_id: str | None = Query(default=None),
     project_id: str | None = Query(default=None),
     dry_run: bool = Query(default=False),
 ):
@@ -1010,14 +1114,17 @@ async def v1_delete_junk_episodes(
 
     Use dry_run=true to preview what would be deleted.
     """
+    resolved_user_id = _resolve_user_id(request, user_id)
     try:
         result = await asyncio.to_thread(
             _service.delete_junk_episodes,
-            user_id=user_id,
+            user_id=resolved_user_id,
             project_id=project_id,
             dry_run=dry_run,
         )
         return {"status": "ok", **result}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("v1 delete_junk_episodes failed")
         raise HTTPException(status_code=500, detail="Failed to delete junk episodes")
@@ -1043,14 +1150,16 @@ async def v1_delete_episode(episode_uuid: str):
 
 @v1_router.get("/graph/communities")
 async def v1_graph_communities(
-    user_id: str = Query(...),
+    request: Request,
+    user_id: str | None = Query(default=None),
     project_id: str | None = Query(default=None),
     limit: int = Query(default=20),
 ):
     """List community nodes from Graphiti with project_id filter."""
+    resolved_user_id = _resolve_user_id(request, user_id)
     communities = await asyncio.to_thread(
         _service.get_graph_communities,
-        user_id=user_id,
+        user_id=resolved_user_id,
         project_id=project_id,
         limit=limit,
     )

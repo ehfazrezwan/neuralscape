@@ -391,6 +391,41 @@ Both pipelines write to the same backend. `source_type` distinguishes them on re
 
 Content-hash dedup in `service.store_raw()` ensures that even if both paths land on the same fact, only one row is created. See [05-llm-extraction](./05-llm-extraction.md) for the cost/architecture comparison.
 
+## Multi-user identity + auth (v2.2)
+
+Released alongside the memory model's multi-user visibility split (see [03-memory-model](./03-memory-model.md)). Two relevant changes for the plugin client:
+
+### Per-user HMAC tokens (preferred)
+
+The plugin's `API_KEY` userConfig field now accepts a per-user HMAC token in addition to the legacy shared API key. Tokens are signed by the backend admin via:
+
+```bash
+# On the Neuralscape server
+NEURALSCAPE_USER_TOKEN_SECRET=<secret> python scripts/issue_user_token.py \
+  --user alice --days 30
+```
+
+The output is a two-segment token like `eyJ1c2VyX2lkIjoiYWxpY2UiLCJleHAiOjE3Nzc...{base64url}.{hmac_sha256_b64url}`. Paste it into the plugin's `API_KEY` config (or set `NEURALSCAPE_API_KEY`).
+
+The plugin's `.mcp.json` template (`Authorization: Bearer ${user_config.API_KEY}`) is unchanged — it transports both token formats identically. The server distinguishes them by checking for a `.` in the token.
+
+### How identity flows after v2.2
+
+| Step | Old behavior (≤ v2.1) | New behavior (v2.2) |
+|---|---|---|
+| Plugin sets `Authorization: Bearer ...` | Single shared API key | Per-user HMAC token (or legacy shared key) |
+| Server validates token | hmac.compare_digest against shared key | HMAC-verify signature → extract `user_id` claim |
+| Identity used by route | Pulled from request body `user_id` (trust-based) | Pulled from `request.state.user_id` (set by middleware from the token) |
+| Body `user_id` mismatch | Trusted as-is — cross-user spoofing possible | 400 Bad Request — server rejects the request |
+
+### USER_ID userConfig field
+
+`USER_ID` stays in the plugin's userConfig prompts because the plugin still sends it as a query-string / body field on the existing routes. With a per-user token, the server uses the token's claim and validates that `USER_ID == token.user_id` (otherwise 400). The recommendation is to set `USER_ID` to the same string used when issuing the token.
+
+### Compile-observations skill default visibility
+
+The compile-observations skill is updated (in v2.2) to set `visibility` on every memory it writes. Per-category defaults match the table in [03-memory-model](./03-memory-model.md): private for `preference` / `personal_fact` / `task_context`; shared for `tech_stack` / `convention` / `architecture` / `decision` etc. The model can override per-memory when the default is wrong for a specific work unit. See `neuralscape-plugin/skills/compile-observations/SKILL.md` for the rubric.
+
 ## Related
 
 - [01-getting-started](./01-getting-started.md) — Step 8 walks through the marketplace install
