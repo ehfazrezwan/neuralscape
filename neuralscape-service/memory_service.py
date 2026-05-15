@@ -2702,10 +2702,15 @@ class MemoryService:
 
             try:
                 embedding = m.embedding_model.embed(text)
+                # mem0 v2.0.2 renamed the search kwarg ``limit`` → ``top_k``
+                # on its Qdrant wrapper (``mem0/mem0/vector_stores/qdrant.py``).
+                # Calling with ``limit`` raises ``Qdrant.search() got an
+                # unexpected keyword argument 'limit'`` and dedup silently
+                # fails for every memory in the user's pool.
                 hits = m.vector_store.search(
                     query=text,
                     vectors=embedding,
-                    limit=5,
+                    top_k=5,
                     filters={"user_id": user_id},
                 )
             except Exception as e:
