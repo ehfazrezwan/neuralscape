@@ -1276,6 +1276,30 @@ async def v1_admin_synthesize(req: SynthesizeRequest):
     }
 
 
+@v1_router.get("/admin/synthesize/status")
+async def v1_admin_synthesize_status():
+    """Return the most recent synthesis-run state plus current config.
+
+    Process-local: when the API and worker are separate processes, each
+    has its own ``last_run`` snapshot. The API process reports runs
+    triggered through ``POST /v1/admin/synthesize``; the worker process
+    reports its cron runs. Cross-process unification is a follow-up.
+    """
+    from extensions.wiki_synthesizer.config import synthesizer_settings
+    from extensions.wiki_synthesizer.synthesizer import get_last_run_snapshot
+
+    return {
+        "enabled": synthesizer_settings.enabled,
+        "cron_hours": synthesizer_settings.cron_hours,
+        "max_memories_per_page": synthesizer_settings.max_memories_per_page,
+        "gemini_timeout_seconds": synthesizer_settings.gemini_timeout_seconds,
+        "gemini_max_retries": synthesizer_settings.gemini_max_retries,
+        "attach_window_seconds": synthesizer_settings.attach_window_seconds,
+        "wiki_dir": str(synthesizer_settings.wiki_dir),
+        "last_run": get_last_run_snapshot(),
+    }
+
+
 # Mount v1 router
 app.include_router(v1_router)
 

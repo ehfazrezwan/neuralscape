@@ -2220,15 +2220,18 @@ class TestSearchMultiUserIsolation:
         assert service._memory.vector_store.client.query_points.call_count == 0
 
     def test_personal_pool_uses_mem0_user_id_namespace(self, service):
-        """The personal-pool call always passes user_id=caller to mem0 — that's
-        what enforces cross-user isolation at the vector store layer."""
+        """The personal-pool call always scopes the mem0 search to user_id=caller — that's
+        what enforces cross-user isolation at the vector store layer. mem0 v2.0.2
+        rejects ``user_id`` as a top-level kwarg, so the value now rides inside ``filters``."""
         service._memory.search.return_value = {"results": []}
         service._memory.embedding_model.embed.return_value = [0.1] * 768
         service._memory.vector_store.client = MagicMock()
         service._memory.vector_store.client.query_points.return_value = _qresult([])
         service.search(query="anything", user_id="alice", scope="global")
         call_kwargs = service._memory.search.call_args[1]
-        assert call_kwargs["user_id"] == "alice"
+        # Pre-cleanup this lived as a top-level kwarg; mem0 v2.0.2 moves it to filters.
+        assert "user_id" not in call_kwargs
+        assert call_kwargs["filters"]["user_id"] == "alice"
 
     def test_shared_pool_filter_includes_visibility_shared(self, service):
         """The shared-pool query MUST include the visibility=shared filter or
