@@ -1214,6 +1214,68 @@ async def v1_emit_extension_event(req: EmitEventRequest):
     }
 
 
+class SynthesizeRequest(BaseModel):
+    """Body for POST /v1/admin/synthesize."""
+
+    category: str | None = Field(
+        default=None,
+        description="Restrict synthesis to a single NeuralScape category. None = all categories.",
+    )
+    dry_run: bool = Field(
+        default=False,
+        description=(
+            "When true, do everything except write to the vault and patch Neo4j. "
+            "The response still reports what would have happened."
+        ),
+    )
+
+
+@v1_router.post("/admin/synthesize")
+async def v1_admin_synthesize(req: SynthesizeRequest):
+    """Manually trigger one wiki-synthesis pass.
+
+    Gated by ``WIKI_SYNTHESIZER_ENABLED`` — when disabled, the response
+    contains zero pages and an explanatory error. Useful for development
+    and for one-shot synthesis after a content backfill.
+    """
+    from extensions.wiki_synthesizer.config import synthesizer_settings
+    from extensions.wiki_synthesizer.synthesizer import synthesize_all
+
+    if not synthesizer_settings.enabled:
+        return {
+            "pages_created": 0,
+            "pages_updated": 0,
+            "memories_processed": 0,
+            "communities_skipped_empty": 0,
+            "errors": ["WIKI_SYNTHESIZER_ENABLED=false — set the env var to true to run"],
+            "pages": [],
+        }
+
+    result = await synthesize_all(
+        service=_service,
+        settings=synthesizer_settings,
+        only_category=req.category,
+        dry_run=req.dry_run,
+    )
+    return {
+        "pages_created": result.pages_created,
+        "pages_updated": result.pages_updated,
+        "memories_processed": result.memories_processed,
+        "communities_skipped_empty": result.communities_skipped_empty,
+        "errors": result.errors,
+        "pages": [
+            {
+                "category": p.category,
+                "community_id": p.community_id,
+                "wiki_path": p.wiki_path,
+                "created": p.created,
+                "source_memory_count": p.source_memory_count,
+            }
+            for p in result.pages
+        ],
+    }
+
+
 # Mount v1 router
 app.include_router(v1_router)
 

@@ -210,10 +210,45 @@ async def expire_old_memories_cron(ctx: dict) -> dict:
     return result
 
 
+async def synthesize_topical_wikis_cron(ctx: dict) -> dict:
+    """Cron job: synthesize shared memories into topical wiki pages.
+
+    Gated by ``WIKI_SYNTHESIZER_ENABLED``; the synthesizer itself returns
+    an empty result when disabled, so this wrapper just forwards.
+    """
+    from extensions.wiki_synthesizer.config import synthesizer_settings
+    from extensions.wiki_synthesizer.synthesizer import synthesize_all
+
+    if not synthesizer_settings.enabled:
+        return {"skipped": True, "reason": "WIKI_SYNTHESIZER_ENABLED=false"}
+    service: MemoryService = ctx["service"]
+    result = await synthesize_all(service=service, settings=synthesizer_settings)
+    return {
+        "pages_created": result.pages_created,
+        "pages_updated": result.pages_updated,
+        "memories_processed": result.memories_processed,
+        "errors": result.errors,
+    }
+
+
 def _generate_job_id(content: str, user_id: str) -> str:
     """Generate a deterministic job ID from content + user_id."""
     h = hashlib.sha256(f"{user_id}:{content}".encode()).hexdigest()[:16]
     return f"raw-{h}"
+
+
+def _synthesizer_cron_hours() -> list[int]:
+    """Resolve the hours the wiki-synthesizer cron fires.
+
+    ``WIKI_SYNTHESIZER_CRON_HOURS`` is an interval in hours (default 6).
+    We translate it into the discrete hour-of-day set that arq's `cron`
+    accepts. Starts at 03:45 + offset to stagger with the dedup
+    (hour=dedup_cron_hours) and the expire (hour={3}) crons.
+    """
+    from extensions.wiki_synthesizer.config import synthesizer_settings
+
+    interval = max(1, min(24, synthesizer_settings.cron_hours))
+    return list(range(0, 24, interval))
 
 
 async def process_conversation_flush(
@@ -385,6 +420,20 @@ class WorkerSettings:
             hour={3},
             minute=15,
             timeout=600,
+            unique=True,
+            max_tries=1,
+            run_at_startup=False,
+        ),
+        cron(
+            synthesize_topical_wikis_cron,
+            # Imported lazily so importing worker.py doesn't load the
+            # synthesizer's whole settings tree before WorkerSettings is
+            # actually instantiated. Cadence is read directly from the env
+            # var here because cron() needs a concrete value at class
+            # body evaluation time.
+            hour=set(_synthesizer_cron_hours()),
+            minute=45,
+            timeout=1800,
             unique=True,
             max_tries=1,
             run_at_startup=False,
