@@ -156,7 +156,7 @@ async def synthesize_all(
         _record_last_run(result, started)
         return result
 
-    shared_group_ids = await _list_shared_group_ids(driver)
+    shared_group_ids = await _list_shared_group_ids(service)
     if not shared_group_ids:
         logger.info("synthesis skipped: no shared group_ids in the graph")
         return result
@@ -172,7 +172,7 @@ async def synthesize_all(
 
     for group_id in shared_group_ids:
         try:
-            communities = await load_communities(driver, group_id=group_id)
+            communities = await load_communities(service, group_id=group_id)
         except Exception as exc:
             logger.warning(
                 "load_communities raised for group_id=%s: %s", group_id, exc
@@ -310,7 +310,7 @@ async def _synthesize_community(
     if not dry_run:
         write_page(page_path, rendered)
         await patch_wiki_path(
-            driver,
+            service,
             node_uuids=community.member_node_uuids,
             wiki_path=rel_path,
             group_id=group_id,
@@ -328,28 +328,39 @@ async def _synthesize_community(
 # ── Helpers ────────────────────────────────────────────────────────
 
 
-async def _list_shared_group_ids(driver: Any) -> list[str]:
+async def _list_shared_group_ids(service: MemoryService) -> list[str]:
     """Return every group_id that starts with ``shared``.
 
     Covers the team-wide ``shared`` group plus per-project shared
     groups (``shared--project--<pid>``). Private groups (``user--...``,
     ``user--...--project--...``) and the legacy ``global`` namespace are
     intentionally excluded — v1 vault content is shared-only.
+
+    Runs on the Graphiti bridge's event loop. The async driver is bound
+    to that loop and any direct ``await driver.session()`` from another
+    loop raises ``Future attached to a different loop``.
     """
+    driver = service._graphiti.driver if service._graphiti else None  # type: ignore[attr-defined]
+    if driver is None:
+        return []
     cypher = """
     MATCH (n)
     WHERE n.group_id STARTS WITH 'shared'
     RETURN DISTINCT n.group_id AS gid
     ORDER BY gid
     """
-    try:
+
+    async def _inner() -> list[dict]:
         async with driver.session() as session:
             result = await session.run(cypher)
-            records = await result.data()
-        return [r["gid"] for r in records if r.get("gid")]
+            return await result.data()
+
+    try:
+        records = await service._run_on_bridge_async(_inner(), timeout=30.0)
     except Exception:
         logger.warning("_list_shared_group_ids failed", exc_info=True)
         return []
+    return [r["gid"] for r in records if r.get("gid")]
 
 
 async def _ensure_communities_built(
@@ -365,10 +376,9 @@ async def _ensure_communities_built(
     zero. We check per-group_id and trigger build for the empty ones.
     Best-effort: failures are logged but don't fail the synthesis run.
     """
-    driver = service._graphiti.driver  # type: ignore[attr-defined]
+    driver = service._graphiti.driver if service._graphiti else None  # type: ignore[attr-defined]
     graphiti = service._graphiti
-    bridge_runner = service._run_on_bridge
-    if not (graphiti and bridge_runner):
+    if not (graphiti and driver):
         return
 
     cypher = """
@@ -377,11 +387,15 @@ async def _ensure_communities_built(
     WITH gid, count(c) AS n
     RETURN gid, n
     """
-    needs_build: list[str] = []
-    try:
+
+    async def _inner() -> list[dict]:
         async with driver.session() as session:
             cursor = await session.run(cypher, gids=group_ids)
-            records = await cursor.data()
+            return await cursor.data()
+
+    needs_build: list[str] = []
+    try:
+        records = await service._run_on_bridge_async(_inner(), timeout=30.0)
         for r in records:
             if int(r.get("n") or 0) == 0:
                 needs_build.append(r["gid"])
@@ -397,7 +411,7 @@ async def _ensure_communities_built(
         needs_build,
     )
     try:
-        bridge_runner(
+        await service._run_on_bridge_async(
             graphiti.build_communities(group_ids=needs_build), timeout=600.0
         )
     except Exception as exc:
