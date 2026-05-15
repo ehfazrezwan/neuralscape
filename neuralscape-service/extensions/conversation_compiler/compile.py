@@ -228,13 +228,18 @@ async def compile_date(
     articles: list[CompiledArticle] = []
     entries_compiled = 0
 
+    # Each writer now returns the vault-root-relative path (including the
+    # `_raw/` prefix) so the article paths surfaced in CompiledArticle
+    # match the actual on-disk location and resolve as Obsidian wikilinks.
+    # The is-new checks use `raw_file_exists` so callers don't have to
+    # know about the `_raw/` prefix convention.
+
     # 1. Session summary (always produced if there are entries)
     all_text = _entries_to_text(entries)
     try:
-        summary_path = f"Sessions/{date}.md"
-        is_new = not writer.file_exists(summary_path)
+        is_new = not writer.raw_file_exists(f"Sessions/{date}.md")
         summary_content = await _async_call_gemini(SESSION_SUMMARY_PROMPT + all_text)
-        writer.write_session_summary(date, summary_content)
+        summary_path = writer.write_session_summary(date, summary_content)
         articles.append(
             CompiledArticle(
                 path=summary_path,
@@ -251,12 +256,13 @@ async def compile_date(
     projects: dict[str, list[dict]] = grouped.get("projects", {})
     for project_name, project_entries in projects.items():
         try:
-            project_path = f"Projects/{_slugify(project_name)}/README.md"
-            is_new = not writer.file_exists(project_path)
+            is_new = not writer.raw_file_exists(
+                f"Projects/{_slugify(project_name)}/README.md"
+            )
             prompt = PROJECT_SYNTHESIS_PROMPT.format(project=project_name)
             prompt += _entries_to_text(project_entries)
             project_content = await _async_call_gemini(prompt)
-            writer.update_project_page(project_name, project_content)
+            project_path = writer.update_project_page(project_name, project_content)
             articles.append(
                 CompiledArticle(
                     path=project_path,
@@ -273,11 +279,10 @@ async def compile_date(
     if decision_entries:
         try:
             slug = _extract_decision_slug(decision_entries)
-            decision_path = f"Decisions/{_slugify(slug)}.md"
-            is_new = not writer.file_exists(decision_path)
+            is_new = not writer.raw_file_exists(f"Decisions/{_slugify(slug)}.md")
             prompt = DECISION_SYNTHESIS_PROMPT + _entries_to_text(decision_entries)
             decision_content = await _async_call_gemini(prompt)
-            writer.write_decision(slug, decision_content)
+            decision_path = writer.write_decision(slug, decision_content)
             articles.append(
                 CompiledArticle(
                     path=decision_path,
@@ -294,12 +299,11 @@ async def compile_date(
     if research_entries:
         try:
             topic = _extract_research_topic(research_entries)
-            research_path = f"Research/{_slugify(topic)}.md"
-            is_new = not writer.file_exists(research_path)
+            is_new = not writer.raw_file_exists(f"Research/{_slugify(topic)}.md")
             prompt = RESEARCH_SYNTHESIS_PROMPT.format(topic=topic)
             prompt += _entries_to_text(research_entries)
             research_content = await _async_call_gemini(prompt)
-            writer.write_research(topic, research_content)
+            research_path = writer.write_research(topic, research_content)
             articles.append(
                 CompiledArticle(
                     path=research_path,

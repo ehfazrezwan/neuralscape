@@ -108,15 +108,15 @@ class TestObsidianWriter:
             {"time": "10:30", "category": "decision", "content": "Chose FastAPI", "session_id": "s1"}
         ]
         rel_path = writer.append_daily_log("2026-04-07", entries)
-        assert rel_path == "Daily/2026-04-07.md"
-        assert (tmp_vault / "Daily" / "2026-04-07.md").exists()
+        assert rel_path == "_raw/Daily/2026-04-07.md"
+        assert (tmp_vault / "_raw" / "Daily" / "2026-04-07.md").exists()
 
     def test_append_daily_log_content(self, writer, tmp_vault):
         entries = [
             {"time": "10:30", "category": "decision", "content": "Chose FastAPI", "session_id": "s1"}
         ]
         writer.append_daily_log("2026-04-07", entries)
-        content = (tmp_vault / "Daily" / "2026-04-07.md").read_text()
+        content = (tmp_vault / "_raw" / "Daily" / "2026-04-07.md").read_text()
         assert "Chose FastAPI" in content
         assert "`decision`" in content
         assert "session: s1" in content
@@ -124,7 +124,7 @@ class TestObsidianWriter:
     def test_append_daily_log_appends(self, writer, tmp_vault):
         writer.append_daily_log("2026-04-07", [{"time": "10:00", "category": "fact", "content": "First"}])
         writer.append_daily_log("2026-04-07", [{"time": "11:00", "category": "fact", "content": "Second"}])
-        content = (tmp_vault / "Daily" / "2026-04-07.md").read_text()
+        content = (tmp_vault / "_raw" / "Daily" / "2026-04-07.md").read_text()
         assert "First" in content
         assert "Second" in content
 
@@ -162,38 +162,38 @@ class TestObsidianWriter:
 
     def test_write_session_summary(self, writer, tmp_vault):
         rel_path = writer.write_session_summary("2026-04-07", "Today was productive.")
-        assert rel_path == "Sessions/2026-04-07.md"
-        content = (tmp_vault / "Sessions" / "2026-04-07.md").read_text()
+        assert rel_path == "_raw/Sessions/2026-04-07.md"
+        content = (tmp_vault / "_raw" / "Sessions" / "2026-04-07.md").read_text()
         assert "Today was productive." in content
 
     def test_update_project_page_create(self, writer, tmp_vault):
         rel_path = writer.update_project_page("NeuralScape", "A memory service.")
-        assert "Projects/" in rel_path
+        assert rel_path.startswith("_raw/Projects/")
         assert (tmp_vault / rel_path).exists()
 
     def test_write_decision(self, writer, tmp_vault):
         rel_path = writer.write_decision("use-fastapi", "Chose FastAPI because...")
-        assert rel_path == "Decisions/use-fastapi.md"
+        assert rel_path == "_raw/Decisions/use-fastapi.md"
         content = (tmp_vault / rel_path).read_text()
         assert "Chose FastAPI because..." in content
 
     def test_write_research(self, writer, tmp_vault):
         rel_path = writer.write_research("graphiti-vs-neo4j", "Comparison notes...")
-        assert rel_path == "Research/graphiti-vs-neo4j.md"
+        assert rel_path == "_raw/Research/graphiti-vs-neo4j.md"
 
     def test_update_index(self, writer, tmp_vault):
         entries = [
-            {"path": "Sessions/2026-04-07.md", "title": "Session", "type": "session"},
-            {"path": "Decisions/use-fastapi.md", "title": "Use FastAPI", "type": "decision"},
+            {"path": "_raw/Sessions/2026-04-07.md", "title": "Session", "type": "session"},
+            {"path": "_raw/Decisions/use-fastapi.md", "title": "Use FastAPI", "type": "decision"},
         ]
         writer.update_index(entries)
-        content = (tmp_vault / "index.md").read_text()
-        assert "[[Sessions/2026-04-07.md]]" in content
-        assert "[[Decisions/use-fastapi.md]]" in content
+        content = (tmp_vault / "_raw" / "index.md").read_text()
+        assert "[[_raw/Sessions/2026-04-07.md]]" in content
+        assert "[[_raw/Decisions/use-fastapi.md]]" in content
 
     def test_append_log(self, writer, tmp_vault):
         writer.append_log("Something happened")
-        content = (tmp_vault / "log.md").read_text()
+        content = (tmp_vault / "_raw" / "log.md").read_text()
         assert "Something happened" in content
 
     def test_list_all_files(self, writer, tmp_vault):
@@ -583,7 +583,7 @@ class TestCategoryEntryWriter:
             session_id="s1",
             timestamp="2026-04-29T10:30:00",
         )
-        assert path == "Semantic/Preferences/entries.md"
+        assert path == "_raw/Semantic/Preferences/entries.md"
         full_path = tmp_vault / path
         assert full_path.exists()
         content = full_path.read_text()
@@ -601,7 +601,7 @@ class TestCategoryEntryWriter:
             category="preference", content="Fact two",
             project_id=None, session_id="s2", timestamp="2026-04-29T11:00:00",
         )
-        content = (tmp_vault / "Semantic/Preferences/entries.md").read_text()
+        content = (tmp_vault / "_raw" / "Semantic" / "Preferences" / "entries.md").read_text()
         assert "Fact one" in content
         assert "Fact two" in content
 
@@ -614,7 +614,7 @@ class TestCategoryEntryWriter:
             session_id="s1",
             timestamp="2026-04-29T10:00:00",
         )
-        assert path == "Project/Tech-Stack/neuralscape.md"
+        assert path == "_raw/Project/Tech-Stack/neuralscape.md"
         assert (tmp_vault / path).exists()
 
     def test_global_scoped_uses_entries_file(self, writer, tmp_vault):
@@ -626,7 +626,7 @@ class TestCategoryEntryWriter:
             session_id="s1",
             timestamp="2026-04-29T10:00:00",
         )
-        assert path == "Semantic/Personal-Facts/entries.md"
+        assert path == "_raw/Semantic/Personal-Facts/entries.md"
 
     def test_unknown_category_fallback(self, writer, tmp_vault):
         """Unknown categories fall back to Uncategorized/ folder."""
@@ -637,7 +637,7 @@ class TestCategoryEntryWriter:
             session_id="s1",
             timestamp="2026-04-29T10:00:00",
         )
-        assert path.startswith("Uncategorized/")
+        assert path.startswith("_raw/Uncategorized/")
         assert (tmp_vault / path).exists()
 
 
@@ -650,7 +650,7 @@ class TestCategoryIndex:
     def test_empty_vault(self, writer, tmp_vault):
         """Empty vault produces a minimal index."""
         path = writer.update_category_index()
-        assert path == "category-index.md"
+        assert path == "_raw/category-index.md"
         content = (tmp_vault / path).read_text()
         assert "Category Index" in content
 
@@ -665,9 +665,9 @@ class TestCategoryIndex:
             project_id=None, session_id="s2", timestamp="2026-04-29T11:00:00",
         )
         writer.update_category_index()
-        content = (tmp_vault / "category-index.md").read_text()
+        content = (tmp_vault / "_raw" / "category-index.md").read_text()
         assert "2 entries" in content
-        assert "Semantic/Preferences/entries.md" in content
+        assert "_raw/Semantic/Preferences/entries.md" in content
 
     def test_multiple_projects(self, writer, tmp_vault):
         """Project-scoped categories list multiple project files."""
@@ -680,7 +680,7 @@ class TestCategoryIndex:
             project_id="openclaw", session_id="s2", timestamp="2026-04-29T11:00:00",
         )
         writer.update_category_index()
-        content = (tmp_vault / "category-index.md").read_text()
+        content = (tmp_vault / "_raw" / "category-index.md").read_text()
         assert "neuralscape.md" in content
         assert "openclaw.md" in content
 
@@ -768,14 +768,14 @@ class TestHandleMemoryStored:
         assert "vault_path" in result
 
         # Verify category file was created
-        cat_file = tmp_vault / "Episodic" / "Decisions" / "entries.md"
+        cat_file = tmp_vault / "_raw" / "Episodic" / "Decisions" / "entries.md"
         assert cat_file.exists()
         content = cat_file.read_text()
         assert "Chose dark mode as the default theme" in content
         assert "sess-123" in content
 
         # Verify daily log was created
-        daily_files = list((tmp_vault / "Daily").glob("*.md"))
+        daily_files = list((tmp_vault / "_raw" / "Daily").glob("*.md"))
         assert len(daily_files) == 1
         daily_content = daily_files[0].read_text()
         assert "Chose dark mode as the default theme" in daily_content
@@ -793,7 +793,7 @@ class TestHandleMemoryStored:
         })
         assert result is not None
 
-        cat_file = tmp_vault / "Project" / "Tech-Stack" / "neuralscape.md"
+        cat_file = tmp_vault / "_raw" / "Project" / "Tech-Stack" / "neuralscape.md"
         assert cat_file.exists()
         content = cat_file.read_text()
         assert "Uses FastAPI for API layer" in content
@@ -827,5 +827,5 @@ class TestHandleMemoryStored:
             "user_id": "ehfaz",
         })
         assert result is not None
-        cat_file = tmp_vault / "Project" / "Conventions" / "entries.md"
+        cat_file = tmp_vault / "_raw" / "Project" / "Conventions" / "entries.md"
         assert cat_file.exists()
