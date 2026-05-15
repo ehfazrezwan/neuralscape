@@ -172,6 +172,32 @@ class TestDedupExact:
 
 
 class TestDedupSemantic:
+    def test_search_uses_top_k_not_limit(self, service):
+        """Regression for the mem0 v2.0.2 kwarg rename — ``Qdrant.search()``
+        accepts ``top_k`` not ``limit``. Calling with ``limit`` raised
+        ``unexpected keyword argument`` for every dedup pass, silently
+        breaking semantic dedup for all users."""
+        memories = [
+            _make_point("p1", {"user_id": "u1", "hash": "aaa", "data": "X", "created_at": "2025-01-01T00:00:00"}),
+        ]
+        service._memory.vector_store.client.scroll.return_value = (memories, None)
+        service._memory.vector_store.search.return_value = []
+
+        service.dedup_memories("u1")
+
+        # vector_store.search may be called zero or N times depending on
+        # the user's pool; what matters is that EVERY call uses ``top_k``
+        # not ``limit``.
+        for call in service._memory.vector_store.search.call_args_list:
+            kwargs = call.kwargs
+            assert "limit" not in kwargs, (
+                "vector_store.search must not pass `limit` — mem0 v2.0.2 "
+                "renamed it to `top_k`. See PR #47 follow-up."
+            )
+            # If any results were requested, top_k must be set.
+            if kwargs:
+                assert "top_k" in kwargs or "vectors" in kwargs
+
     def test_deletes_older_above_threshold(self, service):
         memories = [
             _make_point("p1", {"user_id": "u1", "hash": "aaa", "data": "User prefers dark mode", "created_at": "2025-01-01T00:00:00"}),
