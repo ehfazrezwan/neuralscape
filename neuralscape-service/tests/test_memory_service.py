@@ -4,7 +4,28 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from memory_service import MemoryService, _build_group_id, _get_group_ids
+
+def _qresult(hits):
+    """Wrap a list of qdrant ScoredPoint-likes in a query_points()-style result.
+
+    qdrant-client v1.13+ replaced .search() with .query_points(), which
+    returns an object that exposes .points instead of a bare list. Tests
+    use this helper so the mocked client.query_points returns the right
+    shape.
+    """
+    r = MagicMock()
+    r.points = hits
+    return r
+
+from memory_service import (
+    MemoryService,
+    _build_group_id,
+    _clean_conversation_for_graph,
+    _get_group_ids,
+    _infer_project_id,
+    _is_junk_fact,
+    _parse_expires_at,
+)
 from schemas import MemoryResponse, MemoryScope
 
 
@@ -14,25 +35,56 @@ from schemas import MemoryResponse, MemoryScope
 
 
 class TestBuildGroupId:
-    def test_global_scope(self):
-        assert _build_group_id("global") == "global"
+    """Multi-user model: group_ids are namespaced by visibility + user_id.
 
-    def test_project_scope_with_id(self):
-        assert _build_group_id("project", "my-project") == "project--my-project"
+    Private memories go to ``user--{id}`` (with project variant); shared
+    memories go to ``shared`` (with project variant). The pre-multi-user
+    `"global"` / `"project--..."` formats are gone.
+    """
+    def test_private_no_project(self):
+        assert _build_group_id("private", "alice") == "user--alice"
 
-    def test_project_scope_without_id_falls_back_to_global(self):
-        assert _build_group_id("project", None) == "global"
+    def test_private_with_project(self):
+        assert _build_group_id("private", "alice", "myproj") == "user--alice--project--myproj"
+
+    def test_shared_no_project(self):
+        assert _build_group_id("shared", "alice") == "shared"
+
+    def test_shared_with_project(self):
+        assert _build_group_id("shared", "alice", "myproj") == "shared--project--myproj"
+
+    def test_unknown_visibility_falls_back_to_private(self):
+        """Visibility values other than 'shared' (e.g. None or 'global') are
+        treated as private — safe default."""
+        assert _build_group_id("global", "alice") == "user--alice"
+        assert _build_group_id(None, "alice") == "user--alice"
 
 
 class TestGetGroupIds:
-    def test_no_project_returns_global_only(self):
-        assert _get_group_ids() == ["global"]
+    """The caller can read their private namespace + the shared pool."""
 
-    def test_with_project_returns_both(self):
-        ids = _get_group_ids("my-project")
-        assert "global" in ids
-        assert "project--my-project" in ids
-        assert len(ids) == 2
+    def test_no_project_returns_user_and_shared(self):
+        ids = _get_group_ids("alice")
+        assert ids == ["user--alice", "shared"]
+
+    def test_with_project_returns_four_groups(self):
+        ids = _get_group_ids("alice", "myproj")
+        assert ids == [
+            "user--alice",
+            "shared",
+            "user--alice--project--myproj",
+            "shared--project--myproj",
+        ]
+
+    def test_anonymous_caller_only_sees_shared(self):
+        """A request without a verified user_id falls back to shared-only."""
+        assert _get_group_ids("") == ["shared"]
+        assert _get_group_ids("", "myproj") == ["shared", "shared--project--myproj"]
+
+    def test_cross_user_isolation_in_returned_groups(self):
+        """alice's group_ids never include bob's private namespace."""
+        alice_ids = _get_group_ids("alice")
+        assert "user--bob" not in alice_ids
 
 
 # ──────────────────────────────────────────────
@@ -142,7 +194,7 @@ class TestSearch:
             categories=["preference", "convention"],
         )
         call_kwargs = service._memory.search.call_args[1]
-        assert call_kwargs["filters"]["category"] == {"in": ["preference", "convention"]}
+        assert call_kwargs["filters"]["metadata.category"] == {"in": ["preference", "convention"]}
 
 
 class TestGetContext:
@@ -202,9 +254,9 @@ class TestCRUD:
             project_id="my-project",
         )
         call_kwargs = service._memory.get_all.call_args[1]
-        assert call_kwargs["filters"]["scope"] == "global"
-        assert call_kwargs["filters"]["category"] == "preference"
-        assert call_kwargs["filters"]["project_id"] == "my-project"
+        assert call_kwargs["filters"]["metadata.scope"] == "global"
+        assert call_kwargs["filters"]["metadata.category"] == "preference"
+        assert call_kwargs["filters"]["metadata.project_id"] == "my-project"
 
     def test_update_memory(self, service):
         service._memory.get.return_value = {
@@ -219,12 +271,23 @@ class TestCRUD:
 
     def test_update_memory_reingests_into_graph(self, service):
         """When content is updated, the new content should be re-ingested into
-        the knowledge graph so Graphiti can expire contradicting edges."""
+        the knowledge graph so Graphiti can expire contradicting edges.
+
+        Multi-user model: group_id is namespaced by visibility + owner_user_id,
+        so a legacy memory (no `metadata.visibility` set) is treated as
+        ``private`` and writes to ``user--{owner_user_id}--project--{pid}``.
+        """
         service._memory.get.return_value = {
             "id": "m1",
             "memory": "User prefers dark mode",
             "user_id": "ehfaz",
-            "metadata": {"scope": "project", "category": "preference", "project_id": "p1"},
+            "metadata": {
+                "scope": "project",
+                "category": "preference",
+                "project_id": "p1",
+                "owner_user_id": "ehfaz",
+                # No visibility set → defaults to private
+            },
         }
         service._memory.update.return_value = {"message": "Memory updated successfully!"}
 
@@ -232,7 +295,28 @@ class TestCRUD:
 
         service._memory.graph.add.assert_called_once_with(
             data="User prefers light mode",
-            filters={"user_id": "ehfaz", "group_id": "project--p1"},
+            filters={"user_id": "ehfaz", "group_id": "user--ehfaz--project--p1"},
+        )
+
+    def test_update_memory_uses_shared_group_for_shared_memories(self, service):
+        """A memory tagged `visibility=shared` re-ingests under the shared group_id."""
+        service._memory.get.return_value = {
+            "id": "m2",
+            "memory": "Project uses FastAPI",
+            "user_id": "alice",
+            "metadata": {
+                "scope": "project",
+                "category": "tech_stack",
+                "project_id": "neuralscape",
+                "visibility": "shared",
+                "owner_user_id": "alice",
+            },
+        }
+        service._memory.update.return_value = {"message": "ok"}
+        service.update_memory(memory_id="m2", content="Project uses FastAPI 0.116")
+        service._memory.graph.add.assert_called_once_with(
+            data="Project uses FastAPI 0.116",
+            filters={"user_id": "alice", "group_id": "shared--project--neuralscape"},
         )
 
     def test_update_memory_skips_graph_for_metadata_only(self, service):
@@ -263,8 +347,24 @@ class TestCRUD:
         result = service.delete_memory("m1")
         service._memory.delete.assert_called_once_with("m1")
 
-    def test_delete_memories_all(self, service):
+    def test_delete_memories_all_default_keeps_shared(self, service):
+        """Default bulk delete only removes private writes — shared survive."""
+        service._scroll_all_user_memories = MagicMock(return_value=[
+            {"id": "m_priv", "payload": {"data": "p", "metadata": {"visibility": "private"}}},
+            {"id": "m_shared", "payload": {"data": "s", "metadata": {"visibility": "shared"}}},
+        ])
+        service._memory.vector_store.delete = MagicMock()
         result = service.delete_memories(user_id="ehfaz")
+        # mem0's nuke-by-user path must NOT be invoked by default any more
+        service._memory.delete_all.assert_not_called()
+        # Only the private id is deleted
+        deleted_ids = [c.args[0] for c in service._memory.vector_store.delete.call_args_list]
+        assert deleted_ids == ["m_priv"]
+        assert "preserved 1 shared" in result["message"]
+
+    def test_delete_memories_all_include_shared_nukes_everything(self, service):
+        """include_shared=True restores the old full-nuke path."""
+        result = service.delete_memories(user_id="ehfaz", include_shared=True)
         service._memory.delete_all.assert_called_once_with(user_id="ehfaz")
 
     def test_delete_memories_with_filters(self, service):
@@ -316,20 +416,19 @@ class TestExtractAndStore:
         # Returns 2 MemoryResponse objects
         assert len(results) == 2
 
-    def test_extraction_falls_back_on_llm_error(self, service):
+    def test_extraction_returns_empty_on_llm_error(self, service):
         mock_client = MagicMock()
         service._genai_model = mock_client
         mock_client.models.generate_content.side_effect = Exception("API error")
 
-        service._memory.add.return_value = {"results": []}
-
-        service.extract_and_store(
+        results = service.extract_and_store(
             messages=[{"role": "user", "content": "hello"}],
             user_id="ehfaz",
         )
 
-        # Should fall back to basic mem0 add
-        service._memory.add.assert_called_once()
+        # Should return empty list instead of falling back to m.add()
+        assert results == []
+        service._memory.add.assert_not_called()
 
     def test_extraction_still_calls_graph_add(self, service):
         mock_client = MagicMock()
@@ -447,3 +546,2094 @@ class TestMergeResults:
         result2 = {"results": [{"id": "m2", "memory": "high", "score": 0.9}]}
         merged = svc._merge_results(result1, result2)
         assert merged[0]["id"] == "m2"
+
+
+# ──────────────────────────────────────────────
+# Junk filter tests
+# ──────────────────────────────────────────────
+
+
+class TestIsJunkFact:
+    def test_short_content_is_junk(self):
+        assert _is_junk_fact("hi") is True
+        assert _is_junk_fact("") is True
+        assert _is_junk_fact("   ab   ") is True
+
+    def test_ran_command_is_junk(self):
+        assert _is_junk_fact("Ran command: git status") is True
+
+    def test_edited_file_is_junk(self):
+        assert _is_junk_fact("Edited file: src/main.py") is True
+        assert _is_junk_fact("Edited file src/main.py line 42") is True
+
+    def test_wrote_file_is_junk(self):
+        assert _is_junk_fact("Wrote file: /tmp/output.txt") is True
+
+    def test_read_file_is_junk(self):
+        assert _is_junk_fact("Read file: config.json") is True
+
+    def test_tool_result_is_junk(self):
+        assert _is_junk_fact("Tool result: success, 3 files changed") is True
+
+    def test_command_output_is_junk(self):
+        assert _is_junk_fact("Command output: npm install completed") is True
+
+    def test_launched_task_is_junk(self):
+        assert _is_junk_fact("Launched background task: test-runner") is True
+
+    def test_real_fact_is_not_junk(self):
+        assert _is_junk_fact("Ehfaz prefers tabs over spaces") is False
+        assert _is_junk_fact("The neuralscape project uses FastAPI with Qdrant") is False
+        assert _is_junk_fact("User prefers dark mode in all editors") is False
+
+    def test_case_insensitive(self):
+        assert _is_junk_fact("RAN COMMAND: ls -la") is True
+        assert _is_junk_fact("edited FILE: foo.py") is True
+
+
+class TestCleanConversationForGraph:
+    def test_removes_junk_lines_from_content(self):
+        messages = [
+            {"role": "assistant", "content": "Ran command: git status\nGot it, here's the status."},
+        ]
+        cleaned = _clean_conversation_for_graph(messages)
+        assert len(cleaned) == 1
+        assert "Ran command:" not in cleaned[0]["content"]
+        assert "Got it" in cleaned[0]["content"]
+
+    def test_drops_message_that_becomes_empty(self):
+        messages = [
+            {"role": "user", "content": "I prefer dark mode"},
+            {"role": "assistant", "content": "Ran command: echo ok"},
+        ]
+        cleaned = _clean_conversation_for_graph(messages)
+        assert len(cleaned) == 1
+        assert cleaned[0]["content"] == "I prefer dark mode"
+
+    def test_preserves_clean_messages(self):
+        messages = [
+            {"role": "user", "content": "I prefer tabs over spaces"},
+            {"role": "assistant", "content": "Noted, storing that preference."},
+        ]
+        cleaned = _clean_conversation_for_graph(messages)
+        assert len(cleaned) == 2
+        assert cleaned[0]["content"] == "I prefer tabs over spaces"
+        assert cleaned[1]["content"] == "Noted, storing that preference."
+
+    def test_preserves_empty_content_messages(self):
+        messages = [{"role": "system", "content": ""}]
+        cleaned = _clean_conversation_for_graph(messages)
+        assert len(cleaned) == 1
+
+    def test_filters_multiple_junk_patterns(self):
+        messages = [
+            {"role": "assistant", "content": "Edited file: src/main.py\nWrote file: /tmp/out.txt\nTool result: success\nDone with the changes."},
+        ]
+        cleaned = _clean_conversation_for_graph(messages)
+        assert len(cleaned) == 1
+        assert cleaned[0]["content"] == "Done with the changes."
+
+    def test_empty_messages_list(self):
+        assert _clean_conversation_for_graph([]) == []
+
+    def test_preserves_role_and_other_keys(self):
+        messages = [
+            {"role": "user", "content": "hello", "name": "ehfaz"},
+        ]
+        cleaned = _clean_conversation_for_graph(messages)
+        assert cleaned[0]["role"] == "user"
+        assert cleaned[0]["name"] == "ehfaz"
+
+    def test_case_insensitive_junk_detection(self):
+        messages = [
+            {"role": "assistant", "content": "RAN COMMAND: ls -la\nHere are the files."},
+        ]
+        cleaned = _clean_conversation_for_graph(messages)
+        assert len(cleaned) == 1
+        assert "RAN COMMAND:" not in cleaned[0]["content"]
+        assert "Here are the files." in cleaned[0]["content"]
+
+
+class TestExtractAndStoreJunkFilter:
+    def test_junk_facts_filtered_from_extraction(self, service):
+        mock_client = MagicMock()
+        service._genai_model = mock_client
+        mock_client.models.generate_content.return_value = MagicMock(
+            text='{"facts": ["[preference] Prefers tabs over spaces", "[interaction] Ran command: git status"]}'
+        )
+
+        service._memory.embedding_model.embed_batch.return_value = [[0.1] * 768]
+
+        results = service.extract_and_store(
+            messages=[{"role": "user", "content": "I prefer tabs"}],
+            user_id="ehfaz",
+        )
+
+        # Only 1 fact should remain after filtering
+        assert len(results) == 1
+        assert results[0].memory == "Prefers tabs over spaces"
+
+    def test_graph_text_has_junk_lines_stripped(self, service):
+        mock_client = MagicMock()
+        service._genai_model = mock_client
+        mock_client.models.generate_content.return_value = MagicMock(
+            text='{"facts": ["[preference] Prefers dark mode"]}'
+        )
+        service._memory.embedding_model.embed_batch.return_value = [[0.1] * 768]
+
+        service.extract_and_store(
+            messages=[
+                {"role": "user", "content": "I prefer dark mode"},
+                {"role": "assistant", "content": "Ran command: echo ok\nGot it, storing preference."},
+            ],
+            user_id="ehfaz",
+        )
+
+        # Graph add should be called with text that doesn't contain the junk line
+        call_args = service._memory.graph.add.call_args
+        graph_text = call_args[1]["data"] if "data" in call_args[1] else call_args[0][0]
+        assert "Ran command:" not in graph_text
+        assert "dark mode" in graph_text
+
+    def test_graph_add_skipped_when_all_messages_are_junk(self, service):
+        """If _clean_conversation_for_graph removes all content, graph.add() should not be called."""
+        mock_client = MagicMock()
+        service._genai_model = mock_client
+        mock_client.models.generate_content.return_value = MagicMock(
+            text='{"facts": ["[preference] Prefers dark mode"]}'
+        )
+        service._memory.embedding_model.embed_batch.return_value = [[0.1] * 768]
+
+        service.extract_and_store(
+            messages=[
+                {"role": "assistant", "content": "Ran command: git status"},
+                {"role": "assistant", "content": "Tool result: success"},
+            ],
+            user_id="ehfaz",
+        )
+
+        service._memory.graph.add.assert_not_called()
+
+    def test_store_raw_does_not_filter_graph_content(self, service):
+        """store_raw() graph path should NOT apply conversation junk filter."""
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+
+        service.store_raw(
+            content="Ran command: git status\nImportant context.",
+            user_id="ehfaz",
+            category="task_context",
+        )
+
+        # store_raw passes content directly to graph.add without filtering
+        call_args = service._memory.graph.add.call_args
+        graph_text = call_args[1]["data"] if "data" in call_args[1] else call_args[0][0]
+        assert "Ran command:" in graph_text
+
+
+# ──────────────────────────────────────────────
+# Null-category bulk delete tests
+# ──────────────────────────────────────────────
+
+
+class TestBulkDeleteNullCategory:
+    def test_null_category_does_not_trigger_delete_all(self, service):
+        """Passing category=None should NOT delete all memories.
+
+        Note: under the multi-user model, the unfiltered path also no
+        longer calls delete_all by default (shared writes are preserved).
+        We test both that the filter_null_category branch is taken when
+        the flag is set, and that include_shared=True restores the
+        legacy delete_all sweep.
+        """
+        # Unfiltered + include_shared=True = legacy delete_all path
+        service.delete_memories(user_id="ehfaz", include_shared=True)
+        service._memory.delete_all.assert_called_once()
+
+        service._memory.reset_mock()
+
+        # With filter_null_category=True, should NOT call delete_all
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.scroll.return_value = ([], None)
+        service.delete_memories(user_id="ehfaz", filter_null_category=True)
+        service._memory.delete_all.assert_not_called()
+
+    def test_filter_null_category_uses_qdrant_scroll(self, service):
+        """filter_null_category should use IsNullCondition scroll."""
+        mock_client = MagicMock()
+        service._memory.vector_store.client = mock_client
+
+        mock_point = MagicMock()
+        mock_point.id = "point-1"
+        mock_point.payload = {"data": "some uncategorized memory", "metadata": {}}
+        mock_client.scroll.return_value = ([mock_point], None)
+
+        result = service.delete_memories(user_id="ehfaz", filter_null_category=True)
+
+        # Should have called scroll with IsNullCondition
+        mock_client.scroll.assert_called_once()
+        # Should have deleted the found point
+        service._memory.vector_store.delete.assert_called_once_with("point-1")
+        assert "1 null-category" in result["message"]
+
+
+# ──────────────────────────────────────────────
+# project_id inference tests
+# ──────────────────────────────────────────────
+
+
+class TestInferProjectId:
+    def test_infers_known_slug(self):
+        assert _infer_project_id("The neuralscape project uses FastAPI") == "neuralscape"
+        assert _infer_project_id("Lightpath uses Three.js") == "lightpath"
+        assert _infer_project_id("OpenClaw agent framework") == "openclaw"
+        assert _infer_project_id("svc-utility-belt deploys on GKE") == "svc-utility-belt"
+
+    def test_returns_none_for_unknown(self):
+        assert _infer_project_id("User prefers dark mode") is None
+        assert _infer_project_id("Some random project") is None
+
+    def test_case_insensitive(self):
+        assert _infer_project_id("NEURALSCAPE uses Qdrant") == "neuralscape"
+
+    def test_batch_store_infers_project_id(self, service):
+        service._memory.embedding_model.embed_batch.return_value = [[0.1] * 768]
+
+        facts = [("tech_stack", "Neuralscape uses FastAPI with Qdrant for vector search")]
+        results = service._batch_store_facts(facts=facts, user_id="ehfaz")
+
+        assert results[0].scope == "project"
+        assert results[0].project_id == "neuralscape"
+
+
+# ──────────────────────────────────────────────
+# Graph episode deletion tests
+# ──────────────────────────────────────────────
+
+
+class TestDeleteEpisode:
+    def test_delete_episode_calls_cypher(self, service):
+        service._bridge.run = MagicMock(return_value=None)
+        # Mock run_coroutine_threadsafe + future
+        import asyncio
+        import concurrent.futures
+
+        mock_future = MagicMock()
+        mock_future.result.return_value = None
+        with patch("asyncio.run_coroutine_threadsafe", return_value=mock_future):
+            result = service.delete_episode("some-uuid")
+
+        assert result["message"] == "Episode some-uuid deleted"
+
+    def test_delete_episode_passes_uuid_as_kwarg(self, service):
+        """Regression: uuid must be a direct kwarg, not inside parameters_.
+
+        The graphiti driver wrapper already passes parameters_= to the
+        Neo4j driver, so passing parameters_={"uuid": ...} from the
+        caller causes 'multiple values for keyword argument parameters_'.
+        """
+        import asyncio
+
+        mock_future = MagicMock()
+        mock_future.result.return_value = None
+        with patch("asyncio.run_coroutine_threadsafe", return_value=mock_future) as mock_rcts:
+            service.delete_episode("test-uuid-123")
+
+        # execute_query should have been called with uuid as a direct kwarg
+        service._graphiti.driver.execute_query.assert_called_once_with(
+            "MATCH (e:Episodic {uuid: $uuid}) DETACH DELETE e",
+            uuid="test-uuid-123",
+        )
+
+    def test_delete_episode_handles_error(self, service):
+        import asyncio
+
+        mock_future = MagicMock()
+        mock_future.result.side_effect = Exception("Neo4j down")
+        with patch("asyncio.run_coroutine_threadsafe", return_value=mock_future):
+            result = service.delete_episode("bad-uuid")
+
+        assert "error" in result
+
+
+class TestDeleteJunkEpisodes:
+    def _mock_episodes_by_project(self, user_id=None, project_id=None, limit=500):
+        """Return test episodes keyed by project_id (None = global)."""
+        data = {
+            None: [
+                {"uuid": "g-1", "content": "Ehfaz prefers dark mode", "group_id": "global"},
+                {"uuid": "g-2", "content": "assistant: Got it, I'll fix that bug now.", "group_id": "global"},
+                {"uuid": "g-3", "content": "Ran command: git status", "group_id": "global"},
+            ],
+            "svc-utility-belt": [
+                {"uuid": "su-1", "content": "assistant: Sure, deploying now.", "group_id": "project--svc-utility-belt"},
+                {"uuid": "su-2", "content": "Uses FastAPI for microservices", "group_id": "project--svc-utility-belt"},
+            ],
+            "lightpath": [],
+            "neuralscape": [
+                {"uuid": "ns-1", "content": "Wrote file: main.py", "group_id": "project--neuralscape"},
+                {"uuid": "ns-2", "content": "Neo4j is the graph backend", "group_id": "project--neuralscape"},
+            ],
+            "openclaw": [
+                {"uuid": "oc-1", "content": "Tool result: success", "group_id": "project--openclaw"},
+            ],
+        }
+        return data.get(project_id, [])
+
+    def test_dry_run_single_project(self, service):
+        """dry_run with explicit project_id only scans that group."""
+        service.get_graph_episodes = MagicMock(return_value=[
+            {"uuid": "ep-1", "content": "Ehfaz prefers dark mode", "group_id": "global"},
+            {"uuid": "ep-2", "content": "assistant: Got it, fixing.", "group_id": "global"},
+            {"uuid": "ep-3", "content": "Ran command: git status", "group_id": "global"},
+            {"uuid": "ep-4", "content": "User uses Python 3.12", "group_id": "global"},
+        ])
+
+        result = service.delete_junk_episodes(user_id="ehfaz", project_id="neuralscape", dry_run=True)
+
+        assert result["dry_run"] is True
+        assert result["junk_count"] == 2
+        assert "breakdown" in result
+        assert "neuralscape" in result["breakdown"]
+        assert len(result["breakdown"]) == 1
+        service.get_graph_episodes.assert_called_once_with(user_id="ehfaz", project_id="neuralscape", limit=500)
+
+    def test_dry_run_all_groups(self, service):
+        """dry_run without project_id scans all known groups."""
+        service.get_graph_episodes = MagicMock(side_effect=self._mock_episodes_by_project)
+
+        result = service.delete_junk_episodes(user_id="ehfaz", dry_run=True)
+
+        assert result["dry_run"] is True
+        # g-2, g-3 (global) + su-1 (svc-utility-belt) + ns-1 (neuralscape) + oc-1 (openclaw) = 5
+        assert result["junk_count"] == 5
+        assert "breakdown" in result
+        assert result["breakdown"]["global"]["junk_count"] == 2
+        assert result["breakdown"]["svc-utility-belt"]["junk_count"] == 1
+        assert result["breakdown"]["lightpath"]["junk_count"] == 0
+        assert result["breakdown"]["neuralscape"]["junk_count"] == 1
+        assert result["breakdown"]["openclaw"]["junk_count"] == 1
+        # Should have called get_graph_episodes 5 times (global + 4 projects)
+        assert service.get_graph_episodes.call_count == 5
+
+    def test_delete_all_groups(self, service):
+        """Actual delete without project_id cleans all groups."""
+        service.get_graph_episodes = MagicMock(side_effect=self._mock_episodes_by_project)
+        service.delete_episode = MagicMock(return_value={"message": "deleted"})
+
+        result = service.delete_junk_episodes(user_id="ehfaz", dry_run=False)
+
+        assert "dry_run" not in result
+        assert result["deleted_count"] == 5
+        assert "breakdown" in result
+        assert result["breakdown"]["global"]["deleted_count"] == 2
+        assert result["breakdown"]["svc-utility-belt"]["deleted_count"] == 1
+        assert result["breakdown"]["neuralscape"]["deleted_count"] == 1
+        assert result["breakdown"]["openclaw"]["deleted_count"] == 1
+        # Verify delete_episode was called for each junk episode
+        deleted_uuids = [call.args[0] for call in service.delete_episode.call_args_list]
+        assert "g-2" in deleted_uuids
+        assert "g-3" in deleted_uuids
+        assert "su-1" in deleted_uuids
+        assert "ns-1" in deleted_uuids
+        assert "oc-1" in deleted_uuids
+        # Non-junk should NOT be deleted
+        assert "g-1" not in deleted_uuids
+        assert "su-2" not in deleted_uuids
+        assert "ns-2" not in deleted_uuids
+
+    def test_delete_single_project(self, service):
+        """Actual delete with explicit project_id only cleans that group."""
+        service.get_graph_episodes = MagicMock(return_value=[
+            {"uuid": "ns-1", "content": "Wrote file: main.py", "group_id": "project--neuralscape"},
+            {"uuid": "ns-2", "content": "Neo4j is the graph backend", "group_id": "project--neuralscape"},
+        ])
+        service.delete_episode = MagicMock(return_value={"message": "deleted"})
+
+        result = service.delete_junk_episodes(user_id="ehfaz", project_id="neuralscape", dry_run=False)
+
+        assert result["deleted_count"] == 1
+        assert len(result["breakdown"]) == 1
+        assert result["breakdown"]["neuralscape"]["deleted_count"] == 1
+        service.delete_episode.assert_called_once_with("ns-1")
+
+    def test_delete_handles_partial_failures(self, service):
+        """If some deletes fail, only successful ones are counted."""
+        service.get_graph_episodes = MagicMock(return_value=[
+            {"uuid": "ep-1", "content": "assistant: hello", "group_id": "global"},
+            {"uuid": "ep-2", "content": "Ran command: ls", "group_id": "global"},
+        ])
+        service.delete_episode = MagicMock(side_effect=[
+            {"message": "deleted"},
+            {"error": "Neo4j timeout"},
+        ])
+
+        result = service.delete_junk_episodes(user_id="ehfaz", project_id="global-only", dry_run=False)
+
+        assert result["deleted_count"] == 1
+        assert len(result["breakdown"]["global-only"]["deleted_uuids"]) == 1
+
+
+# ──────────────────────────────────────────────
+# Response shaping (mem0 metadata unwrap)
+# ──────────────────────────────────────────────
+
+
+class TestMemToResponse:
+    """Regression coverage for the mem0 metadata-double-wrap fix.
+
+    mem0's `_search_vector_store` and `_get_all_from_vector_store` lift every
+    payload field that isn't on a hardcoded promoted-keys list into a
+    top-level `metadata` dict. Because our Qdrant payload nests our domain
+    fields under a literal `metadata` key, the result that reaches
+    `_mem_to_response` is shaped like
+    `{"metadata": {"metadata": {"scope": ..., "category": ...}}}`.
+
+    Without the unwrap, `metadata.get("category")` resolves to None and
+    every search/list response loses category, scope, project_id, and tags.
+    """
+
+    def test_unwraps_double_nested_metadata(self, service):
+        """The shape mem0 actually produces — must unwrap once."""
+        mem = {
+            "id": "abc-123",
+            "memory": "Prefers TypeScript over JavaScript",
+            "score": 0.85,
+            "created_at": "2026-05-08T19:38:47Z",
+            "updated_at": None,
+            "metadata": {
+                "metadata": {
+                    "scope": "global",
+                    "category": "preference",
+                    "project_id": None,
+                    "tags": ["editor"],
+                    "source": "explicit",
+                }
+            },
+        }
+
+        resp = service._mem_to_response(mem)
+
+        assert resp.id == "abc-123"
+        assert resp.memory == "Prefers TypeScript over JavaScript"
+        assert resp.category == "preference"
+        assert resp.scope == "global"
+        assert resp.project_id is None
+        assert resp.tags == ["editor"]
+        assert resp.score == 0.85
+        assert resp.created_at == "2026-05-08T19:38:47Z"
+        assert resp.source == "vector"
+
+    def test_handles_flat_metadata(self, service):
+        """Defensive: if mem0 ever flattens, our code must still resolve."""
+        mem = {
+            "id": "def-456",
+            "memory": "Uses FastAPI",
+            "score": 0.72,
+            "metadata": {
+                "scope": "project",
+                "category": "tech_stack",
+                "project_id": "neuralscape",
+                "tags": None,
+            },
+        }
+
+        resp = service._mem_to_response(mem)
+
+        assert resp.category == "tech_stack"
+        assert resp.scope == "project"
+        assert resp.project_id == "neuralscape"
+
+    def test_missing_metadata_returns_null_fields(self, service):
+        """No metadata key at all — fields stay None, response still valid."""
+        mem = {"id": "ghi-789", "memory": "Bare memory", "score": 0.5}
+
+        resp = service._mem_to_response(mem)
+
+        assert resp.id == "ghi-789"
+        assert resp.category is None
+        assert resp.scope is None
+        assert resp.project_id is None
+        assert resp.tags is None
+        assert resp.source == "vector"
+
+    def test_empty_metadata_returns_null_fields(self, service):
+        """Metadata is an empty dict — same behavior as missing."""
+        mem = {"id": "jkl-012", "memory": "Empty md", "metadata": {}}
+
+        resp = service._mem_to_response(mem)
+
+        assert resp.category is None
+        assert resp.scope is None
+
+    def test_inner_metadata_dict_takes_precedence_over_outer(self, service):
+        """When both layers present, the inner (real) one wins."""
+        mem = {
+            "id": "mno-345",
+            "memory": "Layered",
+            "metadata": {
+                "category": "should-be-ignored",  # outer wrapper level
+                "metadata": {
+                    "category": "preference",  # real, inner level
+                    "scope": "global",
+                },
+            },
+        }
+
+        resp = service._mem_to_response(mem)
+
+        assert resp.category == "preference"
+        assert resp.scope == "global"
+
+
+# ──────────────────────────────────────────────
+# Memory model v2: store_raw v2 fields
+# ──────────────────────────────────────────────
+
+
+class TestStoreRawV2:
+    """Memory-model v2 — store_raw accepts and persists the new optional fields."""
+
+    def test_v2_fields_persisted_to_metadata(self, service):
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        # _find_by_content_hash uses client.scroll; mock empty result to avoid dedup hit
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.scroll.return_value = ([], None)
+
+        from datetime import datetime, timezone
+
+        result = service.store_raw(
+            content="Adopted feature flags via GrowthBook for the checkout flow",
+            user_id="ehfaz",
+            category="decision",
+            domain="coding",
+            observation_type="decision",
+            concepts=["why-it-exists", "trade-off"],
+            source_type="tool_extraction",
+            related_memory_ids=["mem-1", "mem-2"],
+            confidence=0.85,
+            expires_at=datetime(2026, 12, 1, tzinfo=timezone.utc),
+        )
+
+        assert len(result) == 1
+        resp = result[0]
+        assert resp.domain == "coding"
+        assert resp.observation_type == "decision"
+        assert resp.concepts == ["why-it-exists", "trade-off"]
+        assert resp.source_type == "tool_extraction"
+        assert resp.related_memory_ids == ["mem-1", "mem-2"]
+        assert resp.confidence == 0.85
+        assert resp.expires_at is not None
+
+        # Payload metadata should reflect every v2 field
+        insert_kwargs = service._memory.vector_store.insert.call_args[1]
+        metadata = insert_kwargs["payloads"][0]["metadata"]
+        assert metadata["domain"] == "coding"
+        assert metadata["observation_type"] == "decision"
+        assert metadata["concepts"] == ["why-it-exists", "trade-off"]
+        assert metadata["source_type"] == "tool_extraction"
+        assert metadata["related_memory_ids"] == ["mem-1", "mem-2"]
+        assert metadata["confidence"] == 0.85
+        assert "expires_at" in metadata
+
+    def test_v2_fields_optional(self, service):
+        """Calling store_raw with no v2 fields produces a v1-compatible memory."""
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.scroll.return_value = ([], None)
+
+        result = service.store_raw(
+            content="Prefers tabs over spaces",
+            user_id="ehfaz",
+            category="preference",
+        )
+        assert len(result) == 1
+        # All v2 fields stay null when not supplied
+        assert result[0].domain is None
+        assert result[0].observation_type is None
+        assert result[0].concepts is None
+        assert result[0].confidence is None
+
+        # Metadata should not contain any v2 keys when fields weren't supplied
+        insert_kwargs = service._memory.vector_store.insert.call_args[1]
+        metadata = insert_kwargs["payloads"][0]["metadata"]
+        for v2_key in ("domain", "observation_type", "concepts", "source_type",
+                       "related_memory_ids", "confidence", "expires_at"):
+            assert v2_key not in metadata, f"Unexpected v2 key '{v2_key}' in v1-style payload"
+
+
+# ──────────────────────────────────────────────
+# Memory model v2: content-hash dedup
+# ──────────────────────────────────────────────
+
+
+class TestContentHashDedup:
+    """Memory-model v2 — store_raw is idempotent via content-hash dedup."""
+
+    def test_dedup_hit_returns_existing(self, service):
+        """When the same (user_id, scope, hash) is found, return existing without insert."""
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        mock_client = MagicMock()
+        service._memory.vector_store.client = mock_client
+
+        # Configure scroll to return one matching point
+        existing_point = MagicMock()
+        existing_point.id = "existing-id"
+        existing_point.payload = {
+            "data": "Prefers tabs over spaces",
+            "created_at": "2026-01-01T00:00:00Z",
+            "metadata": {
+                "scope": "global",
+                "category": "preference",
+                "project_id": None,
+                "domain": "coding",
+            },
+        }
+        mock_client.scroll.return_value = ([existing_point], None)
+
+        result = service.store_raw(
+            content="Prefers tabs over spaces",
+            user_id="ehfaz",
+            category="preference",
+        )
+
+        # Should NOT have called insert (dedup hit)
+        service._memory.vector_store.insert.assert_not_called()
+        assert len(result) == 1
+        assert result[0].id == "existing-id"
+        assert result[0].domain == "coding"
+
+    def test_dedup_miss_inserts(self, service):
+        """When no matching hash found, proceed with normal insert."""
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        mock_client = MagicMock()
+        service._memory.vector_store.client = mock_client
+        mock_client.scroll.return_value = ([], None)
+
+        result = service.store_raw(
+            content="A novel fact never seen before",
+            user_id="ehfaz",
+            category="personal_fact",
+        )
+
+        # Should have called insert (dedup miss)
+        service._memory.vector_store.insert.assert_called_once()
+        assert len(result) == 1
+        assert result[0].id != "existing-id"
+
+    def test_dedup_lookup_failure_does_not_block_insert(self, service):
+        """Defensive: if the dedup lookup raises, store_raw should still insert."""
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        mock_client = MagicMock()
+        service._memory.vector_store.client = mock_client
+        mock_client.scroll.side_effect = Exception("Qdrant transient error")
+
+        result = service.store_raw(
+            content="A fact",
+            user_id="ehfaz",
+            category="personal_fact",
+        )
+
+        # Insert proceeds even when dedup query fails — safer to risk a dup.
+        service._memory.vector_store.insert.assert_called_once()
+        assert len(result) == 1
+
+
+# ──────────────────────────────────────────────
+# Memory model v2: store_raw_batch
+# ──────────────────────────────────────────────
+
+
+class TestStoreRawBatch:
+    """Memory-model v2 — batch storage of pre-categorized facts."""
+
+    def test_stores_each_item(self, service):
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.scroll.return_value = ([], None)
+
+        items = [
+            {"content": "Fact one", "user_id": "ehfaz", "category": "personal_fact",
+             "domain": "personal"},
+            {"content": "Fact two", "user_id": "ehfaz", "category": "preference",
+             "concepts": ["how-it-works"]},
+        ]
+        results = service.store_raw_batch(items)
+
+        assert len(results) == 2
+        assert results[0].domain == "personal"
+        assert results[1].concepts == ["how-it-works"]
+        # Two inserts, one per item
+        assert service._memory.vector_store.insert.call_count == 2
+
+    def test_continues_on_per_item_error(self, service):
+        """A bad item must not block the rest of the batch."""
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.scroll.return_value = ([], None)
+
+        items = [
+            {"content": "Good", "user_id": "ehfaz", "category": "preference"},
+            {"content": "Bad", "user_id": "ehfaz", "category": "INVALID-CATEGORY"},
+            {"content": "Also good", "user_id": "ehfaz", "category": "personal_fact"},
+        ]
+        results = service.store_raw_batch(items)
+
+        # Two stored, one skipped due to bad category
+        assert len(results) == 2
+
+    def test_handles_iso_string_expires_at(self, service):
+        """expires_at can arrive as ISO string after JSON enqueue — should round-trip."""
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.scroll.return_value = ([], None)
+
+        items = [
+            {"content": "Time-bound fact", "user_id": "ehfaz", "category": "task_context",
+             "expires_at": "2026-12-01T00:00:00+00:00"},
+        ]
+        results = service.store_raw_batch(items)
+
+        assert len(results) == 1
+        assert results[0].expires_at is not None
+
+
+# ──────────────────────────────────────────────
+# Memory model v2: search filters
+# ──────────────────────────────────────────────
+
+
+class TestSearchV2Filters:
+    """Memory-model v2 — search honors domain/observation_type/concepts filters."""
+
+    def test_domain_filter_applied(self, service):
+        service._memory.search.return_value = {"results": []}
+        service.search(
+            query="anything",
+            user_id="ehfaz",
+            scope="global",  # avoid the dual-scope merge path
+            domain="research",
+        )
+        call_kwargs = service._memory.search.call_args[1]
+        assert call_kwargs["filters"]["metadata.domain"] == "research"
+
+    def test_observation_type_filter_applied(self, service):
+        service._memory.search.return_value = {"results": []}
+        service.search(
+            query="anything",
+            user_id="ehfaz",
+            scope="global",
+            observation_type="bugfix",
+        )
+        call_kwargs = service._memory.search.call_args[1]
+        assert call_kwargs["filters"]["metadata.observation_type"] == "bugfix"
+
+    def test_concepts_filter_applied_as_in(self, service):
+        service._memory.search.return_value = {"results": []}
+        service.search(
+            query="anything",
+            user_id="ehfaz",
+            scope="global",
+            concepts=["gotcha", "trade-off"],
+        )
+        call_kwargs = service._memory.search.call_args[1]
+        assert call_kwargs["filters"]["metadata.concepts"] == {"in": ["gotcha", "trade-off"]}
+
+
+# ──────────────────────────────────────────────
+# Memory model v2: _mem_to_response surfaces new fields
+# ──────────────────────────────────────────────
+
+
+class TestMemToResponseV2:
+    def test_surfaces_v2_fields(self, service):
+        mem = {
+            "id": "v2-001",
+            "memory": "A v2 memory",
+            "metadata": {
+                "metadata": {
+                    "category": "decision",
+                    "scope": "project",
+                    "project_id": "neuralscape",
+                    "domain": "coding",
+                    "observation_type": "decision",
+                    "concepts": ["why-it-exists", "trade-off"],
+                    "source_type": "tool_extraction",
+                    "related_memory_ids": ["mem-1"],
+                    "confidence": 0.9,
+                    "expires_at": "2026-12-01T00:00:00+00:00",
+                }
+            },
+        }
+        resp = service._mem_to_response(mem)
+        assert resp.domain == "coding"
+        assert resp.observation_type == "decision"
+        assert resp.concepts == ["why-it-exists", "trade-off"]
+        assert resp.source_type == "tool_extraction"
+        assert resp.related_memory_ids == ["mem-1"]
+        assert resp.confidence == 0.9
+        assert resp.expires_at == "2026-12-01T00:00:00+00:00"
+
+    def test_legacy_memory_has_null_v2_fields(self, service):
+        """A v1-era memory without v2 metadata renders v2 fields as None."""
+        mem = {
+            "id": "v1-001",
+            "memory": "Legacy memory",
+            "metadata": {"metadata": {"category": "preference", "scope": "global"}},
+        }
+        resp = service._mem_to_response(mem)
+        assert resp.category == "preference"
+        assert resp.domain is None
+        assert resp.observation_type is None
+        assert resp.concepts is None
+        assert resp.confidence is None
+
+
+# ──────────────────────────────────────────────
+# Memory model v2: schema validation
+# ──────────────────────────────────────────────
+
+
+class TestSchemaV2Validators:
+    def test_invalid_domain_rejected(self):
+        from pydantic import ValidationError
+        from schemas import RawMemoryRequest
+
+        with pytest.raises(ValidationError):
+            RawMemoryRequest(
+                content="x", user_id="u", category="preference", domain="not-a-domain"
+            )
+
+    def test_invalid_observation_type_rejected(self):
+        from pydantic import ValidationError
+        from schemas import RawMemoryRequest
+
+        with pytest.raises(ValidationError):
+            RawMemoryRequest(
+                content="x", user_id="u", category="preference", observation_type="bogus"
+            )
+
+    def test_unknown_concept_rejected(self):
+        from pydantic import ValidationError
+        from schemas import RawMemoryRequest
+
+        with pytest.raises(ValidationError):
+            RawMemoryRequest(
+                content="x", user_id="u", category="preference",
+                concepts=["how-it-works", "definitely-not-a-concept"],
+            )
+
+    def test_concepts_capped_at_5(self):
+        from pydantic import ValidationError
+        from schemas import RawMemoryRequest
+
+        with pytest.raises(ValidationError):
+            RawMemoryRequest(
+                content="x", user_id="u", category="preference",
+                concepts=["how-it-works", "why-it-exists", "what-changed",
+                          "problem-solution", "gotcha", "pattern"],  # 6 > 5
+            )
+
+    def test_confidence_range_enforced(self):
+        from pydantic import ValidationError
+        from schemas import RawMemoryRequest
+
+        with pytest.raises(ValidationError):
+            RawMemoryRequest(
+                content="x", user_id="u", category="preference", confidence=1.5
+            )
+
+    def test_valid_v2_memory_passes(self):
+        from datetime import datetime, timezone
+        from schemas import RawMemoryRequest
+
+        req = RawMemoryRequest(
+            content="x",
+            user_id="u",
+            category="decision",
+            scope="project",
+            project_id="proj1",
+            domain="coding",
+            observation_type="decision",
+            concepts=["why-it-exists", "trade-off"],
+            source_type="tool_extraction",
+            confidence=0.7,
+            expires_at=datetime(2026, 12, 1, tzinfo=timezone.utc),
+        )
+        assert req.domain == "coding"
+        assert req.observation_type == "decision"
+        assert req.confidence == 0.7
+
+    def test_batch_request_caps_at_50(self):
+        from pydantic import ValidationError
+        from schemas import RawMemoryBatchRequest, RawMemoryRequest
+
+        small = RawMemoryRequest(content="x", user_id="u", category="preference")
+        with pytest.raises(ValidationError):
+            RawMemoryBatchRequest(memories=[small] * 51)
+
+    def test_batch_request_min_one(self):
+        from pydantic import ValidationError
+        from schemas import RawMemoryBatchRequest
+
+        with pytest.raises(ValidationError):
+            RawMemoryBatchRequest(memories=[])
+
+    def test_raw_invalid_source_type(self):
+        from pydantic import ValidationError
+        from schemas import RawMemoryRequest
+
+        with pytest.raises(ValidationError):
+            RawMemoryRequest(
+                content="x", user_id="u", category="preference", source_type="bogus"
+            )
+
+    def test_raw_concepts_none_passes(self):
+        """concepts=None must short-circuit validation, not iterate."""
+        from schemas import RawMemoryRequest
+
+        req = RawMemoryRequest(content="x", user_id="u", category="preference", concepts=None)
+        assert req.concepts is None
+
+    def test_search_invalid_domain(self):
+        from pydantic import ValidationError
+        from schemas import SearchMemoryRequest
+
+        with pytest.raises(ValidationError):
+            SearchMemoryRequest(query="hi", user_id="u", domain="not-a-domain")
+
+    def test_search_invalid_observation_type(self):
+        from pydantic import ValidationError
+        from schemas import SearchMemoryRequest
+
+        with pytest.raises(ValidationError):
+            SearchMemoryRequest(query="hi", user_id="u", observation_type="bogus")
+
+    def test_search_unknown_concept_rejected(self):
+        """Mirror RawMemoryRequest so typos surface as 422, not silent misses.
+        Regression for CR-12."""
+        from pydantic import ValidationError
+        from schemas import SearchMemoryRequest
+
+        with pytest.raises(ValidationError):
+            SearchMemoryRequest(query="hi", user_id="u", concepts=["definitely-not-a-concept"])
+
+    def test_search_known_concept_passes(self):
+        from schemas import SearchMemoryRequest
+
+        req = SearchMemoryRequest(query="hi", user_id="u", concepts=["gotcha", "trade-off"])
+        assert req.concepts == ["gotcha", "trade-off"]
+
+    def test_search_concepts_capped_at_5(self):
+        from pydantic import ValidationError
+        from schemas import SearchMemoryRequest
+
+        with pytest.raises(ValidationError):
+            SearchMemoryRequest(
+                query="hi", user_id="u",
+                concepts=["how-it-works", "why-it-exists", "what-changed",
+                          "problem-solution", "gotcha", "pattern"],  # 6 > 5
+            )
+
+    def test_search_concepts_none_allowed(self):
+        from schemas import SearchMemoryRequest
+
+        req = SearchMemoryRequest(query="hi", user_id="u", concepts=None)
+        assert req.concepts is None
+
+    def test_store_request_invalid_domain(self):
+        from pydantic import ValidationError
+        from schemas import StoreMemoryRequest
+
+        with pytest.raises(ValidationError):
+            StoreMemoryRequest(
+                messages=[{"role": "user", "content": "x"}],
+                user_id="u",
+                domain="not-a-domain",
+            )
+
+    def test_store_request_valid_domain(self):
+        from schemas import StoreMemoryRequest
+
+        req = StoreMemoryRequest(
+            messages=[{"role": "user", "content": "x"}],
+            user_id="u",
+            domain="research",
+        )
+        assert req.domain == "research"
+
+
+# ──────────────────────────────────────────────
+# Memory model v2: _find_by_content_hash project-scope branch
+# ──────────────────────────────────────────────
+
+
+class TestFindByContentHashProjectScope:
+    """Memory-model v2 — _find_by_content_hash adds project_id filter when scope='project'."""
+
+    def test_project_scope_appends_project_filter(self, service):
+        """When scope='project' AND project_id supplied, the Qdrant filter must include project_id."""
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+        mock_client = MagicMock()
+        service._memory.vector_store.client = mock_client
+        mock_client.scroll.return_value = ([], None)
+
+        service._find_by_content_hash(
+            user_id="ehfaz",
+            content_hash="abc123",
+            scope="project",
+            project_id="neuralscape",
+        )
+
+        mock_client.scroll.assert_called_once()
+        call_kwargs = mock_client.scroll.call_args[1]
+        scroll_filter = call_kwargs["scroll_filter"]
+        # 4 conditions when project scope: user_id, hash, scope, project_id
+        assert len(scroll_filter.must) == 4
+
+    def test_project_scope_without_project_id_skips_filter(self, service):
+        """scope='project' but project_id=None: no project_id filter appended."""
+        mock_client = MagicMock()
+        service._memory.vector_store.client = mock_client
+        mock_client.scroll.return_value = ([], None)
+
+        service._find_by_content_hash(
+            user_id="ehfaz",
+            content_hash="abc123",
+            scope="project",
+            project_id=None,
+        )
+
+        scroll_filter = mock_client.scroll.call_args[1]["scroll_filter"]
+        # 3 conditions when no project_id: user_id, hash, scope
+        assert len(scroll_filter.must) == 3
+
+
+# ──────────────────────────────────────────────
+# Memory model v2: expire_old_memories
+# ──────────────────────────────────────────────
+
+
+class TestExpireOldMemories:
+    """Memory-model v2 — nightly purge of memories with expired expires_at."""
+
+    def _make_point(self, pt_id, expires_at, user_id="ehfaz"):
+        pt = MagicMock()
+        pt.id = pt_id
+        pt.payload = {
+            "data": f"memory {pt_id}",
+            "user_id": user_id,
+            "metadata": {
+                "scope": "global",
+                "category": "task_context",
+                "expires_at": expires_at,
+            },
+        }
+        return pt
+
+    def test_deletes_expired_skips_future_and_null(self, service):
+        from datetime import datetime, timedelta, timezone
+
+        past = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        future = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+
+        expired = self._make_point("expired-1", past, user_id="alice")
+        future_pt = self._make_point("future-1", future, user_id="alice")
+        no_expiry = MagicMock()
+        no_expiry.id = "no-expiry-1"
+        no_expiry.payload = {
+            "data": "no expiry", "user_id": "alice",
+            "metadata": {"scope": "global"},  # no expires_at
+        }
+
+        mock_client = MagicMock()
+        service._memory.vector_store.client = mock_client
+        # Single page with all three; second call returns empty to terminate
+        mock_client.scroll.side_effect = [
+            ([expired, future_pt, no_expiry], None),  # next_offset=None terminates
+        ]
+        # Mock the delete + graph cleanup helper
+        service._delete_qdrant_memory_with_graph_cleanup = MagicMock()
+
+        result = service.expire_old_memories(batch_size=100)
+
+        assert result["deleted_count"] == 1
+        assert result["per_user"] == {"alice": 1}
+        # Only the expired one was deleted
+        service._delete_qdrant_memory_with_graph_cleanup.assert_called_once()
+        deleted_id = service._delete_qdrant_memory_with_graph_cleanup.call_args[0][0]
+        assert deleted_id == "expired-1"
+
+    def test_handles_per_point_delete_failure(self, service):
+        """A failed delete on one point doesn't abort the run."""
+        from datetime import datetime, timedelta, timezone
+
+        past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        p1 = self._make_point("p1", past, user_id="bob")
+        p2 = self._make_point("p2", past, user_id="bob")
+
+        mock_client = MagicMock()
+        service._memory.vector_store.client = mock_client
+        mock_client.scroll.side_effect = [([p1, p2], None)]
+
+        # First delete fails, second succeeds
+        service._delete_qdrant_memory_with_graph_cleanup = MagicMock(
+            side_effect=[Exception("Qdrant transient"), None]
+        )
+
+        result = service.expire_old_memories(batch_size=100)
+        assert result["deleted_count"] == 1
+        assert result["per_user"] == {"bob": 1}
+
+    def test_paginates_through_multiple_pages(self, service):
+        """When Qdrant returns next_offset, the cron continues to the next page."""
+        from datetime import datetime, timedelta, timezone
+
+        past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        p1 = self._make_point("p1", past, user_id="alice")
+        p2 = self._make_point("p2", past, user_id="bob")
+
+        mock_client = MagicMock()
+        service._memory.vector_store.client = mock_client
+        # First page has p1 with next_offset='cursor', second page has p2 with None
+        mock_client.scroll.side_effect = [
+            ([p1], "cursor"),
+            ([p2], None),
+        ]
+        service._delete_qdrant_memory_with_graph_cleanup = MagicMock()
+
+        result = service.expire_old_memories(batch_size=1)
+        assert result["deleted_count"] == 2
+        assert result["per_user"] == {"alice": 1, "bob": 1}
+        # Two scroll calls = paginated
+        assert mock_client.scroll.call_count == 2
+
+    def test_empty_collection(self, service):
+        """No points returned: terminates cleanly with zero deletions."""
+        mock_client = MagicMock()
+        service._memory.vector_store.client = mock_client
+        mock_client.scroll.return_value = ([], None)
+
+        result = service.expire_old_memories()
+        assert result["deleted_count"] == 0
+        assert result["per_user"] == {}
+
+    def test_skips_unparseable_expires_at(self, service):
+        """A memory whose expires_at is malformed must be skipped, not deleted."""
+        pt = MagicMock()
+        pt.id = "bad-1"
+        pt.payload = {
+            "data": "x", "user_id": "alice",
+            "metadata": {"expires_at": "not-a-timestamp"},
+        }
+        mock_client = MagicMock()
+        service._memory.vector_store.client = mock_client
+        mock_client.scroll.side_effect = [([pt], None)]
+        service._delete_qdrant_memory_with_graph_cleanup = MagicMock()
+
+        result = service.expire_old_memories()
+        assert result["deleted_count"] == 0
+        service._delete_qdrant_memory_with_graph_cleanup.assert_not_called()
+
+    def test_cold_start_initializes_memory(self, service):
+        """expire_old_memories must call _get_memory() before touching client.
+
+        Regression for the cold-start AttributeError CodeRabbit flagged: the
+        cron can fire on a worker that hasn't served any request yet.
+        """
+        # Pretend memory hasn't been initialized — _get_memory should be invoked
+        with patch.object(service, "_get_memory", return_value=service._memory) as mock_get:
+            mock_client = MagicMock()
+            service._memory.vector_store.client = mock_client
+            mock_client.scroll.return_value = ([], None)
+            service.expire_old_memories()
+        mock_get.assert_called_once()
+
+
+class TestParseExpiresAt:
+    """Memory-model v2 — robust ISO-8601 parsing used by the expiry cron."""
+
+    def test_parses_z_suffix_as_utc(self):
+        from datetime import timezone
+        dt = _parse_expires_at("2026-12-01T00:00:00Z")
+        assert dt is not None
+        assert dt.tzinfo == timezone.utc
+        assert dt.year == 2026
+
+    def test_parses_offset(self):
+        dt = _parse_expires_at("2026-12-01T00:00:00-05:00")
+        assert dt is not None
+        # Should be tz-aware regardless of offset
+        assert dt.tzinfo is not None
+
+    def test_naive_string_treated_as_utc(self):
+        from datetime import timezone
+        dt = _parse_expires_at("2026-12-01T00:00:00")
+        assert dt is not None
+        assert dt.tzinfo == timezone.utc
+
+    def test_returns_none_for_malformed(self):
+        assert _parse_expires_at("not-a-date") is None
+        assert _parse_expires_at("") is None
+        assert _parse_expires_at("   ") is None
+
+    def test_returns_none_for_none(self):
+        assert _parse_expires_at(None) is None
+
+    def test_returns_none_for_non_string_non_datetime(self):
+        assert _parse_expires_at(42) is None
+        assert _parse_expires_at(["x"]) is None
+
+    def test_datetime_input_passes_through(self):
+        from datetime import datetime, timezone
+        aware = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        assert _parse_expires_at(aware) is aware
+
+    def test_naive_datetime_treated_as_utc(self):
+        from datetime import datetime, timezone
+        naive = datetime(2026, 1, 1)
+        dt = _parse_expires_at(naive)
+        assert dt is not None
+        assert dt.tzinfo == timezone.utc
+
+    def test_mixed_offset_comparison_ordering(self):
+        """Strings that sort wrong lexicographically still compare correctly
+        once parsed — regression for CR-10 / CP-02.
+        """
+        # "Z" sorts before "-" but Z is UTC noon, -05:00 is later actual time.
+        earlier = _parse_expires_at("2026-01-01T12:00:00Z")
+        later = _parse_expires_at("2026-01-01T08:00:00-05:00")  # = 13:00 UTC
+        assert earlier is not None and later is not None
+        assert earlier < later
+
+
+# ──────────────────────────────────────────────
+# Memory model v2: graph result enrichment + filtering
+# ──────────────────────────────────────────────
+
+
+class TestGraphEnrichment:
+    """Memory-model v2 — _enrich_graph_with_v2 and _enrich_and_filter_graph.
+
+    Graphiti edges don't carry v2 fields natively; we recover them by top-1
+    semantic search against Qdrant, gated by a similarity threshold so we
+    never propagate metadata from an unrelated nearest neighbor.
+    """
+
+    def _hit(self, score: float, metadata: dict, data: str = "x"):
+        """Build a fake qdrant ScoredPoint-like object."""
+        h = MagicMock()
+        h.score = score
+        h.payload = {"data": data, "metadata": metadata}
+        return h
+
+    def test_high_similarity_match_copies_v2_fields(self, service):
+        from schemas import MemoryResponse
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.query_points.return_value = _qresult([
+            self._hit(0.95, {
+                "category": "decision", "scope": "global",
+                "domain": "meeting", "observation_type": "meeting_outcome",
+                "concepts": ["blocker"], "source_type": "tool_extraction",
+                "confidence": 0.8,
+            })
+        ])
+        graph_responses = [MemoryResponse(id="g1", memory="OKR was shifted", source="graph")]
+        result = service._enrich_graph_with_v2(graph_responses, user_id="u", project_id=None)
+        assert result[0].domain == "meeting"
+        assert result[0].observation_type == "meeting_outcome"
+        assert result[0].concepts == ["blocker"]
+        assert result[0].source_type == "tool_extraction"
+        assert result[0].confidence == 0.8
+        assert result[0].category == "decision"
+        assert result[0].scope == "global"
+
+    def test_below_threshold_does_not_enrich(self, service):
+        from schemas import MemoryResponse
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        # Score 0.5 is below default 0.7 threshold
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.query_points.return_value = _qresult([
+            self._hit(0.5, {"domain": "coding", "observation_type": "decision"})
+        ])
+        graph_responses = [MemoryResponse(id="g1", memory="unrelated graph fact", source="graph")]
+        result = service._enrich_graph_with_v2(graph_responses, user_id="u", project_id=None)
+        # Below threshold → fields stay None
+        assert result[0].domain is None
+        assert result[0].observation_type is None
+
+    def test_no_hits_skips_enrichment(self, service):
+        from schemas import MemoryResponse
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.query_points.return_value = _qresult([])
+        graph_responses = [MemoryResponse(id="g1", memory="lonely graph fact", source="graph")]
+        result = service._enrich_graph_with_v2(graph_responses, user_id="u", project_id=None)
+        assert result[0].domain is None
+
+    def test_does_not_overwrite_existing_v2_fields(self, service):
+        from schemas import MemoryResponse
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.query_points.return_value = _qresult([
+            self._hit(0.95, {"domain": "research"})
+        ])
+        graph_responses = [
+            MemoryResponse(id="g1", memory="x", source="graph", domain="coding"),
+        ]
+        result = service._enrich_graph_with_v2(graph_responses, user_id="u", project_id=None)
+        # Existing domain="coding" preserved, not overwritten by enrichment "research"
+        assert result[0].domain == "coding"
+
+    def test_handles_double_wrapped_metadata(self, service):
+        """mem0 sometimes nests metadata under metadata.metadata — unwrap it."""
+        from schemas import MemoryResponse
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.query_points.return_value = _qresult([
+            self._hit(0.95, {"metadata": {"domain": "ops", "observation_type": "feature"}})
+        ])
+        graph_responses = [MemoryResponse(id="g1", memory="x", source="graph")]
+        result = service._enrich_graph_with_v2(graph_responses, user_id="u", project_id=None)
+        assert result[0].domain == "ops"
+        assert result[0].observation_type == "feature"
+
+    def test_skips_empty_memory_text(self, service):
+        from schemas import MemoryResponse
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.query_points.return_value = _qresult([])
+        graph_responses = [MemoryResponse(id="g1", memory="", source="graph")]
+        result = service._enrich_graph_with_v2(graph_responses, user_id="u", project_id=None)
+        # Empty memory: never hits the search, fields stay None
+        assert result[0].domain is None
+        service._memory.embedding_model.embed.assert_not_called()
+
+    def test_swallows_per_row_errors(self, service):
+        """A failure on one row doesn't abort the whole enrichment pass."""
+        from schemas import MemoryResponse
+        service._memory.embedding_model.embed.side_effect = Exception("embed fail")
+        graph_responses = [MemoryResponse(id="g1", memory="x", source="graph")]
+        # Should not raise
+        result = service._enrich_graph_with_v2(graph_responses, user_id="u", project_id=None)
+        assert result[0].domain is None
+
+    def test_dict_hit_format_supported(self, service):
+        """Some Qdrant client versions return dicts instead of ScoredPoint."""
+        from schemas import MemoryResponse
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.query_points.return_value = _qresult([
+            {"score": 0.9, "payload": {"metadata": {"domain": "writing"}}}
+        ])
+        graph_responses = [MemoryResponse(id="g1", memory="x", source="graph")]
+        result = service._enrich_graph_with_v2(graph_responses, user_id="u", project_id=None)
+        assert result[0].domain == "writing"
+
+    def test_project_scope_added_to_lookup_filter(self, service):
+        """When project_id is supplied, the enrichment lookup must constrain
+        to that project so a graph edge can't inherit metadata from a
+        semantically similar memory in another project — regression for
+        CR-11 / CP-05.
+
+        Multi-user model: filter is now a Qdrant `should` (user_id=caller
+        OR visibility=shared) plus a `must` (project_id) when present.
+        """
+        from qdrant_client.models import FieldCondition
+        from schemas import MemoryResponse
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.query_points.return_value = _qresult([])
+        graph_responses = [MemoryResponse(id="g1", memory="x", source="graph")]
+        service._enrich_graph_with_v2(
+            graph_responses, user_id="ehfaz", project_id="neuralscape",
+        )
+        qf = service._memory.vector_store.client.query_points.call_args[1]["query_filter"]
+        must_keys = {
+            c.key for c in (qf.must or [])
+            if isinstance(c, FieldCondition)
+        }
+        assert "metadata.project_id" in must_keys
+
+    def test_global_scope_uses_user_or_shared_filter(self, service):
+        """Without project_id, the filter has caller's user_id OR shared
+        visibility in the should clause and no project constraint."""
+        from qdrant_client.models import FieldCondition
+        from schemas import MemoryResponse
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.query_points.return_value = _qresult([])
+        graph_responses = [MemoryResponse(id="g1", memory="x", source="graph")]
+        service._enrich_graph_with_v2(
+            graph_responses, user_id="ehfaz", project_id=None,
+        )
+        qf = service._memory.vector_store.client.query_points.call_args[1]["query_filter"]
+        should_keys = {
+            c.key for c in (qf.should or [])
+            if isinstance(c, FieldCondition)
+        }
+        assert "user_id" in should_keys
+        assert "metadata.visibility" in should_keys
+        # No project_id constraint in must when project_id was not supplied
+        must = qf.must or []
+        assert not any(
+            isinstance(c, FieldCondition) and c.key == "metadata.project_id"
+            for c in must
+        )
+
+
+class TestGraphFilterByV2:
+    """Memory-model v2 — _enrich_and_filter_graph drops rows that don't match the filter."""
+
+    def _hit(self, score: float, metadata: dict):
+        h = MagicMock()
+        h.score = score
+        h.payload = {"data": "x", "metadata": metadata}
+        return h
+
+    def test_domain_filter_drops_non_match(self, service):
+        from schemas import MemoryResponse
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        # Two graph rows, one source has domain=coding, the other meeting
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.query_points.side_effect = [
+            [self._hit(0.9, {"domain": "coding", "observation_type": "decision"})],
+            [self._hit(0.9, {"domain": "meeting", "observation_type": "meeting_outcome"})],
+        ]
+        graph_responses = [
+            MemoryResponse(id="g1", memory="fact1", source="graph"),
+            MemoryResponse(id="g2", memory="fact2", source="graph"),
+        ]
+        result = service._enrich_and_filter_graph(
+            graph_responses, user_id="u", project_id=None,
+            domain="meeting", observation_type=None, concepts=None,
+        )
+        assert len(result) == 1
+        assert result[0].id == "g2"
+
+    def test_observation_type_filter_drops_non_match(self, service):
+        from schemas import MemoryResponse
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.query_points.side_effect = [
+            [self._hit(0.9, {"observation_type": "bugfix"})],
+            [self._hit(0.9, {"observation_type": "feature"})],
+        ]
+        graph_responses = [
+            MemoryResponse(id="g1", memory="fact1", source="graph"),
+            MemoryResponse(id="g2", memory="fact2", source="graph"),
+        ]
+        result = service._enrich_and_filter_graph(
+            graph_responses, user_id="u", project_id=None,
+            domain=None, observation_type="bugfix", concepts=None,
+        )
+        assert len(result) == 1
+        assert result[0].id == "g1"
+
+    def test_concepts_filter_keeps_overlap(self, service):
+        from schemas import MemoryResponse
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.query_points.side_effect = [
+            [self._hit(0.9, {"concepts": ["gotcha", "pattern"]})],
+            [self._hit(0.9, {"concepts": ["how-it-works"]})],
+            [self._hit(0.9, {})],  # no concepts at all
+        ]
+        graph_responses = [
+            MemoryResponse(id="g1", memory="a", source="graph"),
+            MemoryResponse(id="g2", memory="b", source="graph"),
+            MemoryResponse(id="g3", memory="c", source="graph"),
+        ]
+        result = service._enrich_and_filter_graph(
+            graph_responses, user_id="u", project_id=None,
+            domain=None, observation_type=None, concepts=["gotcha"],
+        )
+        # Only g1 has overlap with concepts=[gotcha]
+        assert [r.id for r in result] == ["g1"]
+
+    def test_below_threshold_falls_off_when_filtering(self, service):
+        """Rows whose source match is below threshold get None'd, then filter drops them."""
+        from schemas import MemoryResponse
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.query_points.side_effect = [
+            [self._hit(0.95, {"domain": "coding"})],  # passes threshold
+            [self._hit(0.4, {"domain": "coding"})],   # below threshold → not enriched
+        ]
+        graph_responses = [
+            MemoryResponse(id="g1", memory="related", source="graph"),
+            MemoryResponse(id="g2", memory="unrelated", source="graph"),
+        ]
+        result = service._enrich_and_filter_graph(
+            graph_responses, user_id="u", project_id=None,
+            domain="coding", observation_type=None, concepts=None,
+        )
+        assert [r.id for r in result] == ["g1"]
+
+    def test_combined_filters_all_must_match(self, service):
+        from schemas import MemoryResponse
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.query_points.side_effect = [
+            [self._hit(0.9, {"domain": "coding", "observation_type": "decision",
+                             "concepts": ["why-it-exists"]})],
+            [self._hit(0.9, {"domain": "coding", "observation_type": "bugfix",
+                             "concepts": ["why-it-exists"]})],
+        ]
+        graph_responses = [
+            MemoryResponse(id="g1", memory="a", source="graph"),
+            MemoryResponse(id="g2", memory="b", source="graph"),
+        ]
+        # Domain matches both; obs_type only matches g1
+        result = service._enrich_and_filter_graph(
+            graph_responses, user_id="u", project_id=None,
+            domain="coding", observation_type="decision", concepts=["why-it-exists"],
+        )
+        assert [r.id for r in result] == ["g1"]
+
+    def test_empty_graph_responses_returns_empty(self, service):
+        result = service._enrich_and_filter_graph(
+            [], user_id="u", project_id=None,
+            domain="coding", observation_type=None, concepts=None,
+        )
+        assert result == []
+
+
+# ──────────────────────────────────────────────
+# Multi-user model: visibility on store_raw + search isolation
+# ──────────────────────────────────────────────
+
+
+class TestStoreRawMultiUser:
+    """``store_raw`` defaults visibility per category and stamps owner_user_id."""
+
+    def test_default_visibility_for_preference_is_private(self, service):
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.scroll.return_value = ([], None)
+        result = service.store_raw(content="x", user_id="alice", category="preference")
+        payload = service._memory.vector_store.insert.call_args[1]["payloads"][0]
+        assert payload["metadata"]["visibility"] == "private"
+        assert payload["metadata"]["owner_user_id"] == "alice"
+        assert result[0].visibility == "private"
+        assert result[0].owner_user_id == "alice"
+
+    def test_default_visibility_for_tech_stack_is_shared(self, service):
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.scroll.return_value = ([], None)
+        result = service.store_raw(
+            content="Uses FastAPI", user_id="alice", category="tech_stack",
+            scope="project", project_id="proj1",
+        )
+        payload = service._memory.vector_store.insert.call_args[1]["payloads"][0]
+        assert payload["metadata"]["visibility"] == "shared"
+        assert payload["metadata"]["owner_user_id"] == "alice"
+        assert result[0].visibility == "shared"
+
+    def test_explicit_visibility_overrides_category_default(self, service):
+        """Caller can force private on a normally-shared category, or vice versa."""
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.scroll.return_value = ([], None)
+        # tech_stack defaults to shared but caller forces private:
+        service.store_raw(
+            content="Internal note", user_id="alice", category="tech_stack",
+            scope="project", project_id="proj1", visibility="private",
+        )
+        payload = service._memory.vector_store.insert.call_args[1]["payloads"][0]
+        assert payload["metadata"]["visibility"] == "private"
+
+    def test_graph_group_id_uses_visibility_namespace(self, service):
+        """Private writes go under user--{id}; shared writes go under 'shared'."""
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.scroll.return_value = ([], None)
+        # Private preference
+        service.store_raw(content="dark mode", user_id="alice", category="preference")
+        # First (and only) graph.add call's group_id
+        graph_call = service._memory.graph.add.call_args[1]
+        assert graph_call["filters"]["group_id"] == "user--alice"
+
+        # Reset, then shared tech_stack with project
+        service._memory.graph.add.reset_mock()
+        service.store_raw(
+            content="Uses FastAPI", user_id="alice", category="tech_stack",
+            scope="project", project_id="myproj",
+        )
+        graph_call = service._memory.graph.add.call_args[1]
+        assert graph_call["filters"]["group_id"] == "shared--project--myproj"
+
+
+class TestSearchMultiUserIsolation:
+    """``search`` returns the caller's personal pool ∪ shared pool."""
+
+    def _qdrant_hit(self, mid, data, metadata, score=0.9):
+        h = MagicMock()
+        h.id = mid
+        h.score = score
+        h.payload = {"data": data, "metadata": metadata}
+        return h
+
+    def test_search_calls_both_pools_by_default(self, service):
+        """By default, search queries mem0 (personal) AND direct-Qdrant (shared)."""
+        service._memory.search.return_value = {"results": []}
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.query_points.return_value = _qresult([])
+
+        service.search(query="anything", user_id="alice", scope="global")
+        # personal pool: one mem0.search call (no project merge since scope=global)
+        assert service._memory.search.call_count == 1
+        # shared pool: one direct Qdrant client.search call
+        assert service._memory.vector_store.client.query_points.call_count == 1
+
+    def test_visibility_private_skips_shared_pool(self, service):
+        service._memory.search.return_value = {"results": []}
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service.search(
+            query="anything", user_id="alice", scope="global", visibility="private"
+        )
+        assert service._memory.search.call_count == 1
+        assert service._memory.vector_store.client.query_points.call_count == 0
+
+    def test_visibility_shared_skips_personal_pool(self, service):
+        service._memory.search.return_value = {"results": []}
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.query_points.return_value = _qresult([])
+        service.search(
+            query="anything", user_id="alice", scope="global", visibility="shared"
+        )
+        assert service._memory.search.call_count == 0
+        assert service._memory.vector_store.client.query_points.call_count == 1
+
+    def test_include_shared_false_skips_shared_pool(self, service):
+        service._memory.search.return_value = {"results": []}
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service.search(
+            query="anything", user_id="alice", scope="global", include_shared=False
+        )
+        assert service._memory.search.call_count == 1
+        assert service._memory.vector_store.client.query_points.call_count == 0
+
+    def test_personal_pool_uses_mem0_user_id_namespace(self, service):
+        """The personal-pool call always scopes the mem0 search to user_id=caller — that's
+        what enforces cross-user isolation at the vector store layer. mem0 v2.0.2
+        rejects ``user_id`` as a top-level kwarg, so the value now rides inside ``filters``."""
+        service._memory.search.return_value = {"results": []}
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.query_points.return_value = _qresult([])
+        service.search(query="anything", user_id="alice", scope="global")
+        call_kwargs = service._memory.search.call_args[1]
+        # Pre-cleanup this lived as a top-level kwarg; mem0 v2.0.2 moves it to filters.
+        assert "user_id" not in call_kwargs
+        assert call_kwargs["filters"]["user_id"] == "alice"
+
+    def test_shared_pool_filter_includes_visibility_shared(self, service):
+        """The shared-pool query MUST include the visibility=shared filter or
+        we'd be returning legacy memories (no visibility) as shared."""
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        service._memory.search.return_value = {"results": []}
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.query_points.return_value = _qresult([])
+        service.search(query="anything", user_id="alice", scope="global")
+        call_kwargs = service._memory.vector_store.client.query_points.call_args[1]
+        qf = call_kwargs["query_filter"]
+        # Look for the visibility=shared condition in the must clause
+        vis_conditions = [
+            c for c in qf.must
+            if isinstance(c, FieldCondition) and c.key == "metadata.visibility"
+        ]
+        assert vis_conditions, "shared-pool search must filter on metadata.visibility"
+        assert vis_conditions[0].match.value == "shared"
+
+    def test_dedups_caller_own_shared_writes_across_pools(self, service):
+        """When alice writes a shared memory, it matches both pools (mem0
+        user_id=alice + direct visibility=shared). Result must appear once."""
+        # mem0 returns alice's own shared write
+        service._memory.search.return_value = {
+            "results": [
+                {
+                    "id": "shared-by-alice",
+                    "memory": "Project uses FastAPI",
+                    "score": 0.9,
+                    "metadata": {
+                        "metadata": {
+                            "category": "tech_stack",
+                            "visibility": "shared",
+                            "owner_user_id": "alice",
+                        }
+                    },
+                }
+            ]
+        }
+        # Shared-pool direct search returns the SAME memory
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        same_hit = self._qdrant_hit(
+            "shared-by-alice",
+            "Project uses FastAPI",
+            {
+                "category": "tech_stack",
+                "visibility": "shared",
+                "owner_user_id": "alice",
+            },
+        )
+        service._memory.vector_store.client.query_points.return_value = _qresult([same_hit])
+
+        results = service.search(query="FastAPI", user_id="alice", scope="global")
+        assert len(results) == 1
+        assert results[0].id == "shared-by-alice"
+
+
+class TestSharedPoolDualScopeMerge:
+    """Regression for the post-review-fix #1/#2 bug: when `project_id` is set
+    and `scope` is omitted, the shared-pool search must do a project+global
+    merge — same as the personal pool. Otherwise a project-scoped search
+    misses global shared memories that should still be visible.
+
+    The graph read-set (via _get_group_ids) already covers both `shared`
+    AND `shared--project--{pid}`, so the vector path must match.
+    """
+
+    def test_project_id_without_scope_runs_two_shared_queries(self, service):
+        service._memory.search.return_value = {"results": []}
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.query_points.return_value = _qresult([])
+
+        service.search(
+            query="anything",
+            user_id="alice",
+            project_id="neuralscape",
+            # scope intentionally omitted — this is the dual-scope-merge case
+        )
+
+        # Personal pool already did project + global → 2 mem0 calls
+        assert service._memory.search.call_count == 2
+        # Shared pool must mirror that → 2 direct Qdrant calls
+        assert service._memory.vector_store.client.query_points.call_count == 2
+
+    def test_project_id_with_explicit_scope_runs_single_shared_query(self, service):
+        """When the caller passes `scope` explicitly, we honor it — no merge."""
+        service._memory.search.return_value = {"results": []}
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.query_points.return_value = _qresult([])
+
+        service.search(
+            query="anything",
+            user_id="alice",
+            project_id="neuralscape",
+            scope="project",
+        )
+        assert service._memory.vector_store.client.query_points.call_count == 1
+
+    def test_global_only_search_runs_single_shared_query(self, service):
+        """No project_id → single query, scope=global passed through."""
+        service._memory.search.return_value = {"results": []}
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.query_points.return_value = _qresult([])
+
+        service.search(query="anything", user_id="alice", scope="global")
+        assert service._memory.vector_store.client.query_points.call_count == 1
+
+    def test_dual_scope_first_call_filters_by_project_second_by_global(self, service):
+        """The two shared-pool calls must filter differently — one by
+        project_id, one by scope=global — otherwise we're just running
+        the same query twice."""
+        from qdrant_client.models import FieldCondition
+        service._memory.search.return_value = {"results": []}
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.query_points.return_value = _qresult([])
+
+        service.search(query="anything", user_id="alice", project_id="np")
+
+        calls = service._memory.vector_store.client.query_points.call_args_list
+        # Collect the metadata.* filter keys from each call
+        def keys_for_call(call):
+            qf = call[1]["query_filter"]
+            return {
+                c.key for c in qf.must
+                if isinstance(c, FieldCondition)
+            }
+
+        all_keys = [keys_for_call(c) for c in calls]
+        # One call filters on project_id, the other on scope
+        assert any("metadata.project_id" in keys for keys in all_keys), (
+            "project-scoped shared query missing"
+        )
+        assert any("metadata.scope" in keys for keys in all_keys), (
+            "global-scoped shared query missing"
+        )
+
+
+class TestExpireUserGraphWrites:
+    """Regression for CR-06: bulk-delete cleans up every group_id the user authored.
+
+    Before the fix, only ``user--{user_id}`` (and optionally one
+    ``user--{user_id}--project--*``) got expired, leaving project-private
+    and shared-authored graph edges orphaned.
+    """
+
+    def _mem(self, mid: str, owner: str, visibility: str, project_id: str | None = None):
+        return {
+            "id": mid,
+            "payload": {
+                "data": f"{mid} content",
+                "user_id": owner,
+                "metadata": {
+                    "owner_user_id": owner,
+                    "visibility": visibility,
+                    "project_id": project_id,
+                },
+            },
+        }
+
+    def test_expires_all_private_project_groups(self, service):
+        """Bulk-delete must expire `user--alice--project--X` for every X
+        Alice wrote to, not just the one optionally passed in."""
+        service._scroll_all_user_memories = MagicMock(return_value=[
+            self._mem("m1", "alice", "private"),
+            self._mem("m2", "alice", "private", project_id="alpha"),
+            self._mem("m3", "alice", "private", project_id="beta"),
+        ])
+        service._expire_graph_edges_for_groups = MagicMock()
+        service._expire_graph_edges_for_memory = MagicMock()
+        service._expire_user_graph_writes("alice")
+        called_groups = set(service._expire_graph_edges_for_groups.call_args[0][0])
+        assert "user--alice" in called_groups
+        assert "user--alice--project--alpha" in called_groups
+        assert "user--alice--project--beta" in called_groups
+
+    def test_shared_authored_memories_use_per_memory_cleanup(self, service):
+        """Shared-pool edges authored by Alice get expired memory-by-memory
+        — we never blanket-expire the `shared` group_id because other
+        users' edges live there too."""
+        service._scroll_all_user_memories = MagicMock(return_value=[
+            self._mem("m1", "alice", "shared"),
+            self._mem("m2", "alice", "shared", project_id="alpha"),
+        ])
+        service._expire_graph_edges_for_groups = MagicMock()
+        service._expire_graph_edges_for_memory = MagicMock()
+        service._expire_user_graph_writes("alice")
+        # Groups-level expiration NOT called for shared
+        if service._expire_graph_edges_for_groups.called:
+            called_groups = set(service._expire_graph_edges_for_groups.call_args[0][0])
+            assert "shared" not in called_groups
+            assert "shared--project--alpha" not in called_groups
+        # Per-memory expiration called once per shared memory
+        assert service._expire_graph_edges_for_memory.call_count == 2
+
+    def test_mixed_visibility_user(self, service):
+        """A user with both private and shared writes triggers both code paths."""
+        service._scroll_all_user_memories = MagicMock(return_value=[
+            self._mem("priv-1", "alice", "private"),
+            self._mem("shar-1", "alice", "shared"),
+        ])
+        service._expire_graph_edges_for_groups = MagicMock()
+        service._expire_graph_edges_for_memory = MagicMock()
+        service._expire_user_graph_writes("alice")
+        groups = set(service._expire_graph_edges_for_groups.call_args[0][0])
+        assert "user--alice" in groups
+        assert "shared" not in groups
+        assert service._expire_graph_edges_for_memory.call_count == 1
+
+    def test_scroll_failure_is_non_fatal(self, service):
+        """If scrolling memories fails, expire returns quietly rather than
+        propagating — bulk delete must still succeed at the vector-store layer."""
+        service._scroll_all_user_memories = MagicMock(side_effect=Exception("Qdrant transient"))
+        # Should not raise
+        service._expire_user_graph_writes("alice")
+
+
+class TestBulkDeleteSharedProtection:
+    """A user's bulk delete must not wipe shared (team) memories by default.
+
+    Shared memories are team artifacts. One user calling `delete_memories`
+    via API or MCP — including via an LLM agent — should not be able to
+    sweep shared writes away. Opt-in via include_shared=True.
+    """
+
+    def _mem(self, mid, visibility, project_id=None):
+        return {
+            "id": mid,
+            "payload": {
+                "data": f"{mid} content",
+                "metadata": {"visibility": visibility, "project_id": project_id},
+            },
+        }
+
+    def test_default_unfiltered_skips_shared(self, service):
+        service._scroll_all_user_memories = MagicMock(return_value=[
+            self._mem("priv-1", "private"),
+            self._mem("share-1", "shared"),
+            self._mem("priv-2", "private", project_id="alpha"),
+        ])
+        service._memory.vector_store.delete = MagicMock()
+        result = service.delete_memories(user_id="alice")
+        deleted = [c.args[0] for c in service._memory.vector_store.delete.call_args_list]
+        assert set(deleted) == {"priv-1", "priv-2"}
+        assert "share-1" not in deleted
+        service._memory.delete_all.assert_not_called()
+        assert "preserved 1 shared" in result["message"]
+
+    def test_include_shared_true_uses_delete_all(self, service):
+        service.delete_memories(user_id="alice", include_shared=True)
+        service._memory.delete_all.assert_called_once_with(user_id="alice")
+
+    def test_filtered_delete_skips_shared_by_default(self, service):
+        """Even with a category filter, shared writes survive by default."""
+        from schemas import MemoryResponse
+        service.list_memories = MagicMock(return_value=[
+            MemoryResponse(id="t-priv", memory="x", visibility="private"),
+            MemoryResponse(id="t-share", memory="x", visibility="shared"),
+        ])
+        service._memory.get.return_value = {"memory": "x", "metadata": {}}
+        service._memory.delete = MagicMock()
+        result = service.delete_memories(user_id="alice", category="tech_stack")
+        deleted = [c.args[0] for c in service._memory.delete.call_args_list]
+        assert deleted == ["t-priv"]
+        assert "preserved 1 shared" in result["message"]
+
+    def test_filtered_delete_with_include_shared_true_removes_shared(self, service):
+        from schemas import MemoryResponse
+        service.list_memories = MagicMock(return_value=[
+            MemoryResponse(id="t-priv", memory="x", visibility="private"),
+            MemoryResponse(id="t-share", memory="x", visibility="shared"),
+        ])
+        service._memory.get.return_value = {"memory": "x", "metadata": {}}
+        service._memory.delete = MagicMock()
+        service.delete_memories(user_id="alice", category="tech_stack", include_shared=True)
+        deleted = [c.args[0] for c in service._memory.delete.call_args_list]
+        assert set(deleted) == {"t-priv", "t-share"}
+
+    def test_legacy_visibility_none_treated_as_private(self, service):
+        """Existing memories with no visibility metadata count as private
+        (safe default) and are deleted in the default sweep."""
+        service._scroll_all_user_memories = MagicMock(return_value=[
+            {"id": "legacy-1", "payload": {"data": "x", "metadata": {}}},
+        ])
+        service._memory.vector_store.delete = MagicMock()
+        service.delete_memories(user_id="alice")
+        deleted = [c.args[0] for c in service._memory.vector_store.delete.call_args_list]
+        assert deleted == ["legacy-1"]
+
+
+class TestExpireGraphEdgesForMemoryScope:
+    """Regression for CR-07: per-memory edge expiration uses the memory's
+    exact group_id, not the owner's full readable namespace.
+    """
+
+    def test_private_memory_only_expires_private_group(self, service):
+        """A private memory's edge cleanup should NEVER touch the shared pool."""
+        from graphiti_core.search.search_config_recipes import EDGE_HYBRID_SEARCH_RRF
+        # Mock the bridge call so we capture the group_ids actually passed
+        service._run_on_bridge = MagicMock(return_value=MagicMock(edges=[]))
+        service._graphiti = MagicMock()
+        service._graphiti.search_ = MagicMock()
+        mem = {
+            "memory": "alice's secret",
+            "metadata": {
+                "owner_user_id": "alice",
+                "visibility": "private",
+                "project_id": None,
+            },
+        }
+        service._expire_graph_edges_for_memory(mem)
+        # _graphiti.search_ should have been called with group_ids=["user--alice"]
+        call_kwargs = service._graphiti.search_.call_args[1]
+        assert call_kwargs["group_ids"] == ["user--alice"]
+
+    def test_shared_memory_only_expires_shared_group(self, service):
+        service._run_on_bridge = MagicMock(return_value=MagicMock(edges=[]))
+        service._graphiti = MagicMock()
+        service._graphiti.search_ = MagicMock()
+        mem = {
+            "memory": "shared fact",
+            "metadata": {
+                "owner_user_id": "alice",
+                "visibility": "shared",
+                "project_id": "myproj",
+            },
+        }
+        service._expire_graph_edges_for_memory(mem)
+        call_kwargs = service._graphiti.search_.call_args[1]
+        assert call_kwargs["group_ids"] == ["shared--project--myproj"]
+
+
+class TestSearchGraphForVisibility:
+    """Regression for CP-01/CP-02: graph search is scoped by visibility at
+    the group_ids level, not just post-filtered.
+    """
+
+    def test_private_only_scopes_to_user_groups(self, service):
+        service._do_graph_search = MagicMock(return_value={"edges": [], "nodes": [], "episodes": [], "communities": []})
+        service._search_graph_for_visibility(
+            query="x", user_id="alice", project_id=None, limit=10,
+            visibility="private", include_shared=True,
+        )
+        kwargs = service._do_graph_search.call_args[1]
+        assert kwargs["group_ids"] == ["user--alice"]
+        # CRITICALLY: 'shared' must NOT appear in the private-only group_ids
+        assert "shared" not in kwargs["group_ids"]
+
+    def test_shared_only_scopes_to_shared_groups(self, service):
+        service._do_graph_search = MagicMock(return_value={"edges": [], "nodes": [], "episodes": [], "communities": []})
+        service._search_graph_for_visibility(
+            query="x", user_id="alice", project_id="myproj", limit=10,
+            visibility="shared", include_shared=True,
+        )
+        kwargs = service._do_graph_search.call_args[1]
+        assert kwargs["group_ids"] == ["shared", "shared--project--myproj"]
+        # CRITICALLY: no 'user--alice' in shared-only group_ids
+        assert not any("user--alice" in g for g in kwargs["group_ids"])
+
+    def test_include_shared_false_scopes_to_user_only(self, service):
+        service._do_graph_search = MagicMock(return_value={"edges": [], "nodes": [], "episodes": [], "communities": []})
+        service._search_graph_for_visibility(
+            query="x", user_id="alice", project_id=None, limit=10,
+            visibility=None, include_shared=False,
+        )
+        kwargs = service._do_graph_search.call_args[1]
+        assert kwargs["group_ids"] == ["user--alice"]
+
+    def test_default_uses_full_read_set(self, service):
+        service._do_graph_search = MagicMock(return_value={"edges": [], "nodes": [], "episodes": [], "communities": []})
+        service._search_graph_for_visibility(
+            query="x", user_id="alice", project_id=None, limit=10,
+            visibility=None, include_shared=True,
+        )
+        kwargs = service._do_graph_search.call_args[1]
+        # Same as _get_group_ids — caller's private + shared
+        assert "user--alice" in kwargs["group_ids"]
+        assert "shared" in kwargs["group_ids"]
+
+
+class TestGraphEnrichmentMultiUser:
+    """``_enrich_graph_with_v2`` allows shared-pool sources, not just user's own."""
+
+    def test_filter_uses_should_clause_for_user_or_shared(self, service):
+        """The Qdrant filter must accept either caller's user_id or shared-pool."""
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.query_points.return_value = _qresult([])
+        responses = [MemoryResponse(id="g1", memory="fact1", source="graph")]
+        service._enrich_graph_with_v2(responses, user_id="alice", project_id=None)
+
+        qf = service._memory.vector_store.client.query_points.call_args[1]["query_filter"]
+        # The should clause should contain user_id=alice OR visibility=shared
+        should_keys = {
+            c.key for c in qf.should
+            if isinstance(c, FieldCondition)
+        }
+        assert "user_id" in should_keys
+        assert "metadata.visibility" in should_keys

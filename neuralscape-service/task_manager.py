@@ -4,6 +4,7 @@ Centralizes task enqueuing and status tracking, replacing the in-memory _tasks d
 """
 
 import hashlib
+import json
 import logging
 
 from arq.connections import ArqRedis, create_pool
@@ -81,13 +82,38 @@ class TaskManager:
         tags: list[str] | None = None,
         agent_id: str | None = None,
         run_id: str | None = None,
+        # Memory-model v2 fields
+        domain: str | None = None,
+        observation_type: str | None = None,
+        concepts: list[str] | None = None,
+        source_type: str | None = None,
+        related_memory_ids: list[str] | None = None,
+        confidence: float | None = None,
+        expires_at: str | None = None,
+        # Multi-user model
+        visibility: str | None = None,
     ) -> str:
         """Enqueue raw memory storage task. Returns task_id (job_id).
 
         Uses a deterministic job ID based on content hash to prevent
-        duplicate enqueues of the same fact.
+        duplicate enqueues of the same fact. v2 + multi-user fields are
+        forwarded as a kwargs dict to the worker so the signature stays
+        backward-compatible.
         """
         job_id = _generate_job_id(f"raw:{content}", user_id)
+
+        v2_extras = {
+            "domain": domain,
+            "observation_type": observation_type,
+            "concepts": concepts,
+            "source_type": source_type,
+            "related_memory_ids": related_memory_ids,
+            "confidence": confidence,
+            "expires_at": expires_at,
+            "visibility": visibility,
+        }
+        # Drop None values so the worker signature can default cleanly
+        v2_extras = {k: v for k, v in v2_extras.items() if v is not None}
 
         job = await self.pool.enqueue_job(
             "process_memory_raw",
@@ -99,6 +125,33 @@ class TaskManager:
             tags,
             agent_id,
             run_id,
+            v2_extras,
+            _job_id=job_id,
+        )
+        if job is None:
+            return job_id
+        return job.job_id
+
+    async def enqueue_raw_batch(self, items: list[dict]) -> str:
+        """Enqueue a batch of raw memory storage tasks (memory-model v2).
+
+        Items are dispatched as a single ARQ job. Job ID is deterministic
+        based on a canonical JSON encoding of the items so distinct batches
+        cannot collide even when item content includes delimiter characters
+        like ``|`` or quotes.
+        """
+        # Canonical JSON gives us a representation that's stable across
+        # re-orderings of dict keys (sort_keys=True) and unambiguous w.r.t.
+        # special characters — far safer than join(delimiter, ...).
+        canonical = json.dumps(items, sort_keys=True, separators=(",", ":"))
+        # Keep the deterministic-id key partitioned by the first item's user
+        # so two users batching the same content still get distinct job ids.
+        partition_user = items[0].get("user_id", "batch") if items else "batch"
+        job_id = _generate_job_id(f"raw_batch:{canonical}", partition_user)
+
+        job = await self.pool.enqueue_job(
+            "process_memory_raw_batch",
+            items,
             _job_id=job_id,
         )
         if job is None:

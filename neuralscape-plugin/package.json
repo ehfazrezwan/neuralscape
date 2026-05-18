@@ -1,15 +1,32 @@
 {
   "name": "neuralscape-plugin",
-  "version": "1.0.0",
-  "description": "Claude Code plugin for Neuralscape persistent memory",
+  "version": "2.2.0",
+  "description": "Persistent agentic memory plugin for Claude Code and Claude Cowork",
   "private": true,
   "type": "module",
+  "license": "MIT",
+  "author": {
+    "name": "Ehfaz Rezwan",
+    "email": "ehfaz.rezwan@gmail.com"
+  },
+  "homepage": "https://github.com/ehfazrezwan/neuralscape",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ehfazrezwan/neuralscape.git",
+    "directory": "neuralscape-plugin"
+  },
   "scripts": {
     "build": "node esbuild.config.js",
-    "watch": "node esbuild.config.js --watch"
+    "watch": "node esbuild.config.js --watch",
+    "postinstall": "node esbuild.config.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
   },
   "devDependencies": {
-    "esbuild": "^0.24.0",
-    "typescript": "^5.7.0"
+    "@vitest/coverage-v8": "^4.1.6",
+    "esbuild": "^0.28.0",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.6"
   }
 }

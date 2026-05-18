@@ -494,3 +494,440 @@ class TestV1GraphIntrospection:
         mock_service.get_graph_communities.return_value = []
         resp = client.get("/v1/graph/communities", params={"user_id": "ehfaz"})
         assert resp.status_code == 200
+
+
+# ══════════════════════════════════════════════
+# V1 Memory model v2 endpoints
+# ══════════════════════════════════════════════
+
+
+class TestV1StoreRawMemoryV2:
+    """Memory-model v2 — POST /v1/memories/raw with v2 fields."""
+
+    def test_serializes_expires_at_datetime_for_enqueue(self, client, mock_task_manager):
+        """expires_at as datetime gets ISO-stringified before enqueue."""
+        resp = client.post("/v1/memories/raw", json={
+            "content": "Time-bound fact",
+            "user_id": "ehfaz",
+            "category": "task_context",
+            "domain": "coding",
+            "observation_type": "task_plan",
+            "concepts": ["next-step"],
+            "source_type": "tool_extraction",
+            "confidence": 0.85,
+            "expires_at": "2026-12-01T00:00:00+00:00",
+        })
+        assert resp.status_code == 202
+        kwargs = mock_task_manager.enqueue_raw.call_args[1]
+        assert kwargs["domain"] == "coding"
+        assert kwargs["observation_type"] == "task_plan"
+        assert kwargs["concepts"] == ["next-step"]
+        assert kwargs["source_type"] == "tool_extraction"
+        assert kwargs["confidence"] == 0.85
+        # ISO string survives the JSON-enqueue serialization
+        assert kwargs["expires_at"] == "2026-12-01T00:00:00+00:00"
+
+    def test_redis_unavailable_falls_back_to_sync(self, client, mock_task_manager, mock_service):
+        """When Redis is down, the route calls service.store_raw directly."""
+        from schemas import MemoryResponse
+
+        mock_task_manager.enqueue_raw.side_effect = ConnectionError("Redis down")
+        mock_service.store_raw.return_value = [
+            MemoryResponse(id="m1", memory="x", category="preference"),
+        ]
+        resp = client.post("/v1/memories/raw", json={
+            "content": "x",
+            "user_id": "ehfaz",
+            "category": "preference",
+            "expires_at": "2026-12-01T00:00:00+00:00",  # exercises ISO → datetime path
+        })
+        assert resp.status_code == 200
+        # store_raw was called with the deserialized datetime
+        call_kwargs = mock_service.store_raw.call_args[1]
+        from datetime import datetime
+        assert isinstance(call_kwargs["expires_at"], datetime)
+
+    def test_redis_unavailable_no_expires_sync_fallback(self, client, mock_task_manager, mock_service):
+        """When Redis is down and no expires_at is supplied, sync fallback still succeeds.
+
+        Note: Pydantic rejects malformed `expires_at` ISO strings at request
+        validation (422), so the route's defensive `except ValueError`
+        branch in the sync-fallback path is unreachable through the HTTP
+        contract. That branch is exercised by the unit test
+        `test_handles_iso_string_expires_at` against `store_raw_batch`.
+        """
+        from schemas import MemoryResponse
+        mock_task_manager.enqueue_raw.side_effect = OSError("Connection refused")
+        mock_service.store_raw.return_value = [MemoryResponse(id="m1", memory="x")]
+        resp = client.post("/v1/memories/raw", json={
+            "content": "x",
+            "user_id": "ehfaz",
+            "category": "preference",
+        })
+        assert resp.status_code == 200
+
+
+class TestV1StoreRawBatch:
+    """Memory-model v2 — POST /v1/memories/raw/batch."""
+
+    def test_enqueues_batch_returns_202(self, client, mock_task_manager):
+        mock_task_manager.enqueue_raw_batch = AsyncMock(return_value="batch-task-id")
+        resp = client.post("/v1/memories/raw/batch", json={
+            "memories": [
+                {"content": "Fact A", "user_id": "ehfaz", "category": "preference"},
+                {"content": "Fact B", "user_id": "ehfaz", "category": "personal_fact",
+                 "domain": "personal"},
+            ],
+        })
+        assert resp.status_code == 202
+        data = resp.json()
+        assert data["task_id"] == "batch-task-id"
+        mock_task_manager.enqueue_raw_batch.assert_called_once()
+        items = mock_task_manager.enqueue_raw_batch.call_args[1]["items"]
+        assert len(items) == 2
+        assert items[1]["domain"] == "personal"
+
+    def test_serializes_expires_at_in_each_item(self, client, mock_task_manager):
+        mock_task_manager.enqueue_raw_batch = AsyncMock(return_value="batch-task-id")
+        resp = client.post("/v1/memories/raw/batch", json={
+            "memories": [
+                {"content": "x", "user_id": "u", "category": "task_context",
+                 "expires_at": "2026-12-01T00:00:00+00:00"},
+            ],
+        })
+        assert resp.status_code == 202
+        items = mock_task_manager.enqueue_raw_batch.call_args[1]["items"]
+        # Stored as ISO string for JSON-enqueue safety
+        assert items[0]["expires_at"] == "2026-12-01T00:00:00+00:00"
+
+    def test_invalid_category_in_one_item_400s_whole_batch(self, client, mock_task_manager):
+        resp = client.post("/v1/memories/raw/batch", json={
+            "memories": [
+                {"content": "Fact A", "user_id": "ehfaz", "category": "preference"},
+                {"content": "Fact B", "user_id": "ehfaz", "category": "BOGUS"},
+            ],
+        })
+        assert resp.status_code == 400
+        assert "Item 1" in resp.json()["detail"]
+
+    def test_project_scope_without_project_id_400s(self, client):
+        resp = client.post("/v1/memories/raw/batch", json={
+            "memories": [
+                {"content": "Fact A", "user_id": "ehfaz", "category": "tech_stack",
+                 "scope": "project"},
+            ],
+        })
+        assert resp.status_code == 400
+        assert "Item 0" in resp.json()["detail"]
+
+    def test_redis_unavailable_falls_back_to_sync_batch(self, client, mock_task_manager, mock_service):
+        from schemas import MemoryResponse
+        mock_task_manager.enqueue_raw_batch = AsyncMock(side_effect=ConnectionError("Redis down"))
+        mock_service.store_raw_batch.return_value = [
+            MemoryResponse(id="m1", memory="A", category="preference"),
+            MemoryResponse(id="m2", memory="B", category="personal_fact"),
+        ]
+        resp = client.post("/v1/memories/raw/batch", json={
+            "memories": [
+                {"content": "A", "user_id": "ehfaz", "category": "preference"},
+                {"content": "B", "user_id": "ehfaz", "category": "personal_fact"},
+            ],
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "ok"
+        assert len(data["memories"]) == 2
+        mock_service.store_raw_batch.assert_called_once()
+
+    def test_empty_batch_422s(self, client):
+        """RawMemoryBatchRequest min_length=1 rejects empty memories list."""
+        resp = client.post("/v1/memories/raw/batch", json={"memories": []})
+        assert resp.status_code == 422  # Pydantic validation error
+
+    def test_oversized_batch_422s(self, client):
+        """RawMemoryBatchRequest max_length=50 rejects > 50 items."""
+        items = [
+            {"content": f"f{i}", "user_id": "u", "category": "preference"}
+            for i in range(51)
+        ]
+        resp = client.post("/v1/memories/raw/batch", json={"memories": items})
+        assert resp.status_code == 422
+
+
+class TestV1SearchV2:
+    """Memory-model v2 — search route honors new optional filters."""
+
+    def test_passes_v2_filters_through(self, client, mock_service):
+        mock_service.search.return_value = []
+        resp = client.post("/v1/search", json={
+            "query": "anything",
+            "user_id": "ehfaz",
+            "domain": "research",
+            "observation_type": "discovery",
+            "concepts": ["gotcha", "pattern"],
+        })
+        assert resp.status_code == 200
+        kwargs = mock_service.search.call_args[1]
+        assert kwargs["domain"] == "research"
+        assert kwargs["observation_type"] == "discovery"
+        assert kwargs["concepts"] == ["gotcha", "pattern"]
+
+
+# ══════════════════════════════════════════════
+# Multi-user identity resolution (token vs body)
+# ══════════════════════════════════════════════
+
+
+class TestV1MultiUserIdentityResolution:
+    """Routes prefer request.state.user_id (token-derived) over body user_id.
+
+    The TestClient bypasses the actual auth middleware, so for these tests
+    we monkey-patch `_resolve_user_id` or simulate a verified token by
+    pushing user_id into request state via a small middleware override.
+    """
+
+    def _push_token_user_id(self, app_user_id: str):
+        """Return a starlette middleware that sets request.state.user_id."""
+        from starlette.middleware.base import BaseHTTPMiddleware
+
+        class _UserIdInjector(BaseHTTPMiddleware):
+            async def dispatch(self, request, call_next):
+                request.state.user_id = app_user_id
+                return await call_next(request)
+
+        return _UserIdInjector
+
+    def test_route_prefers_token_user_id_over_body(self, mock_service, mock_task_manager):
+        """When a token attaches user_id=alice and the body says nothing,
+        the route uses alice."""
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        import main
+        # Build a fresh app with our identity-injecting middleware in front.
+        injector = self._push_token_user_id("alice-from-token")
+        sub_app = FastAPI()
+        sub_app.add_middleware(injector)
+        sub_app.include_router(main.v1_router)
+        client = TestClient(sub_app, raise_server_exceptions=False)
+
+        resp = client.post("/v1/memories/raw", json={
+            "content": "hello",
+            "category": "preference",
+            # No user_id in body — route should use the token's
+        })
+        assert resp.status_code in (200, 202)
+        kwargs = mock_task_manager.enqueue_raw.call_args[1]
+        assert kwargs["user_id"] == "alice-from-token"
+
+    def test_token_body_mismatch_returns_400(self, mock_service, mock_task_manager):
+        """If body has user_id=bob but the token says alice, reject."""
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        import main
+        injector = self._push_token_user_id("alice-from-token")
+        sub_app = FastAPI()
+        sub_app.add_middleware(injector)
+        sub_app.include_router(main.v1_router)
+        client = TestClient(sub_app, raise_server_exceptions=False)
+
+        resp = client.post("/v1/memories/raw", json={
+            "content": "hello",
+            "user_id": "bob-impersonator",
+            "category": "preference",
+        })
+        assert resp.status_code == 400
+        assert "does not match" in resp.json()["detail"]
+
+    def test_token_body_match_passes(self, mock_service, mock_task_manager):
+        """body user_id == token user_id is fine."""
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        import main
+        injector = self._push_token_user_id("alice-from-token")
+        sub_app = FastAPI()
+        sub_app.add_middleware(injector)
+        sub_app.include_router(main.v1_router)
+        client = TestClient(sub_app, raise_server_exceptions=False)
+
+        resp = client.post("/v1/memories/raw", json={
+            "content": "hello",
+            "user_id": "alice-from-token",
+            "category": "preference",
+        })
+        assert resp.status_code in (200, 202)
+
+    def test_legacy_no_token_falls_back_to_body(self, client, mock_task_manager):
+        """Without a token (legacy shared-key callers), body user_id wins."""
+        resp = client.post("/v1/memories/raw", json={
+            "content": "hello",
+            "user_id": "legacy-alice",
+            "category": "preference",
+        })
+        assert resp.status_code in (200, 202)
+        kwargs = mock_task_manager.enqueue_raw.call_args[1]
+        assert kwargs["user_id"] == "legacy-alice"
+
+    def test_search_token_body_mismatch_returns_400(self, mock_service):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        import main
+        injector = self._push_token_user_id("alice")
+        sub_app = FastAPI()
+        sub_app.add_middleware(injector)
+        sub_app.include_router(main.v1_router)
+        client = TestClient(sub_app, raise_server_exceptions=False)
+
+        resp = client.post("/v1/search", json={
+            "query": "anything",
+            "user_id": "bob",
+        })
+        assert resp.status_code == 400
+
+
+class TestV1SearchMultiUserFlags:
+    """Visibility + include_shared are forwarded to MemoryService.search."""
+
+    def test_visibility_private_forwarded(self, client, mock_service):
+        mock_service.search.return_value = []
+        resp = client.post("/v1/search", json={
+            "query": "x",
+            "user_id": "alice",
+            "visibility": "private",
+        })
+        assert resp.status_code == 200
+        kwargs = mock_service.search.call_args[1]
+        assert kwargs["visibility"] == "private"
+
+    def test_visibility_shared_forwarded(self, client, mock_service):
+        mock_service.search.return_value = []
+        resp = client.post("/v1/search", json={
+            "query": "x",
+            "user_id": "alice",
+            "visibility": "shared",
+        })
+        kwargs = mock_service.search.call_args[1]
+        assert kwargs["visibility"] == "shared"
+
+    def test_include_shared_false_forwarded(self, client, mock_service):
+        mock_service.search.return_value = []
+        resp = client.post("/v1/search", json={
+            "query": "x",
+            "user_id": "alice",
+            "include_shared": False,
+        })
+        kwargs = mock_service.search.call_args[1]
+        assert kwargs["include_shared"] is False
+
+    def test_invalid_visibility_value_rejected(self, client):
+        resp = client.post("/v1/search", json={
+            "query": "x",
+            "user_id": "alice",
+            "visibility": "not-a-real-vis",
+        })
+        # Pydantic enum validation produces 422
+        assert resp.status_code == 422
+
+    def test_raw_store_visibility_forwarded(self, client, mock_task_manager):
+        resp = client.post("/v1/memories/raw", json={
+            "content": "Project uses Postgres",
+            "user_id": "alice",
+            "category": "tech_stack",
+            "scope": "project",
+            "project_id": "neuralscape",
+            "visibility": "shared",
+        })
+        assert resp.status_code in (200, 202)
+        kwargs = mock_task_manager.enqueue_raw.call_args[1]
+        assert kwargs["visibility"] == "shared"
+
+
+class TestV1BatchUserIdBypass:
+    """Regression for CR-05: a token-authenticated batch caller can NOT
+    sidestep their token's user_id by submitting `item.user_id=""`.
+
+    Pre-fix: items_payload was built via `d.setdefault("user_id", ...)`,
+    which preserved an explicitly-empty user_id from the request body.
+    Post-fix: when a token is present, every item's user_id is
+    overwritten with the token's user_id.
+    """
+
+    def _push_token_user_id(self, app_user_id: str):
+        from starlette.middleware.base import BaseHTTPMiddleware
+
+        class _UserIdInjector(BaseHTTPMiddleware):
+            async def dispatch(self, request, call_next):
+                request.state.user_id = app_user_id
+                return await call_next(request)
+
+        return _UserIdInjector
+
+    def _client_with_token(self, app_user_id: str):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        import main
+        injector = self._push_token_user_id(app_user_id)
+        sub_app = FastAPI()
+        sub_app.add_middleware(injector)
+        sub_app.include_router(main.v1_router)
+        return TestClient(sub_app, raise_server_exceptions=False)
+
+    def test_empty_user_id_in_item_rejected_at_schema(self, mock_task_manager):
+        """Empty user_id is rejected by schema validation (pattern requires
+        non-empty), so it can't reach the route — first line of defense."""
+        client = self._client_with_token("alice-from-token")
+        resp = client.post("/v1/memories/raw/batch", json={
+            "memories": [
+                {"content": "x", "user_id": "", "category": "preference"},
+            ],
+        })
+        assert resp.status_code == 422
+
+    def test_missing_user_id_in_item_filled_from_token(self, mock_task_manager):
+        from unittest.mock import AsyncMock
+        mock_task_manager.enqueue_raw_batch = AsyncMock(return_value="batch-task")
+        client = self._client_with_token("alice-from-token")
+        resp = client.post("/v1/memories/raw/batch", json={
+            "memories": [
+                {"content": "x", "category": "preference"},
+            ],
+        })
+        assert resp.status_code in (200, 202)
+        items = mock_task_manager.enqueue_raw_batch.call_args[1]["items"]
+        assert items[0]["user_id"] == "alice-from-token"
+
+    def test_matching_user_id_in_item_kept_as_token(self, mock_task_manager):
+        from unittest.mock import AsyncMock
+        mock_task_manager.enqueue_raw_batch = AsyncMock(return_value="batch-task")
+        client = self._client_with_token("alice-from-token")
+        resp = client.post("/v1/memories/raw/batch", json={
+            "memories": [
+                {"content": "x", "user_id": "alice-from-token", "category": "preference"},
+            ],
+        })
+        assert resp.status_code in (200, 202)
+        items = mock_task_manager.enqueue_raw_batch.call_args[1]["items"]
+        assert items[0]["user_id"] == "alice-from-token"
+
+    def test_mismatching_user_id_in_item_returns_400(self, mock_task_manager):
+        client = self._client_with_token("alice-from-token")
+        resp = client.post("/v1/memories/raw/batch", json={
+            "memories": [
+                {"content": "x", "user_id": "bob-impersonator", "category": "preference"},
+            ],
+        })
+        assert resp.status_code == 400
+        assert "does not match" in resp.json()["detail"]
+
+    def test_legacy_no_token_keeps_per_item_user_id(self, client, mock_task_manager):
+        """Without a token (legacy shared-key path), per-item body user_id
+        is trusted as before."""
+        from unittest.mock import AsyncMock
+        mock_task_manager.enqueue_raw_batch = AsyncMock(return_value="batch-task")
+        resp = client.post("/v1/memories/raw/batch", json={
+            "memories": [
+                {"content": "x", "user_id": "legacy-alice", "category": "preference"},
+            ],
+        })
+        assert resp.status_code in (200, 202)
+        items = mock_task_manager.enqueue_raw_batch.call_args[1]["items"]
+        assert items[0]["user_id"] == "legacy-alice"

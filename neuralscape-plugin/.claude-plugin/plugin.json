@@ -1,9 +1,60 @@
 {
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "neuralscape",
-  "version": "1.0.0",
-  "description": "Persistent memory for Claude Code — automatic context capture and retrieval via Neuralscape",
+  "version": "2.2.0",
+  "description": "Persistent agentic memory for Claude. Multi-user support: each user has personal memory (only they can read it) plus access to a shared team knowledge pool. Auto-captures conversations + per-tool observations, recalls relevant context on every session start, and exposes 7 MCP tools (recall, remember, search, project context, graph search, list, delete).",
   "author": {
     "name": "Ehfaz Rezwan",
     "email": "ehfaz.rezwan@gmail.com"
+  },
+  "homepage": "https://github.com/ehfazrezwan/neuralscape",
+  "repository": "https://github.com/ehfazrezwan/neuralscape",
+  "license": "MIT",
+  "keywords": [
+    "memory",
+    "context",
+    "rag",
+    "knowledge-graph",
+    "mem0",
+    "graphiti",
+    "neuralscape",
+    "agent",
+    "claude-code",
+    "claude-cowork"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "userConfig": {
+    "URL": {
+      "type": "string",
+      "title": "Neuralscape service URL",
+      "description": "Base URL of your Neuralscape API (e.g. https://neuralscape.example.com or http://localhost:8199).",
+      "required": true,
+      "default": "http://localhost:8199"
+    },
+    "API_KEY": {
+      "type": "string",
+      "title": "Bearer token (per-user) or legacy shared API key",
+      "description": "For multi-user deployments, this is your per-user token issued by the admin via `scripts/issue_user_token.py --user <name>`. The token encodes your user_id; the server reads it from the token, not from the body. For legacy single-user deployments, this is the shared NEURALSCAPE_API_KEY. Leave empty for local dev.",
+      "sensitive": true
+    },
+    "USER_ID": {
+      "type": "string",
+      "title": "Your user ID",
+      "description": "Stable identifier used to scope memories to you. When using a per-user token, this must match the user_id encoded in the token (or be left empty — the token wins). Required for legacy shared-key auth.",
+      "required": true
+    },
+    "COMPILE_THRESHOLD": {
+      "type": "string",
+      "title": "Compile threshold (observations)",
+      "description": "Buffer size that triggers in-session compilation via UserPromptSubmit. Default: 25.",
+      "default": "25"
+    },
+    "COMPILE_AGE_MIN": {
+      "type": "string",
+      "title": "Compile age (minutes)",
+      "description": "Buffer age (oldest entry) that triggers in-session compilation. Default: 30.",
+      "default": "30"
+    }
   }
 }

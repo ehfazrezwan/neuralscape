@@ -31,13 +31,17 @@ class EmbeddingBase(ABC):
         pass
 
     def embed_batch(self, texts: list[str], memory_action: Optional[Literal["add", "search", "update"]] = None) -> list[list]:
-        """Get embeddings for multiple texts. Subclasses may override with a native batch API.
+        """Embed multiple texts. Override in subclasses for native batch support.
+
+        Default implementation calls embed() sequentially for each text.
+        Subclasses with native batch APIs (e.g., OpenAI, Gemini) should override
+        this for better performance.
 
         Args:
-            texts: List of texts to embed.
-            memory_action: Optional embedding type hint.
+            texts: List of text strings to embed.
+            memory_action: The action context ("add", "search", "update").
 
         Returns:
-            List of embedding vectors, one per input text.
+            List of embedding vectors (list of floats), one per input text.
         """
         return [self.embed(text, memory_action=memory_action) for text in texts]

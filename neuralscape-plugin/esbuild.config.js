@@ -1,9 +1,11 @@
 import * as esbuild from "esbuild";
 
 const entryPoints = [
-  "src/session-start.ts",
-  "src/post-tool-use.ts",
-  "src/stop.ts",
+  "src/hooks/session-start.ts",
+  "src/hooks/conversation-turn.ts",
+  "src/hooks/session-end.ts",
+  "src/hooks/post-tool-use.ts",
+  "src/hooks/user-prompt-submit.ts",
 ];
 
 const isWatch = process.argv.includes("--watch");
@@ -15,6 +17,8 @@ const buildOptions = {
   target: "node18",
   format: "esm",
   outdir: "scripts",
+  outbase: "src/hooks",
+  minify: true,
   banner: {
     js: '#!/usr/bin/env node',
   },

@@ -961,7 +961,7 @@ wheels = [
 
 [[package]]
 name = "mem0ai"
-version = "1.0.4"
+version = "2.0.2"
 source = { editable = "../mem0" }
 dependencies = [
     { name = "openai" },
@@ -996,22 +996,19 @@ requires-dist = [
     { name = "graphiti-core", extras = ["google-genai"], marker = "extra == 'graphiti'", editable = "../graphiti" },
     { name = "groq", marker = "extra == 'llms'", specifier = ">=0.3.0" },
     { name = "isort", marker = "extra == 'dev'", specifier = ">=5.13.2" },
-    { name = "kuzu", marker = "extra == 'graph'", specifier = ">=0.11.0" },
-    { name = "langchain-aws", marker = "extra == 'graph'", specifier = ">=0.2.23" },
-    { name = "langchain-aws", marker = "extra == 'vector-stores'", specifier = ">=0.2.23" },
-    { name = "langchain-community", marker = "extra == 'extras'", specifier = ">=0.0.0" },
-    { name = "langchain-memgraph", marker = "extra == 'graph'", specifier = ">=0.1.0" },
-    { name = "langchain-neo4j", marker = "extra == 'graph'", specifier = ">=0.4.0" },
-    { name = "litellm", marker = "extra == 'llms'", specifier = ">=1.74.0" },
-    { name = "neo4j", marker = "extra == 'graph'", specifier = ">=5.23.1" },
-    { name = "ollama", marker = "extra == 'llms'", specifier = ">=0.1.0" },
+    { name = "langchain", marker = "extra == 'extras'", specifier = ">=0.3.0,<1.0.0" },
+    { name = "langchain-aws", marker = "extra == 'vector-stores'", specifier = ">=0.2.23,<0.3.0" },
+    { name = "langchain-community", marker = "extra == 'extras'", specifier = ">=0.3.0,<1.0.0" },
+    { name = "langchain-core", marker = "extra == 'extras'", specifier = ">=0.3.81,<1.0.0" },
+    { name = "litellm", marker = "extra == 'llms'", specifier = ">=1.83.7" },
+    { name = "ollama", marker = "extra == 'llms'", specifier = ">=0.3.0" },
     { name = "openai", specifier = ">=1.90.0" },
     { name = "openai", marker = "extra == 'llms'", specifier = ">=1.90.0" },
     { name = "opensearch-py", marker = "extra == 'extras'", specifier = ">=2.0.0" },
     { name = "pinecone", marker = "extra == 'vector-stores'", specifier = "<=7.3.0" },
     { name = "pinecone-text", marker = "extra == 'vector-stores'", specifier = ">=0.10.0" },
-    { name = "posthog", specifier = ">=3.5.0" },
-    { name = "protobuf", specifier = ">=5.29.0,<6.0.0" },
+    { name = "posthog", specifier = ">=4.5.0" },
+    { name = "protobuf", specifier = ">=5.29.6,<7.0.0" },
     { name = "psycopg", marker = "extra == 'vector-stores'", specifier = ">=3.2.8" },
     { name = "psycopg-pool", marker = "extra == 'vector-stores'", specifier = ">=3.2.6,<4.0.0" },
     { name = "pydantic", specifier = ">=2.7.3" },
@@ -1024,21 +1021,21 @@ requires-dist = [
     { name = "pytest-asyncio", marker = "extra == 'test'", specifier = ">=0.23.7" },
     { name = "pytest-mock", marker = "extra == 'test'", specifier = ">=3.14.0" },
     { name = "pytz", specifier = ">=2024.1" },
-    { name = "qdrant-client", specifier = ">=1.9.1" },
-    { name = "rank-bm25", marker = "extra == 'graph'", specifier = ">=0.2.2" },
+    { name = "qdrant-client", specifier = ">=1.12.0" },
     { name = "redis", marker = "extra == 'vector-stores'", specifier = ">=5.0.0,<6.0.0" },
     { name = "redisvl", marker = "extra == 'vector-stores'", specifier = ">=0.1.0,<1.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6.5" },
     { name = "sentence-transformers", marker = "extra == 'extras'", specifier = ">=5.0.0" },
+    { name = "spacy", marker = "extra == 'nlp'", specifier = ">=3.7.0" },
     { name = "sqlalchemy", specifier = ">=2.0.31" },
     { name = "together", marker = "extra == 'llms'", specifier = ">=0.2.10" },
-    { name = "upstash-vector", marker = "extra == 'vector-stores'", specifier = ">=0.1.0" },
+    { name = "upstash-vector", marker = "extra == 'vector-stores'", specifier = ">=0.6.0" },
     { name = "valkey", marker = "extra == 'vector-stores'", specifier = ">=6.0.0" },
     { name = "vecs", marker = "extra == 'vector-stores'", specifier = ">=0.4.0" },
     { name = "vertexai", marker = "extra == 'llms'", specifier = ">=0.1.0" },
-    { name = "weaviate-client", marker = "extra == 'vector-stores'", specifier = ">=4.4.0,<4.15.0" },
+    { name = "weaviate-client", marker = "extra == 'vector-stores'", specifier = ">=4.15.4,<5.0.0" },
 ]
-provides-extras = ["graph", "vector-stores", "llms", "graphiti", "extras", "test", "dev"]
+provides-extras = ["nlp", "vector-stores", "llms", "graphiti", "extras", "test", "dev"]
 
 [[package]]
 name = "neo4j"

@@ -172,3 +172,7 @@ mcp_servers.json
 
 # Docker Compose override (machine-specific)
 docker-compose.override.yml
+
+# Local vault directory (created by Docker volume mount)
+vault/
+settings.local.json

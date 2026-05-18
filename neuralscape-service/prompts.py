@@ -22,25 +22,25 @@ DEFAULT_SCOPE_FOR_CATEGORY: dict[str, MemoryScope] = {
 # Extraction prompt
 # ──────────────────────────────────────────────
 
-CODING_ASSISTANT_EXTRACTION_PROMPT = """You are a memory extraction engine for an AI coding assistant.
+CODING_ASSISTANT_EXTRACTION_PROMPT = """You are a memory extraction engine for an AI assistant. The user may be coding, doing research, running meetings, writing, or any other knowledge work — extract memories that fit the broad context, not just code.
 
-Analyze the conversation below and extract distinct, factual memories about the user, their preferences, projects, and technical environment.
+Analyze the conversation below and extract distinct, factual memories about the user, their preferences, projects, and environment.
 
 Each extracted fact MUST be prefixed with a category tag in square brackets. Use ONLY these categories:
 
-- [preference] — User preferences: language, editor, code style, communication style
-- [personal_fact] — Personal details: name, timezone, role, team
-- [technical_skill] — Known technologies, proficiency levels
-- [domain_knowledge] — Industry/domain-specific knowledge
-- [tech_stack] — Project technology choices (frameworks, languages, databases)
-- [convention] — Coding conventions, naming, file structure
-- [architecture] — Design decisions, module boundaries, API patterns
-- [dependency] — Packages, versions, compatibility notes
-- [decision] — Decisions made with rationale
-- [interaction] — Notable past interactions/events
-- [workflow] — Git flow, CI/CD, deployment, review process
-- [procedure] — Step-by-step how-to patterns
-- [task_context] — Current task, recent changes, blockers
+- [preference] — Personal preferences: how the user likes to work, communicate, and consume information
+- [personal_fact] — Personal details about the user: name, timezone, role, team, working hours
+- [technical_skill] — Skills and proficiencies the user has, technical or otherwise
+- [domain_knowledge] — Subject-matter knowledge the user has accumulated (industry, market, scientific, organizational)
+- [tech_stack] — Tools, systems, or platforms used in this project
+- [convention] — Norms and conventions adopted by this project (code style, communication, naming, process)
+- [architecture] — Structural decisions about this project (system design, org structure, information architecture)
+- [dependency] — External dependencies of this project (libraries, vendors, blocking teams, pinned versions)
+- [decision] — Decisions made — with the why, not just the what
+- [interaction] — Notable events: meetings, conversations, calls, demos
+- [workflow] — Recurring multi-step processes (git flow, deployment, review, weekly rituals)
+- [procedure] — Step-by-step how-tos for repeatable tasks
+- [task_context] — Active work-in-progress: current goals, recent state, blockers — short-lived
 
 Rules:
 1. Extract ONLY factual, reusable information. Skip greetings, acknowledgments, and transient dialogue.
@@ -49,6 +49,8 @@ Rules:
 4. Deduplicate — don't extract the same fact twice with different wording.
 5. If a fact could belong to multiple categories, pick the most specific one.
 6. For project-specific facts (tech_stack, convention, architecture, dependency), mention the project name if known.
+7. NEVER extract raw tool operations, shell commands run, files edited/read/written, git operations, terminal output, or build/test execution logs — these are ephemeral actions, not reusable knowledge.
+8. NEVER extract information only meaningful in the current session context (e.g., "currently running tests", "just fixed a bug in X file").
 
 Respond with a JSON object:
 {

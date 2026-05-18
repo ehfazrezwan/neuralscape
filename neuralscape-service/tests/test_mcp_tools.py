@@ -156,6 +156,90 @@ class TestRememberTool:
         assert call_kwargs["scope"] == "project"
         assert call_kwargs["project_id"] == "my-project"
 
+    @pytest.mark.asyncio
+    async def test_v2_fields_forwarded_to_enqueue(self, mock_mcp_service, mock_task_manager):
+        """Memory-model v2 — domain/observation_type/concepts/etc. flow through to enqueue_raw."""
+        await mcp_server.call_tool("remember", {
+            "content": "Decided to use feature flags via GrowthBook",
+            "user_id": "ehfaz",
+            "category": "decision",
+            "project_id": "my-project",
+            "domain": "coding",
+            "observation_type": "decision",
+            "concepts": ["why-it-exists", "trade-off"],
+            "source_type": "tool_extraction",
+            "confidence": 0.85,
+        })
+        call_kwargs = mock_task_manager.enqueue_raw.call_args[1]
+        assert call_kwargs["domain"] == "coding"
+        assert call_kwargs["observation_type"] == "decision"
+        assert call_kwargs["concepts"] == ["why-it-exists", "trade-off"]
+        assert call_kwargs["source_type"] == "tool_extraction"
+        assert call_kwargs["confidence"] == 0.85
+
+    @pytest.mark.asyncio
+    async def test_redis_unavailable_falls_back_to_sync_with_iso_expires(
+        self, mock_mcp_service, mock_task_manager
+    ):
+        """When Redis is down, sync-fallback re-hydrates expires_at ISO string to datetime."""
+        from datetime import datetime as _dt
+
+        mock_task_manager.enqueue_raw.side_effect = ConnectionError("Redis down")
+        mock_mcp_service.store_raw.return_value = [
+            MemoryResponse(id="m1", memory="x", category="task_context"),
+        ]
+
+        result = await mcp_server.call_tool("remember", {
+            "content": "x",
+            "user_id": "ehfaz",
+            "category": "task_context",
+            "expires_at": "2026-12-01T00:00:00+00:00",
+            "domain": "personal",
+        })
+        data = json.loads(result[0].text)
+        assert data["status"] == "completed"
+        assert data["fallback"] == "sync"
+
+        # The sync path got expires_at as a real datetime, not ISO string
+        call_kwargs = mock_mcp_service.store_raw.call_args[1]
+        assert isinstance(call_kwargs["expires_at"], _dt)
+        assert call_kwargs["domain"] == "personal"
+
+    @pytest.mark.asyncio
+    async def test_redis_unavailable_invalid_iso_drops(self, mock_mcp_service, mock_task_manager):
+        """Malformed expires_at ISO string in fallback path drops to None."""
+        mock_task_manager.enqueue_raw.side_effect = OSError("Connection refused")
+        mock_mcp_service.store_raw.return_value = [
+            MemoryResponse(id="m1", memory="x"),
+        ]
+        await mcp_server.call_tool("remember", {
+            "content": "x",
+            "user_id": "ehfaz",
+            "category": "preference",
+            "expires_at": "not-a-date",
+        })
+        # store_raw was called; expires_at gets dropped (None) so it's not in kwargs
+        # at all (we filter `None` values before passing).
+        assert "expires_at" not in mock_mcp_service.store_raw.call_args[1]
+
+    @pytest.mark.asyncio
+    async def test_wait_true_returns_completed_status(self, mock_mcp_service, mock_task_manager):
+        mock_task_manager.wait_for_result.return_value = {
+            "task_id": "task-123",
+            "status": "completed",
+            "result": {"memories": [{"id": "m1"}]},
+            "error": None,
+        }
+        result = await mcp_server.call_tool("remember", {
+            "content": "x",
+            "user_id": "ehfaz",
+            "category": "preference",
+            "wait": True,
+        })
+        data = json.loads(result[0].text)
+        assert data["status"] == "completed"
+        assert data["task_id"] == "task-123"
+
 
 class TestRememberConversationTool:
     @pytest.mark.asyncio

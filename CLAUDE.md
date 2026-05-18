@@ -87,6 +87,22 @@ REDIS_URL          # Redis connection string
 QDRANT_URL         # Qdrant server URL (omit for local on-disk mode)
 ```
 
+## Git Workflow
+
+**NEVER commit directly to `dev` or `main`.** Always create a feature branch:
+
+```bash
+git checkout -b feature/my-feature dev
+# ... make changes, commit ...
+# push and create PR targeting dev
+git push -u origin feature/my-feature
+gh pr create --base dev
+```
+
+- All work happens on feature branches (`feature/`, `fix/`, `hotfix/`)
+- PRs target `dev`, get reviewed, then merge
+- `dev` → `main` via release PRs only
+
 ## Testing
 
 Tests are in `neuralscape-service/tests/`. Unit tests mock all external services. Integration tests (`test_async_pipeline.py`) require running Neo4j, Redis, and Qdrant — marked with `@pytest.mark.integration`.
