@@ -51,17 +51,6 @@ class SynthesizerSettings(BaseSettings):
         ),
     )
 
-    auto_build_communities: bool = Field(
-        default=True,
-        description=(
-            "Before walking communities, call ``Graphiti.build_communities`` "
-            "for any shared group_id that has zero Community nodes. "
-            "Graphiti's incremental ``update_communities=True`` flag only "
-            "refreshes EXISTING communities; without this pre-build, "
-            "freshly populated groups would never produce synthesis output."
-        ),
-    )
-
     attach_window_seconds: int = Field(
         default=120,
         ge=10,

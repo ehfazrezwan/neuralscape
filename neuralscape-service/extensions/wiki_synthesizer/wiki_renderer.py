@@ -2,6 +2,12 @@
 
 Reuses the atomic-write primitives from the conversation_compiler so
 both extensions share the same file-locking + temp-file-rename semantics.
+
+Page identity is ``(category, group_id)`` — deterministic, one page per
+bucket. Filenames are derived from ``group_id``:
+
+- ``"shared"`` → ``shared.md`` (team-wide pool)
+- ``"shared--project--<pid>"`` → ``<pid>.md`` (per-project shared pool)
 """
 
 from __future__ import annotations
@@ -14,18 +20,27 @@ from extensions.conversation_compiler.obsidian_writer import (
     _atomic_write,
     _slugify,
 )
-
-# Maps the 13 NeuralScape categories to vault folders. Reuses the same
-# table the conversation_compiler keys off of so the wiki tree mirrors
-# the _raw/ tree's directory structure.
-from schemas import CATEGORY_VAULT_PATHS
+from schemas import CATEGORY_VAULT_PATHS, MEMORY_CATEGORIES
 
 
-def community_filename(community_id: str, community_name: str) -> str:
-    """Stable filename for a (category, community) wiki page."""
-    short_id = community_id.split("-", 1)[0] if community_id else "noid"
-    slug = _slugify(community_name) or "untitled"
-    return f"community-{short_id}-{slug}.md"
+_SHARED_PROJECT_PREFIX = "shared--project--"
+
+
+def category_filename(group_id: str) -> str:
+    """Stable filename for a ``(category, group_id)`` wiki page.
+
+    The category is encoded in the folder path (see
+    :func:`wiki_page_path`); the filename only needs to disambiguate the
+    group within that folder.
+    """
+    if not group_id or group_id == "shared":
+        return "shared.md"
+    if group_id.startswith(_SHARED_PROJECT_PREFIX):
+        pid = group_id[len(_SHARED_PROJECT_PREFIX):]
+        return f"{_slugify(pid) or 'unknown'}.md"
+    # Fallback — should not happen for shared synthesis but keeps the
+    # function total.
+    return f"{_slugify(group_id) or 'unknown'}.md"
 
 
 def wiki_page_path(wiki_root: Path, category: str, filename: str) -> Path:
@@ -35,16 +50,35 @@ def wiki_page_path(wiki_root: Path, category: str, filename: str) -> Path:
 
 
 def wikilink_path(category: str, filename: str) -> str:
-    """Vault-root-relative path used in API responses and `[[wikilinks]]`."""
+    """Vault-root-relative path used in API responses and ``[[wikilinks]]``."""
     folder = CATEGORY_VAULT_PATHS.get(category, f"Uncategorized/{_slugify(category)}")
     return f"Wiki/{folder}/{filename}"
+
+
+def category_page_title(category: str, group_id: str) -> str:
+    """Human-readable title for a ``(category, group_id)`` page.
+
+    - ``("convention", "shared")`` → ``"Conventions"`` (team-wide)
+    - ``("convention", "shared--project--neuralscape")`` →
+      ``"Conventions — neuralscape"``
+    """
+    folder = CATEGORY_VAULT_PATHS.get(category, category)
+    # Folder leaves are already nicely capitalized ("Conventions",
+    # "Tech-Stack"); use the trailing segment.
+    base = folder.rsplit("/", 1)[-1].replace("-", " ")
+    if group_id == "shared" or not group_id:
+        return base
+    if group_id.startswith(_SHARED_PROJECT_PREFIX):
+        pid = group_id[len(_SHARED_PROJECT_PREFIX):]
+        return f"{base} — {pid}"
+    return base
 
 
 _FRONTMATTER_RE = re.compile(r"^---\n(?P<fm>.*?)\n---\n(?P<body>.*)$", re.DOTALL)
 
 
 def split_existing_page(content: str) -> tuple[dict, str]:
-    """Return (frontmatter_dict, body_text). Empty input → ({}, "")."""
+    """Return ``(frontmatter_dict, body_text)``. Empty input → ``({}, "")``."""
     if not content:
         return {}, ""
     m = _FRONTMATTER_RE.match(content)
@@ -65,29 +99,25 @@ def render_page(
     *,
     title: str,
     category: str,
-    community_id: str,
-    community_name: str,
     group_id: str,
     visibility: str,
     body: str,
     source_memory_ids: list[str],
-    graph_node_uuids: list[str],
     synthesis_count: int,
     source_count: int,
     now: datetime | None = None,
 ) -> str:
     """Return the full page text (frontmatter + body), ready to atomic-write."""
     timestamp = (now or datetime.now(timezone.utc)).isoformat()
+    description = MEMORY_CATEGORIES.get(category, "")
     fm_lines: list[str] = [
         "---",
         f"title: {title}",
         f"category: {category}",
-        f"community_id: {community_id}",
-        f"community_name: {community_name}",
+        f"category_description: {description}",
         f"visibility: {visibility}",
         f"group_id: {group_id}",
         f"source_memory_ids: {_yaml_list(source_memory_ids)}",
-        f"graph_node_uuids: {_yaml_list(graph_node_uuids)}",
         f"last_synthesized: {timestamp}",
         f"synthesis_count: {synthesis_count}",
         f"source_count: {source_count}",

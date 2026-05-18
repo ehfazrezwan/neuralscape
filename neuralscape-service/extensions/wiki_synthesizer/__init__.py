@@ -81,12 +81,12 @@ class WikiSynthesizerExtension:
             "pages_created": result.pages_created,
             "pages_updated": result.pages_updated,
             "memories_processed": result.memories_processed,
-            "communities_skipped_empty": result.communities_skipped_empty,
+            "pages_skipped_empty": result.pages_skipped_empty,
             "errors": result.errors,
             "pages": [
                 {
                     "category": p.category,
-                    "community_id": p.community_id,
+                    "group_id": p.group_id,
                     "wiki_path": p.wiki_path,
                     "created": p.created,
                     "source_memory_count": p.source_memory_count,
