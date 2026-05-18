@@ -154,6 +154,44 @@ services:
       timeout: 5s
       retries: 3
 
+  # ── Cloudflare tunnel ───────────────────────────────────────────
+  # Exposes the API to the public internet via a Cloudflare Tunnel
+  # without opening any inbound ports on the host. Gated behind the
+  # `tunnel` compose profile so it never starts with a bare
+  # `docker compose up` — only deployments that have provisioned a
+  # tunnel in the Cloudflare dashboard need it. Use:
+  #
+  #   docker compose --profile tunnel up -d cloudflared
+  #
+  # In the Cloudflare dashboard (Zero Trust → Networks → Tunnels)
+  # create a tunnel, copy the token, and put it in .env as
+  # CLOUDFLARE_TUNNEL_TOKEN. Configure the public hostname to route
+  # to ``neuralscape:8199`` — cloudflared joins the same default
+  # compose network so the service-name DNS works.
+  #
+  # TLS, DDoS protection, and (optionally) Cloudflare Access auth all
+  # terminate at Cloudflare's edge. The Windows host never needs an
+  # open port 80/443.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    profiles: ["tunnel"]
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      neuralscape:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   # ── Test runner ─────────────────────────────────────────────────
   # Reproducible test runner. Gated behind the `test` compose profile
   # so it never starts with `docker compose up`. Use:
