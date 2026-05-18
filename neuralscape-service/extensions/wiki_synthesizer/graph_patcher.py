@@ -6,8 +6,8 @@ Two responsibilities:
 1. **At write time** — after a memory write produces Graphiti entity
    nodes, mark those nodes with the originating ``memory_id`` and the
    memory's ``visibility`` / ``owner_user_id``. This is the link the
-   wiki synthesizer later uses to walk from a community back to its
-   source memories.
+   wiki synthesizer later uses to walk from a memory back to the graph
+   nodes it contributed.
 
 2. **After synthesis** — once a wiki page has been written, set
    ``wiki_path`` and ``wiki_synthesized_at`` on every node that
@@ -166,6 +166,78 @@ async def patch_wiki_path(
         logger.warning(
             "patch_wiki_path failed for %d uuids → %s (non-fatal)",
             len(uuids),
+            wiki_path,
+            exc_info=True,
+        )
+        return 0
+
+
+async def patch_wiki_path_by_memory_ids(
+    service: Any,
+    *,
+    memory_ids: Iterable[str],
+    wiki_path: str,
+    group_id: str | None = None,
+    synthesized_at: datetime | None = None,
+) -> int:
+    """Stamp ``wiki_path`` onto every node whose ``memory_id`` is in the input.
+
+    The category-based synthesizer doesn't go through a community walk to
+    collect node UUIDs — it owns the set of source memory IDs directly.
+    This helper closes the loop by matching nodes whose ``memory_id``
+    property (set at write time by :func:`attach_memory_id`) is in the
+    page's source set.
+
+    Same loop-bridge + best-effort semantics as :func:`patch_wiki_path`.
+    """
+    mids = [m for m in memory_ids if m]
+    if not mids or not wiki_path:
+        return 0
+    graphiti = getattr(service, "_graphiti", None)
+    driver = getattr(graphiti, "driver", None) if graphiti else None
+    if driver is None:
+        return 0
+    ts = (synthesized_at or datetime.now(timezone.utc)).isoformat()
+    if group_id:
+        cypher = """
+        MATCH (n)
+        WHERE n.memory_id IN $mids AND n.group_id = $group_id
+        SET n.wiki_path = $wiki_path,
+            n.wiki_synthesized_at = datetime($synthesized_at)
+        RETURN count(n) AS patched
+        """
+        params: dict[str, Any] = {
+            "mids": mids,
+            "wiki_path": wiki_path,
+            "synthesized_at": ts,
+            "group_id": group_id,
+        }
+    else:
+        cypher = """
+        MATCH (n)
+        WHERE n.memory_id IN $mids
+        SET n.wiki_path = $wiki_path,
+            n.wiki_synthesized_at = datetime($synthesized_at)
+        RETURN count(n) AS patched
+        """
+        params = {
+            "mids": mids,
+            "wiki_path": wiki_path,
+            "synthesized_at": ts,
+        }
+
+    async def _inner() -> int:
+        async with driver.session() as session:
+            result = await session.run(cypher, **params)
+            record = await result.single()
+            return int(record["patched"]) if record else 0
+
+    try:
+        return await service._run_on_bridge_async(_inner(), timeout=30.0)
+    except Exception:
+        logger.warning(
+            "patch_wiki_path_by_memory_ids failed for %d memory_ids → %s (non-fatal)",
+            len(mids),
             wiki_path,
             exc_info=True,
         )

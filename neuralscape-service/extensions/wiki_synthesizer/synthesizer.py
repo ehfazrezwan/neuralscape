@@ -1,22 +1,25 @@
-"""Wiki synthesizer orchestrator.
+"""Wiki synthesizer orchestrator (category-based).
 
-The synthesizer is the third tier of the memory pipeline:
+The synthesizer is tier 3 of the memory pipeline:
 
-1. CAPTURE     — plugin hook buffers tool observations (existing)
-2. COMPILE     — compile-observations skill stores structured memories  (existing)
-3. SYNTHESIZE  — *this* module turns shared memories into topical wiki  pages
+1. CAPTURE     — plugin hook buffers tool observations  (existing)
+2. COMPILE     — compile-observations skill stores structured memories (existing)
+3. SYNTHESIZE  — *this* module turns shared memories into topical wiki pages
 
-Per cron run it walks every NeuralScape category's shared Graphiti
-group, enumerates communities inside, then for each (category, community)
-pair:
+Per cron run, for every shared ``group_id`` and every NeuralScape category,
+the synthesizer scrolls Qdrant for memories matching
+``(visibility=shared, group_id, category)`` and incrementally merges them
+into one wiki page via Gemini.
 
-* loads the community's source memories from Qdrant via MemoryService
-* incrementally merges them into the existing wiki page via Gemini
-* atomic-writes the page under ``{vault}/Wiki/{category_folder}/...``
-* patches every contributing Graphiti node with a ``wiki_path`` back-reference
+The grouping key is **(group_id × category)** — deterministic, derived
+from the existing taxonomy. No Graphiti community detection, no LLM
+clustering, no multi-hour cold-start build. Earlier versions of this
+synthesizer used ``Graphiti.build_communities`` for topic discovery; the
+LLM tournament summarization there was an order of magnitude too slow
+to run on real data, so we replaced it with category-based bucketing.
 
-The synthesizer touches only ``visibility=shared`` memories in v1 —
-private memories never reach the vault.
+The synthesizer touches only ``visibility=shared`` memories — private
+memories never reach the vault.
 """
 
 from __future__ import annotations
@@ -26,15 +29,15 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from memory_service import MemoryService, _build_group_id
+from memory_service import MemoryService
 from schemas import CATEGORY_VAULT_PATHS, MemoryVisibility
 
-from .community_loader import Community, load_communities
 from .config import SynthesizerSettings, synthesizer_settings
-from .graph_patcher import patch_wiki_path
+from .graph_patcher import patch_wiki_path_by_memory_ids
 from .prompts import INCREMENTAL_MERGE_PROMPT, render_memories_block
 from .wiki_renderer import (
-    community_filename,
+    category_filename,
+    category_page_title,
     render_page,
     split_existing_page,
     wiki_page_path,
@@ -49,7 +52,7 @@ logger = logging.getLogger(__name__)
 @dataclass(slots=True)
 class PageResult:
     category: str
-    community_id: str
+    group_id: str
     wiki_path: str
     created: bool
     source_memory_count: int
@@ -60,7 +63,7 @@ class SynthesisResult:
     pages_created: int = 0
     pages_updated: int = 0
     memories_processed: int = 0
-    communities_skipped_empty: int = 0
+    pages_skipped_empty: int = 0
     errors: list[str] = None  # type: ignore[assignment]
     pages: list[PageResult] = None  # type: ignore[assignment]
 
@@ -73,10 +76,9 @@ class SynthesisResult:
 
 # In-process last-run state, surfaced by the admin `synthesize/status`
 # endpoint. Mutated only by ``synthesize_all`` at the end of a pass.
-# This is a process-local snapshot — when the API and worker are
-# separate processes (the usual deploy shape) each tracks its own last
-# run. For a single source of truth across processes, route status
-# through Redis (follow-up).
+# Process-local — when the API and worker are separate processes (the
+# usual deploy shape) each tracks its own last run. For a single source
+# of truth across processes, route status through Redis (follow-up).
 @dataclass(slots=True)
 class LastRunSnapshot:
     started_at: str | None = None
@@ -85,7 +87,7 @@ class LastRunSnapshot:
     pages_created: int = 0
     pages_updated: int = 0
     memories_processed: int = 0
-    communities_skipped_empty: int = 0
+    pages_skipped_empty: int = 0
     errors: list[str] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
@@ -97,11 +99,7 @@ _LAST_RUN = LastRunSnapshot()
 
 
 def get_last_run_snapshot() -> dict:
-    """Return the most recent synthesis run state as a plain dict.
-
-    Process-local. See LastRunSnapshot docstring for cross-process
-    caveats.
-    """
+    """Return the most recent synthesis run state as a plain dict."""
     return {
         "started_at": _LAST_RUN.started_at,
         "finished_at": _LAST_RUN.finished_at,
@@ -109,7 +107,7 @@ def get_last_run_snapshot() -> dict:
         "pages_created": _LAST_RUN.pages_created,
         "pages_updated": _LAST_RUN.pages_updated,
         "memories_processed": _LAST_RUN.memories_processed,
-        "communities_skipped_empty": _LAST_RUN.communities_skipped_empty,
+        "pages_skipped_empty": _LAST_RUN.pages_skipped_empty,
         "errors": list(_LAST_RUN.errors),
     }
 
@@ -121,24 +119,19 @@ async def synthesize_all(
     only_category: str | None = None,
     dry_run: bool = False,
 ) -> SynthesisResult:
-    """Run one full synthesis pass over every shared group_id.
+    """Run one full synthesis pass over every shared ``(group_id × category)``.
 
     Walks every group_id that starts with ``shared``: the team-wide
-    ``shared`` pool plus every ``shared--project--<pid>`` pool. The
-    earlier "one outer loop per category" design was wrong — categories
-    are a per-memory property, not a per-group property, so iterating
-    13 times per group produced 13 duplicate page attempts per community.
-    Now we iterate group_id → community → infer category from the
-    community's member memories. The ``only_category`` filter still works
-    but is applied after the category is inferred.
+    ``shared`` pool plus every ``shared--project--<pid>`` pool. For each
+    group, walks all 13 NeuralScape categories. Pages with zero matching
+    memories are skipped.
 
     Args:
-        service: The shared MemoryService instance. Used to access the
-            Neo4j driver and to fetch source memory content from Qdrant.
+        service: Shared MemoryService instance. Used to access Qdrant
+            (for the memory scroll) and Graphiti's bridge loop (for the
+            wiki_path back-reference patch).
         settings: Synthesizer settings (cadence, vault path, model).
-        only_category: When set, only synthesize pages whose inferred
-            category matches. Communities that resolve to a different
-            category are skipped.
+        only_category: When set, only synthesize pages for this category.
         dry_run: When True, do everything except write to the vault and
             patch Neo4j. The returned result still reports what would
             have happened.
@@ -150,69 +143,43 @@ async def synthesize_all(
         _record_last_run(result, started)
         return result
 
-    driver = _driver_from_service(service)
-    if driver is None:
-        result.errors.append("no Neo4j driver available on MemoryService")
-        _record_last_run(result, started)
-        return result
-
     shared_group_ids = await _list_shared_group_ids(service)
     if not shared_group_ids:
         logger.info("synthesis skipped: no shared group_ids in the graph")
+        _record_last_run(result, started)
         return result
 
-    # Make sure every group_id has at least one Community node before we
-    # try to walk it. Graphiti's incremental `update_communities=True`
-    # only updates EXISTING communities, so freshly-populated groups
-    # often have zero communities until we explicitly call build.
-    if settings.auto_build_communities:
-        await _ensure_communities_built(
-            service=service, group_ids=shared_group_ids, result=result
-        )
+    categories = (
+        [only_category] if only_category else list(CATEGORY_VAULT_PATHS.keys())
+    )
 
     for group_id in shared_group_ids:
-        try:
-            communities = await load_communities(service, group_id=group_id)
-        except Exception as exc:
-            logger.warning(
-                "load_communities raised for group_id=%s: %s", group_id, exc
-            )
-            result.errors.append(f"{group_id}: load_communities failed")
-            continue
-
-        for community in communities:
-            if not community.member_memory_ids:
-                result.communities_skipped_empty += 1
+        for category in categories:
+            if category not in CATEGORY_VAULT_PATHS:
+                # Defensive: unknown category names produced by future
+                # taxonomy changes should not crash the cron.
+                logger.warning("unknown category %r — skipping", category)
                 continue
-
-            inferred_category = _infer_category(service, community)
-            if inferred_category is None:
-                result.communities_skipped_empty += 1
-                continue
-            if only_category and inferred_category != only_category:
-                continue
-
             try:
-                page = await _synthesize_community(
+                page = await _synthesize_category_page(
                     service=service,
                     settings=settings,
-                    driver=driver,
-                    category=inferred_category,
                     group_id=group_id,
-                    community=community,
+                    category=category,
                     dry_run=dry_run,
                 )
             except Exception as exc:
                 logger.exception(
-                    "synthesis failed for group_id=%s community=%s",
+                    "synthesis failed for group_id=%s category=%s",
                     group_id,
-                    community.uuid,
+                    category,
                 )
                 result.errors.append(
-                    f"{group_id}/{community.uuid}: {exc.__class__.__name__}"
+                    f"{group_id}/{category}: {exc.__class__.__name__}"
                 )
                 continue
             if page is None:
+                result.pages_skipped_empty += 1
                 continue
             if page.created:
                 result.pages_created += 1
@@ -222,10 +189,11 @@ async def synthesize_all(
             result.pages.append(page)
 
     logger.info(
-        "synthesis complete: created=%d updated=%d memories=%d errors=%d",
+        "synthesis complete: created=%d updated=%d memories=%d skipped=%d errors=%d",
         result.pages_created,
         result.pages_updated,
         result.memories_processed,
+        result.pages_skipped_empty,
         len(result.errors),
     )
     _record_last_run(result, started)
@@ -241,53 +209,49 @@ def _record_last_run(result: SynthesisResult, started: datetime) -> None:
     _LAST_RUN.pages_created = result.pages_created
     _LAST_RUN.pages_updated = result.pages_updated
     _LAST_RUN.memories_processed = result.memories_processed
-    _LAST_RUN.communities_skipped_empty = result.communities_skipped_empty
+    _LAST_RUN.pages_skipped_empty = result.pages_skipped_empty
     _LAST_RUN.errors = list(result.errors)
 
 
-async def _synthesize_community(
+async def _synthesize_category_page(
     *,
     service: MemoryService,
     settings: SynthesizerSettings,
-    driver: Any,
-    category: str,
     group_id: str,
-    community: Community,
+    category: str,
     dry_run: bool,
 ) -> PageResult | None:
-    """Synthesize one community's wiki page. Returns the page result, or None on no-op."""
+    """Synthesize one ``(group_id, category)`` wiki page.
 
-    # Cap the per-page memory count so a runaway community doesn't try
-    # to stuff thousands of memories through a single LLM call.
-    memory_ids = community.member_memory_ids[: settings.max_memories_per_page]
-
-    memories = [m for m in (_load_memory(service, mid) for mid in memory_ids) if m]
+    Returns ``None`` when the bucket has zero matching memories (no page
+    is written and the run reports it as ``pages_skipped_empty``).
+    """
+    memories = _scroll_memories(
+        service=service,
+        group_id=group_id,
+        category=category,
+        limit=settings.max_memories_per_page,
+    )
     if not memories:
-        logger.debug(
-            "community %s has %d member memory_ids but none resolved to memories",
-            community.uuid,
-            len(memory_ids),
-        )
         return None
 
-    filename = community_filename(community.uuid, community.name)
+    memory_ids = [m["memory_id"] for m in memories if m.get("memory_id")]
+
+    filename = category_filename(group_id)
     page_path = wiki_page_path(settings.wiki_dir, category, filename)
     rel_path = wikilink_path(category, filename)
 
-    # Load existing content (if any) and pull out the previous body so
-    # we can ask Gemini for an incremental merge instead of a full rewrite.
     existing_text = _safe_read_text(page_path)
     fm, existing_body = split_existing_page(existing_text)
     prior_count = int(fm.get("synthesis_count") or 0)
 
-    title = community.name or f"Untitled topic ({community.uuid[:8]})"
+    title = category_page_title(category, group_id)
     prompt = INCREMENTAL_MERGE_PROMPT.format(
         topic_title=title,
         category=category,
         existing_body=existing_body or "(empty — this is the first synthesis)",
         memories_block=render_memories_block(memories),
     )
-
     body = await _call_gemini(prompt, settings=settings)
     if not body:
         return None
@@ -295,13 +259,10 @@ async def _synthesize_community(
     rendered = render_page(
         title=title,
         category=category,
-        community_id=community.uuid,
-        community_name=community.name,
         group_id=group_id,
         visibility=MemoryVisibility.SHARED.value,
         body=body,
         source_memory_ids=memory_ids,
-        graph_node_uuids=community.member_node_uuids,
         synthesis_count=prior_count + 1,
         source_count=len(memories),
         now=datetime.now(timezone.utc),
@@ -309,16 +270,27 @@ async def _synthesize_community(
 
     if not dry_run:
         write_page(page_path, rendered)
-        await patch_wiki_path(
-            service,
-            node_uuids=community.member_node_uuids,
-            wiki_path=rel_path,
-            group_id=group_id,
-        )
+        # Best-effort back-reference: stamp ``wiki_path`` on every
+        # Graphiti entity node whose ``memory_id`` is in this page.
+        # Skipped silently if the bridge or driver isn't available.
+        try:
+            await patch_wiki_path_by_memory_ids(
+                service,
+                memory_ids=memory_ids,
+                wiki_path=rel_path,
+                group_id=group_id,
+            )
+        except Exception:
+            logger.warning(
+                "patch_wiki_path_by_memory_ids failed for %s/%s (non-fatal)",
+                group_id,
+                category,
+                exc_info=True,
+            )
 
     return PageResult(
         category=category,
-        community_id=community.uuid,
+        group_id=group_id,
         wiki_path=rel_path,
         created=not existing_text,
         source_memory_count=len(memories),
@@ -331,16 +303,17 @@ async def _synthesize_community(
 async def _list_shared_group_ids(service: MemoryService) -> list[str]:
     """Return every group_id that starts with ``shared``.
 
-    Covers the team-wide ``shared`` group plus per-project shared
-    groups (``shared--project--<pid>``). Private groups (``user--...``,
+    Covers the team-wide ``shared`` group plus per-project shared groups
+    (``shared--project--<pid>``). Private groups (``user--...``,
     ``user--...--project--...``) and the legacy ``global`` namespace are
     intentionally excluded — v1 vault content is shared-only.
 
-    Runs on the Graphiti bridge's event loop. The async driver is bound
-    to that loop and any direct ``await driver.session()`` from another
+    Runs on Graphiti's bridge event loop. The async driver is bound to
+    that loop and any direct ``await driver.session()`` from another
     loop raises ``Future attached to a different loop``.
     """
-    driver = service._graphiti.driver if service._graphiti else None  # type: ignore[attr-defined]
+    graphiti = getattr(service, "_graphiti", None)
+    driver = getattr(graphiti, "driver", None) if graphiti else None
     if driver is None:
         return []
     cypher = """
@@ -352,8 +325,8 @@ async def _list_shared_group_ids(service: MemoryService) -> list[str]:
 
     async def _inner() -> list[dict]:
         async with driver.session() as session:
-            result = await session.run(cypher)
-            return await result.data()
+            cursor = await session.run(cypher)
+            return await cursor.data()
 
     try:
         records = await service._run_on_bridge_async(_inner(), timeout=30.0)
@@ -363,121 +336,113 @@ async def _list_shared_group_ids(service: MemoryService) -> list[str]:
     return [r["gid"] for r in records if r.get("gid")]
 
 
-async def _ensure_communities_built(
+def _scroll_memories(
     *,
     service: MemoryService,
-    group_ids: list[str],
-    result: SynthesisResult,
-) -> None:
-    """Call ``Graphiti.build_communities`` for any group_id with none yet.
+    group_id: str,
+    category: str,
+    limit: int,
+) -> list[dict]:
+    """Return shared memories for one ``(group_id, category)`` bucket.
 
-    Graphiti's ``update_communities=True`` flag only refreshes EXISTING
-    communities on episode add — a group with zero communities stays at
-    zero. We check per-group_id and trigger build for the empty ones.
-    Best-effort: failures are logged but don't fail the synthesis run.
+    Scrolls Qdrant directly on the payload filter
+    ``metadata.visibility=shared AND metadata.category=<cat> AND
+    metadata.scope/project_id derived from group_id``. The visibility
+    filter is belt-and-braces — the group_id parse already constrains
+    us to shared content — but cheap insurance against a future
+    metadata schema drift.
+
+    Returns at most ``limit`` memories. Errors are logged and downgraded
+    to an empty list so a single bad bucket doesn't break the cron.
     """
-    driver = service._graphiti.driver if service._graphiti else None  # type: ignore[attr-defined]
-    graphiti = service._graphiti
-    if not (graphiti and driver):
-        return
+    visibility, project_id = _parse_shared_group_id(group_id)
+    if visibility is None:
+        logger.warning("unexpected group_id %r (not shared) — skipping", group_id)
+        return []
 
-    cypher = """
-    UNWIND $gids AS gid
-    OPTIONAL MATCH (c:Community {group_id: gid})
-    WITH gid, count(c) AS n
-    RETURN gid, n
-    """
-
-    async def _inner() -> list[dict]:
-        async with driver.session() as session:
-            cursor = await session.run(cypher, gids=group_ids)
-            return await cursor.data()
-
-    needs_build: list[str] = []
     try:
-        records = await service._run_on_bridge_async(_inner(), timeout=30.0)
-        for r in records:
-            if int(r.get("n") or 0) == 0:
-                needs_build.append(r["gid"])
-    except Exception:
-        logger.warning("could not check community counts (skipping pre-build)", exc_info=True)
-        return
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
 
-    if not needs_build:
-        return
-    logger.info(
-        "synthesizer pre-build: triggering build_communities for %d empty group(s): %s",
-        len(needs_build),
-        needs_build,
-    )
-    try:
-        await service._run_on_bridge_async(
-            graphiti.build_communities(group_ids=needs_build), timeout=600.0
+        client = service._memory.vector_store.client
+        from config import settings as core_settings
+
+        must: list = [
+            FieldCondition(
+                key="metadata.visibility",
+                match=MatchValue(value=MemoryVisibility.SHARED.value),
+            ),
+            FieldCondition(
+                key="metadata.category",
+                match=MatchValue(value=category),
+            ),
+        ]
+        if project_id:
+            must.extend([
+                FieldCondition(
+                    key="metadata.scope", match=MatchValue(value="project")
+                ),
+                FieldCondition(
+                    key="metadata.project_id",
+                    match=MatchValue(value=project_id),
+                ),
+            ])
+        else:
+            # Team-wide shared (group_id == "shared"). Constrain to
+            # scope=global so per-project shared content doesn't double-
+            # surface on the team-wide page.
+            must.append(
+                FieldCondition(key="metadata.scope", match=MatchValue(value="global"))
+            )
+
+        points, _ = client.scroll(
+            collection_name=core_settings.qdrant_collection,
+            scroll_filter=Filter(must=must),
+            limit=limit,
+            with_payload=True,
+            with_vectors=False,
         )
-    except Exception as exc:
-        logger.warning("build_communities failed (continuing): %s", exc, exc_info=True)
-        result.errors.append(f"build_communities: {exc.__class__.__name__}")
-
-
-def _infer_category(service: MemoryService, community: Community) -> str | None:
-    """Return the most-common NeuralScape category among the community's members.
-
-    Walks the community's ``member_memory_ids``, looks up each memory in
-    Qdrant via ``service.get_memory``, and returns the modal category.
-    Returns ``None`` if no member resolved to a memory with a known
-    category — the synthesizer treats that as "skip this community".
-    """
-    if not community.member_memory_ids:
-        return None
-    counts: dict[str, int] = {}
-    # Cap the lookup; on huge communities we don't need to read all members
-    # just to pick a category.
-    for mid in community.member_memory_ids[:25]:
-        mem = _load_memory(service, mid)
-        if not mem:
-            continue
-        cat = (mem.get("category") or "").strip()
-        if cat and cat in CATEGORY_VAULT_PATHS:
-            counts[cat] = counts.get(cat, 0) + 1
-    if not counts:
-        return None
-    # Most common wins; ties broken by sort order (stable).
-    return max(counts.items(), key=lambda kv: kv[1])[0]
-
-
-def _driver_from_service(service: MemoryService) -> Any | None:
-    """Reach through MemoryService to the Neo4j driver Graphiti is using.
-
-    Mirrors how ``memory_service.py`` itself accesses the driver
-    (``self._graphiti.driver``). Returns None if Graphiti isn't wired up
-    in this MemoryService instance, in which case the synthesizer logs
-    and skips the run.
-    """
-    graphiti = getattr(service, "_graphiti", None)
-    if graphiti is None:
-        return None
-    return getattr(graphiti, "driver", None)
-
-
-def _load_memory(service: MemoryService, memory_id: str) -> dict | None:
-    """Best-effort fetch of a memory's content + v2 metadata."""
-    try:
-        mem = service.get_memory(memory_id)
     except Exception:
-        logger.warning("get_memory failed for %s (non-fatal)", memory_id, exc_info=True)
-        return None
-    if mem is None:
-        return None
-    return {
-        "memory_id": getattr(mem, "id", memory_id),
-        "content": getattr(mem, "memory", "") or "",
-        "category": getattr(mem, "category", "") or "",
-        "domain": getattr(mem, "domain", None),
-        "observation_type": getattr(mem, "observation_type", None),
-        "confidence": getattr(mem, "confidence", None),
-        "created_at": getattr(mem, "created_at", None),
-        "visibility": getattr(mem, "visibility", None),
-    }
+        logger.warning(
+            "Qdrant scroll failed for group_id=%s category=%s",
+            group_id,
+            category,
+            exc_info=True,
+        )
+        return []
+
+    memories: list[dict] = []
+    for point in points or []:
+        payload = getattr(point, "payload", None) or {}
+        metadata = payload.get("metadata", {}) or {}
+        memories.append(
+            {
+                "memory_id": str(getattr(point, "id", "") or ""),
+                "content": payload.get("data", "") or "",
+                "category": metadata.get("category", category),
+                "domain": metadata.get("domain"),
+                "observation_type": metadata.get("observation_type"),
+                "confidence": metadata.get("confidence"),
+                "created_at": payload.get("created_at"),
+                "visibility": metadata.get("visibility"),
+            }
+        )
+    return memories
+
+
+def _parse_shared_group_id(group_id: str) -> tuple[str | None, str | None]:
+    """Parse a shared group_id into ``(visibility, project_id)``.
+
+    - ``"shared"`` → ``("shared", None)`` (team-wide)
+    - ``"shared--project--<pid>"`` → ``("shared", "<pid>")``
+    - anything else → ``(None, None)`` (caller should skip)
+    """
+    if group_id == "shared":
+        return MemoryVisibility.SHARED.value, None
+    prefix = "shared--project--"
+    if group_id.startswith(prefix):
+        pid = group_id[len(prefix):]
+        return MemoryVisibility.SHARED.value, pid or None
+    return None, None
 
 
 def _safe_read_text(path) -> str:
@@ -491,19 +456,7 @@ def _safe_read_text(path) -> str:
 
 
 async def _call_gemini(prompt: str, *, settings: SynthesizerSettings) -> str:
-    """Run the incremental-merge prompt through Gemini.
-
-    Reuses the conversation_compiler's Gemini helper so model selection
-    stays consistent across the two LLM-driven extensions. Adds:
-
-    * ``WIKI_SYNTHESIZER_GEMINI_TIMEOUT_SECONDS`` hard timeout per
-      attempt (default 5 minutes) — a hung Gemini call won't stall the
-      whole cron.
-    * ``WIKI_SYNTHESIZER_GEMINI_MAX_RETRIES`` exponential-backoff
-      retries on transient failures or timeouts (default 2).
-    """
-    # Imported lazily to avoid a hard dependency between the two
-    # extensions at import time.
+    """Run the incremental-merge prompt through Gemini with a timeout + retries."""
     import asyncio
 
     from extensions.conversation_compiler.compile import _async_call_gemini
@@ -533,7 +486,7 @@ async def _call_gemini(prompt: str, *, settings: SynthesizerSettings) -> str:
                 exc.__class__.__name__,
             )
         if attempt + 1 < attempts:
-            await asyncio.sleep(2 ** attempt)  # 1s, 2s, 4s, ...
+            await asyncio.sleep(2 ** attempt)
 
     logger.error(
         "Gemini incremental-merge call exhausted %d attempt(s): %s",

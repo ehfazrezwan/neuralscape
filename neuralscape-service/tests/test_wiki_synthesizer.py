@@ -1,4 +1,4 @@
-"""Tests for the wiki_synthesizer extension.
+"""Tests for the wiki_synthesizer extension (category-based).
 
 Focused unit tests with all I/O mocked. The container-level end-to-end
 verification (real Neo4j, real Gemini) lives in
@@ -9,26 +9,30 @@ duplicated here.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 pytest.importorskip("fcntl")  # writer primitives are POSIX-only
 
-from extensions.wiki_synthesizer.community_loader import Community
 from extensions.wiki_synthesizer.config import SynthesizerSettings
 from extensions.wiki_synthesizer.graph_patcher import (
     attach_memory_id,
     patch_wiki_path,
+    patch_wiki_path_by_memory_ids,
 )
 from extensions.wiki_synthesizer.prompts import (
     INCREMENTAL_MERGE_PROMPT,
     render_memories_block,
 )
-from extensions.wiki_synthesizer.synthesizer import synthesize_all
+from extensions.wiki_synthesizer.synthesizer import (
+    _parse_shared_group_id,
+    synthesize_all,
+)
 from extensions.wiki_synthesizer.wiki_renderer import (
-    community_filename,
+    category_filename,
+    category_page_title,
     render_page,
     split_existing_page,
     wiki_page_path,
@@ -42,27 +46,40 @@ from extensions.wiki_synthesizer.wiki_renderer import (
 
 
 class TestWikiRenderer:
-    def test_community_filename_includes_slug_and_short_id(self):
-        name = community_filename("01928fab-1234-5678-9abc-def012345678", "Async-First Python")
-        assert name.startswith("community-01928fab-")
-        assert "async-first-python" in name
-        assert name.endswith(".md")
+    def test_category_filename_team_wide(self):
+        assert category_filename("shared") == "shared.md"
 
-    def test_community_filename_handles_missing_id(self):
-        assert community_filename("", "topic").startswith("community-noid-")
+    def test_category_filename_per_project(self):
+        assert category_filename("shared--project--neuralscape") == "neuralscape.md"
+
+    def test_category_filename_slugifies_dirty_project_id(self):
+        # `_slugify` should normalize whitespace/symbols to a clean filename.
+        assert category_filename("shared--project--My Big Project!") == "my-big-project.md"
+
+    def test_category_filename_handles_empty(self):
+        assert category_filename("") == "shared.md"
 
     def test_wiki_page_path_uses_category_folder(self, tmp_path):
-        path = wiki_page_path(tmp_path / "Wiki", "preference", "community-x.md")
-        assert path == tmp_path / "Wiki" / "Semantic" / "Preferences" / "community-x.md"
+        path = wiki_page_path(tmp_path / "Wiki", "preference", "shared.md")
+        assert path == tmp_path / "Wiki" / "Semantic" / "Preferences" / "shared.md"
 
     def test_wikilink_path_includes_wiki_prefix(self):
-        assert wikilink_path("decision", "community-x.md") == "Wiki/Episodic/Decisions/community-x.md"
+        assert wikilink_path("decision", "shared.md") == "Wiki/Episodic/Decisions/shared.md"
+
+    def test_category_page_title_team_wide(self):
+        assert category_page_title("convention", "shared") == "Conventions"
+
+    def test_category_page_title_per_project(self):
+        assert (
+            category_page_title("convention", "shared--project--neuralscape")
+            == "Conventions — neuralscape"
+        )
 
     def test_split_existing_page_with_frontmatter(self):
-        content = "---\ntitle: T\ncommunity_id: 12\n---\n\n# T\n\nBody text"
+        content = "---\ntitle: T\nsynthesis_count: 2\n---\n\n# T\n\nBody text"
         fm, body = split_existing_page(content)
         assert fm["title"] == "T"
-        assert fm["community_id"] == "12"
+        assert fm["synthesis_count"] == "2"
         assert "Body text" in body
 
     def test_split_existing_page_empty(self):
@@ -75,44 +92,38 @@ class TestWikiRenderer:
 
     def test_render_page_includes_all_metadata(self):
         page = render_page(
-            title="Async-First Python",
-            category="preference",
-            community_id="01928fab",
-            community_name="Async Style",
-            group_id="shared",
+            title="Conventions — neuralscape",
+            category="convention",
+            group_id="shared--project--neuralscape",
             visibility="shared",
             body="Some body content.",
             source_memory_ids=["mem-1", "mem-2"],
-            graph_node_uuids=["u-1", "u-2"],
             synthesis_count=3,
             source_count=5,
             now=datetime(2026, 5, 15, 12, 0, 0, tzinfo=timezone.utc),
         )
         assert page.startswith("---\n")
-        assert "title: Async-First Python" in page
+        assert "title: Conventions — neuralscape" in page
+        assert "category: convention" in page
+        assert "group_id: shared--project--neuralscape" in page
         assert "synthesis_count: 3" in page
         assert "source_count: 5" in page
         assert "source_memory_ids: [mem-1, mem-2]" in page
-        assert "graph_node_uuids: [u-1, u-2]" in page
-        assert "# Async-First Python" in page
+        assert "# Conventions — neuralscape" in page
         assert "Some body content." in page
 
-    def test_render_page_handles_empty_id_lists(self):
+    def test_render_page_handles_empty_source_list(self):
         page = render_page(
             title="T",
             category="decision",
-            community_id="c1",
-            community_name="C",
             group_id="shared",
             visibility="shared",
             body="b",
             source_memory_ids=[],
-            graph_node_uuids=[],
             synthesis_count=1,
             source_count=0,
         )
         assert "source_memory_ids: []" in page
-        assert "graph_node_uuids: []" in page
 
 
 # ──────────────────────────────────────────────
@@ -122,8 +133,6 @@ class TestWikiRenderer:
 
 class TestPrompts:
     def test_incremental_prompt_has_required_placeholders(self):
-        # Every placeholder must be present and orthogonal so .format()
-        # works without KeyError surprises.
         for token in ("{topic_title}", "{category}", "{existing_body}", "{memories_block}"):
             assert token in INCREMENTAL_MERGE_PROMPT
 
@@ -143,9 +152,28 @@ class TestPrompts:
 
     def test_render_memories_block_skips_empty(self):
         block = render_memories_block([{"content": ""}, {"content": "x"}])
-        # Only the non-empty entry survives, numbered from 1.
         assert block.startswith("1. x")
         assert "\n2." not in block
+
+
+# ──────────────────────────────────────────────
+# parser
+# ──────────────────────────────────────────────
+
+
+class TestParseSharedGroupId:
+    def test_team_wide(self):
+        assert _parse_shared_group_id("shared") == ("shared", None)
+
+    def test_per_project(self):
+        assert _parse_shared_group_id("shared--project--neuralscape") == (
+            "shared",
+            "neuralscape",
+        )
+
+    def test_unknown_returns_none(self):
+        assert _parse_shared_group_id("user--ehfaz") == (None, None)
+        assert _parse_shared_group_id("global") == (None, None)
 
 
 # ──────────────────────────────────────────────
@@ -181,11 +209,10 @@ def _fake_driver(record_value):
 def _fake_service_with(driver):
     """Build a minimal fake MemoryService wrapping ``driver``.
 
-    ``patch_wiki_path`` / ``load_communities`` now take a service and
-    dispatch via ``service._run_on_bridge_async``. For unit tests we
-    just await the inner coroutine on the calling loop — the bridge
-    indirection only matters when the real Graphiti driver is bound to
-    a separate loop.
+    The graph patchers take a service and dispatch via
+    ``service._run_on_bridge_async``. For unit tests we just await the
+    inner coroutine on the calling loop — the bridge indirection only
+    matters when the real Graphiti driver is bound to a separate loop.
     """
 
     class _FakeGraphiti:
@@ -230,7 +257,6 @@ class TestGraphPatcher:
 
     @pytest.mark.asyncio
     async def test_attach_memory_id_swallows_driver_errors(self):
-        # Driver that raises on session() — patcher must not propagate.
         broken = MagicMock()
         broken.session.side_effect = RuntimeError("connection refused")
         assert await attach_memory_id(
@@ -244,23 +270,18 @@ class TestGraphPatcher:
 
     @pytest.mark.asyncio
     async def test_patch_wiki_path_returns_patched_count(self):
-        # patch_wiki_path now takes a service, not the raw driver, so it
-        # can dispatch the Cypher onto Graphiti's bridge loop. The fake
-        # service exposes a synchronous `_run_on_bridge_async` that
-        # awaits the inner coroutine on the calling loop, which is
-        # equivalent for the test's purposes.
         driver = _fake_driver(record_value=2)
         service = _fake_service_with(driver)
         n = await patch_wiki_path(
             service,
             node_uuids=["u1", "u2"],
-            wiki_path="Wiki/Semantic/Preferences/community-x.md",
+            wiki_path="Wiki/Semantic/Preferences/shared.md",
         )
         assert n == 2
 
     @pytest.mark.asyncio
     async def test_patch_wiki_path_empty_uuids_short_circuits(self):
-        driver = _fake_driver(record_value=99)  # would lie about count if called
+        driver = _fake_driver(record_value=99)
         service = _fake_service_with(driver)
         assert await patch_wiki_path(
             service,
@@ -268,10 +289,91 @@ class TestGraphPatcher:
             wiki_path="Wiki/x.md",
         ) == 0
 
+    @pytest.mark.asyncio
+    async def test_patch_wiki_path_by_memory_ids_returns_patched_count(self):
+        driver = _fake_driver(record_value=5)
+        service = _fake_service_with(driver)
+        n = await patch_wiki_path_by_memory_ids(
+            service,
+            memory_ids=["mem-1", "mem-2", "mem-3"],
+            wiki_path="Wiki/Project/Conventions/neuralscape.md",
+            group_id="shared--project--neuralscape",
+        )
+        assert n == 5
+
+    @pytest.mark.asyncio
+    async def test_patch_wiki_path_by_memory_ids_empty_short_circuits(self):
+        driver = _fake_driver(record_value=99)
+        service = _fake_service_with(driver)
+        assert await patch_wiki_path_by_memory_ids(
+            service,
+            memory_ids=[],
+            wiki_path="Wiki/x.md",
+        ) == 0
+
 
 # ──────────────────────────────────────────────
 # synthesize_all — top-level orchestration smoke
 # ──────────────────────────────────────────────
+
+
+def _qdrant_point(memory_id: str, content: str, category: str) -> SimpleNamespace:
+    """Shape a Qdrant scroll point the way ``client.scroll()`` returns it."""
+    return SimpleNamespace(
+        id=memory_id,
+        payload={
+            "data": content,
+            "metadata": {
+                "category": category,
+                "visibility": "shared",
+                "domain": "coding",
+            },
+        },
+    )
+
+
+def _service_with_qdrant_points(
+    points_by_filter: dict[tuple[str, str], list[SimpleNamespace]],
+):
+    """Build a MemoryService mock whose Qdrant client returns the
+    supplied points based on ``(group_id, category)``.
+
+    The scroll mock inspects the must-filter list for
+    ``metadata.category`` and ``metadata.project_id`` and returns the
+    matching pre-staged list — empty if no entry matches.
+    """
+    from qdrant_client.models import FieldCondition
+
+    def _scroll(collection_name, scroll_filter, limit, with_payload, with_vectors):
+        cat: str | None = None
+        project: str | None = None
+        scope: str | None = None
+        for cond in getattr(scroll_filter, "must", []) or []:
+            if not isinstance(cond, FieldCondition):
+                continue
+            key = cond.key
+            val = getattr(cond.match, "value", None)
+            if key == "metadata.category":
+                cat = val
+            elif key == "metadata.project_id":
+                project = val
+            elif key == "metadata.scope":
+                scope = val
+        gid = f"shared--project--{project}" if project else "shared"
+        # If scope is missing the scroll is malformed for our purposes.
+        assert scope in ("global", "project")
+        return (points_by_filter.get((gid, cat or ""), []), None)
+
+    client = MagicMock()
+    client.scroll = _scroll
+
+    service = MagicMock()
+    service._memory = MagicMock()
+    service._memory.vector_store = MagicMock()
+    service._memory.vector_store.client = client
+    service._graphiti = MagicMock()
+    service._graphiti.driver = MagicMock()
+    return service
 
 
 class TestSynthesizeAll:
@@ -284,133 +386,169 @@ class TestSynthesizeAll:
         assert result.errors == []
 
     @pytest.mark.asyncio
-    async def test_missing_driver_records_error(self):
-        settings = SynthesizerSettings(enabled=True)
-        service = MagicMock()
-        service._graphiti = None
-        result = await synthesize_all(service=service, settings=settings)
-        assert result.pages_created == 0
-        assert any("Neo4j driver" in e for e in result.errors)
-
-    @pytest.mark.asyncio
-    async def test_skips_empty_communities(self, tmp_path):
-        # Driver returns one community with no member memory IDs.
-        # The synthesizer should count it as skipped and produce no pages.
-        empty_community = Community(uuid="c1", name="Empty topic", member_memory_ids=[])
-
+    async def test_no_shared_group_ids_short_circuits(self, tmp_path):
         settings = SynthesizerSettings(
-            enabled=True,
-            obsidian_vault_path=str(tmp_path),
-            auto_build_communities=False,
+            enabled=True, obsidian_vault_path=str(tmp_path)
         )
         service = MagicMock()
-        service._graphiti = MagicMock()
-        service._graphiti.driver = MagicMock()
+        with patch(
+            "extensions.wiki_synthesizer.synthesizer._list_shared_group_ids",
+            new=AsyncMock(return_value=[]),
+        ):
+            result = await synthesize_all(service=service, settings=settings)
+        assert result.pages_created == 0
+        assert result.pages_updated == 0
+        assert result.pages_skipped_empty == 0
 
+    @pytest.mark.asyncio
+    async def test_buckets_with_no_memories_are_skipped(self, tmp_path):
+        # All Qdrant scrolls return empty. Every (group × category) pair
+        # should be counted as skipped, no pages created.
+        settings = SynthesizerSettings(
+            enabled=True, obsidian_vault_path=str(tmp_path)
+        )
+        service = _service_with_qdrant_points({})
         with patch(
             "extensions.wiki_synthesizer.synthesizer._list_shared_group_ids",
             new=AsyncMock(return_value=["shared"]),
         ), patch(
-            "extensions.wiki_synthesizer.synthesizer.load_communities",
-            new=AsyncMock(return_value=[empty_community]),
+            "extensions.wiki_synthesizer.synthesizer._call_gemini",
+            new=AsyncMock(return_value="body"),  # never invoked
+        ):
+            result = await synthesize_all(service=service, settings=settings)
+        # 13 categories × 1 group, all empty
+        assert result.pages_skipped_empty == 13
+        assert result.pages_created == 0
+
+    @pytest.mark.asyncio
+    async def test_creates_one_page_per_nonempty_bucket(self, tmp_path):
+        # One non-empty bucket: shared/convention. Synthesizer should
+        # produce exactly one created page and skip the other 12.
+        settings = SynthesizerSettings(
+            enabled=True, obsidian_vault_path=str(tmp_path)
+        )
+        service = _service_with_qdrant_points({
+            ("shared", "convention"): [
+                _qdrant_point("mem-1", "use PRs targeting dev", "convention"),
+                _qdrant_point("mem-2", "no direct commits to main", "convention"),
+            ],
+        })
+        with patch(
+            "extensions.wiki_synthesizer.synthesizer._list_shared_group_ids",
+            new=AsyncMock(return_value=["shared"]),
+        ), patch(
+            "extensions.wiki_synthesizer.synthesizer._call_gemini",
+            new=AsyncMock(return_value="wiki body about conventions"),
+        ), patch(
+            "extensions.wiki_synthesizer.synthesizer."
+            "patch_wiki_path_by_memory_ids",
+            new=AsyncMock(return_value=2),
+        ):
+            result = await synthesize_all(service=service, settings=settings)
+        assert result.pages_created == 1
+        assert result.pages_updated == 0
+        assert result.memories_processed == 2
+        assert result.pages_skipped_empty == 12
+        page = result.pages[0]
+        assert page.category == "convention"
+        assert page.group_id == "shared"
+        assert page.wiki_path == "Wiki/Project/Conventions/shared.md"
+        # The actual file was written (not dry_run).
+        assert (tmp_path / "Wiki" / "Project" / "Conventions" / "shared.md").exists()
+
+    @pytest.mark.asyncio
+    async def test_only_category_restricts_scope(self, tmp_path):
+        # Stage memories in two categories. With only_category="convention"
+        # we should produce exactly one page, even though both buckets
+        # have content.
+        settings = SynthesizerSettings(
+            enabled=True, obsidian_vault_path=str(tmp_path)
+        )
+        service = _service_with_qdrant_points({
+            ("shared", "convention"): [_qdrant_point("m1", "x", "convention")],
+            ("shared", "decision"): [_qdrant_point("m2", "y", "decision")],
+        })
+        with patch(
+            "extensions.wiki_synthesizer.synthesizer._list_shared_group_ids",
+            new=AsyncMock(return_value=["shared"]),
+        ), patch(
+            "extensions.wiki_synthesizer.synthesizer._call_gemini",
+            new=AsyncMock(return_value="body"),
+        ), patch(
+            "extensions.wiki_synthesizer.synthesizer."
+            "patch_wiki_path_by_memory_ids",
+            new=AsyncMock(return_value=1),
         ):
             result = await synthesize_all(
                 service=service,
                 settings=settings,
-                only_category="preference",
+                only_category="convention",
             )
+        assert result.pages_created == 1
+        assert result.pages[0].category == "convention"
+        # only_category="convention" → never even scrolls decision bucket.
+        assert result.pages_skipped_empty == 0
 
-        assert result.pages_created == 0
-        assert result.pages_updated == 0
-        assert result.communities_skipped_empty == 1
+    @pytest.mark.asyncio
+    async def test_dry_run_does_not_write_or_patch(self, tmp_path):
+        settings = SynthesizerSettings(
+            enabled=True, obsidian_vault_path=str(tmp_path)
+        )
+        service = _service_with_qdrant_points({
+            ("shared", "convention"): [_qdrant_point("m1", "x", "convention")],
+        })
+        patch_mock = AsyncMock(return_value=0)
+        with patch(
+            "extensions.wiki_synthesizer.synthesizer._list_shared_group_ids",
+            new=AsyncMock(return_value=["shared"]),
+        ), patch(
+            "extensions.wiki_synthesizer.synthesizer._call_gemini",
+            new=AsyncMock(return_value="body"),
+        ), patch(
+            "extensions.wiki_synthesizer.synthesizer."
+            "patch_wiki_path_by_memory_ids",
+            new=patch_mock,
+        ):
+            result = await synthesize_all(
+                service=service, settings=settings, dry_run=True
+            )
+        assert result.pages_created == 1
+        # dry_run → no file written, no graph patch
+        assert not (tmp_path / "Wiki" / "Project" / "Conventions" / "shared.md").exists()
+        patch_mock.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_walks_all_shared_group_ids(self, tmp_path):
-        # The fix: synthesizer walks `shared` AND `shared--project--<X>`.
-        # Confirm load_communities is invoked once per discovered group_id.
+        # Verify both team-wide and per-project shared groups are visited.
         settings = SynthesizerSettings(
-            enabled=True,
-            obsidian_vault_path=str(tmp_path),
-            auto_build_communities=False,
+            enabled=True, obsidian_vault_path=str(tmp_path)
         )
-        service = MagicMock()
-        service._graphiti = MagicMock()
-        service._graphiti.driver = MagicMock()
-
-        load_calls: list[str] = []
-
-        async def fake_load(service_arg, *, group_id):
-            load_calls.append(group_id)
-            return []
-
+        service = _service_with_qdrant_points({
+            ("shared", "convention"): [_qdrant_point("m1", "x", "convention")],
+            ("shared--project--neuralscape", "convention"): [
+                _qdrant_point("m2", "y", "convention"),
+            ],
+        })
         with patch(
             "extensions.wiki_synthesizer.synthesizer._list_shared_group_ids",
             new=AsyncMock(return_value=[
                 "shared",
                 "shared--project--neuralscape",
-                "shared--project--lightpath",
             ]),
-        ), patch(
-            "extensions.wiki_synthesizer.synthesizer.load_communities",
-            new=fake_load,
-        ):
-            await synthesize_all(service=service, settings=settings)
-
-        assert load_calls == [
-            "shared",
-            "shared--project--neuralscape",
-            "shared--project--lightpath",
-        ]
-
-    @pytest.mark.asyncio
-    async def test_only_category_filters_inferred_category(self, tmp_path):
-        # only_category is now applied AFTER category inference, not
-        # used to drive an outer loop. Communities whose inferred
-        # category mismatches are skipped silently (not counted as
-        # empty).
-        community = Community(
-            uuid="c-tech",
-            name="Stack basics",
-            member_node_uuids=["u1"],
-            member_memory_ids=["mem-1", "mem-2"],
-        )
-
-        settings = SynthesizerSettings(
-            enabled=True,
-            obsidian_vault_path=str(tmp_path),
-            auto_build_communities=False,
-        )
-        service = MagicMock()
-        service._graphiti = MagicMock()
-        service._graphiti.driver = MagicMock()
-        # Both member memories report category=tech_stack.
-        service.get_memory = MagicMock(side_effect=lambda mid: MagicMock(
-            id=mid, memory="x", category="tech_stack",
-            domain=None, observation_type=None, confidence=None,
-            created_at=None, visibility="shared",
-        ))
-
-        with patch(
-            "extensions.wiki_synthesizer.synthesizer._list_shared_group_ids",
-            new=AsyncMock(return_value=["shared"]),
-        ), patch(
-            "extensions.wiki_synthesizer.synthesizer.load_communities",
-            new=AsyncMock(return_value=[community]),
         ), patch(
             "extensions.wiki_synthesizer.synthesizer._call_gemini",
             new=AsyncMock(return_value="body"),
+        ), patch(
+            "extensions.wiki_synthesizer.synthesizer."
+            "patch_wiki_path_by_memory_ids",
+            new=AsyncMock(return_value=1),
         ):
-            # Wrong category filter — community is tech_stack, filter is preference
-            r1 = await synthesize_all(
-                service=service, settings=settings, only_category="preference"
+            result = await synthesize_all(
+                service=service,
+                settings=settings,
+                only_category="convention",
             )
-            assert r1.pages_created == 0
-            assert r1.pages_updated == 0
-
-            # Right category filter — should produce a page
-            r2 = await synthesize_all(
-                service=service, settings=settings,
-                only_category="tech_stack",
-                dry_run=True,
-            )
-            assert r2.pages_created + r2.pages_updated == 1
+        assert result.pages_created == 2
+        paths = {p.wiki_path for p in result.pages}
+        assert "Wiki/Project/Conventions/shared.md" in paths
+        assert "Wiki/Project/Conventions/neuralscape.md" in paths
