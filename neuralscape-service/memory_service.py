@@ -1727,17 +1727,17 @@ class MemoryService:
         m = self._get_memory()
 
         # Get global memories
+        # mem0 v2.0.2: ``user_id`` must live inside ``filters`` (top-level
+        # rejected) and ``limit`` was renamed to ``top_k``.
         global_result = m.get_all(
-            user_id=user_id,
-            filters={"metadata.scope": "global"},
-            limit=200,
+            filters={"user_id": user_id, "metadata.scope": "global"},
+            top_k=200,
         )
 
         # Get project memories
         project_result = m.get_all(
-            user_id=user_id,
-            filters={"metadata.project_id": project_id},
-            limit=200,
+            filters={"user_id": user_id, "metadata.project_id": project_id},
+            top_k=200,
         )
 
         # Organize by category
@@ -1770,10 +1770,10 @@ class MemoryService:
         """
         m = self._get_memory()
 
+        # mem0 v2.0.2 kwarg drift — see list_memories below.
         result = m.get_all(
-            user_id=user_id,
-            filters={"metadata.scope": "global"},
-            limit=200,
+            filters={"user_id": user_id, "metadata.scope": "global"},
+            top_k=200,
         )
 
         categories: dict[str, list[MemoryResponse]] = {}
@@ -1814,7 +1814,11 @@ class MemoryService:
         """List memories with optional filters."""
         m = self._get_memory()
 
-        filters = {}
+        # mem0 v2.0.2 ``get_all`` rejects top-level entity kwargs and
+        # renamed ``limit`` -> ``top_k`` on its Qdrant wrapper. Same drift
+        # pattern as ``Memory.search`` (#46) and
+        # ``Memory.vector_store.search`` (#48).
+        filters: dict = {"user_id": user_id}
         if scope:
             filters["metadata.scope"] = scope
         if category:
@@ -1823,9 +1827,8 @@ class MemoryService:
             filters["metadata.project_id"] = project_id
 
         result = m.get_all(
-            user_id=user_id,
-            filters=filters if filters else None,
-            limit=limit,
+            filters=filters,
+            top_k=limit,
         )
 
         memories = self._extract_memory_list(result)

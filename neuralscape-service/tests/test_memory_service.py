@@ -258,6 +258,21 @@ class TestCRUD:
         assert call_kwargs["filters"]["metadata.category"] == "preference"
         assert call_kwargs["filters"]["metadata.project_id"] == "my-project"
 
+    def test_list_memories_uses_v2_kwarg_shape(self, service):
+        """Regression for the mem0 v2.0.2 ``get_all`` drift — ``user_id``
+        must live inside ``filters`` (top-level rejected) and ``limit``
+        was renamed to ``top_k``. Same pattern as ``Memory.search`` (#46)
+        and ``Memory.vector_store.search`` (#48)."""
+        service._memory.get_all.return_value = {"results": []}
+        service.list_memories(user_id="ehfaz", limit=50)
+        call_kwargs = service._memory.get_all.call_args[1]
+        # user_id must be inside filters, NOT at the top level
+        assert "user_id" not in call_kwargs
+        assert call_kwargs["filters"]["user_id"] == "ehfaz"
+        # limit was renamed to top_k
+        assert "limit" not in call_kwargs
+        assert call_kwargs["top_k"] == 50
+
     def test_update_memory(self, service):
         service._memory.get.return_value = {
             "id": "m1",
