@@ -64,25 +64,37 @@ import argparse
 import asyncio
 import logging
 import sys
+from pathlib import Path
 
-# This script runs inside the neuralscape-service container, where the
-# working directory is /app/neuralscape-service and the package layout
-# matches normal imports.
-from extensions import ExtensionRegistry
-from memory_service import MemoryService
+# When invoked as ``python scripts/backfill_vault_writes.py``, Python
+# puts ``scripts/`` (not the CWD) on ``sys.path[0]``, so imports from
+# the service root fail. Mirror the sibling scripts (issue_user_token,
+# bulk_promote_visibility, migrate_graph_groups) and prepend the
+# service root explicitly so the imports below resolve.
+_SERVICE_DIR = Path(__file__).resolve().parent.parent
+if str(_SERVICE_DIR) not in sys.path:
+    sys.path.insert(0, str(_SERVICE_DIR))
+
+from extensions import ExtensionRegistry  # noqa: E402
+from memory_service import MemoryService  # noqa: E402
 
 logger = logging.getLogger("backfill_vault_writes")
 
 
-def _payload_from_memory(mem) -> dict:
+def _payload_from_memory(mem, user_id: str) -> dict:
     """Construct a ``memory_stored`` event payload matching ``worker.py``
     emit shape for one MemoryResponse.
+
+    ``user_id`` is the caller (matches ``worker.py``'s emit, which uses
+    the request's user_id, not the memory's owner). ``owner_user_id`` is
+    kept as a separate field so consumers can still distinguish them on
+    legacy memories where they may differ.
 
     Source is set to ``"backfill"`` (NOT ``"conversation-compiler"``)
     so the consumer's skip-self-writes guard doesn't fire.
     """
     return {
-        "user_id": mem.owner_user_id or "",
+        "user_id": user_id,
         "memory_id": mem.id,
         "content": mem.memory,
         "category": mem.category or "",
@@ -105,71 +117,83 @@ async def _run(args: argparse.Namespace) -> int:
 
     # Use the same boot path the ARQ worker uses (startup() in worker.py).
     service = MemoryService()
-    service._get_memory()  # warm up connections
-
     registry = ExtensionRegistry()
-    await registry.discover()
-    await registry.startup_all()
 
-    if args.user:
-        user_ids = [args.user]
-        print(f"Scoped to single user: {args.user}")
-    else:
-        user_ids = service.get_all_user_ids(batch_size=100)
-        print(f"Found {len(user_ids)} user(s) in pool: {user_ids}")
+    try:
+        service._get_memory()  # warm up connections
+        await registry.discover()
+        await registry.startup_all()
 
-    total_scanned = 0
-    total_emitted = 0
-    total_responses = 0
-    total_errors = 0
+        if args.user:
+            user_ids = [args.user]
+            print(f"Scoped to single user: {args.user}")
+        else:
+            # user_ids may contain PII (real user identifiers); log only
+            # the count so backfill logs are safe to ship around.
+            user_ids = service.get_all_user_ids(batch_size=100)
+            print(f"Found {len(user_ids)} user(s) in pool")
 
-    for uid in user_ids:
-        try:
-            memories = service.list_memories(user_id=uid, limit=args.limit)
-        except Exception as e:
-            print(f"  [user={uid}] list_memories FAILED: {e}")
-            total_errors += 1
-            continue
+        total_scanned = 0
+        total_emitted = 0
+        total_responses = 0
+        total_errors = 0
 
-        n_user = 0
-        n_resp_user = 0
-        for mem in memories:
-            total_scanned += 1
-            n_user += 1
-            payload = _payload_from_memory(mem)
-            if args.verbose:
-                vis = payload.get("visibility")
-                print(
-                    f"  [user={uid}] {mem.id[:8]} "
-                    f"[{payload.get('category','?')}/{payload.get('scope','?')}/{vis}] "
-                    f"{(mem.memory or '')[:60]!r}"
-                )
-            if args.dry_run:
-                continue
+        for uid in user_ids:
             try:
-                result = await registry.emit_event("memory_stored", payload)
-                total_emitted += 1
-                if result.responses:
-                    n_resp_user += 1
-                    total_responses += 1
+                memories = service.list_memories(user_id=uid, limit=args.limit)
             except Exception as e:
+                print(f"  [user={uid}] list_memories FAILED: {e}")
                 total_errors += 1
-                logger.warning("emit_event failed for %s: %s", mem.id, e)
-        print(f"  [user={uid}] scanned={n_user} vault-writes={n_resp_user}")
+                continue
 
-    print()
-    print(
-        f"Summary: scanned={total_scanned} "
-        f"emitted={total_emitted} "
-        f"vault-writes={total_responses} "
-        f"errors={total_errors}"
-    )
-    if args.dry_run:
-        print("(dry-run — no events emitted, no vault writes)")
+            n_user = 0
+            n_resp_user = 0
+            for mem in memories:
+                total_scanned += 1
+                n_user += 1
+                payload = _payload_from_memory(mem, uid)
+                if args.verbose:
+                    vis = payload.get("visibility")
+                    print(
+                        f"  [user={uid}] {mem.id[:8]} "
+                        f"[{payload.get('category','?')}/{payload.get('scope','?')}/{vis}] "
+                        f"{(mem.memory or '')[:60]!r}"
+                    )
+                if args.dry_run:
+                    continue
+                try:
+                    result = await registry.emit_event("memory_stored", payload)
+                    total_emitted += 1
+                    if result.responses:
+                        n_resp_user += 1
+                        total_responses += 1
+                except Exception as e:
+                    total_errors += 1
+                    logger.warning("emit_event failed for %s: %s", mem.id, e)
+            print(f"  [user={uid}] scanned={n_user} vault-writes={n_resp_user}")
 
-    await registry.shutdown_all()
-    service.close()
-    return 0 if total_errors == 0 else 1
+        print()
+        print(
+            f"Summary: scanned={total_scanned} "
+            f"emitted={total_emitted} "
+            f"vault-writes={total_responses} "
+            f"errors={total_errors}"
+        )
+        if args.dry_run:
+            print("(dry-run — no events emitted, no vault writes)")
+
+        return 0 if total_errors == 0 else 1
+    finally:
+        # Always release Redis / Qdrant / Neo4j connections, even on
+        # partway failures, so a half-run leaves no dangling sockets.
+        try:
+            await registry.shutdown_all()
+        except Exception:
+            logger.exception("registry.shutdown_all failed")
+        try:
+            service.close()
+        except Exception:
+            logger.exception("service.close failed")
 
 
 def main() -> int:

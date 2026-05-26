@@ -223,8 +223,14 @@ def _build_group_id(
     authenticated user.
     """
     # Tolerate enum / str / legacy "MemoryVisibility.X" / None — see
-    # normalize_visibility docstring for why this matters.
-    vis = normalize_visibility(visibility) or MemoryVisibility.PRIVATE.value
+    # normalize_visibility docstring for why this matters. Unrecognized
+    # values fall back to PRIVATE so an unknown visibility never
+    # accidentally lands a memory in the shared pool (safe default
+    # preserves the pre-fix behavior of ``str(visibility or PRIVATE)``).
+    try:
+        vis = normalize_visibility(visibility) or MemoryVisibility.PRIVATE.value
+    except (ValueError, TypeError):
+        vis = MemoryVisibility.PRIVATE.value
     if vis == MemoryVisibility.SHARED.value:
         if project_id:
             return f"shared--project--{project_id}"
