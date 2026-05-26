@@ -26,9 +26,54 @@ class MemoryVisibility(str, Enum):
     (cross-project for that user) or `project`-scoped; a shared memory can
     be cross-project or project-scoped (visible to anyone who searches that
     project).
+
+    NOTE on ``__str__`` override: in Python 3.11+, ``str(EnumMember)`` of a
+    ``(str, Enum)`` subclass returns the repr-style ``"MemoryVisibility.SHARED"``
+    instead of the value ``"shared"`` (PEP 663-related regression). Without
+    this override, ``str(visibility)`` calls in memory_service.py used to
+    write ``"MemoryVisibility.SHARED"`` into Qdrant metadata, breaking the
+    GET API response shape and crashing the conversation_compiler extension
+    handler with ``ValueError: 'MemoryVisibility.SHARED' is not a valid
+    MemoryVisibility``. Overriding ``__str__`` to return the value matches
+    the ``StrEnum`` behavior (Python 3.11+) without bumping the minimum
+    Python version. See ``normalize_visibility()`` for legacy-data recovery.
     """
     PRIVATE = "private"
     SHARED = "shared"
+
+    def __str__(self) -> str:
+        return self.value
+
+
+def normalize_visibility(v) -> str | None:
+    """Coerce any visibility input to its canonical lowercase string value.
+
+    Handles four input shapes:
+      - ``None``                              → ``None``
+      - ``MemoryVisibility`` enum             → its ``.value``
+      - ``"shared"`` / ``"private"`` (str)    → unchanged
+      - ``"MemoryVisibility.SHARED"`` (legacy stringified-enum from the
+        Python 3.11+ ``str(Enum)`` bug)        → ``"shared"``
+
+    Use this at any boundary where visibility crosses a serialization
+    layer (event payloads, Qdrant writes, JSON responses) so old data
+    written before the ``__str__`` fix still parses cleanly.
+
+    Raises ``ValueError`` if the input is a string that doesn't match
+    a known visibility after prefix-stripping.
+    Raises ``TypeError`` for unsupported input types.
+    """
+    if v is None:
+        return None
+    if isinstance(v, MemoryVisibility):
+        return v.value
+    if isinstance(v, str):
+        # Strip any "MemoryVisibility." prefix that may have been written
+        # by the pre-__str__-override stringification bug, then lowercase.
+        candidate = v.rsplit(".", 1)[-1].lower()
+        MemoryVisibility(candidate)  # validates membership; raises ValueError if unknown
+        return candidate
+    raise TypeError(f"Cannot normalize visibility from {type(v).__name__}: {v!r}")
 
 
 class MemoryCategory(str, Enum):

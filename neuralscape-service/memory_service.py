@@ -197,6 +197,7 @@ from schemas import (
     MemoryVisibility,
     default_scope_for_category,
     default_visibility_for_category,
+    normalize_visibility,
 )
 
 logger = logging.getLogger(__name__)
@@ -221,7 +222,9 @@ def _build_group_id(
     `shared` namespace is the team-wide knowledge pool readable by any
     authenticated user.
     """
-    vis = str(visibility or MemoryVisibility.PRIVATE.value)
+    # Tolerate enum / str / legacy "MemoryVisibility.X" / None — see
+    # normalize_visibility docstring for why this matters.
+    vis = normalize_visibility(visibility) or MemoryVisibility.PRIVATE.value
     if vis == MemoryVisibility.SHARED.value:
         if project_id:
             return f"shared--project--{project_id}"
@@ -618,9 +621,14 @@ class MemoryService:
             raise ValueError("project_id is required when scope='project'")
 
         # Resolve visibility: explicit caller value > per-category default.
-        # Coerce enum → str for downstream filters.
+        # ``normalize_visibility`` handles MemoryVisibility enum, plain
+        # str, and the legacy "MemoryVisibility.X" stringified-enum
+        # format from the pre-__str__-override bug (Python 3.11+ str(Enum)
+        # regression). Without normalization, "MemoryVisibility.SHARED"
+        # used to land in Qdrant metadata and break both the GET API
+        # shape and the conversation_compiler event handler.
         effective_visibility = (
-            str(visibility)
+            normalize_visibility(visibility)
             if visibility is not None
             else default_visibility_for_category(category).value
         )
