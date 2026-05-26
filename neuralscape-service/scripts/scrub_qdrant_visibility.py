@@ -77,11 +77,16 @@ _LEGACY_TO_CANONICAL: dict[str, str] = {
 
 
 def _qdrant_client() -> QdrantClient:
-    """Build a QdrantClient using the same config the service uses."""
+    """Build a QdrantClient using the same config the service uses.
+
+    No API key is wired through — the deployed Qdrant runs on the
+    internal docker network and config.py exposes no auth field. If
+    Qdrant ever moves behind auth, add the key here.
+    """
     if settings.qdrant_url:
-        return QdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
+        return QdrantClient(url=settings.qdrant_url)
     # Local on-disk fallback (matches MemoryService config).
-    return QdrantClient(path=settings.qdrant_path)
+    return QdrantClient(path=str(Path(settings.qdrant_path).expanduser()))
 
 
 def _scrub(client: QdrantClient, collection: str, legacy: str, canonical: str,
