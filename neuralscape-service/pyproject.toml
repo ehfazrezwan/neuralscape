@@ -18,6 +18,16 @@ dependencies = [
     "arq>=0.26.0",
     "redis[hiredis]>=5.0.0",
     "structlog>=24.0.0",
+    # ── Search-quality dependencies that mem0 picks up at import time ──
+    # Without these, the worker logs at startup:
+    #   "Failed to load spaCy lemma model: spaCy is not installed."
+    #   "fastembed not installed — BM25 keyword search disabled."
+    # spaCy enables lemmatization for keyword extraction; fastembed
+    # provides BM25 keyword search as a complement to vector similarity.
+    # The Dockerfile also runs `python -m spacy download en_core_web_sm`
+    # so the small English model is bundled (~12MB).
+    "spacy>=3.7",
+    "fastembed>=0.3",
 ]
 
 [tool.hatch.build.targets.wheel]

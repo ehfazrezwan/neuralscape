@@ -20,6 +20,12 @@ COPY neuralscape-service/extensions/ neuralscape-service/extensions/
 # Install all dependencies using uv from the neuralscape-service project
 RUN cd neuralscape-service && uv sync --frozen --no-dev
 
+# Download the small English spaCy model so mem0's keyword-extraction
+# layer finds it at import time. Without this the worker logs a
+# "Failed to load spaCy lemma model" warning on every startup and
+# falls back to no lemmatization, hurting search quality.
+RUN cd neuralscape-service && .venv/bin/python -m spacy download en_core_web_sm
+
 # ── Stage 2: Runtime ────────────────────────────────────────────
 FROM python:3.12-slim AS runtime
 
@@ -82,6 +88,10 @@ COPY neuralscape-service/extensions/ neuralscape-service/extensions/
 
 # Resolve WITH dev deps so pytest, pytest-asyncio, etc. are available.
 RUN cd neuralscape-service && uv sync --frozen
+
+# Same spaCy model download as the runtime stage so unit tests that
+# import mem0's NLP path see the same dependency graph as production.
+RUN cd neuralscape-service && .venv/bin/python -m spacy download en_core_web_sm
 
 # Pull tests + helper scripts into the image so they're available without
 # a host bind-mount. Bind-mounts can still be layered on top from compose
