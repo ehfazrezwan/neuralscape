@@ -36,7 +36,6 @@ from .config import SynthesizerSettings, synthesizer_settings
 from .graph_patcher import patch_wiki_path_by_memory_ids
 from .prompts import INCREMENTAL_MERGE_PROMPT, render_memories_block
 from .wiki_renderer import (
-    category_filename,
     category_page_title,
     render_page,
     split_existing_page,
@@ -237,9 +236,12 @@ async def _synthesize_category_page(
 
     memory_ids = [m["memory_id"] for m in memories if m.get("memory_id")]
 
-    filename = category_filename(group_id)
-    page_path = wiki_page_path(settings.wiki_dir, category, filename)
-    rel_path = wikilink_path(category, filename)
+    page_path = wiki_page_path(settings.wiki_dir, category, group_id)
+    rel_path = wikilink_path(category, group_id)
+    if page_path is None or rel_path is None:
+        # wiki_renderer logged the reason (reserved/empty project_id,
+        # unexpected group_id shape, etc.); skip the bucket.
+        return None
 
     existing_text = _safe_read_text(page_path)
     fm, existing_body = split_existing_page(existing_text)

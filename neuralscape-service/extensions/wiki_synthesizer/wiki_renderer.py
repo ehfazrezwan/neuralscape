@@ -4,14 +4,19 @@ Reuses the atomic-write primitives from the conversation_compiler so
 both extensions share the same file-locking + temp-file-rename semantics.
 
 Page identity is ``(category, group_id)`` — deterministic, one page per
-bucket. Filenames are derived from ``group_id``:
+bucket. The on-disk layout is pivoted by scope:
 
-- ``"shared"`` → ``shared.md`` (team-wide pool)
-- ``"shared--project--<pid>"`` → ``<pid>.md`` (per-project shared pool)
+- ``group_id == "shared"`` → ``Wiki/global/<TypeGroup>/<Leaf>.md``
+- ``group_id == "shared--project--<pid>"`` → ``Wiki/<pid>/<TypeGroup>/<Leaf>.md``
+
+The "Project" type-group is renamed to "General" everywhere — inside
+both per-project trees (where "Project" would be redundant) and the
+global tree (consistent rename rather than asymmetric exceptions).
 """
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,37 +27,127 @@ from extensions.conversation_compiler.obsidian_writer import (
 )
 from schemas import CATEGORY_VAULT_PATHS, MEMORY_CATEGORIES
 
+logger = logging.getLogger(__name__)
+
 
 _SHARED_PROJECT_PREFIX = "shared--project--"
+_GLOBAL_SCOPE_DIR = "global"
+_UNCATEGORIZED_TYPE_GROUP = "Uncategorized"
+_TYPE_GROUP_RENAMES: dict[str, str] = {"Project": "General"}
+
+# Reserve every directory name that has independent meaning in the layout.
+# A project_id colliding with any of these would either overwrite the
+# global tree, masquerade as a type-group folder, or hijack the
+# Uncategorized fallback. Better to skip the bucket and log than silently
+# shadow data — especially on case-insensitive filesystems (macOS APFS,
+# Windows NTFS) where ``Wiki/Project`` and ``Wiki/project`` share storage.
+# Entries are lowercased because ``_slugify`` always lowercases its input.
+_RESERVED_PROJECT_IDS: set[str] = {
+    _GLOBAL_SCOPE_DIR,
+    "shared",
+    "project",
+    "episodic",
+    "procedural",
+    "semantic",
+    "working",
+    "general",
+    _UNCATEGORIZED_TYPE_GROUP.lower(),
+}
+
+# Startup invariant: every CATEGORY_VAULT_PATHS value is exactly
+# "TypeGroup/Leaf" — two segments. The new layout depends on splitting
+# at this single slash; any future schema drift would silently corrupt
+# the wiki tree.
+assert all(p.count("/") == 1 for p in CATEGORY_VAULT_PATHS.values()), (
+    "wiki_renderer assumes CATEGORY_VAULT_PATHS values are 'TypeGroup/Leaf'"
+)
 
 
-def category_filename(group_id: str) -> str:
-    """Stable filename for a ``(category, group_id)`` wiki page.
+def _resolve_wiki_parts(
+    category: str, group_id: str
+) -> tuple[str, str, str] | None:
+    """Resolve ``(scope_dir, type_group, leaf)`` for a wiki bucket.
 
-    The category is encoded in the folder path (see
-    :func:`wiki_page_path`); the filename only needs to disambiguate the
-    group within that folder.
+    Returns ``None`` when the bucket should be skipped — caller logs
+    once and moves on without writing or patching anything.
+
+    Skip conditions:
+
+    - ``group_id`` is neither ``"shared"`` nor a ``shared--project--<pid>``
+      shape (the synthesizer should never reach this path, but guard
+      against drift).
+    - ``project_id`` is empty after stripping the prefix (e.g.
+      ``"shared--project--"``).
+    - ``project_id`` slug collides with a reserved layout name
+      (``global``, ``shared``, type-group names, ``Uncategorized``,
+      ``General``).
     """
     if not group_id or group_id == "shared":
-        return "shared.md"
-    if group_id.startswith(_SHARED_PROJECT_PREFIX):
-        pid = group_id[len(_SHARED_PROJECT_PREFIX):]
-        return f"{_slugify(pid) or 'unknown'}.md"
-    # Fallback — should not happen for shared synthesis but keeps the
-    # function total.
-    return f"{_slugify(group_id) or 'unknown'}.md"
+        scope_dir = _GLOBAL_SCOPE_DIR
+    elif group_id.startswith(_SHARED_PROJECT_PREFIX):
+        pid_raw = group_id[len(_SHARED_PROJECT_PREFIX):]
+        pid_slug = _slugify(pid_raw)
+        if not pid_slug:
+            logger.warning(
+                "wiki_renderer: empty project_id after stripping prefix from "
+                "group_id %r — skipping bucket",
+                group_id,
+            )
+            return None
+        if pid_slug in _RESERVED_PROJECT_IDS:
+            logger.warning(
+                "wiki_renderer: project_id %r collides with a reserved layout "
+                "name; skipping bucket for group_id %r",
+                pid_slug,
+                group_id,
+            )
+            return None
+        scope_dir = pid_slug
+    else:
+        logger.warning(
+            "wiki_renderer: unexpected group_id %r (not a shared synthesis "
+            "target) — skipping bucket",
+            group_id,
+        )
+        return None
+
+    folder = CATEGORY_VAULT_PATHS.get(category)
+    if folder is None:
+        leaf = _slugify(category) or "uncategorized"
+        return (scope_dir, _UNCATEGORIZED_TYPE_GROUP, leaf)
+
+    type_group_raw, leaf = folder.split("/", 1)
+    type_group = _TYPE_GROUP_RENAMES.get(type_group_raw, type_group_raw)
+    return (scope_dir, type_group, leaf)
 
 
-def wiki_page_path(wiki_root: Path, category: str, filename: str) -> Path:
-    """Absolute path of a wiki page under ``{wiki_root}/{category_folder}/``."""
-    folder = CATEGORY_VAULT_PATHS.get(category, f"Uncategorized/{_slugify(category)}")
-    return wiki_root / folder / filename
+def wiki_page_path(
+    wiki_root: Path, category: str, group_id: str
+) -> Path | None:
+    """Absolute path of a wiki page under ``wiki_root``.
+
+    Returns ``None`` when the bucket should be skipped (see
+    :func:`_resolve_wiki_parts`).
+    """
+    parts = _resolve_wiki_parts(category, group_id)
+    if parts is None:
+        return None
+    scope_dir, type_group, leaf = parts
+    return wiki_root / scope_dir / type_group / f"{leaf}.md"
 
 
-def wikilink_path(category: str, filename: str) -> str:
-    """Vault-root-relative path used in API responses and ``[[wikilinks]]``."""
-    folder = CATEGORY_VAULT_PATHS.get(category, f"Uncategorized/{_slugify(category)}")
-    return f"Wiki/{folder}/{filename}"
+def wikilink_path(category: str, group_id: str) -> str | None:
+    """Vault-root-relative path used in API responses and ``[[wikilinks]]``.
+
+    Returns ``None`` when the bucket should be skipped. The synthesizer
+    uses this value verbatim as the Neo4j ``wiki_path`` property, so the
+    None case must short-circuit before any graph writeback.
+    """
+    parts = _resolve_wiki_parts(category, group_id)
+    if parts is None:
+        return None
+    scope_dir, type_group, leaf = parts
+    return f"Wiki/{scope_dir}/{type_group}/{leaf}.md"
 
 
 def category_page_title(category: str, group_id: str) -> str:
