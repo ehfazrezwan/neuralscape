@@ -31,7 +31,6 @@ from extensions.wiki_synthesizer.synthesizer import (
     synthesize_all,
 )
 from extensions.wiki_synthesizer.wiki_renderer import (
-    category_filename,
     category_page_title,
     render_page,
     split_existing_page,
@@ -46,25 +45,100 @@ from extensions.wiki_synthesizer.wiki_renderer import (
 
 
 class TestWikiRenderer:
-    def test_category_filename_team_wide(self):
-        assert category_filename("shared") == "shared.md"
+    def test_wiki_page_path_global_scope(self, tmp_path):
+        path = wiki_page_path(tmp_path / "Wiki", "preference", "shared")
+        assert path == tmp_path / "Wiki" / "global" / "Semantic" / "Preferences.md"
 
-    def test_category_filename_per_project(self):
-        assert category_filename("shared--project--neuralscape") == "neuralscape.md"
+    def test_wiki_page_path_per_project_scope(self, tmp_path):
+        path = wiki_page_path(
+            tmp_path / "Wiki", "decision", "shared--project--neuralscape"
+        )
+        assert (
+            path
+            == tmp_path / "Wiki" / "neuralscape" / "Episodic" / "Decisions.md"
+        )
 
-    def test_category_filename_slugifies_dirty_project_id(self):
-        # `_slugify` should normalize whitespace/symbols to a clean filename.
-        assert category_filename("shared--project--My Big Project!") == "my-big-project.md"
+    def test_wikilink_path_global_scope(self):
+        assert (
+            wikilink_path("decision", "shared")
+            == "Wiki/global/Episodic/Decisions.md"
+        )
 
-    def test_category_filename_handles_empty(self):
-        assert category_filename("") == "shared.md"
+    def test_wikilink_path_project_scope_renames_project_to_general(self):
+        # 'Project' type-group renames to 'General' inside per-project trees
+        # because 'Wiki/<project>/Project/...' would be redundant.
+        assert (
+            wikilink_path("architecture", "shared--project--neuralscape")
+            == "Wiki/neuralscape/General/Architecture.md"
+        )
 
-    def test_wiki_page_path_uses_category_folder(self, tmp_path):
-        path = wiki_page_path(tmp_path / "Wiki", "preference", "shared.md")
-        assert path == tmp_path / "Wiki" / "Semantic" / "Preferences" / "shared.md"
+    def test_wikilink_path_project_scope_non_project_typegroup_unchanged(self):
+        # Episodic / Procedural / Semantic / Working stay named the same
+        # under per-project trees — only the 'Project' type-group renames.
+        assert (
+            wikilink_path("decision", "shared--project--neuralscape")
+            == "Wiki/neuralscape/Episodic/Decisions.md"
+        )
 
-    def test_wikilink_path_includes_wiki_prefix(self):
-        assert wikilink_path("decision", "shared.md") == "Wiki/Episodic/Decisions/shared.md"
+    def test_wikilink_path_global_scope_with_project_category_also_renames(self):
+        # The 'Project' rename to 'General' is consistent across scopes —
+        # not asymmetric. A shared 'architecture' memory (rare but legal)
+        # lands at Wiki/global/General/Architecture.md, not Wiki/global/Project/.
+        assert (
+            wikilink_path("architecture", "shared")
+            == "Wiki/global/General/Architecture.md"
+        )
+
+    def test_wikilink_path_slugifies_dirty_project_id(self):
+        assert (
+            wikilink_path("decision", "shared--project--My Big Project!")
+            == "Wiki/my-big-project/Episodic/Decisions.md"
+        )
+
+    def test_wikilink_path_empty_group_id_treated_as_global(self):
+        # Empty / falsy group_id is defensively routed to the global tree
+        # rather than crashing — matches the legacy fallback at the call site.
+        assert wikilink_path("decision", "") == "Wiki/global/Episodic/Decisions.md"
+
+    def test_wikilink_path_reserved_project_id_global_returns_none(self):
+        # A project literally named "global" would collide with the
+        # global-scope dir — skip the bucket.
+        assert wikilink_path("decision", "shared--project--global") is None
+
+    def test_wikilink_path_reserved_project_id_shared_returns_none(self):
+        # A project named "shared" would collide with reserved layout
+        # vocabulary — skip.
+        assert wikilink_path("decision", "shared--project--shared") is None
+
+    def test_wikilink_path_reserved_project_id_typegroup_returns_none(self):
+        # A project slugged to "episodic" would create
+        # Wiki/episodic/General/Architecture.md, which on
+        # case-insensitive filesystems collides with
+        # Wiki/<other-project>/Episodic/Decisions.md — skip.
+        assert wikilink_path("decision", "shared--project--Episodic") is None
+
+    def test_wikilink_path_empty_project_id_returns_none(self):
+        # 'shared--project--' alone (no pid) must not silently slip
+        # through to 'Wiki/<scope>/Episodic/Decisions.md' with an
+        # unknown scope. Returns None instead.
+        assert wikilink_path("decision", "shared--project--") is None
+
+    def test_wikilink_path_unknown_category_falls_back_to_uncategorized(self):
+        # Categories not in CATEGORY_VAULT_PATHS land under an
+        # 'Uncategorized' type-group with a slugged leaf so the page is
+        # still discoverable rather than dropped.
+        assert (
+            wikilink_path("nonsense_category", "shared")
+            == "Wiki/global/Uncategorized/nonsense-category.md"
+        )
+
+    def test_wiki_page_path_returns_none_for_reserved_project_id(self, tmp_path):
+        # wiki_page_path must propagate the same skip signal as
+        # wikilink_path — they're a pair and the call site checks both.
+        assert (
+            wiki_page_path(tmp_path / "Wiki", "decision", "shared--project--global")
+            is None
+        )
 
     def test_category_page_title_team_wide(self):
         assert category_page_title("convention", "shared") == "Conventions"
@@ -296,7 +370,7 @@ class TestGraphPatcher:
         n = await patch_wiki_path_by_memory_ids(
             service,
             memory_ids=["mem-1", "mem-2", "mem-3"],
-            wiki_path="Wiki/Project/Conventions/neuralscape.md",
+            wiki_path="Wiki/neuralscape/General/Conventions.md",
             group_id="shared--project--neuralscape",
         )
         assert n == 5
@@ -452,9 +526,13 @@ class TestSynthesizeAll:
         page = result.pages[0]
         assert page.category == "convention"
         assert page.group_id == "shared"
-        assert page.wiki_path == "Wiki/Project/Conventions/shared.md"
+        # New layout: group_id=='shared' → scope='global'; 'Project'
+        # type-group renames to 'General' here too (consistent rename).
+        assert page.wiki_path == "Wiki/global/General/Conventions.md"
         # The actual file was written (not dry_run).
-        assert (tmp_path / "Wiki" / "Project" / "Conventions" / "shared.md").exists()
+        assert (
+            tmp_path / "Wiki" / "global" / "General" / "Conventions.md"
+        ).exists()
 
     @pytest.mark.asyncio
     async def test_only_category_restricts_scope(self, tmp_path):
@@ -514,7 +592,9 @@ class TestSynthesizeAll:
             )
         assert result.pages_created == 1
         # dry_run → no file written, no graph patch
-        assert not (tmp_path / "Wiki" / "Project" / "Conventions" / "shared.md").exists()
+        assert not (
+            tmp_path / "Wiki" / "global" / "General" / "Conventions.md"
+        ).exists()
         patch_mock.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -550,5 +630,149 @@ class TestSynthesizeAll:
             )
         assert result.pages_created == 2
         paths = {p.wiki_path for p in result.pages}
-        assert "Wiki/Project/Conventions/shared.md" in paths
-        assert "Wiki/Project/Conventions/neuralscape.md" in paths
+        # 'convention' is in the 'Project' type-group → renamed to 'General'.
+        # group_id 'shared' → scope 'global'; 'shared--project--neuralscape'
+        # → scope 'neuralscape'.
+        assert "Wiki/global/General/Conventions.md" in paths
+        assert "Wiki/neuralscape/General/Conventions.md" in paths
+
+    @pytest.mark.asyncio
+    async def test_synthesis_calls_patch_wiki_path_with_new_format_path(
+        self, tmp_path
+    ):
+        # Regression guard against drift between what gets written to
+        # disk and what gets stamped onto Neo4j nodes. The graph patcher
+        # must receive the same new-format path string that's reflected
+        # in result.pages[].wiki_path.
+        settings = SynthesizerSettings(
+            enabled=True, obsidian_vault_path=str(tmp_path)
+        )
+        service = _service_with_qdrant_points({
+            ("shared--project--neuralscape", "architecture"): [
+                _qdrant_point("m1", "dual-backend design", "architecture"),
+            ],
+        })
+        patch_mock = AsyncMock(return_value=1)
+        with patch(
+            "extensions.wiki_synthesizer.synthesizer._list_shared_group_ids",
+            new=AsyncMock(return_value=["shared--project--neuralscape"]),
+        ), patch(
+            "extensions.wiki_synthesizer.synthesizer._call_gemini",
+            new=AsyncMock(return_value="body"),
+        ), patch(
+            "extensions.wiki_synthesizer.synthesizer."
+            "patch_wiki_path_by_memory_ids",
+            new=patch_mock,
+        ):
+            result = await synthesize_all(
+                service=service,
+                settings=settings,
+                only_category="architecture",
+            )
+        assert result.pages_created == 1
+        # One patch call per successful page write
+        patch_mock.assert_awaited_once()
+        call_kwargs = patch_mock.await_args.kwargs
+        assert (
+            call_kwargs["wiki_path"]
+            == "Wiki/neuralscape/General/Architecture.md"
+        )
+        assert call_kwargs["group_id"] == "shared--project--neuralscape"
+
+    @pytest.mark.asyncio
+    async def test_existing_page_at_new_path_increments_synthesis_count(
+        self, tmp_path
+    ):
+        # First synthesis writes synthesis_count: 1 at the new path.
+        # Second run at the same path reads existing frontmatter, bumps
+        # synthesis_count to 2, and reports pages_updated.
+        settings = SynthesizerSettings(
+            enabled=True, obsidian_vault_path=str(tmp_path)
+        )
+        service = _service_with_qdrant_points({
+            ("shared", "convention"): [
+                _qdrant_point("m1", "use PRs targeting dev", "convention"),
+            ],
+        })
+        with patch(
+            "extensions.wiki_synthesizer.synthesizer._list_shared_group_ids",
+            new=AsyncMock(return_value=["shared"]),
+        ), patch(
+            "extensions.wiki_synthesizer.synthesizer._call_gemini",
+            new=AsyncMock(return_value="first body"),
+        ), patch(
+            "extensions.wiki_synthesizer.synthesizer."
+            "patch_wiki_path_by_memory_ids",
+            new=AsyncMock(return_value=1),
+        ):
+            first = await synthesize_all(
+                service=service,
+                settings=settings,
+                only_category="convention",
+            )
+        assert first.pages_created == 1
+        page_path = tmp_path / "Wiki" / "global" / "General" / "Conventions.md"
+        assert page_path.exists()
+        assert "synthesis_count: 1" in page_path.read_text()
+
+        # Second run — same bucket, page now exists at the new path
+        with patch(
+            "extensions.wiki_synthesizer.synthesizer._list_shared_group_ids",
+            new=AsyncMock(return_value=["shared"]),
+        ), patch(
+            "extensions.wiki_synthesizer.synthesizer._call_gemini",
+            new=AsyncMock(return_value="second body"),
+        ), patch(
+            "extensions.wiki_synthesizer.synthesizer."
+            "patch_wiki_path_by_memory_ids",
+            new=AsyncMock(return_value=1),
+        ):
+            second = await synthesize_all(
+                service=service,
+                settings=settings,
+                only_category="convention",
+            )
+        # Existing file at new path → updated, not created.
+        assert second.pages_created == 0
+        assert second.pages_updated == 1
+        assert "synthesis_count: 2" in page_path.read_text()
+
+    @pytest.mark.asyncio
+    async def test_reserved_project_id_bucket_is_skipped_during_synthesis(
+        self, tmp_path
+    ):
+        # If Neo4j somehow surfaces a group_id like
+        # 'shared--project--global' (a project literally named "global"),
+        # the synthesizer must skip it rather than overwrite the global
+        # wiki tree. No page created, no Gemini call, no graph patch.
+        settings = SynthesizerSettings(
+            enabled=True, obsidian_vault_path=str(tmp_path)
+        )
+        service = _service_with_qdrant_points({
+            ("shared--project--global", "decision"): [
+                _qdrant_point("m1", "x", "decision"),
+            ],
+        })
+        gemini_mock = AsyncMock(return_value="body")
+        patch_mock = AsyncMock(return_value=1)
+        with patch(
+            "extensions.wiki_synthesizer.synthesizer._list_shared_group_ids",
+            new=AsyncMock(return_value=["shared--project--global"]),
+        ), patch(
+            "extensions.wiki_synthesizer.synthesizer._call_gemini",
+            new=gemini_mock,
+        ), patch(
+            "extensions.wiki_synthesizer.synthesizer."
+            "patch_wiki_path_by_memory_ids",
+            new=patch_mock,
+        ):
+            result = await synthesize_all(
+                service=service,
+                settings=settings,
+                only_category="decision",
+            )
+        assert result.pages_created == 0
+        assert result.pages_updated == 0
+        # Bucket skipped before any expensive work
+        gemini_mock.assert_not_awaited()
+        patch_mock.assert_not_awaited()
