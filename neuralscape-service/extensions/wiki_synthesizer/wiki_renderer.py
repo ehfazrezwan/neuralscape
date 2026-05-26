@@ -57,10 +57,18 @@ _RESERVED_PROJECT_IDS: set[str] = {
 # Startup invariant: every CATEGORY_VAULT_PATHS value is exactly
 # "TypeGroup/Leaf" — two segments. The new layout depends on splitting
 # at this single slash; any future schema drift would silently corrupt
-# the wiki tree.
-assert all(p.count("/") == 1 for p in CATEGORY_VAULT_PATHS.values()), (
-    "wiki_renderer assumes CATEGORY_VAULT_PATHS values are 'TypeGroup/Leaf'"
-)
+# the wiki tree. Using a runtime ``raise`` rather than ``assert`` because
+# ``assert`` is elided under ``python -O`` and this check must fire in
+# production builds too.
+_malformed = [
+    k for k, v in CATEGORY_VAULT_PATHS.items() if v.count("/") != 1
+]
+if _malformed:
+    raise RuntimeError(
+        "wiki_renderer requires CATEGORY_VAULT_PATHS values to be "
+        f"'TypeGroup/Leaf' (single slash). Malformed: {_malformed}"
+    )
+del _malformed
 
 
 def _resolve_wiki_parts(

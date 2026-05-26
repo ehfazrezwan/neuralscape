@@ -81,17 +81,26 @@ def reverse_old_path(rel_path: Path) -> tuple[str, str] | None:
     if type_group not in _OLD_TYPE_GROUPS:
         # Either already migrated (Wiki/<scope>/...) or junk in vault root.
         return None
-    folder_value = f"{type_group}/{category_folder}"
-    category = _FOLDER_TO_CATEGORY.get(folder_value)
-    if category is None:
-        # E.g. user-created subfolders, or Uncategorized leaves from the
-        # old fallback path. Skip with a warning so they don't silently
-        # rot under the old layout.
-        logger.warning(
-            "skipping %s — (%r, %r) is not in CATEGORY_VAULT_PATHS",
-            rel_path, type_group, category_folder,
-        )
-        return None
+    if type_group == "Uncategorized":
+        # OLD fallback path was ``Wiki/Uncategorized/<slug>/<file>.md``
+        # for categories not in CATEGORY_VAULT_PATHS. The new renderer's
+        # Uncategorized fallback round-trips: feeding the slug back as
+        # the ``category`` argument fails the CATEGORY_VAULT_PATHS lookup
+        # and hits the same fallback, producing
+        # ``Wiki/<scope>/Uncategorized/<slug>.md``. (_slugify is
+        # idempotent on already-slugged strings.)
+        category = category_folder
+    else:
+        folder_value = f"{type_group}/{category_folder}"
+        category = _FOLDER_TO_CATEGORY.get(folder_value)
+        if category is None:
+            # User-created subfolders or unknown shapes — skip with a
+            # warning so they don't silently rot under the old layout.
+            logger.warning(
+                "skipping %s — (%r, %r) is not in CATEGORY_VAULT_PATHS",
+                rel_path, type_group, category_folder,
+            )
+            return None
     stem = filename[:-3]  # strip ".md"
     if stem == "shared":
         group_id = "shared"
@@ -139,10 +148,15 @@ def plan_moves(wiki_root: Path) -> list[tuple[Path, Path]]:
 
 
 def apply_moves(moves: list[tuple[Path, Path]], dry_run: bool) -> int:
-    """Execute the planned moves. Returns count of successful moves."""
+    """Execute the planned moves. Returns count of successful moves.
+
+    Per-file ``OSError`` is logged and the loop continues — one bad page
+    (permission denied, source vanished mid-walk, target on a full disk)
+    must not abort the whole migration and leave the rest unprocessed.
+    """
     n_done = 0
+    n_failed = 0
     for old, new in moves:
-        rel_old = old.relative_to(old.parents[len(old.parents) - 1])  # best-effort
         if new.exists():
             logger.warning(
                 "destination already exists, skipping: %s → %s "
@@ -153,9 +167,22 @@ def apply_moves(moves: list[tuple[Path, Path]], dry_run: bool) -> int:
         action = "WOULD MOVE" if dry_run else "MOVING"
         logger.info("%s  %s → %s", action, old, new)
         if not dry_run:
-            new.parent.mkdir(parents=True, exist_ok=True)
-            old.rename(new)
+            try:
+                new.parent.mkdir(parents=True, exist_ok=True)
+                old.rename(new)
+            except OSError as e:
+                logger.error(
+                    "failed to move %s → %s: %s — leaving in place, continuing",
+                    old, new, e,
+                )
+                n_failed += 1
+                continue
         n_done += 1
+    if n_failed:
+        logger.warning(
+            "%d page(s) failed to move; %d page(s) succeeded",
+            n_failed, n_done,
+        )
     return n_done
 
 
