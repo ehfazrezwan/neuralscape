@@ -361,6 +361,50 @@ class TestResourceChallenge:
 # ── MCP identity from token, not arguments ───────────────────────────────
 
 
+class TestAcceptHeaderShim:
+    """The /mcp Accept-header normalization that unblocks Cowork's SSE-only client."""
+
+    def test_sse_only_gets_json_added(self):
+        from mcp_server import _ensure_accept
+
+        out = _ensure_accept(b"text/event-stream")
+        assert b"application/json" in out and b"text/event-stream" in out
+
+    def test_json_only_gets_sse_added(self):
+        from mcp_server import _ensure_accept
+
+        out = _ensure_accept(b"application/json")
+        assert b"application/json" in out and b"text/event-stream" in out
+
+    def test_both_present_unchanged(self):
+        from mcp_server import _ensure_accept
+
+        both = b"application/json, text/event-stream"
+        assert _ensure_accept(both) == both
+
+    def test_empty_gets_both(self):
+        from mcp_server import _ensure_accept
+
+        out = _ensure_accept(b"")
+        assert b"application/json" in out and b"text/event-stream" in out
+
+    def test_shim_rewrites_scope_header(self):
+        import asyncio
+
+        from mcp_server import _AcceptHeaderShim
+
+        seen = {}
+
+        async def fake_app(scope, receive, send):
+            seen["headers"] = scope["headers"]
+
+        shim = _AcceptHeaderShim(fake_app)
+        scope = {"type": "http", "headers": [(b"accept", b"text/event-stream")]}
+        asyncio.run(shim(scope, None, None))
+        accept = dict(seen["headers"])[b"accept"]
+        assert b"application/json" in accept and b"text/event-stream" in accept
+
+
 class TestMcpIdentity:
     def test_tool_uses_contextvar_identity_over_arguments(self):
         import asyncio

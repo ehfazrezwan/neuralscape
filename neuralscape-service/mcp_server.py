@@ -555,6 +555,54 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
 
 
+def _ensure_accept(accept: bytes) -> bytes:
+    """Return an Accept header value containing both JSON and SSE media types.
+
+    MCP's StreamableHTTPSessionManager 406-rejects a POST whose Accept header
+    lacks ``application/json`` (in json-response mode) or lacks either type (in
+    SSE mode). Claude Cowork's connector sends ``Accept: text/event-stream``
+    only, so its ``initialize`` handshake 406s ("McpServerError") even though
+    OAuth succeeded. Adding the missing media type(s) makes the SDK's check
+    pass; with ``json_response=True`` the server then replies with JSON, which
+    the connector accepts. Idempotent — a header that already advertises both
+    (e.g. Claude Code CLI) is returned unchanged.
+    """
+    low = accept.lower()
+    has_json = b"application/json" in low
+    has_sse = b"text/event-stream" in low
+    if has_json and has_sse:
+        return accept
+    parts = [accept.decode("latin-1").strip()] if accept.strip() else []
+    if not has_json:
+        parts.append("application/json")
+    if not has_sse:
+        parts.append("text/event-stream")
+    return ", ".join(parts).encode("latin-1")
+
+
+class _AcceptHeaderShim:
+    """ASGI shim that normalizes the Accept header on inbound MCP requests.
+
+    Wraps the MCP sub-app so Claude Cowork's ``text/event-stream``-only Accept
+    header doesn't trip the SDK's 406 gate (see ``_ensure_accept``). ASGI
+    guarantees header names are lowercased bytes, so we match ``b"accept"``.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            headers = list(scope.get("headers", []))
+            current = next((v for k, v in headers if k == b"accept"), b"")
+            normalized = _ensure_accept(current)
+            if normalized != current:
+                headers = [(k, v) for k, v in headers if k != b"accept"]
+                headers.append((b"accept", normalized))
+                scope = {**scope, "headers": headers}
+        await self.app(scope, receive, send)
+
+
 def create_mcp_http_app():
     """Create a Starlette ASGI app for Streamable HTTP MCP transport.
 
@@ -563,7 +611,8 @@ def create_mcp_http_app():
     lifespan (FastAPI doesn't trigger lifespan for mounted sub-apps).
 
     Returns (mcp_app, session_manager) so main.py can start the session
-    manager in its own lifespan.
+    manager in its own lifespan. The app is wrapped in _AcceptHeaderShim so
+    Cowork's SSE-only Accept header is tolerated.
     """
     from starlette.applications import Starlette
     from starlette.routing import Mount
@@ -578,7 +627,7 @@ def create_mcp_http_app():
     mcp_app = Starlette(
         routes=[Mount("/", app=session_manager.handle_request)],
     )
-    return mcp_app, session_manager
+    return _AcceptHeaderShim(mcp_app), session_manager
 
 
 async def run_stdio():
