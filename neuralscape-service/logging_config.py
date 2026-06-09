@@ -60,5 +60,19 @@ def configure_logging() -> None:
     root_logger.setLevel(getattr(logging, log_level, logging.INFO))
 
     # Reduce noise from third-party loggers
-    for noisy in ("httpcore", "httpx", "neo4j", "urllib3", "uvicorn.access"):
+    for noisy in ("httpcore", "httpx", "neo4j", "urllib3"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    # uvicorn access logs (request method/path/status) are silenced by default
+    # to cut noise. But when the OAuth connector is enabled they're the only
+    # window into the Claude Cowork handshake — the 307/406/200 on /mcp that
+    # broke the connector and were invisible in `docker logs` (we needed a
+    # tcpdump sidecar to see them). Surface them at INFO in that case so
+    # connector issues are debuggable without packet capture.
+    oauth_enabled = bool(
+        os.environ.get("NEURALSCAPE_PUBLIC_URL", "").strip()
+        and os.environ.get("NEURALSCAPE_USER_TOKEN_SECRET", "").strip()
+    )
+    logging.getLogger("uvicorn.access").setLevel(
+        logging.INFO if oauth_enabled else logging.WARNING
+    )
