@@ -86,7 +86,9 @@ uv run pytest tests/test_async_pipeline.py -v -s
 
 ## Claude Code / Cowork Plugin
 
-The **neuralscape plugin** gives Claude Code (and Claude Cowork — same plugin, same marketplace) automatic, persistent memory. Two lifecycle hooks plus four discoverable slash commands plus the seven Neuralscape MCP tools auto-wired on install.
+The **neuralscape plugin** gives Claude Code automatic, persistent memory: two lifecycle hooks plus four discoverable slash commands plus the seven Neuralscape MCP tools auto-wired on install.
+
+> **Claude Cowork:** Cowork does **not** run plugin hooks ([#27398](https://github.com/anthropics/claude-code/issues/27398)), so the automatic inject/capture loop below does not fire there. Cowork is supported via a remote **MCP OAuth connector** plus a standing-context "memory protocol" that drives recall/capture through the MCP tools. See **[COWORK.md](./COWORK.md)** — that is the supported Cowork path, not this hook-based one.
 
 ### How It Works
 
@@ -120,7 +122,7 @@ Slash commands (auto-discovered from `skills/`):
 /plugin install neuralscape@neuralscape-plugins
 ```
 
-Claude Code / Cowork prompts you for three values from the manifest's `userConfig`:
+Claude Code prompts you for three values from the manifest's `userConfig`:
 
 | Prompt | Notes |
 |---|---|
@@ -130,7 +132,7 @@ Claude Code / Cowork prompts you for three values from the manifest's `userConfi
 
 That's it. The plugin builds itself via `postinstall`, registers hooks, and the next session you open fires `SessionStart` and injects context.
 
-**Cowork users:** Customize → Browse plugins → Install — same prompts, same outcome.
+**Cowork users:** the marketplace plugin loads the **skills**, but hooks won't fire and the `userConfig` token prompt is unreliable in Cowork ([#39455](https://github.com/anthropics/claude-code/issues/39455)). Use the **OAuth connector + standing context** instead — full runbook in **[COWORK.md](./COWORK.md)**.
 
 **OpenClaw users:** see `neuralscape-plugin/README.md` for the manual `~/.openclaw/hooks/` install path (no marketplace there).
 

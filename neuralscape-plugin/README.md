@@ -27,14 +27,26 @@ That's it. Open a new session — the SessionStart hook will pull your prior con
 
 ## Claude Cowork install
 
-Cowork uses the same plugin model and same marketplace. Install path:
+Cowork is **not** the same experience as Claude Code: it does not run plugin
+hooks ([#27398](https://github.com/anthropics/claude-code/issues/27398)) and
+its connector UI can't take a static Bearer token
+([#112](https://github.com/anthropics/claude-ai-mcp/issues/112)). The supported
+Cowork path is a **remote MCP OAuth connector** plus a standing-context memory
+protocol — not the hook-driven marketplace flow.
 
-1. Open the **Cowork** tab in Claude.
-2. Click **Customize → Browse plugins**.
-3. Search for `neuralscape` (or paste `ehfazrezwan/neuralscape` if your workspace allows direct marketplace add).
-4. Click **Install**, fill in the same three prompts.
+➡️ **Full Cowork runbook: [`../COWORK.md`](../COWORK.md).** In short:
 
-Cowork blocks `npm` and `pip` MCP sources, but Neuralscape's MCP runs over HTTP at the configured service URL — no npm package needed.
+1. Admin: expose the service on a public HTTPS URL and set
+   `NEURALSCAPE_PUBLIC_URL` + `NEURALSCAPE_USER_TOKEN_SECRET` (turns on the
+   built-in OAuth server).
+2. User: **Settings → Connectors → Add custom connector** → URL
+   `https://<your-host>/mcp/` → **Connect** → paste your per-user token once.
+3. Paste the [standing-context block](./cowork/STANDING_CONTEXT.md) into your
+   Cowork workspace instructions so Claude recalls at task start and saves at
+   task end via the MCP tools.
+
+Installing the marketplace plugin in Cowork still loads the **skills** (useful),
+but hooks won't fire — rely on the connector + standing context above.
 
 ## What gets installed
 
