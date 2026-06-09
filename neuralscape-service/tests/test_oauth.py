@@ -364,6 +364,15 @@ class TestResourceChallenge:
 class TestAcceptHeaderShim:
     """The /mcp Accept-header normalization that unblocks Cowork's SSE-only client."""
 
+    def test_accepts_json_variants(self):
+        from mcp_server import _accepts_json
+
+        assert _accepts_json(b"application/json, text/event-stream")
+        assert _accepts_json(b"application/json")
+        assert _accepts_json(b"*/*")
+        assert _accepts_json(b"")
+        assert not _accepts_json(b"text/event-stream")
+
     def test_sse_only_gets_json_added(self):
         from mcp_server import _ensure_accept
 
@@ -388,21 +397,47 @@ class TestAcceptHeaderShim:
         out = _ensure_accept(b"")
         assert b"application/json" in out and b"text/event-stream" in out
 
-    def test_shim_rewrites_scope_header(self):
+    def test_router_sends_sse_only_client_to_sse_app_with_normalized_header(self):
         import asyncio
 
-        from mcp_server import _AcceptHeaderShim
+        from mcp_server import _AcceptRouter
 
         seen = {}
 
-        async def fake_app(scope, receive, send):
+        async def json_app(scope, receive, send):
+            seen["app"] = "json"
+
+        async def sse_app(scope, receive, send):
+            seen["app"] = "sse"
             seen["headers"] = scope["headers"]
 
-        shim = _AcceptHeaderShim(fake_app)
+        router = _AcceptRouter(json_app, sse_app)
         scope = {"type": "http", "headers": [(b"accept", b"text/event-stream")]}
-        asyncio.run(shim(scope, None, None))
+        asyncio.run(router(scope, None, None))
+        assert seen["app"] == "sse"
         accept = dict(seen["headers"])[b"accept"]
         assert b"application/json" in accept and b"text/event-stream" in accept
+
+    def test_router_keeps_json_clients_on_json_app_unchanged(self):
+        import asyncio
+
+        from mcp_server import _AcceptRouter
+
+        seen = {}
+
+        async def json_app(scope, receive, send):
+            seen["app"] = "json"
+            seen["headers"] = scope["headers"]
+
+        async def sse_app(scope, receive, send):
+            seen["app"] = "sse"
+
+        router = _AcceptRouter(json_app, sse_app)
+        original = [(b"accept", b"application/json, text/event-stream")]
+        scope = {"type": "http", "headers": list(original)}
+        asyncio.run(router(scope, None, None))
+        assert seen["app"] == "json"
+        assert seen["headers"] == original
 
 
 class TestMcpIdentity:

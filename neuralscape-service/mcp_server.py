@@ -5,6 +5,7 @@ transport (remote agent access via /mcp/ endpoint on port 8199).
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import sys
@@ -563,9 +564,8 @@ def _ensure_accept(accept: bytes) -> bytes:
     SSE mode). Claude Cowork's connector sends ``Accept: text/event-stream``
     only, so its ``initialize`` handshake 406s ("McpServerError") even though
     OAuth succeeded. Adding the missing media type(s) makes the SDK's check
-    pass; with ``json_response=True`` the server then replies with JSON, which
-    the connector accepts. Idempotent — a header that already advertises both
-    (e.g. Claude Code CLI) is returned unchanged.
+    pass. Idempotent — a header that already advertises both (e.g. Claude Code
+    CLI) is returned unchanged.
     """
     low = accept.lower()
     has_json = b"application/json" in low
@@ -580,27 +580,69 @@ def _ensure_accept(accept: bytes) -> bytes:
     return ", ".join(parts).encode("latin-1")
 
 
-class _AcceptHeaderShim:
-    """ASGI shim that normalizes the Accept header on inbound MCP requests.
+def _accepts_json(accept: bytes) -> bool:
+    """Whether the client's original Accept header allows a JSON response.
 
-    Wraps the MCP sub-app so Claude Cowork's ``text/event-stream``-only Accept
-    header doesn't trip the SDK's 406 gate (see ``_ensure_accept``). ASGI
-    guarantees header names are lowercased bytes, so we match ``b"accept"``.
+    Empty/absent and ``*/*`` count as yes — that matches every client we serve
+    today (Claude Code CLI sends both media types; curl defaults to ``*/*``).
+    Only a client that explicitly narrows Accept to exclude JSON — Cowork's
+    connector sends ``text/event-stream`` alone — answers no.
+    """
+    if not accept.strip():
+        return True
+    low = accept.lower()
+    return b"application/json" in low or b"*/*" in low
+
+
+class _AcceptRouter:
+    """ASGI dispatcher that content-negotiates between JSON and SSE transports.
+
+    Cowork's connector sends ``Accept: text/event-stream`` only and rejects an
+    ``application/json`` response body, while the Claude Code plugin/CLI path
+    has always received JSON. One global ``json_response`` mode can't serve
+    both, so /mcp runs two session managers over the same MCP server: requests
+    whose original Accept allows JSON keep today's JSON responses unchanged;
+    SSE-only clients get an SSE response. After routing, the Accept header is
+    normalized (see ``_ensure_accept``) so neither manager's 406 gate trips.
+    ASGI guarantees header names are lowercased bytes, so we match
+    ``b"accept"``.
     """
 
-    def __init__(self, app):
-        self.app = app
+    def __init__(self, json_app, sse_app):
+        self.json_app = json_app
+        self.sse_app = sse_app
 
     async def __call__(self, scope, receive, send):
+        app = self.json_app
         if scope.get("type") == "http":
             headers = list(scope.get("headers", []))
             current = next((v for k, v in headers if k == b"accept"), b"")
+            if not _accepts_json(current):
+                app = self.sse_app
             normalized = _ensure_accept(current)
             if normalized != current:
                 headers = [(k, v) for k, v in headers if k != b"accept"]
                 headers.append((b"accept", normalized))
                 scope = {**scope, "headers": headers}
-        await self.app(scope, receive, send)
+        await app(scope, receive, send)
+
+
+class _SessionManagerGroup:
+    """Run several StreamableHTTPSessionManagers under one lifespan context.
+
+    main.py holds a single ``async with manager.run():`` — this keeps that
+    contract while /mcp is backed by two managers (JSON + SSE modes).
+    """
+
+    def __init__(self, *managers):
+        self.managers = managers
+
+    @contextlib.asynccontextmanager
+    async def run(self):
+        async with contextlib.AsyncExitStack() as stack:
+            for manager in self.managers:
+                await stack.enter_async_context(manager.run())
+            yield
 
 
 def create_mcp_http_app():
@@ -610,24 +652,32 @@ def create_mcp_http_app():
     The session manager's run() context must be managed by the parent app's
     lifespan (FastAPI doesn't trigger lifespan for mounted sub-apps).
 
-    Returns (mcp_app, session_manager) so main.py can start the session
-    manager in its own lifespan. The app is wrapped in _AcceptHeaderShim so
-    Cowork's SSE-only Accept header is tolerated.
+    Returns (mcp_app, session_manager_group) so main.py can start the session
+    managers in its own lifespan. Two managers back the mount — JSON-response
+    mode for clients that accept application/json (Claude Code plugin/CLI) and
+    SSE mode for Cowork's SSE-only connector — dispatched by _AcceptRouter on
+    the client's original Accept header.
     """
     from starlette.applications import Starlette
     from starlette.routing import Mount
     from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
-    session_manager = StreamableHTTPSessionManager(
+    json_manager = StreamableHTTPSessionManager(
         app=server,
         json_response=True,
         stateless=True,
     )
-
-    mcp_app = Starlette(
-        routes=[Mount("/", app=session_manager.handle_request)],
+    sse_manager = StreamableHTTPSessionManager(
+        app=server,
+        json_response=False,
+        stateless=True,
     )
-    return _AcceptHeaderShim(mcp_app), session_manager
+
+    router = _AcceptRouter(json_manager.handle_request, sse_manager.handle_request)
+    mcp_app = Starlette(
+        routes=[Mount("/", app=router)],
+    )
+    return mcp_app, _SessionManagerGroup(json_manager, sse_manager)
 
 
 async def run_stdio():
