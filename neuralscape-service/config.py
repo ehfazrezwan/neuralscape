@@ -55,6 +55,18 @@ class Settings(BaseSettings):
     # `request.state.user_id` so routes don't need to trust the request body.
     # Generate tokens via `python scripts/issue_user_token.py --user <name>`.
     neuralscape_user_token_secret: str = ""
+    # Public HTTPS base URL the service is reachable at from the internet
+    # (e.g. the cloudflared tunnel hostname: "https://neuralscape.example.com").
+    # Used as the OAuth issuer and to build the .well-known metadata URLs that
+    # Claude Cowork / claude.ai fetch when connecting as a custom MCP connector.
+    # Leave empty for local dev / Claude Code CLI (OAuth discovery is then off).
+    # No trailing slash; a trailing slash is stripped at use sites.
+    neuralscape_public_url: str = ""
+    # OAuth access-token TTL (seconds). Anthropic silently refreshes via the
+    # refresh token, so this can be short. Default 1 hour.
+    oauth_access_ttl: int = 3600
+    # OAuth refresh-token TTL (seconds). Default 30 days.
+    oauth_refresh_ttl: int = 30 * 24 * 3600
 
     # Service
     host: str = "0.0.0.0"
