@@ -1303,6 +1303,15 @@ async def v1_admin_synthesize_status():
 # Mount v1 router
 app.include_router(v1_router)
 
+# Mount the built-in OAuth 2.1 Authorization Server (discovery metadata, DCR,
+# consent, token). Endpoints self-disable (404) unless NEURALSCAPE_PUBLIC_URL
+# and NEURALSCAPE_USER_TOKEN_SECRET are both set, so this is inert for local
+# dev / Claude Code CLI. It's what lets Claude Cowork add Neuralscape as a
+# custom MCP connector with a "Connect → log in" flow.
+from oauth import router as oauth_router
+
+app.include_router(oauth_router)
+
 # Mount MCP HTTP transport at /mcp/ for remote agent access
 if settings.mcp_transport == "http":
     from mcp_server import create_mcp_http_app
