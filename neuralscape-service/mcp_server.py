@@ -53,7 +53,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "user_id": {
                         "type": "string",
-                        "description": "User ID to scope the search",
+                        "description": "User ID to scope the search. OPTIONAL when connected over an authenticated connector — the server uses your token identity and ignores this. Set it only for local/stdio use.",
                     },
                     "project_id": {
                         "type": "string",
@@ -88,7 +88,7 @@ async def list_tools() -> list[Tool]:
                         ),
                     },
                 },
-                "required": ["query", "user_id"],
+                "required": ["query"],
             },
         ),
         Tool(
@@ -194,7 +194,7 @@ async def list_tools() -> list[Tool]:
                         "description": "If true, wait for memory to be fully stored before returning. Default: false (fire-and-forget).",
                     },
                 },
-                "required": ["content", "user_id", "category"],
+                "required": ["content", "category"],
             },
         ),
         Tool(
@@ -232,7 +232,7 @@ async def list_tools() -> list[Tool]:
                         "description": "If true, wait for memories to be fully stored before returning. Default: false (fire-and-forget).",
                     },
                 },
-                "required": ["messages", "user_id"],
+                "required": ["messages"],
             },
         ),
         Tool(
@@ -255,7 +255,7 @@ async def list_tools() -> list[Tool]:
                         "description": "Project ID to load project-specific context for",
                     },
                 },
-                "required": ["user_id", "project_id"],
+                "required": ["project_id"],
             },
         ),
         Tool(
@@ -286,7 +286,7 @@ async def list_tools() -> list[Tool]:
                         "description": "Max results (default: 10)",
                     },
                 },
-                "required": ["query", "user_id"],
+                "required": ["query"],
             },
         ),
         Tool(
@@ -322,7 +322,7 @@ async def list_tools() -> list[Tool]:
                         "description": "Max results (default: 100)",
                     },
                 },
-                "required": ["user_id"],
+                "required": [],
             },
         ),
         Tool(
@@ -373,7 +373,7 @@ async def list_tools() -> list[Tool]:
                         ),
                     },
                 },
-                "required": ["user_id"],
+                "required": [],
             },
         ),
     ]
@@ -381,7 +381,16 @@ async def list_tools() -> list[Tool]:
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    user_id = arguments.get("user_id", settings.default_user_id)
+    # Identity precedence:
+    #   1. The OAuth/per-user token the request authenticated with (authoritative
+    #      — set by BearerAuthMiddleware for this request). Over an authenticated
+    #      HTTP connector the model needn't pass user_id at all, and a mismatched
+    #      arguments["user_id"] is ignored rather than trusted.
+    #   2. An explicit user_id argument (stdio / local Claude Code, legacy).
+    #   3. The configured default_user_id.
+    from auth import current_user_id
+
+    user_id = current_user_id.get() or arguments.get("user_id") or settings.default_user_id
 
     try:
         if name == "recall_memories":
