@@ -418,6 +418,29 @@ class TestAcceptHeaderShim:
         accept = dict(seen["headers"])[b"accept"]
         assert b"application/json" in accept and b"text/event-stream" in accept
 
+    def test_mcp_path_without_trailing_slash_is_rewritten_not_redirected(self):
+        import asyncio
+
+        from main import _McpTrailingSlash
+
+        seen = {}
+
+        async def fake_app(scope, receive, send):
+            seen["path"] = scope["path"]
+            seen["raw_path"] = scope["raw_path"]
+
+        mw = _McpTrailingSlash(fake_app)
+        scope = {"type": "http", "path": "/mcp", "raw_path": b"/mcp"}
+        asyncio.run(mw(scope, None, None))
+        # Anthropic's connector POSTs to the advertised resource URL /mcp
+        # (no slash) and won't follow a 307 — the path must serve directly.
+        assert seen["path"] == "/mcp/"
+        assert seen["raw_path"] == b"/mcp/"
+
+        scope = {"type": "http", "path": "/mcp/other", "raw_path": b"/mcp/other"}
+        asyncio.run(mw(scope, None, None))
+        assert seen["path"] == "/mcp/other"
+
     def test_router_keeps_json_clients_on_json_app_unchanged(self):
         import asyncio
 
