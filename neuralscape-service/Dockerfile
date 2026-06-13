@@ -27,10 +27,14 @@ RUN cd neuralscape-service && uv sync --frozen --no-dev
 # A pre-downloaded wheel in neuralscape-service/vendor/ takes priority —
 # needed on hosts whose TLS is intercepted (e.g. Cisco Umbrella), where
 # the build container can't validate GitHub's release CDN certificate.
-COPY neuralscape-service/vendor* neuralscape-service/vendor/
+# (COPY copies the directory's contents into the destination, so the wheel
+# lands at vendor/en_core_web_sm-*.whl, not vendor/vendor/.)
+COPY neuralscape-service/vendor/ neuralscape-service/vendor/
 RUN cd neuralscape-service && \
-    if ls vendor/en_core_web_sm-*.whl >/dev/null 2>&1; then \
-        uv pip install --python .venv/bin/python vendor/en_core_web_sm-*.whl; \
+    set -- vendor/en_core_web_sm-*.whl; \
+    if [ -f "$1" ]; then \
+        [ "$#" -eq 1 ] || { echo "expected exactly one en_core_web_sm wheel in vendor/, found $#" >&2; exit 1; }; \
+        uv pip install --python .venv/bin/python "$1"; \
     else \
         .venv/bin/python -m spacy download en_core_web_sm; \
     fi
@@ -98,12 +102,14 @@ COPY neuralscape-service/extensions/ neuralscape-service/extensions/
 # Resolve WITH dev deps so pytest, pytest-asyncio, etc. are available.
 RUN cd neuralscape-service && uv sync --frozen
 
-# Same spaCy model download as the runtime stage so unit tests that
+# Same spaCy model handling as the runtime stage so unit tests that
 # import mem0's NLP path see the same dependency graph as production.
-COPY neuralscape-service/vendor* neuralscape-service/vendor/
+COPY neuralscape-service/vendor/ neuralscape-service/vendor/
 RUN cd neuralscape-service && \
-    if ls vendor/en_core_web_sm-*.whl >/dev/null 2>&1; then \
-        uv pip install --python .venv/bin/python vendor/en_core_web_sm-*.whl; \
+    set -- vendor/en_core_web_sm-*.whl; \
+    if [ -f "$1" ]; then \
+        [ "$#" -eq 1 ] || { echo "expected exactly one en_core_web_sm wheel in vendor/, found $#" >&2; exit 1; }; \
+        uv pip install --python .venv/bin/python "$1"; \
     else \
         .venv/bin/python -m spacy download en_core_web_sm; \
     fi
