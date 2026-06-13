@@ -69,9 +69,16 @@ def configure_logging() -> None:
     # broke the connector and were invisible in `docker logs` (we needed a
     # tcpdump sidecar to see them). Surface them at INFO in that case so
     # connector issues are debuggable without packet capture.
+    #
+    # Read from settings, not os.environ: config is loaded via pydantic-settings
+    # (incl. the .env file), which does NOT populate os.environ. Checking
+    # os.environ here would miss a .env-only deployment and keep the logs
+    # silenced exactly when they're needed.
+    from config import settings
+
     oauth_enabled = bool(
-        os.environ.get("NEURALSCAPE_PUBLIC_URL", "").strip()
-        and os.environ.get("NEURALSCAPE_USER_TOKEN_SECRET", "").strip()
+        settings.neuralscape_public_url.strip()
+        and settings.neuralscape_user_token_secret.strip()
     )
     logging.getLogger("uvicorn.access").setLevel(
         logging.INFO if oauth_enabled else logging.WARNING

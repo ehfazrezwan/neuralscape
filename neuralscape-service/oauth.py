@@ -506,7 +506,10 @@ async def token(
         jti = claims.get("jti", "")
         if jti and not await _consume_code_jti(jti):
             return _token_error("invalid_grant", "authorization code already used")
-        return _token_response(claims["user_id"])
+        user_id = claims.get("user_id")
+        if not isinstance(user_id, str) or not user_id:
+            return _token_error("invalid_grant", "code missing user")
+        return _token_response(user_id)
 
     if grant_type == "refresh_token":
         claims = verify_payload(refresh_token, _secret())

@@ -118,7 +118,11 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         """
         headers = {}
         base = _public_base_url()
-        if base:
+        # Only advertise OAuth discovery when the AS is actually enabled — i.e.
+        # both the public URL AND the signing secret are set. The /.well-known
+        # endpoints 404 without the secret, so pointing a client there would
+        # send it chasing discovery against dead endpoints.
+        if base and settings.neuralscape_user_token_secret:
             resource_metadata = f'{base}/.well-known/oauth-protected-resource'
             headers["WWW-Authenticate"] = (
                 f'Bearer resource_metadata="{resource_metadata}"'

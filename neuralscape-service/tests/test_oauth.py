@@ -317,6 +317,35 @@ class TestToken:
         assert resp.status_code == 400
         assert resp.json()["error"] == "invalid_grant"
 
+    def test_code_exchange_rejects_code_without_user(self, client):
+        # a malformed-but-signed code (no user_id) must yield a spec-compliant
+        # invalid_grant, not a 500 from a KeyError on claims["user_id"].
+        client_id, redirect_uri = _register(client)
+        verifier, challenge = _pkce()
+        forged = sign_payload(
+            {
+                "typ": "code",
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "code_challenge": challenge,
+                "jti": "no-user-jti",
+                "exp": int(time.time()) + 300,
+            },
+            SECRET,
+        )
+        resp = client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": forged,
+                "code_verifier": verifier,
+                "redirect_uri": redirect_uri,
+                "client_id": client_id,
+            },
+        )
+        assert resp.status_code == 400
+        assert resp.json()["error"] == "invalid_grant"
+
     def test_code_exchange_wrong_pkce_rejected(self, client):
         client_id, redirect_uri, _verifier, code = self._full_flow_to_code(client)
         resp = client.post(
@@ -406,6 +435,24 @@ class TestResourceChallenge:
         www = resp.headers.get("WWW-Authenticate", "")
         assert "resource_metadata=" in www
         assert "/.well-known/oauth-protected-resource" in www
+
+    def test_401_omits_www_authenticate_without_secret(self, client):
+        # OAuth self-disables unless BOTH public_url and the signing secret are
+        # set. With only public_url (auth still on via a legacy key), the 401
+        # must NOT advertise discovery — the /.well-known endpoints 404.
+        from config import settings
+
+        orig_secret = settings.neuralscape_user_token_secret
+        orig_key = settings.neuralscape_api_key
+        settings.neuralscape_user_token_secret = ""
+        settings.neuralscape_api_key = "legacy-key"  # keep auth enforced
+        try:
+            resp = client.get("/v1/memories", params={"user_id": "x"})
+            assert resp.status_code == 401
+            assert "WWW-Authenticate" not in resp.headers
+        finally:
+            settings.neuralscape_user_token_secret = orig_secret
+            settings.neuralscape_api_key = orig_key
 
 
 # ── MCP identity from token, not arguments ───────────────────────────────
