@@ -1303,11 +1303,43 @@ async def v1_admin_synthesize_status():
 # Mount v1 router
 app.include_router(v1_router)
 
+# Mount the built-in OAuth 2.1 Authorization Server (discovery metadata, DCR,
+# consent, token). Endpoints self-disable (404) unless NEURALSCAPE_PUBLIC_URL
+# and NEURALSCAPE_USER_TOKEN_SECRET are both set, so this is inert for local
+# dev / Claude Code CLI. It's what lets Claude Cowork add Neuralscape as a
+# custom MCP connector with a "Connect → log in" flow.
+from oauth import router as oauth_router
+
+app.include_router(oauth_router)
+
+
+class _McpTrailingSlash:
+    """Serve /mcp and /mcp/ identically — never redirect between them.
+
+    The protected-resource metadata advertises the resource as
+    ``{public_url}/mcp``, so Anthropic's connector POSTs to /mcp exactly.
+    Starlette's mount answers that with a 307 to /mcp/, which the
+    connector does not follow (and behind the tunnel the Location is
+    generated as http://), so the initialize handshake dies as
+    "Authorization with the MCP server failed". Rewriting the path
+    before routing removes the redirect entirely.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http" and scope.get("path") == "/mcp":
+            scope = {**scope, "path": "/mcp/", "raw_path": b"/mcp/"}
+        await self.app(scope, receive, send)
+
+
 # Mount MCP HTTP transport at /mcp/ for remote agent access
 if settings.mcp_transport == "http":
     from mcp_server import create_mcp_http_app
     mcp_app, _mcp_session_manager = create_mcp_http_app()
     app.mount("/mcp", mcp_app)
+    app.add_middleware(_McpTrailingSlash)
 
 
 if __name__ == "__main__":

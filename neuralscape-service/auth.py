@@ -21,6 +21,7 @@ Public paths (`/health`) always bypass auth.
 
 import hmac
 import logging
+from contextvars import ContextVar
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -31,8 +32,24 @@ from tokens import issue_user_token, verify_user_token  # noqa: F401 (re-export)
 
 logger = logging.getLogger(__name__)
 
+# Identity of the caller for the current request, set after a per-user token
+# is verified. Lets the MCP tool layer — which only receives a tool-arguments
+# dict, not the HTTP request — scope operations to the authenticated user
+# without the model having to pass `user_id`. Default None = unauthenticated
+# or legacy shared-key (fall back to the request body / arguments).
+current_user_id: ContextVar[str | None] = ContextVar("current_user_id", default=None)
+
 # Paths that never require authentication
 PUBLIC_PATHS = {"/health", "/api/v1/health"}
+# Path prefixes that never require auth: OAuth discovery metadata and the
+# Authorization Server endpoints themselves (the consent page, DCR, token
+# exchange). These are the public front door of the OAuth flow.
+PUBLIC_PREFIXES = ("/.well-known/", "/oauth/")
+
+
+def _public_base_url() -> str:
+    """Public base URL (no trailing slash) for building metadata URLs."""
+    return settings.neuralscape_public_url.rstrip("/")
 
 # Header set on responses when a caller used a legacy shared API key, to
 # nudge them toward per-user tokens. Non-fatal.
@@ -50,16 +67,14 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         if not token_secret and not legacy_key:
             return await call_next(request)
 
-        # Health checks are always public
-        if request.url.path in PUBLIC_PATHS:
+        # Health checks and the OAuth front door are always public
+        path = request.url.path
+        if path in PUBLIC_PATHS or path.startswith(PUBLIC_PREFIXES):
             return await call_next(request)
 
         auth_header = request.headers.get("authorization", "")
         if not auth_header.startswith("Bearer "):
-            return JSONResponse(
-                status_code=401,
-                content={"detail": "Missing or invalid Authorization header"},
-            )
+            return self._unauthorized(request, "Missing or invalid Authorization header")
         token = auth_header[7:]  # strip "Bearer "
 
         # Try the per-user HMAC token path first (preferred). The token
@@ -74,7 +89,12 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             if payload is not None:
                 request.state.user_id = payload["user_id"]
                 request.state.auth_mode = "user_token"
-                return await call_next(request)
+                # Expose identity to the MCP tool layer for this request.
+                ctx_token = current_user_id.set(payload["user_id"])
+                try:
+                    return await call_next(request)
+                finally:
+                    current_user_id.reset(ctx_token)
             # else: HMAC verify failed — fall through to legacy check.
 
         # Fall back to the legacy shared API key. user_id is NOT set on
@@ -86,7 +106,29 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             response.headers[DEPRECATION_HEADER] = DEPRECATION_MSG
             return response
 
+        return self._unauthorized(request, "Invalid or expired token")
+
+    def _unauthorized(self, request: Request, detail: str) -> JSONResponse:
+        """401 response, carrying an RFC 9728 ``WWW-Authenticate`` header.
+
+        When a public URL is configured, the header points MCP clients
+        (Claude Cowork / claude.ai) at our Protected Resource Metadata so they
+        can discover the Authorization Server and start the OAuth flow. Without
+        this header, the connector UI never offers a "Connect" / login step.
+        """
+        headers = {}
+        base = _public_base_url()
+        # Only advertise OAuth discovery when the AS is actually enabled — i.e.
+        # both the public URL AND the signing secret are set. The /.well-known
+        # endpoints 404 without the secret, so pointing a client there would
+        # send it chasing discovery against dead endpoints.
+        if base and settings.neuralscape_user_token_secret:
+            resource_metadata = f'{base}/.well-known/oauth-protected-resource'
+            headers["WWW-Authenticate"] = (
+                f'Bearer resource_metadata="{resource_metadata}"'
+            )
         return JSONResponse(
             status_code=401,
-            content={"detail": "Invalid or expired token"},
+            content={"detail": detail},
+            headers=headers,
         )

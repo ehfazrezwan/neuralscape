@@ -5,6 +5,7 @@ transport (remote agent access via /mcp/ endpoint on port 8199).
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import sys
@@ -53,7 +54,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "user_id": {
                         "type": "string",
-                        "description": "User ID to scope the search",
+                        "description": "User ID to scope the search. OPTIONAL when connected over an authenticated connector — the server uses your token identity and ignores this. Set it only for local/stdio use.",
                     },
                     "project_id": {
                         "type": "string",
@@ -88,7 +89,7 @@ async def list_tools() -> list[Tool]:
                         ),
                     },
                 },
-                "required": ["query", "user_id"],
+                "required": ["query"],
             },
         ),
         Tool(
@@ -194,7 +195,7 @@ async def list_tools() -> list[Tool]:
                         "description": "If true, wait for memory to be fully stored before returning. Default: false (fire-and-forget).",
                     },
                 },
-                "required": ["content", "user_id", "category"],
+                "required": ["content", "category"],
             },
         ),
         Tool(
@@ -232,7 +233,7 @@ async def list_tools() -> list[Tool]:
                         "description": "If true, wait for memories to be fully stored before returning. Default: false (fire-and-forget).",
                     },
                 },
-                "required": ["messages", "user_id"],
+                "required": ["messages"],
             },
         ),
         Tool(
@@ -255,7 +256,7 @@ async def list_tools() -> list[Tool]:
                         "description": "Project ID to load project-specific context for",
                     },
                 },
-                "required": ["user_id", "project_id"],
+                "required": ["project_id"],
             },
         ),
         Tool(
@@ -286,7 +287,7 @@ async def list_tools() -> list[Tool]:
                         "description": "Max results (default: 10)",
                     },
                 },
-                "required": ["query", "user_id"],
+                "required": ["query"],
             },
         ),
         Tool(
@@ -322,7 +323,7 @@ async def list_tools() -> list[Tool]:
                         "description": "Max results (default: 100)",
                     },
                 },
-                "required": ["user_id"],
+                "required": [],
             },
         ),
         Tool(
@@ -373,15 +374,27 @@ async def list_tools() -> list[Tool]:
                         ),
                     },
                 },
-                "required": ["user_id"],
+                "required": [],
             },
         ),
     ]
 
 
 @server.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    user_id = arguments.get("user_id", settings.default_user_id)
+async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
+    # Identity precedence:
+    #   1. The OAuth/per-user token the request authenticated with (authoritative
+    #      — set by BearerAuthMiddleware for this request). Over an authenticated
+    #      HTTP connector the model needn't pass user_id at all, and a mismatched
+    #      arguments["user_id"] is ignored rather than trusted.
+    #   2. An explicit user_id argument (stdio / local Claude Code, legacy).
+    #   3. The configured default_user_id.
+    from auth import current_user_id
+
+    # Tools like list_memories / delete_memories declare no required fields, so a
+    # client may omit `arguments` entirely (None). Normalize before any access.
+    arguments = arguments or {}
+    user_id = current_user_id.get() or arguments.get("user_id") or settings.default_user_id
 
     try:
         if name == "recall_memories":
@@ -546,6 +559,95 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
 
 
+def _ensure_accept(accept: bytes) -> bytes:
+    """Return an Accept header value containing both JSON and SSE media types.
+
+    MCP's StreamableHTTPSessionManager 406-rejects a POST whose Accept header
+    lacks ``application/json`` (in json-response mode) or lacks either type (in
+    SSE mode). Claude Cowork's connector sends ``Accept: text/event-stream``
+    only, so its ``initialize`` handshake 406s ("McpServerError") even though
+    OAuth succeeded. Adding the missing media type(s) makes the SDK's check
+    pass. Idempotent — a header that already advertises both (e.g. Claude Code
+    CLI) is returned unchanged.
+    """
+    low = accept.lower()
+    has_json = b"application/json" in low
+    has_sse = b"text/event-stream" in low
+    if has_json and has_sse:
+        return accept
+    parts = [accept.decode("latin-1").strip()] if accept.strip() else []
+    if not has_json:
+        parts.append("application/json")
+    if not has_sse:
+        parts.append("text/event-stream")
+    return ", ".join(parts).encode("latin-1")
+
+
+def _accepts_json(accept: bytes) -> bool:
+    """Whether the client's original Accept header allows a JSON response.
+
+    Empty/absent and ``*/*`` count as yes — that matches every client we serve
+    today (Claude Code CLI sends both media types; curl defaults to ``*/*``).
+    Only a client that explicitly narrows Accept to exclude JSON — Cowork's
+    connector sends ``text/event-stream`` alone — answers no.
+    """
+    if not accept.strip():
+        return True
+    low = accept.lower()
+    return b"application/json" in low or b"*/*" in low
+
+
+class _AcceptRouter:
+    """ASGI dispatcher that content-negotiates between JSON and SSE transports.
+
+    Cowork's connector sends ``Accept: text/event-stream`` only and rejects an
+    ``application/json`` response body, while the Claude Code plugin/CLI path
+    has always received JSON. One global ``json_response`` mode can't serve
+    both, so /mcp runs two session managers over the same MCP server: requests
+    whose original Accept allows JSON keep today's JSON responses unchanged;
+    SSE-only clients get an SSE response. After routing, the Accept header is
+    normalized (see ``_ensure_accept``) so neither manager's 406 gate trips.
+    ASGI guarantees header names are lowercased bytes, so we match
+    ``b"accept"``.
+    """
+
+    def __init__(self, json_app, sse_app):
+        self.json_app = json_app
+        self.sse_app = sse_app
+
+    async def __call__(self, scope, receive, send):
+        app = self.json_app
+        if scope.get("type") == "http":
+            headers = list(scope.get("headers", []))
+            current = next((v for k, v in headers if k == b"accept"), b"")
+            if not _accepts_json(current):
+                app = self.sse_app
+            normalized = _ensure_accept(current)
+            if normalized != current:
+                headers = [(k, v) for k, v in headers if k != b"accept"]
+                headers.append((b"accept", normalized))
+                scope = {**scope, "headers": headers}
+        await app(scope, receive, send)
+
+
+class _SessionManagerGroup:
+    """Run several StreamableHTTPSessionManagers under one lifespan context.
+
+    main.py holds a single ``async with manager.run():`` — this keeps that
+    contract while /mcp is backed by two managers (JSON + SSE modes).
+    """
+
+    def __init__(self, *managers):
+        self.managers = managers
+
+    @contextlib.asynccontextmanager
+    async def run(self):
+        async with contextlib.AsyncExitStack() as stack:
+            for manager in self.managers:
+                await stack.enter_async_context(manager.run())
+            yield
+
+
 def create_mcp_http_app():
     """Create a Starlette ASGI app for Streamable HTTP MCP transport.
 
@@ -553,23 +655,32 @@ def create_mcp_http_app():
     The session manager's run() context must be managed by the parent app's
     lifespan (FastAPI doesn't trigger lifespan for mounted sub-apps).
 
-    Returns (mcp_app, session_manager) so main.py can start the session
-    manager in its own lifespan.
+    Returns (mcp_app, session_manager_group) so main.py can start the session
+    managers in its own lifespan. Two managers back the mount — JSON-response
+    mode for clients that accept application/json (Claude Code plugin/CLI) and
+    SSE mode for Cowork's SSE-only connector — dispatched by _AcceptRouter on
+    the client's original Accept header.
     """
     from starlette.applications import Starlette
     from starlette.routing import Mount
     from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
-    session_manager = StreamableHTTPSessionManager(
+    json_manager = StreamableHTTPSessionManager(
         app=server,
         json_response=True,
         stateless=True,
     )
-
-    mcp_app = Starlette(
-        routes=[Mount("/", app=session_manager.handle_request)],
+    sse_manager = StreamableHTTPSessionManager(
+        app=server,
+        json_response=False,
+        stateless=True,
     )
-    return mcp_app, session_manager
+
+    router = _AcceptRouter(json_manager.handle_request, sse_manager.handle_request)
+    mcp_app = Starlette(
+        routes=[Mount("/", app=router)],
+    )
+    return mcp_app, _SessionManagerGroup(json_manager, sse_manager)
 
 
 async def run_stdio():

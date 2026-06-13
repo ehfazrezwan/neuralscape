@@ -203,7 +203,7 @@ Claude Code prompts for three values defined in the manifest's `userConfig`:
 
 That's it — the post-install build runs automatically (`postinstall` script in `package.json`), the marketplace registers the plugin's hooks, and the next session you open will fire `SessionStart` and inject memory context via `additionalContext`.
 
-**Cowork:** same marketplace, GUI install path. Open the **Cowork** tab → **Customize → Browse plugins**, search `neuralscape`, click **Install**, fill in the same three prompts.
+**Cowork:** the marketplace install loads the skills, but **hooks don't fire in Cowork** and the token prompt is unreliable there — so the auto inject/capture loop above won't run. Use the **MCP OAuth connector + standing context** instead. Full runbook: [`../../COWORK.md`](../../COWORK.md).
 
 **MCP tools come for free.** The plugin's `.mcp.json` points at the deployed `/mcp/` endpoint, so installing the plugin auto-wires the seven Neuralscape MCP tools (`recall_memories`, `remember`, etc.) into Claude Code's tool list.
 

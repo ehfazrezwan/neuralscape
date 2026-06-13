@@ -2,7 +2,10 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from arq.connections import RedisSettings
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
+
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
 
 
 class Settings(BaseSettings):
@@ -55,6 +58,18 @@ class Settings(BaseSettings):
     # `request.state.user_id` so routes don't need to trust the request body.
     # Generate tokens via `python scripts/issue_user_token.py --user <name>`.
     neuralscape_user_token_secret: str = ""
+    # Public HTTPS base URL the service is reachable at from the internet
+    # (e.g. the cloudflared tunnel hostname: "https://neuralscape.example.com").
+    # Used as the OAuth issuer and to build the .well-known metadata URLs that
+    # Claude Cowork / claude.ai fetch when connecting as a custom MCP connector.
+    # Leave empty for local dev / Claude Code CLI (OAuth discovery is then off).
+    # No trailing slash; a trailing slash is stripped at use sites.
+    neuralscape_public_url: str = ""
+    # OAuth access-token TTL (seconds). Anthropic silently refreshes via the
+    # refresh token, so this can be short. Default 1 hour.
+    oauth_access_ttl: int = 3600
+    # OAuth refresh-token TTL (seconds). Default 30 days.
+    oauth_refresh_ttl: int = 30 * 24 * 3600
 
     # Service
     host: str = "0.0.0.0"
@@ -64,6 +79,30 @@ class Settings(BaseSettings):
     mcp_transport: str = "stdio"  # "stdio" or "http"
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+
+    @field_validator("neuralscape_public_url")
+    @classmethod
+    def _validate_public_url(cls, value: str) -> str:
+        """OAuth issuer must be a well-formed absolute URL, and HTTPS unless it
+        points at a loopback host (local dev / OAuth testing). Empty disables
+        OAuth discovery and is allowed. Trailing slash is normalized off."""
+        if not value:
+            return value
+        parsed = urlparse(value)
+        host = (parsed.hostname or "").lower()
+        is_loopback = host in _LOOPBACK_HOSTS
+        if not parsed.netloc or parsed.scheme not in ("https", "http"):
+            raise ValueError("NEURALSCAPE_PUBLIC_URL must be an absolute http(s):// URL")
+        if parsed.scheme != "https" and not is_loopback:
+            raise ValueError("NEURALSCAPE_PUBLIC_URL must use https:// (except loopback hosts)")
+        return value.rstrip("/")
+
+    @field_validator("oauth_access_ttl", "oauth_refresh_ttl")
+    @classmethod
+    def _validate_positive_ttl(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("OAuth token TTLs must be > 0 seconds")
+        return value
 
     def validate_required(self) -> None:
         """Validate that all required configuration fields are set.
