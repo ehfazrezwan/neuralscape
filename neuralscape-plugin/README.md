@@ -2,7 +2,7 @@
 
 Persistent agentic memory for **Claude Code** and **Claude Cowork**. The plugin auto-captures your conversations, recalls relevant context on every session start, and exposes the 7 Neuralscape MCP tools — all backed by your own Neuralscape service (FastAPI + mem0 + Graphiti).
 
-- **What you get:** memory injection on `SessionStart`, conversation flush + compile on `Stop`, **incremental tool-observation capture on `PostToolUse` + threshold-driven compile on `UserPromptSubmit`** (no extra API cost — runs on your subscription), five slash command skills (`status`, `search`, `sync`, `config`, `capture`), and the Neuralscape MCP toolkit auto-wired via `.mcp.json`.
+- **What you get:** memory injection on `SessionStart`, conversation flush + compile on `Stop`, **incremental tool-observation capture on `PostToolUse` + threshold-driven compile on `UserPromptSubmit`** (no extra API cost — runs on your subscription), five slash command skills (`ns-status`, `search`, `sync`, `ns-config`, `capture`), and the Neuralscape MCP toolkit auto-wired via `.mcp.json`.
 - **Where it stores:** in your own Neuralscape deployment. The plugin never sends data anywhere else.
 - **Cost:** zero additional. The plugin is a thin client over your service.
 
@@ -39,11 +39,11 @@ Cowork blocks `npm` and `pip` MCP sources, but Neuralscape's MCP runs over HTTP 
 ## What gets installed
 
 ```
-.claude/plugins/cache/neuralscape-plugins/neuralscape/2.1.0/
+.claude/plugins/cache/neuralscape-plugins/neuralscape/2.2.1/
 ├── .claude-plugin/plugin.json    manifest with userConfig prompts
 ├── .mcp.json                      remote HTTP MCP at <URL>/mcp/
 ├── hooks/hooks.json               SessionStart, PostToolUse, UserPromptSubmit, Stop
-├── skills/{status,search,sync,config,capture,compile-observations}/SKILL.md
+├── skills/{ns-status,search,sync,ns-config,capture,compile-observations}/SKILL.md
 ├── scripts/                       built hook bundles
 └── LICENSE / CHANGELOG.md
 ```
