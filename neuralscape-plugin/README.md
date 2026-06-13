@@ -2,7 +2,7 @@
 
 Persistent agentic memory for **Claude Code** and **Claude Cowork**. The plugin auto-captures your conversations, recalls relevant context on every session start, and exposes the 7 Neuralscape MCP tools — all backed by your own Neuralscape service (FastAPI + mem0 + Graphiti).
 
-- **What you get:** memory injection on `SessionStart`, conversation flush + compile on `Stop`, **incremental tool-observation capture on `PostToolUse` + threshold-driven compile on `UserPromptSubmit`** (no extra API cost — runs on your subscription), five slash command skills (`status`, `search`, `sync`, `config`, `capture`), and the Neuralscape MCP toolkit auto-wired via `.mcp.json`.
+- **What you get:** memory injection on `SessionStart`, conversation flush + compile on `Stop`, **incremental tool-observation capture on `PostToolUse` + threshold-driven compile on `UserPromptSubmit`** (no extra API cost — runs on your subscription), five slash command skills (`ns-status`, `search`, `sync`, `ns-config`, `capture`), and the Neuralscape MCP toolkit auto-wired via `.mcp.json`.
 - **Where it stores:** in your own Neuralscape deployment. The plugin never sends data anywhere else.
 - **Cost:** zero additional. The plugin is a thin client over your service.
 
@@ -39,11 +39,11 @@ Cowork blocks `npm` and `pip` MCP sources, but Neuralscape's MCP runs over HTTP 
 ## What gets installed
 
 ```
-.claude/plugins/cache/neuralscape-plugins/neuralscape/2.1.0/
+.claude/plugins/cache/neuralscape-plugins/neuralscape/2.2.1/
 ├── .claude-plugin/plugin.json    manifest with userConfig prompts
 ├── .mcp.json                      remote HTTP MCP at <URL>/mcp/
 ├── hooks/hooks.json               SessionStart, PostToolUse, UserPromptSubmit, Stop
-├── skills/{status,search,sync,config,capture,compile-observations}/SKILL.md
+├── skills/{ns-status,search,sync,ns-config,capture,compile-observations}/SKILL.md
 ├── scripts/                       built hook bundles
 └── LICENSE / CHANGELOG.md
 ```
@@ -68,10 +68,10 @@ The PostToolUse path is **client-LLM-extracted**: the hook records raw observati
 
 Once installed, ask Claude any of:
 
-- "Is neuralscape working?" → `/neuralscape:status`
+- "Is neuralscape working?" → `/neuralscape:ns-status`
 - "What do I know about X?" → `/neuralscape:search`
 - "Save this conversation to memory now" → `/neuralscape:sync`
-- "What's my neuralscape config?" → `/neuralscape:config`
+- "What's my neuralscape config?" → `/neuralscape:ns-config`
 - "Compile my tool observations now" → `/neuralscape:capture`
 
 Claude can also invoke them automatically when it judges them relevant.
@@ -126,13 +126,13 @@ To change settings after install:
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | SessionStart silently skips context | `USER_ID` not set | Run `/plugin config neuralscape@neuralscape-plugins` and fill in the `Your user ID` prompt |
-| `/neuralscape:status` returns 503 | Vector store (Qdrant) unreachable | See `01-getting-started.md` Step 4 in the service docs |
-| 202s become 200s on writes | Redis disconnected — plugin falls back to sync | Check `docker compose logs redis`; `/neuralscape:status` will report `redis: degraded` |
+| `/neuralscape:ns-status` returns 503 | Vector store (Qdrant) unreachable | See `01-getting-started.md` Step 4 in the service docs |
+| 202s become 200s on writes | Redis disconnected — plugin falls back to sync | Check `docker compose logs redis`; `/neuralscape:ns-status` will report `redis: degraded` |
 | `429` from Gemini in compile | Free-tier quota | Service auto-retries with `gemini-2.5-flash` fallback; tune `LLM_RETRY_MAX_DELAY` if it exhausts |
 | Project memories not found | Old `group_id` format | Run `cypher-shell -u neo4j -p $NEO4J_PASSWORD < neuralscape-service/scripts/migrate-group-ids.cypher` once |
 | Plugin not updating after `/plugin update` | Plugin cache stale | `/reload-plugins` or remove `~/.claude/plugins/cache/neuralscape-plugins/neuralscape/<old-version>/` |
 
-For verbose diagnostics: ask Claude to run `/neuralscape:status` — it returns the resolved URL, user_id, API-key state, and a live `/health` probe of all three backends.
+For verbose diagnostics: ask Claude to run `/neuralscape:ns-status` — it returns the resolved URL, user_id, API-key state, and a live `/health` probe of all three backends.
 
 ## Development
 

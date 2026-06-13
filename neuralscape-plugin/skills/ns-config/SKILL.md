@@ -1,5 +1,5 @@
 ---
-name: config
+name: ns-config
 description: Show the current Neuralscape plugin configuration (URL, user_id, API-key state). Use when the user asks "what's my neuralscape config", "where is neuralscape pointing", "am I logged in to neuralscape", or wants to verify their settings.
 ---
 

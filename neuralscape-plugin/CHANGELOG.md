@@ -4,6 +4,17 @@ All notable changes to the `neuralscape` Claude plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.2.1] - 2026-06-13
+
+### Fixed
+
+- **Skill name collision with built-in slash commands.** The `status` and
+  `config` skills declared bare frontmatter names identical to Claude
+  Code's built-in `/status` and `/config`, so typing `/status` resolved
+  to the plugin skill instead of the built-in. Renamed them to `ns-status`
+  and `ns-config` (invoked as `/neuralscape:ns-status` and
+  `/neuralscape:ns-config`); the built-ins are no longer shadowed.
+
 ## [2.2.0] - 2026-05-11
 
 ### Added
