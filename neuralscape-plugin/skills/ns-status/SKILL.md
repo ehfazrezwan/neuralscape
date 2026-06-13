@@ -1,5 +1,5 @@
 ---
-name: status
+name: ns-status
 description: Check Neuralscape service health and show the current plugin configuration. Use when the user asks "is neuralscape working", "is my memory service up", "what URL is neuralscape using", or any health/connectivity question.
 ---
 
@@ -31,4 +31,4 @@ Run this skill when the user wants to confirm the Neuralscape service is reachab
 ## Notes
 
 - This skill only reads. It must never write memories or modify config.
-- If the user asks to *change* the URL or user_id, point them at the `config` skill — they'll need to re-run `/plugin config neuralscape@neuralscape-plugins` since values are stored in the keychain (sensitive) or settings.json (non-sensitive).
+- If the user asks to *change* the URL or user_id, point them at the `ns-config` skill — they'll need to re-run `/plugin config neuralscape@neuralscape-plugins` since values are stored in the keychain (sensitive) or settings.json (non-sensitive).
