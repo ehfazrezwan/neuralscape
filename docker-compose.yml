@@ -178,6 +178,11 @@ services:
     command: tunnel --no-autoupdate run
     environment:
       TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN}
+      # Corporate/Umbrella networks throttle the default QUIC transport
+      # (UDP 7844), causing the edge connections to stall intermittently and
+      # surface as "couldn't reach the MCP server" in Cowork. http2 runs the
+      # edge connection over TCP, which the firewall handles far more reliably.
+      TUNNEL_TRANSPORT_PROTOCOL: http2
     depends_on:
       neuralscape:
         condition: service_healthy
