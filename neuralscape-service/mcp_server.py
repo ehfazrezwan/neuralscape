@@ -381,7 +381,7 @@ async def list_tools() -> list[Tool]:
 
 
 @server.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
     # Identity precedence:
     #   1. The OAuth/per-user token the request authenticated with (authoritative
     #      — set by BearerAuthMiddleware for this request). Over an authenticated
@@ -391,6 +391,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     #   3. The configured default_user_id.
     from auth import current_user_id
 
+    # Tools like list_memories / delete_memories declare no required fields, so a
+    # client may omit `arguments` entirely (None). Normalize before any access.
+    arguments = arguments or {}
     user_id = current_user_id.get() or arguments.get("user_id") or settings.default_user_id
 
     try:

@@ -43,6 +43,7 @@ import html
 import logging
 import secrets
 import time
+from urllib.parse import urlencode, urlparse
 
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -57,6 +58,25 @@ router = APIRouter()
 SCOPE = "neuralscape"
 _CODE_TTL = 300  # authorization code lifetime (seconds)
 _CLIENT_TTL: int | None = None  # client_id registrations don't expire
+# RFC 8252 §7.3 / OAuth 2.1: redirect URIs must be https, except loopback
+# interface URIs which native clients may serve over http.
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def _is_valid_redirect_uri(uri: str) -> bool:
+    """Accept only absolute https:// URIs (or http:// to a loopback host) with
+    no fragment. These are signed into the client_id and later trusted by
+    /oauth/authorize as 303 redirect targets, so they must be constrained at
+    registration time to avoid open-redirect / token-leak to plaintext hosts."""
+    if not isinstance(uri, str) or not uri:
+        return False
+    parsed = urlparse(uri)
+    if not parsed.netloc or parsed.fragment:
+        return False
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme == "https":
+        return True
+    return parsed.scheme == "http" and host in _LOOPBACK_HOSTS
 
 
 # ── helpers ──────────────────────────────────────────────────────────────
@@ -193,13 +213,16 @@ async def register(request: Request) -> JSONResponse:
     if (
         not isinstance(redirect_uris, list)
         or not redirect_uris
-        or not all(isinstance(u, str) and u for u in redirect_uris)
+        or not all(_is_valid_redirect_uri(u) for u in redirect_uris)
     ):
         return JSONResponse(
             status_code=400,
             content={
                 "error": "invalid_redirect_uri",
-                "error_description": "redirect_uris must be a non-empty array of strings",
+                "error_description": (
+                    "redirect_uris must be a non-empty array of absolute https:// "
+                    "URLs (http:// allowed only for loopback hosts)"
+                ),
             },
         )
 
@@ -407,10 +430,14 @@ async def authorize_submit(
         _secret(),
     )
 
-    sep = "&" if "?" in redirect_uri else "?"
-    location = f"{redirect_uri}{sep}code={code}"
+    # Build the query with proper percent-encoding: an opaque `state` may carry
+    # reserved characters (&, =, #, spaces) that would otherwise corrupt the
+    # client's CSRF/state check when concatenated raw.
+    params = {"code": code}
     if state:
-        location += f"&state={state}"
+        params["state"] = state
+    sep = "&" if "?" in redirect_uri else "?"
+    location = f"{redirect_uri}{sep}{urlencode(params)}"
     # 303 so the browser issues a GET to the client's redirect URI.
     return RedirectResponse(url=location, status_code=303)
 
@@ -466,9 +493,13 @@ async def token(
         claims = verify_payload(code, _secret())
         if claims is None or claims.get("typ") != "code":
             return _token_error("invalid_grant", "code is invalid or expired")
-        if client_id and claims.get("client_id") != client_id:
+        # The code is bound to the client_id and redirect_uri it was issued for.
+        # Require both on exchange and demand an exact match — otherwise a caller
+        # could omit them and redeem any otherwise-valid code, defeating the
+        # binding.
+        if not client_id or claims.get("client_id") != client_id:
             return _token_error("invalid_grant", "client mismatch")
-        if redirect_uri and claims.get("redirect_uri") != redirect_uri:
+        if not redirect_uri or claims.get("redirect_uri") != redirect_uri:
             return _token_error("invalid_grant", "redirect_uri mismatch")
         if not _verify_pkce(code_verifier, claims.get("code_challenge", "")):
             return _token_error("invalid_grant", "PKCE verification failed")

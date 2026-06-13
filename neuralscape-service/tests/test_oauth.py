@@ -142,9 +142,13 @@ class TestDiscovery:
     def test_metadata_404_when_not_configured(self, client):
         from config import settings
 
+        orig = settings.neuralscape_public_url
         settings.neuralscape_public_url = ""
-        resp = client.get("/.well-known/oauth-authorization-server")
-        assert resp.status_code == 404
+        try:
+            resp = client.get("/.well-known/oauth-authorization-server")
+            assert resp.status_code == 404
+        finally:
+            settings.neuralscape_public_url = orig
 
 
 # ── dynamic client registration ──────────────────────────────────────────
@@ -162,6 +166,24 @@ class TestRegistration:
     def test_register_rejects_missing_redirect_uris(self, client):
         resp = client.post("/oauth/register", json={})
         assert resp.status_code == 400
+
+    def test_register_rejects_insecure_redirect_uri(self, client):
+        # plaintext http to a non-loopback host must be rejected — it would
+        # otherwise be signed into the client_id and trusted as a 303 target.
+        resp = client.post(
+            "/oauth/register",
+            json={"redirect_uris": ["http://evil.example.com/steal"]},
+        )
+        assert resp.status_code == 400
+        assert resp.json()["error"] == "invalid_redirect_uri"
+
+    def test_register_allows_loopback_http_redirect(self, client):
+        # native/CLI clients may use an http loopback callback (RFC 8252).
+        resp = client.post(
+            "/oauth/register",
+            json={"redirect_uris": ["http://127.0.0.1:7777/callback"]},
+        )
+        assert resp.status_code == 201
 
 
 # ── authorize (consent) ──────────────────────────────────────────────────
@@ -266,6 +288,35 @@ class TestToken:
         assert payload is not None and payload["user_id"] == USER
         assert "refresh_token" in body
 
+    def test_code_exchange_requires_client_id(self, client):
+        # omitting the bound client_id must be rejected, not silently allowed
+        _cid, redirect_uri, verifier, code = self._full_flow_to_code(client)
+        resp = client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "code_verifier": verifier,
+                "redirect_uri": redirect_uri,
+            },
+        )
+        assert resp.status_code == 400
+        assert resp.json()["error"] == "invalid_grant"
+
+    def test_code_exchange_requires_redirect_uri(self, client):
+        client_id, _ru, verifier, code = self._full_flow_to_code(client)
+        resp = client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "code_verifier": verifier,
+                "client_id": client_id,
+            },
+        )
+        assert resp.status_code == 400
+        assert resp.json()["error"] == "invalid_grant"
+
     def test_code_exchange_wrong_pkce_rejected(self, client):
         client_id, redirect_uri, _verifier, code = self._full_flow_to_code(client)
         resp = client.post(
@@ -297,7 +348,6 @@ class TestToken:
         assert "already used" in second.json()["error_description"]
 
     def test_refresh_grant(self, client):
-        _cid, _ru, _v, code = self._full_flow_to_code(client)
         client_id, redirect_uri, verifier, code = self._full_flow_to_code(client)
         tok = client.post(
             "/oauth/token",
