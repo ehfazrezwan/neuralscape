@@ -273,6 +273,25 @@ class TestCRUD:
         assert "limit" not in call_kwargs
         assert call_kwargs["top_k"] == 50
 
+    def test_list_projects_returns_distinct_sorted(self, service):
+        """list_projects collects the distinct, sorted project_ids the caller
+        has memories under. Projects are implicit — derived from stored
+        memories, not a separate entity."""
+        service._memory.get_all.return_value = {
+            "results": [
+                {"id": "m1", "memory": "a", "metadata": {"project_id": "neuralscape"}},
+                {"id": "m2", "memory": "b", "metadata": {"project_id": "lightpath"}},
+                {"id": "m3", "memory": "c", "metadata": {"project_id": "neuralscape"}},
+                {"id": "m4", "memory": "d", "metadata": {}},  # global — no project_id
+            ]
+        }
+        projects = service.list_projects(user_id="ehfaz")
+        assert projects == ["lightpath", "neuralscape"]
+
+    def test_list_projects_empty(self, service):
+        service._memory.get_all.return_value = {"results": []}
+        assert service.list_projects(user_id="ehfaz") == []
+
     def test_update_memory(self, service):
         service._memory.get.return_value = {
             "id": "m1",

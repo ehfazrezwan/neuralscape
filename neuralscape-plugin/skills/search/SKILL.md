@@ -1,31 +1,22 @@
 ---
 name: search
-description: Search the user's Neuralscape memory store for relevant facts. Use when the user asks "what do I know about X", "have we discussed Y", "what did I decide about Z", or any retrieval-style question. Returns hybrid vector + graph results.
+description: Search the user's Neuralscape memory store for relevant facts. Use when the user asks "what do I know about X", "have we discussed Y", "what did I decide about Z", or any retrieval-style question. Returns hybrid vector + graph results. Works in both Claude Code and Claude Cowork (MCP-driven).
 ---
 
 # Neuralscape — Search
 
 Run this skill when the user wants to recall stored memories on a topic.
 
+This skill prefers the **MCP `recall_memories` tool**, so it works identically in Claude Code and Claude Cowork. A raw-HTTP path to `POST /v1/search` is kept only as a Claude Code fast path for when MCP is unavailable.
+
 ## What to do
 
-1. **Resolve the query** — use the user's exact phrasing as the search query. Do not rewrite or summarize unless the query is empty (in that case, ask what they want to look up).
-2. **Read config** from `process.env.CLAUDE_PLUGIN_OPTION_URL` and `CLAUDE_PLUGIN_OPTION_USER_ID` (legacy fallbacks: `NEURALSCAPE_URL`, `NEURALSCAPE_USER_ID`). If `USER_ID` is missing, abort and tell the user to run `/plugin config neuralscape@neuralscape-plugins`.
-3. **Detect project scope** — call `process.cwd()` and use the basename as `project_id`. If the user explicitly says "across all projects" or "globally", omit `project_id` so the search hits global scope only.
-4. **POST `<URL>/v1/search`** with body:
-
-   ```json
-   {
-     "query": "<the user's question>",
-     "user_id": "<USER_ID>",
-     "project_id": "<basename of cwd, or null>",
-     "limit": 10
-   }
-   ```
-
-   Set `Authorization: Bearer <CLAUDE_PLUGIN_OPTION_API_KEY>` if the API key is set. Timeout: 8 seconds.
-
-5. **Render results** as a compact markdown list, ordered by score:
+1. **Resolve the query** — use the user's exact phrasing as the search query. Do not rewrite or summarize unless the query is empty (then ask what they want to look up).
+2. **Resolve `user_id`** — see the Identity block below.
+3. **Detect project scope** — an active project selected this session → else (Claude Code) the working-directory basename → else omit. If the user says "across all projects" or "globally", omit `project_id`.
+4. **Primary path — MCP (both platforms):** call `recall_memories(query=<user's question>, user_id=<resolved>, project_id=<id or omit>, limit=10)`. This is the default and the only path that works in Cowork.
+5. **Optional Claude Code fast path:** only if the `recall_memories` MCP tool is unavailable AND a service URL (`CLAUDE_PLUGIN_OPTION_URL` / `NEURALSCAPE_URL`) plus `curl` are present, fall back to `POST <URL>/v1/search` with body `{"query", "user_id", "project_id", "limit": 10}` and `Authorization: Bearer <API_KEY>` if set (8s timeout). Never require env; never error in Cowork — if neither path is available, say the memory store isn't reachable and stop.
+6. **Render results** as a compact markdown list, ordered by score:
 
    ```
    ## Memories matching "<query>"
@@ -35,9 +26,17 @@ Run this skill when the user wants to recall stored memories on a topic.
    3. **[decision]** Use Qdrant over pgvector (project: neuralscape, source: vector)
    ```
 
-   Show `category` in brackets, then the memory text, then `(score, source)`. Include `project: <id>` when scope is project. If no results, say "No matches found" and suggest broadening the query.
+   Show `category` in brackets, then the memory text, then `(score, source)`. Include `project: <id>` when scope is project. When results carry a `source` field, prefer `graph`-sourced results as authoritative when they conflict with `vector` results. If no results, say "No matches found" and suggest broadening the query.
 
-6. **Brief synthesis** (optional, 1-2 sentences) after the list if the results have a clear collective answer.
+7. **Brief synthesis** (optional, 1-2 sentences) after the list if the results have a clear collective answer.
+
+## Identity block (how to resolve `user_id`)
+
+The MCP `recall_memories` schema marks `user_id` required, but under token auth the server **ignores** the value you pass and scopes by the authenticated token identity.
+
+- If `CLAUDE_PLUGIN_OPTION_USER_ID` (or `NEURALSCAPE_USER_ID`) is set → pass that value.
+- If neither is set (likely Claude Cowork) → pass a placeholder like `"cowork"` to satisfy the schema; the OAuth token determines the real identity.
+- **Never** block, prompt, or error solely because `user_id` is unknown.
 
 ## Notes
 

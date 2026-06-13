@@ -327,6 +327,27 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="list_projects",
+            description=(
+                "List the distinct projects the user has memories under. Use this to let "
+                "the user pick which project to scope memory to — especially when there is "
+                "no working directory to infer one from (e.g. in Claude Cowork). Projects "
+                "are implicit: a project exists once any memory is stored under its "
+                "project_id, so a brand-new project name is valid and will be created on "
+                "the first remember() call. Returns a sorted list of project_id strings."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "User ID to list projects for",
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
             name="delete_memories",
             description=(
                 "Delete memories by ID or by filters. Use with caution — deleted memories "
@@ -535,6 +556,10 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             )
             output = [r.model_dump(exclude_none=True) for r in results]
             return [TextContent(type="text", text=json.dumps(output, default=str))]
+
+        elif name == "list_projects":
+            projects = _service.list_projects(user_id=user_id)
+            return [TextContent(type="text", text=json.dumps({"projects": projects}, default=str))]
 
         elif name == "delete_memories":
             memory_id = arguments.get("memory_id")

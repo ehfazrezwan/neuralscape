@@ -13,8 +13,8 @@
     {
       "name": "neuralscape",
       "source": "./neuralscape-plugin",
-      "description": "Persistent agentic memory for Claude (Code + Cowork). Auto-captures conversations, recalls relevant context on every session start, and exposes 7 MCP tools.",
-      "version": "2.2.1",
+      "description": "Persistent agentic memory for Claude (Code + Cowork). Auto-captures conversations, recalls relevant context on every session start, and exposes 8 MCP tools. Cross-platform skills (recall/remember/save-session/project) work in both Claude Code and Cowork via MCP.",
+      "version": "2.3.0",
       "license": "MIT",
       "keywords": [
         "memory",

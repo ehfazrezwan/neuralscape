@@ -86,7 +86,7 @@ uv run pytest tests/test_async_pipeline.py -v -s
 
 ## Claude Code / Cowork Plugin
 
-The **neuralscape plugin** gives Claude Code automatic, persistent memory: two lifecycle hooks plus four discoverable slash commands plus the seven Neuralscape MCP tools auto-wired on install.
+The **neuralscape plugin** gives Claude Code automatic, persistent memory: lifecycle hooks plus nine discoverable slash commands plus the eight Neuralscape MCP tools auto-wired on install.
 
 > **Claude Cowork:** Cowork does **not** run plugin hooks ([#27398](https://github.com/anthropics/claude-code/issues/27398)), so the automatic inject/capture loop below does not fire there. Cowork is supported via a remote **MCP OAuth connector** plus a standing-context "memory protocol" that drives recall/capture through the MCP tools. See **[COWORK.md](./COWORK.md)** — that is the supported Cowork path, not this hook-based one.
 
@@ -106,14 +106,20 @@ The **neuralscape plugin** gives Claude Code automatic, persistent memory: two l
 | **SessionStart** | Session start / resume / clear | Calls `/v1/context/{projectId}` (or `/v1/context/global`), formats the response by category, injects as `additionalContext` | Yes (sync, ~1s, 30s timeout) |
 | **Stop** | Session ends | Reads transcript since last offset, POSTs each new turn to `/flush`, commits offset only after success, then triggers `/compile` | No (async, 60s timeout) |
 
-Slash commands (auto-discovered from `skills/`):
+Slash commands (auto-discovered from `skills/`). The MCP-driven ones work in
+both Claude Code and Claude Cowork:
 
-| Command | Use |
-|---|---|
-| `/neuralscape:status` | Health check + config display |
-| `/neuralscape:search` | Inline memory recall via `/v1/search` |
-| `/neuralscape:sync` | Manually flush the current conversation |
-| `/neuralscape:config` | Show URL / user_id / API-key state without leaking secrets |
+| Command | Use | Platform |
+|---|---|---|
+| `/neuralscape:recall` | Load relevant memories before planning/acting | Both (MCP) |
+| `/neuralscape:remember` | Save one durable fact now | Both (MCP) |
+| `/neuralscape:save-session` | Extract + store facts from the conversation | Both (MCP) |
+| `/neuralscape:project` | List / pick / create the project to scope memory to | Both (MCP) |
+| `/neuralscape:search` | Inline memory recall (`recall_memories`; `/v1/search` as CLI fast path) | Both (MCP) |
+| `/neuralscape:ns-status` | Reachability check + config display | Both (degrades) |
+| `/neuralscape:ns-config` | Show URL / user_id / API-key state (or connector mode) without leaking secrets | Both (degrades) |
+| `/neuralscape:sync` | Manually flush the current conversation (delegates to `save-session` in Cowork) | Both |
+| `/neuralscape:capture` | Compile the PostToolUse observation buffer now | Claude Code |
 
 ### Installation (60 seconds)
 
@@ -271,7 +277,7 @@ There are two approaches to giving Claude Code persistent memory. Use either or 
 
 The neuralscape plugin handles context injection and conversation capture automatically via lifecycle hooks. See the [Claude Code / Cowork Plugin](#claude-code--cowork-plugin) section above for installation.
 
-Once installed, the plugin loads on every session across all projects. The plugin's `.mcp.json` also auto-wires the seven Neuralscape MCP tools, so the manual MCP setup below is redundant if you've installed the plugin. The MCP-only path remains documented for setups that can't run a plugin.
+Once installed, the plugin loads on every session across all projects. The plugin's `.mcp.json` also auto-wires the eight Neuralscape MCP tools, so the manual MCP setup below is redundant if you've installed the plugin. The MCP-only path remains documented for setups that can't run a plugin.
 
 ### Approach 2: MCP server + CLAUDE.md instructions
 

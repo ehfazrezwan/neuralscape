@@ -4,6 +4,33 @@ All notable changes to the `neuralscape` Claude plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.3.0] - 2026-06-13
+
+### Added
+
+- **Cross-platform memory skills.** Four new MCP-driven skills that work
+  in both Claude Code and Claude Cowork (no hooks, no local config
+  required): `recall` (load relevant context before acting), `remember`
+  (save one fact), `save-session` (extract facts from the conversation —
+  the Cowork stand-in for the Stop hook), and `project` (list/pick/create
+  the project to scope memory to, important in Cowork which has no working
+  directory).
+- **`list_projects` MCP tool + `GET /v1/projects` endpoint.** Returns the
+  caller's distinct project_ids, derived from stored memories (projects are
+  implicit — no separate entity). Brings the documented MCP tool count to 8.
+
+### Changed
+
+- **Skills are now MCP-first and degrade gracefully.** `search` prefers the
+  `recall_memories` MCP tool (HTTP `/v1/search` kept only as a Claude Code
+  fast path); `ns-status` probes reachability via MCP and reports a
+  connector-mode block when no local URL is set; `ns-config` shows a
+  Cowork "connector mode" branch instead of implying misconfiguration.
+- **Hook-dependent skills no longer error in Cowork.** `capture` and
+  `compile-observations` detect a missing observation buffer and redirect to
+  `save-session`/`remember` instead of failing; `sync` delegates to
+  `save-session` (MCP) when no local service URL is configured.
+
 ## [2.2.1] - 2026-06-13
 
 ### Fixed

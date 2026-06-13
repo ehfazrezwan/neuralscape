@@ -1848,6 +1848,25 @@ class MemoryService:
         memories = self._extract_memory_list(result)
         return [self._mem_to_response(mem) for mem in memories]
 
+    def list_projects(self, user_id: str) -> list[str]:
+        """Return the distinct project_ids the caller has memories under.
+
+        Projects in Neuralscape are *implicit*: a project "exists" exactly
+        when at least one memory has been stored under its ``project_id``.
+        There is no separate project entity to create, update, or delete —
+        ``remember(..., project_id="x")`` brings project ``x`` into being and
+        ``delete_memories(scope="project", project_id="x")`` removes it.
+
+        This powers the plugin's `project` selection skill (notably in Claude
+        Cowork, which has no working directory to derive a ``project_id`` from).
+        It scans the caller's own memories — private writes plus the caller's
+        shared writes — and collects the distinct ``project_id`` values. It is
+        an occasional, interactive call, not a hot path, so a single large
+        page is fine.
+        """
+        memories = self.list_memories(user_id=user_id, limit=10000)
+        return sorted({m.project_id for m in memories if m.project_id})
+
     def update_memory(
         self,
         memory_id: str,

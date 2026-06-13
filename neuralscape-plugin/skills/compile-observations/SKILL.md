@@ -18,6 +18,8 @@ The trigger always supplies the path(s) to one or more JSONL files to process.
 
 ## What to do
 
+0. **Guard — no buffer to compile.** If you were invoked with no buffer path and can't find any `.jsonl` in `${CLAUDE_PLUGIN_DATA}/observations/` (fallback `~/.neuralscape/observations/`), don't error: compilation runs from a hook-produced buffer that only exists in **Claude Code**. Point the user at `/neuralscape:save-session` (the conversation-based path that works everywhere) and stop. Otherwise continue.
+
 1. **Read each provided buffer file.** Each line is a JSON row:
    ```json
    {"ts": "...", "session_id": "...", "cwd": "...", "project_id": "...", "user_id": "...", "tool": "Edit|Write|Bash|...", "input": {...}, "output": "..."}
