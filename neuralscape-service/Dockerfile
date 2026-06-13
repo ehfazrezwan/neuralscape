@@ -24,7 +24,16 @@ RUN cd neuralscape-service && uv sync --frozen --no-dev
 # layer finds it at import time. Without this the worker logs a
 # "Failed to load spaCy lemma model" warning on every startup and
 # falls back to no lemmatization, hurting search quality.
-RUN cd neuralscape-service && .venv/bin/python -m spacy download en_core_web_sm
+# A pre-downloaded wheel in neuralscape-service/vendor/ takes priority —
+# needed on hosts whose TLS is intercepted (e.g. Cisco Umbrella), where
+# the build container can't validate GitHub's release CDN certificate.
+COPY neuralscape-service/vendor* neuralscape-service/vendor/
+RUN cd neuralscape-service && \
+    if ls vendor/en_core_web_sm-*.whl >/dev/null 2>&1; then \
+        uv pip install --python .venv/bin/python vendor/en_core_web_sm-*.whl; \
+    else \
+        .venv/bin/python -m spacy download en_core_web_sm; \
+    fi
 
 # ── Stage 2: Runtime ────────────────────────────────────────────
 FROM python:3.12-slim AS runtime
@@ -91,7 +100,13 @@ RUN cd neuralscape-service && uv sync --frozen
 
 # Same spaCy model download as the runtime stage so unit tests that
 # import mem0's NLP path see the same dependency graph as production.
-RUN cd neuralscape-service && .venv/bin/python -m spacy download en_core_web_sm
+COPY neuralscape-service/vendor* neuralscape-service/vendor/
+RUN cd neuralscape-service && \
+    if ls vendor/en_core_web_sm-*.whl >/dev/null 2>&1; then \
+        uv pip install --python .venv/bin/python vendor/en_core_web_sm-*.whl; \
+    else \
+        .venv/bin/python -m spacy download en_core_web_sm; \
+    fi
 
 # Pull tests + helper scripts into the image so they're available without
 # a host bind-mount. Bind-mounts can still be layered on top from compose
