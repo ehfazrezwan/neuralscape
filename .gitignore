@@ -176,3 +176,5 @@ docker-compose.override.yml
 # Local vault directory (created by Docker volume mount)
 vault/
 settings.local.json
+# Vendored wheels (host-downloaded, e.g. spaCy model when TLS is MITMed)
+neuralscape-service/vendor/*.whl
