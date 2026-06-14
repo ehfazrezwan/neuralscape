@@ -19,6 +19,8 @@
     "build": "node esbuild.config.js",
     "watch": "node esbuild.config.js --watch",
     "postinstall": "node esbuild.config.js",
+    "package": "node tools/package.mjs",
+    "dist": "node tools/package.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage"

@@ -184,9 +184,14 @@ cd neuralscape-plugin
 npm install        # also runs the postinstall build
 npm run build      # rebuild bundles
 npm run watch      # rebuild on save
+npm run package    # build a clean installable zip under dist/
 ```
 
 The TypeScript source lives in `src/`. esbuild bundles five entry points (`session-start.ts`, `conversation-turn.ts`, `session-end.ts`, `post-tool-use.ts`, `user-prompt-submit.ts`) into `scripts/*.js` (ESM, Node 18+, minified). Built scripts are gitignored — `npm install` regenerates them.
+
+### Packaging for local install (Cowork / manual)
+
+`npm run package` (alias `npm run dist`, source at `tools/package.mjs`) produces `dist/neuralscape-plugin-<version>.zip` — an installable artifact containing only the runtime files (manifest, `.mcp.json`, `hooks/`, built `scripts/`, `skills/`, `cowork/`, docs). It deliberately **excludes `node_modules/`, `src/`, and `tests/`** so the archive has zero symlinks; Cowork rejects any zip that contains one ("Zip file contains a symbolic link"). The script rebuilds the bundle first and fails loudly if a symlink ever slips into the archive. `dist/` is gitignored.
 
 To run a hook locally for testing:
 

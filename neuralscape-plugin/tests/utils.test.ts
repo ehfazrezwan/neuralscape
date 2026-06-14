@@ -21,6 +21,8 @@ import {
   listPendingBuffers,
   markBufferStale,
   pickRelevantInput,
+  readBakedUrl,
+  readConfig,
   truncateBuffer,
   truncateOutput,
 } from "../src/utils.js";
@@ -481,5 +483,116 @@ describe("getProjectId", () => {
     const repo = join(scratch, "plain-dir");
     mkdirSync(repo, { recursive: true });
     expect(getProjectId(repo)).toBe("plain-dir");
+  });
+});
+
+// ── Baked URL resolution ─────────────────────────────────────────
+//
+// The connector base URL is baked into `.mcp.json` per distribution channel;
+// hooks derive their API base from that same file via readBakedUrl(). These
+// cover the parsing, /mcp/ stripping, template-skipping, and error paths.
+describe("readBakedUrl", () => {
+  let root: string;
+  let prevRoot: string | undefined;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "neuralscape-root-"));
+    prevRoot = process.env.CLAUDE_PLUGIN_ROOT;
+    process.env.CLAUDE_PLUGIN_ROOT = root;
+  });
+
+  afterEach(() => {
+    if (prevRoot === undefined) delete process.env.CLAUDE_PLUGIN_ROOT;
+    else process.env.CLAUDE_PLUGIN_ROOT = prevRoot;
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const writeMcp = (url: unknown) =>
+    writeFileSync(
+      join(root, ".mcp.json"),
+      JSON.stringify({ mcpServers: { neuralscape: { type: "http", url } } }),
+    );
+
+  it("strips a trailing /mcp/ connector suffix to the API base", () => {
+    writeMcp("https://neuralscape.siliconinja.dev/mcp/");
+    expect(readBakedUrl()).toBe("https://neuralscape.siliconinja.dev");
+  });
+
+  it("strips /mcp without a trailing slash", () => {
+    writeMcp("https://example.com/mcp");
+    expect(readBakedUrl()).toBe("https://example.com");
+  });
+
+  it("preserves a path prefix before /mcp/ and keeps the port", () => {
+    writeMcp("http://localhost:8199/api/mcp/");
+    expect(readBakedUrl()).toBe("http://localhost:8199/api");
+  });
+
+  it("drops query strings and hash fragments before stripping", () => {
+    writeMcp("https://example.com/mcp/?token=abc#frag");
+    expect(readBakedUrl()).toBe("https://example.com");
+  });
+
+  it("ignores an un-baked ${...} template", () => {
+    writeMcp("${user_config.URL}/mcp/");
+    expect(readBakedUrl()).toBe("");
+  });
+
+  it("rejects a non-http(s) scheme", () => {
+    writeMcp("ftp://example.com/mcp/");
+    expect(readBakedUrl()).toBe("");
+  });
+
+  it("returns '' when CLAUDE_PLUGIN_ROOT is unset", () => {
+    delete process.env.CLAUDE_PLUGIN_ROOT;
+    expect(readBakedUrl()).toBe("");
+  });
+
+  it("returns '' when .mcp.json is missing", () => {
+    expect(readBakedUrl()).toBe("");
+  });
+
+  it("returns '' on malformed JSON", () => {
+    writeFileSync(join(root, ".mcp.json"), "{ not json");
+    expect(readBakedUrl()).toBe("");
+  });
+
+  it("returns '' when the url field is absent or non-string", () => {
+    writeMcp(undefined);
+    expect(readBakedUrl()).toBe("");
+    writeMcp(42);
+    expect(readBakedUrl()).toBe("");
+  });
+});
+
+describe("readConfig URL precedence", () => {
+  const KEYS = ["CLAUDE_PLUGIN_OPTION_URL", "NEURALSCAPE_URL"] as const;
+  let prev: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    prev = Object.fromEntries(KEYS.map((k) => [k, process.env[k]]));
+    for (const k of KEYS) delete process.env[k];
+  });
+
+  afterEach(() => {
+    for (const k of KEYS) {
+      if (prev[k] === undefined) delete process.env[k];
+      else process.env[k] = prev[k];
+    }
+  });
+
+  it("prefers CLAUDE_PLUGIN_OPTION_URL over the legacy var", () => {
+    process.env.CLAUDE_PLUGIN_OPTION_URL = "https://modern.example";
+    process.env.NEURALSCAPE_URL = "https://legacy.example";
+    expect(readConfig("URL")).toBe("https://modern.example");
+  });
+
+  it("falls back to the legacy NEURALSCAPE_URL var", () => {
+    process.env.NEURALSCAPE_URL = "https://legacy.example";
+    expect(readConfig("URL")).toBe("https://legacy.example");
+  });
+
+  it("returns the fallback when neither is set", () => {
+    expect(readConfig("URL", "fallback")).toBe("fallback");
   });
 });
