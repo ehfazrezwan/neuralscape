@@ -329,9 +329,10 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="list_projects",
             description=(
-                "List the distinct projects the user has memories under. Use this to let "
-                "the user pick which project to scope memory to — especially when there is "
-                "no working directory to infer one from (e.g. in Claude Cowork). Projects "
+                "List the distinct projects the user can scope memory to — their own "
+                "private projects plus all team-shared projects. Use this to let the user "
+                "pick which project to scope memory to, especially when there is no "
+                "working directory to infer one from (e.g. in Claude Cowork). Projects "
                 "are implicit: a project exists once any memory is stored under its "
                 "project_id, so a brand-new project name is valid and will be created on "
                 "the first remember() call. Returns a sorted list of project_id strings."

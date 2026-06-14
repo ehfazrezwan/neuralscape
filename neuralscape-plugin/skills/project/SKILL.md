@@ -12,7 +12,7 @@ Choose the project that `recall`, `remember`, and `save-session` should scope to
 ## What to do
 
 1. **Resolve `user_id`** — see the Identity block below.
-2. **List existing projects** — call the MCP `list_projects(user_id=<resolved>)` tool. It returns a sorted list of the `project_id`s the user already has memories under.
+2. **List existing projects** — call the MCP `list_projects(user_id=<resolved>)` tool. It returns a sorted list of `project_id`s the user can scope to: their own private projects plus all team-shared projects (so a teammate's shared project is selectable even if the user hasn't written to it yet).
 3. **Present the choices** to the user:
    - The existing projects from step 2.
    - A **(global)** option — no project scope; memory operations hit global scope only.

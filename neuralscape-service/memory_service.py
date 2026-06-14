@@ -1849,7 +1849,7 @@ class MemoryService:
         return [self._mem_to_response(mem) for mem in memories]
 
     def list_projects(self, user_id: str) -> list[str]:
-        """Return the distinct project_ids the caller has memories under.
+        """Return the distinct project_ids the caller can scope memory to.
 
         Projects in Neuralscape are *implicit*: a project "exists" exactly
         when at least one memory has been stored under its ``project_id``.
@@ -1857,22 +1857,65 @@ class MemoryService:
         ``remember(..., project_id="x")`` brings project ``x`` into being and
         ``delete_memories(scope="project", project_id="x")`` removes it.
 
-        This powers the plugin's `project` selection skill (notably in Claude
-        Cowork, which has no working directory to derive a ``project_id`` from).
-        It scans the caller's own memories — private writes plus the caller's
-        shared writes — via Qdrant ``scroll`` pagination so the result is
-        complete even for users with very large memory stores (a fixed
-        ``limit`` would silently drop projects past the window).
+        Rather than scanning every memory, this derives the list from Neo4j
+        ``group_id`` values with an index-backed ``DISTINCT`` query. Each
+        project is encoded in the group_id (``user--{uid}--project--{pid}`` for
+        the caller's private projects, ``shared--project--{pid}`` for the
+        team-wide pool), and Graphiti maintains range indexes on ``group_id``
+        per node label (``entity_group_id`` / ``episode_group_id`` /
+        ``community_group_id``), so the ``STARTS WITH`` prefix seeks are cheap
+        and the database returns only the distinct group_ids (tens), never the
+        underlying memories (potentially many thousands).
+
+        Returns the caller's private projects **plus all team-shared
+        projects** — the picker can scope to a shared project even before the
+        caller has contributed to it. Powers the plugin's `project` selection
+        skill (notably in Claude Cowork, which has no working directory to
+        derive a ``project_id`` from).
         """
+        g = self._get_graphiti()
+        if g is None:
+            return []
+
+        user_prefix = f"user--{user_id}--project--"
+        shared_prefix = "shared--project--"
+        # One MATCH per indexed label so the per-label group_id range index is
+        # used; UNION dedupes across labels (and is itself DISTINCT).
+        cypher = """
+        MATCH (n:Entity)
+        WHERE n.group_id STARTS WITH $user_prefix OR n.group_id STARTS WITH $shared_prefix
+        RETURN DISTINCT n.group_id AS group_id
+        UNION
+        MATCH (n:Episodic)
+        WHERE n.group_id STARTS WITH $user_prefix OR n.group_id STARTS WITH $shared_prefix
+        RETURN DISTINCT n.group_id AS group_id
+        UNION
+        MATCH (n:Community)
+        WHERE n.group_id STARTS WITH $user_prefix OR n.group_id STARTS WITH $shared_prefix
+        RETURN DISTINCT n.group_id AS group_id
+        """
+
+        async def _run():
+            async with g.driver.session() as session:
+                result = await session.run(
+                    cypher, user_prefix=user_prefix, shared_prefix=shared_prefix
+                )
+                return await result.data()
+
+        try:
+            records = self._run_on_bridge(_run(), timeout=10.0) or []
+        except Exception as e:
+            logger.warning(f"list_projects graph query failed: {e}")
+            return []
+
         projects: set[str] = set()
-        for point in self._scroll_all_user_memories(user_id):
-            metadata = (point.get("payload") or {}).get("metadata") or {}
-            # mem0 sometimes double-wraps metadata ({"metadata": {"metadata": {...}}});
-            # unwrap one level so project_id resolves. See _mem_to_response.
-            if isinstance(metadata.get("metadata"), dict):
-                metadata = metadata["metadata"]
-            pid = metadata.get("project_id")
-            if isinstance(pid, str) and pid.strip():
+        for rec in records:
+            gid = rec.get("group_id") or ""
+            # Both namespaces end with '--project--{pid}'; everything after the
+            # separator is the project id. Global groups ('user--{uid}',
+            # 'shared') have no separator and are skipped.
+            _, sep, pid = gid.partition("--project--")
+            if sep and pid.strip():
                 projects.add(pid)
         return sorted(projects)
 
