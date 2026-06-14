@@ -20,7 +20,7 @@ Use this for one clear fact at a time. To capture many facts from a whole workin
    - **Episodic**: `decision`, `interaction`
    - **Procedural**: `workflow`, `procedure`
    - **Working**: `task_context`
-3. **Resolve `project_id`**: an active project selected this session → else Claude Code working-directory basename → else omit (global). Project categories (`tech_stack`, `convention`, `architecture`, `dependency`) generally want a `project_id`.
+3. **Resolve `project_id`**: an active project selected this session → else the repo's pinned id (first line of a `.neuralscape-project` marker at the repo root, else the git-repo-root/working-directory basename — Claude Code) → else omit (global). Project categories (`tech_stack`, `convention`, `architecture`, `dependency`) generally want a `project_id`.
 4. **Resolve `user_id`** — see the Identity block below.
 5. **Visibility**: **omit** the `visibility` field to take the per-category default (semantic/personal categories default `private`; team categories like `tech_stack`/`convention`/`architecture`/`dependency`/`decision`/`interaction`/`workflow`/`procedure` default `shared`). Only set `visibility="private"` explicitly when a normally-shared fact is sensitive (internal politics, a personal note, a draft).
 6. **Call `remember`** with `content`, `category`, `user_id`, `project_id?`, `visibility?`. Set `wait: true` only if the user wants confirmation that it landed (default is fire-and-forget, async).

@@ -13,7 +13,7 @@ This is the conversation-level counterpart to `/neuralscape:remember` (one fact)
 
 1. **Gather the relevant recent messages** as a list of `{role, content}` objects from the conversation. Include the substantive user/assistant exchanges; the server's LLM does the extraction, so you don't pre-summarize.
 2. **Apply the noise filter** — drop turns that carry no signal: assistant responses shorter than ~20 characters, and anything matching `NO_REPLY` / `[heartbeat]` / `[system]`. Skip routine acknowledgements and trivia.
-3. **Resolve `project_id`**: an active project selected this session → else Claude Code working-directory basename → else omit (global).
+3. **Resolve `project_id`**: an active project selected this session → else the repo's pinned id (first line of a `.neuralscape-project` marker at the repo root, else the git-repo-root/working-directory basename — Claude Code) → else omit (global).
 4. **Resolve `user_id`** — see the Identity block below.
 5. **Call `remember_conversation(messages=<filtered list>, user_id=<resolved>, project_id=<id or omit>)`.** Extraction is async by default — pass `wait: true` only if the user wants to block until storage completes.
 6. **Report** that extraction was queued, and roughly how many messages you sent. The extracted facts become retrievable via `/neuralscape:recall` shortly after.

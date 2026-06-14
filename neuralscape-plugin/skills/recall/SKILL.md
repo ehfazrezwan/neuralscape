@@ -14,7 +14,7 @@ This skill uses the **MCP tools** (`recall_memories`, `get_project_context`), so
 1. **Resolve `user_id`** — see the Identity block below.
 2. **Resolve the active `project_id`** (in priority order):
    - An active project already selected this session (via the `project` skill, or one the user named) — reuse it.
-   - Claude Code only: the basename of the working directory.
+   - Claude Code: the repo's pinned id — the first line of a `.neuralscape-project` marker file at the repo root if present, otherwise the git-repo-root (or working-directory) basename. This is the same id the hooks use, so manual and automatic memory stay in one scope.
    - Otherwise: leave it unset (global recall). If the user clearly means a project but none is active, offer the `project` skill to pick one.
 3. **Load context:**
    - If a concrete `project_id` is known → call `get_project_context(project_id=<id>, user_id=<resolved>)`. This returns global + project memories organized by category.

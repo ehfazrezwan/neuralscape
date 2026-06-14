@@ -13,7 +13,7 @@ This skill prefers the **MCP `recall_memories` tool**, so it works identically i
 
 1. **Resolve the query** — use the user's exact phrasing as the search query. Do not rewrite or summarize unless the query is empty (then ask what they want to look up).
 2. **Resolve `user_id`** — see the Identity block below.
-3. **Detect project scope** — an active project selected this session → else (Claude Code) the working-directory basename → else omit. If the user says "across all projects" or "globally", omit `project_id`.
+3. **Detect project scope** — an active project selected this session → else (Claude Code) the repo's pinned id (first line of a `.neuralscape-project` marker at the repo root, else the git-repo-root/working-directory basename) → else omit. If the user says "across all projects" or "globally", omit `project_id`.
 4. **Primary path — MCP (both platforms):** call `recall_memories(query=<user's question>, user_id=<resolved>, project_id=<id or omit>, limit=10)`. This is the default and the only path that works in Cowork.
 5. **Optional Claude Code fast path:** only if the `recall_memories` MCP tool is unavailable AND a service URL (`CLAUDE_PLUGIN_OPTION_URL` / `NEURALSCAPE_URL`) plus `curl` are present, fall back to `POST <URL>/v1/search` with body `{"query", "user_id", "project_id", "limit": 10}` and `Authorization: Bearer <API_KEY>` if set (8s timeout). Never require env; never error in Cowork — if neither path is available, say the memory store isn't reachable and stop.
 6. **Render results** as a compact markdown list, ordered by score:

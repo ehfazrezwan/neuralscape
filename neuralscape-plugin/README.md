@@ -142,6 +142,28 @@ To change settings after install:
 /plugin config neuralscape@neuralscape-plugins
 ```
 
+### Pinning the project id (monorepos)
+
+Memories are scoped to a `project_id`. By default the plugin resolves it
+deterministically so the **same repo always reports the same id** no matter
+which subdirectory a command runs in (important for monorepos whose service
+and plugin live in sibling folders — otherwise the id flips between folder
+basenames and memories fragment). Resolution precedence:
+
+1. **`PROJECT_ID` env override** — `CLAUDE_PLUGIN_OPTION_PROJECT_ID` /
+   `NEURALSCAPE_PROJECT_ID`. Pins one id everywhere this shell runs. Use
+   sparingly — it applies globally, so it's the wrong tool if you work across
+   multiple repos.
+2. **A `.neuralscape-project` marker file** at the repo root (walked up from
+   the cwd). Its first line is the id; an empty marker falls back to the
+   marker directory's basename. **This is the recommended mechanism** — commit
+   it so every contributor and every subdirectory agree:
+   ```text
+   echo neuralscape > .neuralscape-project
+   ```
+3. **The git repo root basename** (walk up for `.git`).
+4. **The working-directory basename** (legacy fallback).
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |

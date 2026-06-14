@@ -18,6 +18,14 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 - **`list_projects` MCP tool + `GET /v1/projects` endpoint.** Returns the
   caller's distinct project_ids, derived from stored memories (projects are
   implicit — no separate entity). Brings the documented MCP tool count to 8.
+- **Deterministic `project_id` resolution.** Hooks and skills now resolve the
+  project id with a stable precedence — `PROJECT_ID` override → a
+  `.neuralscape-project` marker file (walked up from the cwd) → git-repo-root
+  basename → working-directory basename — so every subdirectory of a repo
+  reports ONE id. Previously `project_id` was just the cwd basename, which
+  fragmented memories across a monorepo's sibling folders. A
+  `.neuralscape-project` marker is committed at this repo's root pinning it to
+  `neuralscape`.
 
 ### Changed
 
