@@ -17,8 +17,13 @@ Choose the project that `recall`, `remember`, and `save-session` should scope to
    - The existing projects from step 2.
    - A **(global)** option — no project scope; memory operations hit global scope only.
    - "…or type a new name" — to start a new project. Remind them a new project is created implicitly on the first `remember`; nothing else is needed.
-4. **Record the selection as the active project for this session.** State it back clearly (e.g. "Active project: `neuralscape`. I'll scope recall/remember/save to it until you switch."). For the rest of the conversation, pass this `project_id` to `recall`, `remember`, and `save-session`.
-5. If the user picked **(global)**, treat the active project as unset (omit `project_id` on subsequent calls).
+4. **Near-duplicate guard (do this before accepting a *typed* new name).** If the user types a name rather than picking one from the list, normalize both the typed name and every existing project from step 2 — lowercase and strip everything that isn't a letter or digit (so `Neuralscape`, `neural-scape`, `neural_scape`, and `neural scape` all reduce to `neuralscape`). If the normalized typed name matches an existing project's normalized form but the **raw spelling differs**, don't silently create a variant — ask:
+
+   > You typed `Neural-Scape`, but `neuralscape` already exists. Use the existing one, or create `Neural-Scape` as a separate project?
+
+   Default to the existing canonical spelling unless the user confirms they really want a new, distinct project. (A new name with no near-match needs no confirmation — just proceed.)
+5. **Record the selection as the active project for this session.** State it back clearly (e.g. "Active project: `neuralscape`. I'll scope recall/remember/save to it until you switch."). For the rest of the conversation, pass this `project_id` to `recall`, `remember`, and `save-session`.
+6. If the user picked **(global)**, treat the active project as unset (omit `project_id` on subsequent calls).
 
 ## Identity block (how to resolve `user_id`)
 

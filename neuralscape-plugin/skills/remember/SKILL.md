@@ -21,6 +21,8 @@ Use this for one clear fact at a time. To capture many facts from a whole workin
    - **Procedural**: `workflow`, `procedure`
    - **Working**: `task_context`
 3. **Resolve `project_id`**: an active project selected this session → else the repo's pinned id (first line of a `.neuralscape-project` marker at the repo root, else the git-repo-root/working-directory basename — Claude Code) → else omit (global). Project categories (`tech_stack`, `convention`, `architecture`, `dependency`) generally want a `project_id`.
+
+   **Near-duplicate guard.** Only when the `project_id` is a name the *user just supplied* (not the active session selection and not the repo's deterministic pinned id — those are already canonical and need no check), apply the fuzzy check from the `project` skill before writing: call `list_projects`, normalize (lowercase, strip non-alphanumerics), and if it matches an existing project with a different spelling, use the existing canonical name (or confirm with the user) rather than silently creating a variant like `Neuralscape` next to `neuralscape`.
 4. **Resolve `user_id`** — see the Identity block below.
 5. **Visibility**: **omit** the `visibility` field to take the per-category default (semantic/personal categories default `private`; team categories like `tech_stack`/`convention`/`architecture`/`dependency`/`decision`/`interaction`/`workflow`/`procedure` default `shared`). Only set `visibility="private"` explicitly when a normally-shared fact is sensitive (internal politics, a personal note, a draft).
 6. **Call `remember`** with `content`, `category`, `user_id`, `project_id?`, `visibility?`. Set `wait: true` only if the user wants confirmation that it landed (default is fire-and-forget, async).

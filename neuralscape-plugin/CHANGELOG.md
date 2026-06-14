@@ -26,6 +26,11 @@ the project adheres to [Semantic Versioning](https://semver.org/).
   fragmented memories across a monorepo's sibling folders. A
   `.neuralscape-project` marker is committed at this repo's root pinning it to
   `neuralscape`.
+- **Near-duplicate project guard.** The `project` and `remember` skills now
+  fuzzy-match a user-typed project name against existing projects
+  (case- and separator-insensitive) and confirm before creating a variant
+  like `Neuralscape` next to `neuralscape` — the main guard against naming
+  drift in Cowork, where there's no working directory to derive the id from.
 
 ### Changed
 
