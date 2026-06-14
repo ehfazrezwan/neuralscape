@@ -31,6 +31,12 @@ the project adheres to [Semantic Versioning](https://semver.org/).
   (case- and separator-insensitive) and confirm before creating a variant
   like `Neuralscape` next to `neuralscape` — the main guard against naming
   drift in Cowork, where there's no working directory to derive the id from.
+- **Persist project selection to disk.** The `project` skill can now offer to
+  write the chosen id to a `.neuralscape-project` marker at the repo root
+  (via `git rev-parse --show-toplevel`), turning a one-session pick into a
+  durable, repo-wide default the SessionStart hook reads automatically. Always
+  writes at the repo root (never a subdirectory) and skips redundant/global
+  cases.
 
 ### Changed
 
