@@ -117,6 +117,18 @@ class TestGetAllUserIds:
         assert set(result) == {"alice", "bob"}
         assert service._memory.vector_store.client.scroll.call_count == 2
 
+    def test_projects_only_user_id_field(self, service):
+        """Scroll fetches ONLY the user_id field, not the whole memory payload —
+        the point of the cleanup is to stop hauling full payloads just to
+        collect distinct authors."""
+        service._memory.vector_store.client.scroll.return_value = ([], None)
+
+        service.get_all_user_ids()
+
+        call_kwargs = service._memory.vector_store.client.scroll.call_args[1]
+        assert call_kwargs["with_payload"] == ["user_id"]
+        assert call_kwargs["with_vectors"] is False
+
 
 # ──────────────────────────────────────────────
 # dedup_memories — Exact phase
