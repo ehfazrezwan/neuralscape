@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import mcp_server
+from config import settings
 from schemas import ContextResponse, MemoryResponse
 
 
@@ -44,7 +45,7 @@ def mock_task_manager():
 
 class TestListTools:
     @pytest.mark.asyncio
-    async def test_returns_7_tools(self):
+    async def test_returns_8_tools(self):
         tools = await mcp_server.list_tools()
         assert len(tools) == 8
 
@@ -339,6 +340,10 @@ class TestListProjectsTool:
         result = await mcp_server.call_tool("list_projects", {})
         data = json.loads(result[0].text)
         assert data["projects"] == []
+        # Identity contract: with no token and no arg, fall back to default_user_id.
+        mock_mcp_service.list_projects.assert_called_once_with(
+            user_id=settings.default_user_id
+        )
 
 
 class TestDeleteMemoriesTool:

@@ -276,21 +276,36 @@ class TestCRUD:
     def test_list_projects_returns_distinct_sorted(self, service):
         """list_projects collects the distinct, sorted project_ids the caller
         has memories under. Projects are implicit — derived from stored
-        memories, not a separate entity."""
-        service._memory.get_all.return_value = {
-            "results": [
-                {"id": "m1", "memory": "a", "metadata": {"project_id": "neuralscape"}},
-                {"id": "m2", "memory": "b", "metadata": {"project_id": "lightpath"}},
-                {"id": "m3", "memory": "c", "metadata": {"project_id": "neuralscape"}},
-                {"id": "m4", "memory": "d", "metadata": {}},  # global — no project_id
+        memories (scrolled, not a fixed page), not a separate entity."""
+        service._scroll_all_user_memories = MagicMock(
+            return_value=[
+                {"id": "m1", "payload": {"metadata": {"project_id": "neuralscape"}}},
+                {"id": "m2", "payload": {"metadata": {"project_id": "lightpath"}}},
+                {"id": "m3", "payload": {"metadata": {"project_id": "neuralscape"}}},
+                {"id": "m4", "payload": {"metadata": {}}},  # global — no project_id
             ]
-        }
+        )
         projects = service.list_projects(user_id="ehfaz")
         assert projects == ["lightpath", "neuralscape"]
+        # Identity contract: the caller's user_id must be forwarded to the scan.
+        service._scroll_all_user_memories.assert_called_once_with("ehfaz")
 
     def test_list_projects_empty(self, service):
-        service._memory.get_all.return_value = {"results": []}
+        service._scroll_all_user_memories = MagicMock(return_value=[])
         assert service.list_projects(user_id="ehfaz") == []
+
+    def test_list_projects_handles_double_wrapped_and_missing_metadata(self, service):
+        """Survives the double-wrapped metadata shape mem0 sometimes returns,
+        and memories with no metadata/payload at all (no crash, just skipped)."""
+        service._scroll_all_user_memories = MagicMock(
+            return_value=[
+                {"id": "m1", "payload": {"metadata": {"metadata": {"project_id": "deep"}}}},
+                {"id": "m2", "payload": {}},  # no metadata key
+                {"id": "m3"},  # no payload key
+                {"id": "m4", "payload": {"metadata": {"project_id": "  "}}},  # blank → skipped
+            ]
+        )
+        assert service.list_projects(user_id="ehfaz") == ["deep"]
 
     def test_update_memory(self, service):
         service._memory.get.return_value = {

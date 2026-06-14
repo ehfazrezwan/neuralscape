@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "neuralscape",
   "version": "2.3.0",
-  "description": "Persistent agentic memory for Claude Code and Claude Cowork. Multi-user support: each user has personal memory (only they can read it) plus access to a shared team knowledge pool. Auto-captures conversations + per-tool observations (Claude Code), recalls relevant context on every session start, and ships MCP-driven recall/remember/save-session/project skills that work in both platforms. Exposes 8 MCP tools (recall, remember, remember_conversation, project context, graph search, list, list projects, delete).",
+  "description": "Persistent agentic memory for Claude Code and Claude Cowork. Multi-user support: each user has personal memory (only they can read it) plus access to a shared team knowledge pool. Auto-captures conversations + per-tool observations (Claude Code), recalls relevant context on every session start, and ships MCP-driven recall/remember/save-session/project skills that work in both platforms. Exposes 8 MCP tools (recall_memories, remember, remember_conversation, get_project_context, search_knowledge_graph, list_memories, list_projects, delete_memories).",
   "author": {
     "name": "Ehfaz Rezwan",
     "email": "ehfaz.rezwan@gmail.com"

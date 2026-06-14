@@ -1860,12 +1860,21 @@ class MemoryService:
         This powers the plugin's `project` selection skill (notably in Claude
         Cowork, which has no working directory to derive a ``project_id`` from).
         It scans the caller's own memories — private writes plus the caller's
-        shared writes — and collects the distinct ``project_id`` values. It is
-        an occasional, interactive call, not a hot path, so a single large
-        page is fine.
+        shared writes — via Qdrant ``scroll`` pagination so the result is
+        complete even for users with very large memory stores (a fixed
+        ``limit`` would silently drop projects past the window).
         """
-        memories = self.list_memories(user_id=user_id, limit=10000)
-        return sorted({m.project_id for m in memories if m.project_id})
+        projects: set[str] = set()
+        for point in self._scroll_all_user_memories(user_id):
+            metadata = (point.get("payload") or {}).get("metadata") or {}
+            # mem0 sometimes double-wraps metadata ({"metadata": {"metadata": {...}}});
+            # unwrap one level so project_id resolves. See _mem_to_response.
+            if isinstance(metadata.get("metadata"), dict):
+                metadata = metadata["metadata"]
+            pid = metadata.get("project_id")
+            if isinstance(pid, str) and pid.strip():
+                projects.add(pid)
+        return sorted(projects)
 
     def update_memory(
         self,

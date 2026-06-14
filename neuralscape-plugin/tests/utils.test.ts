@@ -474,4 +474,12 @@ describe("getProjectId", () => {
     mkdirSync(join(repo, ".git"), { recursive: true });
     expect(getProjectId(sub)).toBe("gitrepo");
   });
+
+  it("falls back to the cwd basename when no marker and no git exist", () => {
+    // scratch lives under the OS tmpdir, which has no .git or marker ancestor,
+    // so resolution reaches precedence 4 (the cwd basename).
+    const repo = join(scratch, "plain-dir");
+    mkdirSync(repo, { recursive: true });
+    expect(getProjectId(repo)).toBe("plain-dir");
+  });
 });

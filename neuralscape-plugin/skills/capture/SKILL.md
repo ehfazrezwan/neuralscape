@@ -23,13 +23,13 @@ User-triggered alternative to the automatic UserPromptSubmit threshold. Useful w
 
    Then stop.
 
-3. **If a buffer exists** — read the current session's buffer at `${...}/observations/${session_id}.jsonl`. The session_id is whatever is in the current Claude Code session — if you can't read it from the environment, use the path the user gave you, or pick the most recently modified `.jsonl` in the directory.
+3. **If a buffer exists** — read the current session's buffer at `${...}/observations/${session_id}.jsonl`. The session_id is whatever is in the current Claude Code session. If you can't determine it from the environment, use the explicit path the user gave you; **otherwise fail closed and ask for the explicit buffer path.** Do NOT guess by picking the most recently modified `.jsonl` — prior sessions leave their buffers in the directory, so "most recent" can point at a different session and compile/truncate the wrong one.
 
 4. Invoke the `compile-observations` skill on that buffer path. Its rubric and v2 schema are the source of truth — don't duplicate them here.
 
 5. Confirm to the user how many memories were stored vs. how many observations were skipped as noise.
 
-6. If the buffer file is present but empty, tell the user "nothing to capture" and don't write anything.
+6. If the buffer file is present but empty, tell the user "nothing to capture" and truncate it (and remove any `.stale` marker) so the buffer is reset — mirroring how `compile-observations` treats an empty/noisy buffer, so the manual and automatic flows stay consistent.
 
 ## Privacy reminder
 

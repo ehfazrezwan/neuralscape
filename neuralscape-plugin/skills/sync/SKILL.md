@@ -33,7 +33,7 @@ This skill has a deterministic HTTP conversation-compiler path (Claude Code) and
    }
    ```
 
-   Skip turns where the assistant response is shorter than 20 chars or matches `NO_REPLY` / `[heartbeat]` / `[system]` patterns — that's the same noise filter the Stop hook applies.
+   Skip turns where the assistant response is shorter than 20 chars or matches `NO_REPLY` / `[heartbeat]` / `[system]` patterns. This intentionally mirrors the **deterministic** filter the Stop hook applies in code (`MIN_RESPONSE_LENGTH = 20` in `flush.ts`) — that's the whole point of this HTTP path. (The MCP path, `/neuralscape:save-session`, uses a semantic filter instead, since it has no hook to match; the two differ on purpose.)
 
 4. **After all turns flush successfully**, POST to `<URL>/v1/extensions/conversation-compiler/compile`:
 

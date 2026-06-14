@@ -86,7 +86,7 @@ uv run pytest tests/test_async_pipeline.py -v -s
 
 ## Claude Code / Cowork Plugin
 
-The **neuralscape plugin** gives Claude Code automatic, persistent memory: lifecycle hooks plus nine discoverable slash commands plus the eight Neuralscape MCP tools auto-wired on install.
+The **neuralscape plugin** gives Claude Code automatic, persistent memory: lifecycle hooks plus nine user-facing slash commands (plus an internal `compile-observations` helper the hooks/`capture` invoke) plus the eight Neuralscape MCP tools auto-wired on install.
 
 > **Claude Cowork:** Cowork does **not** run plugin hooks ([#27398](https://github.com/anthropics/claude-code/issues/27398)), so the automatic inject/capture loop below does not fire there. Cowork is supported via a remote **MCP OAuth connector** plus a standing-context "memory protocol" that drives recall/capture through the MCP tools. See **[COWORK.md](./COWORK.md)** — that is the supported Cowork path, not this hook-based one.
 
@@ -165,7 +165,7 @@ Both can run simultaneously. The plugin captures breadcrumbs in the background; 
 
 ## MCP Server
 
-7 tools exposed via MCP for direct use by AI agents:
+8 tools exposed via MCP for direct use by AI agents:
 
 | Tool | Mode | Purpose |
 |---|---|---|
@@ -428,7 +428,7 @@ curl "http://localhost:8199/v1/graph/communities?user_id=ehfaz"
        │  ┌──────────────────────────────────────────────┐
        │  │           neuralscape-service                │
        │  │                                              │
-       ├─►│  MCP Server (7 tools)   REST API (/v1)      │
+       ├─►│  MCP Server (8 tools)   REST API (/v1)      │
        │  │       stdio / HTTP         FastAPI           │
        │  │              │                │              │
        │  │              └──────┬─────────┘              │
@@ -636,7 +636,7 @@ neuralscape/
 │   ├── main.py                   # FastAPI app: legacy + v1 endpoints
 │   ├── memory_service.py         # Business logic layer (MemoryService class)
 │   ├── context_formatter.py      # Format memories as markdown for hook injection
-│   ├── mcp_server.py             # MCP server: 7 tools, stdio + HTTP
+│   ├── mcp_server.py             # MCP server: 8 tools, stdio + HTTP
 │   ├── worker.py                 # ARQ worker: background task processing + dedup cron
 │   ├── task_manager.py           # Redis-backed task enqueuing + status
 │   ├── schemas.py                # Enums, category taxonomy, Pydantic models
