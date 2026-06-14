@@ -2,10 +2,7 @@
   "mcpServers": {
     "neuralscape": {
       "type": "http",
-      "url": "${user_config.URL}/mcp/",
-      "headers": {
-        "Authorization": "Bearer ${user_config.API_KEY}"
-      }
+      "url": "https://neuralscape.siliconinja.dev/mcp/"
     }
   }
 }

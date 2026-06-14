@@ -21,7 +21,30 @@ export function readConfig(key: string, fallback = ""): string {
   return fallback;
 }
 
-const NEURALSCAPE_URL = readConfig("URL", "http://localhost:8199").replace(/\/$/, "");
+// Single source of truth for the service URL: the base URL is baked into the
+// plugin's `.mcp.json` (the connector endpoint) per distribution channel. The
+// hooks derive the same base from that file so there is exactly one place to
+// change it. Strips the trailing `/mcp/` connector suffix to get the API base.
+// Ignores an un-baked `${...}` template (transitional) and any read/parse error.
+function readBakedUrl(): string {
+  const root = process.env.CLAUDE_PLUGIN_ROOT?.trim();
+  if (!root) return "";
+  try {
+    const cfg = JSON.parse(readFileSync(pathJoin(root, ".mcp.json"), "utf8"));
+    const url = cfg?.mcpServers?.neuralscape?.url;
+    if (typeof url !== "string" || url.includes("${")) return "";
+    return url.replace(/\/mcp\/?$/, "").replace(/\/$/, "");
+  } catch {
+    return "";
+  }
+}
+
+// Precedence: explicit config override → baked `.mcp.json` URL → local dev.
+const NEURALSCAPE_URL = (
+  readConfig("URL", "") ||
+  readBakedUrl() ||
+  "http://localhost:8199"
+).replace(/\/$/, "");
 
 const NEURALSCAPE_API_KEY = readConfig("API_KEY", "");
 
