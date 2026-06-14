@@ -1902,9 +1902,13 @@ class MemoryService:
                 )
                 return await result.data()
 
+        coro = _run()
         try:
-            records = self._run_on_bridge(_run(), timeout=10.0) or []
+            records = self._run_on_bridge(coro, timeout=10.0) or []
         except Exception as e:
+            # If _run_on_bridge raised before awaiting the coroutine, close it
+            # so it doesn't leak / emit "coroutine was never awaited".
+            coro.close()
             logger.warning(f"list_projects graph query failed: {e}")
             return []
 

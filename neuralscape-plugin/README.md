@@ -1,6 +1,6 @@
 # Neuralscape Plugin
 
-Persistent agentic memory for **Claude Code** and **Claude Cowork**. The plugin auto-captures your conversations, recalls relevant context on every session start, and exposes the 8 Neuralscape MCP tools — all backed by your own Neuralscape service (FastAPI + mem0 + Graphiti).
+Persistent agentic memory for **Claude Code** and **Claude Cowork**, backed by your own Neuralscape service (FastAPI + mem0 + Graphiti). In Claude Code, plugin hooks auto-capture your conversations and recall relevant context on every session start; in Claude Cowork (which doesn't run plugin hooks), the cross-platform skills drive the same recall/capture loop on demand through the MCP connector. Exposes the 8 Neuralscape MCP tools.
 
 - **What you get:** memory injection on `SessionStart`, conversation flush + compile on `Stop`, **incremental tool-observation capture on `PostToolUse` + threshold-driven compile on `UserPromptSubmit`** (no extra API cost — runs on your subscription), cross-platform MCP-driven skills (`recall`, `remember`, `save-session`, `project`, `search`, `ns-status`, `ns-config`) plus Claude-Code capture skills (`sync`, `capture`), and the Neuralscape MCP toolkit auto-wired via `.mcp.json`.
 - **Where it stores:** in your own Neuralscape deployment. The plugin never sends data anywhere else.

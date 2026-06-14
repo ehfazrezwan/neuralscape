@@ -17,14 +17,15 @@ Choose the project that `recall`, `remember`, and `save-session` should scope to
    - The existing projects from step 2.
    - A **(global)** option — no project scope; memory operations hit global scope only.
    - "…or type a new name" — to start a new project. Remind them a new project is created implicitly on the first `remember`; nothing else is needed.
-4. **Near-duplicate guard (do this before accepting a *typed* new name).** If the user types a name rather than picking one from the list, normalize both the typed name and every existing project from step 2 — lowercase and strip everything that isn't a letter or digit (so `Neuralscape`, `neural-scape`, `neural_scape`, and `neural scape` all reduce to `neuralscape`). If the normalized typed name matches an existing project's normalized form but the **raw spelling differs**, don't silently create a variant — ask:
+4. **Validate a *typed* new name (do this first, before anything is recorded or persisted).** Trim the input and reject it if it's empty / whitespace-only, or contains a newline or any control character — a malformed id must never become the active project or get written to `.neuralscape-project` (where it would be reused across sessions). On a bad name, explain briefly and re-prompt. Keep ids to a clean single-line slug (letters, digits, and simple separators like `-`/`_`).
+5. **Near-duplicate guard (before accepting a valid *typed* new name).** If the user types a name rather than picking one from the list, normalize both the typed name and every existing project from step 2 — lowercase and strip everything that isn't a letter or digit (so `Neuralscape`, `neural-scape`, `neural_scape`, and `neural scape` all reduce to `neuralscape`). If the normalized typed name matches an existing project's normalized form but the **raw spelling differs**, don't silently create a variant — ask:
 
    > You typed `Neural-Scape`, but `neuralscape` already exists. Use the existing one, or create `Neural-Scape` as a separate project?
 
    Default to the existing canonical spelling unless the user confirms they really want a new, distinct project. (A new name with no near-match needs no confirmation — just proceed.)
-5. **Record the selection as the active project for this session.** State it back clearly (e.g. "Active project: `neuralscape`. I'll scope recall/remember/save to it until you switch."). For the rest of the conversation, pass this `project_id` to `recall`, `remember`, and `save-session`.
-6. If the user picked **(global)**, treat the active project as unset (omit `project_id` on subsequent calls).
-7. **Offer to persist the selection to disk** (when a writable working directory is available — always in Claude Code; in Cowork only if the session has the repo mounted). Pinning the choice to a `.neuralscape-project` marker makes it stick across future sessions and lets the SessionStart hook (and every subdirectory) pick it up automatically — turning a one-session choice into a durable, repo-wide default. Offer it:
+6. **Record the selection as the active project for this session.** State it back clearly (e.g. "Active project: `neuralscape`. I'll scope recall/remember/save to it until you switch."). For the rest of the conversation, pass this `project_id` to `recall`, `remember`, and `save-session`.
+7. If the user picked **(global)**, treat the active project as unset (omit `project_id` on subsequent calls).
+8. **Offer to persist the selection to disk** (when a writable working directory is available — always in Claude Code; in Cowork only if the session has the repo mounted). Pinning the choice to a `.neuralscape-project` marker makes it stick across future sessions and lets the SessionStart hook (and every subdirectory) pick it up automatically — turning a one-session choice into a durable, repo-wide default. Offer it:
 
    > Want me to pin this by writing `.neuralscape-project` at the repo root? Future sessions will use `<id>` automatically.
 
@@ -46,5 +47,5 @@ Choose the project that `recall`, `remember`, and `save-session` should scope to
 
 ## Notes
 
-- If you persisted the selection (step 7), it's durable: a committed `.neuralscape-project` pins the id for every future session and subdirectory. If you didn't (or couldn't), the active project lives only in this conversation's context — re-select at the start of a new session. In Cowork without the repo mounted, in-context selection is the only option.
+- If you persisted the selection (step 8), it's durable: a committed `.neuralscape-project` pins the id for every future session and subdirectory. If you didn't (or couldn't), the active project lives only in this conversation's context — re-select at the start of a new session. In Cowork without the repo mounted, in-context selection is the only option.
 - To act on the selected project, follow up with `/neuralscape:recall`, `/neuralscape:remember`, or `/neuralscape:save-session`.
