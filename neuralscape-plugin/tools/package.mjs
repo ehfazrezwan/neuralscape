@@ -87,7 +87,8 @@ for (const junk of ["scripts/.DS_Store", ".DS_Store"]) {
   rmSync(join(stagingDir, junk), { force: true });
 }
 
-// 3. Zip with files at the archive root (matches local-install expectations).
+// 3. Zip the single top-level <plugin-name>/ directory (Cowork requires the
+//    manifest at `<plugin-name>/.claude-plugin/plugin.json`, not the zip root).
 const zipName = `neuralscape-plugin-${version}.zip`;
 const zipPath = join(distDir, zipName);
 rmSync(zipPath, { force: true });
@@ -97,12 +98,15 @@ console.log("→ Creating archive...");
 run("zip", ["-rqX", zipPath, pluginName], { cwd: stageRoot });
 
 // Sanity check: fail loudly if any symlink made it into the artifact.
-// zipinfo long format begins each line with the unix mode; symlinks start 'l'.
-const zipinfo = execFileSync("zipinfo", [zipPath], { encoding: "utf8" });
+// `zipinfo -l` forces the long Unix `ls -l`-style listing whose entry lines
+// lead with the file mode (e.g. "-rw-", "drwx", "lrwx"); a symlink's mode
+// starts with 'l'. We trim each line first so the test is robust to any
+// leading whitespace the format may emit.
+const zipinfo = execFileSync("zipinfo", ["-l", zipPath], { encoding: "utf8" });
 const entryLines = zipinfo
-  .trim()
   .split("\n")
-  .filter((l) => /^[-dl]/.test(l));
+  .map((l) => l.trim())
+  .filter((l) => /^[-dl][rwxsStT-]{9}/.test(l));
 const symlinks = entryLines.filter((l) => l.startsWith("l"));
 
 if (symlinks.length > 0) {
