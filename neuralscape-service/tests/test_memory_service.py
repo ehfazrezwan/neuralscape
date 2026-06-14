@@ -273,6 +273,53 @@ class TestCRUD:
         assert "limit" not in call_kwargs
         assert call_kwargs["top_k"] == 50
 
+    @staticmethod
+    def _bridge_returning(records):
+        """Build a _run_on_bridge stand-in that returns `records` and closes the
+        passed coroutine (so it isn't flagged 'never awaited')."""
+
+        def _bridge(coro, timeout=None):
+            coro.close()
+            return records
+
+        return MagicMock(side_effect=_bridge)
+
+    def test_list_projects_returns_distinct_sorted(self, service):
+        """list_projects derives distinct project_ids from Neo4j group_ids via
+        an index-backed DISTINCT query, parsing the pid out of each group_id and
+        skipping global (project-less) groups. Includes team-shared projects."""
+        service._run_on_bridge = self._bridge_returning(
+            [
+                {"group_id": "user--ehfaz--project--neuralscape"},
+                {"group_id": "shared--project--lightpath"},  # team-shared
+                {"group_id": "user--ehfaz--project--neuralscape"},  # duplicate
+                {"group_id": "user--ehfaz"},  # global private — no project
+                {"group_id": "shared"},  # global shared — no project
+            ]
+        )
+        projects = service.list_projects(user_id="ehfaz")
+        assert projects == ["lightpath", "neuralscape"]
+
+    def test_list_projects_empty(self, service):
+        service._run_on_bridge = self._bridge_returning([])
+        assert service.list_projects(user_id="ehfaz") == []
+
+    def test_list_projects_skips_malformed_group_ids(self, service):
+        """A trailing '--project--' with no id, and a None group_id, are skipped
+        without crashing."""
+        service._run_on_bridge = self._bridge_returning(
+            [
+                {"group_id": "shared--project--"},  # empty pid → skipped
+                {"group_id": None},  # null → skipped
+                {"group_id": "user--ehfaz--project--realone"},
+            ]
+        )
+        assert service.list_projects(user_id="ehfaz") == ["realone"]
+
+    def test_list_projects_returns_empty_when_graph_unavailable(self, service):
+        service._get_graphiti = MagicMock(return_value=None)
+        assert service.list_projects(user_id="ehfaz") == []
+
     def test_update_memory(self, service):
         service._memory.get.return_value = {
             "id": "m1",

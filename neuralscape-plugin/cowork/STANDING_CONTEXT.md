@@ -6,6 +6,20 @@ system-prompt equivalent: paste the block below into your Cowork **workspace
 instructions** (or project instructions) so Claude drives memory explicitly
 through the MCP connector.
 
+> **If you've installed the Neuralscape plugin in Cowork**, you can instead
+> just invoke the cross-platform skills directly — they do exactly what this
+> block instructs, on demand:
+>
+> | Protocol bullet | Equivalent skill |
+> |---|---|
+> | Recall context at task start | `/neuralscape:recall` |
+> | Save a durable fact as you learn it | `/neuralscape:remember` |
+> | Save the conversation at session end | `/neuralscape:save-session` |
+> | Pick which project to scope to | `/neuralscape:project` |
+>
+> This paste-block remains the supported path for workspaces **without** the
+> plugin installed (skills aren't available there, but the MCP connector is).
+
 Setup first: add the Neuralscape MCP **custom connector** and Connect once
 (see [`../../COWORK.md`](../../COWORK.md)). Then paste:
 
@@ -30,8 +44,12 @@ no automatic hooks here, so YOU must drive memory explicitly:
   substantive working session, call `remember_conversation` with the relevant
   messages so the service can extract and store the facts.
 
-- **Do not pass a `user_id`** — the connector authenticates you and the server
-  scopes memory to your identity automatically.
+- **Identity is from the connector token, not `user_id`.** The server scopes
+  memory to whoever authenticated the connector and ignores any `user_id` you
+  pass. Some tools (`recall_memories`, `remember`, `remember_conversation`)
+  mark `user_id` as required — when one does, pass a harmless placeholder like
+  `"cowork"` to satisfy the schema; the token still determines your real
+  identity. Never block on not knowing the `user_id`.
 
 - Skip trivia (routine file reads, searches, acknowledgements). Save signal,
   not noise.

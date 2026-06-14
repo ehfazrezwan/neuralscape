@@ -1848,6 +1848,81 @@ class MemoryService:
         memories = self._extract_memory_list(result)
         return [self._mem_to_response(mem) for mem in memories]
 
+    def list_projects(self, user_id: str) -> list[str]:
+        """Return the distinct project_ids the caller can scope memory to.
+
+        Projects in Neuralscape are *implicit*: a project "exists" exactly
+        when at least one memory has been stored under its ``project_id``.
+        There is no separate project entity to create, update, or delete —
+        ``remember(..., project_id="x")`` brings project ``x`` into being and
+        ``delete_memories(scope="project", project_id="x")`` removes it.
+
+        Rather than scanning every memory, this derives the list from Neo4j
+        ``group_id`` values with an index-backed ``DISTINCT`` query. Each
+        project is encoded in the group_id (``user--{uid}--project--{pid}`` for
+        the caller's private projects, ``shared--project--{pid}`` for the
+        team-wide pool), and Graphiti maintains range indexes on ``group_id``
+        per node label (``entity_group_id`` / ``episode_group_id`` /
+        ``community_group_id``), so the ``STARTS WITH`` prefix seeks are cheap
+        and the database returns only the distinct group_ids (tens), never the
+        underlying memories (potentially many thousands).
+
+        Returns the caller's private projects **plus all team-shared
+        projects** — the picker can scope to a shared project even before the
+        caller has contributed to it. Powers the plugin's `project` selection
+        skill (notably in Claude Cowork, which has no working directory to
+        derive a ``project_id`` from).
+        """
+        g = self._get_graphiti()
+        if g is None:
+            return []
+
+        user_prefix = f"user--{user_id}--project--"
+        shared_prefix = "shared--project--"
+        # One MATCH per indexed label so the per-label group_id range index is
+        # used; UNION dedupes across labels (and is itself DISTINCT).
+        cypher = """
+        MATCH (n:Entity)
+        WHERE n.group_id STARTS WITH $user_prefix OR n.group_id STARTS WITH $shared_prefix
+        RETURN DISTINCT n.group_id AS group_id
+        UNION
+        MATCH (n:Episodic)
+        WHERE n.group_id STARTS WITH $user_prefix OR n.group_id STARTS WITH $shared_prefix
+        RETURN DISTINCT n.group_id AS group_id
+        UNION
+        MATCH (n:Community)
+        WHERE n.group_id STARTS WITH $user_prefix OR n.group_id STARTS WITH $shared_prefix
+        RETURN DISTINCT n.group_id AS group_id
+        """
+
+        async def _run():
+            async with g.driver.session() as session:
+                result = await session.run(
+                    cypher, user_prefix=user_prefix, shared_prefix=shared_prefix
+                )
+                return await result.data()
+
+        coro = _run()
+        try:
+            records = self._run_on_bridge(coro, timeout=10.0) or []
+        except Exception as e:
+            # If _run_on_bridge raised before awaiting the coroutine, close it
+            # so it doesn't leak / emit "coroutine was never awaited".
+            coro.close()
+            logger.warning(f"list_projects graph query failed: {e}")
+            return []
+
+        projects: set[str] = set()
+        for rec in records:
+            gid = rec.get("group_id") or ""
+            # Both namespaces end with '--project--{pid}'; everything after the
+            # separator is the project id. Global groups ('user--{uid}',
+            # 'shared') have no separator and are skipped.
+            _, sep, pid = gid.partition("--project--")
+            if sep and pid.strip():
+                projects.add(pid)
+        return sorted(projects)
+
     def update_memory(
         self,
         memory_id: str,
@@ -2635,7 +2710,21 @@ class MemoryService:
                 logger.warning(f"Graph cleanup failed for {memory_id} (non-critical): {e}")
 
     def get_all_user_ids(self, batch_size: int = 100) -> list[str]:
-        """Scroll the entire Qdrant collection and return unique user_ids."""
+        """Return every distinct user_id that has at least one memory.
+
+        Qdrant is the authoritative source here (not Neo4j): a memory's author
+        lives on the Qdrant point payload, including for SHARED writes — whereas
+        the graph's shared group_ids (``shared`` / ``shared--project--{pid}``)
+        don't encode the author, so a user who only ever wrote shared memories
+        would be invisible to a group_id scan. Qdrant's facet API isn't an
+        option either: it requires a keyword payload index on ``user_id``, which
+        the collection doesn't maintain.
+
+        So we still scroll the collection (the dedup cron and backfill genuinely
+        need every author), but project the payload to ONLY ``user_id`` — turning
+        this from "transfer every memory" into "transfer one short string per
+        point". The win is in the payload size, not the iteration.
+        """
         client = self._memory.vector_store.client
         collection = settings.qdrant_collection
 
@@ -2646,7 +2735,7 @@ class MemoryService:
                 collection_name=collection,
                 limit=batch_size,
                 offset=offset,
-                with_payload=True,
+                with_payload=["user_id"],  # project: only the field we need
                 with_vectors=False,
             )
             for pt in points:

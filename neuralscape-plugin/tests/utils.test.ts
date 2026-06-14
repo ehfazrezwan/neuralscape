@@ -16,6 +16,7 @@ import {
   getBufferPath,
   getBufferStats,
   getObservationDir,
+  getProjectId,
   getStaleMarkerPath,
   listPendingBuffers,
   markBufferStale,
@@ -412,5 +413,73 @@ describe("pickRelevantInput", () => {
     expect(result.description).toBe("investigate");
     expect(result.subagent_type).toBe("Explore");
     expect(result.prompt).toBe("find the bug");
+  });
+});
+
+
+describe("getProjectId", () => {
+  // getProjectId reads PROJECT_ID config per-call; isolate those env vars.
+  let prevModern: string | undefined;
+  let prevLegacy: string | undefined;
+
+  beforeEach(() => {
+    prevModern = process.env.CLAUDE_PLUGIN_OPTION_PROJECT_ID;
+    prevLegacy = process.env.NEURALSCAPE_PROJECT_ID;
+    delete process.env.CLAUDE_PLUGIN_OPTION_PROJECT_ID;
+    delete process.env.NEURALSCAPE_PROJECT_ID;
+  });
+
+  afterEach(() => {
+    if (prevModern === undefined) delete process.env.CLAUDE_PLUGIN_OPTION_PROJECT_ID;
+    else process.env.CLAUDE_PLUGIN_OPTION_PROJECT_ID = prevModern;
+    if (prevLegacy === undefined) delete process.env.NEURALSCAPE_PROJECT_ID;
+    else process.env.NEURALSCAPE_PROJECT_ID = prevLegacy;
+  });
+
+  it("prefers the PROJECT_ID config override over everything", () => {
+    process.env.CLAUDE_PLUGIN_OPTION_PROJECT_ID = "pinned-id";
+    // Even with a marker present, the override wins.
+    writeFileSync(join(scratch, ".neuralscape-project"), "from-marker\n");
+    expect(getProjectId(scratch)).toBe("pinned-id");
+  });
+
+  it("honors the legacy NEURALSCAPE_PROJECT_ID override", () => {
+    process.env.NEURALSCAPE_PROJECT_ID = "legacy-id";
+    expect(getProjectId(scratch)).toBe("legacy-id");
+  });
+
+  it("reads the id from a .neuralscape-project marker's first line", () => {
+    writeFileSync(join(scratch, ".neuralscape-project"), "neuralscape\nignored second line\n");
+    expect(getProjectId(scratch)).toBe("neuralscape");
+  });
+
+  it("walks up to find the marker from a nested subdirectory", () => {
+    writeFileSync(join(scratch, ".neuralscape-project"), "monorepo-id\n");
+    const sub = join(scratch, "packages", "service");
+    mkdirSync(sub, { recursive: true });
+    expect(getProjectId(sub)).toBe("monorepo-id");
+  });
+
+  it("falls back to the marker directory basename when the marker is empty", () => {
+    const repo = join(scratch, "my-repo");
+    mkdirSync(repo, { recursive: true });
+    writeFileSync(join(repo, ".neuralscape-project"), "   \n");
+    expect(getProjectId(repo)).toBe("my-repo");
+  });
+
+  it("falls back to the git repo root basename when no marker exists", () => {
+    const repo = join(scratch, "gitrepo");
+    const sub = join(repo, "nested", "deep");
+    mkdirSync(sub, { recursive: true });
+    mkdirSync(join(repo, ".git"), { recursive: true });
+    expect(getProjectId(sub)).toBe("gitrepo");
+  });
+
+  it("falls back to the cwd basename when no marker and no git exist", () => {
+    // scratch lives under the OS tmpdir, which has no .git or marker ancestor,
+    // so resolution reaches precedence 4 (the cwd basename).
+    const repo = join(scratch, "plain-dir");
+    mkdirSync(repo, { recursive: true });
+    expect(getProjectId(repo)).toBe("plain-dir");
   });
 });

@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import mcp_server
+from config import settings
 from schemas import ContextResponse, MemoryResponse
 
 
@@ -44,9 +45,9 @@ def mock_task_manager():
 
 class TestListTools:
     @pytest.mark.asyncio
-    async def test_returns_7_tools(self):
+    async def test_returns_8_tools(self):
         tools = await mcp_server.list_tools()
-        assert len(tools) == 7
+        assert len(tools) == 8
 
     @pytest.mark.asyncio
     async def test_tool_names(self):
@@ -59,6 +60,7 @@ class TestListTools:
             "get_project_context",
             "search_knowledge_graph",
             "list_memories",
+            "list_projects",
             "delete_memories",
         }
         assert names == expected
@@ -319,6 +321,29 @@ class TestListMemoriesTool:
         call_kwargs = mock_mcp_service.list_memories.call_args[1]
         assert call_kwargs["scope"] == "global"
         assert call_kwargs["category"] == "preference"
+
+
+class TestListProjectsTool:
+    @pytest.mark.asyncio
+    async def test_lists_projects(self, mock_mcp_service):
+        mock_mcp_service.list_projects.return_value = ["lightpath", "neuralscape"]
+        result = await mcp_server.call_tool("list_projects", {"user_id": "ehfaz"})
+        data = json.loads(result[0].text)
+        assert data["projects"] == ["lightpath", "neuralscape"]
+        mock_mcp_service.list_projects.assert_called_once_with(user_id="ehfaz")
+
+    @pytest.mark.asyncio
+    async def test_lists_projects_without_user_id(self, mock_mcp_service):
+        """user_id is optional in the schema — omitting it falls back to the
+        token identity / default, never errors."""
+        mock_mcp_service.list_projects.return_value = []
+        result = await mcp_server.call_tool("list_projects", {})
+        data = json.loads(result[0].text)
+        assert data["projects"] == []
+        # Identity contract: with no token and no arg, fall back to default_user_id.
+        mock_mcp_service.list_projects.assert_called_once_with(
+            user_id=settings.default_user_id
+        )
 
 
 class TestDeleteMemoriesTool:

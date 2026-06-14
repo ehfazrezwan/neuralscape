@@ -4,6 +4,55 @@ All notable changes to the `neuralscape` Claude plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.3.0] - 2026-06-13
+
+### Added
+
+- **Cross-platform memory skills.** Four new MCP-driven skills that work
+  in both Claude Code and Claude Cowork (no hooks, no local config
+  required): `recall` (load relevant context before acting), `remember`
+  (save one fact), `save-session` (extract facts from the conversation —
+  the Cowork stand-in for the Stop hook), and `project` (list/pick/create
+  the project to scope memory to, important in Cowork which has no working
+  directory).
+- **`list_projects` MCP tool + `GET /v1/projects` endpoint.** Returns the
+  caller's distinct project_ids — private projects plus all team-shared
+  projects. Projects are implicit (no separate entity); the list is derived
+  from Neo4j `group_id`s via an index-backed `DISTINCT` query (not by scanning
+  memories), so it stays cheap even for very large stores. Brings the
+  documented MCP tool count to 8.
+- **Deterministic `project_id` resolution.** Hooks and skills now resolve the
+  project id with a stable precedence — `PROJECT_ID` override → a
+  `.neuralscape-project` marker file (walked up from the cwd) → git-repo-root
+  basename → working-directory basename — so every subdirectory of a repo
+  reports ONE id. Previously `project_id` was just the cwd basename, which
+  fragmented memories across a monorepo's sibling folders. A
+  `.neuralscape-project` marker is committed at this repo's root pinning it to
+  `neuralscape`.
+- **Near-duplicate project guard.** The `project` and `remember` skills now
+  fuzzy-match a user-typed project name against existing projects
+  (case- and separator-insensitive) and confirm before creating a variant
+  like `Neuralscape` next to `neuralscape` — the main guard against naming
+  drift in Cowork, where there's no working directory to derive the id from.
+- **Persist project selection to disk.** The `project` skill can now offer to
+  write the chosen id to a `.neuralscape-project` marker at the repo root
+  (via `git rev-parse --show-toplevel`), turning a one-session pick into a
+  durable, repo-wide default the SessionStart hook reads automatically. Always
+  writes at the repo root (never a subdirectory) and skips redundant/global
+  cases.
+
+### Changed
+
+- **Skills are now MCP-first and degrade gracefully.** `search` prefers the
+  `recall_memories` MCP tool (HTTP `/v1/search` kept only as a Claude Code
+  fast path); `ns-status` probes reachability via MCP and reports a
+  connector-mode block when no local URL is set; `ns-config` shows a
+  Cowork "connector mode" branch instead of implying misconfiguration.
+- **Hook-dependent skills no longer error in Cowork.** `capture` and
+  `compile-observations` detect a missing observation buffer and redirect to
+  `save-session`/`remember` instead of failing; `sync` delegates to
+  `save-session` (MCP) when no local service URL is configured.
+
 ## [2.2.1] - 2026-06-13
 
 ### Fixed

@@ -48,9 +48,10 @@ exactly that and nothing else. We do **not** rely on hooks firing, on
 
 | Capability | Claude Code CLI | Claude Cowork |
 |---|---|---|
-| 7 MCP tools (recall/remember/search/…) | ✅ hooks + MCP | ✅ MCP connector |
-| Recall context at task start | ✅ automatic (`SessionStart`) | ✅ **instructed** (standing context → `get_project_context`/`recall_memories`) |
-| Save memories at task end | ✅ automatic (`Stop`) | ✅ **instructed** (standing context → `remember`/`remember_conversation`) |
+| 8 MCP tools (recall/remember/search/projects/…) | ✅ hooks + MCP | ✅ MCP connector |
+| Recall context at task start | ✅ automatic (`SessionStart`) | ✅ **instructed / on-demand** (standing context or `/neuralscape:recall` → `get_project_context`/`recall_memories`) |
+| Save memories at task end | ✅ automatic (`Stop`) | ✅ **instructed / on-demand** (standing context or `/neuralscape:save-session` → `remember`/`remember_conversation`) |
+| Pick a project (no working dir in Cowork) | ✅ from `cwd` | ✅ `/neuralscape:project` → `list_projects` |
 | Passive per-tool observation buffering | ✅ automatic (`PostToolUse`) | ⚠️ **not available** — no hook can observe tool use in Cowork. Degrades to explicit "checkpoint" saves. *(No design can do this in Cowork; the hook is the only thing that can passively observe tool calls.)* |
 | Onboarding | `userConfig` prompts / env vars | **OAuth connector** (this doc) |
 
@@ -114,10 +115,12 @@ In Claude (Cowork / claude.ai):
 5. That's it. Anthropic now holds short-lived OAuth tokens and refreshes them
    silently — you never paste anything again.
 
-After connecting, the 7 Neuralscape MCP tools appear in Cowork. **You don't
-need to supply a `user_id`** to any of them — the server reads your identity
-from the OAuth token. (A `user_id` argument is still accepted for local/stdio
-use, but over the connector it's ignored in favor of your token identity.)
+After connecting, the 8 Neuralscape MCP tools appear in Cowork. The server
+reads your identity from the OAuth token, so the `user_id` you pass is
+ignored over the connector. A few tools mark `user_id` as required in their
+schema (`recall_memories`, `remember`, `remember_conversation`) — pass a
+harmless placeholder like `"cowork"` when one does; the token still scopes
+memory to you. (A real `user_id` argument is honored for local/stdio use.)
 
 ### How the OAuth flow works (for the curious / for debugging)
 
@@ -148,8 +151,12 @@ For a whole team, do the per-user steps above once and standardize the rest:
 
 - **Connect the marketplace** under *Organization settings → Plugins* (GitHub-
   synced to this repo). Force-enabling the plugin reliably loads the **skills**
-  in Cowork even though hooks won't fire — `/neuralscape:search`,
-  `/neuralscape:status`, `/neuralscape:config` remain useful.
+  in Cowork even though hooks won't fire. The cross-platform skills do the work
+  the hooks would: `/neuralscape:recall`, `/neuralscape:remember`,
+  `/neuralscape:save-session`, `/neuralscape:project`, plus
+  `/neuralscape:search`, `/neuralscape:ns-status`, `/neuralscape:ns-config`.
+  With those installed, the standing-context paste-block becomes optional (it
+  remains the fallback for workspaces without the plugin).
 - **Distribute the connector URL** and each member's per-user token (e.g. via
   your secrets manager). Each member adds the connector + Connects once.
 - **Ship the standing context** (below) as the default workspace instruction
@@ -194,8 +201,12 @@ no automatic hooks here, so YOU must drive memory explicitly:
   substantive working session, call `remember_conversation` with the relevant
   messages so the service can extract and store the facts.
 
-- **Do not pass a `user_id`** — the connector authenticates you and the server
-  scopes memory to your identity automatically.
+- **Identity is from the connector token, not `user_id`.** The server scopes
+  memory to whoever authenticated the connector and ignores any `user_id` you
+  pass. Some tools (`recall_memories`, `remember`, `remember_conversation`)
+  mark `user_id` as required — when one does, pass a harmless placeholder like
+  `"cowork"` to satisfy the schema; the token still determines your real
+  identity. Never block on not knowing the `user_id`.
 
 - Skip trivia (routine file reads, searches, acknowledgements). Save signal,
   not noise.

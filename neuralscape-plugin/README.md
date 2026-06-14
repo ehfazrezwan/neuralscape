@@ -1,8 +1,8 @@
 # Neuralscape Plugin
 
-Persistent agentic memory for **Claude Code** and **Claude Cowork**. The plugin auto-captures your conversations, recalls relevant context on every session start, and exposes the 7 Neuralscape MCP tools — all backed by your own Neuralscape service (FastAPI + mem0 + Graphiti).
+Persistent agentic memory for **Claude Code** and **Claude Cowork**, backed by your own Neuralscape service (FastAPI + mem0 + Graphiti). In Claude Code, plugin hooks auto-capture your conversations and recall relevant context on every session start; in Claude Cowork (which doesn't run plugin hooks), the cross-platform skills drive the same recall/capture loop on demand through the MCP connector. Exposes the 8 Neuralscape MCP tools.
 
-- **What you get:** memory injection on `SessionStart`, conversation flush + compile on `Stop`, **incremental tool-observation capture on `PostToolUse` + threshold-driven compile on `UserPromptSubmit`** (no extra API cost — runs on your subscription), five slash command skills (`ns-status`, `search`, `sync`, `ns-config`, `capture`), and the Neuralscape MCP toolkit auto-wired via `.mcp.json`.
+- **What you get:** memory injection on `SessionStart`, conversation flush + compile on `Stop`, **incremental tool-observation capture on `PostToolUse` + threshold-driven compile on `UserPromptSubmit`** (no extra API cost — runs on your subscription), cross-platform MCP-driven skills (`recall`, `remember`, `save-session`, `project`, `search`, `ns-status`, `ns-config`) plus Claude-Code capture skills (`sync`, `capture`), and the Neuralscape MCP toolkit auto-wired via `.mcp.json`.
 - **Where it stores:** in your own Neuralscape deployment. The plugin never sends data anywhere else.
 - **Cost:** zero additional. The plugin is a thin client over your service.
 
@@ -51,11 +51,11 @@ but hooks won't fire — rely on the connector + standing context above.
 ## What gets installed
 
 ```
-.claude/plugins/cache/neuralscape-plugins/neuralscape/2.2.1/
+.claude/plugins/cache/neuralscape-plugins/neuralscape/2.3.0/
 ├── .claude-plugin/plugin.json    manifest with userConfig prompts
 ├── .mcp.json                      remote HTTP MCP at <URL>/mcp/
 ├── hooks/hooks.json               SessionStart, PostToolUse, UserPromptSubmit, Stop
-├── skills/{ns-status,search,sync,ns-config,capture,compile-observations}/SKILL.md
+├── skills/{recall,remember,save-session,project,search,ns-status,ns-config,sync,capture,compile-observations}/SKILL.md
 ├── scripts/                       built hook bundles
 └── LICENSE / CHANGELOG.md
 ```
@@ -80,17 +80,25 @@ The PostToolUse path is **client-LLM-extracted**: the hook records raw observati
 
 Once installed, ask Claude any of:
 
+- "Load my context / neuralscape on" → `/neuralscape:recall` *(both platforms)*
+- "Remember that I prefer X" → `/neuralscape:remember` *(both platforms)*
+- "Save this session to memory" → `/neuralscape:save-session` *(both platforms)*
+- "Switch project / what projects do I have?" → `/neuralscape:project` *(both platforms)*
+- "What do I know about X?" → `/neuralscape:search` *(both platforms)*
 - "Is neuralscape working?" → `/neuralscape:ns-status`
-- "What do I know about X?" → `/neuralscape:search`
-- "Save this conversation to memory now" → `/neuralscape:sync`
 - "What's my neuralscape config?" → `/neuralscape:ns-config`
-- "Compile my tool observations now" → `/neuralscape:capture`
+- "Save this conversation to memory now" → `/neuralscape:sync` *(delegates to save-session in Cowork)*
+- "Compile my tool observations now" → `/neuralscape:capture` *(Claude Code only)*
 
 Claude can also invoke them automatically when it judges them relevant.
 
+### Skills in Cowork
+
+Claude Cowork loads plugin **skills** but runs no hooks. The MCP-driven skills above (`recall`, `remember`, `save-session`, `project`, `search`, `ns-status`, `ns-config`) work in Cowork via the MCP connector; the hook-fed skills (`capture`, and `sync`'s HTTP path) detect the missing buffer/URL and redirect you to the MCP equivalents instead of erroring. See [`../COWORK.md`](../COWORK.md) for connector setup.
+
 ## MCP tools (auto-wired)
 
-Installing the plugin enables seven MCP tools backed by your Neuralscape service:
+Installing the plugin enables eight MCP tools backed by your Neuralscape service:
 
 | Tool | Purpose |
 |---|---|
@@ -100,6 +108,7 @@ Installing the plugin enables seven MCP tools backed by your Neuralscape service
 | `get_project_context` | Load all memories for a project, organized by category |
 | `search_knowledge_graph` | Graph-only structured search (entities, relationships, episodes) |
 | `list_memories` | List with filters (scope, category, project_id) |
+| `list_projects` | List the caller's distinct project_ids (powers the `project` skill) |
 | `delete_memories` | Bulk delete by ID or filters |
 
 These are reachable from any MCP client that picks up your plugin's `.mcp.json`. The transport is Streamable HTTP at `<URL>/mcp/`; the API key (if set) is sent as a Bearer token.
@@ -132,6 +141,28 @@ To change settings after install:
 ```text
 /plugin config neuralscape@neuralscape-plugins
 ```
+
+### Pinning the project id (monorepos)
+
+Memories are scoped to a `project_id`. By default the plugin resolves it
+deterministically so the **same repo always reports the same id** no matter
+which subdirectory a command runs in (important for monorepos whose service
+and plugin live in sibling folders — otherwise the id flips between folder
+basenames and memories fragment). Resolution precedence:
+
+1. **`PROJECT_ID` env override** — `CLAUDE_PLUGIN_OPTION_PROJECT_ID` /
+   `NEURALSCAPE_PROJECT_ID`. Pins one id everywhere this shell runs. Use
+   sparingly — it applies globally, so it's the wrong tool if you work across
+   multiple repos.
+2. **A `.neuralscape-project` marker file** at the repo root (walked up from
+   the cwd). Its first line is the id; an empty marker falls back to the
+   marker directory's basename. **This is the recommended mechanism** — commit
+   it so every contributor and every subdirectory agree:
+   ```text
+   echo neuralscape > .neuralscape-project
+   ```
+3. **The git repo root basename** (walk up for `.git`).
+4. **The working-directory basename** (legacy fallback).
 
 ## Troubleshooting
 

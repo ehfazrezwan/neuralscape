@@ -3,8 +3,9 @@
  */
 
 import { appendFile, mkdir, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join as pathJoin, parse as parsePath } from "node:path";
+import { dirname, join as pathJoin, parse as parsePath } from "node:path";
 
 // ── Configuration ────────────────────────────────────────────────
 //
@@ -135,15 +136,63 @@ export function hasApiKey(): boolean {
   return NEURALSCAPE_API_KEY.length > 0;
 }
 
+/** File name the plugin walks up the tree to find, to pin one project id
+ *  across every subdirectory of a repo (e.g. a monorepo whose service and
+ *  plugin live in sibling folders). Its trimmed first line, if any, IS the
+ *  project id; an empty marker falls back to the marker directory's basename. */
+const PROJECT_MARKER = ".neuralscape-project";
+
 /**
- * Project ID is the basename of the working directory.
- * Uses path.parse so it handles both POSIX (/home/foo/bar) and
- * Windows (C:\Users\foo\bar) path separators.
+ * Walk up from `start` (inclusive) to the filesystem root looking for an
+ * entry named `name`. Returns the absolute path of the containing directory,
+ * or undefined. Synchronous on purpose — `getProjectId` is sync and called
+ * from hook hot paths.
+ */
+function findUp(start: string, name: string): string | undefined {
+  let dir = start;
+  // Bounded by the root check below (dirname(root) === root), so this can't loop forever.
+  for (;;) {
+    if (existsSync(pathJoin(dir, name))) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) return undefined;
+    dir = parent;
+  }
+}
+
+/**
+ * Resolve the project id with a deterministic precedence so the SAME repo
+ * always reports the SAME id regardless of which subdirectory a hook runs in:
+ *
+ *   1. Explicit config override — `PROJECT_ID` (CLAUDE_PLUGIN_OPTION_PROJECT_ID
+ *      / NEURALSCAPE_PROJECT_ID). Pins one id everywhere.
+ *   2. A `.neuralscape-project` marker file found by walking up from `cwd`.
+ *      Its trimmed first line is the id; an empty marker → its dir basename.
+ *   3. The git repo root basename (walk up for `.git`).
+ *   4. Legacy fallback: the basename of `cwd`.
+ *
+ * Uses path.parse so it handles both POSIX and Windows separators.
  */
 export function getProjectId(cwd?: string): string | undefined {
+  const override = readConfig("PROJECT_ID", "").trim();
+  if (override) return override;
+
   const dir = cwd || process.cwd();
-  const name = parsePath(dir).name;
-  return name || undefined;
+
+  const markerDir = findUp(dir, PROJECT_MARKER);
+  if (markerDir) {
+    try {
+      const id = readFileSync(pathJoin(markerDir, PROJECT_MARKER), "utf8").trim().split(/\r?\n/)[0]?.trim();
+      if (id) return id;
+    } catch {
+      /* unreadable marker — fall through to its directory basename */
+    }
+    return parsePath(markerDir).name || undefined;
+  }
+
+  const gitDir = findUp(dir, ".git");
+  if (gitDir) return parsePath(gitDir).name || undefined;
+
+  return parsePath(dir).name || undefined;
 }
 
 // ── HTTP Client ──────────────────────────────────────────────────
