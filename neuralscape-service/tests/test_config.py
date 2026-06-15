@@ -49,13 +49,18 @@ class TestProviderToggle:
             assert emb["embedding_dims"] == 768
             assert emb["openai_base_url"] == "https://gw.example.com/v1"
 
+            # graphiti stays on AI Studio (gemini) even in gateway mode: the mem0
+            # graphiti adapter can't yet configure it for the Vertex gateway
+            # (batched embeddings rejected, hardcoded gpt-4.1-nano small_model,
+            # OpenAIRerankerClient(api_key=) init bug). mem0's vector path above
+            # is what routes through the gateway and stabilizes the API.
             gs = cfg["graph_store"]["config"]
-            assert gs["graphiti_llm_provider"] == "openai"
-            assert gs["graphiti_embedder_provider"] == "openai"
-            assert gs["graphiti_embedder_model"] == "google-vertex/gemini-embedding-001"
-            assert gs["graphiti_reranker_provider"] == "openai"
+            assert gs["graphiti_llm_provider"] == "gemini"
+            assert gs["graphiti_embedder_provider"] == "gemini"
+            assert gs["graphiti_reranker_provider"] == "gemini"
 
-            # graphiti's OpenAI clients have no explicit base_url → env fallback.
+            # OPENAI_BASE_URL is still set (mem0's openai clients + a future
+            # graphiti-on-gateway both rely on it).
             assert os.environ["OPENAI_BASE_URL"] == "https://gw.example.com/v1"
         finally:
             if prev is None:

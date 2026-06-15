@@ -194,15 +194,27 @@ class Settings(BaseSettings):
                     "embedding_dims": 768,
                 },
             }
+            # NOTE: graphiti is NOT routed through the gateway yet. The mem0
+            # graphiti adapter (graphiti_memory.py) builds the OpenAI llm/
+            # embedder/reranker without exposing enough config to make the
+            # Vertex gateway work:
+            #   * embedder batches inputs → Vertex 400 batch_not_supported
+            #   * llm small_model hardcodes gpt-4.1-nano → not on the Vertex
+            #     gateway (400 no provider)
+            #   * openai reranker is built as OpenAIRerankerClient(api_key=...)
+            #     which the client doesn't accept → init throws
+            # Until the adapter is patched, keep graphiti on AI Studio so graph
+            # writes work. mem0's vector path (above) still routes through the
+            # gateway, which is what stabilizes the API event loop.
             graphiti_models = {
-                "graphiti_llm_provider": "openai",
-                "graphiti_llm_model": self.llm_gateway_llm_model,
-                "graphiti_llm_fallback_model": self.llm_gateway_llm_fallback_model,
-                "graphiti_llm_api_key": self.llm_gateway_api_key,
-                "graphiti_embedder_provider": "openai",
-                "graphiti_embedder_model": self.llm_gateway_embedder_model,
-                "graphiti_embedder_api_key": self.llm_gateway_api_key,
-                "graphiti_reranker_provider": "openai",
+                "graphiti_llm_provider": "gemini",
+                "graphiti_llm_model": self.gemini_llm_model,
+                "graphiti_llm_fallback_model": self.gemini_llm_fallback_model,
+                "graphiti_llm_api_key": self.google_api_key,
+                "graphiti_embedder_provider": "gemini",
+                "graphiti_embedder_model": self.gemini_embedder_model,
+                "graphiti_embedder_api_key": self.google_api_key,
+                "graphiti_reranker_provider": "gemini",
             }
         else:
             llm_block = {
