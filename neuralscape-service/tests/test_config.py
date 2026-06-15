@@ -1,0 +1,85 @@
+"""Tests for config.py — the AI Studio ↔ LLM-gateway provider toggle.
+
+The toggle is a single flag (``llm_gateway_enabled``) that flips the mem0 LLM +
+embedder (and the graphiti llm/embedder/reranker) between Google AI Studio
+(``gemini`` provider) and an OpenAI-compatible gateway (``openai`` provider with
+the gateway base_url + key). graphiti's OpenAI clients read the base_url from
+``OPENAI_BASE_URL``, which get_mem0_config sets when the flag is on.
+"""
+
+import os
+
+from config import Settings
+
+
+def _settings(**kw) -> Settings:
+    # Hermetic: don't read a real .env so the test only sees its kwargs.
+    return Settings(_env_file=None, **kw)
+
+
+class TestProviderToggle:
+    def test_default_uses_gemini_direct(self):
+        cfg = _settings(llm_gateway_enabled=False).get_mem0_config()
+        assert cfg["llm"]["provider"] == "gemini"
+        assert cfg["embedder"]["provider"] == "gemini"
+        gs = cfg["graph_store"]["config"]
+        assert gs["graphiti_llm_provider"] == "gemini"
+        assert gs["graphiti_embedder_provider"] == "gemini"
+        assert gs["graphiti_reranker_provider"] == "gemini"
+
+    def test_gateway_routes_through_openai_compatible(self):
+        prev = os.environ.get("OPENAI_BASE_URL")
+        try:
+            cfg = _settings(
+                llm_gateway_enabled=True,
+                llm_gateway_base_url="https://gw.example.com",
+                llm_gateway_api_key="k",
+                llm_gateway_llm_model="gemini-3.1-flash-lite",
+                llm_gateway_embedder_model="google-vertex/gemini-embedding-001",
+            ).get_mem0_config()
+
+            assert cfg["llm"]["provider"] == "openai"
+            assert cfg["llm"]["config"]["openai_base_url"] == "https://gw.example.com/v1"
+            assert cfg["llm"]["config"]["model"] == "gemini-3.1-flash-lite"
+            assert cfg["llm"]["config"]["api_key"] == "k"
+
+            emb = cfg["embedder"]["config"]
+            assert cfg["embedder"]["provider"] == "openai"
+            assert emb["model"] == "google-vertex/gemini-embedding-001"
+            assert emb["embedding_dims"] == 768
+            assert emb["openai_base_url"] == "https://gw.example.com/v1"
+
+            gs = cfg["graph_store"]["config"]
+            assert gs["graphiti_llm_provider"] == "openai"
+            assert gs["graphiti_embedder_provider"] == "openai"
+            assert gs["graphiti_embedder_model"] == "google-vertex/gemini-embedding-001"
+            assert gs["graphiti_reranker_provider"] == "openai"
+
+            # graphiti's OpenAI clients have no explicit base_url → env fallback.
+            assert os.environ["OPENAI_BASE_URL"] == "https://gw.example.com/v1"
+        finally:
+            if prev is None:
+                os.environ.pop("OPENAI_BASE_URL", None)
+            else:
+                os.environ["OPENAI_BASE_URL"] = prev
+
+    def test_gateway_base_url_v1_not_double_appended(self):
+        prev = os.environ.get("OPENAI_BASE_URL")
+        try:
+            cfg = _settings(
+                llm_gateway_enabled=True,
+                llm_gateway_base_url="https://gw.example.com/v1/",
+                llm_gateway_api_key="k",
+            ).get_mem0_config()
+            assert cfg["llm"]["config"]["openai_base_url"] == "https://gw.example.com/v1"
+        finally:
+            if prev is None:
+                os.environ.pop("OPENAI_BASE_URL", None)
+            else:
+                os.environ["OPENAI_BASE_URL"] = prev
+
+    def test_embedding_dims_stay_768_both_modes(self):
+        # Existing Qdrant collection is 768-dim; both routes must keep that.
+        off = _settings(llm_gateway_enabled=False).get_mem0_config()
+        assert off["vector_store"]["config"]["embedding_model_dims"] == 768
+        assert off["embedder"]["config"]["embedding_dims"] == 768
