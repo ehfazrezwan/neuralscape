@@ -385,6 +385,69 @@ class TestGraphPatcher:
             wiki_path="Wiki/x.md",
         ) == 0
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("with_group_id", [False, True])
+    async def test_wiki_synthesized_at_stored_as_string_not_native_datetime(
+        self, with_group_id
+    ):
+        """Regression: ``wiki_synthesized_at`` must be written as a plain ISO
+        string, never a native neo4j ``datetime()``.
+
+        Graphiti hydrates unknown node properties into ``node.attributes`` on
+        load and ``json.dumps`` them during entity resolution in
+        ``add_episode``. A ``neo4j.time.DateTime`` is not JSON serializable, so
+        a native-datetime ``wiki_synthesized_at`` broke graph storage on every
+        write that resolved against a wiki-synthesized entity.
+        """
+        captured: list[tuple[str, dict]] = []
+
+        class _CapSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def run(self, query, **params):
+                captured.append((query, params))
+
+                class _R:
+                    async def single(self_inner):
+                        return {"patched": 1}
+
+                return _R()
+
+        class _CapDriver:
+            def session(self):
+                return _CapSession()
+
+        service = _fake_service_with(_CapDriver())
+        when = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
+        group_id = "shared--project--neuralscape" if with_group_id else None
+
+        await patch_wiki_path(
+            service,
+            node_uuids=["u1"],
+            wiki_path="Wiki/x.md",
+            group_id=group_id,
+            synthesized_at=when,
+        )
+        await patch_wiki_path_by_memory_ids(
+            service,
+            memory_ids=["mem-1"],
+            wiki_path="Wiki/x.md",
+            group_id=group_id,
+            synthesized_at=when,
+        )
+
+        assert captured, "expected the patchers to issue a Cypher write"
+        for query, params in captured:
+            assert "n.wiki_synthesized_at = $synthesized_at" in query
+            assert "datetime($synthesized_at)" not in query
+            # Bound value must be a string (isoformat), not a datetime object.
+            assert isinstance(params["synthesized_at"], str)
+            assert params["synthesized_at"] == when.isoformat()
+
 
 # ──────────────────────────────────────────────
 # synthesize_all — top-level orchestration smoke
