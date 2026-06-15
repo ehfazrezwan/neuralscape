@@ -497,6 +497,13 @@ class ContextResponse(BaseModel):
     user_id: str
     project_id: str | None = None
     categories: dict[str, list[MemoryResponse]] = Field(default_factory=dict)
+    # Pagination over the combined (global + project) memory set. The page is
+    # sorted newest-first, so `offset`/`limit` page deterministically.
+    total: int = 0
+    returned: int = 0
+    offset: int = 0
+    limit: int | None = None
+    has_more: bool = False
 
 
 class TaskAcceptedResponse(BaseModel):

@@ -1725,18 +1725,31 @@ class MemoryService:
     # Context operations
     # ──────────────────────────────────────────────
 
-    def get_project_context(self, user_id: str, project_id: str) -> ContextResponse:
-        """Get full project + global context organized by category.
+    def get_project_context(
+        self,
+        user_id: str,
+        project_id: str,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> ContextResponse:
+        """Get project + global context organized by category, with paging.
 
-        Retrieves all user preferences (global) plus project-specific memories,
-        organized into category buckets for easy consumption by agents.
+        Retrieves user preferences (global) plus project-specific memories,
+        organized into category buckets for easy consumption by agents. The
+        combined set is sorted newest-first and paged by ``offset``/``limit``
+        so a large project doesn't return one oversized payload.
 
         Args:
             user_id: User identifier
             project_id: Project identifier
+            limit: Max memories across all categories for this page. ``None``
+                returns everything from ``offset`` on (legacy behavior).
+            offset: Number of (newest-first) memories to skip.
 
         Returns:
-            ContextResponse with memories organized by category.
+            ContextResponse with the page bucketed by category plus pagination
+            metadata (``total``, ``returned``, ``offset``, ``limit``,
+            ``has_more``).
         """
         m = self._get_memory()
 
@@ -1754,23 +1767,49 @@ class MemoryService:
             top_k=200,
         )
 
-        # Organize by category
-        categories: dict[str, list[MemoryResponse]] = {}
-
+        # Flatten to a deterministically ordered list (newest first) so paging
+        # is stable across calls. created_at may be absent → fall back to id.
+        flat: list[tuple[str, MemoryResponse]] = []
         for result_set in [global_result, project_result]:
-            memories = self._extract_memory_list(result_set)
-            for mem in memories:
-                metadata = mem.get("metadata", {}) or {}
-                cat = metadata.get("category", "personal_fact")
+            for mem in self._extract_memory_list(result_set):
                 response = self._mem_to_response(mem)
-                if cat not in categories:
-                    categories[cat] = []
-                categories[cat].append(response)
+                # Bucket by the response's resolved category — `_mem_to_response`
+                # unwraps mem0's nested `{metadata: {metadata: {...}}}` shape, so
+                # reading raw `mem["metadata"]` here would mis-bucket as the
+                # default whenever the category lives one level deeper.
+                cat = getattr(response, "category", None) or "personal_fact"
+                flat.append((cat, response))
+
+        flat.sort(
+            key=lambda cr: (
+                str(getattr(cr[1], "created_at", "") or ""),
+                str(getattr(cr[1], "id", "") or ""),
+            ),
+            reverse=True,
+        )
+
+        total = len(flat)
+        offset = max(0, offset)
+        # Normalize a non-positive limit to 1: otherwise the page is empty while
+        # has_more stays True, and a client advancing by `offset += returned`
+        # never progresses (infinite pagination loop).
+        if limit is not None and limit < 1:
+            limit = 1
+        page = flat[offset:] if limit is None else flat[offset : offset + limit]
+
+        categories: dict[str, list[MemoryResponse]] = {}
+        for cat, response in page:
+            categories.setdefault(cat, []).append(response)
 
         return ContextResponse(
             user_id=user_id,
             project_id=project_id,
             categories=categories,
+            total=total,
+            returned=len(page),
+            offset=offset,
+            limit=limit,
+            has_more=(offset + len(page)) < total,
         )
 
     def get_global_context(self, user_id: str) -> ContextResponse:
@@ -1793,16 +1832,23 @@ class MemoryService:
         categories: dict[str, list[MemoryResponse]] = {}
         memories = self._extract_memory_list(result)
         for mem in memories:
-            metadata = mem.get("metadata", {}) or {}
-            cat = metadata.get("category", "personal_fact")
             response = self._mem_to_response(mem)
+            cat = getattr(response, "category", None) or "personal_fact"
             if cat not in categories:
                 categories[cat] = []
             categories[cat].append(response)
 
+        # Global context isn't paged — report the full set so the pagination
+        # metadata isn't misleading (total=0 with non-empty categories).
+        count = len(memories)
         return ContextResponse(
             user_id=user_id,
             categories=categories,
+            total=count,
+            returned=count,
+            offset=0,
+            limit=None,
+            has_more=False,
         )
 
     # ──────────────────────────────────────────────
