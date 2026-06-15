@@ -936,8 +936,8 @@ async def v1_get_project_context(
     project_id: str,
     request: Request,
     user_id: str | None = Query(default=None),
-    limit: int | None = Query(default=None),
-    offset: int = Query(default=0),
+    limit: int | None = Query(default=None, ge=1),
+    offset: int = Query(default=0, ge=0),
 ):
     """Get project + global context organized by category (paginated).
 

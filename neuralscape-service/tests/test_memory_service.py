@@ -242,6 +242,20 @@ class TestGetContext:
         assert ctx.limit == 2
         assert ctx.has_more is True
         assert sum(len(v) for v in ctx.categories.values()) == 2
+        # Newest-first by (created_at, id) desc → p3, p2, p1, g2, g1; the
+        # offset=1/limit=2 window is exactly {p2, p1}.
+        page_ids = {m.id for bucket in ctx.categories.values() for m in bucket}
+        assert page_ids == {"p2", "p1"}
+
+    def test_project_context_clamps_nonpositive_limit(self, service):
+        service._memory.get_all.side_effect = [
+            {"results": [{"id": "g1", "memory": "a", "metadata": {"category": "preference"}}]},
+            {"results": [{"id": "p1", "memory": "c", "metadata": {"category": "tech_stack"}}]},
+        ]
+        # limit<=0 must not yield an empty page with has_more=True (infinite loop).
+        ctx = service.get_project_context(user_id="ehfaz", project_id="proj", limit=0)
+        assert ctx.returned == 1
+        assert ctx.limit == 1
 
     def test_project_context_no_limit_returns_all(self, service):
         service._memory.get_all.side_effect = [

@@ -257,10 +257,14 @@ async def list_tools() -> list[Tool]:
                     },
                     "limit": {
                         "type": "integer",
+                        "minimum": 1,
+                        "default": 100,
                         "description": "Max memories to return this page (default 100, newest first). Use with offset to page through a large project.",
                     },
                     "offset": {
                         "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
                         "description": "Number of (newest-first) memories to skip (default 0).",
                     },
                 },

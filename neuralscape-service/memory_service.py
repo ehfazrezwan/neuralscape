@@ -1772,9 +1772,13 @@ class MemoryService:
         flat: list[tuple[str, MemoryResponse]] = []
         for result_set in [global_result, project_result]:
             for mem in self._extract_memory_list(result_set):
-                metadata = mem.get("metadata", {}) or {}
-                cat = metadata.get("category", "personal_fact")
-                flat.append((cat, self._mem_to_response(mem)))
+                response = self._mem_to_response(mem)
+                # Bucket by the response's resolved category — `_mem_to_response`
+                # unwraps mem0's nested `{metadata: {metadata: {...}}}` shape, so
+                # reading raw `mem["metadata"]` here would mis-bucket as the
+                # default whenever the category lives one level deeper.
+                cat = getattr(response, "category", None) or "personal_fact"
+                flat.append((cat, response))
 
         flat.sort(
             key=lambda cr: (
@@ -1786,7 +1790,12 @@ class MemoryService:
 
         total = len(flat)
         offset = max(0, offset)
-        page = flat[offset:] if limit is None else flat[offset : offset + max(0, limit)]
+        # Normalize a non-positive limit to 1: otherwise the page is empty while
+        # has_more stays True, and a client advancing by `offset += returned`
+        # never progresses (infinite pagination loop).
+        if limit is not None and limit < 1:
+            limit = 1
+        page = flat[offset:] if limit is None else flat[offset : offset + limit]
 
         categories: dict[str, list[MemoryResponse]] = {}
         for cat, response in page:
@@ -1823,16 +1832,23 @@ class MemoryService:
         categories: dict[str, list[MemoryResponse]] = {}
         memories = self._extract_memory_list(result)
         for mem in memories:
-            metadata = mem.get("metadata", {}) or {}
-            cat = metadata.get("category", "personal_fact")
             response = self._mem_to_response(mem)
+            cat = getattr(response, "category", None) or "personal_fact"
             if cat not in categories:
                 categories[cat] = []
             categories[cat].append(response)
 
+        # Global context isn't paged — report the full set so the pagination
+        # metadata isn't misleading (total=0 with non-empty categories).
+        count = len(memories)
         return ContextResponse(
             user_id=user_id,
             categories=categories,
+            total=count,
+            returned=count,
+            offset=0,
+            limit=None,
+            has_more=False,
         )
 
     # ──────────────────────────────────────────────
