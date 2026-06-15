@@ -131,7 +131,7 @@ async def patch_wiki_path(
         MATCH (n)
         WHERE n.uuid IN $uuids AND n.group_id = $group_id
         SET n.wiki_path = $wiki_path,
-            n.wiki_synthesized_at = datetime($synthesized_at)
+            n.wiki_synthesized_at = $synthesized_at
         RETURN count(n) AS patched
         """
         params: dict[str, Any] = {
@@ -145,7 +145,7 @@ async def patch_wiki_path(
         MATCH (n)
         WHERE n.uuid IN $uuids
         SET n.wiki_path = $wiki_path,
-            n.wiki_synthesized_at = datetime($synthesized_at)
+            n.wiki_synthesized_at = $synthesized_at
         RETURN count(n) AS patched
         """
         params = {
@@ -203,7 +203,7 @@ async def patch_wiki_path_by_memory_ids(
         MATCH (n)
         WHERE n.memory_id IN $mids AND n.group_id = $group_id
         SET n.wiki_path = $wiki_path,
-            n.wiki_synthesized_at = datetime($synthesized_at)
+            n.wiki_synthesized_at = $synthesized_at
         RETURN count(n) AS patched
         """
         params: dict[str, Any] = {
@@ -217,7 +217,7 @@ async def patch_wiki_path_by_memory_ids(
         MATCH (n)
         WHERE n.memory_id IN $mids
         SET n.wiki_path = $wiki_path,
-            n.wiki_synthesized_at = datetime($synthesized_at)
+            n.wiki_synthesized_at = $synthesized_at
         RETURN count(n) AS patched
         """
         params = {
