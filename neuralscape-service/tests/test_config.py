@@ -68,6 +68,29 @@ class TestProviderToggle:
             else:
                 os.environ["OPENAI_BASE_URL"] = prev
 
+    def test_graphiti_gateway_flag_routes_graphiti_through_gateway(self):
+        # LLM_GATEWAY_GRAPHITI_ENABLED=True opts graphiti into the gateway too.
+        prev = os.environ.get("OPENAI_BASE_URL")
+        try:
+            gs = _settings(
+                llm_gateway_enabled=True,
+                llm_gateway_graphiti_enabled=True,
+                llm_gateway_base_url="https://gw.example.com",
+                llm_gateway_api_key="k",
+            ).get_mem0_config()["graph_store"]["config"]
+            assert gs["graphiti_llm_provider"] == "openai"
+            assert gs["graphiti_reranker_provider"] == "openai"
+            # main vs small model are decoupled and both google-vertex/ prefixed
+            assert gs["graphiti_llm_model"] == "google-vertex/gemini-3.1-flash-lite"
+            assert gs["graphiti_llm_small_model"] == "google-vertex/gemini-3.1-flash-lite"
+            # embedder stays on AI Studio (Vertex rejects batched embeds)
+            assert gs["graphiti_embedder_provider"] == "gemini"
+        finally:
+            if prev is None:
+                os.environ.pop("OPENAI_BASE_URL", None)
+            else:
+                os.environ["OPENAI_BASE_URL"] = prev
+
     def test_gateway_base_url_v1_not_double_appended(self):
         prev = os.environ.get("OPENAI_BASE_URL")
         try:

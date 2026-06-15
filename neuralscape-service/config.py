@@ -28,9 +28,26 @@ class Settings(BaseSettings):
     llm_gateway_enabled: bool = False
     llm_gateway_base_url: str = ""  # e.g. https://llm-gateway.example.com (/v1 appended if absent)
     llm_gateway_api_key: str = ""
-    llm_gateway_llm_model: str = "gemini-3.1-flash-lite"
-    llm_gateway_llm_fallback_model: str = "gemini-2.5-flash"
+    # The gateway only fronts Google/Anthropic models on Vertex (no OpenAI
+    # models), so every model tag carries the `google-vertex/` provider prefix —
+    # the bare tag routes elsewhere and doesn't enforce the strict json_schema
+    # graphiti's entity extraction depends on.
+    llm_gateway_llm_model: str = "google-vertex/gemini-3.1-flash-lite"
+    llm_gateway_llm_fallback_model: str = "google-vertex/gemini-2.5-flash"
     llm_gateway_embedder_model: str = "google-vertex/gemini-embedding-001"
+    # Model for graphiti entity/edge extraction. A stronger model does NOT help
+    # the residual structured-output flakiness — that's the gateway's incomplete
+    # OpenAI strict-json_schema support for Gemini, not model quality (2.5-flash
+    # was slower and no better than flash-lite). Kept configurable for when the
+    # gateway adds strict structured output.
+    llm_gateway_graphiti_model: str = "google-vertex/gemini-3.1-flash-lite"
+    # Whether graphiti (graph extraction) ALSO routes through the gateway. Default
+    # False → graphiti stays on AI Studio for clean/complete extraction (native
+    # Gemini handles structured output; the gateway's strict json_schema support
+    # for Gemini is incomplete → flaky/partial graphs). Set True once the gateway
+    # supports strict structured output. Independent of llm_gateway_enabled, which
+    # routes the vector path (and is what stabilizes the API event loop).
+    llm_gateway_graphiti_enabled: bool = False
 
     # Neo4j
     neo4j_uri: str = "neo4j://127.0.0.1:7687"
@@ -148,6 +165,37 @@ class Settings(BaseSettings):
             base += "/v1"
         return base
 
+    def _graphiti_ai_studio_models(self) -> dict:
+        """graphiti (LLM + embedder + reranker) on Google AI Studio — clean,
+        complete structured-output extraction. The default for graph writes."""
+        return {
+            "graphiti_llm_provider": "gemini",
+            "graphiti_llm_model": self.gemini_llm_model,
+            "graphiti_llm_fallback_model": self.gemini_llm_fallback_model,
+            "graphiti_llm_api_key": self.google_api_key,
+            "graphiti_embedder_provider": "gemini",
+            "graphiti_embedder_model": self.gemini_embedder_model,
+            "graphiti_embedder_api_key": self.google_api_key,
+            "graphiti_reranker_provider": "gemini",
+        }
+
+    def _graphiti_gateway_models(self) -> dict:
+        """graphiti LLM + reranker through the gateway. Requires the NEURALSCAPE
+        PATCH in mem0/mem0/memory/graphiti_memory.py (small_model threading +
+        reranker config). Embedder stays on AI Studio: graphiti batches inputs
+        and Vertex rejects multi-input embeds (400 batch_not_supported)."""
+        return {
+            "graphiti_llm_provider": "openai",
+            "graphiti_llm_model": self.llm_gateway_graphiti_model,
+            "graphiti_llm_small_model": self.llm_gateway_llm_model,
+            "graphiti_llm_fallback_model": self.llm_gateway_llm_fallback_model,
+            "graphiti_llm_api_key": self.llm_gateway_api_key,
+            "graphiti_embedder_provider": "gemini",
+            "graphiti_embedder_model": self.gemini_embedder_model,
+            "graphiti_embedder_api_key": self.google_api_key,
+            "graphiti_reranker_provider": "openai",
+        }
+
     def get_mem0_config(self) -> dict:
         """Build mem0 config dict for Memory(config=...).
 
@@ -194,28 +242,15 @@ class Settings(BaseSettings):
                     "embedding_dims": 768,
                 },
             }
-            # NOTE: graphiti is NOT routed through the gateway yet. The mem0
-            # graphiti adapter (graphiti_memory.py) builds the OpenAI llm/
-            # embedder/reranker without exposing enough config to make the
-            # Vertex gateway work:
-            #   * embedder batches inputs → Vertex 400 batch_not_supported
-            #   * llm small_model hardcodes gpt-4.1-nano → not on the Vertex
-            #     gateway (400 no provider)
-            #   * openai reranker is built as OpenAIRerankerClient(api_key=...)
-            #     which the client doesn't accept → init throws
-            # Until the adapter is patched, keep graphiti on AI Studio so graph
-            # writes work. mem0's vector path (above) still routes through the
-            # gateway, which is what stabilizes the API event loop.
-            graphiti_models = {
-                "graphiti_llm_provider": "gemini",
-                "graphiti_llm_model": self.gemini_llm_model,
-                "graphiti_llm_fallback_model": self.gemini_llm_fallback_model,
-                "graphiti_llm_api_key": self.google_api_key,
-                "graphiti_embedder_provider": "gemini",
-                "graphiti_embedder_model": self.gemini_embedder_model,
-                "graphiti_embedder_api_key": self.google_api_key,
-                "graphiti_reranker_provider": "gemini",
-            }
+            # graphiti routes through the gateway only when explicitly enabled;
+            # otherwise it stays on AI Studio for a clean graph (the gateway's
+            # strict json_schema support for Gemini is incomplete → flaky/partial
+            # extraction). The vector path above is what stabilizes the API.
+            graphiti_models = (
+                self._graphiti_gateway_models()
+                if self.llm_gateway_graphiti_enabled
+                else self._graphiti_ai_studio_models()
+            )
         else:
             llm_block = {
                 "provider": "gemini",
@@ -232,16 +267,7 @@ class Settings(BaseSettings):
                     "embedding_dims": 768,
                 },
             }
-            graphiti_models = {
-                "graphiti_llm_provider": "gemini",
-                "graphiti_llm_model": self.gemini_llm_model,
-                "graphiti_llm_fallback_model": self.gemini_llm_fallback_model,
-                "graphiti_llm_api_key": self.google_api_key,
-                "graphiti_embedder_provider": "gemini",
-                "graphiti_embedder_model": self.gemini_embedder_model,
-                "graphiti_embedder_api_key": self.google_api_key,
-                "graphiti_reranker_provider": "gemini",
-            }
+            graphiti_models = self._graphiti_ai_studio_models()
 
         return {
             "llm": llm_block,
