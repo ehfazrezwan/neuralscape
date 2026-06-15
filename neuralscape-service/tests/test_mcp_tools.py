@@ -277,6 +277,9 @@ class TestGetProjectContextTool:
         assert data["project_id"] == "my-project"
         assert "preference" in data["categories"]
         assert "tech_stack" in data["categories"]
+        # Default page size is bounded (25) so large projects don't overflow the
+        # agent tool-result token limit.
+        assert mock_mcp_service.get_project_context.call_args.kwargs["limit"] == 25
 
 
 class TestSearchKnowledgeGraphTool:
