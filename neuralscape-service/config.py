@@ -145,6 +145,9 @@ class Settings(BaseSettings):
             ValueError: If any required field is empty or missing.
         """
         errors = []
+        # GOOGLE_API_KEY stays required even in gateway mode: graphiti's embedder
+        # always runs on AI Studio (Vertex rejects batched embeds), and graphiti
+        # defaults to AI Studio entirely unless LLM_GATEWAY_GRAPHITI_ENABLED.
         if not self.google_api_key:
             errors.append("GOOGLE_API_KEY is required but not set")
         if not self.neo4j_password:
@@ -153,6 +156,11 @@ class Settings(BaseSettings):
             errors.append("NEO4J_URI is required but not set")
         if not self.redis_url:
             errors.append("REDIS_URL is required but not set")
+        if self.llm_gateway_enabled:
+            if not self.llm_gateway_base_url:
+                errors.append("LLM_GATEWAY_BASE_URL is required when LLM_GATEWAY_ENABLED is true")
+            if not self.llm_gateway_api_key:
+                errors.append("LLM_GATEWAY_API_KEY is required when LLM_GATEWAY_ENABLED is true")
         if errors:
             raise ValueError(
                 "Missing required configuration:\n  - " + "\n  - ".join(errors)
@@ -222,8 +230,11 @@ class Settings(BaseSettings):
             # back to OPENAI_BASE_URL. Set it (and a default key) here, before
             # the graph clients are constructed, so the graph side also routes
             # through the gateway. mem0's own clients use openai_base_url below.
+            # Set (not setdefault) so a stale OPENAI_API_KEY from the environment
+            # can't shadow the gateway key for graphiti's env-fed openai clients.
+            # base_url non-emptiness is guaranteed by validate_required() above.
             os.environ["OPENAI_BASE_URL"] = gw
-            os.environ.setdefault("OPENAI_API_KEY", self.llm_gateway_api_key)
+            os.environ["OPENAI_API_KEY"] = self.llm_gateway_api_key
 
             llm_block = {
                 "provider": "openai",

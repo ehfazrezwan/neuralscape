@@ -9,6 +9,8 @@ the gateway base_url + key). graphiti's OpenAI clients read the base_url from
 
 import os
 
+import pytest
+
 from config import Settings
 
 
@@ -105,6 +107,28 @@ class TestProviderToggle:
                 os.environ.pop("OPENAI_BASE_URL", None)
             else:
                 os.environ["OPENAI_BASE_URL"] = prev
+
+    def test_validate_required_gateway_creds(self):
+        # Gateway enabled but missing gateway creds → error.
+        with pytest.raises(ValueError, match="LLM_GATEWAY_BASE_URL"):
+            _settings(
+                llm_gateway_enabled=True, google_api_key="g", neo4j_password="p"
+            ).validate_required()
+        # Gateway enabled with creds → ok (and GOOGLE_API_KEY still required).
+        _settings(
+            llm_gateway_enabled=True,
+            llm_gateway_base_url="https://gw",
+            llm_gateway_api_key="k",
+            google_api_key="g",
+            neo4j_password="p",
+        ).validate_required()
+        with pytest.raises(ValueError, match="GOOGLE_API_KEY"):
+            _settings(
+                llm_gateway_enabled=True,
+                llm_gateway_base_url="https://gw",
+                llm_gateway_api_key="k",
+                neo4j_password="p",
+            ).validate_required()
 
     def test_embedding_dims_stay_768_both_modes(self):
         # Existing Qdrant collection is 768-dim; both routes must keep that.
