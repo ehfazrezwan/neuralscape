@@ -4,6 +4,43 @@ All notable changes to the `neuralscape` Claude plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.4.0] - 2026-06-15
+
+### Changed
+
+- **Baked-URL distribution model (Cowork-compatible connector).** The MCP
+  connector URL in `.mcp.json` is now a **literal value baked per distribution
+  channel** instead of `${user_config.URL}`. Cowork bundles the connector
+  read-only and does not interpolate `${user_config.*}`, so the template
+  rendered as a locked, invalid field; a literal URL is read by both Cowork and
+  Claude Code. The bundled connector now appears pre-configured in Cowork —
+  users just **Connect** (OAuth), with no manual URL entry. Verified end-to-end:
+  Cowork loads the skills, connects, and calls the MCP tools.
+- **OAuth-only connector auth.** The static `Authorization: Bearer
+  ${user_config.API_KEY}` header was removed from `.mcp.json`. Auth is handled
+  by the service's OAuth flow (dynamic client registration + PKCE), so no key is
+  configured for the connector on either platform.
+- **Single source of truth for the service URL.** The Claude Code hooks now
+  derive their API base from the same baked `.mcp.json` (`readBakedUrl`), with
+  precedence: explicit `URL` override → baked URL → `localhost`. One place to
+  change the URL.
+
+### Added
+
+- **`npm run bake` (`tools/bake.mjs`).** Stamps a distribution channel into the
+  committed files: rewrites the literal connector URL in `.mcp.json` and,
+  optionally, the marketplace `name`/`owner`. A self-hoster or vendor forks the
+  repo and runs one command (`npm run bake -- --url https://their-host`) instead
+  of hand-editing JSON. Validates https (loopback http allowed), normalizes a
+  base or full `/mcp/` URL, rejects templates; `--dry-run` previews.
+- **`npm run package` (`tools/package.mjs`).** Builds a clean, installable zip
+  under `dist/` (single top-level dir, zero symlinks) for local `--plugin-dir`
+  installs. Note: the **marketplace flow is the supported Cowork path**; Cowork's
+  local zip upload is unreliable.
+- **Distribution & self-hosting docs.** README + `COWORK.md` document the three
+  channels (official / self-host fork / vendor's existing marketplace) and the
+  low-effort OAuth self-host setup (two env vars + public HTTPS).
+
 ## [2.3.0] - 2026-06-13
 
 ### Added

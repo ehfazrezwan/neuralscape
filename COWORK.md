@@ -102,18 +102,24 @@ curl https://neuralscape.example.com/.well-known/oauth-protected-resource
 
 ---
 
-## 2. Add the connector (each user, one-time)
+## 2. Connect (each user, one-time)
 
-In Claude (Cowork / claude.ai):
+The connector is **bundled with the plugin** — its URL is baked into `.mcp.json`
+per distribution channel (Cowork bundles the connector read-only, so there's no
+URL to type). Install the plugin from your channel's marketplace, then:
 
-1. **Settings → Connectors → Add custom connector.**
-2. **Remote MCP server URL:** `https://neuralscape.example.com/mcp/`
-3. Save, then click **Connect**.
-4. Claude discovers the Authorization Server and opens the Neuralscape consent
+1. Open the bundled **Neuralscape** connector (Connectors → Neuralscape).
+2. Click **Connect**.
+3. Claude discovers the Authorization Server and opens the Neuralscape consent
    page. **Paste the per-user token your admin issued you** and click
    **Authorize**.
-5. That's it. Anthropic now holds short-lived OAuth tokens and refreshes them
+4. That's it. Anthropic now holds short-lived OAuth tokens and refreshes them
    silently — you never paste anything again.
+
+> **Different URL than the baked one?** (e.g. testing a second deployment) You
+> can still add it manually: **Settings → Connectors → Add custom connector** →
+> `https://<your-host>/mcp/` → **Connect**. Bake your URL into the plugin (see
+> the README's *Distribution & self-hosting*) to make it the bundled default.
 
 After connecting, the 8 Neuralscape MCP tools appear in Cowork. The server
 reads your identity from the OAuth token, so the `user_id` you pass is
