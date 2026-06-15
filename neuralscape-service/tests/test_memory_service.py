@@ -220,6 +220,40 @@ class TestGetContext:
         assert ctx.project_id == "my-project"
         assert service._memory.get_all.call_count == 2
 
+    def test_project_context_paginates(self, service):
+        # 2 global + 3 project = 5 total; page the second window of 2.
+        service._memory.get_all.side_effect = [
+            {"results": [
+                {"id": "g1", "memory": "a", "metadata": {"category": "preference"}},
+                {"id": "g2", "memory": "b", "metadata": {"category": "preference"}},
+            ]},
+            {"results": [
+                {"id": "p1", "memory": "c", "metadata": {"category": "tech_stack"}},
+                {"id": "p2", "memory": "d", "metadata": {"category": "tech_stack"}},
+                {"id": "p3", "memory": "e", "metadata": {"category": "tech_stack"}},
+            ]},
+        ]
+        ctx = service.get_project_context(
+            user_id="ehfaz", project_id="proj", limit=2, offset=1
+        )
+        assert ctx.total == 5
+        assert ctx.returned == 2
+        assert ctx.offset == 1
+        assert ctx.limit == 2
+        assert ctx.has_more is True
+        assert sum(len(v) for v in ctx.categories.values()) == 2
+
+    def test_project_context_no_limit_returns_all(self, service):
+        service._memory.get_all.side_effect = [
+            {"results": [{"id": "g1", "memory": "a", "metadata": {"category": "preference"}}]},
+            {"results": [{"id": "p1", "memory": "c", "metadata": {"category": "tech_stack"}}]},
+        ]
+        ctx = service.get_project_context(user_id="ehfaz", project_id="proj")
+        assert ctx.total == 2
+        assert ctx.returned == 2
+        assert ctx.limit is None
+        assert ctx.has_more is False
+
 
 class TestCRUD:
     def test_get_memory_found(self, service):

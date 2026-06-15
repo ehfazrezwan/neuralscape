@@ -936,14 +936,22 @@ async def v1_get_project_context(
     project_id: str,
     request: Request,
     user_id: str | None = Query(default=None),
+    limit: int | None = Query(default=None),
+    offset: int = Query(default=0),
 ):
-    """Get full project + global context organized by category."""
+    """Get project + global context organized by category (paginated).
+
+    ``limit`` defaults to ``None`` (return everything) for backward
+    compatibility; pass ``limit``/``offset`` to page newest-first.
+    """
     resolved_user_id = _resolve_user_id(request, user_id)
     try:
         return await asyncio.to_thread(
             _service.get_project_context,
             user_id=resolved_user_id,
             project_id=project_id,
+            limit=limit,
+            offset=offset,
         )
     except HTTPException:
         raise
