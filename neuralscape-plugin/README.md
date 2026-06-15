@@ -13,47 +13,92 @@ Persistent agentic memory for **Claude Code** and **Claude Cowork**, backed by y
 /plugin install neuralscape@neuralscape-plugins
 ```
 
-Claude Code prompts you for three values at install time:
+The MCP connector URL is **baked into the plugin** per distribution channel
+(see **Distribution & self-hosting** below), and auth is handled by **OAuth** —
+so you don't enter a URL or API key. On first connect, Claude Code runs the
+OAuth flow; paste your per-user token once on the consent page.
 
-| Prompt | Notes |
-|---|---|
-| Neuralscape service URL | e.g. `https://neuralscape.example.com` or `http://localhost:8199` |
-| API key (optional) | bearer token if your deployment is authenticated; leave empty for local dev |
-| Your user ID | a stable identifier so memories are scoped to you (e.g. your username) |
+`userConfig` (URL / USER_ID) now only configures the Claude Code **hooks**, and
+can be left at defaults — the hooks derive the same baked URL from `.mcp.json`.
+Set `USER_ID` if you want hook-captured memories scoped to a specific id; set
+`URL` only to point the hooks at a different host than the baked connector.
 
-That's it. Open a new session — the SessionStart hook will pull your prior context and inject it as `additionalContext`.
+Open a new session — the SessionStart hook pulls your prior context and injects
+it as `additionalContext`.
 
 > **First time on Neuralscape?** Set up the service first. The full 8-step walkthrough is at [`docs/neuralscape/01-getting-started.md`](../docs/neuralscape/01-getting-started.md) in this repo.
 
 ## Claude Cowork install
 
 Cowork is **not** the same experience as Claude Code: it does not run plugin
-hooks ([#27398](https://github.com/anthropics/claude-code/issues/27398)) and
-its connector UI can't take a static Bearer token
-([#112](https://github.com/anthropics/claude-ai-mcp/issues/112)). The supported
-Cowork path is a **remote MCP OAuth connector** plus a standing-context memory
-protocol — not the hook-driven marketplace flow.
+hooks ([#27398](https://github.com/anthropics/claude-code/issues/27398)). The
+memory loop is driven by the **cross-platform skills + the bundled OAuth MCP
+connector** instead. Installing the marketplace plugin in Cowork is enough —
+the connector ships **pre-configured** with the channel's baked URL (Cowork
+bundles `.mcp.json` read-only), so there is **no manual URL entry**.
 
 ➡️ **Full Cowork runbook: [`../COWORK.md`](../COWORK.md).** In short:
 
-1. Admin: expose the service on a public HTTPS URL and set
+1. Admin (self-host): expose the service on a public HTTPS URL and set
    `NEURALSCAPE_PUBLIC_URL` + `NEURALSCAPE_USER_TOKEN_SECRET` (turns on the
-   built-in OAuth server).
-2. User: **Settings → Connectors → Add custom connector** → URL
-   `https://<your-host>/mcp/` → **Connect** → paste your per-user token once.
-3. Paste the [standing-context block](./cowork/STANDING_CONTEXT.md) into your
-   Cowork workspace instructions so Claude recalls at task start and saves at
-   task end via the MCP tools.
+   built-in OAuth server). See **Distribution & self-hosting** below to bake
+   your URL into the plugin.
+2. User: install the plugin from your channel's marketplace → open the bundled
+   **Neuralscape** connector → **Connect** → paste your per-user token once on
+   the OAuth consent page. (No key, no URL to type.)
+3. Optional: paste the [standing-context block](./cowork/STANDING_CONTEXT.md)
+   into your Cowork workspace instructions so Claude recalls at task start and
+   saves at task end via the MCP tools.
 
-Installing the marketplace plugin in Cowork still loads the **skills** (useful),
-but hooks won't fire — rely on the connector + standing context above.
+Hooks won't fire in Cowork (the built `scripts/*.js` aren't shipped) — the
+skills + connector do that work. They're listed in the Hooks panel but inert.
+
+## Distribution & self-hosting (baked URL)
+
+Neuralscape is **self-hosted** — every deployment has its own URL. Cowork bundles
+the MCP connector from `.mcp.json` **read-only** and can't interpolate
+`${user_config.*}`, so a per-user runtime URL is impossible for a bundled
+connector. The model instead is: **the connector URL is a literal baked into
+`.mcp.json` per distribution channel.** A channel = a repo/marketplace whose
+plugin has its URL baked in. Three ways to distribute:
+
+| Channel | Who | How |
+|---|---|---|
+| **Official** | Hosted Neuralscape | Install from `ehfazrezwan/neuralscape`; URL is the official endpoint. |
+| **Self-host fork** | You run the service | Fork this repo, bake your URL, publish the fork as your marketplace. |
+| **Vendor marketplace** | You already run a Claude marketplace | Vendor the `neuralscape-plugin/` dir into your marketplace repo with your URL baked in. |
+
+**Bake your channel** (rewrites the literal URL in `.mcp.json`; the hooks derive
+their base from the same file, so it's the single source of truth):
+
+```bash
+cd neuralscape-plugin
+npm run bake -- --url https://your-host          # → https://your-host/mcp/
+npm run bake -- --url https://your-host --dry-run # preview only
+# publishing your own marketplace? also stamp its identity:
+npm run bake -- --url https://your-host --marketplace-name acme-plugins --owner "Acme"
+```
+
+Then commit the result to your channel's repo (marketplace installs pull raw
+from git — there's no build step, so the baked value must be committed).
+
+**Enable OAuth on your service** (required; the connector is OAuth-only, no API
+key). It's a thin wrapper over the token you already issue — no user database,
+no OAuth app registration:
+
+1. Set `NEURALSCAPE_PUBLIC_URL` (your public https base URL — turns OAuth on).
+2. Set `NEURALSCAPE_USER_TOKEN_SECRET` (the HMAC signing secret you already use).
+3. Expose the service over public HTTPS.
+
+Users then connect once and paste their admin-issued token on the consent page;
+dynamic client registration and PKCE are automatic.
 
 ## What gets installed
 
 ```
-.claude/plugins/cache/neuralscape-plugins/neuralscape/2.3.0/
-├── .claude-plugin/plugin.json    manifest with userConfig prompts
-├── .mcp.json                      remote HTTP MCP at <URL>/mcp/
+.claude/plugins/cache/neuralscape-plugins/neuralscape/2.4.0/
+├── .claude-plugin/plugin.json    manifest with userConfig (hooks) prompts
+├── .mcp.json                      bundled OAuth MCP connector at the baked <URL>/mcp/
 ├── hooks/hooks.json               SessionStart, PostToolUse, UserPromptSubmit, Stop
 ├── skills/{recall,remember,save-session,project,search,ns-status,ns-config,sync,capture,compile-observations}/SKILL.md
 ├── scripts/                       built hook bundles
