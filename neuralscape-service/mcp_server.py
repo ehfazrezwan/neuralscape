@@ -258,8 +258,8 @@ async def list_tools() -> list[Tool]:
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
-                        "default": 100,
-                        "description": "Max memories to return this page (default 100, newest first). Use with offset to page through a large project.",
+                        "default": 25,
+                        "description": "Max memories to return this page (default 25, newest first). Use with offset to page through a large project, or raise it to pull more at once.",
                     },
                     "offset": {
                         "type": "integer",
@@ -535,12 +535,13 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps({"status": "accepted", "task_id": task_id}, default=str))]
 
         elif name == "get_project_context":
-            # Default to a bounded page so a large project doesn't overflow the
-            # tool-result limit; callers can raise limit / page with offset.
+            # Default to a small bounded page so a large project doesn't overflow
+            # the agent tool-result token limit (a 218-memory project at limit=100
+            # was ~112K chars); callers can raise limit / page with offset.
             context = _service.get_project_context(
                 user_id=user_id,
                 project_id=arguments["project_id"],
-                limit=arguments.get("limit", 100),
+                limit=arguments.get("limit", 25),
                 offset=arguments.get("offset", 0),
             )
             # Convert to serializable format
