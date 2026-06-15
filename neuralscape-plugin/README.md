@@ -50,8 +50,9 @@ bundles `.mcp.json` read-only), so there is **no manual URL entry**.
    into your Cowork workspace instructions so Claude recalls at task start and
    saves at task end via the MCP tools.
 
-Hooks won't fire in Cowork (the built `scripts/*.js` aren't shipped) — the
-skills + connector do that work. They're listed in the Hooks panel but inert.
+Hooks won't fire in Cowork — it doesn't run plugin hooks
+([#27398](https://github.com/anthropics/claude-code/issues/27398)), so the Hooks
+panel lists them but they're inert. The skills + connector do that work instead.
 
 ## Distribution & self-hosting (baked URL)
 

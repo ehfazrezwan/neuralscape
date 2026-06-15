@@ -41,6 +41,14 @@ function parseArgs(argv) {
   const opts = { dryRun: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
+    // Consume the next token as this flag's value, failing fast if it's missing
+    // or is itself another flag (e.g. `--owner --dry-run` or a trailing `--owner`).
+    const takeValue = () => {
+      const v = argv[i + 1];
+      if (v === undefined || v.startsWith("--")) fail(`${a} requires a value`);
+      i++;
+      return v;
+    };
     switch (a) {
       case "--help":
       case "-h":
@@ -50,16 +58,16 @@ function parseArgs(argv) {
         opts.dryRun = true;
         break;
       case "--url":
-        opts.url = argv[++i];
+        opts.url = takeValue();
         break;
       case "--marketplace-name":
-        opts.marketplaceName = argv[++i];
+        opts.marketplaceName = takeValue();
         break;
       case "--owner":
-        opts.owner = argv[++i];
+        opts.owner = takeValue();
         break;
       case "--owner-email":
-        opts.ownerEmail = argv[++i];
+        opts.ownerEmail = takeValue();
         break;
       default:
         fail(`Unknown argument: ${a}  (try --help)`);
@@ -73,9 +81,11 @@ function fail(msg) {
   process.exit(1);
 }
 
+// Render --help from this file's own JSDoc block: keep ` *` body lines, drop the
+// ` */` terminator, strip the leading ` * ` marker.
 const HELP = readFileSync(fileURLToPath(import.meta.url), "utf8")
   .split("\n")
-  .filter((l) => l.startsWith(" * ") || l.startsWith(" *"))
+  .filter((l) => l.startsWith(" *") && !l.startsWith(" */"))
   .map((l) => l.replace(/^ \* ?/, ""))
   .join("\n");
 
