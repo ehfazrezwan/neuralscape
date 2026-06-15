@@ -12,6 +12,10 @@ class GraphitiConfig(BaseModel):
     database: str = Field(default="neo4j", description="Neo4j database name")
     graphiti_llm_provider: str = Field(default="gemini", description="LLM provider for Graphiti extraction")
     graphiti_llm_model: Optional[str] = Field(default=None, description="LLM model name")
+    # NEURALSCAPE PATCH: lets us set graphiti's cheaper small-task model
+    # independently. Graphiti's OpenAIBaseClient otherwise defaults small_model
+    # to "gpt-4.1-nano", which an OpenAI-compatible Vertex-only gateway can't serve.
+    graphiti_llm_small_model: Optional[str] = Field(default=None, description="Smaller/cheaper LLM model for sub-tasks")
     graphiti_llm_api_key: Optional[str] = Field(default=None, description="LLM API key")
     graphiti_embedder_provider: str = Field(default="gemini", description="Embedder provider for Graphiti")
     graphiti_embedder_model: Optional[str] = Field(default=None, description="Embedder model name")

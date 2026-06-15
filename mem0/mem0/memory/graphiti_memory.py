@@ -27,6 +27,7 @@ def _create_llm_client(
     model: str | None,
     api_key: str | None,
     fallback_model: str | None = None,
+    small_model: str | None = None,
 ):
     """Create a Graphiti LLM client based on provider name."""
     if provider == "gemini":
@@ -37,7 +38,17 @@ def _create_llm_client(
     elif provider == "openai":
         from graphiti_core.llm_client.openai_client import OpenAIClient
 
-        config = LLMConfig(api_key=api_key, model=model, fallback_model=fallback_model)
+        # NEURALSCAPE PATCH: default small_model to the main model. Graphiti's
+        # OpenAIBaseClient uses small_model for cheaper sub-tasks and otherwise
+        # falls back to DEFAULT_SMALL_MODEL ("gpt-4.1-nano") — an OpenAI model an
+        # OpenAI-compatible gateway that only fronts Google/Anthropic-on-Vertex
+        # doesn't provision. base_url is left to OPENAI_BASE_URL.
+        config = LLMConfig(
+            api_key=api_key,
+            model=model,
+            fallback_model=fallback_model,
+            small_model=small_model or model,
+        )
         return OpenAIClient(config=config)
     elif provider == "anthropic":
         from graphiti_core.llm_client.anthropic_client import AnthropicClient
@@ -80,12 +91,17 @@ def _create_embedder(provider: str, model: str | None, api_key: str | None):
         raise ValueError(f"Unsupported Graphiti embedder provider: {provider}")
 
 
-def _create_cross_encoder(provider: str | None, api_key: str | None):
+def _create_cross_encoder(provider: str | None, api_key: str | None, model: str | None = None):
     """Create a Graphiti cross-encoder/reranker client."""
     if provider is None or provider == "openai":
         from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
 
-        return OpenAIRerankerClient(api_key=api_key)
+        # NEURALSCAPE PATCH: OpenAIRerankerClient takes a `config` (LLMConfig),
+        # not `api_key=` — passing api_key raises TypeError and fails graphiti
+        # init. Build a config (model + key; base_url via OPENAI_BASE_URL) so the
+        # reranker can route through an OpenAI-compatible gateway.
+        config = LLMConfig(api_key=api_key, model=model)
+        return OpenAIRerankerClient(config=config)
     elif provider == "gemini":
         from graphiti_core.cross_encoder.gemini_reranker_client import GeminiRerankerClient
 
@@ -148,6 +164,7 @@ class MemoryGraph:
             model=graph_config.graphiti_llm_model,
             api_key=graph_config.graphiti_llm_api_key,
             fallback_model=getattr(graph_config, "graphiti_llm_fallback_model", None),
+            small_model=getattr(graph_config, "graphiti_llm_small_model", None),
         )
 
         embedder = _create_embedder(
@@ -159,6 +176,7 @@ class MemoryGraph:
         cross_encoder = _create_cross_encoder(
             provider=graph_config.graphiti_reranker_provider,
             api_key=graph_config.graphiti_llm_api_key,
+            model=graph_config.graphiti_llm_model,
         )
 
         # Create Neo4j driver and Graphiti instance ON the bridge loop
