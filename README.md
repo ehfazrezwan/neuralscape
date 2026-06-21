@@ -163,6 +163,15 @@ The plugin and MCP server complement each other:
 
 Both can run simultaneously. The plugin captures breadcrumbs in the background; MCP tools let you or the agent interact with memory directly.
 
+## Authentication
+
+The service authenticates requests via `Authorization: Bearer` tokens and, for
+Claude Cowork / claude.ai, a built-in OAuth 2.1 connector. The human-login step
+is pluggable per deployment via `AUTH_PROVIDER` (`token` | `google` | `supabase`)
+— admin-issued HMAC tokens, "Sign in with Google" (OIDC + env allowlist), or
+Supabase (Google + a managed allowlist hook). Full runbook, setup steps, and
+troubleshooting: **[AUTH.md](./AUTH.md)**.
+
 ## MCP Server
 
 8 tools exposed via MCP for direct use by AI agents:
