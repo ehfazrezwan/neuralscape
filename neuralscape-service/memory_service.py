@@ -588,7 +588,14 @@ class MemoryService:
         expires_at: datetime | None = None,
         # Multi-user model (None → category default)
         visibility: str | None = None,
-    ) -> list[MemoryResponse]:
+        # Write-path isolation: when False, skip the slow inline graph.add so
+        # the fast vector write returns immediately — the caller is expected to
+        # enqueue enrich_graph() onto the graph worker. When return_created is
+        # True, returns (responses, created) so the caller only enqueues graph
+        # enrichment for genuinely new rows (not content-hash dedup hits).
+        add_to_graph: bool = True,
+        return_created: bool = False,
+    ) -> list[MemoryResponse] | tuple[list[MemoryResponse], bool]:
         """Store a single pre-categorized fact directly (no LLM extraction).
 
         Performs content-hash dedup before insert: if a memory with the same
@@ -652,7 +659,8 @@ class MemoryService:
             logger.info(
                 f"Dedup hit for user={user_id} hash={content_hash[:8]}... — returning existing id={existing.id}"
             )
-            return [existing]
+            # created=False → caller must NOT re-enqueue graph enrichment.
+            return ([existing], False) if return_created else [existing]
 
         # ── Direct embed + Qdrant insert (bypass m.add) ──
         mid = str(uuid.uuid4())
@@ -709,33 +717,20 @@ class MemoryService:
             logger.warning(f"History record failed for {mid}: {e}")
 
         # ── Add to knowledge graph ──
-        # Group_id encodes visibility + user namespace so the graph search
-        # can scope by allowed groups without re-leaking cross-user facts.
-        group_id = _build_group_id(effective_visibility, user_id, project_id)
-        graph_write_started_at = datetime.now(timezone.utc)
-        try:
-            if self._graphiti and self._bridge:
-                retry_transient(
-                    self._memory.graph.add,
-                    data=content,
-                    filters={"user_id": user_id, "group_id": group_id},
-                    operation="store_raw graph add",
-                )
-                # Best-effort: attach memory_id back-reference onto the entity
-                # nodes Graphiti just created in this group, so the wiki
-                # synthesizer can walk community → source memories. Failures
-                # here are logged but never fail the write.
-                self._attach_memory_id_to_graph_nodes(
-                    group_id=group_id,
-                    memory_id=mid,
-                    visibility=effective_visibility,
-                    owner_user_id=user_id,
-                    write_started_at=graph_write_started_at,
-                )
-        except Exception as e:
-            logger.warning(f"Graph storage failed (non-critical): {e}")
+        # Graphiti entity extraction is slow (~minutes, gated by Gemini). When
+        # add_to_graph is False the caller enqueues enrich_graph() onto the
+        # graph worker instead, so this fast path returns right after the
+        # vector insert.
+        if add_to_graph:
+            self.enrich_graph(
+                content=content,
+                user_id=user_id,
+                project_id=project_id,
+                visibility=effective_visibility,
+                memory_id=mid,
+            )
 
-        return [
+        responses = [
             MemoryResponse(
                 id=mid,
                 memory=content,
@@ -756,6 +751,51 @@ class MemoryService:
                 owner_user_id=user_id,
             )
         ]
+        # created=True → a new row was written, so the caller should enqueue
+        # graph enrichment (when it deferred it via add_to_graph=False).
+        return (responses, True) if return_created else responses
+
+    def enrich_graph(
+        self,
+        content: str,
+        user_id: str,
+        project_id: str | None,
+        visibility: str,
+        memory_id: str,
+    ) -> None:
+        """Add content to the knowledge graph + attach memory_id back-refs.
+
+        Extracted from store_raw so it can run either inline (add_to_graph=True)
+        or — preferably — as a separate background job on the graph worker,
+        since Graphiti entity extraction is slow (~minutes, Gemini-gated) and
+        must not block the fast vector write or the API/MCP event loop.
+        Best-effort: logs and swallows errors, never raises.
+        """
+        if not (self._graphiti and self._bridge):
+            return
+        # Group_id encodes visibility + user namespace so graph search can
+        # scope by allowed groups without re-leaking cross-user facts.
+        group_id = _build_group_id(visibility, user_id, project_id)
+        graph_write_started_at = datetime.now(timezone.utc)
+        try:
+            retry_transient(
+                self._memory.graph.add,
+                data=content,
+                filters={"user_id": user_id, "group_id": group_id},
+                operation="enrich_graph add",
+            )
+            # Best-effort: attach memory_id back-reference onto the entity nodes
+            # Graphiti just created in this group, so the wiki synthesizer can
+            # walk community → source memories.
+            self._attach_memory_id_to_graph_nodes(
+                group_id=group_id,
+                memory_id=memory_id,
+                visibility=visibility,
+                owner_user_id=user_id,
+                write_started_at=graph_write_started_at,
+            )
+        except Exception as e:
+            logger.warning(f"Graph enrichment failed (non-critical): {e}")
 
     def _search_shared_pool(
         self,
