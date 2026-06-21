@@ -108,10 +108,21 @@ class TestAllowlist:
             "not-an-email", email_verified=True,
             allowed_domains={"x.com"}, email_allowlist=set())
 
+    def test_empty_local_part_rejected(self):
+        # "@example.com" has an empty local-part and must not pass the domain gate.
+        assert not is_email_allowed(
+            "@example.com", email_verified=True,
+            allowed_domains={"example.com"}, email_allowlist=set())
+        assert not is_email_allowed(
+            "a@", email_verified=True,
+            allowed_domains={"example.com"}, email_allowlist={"a@"})
+
     def test_helpers(self):
         assert normalize_email("  A@B.com ") == "a@b.com"
         assert email_domain("a@b.com") == "b.com"
         assert email_domain("garbage") == ""
+        assert email_domain("@b.com") == ""   # empty local-part
+        assert email_domain("a@") == ""        # empty domain
 
 
 # ── identity ──────────────────────────────────────────────────────────────
@@ -303,6 +314,7 @@ class TestSupabaseProvider:
         req = _Req(form={"access_token": token, "state": sign_login_state(_make_ctx(), _SECRET)})
         res = await SupabaseProvider().complete(req)
         assert isinstance(res, LoginError)
+        assert res.status == 401  # JWT verification failure
 
     @pytest.mark.asyncio
     async def test_invalid_state_rejected(self, auth_settings):
@@ -383,12 +395,14 @@ class TestGoogleProvider:
         state = sign_login_state(_make_ctx(), _SECRET)
         res = await GoogleProvider().complete(_Req(query={"code": "abc", "state": state}))
         assert isinstance(res, LoginError)
+        assert res.status == 403  # unverified email → not authorized
 
     @pytest.mark.asyncio
     async def test_provider_error_param(self, auth_settings):
         auth_settings.auth_provider = "google"
         res = await GoogleProvider().complete(_Req(query={"error": "access_denied"}))
         assert isinstance(res, LoginError)
+        assert res.status == 400
 
     @pytest.mark.asyncio
     async def test_bad_state_rejected(self, auth_settings):

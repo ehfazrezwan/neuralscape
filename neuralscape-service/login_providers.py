@@ -392,8 +392,11 @@ const {{ error }} = await supabase.auth.signInWithOAuth({{
   provider: 'google',
   options: {{ redirectTo: {_js_str_raw(cb)} }}
 }});
-if (error) {{ document.querySelector('.card').innerHTML =
-  '<h1>Sign-in error</h1><p class=\\'err\\'>' + error.message + '</p>'; }}
+if (error) {{
+  const card = document.querySelector('.card');
+  card.innerHTML = '<h1>Sign-in error</h1><p class="err"></p>';
+  card.querySelector('.err').textContent = error.message;  // textContent: no HTML injection
+}}
 </script>"""
         + _SUPABASE_FOOT
     )
@@ -409,8 +412,11 @@ def _supabase_finish_page() -> str:
 import {{ createClient }} from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
 const supabase = createClient({_js_str(settings.supabase_url)}, {_js_str(settings.supabase_anon_key)});
 const state = new URLSearchParams(location.search).get('state') || '';
-function fail(msg) {{ document.querySelector('.card').innerHTML =
-  '<h1>Sign-in error</h1><p class=\\'err\\'>' + msg + '</p>'; }}
+function fail(msg) {{
+  const card = document.querySelector('.card');
+  card.innerHTML = '<h1>Sign-in error</h1><p class="err"></p>';
+  card.querySelector('.err').textContent = msg;  // textContent: no HTML injection
+}}
 try {{
   // detectSessionInUrl (default) exchanges the ?code= on load.
   let {{ data: {{ session }} }} = await supabase.auth.getSession();
@@ -432,13 +438,23 @@ try {{
 
 
 def _js_str(value: str) -> str:
-    """Embed a Python string as a single-quoted JS string literal (escaped)."""
-    return "'" + (value or "").replace("\\", "\\\\").replace("'", "\\'") + "'"
+    """Embed a Python string as a single-quoted JS string literal (escaped).
+
+    Callers only pass server-controlled config today, but escape defensively:
+    backslash + quote (literal integrity), newlines (would break the literal),
+    and ``</`` (so an embedded ``</script>`` can't break out of the tag).
+    """
+    escaped = (value or "").replace("\\", "\\\\").replace("'", "\\'")
+    escaped = escaped.replace("\n", "\\n").replace("\r", "\\r")
+    escaped = escaped.replace("</", "<\\/")
+    return "'" + escaped + "'"
 
 
 def _js_str_raw(value: str) -> str:
     """Like _js_str but for an already-HTML-escaped value used in JS context."""
-    return "'" + (value or "").replace("'", "\\'") + "'"
+    escaped = (value or "").replace("'", "\\'")
+    escaped = escaped.replace("\n", "\\n").replace("\r", "\\r")
+    return "'" + escaped + "'"
 
 
 # ── factory ──────────────────────────────────────────────────────────────

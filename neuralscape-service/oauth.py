@@ -343,7 +343,9 @@ def _render_consent(
 
 @router.get("/oauth/authorize", response_model=None)
 async def authorize(request: Request) -> HTMLResponse | JSONResponse:
-    """Render the consent (token-paste) page after validating the request."""
+    """Validate the authorize request, then hand the human-login step to the
+    configured provider (token-paste page, Google redirect, or Supabase
+    sign-in page per AUTH_PROVIDER)."""
     if not oauth_enabled():
         return _not_configured()
     q = request.query_params

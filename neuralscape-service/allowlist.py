@@ -22,11 +22,17 @@ def normalize_email(email: str | None) -> str:
 
 
 def email_domain(email: str) -> str:
-    """The domain part of a normalized email, or '' if malformed."""
+    """The domain part of a normalized email, or '' if malformed.
+
+    Requires a non-empty local-part AND domain, so addresses like
+    ``@example.com`` (empty local-part) or ``a@`` are rejected — important
+    because this feeds the allowlist's domain gate.
+    """
     norm = normalize_email(email)
-    _, _, domain = norm.rpartition("@")
-    # rpartition returns ('', '', whole) when there's no '@' — guard that.
-    return domain if "@" in norm else ""
+    local, sep, domain = norm.rpartition("@")
+    if not sep or not local or not domain:
+        return ""
+    return domain
 
 
 def is_email_allowed(
@@ -47,11 +53,15 @@ def is_email_allowed(
     if not email_verified:
         return False
     norm = normalize_email(email)
-    if not norm or "@" not in norm:
+    # Require a well-formed address: non-empty local-part AND domain. This
+    # rejects malformed inputs like "@example.com" that would otherwise slip
+    # through the domain gate (email_domain returns '' for those).
+    domain = email_domain(norm)
+    if not domain:
         return False
     if not allowed_domains and not email_allowlist:
         # Fail closed: an unconfigured allowlist must not admit the world.
         return False
     if norm in email_allowlist:
         return True
-    return email_domain(norm) in allowed_domains
+    return domain in allowed_domains

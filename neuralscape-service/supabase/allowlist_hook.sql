@@ -57,11 +57,18 @@ declare
 begin
   email := lower(event->'user'->>'email');
 
-  -- No email on the account → reject (we scope memory by email-derived id).
-  if email is null or email = '' or position('@' in email) = 0 then
+  -- Require a well-formed address: a non-empty local-part AND domain. The
+  -- `@` must not be the first char (empty local-part like "@example.com") nor
+  -- absent, and the domain part must be non-empty. (OAuth signups arrive with
+  -- an email already verified by the upstream IdP, e.g. Google; the service
+  -- additionally checks `email_verified` on the session JWT.)
+  if email is null or email = ''
+     or position('@' in email) <= 1
+     or split_part(email, '@', 2) = ''
+  then
     return jsonb_build_object(
       'error', jsonb_build_object(
-        'message', 'An email address is required to sign in.',
+        'message', 'A valid email address is required to sign in.',
         'http_code', 403
       )
     );
