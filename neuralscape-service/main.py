@@ -807,6 +807,19 @@ def _require_vault():
     return _vault
 
 
+async def _require_owned_connector(vault, connector_id: str, caller: str) -> dict:
+    """Return the connector record only if ``caller`` owns it, else 404.
+
+    Connectors are per-owner (``owner_user_id`` set at registration). A non-owner
+    gets 404 — not 403 — so the endpoint can't be used as an oracle to probe
+    which connector_ids exist in another user's namespace.
+    """
+    rec = await vault.get_redacted(connector_id)
+    if rec is None or rec.get("owner_user_id") != caller:
+        raise HTTPException(status_code=404, detail=f"Connector '{connector_id}' not found")
+    return rec
+
+
 @v1_router.post("/connectors", status_code=201)
 async def v1_register_connector(req: ConnectorConfigRequest, request: Request):
     """Register (or replace) a data-layer connector instance. Secrets are encrypted at rest."""
@@ -820,36 +833,37 @@ async def v1_register_connector(req: ConnectorConfigRequest, request: Request):
 
 @v1_router.get("/connectors")
 async def v1_list_connectors(request: Request):
-    """List configured connectors (credentials redacted)."""
+    """List the caller's configured connectors (credentials redacted)."""
     vault = _require_vault()
-    return {"connectors": await vault.list()}
+    caller = _resolve_user_id(request, None)
+    connectors = [c for c in await vault.list() if c.get("owner_user_id") == caller]
+    return {"connectors": connectors}
 
 
 @v1_router.get("/connectors/{connector_id}")
-async def v1_get_connector(connector_id: str):
-    """Get one connector config (credentials redacted)."""
+async def v1_get_connector(connector_id: str, request: Request):
+    """Get one of the caller's connector configs (credentials redacted)."""
     vault = _require_vault()
-    rec = await vault.get_redacted(connector_id)
-    if rec is None:
-        raise HTTPException(status_code=404, detail=f"Connector '{connector_id}' not found")
-    return rec
+    caller = _resolve_user_id(request, None)
+    return await _require_owned_connector(vault, connector_id, caller)
 
 
 @v1_router.delete("/connectors/{connector_id}")
-async def v1_delete_connector(connector_id: str):
-    """Delete a connector config (does not remove already-ingested memories)."""
+async def v1_delete_connector(connector_id: str, request: Request):
+    """Delete one of the caller's connectors (does not remove ingested memories)."""
     vault = _require_vault()
+    caller = _resolve_user_id(request, None)
+    await _require_owned_connector(vault, connector_id, caller)
     removed = await vault.delete(connector_id)
     return {"status": "ok", "deleted": removed}
 
 
 @v1_router.post("/connectors/{connector_id}/sync", status_code=202)
-async def v1_sync_connector(connector_id: str):
-    """Trigger an immediate sync for a connector (enqueues a background job)."""
+async def v1_sync_connector(connector_id: str, request: Request):
+    """Trigger an immediate sync for one of the caller's connectors."""
     vault = _require_vault()
-    rec = await vault.get_redacted(connector_id)
-    if rec is None:
-        raise HTTPException(status_code=404, detail=f"Connector '{connector_id}' not found")
+    caller = _resolve_user_id(request, None)
+    await _require_owned_connector(vault, connector_id, caller)
     task_id = await _task_manager.enqueue_connector_sync(connector_id)
     return TaskAcceptedResponse(task_id=task_id, poll_url=f"/v1/memories/status/{task_id}")
 
@@ -966,6 +980,7 @@ async def v1_search_memories(req: SearchMemoryRequest, request: Request):
             domain=req.domain,
             observation_type=req.observation_type,
             concepts=req.concepts,
+            memory_kind=req.memory_kind,
             visibility=req.visibility.value if req.visibility else None,
             include_shared=req.include_shared,
         )

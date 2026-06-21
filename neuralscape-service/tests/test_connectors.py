@@ -9,6 +9,65 @@ from connectors.base import ConnectorAdapter, ConnectorResource
 from connectors.registry import build_adapter, get_adapter_class
 
 
+class TestConnectorOwnership:
+    """get/delete/sync must 404 for non-owners (C5-C8), not leak/act cross-user."""
+
+    def _owned_vault(self):
+        import fnmatch
+        from cryptography.fernet import Fernet
+        from connectors.vault import ConnectorVault
+
+        class FakeStore:
+            def __init__(self):
+                self.d = {}
+
+            async def set(self, k, v):
+                self.d[k] = v
+
+            async def get(self, k):
+                return self.d.get(k)
+
+            async def delete(self, k):
+                return 1 if self.d.pop(k, None) is not None else 0
+
+            async def keys(self, pattern):
+                return [k for k in self.d if fnmatch.fnmatch(k, pattern)]
+
+        return ConnectorVault(FakeStore(), Fernet(Fernet.generate_key()))
+
+    @pytest.mark.asyncio
+    async def test_owner_gets_record_non_owner_404s(self):
+        import main
+
+        vault = self._owned_vault()
+        await vault.put({
+            "connector_id": "notion-personal",
+            "connector_type": "notion",
+            "credentials": {"token": "x"},
+            "owner_user_id": "alice",
+        })
+        # Owner resolves the record.
+        rec = await main._require_owned_connector(vault, "notion-personal", "alice")
+        assert rec["connector_id"] == "notion-personal"
+        assert "credentials" not in rec  # redacted
+
+        # Non-owner gets 404 (not 403 → no existence oracle).
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException) as ei:
+            await main._require_owned_connector(vault, "notion-personal", "bob")
+        assert ei.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_missing_connector_404s(self):
+        import main
+        from fastapi import HTTPException
+
+        vault = self._owned_vault()
+        with pytest.raises(HTTPException) as ei:
+            await main._require_owned_connector(vault, "nope", "alice")
+        assert ei.value.status_code == 404
+
+
 class TestRegistry:
     def test_resolves_known_types(self):
         from connectors.adapters.notion import NotionAdapter

@@ -1004,6 +1004,8 @@ class MemoryService:
                     confidence=item.get("confidence"),
                     expires_at=expires_at,
                     visibility=item.get("visibility"),
+                    memory_kind=item.get("memory_kind"),
+                    source_ref=item.get("source_ref"),
                 )
                 results.extend(stored)
             except Exception as e:
@@ -1220,6 +1222,7 @@ class MemoryService:
         domain: str | None = None,
         observation_type: str | None = None,
         concepts: list[str] | None = None,
+        memory_kind: str | None = None,
         # Multi-user pool selection
         visibility: str | None = None,
         include_shared: bool = True,
@@ -1432,6 +1435,15 @@ class MemoryService:
 
         # Deduplicate and enforce caller's limit
         combined = self._deduplicate_responses(vector_responses, graph_responses)
+
+        # memory_kind filter (data-layer connectors). Legacy memories have no
+        # memory_kind, so a "fact" filter treats null as fact (back-compat);
+        # "passage" matches only explicitly-tagged passages.
+        if memory_kind == "fact":
+            combined = [r for r in combined if (r.memory_kind or "fact") == "fact"]
+        elif memory_kind == "passage":
+            combined = [r for r in combined if r.memory_kind == "passage"]
+
         return combined[:limit]
 
     # Minimum vector similarity for graph→source enrichment to be trusted.

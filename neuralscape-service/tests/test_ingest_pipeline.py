@@ -1,7 +1,27 @@
 """Tests for ingest.pipeline.ingest_document — passages + facts with provenance."""
 
 from schemas import MemoryResponse
-from ingest.pipeline import IngestDoc, ingest_document
+from ingest.pipeline import IngestDoc, _fact_scope, ingest_document
+
+
+class TestFactScope:
+    """_fact_scope must never attach a project_id to a global-scope fact (C3)."""
+
+    def test_global_category_with_project_id_drops_project(self):
+        # preference is a GLOBAL category — stays global, project_id dropped.
+        assert _fact_scope("preference", "proj1") == ("global", None)
+
+    def test_project_category_with_project_id(self):
+        assert _fact_scope("tech_stack", "proj1") == ("project", "proj1")
+
+    def test_project_category_without_project_id_falls_back_global(self):
+        assert _fact_scope("tech_stack", None) == ("global", None)
+
+    def test_flexible_category_with_project_id_is_project(self):
+        assert _fact_scope("decision", "proj1") == ("project", "proj1")
+
+    def test_flexible_category_without_project_id_is_global(self):
+        assert _fact_scope("decision", None) == ("global", None)
 
 
 class FakeService:

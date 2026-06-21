@@ -92,6 +92,9 @@ class TaskManager:
         expires_at: str | None = None,
         # Multi-user model
         visibility: str | None = None,
+        # Data-layer connectors
+        memory_kind: str | None = None,
+        source_ref: dict | None = None,
     ) -> str:
         """Enqueue raw memory storage task. Returns task_id (job_id).
 
@@ -111,6 +114,8 @@ class TaskManager:
             "confidence": confidence,
             "expires_at": expires_at,
             "visibility": visibility,
+            "memory_kind": memory_kind,
+            "source_ref": source_ref,
         }
         # Drop None values so the worker signature can default cleanly
         v2_extras = {k: v for k, v in v2_extras.items() if v is not None}
@@ -156,9 +161,12 @@ class TaskManager:
         """Enqueue a connector sync task. Returns job_id.
 
         Job id is keyed on the connector instance so overlapping syncs of the
-        same connector coalesce rather than stacking.
+        same connector coalesce rather than stacking. Must match the id scheme
+        used by ``connector_sync_cron`` in worker.py (``sync-<connector_id>``)
+        so a cron-triggered and an API-triggered sync of the same connector
+        coalesce instead of racing on the cursor/revision state.
         """
-        job_id = _generate_job_id(f"sync:{connector_id}", "connector")
+        job_id = f"sync-{connector_id}"
         job = await self.pool.enqueue_job(
             "process_connector_sync",
             connector_id,

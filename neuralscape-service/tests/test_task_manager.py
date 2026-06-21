@@ -87,6 +87,30 @@ class TestEnqueueRawV2:
         assert v2_extras["expires_at"] == "2026-12-01T00:00:00+00:00"
 
     @pytest.mark.asyncio
+    async def test_memory_kind_and_source_ref_forwarded(self, tm):
+        """Connector provenance fields reach the worker via v2_extras (C1)."""
+        tm.pool.enqueue_job.return_value = None  # simulate dup → returns job_id
+        src = {"connector_id": "notion-x", "connector_type": "notion"}
+        await tm.enqueue_raw(
+            content="x",
+            user_id="ehfaz",
+            category="domain_knowledge",
+            memory_kind="passage",
+            source_ref=src,
+        )
+        v2_extras = tm.pool.enqueue_job.call_args[0][9]
+        assert v2_extras["memory_kind"] == "passage"
+        assert v2_extras["source_ref"] == src
+
+    @pytest.mark.asyncio
+    async def test_connector_sync_job_id_matches_cron_scheme(self, tm):
+        """enqueue_connector_sync uses the same sync-<id> job id as the cron (C2)."""
+        tm.pool.enqueue_job.return_value = None
+        job_id = await tm.enqueue_connector_sync("notion-personal")
+        assert job_id == "sync-notion-personal"
+        assert tm.pool.enqueue_job.call_args.kwargs["_job_id"] == "sync-notion-personal"
+
+    @pytest.mark.asyncio
     async def test_no_v2_fields_packs_empty_extras(self, tm):
         """Without v2 fields, extras dict is empty (None values dropped)."""
         mock_job = MagicMock()

@@ -65,7 +65,8 @@ def _fact_scope(category: str, project_id: str | None) -> tuple[str, str | None]
     if category in PROJECT_CATEGORIES and not project_id:
         scope = MemoryScope.GLOBAL
     scope_val = scope.value if isinstance(scope, MemoryScope) else scope
-    return scope_val, (project_id if scope_val == "project" else project_id)
+    # A global-scope fact is cross-project, so it must not carry a project_id.
+    return scope_val, (project_id if scope_val == "project" else None)
 
 
 def ingest_document(service, doc: IngestDoc) -> dict:
