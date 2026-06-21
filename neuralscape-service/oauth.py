@@ -49,6 +49,14 @@ from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from config import settings
+from login_providers import (
+    AuthorizeContext,
+    GoogleProvider,
+    LoginError,
+    SupabaseProvider,
+    _supabase_finish_page,
+    get_login_provider,
+)
 from tokens import issue_user_token, sign_payload, verify_payload, verify_user_token
 
 logger = logging.getLogger(__name__)
@@ -368,7 +376,10 @@ async def authorize(request: Request) -> HTMLResponse | JSONResponse:
             content={"error": "invalid_request", "error_description": "PKCE S256 required"},
         )
 
-    return _render_consent(
+    # Delegate the human-login step to the configured provider. Everything
+    # validated above (client, redirect_uri, PKCE) is preserved across any
+    # external IdP redirect inside the provider's signed login-state token.
+    ctx = AuthorizeContext(
         client_id=client_id,
         redirect_uri=redirect_uri,
         state=state,
@@ -376,6 +387,18 @@ async def authorize(request: Request) -> HTMLResponse | JSONResponse:
         code_challenge_method=code_challenge_method,
         resource=resource,
     )
+
+    def render_consent() -> HTMLResponse:
+        return _render_consent(
+            client_id=client_id,
+            redirect_uri=redirect_uri,
+            state=state,
+            code_challenge=code_challenge,
+            code_challenge_method=code_challenge_method,
+            resource=resource,
+        )
+
+    return await get_login_provider().begin(ctx, render_consent)
 
 
 @router.post("/oauth/authorize", response_model=None)
@@ -392,6 +415,15 @@ async def authorize_submit(
     """Validate the pasted login token and issue an authorization code."""
     if not oauth_enabled():
         return _not_configured()
+    # The token-paste form is only the login mechanism when AUTH_PROVIDER=token.
+    # Under google/supabase the consent page never renders it; reject as a
+    # defense against a hand-crafted POST bypassing the configured provider.
+    if settings.auth_provider != "token":
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_request",
+                     "error_description": "token login is disabled; use the configured provider"},
+        )
 
     client = _decode_client(client_id)
     if client is None:
@@ -416,30 +448,104 @@ async def authorize_submit(
             status_code=400,
         )
 
-    user_id = payload["user_id"]
+    ctx = AuthorizeContext(
+        client_id=client_id,
+        redirect_uri=redirect_uri,
+        state=state,
+        code_challenge=code_challenge,
+        code_challenge_method=code_challenge_method,
+        resource=resource,
+    )
+    return _issue_code_and_redirect(ctx, payload["user_id"])
+
+
+def _issue_code_and_redirect(ctx: AuthorizeContext, user_id: str) -> RedirectResponse:
+    """Mint a PKCE-bound authorization code for ``user_id`` and 303 back to the
+    MCP client's redirect_uri. Shared by every login provider — the only thing
+    that varies upstream is how ``user_id`` was authenticated."""
     code = sign_payload(
         {
             "typ": "code",
             "user_id": user_id,
-            "client_id": client_id,
-            "redirect_uri": redirect_uri,
-            "code_challenge": code_challenge,
+            "client_id": ctx.client_id,
+            "redirect_uri": ctx.redirect_uri,
+            "code_challenge": ctx.code_challenge,
             "jti": secrets.token_urlsafe(12),
             "exp": int(time.time()) + _CODE_TTL,
         },
         _secret(),
     )
-
     # Build the query with proper percent-encoding: an opaque `state` may carry
     # reserved characters (&, =, #, spaces) that would otherwise corrupt the
     # client's CSRF/state check when concatenated raw.
     params = {"code": code}
-    if state:
-        params["state"] = state
-    sep = "&" if "?" in redirect_uri else "?"
-    location = f"{redirect_uri}{sep}{urlencode(params)}"
+    if ctx.state:
+        params["state"] = ctx.state
+    sep = "&" if "?" in ctx.redirect_uri else "?"
+    location = f"{ctx.redirect_uri}{sep}{urlencode(params)}"
     # 303 so the browser issues a GET to the client's redirect URI.
     return RedirectResponse(url=location, status_code=303)
+
+
+def _login_error_page(err: LoginError) -> HTMLResponse:
+    """Render a login failure (allowlist denial, verification failure) as a
+    simple page rather than a raw JSON blob the user lands on mid-browser-flow."""
+    safe = html.escape(err.message)
+    page = (
+        "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<title>Sign-in failed</title><style>"
+        ":root{color-scheme:light dark;}"
+        "body{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;"
+        "margin:0;min-height:100vh;display:grid;place-items:center;background:#0b0d12;color:#e7e9ee;}"
+        ".card{width:min(440px,92vw);background:#151821;border:1px solid #262b38;border-radius:16px;"
+        "padding:28px;box-shadow:0 12px 40px rgba(0,0,0,.45);}"
+        "h1{font-size:19px;margin:0 0 8px;}p{font-size:14px;color:#aab1c2;}"
+        "</style></head><body><div class='card'><h1>Sign-in failed</h1>"
+        f"<p>{safe}</p></div></body></html>"
+    )
+    return HTMLResponse(content=page, status_code=err.status)
+
+
+# ── federated login callbacks (google / supabase) ────────────────────────
+
+
+@router.get("/oauth/google/callback", response_model=None)
+async def google_callback(request: Request) -> RedirectResponse | HTMLResponse | JSONResponse:
+    """Google OIDC redirect target: verify the id_token, allowlist-check the
+    email, then continue the MCP authorization-code flow."""
+    if not oauth_enabled():
+        return _not_configured()
+    if settings.auth_provider != "google":
+        return JSONResponse(status_code=404, content={"detail": "google login not enabled"})
+    result = await GoogleProvider().complete(request)
+    if isinstance(result, LoginError):
+        return _login_error_page(result)
+    return _issue_code_and_redirect(result.ctx, result.user_id)
+
+
+@router.get("/oauth/supabase/callback", response_model=None)
+async def supabase_callback_get(request: Request) -> HTMLResponse | JSONResponse:
+    """Supabase redirect target (browser): render the page that exchanges the
+    PKCE code for a session and POSTs the access token back to the server."""
+    if not oauth_enabled():
+        return _not_configured()
+    if settings.auth_provider != "supabase":
+        return JSONResponse(status_code=404, content={"detail": "supabase login not enabled"})
+    return HTMLResponse(_supabase_finish_page())
+
+
+@router.post("/oauth/supabase/callback", response_model=None)
+async def supabase_callback_post(request: Request) -> RedirectResponse | HTMLResponse | JSONResponse:
+    """Verify the posted Supabase session JWT, then continue the MCP flow."""
+    if not oauth_enabled():
+        return _not_configured()
+    if settings.auth_provider != "supabase":
+        return JSONResponse(status_code=404, content={"detail": "supabase login not enabled"})
+    result = await SupabaseProvider().complete(request)
+    if isinstance(result, LoginError):
+        return _login_error_page(result)
+    return _issue_code_and_redirect(result.ctx, result.user_id)
 
 
 # ── token endpoint ───────────────────────────────────────────────────────

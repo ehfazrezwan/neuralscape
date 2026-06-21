@@ -105,6 +105,49 @@ class Settings(BaseSettings):
     # OAuth refresh-token TTL (seconds). Default 30 days.
     oauth_refresh_ttl: int = 30 * 24 * 3600
 
+    # ── Federated login providers (the consent-screen identity step) ──────
+    # Selects HOW a human proves identity at the OAuth consent step. The MCP
+    # OAuth machinery (DCR, auth codes, access/refresh tokens, BearerAuth) is
+    # identical for every provider — only the /oauth/authorize login UX
+    # changes. Pre-issued admin HMAC tokens keep working as Bearer credentials
+    # regardless of this setting (so CLI/CI/e2e are unaffected).
+    #   "token"    → paste an admin-issued HMAC token (default; legacy behavior)
+    #   "google"   → Sign in with Google (OIDC), gated by the env allowlist
+    #   "supabase" → Sign in via Supabase (Google), gated by Supabase's
+    #                Before-User-Created hook (+ optional env allowlist)
+    # This is a per-deployment switch: a managed deployment may set "supabase",
+    # public installs set "google", local/dev leaves "token".
+    auth_provider: str = "token"
+
+    # Google OIDC (auth_provider="google"). Neuralscape is a *confidential*
+    # client TO Google here (server-side code exchange) while still being a
+    # *public* OAuth AS to the MCP client. Register this redirect URI in Google
+    # Cloud → Credentials:  {NEURALSCAPE_PUBLIC_URL}/oauth/google/callback
+    google_oauth_client_id: str = ""
+    google_oauth_client_secret: str = ""
+
+    # Email allowlist — the gate for "google"; an optional extra gate for
+    # "supabase". A login is accepted when the verified email's domain is in
+    # auth_allowed_domains OR the exact email is in auth_email_allowlist.
+    # Both are comma-separated and case-insensitive. A leading "@" on a domain
+    # is tolerated ("@example.com" == "example.com").
+    auth_allowed_domains: str = ""   # e.g. "example.com"
+    auth_email_allowlist: str = ""   # e.g. "alice@gmail.com,bob@x.com"
+
+    # Supabase (auth_provider="supabase"). The browser sign-in page uses the
+    # anon key; the returned session JWT is verified server-side. Provide
+    # EITHER the legacy HS256 jwt secret, OR leave it empty to verify against
+    # the project's asymmetric JWKS (auto-derived from supabase_url).
+    supabase_url: str = ""           # e.g. "https://abcd.supabase.co" (no trailing slash)
+    supabase_anon_key: str = ""      # publishable anon/publishable key (browser sign-in)
+    supabase_jwt_secret: str = ""    # legacy HS256 secret; empty → use project JWKS
+
+    # Identity mapping: verified email → existing Neuralscape user_id. Unmapped
+    # emails are slugified deterministically (user_id can't contain "@"). Use
+    # this to preserve memories already keyed by an existing id.
+    # Format: "alice@example.com:alice,ops@example.com:ops-bot"
+    auth_identity_map: str = ""
+
     # Service
     host: str = "0.0.0.0"
     port: int = 8199
@@ -138,6 +181,52 @@ class Settings(BaseSettings):
             raise ValueError("OAuth token TTLs must be > 0 seconds")
         return value
 
+    @field_validator("auth_provider")
+    @classmethod
+    def _validate_auth_provider(cls, value: str) -> str:
+        v = (value or "token").strip().lower()
+        if v not in ("token", "google", "supabase"):
+            raise ValueError(
+                "AUTH_PROVIDER must be one of: token, google, supabase"
+            )
+        return v
+
+    @field_validator("supabase_url")
+    @classmethod
+    def _normalize_supabase_url(cls, value: str) -> str:
+        return (value or "").rstrip("/")
+
+    # ── parsed views of the comma-separated auth settings ────────────────
+    def allowed_domains_set(self) -> set[str]:
+        """Lowercased allowed email domains, leading '@' stripped."""
+        return {
+            d.strip().lstrip("@").lower()
+            for d in self.auth_allowed_domains.split(",")
+            if d.strip()
+        }
+
+    def email_allowlist_set(self) -> set[str]:
+        """Lowercased exact-match allowed emails."""
+        return {
+            e.strip().lower()
+            for e in self.auth_email_allowlist.split(",")
+            if e.strip()
+        }
+
+    def identity_map_dict(self) -> dict[str, str]:
+        """Parse "email:user_id,email2:user_id2" into a lowercased-email map."""
+        out: dict[str, str] = {}
+        for pair in self.auth_identity_map.split(","):
+            pair = pair.strip()
+            if not pair or ":" not in pair:
+                continue
+            email, _, user_id = pair.partition(":")
+            email = email.strip().lower()
+            user_id = user_id.strip()
+            if email and user_id:
+                out[email] = user_id
+        return out
+
     def validate_required(self) -> None:
         """Validate that all required configuration fields are set.
 
@@ -161,6 +250,33 @@ class Settings(BaseSettings):
                 errors.append("LLM_GATEWAY_BASE_URL is required when LLM_GATEWAY_ENABLED is true")
             if not self.llm_gateway_api_key:
                 errors.append("LLM_GATEWAY_API_KEY is required when LLM_GATEWAY_ENABLED is true")
+        # Federated login: a non-token provider needs the OAuth AS turned on
+        # (public URL + signing secret) plus that provider's own credentials.
+        if self.auth_provider in ("google", "supabase"):
+            if not self.neuralscape_public_url:
+                errors.append(
+                    f"NEURALSCAPE_PUBLIC_URL is required when AUTH_PROVIDER={self.auth_provider}"
+                )
+            if not self.neuralscape_user_token_secret:
+                errors.append(
+                    f"NEURALSCAPE_USER_TOKEN_SECRET is required when AUTH_PROVIDER={self.auth_provider}"
+                )
+        if self.auth_provider == "google":
+            if not self.google_oauth_client_id or not self.google_oauth_client_secret:
+                errors.append(
+                    "GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET are required "
+                    "when AUTH_PROVIDER=google"
+                )
+            if not self.allowed_domains_set() and not self.email_allowlist_set():
+                errors.append(
+                    "AUTH_ALLOWED_DOMAINS or AUTH_EMAIL_ALLOWLIST must be set when "
+                    "AUTH_PROVIDER=google (an empty allowlist denies everyone)"
+                )
+        if self.auth_provider == "supabase":
+            if not self.supabase_url or not self.supabase_anon_key:
+                errors.append(
+                    "SUPABASE_URL and SUPABASE_ANON_KEY are required when AUTH_PROVIDER=supabase"
+                )
         if errors:
             raise ValueError(
                 "Missing required configuration:\n  - " + "\n  - ".join(errors)
