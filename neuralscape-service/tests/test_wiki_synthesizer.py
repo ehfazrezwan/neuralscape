@@ -778,7 +778,15 @@ class TestSynthesizeAll:
         assert page_path.exists()
         assert "synthesis_count: 1" in page_path.read_text()
 
-        # Second run — same bucket, page now exists at the new path
+        # Second run — bucket now has an ADDED memory, so the source set
+        # changed and the page is re-synthesized (incremental skip only fires
+        # when the source-id set is identical; see the skip test below).
+        service2 = _service_with_qdrant_points({
+            ("shared", "convention"): [
+                _qdrant_point("m1", "use PRs targeting dev", "convention"),
+                _qdrant_point("m2", "squash-merge feature branches", "convention"),
+            ],
+        })
         with patch(
             "extensions.wiki_synthesizer.synthesizer._list_shared_group_ids",
             new=AsyncMock(return_value=["shared"]),
@@ -791,11 +799,11 @@ class TestSynthesizeAll:
             new=AsyncMock(return_value=1),
         ):
             second = await synthesize_all(
-                service=service,
+                service=service2,
                 settings=settings,
                 only_category="convention",
             )
-        # Existing file at new path → updated, not created.
+        # Existing file, changed source set → updated, not created.
         assert second.pages_created == 0
         assert second.pages_updated == 1
         assert "synthesis_count: 2" in page_path.read_text()
@@ -839,3 +847,84 @@ class TestSynthesizeAll:
         # Bucket skipped before any expensive work
         gemini_mock.assert_not_awaited()
         patch_mock.assert_not_awaited()
+
+
+class TestIncrementalSynthesis:
+    """Re-synthesis is skipped when a page's source memory-id set is unchanged."""
+
+    def test_parse_id_list(self):
+        from extensions.wiki_synthesizer.synthesizer import _parse_id_list
+        assert _parse_id_list("[a, b, c]") == {"a", "b", "c"}
+        assert _parse_id_list("[only]") == {"only"}
+        assert _parse_id_list("[]") == set()
+        assert _parse_id_list("") == set()
+
+    @pytest.mark.asyncio
+    async def test_unchanged_bucket_is_skipped_on_second_run(self, tmp_path):
+        settings = SynthesizerSettings(enabled=True, obsidian_vault_path=str(tmp_path))
+        points = {("shared", "convention"): [_qdrant_point("m1", "use PRs", "convention")]}
+        service = _service_with_qdrant_points(points)
+        with patch(
+            "extensions.wiki_synthesizer.synthesizer._list_shared_group_ids",
+            new=AsyncMock(return_value=["shared"]),
+        ), patch(
+            "extensions.wiki_synthesizer.synthesizer._call_gemini",
+            new=AsyncMock(return_value="body one"),
+        ), patch(
+            "extensions.wiki_synthesizer.synthesizer.patch_wiki_path_by_memory_ids",
+            new=AsyncMock(return_value=1),
+        ):
+            first = await synthesize_all(service=service, settings=settings, only_category="convention")
+        assert first.pages_created == 1
+
+        # Second run, identical source set → skipped, no LLM merge.
+        service2 = _service_with_qdrant_points(points)
+        gemini2 = AsyncMock(return_value="body two")
+        with patch(
+            "extensions.wiki_synthesizer.synthesizer._list_shared_group_ids",
+            new=AsyncMock(return_value=["shared"]),
+        ), patch(
+            "extensions.wiki_synthesizer.synthesizer._call_gemini", new=gemini2,
+        ), patch(
+            "extensions.wiki_synthesizer.synthesizer.patch_wiki_path_by_memory_ids",
+            new=AsyncMock(return_value=1),
+        ):
+            second = await synthesize_all(service=service2, settings=settings, only_category="convention")
+        assert second.pages_updated == 0
+        assert second.pages_skipped_unchanged == 1
+        gemini2.assert_not_awaited()  # the expensive merge was skipped
+
+    @pytest.mark.asyncio
+    async def test_force_resynthesizes_unchanged_bucket(self, tmp_path):
+        settings = SynthesizerSettings(enabled=True, obsidian_vault_path=str(tmp_path))
+        points = {("shared", "convention"): [_qdrant_point("m1", "use PRs", "convention")]}
+        service = _service_with_qdrant_points(points)
+        with patch(
+            "extensions.wiki_synthesizer.synthesizer._list_shared_group_ids",
+            new=AsyncMock(return_value=["shared"]),
+        ), patch(
+            "extensions.wiki_synthesizer.synthesizer._call_gemini",
+            new=AsyncMock(return_value="body one"),
+        ), patch(
+            "extensions.wiki_synthesizer.synthesizer.patch_wiki_path_by_memory_ids",
+            new=AsyncMock(return_value=1),
+        ):
+            await synthesize_all(service=service, settings=settings, only_category="convention")
+
+        service2 = _service_with_qdrant_points(points)
+        gemini2 = AsyncMock(return_value="body two")
+        with patch(
+            "extensions.wiki_synthesizer.synthesizer._list_shared_group_ids",
+            new=AsyncMock(return_value=["shared"]),
+        ), patch(
+            "extensions.wiki_synthesizer.synthesizer._call_gemini", new=gemini2,
+        ), patch(
+            "extensions.wiki_synthesizer.synthesizer.patch_wiki_path_by_memory_ids",
+            new=AsyncMock(return_value=1),
+        ):
+            forced = await synthesize_all(
+                service=service2, settings=settings, only_category="convention", force=True,
+            )
+        assert forced.pages_skipped_unchanged == 0
+        assert forced.pages_updated == 1
+        gemini2.assert_awaited_once()  # force bypasses the skip
