@@ -394,19 +394,23 @@ class MemoryService:
         visibility: str,
         owner_user_id: str,
         write_started_at: datetime,
+        source_ref: dict | None = None,
     ) -> None:
         """Stamp ``memory_id``/visibility/owner onto recently-created Graphiti nodes.
 
         Called by every store path after the Graphiti write completes. The
         wiki synthesizer uses these properties to walk community → source
-        memories. Failures here never fail the underlying write — the
-        helper logs and returns 0.
+        memories. When ``source_ref`` is present (data-layer-connector
+        ingestion), also links those nodes to a ``(:Source)`` node so the
+        graph can walk memory → source → connector. Failures here never fail
+        the underlying write — the helpers log and return 0.
         """
         if not (self._graphiti and self._bridge):
             return
         from extensions.wiki_synthesizer.config import synthesizer_settings
         from extensions.wiki_synthesizer.graph_patcher import (
             attach_memory_id,
+            attach_source_ref,
         )
 
         # Coroutine built separately so we can ``.close()`` it if
@@ -430,6 +434,25 @@ class MemoryService:
                 "attach_memory_id post-write hook failed (non-critical)",
                 exc_info=True,
             )
+
+        # Link to the originating data-layer source, when ingested via a connector.
+        if source_ref:
+            src_coro = attach_source_ref(
+                self._graphiti.driver,
+                group_id=group_id,
+                memory_id=memory_id,
+                source_ref=source_ref,
+                write_started_at=write_started_at,
+                window_seconds=synthesizer_settings.attach_window_seconds,
+            )
+            try:
+                self._run_on_bridge(src_coro, timeout=10.0)
+            except Exception:
+                src_coro.close()
+                logger.warning(
+                    "attach_source_ref post-write hook failed (non-critical)",
+                    exc_info=True,
+                )
 
     def _get_genai_client(self):
         """Get a Gemini client for fact extraction.
@@ -568,6 +591,38 @@ class MemoryService:
 
         return stored
 
+    def extract_facts_only(self, text: str) -> list[tuple[str, str]]:
+        """Run LLM fact extraction over a block of text and return (category, content) tuples.
+
+        Reuses the same Gemini extraction + junk filter as ``extract_and_store``
+        but stores nothing — the caller decides how to persist (the ingest
+        pipeline stores them with ``source_type="imported"`` and the document's
+        ``source_ref``). Returns ``[]`` on extraction failure (logged), so a
+        flaky LLM call degrades to passages-only rather than failing ingest.
+        """
+        if not text or not text.strip():
+            return []
+        extraction_messages = build_extraction_messages([{"role": "user", "content": text}])
+        client = self._get_genai_client()
+        try:
+            from google.genai.types import GenerateContentConfig, HttpOptions
+
+            response = retry_transient(
+                client.models.generate_content,
+                model=settings.gemini_llm_model,
+                contents=extraction_messages[0]["content"],
+                config=GenerateContentConfig(
+                    http_options=HttpOptions(timeout=60_000),
+                ),
+                operation="LLM extraction (ingest)",
+                fallback_model=settings.gemini_llm_fallback_model,
+            )
+            parsed_facts = parse_extraction_response(response.text)
+        except Exception as e:
+            logger.error(f"Ingest extraction failed: {e}")
+            return []
+        return [(cat, content) for cat, content in parsed_facts if not _is_junk_fact(content)]
+
     def store_raw(
         self,
         content: str,
@@ -588,6 +643,10 @@ class MemoryService:
         expires_at: datetime | None = None,
         # Multi-user model (None → category default)
         visibility: str | None = None,
+        # Data-layer connectors (None → omitted)
+        memory_kind: str | None = None,
+        source_ref: dict | None = None,
+        add_to_graph: bool = True,
     ) -> list[MemoryResponse]:
         """Store a single pre-categorized fact directly (no LLM extraction).
 
@@ -686,6 +745,11 @@ class MemoryService:
             metadata["confidence"] = confidence
         if expires_at is not None:
             metadata["expires_at"] = expires_at.isoformat() if hasattr(expires_at, "isoformat") else str(expires_at)
+        # Data-layer connector provenance
+        if memory_kind is not None:
+            metadata["memory_kind"] = memory_kind
+        if source_ref:
+            metadata["source_ref"] = source_ref
 
         payload = {
             "data": content,
@@ -714,7 +778,7 @@ class MemoryService:
         group_id = _build_group_id(effective_visibility, user_id, project_id)
         graph_write_started_at = datetime.now(timezone.utc)
         try:
-            if self._graphiti and self._bridge:
+            if add_to_graph and self._graphiti and self._bridge:
                 retry_transient(
                     self._memory.graph.add,
                     data=content,
@@ -731,6 +795,7 @@ class MemoryService:
                     visibility=effective_visibility,
                     owner_user_id=user_id,
                     write_started_at=graph_write_started_at,
+                    source_ref=source_ref,
                 )
         except Exception as e:
             logger.warning(f"Graph storage failed (non-critical): {e}")
@@ -752,6 +817,8 @@ class MemoryService:
                 related_memory_ids=related_memory_ids,
                 confidence=confidence,
                 expires_at=expires_at.isoformat() if expires_at and hasattr(expires_at, "isoformat") else None,
+                memory_kind=memory_kind,
+                source_ref=source_ref,
                 visibility=effective_visibility,
                 owner_user_id=user_id,
             )
@@ -882,6 +949,8 @@ class MemoryService:
                 related_memory_ids=metadata.get("related_memory_ids"),
                 confidence=metadata.get("confidence"),
                 expires_at=metadata.get("expires_at"),
+                memory_kind=metadata.get("memory_kind"),
+                source_ref=metadata.get("source_ref"),
                 visibility=metadata.get("visibility"),
                 owner_user_id=metadata.get("owner_user_id"),
             )
@@ -1013,6 +1082,9 @@ class MemoryService:
         agent_id: str | None = None,
         run_id: str | None = None,
         source: str = "conversation",
+        source_type: str | None = None,
+        memory_kind: str | None = None,
+        source_ref: dict | None = None,
     ) -> list[MemoryResponse]:
         """Store multiple categorized facts via a single batch embed + single Qdrant upsert.
 
@@ -1080,6 +1152,9 @@ class MemoryService:
                     "agent_id": agent_id,
                     "run_id": run_id,
                     "source": source,
+                    **({"source_type": source_type} if source_type is not None else {}),
+                    **({"memory_kind": memory_kind} if memory_kind is not None else {}),
+                    **({"source_ref": source_ref} if source_ref else {}),
                 },
             }
 
@@ -1117,6 +1192,9 @@ class MemoryService:
                     project_id=fact_pid,
                     source="vector",
                     created_at=now_iso,
+                    source_type=source_type,
+                    memory_kind=memory_kind,
+                    source_ref=source_ref,
                 )
             )
 
@@ -1455,6 +1533,10 @@ class MemoryService:
                     resp.confidence = src_metadata.get("confidence")
                 if resp.expires_at is None:
                     resp.expires_at = src_metadata.get("expires_at")
+                if resp.memory_kind is None:
+                    resp.memory_kind = src_metadata.get("memory_kind")
+                if resp.source_ref is None:
+                    resp.source_ref = src_metadata.get("source_ref")
                 if resp.category is None:
                     resp.category = src_metadata.get("category")
                 if resp.scope is None:
@@ -2531,6 +2613,8 @@ class MemoryService:
             related_memory_ids=metadata.get("related_memory_ids"),
             confidence=metadata.get("confidence"),
             expires_at=metadata.get("expires_at"),
+            memory_kind=metadata.get("memory_kind"),
+            source_ref=metadata.get("source_ref"),
             visibility=metadata.get("visibility"),
             owner_user_id=metadata.get("owner_user_id"),
         )

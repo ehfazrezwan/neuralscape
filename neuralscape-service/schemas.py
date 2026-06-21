@@ -182,6 +182,14 @@ SOURCE_TYPE_VOCAB: set[str] = {
     "conversation", "tool_extraction", "explicit", "imported", "compiler",
 }
 
+# memory_kind distinguishes a distilled atomic fact from a verbatim passage
+# (chunk) of an ingested document. Legacy memories have no memory_kind set;
+# readers should treat a null value as "fact".
+MEMORY_KIND_VOCAB: set[str] = {"fact", "passage"}
+
+# Connector adapter types recognised by the ingest/connector subsystem.
+CONNECTOR_TYPE_VOCAB: set[str] = {"google_drive", "notion", "generic_rest", "mcp"}
+
 
 # ──────────────────────────────────────────────
 # Default visibility per category (multi-user model)
@@ -229,6 +237,54 @@ def default_visibility_for_category(category: str) -> MemoryVisibility:
 
 # Reusable field constraints
 _ID_PATTERN = r"^[a-zA-Z0-9_.\-]+$"
+
+
+# ──────────────────────────────────────────────
+# Source provenance (data-layer connectors)
+# ──────────────────────────────────────────────
+
+
+class RetrievalHandle(BaseModel):
+    """How a consuming agent can deterministically re-fetch the source.
+
+    Points at the MCP server + tool + args the agent should invoke to pull
+    the original (or fuller) content — e.g.
+    ``{mcp_server: "claude_ai_Notion", tool: "notion-fetch", args: {"id": "<page>"}}``.
+    """
+    mcp_server: str | None = Field(default=None, max_length=200)
+    tool: str | None = Field(default=None, max_length=200)
+    args: dict | None = None
+
+
+class SourceDescriptor(BaseModel):
+    """Where an ingested memory came from + how to fetch more.
+
+    Nested into the existing Qdrant ``metadata`` dict under ``source_ref`` —
+    no payload restructuring. ``connector_id``/``connector_type`` are required
+    so a memory can always be traced back to the connector instance that
+    produced it; everything else is optional and connector-dependent.
+    """
+    connector_id: str = Field(max_length=200, description="Configured connector INSTANCE id")
+    connector_type: str = Field(description="Adapter type (see CONNECTOR_TYPE_VOCAB)")
+    external_id: str | None = Field(default=None, max_length=500, description="Stable id in the source system")
+    parent_id: str | None = Field(default=None, max_length=500, description="The file/page; chunks of one doc share this")
+    url: str | None = Field(default=None, max_length=2000, description="Human/clickable link to the source")
+    title: str | None = Field(default=None, max_length=1000)
+    chunk_index: int | None = Field(default=None, ge=0, description="Position of this passage within the parent doc")
+    span: list[int] | None = Field(default=None, max_length=2, description="[start_char, end_char] within the parent")
+    content_hash: str | None = Field(default=None, max_length=64)
+    revision: str | None = Field(default=None, max_length=200, description="Source-side version (etag / last_edited_time)")
+    last_synced_at: str | None = Field(default=None, description="ISO 8601 timestamp of last sync from source")
+    retrieval: RetrievalHandle | None = None
+
+    @field_validator("connector_type")
+    @classmethod
+    def _validate_connector_type(cls, v: str) -> str:
+        if v not in CONNECTOR_TYPE_VOCAB:
+            raise ValueError(
+                f"Invalid connector_type '{v}'. Must be one of: {sorted(CONNECTOR_TYPE_VOCAB)}"
+            )
+        return v
 
 
 class StoreMemoryRequest(BaseModel):
@@ -297,6 +353,10 @@ class RawMemoryRequest(BaseModel):
     confidence: float | None = Field(default=None, ge=0.0, le=1.0, description="Extractor's self-rated confidence")
     expires_at: datetime | None = Field(default=None, description="Optional expiry for short-lived memories")
 
+    # Data-layer connectors (optional, additive)
+    memory_kind: str | None = Field(default=None, description="'fact' (distilled) or 'passage' (verbatim chunk). Null → fact.")
+    source_ref: SourceDescriptor | None = Field(default=None, description="Provenance + retrieval handle for ingested content")
+
     @field_validator("domain")
     @classmethod
     def _validate_domain(cls, v: str | None) -> str | None:
@@ -334,10 +394,85 @@ class RawMemoryRequest(BaseModel):
             )
         return v
 
+    @field_validator("memory_kind")
+    @classmethod
+    def _validate_memory_kind(cls, v: str | None) -> str | None:
+        if v is not None and v not in MEMORY_KIND_VOCAB:
+            raise ValueError(
+                f"Invalid memory_kind '{v}'. Must be one of: {sorted(MEMORY_KIND_VOCAB)}"
+            )
+        return v
+
 
 class RawMemoryBatchRequest(BaseModel):
     """Store multiple pre-categorized facts in one request (memory-model v2)."""
     memories: list[RawMemoryRequest] = Field(min_length=1, max_length=50)
+
+
+class IngestDocumentRequest(BaseModel):
+    """Ingest a document from a data layer: chunk → passages + distilled facts.
+
+    The ``source`` descriptor is attached to every memory produced (passages
+    carry per-chunk ``chunk_index``/``span``; facts carry the parent-level
+    descriptor). Re-ingesting the same content is idempotent via content-hash
+    dedup in ``store_raw``.
+    """
+    content: str = Field(min_length=1, max_length=2_000_000, description="Full document text to ingest")
+    source: SourceDescriptor = Field(description="Provenance + retrieval handle for this document")
+    category: str = Field(default="domain_knowledge", description="Category for produced memories")
+    scope: str = Field(default="global", description="'global' or 'project'")
+    project_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+    user_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+    visibility: MemoryVisibility | None = Field(default=None)
+    extract_facts: bool = Field(default=True, description="Run LLM extraction to also store distilled facts")
+    index_passages: bool = Field(default=True, description="Chunk + store verbatim passages")
+    tags: list[str] | None = Field(default=None, max_length=20)
+    agent_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+    run_id: str | None = Field(default=None, max_length=100)
+
+    @field_validator("category")
+    @classmethod
+    def _validate_category(cls, v: str) -> str:
+        if v not in MEMORY_CATEGORIES:
+            raise ValueError(f"Invalid category '{v}'. Must be one of: {list(MEMORY_CATEGORIES.keys())}")
+        return v
+
+
+class ConnectorConfigRequest(BaseModel):
+    """Register a data-layer connector instance.
+
+    ``credentials`` is connector-type specific (e.g. ``{"token": "..."}`` for
+    Notion, an OAuth refresh-token blob for Google Drive, an MCP server spec
+    for the generic adapter). It is encrypted at rest in the vault and never
+    returned by the API.
+    """
+    connector_id: str = Field(max_length=200, pattern=_ID_PATTERN, description="Unique instance id, e.g. 'notion-personal'")
+    connector_type: str = Field(description="Adapter type (see CONNECTOR_TYPE_VOCAB)")
+    name: str | None = Field(default=None, max_length=200, description="Human label")
+    credentials: dict = Field(description="Connector-type-specific secrets (encrypted at rest)")
+    config: dict | None = Field(default=None, description="Non-secret connector options (e.g. folder/db filters)")
+    enabled: bool = Field(default=True, description="Whether the sync cron includes this connector")
+    # Defaults for memories produced by this connector's syncs.
+    default_category: str = Field(default="domain_knowledge")
+    default_scope: str = Field(default="global")
+    default_project_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+    default_visibility: MemoryVisibility | None = Field(default=None)
+
+    @field_validator("connector_type")
+    @classmethod
+    def _validate_connector_type(cls, v: str) -> str:
+        if v not in CONNECTOR_TYPE_VOCAB:
+            raise ValueError(
+                f"Invalid connector_type '{v}'. Must be one of: {sorted(CONNECTOR_TYPE_VOCAB)}"
+            )
+        return v
+
+    @field_validator("default_category")
+    @classmethod
+    def _validate_default_category(cls, v: str) -> str:
+        if v not in MEMORY_CATEGORIES:
+            raise ValueError(f"Invalid default_category '{v}'.")
+        return v
 
 
 class SearchMemoryRequest(BaseModel):
@@ -359,6 +494,7 @@ class SearchMemoryRequest(BaseModel):
     domain: str | None = Field(default=None, description="Filter by domain")
     observation_type: str | None = Field(default=None, description="Filter by observation_type")
     concepts: list[str] | None = Field(default=None, max_length=5, description="Filter by concept tags (any-match)")
+    memory_kind: str | None = Field(default=None, description="Filter by 'fact' or 'passage'")
 
     # Multi-user pool selection
     visibility: MemoryVisibility | None = Field(
@@ -398,6 +534,15 @@ class SearchMemoryRequest(BaseModel):
         if unknown:
             raise ValueError(
                 f"Unknown concepts: {unknown}. Must be from: {sorted(CONCEPT_VOCAB)}"
+            )
+        return v
+
+    @field_validator("memory_kind")
+    @classmethod
+    def _validate_memory_kind(cls, v: str | None) -> str | None:
+        if v is not None and v not in MEMORY_KIND_VOCAB:
+            raise ValueError(
+                f"Invalid memory_kind '{v}'. Must be one of: {sorted(MEMORY_KIND_VOCAB)}"
             )
         return v
 
@@ -473,6 +618,10 @@ class MemoryResponse(BaseModel):
     related_memory_ids: list[str] | None = None
     confidence: float | None = None
     expires_at: str | None = None
+
+    # Data-layer connectors (null for non-ingested memories)
+    memory_kind: str | None = None
+    source_ref: dict | None = None
 
     # Multi-user model
     visibility: str | None = None

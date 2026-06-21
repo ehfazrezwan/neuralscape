@@ -97,6 +97,84 @@ async def attach_memory_id(
         return 0
 
 
+async def attach_source_ref(
+    driver: Any,
+    *,
+    group_id: str,
+    memory_id: str,
+    source_ref: dict,
+    write_started_at: datetime,
+    window_seconds: int | None = None,
+) -> int:
+    """Link freshly-created graph nodes to the data-layer source they came from.
+
+    For memories ingested from an external connector (Google Drive, Notion,
+    an MCP server, …), this MERGEs a ``(:Source)`` node keyed by
+    ``connector_id`` + a stable source key (external_id → parent_id →
+    connector_id) and connects every node written in this group/window to it
+    via ``(:Entity)-[:DERIVED_FROM]->(:Source)``. It also stamps connector
+    properties directly on those nodes so a graph search can answer "which
+    connector produced this / what else came from the same source" without a
+    hop. Best-effort — never raises (mirrors :func:`attach_memory_id`).
+    """
+    if not source_ref or not group_id:
+        return 0
+    connector_id = source_ref.get("connector_id")
+    if not connector_id:
+        return 0
+    # MERGE keys must be non-null; pick the most specific stable id available.
+    source_key = (
+        source_ref.get("external_id")
+        or source_ref.get("parent_id")
+        or connector_id
+    )
+    window = window_seconds if window_seconds is not None else WRITE_WINDOW_SECONDS
+    lower_bound = (
+        write_started_at.astimezone(timezone.utc) - _delta_seconds(window)
+    ).isoformat()
+    cypher = """
+    MERGE (s:Source {connector_id: $connector_id, source_key: $source_key})
+    SET s.connector_type = $connector_type,
+        s.url = coalesce($url, s.url),
+        s.title = coalesce($title, s.title),
+        s.external_id = coalesce($external_id, s.external_id),
+        s.last_synced_at = $last_synced_at
+    WITH s
+    MATCH (n)
+    WHERE n.group_id = $group_id
+      AND n.created_at >= datetime($lower_bound)
+    SET n.ns_connector_id = coalesce(n.ns_connector_id, $connector_id),
+        n.ns_connector_type = coalesce(n.ns_connector_type, $connector_type),
+        n.ns_source_url = coalesce(n.ns_source_url, $url)
+    MERGE (n)-[:DERIVED_FROM]->(s)
+    RETURN count(n) AS patched
+    """
+    try:
+        async with driver.session() as session:
+            result = await session.run(
+                cypher,
+                connector_id=connector_id,
+                source_key=source_key,
+                connector_type=source_ref.get("connector_type"),
+                url=source_ref.get("url"),
+                title=source_ref.get("title"),
+                external_id=source_ref.get("external_id"),
+                last_synced_at=source_ref.get("last_synced_at"),
+                group_id=group_id,
+                lower_bound=lower_bound,
+            )
+            record = await result.single()
+            return int(record["patched"]) if record else 0
+    except Exception:
+        logger.warning(
+            "attach_source_ref failed for connector_id=%s group_id=%s (non-fatal)",
+            connector_id,
+            group_id,
+            exc_info=True,
+        )
+        return 0
+
+
 async def patch_wiki_path(
     service: Any,
     *,
