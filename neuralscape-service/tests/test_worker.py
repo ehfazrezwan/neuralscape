@@ -23,13 +23,20 @@ from schemas import MemoryResponse
 
 @pytest.fixture
 def ctx():
-    """Minimal ARQ ctx with a mocked MemoryService and no extension registry."""
+    """Minimal ARQ ctx with a mocked MemoryService and no extension registry.
+
+    process_memory_raw now calls store_raw(return_created=True), so the mock
+    returns the (memories, created) tuple shape, and ctx carries a mock redis
+    (ArqRedis) for the deferred graph-enrichment enqueue.
+    """
     service = MagicMock(name="MemoryService")
     service.search.return_value = []
-    service.store_raw.return_value = []
+    service.store_raw.return_value = ([], False)
     service.store_raw_batch.return_value = []
     service.expire_old_memories.return_value = {"deleted_count": 0, "per_user": {}}
-    return {"service": service}
+    redis = MagicMock(name="ArqRedis")
+    redis.enqueue_job = AsyncMock()
+    return {"service": service, "redis": redis}
 
 
 @pytest.fixture
@@ -37,15 +44,18 @@ def ctx_with_registry():
     """ctx with a mocked extension registry — exercises emit_event paths."""
     service = MagicMock(name="MemoryService")
     service.search.return_value = []
-    service.store_raw.return_value = [
-        MemoryResponse(id="m1", memory="x", category="preference"),
-    ]
+    service.store_raw.return_value = (
+        [MemoryResponse(id="m1", memory="x", category="preference")],
+        True,
+    )
     service.store_raw_batch.return_value = [
         MemoryResponse(id="m1", memory="A", category="preference", scope="global"),
     ]
     registry = MagicMock(name="ExtensionRegistry")
     registry.emit_event = AsyncMock()
-    return {"service": service, "extension_registry": registry}
+    redis = MagicMock(name="ArqRedis")
+    redis.enqueue_job = AsyncMock()
+    return {"service": service, "extension_registry": registry, "redis": redis}
 
 
 # ──────────────────────────────────────────────
@@ -56,9 +66,10 @@ def ctx_with_registry():
 class TestProcessMemoryRaw:
     @pytest.mark.asyncio
     async def test_v2_extras_forwarded(self, ctx):
-        ctx["service"].store_raw.return_value = [
-            MemoryResponse(id="m1", memory="x", domain="coding"),
-        ]
+        ctx["service"].store_raw.return_value = (
+            [MemoryResponse(id="m1", memory="x", domain="coding")],
+            True,
+        )
         await worker.process_memory_raw(
             ctx,
             content="x",
@@ -82,7 +93,7 @@ class TestProcessMemoryRaw:
 
     @pytest.mark.asyncio
     async def test_iso_expires_at_rehydrated_to_datetime(self, ctx):
-        ctx["service"].store_raw.return_value = []
+        ctx["service"].store_raw.return_value = ([], True)
         await worker.process_memory_raw(
             ctx,
             content="x",
@@ -95,7 +106,7 @@ class TestProcessMemoryRaw:
 
     @pytest.mark.asyncio
     async def test_invalid_iso_expires_at_dropped(self, ctx):
-        ctx["service"].store_raw.return_value = []
+        ctx["service"].store_raw.return_value = ([], True)
         await worker.process_memory_raw(
             ctx,
             content="x",
@@ -108,7 +119,7 @@ class TestProcessMemoryRaw:
 
     @pytest.mark.asyncio
     async def test_no_v2_extras(self, ctx):
-        ctx["service"].store_raw.return_value = []
+        ctx["service"].store_raw.return_value = ([], True)
         await worker.process_memory_raw(
             ctx,
             content="x",
@@ -139,9 +150,10 @@ class TestProcessMemoryRaw:
     async def test_idempotency_check_failure_proceeds_with_store(self, ctx):
         """Idempotency search failure must not block the store path."""
         ctx["service"].search.side_effect = Exception("Qdrant transient")
-        ctx["service"].store_raw.return_value = [
-            MemoryResponse(id="m1", memory="x"),
-        ]
+        ctx["service"].store_raw.return_value = (
+            [MemoryResponse(id="m1", memory="x")],
+            True,
+        )
         result = await worker.process_memory_raw(
             ctx,
             content="x",
@@ -150,6 +162,73 @@ class TestProcessMemoryRaw:
         )
         ctx["service"].store_raw.assert_called_once()
         assert "deduplicated" not in result
+
+    @pytest.mark.asyncio
+    async def test_stores_vector_only_and_defers_graph(self, ctx):
+        """Fast path: store_raw is called with add_to_graph=False (graph deferred)."""
+        ctx["service"].store_raw.return_value = ([MemoryResponse(id="m1", memory="x")], True)
+        await worker.process_memory_raw(ctx, content="x", user_id="ehfaz", category="preference")
+        kwargs = ctx["service"].store_raw.call_args[1]
+        assert kwargs["add_to_graph"] is False
+        assert kwargs["return_created"] is True
+
+    @pytest.mark.asyncio
+    async def test_enqueues_graph_enrichment_when_created(self, ctx):
+        """A newly-created memory enqueues graph enrichment on the graph queue."""
+        from config import settings
+        ctx["service"].store_raw.return_value = (
+            [MemoryResponse(id="mem-1", memory="x", visibility="private")],
+            True,
+        )
+        await worker.process_memory_raw(ctx, content="x", user_id="ehfaz", category="preference")
+        ctx["redis"].enqueue_job.assert_awaited_once()
+        args, kwargs = ctx["redis"].enqueue_job.call_args
+        assert args[0] == "process_graph_enrichment"
+        assert args[1] == "mem-1"  # memory_id
+        assert kwargs["_queue_name"] == settings.graph_queue_name
+
+    @pytest.mark.asyncio
+    async def test_skips_graph_enrichment_on_dedup(self, ctx):
+        """A content-hash dedup hit (created=False) must NOT re-enqueue enrichment."""
+        ctx["service"].store_raw.return_value = (
+            [MemoryResponse(id="existing", memory="x")],
+            False,
+        )
+        await worker.process_memory_raw(ctx, content="x", user_id="ehfaz", category="preference")
+        ctx["redis"].enqueue_job.assert_not_awaited()
+
+
+class TestProcessGraphEnrichment:
+    @pytest.mark.asyncio
+    async def test_calls_enrich_graph(self, ctx):
+        await worker.process_graph_enrichment(
+            ctx, memory_id="mem-1", content="hello", user_id="ehfaz",
+            project_id="proj", visibility="shared",
+        )
+        ctx["service"].enrich_graph.assert_called_once()
+        kwargs = ctx["service"].enrich_graph.call_args[1]
+        assert kwargs["memory_id"] == "mem-1"
+        assert kwargs["visibility"] == "shared"
+
+    @pytest.mark.asyncio
+    async def test_defaults_visibility_to_private(self, ctx):
+        await worker.process_graph_enrichment(ctx, memory_id="m", content="c", user_id="u")
+        assert ctx["service"].enrich_graph.call_args[1]["visibility"] == "private"
+
+
+class TestWorkerTopology:
+    def test_graph_worker_owns_graph_queue_and_enrichment(self):
+        from config import settings
+        assert worker.GraphWorkerSettings.queue_name == settings.graph_queue_name
+        assert worker.process_graph_enrichment in worker.GraphWorkerSettings.functions
+
+    def test_heavy_crons_moved_off_light_worker(self):
+        light_crons = {c.coroutine.__name__ for c in worker.WorkerSettings.cron_jobs}
+        graph_crons = {c.coroutine.__name__ for c in worker.GraphWorkerSettings.cron_jobs}
+        assert "dedup_all_memories" in graph_crons
+        assert "synthesize_topical_wikis_cron" in graph_crons
+        assert "dedup_all_memories" not in light_crons
+        assert "synthesize_topical_wikis_cron" not in light_crons
 
     @pytest.mark.asyncio
     async def test_emits_memory_stored_event_when_registry_present(self, ctx_with_registry):

@@ -114,7 +114,10 @@ async def process_memory_raw(
         except ValueError:
             expires_at = None
 
-    memories = service.store_raw(
+    # Fast path: vector write only (sub-second). The slow Graphiti graph.add
+    # is deferred to a separate process_graph_enrichment job (see below) so it
+    # can't make this job block for minutes and starve other writes.
+    memories, created = service.store_raw(
         content=content,
         user_id=user_id,
         category=category,
@@ -131,7 +134,26 @@ async def process_memory_raw(
         confidence=v2_extras.get("confidence"),
         expires_at=expires_at,
         visibility=v2_extras.get("visibility"),
+        add_to_graph=False,
+        return_created=True,
     )
+
+    # Defer graph enrichment for newly-created rows onto the graph queue. Skip
+    # for content-hash dedup hits (created=False) — they're already in the graph.
+    if created and memories:
+        mem = memories[0]
+        try:
+            await ctx["redis"].enqueue_job(
+                "process_graph_enrichment",
+                mem.id,
+                content,
+                user_id,
+                project_id,
+                getattr(mem, "visibility", None),
+                _queue_name=settings.graph_queue_name,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to enqueue graph enrichment for {mem.id}: {e}")
 
     # Emit memory_stored event so extensions can write to vault
     registry = ctx.get("extension_registry")
@@ -199,6 +221,33 @@ async def process_memory_raw_batch(ctx: dict, items: list[dict]) -> dict:
         _rebuild_category_index(registry)
 
     return {"memories": [m.model_dump(exclude_none=True) for m in memories]}
+
+
+async def process_graph_enrichment(
+    ctx: dict,
+    memory_id: str,
+    content: str,
+    user_id: str,
+    project_id: str | None = None,
+    visibility: str | None = None,
+) -> dict:
+    """Background task: add a stored memory's content to the knowledge graph.
+
+    This is the slow half of a write (Graphiti entity extraction, ~minutes,
+    Gemini-gated) split out of the synchronous vector store so it runs on the
+    dedicated graph queue/worker and never blocks fast writes or reads.
+    Best-effort — MemoryService.enrich_graph swallows its own errors.
+    """
+    service: MemoryService = ctx["service"]
+    await asyncio.to_thread(
+        service.enrich_graph,
+        content=content,
+        user_id=user_id,
+        project_id=project_id,
+        visibility=visibility or "private",
+        memory_id=memory_id,
+    )
+    return {"memory_id": memory_id, "enriched": True}
 
 
 async def expire_old_memories_cron(ctx: dict) -> dict:
@@ -389,6 +438,13 @@ async def shutdown(ctx: dict) -> None:
 
 
 class WorkerSettings:
+    """Light/fast worker: vector writes, reads, conversation tasks, light crons.
+
+    The slow Graphiti work (per-write graph enrichment + the heavy dedup /
+    wiki-synth crons) lives on GraphWorkerSettings instead, so a burst of graph
+    writes or a 12-minute wiki-synth run can't starve fast writes here. Run with
+    ``arq worker.WorkerSettings``.
+    """
     functions = [
         process_memory_store,
         process_memory_raw,
@@ -397,15 +453,6 @@ class WorkerSettings:
         process_conversation_compile,
     ]
     cron_jobs = [
-        cron(
-            dedup_all_memories,
-            hour=settings.dedup_cron_hours,
-            minute=0,
-            timeout=1800,
-            unique=True,
-            max_tries=1,
-            run_at_startup=False,
-        ),
         cron(
             auto_compile_check,
             hour={18, 19, 20, 21, 22, 23},
@@ -424,10 +471,42 @@ class WorkerSettings:
             max_tries=1,
             run_at_startup=False,
         ),
+    ]
+    on_startup = startup
+    on_shutdown = shutdown
+    redis_settings = parse_redis_settings()
+    queue_name = settings.arq_queue_name
+    max_jobs = 10
+    job_timeout = settings.arq_job_timeout
+
+
+class GraphWorkerSettings:
+    """Heavy/slow worker: knowledge-graph enrichment + the expensive crons.
+
+    Consumes the dedicated graph queue so slow Graphiti entity extraction
+    (~minutes per write) and the dedup / wiki-synth crons run here, isolated
+    from the latency-sensitive vector writes/reads on WorkerSettings. Run with
+    ``arq worker.GraphWorkerSettings``. Lower max_jobs caps concurrent Gemini
+    extraction (avoids AI-Studio throttling); higher job_timeout fits the
+    multi-minute graph writes.
+    """
+    functions = [
+        process_graph_enrichment,
+    ]
+    cron_jobs = [
+        cron(
+            dedup_all_memories,
+            hour=settings.dedup_cron_hours,
+            minute=0,
+            timeout=1800,
+            unique=True,
+            max_tries=1,
+            run_at_startup=False,
+        ),
         cron(
             synthesize_topical_wikis_cron,
             # Imported lazily so importing worker.py doesn't load the
-            # synthesizer's whole settings tree before WorkerSettings is
+            # synthesizer's whole settings tree before the worker is
             # actually instantiated. Cadence is read directly from the env
             # var here because cron() needs a concrete value at class
             # body evaluation time.
@@ -442,7 +521,7 @@ class WorkerSettings:
     on_startup = startup
     on_shutdown = shutdown
     redis_settings = parse_redis_settings()
-    queue_name = settings.arq_queue_name
-    max_jobs = 10
-    job_timeout = settings.arq_job_timeout
+    queue_name = settings.graph_queue_name
+    max_jobs = 4
+    job_timeout = 900  # graph.add + entity extraction can run several minutes
     max_tries = settings.arq_max_retries
