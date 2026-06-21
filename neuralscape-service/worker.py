@@ -201,6 +201,51 @@ async def process_memory_raw_batch(ctx: dict, items: list[dict]) -> dict:
     return {"memories": [m.model_dump(exclude_none=True) for m in memories]}
 
 
+async def process_ingest_document(ctx: dict, doc: dict) -> dict:
+    """Background task: ingest a document into passages + distilled facts.
+
+    ``doc`` is the serialized :class:`ingest.pipeline.IngestDoc` field set
+    (content, source descriptor, user_id, category, scope, options). Re-ingest
+    is idempotent via content-hash dedup in ``store_raw``.
+    """
+    from ingest.pipeline import IngestDoc, ingest_document
+
+    service: MemoryService = ctx["service"]
+    ingest_doc = IngestDoc(
+        content=doc["content"],
+        source=doc["source"],
+        user_id=doc["user_id"],
+        category=doc.get("category", "domain_knowledge"),
+        scope=doc.get("scope", "global"),
+        project_id=doc.get("project_id"),
+        visibility=doc.get("visibility"),
+        tags=doc.get("tags"),
+        agent_id=doc.get("agent_id"),
+        run_id=doc.get("run_id"),
+        extract_facts=doc.get("extract_facts", True),
+        index_passages=doc.get("index_passages", True),
+        max_chars=doc.get("max_chars"),
+        overlap=doc.get("overlap"),
+    )
+    result = await asyncio.to_thread(ingest_document, service, ingest_doc)
+
+    # Emit a single summary event so extensions know an ingest landed. We don't
+    # emit one event per passage — a large doc would flood the vault writer.
+    registry = ctx.get("extension_registry")
+    if registry and result.get("memory_ids"):
+        await registry.emit_event("memory_stored", {
+            "user_id": doc["user_id"],
+            "memory_id": result["memory_ids"][0],
+            "content": f"[ingest] {result['passages']} passages + {result['facts']} facts",
+            "category": doc.get("category", "domain_knowledge"),
+            "scope": doc.get("scope", "global"),
+            "project_id": doc.get("project_id"),
+            "source": "ingest",
+        })
+
+    return result
+
+
 async def expire_old_memories_cron(ctx: dict) -> dict:
     """Cron job: purge memories whose expires_at is in the past (memory-model v2)."""
     service: MemoryService = ctx["service"]
@@ -359,6 +404,103 @@ async def dedup_all_memories(ctx: dict) -> dict:
     return summary
 
 
+async def process_connector_sync(ctx: dict, connector_id: str) -> dict:
+    """Background task: pull a connector's resources and ingest changed ones.
+
+    Incremental: resources whose source-side revision matches the last-seen
+    revision are skipped; content-hash dedup in ``store_raw`` is the backstop
+    for sources without a revision marker. Sync state (cursor + per-resource
+    revisions + timestamp) is persisted back to the vault.
+    """
+    from datetime import timezone
+
+    from connectors.registry import build_adapter
+    from ingest.pipeline import IngestDoc, ingest_document
+
+    vault = ctx.get("vault")
+    if vault is None:
+        return {"skipped": True, "reason": "connectors disabled (no vault)"}
+    record = await vault.get(connector_id)
+    if not record:
+        return {"skipped": True, "reason": "connector not found"}
+    if not record.get("enabled", True):
+        return {"skipped": True, "reason": "connector disabled"}
+
+    service: MemoryService = ctx["service"]
+    owner = record.get("owner_user_id") or settings.default_user_id
+    adapter = build_adapter(record)
+    revisions = dict(record.get("last_revision_by_id") or {})
+    cursor = record.get("cursor")
+    next_cursor = cursor
+    synced = skipped = 0
+
+    try:
+        resources, next_cursor = await adapter.list_resources(cursor)
+        for r in resources:
+            if r.revision and revisions.get(r.external_id) == r.revision:
+                skipped += 1
+                continue
+            try:
+                content = await adapter.fetch(r)
+            except Exception as e:
+                logger.warning(f"Connector {connector_id}: fetch failed for {r.external_id}: {e}")
+                continue
+            if not content or not content.strip():
+                continue
+            doc = IngestDoc(
+                content=content,
+                source=adapter.source_descriptor(r),
+                user_id=owner,
+                category=record.get("default_category", "domain_knowledge"),
+                scope=record.get("default_scope", "global"),
+                project_id=record.get("default_project_id"),
+                visibility=record.get("default_visibility"),
+            )
+            await asyncio.to_thread(ingest_document, service, doc)
+            if r.revision:
+                revisions[r.external_id] = r.revision
+            synced += 1
+    finally:
+        await adapter.aclose()
+
+    await vault.update_sync_state(
+        connector_id,
+        cursor=next_cursor,
+        last_synced_at=datetime.now(timezone.utc).isoformat(),
+        revisions=revisions,
+    )
+    logger.info(f"Connector sync [{connector_id}]: {synced} ingested, {skipped} unchanged")
+    return {"connector_id": connector_id, "synced": synced, "skipped": skipped}
+
+
+async def connector_sync_cron(ctx: dict) -> dict:
+    """Cron job: enqueue a sync for every enabled connector."""
+    if not settings.connectors_enabled:
+        return {"skipped": True, "reason": "CONNECTORS_ENABLED=false"}
+    vault = ctx.get("vault")
+    if vault is None:
+        return {"skipped": True, "reason": "no vault"}
+    redis = ctx["redis"]  # ARQ injects the ArqRedis pool into the job context
+    enqueued = 0
+    for rec in await vault.list():
+        if not rec.get("enabled", True):
+            continue
+        await redis.enqueue_job(
+            "process_connector_sync",
+            rec["connector_id"],
+            _job_id=f"sync-{rec['connector_id']}",
+        )
+        enqueued += 1
+    logger.info(f"Connector sync cron: enqueued {enqueued} connector(s)")
+    return {"enqueued": enqueued}
+
+
+def _connector_sync_cron_hours() -> list[int]:
+    """Translate the connector sync interval (hours) into a set of hours-of-day."""
+    interval = max(1, min(24, settings.connector_sync_cron_hours))
+    return list(range(0, 24, interval))
+
+
 async def startup(ctx: dict) -> None:
     """Worker startup: initialize MemoryService + extension registry."""
     logger.info("ARQ worker starting up...")
@@ -373,6 +515,20 @@ async def startup(ctx: dict) -> None:
     await registry.discover()
     await registry.startup_all()
     ctx["extension_registry"] = registry
+
+    # Connector vault (only when connectors are enabled + a vault key is set).
+    if settings.connectors_enabled:
+        try:
+            from connectors.vault import ConnectorVault
+
+            ctx["vault"] = ConnectorVault.from_settings(settings)
+            logger.info("Connector vault initialized")
+        except Exception:
+            logger.warning(
+                "Connector vault init failed; connector sync disabled this run",
+                exc_info=True,
+            )
+
     logger.info("ARQ worker ready.")
 
 
@@ -393,6 +549,8 @@ class WorkerSettings:
         process_memory_store,
         process_memory_raw,
         process_memory_raw_batch,
+        process_ingest_document,
+        process_connector_sync,
         process_conversation_flush,
         process_conversation_compile,
     ]
@@ -434,6 +592,15 @@ class WorkerSettings:
             hour=set(_synthesizer_cron_hours()),
             minute=45,
             timeout=1800,
+            unique=True,
+            max_tries=1,
+            run_at_startup=False,
+        ),
+        cron(
+            connector_sync_cron,
+            hour=set(_connector_sync_cron_hours()),
+            minute=50,
+            timeout=600,
             unique=True,
             max_tries=1,
             run_at_startup=False,

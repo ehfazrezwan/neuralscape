@@ -27,8 +27,10 @@ from schemas import (
     MEMORY_CATEGORIES,
     BulkDeleteRequest,
     CategoryListResponse,
+    ConnectorConfigRequest,
     ContextResponse,
     GraphSearchRequest,
+    IngestDocumentRequest,
     MemoryResponse,
     RawMemoryBatchRequest,
     RawMemoryRequest,
@@ -52,6 +54,9 @@ _task_manager = TaskManager()
 
 # Extension registry (discovered + started in lifespan)
 _extension_registry = ExtensionRegistry()
+
+# Connector vault (initialized in lifespan when connectors are enabled)
+_vault = None
 
 # Legacy lazy-init globals (kept for backward compat with old endpoints + tests)
 _memory = None
@@ -126,6 +131,17 @@ async def lifespan(app: FastAPI):
     await _extension_registry.discover()
     await _extension_registry.startup_all()
     _extension_registry.mount_routes(app)
+
+    # Initialize the connector vault when enabled.
+    if settings.connectors_enabled:
+        global _vault
+        try:
+            from connectors.vault import ConnectorVault
+
+            _vault = ConnectorVault.from_settings(settings)
+            logger.info("Connector vault initialized")
+        except Exception as e:
+            logger.warning(f"Connector vault init failed (connector API disabled): {e}")
 
     # Start MCP HTTP session manager if enabled and connect its task manager
     if _mcp_session_manager is not None:
@@ -728,6 +744,114 @@ async def v1_store_raw_memory(req: RawMemoryRequest, request: Request):
         task_id=task_id,
         poll_url=f"/v1/memories/status/{task_id}",
     )
+
+
+# ── Ingest (data-layer documents) ────────────────
+
+
+@v1_router.post("/ingest", status_code=202)
+async def v1_ingest_document(req: IngestDocumentRequest, request: Request):
+    """Ingest a document from a data layer: chunk → passages + distilled facts.
+
+    Each produced memory carries the ``source`` descriptor (passages get a
+    per-chunk ``chunk_index``/``span``; facts get the parent-level descriptor)
+    so a consuming agent can trace the memory back and re-fetch via the
+    retrieval handle. Async (202 + poll) with a sync fallback if Redis is down.
+    Re-ingesting unchanged content is idempotent (content-hash dedup).
+    """
+    if req.scope == "project" and not req.project_id:
+        raise HTTPException(status_code=400, detail="project_id is required when scope='project'")
+
+    resolved_user_id = _resolve_user_id(request, req.user_id)
+    doc = {
+        "content": req.content,
+        "source": req.source.model_dump(exclude_none=True),
+        "user_id": resolved_user_id,
+        "category": req.category,
+        "scope": req.scope,
+        "project_id": req.project_id,
+        "visibility": req.visibility.value if req.visibility else None,
+        "tags": req.tags,
+        "agent_id": req.agent_id,
+        "run_id": req.run_id,
+        "extract_facts": req.extract_facts,
+        "index_passages": req.index_passages,
+    }
+    doc = {k: v for k, v in doc.items() if v is not None}
+
+    try:
+        task_id = await _task_manager.enqueue_ingest_document(doc)
+    except (ConnectionError, OSError) as e:
+        logger.warning(f"Redis unavailable, falling back to sync ingest: {e}")
+        from ingest.pipeline import IngestDoc, ingest_document
+
+        result = await asyncio.to_thread(ingest_document, _service, IngestDoc(**doc))
+        return JSONResponse(status_code=200, content={"status": "ok", **result})
+
+    return TaskAcceptedResponse(
+        task_id=task_id,
+        poll_url=f"/v1/memories/status/{task_id}",
+    )
+
+
+# ── Connectors (data-layer sources) ──────────────
+
+
+def _require_vault():
+    """Return the connector vault or raise 503 when connectors are disabled."""
+    if _vault is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Connectors are disabled. Set CONNECTORS_ENABLED=true and NEURALSCAPE_VAULT_KEY.",
+        )
+    return _vault
+
+
+@v1_router.post("/connectors", status_code=201)
+async def v1_register_connector(req: ConnectorConfigRequest, request: Request):
+    """Register (or replace) a data-layer connector instance. Secrets are encrypted at rest."""
+    vault = _require_vault()
+    resolved_user_id = _resolve_user_id(request, None)
+    record = req.model_dump(mode="json", exclude_none=True)
+    record["owner_user_id"] = resolved_user_id
+    redacted = await vault.put(record)
+    return JSONResponse(status_code=201, content=redacted)
+
+
+@v1_router.get("/connectors")
+async def v1_list_connectors(request: Request):
+    """List configured connectors (credentials redacted)."""
+    vault = _require_vault()
+    return {"connectors": await vault.list()}
+
+
+@v1_router.get("/connectors/{connector_id}")
+async def v1_get_connector(connector_id: str):
+    """Get one connector config (credentials redacted)."""
+    vault = _require_vault()
+    rec = await vault.get_redacted(connector_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail=f"Connector '{connector_id}' not found")
+    return rec
+
+
+@v1_router.delete("/connectors/{connector_id}")
+async def v1_delete_connector(connector_id: str):
+    """Delete a connector config (does not remove already-ingested memories)."""
+    vault = _require_vault()
+    removed = await vault.delete(connector_id)
+    return {"status": "ok", "deleted": removed}
+
+
+@v1_router.post("/connectors/{connector_id}/sync", status_code=202)
+async def v1_sync_connector(connector_id: str):
+    """Trigger an immediate sync for a connector (enqueues a background job)."""
+    vault = _require_vault()
+    rec = await vault.get_redacted(connector_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail=f"Connector '{connector_id}' not found")
+    task_id = await _task_manager.enqueue_connector_sync(connector_id)
+    return TaskAcceptedResponse(task_id=task_id, poll_url=f"/v1/memories/status/{task_id}")
 
 
 @v1_router.post("/memories/raw/batch", status_code=202)

@@ -132,6 +132,42 @@ class TaskManager:
             return job_id
         return job.job_id
 
+    async def enqueue_ingest_document(self, doc: dict) -> str:
+        """Enqueue a document-ingest task (chunk → passages + facts). Returns job_id.
+
+        Deterministic job id from the content hash + connector instance so the
+        same document re-submitted by a re-sync coalesces onto one job.
+        """
+        content = doc.get("content", "")
+        connector_id = (doc.get("source") or {}).get("connector_id", "")
+        partition = doc.get("user_id") or "ingest"
+        job_id = _generate_job_id(f"ingest:{connector_id}:{content}", partition)
+
+        job = await self.pool.enqueue_job(
+            "process_ingest_document",
+            doc,
+            _job_id=job_id,
+        )
+        if job is None:
+            return job_id
+        return job.job_id
+
+    async def enqueue_connector_sync(self, connector_id: str) -> str:
+        """Enqueue a connector sync task. Returns job_id.
+
+        Job id is keyed on the connector instance so overlapping syncs of the
+        same connector coalesce rather than stacking.
+        """
+        job_id = _generate_job_id(f"sync:{connector_id}", "connector")
+        job = await self.pool.enqueue_job(
+            "process_connector_sync",
+            connector_id,
+            _job_id=job_id,
+        )
+        if job is None:
+            return job_id
+        return job.job_id
+
     async def enqueue_raw_batch(self, items: list[dict]) -> str:
         """Enqueue a batch of raw memory storage tasks (memory-model v2).
 
