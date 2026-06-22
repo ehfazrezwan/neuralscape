@@ -534,8 +534,12 @@ class _FakeRedis:
         pass
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def fake_store(monkeypatch):
+    """Isolate EVERY test from real Redis: the identity store always talks to a
+    fresh in-memory fake. autouse so no test can leak links into a dev instance
+    (resolver promotion writes to the store). Tests that inspect it just request
+    ``fake_store`` to get the instance."""
     fake = _FakeRedis()
     monkeypatch.setattr(identity_store, "_client", lambda: fake)
     return fake
