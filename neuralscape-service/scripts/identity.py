@@ -214,7 +214,7 @@ def cmd_merge(args) -> int:
         with driver.session(database=settings.neo4j_database) as session:
             _neo4j_rekey(session, from_id, to_id)
         driver.close()
-        print(f"  Neo4j: re-keyed group_id {old_prefix!r} → {new_prefix!r}")
+        print(f"  Neo4j: re-keyed group_id {_exact(from_id)!r} → {_exact(to_id)!r}")
     print("\nDone. Verify with:  uv run python scripts/identity.py list")
     return 0
 

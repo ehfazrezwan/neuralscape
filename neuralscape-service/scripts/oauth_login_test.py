@@ -176,8 +176,10 @@ def main() -> int:
         "client_id": client_id,
     })
     access = tok["access_token"]
+    # NB: Neuralscape access tokens are a 2-segment HMAC token "payload.sig"
+    # (NOT a 3-segment JWT), so the payload is segment [0], not [1].
     payload = json.loads(_b64url_decode(access.split(".")[0]))
-    print(f"\n✅ access token obtained")
+    print("\n✅ access token obtained")
     print(f"   resolved user_id : {payload.get('user_id')}")
     print(f"   expires_in       : {tok.get('expires_in')}s")
     print(f"   refresh_token    : {'present' if tok.get('refresh_token') else 'missing'}")
