@@ -197,6 +197,19 @@ class TestProcessMemoryRaw:
         await worker.process_memory_raw(ctx, content="x", user_id="ehfaz", category="preference")
         ctx["redis"].enqueue_job.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_falls_back_to_inline_enrichment_on_enqueue_failure(self, ctx):
+        """If the graph-queue enqueue fails, enrich inline so it isn't lost (perf-1)."""
+        ctx["service"].store_raw.return_value = (
+            [MemoryResponse(id="mem-1", memory="x", visibility="private")],
+            True,
+        )
+        ctx["redis"].enqueue_job.side_effect = ConnectionError("graph queue down")
+        await worker.process_memory_raw(ctx, content="x", user_id="ehfaz", category="preference")
+        # Fallback path enriched the graph directly rather than dropping it.
+        ctx["service"].enrich_graph.assert_called_once()
+        assert ctx["service"].enrich_graph.call_args[1]["memory_id"] == "mem-1"
+
 
 class TestProcessGraphEnrichment:
     @pytest.mark.asyncio
@@ -221,6 +234,12 @@ class TestWorkerTopology:
         from config import settings
         assert worker.GraphWorkerSettings.queue_name == settings.graph_queue_name
         assert worker.process_graph_enrichment in worker.GraphWorkerSettings.functions
+
+    def test_both_workers_set_max_tries(self):
+        """Light worker must keep its retry budget (perf-2 regression)."""
+        from config import settings
+        assert worker.WorkerSettings.max_tries == settings.arq_max_retries
+        assert worker.GraphWorkerSettings.max_tries == settings.arq_max_retries
 
     def test_heavy_crons_moved_off_light_worker(self):
         light_crons = {c.coroutine.__name__ for c in worker.WorkerSettings.cron_jobs}

@@ -153,7 +153,23 @@ async def process_memory_raw(
                 _queue_name=settings.graph_queue_name,
             )
         except Exception as e:
-            logger.warning(f"Failed to enqueue graph enrichment for {mem.id}: {e}")
+            # The enqueue is this memory's ONLY shot at graph enrichment: a
+            # later retry/dedup returns created=False and skips this block, so
+            # a lost enqueue means the graph is never updated. Fall back to
+            # enriching inline (in a thread) so graph state still lands when the
+            # graph queue is down/misconfigured — slower, but not silently lost.
+            logger.warning(f"Graph enqueue failed for {mem.id}; enriching inline as fallback: {e}")
+            try:
+                await asyncio.to_thread(
+                    service.enrich_graph,
+                    content=content,
+                    user_id=user_id,
+                    project_id=project_id,
+                    visibility=getattr(mem, "visibility", None) or "private",
+                    memory_id=mem.id,
+                )
+            except Exception as e2:  # noqa: BLE001 — enrichment is best-effort
+                logger.warning(f"Inline graph-enrichment fallback also failed for {mem.id}: {e2}")
 
     # Emit memory_stored event so extensions can write to vault
     registry = ctx.get("extension_registry")
@@ -478,6 +494,7 @@ class WorkerSettings:
     queue_name = settings.arq_queue_name
     max_jobs = 10
     job_timeout = settings.arq_job_timeout
+    max_tries = settings.arq_max_retries  # keep light-queue retry behavior unchanged
 
 
 class GraphWorkerSettings:

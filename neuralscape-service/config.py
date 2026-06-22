@@ -68,9 +68,13 @@ class Settings(BaseSettings):
     # Redis / ARQ
     redis_url: str = "redis://localhost:6379"
     arq_queue_name: str = "neuralscape:queue"
-    # Slow Graphiti graph writes run on their own queue so they can't starve
-    # fast vector writes / reads. A dedicated graph worker (GraphWorkerSettings)
-    # consumes it; until that worker is deployed this points at the main queue.
+    # Slow Graphiti graph writes run on their OWN queue so they can't starve
+    # fast vector writes / reads. This is a DEDICATED queue by default, consumed
+    # by `arq worker.GraphWorkerSettings` — that worker MUST be running (see the
+    # deploy note / docker-compose neuralscape-graph-worker) or graph-enrichment
+    # jobs queue unconsumed. To collapse back onto the single main worker, set
+    # GRAPH_QUEUE_NAME=neuralscape:queue and register process_graph_enrichment
+    # on WorkerSettings.
     graph_queue_name: str = "neuralscape:graph"
     arq_max_retries: int = 3
     arq_job_timeout: int = 300  # 5 min max per task
