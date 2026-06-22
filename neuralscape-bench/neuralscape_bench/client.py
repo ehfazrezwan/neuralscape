@@ -19,7 +19,8 @@ class TaskTimeout(Exception):
 
 
 class NeuralscapeClient:
-    def __init__(self, base_url: str, token: str | None = None, request_timeout: float = 30.0):
+    def __init__(self, base_url: str, token: str | None = None, request_timeout: float = 30.0,
+                 max_connections: int = 100):
         headers = {"Content-Type": "application/json"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
@@ -27,6 +28,10 @@ class NeuralscapeClient:
             base_url=base_url.rstrip("/"),
             headers=headers,
             timeout=request_timeout,
+            # The stress test fans out to users x per-user-concurrency clients;
+            # raise the pool ceiling so the harness doesn't self-throttle.
+            limits=httpx.Limits(max_connections=max_connections,
+                                max_keepalive_connections=max_connections),
         )
 
     async def aclose(self) -> None:
@@ -48,6 +53,7 @@ class NeuralscapeClient:
         scope: str = "global",
         project_id: str | None = None,
         tags: list[str] | None = None,
+        visibility: str | None = None,
     ) -> dict:
         """POST /v1/memories/raw. Returns the response body ({task_id,...} on 202)."""
         body: dict = {"content": content, "user_id": user_id, "category": category, "scope": scope}
@@ -55,6 +61,8 @@ class NeuralscapeClient:
             body["project_id"] = project_id
         if tags:
             body["tags"] = tags
+        if visibility:
+            body["visibility"] = visibility
         r = await self._http.post("/v1/memories/raw", json=body)
         r.raise_for_status()
         return r.json()
