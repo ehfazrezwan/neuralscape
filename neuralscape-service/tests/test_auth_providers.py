@@ -306,6 +306,21 @@ class TestSupabaseProvider:
         assert res.user_id == "anyone"
 
     @pytest.mark.asyncio
+    async def test_user_metadata_cannot_assert_verification(self, auth_settings):
+        # user_metadata is user-writable → must NOT satisfy the verification gate
+        # even if it claims email_verified=True while the top-level flag is False.
+        auth_settings.supabase_jwt_secret = "sbsecret"
+        token = jwt.encode(
+            {"aud": "authenticated", "email": "a@example.com", "email_verified": False,
+             "user_metadata": {"email_verified": True}, "sub": "uuid-x",
+             "exp": int(time.time()) + 300},
+            "sbsecret", algorithm="HS256")
+        req = _Req(form={"access_token": token, "state": sign_login_state(_make_ctx(), _SECRET)})
+        res = await SupabaseProvider().complete(req)
+        assert isinstance(res, LoginError)
+        assert res.status == 403
+
+    @pytest.mark.asyncio
     async def test_env_allowlist_as_extra_gate_denies(self, auth_settings):
         auth_settings.supabase_jwt_secret = "sbsecret"
         auth_settings.auth_allowed_domains = "example.com"

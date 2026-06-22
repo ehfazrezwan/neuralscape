@@ -83,28 +83,47 @@ def _neo4j_driver():
     )
 
 
-def _neo4j_count(session, old_prefix: str) -> tuple[int, int]:
+# A user's private group_ids are exactly "user--{id}" (global) and
+# "user--{id}--project--{pid}" (per project). We must NOT use a bare
+# STARTS WITH "user--{id}" — that also matches a different user whose id has
+# {id} as a prefix (e.g. from_id="a" matching "user--alice"). Match the exact
+# global id OR the project-namespace prefix only.
+def _exact(uid: str) -> str:
+    return f"user--{uid}"
+
+
+def _proj_prefix(uid: str) -> str:
+    return f"user--{uid}--project--"
+
+
+_OWN_WHERE = "(n.group_id = $exact OR n.group_id STARTS WITH $proj)"
+_OWN_WHERE_REL = "(r.group_id = $exact OR r.group_id STARTS WITH $proj)"
+
+
+def _neo4j_count(session, from_id: str) -> tuple[int, int]:
+    p = {"exact": _exact(from_id), "proj": _proj_prefix(from_id)}
     nodes = session.run(
-        "MATCH (n) WHERE n.group_id STARTS WITH $p RETURN count(n) AS c",
-        p=old_prefix,
+        f"MATCH (n) WHERE {_OWN_WHERE} RETURN count(n) AS c", **p
     ).single()["c"]
     rels = session.run(
-        "MATCH ()-[r]->() WHERE r.group_id STARTS WITH $p RETURN count(r) AS c",
-        p=old_prefix,
+        f"MATCH ()-[r]->() WHERE {_OWN_WHERE_REL} RETURN count(r) AS c", **p
     ).single()["c"]
     return nodes, rels
 
 
-def _neo4j_rekey(session, old_prefix: str, new_prefix: str) -> None:
+def _neo4j_rekey(session, from_id: str, to_id: str) -> None:
+    # Rewrite by replacing the "user--{from_id}" prefix with "user--{to_id}",
+    # preserving any "--project--{pid}" suffix via substring.
+    p = {"exact": _exact(from_id), "proj": _proj_prefix(from_id), "new": _exact(to_id)}
     session.run(
-        "MATCH (n) WHERE n.group_id STARTS WITH $old "
-        "SET n.group_id = $new + substring(n.group_id, size($old))",
-        old=old_prefix, new=new_prefix,
+        f"MATCH (n) WHERE {_OWN_WHERE} "
+        "SET n.group_id = $new + substring(n.group_id, size($exact))",
+        **p,
     )
     session.run(
-        "MATCH ()-[r]->() WHERE r.group_id STARTS WITH $old "
-        "SET r.group_id = $new + substring(r.group_id, size($old))",
-        old=old_prefix, new=new_prefix,
+        f"MATCH ()-[r]->() WHERE {_OWN_WHERE_REL} "
+        "SET r.group_id = $new + substring(r.group_id, size($exact))",
+        **p,
     )
 
 
@@ -119,18 +138,23 @@ def cmd_list(_args) -> int:
     print("\n== existing memory owners (Qdrant user_id) ==")
     owners: dict[str, int] = {}
     for coll in _COLLECTIONS:
+        offset = None
         try:
-            res = _qdrant(
-                f"/collections/{coll}/points/scroll",
-                {"limit": 1000, "with_payload": ["user_id"], "with_vector": False},
-            )["result"]
+            while True:  # paginate — a single scroll page misses owners past the limit
+                body = {"limit": 1000, "with_payload": ["user_id"], "with_vector": False}
+                if offset is not None:
+                    body["offset"] = offset
+                res = _qdrant(f"/collections/{coll}/points/scroll", body)["result"]
+                for p in res.get("points", []):
+                    uid = (p.get("payload") or {}).get("user_id")
+                    if uid:
+                        owners[uid] = owners.get(uid, 0) + 1
+                offset = res.get("next_page_offset")
+                if offset is None:
+                    break
         except Exception as e:
             print(f"  ({coll}: {e})")
             continue
-        for p in res.get("points", []):
-            uid = (p.get("payload") or {}).get("user_id")
-            if uid:
-                owners[uid] = owners.get(uid, 0) + 1
     for uid, n in sorted(owners.items(), key=lambda x: -x[1]):
         print(f"  {n:5}  {uid}")
     return 0
@@ -150,8 +174,6 @@ def cmd_unlink(args) -> int:
 
 def cmd_merge(args) -> int:
     from_id, to_id = args.from_id, args.to_id
-    old_prefix = f"user--{from_id}"
-    new_prefix = f"user--{to_id}"
     mode = "APPLY" if args.apply else "DRY-RUN"
     print(f"=== merge {from_id!r} → {to_id!r}  [{mode}] ===\n")
 
@@ -170,9 +192,9 @@ def cmd_merge(args) -> int:
     try:
         driver = _neo4j_driver()
         with driver.session(database=settings.neo4j_database) as session:
-            nodes, rels = _neo4j_count(session, old_prefix)
+            nodes, rels = _neo4j_count(session, from_id)
         print(f"  Neo4j: {nodes} node(s) + {rels} relationship(s) under "
-              f"group_id prefix {old_prefix!r}")
+              f"group_id 'user--{from_id}' (exact + --project--)")
         driver.close()
     except Exception as e:
         print(f"  Neo4j: ERROR {e}")
@@ -190,7 +212,7 @@ def cmd_merge(args) -> int:
     if nodes or rels:
         driver = _neo4j_driver()
         with driver.session(database=settings.neo4j_database) as session:
-            _neo4j_rekey(session, old_prefix, new_prefix)
+            _neo4j_rekey(session, from_id, to_id)
         driver.close()
         print(f"  Neo4j: re-keyed group_id {old_prefix!r} → {new_prefix!r}")
     print("\nDone. Verify with:  uv run python scripts/identity.py list")

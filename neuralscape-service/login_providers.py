@@ -385,10 +385,12 @@ document.getElementById('ns-google-btn').addEventListener('click', async () => {
             return LoginError("Could not verify Supabase session.", 401)
 
         email = claims.get("email", "")
-        # Supabase nests the verification flag under user_metadata; accept the
-        # top-level flag too for forward-compat.
-        meta = claims.get("user_metadata") or {}
-        email_verified = bool(claims.get("email_verified") or meta.get("email_verified"))
+        # Trust ONLY server-controlled verification flags: GoTrue's top-level
+        # `email_verified` and `app_metadata` (admin/server-set). `user_metadata`
+        # is user-writable (supabase.auth.updateUser), so trusting it here would
+        # let a user self-assert a verified email — a bypass. Not consulted.
+        app_meta = claims.get("app_metadata") or {}
+        email_verified = bool(claims.get("email_verified") or app_meta.get("email_verified"))
         sub = claims.get("sub")
         return await _resolve_identity(
             ctx, email, email_verified, sub, trust_external_gate=True

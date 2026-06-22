@@ -163,7 +163,8 @@ and continues the MCP flow. The start and finish pages **must be same-origin**
 | `GET /.well-known/oauth-protected-resource[/mcp]` | RFC 9728 PRM |
 | `POST /oauth/register` | Dynamic Client Registration |
 | `GET /oauth/authorize` | Consent step (delegates to the active provider) |
-| `POST /oauth/authorize` | Token-paste submit (only when `AUTH_PROVIDER=token`) |
+| `POST /oauth/authorize` | Token-paste submit (when `AUTH_PROVIDER=token`, or any provider with `AUTH_ALLOW_TOKEN_PASTE=true`) |
+| `POST /oauth/link` | First-login link decision (continue-as-new / claim existing) |
 | `GET /oauth/google/callback` | Google OIDC redirect target |
 | `GET /oauth/supabase/callback` | Supabase browser finisher (renders) |
 | `POST /oauth/supabase/callback` | Supabase JWT verify → continue |
