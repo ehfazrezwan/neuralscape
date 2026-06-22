@@ -1,0 +1,22 @@
+# Benchmark override: lets a second (or third) Neuralscape stack run alongside
+# the existing one without host-port collisions. Apply ON TOP of a branch's
+# docker-compose.yml:
+#
+#   BENCH_API_PORT=8299 docker compose -p nsbench-<slug> \
+#     -f <worktree>/docker-compose.yml -f docker-compose.bench.yml up -d --build
+#
+# `docker compose -p` already isolates the network + named volumes per project.
+# This file additionally removes the backing-store host-port publishes (they're
+# only reached in-cluster via service DNS) and maps ONLY the API to an offset
+# host port — so any number of stacks coexist, each reachable at its own
+# BENCH_API_PORT. The orchestrator sets BENCH_API_PORT per stack.
+services:
+  neo4j:
+    ports: []
+  redis:
+    ports: []
+  qdrant:
+    ports: []
+  neuralscape:
+    ports:
+      - "${BENCH_API_PORT:-8299}:8199"
