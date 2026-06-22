@@ -228,6 +228,21 @@ class TestProcessGraphEnrichment:
         await worker.process_graph_enrichment(ctx, memory_id="m", content="c", user_id="u")
         assert ctx["service"].enrich_graph.call_args[1]["visibility"] == "private"
 
+    @pytest.mark.asyncio
+    async def test_reports_real_enriched_status_true(self, ctx):
+        """enriched reflects enrich_graph's actual success, not a hardcoded True."""
+        ctx["service"].enrich_graph.return_value = True
+        result = await worker.process_graph_enrichment(ctx, memory_id="m", content="c", user_id="u")
+        assert result == {"memory_id": "m", "enriched": True}
+
+    @pytest.mark.asyncio
+    async def test_reports_enriched_false_when_dropped(self, ctx):
+        """A swallowed graph failure (e.g. transient 503) must surface as enriched=False,
+        not masquerade as success — this is what makes silent drops observable."""
+        ctx["service"].enrich_graph.return_value = False
+        result = await worker.process_graph_enrichment(ctx, memory_id="m", content="c", user_id="u")
+        assert result == {"memory_id": "m", "enriched": False}
+
 
 class TestWorkerTopology:
     def test_graph_worker_owns_graph_queue_and_enrichment(self):

@@ -252,10 +252,14 @@ async def process_graph_enrichment(
     This is the slow half of a write (Graphiti entity extraction, ~minutes,
     Gemini-gated) split out of the synchronous vector store so it runs on the
     dedicated graph queue/worker and never blocks fast writes or reads.
-    Best-effort — MemoryService.enrich_graph swallows its own errors.
+    Best-effort — MemoryService.enrich_graph swallows its own errors and
+    returns whether the graph write actually succeeded. We surface that honestly
+    in the result (``enriched``) and log dropped enrichments so a silent run of
+    transient Gemini 503s (which leave memories vector-only) is observable rather
+    than masquerading as success.
     """
     service: MemoryService = ctx["service"]
-    await asyncio.to_thread(
+    enriched = await asyncio.to_thread(
         service.enrich_graph,
         content=content,
         user_id=user_id,
@@ -263,7 +267,14 @@ async def process_graph_enrichment(
         visibility=visibility or "private",
         memory_id=memory_id,
     )
-    return {"memory_id": memory_id, "enriched": True}
+    if not enriched:
+        logger.warning(
+            "Graph enrichment did not complete for memory %s — it remains "
+            "vector-only (graph unconfigured or a transient LLM/Graphiti error "
+            "was swallowed). See enrich_graph warnings above.",
+            memory_id,
+        )
+    return {"memory_id": memory_id, "enriched": enriched}
 
 
 async def expire_old_memories_cron(ctx: dict) -> dict:

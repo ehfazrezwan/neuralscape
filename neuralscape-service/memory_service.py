@@ -762,7 +762,7 @@ class MemoryService:
         project_id: str | None,
         visibility: str,
         memory_id: str,
-    ) -> None:
+    ) -> bool:
         """Add content to the knowledge graph + attach memory_id back-refs.
 
         Extracted from store_raw so it can run either inline (add_to_graph=True)
@@ -770,9 +770,15 @@ class MemoryService:
         since Graphiti entity extraction is slow (~minutes, Gemini-gated) and
         must not block the fast vector write or the API/MCP event loop.
         Best-effort: logs and swallows errors, never raises.
+
+        Returns True if the graph write actually succeeded, False if it was
+        skipped (no graph configured) or swallowed an error. Callers use this
+        to report honest enrichment status instead of assuming success — a
+        transient Gemini 503 leaves the memory vector-only, and that must be
+        observable rather than reported as ``enriched=True``.
         """
         if not (self._graphiti and self._bridge):
-            return
+            return False
         # Group_id encodes visibility + user namespace so graph search can
         # scope by allowed groups without re-leaking cross-user facts.
         group_id = _build_group_id(visibility, user_id, project_id)
@@ -794,8 +800,10 @@ class MemoryService:
                 owner_user_id=user_id,
                 write_started_at=graph_write_started_at,
             )
+            return True
         except Exception as e:
             logger.warning(f"Graph enrichment failed (non-critical): {e}")
+            return False
 
     def _search_shared_pool(
         self,

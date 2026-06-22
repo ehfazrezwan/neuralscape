@@ -14,6 +14,25 @@ import pytest
 from config import Settings
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_env(monkeypatch):
+    """Strip provider/cred env vars before each test in this module.
+
+    ``graphiti_core`` calls ``load_dotenv()`` at import time (graphiti.py /
+    helpers.py / driver.py), leaking the repo ``.env`` into ``os.environ``.
+    ``_settings(_env_file=None, ...)`` disables the .env file but pydantic still
+    reads ``os.environ``, so a leaked ``LLM_GATEWAY_BASE_URL`` would defeat the
+    "missing creds → error" assertions. Clearing them makes ``_settings`` truly
+    hermetic — kwargs and class defaults fully control the Settings under test.
+    """
+    for var in (
+        "LLM_GATEWAY_ENABLED", "LLM_GATEWAY_BASE_URL", "LLM_GATEWAY_API_KEY",
+        "LLM_GATEWAY_GRAPHITI_ENABLED", "GOOGLE_API_KEY", "NEO4J_PASSWORD",
+        "GEMINI_LLM_MODEL", "GEMINI_LLM_FALLBACK_MODEL", "GEMINI_EMBEDDER_MODEL",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
 def _settings(**kw) -> Settings:
     # Hermetic: don't read a real .env so the test only sees its kwargs.
     return Settings(_env_file=None, **kw)

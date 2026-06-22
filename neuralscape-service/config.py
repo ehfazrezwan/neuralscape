@@ -12,7 +12,7 @@ _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
 class Settings(BaseSettings):
     # Gemini (direct Google AI Studio)
     google_api_key: str = ""
-    gemini_llm_model: str = "gemini-3-flash-preview"
+    gemini_llm_model: str = "gemini-3.1-flash-lite"
     gemini_llm_fallback_model: str = "gemini-2.5-flash"
     gemini_embedder_model: str = "gemini-embedding-001"
 
@@ -187,6 +187,10 @@ class Settings(BaseSettings):
         return {
             "graphiti_llm_provider": "gemini",
             "graphiti_llm_model": self.gemini_llm_model,
+            # Pin the small-model (cheap sub-tasks like edge dedup) to the main
+            # model too — otherwise Graphiti's GeminiClient falls back to its
+            # hardcoded DEFAULT_SMALL_MODEL, which is a flaky preview-tier model.
+            "graphiti_llm_small_model": self.gemini_llm_model,
             "graphiti_llm_fallback_model": self.gemini_llm_fallback_model,
             "graphiti_llm_api_key": self.google_api_key,
             "graphiti_embedder_provider": "gemini",
