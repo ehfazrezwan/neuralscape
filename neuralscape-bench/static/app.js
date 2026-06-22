@@ -98,6 +98,28 @@ async function showRun(name) {
       datasets: [{ label: run.label, backgroundColor: COLORS.cand, data: [t.reads_per_sec, t.writes_per_sec] }],
     });
   }
+  if (m.stress) {
+    const s = m.stress, f = s.fairness || {};
+    const sum = card("Multi-user stress");
+    sum.innerHTML += `<div class="note">${s.users} users · <b>${s.ops_per_sec} ops/sec</b> · ` +
+      `errors ${(s.error_rate*100).toFixed(1)}% · read p95 ${s.read.p95}ms · ` +
+      `fairness spread ×${f.read_p95_spread ?? "?"} (cv ${f.read_p95_cv})</div>`;
+    chart(card("Stress latency (ms)"), "bar", {
+      labels: ["p50", "p95", "p99"],
+      datasets: [
+        { label: "read", backgroundColor: COLORS.p50, data: ["p50","p95","p99"].map((p)=>s.read[p]) },
+        { label: "write enqueue", backgroundColor: COLORS.p99, data: ["p50","p95","p99"].map((p)=>s.write[p]) },
+      ],
+    });
+    const users = Object.keys(s.per_user_read_p95 || {});
+    if (users.length) {
+      chart(card("Per-user read p95 — fairness (flat = fair)"), "bar", {
+        labels: users,
+        datasets: [{ label: "read p95 (ms)", backgroundColor: COLORS.cand,
+          data: users.map((u) => s.per_user_read_p95[u]) }],
+      });
+    }
+  }
   if (run.notes && run.notes.length) {
     const n = card("Notes"); n.innerHTML += "<ul class='note'>" + run.notes.map((x)=>`<li>${x}</li>`).join("") + "</ul>";
   }
@@ -154,6 +176,14 @@ $("run-btn").onclick = async () => {
     body: JSON.stringify({ target: $("t-url").value, label: $("t-label").value,
       profile: $("t-profile").value, live_baseline: $("t-live").value === "true" }) });
   setTimeout(() => { $("run-btn").disabled = false; $("run-btn").textContent = "Run"; loadRuns(); }, 1500);
+  pollStatus();
+};
+$("stress-btn").onclick = async () => {
+  $("stress-btn").disabled = true; $("stress-btn").textContent = "Running…";
+  await api("/api/stress", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ target: $("s-url").value, label: $("s-label").value, profile: $("s-profile").value,
+      users: parseInt($("s-users").value) || null, duration: parseFloat($("s-dur").value) || null }) });
+  setTimeout(() => { $("stress-btn").disabled = false; $("stress-btn").textContent = "Run stress"; loadRuns(); }, 1500);
   pollStatus();
 };
 $("ab-btn").onclick = async () => {

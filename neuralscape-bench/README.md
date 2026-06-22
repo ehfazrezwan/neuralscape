@@ -60,6 +60,29 @@ uv run python -m neuralscape_bench.orchestrator \
 Requires Docker + a `.env` with `GOOGLE_API_KEY` / `NEO4J_PASSWORD` (built stacks
 run the real graph path). `--no-teardown` leaves stacks up for inspection.
 
+## Multi-user stress test
+
+Simulates **N distinct users** hitting the service concurrently with a read/write
+mix for a fixed duration — the "can it handle concurrent users" scenario. Reports
+aggregate throughput + error rate, overall read/write latency percentiles, and
+crucially **per-user p95 + a fairness measure** (does one user's load starve
+another?). Writes are enqueue-only (202 latency under load), not polled to
+completion.
+
+```bash
+uv run python -m neuralscape_bench.stress \
+  --target http://localhost:8199 --label dev-stress \
+  --users 20 --duration 30 --concurrency 3 --profile full
+```
+
+Each simulated user gets its own `stress-<runid>-uN` namespace (seeded + cleaned
+up). `fairness.read_p95_spread` = max/min per-user read p95 (1.0 = perfectly
+fair; large = some users starved); `read_p95_cv` is the coefficient of variation.
+Results render in the dashboard with a per-user p95 bar chart.
+
+> Auth note: distinct users are simulated via distinct `user_id` (local dev needs
+> no auth). Under per-user-token auth you'd issue a token per user — a future knob.
+
 ## Dashboard
 
 ```bash

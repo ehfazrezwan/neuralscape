@@ -2,6 +2,7 @@
 results/*.json
 !results/sample-run.json
 !results/sample-compare.json
+!results/sample-stress.json
 
 # Orchestrator-managed stack worktrees
 .stacks/

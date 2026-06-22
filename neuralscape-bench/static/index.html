@@ -61,6 +61,21 @@
         <button id="run-btn">Run</button>
       </div>
       <div class="card">
+        <strong>Multi-user stress</strong>
+        <label>Target URL</label>
+        <input id="s-url" value="http://localhost:8199" />
+        <label>Label</label>
+        <input id="s-label" value="dev-stress" />
+        <div class="row">
+          <div><label>Users</label><input id="s-users" type="number" value="8" /></div>
+          <div><label>Duration (s)</label><input id="s-dur" type="number" value="15" /></div>
+        </div>
+        <label>Profile</label>
+        <select id="s-profile"><option>light</option><option>full</option></select>
+        <button id="stress-btn">Run stress</button>
+        <p class="note">N users × workers hitting reads+writes concurrently; reports throughput, errors, and per-user fairness.</p>
+      </div>
+      <div class="card">
         <strong>Run A/B (builds stacks)</strong>
         <label>Candidate branch</label>
         <input id="ab-cand" value="perf/write-read-isolation" />

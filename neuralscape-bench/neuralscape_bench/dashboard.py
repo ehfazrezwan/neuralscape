@@ -126,6 +126,37 @@ def trigger_ab(req: ABRequest) -> dict:
     return {"status": "accepted", "cmd": " ".join(cmd)}
 
 
+class StressRequest(BaseModel):
+    target: str
+    label: str
+    profile: str = "light"
+    token: str | None = None
+    users: int | None = None
+    duration: float | None = None
+    concurrency: int | None = None
+
+
+async def _do_stress(req: StressRequest) -> None:
+    from neuralscape_bench.stress import run_stress, stress_config
+    _running[req.label] = "running"
+    try:
+        cfg = stress_config(req.profile, users=req.users, duration_s=req.duration,
+                            per_user_concurrency=req.concurrency)
+        target = Target(base_url=req.target, label=req.label, token=req.token, profile=req.profile)
+        result = await run_stress(target, cfg, now_iso=datetime.now(timezone.utc).isoformat())
+        save_result(result)
+        _running[req.label] = "done"
+    except Exception as e:  # noqa: BLE001
+        _running[req.label] = f"error: {e}"
+
+
+@app.post("/api/stress")
+async def trigger_stress(req: StressRequest) -> dict:
+    """Kick off a multi-user stress test in the background."""
+    asyncio.create_task(_do_stress(req))
+    return {"status": "accepted", "label": req.label}
+
+
 @app.get("/api/status")
 def status() -> dict:
     return {"running": _running}
