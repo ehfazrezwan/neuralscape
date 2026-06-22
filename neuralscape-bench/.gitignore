@@ -1,0 +1,13 @@
+# Benchmark outputs (keep the sample, ignore the rest)
+results/*.json
+!results/sample-run.json
+!results/sample-compare.json
+
+# Orchestrator-managed stack worktrees
+.stacks/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
