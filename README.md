@@ -664,7 +664,7 @@ neuralscape/
 │   └── sync-upstream.sh          # Pull upstream changes for git subtree deps
 ├── mem0/                         # mem0 (git subtree from upstream)
 │   └── mem0/memory/
-│       └── graphiti_memory.py    # Graphiti adapter (local patches applied)
+│       └── graphiti_memory.py    # Graphiti adapter (NS-authored; never existed upstream)
 └── graphiti/                     # graphiti-core (git subtree from upstream)
 ```
 
@@ -686,4 +686,7 @@ neuralscape/
 
 **Why a periodic dedup cron instead of dedup-on-write?** `mem0.add(infer=False)` bypasses mem0's built-in LLM dedup because we do our own extraction. Checking for duplicates on every write would add latency to the async write path and require embedding + search per write. A periodic batch job is simpler, runs during low-traffic hours, and can use higher thresholds without blocking user-facing operations.
 
-**Why git subtrees for mem0 and graphiti?** Both dependencies have local patches (Graphiti adapter scoping, Neo4j driver fixes). Git subtrees keep the full upstream history, allow pulling upstream changes with `scripts/sync-upstream.sh`, and let local patches live as normal commits — no submodule headaches or fork maintenance.
+**Why git subtrees for mem0 and graphiti?** Both dependencies carry NS-local changes. Git subtrees keep the full upstream history, allow pulling upstream changes with `scripts/sync-upstream.sh`, and let local changes live as normal commits — no submodule headaches or fork maintenance. Two of these changes are not "patches" in the usual sense but a maintained fork of code that no longer exists upstream:
+
+- **`mem0/memory/graphiti_memory.py` is net-new NS code** — it has never existed in mem0's upstream history. It is the adapter we wrote to present Graphiti as a mem0 graph provider, not a patched upstream file.
+- **mem0 deleted its entire self-hostable OSS graph layer upstream** (PR #4805 / `a488e190`, 2026-04-14, the "v3 pipeline"): `mem0/graphs/` plus `graph_memory.py` / `memgraph_memory.py` etc. were removed and graph memory became a hosted-Platform-only feature. We restore and maintain that layer (Neo4j/Memgraph/Neptune/Kuzu providers + a `GraphStoreFactory`) ourselves, and our `Memory` re-attach shim in `memory_service.py` bolts it onto a mem0 core that no longer has a `.graph` concept. Every upstream sync re-grafts this layer — see `docs/neuralscape/14-upstream-delta-report.md` for the full risk surface.
