@@ -243,6 +243,16 @@ class TestProcessGraphEnrichment:
         result = await worker.process_graph_enrichment(ctx, memory_id="m", content="c", user_id="u")
         assert result == {"memory_id": "m", "enriched": False}
 
+    @pytest.mark.asyncio
+    async def test_skips_enrichment_when_memory_deleted_while_queued(self, ctx):
+        """If the memory was deleted/expired while the job sat in the queue,
+        enriching would resurrect it in the graph — so skip and don't call
+        enrich_graph at all."""
+        ctx["service"].get_memory.return_value = None
+        result = await worker.process_graph_enrichment(ctx, memory_id="gone", content="c", user_id="u")
+        assert result == {"memory_id": "gone", "enriched": False, "skipped": "memory_missing"}
+        ctx["service"].enrich_graph.assert_not_called()
+
 
 class TestWorkerTopology:
     def test_graph_worker_owns_graph_queue_and_enrichment(self):

@@ -26,8 +26,12 @@ def _hermetic_env(monkeypatch):
     hermetic — kwargs and class defaults fully control the Settings under test.
     """
     for var in (
+        "OPENAI_BASE_URL", "OPENAI_API_KEY",
         "LLM_GATEWAY_ENABLED", "LLM_GATEWAY_BASE_URL", "LLM_GATEWAY_API_KEY",
-        "LLM_GATEWAY_GRAPHITI_ENABLED", "GOOGLE_API_KEY", "NEO4J_PASSWORD",
+        "LLM_GATEWAY_GRAPHITI_ENABLED",
+        "LLM_GATEWAY_LLM_MODEL", "LLM_GATEWAY_LLM_FALLBACK_MODEL",
+        "LLM_GATEWAY_EMBEDDER_MODEL", "LLM_GATEWAY_GRAPHITI_MODEL",
+        "GOOGLE_API_KEY", "NEO4J_PASSWORD", "GRAPH_QUEUE_NAME",
         "GEMINI_LLM_MODEL", "GEMINI_LLM_FALLBACK_MODEL", "GEMINI_EMBEDDER_MODEL",
     ):
         monkeypatch.delenv(var, raising=False)

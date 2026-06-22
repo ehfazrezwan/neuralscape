@@ -38,7 +38,11 @@ async def process_memory_store(
 ) -> dict:
     """Background task: LLM extraction + store each fact."""
     service: MemoryService = ctx["service"]
-    memories = service.extract_and_store(
+    # Offload the synchronous, network-bound work (LLM extraction + embedding +
+    # Qdrant insert) to a thread so it doesn't block the ARQ event loop and
+    # serialize other concurrent jobs. (process_memory_raw_batch already does this.)
+    memories = await asyncio.to_thread(
+        service.extract_and_store,
         messages=messages,
         user_id=user_id,
         project_id=project_id,
@@ -116,8 +120,12 @@ async def process_memory_raw(
 
     # Fast path: vector write only (sub-second). The slow Graphiti graph.add
     # is deferred to a separate process_graph_enrichment job (see below) so it
-    # can't make this job block for minutes and starve other writes.
-    memories, created = service.store_raw(
+    # can't make this job block for minutes and starve other writes. Run it in a
+    # thread: the embedding + Qdrant insert + history write are synchronous and
+    # network-bound, so calling them directly would block the ARQ event loop and
+    # serialize concurrent jobs (process_memory_raw_batch already offloads).
+    memories, created = await asyncio.to_thread(
+        service.store_raw,
         content=content,
         user_id=user_id,
         category=category,
@@ -259,6 +267,17 @@ async def process_graph_enrichment(
     than masquerading as success.
     """
     service: MemoryService = ctx["service"]
+    # Guard against a delete/expiry that happened while this job sat in the
+    # queue: graph enrichment can run minutes after the write, and adding now
+    # would resurrect the deleted memory's content in Neo4j. If it's gone from
+    # the store, skip rather than re-create graph state for it.
+    if await asyncio.to_thread(service.get_memory, memory_id) is None:
+        logger.info(
+            "Skipping graph enrichment for memory %s — no longer in the store "
+            "(deleted/expired while the job was queued).",
+            memory_id,
+        )
+        return {"memory_id": memory_id, "enriched": False, "skipped": "memory_missing"}
     enriched = await asyncio.to_thread(
         service.enrich_graph,
         content=content,

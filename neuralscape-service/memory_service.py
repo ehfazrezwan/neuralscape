@@ -598,6 +598,10 @@ class MemoryService:
     ) -> list[MemoryResponse] | tuple[list[MemoryResponse], bool]:
         """Store a single pre-categorized fact directly (no LLM extraction).
 
+        Returns a ``list[MemoryResponse]`` by default, or ``(responses, created)``
+        when ``return_created=True`` (``created`` is False for content-hash dedup
+        hits) — callers must not assume the return is always a list.
+
         Performs content-hash dedup before insert: if a memory with the same
         md5(content) + user_id + scope already exists, the existing memory is
         returned instead of creating a duplicate. This makes hook-driven

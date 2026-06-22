@@ -44,6 +44,9 @@ else:
 
 logger = logging.getLogger(__name__)
 
+# NEURALSCAPE PATCH: default models changed from gemini-3-flash-preview /
+# gemini-2.5-flash-lite (preview/flaky tiers that 503 under load) to the
+# reliable gemini-3.1-flash-lite. Re-apply after upstream subtree syncs.
 DEFAULT_MODEL = 'gemini-3.1-flash-lite'
 DEFAULT_SMALL_MODEL = 'gemini-3.1-flash-lite'
 
@@ -54,7 +57,8 @@ _TRANSIENT_PATTERNS = ('503', 'unavailable', 'overloaded', 'capacity', 'high dem
 def _is_transient_error(exc: Exception) -> bool:
     """Check if an exception indicates a transient model availability issue.
 
-    Walks the exception's cause/context chain, not just ``str(exc)``: the
+    NEURALSCAPE PATCH: walks the cause/context chain (re-apply after upstream
+    subtree syncs). Walks the exception's cause/context chain, not just ``str(exc)``: the
     Gemini transient (503/"high demand") often surfaces as a re-raised wrapper
     whose own message is empty, with the real text living in ``__cause__``.
     Inspecting only the top-level message would miss it and silently disable
@@ -74,7 +78,7 @@ GEMINI_MODEL_MAX_TOKENS = {
     # Gemini 3 models
     'gemini-3-pro-preview': 65536,
     'gemini-3-flash-preview': 65536,
-    'gemini-3.1-flash-lite': 65536,
+    'gemini-3.1-flash-lite': 65536,  # NEURALSCAPE PATCH: our default model (re-apply after sync)
     # Gemini 2.5 models
     'gemini-2.5-pro': 65536,
     'gemini-2.5-flash': 65536,
@@ -382,6 +386,7 @@ class GeminiClient(LLMClient):
                 raise RateLimitError from e
 
             logger.error(f'Error in generating LLM response: {e}')
+            # NEURALSCAPE PATCH (re-apply after upstream subtree syncs):
             # Preserve the original error text — ``raise Exception from e`` would
             # produce a message-less exception, so downstream transient-error
             # detection (``_is_transient_error``) and the safety-block check see
