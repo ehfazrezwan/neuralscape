@@ -413,14 +413,62 @@ class TestGoogleProvider:
         assert isinstance(res, LoginError)
         assert res.status == 400
 
-    @pytest.mark.asyncio
-    async def test_begin_redirects_to_google(self, auth_settings):
+    def test_consent_block_has_google_link(self, auth_settings):
         auth_settings.auth_provider = "google"
         auth_settings.google_oauth_client_id = "cid"
         auth_settings.google_oauth_client_secret = "sec"
-        resp = await GoogleProvider().begin(_make_ctx(), lambda: None)
-        assert resp.status_code == 302
-        loc = resp.headers["location"]
-        assert "accounts.google.com" in loc and "client_id=cid" in loc
-        # redirect_uri is percent-encoded in the query string
-        assert "google%2Fcallback" in loc
+        block = GoogleProvider().consent_block(_make_ctx())
+        assert '<a class="provider-btn"' in block
+        assert "accounts.google.com" in block and "client_id=cid" in block
+        # redirect_uri is percent-encoded in the href query string
+        assert "google%2Fcallback" in block
+
+    def test_consent_block_not_configured(self, auth_settings):
+        auth_settings.auth_provider = "google"
+        auth_settings.google_oauth_client_id = ""
+        auth_settings.google_oauth_client_secret = ""
+        block = GoogleProvider().consent_block(_make_ctx())
+        assert "not configured" in block.lower()
+
+
+class TestConsentComposition:
+    def test_token_provider_block_empty(self, auth_settings):
+        from login_providers import TokenProvider
+        assert TokenProvider().consent_block(_make_ctx()) == ""
+
+    def test_supabase_consent_block_has_button_and_url(self, auth_settings):
+        from login_providers import SupabaseProvider
+        auth_settings.supabase_url = "https://abc.supabase.co"
+        auth_settings.supabase_anon_key = "anon"
+        block = SupabaseProvider().consent_block(_make_ctx())
+        assert "ns-google-btn" in block
+        assert "abc.supabase.co" in block
+        assert "supabase/callback" in block
+
+    def _render(self, provider_block, show_token_form):
+        from oauth import _render_consent
+        resp = _render_consent(
+            client_id="c", redirect_uri="https://r/cb", state="s",
+            code_challenge="h", code_challenge_method="S256", resource="",
+            provider_block=provider_block, show_token_form=show_token_form,
+        )
+        return resp.body.decode()
+
+    def test_page_shows_both_provider_and_token(self):
+        # The headline requirement: Google button AND token paste, with a divider.
+        body = self._render('<a class="provider-btn" href="x">G</a>', True)
+        assert '<a class="provider-btn"' in body
+        assert 'name="token"' in body
+        assert '<div class="divider">' in body
+
+    def test_page_provider_only_when_paste_disabled(self):
+        body = self._render('<a class="provider-btn" href="x">G</a>', False)
+        assert '<a class="provider-btn"' in body
+        assert 'name="token"' not in body
+        assert '<div class="divider">' not in body
+
+    def test_page_token_only_in_token_mode(self):
+        body = self._render("", True)
+        assert 'name="token"' in body
+        assert '<a class="provider-btn"' not in body
+        assert '<div class="divider">' not in body

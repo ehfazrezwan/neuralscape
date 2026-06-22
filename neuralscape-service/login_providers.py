@@ -32,7 +32,6 @@ from urllib.parse import urlencode
 import httpx
 import jwt
 from fastapi import Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from jwt import PyJWKClient
 
 from allowlist import is_email_allowed
@@ -167,26 +166,29 @@ def _resolve_identity(
 
 
 class LoginProvider:
-    """Base interface. ``begin`` renders/starts the login for ``GET
-    /oauth/authorize``; redirect-based providers also implement callbacks."""
+    """Base interface. ``consent_block`` returns the provider's login UI as an
+    HTML snippet injected into the shared consent page (above the optional
+    token-paste form); redirect-based providers also implement ``complete``."""
 
     name = "base"
 
-    async def begin(self, ctx: AuthorizeContext, render_consent) -> Response:
-        raise NotImplementedError
+    def consent_block(self, ctx: AuthorizeContext) -> str:
+        """HTML snippet for this provider's login control. '' = no provider UI
+        (the token-paste form is the only login mechanism)."""
+        return ""
 
 
 # ── token provider (paste an admin HMAC token) ───────────────────────────
 
 
 class TokenProvider(LoginProvider):
-    """Legacy default: render the token-paste consent page. The POST handler
-    in ``oauth.py`` verifies the pasted token (kept there for back-compat)."""
+    """Legacy default: the consent page shows only the token-paste form (no
+    provider button). The POST handler in ``oauth.py`` verifies the token."""
 
     name = "token"
 
-    async def begin(self, ctx: AuthorizeContext, render_consent) -> Response:
-        return render_consent()
+    def consent_block(self, ctx: AuthorizeContext) -> str:
+        return ""
 
 
 # ── google provider (OIDC) ───────────────────────────────────────────────
@@ -198,13 +200,7 @@ class GoogleProvider(LoginProvider):
     def _redirect_uri(self) -> str:
         return f"{settings.neuralscape_public_url.rstrip('/')}/oauth/google/callback"
 
-    async def begin(self, ctx: AuthorizeContext, render_consent) -> Response:
-        if not settings.google_oauth_client_id or not settings.google_oauth_client_secret:
-            return JSONResponse(
-                status_code=500,
-                content={"error": "server_error",
-                         "error_description": "Google login is not configured"},
-            )
+    def _authorize_url(self, ctx: AuthorizeContext) -> str:
         state = sign_login_state(ctx, settings.neuralscape_user_token_secret)
         params = {
             "response_type": "code",
@@ -215,9 +211,13 @@ class GoogleProvider(LoginProvider):
             "access_type": "online",
             "prompt": "select_account",
         }
-        return RedirectResponse(
-            url=f"{GOOGLE_AUTH_ENDPOINT}?{urlencode(params)}", status_code=302
-        )
+        return f"{GOOGLE_AUTH_ENDPOINT}?{urlencode(params)}"
+
+    def consent_block(self, ctx: AuthorizeContext) -> str:
+        if not settings.google_oauth_client_id or not settings.google_oauth_client_secret:
+            return '<p class="err">Google login is not configured on this server.</p>'
+        url = html.escape(self._authorize_url(ctx))
+        return f'<a class="provider-btn" href="{url}">Sign in with Google</a>'
 
     async def complete(self, request: Request) -> LoginResult | LoginError:
         q = request.query_params
@@ -276,15 +276,24 @@ class SupabaseProvider(LoginProvider):
         base = settings.neuralscape_public_url.rstrip("/")
         return f"{base}/oauth/supabase/callback?state={state}"
 
-    async def begin(self, ctx: AuthorizeContext, render_consent) -> Response:
+    def consent_block(self, ctx: AuthorizeContext) -> str:
         if not settings.supabase_url or not settings.supabase_anon_key:
-            return JSONResponse(
-                status_code=500,
-                content={"error": "server_error",
-                         "error_description": "Supabase login is not configured"},
-            )
+            return '<p class="err">Supabase login is not configured on this server.</p>'
         state = sign_login_state(ctx, settings.neuralscape_user_token_secret)
-        return HTMLResponse(_supabase_start_page(state))
+        cb = self._callback_uri(state)
+        # The button triggers supabase-js signInWithOAuth (browser PKCE flow),
+        # redirecting back to GET /oauth/supabase/callback to finish.
+        return f"""<button id="ns-google-btn" type="button" class="provider-btn">Sign in with Google</button>
+<script type="module">
+import {{ createClient }} from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
+const supabase = createClient({_js_str(settings.supabase_url)}, {_js_str(settings.supabase_anon_key)});
+document.getElementById('ns-google-btn').addEventListener('click', async () => {{
+  const {{ error }} = await supabase.auth.signInWithOAuth({{
+    provider: 'google', options: {{ redirectTo: {_js_str_raw(html.escape(cb))} }}
+  }});
+  if (error) {{ window.alert('Sign-in error: ' + error.message); }}  // alert: text-only, no HTML injection
+}});
+</script>"""
 
     async def complete(self, request: Request) -> LoginResult | LoginError:
         form = await request.form()
@@ -375,31 +384,6 @@ _SUPABASE_HEAD = """<!doctype html><html lang="en"><head>
 </style></head><body><div class="card">"""
 
 _SUPABASE_FOOT = "</div></body></html>"
-
-
-def _supabase_start_page(state: str) -> str:
-    """Page rendered at GET /oauth/authorize — kicks off Supabase Google sign-in."""
-    cb = html.escape(
-        f"{settings.neuralscape_public_url.rstrip('/')}/oauth/supabase/callback?state={state}"
-    )
-    return (
-        _SUPABASE_HEAD.format()
-        + "<h1>Connect Neuralscape memory</h1><p>Redirecting you to sign in with Google…</p>"
-        + f"""<script type="module">
-import {{ createClient }} from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
-const supabase = createClient({_js_str(settings.supabase_url)}, {_js_str(settings.supabase_anon_key)});
-const {{ error }} = await supabase.auth.signInWithOAuth({{
-  provider: 'google',
-  options: {{ redirectTo: {_js_str_raw(cb)} }}
-}});
-if (error) {{
-  const card = document.querySelector('.card');
-  card.innerHTML = '<h1>Sign-in error</h1><p class="err"></p>';
-  card.querySelector('.err').textContent = error.message;  // textContent: no HTML injection
-}}
-</script>"""
-        + _SUPABASE_FOOT
-    )
 
 
 def _supabase_finish_page() -> str:

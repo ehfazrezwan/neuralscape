@@ -40,6 +40,17 @@ A non-`token` provider requires the OAuth AS to be on:
 `NEURALSCAPE_PUBLIC_URL` **and** `NEURALSCAPE_USER_TOKEN_SECRET` must be set.
 Startup validation fails loudly if a provider's required vars are missing.
 
+### Both options on one screen
+
+When `google` or `supabase` is active, the consent page shows **both** a "Sign in
+with Google" button **and** the admin-token paste box — so tokens issued by
+`issue_user_token.py` remain a valid login (service accounts, CI, users without a
+Google identity), and admin tokens also still work directly as
+`Authorization: Bearer` credentials without visiting the page at all. Set
+`AUTH_ALLOW_TOKEN_PASTE=false` for a provider-only screen (the paste box is
+hidden and `POST /oauth/authorize` rejects token submits). It's always shown for
+`AUTH_PROVIDER=token`.
+
 ## Identity: email → `user_id`
 
 `user_id` flows into Qdrant/Neo4j group-ids and is validated by

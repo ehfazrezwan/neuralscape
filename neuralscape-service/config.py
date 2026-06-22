@@ -119,6 +119,14 @@ class Settings(BaseSettings):
     # public installs set "google", local/dev leaves "token".
     auth_provider: str = "token"
 
+    # When a federated provider (google/supabase) is active, the consent screen
+    # ALSO offers an admin-issued-token paste box by default, so tokens from
+    # issue_user_token.py keep working as a login option (service accounts, CI,
+    # users without a Google identity). Set False for a provider-only login
+    # screen (no token paste). Ignored when auth_provider="token" (the paste box
+    # is the only mechanism there and always shown).
+    auth_allow_token_paste: bool = True
+
     # Google OIDC (auth_provider="google"). Neuralscape is a *confidential*
     # client TO Google here (server-side code exchange) while still being a
     # *public* OAuth AS to the MCP client. Register this redirect URI in Google

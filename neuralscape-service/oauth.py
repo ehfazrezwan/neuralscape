@@ -291,6 +291,15 @@ _CONSENT_PAGE = """<!doctype html>
          border-radius: 10px; padding: 10px 12px; margin: 14px 0 0; }}
   .hint {{ font-size: 12px; color: #7b8198; }}
   code {{ background:#0d0f16; padding:1px 5px; border-radius:5px; font-size:12px; }}
+  .provider-btn {{ display:flex; align-items:center; justify-content:center; gap:8px;
+           width:100%; box-sizing:border-box; margin-top:8px; padding:11px; font-size:14px;
+           font-weight:600; text-decoration:none; border-radius:10px; background:#fff;
+           color:#1f2330; border:1px solid #d6d9e0; cursor:pointer; }}
+  .provider-btn:hover {{ background:#f1f3f7; }}
+  .divider {{ display:flex; align-items:center; text-align:center; color:#7b8198;
+           font-size:12px; margin:20px 0 4px; }}
+  .divider::before, .divider::after {{ content:""; flex:1; border-top:1px solid #262b38; }}
+  .divider span {{ padding:0 10px; }}
 </style>
 </head>
 <body>
@@ -298,7 +307,14 @@ _CONSENT_PAGE = """<!doctype html>
     <h1>Connect Neuralscape memory</h1>
     <p class="who">{client_label} is requesting access to your Neuralscape memories.</p>
     {error_html}
-    <form method="post" action="/oauth/authorize">
+    <!--PROVIDER_BLOCK-->
+    <!--DIVIDER-->
+    <!--TOKEN_FORM-->
+  </div>
+</body>
+</html>"""
+
+_TOKEN_FORM = """<form method="post" action="/oauth/authorize">
       <input type="hidden" name="client_id" value="{client_id}">
       <input type="hidden" name="redirect_uri" value="{redirect_uri}">
       <input type="hidden" name="state" value="{state}">
@@ -306,13 +322,10 @@ _CONSENT_PAGE = """<!doctype html>
       <input type="hidden" name="code_challenge_method" value="{code_challenge_method}">
       <input type="hidden" name="resource" value="{resource}">
       <label for="token">Your Neuralscape access token</label>
-      <textarea id="token" name="token" placeholder="paste the token your admin issued you" autofocus></textarea>
+      <textarea id="token" name="token" placeholder="paste the token your admin issued you"></textarea>
       <p class="hint">Issued by your team admin via <code>issue_user_token.py</code>. You only paste this once.</p>
       <button type="submit">Authorize</button>
-    </form>
-  </div>
-</body>
-</html>"""
+    </form>"""
 
 
 def _render_consent(
@@ -326,17 +339,36 @@ def _render_consent(
     client_label: str = "Claude",
     error: str | None = None,
     status_code: int = 200,
+    provider_block: str = "",
+    show_token_form: bool = True,
 ) -> HTMLResponse:
+    """Render the consent page composing an optional provider login button
+    (Google/Supabase) and/or the admin-token paste form, with a divider between
+    them when both are present."""
     error_html = f'<div class="err">{html.escape(error)}</div>' if error else ""
     page = _CONSENT_PAGE.format(
         client_label=html.escape(client_label),
-        client_id=html.escape(client_id),
-        redirect_uri=html.escape(redirect_uri),
-        state=html.escape(state or ""),
-        code_challenge=html.escape(code_challenge or ""),
-        code_challenge_method=html.escape(code_challenge_method or ""),
-        resource=html.escape(resource or ""),
         error_html=error_html,
+    )
+    token_form = ""
+    if show_token_form:
+        token_form = _TOKEN_FORM.format(
+            client_id=html.escape(client_id),
+            redirect_uri=html.escape(redirect_uri),
+            state=html.escape(state or ""),
+            code_challenge=html.escape(code_challenge or ""),
+            code_challenge_method=html.escape(code_challenge_method or ""),
+            resource=html.escape(resource or ""),
+        )
+    divider = (
+        '<div class="divider"><span>or paste an access token</span></div>'
+        if provider_block and token_form
+        else ""
+    )
+    page = (
+        page.replace("<!--PROVIDER_BLOCK-->", provider_block)
+        .replace("<!--DIVIDER-->", divider)
+        .replace("<!--TOKEN_FORM-->", token_form)
     )
     return HTMLResponse(content=page, status_code=status_code)
 
@@ -378,9 +410,11 @@ async def authorize(request: Request) -> HTMLResponse | JSONResponse:
             content={"error": "invalid_request", "error_description": "PKCE S256 required"},
         )
 
-    # Delegate the human-login step to the configured provider. Everything
-    # validated above (client, redirect_uri, PKCE) is preserved across any
-    # external IdP redirect inside the provider's signed login-state token.
+    # Compose the consent page: the configured provider contributes a login
+    # button (Google / Supabase), and — unless explicitly disabled — the
+    # admin-token paste form is shown alongside it. Everything validated above
+    # (client, redirect_uri, PKCE) is preserved across any external IdP redirect
+    # inside the provider's signed login-state token.
     ctx = AuthorizeContext(
         client_id=client_id,
         redirect_uri=redirect_uri,
@@ -389,18 +423,20 @@ async def authorize(request: Request) -> HTMLResponse | JSONResponse:
         code_challenge_method=code_challenge_method,
         resource=resource,
     )
-
-    def render_consent() -> HTMLResponse:
-        return _render_consent(
-            client_id=client_id,
-            redirect_uri=redirect_uri,
-            state=state,
-            code_challenge=code_challenge,
-            code_challenge_method=code_challenge_method,
-            resource=resource,
-        )
-
-    return await get_login_provider().begin(ctx, render_consent)
+    provider_block = get_login_provider().consent_block(ctx)
+    # The token-paste box always shows in token mode; under a federated provider
+    # it shows unless the deployer turned it off.
+    show_token_form = settings.auth_provider == "token" or settings.auth_allow_token_paste
+    return _render_consent(
+        client_id=client_id,
+        redirect_uri=redirect_uri,
+        state=state,
+        code_challenge=code_challenge,
+        code_challenge_method=code_challenge_method,
+        resource=resource,
+        provider_block=provider_block,
+        show_token_form=show_token_form,
+    )
 
 
 @router.post("/oauth/authorize", response_model=None)
@@ -414,17 +450,18 @@ async def authorize_submit(
     code_challenge_method: str = Form("S256"),
     resource: str = Form(""),
 ) -> HTMLResponse | RedirectResponse | JSONResponse:
-    """Validate the pasted login token and issue an authorization code."""
+    """Validate the pasted login token and issue an authorization code.
+
+    Available under any AUTH_PROVIDER so admin-issued tokens remain a login
+    option alongside Google/Supabase — unless the deployer disabled the paste
+    box via AUTH_ALLOW_TOKEN_PASTE for a provider-only login screen."""
     if not oauth_enabled():
         return _not_configured()
-    # The token-paste form is only the login mechanism when AUTH_PROVIDER=token.
-    # Under google/supabase the consent page never renders it; reject as a
-    # defense against a hand-crafted POST bypassing the configured provider.
-    if settings.auth_provider != "token":
+    if settings.auth_provider != "token" and not settings.auth_allow_token_paste:
         return JSONResponse(
             status_code=400,
             content={"error": "invalid_request",
-                     "error_description": "token login is disabled; use the configured provider"},
+                     "error_description": "token login is disabled on this deployment"},
         )
 
     client = _decode_client(client_id)
