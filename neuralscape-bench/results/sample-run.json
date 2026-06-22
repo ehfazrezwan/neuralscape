@@ -1,0 +1,112 @@
+{
+  "label": "perf/write-read-isolation@300c529",
+  "target_url": "http://localhost:8299",
+  "profile": "full",
+  "timestamp": "2026-06-22T03:30:00+00:00",
+  "git_commit": "300c529",
+  "config": {
+    "iterations": 50,
+    "profile": "full"
+  },
+  "metrics": {
+    "write": {
+      "enqueue_ms": {
+        "count": 50,
+        "p50": 7,
+        "p95": 20,
+        "p99": 35,
+        "mean": 7,
+        "min": 4,
+        "max": 40
+      },
+      "e2e_ms": {
+        "count": 10,
+        "p50": 650,
+        "p95": 900,
+        "p99": 1200,
+        "mean": 650,
+        "min": 600,
+        "max": 1250
+      },
+      "e2e_attempts": 10,
+      "e2e_completed": 10,
+      "e2e_timeouts": 0,
+      "e2e_failed": 0,
+      "enqueue_errors": 0
+    },
+    "read": {
+      "search": {
+        "count": 50,
+        "p50": 31.200000000000003,
+        "p95": 78,
+        "p99": 109.19999999999999,
+        "mean": 39.0,
+        "min": 15.600000000000001,
+        "max": 124.80000000000001,
+        "errors": 0
+      },
+      "graph_search": {
+        "count": 50,
+        "p50": 120.0,
+        "p95": 300,
+        "p99": 450.0,
+        "mean": 150.0,
+        "min": 60.0,
+        "max": 510.0,
+        "errors": 0
+      },
+      "list": {
+        "count": 50,
+        "p50": 24,
+        "p95": 58,
+        "p99": 80,
+        "mean": 30,
+        "min": 15,
+        "max": 95,
+        "errors": 0
+      },
+      "context": {
+        "count": 50,
+        "p50": 42,
+        "p95": 105,
+        "p99": 150,
+        "mean": 55,
+        "min": 25,
+        "max": 170,
+        "errors": 0
+      }
+    },
+    "contention": {
+      "unloaded": {
+        "count": 40,
+        "p50": 40.0,
+        "p95": 80,
+        "p99": 104.0,
+        "mean": 48.0,
+        "min": 24.0,
+        "max": 112.0
+      },
+      "loaded": {
+        "count": 40,
+        "p50": 60.0,
+        "p95": 120,
+        "p99": 156.0,
+        "mean": 72.0,
+        "min": 36.0,
+        "max": 168.0
+      },
+      "loaded_over_unloaded_p95": 1.5
+    },
+    "throughput": {
+      "reads_per_sec": 150,
+      "read_errors": 0,
+      "writes_per_sec": 9.0,
+      "write_errors": 0
+    }
+  },
+  "notes": [
+    "REST-driven; MCP event-loop fix (#1) not exercised here.",
+    "profile=full",
+    "seeded 30 searchable memories"
+  ]
+}
