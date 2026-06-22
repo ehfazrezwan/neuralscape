@@ -49,13 +49,17 @@ from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from config import settings
+import identity_store
 from login_providers import (
     AuthorizeContext,
     GoogleProvider,
     LoginError,
+    LoginNeedsLink,
     SupabaseProvider,
     _supabase_finish_page,
     get_login_provider,
+    sign_link_ticket,
+    verify_link_ticket,
 )
 from tokens import issue_user_token, sign_payload, verify_payload, verify_user_token
 
@@ -546,21 +550,86 @@ def _login_error_page(err: LoginError) -> HTMLResponse:
     return HTMLResponse(content=page, status_code=err.status)
 
 
+# ── self-service link (claim an existing account) ─────────────────────────
+
+_LINK_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Link your Neuralscape account</title><style>
+  :root {{ color-scheme: light dark; }}
+  body {{ font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+         margin:0; min-height:100vh; display:grid; place-items:center; background:#0b0d12; color:#e7e9ee; }}
+  .card {{ width:min(460px,92vw); background:#151821; border:1px solid #262b38; border-radius:16px;
+          padding:28px; box-shadow:0 12px 40px rgba(0,0,0,.45); }}
+  h1 {{ font-size:19px; margin:0 0 4px; }}
+  p {{ font-size:14px; line-height:1.5; color:#aab1c2; margin:8px 0; }}
+  .who {{ font-size:13px; color:#8b93a7; }}
+  textarea {{ width:100%; box-sizing:border-box; min-height:78px; resize:vertical;
+             font-family:ui-monospace,Menlo,monospace; font-size:12px; background:#0d0f16;
+             color:#e7e9ee; border:1px solid #2c3242; border-radius:10px; padding:10px; }}
+  button {{ margin-top:12px; width:100%; padding:11px; font-size:14px; font-weight:600; border:0;
+           border-radius:10px; cursor:pointer; }}
+  .primary {{ background:#5b7cfa; color:#fff; }} .primary:hover {{ background:#4f70ee; }}
+  .secondary {{ background:#fff; color:#1f2330; border:1px solid #d6d9e0; }}
+  .divider {{ display:flex; align-items:center; color:#7b8198; font-size:12px; margin:20px 0 6px; }}
+  .divider::before, .divider::after {{ content:""; flex:1; border-top:1px solid #262b38; }}
+  .divider span {{ padding:0 10px; }}
+  .hint {{ font-size:12px; color:#7b8198; }} code {{ background:#0d0f16; padding:1px 5px; border-radius:5px; }}
+  .err {{ background:#2a1518; border:1px solid #5b2a2f; color:#ffb4b4; font-size:13px;
+         border-radius:10px; padding:10px 12px; margin:14px 0 0; }}
+</style></head><body><div class="card">
+  <h1>Welcome to Neuralscape</h1>
+  <p class="who">Signed in as <b>{email}</b>. First time here — how should we set up your memory?</p>
+  {error_html}
+  <form method="post" action="/oauth/link">
+    <input type="hidden" name="ticket" value="{ticket}">
+    <input type="hidden" name="action" value="new">
+    <button class="primary" type="submit">Continue as a new account (<code>{suggested}</code>)</button>
+  </form>
+  <div class="divider"><span>or link an existing account</span></div>
+  <form method="post" action="/oauth/link">
+    <input type="hidden" name="ticket" value="{ticket}">
+    <input type="hidden" name="action" value="link">
+    <p class="hint">Already have Neuralscape memories under another id? Paste an access
+       token for it (from <code>issue_user_token.py</code>) to link this Google account to it.</p>
+    <textarea name="token" placeholder="paste an existing access token to link"></textarea>
+    <button class="secondary" type="submit">Link to that account</button>
+  </form>
+</div></body></html>"""
+
+
+def _render_link_page(ticket: str, email: str, suggested: str,
+                      error: str | None = None, status_code: int = 200) -> HTMLResponse:
+    error_html = f'<div class="err">{html.escape(error)}</div>' if error else ""
+    page = _LINK_PAGE.format(
+        email=html.escape(email), ticket=html.escape(ticket),
+        suggested=html.escape(suggested), error_html=error_html,
+    )
+    return HTMLResponse(content=page, status_code=status_code)
+
+
+async def _finish_login(result) -> HTMLResponse | RedirectResponse:
+    """Turn a provider login result into the right response: issue the code
+    (linked), render the link page (first login), or show the error."""
+    if isinstance(result, LoginError):
+        return _login_error_page(result)
+    if isinstance(result, LoginNeedsLink):
+        ticket = sign_link_ticket(result, _secret())
+        return _render_link_page(ticket, result.email, result.suggested_user_id)
+    return _issue_code_and_redirect(result.ctx, result.user_id)
+
+
 # ── federated login callbacks (google / supabase) ────────────────────────
 
 
 @router.get("/oauth/google/callback", response_model=None)
 async def google_callback(request: Request) -> RedirectResponse | HTMLResponse | JSONResponse:
     """Google OIDC redirect target: verify the id_token, allowlist-check the
-    email, then continue the MCP authorization-code flow."""
+    email, then continue the MCP flow (or show the first-login link page)."""
     if not oauth_enabled():
         return _not_configured()
     if settings.auth_provider != "google":
         return JSONResponse(status_code=404, content={"detail": "google login not enabled"})
-    result = await GoogleProvider().complete(request)
-    if isinstance(result, LoginError):
-        return _login_error_page(result)
-    return _issue_code_and_redirect(result.ctx, result.user_id)
+    return await _finish_login(await GoogleProvider().complete(request))
 
 
 @router.get("/oauth/supabase/callback", response_model=None)
@@ -581,10 +650,49 @@ async def supabase_callback_post(request: Request) -> RedirectResponse | HTMLRes
         return _not_configured()
     if settings.auth_provider != "supabase":
         return JSONResponse(status_code=404, content={"detail": "supabase login not enabled"})
-    result = await SupabaseProvider().complete(request)
-    if isinstance(result, LoginError):
-        return _login_error_page(result)
-    return _issue_code_and_redirect(result.ctx, result.user_id)
+    return await _finish_login(await SupabaseProvider().complete(request))
+
+
+@router.post("/oauth/link", response_model=None)
+async def oauth_link(
+    request: Request,
+    ticket: str = Form(...),
+    action: str = Form("new"),
+    token: str = Form(""),
+) -> RedirectResponse | HTMLResponse | JSONResponse:
+    """Finalize a first-login link decision, then issue the auth code.
+
+    The signed ticket binds the verified Google/Supabase ``sub``+``email`` and
+    the original authorize context. ``action=link`` claims an existing id by
+    proving ownership with that id's admin token; ``action=new`` provisions the
+    suggested slug. Either way the (sub, email) → user_id mapping is persisted
+    so subsequent logins skip this page."""
+    if not oauth_enabled():
+        return _not_configured()
+    claims = verify_link_ticket(ticket, _secret())
+    if claims is None:
+        return _login_error_page(LoginError("This link request expired. Please sign in again.", 400))
+
+    ctx = claims["ctx"]
+    sub = claims.get("sub") or None
+    email = claims.get("email") or None
+
+    if action == "link":
+        payload = verify_user_token(token.strip(), _secret()) if token.strip() else None
+        if payload is None:
+            return _render_link_page(
+                ticket, email or "", claims.get("suggested_user_id", ""),
+                error="That token is invalid or expired. Paste a valid access token, or continue as a new account.",
+                status_code=400,
+            )
+        user_id = payload["user_id"]
+    else:
+        user_id = claims.get("suggested_user_id") or ""
+        if not user_id:
+            return _login_error_page(LoginError("Could not determine an account id.", 400))
+
+    await identity_store.link(user_id, sub=sub, email=email)
+    return _issue_code_and_redirect(ctx, user_id)
 
 
 # ── token endpoint ───────────────────────────────────────────────────────

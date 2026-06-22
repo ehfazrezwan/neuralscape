@@ -11,6 +11,7 @@ import time
 import jwt
 import pytest
 
+import identity_store
 import login_providers as lp
 from allowlist import email_domain, is_email_allowed, normalize_email
 from config import Settings, settings
@@ -19,10 +20,14 @@ from login_providers import (
     AuthorizeContext,
     GoogleProvider,
     LoginError,
+    LoginNeedsLink,
     LoginResult,
     SupabaseProvider,
     get_login_provider,
+    resolve_login_identity,
+    sign_link_ticket,
     sign_login_state,
+    verify_link_ticket,
     verify_login_state,
 )
 from schemas import _ID_PATTERN
@@ -279,14 +284,26 @@ class TestSupabaseProvider:
         assert res.ctx == ctx
 
     @pytest.mark.asyncio
-    async def test_trusts_external_gate_without_env_allowlist(self, auth_settings):
-        # No env allowlist → trust Supabase's hook; slug a fresh user.
+    async def test_trusts_external_gate_without_env_allowlist(self, auth_settings, fake_store):
+        # No env allowlist → trust Supabase's hook; a fresh (unlinked) user is
+        # offered the link page with a slug suggestion.
         auth_settings.supabase_jwt_secret = "sbsecret"
         token = _supabase_jwt("anyone@gmail.com")
         req = _Req(form={"access_token": token, "state": sign_login_state(_make_ctx(), _SECRET)})
         res = await SupabaseProvider().complete(req)
+        assert isinstance(res, LoginNeedsLink)
+        assert res.suggested_user_id == "anyone-gmail.com"
+
+    @pytest.mark.asyncio
+    async def test_linked_user_returns_result(self, auth_settings, fake_store):
+        # A previously-linked identity skips the link page.
+        auth_settings.supabase_jwt_secret = "sbsecret"
+        await identity_store.link("anyone", sub="uuid-123", email="anyone@gmail.com")
+        token = _supabase_jwt("anyone@gmail.com")
+        req = _Req(form={"access_token": token, "state": sign_login_state(_make_ctx(), _SECRET)})
+        res = await SupabaseProvider().complete(req)
         assert isinstance(res, LoginResult)
-        assert res.user_id == "anyone-gmail.com"
+        assert res.user_id == "anyone"
 
     @pytest.mark.asyncio
     async def test_env_allowlist_as_extra_gate_denies(self, auth_settings):
@@ -356,18 +373,36 @@ class _FakeClient:
 
 class TestGoogleProvider:
     @pytest.mark.asyncio
-    async def test_happy_path_allowlisted(self, auth_settings, monkeypatch):
+    async def test_happy_path_allowlisted_new_user_needs_link(self, auth_settings, monkeypatch, fake_store):
         auth_settings.auth_provider = "google"
         auth_settings.google_oauth_client_id = "cid"
         auth_settings.google_oauth_client_secret = "sec"
         auth_settings.auth_allowed_domains = "example.com"
         monkeypatch.setattr(lp.httpx, "AsyncClient", _FakeClient)
         monkeypatch.setattr(lp, "_verify_oidc_jwt",
-                            lambda *a, **k: {"email": "x@example.com", "email_verified": True})
+                            lambda *a, **k: {"email": "x@example.com", "email_verified": True,
+                                             "sub": "goog-x"})
+        state = sign_login_state(_make_ctx(), _SECRET)
+        res = await GoogleProvider().complete(_Req(query={"code": "abc", "state": state}))
+        assert isinstance(res, LoginNeedsLink)
+        assert res.suggested_user_id == "x-example.com"
+        assert res.sub == "goog-x"
+
+    @pytest.mark.asyncio
+    async def test_happy_path_linked_returns_result(self, auth_settings, monkeypatch, fake_store):
+        auth_settings.auth_provider = "google"
+        auth_settings.google_oauth_client_id = "cid"
+        auth_settings.google_oauth_client_secret = "sec"
+        auth_settings.auth_allowed_domains = "example.com"
+        await identity_store.link("ehfazrezwan", sub="goog-x", email="x@example.com")
+        monkeypatch.setattr(lp.httpx, "AsyncClient", _FakeClient)
+        monkeypatch.setattr(lp, "_verify_oidc_jwt",
+                            lambda *a, **k: {"email": "x@example.com", "email_verified": True,
+                                             "sub": "goog-x"})
         state = sign_login_state(_make_ctx(), _SECRET)
         res = await GoogleProvider().complete(_Req(query={"code": "abc", "state": state}))
         assert isinstance(res, LoginResult)
-        assert res.user_id == "x-example.com"
+        assert res.user_id == "ehfazrezwan"
 
     @pytest.mark.asyncio
     async def test_not_allowlisted_denied(self, auth_settings, monkeypatch):
@@ -472,3 +507,170 @@ class TestConsentComposition:
         assert 'name="token"' in body
         assert '<a class="provider-btn"' not in body
         assert '<div class="divider">' not in body
+
+
+# ── durable identity store + resolver + link flow ─────────────────────────
+
+
+class _FakeRedis:
+    """Tiny in-memory async stand-in for redis.asyncio (hash ops only)."""
+
+    def __init__(self):
+        self.h = {}
+
+    async def hget(self, name, key):
+        return self.h.get(name, {}).get(key)
+
+    async def hset(self, name, key, val):
+        self.h.setdefault(name, {})[key] = val
+
+    async def hdel(self, name, key):
+        self.h.get(name, {}).pop(key, None)
+
+    async def hgetall(self, name):
+        return dict(self.h.get(name, {}))
+
+    async def aclose(self):
+        pass
+
+
+@pytest.fixture
+def fake_store(monkeypatch):
+    fake = _FakeRedis()
+    monkeypatch.setattr(identity_store, "_client", lambda: fake)
+    return fake
+
+
+class TestIdentityStore:
+    @pytest.mark.asyncio
+    async def test_link_and_resolve_by_sub_and_email(self, fake_store):
+        await identity_store.link("alice", sub="sub-123", email="Alice@Example.com")
+        assert await identity_store.resolve("sub-123", None) == "alice"
+        assert await identity_store.resolve(None, "alice@example.com") == "alice"  # normalized
+        assert await identity_store.resolve("nope", "nobody@x.com") is None
+
+    @pytest.mark.asyncio
+    async def test_sub_precedence_over_email(self, fake_store):
+        await identity_store.link("by-sub", sub="s1")
+        await identity_store.link("by-email", email="dup@example.com")
+        # sub wins when both could match
+        assert await identity_store.resolve("s1", "dup@example.com") == "by-sub"
+
+    @pytest.mark.asyncio
+    async def test_unlink(self, fake_store):
+        await identity_store.link("alice", sub="s", email="a@x.com")
+        await identity_store.unlink(sub="s", email="a@x.com")
+        assert await identity_store.resolve("s", "a@x.com") is None
+
+    @pytest.mark.asyncio
+    async def test_degrades_when_redis_down(self, monkeypatch):
+        def boom():
+            raise ConnectionError("no redis")
+        monkeypatch.setattr(identity_store, "_client", boom)
+        assert await identity_store.resolve("s", "a@x.com") is None   # no raise
+        assert await identity_store.link("alice", sub="s") is False    # best-effort
+
+
+class TestResolver:
+    @pytest.mark.asyncio
+    async def test_store_hit_is_linked(self, auth_settings, fake_store):
+        await identity_store.link("ehfazrezwan", sub="goog-1", email="a@example.com")
+        uid, linked = await resolve_login_identity("goog-1", "a@example.com")
+        assert (uid, linked) == ("ehfazrezwan", True)
+
+    @pytest.mark.asyncio
+    async def test_env_seed_promoted_to_store(self, auth_settings, fake_store):
+        auth_settings.auth_identity_map = "a@example.com:ehfazrezwan"
+        uid, linked = await resolve_login_identity("goog-2", "a@example.com")
+        assert (uid, linked) == ("ehfazrezwan", True)
+        # seed should now be persisted durably (so the env var can be removed)
+        assert await identity_store.resolve("goog-2", None) == "ehfazrezwan"
+
+    @pytest.mark.asyncio
+    async def test_new_user_slug_unlinked(self, auth_settings, fake_store):
+        auth_settings.auth_identity_map = ""
+        uid, linked = await resolve_login_identity("goog-3", "fresh@example.com")
+        assert (uid, linked) == ("fresh-example.com", False)
+
+
+class TestResolveIdentityResult:
+    @pytest.mark.asyncio
+    async def test_linked_returns_login_result(self, auth_settings, fake_store):
+        auth_settings.auth_allowed_domains = "example.com"
+        await identity_store.link("ehfazrezwan", sub="g1", email="a@example.com")
+        res = await lp._resolve_identity(
+            _make_ctx(), "a@example.com", True, "g1", trust_external_gate=False)
+        assert isinstance(res, LoginResult) and res.user_id == "ehfazrezwan"
+
+    @pytest.mark.asyncio
+    async def test_unlinked_returns_needs_link(self, auth_settings, fake_store):
+        auth_settings.auth_allowed_domains = "example.com"
+        auth_settings.auth_identity_map = ""
+        res = await lp._resolve_identity(
+            _make_ctx(), "new@example.com", True, "g9", trust_external_gate=False)
+        assert isinstance(res, LoginNeedsLink)
+        assert res.suggested_user_id == "new-example.com"
+        assert res.sub == "g9"
+
+    @pytest.mark.asyncio
+    async def test_denied_returns_error_before_link(self, auth_settings, fake_store):
+        auth_settings.auth_allowed_domains = "example.com"
+        res = await lp._resolve_identity(
+            _make_ctx(), "outsider@gmail.com", True, "g8", trust_external_gate=False)
+        assert isinstance(res, LoginError) and res.status == 403
+
+
+class TestLinkTicket:
+    def test_roundtrip(self, auth_settings):
+        needs = LoginNeedsLink(_make_ctx(), "a@example.com", "g1", "a-example.com")
+        claims = verify_link_ticket(sign_link_ticket(needs, _SECRET), _SECRET)
+        assert claims["sub"] == "g1"
+        assert claims["email"] == "a@example.com"
+        assert claims["suggested_user_id"] == "a-example.com"
+        assert claims["ctx"] == _make_ctx()
+
+    def test_wrong_secret_and_typ_rejected(self, auth_settings):
+        needs = LoginNeedsLink(_make_ctx(), "a@example.com", "g1", "a-example.com")
+        tok = sign_link_ticket(needs, _SECRET)
+        assert verify_link_ticket(tok, "other") is None
+        # a login_state token must not be redeemable as a link ticket
+        assert verify_link_ticket(sign_login_state(_make_ctx(), _SECRET), _SECRET) is None
+
+
+class TestOAuthLinkEndpoint:
+    @pytest.mark.asyncio
+    async def test_action_new_provisions_and_links(self, auth_settings, fake_store):
+        import oauth
+        needs = LoginNeedsLink(_make_ctx(), "new@example.com", "g1", "new-example.com")
+        ticket = sign_link_ticket(needs, _SECRET)
+        resp = await oauth.oauth_link(None, ticket=ticket, action="new", token="")
+        assert resp.status_code == 303
+        assert "code=" in resp.headers["location"]
+        # mapping persisted so next login skips the page
+        assert await identity_store.resolve("g1", "new@example.com") == "new-example.com"
+
+    @pytest.mark.asyncio
+    async def test_action_link_with_valid_token_claims_existing(self, auth_settings, fake_store):
+        import oauth
+        from tokens import issue_user_token
+        existing = issue_user_token("ehfazrezwan", _SECRET, 3600)
+        needs = LoginNeedsLink(_make_ctx(), "a@example.com", "g2", "a-example.com")
+        ticket = sign_link_ticket(needs, _SECRET)
+        resp = await oauth.oauth_link(None, ticket=ticket, action="link", token=existing)
+        assert resp.status_code == 303
+        assert await identity_store.resolve("g2", "a@example.com") == "ehfazrezwan"
+
+    @pytest.mark.asyncio
+    async def test_action_link_bad_token_rerenders(self, auth_settings, fake_store):
+        import oauth
+        needs = LoginNeedsLink(_make_ctx(), "a@example.com", "g3", "a-example.com")
+        ticket = sign_link_ticket(needs, _SECRET)
+        resp = await oauth.oauth_link(None, ticket=ticket, action="link", token="garbage")
+        assert resp.status_code == 400
+        assert b"invalid or expired" in resp.body
+
+    @pytest.mark.asyncio
+    async def test_expired_ticket_errors(self, auth_settings, fake_store):
+        import oauth
+        resp = await oauth.oauth_link(None, ticket="garbage", action="new", token="")
+        assert resp.status_code == 400

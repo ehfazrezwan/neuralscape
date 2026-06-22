@@ -34,9 +34,10 @@ import jwt
 from fastapi import Request
 from jwt import PyJWKClient
 
+import identity_store
 from allowlist import is_email_allowed
 from config import settings
-from identity import derive_user_id
+from identity import slugify_email
 from tokens import sign_payload, verify_payload, verify_user_token
 
 logger = logging.getLogger(__name__)
@@ -125,19 +126,89 @@ class LoginError:
     status: int = 400
 
 
-def _resolve_identity(
+@dataclass
+class LoginNeedsLink:
+    """An allowlisted login whose identity isn't linked to a user_id yet.
+
+    The caller renders the self-service link page: continue as ``suggested_user_id``
+    (a fresh slug) or claim an existing account by pasting its admin token.
+    """
+
+    ctx: AuthorizeContext
+    email: str
+    sub: str
+    suggested_user_id: str
+
+
+_LINK_TICKET_TTL = 600  # 10 min to make the link decision
+
+
+def sign_link_ticket(needs: LoginNeedsLink, secret: str) -> str:
+    """Sign the verified identity + authorize context for the link page, so the
+    link decision is bound to the IdP-verified ``sub``/``email`` (unforgeable)."""
+    claims = {
+        "typ": "link_ticket",
+        "sub": needs.sub,
+        "email": needs.email,
+        "suggested_user_id": needs.suggested_user_id,
+        "exp": int(time.time()) + _LINK_TICKET_TTL,
+        **asdict(needs.ctx),
+    }
+    return sign_payload(claims, secret)
+
+
+def verify_link_ticket(token: str, secret: str) -> dict | None:
+    """Return the link-ticket claims (incl. a rebuilt ``ctx``) or None."""
+    claims = verify_payload(token, secret)
+    if claims is None or claims.get("typ") != "link_ticket":
+        return None
+    try:
+        claims["ctx"] = AuthorizeContext(
+            client_id=claims["client_id"],
+            redirect_uri=claims["redirect_uri"],
+            state=claims.get("state", ""),
+            code_challenge=claims["code_challenge"],
+            code_challenge_method=claims.get("code_challenge_method", "S256"),
+            resource=claims.get("resource", ""),
+        )
+    except KeyError:
+        return None
+    return claims
+
+
+async def resolve_login_identity(sub: str | None, email: str) -> tuple[str, bool]:
+    """Map a verified identity to a ``user_id``. Returns ``(user_id, linked)``.
+
+    Order: durable store → ``AUTH_IDENTITY_MAP`` seed (promoted into the store)
+    → email slug (a fresh, *unlinked* identity the caller can offer to link).
+    """
+    uid = await identity_store.resolve(sub, email)
+    if uid:
+        return uid, True
+    seed = settings.identity_map_dict().get((email or "").strip().lower())
+    if seed:
+        await identity_store.link(seed, sub=sub, email=email)  # promote seed → durable
+        return seed, True
+    return slugify_email(email), False
+
+
+async def _resolve_identity(
     ctx: AuthorizeContext,
     email: str,
     email_verified: bool,
+    sub: str | None,
     *,
     trust_external_gate: bool,
-) -> LoginResult | LoginError:
-    """Apply the allowlist + identity map to a verified email.
+) -> LoginResult | LoginNeedsLink | LoginError:
+    """Allowlist-gate a verified email, then resolve its ``user_id``.
 
     ``trust_external_gate`` is True for Supabase (its Before-User-Created hook
     already enforced the allowlist) — there the env allowlist is only applied
     as an extra gate *when configured*. For Google it is False: the env
     allowlist is the sole gate and must be configured.
+
+    Returns a ``LoginResult`` for an already-linked identity, ``LoginNeedsLink``
+    for an allowlisted but unlinked one (first login), or ``LoginError``.
     """
     domains = settings.allowed_domains_set()
     emails = settings.email_allowlist_set()
@@ -145,7 +216,6 @@ def _resolve_identity(
     if trust_external_gate:
         if not email or not email_verified:
             return LoginError("Email is missing or unverified.", 403)
-        # Only re-check when an env allowlist is also configured.
         if (domains or emails) and not is_email_allowed(
             email, email_verified=email_verified,
             allowed_domains=domains, email_allowlist=emails,
@@ -158,8 +228,10 @@ def _resolve_identity(
         ):
             return LoginError("This account is not authorized.", 403)
 
-    user_id = derive_user_id(email, settings.identity_map_dict())
-    return LoginResult(ctx=ctx, user_id=user_id)
+    user_id, linked = await resolve_login_identity(sub, email)
+    if linked:
+        return LoginResult(ctx=ctx, user_id=user_id)
+    return LoginNeedsLink(ctx=ctx, email=email, sub=sub or "", suggested_user_id=user_id)
 
 
 # ── provider base ────────────────────────────────────────────────────────
@@ -263,7 +335,10 @@ class GoogleProvider(LoginProvider):
 
         email = claims.get("email", "")
         email_verified = bool(claims.get("email_verified"))
-        return _resolve_identity(ctx, email, email_verified, trust_external_gate=False)
+        sub = claims.get("sub")
+        return await _resolve_identity(
+            ctx, email, email_verified, sub, trust_external_gate=False
+        )
 
 
 # ── supabase provider (Supabase Auth → Google) ───────────────────────────
@@ -314,7 +389,10 @@ document.getElementById('ns-google-btn').addEventListener('click', async () => {
         # top-level flag too for forward-compat.
         meta = claims.get("user_metadata") or {}
         email_verified = bool(claims.get("email_verified") or meta.get("email_verified"))
-        return _resolve_identity(ctx, email, email_verified, trust_external_gate=True)
+        sub = claims.get("sub")
+        return await _resolve_identity(
+            ctx, email, email_verified, sub, trust_external_gate=True
+        )
 
 
 # ── JWT verification helpers ─────────────────────────────────────────────
@@ -457,7 +535,8 @@ def get_login_provider() -> LoginProvider:
 
 # Re-export for oauth.py's token POST path (kept there for back-compat).
 __all__ = [
-    "AuthorizeContext", "LoginResult", "LoginError", "LoginProvider",
-    "get_login_provider", "sign_login_state", "verify_login_state",
+    "AuthorizeContext", "LoginResult", "LoginError", "LoginNeedsLink",
+    "LoginProvider", "get_login_provider", "sign_login_state", "verify_login_state",
+    "sign_link_ticket", "verify_link_ticket", "resolve_login_identity",
     "verify_user_token",
 ]
