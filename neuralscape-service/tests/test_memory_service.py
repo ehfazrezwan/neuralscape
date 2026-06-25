@@ -17,6 +17,27 @@ def _qresult(hits):
     r.points = hits
     return r
 
+
+def _classify_pool_calls(qp_mock):
+    """Split mocked ``query_points`` calls into (personal, shared) by filter.
+
+    After the embed-once refactor both pools query Qdrant directly with a single
+    precomputed vector; personal-pool calls carry a top-level ``user_id``
+    FieldCondition, shared-pool calls carry ``metadata.visibility``.
+    """
+    from qdrant_client.models import FieldCondition
+
+    personal, shared = [], []
+    for call in qp_mock.call_args_list:
+        qf = call.kwargs["query_filter"]
+        keys = {c.key for c in qf.must if isinstance(c, FieldCondition)}
+        if "metadata.visibility" in keys:
+            shared.append(call)
+        elif "user_id" in keys:
+            personal.append(call)
+    return personal, shared
+
+
 from memory_service import (
     MemoryService,
     _build_group_id,
@@ -103,6 +124,10 @@ def service():
     svc._memory.graph = MagicMock()
     svc._memory.graph.graphiti = svc._graphiti
     svc._memory.graph._bridge = svc._bridge
+    # search() now embeds once and queries Qdrant directly for both pools;
+    # give safe defaults so search tests only override what they assert on.
+    svc._memory.embedding_model.embed.return_value = [0.1] * 768
+    svc._memory.vector_store.client.query_points.return_value = _qresult([])
     return svc
 
 
@@ -154,47 +179,44 @@ class TestStoreRaw:
 
 class TestSearch:
     def test_basic_search(self, service):
-        service._memory.search.return_value = {
-            "results": [
-                {"id": "m1", "memory": "Prefers tabs", "score": 0.95, "metadata": {"category": "preference"}}
-            ]
-        }
+        hit = MagicMock()
+        hit.id = "m1"
+        hit.score = 0.95
+        hit.payload = {"data": "Prefers tabs", "metadata": {"category": "preference"}}
+        service._memory.vector_store.client.query_points.return_value = _qresult([hit])
         results = service.search(query="indentation", user_id="ehfaz")
         assert len(results) == 1
         assert results[0].memory == "Prefers tabs"
+        # The query is embedded exactly ONCE and reused across pools/scopes.
+        assert service._memory.embedding_model.embed.call_count == 1
 
     def test_search_with_project_merges_scopes(self, service):
-        service._memory.search.return_value = {
-            "results": [
-                {"id": "m1", "memory": "Uses FastAPI", "score": 0.9, "metadata": {}}
-            ]
-        }
-        results = service.search(
-            query="tech stack",
-            user_id="ehfaz",
-            project_id="my-project",
-        )
-        # Should call search twice (project + global)
-        assert service._memory.search.call_count == 2
+        service.search(query="tech stack", user_id="ehfaz", project_id="my-project")
+        # Personal pool runs project + global → 2 direct Qdrant queries…
+        personal, _ = _classify_pool_calls(service._memory.vector_store.client.query_points)
+        assert len(personal) == 2
+        # …but the whole search still embeds the query only once.
+        assert service._memory.embedding_model.embed.call_count == 1
 
     def test_search_with_explicit_scope_single_call(self, service):
-        service._memory.search.return_value = {"results": []}
-        service.search(
-            query="preferences",
-            user_id="ehfaz",
-            scope="global",
-        )
-        assert service._memory.search.call_count == 1
+        service.search(query="preferences", user_id="ehfaz", scope="global")
+        personal, _ = _classify_pool_calls(service._memory.vector_store.client.query_points)
+        assert len(personal) == 1
 
     def test_search_with_categories(self, service):
-        service._memory.search.return_value = {"results": []}
+        from qdrant_client.models import FieldCondition
+
         service.search(
             query="coding style",
             user_id="ehfaz",
             categories=["preference", "convention"],
         )
-        call_kwargs = service._memory.search.call_args[1]
-        assert call_kwargs["filters"]["metadata.category"] == {"in": ["preference", "convention"]}
+        personal, _ = _classify_pool_calls(service._memory.vector_store.client.query_points)
+        cats = [
+            c for c in personal[0].kwargs["query_filter"].must
+            if isinstance(c, FieldCondition) and c.key == "metadata.category"
+        ]
+        assert cats and cats[0].match.any == ["preference", "convention"]
 
 
 class TestGetContext:
@@ -1415,38 +1437,40 @@ class TestStoreRawBatch:
 class TestSearchV2Filters:
     """Memory-model v2 — search honors domain/observation_type/concepts filters."""
 
+    def _personal_must(self, service):
+        personal, _ = _classify_pool_calls(service._memory.vector_store.client.query_points)
+        return personal[0].kwargs["query_filter"].must
+
     def test_domain_filter_applied(self, service):
-        service._memory.search.return_value = {"results": []}
+        from qdrant_client.models import FieldCondition
+
         service.search(
-            query="anything",
-            user_id="ehfaz",
-            scope="global",  # avoid the dual-scope merge path
-            domain="research",
+            query="anything", user_id="ehfaz", scope="global", domain="research"
         )
-        call_kwargs = service._memory.search.call_args[1]
-        assert call_kwargs["filters"]["metadata.domain"] == "research"
+        conds = [c for c in self._personal_must(service)
+                 if isinstance(c, FieldCondition) and c.key == "metadata.domain"]
+        assert conds and conds[0].match.value == "research"
 
     def test_observation_type_filter_applied(self, service):
-        service._memory.search.return_value = {"results": []}
+        from qdrant_client.models import FieldCondition
+
         service.search(
-            query="anything",
-            user_id="ehfaz",
-            scope="global",
-            observation_type="bugfix",
+            query="anything", user_id="ehfaz", scope="global", observation_type="bugfix"
         )
-        call_kwargs = service._memory.search.call_args[1]
-        assert call_kwargs["filters"]["metadata.observation_type"] == "bugfix"
+        conds = [c for c in self._personal_must(service)
+                 if isinstance(c, FieldCondition) and c.key == "metadata.observation_type"]
+        assert conds and conds[0].match.value == "bugfix"
 
     def test_concepts_filter_applied_as_in(self, service):
-        service._memory.search.return_value = {"results": []}
+        from qdrant_client.models import FieldCondition
+
         service.search(
-            query="anything",
-            user_id="ehfaz",
-            scope="global",
+            query="anything", user_id="ehfaz", scope="global",
             concepts=["gotcha", "trade-off"],
         )
-        call_kwargs = service._memory.search.call_args[1]
-        assert call_kwargs["filters"]["metadata.concepts"] == {"in": ["gotcha", "trade-off"]}
+        conds = [c for c in self._personal_must(service)
+                 if isinstance(c, FieldCondition) and c.key == "metadata.concepts"]
+        assert conds and conds[0].match.any == ["gotcha", "trade-off"]
 
 
 # ──────────────────────────────────────────────
@@ -2286,27 +2310,22 @@ class TestSearchMultiUserIsolation:
         return h
 
     def test_search_calls_both_pools_by_default(self, service):
-        """By default, search queries mem0 (personal) AND direct-Qdrant (shared)."""
-        service._memory.search.return_value = {"results": []}
-        service._memory.embedding_model.embed.return_value = [0.1] * 768
-        service._memory.vector_store.client = MagicMock()
-        service._memory.vector_store.client.query_points.return_value = _qresult([])
-
+        """By default, search queries the personal pool AND the shared pool —
+        both via direct Qdrant query_points, with a single shared query embed."""
         service.search(query="anything", user_id="alice", scope="global")
-        # personal pool: one mem0.search call (no project merge since scope=global)
-        assert service._memory.search.call_count == 1
-        # shared pool: one direct Qdrant client.search call
-        assert service._memory.vector_store.client.query_points.call_count == 1
+        personal, shared = _classify_pool_calls(service._memory.vector_store.client.query_points)
+        assert len(personal) == 1  # user_id-scoped
+        assert len(shared) == 1     # visibility=shared
+        # One embed for the whole search, reused across both pools.
+        assert service._memory.embedding_model.embed.call_count == 1
 
     def test_visibility_private_skips_shared_pool(self, service):
-        service._memory.search.return_value = {"results": []}
-        service._memory.embedding_model.embed.return_value = [0.1] * 768
-        service._memory.vector_store.client = MagicMock()
         service.search(
             query="anything", user_id="alice", scope="global", visibility="private"
         )
-        assert service._memory.search.call_count == 1
-        assert service._memory.vector_store.client.query_points.call_count == 0
+        personal, shared = _classify_pool_calls(service._memory.vector_store.client.query_points)
+        assert len(personal) == 1
+        assert len(shared) == 0
 
     def test_visibility_shared_skips_personal_pool(self, service):
         service._memory.search.return_value = {"results": []}
@@ -2320,28 +2339,27 @@ class TestSearchMultiUserIsolation:
         assert service._memory.vector_store.client.query_points.call_count == 1
 
     def test_include_shared_false_skips_shared_pool(self, service):
-        service._memory.search.return_value = {"results": []}
-        service._memory.embedding_model.embed.return_value = [0.1] * 768
-        service._memory.vector_store.client = MagicMock()
         service.search(
             query="anything", user_id="alice", scope="global", include_shared=False
         )
-        assert service._memory.search.call_count == 1
-        assert service._memory.vector_store.client.query_points.call_count == 0
+        personal, shared = _classify_pool_calls(service._memory.vector_store.client.query_points)
+        assert len(personal) == 1
+        assert len(shared) == 0
 
-    def test_personal_pool_uses_mem0_user_id_namespace(self, service):
-        """The personal-pool call always scopes the mem0 search to user_id=caller — that's
-        what enforces cross-user isolation at the vector store layer. mem0 v2.0.2
-        rejects ``user_id`` as a top-level kwarg, so the value now rides inside ``filters``."""
-        service._memory.search.return_value = {"results": []}
-        service._memory.embedding_model.embed.return_value = [0.1] * 768
-        service._memory.vector_store.client = MagicMock()
-        service._memory.vector_store.client.query_points.return_value = _qresult([])
+    def test_personal_pool_uses_user_id_namespace(self, service):
+        """The personal-pool query MUST scope to user_id=caller — that's what
+        enforces cross-user isolation at the vector store layer. Post embed-once
+        refactor the personal pool queries Qdrant directly, so the scoping is a
+        top-level ``user_id`` FieldCondition rather than a mem0 filters kwarg."""
+        from qdrant_client.models import FieldCondition
+
         service.search(query="anything", user_id="alice", scope="global")
-        call_kwargs = service._memory.search.call_args[1]
-        # Pre-cleanup this lived as a top-level kwarg; mem0 v2.0.2 moves it to filters.
-        assert "user_id" not in call_kwargs
-        assert call_kwargs["filters"]["user_id"] == "alice"
+        personal, _ = _classify_pool_calls(service._memory.vector_store.client.query_points)
+        uid = [
+            c for c in personal[0].kwargs["query_filter"].must
+            if isinstance(c, FieldCondition) and c.key == "user_id"
+        ]
+        assert uid and uid[0].match.value == "alice"
 
     def test_shared_pool_filter_includes_visibility_shared(self, service):
         """The shared-pool query MUST include the visibility=shared filter or
@@ -2412,22 +2430,17 @@ class TestSharedPoolDualScopeMerge:
     """
 
     def test_project_id_without_scope_runs_two_shared_queries(self, service):
-        service._memory.search.return_value = {"results": []}
-        service._memory.embedding_model.embed.return_value = [0.1] * 768
-        service._memory.vector_store.client = MagicMock()
-        service._memory.vector_store.client.query_points.return_value = _qresult([])
-
         service.search(
             query="anything",
             user_id="alice",
             project_id="neuralscape",
             # scope intentionally omitted — this is the dual-scope-merge case
         )
-
-        # Personal pool already did project + global → 2 mem0 calls
-        assert service._memory.search.call_count == 2
-        # Shared pool must mirror that → 2 direct Qdrant calls
-        assert service._memory.vector_store.client.query_points.call_count == 2
+        personal, shared = _classify_pool_calls(service._memory.vector_store.client.query_points)
+        # Both pools do project + global → 2 queries each, one embed total.
+        assert len(personal) == 2
+        assert len(shared) == 2
+        assert service._memory.embedding_model.embed.call_count == 1
 
     def test_project_id_with_explicit_scope_runs_single_shared_query(self, service):
         """When the caller passes `scope` explicitly, we honor it — no merge."""
@@ -2442,17 +2455,14 @@ class TestSharedPoolDualScopeMerge:
             project_id="neuralscape",
             scope="project",
         )
-        assert service._memory.vector_store.client.query_points.call_count == 1
+        _, shared = _classify_pool_calls(service._memory.vector_store.client.query_points)
+        assert len(shared) == 1
 
     def test_global_only_search_runs_single_shared_query(self, service):
         """No project_id → single query, scope=global passed through."""
-        service._memory.search.return_value = {"results": []}
-        service._memory.embedding_model.embed.return_value = [0.1] * 768
-        service._memory.vector_store.client = MagicMock()
-        service._memory.vector_store.client.query_points.return_value = _qresult([])
-
         service.search(query="anything", user_id="alice", scope="global")
-        assert service._memory.vector_store.client.query_points.call_count == 1
+        _, shared = _classify_pool_calls(service._memory.vector_store.client.query_points)
+        assert len(shared) == 1
 
     def test_dual_scope_first_call_filters_by_project_second_by_global(self, service):
         """The two shared-pool calls must filter differently — one by

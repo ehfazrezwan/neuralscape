@@ -768,6 +768,7 @@ class MemoryService:
         observation_type: str | None,
         concepts: list[str] | None,
         limit: int,
+        query_embedding: list[float] | None = None,
     ) -> list[MemoryResponse]:
         """Search Qdrant for shared-pool memories (any writer).
 
@@ -776,6 +777,11 @@ class MemoryService:
         wrapper enforces user_id namespacing — for the shared pool we
         explicitly want hits across writers, scoped by
         ``metadata.visibility=shared`` plus any other supplied filters.
+
+        ``query_embedding`` lets the caller pass a precomputed query vector so a
+        single ``search()`` doesn't re-embed the same query for every pool/scope
+        (the embed round-trip dominates read latency); falls back to embedding
+        ``query`` when not provided.
         """
         from qdrant_client.models import (
             FieldCondition,
@@ -785,7 +791,11 @@ class MemoryService:
         )
 
         client = m.vector_store.client
-        embedding = m.embedding_model.embed(query, memory_action="search")
+        embedding = (
+            query_embedding
+            if query_embedding is not None
+            else m.embedding_model.embed(query, memory_action="search")
+        )
 
         must: list = [
             FieldCondition(
@@ -811,6 +821,73 @@ class MemoryService:
         result = client.query_points(
             collection_name=settings.qdrant_collection,
             query=embedding,
+            query_filter=Filter(must=must),
+            limit=limit,
+            with_payload=True,
+        )
+        hits = getattr(result, "points", result) or []
+
+        out: list[MemoryResponse] = []
+        for hit in hits:
+            payload = getattr(hit, "payload", None) or {}
+            mem_dict = {
+                "id": str(getattr(hit, "id", "")),
+                "memory": payload.get("data", ""),
+                "metadata": payload.get("metadata", {}),
+                "score": getattr(hit, "score", None),
+                "created_at": payload.get("created_at"),
+            }
+            out.append(self._mem_to_response(mem_dict))
+        return out
+
+    def _search_personal_pool(
+        self,
+        m,
+        user_id: str,
+        query_embedding: list[float],
+        project_id: str | None,
+        categories: list[str] | None,
+        scope: str | None,
+        domain: str | None,
+        observation_type: str | None,
+        concepts: list[str] | None,
+        limit: int,
+    ) -> list[MemoryResponse]:
+        """Search Qdrant for the caller's own memories using a precomputed vector.
+
+        Mirrors ``_search_shared_pool`` but scopes by the top-level ``user_id``
+        payload field (mem0's namespace) instead of ``visibility=shared``, and
+        returns the caller's memories regardless of visibility. We query Qdrant
+        directly — like the shared pool — rather than via ``Memory.search`` so a
+        single ``search()`` embeds the query ONCE and reuses ``query_embedding``
+        across every pool/scope, instead of re-embedding per ``Memory.search``
+        call (the embed round-trip dominates read latency).
+        """
+        from qdrant_client.models import (
+            FieldCondition,
+            Filter,
+            MatchAny,
+            MatchValue,
+        )
+
+        client = m.vector_store.client
+        must: list = [FieldCondition(key="user_id", match=MatchValue(value=user_id))]
+        if categories:
+            must.append(FieldCondition(key="metadata.category", match=MatchAny(any=categories)))
+        if scope:
+            must.append(FieldCondition(key="metadata.scope", match=MatchValue(value=scope)))
+        if project_id:
+            must.append(FieldCondition(key="metadata.project_id", match=MatchValue(value=project_id)))
+        if domain:
+            must.append(FieldCondition(key="metadata.domain", match=MatchValue(value=domain)))
+        if observation_type:
+            must.append(FieldCondition(key="metadata.observation_type", match=MatchValue(value=observation_type)))
+        if concepts:
+            must.append(FieldCondition(key="metadata.concepts", match=MatchAny(any=concepts)))
+
+        result = client.query_points(
+            collection_name=settings.qdrant_collection,
+            query=query_embedding,
             query_filter=Filter(must=must),
             limit=limit,
             with_payload=True,
@@ -1167,58 +1244,47 @@ class MemoryService:
         """
         m = self._get_memory()
 
-        # Build common metadata filters — these fields are nested under
-        # "metadata" in the Qdrant payload, so prefix keys with "metadata."
-        # for filtering.
-        common_filters: dict = {}
-        if categories:
-            common_filters["metadata.category"] = {"in": categories}
-        if scope:
-            common_filters["metadata.scope"] = scope
-        if domain:
-            common_filters["metadata.domain"] = domain
-        if observation_type:
-            common_filters["metadata.observation_type"] = observation_type
-        if concepts:
-            common_filters["metadata.concepts"] = {"in": concepts}
+        # Embed the query ONCE and reuse the vector across every pool/scope
+        # below. Both pools query Qdrant directly with this precomputed vector
+        # (see _search_personal_pool / _search_shared_pool). Previously each
+        # Memory.search + shared-pool call re-embedded the same query — 4-5
+        # embeds per recall — and the embed round-trip dominates read latency.
+        query_embedding = m.embedding_model.embed(query, memory_action="search")
 
         vector_responses: list[MemoryResponse] = []
 
-        # ── Personal pool: mem0's user_id namespacing ──────────────
-        # Skip when caller restricted to shared-only.
+        # ── Personal pool: the caller's own memories (any visibility) ──
+        # Skip when caller restricted to shared-only. Dedup + sort + limit
+        # happen once across both pools below.
         want_personal = visibility != MemoryVisibility.SHARED.value
         if want_personal and user_id:
-            # mem0 v2.0.2 rejects ``user_id`` (and ``agent_id``/``run_id``)
-            # as top-level kwargs on ``Memory.search``; entity-scoping
-            # parameters must go through ``filters``. We bake the user_id
-            # into each filter dict below so the warning stays silent.
             if project_id and not scope:
-                project_filters = {**common_filters, "user_id": user_id, "metadata.project_id": project_id}
-                project_results = m.search(
-                    query=query,
-                    limit=limit,
-                    filters=project_filters,
-                )
-                global_filters = {**common_filters, "user_id": user_id, "metadata.scope": "global"}
-                global_results = m.search(
-                    query=query,
-                    limit=limit,
-                    filters=global_filters,
-                )
-                all_results = self._merge_results(project_results, global_results)
+                # Dual-scope: this user's project-scoped + global memories.
                 vector_responses.extend(
-                    self._results_to_responses(all_results[:limit])
+                    self._search_personal_pool(
+                        m=m, user_id=user_id, query_embedding=query_embedding,
+                        project_id=project_id, categories=categories, scope=None,
+                        domain=domain, observation_type=observation_type,
+                        concepts=concepts, limit=limit,
+                    )
+                )
+                vector_responses.extend(
+                    self._search_personal_pool(
+                        m=m, user_id=user_id, query_embedding=query_embedding,
+                        project_id=None, categories=categories, scope="global",
+                        domain=domain, observation_type=observation_type,
+                        concepts=concepts, limit=limit,
+                    )
                 )
             else:
-                filters = {**common_filters, "user_id": user_id}
-                if project_id:
-                    filters["metadata.project_id"] = project_id
-                results = m.search(
-                    query=query,
-                    limit=limit,
-                    filters=filters,
+                vector_responses.extend(
+                    self._search_personal_pool(
+                        m=m, user_id=user_id, query_embedding=query_embedding,
+                        project_id=project_id, categories=categories, scope=scope,
+                        domain=domain, observation_type=observation_type,
+                        concepts=concepts, limit=limit,
+                    )
                 )
-                vector_responses.extend(self._results_to_responses(results))
 
         # ── Shared pool: direct Qdrant, no user_id namespace ───────
         # Bypass mem0's wrapper because shared memories span multiple
@@ -1248,6 +1314,7 @@ class MemoryService:
                             observation_type=observation_type,
                             concepts=concepts,
                             limit=limit,
+                            query_embedding=query_embedding,
                         )
                     )
                     vector_responses.extend(
@@ -1261,6 +1328,7 @@ class MemoryService:
                             observation_type=observation_type,
                             concepts=concepts,
                             limit=limit,
+                            query_embedding=query_embedding,
                         )
                     )
                 else:
@@ -1275,6 +1343,7 @@ class MemoryService:
                             observation_type=observation_type,
                             concepts=concepts,
                             limit=limit,
+                            query_embedding=query_embedding,
                         )
                     )
             except Exception as e:
