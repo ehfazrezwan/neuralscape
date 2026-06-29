@@ -1,0 +1,67 @@
+{
+  "label": "dev-stress@da54615",
+  "target_url": "http://localhost:8199",
+  "profile": "light",
+  "timestamp": "2026-06-22T10:10:00+00:00",
+  "git_commit": "da54615",
+  "config": {
+    "users": 6,
+    "duration_s": 15.0,
+    "per_user_concurrency": 2,
+    "read_ratio": 0.8
+  },
+  "metrics": {
+    "stress": {
+      "users": 6,
+      "duration_s": 15.0,
+      "total_ops": 69,
+      "ops_per_sec": 4.6,
+      "errors": 3,
+      "error_rate": 0.0435,
+      "read": {
+        "count": 36,
+        "p50": 30.0,
+        "p95": 97.38,
+        "p99": 116.85,
+        "mean": 38.79,
+        "min": 18.0,
+        "max": 123.5
+      },
+      "write": {
+        "count": 30,
+        "p50": 18.0,
+        "p95": 25.0,
+        "p99": 25.0,
+        "mean": 18.0,
+        "min": 12,
+        "max": 25
+      },
+      "per_user_read_p95": {
+        "stress-demo-u0": 37.5,
+        "stress-demo-u1": 37.5,
+        "stress-demo-u2": 37.5,
+        "stress-demo-u3": 37.5,
+        "stress-demo-u4": 37.5,
+        "stress-demo-u5": 118.75
+      },
+      "per_user_write_p95": {
+        "stress-demo-u0": 24.0,
+        "stress-demo-u1": 24.0,
+        "stress-demo-u2": 24.0,
+        "stress-demo-u3": 24.0,
+        "stress-demo-u4": 24.0,
+        "stress-demo-u5": 24.0
+      },
+      "fairness": {
+        "read_p95_max": 118.75,
+        "read_p95_min": 37.5,
+        "read_p95_spread": 3.17,
+        "read_p95_cv": 0.593
+      }
+    }
+  },
+  "notes": [
+    "6 users \u00d7 2 workers",
+    "writes are enqueue-only (202 latency)"
+  ]
+}
