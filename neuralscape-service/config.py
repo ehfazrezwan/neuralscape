@@ -89,6 +89,15 @@ class Settings(BaseSettings):
     dedup_batch_size: int = 100
     dedup_cron_hours: set = {0, 6, 12, 18}
 
+    # ── Data-layer connectors ─────────────────────────────────────────
+    # When enabled, the service hosts connectors (Notion/Drive/MCP/REST),
+    # stores their credentials encrypted in the vault, and runs a periodic
+    # sync. `vault_key` is a Fernet key (generate with
+    # `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`).
+    connectors_enabled: bool = False
+    vault_key: str = ""  # NEURALSCAPE_VAULT_KEY — required when connectors_enabled
+    connector_sync_cron_hours: int = 6  # interval (hours) the sync cron fires
+
     # Auth
     # Legacy single shared API key. When set without `neuralscape_user_token_secret`,
     # all requests must present this exact token in `Authorization: Bearer ...` and
@@ -266,6 +275,8 @@ class Settings(BaseSettings):
                 errors.append("LLM_GATEWAY_BASE_URL is required when LLM_GATEWAY_ENABLED is true")
             if not self.llm_gateway_api_key:
                 errors.append("LLM_GATEWAY_API_KEY is required when LLM_GATEWAY_ENABLED is true")
+        if self.connectors_enabled and not self.vault_key:
+            errors.append("NEURALSCAPE_VAULT_KEY is required when CONNECTORS_ENABLED is true")
         # Federated login: a non-token provider needs the OAuth AS turned on
         # (public URL + signing secret) plus that provider's own credentials.
         if self.auth_provider in ("google", "supabase"):

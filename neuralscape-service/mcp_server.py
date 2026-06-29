@@ -43,7 +43,10 @@ async def list_tools() -> list[Tool]:
                 "returning the most relevant results sorted by relevance score. "
                 "Results include a 'source' field: 'graph' results come from the knowledge graph and reflect "
                 "the latest contradiction-resolved state; 'vector' results come from the vector store. "
-                "When vector and graph results conflict, prefer graph-sourced results as authoritative."
+                "When vector and graph results conflict, prefer graph-sourced results as authoritative. "
+                "Memories ingested from a data layer carry a 'source_ref' (origin url/connector + a "
+                "'retrieval' handle {mcp_server, tool, args}); use that handle to fetch the original "
+                "source or more context when a result references external content."
             ),
             inputSchema={
                 "type": "object",
@@ -234,6 +237,64 @@ async def list_tools() -> list[Tool]:
                     },
                 },
                 "required": ["messages"],
+            },
+        ),
+        Tool(
+            name="ingest_document",
+            description=(
+                "Ingest a document from a data layer (a Google Drive file, a Notion page, "
+                "an API response, anything you can fetch) into memory. The content is chunked "
+                "into verbatim passages AND distilled into atomic facts; every resulting memory "
+                "is stamped with a 'source_ref' provenance descriptor — where it came from plus a "
+                "structured retrieval handle {mcp_server, tool, args} so a future agent can re-fetch "
+                "the original. Use this to index external content the user wants remembered. "
+                "Pass the source descriptor so the memory can point back to its origin."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "The full document text to ingest",
+                    },
+                    "source": {
+                        "type": "object",
+                        "description": (
+                            "Provenance descriptor. connector_id + connector_type are required; "
+                            "include url/title/external_id and a 'retrieval' handle so agents can re-fetch."
+                        ),
+                        "properties": {
+                            "connector_id": {"type": "string", "description": "Connector instance id, e.g. 'notion-personal'"},
+                            "connector_type": {"type": "string", "enum": ["google_drive", "notion", "generic_rest", "mcp"]},
+                            "external_id": {"type": "string", "description": "Stable id in the source system"},
+                            "url": {"type": "string", "description": "Human/clickable link"},
+                            "title": {"type": "string"},
+                            "retrieval": {
+                                "type": "object",
+                                "description": "How to re-fetch: which MCP server + tool + args",
+                                "properties": {
+                                    "mcp_server": {"type": "string"},
+                                    "tool": {"type": "string"},
+                                    "args": {"type": "object"},
+                                },
+                            },
+                        },
+                        "required": ["connector_id", "connector_type"],
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "Category for produced memories (default: domain_knowledge)",
+                        "enum": list(MEMORY_CATEGORIES.keys()),
+                    },
+                    "project_id": {"type": "string", "description": "Project id (sets project scope)"},
+                    "scope": {"type": "string", "enum": ["global", "project"]},
+                    "visibility": {"type": "string", "enum": ["private", "shared"]},
+                    "extract_facts": {"type": "boolean", "description": "Also run LLM extraction for distilled facts (default true)"},
+                    "index_passages": {"type": "boolean", "description": "Chunk + store verbatim passages (default true)"},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                    "wait": {"type": "boolean", "description": "Wait for ingest to finish before returning. Default false."},
+                },
+                "required": ["content", "source"],
             },
         ),
         Tool(
@@ -533,6 +594,40 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 )
                 output = [m.model_dump(exclude_none=True) for m in memories]
                 return [TextContent(type="text", text=json.dumps({"status": "completed", "result": {"memories": output}, "fallback": "sync"}, default=str))]
+
+            if wait:
+                result = await _task_manager.wait_for_result(task_id)
+                return [TextContent(type="text", text=json.dumps({"status": result["status"], "task_id": task_id, "result": result.get("result")}, default=str))]
+
+            return [TextContent(type="text", text=json.dumps({"status": "accepted", "task_id": task_id}, default=str))]
+
+        elif name == "ingest_document":
+            wait = arguments.get("wait", False)
+            scope = arguments.get("scope")
+            project_id = arguments.get("project_id")
+            if not scope:
+                scope = "project" if project_id else "global"
+            doc = {
+                "content": arguments["content"],
+                "source": arguments["source"],
+                "user_id": user_id,
+                "category": arguments.get("category", "domain_knowledge"),
+                "scope": scope,
+                "project_id": project_id,
+                "visibility": arguments.get("visibility"),
+                "tags": arguments.get("tags"),
+                "extract_facts": arguments.get("extract_facts", True),
+                "index_passages": arguments.get("index_passages", True),
+            }
+            doc = {k: v for k, v in doc.items() if v is not None}
+
+            try:
+                task_id = await _task_manager.enqueue_ingest_document(doc)
+            except (ConnectionError, OSError) as e:
+                logger.warning(f"Redis unavailable, falling back to sync ingest: {e}")
+                from ingest.pipeline import IngestDoc, ingest_document
+                result = ingest_document(_service, IngestDoc(**doc))
+                return [TextContent(type="text", text=json.dumps({"status": "completed", "result": result, "fallback": "sync"}, default=str))]
 
             if wait:
                 result = await _task_manager.wait_for_result(task_id)

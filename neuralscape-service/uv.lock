@@ -1631,6 +1631,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "arq" },
+    { name = "cryptography" },
     { name = "fastapi" },
     { name = "fastembed" },
     { name = "google-genai" },
@@ -1663,6 +1664,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "arq", specifier = ">=0.26.0" },
+    { name = "cryptography", specifier = ">=42.0" },
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "fastembed", specifier = ">=0.3" },
     { name = "google-genai", specifier = ">=1.0.0" },
