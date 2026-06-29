@@ -39,6 +39,27 @@ _ID_RE = re.compile(_ID_PATTERN)
 # ── fixtures / stubs ──────────────────────────────────────────────────────
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_auth_env(monkeypatch):
+    """Strip auth/provider env vars before each test in this module.
+
+    ``graphiti_core`` calls ``load_dotenv()`` at import time, leaking the repo
+    ``.env`` into ``os.environ``. When the full suite runs (so something imports
+    graphiti_core), a real ``GOOGLE_OAUTH_CLIENT_ID`` / ``AUTH_ALLOWED_DOMAINS``
+    from that .env would defeat the "missing creds/allowlist → error" assertions
+    in ``TestValidateRequired`` (which build ``Settings(**kw)`` and expect the
+    unspecified fields to be empty). Clearing them keeps those tests hermetic.
+    """
+    for var in (
+        "AUTH_PROVIDER", "AUTH_ALLOW_TOKEN_PASTE",
+        "NEURALSCAPE_PUBLIC_URL", "NEURALSCAPE_USER_TOKEN_SECRET",
+        "GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET",
+        "AUTH_ALLOWED_DOMAINS", "AUTH_EMAIL_ALLOWLIST", "AUTH_IDENTITY_MAP",
+        "SUPABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_JWT_SECRET",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
 @pytest.fixture
 def auth_settings():
     """Snapshot + restore every auth-related settings field per test."""
