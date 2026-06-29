@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -30,8 +32,12 @@ app = FastAPI(title="Neuralscape Benchmark Dashboard")
 
 
 def _load(name: str) -> dict:
-    path = RESULTS_DIR / name
-    if not path.is_file() or path.suffix != ".json" or path.parent != RESULTS_DIR:
+    base = RESULTS_DIR.resolve()
+    # resolve() collapses `..` and follows symlinks, so a symlink planted in
+    # RESULTS_DIR pointing outside it (or a `../` traversal in `name`) resolves
+    # to a parent != base and is rejected — no read outside the results dir.
+    path = (base / name).resolve()
+    if path.suffix != ".json" or path.parent != base or not path.is_file():
         raise HTTPException(404, f"result '{name}' not found")
     return json.loads(path.read_text())
 
@@ -84,27 +90,42 @@ class RunRequest(BaseModel):
     live_baseline: bool = False
 
 
-_running: dict[str, str] = {}  # label -> status, surfaced for the UI
+# run_id -> status string, surfaced for the UI. Keyed by a unique id (not the
+# user-supplied label) so two concurrent runs sharing a label can't overwrite
+# each other's status / report a false "done".
+_running: dict[str, str] = {}
+
+# Retain references to background tasks. asyncio holds only a weak reference, so
+# a fire-and-forget create_task() can be GC'd mid-flight ("Task was destroyed
+# but it is pending!"); this set keeps them alive until they finish.
+_tasks: set[asyncio.Task] = set()
 
 
-async def _do_run(req: RunRequest) -> None:
-    _running[req.label] = "running"
+def _spawn(coro) -> None:
+    task = asyncio.create_task(coro)
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
+
+
+async def _do_run(req: RunRequest, run_id: str) -> None:
+    _running[run_id] = "running"
     try:
         cfg = config_for_profile(req.profile)
         target = Target(base_url=req.target, label=req.label, token=req.token,
                         profile=req.profile, live_baseline=req.live_baseline)
         result = await run_benchmark(target, cfg, now_iso=datetime.now(timezone.utc).isoformat())
         save_result(result)
-        _running[req.label] = "done"
+        _running[run_id] = "done"
     except Exception as e:  # noqa: BLE001
-        _running[req.label] = f"error: {e}"
+        _running[run_id] = f"error: {e}"
 
 
 @app.post("/api/run")
 async def trigger_run(req: RunRequest) -> dict:
     """Kick off a single-target benchmark in the background."""
-    asyncio.create_task(_do_run(req))
-    return {"status": "accepted", "label": req.label}
+    run_id = f"{req.label}-{uuid.uuid4().hex[:8]}"
+    _spawn(_do_run(req, run_id))
+    return {"status": "accepted", "label": req.label, "run_id": run_id}
 
 
 class ABRequest(BaseModel):
@@ -115,14 +136,23 @@ class ABRequest(BaseModel):
 
 
 @app.post("/api/ab")
-def trigger_ab(req: ABRequest) -> dict:
-    """Spawn the A/B orchestrator as a detached process (it builds Docker stacks)."""
+def trigger_ab(req: ABRequest, x_bench_token: str | None = Header(default=None)) -> dict:
+    """Spawn the A/B orchestrator as a detached process (it builds Docker stacks).
+
+    This endpoint launches local subprocesses (Docker builds, git worktrees), so
+    it's the most dangerous one if the dashboard is ever exposed beyond the
+    default 127.0.0.1 bind. Opt-in token gate: when NSBENCH_AB_TOKEN is set, the
+    request must carry a matching X-Bench-Token header. Unset → open (local dev).
+    """
+    expected = os.environ.get("NSBENCH_AB_TOKEN")
+    if expected and x_bench_token != expected:
+        raise HTTPException(401, "invalid or missing X-Bench-Token")
     cmd = [sys.executable, "-m", "neuralscape_bench.orchestrator",
            "--candidate-branch", req.candidate_branch,
            "--baseline-branch", req.baseline_branch, "--profile", req.profile]
     if req.baseline_url:
         cmd += ["--baseline-url", req.baseline_url]
-    subprocess.Popen(cmd, cwd=str(BENCH_DIR))  # noqa: S603 — operator-triggered
+    subprocess.Popen(cmd, cwd=str(BENCH_DIR))  # noqa: S603 — operator-triggered, token-gated
     return {"status": "accepted", "cmd": " ".join(cmd)}
 
 
@@ -136,25 +166,26 @@ class StressRequest(BaseModel):
     concurrency: int | None = None
 
 
-async def _do_stress(req: StressRequest) -> None:
+async def _do_stress(req: StressRequest, run_id: str) -> None:
     from neuralscape_bench.stress import run_stress, stress_config
-    _running[req.label] = "running"
+    _running[run_id] = "running"
     try:
         cfg = stress_config(req.profile, users=req.users, duration_s=req.duration,
                             per_user_concurrency=req.concurrency)
         target = Target(base_url=req.target, label=req.label, token=req.token, profile=req.profile)
         result = await run_stress(target, cfg, now_iso=datetime.now(timezone.utc).isoformat())
         save_result(result)
-        _running[req.label] = "done"
+        _running[run_id] = "done"
     except Exception as e:  # noqa: BLE001
-        _running[req.label] = f"error: {e}"
+        _running[run_id] = f"error: {e}"
 
 
 @app.post("/api/stress")
 async def trigger_stress(req: StressRequest) -> dict:
     """Kick off a multi-user stress test in the background."""
-    asyncio.create_task(_do_stress(req))
-    return {"status": "accepted", "label": req.label}
+    run_id = f"{req.label}-{uuid.uuid4().hex[:8]}"
+    _spawn(_do_stress(req, run_id))
+    return {"status": "accepted", "label": req.label, "run_id": run_id}
 
 
 @app.get("/api/status")

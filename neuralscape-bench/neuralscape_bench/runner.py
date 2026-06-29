@@ -93,8 +93,6 @@ async def _seed(client: NeuralscapeClient, cfg: BenchConfig, user: str, project:
 
 async def measure_write_latency(client, cfg, user, project) -> dict:
     # Enqueue phase — concurrent, capture 202 latency + start time per write.
-    starts: list[tuple] = []
-
     async def enqueue(i):
         t0 = time.perf_counter()
         resp = await client.raw_write(_content(1000 + i), user_id=user, category="convention",
@@ -167,15 +165,21 @@ async def measure_contention(client, cfg, user, project) -> dict:
     unloaded = summarize(await read_burst(cfg.contention_reads))
 
     stop = asyncio.Event()
+    write_attempts = write_errors = 0
 
     async def writer(wid):
+        # The load generator tolerates write failures, but must COUNT them:
+        # if writers are silently erroring, the "loaded" read latency looks
+        # healthy while no real write load was ever applied (false negative).
+        nonlocal write_attempts, write_errors
         i = 0
         while not stop.is_set():
+            write_attempts += 1
             try:
                 await client.raw_write(_content(5000 + wid * 1000 + i), user_id=user,
                                        category="convention", scope="project", project_id=project)
-            except Exception:  # noqa: BLE001 — load generator tolerates errors
-                pass
+            except Exception:  # noqa: BLE001 — tolerated but counted (see above)
+                write_errors += 1
             i += 1
 
     writers = [asyncio.create_task(writer(w)) for w in range(cfg.write_load_writers)]
@@ -186,7 +190,12 @@ async def measure_contention(client, cfg, user, project) -> dict:
         await asyncio.gather(*writers, return_exceptions=True)
 
     ratio = round(loaded["p95"] / unloaded["p95"], 2) if unloaded["p95"] else None
-    return {"unloaded": unloaded, "loaded": loaded, "loaded_over_unloaded_p95": ratio}
+    return {
+        "unloaded": unloaded, "loaded": loaded, "loaded_over_unloaded_p95": ratio,
+        # Surfaced so a failed write-load (which invalidates the contention
+        # result) is visible instead of silently passing.
+        "write_load_attempts": write_attempts, "write_load_errors": write_errors,
+    }
 
 
 async def measure_throughput(client, cfg, user, project) -> dict:
@@ -281,14 +290,22 @@ async def _main_async(args) -> None:
     print(f"\nSaved → {path}")
 
 
+def _positive_int(value: str) -> int:
+    """argparse type: reject 0/negative overrides before they reach scheduling."""
+    iv = int(value)
+    if iv < 1:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {value}")
+    return iv
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Benchmark a Neuralscape target.")
     ap.add_argument("--target", required=True, help="Base URL, e.g. http://localhost:8199")
     ap.add_argument("--label", required=True, help="Run label, e.g. dev@da54615")
     ap.add_argument("--profile", default="light", choices=["light", "full"])
     ap.add_argument("--token", default=None, help="Optional bearer token")
-    ap.add_argument("--iterations", type=int, default=None)
-    ap.add_argument("--concurrency", type=int, default=None)
+    ap.add_argument("--iterations", type=_positive_int, default=None)
+    ap.add_argument("--concurrency", type=_positive_int, default=None)
     ap.add_argument("--live-baseline", action="store_true",
                     help="Mark this target as a pre-existing populated stack (read-latency caveat).")
     asyncio.run(_main_async(ap.parse_args()))

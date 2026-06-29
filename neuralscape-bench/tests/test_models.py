@@ -1,5 +1,7 @@
 """Unit tests for the pure stats / compare layer."""
 
+import pytest
+
 from neuralscape_bench.models import (
     BenchConfig,
     RunResult,
@@ -7,6 +9,19 @@ from neuralscape_bench.models import (
     percentile,
     summarize,
 )
+
+
+class TestBenchConfigValidation:
+    def test_rejects_zero_concurrency(self):
+        with pytest.raises(ValueError):
+            BenchConfig(concurrency=0)
+
+    def test_rejects_negative_iterations(self):
+        with pytest.raises(ValueError):
+            BenchConfig(iterations=-1)
+
+    def test_accepts_zero_warmup(self):
+        assert BenchConfig(warmup=0).warmup == 0
 
 
 class TestPercentile:
@@ -58,6 +73,15 @@ class TestCompare:
         cmp = compare_metrics({"throughput": {"writes_per_sec": 1.0}},
                               {"throughput": {"writes_per_sec": 5.0}})
         assert cmp["throughput.writes_per_sec"]["improved"] is True
+
+    def test_throughput_errors_lower_is_better(self):
+        # *_errors live under `throughput` but are counts — more is worse. Guards
+        # against the old substring match that flagged any "throughput" path as
+        # higher-is-better.
+        cmp = compare_metrics({"throughput": {"write_errors": 1.0, "read_errors": 0.0}},
+                              {"throughput": {"write_errors": 5.0, "read_errors": 3.0}})
+        assert cmp["throughput.write_errors"]["improved"] is False
+        assert cmp["throughput.read_errors"]["improved"] is False
 
     def test_skips_unmatched_paths(self):
         cmp = compare_metrics({"a": {"p95": 1.0}}, {"b": {"p95": 1.0}})

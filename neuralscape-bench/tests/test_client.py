@@ -7,10 +7,10 @@ from neuralscape_bench.client import NeuralscapeClient, TaskTimeout
 
 
 def _client(handler):
-    c = NeuralscapeClient("http://test")
-    c._http = httpx.AsyncClient(base_url="http://test", transport=httpx.MockTransport(handler),
-                               headers={"Content-Type": "application/json"})
-    return c
+    # Inject a MockTransport-backed client (no overwrite of a real one → no leak).
+    http = httpx.AsyncClient(base_url="http://test", transport=httpx.MockTransport(handler),
+                             headers={"Content-Type": "application/json"})
+    return NeuralscapeClient("http://test", http=http)
 
 
 async def test_raw_write_returns_task_id():
@@ -38,6 +38,19 @@ async def test_wait_for_task_polls_to_completion():
     try:
         out = await c.wait_for_task("t1", timeout_s=5, interval_s=0.01)
         assert out["status"] == "completed" and calls["n"] >= 2
+    finally:
+        await c.aclose()
+
+
+async def test_wait_for_task_treats_404_as_terminal():
+    # A 404 from the status endpoint is a terminal "unknown/expired" state and
+    # must not raise — it should return not_found so a run isn't aborted.
+    def handler(req):
+        return httpx.Response(404, json={"detail": "no such task"})
+    c = _client(handler)
+    try:
+        out = await c.wait_for_task("t1", timeout_s=5, interval_s=0.01)
+        assert out["status"] == "not_found"
     finally:
         await c.aclose()
 

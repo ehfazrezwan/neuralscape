@@ -11,12 +11,17 @@
 # host port — so any number of stacks coexist, each reachable at its own
 # BENCH_API_PORT. The orchestrator sets BENCH_API_PORT per stack.
 services:
+  # `!reset []` truly clears the base port list — plain `ports: []` MERGES in
+  # Compose and leaves the host publishes in place, colliding with an already-
+  # running stack (e.g. the live stack on 6379/6333/7687).
   neo4j:
-    ports: []
+    ports: !reset []
   redis:
-    ports: []
+    ports: !reset []
   qdrant:
-    ports: []
+    ports: !reset []
+  # `!override` REPLACES the base port list (plain merge would keep 8199:8199
+  # too and collide with the live stack); `!reset` would wrongly clear it.
   neuralscape:
-    ports:
+    ports: !override
       - "${BENCH_API_PORT:-8299}:8199"

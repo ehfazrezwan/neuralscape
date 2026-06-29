@@ -37,6 +37,22 @@ class BenchConfig:
     seed_count: int = 30             # synthetic corpus size seeded per target
     seed_wait_s: float = 60.0        # max wait for seeded vectors to become searchable
 
+    def __post_init__(self) -> None:
+        # Validate before these reach asyncio.Semaphore / sample loops. A 0 or
+        # negative concurrency hangs (Semaphore(0)) or errors; non-positive
+        # sample counts produce meaningless no-op runs. CLI/dashboard overrides
+        # flow through here, so this is the single chokepoint to reject them.
+        if self.concurrency < 1:
+            raise ValueError(f"concurrency must be >= 1, got {self.concurrency}")
+        if self.iterations < 1:
+            raise ValueError(f"iterations must be >= 1, got {self.iterations}")
+        if self.write_load_writers < 1:
+            raise ValueError(f"write_load_writers must be >= 1, got {self.write_load_writers}")
+        if self.contention_reads < 1:
+            raise ValueError(f"contention_reads must be >= 1, got {self.contention_reads}")
+        if self.warmup < 0:
+            raise ValueError(f"warmup must be >= 0, got {self.warmup}")
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -98,12 +114,15 @@ class RunResult:
         return asdict(self)
 
 
-# Metric paths that are "higher is better" (everything else: lower is better).
-_HIGHER_IS_BETTER = ("throughput", "per_sec", "writes_per_sec", "reads_per_sec")
-
-
 def _is_higher_better(path: str) -> bool:
-    return any(tok in path for tok in _HIGHER_IS_BETTER)
+    """Only rate metrics are higher-is-better (e.g. throughput.writes_per_sec).
+
+    Counts like throughput.read_errors / throughput.write_errors live under the
+    same `throughput` parent but are lower-is-better — matching the `throughput`
+    substring alone wrongly flagged rising error counts as "improved", so key
+    off the `_per_sec` rate suffix instead.
+    """
+    return path.endswith("_per_sec")
 
 
 def _flatten(d: dict, prefix: str = "") -> dict:

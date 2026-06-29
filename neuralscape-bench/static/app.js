@@ -1,6 +1,17 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
-const api = (p, opts) => fetch(p, opts).then((r) => r.json());
+// Escape untrusted strings before they go into innerHTML. Run metadata (labels,
+// notes, urls, commits) comes from result JSON files on disk, so a crafted file
+// would otherwise be a DOM-XSS vector in this local dashboard.
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const api = async (p, opts) => {
+  const r = await fetch(p, opts);
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText} — ${p}`);
+  if (!(r.headers.get("content-type") || "").includes("application/json"))
+    throw new Error(`non-JSON response — ${p}`);
+  return r.json();
+};
 const COLORS = { base: "#8b949e", cand: "#388bfd", p50: "#3fb950", p95: "#d29922", p99: "#f85149" };
 let charts = [];
 let selected = []; // single-run filenames selected for compare
@@ -30,12 +41,12 @@ async function loadRuns() {
     const el = document.createElement("div"); el.className = "run";
     if (selected.includes(r.name)) el.classList.add("sel");
     if (r.kind === "compare") {
-      el.innerHTML = `<div class="lbl">${r.baseline} <span class="muted">vs</span> ${r.candidate}</div>
-        <div class="meta"><span class="pill compare">A/B</span> ${(r.timestamp||"").slice(0,19)}</div>`;
+      el.innerHTML = `<div class="lbl">${esc(r.baseline)} <span class="muted">vs</span> ${esc(r.candidate)}</div>
+        <div class="meta"><span class="pill compare">A/B</span> ${esc((r.timestamp||"").slice(0,19))}</div>`;
       el.onclick = () => { selected = []; loadRuns(); showCompareFile(r.name); };
     } else {
-      el.innerHTML = `<div class="lbl">${r.label}</div>
-        <div class="meta"><span class="pill">${r.profile}</span> ${(r.timestamp||"").slice(0,19)}</div>`;
+      el.innerHTML = `<div class="lbl">${esc(r.label)}</div>
+        <div class="meta"><span class="pill">${esc(r.profile)}</span> ${esc((r.timestamp||"").slice(0,19))}</div>`;
       el.onclick = () => toggleSelect(r.name);
     }
     box.appendChild(el);
@@ -57,7 +68,7 @@ async function showRun(name) {
   const run = await api(`/api/runs/${name}`);
   clearCharts(); $("view").innerHTML = "";
   const head = card(run.label);
-  head.innerHTML += `<div class="note">${run.target_url} · profile ${run.profile} · ${(run.timestamp||"").slice(0,19)} · ${run.git_commit||""}</div>`;
+  head.innerHTML += `<div class="note">${esc(run.target_url)} · profile ${esc(run.profile)} · ${esc((run.timestamp||"").slice(0,19))} · ${esc(run.git_commit||"")}</div>`;
   const m = run.metrics || {};
 
   if (m.read) {
@@ -121,7 +132,7 @@ async function showRun(name) {
     }
   }
   if (run.notes && run.notes.length) {
-    const n = card("Notes"); n.innerHTML += "<ul class='note'>" + run.notes.map((x)=>`<li>${x}</li>`).join("") + "</ul>";
+    const n = card("Notes"); n.innerHTML += "<ul class='note'>" + run.notes.map((x)=>`<li>${esc(x)}</li>`).join("") + "</ul>";
   }
 }
 

@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
+import re
 import shutil
 import subprocess
 import time
@@ -47,7 +49,12 @@ def _repo_root() -> Path:
 
 
 def _slug(branch: str) -> str:
-    return branch.replace("/", "-").replace("+", "-")
+    # The slug names BOTH the git worktree dir and the docker compose project,
+    # so distinct branches must produce distinct slugs. Plain char-substitution
+    # collides (`a/b` and `a+b` both → `a-b`), reusing the wrong worktree and
+    # invalidating A/B attribution. Append a short hash of the exact branch name.
+    safe = re.sub(r"[^A-Za-z0-9._-]", "-", branch).strip("-") or "branch"
+    return f"{safe}-{hashlib.sha1(branch.encode()).hexdigest()[:8]}"
 
 
 def _branch_commit(worktree: Path) -> str:
@@ -154,8 +161,10 @@ def main() -> None:
         else:
             wt = ensure_worktree(repo_root, args.baseline_branch)
             proj = f"nsbench-{_slug(args.baseline_branch)}"
-            stack_up(proj, wt, args.baseline_port, env_file)
+            # Track BEFORE bring-up: if stack_up fails after creating some
+            # containers, the finally block must still tear them down.
             brought_up.append((proj, wt))
+            stack_up(proj, wt, args.baseline_port, env_file)
             wait_health(args.baseline_port)
             label = f"{args.baseline_branch}@{_branch_commit(wt)}"
             baseline = asyncio.run(_bench_target(
@@ -164,8 +173,8 @@ def main() -> None:
         # ── Candidate ──
         wt = ensure_worktree(repo_root, args.candidate_branch)
         proj = f"nsbench-{_slug(args.candidate_branch)}"
+        brought_up.append((proj, wt))  # track before bring-up (see baseline note)
         stack_up(proj, wt, args.candidate_port, env_file)
-        brought_up.append((proj, wt))
         wait_health(args.candidate_port)
         label = f"{args.candidate_branch}@{_branch_commit(wt)}"
         candidate = asyncio.run(_bench_target(

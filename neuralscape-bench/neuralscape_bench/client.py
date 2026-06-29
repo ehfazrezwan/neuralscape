@@ -19,8 +19,13 @@ class TaskTimeout(Exception):
 
 
 class NeuralscapeClient:
-    def __init__(self, base_url: str, token: str | None = None, request_timeout: float = 30.0,
-                 max_connections: int = 100):
+    def __init__(self, base_url: str, token: str | None = None, request_timeout: float = 120.0,
+                 max_connections: int = 100, http: httpx.AsyncClient | None = None):
+        # Tests inject a MockTransport-backed client here instead of overwriting
+        # the private ._http afterward (which would leak the client created below).
+        if http is not None:
+            self._http = http
+            return
         headers = {"Content-Type": "application/json"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
@@ -79,14 +84,22 @@ class NeuralscapeClient:
         """Poll GET /v1/memories/status/{task_id} until terminal. Raises TaskTimeout."""
         deadline = time.perf_counter() + timeout_s
         while True:
-            r = await self._http.get(f"/v1/memories/status/{task_id}")
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                raise TaskTimeout(f"task {task_id} not terminal after {timeout_s}s")
+            # Bound each poll by the time left so a single stalled GET can't run
+            # far past the declared poll timeout (up to the client-wide timeout).
+            r = await self._http.get(f"/v1/memories/status/{task_id}",
+                                     timeout=max(0.001, remaining))
+            # 404 is a terminal "task unknown/expired" state, not a hard error
+            # that should abort the run — surface it like the other terminals.
+            if r.status_code == 404:
+                return {"task_id": task_id, "status": "not_found"}
             r.raise_for_status()
             data = r.json()
             status = data.get("status")
             if status in ("completed", "failed", "not_found"):
                 return data
-            if time.perf_counter() >= deadline:
-                raise TaskTimeout(f"task {task_id} still '{status}' after {timeout_s}s")
             await asyncio.sleep(interval_s)
 
     # ── reads (synchronous 200) ──

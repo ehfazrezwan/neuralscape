@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 
 from neuralscape_bench.client import NeuralscapeClient
 from neuralscape_bench.models import RunResult, Target, percentile, summarize
-from neuralscape_bench.runner import RESULTS_DIR, _QUERIES, _content, _git_commit, save_result
+from neuralscape_bench.runner import _QUERIES, _content, _git_commit, save_result
 
 _STRESS_PROFILES = {
     "light": dict(users=8, duration_s=15.0, per_user_concurrency=2, read_ratio=0.8,
