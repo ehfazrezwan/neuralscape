@@ -588,8 +588,19 @@ class MemoryService:
         expires_at: datetime | None = None,
         # Multi-user model (None → category default)
         visibility: str | None = None,
-    ) -> list[MemoryResponse]:
+        # Write-path isolation: when False, skip the slow inline graph.add so
+        # the fast vector write returns immediately — the caller is expected to
+        # enqueue enrich_graph() onto the graph worker. When return_created is
+        # True, returns (responses, created) so the caller only enqueues graph
+        # enrichment for genuinely new rows (not content-hash dedup hits).
+        add_to_graph: bool = True,
+        return_created: bool = False,
+    ) -> list[MemoryResponse] | tuple[list[MemoryResponse], bool]:
         """Store a single pre-categorized fact directly (no LLM extraction).
+
+        Returns a ``list[MemoryResponse]`` by default, or ``(responses, created)``
+        when ``return_created=True`` (``created`` is False for content-hash dedup
+        hits) — callers must not assume the return is always a list.
 
         Performs content-hash dedup before insert: if a memory with the same
         md5(content) + user_id + scope already exists, the existing memory is
@@ -652,7 +663,8 @@ class MemoryService:
             logger.info(
                 f"Dedup hit for user={user_id} hash={content_hash[:8]}... — returning existing id={existing.id}"
             )
-            return [existing]
+            # created=False → caller must NOT re-enqueue graph enrichment.
+            return ([existing], False) if return_created else [existing]
 
         # ── Direct embed + Qdrant insert (bypass m.add) ──
         mid = str(uuid.uuid4())
@@ -709,33 +721,20 @@ class MemoryService:
             logger.warning(f"History record failed for {mid}: {e}")
 
         # ── Add to knowledge graph ──
-        # Group_id encodes visibility + user namespace so the graph search
-        # can scope by allowed groups without re-leaking cross-user facts.
-        group_id = _build_group_id(effective_visibility, user_id, project_id)
-        graph_write_started_at = datetime.now(timezone.utc)
-        try:
-            if self._graphiti and self._bridge:
-                retry_transient(
-                    self._memory.graph.add,
-                    data=content,
-                    filters={"user_id": user_id, "group_id": group_id},
-                    operation="store_raw graph add",
-                )
-                # Best-effort: attach memory_id back-reference onto the entity
-                # nodes Graphiti just created in this group, so the wiki
-                # synthesizer can walk community → source memories. Failures
-                # here are logged but never fail the write.
-                self._attach_memory_id_to_graph_nodes(
-                    group_id=group_id,
-                    memory_id=mid,
-                    visibility=effective_visibility,
-                    owner_user_id=user_id,
-                    write_started_at=graph_write_started_at,
-                )
-        except Exception as e:
-            logger.warning(f"Graph storage failed (non-critical): {e}")
+        # Graphiti entity extraction is slow (~minutes, gated by Gemini). When
+        # add_to_graph is False the caller enqueues enrich_graph() onto the
+        # graph worker instead, so this fast path returns right after the
+        # vector insert.
+        if add_to_graph:
+            self.enrich_graph(
+                content=content,
+                user_id=user_id,
+                project_id=project_id,
+                visibility=effective_visibility,
+                memory_id=mid,
+            )
 
-        return [
+        responses = [
             MemoryResponse(
                 id=mid,
                 memory=content,
@@ -756,6 +755,59 @@ class MemoryService:
                 owner_user_id=user_id,
             )
         ]
+        # created=True → a new row was written, so the caller should enqueue
+        # graph enrichment (when it deferred it via add_to_graph=False).
+        return (responses, True) if return_created else responses
+
+    def enrich_graph(
+        self,
+        content: str,
+        user_id: str,
+        project_id: str | None,
+        visibility: str,
+        memory_id: str,
+    ) -> bool:
+        """Add content to the knowledge graph + attach memory_id back-refs.
+
+        Extracted from store_raw so it can run either inline (add_to_graph=True)
+        or — preferably — as a separate background job on the graph worker,
+        since Graphiti entity extraction is slow (~minutes, Gemini-gated) and
+        must not block the fast vector write or the API/MCP event loop.
+        Best-effort: logs and swallows errors, never raises.
+
+        Returns True if the graph write actually succeeded, False if it was
+        skipped (no graph configured) or swallowed an error. Callers use this
+        to report honest enrichment status instead of assuming success — a
+        transient Gemini 503 leaves the memory vector-only, and that must be
+        observable rather than reported as ``enriched=True``.
+        """
+        if not (self._graphiti and self._bridge):
+            return False
+        # Group_id encodes visibility + user namespace so graph search can
+        # scope by allowed groups without re-leaking cross-user facts.
+        group_id = _build_group_id(visibility, user_id, project_id)
+        graph_write_started_at = datetime.now(timezone.utc)
+        try:
+            retry_transient(
+                self._memory.graph.add,
+                data=content,
+                filters={"user_id": user_id, "group_id": group_id},
+                operation="enrich_graph add",
+            )
+            # Best-effort: attach memory_id back-reference onto the entity nodes
+            # Graphiti just created in this group, so the wiki synthesizer can
+            # walk community → source memories.
+            self._attach_memory_id_to_graph_nodes(
+                group_id=group_id,
+                memory_id=memory_id,
+                visibility=visibility,
+                owner_user_id=user_id,
+                write_started_at=graph_write_started_at,
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"Graph enrichment failed (non-critical): {e}")
+            return False
 
     def _search_shared_pool(
         self,
@@ -768,6 +820,7 @@ class MemoryService:
         observation_type: str | None,
         concepts: list[str] | None,
         limit: int,
+        query_embedding: list[float] | None = None,
     ) -> list[MemoryResponse]:
         """Search Qdrant for shared-pool memories (any writer).
 
@@ -776,6 +829,11 @@ class MemoryService:
         wrapper enforces user_id namespacing — for the shared pool we
         explicitly want hits across writers, scoped by
         ``metadata.visibility=shared`` plus any other supplied filters.
+
+        ``query_embedding`` lets the caller pass a precomputed query vector so a
+        single ``search()`` doesn't re-embed the same query for every pool/scope
+        (the embed round-trip dominates read latency); falls back to embedding
+        ``query`` when not provided.
         """
         from qdrant_client.models import (
             FieldCondition,
@@ -785,7 +843,11 @@ class MemoryService:
         )
 
         client = m.vector_store.client
-        embedding = m.embedding_model.embed(query, memory_action="search")
+        embedding = (
+            query_embedding
+            if query_embedding is not None
+            else m.embedding_model.embed(query, memory_action="search")
+        )
 
         must: list = [
             FieldCondition(
@@ -811,6 +873,73 @@ class MemoryService:
         result = client.query_points(
             collection_name=settings.qdrant_collection,
             query=embedding,
+            query_filter=Filter(must=must),
+            limit=limit,
+            with_payload=True,
+        )
+        hits = getattr(result, "points", result) or []
+
+        out: list[MemoryResponse] = []
+        for hit in hits:
+            payload = getattr(hit, "payload", None) or {}
+            mem_dict = {
+                "id": str(getattr(hit, "id", "")),
+                "memory": payload.get("data", ""),
+                "metadata": payload.get("metadata", {}),
+                "score": getattr(hit, "score", None),
+                "created_at": payload.get("created_at"),
+            }
+            out.append(self._mem_to_response(mem_dict))
+        return out
+
+    def _search_personal_pool(
+        self,
+        m,
+        user_id: str,
+        query_embedding: list[float],
+        project_id: str | None,
+        categories: list[str] | None,
+        scope: str | None,
+        domain: str | None,
+        observation_type: str | None,
+        concepts: list[str] | None,
+        limit: int,
+    ) -> list[MemoryResponse]:
+        """Search Qdrant for the caller's own memories using a precomputed vector.
+
+        Mirrors ``_search_shared_pool`` but scopes by the top-level ``user_id``
+        payload field (mem0's namespace) instead of ``visibility=shared``, and
+        returns the caller's memories regardless of visibility. We query Qdrant
+        directly — like the shared pool — rather than via ``Memory.search`` so a
+        single ``search()`` embeds the query ONCE and reuses ``query_embedding``
+        across every pool/scope, instead of re-embedding per ``Memory.search``
+        call (the embed round-trip dominates read latency).
+        """
+        from qdrant_client.models import (
+            FieldCondition,
+            Filter,
+            MatchAny,
+            MatchValue,
+        )
+
+        client = m.vector_store.client
+        must: list = [FieldCondition(key="user_id", match=MatchValue(value=user_id))]
+        if categories:
+            must.append(FieldCondition(key="metadata.category", match=MatchAny(any=categories)))
+        if scope:
+            must.append(FieldCondition(key="metadata.scope", match=MatchValue(value=scope)))
+        if project_id:
+            must.append(FieldCondition(key="metadata.project_id", match=MatchValue(value=project_id)))
+        if domain:
+            must.append(FieldCondition(key="metadata.domain", match=MatchValue(value=domain)))
+        if observation_type:
+            must.append(FieldCondition(key="metadata.observation_type", match=MatchValue(value=observation_type)))
+        if concepts:
+            must.append(FieldCondition(key="metadata.concepts", match=MatchAny(any=concepts)))
+
+        result = client.query_points(
+            collection_name=settings.qdrant_collection,
+            query=query_embedding,
             query_filter=Filter(must=must),
             limit=limit,
             with_payload=True,
@@ -1167,58 +1296,53 @@ class MemoryService:
         """
         m = self._get_memory()
 
-        # Build common metadata filters — these fields are nested under
-        # "metadata" in the Qdrant payload, so prefix keys with "metadata."
-        # for filtering.
-        common_filters: dict = {}
-        if categories:
-            common_filters["metadata.category"] = {"in": categories}
-        if scope:
-            common_filters["metadata.scope"] = scope
-        if domain:
-            common_filters["metadata.domain"] = domain
-        if observation_type:
-            common_filters["metadata.observation_type"] = observation_type
-        if concepts:
-            common_filters["metadata.concepts"] = {"in": concepts}
+        # Embed the query ONCE and reuse the vector across every pool/scope
+        # below. Both pools query Qdrant directly with this precomputed vector
+        # (see _search_personal_pool / _search_shared_pool). Previously each
+        # Memory.search + shared-pool call re-embedded the same query — 4-5
+        # embeds per recall — and the embed round-trip dominates read latency.
+        query_embedding = m.embedding_model.embed(query, memory_action="search")
 
         vector_responses: list[MemoryResponse] = []
 
-        # ── Personal pool: mem0's user_id namespacing ──────────────
-        # Skip when caller restricted to shared-only.
+        # ── Personal pool: the caller's own memories (any visibility) ──
+        # Skip when caller restricted to shared-only. Dedup + sort + limit
+        # happen once across both pools below.
         want_personal = visibility != MemoryVisibility.SHARED.value
         if want_personal and user_id:
-            # mem0 v2.0.2 rejects ``user_id`` (and ``agent_id``/``run_id``)
-            # as top-level kwargs on ``Memory.search``; entity-scoping
-            # parameters must go through ``filters``. We bake the user_id
-            # into each filter dict below so the warning stays silent.
-            if project_id and not scope:
-                project_filters = {**common_filters, "user_id": user_id, "metadata.project_id": project_id}
-                project_results = m.search(
-                    query=query,
-                    limit=limit,
-                    filters=project_filters,
-                )
-                global_filters = {**common_filters, "user_id": user_id, "metadata.scope": "global"}
-                global_results = m.search(
-                    query=query,
-                    limit=limit,
-                    filters=global_filters,
-                )
-                all_results = self._merge_results(project_results, global_results)
-                vector_responses.extend(
-                    self._results_to_responses(all_results[:limit])
-                )
-            else:
-                filters = {**common_filters, "user_id": user_id}
-                if project_id:
-                    filters["metadata.project_id"] = project_id
-                results = m.search(
-                    query=query,
-                    limit=limit,
-                    filters=filters,
-                )
-                vector_responses.extend(self._results_to_responses(results))
+            # Failure isolation: a transient Qdrant error in the personal
+            # pool must not abort the whole recall — degrade to shared/graph
+            # results instead, matching the shared-pool/graph paths below.
+            try:
+                if project_id and not scope:
+                    # Dual-scope: this user's project-scoped + global memories.
+                    vector_responses.extend(
+                        self._search_personal_pool(
+                            m=m, user_id=user_id, query_embedding=query_embedding,
+                            project_id=project_id, categories=categories, scope=None,
+                            domain=domain, observation_type=observation_type,
+                            concepts=concepts, limit=limit,
+                        )
+                    )
+                    vector_responses.extend(
+                        self._search_personal_pool(
+                            m=m, user_id=user_id, query_embedding=query_embedding,
+                            project_id=None, categories=categories, scope="global",
+                            domain=domain, observation_type=observation_type,
+                            concepts=concepts, limit=limit,
+                        )
+                    )
+                else:
+                    vector_responses.extend(
+                        self._search_personal_pool(
+                            m=m, user_id=user_id, query_embedding=query_embedding,
+                            project_id=project_id, categories=categories, scope=scope,
+                            domain=domain, observation_type=observation_type,
+                            concepts=concepts, limit=limit,
+                        )
+                    )
+            except Exception as e:
+                logger.warning(f"Personal-pool search failed (non-critical): {e}")
 
         # ── Shared pool: direct Qdrant, no user_id namespace ───────
         # Bypass mem0's wrapper because shared memories span multiple
@@ -1233,7 +1357,13 @@ class MemoryService:
         # memories that should still be visible (the graph read-set
         # already covers both via `_get_group_ids`). The downstream
         # dedup at line ~1094 collapses any overlap.
-        want_shared = include_shared and visibility != MemoryVisibility.PRIVATE.value
+        # An explicit `visibility="shared"` selects the shared pool even when
+        # `include_shared=False` — otherwise the vector path would suppress the
+        # shared pool while the graph path (which keys off `visibility==shared`)
+        # still returns it, yielding inconsistent/partial results.
+        want_shared = visibility == MemoryVisibility.SHARED.value or (
+            include_shared and visibility != MemoryVisibility.PRIVATE.value
+        )
         if want_shared:
             try:
                 if project_id and not scope:
@@ -1248,6 +1378,7 @@ class MemoryService:
                             observation_type=observation_type,
                             concepts=concepts,
                             limit=limit,
+                            query_embedding=query_embedding,
                         )
                     )
                     vector_responses.extend(
@@ -1261,6 +1392,7 @@ class MemoryService:
                             observation_type=observation_type,
                             concepts=concepts,
                             limit=limit,
+                            query_embedding=query_embedding,
                         )
                     )
                 else:
@@ -1275,6 +1407,7 @@ class MemoryService:
                             observation_type=observation_type,
                             concepts=concepts,
                             limit=limit,
+                            query_embedding=query_embedding,
                         )
                     )
             except Exception as e:

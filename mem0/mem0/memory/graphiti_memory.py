@@ -33,7 +33,18 @@ def _create_llm_client(
     if provider == "gemini":
         from graphiti_core.llm_client.gemini_client import GeminiClient
 
-        config = LLMConfig(api_key=api_key, model=model, fallback_model=fallback_model)
+        # NEURALSCAPE PATCH: default small_model to the main model. Graphiti's
+        # GeminiClient uses small_model for cheaper sub-tasks (e.g.
+        # dedupe_edges.resolve_edge); if left unset it uses its own hardcoded
+        # DEFAULT_SMALL_MODEL. Threading the configured main model here keeps the
+        # ENTIRE enrichment path (extraction + dedup) on one reliable model
+        # instead of silently splitting onto a different default.
+        config = LLMConfig(
+            api_key=api_key,
+            model=model,
+            fallback_model=fallback_model,
+            small_model=small_model or model,
+        )
         return GeminiClient(config=config)
     elif provider == "openai":
         from graphiti_core.llm_client.openai_client import OpenAIClient
