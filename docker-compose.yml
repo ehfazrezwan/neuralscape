@@ -100,9 +100,10 @@ services:
     restart: unless-stopped
     # Docker's restart policy only fires on container EXIT, not on a failing
     # healthcheck — a wedged-but-running API (e.g. after the host sleeps) would
-    # otherwise stay dead. The `autoheal` sidecar restarts it on unhealthy.
+    # otherwise stay wedged/unresponsive. The `autoheal` sidecar restarts it on
+    # unhealthy. Reverse-DNS label so it can't collide with another stack's.
     labels:
-      autoheal: "true"
+      com.neuralscape.autoheal: "true"
     deploy:
       resources:
         limits:
@@ -117,6 +118,11 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
+      # Slow first boot (spaCy/fastembed load, backend connections) must not
+      # count failed checks toward `retries` — otherwise autoheal would restart
+      # the API mid-initialization. This is the per-container startup grace;
+      # AUTOHEAL_START_PERIOD on the sidecar is unrelated (its own boot delay).
+      start_period: 90s
 
   neuralscape-worker:
     build:
@@ -293,20 +299,25 @@ services:
       - test_venv:/app/neuralscape-service/.venv
 
   # ── Autoheal ────────────────────────────────────────────────────
-  # Restarts any container labelled `autoheal=true` whose Docker healthcheck
-  # reports `unhealthy`. Docker's own `restart: unless-stopped` only fires on
-  # process EXIT, so a wedged-but-running API (e.g. after the host sleeps and
-  # its event loop / backend connections go stale) would otherwise stay dead
-  # until a manual restart. Scoped by label (NOT "all") so it never touches
-  # unrelated containers on the host.
+  # Restarts any container labelled `com.neuralscape.autoheal=true` whose Docker
+  # healthcheck reports `unhealthy`. Docker's own `restart: unless-stopped` only
+  # fires on process EXIT, so a wedged-but-running API (e.g. after the host
+  # sleeps and its event loop / backend connections go stale) would otherwise
+  # stay wedged/unresponsive until a manual restart. Scoped by a reverse-DNS
+  # label (NOT "all") so it never touches unrelated containers on the host.
   autoheal:
-    image: willfarrell/autoheal:latest
-    container_name: neuralscape-autoheal
+    # Pinned by digest: this container has the Docker socket (root-equivalent on
+    # the host), so a mutable :latest tag is a supply-chain risk. Digest is
+    # willfarrell/autoheal:latest as of 2026-06-29; bump deliberately.
+    image: willfarrell/autoheal@sha256:3fd4d591075224304e95d92af8619adda1fe6e1469587e8b5230d946b0926f00
     restart: unless-stopped
+    # Only needs the Docker Unix socket; no webhook/notifications are
+    # configured, so deny it network access entirely.
+    network_mode: "none"
     environment:
-      AUTOHEAL_CONTAINER_LABEL: autoheal      # only manage autoheal=true containers
+      AUTOHEAL_CONTAINER_LABEL: com.neuralscape.autoheal  # only this stack's containers
       AUTOHEAL_INTERVAL: "15"                  # seconds between health polls
-      AUTOHEAL_START_PERIOD: "90"              # grace window after a (re)start
+      AUTOHEAL_START_PERIOD: "90"              # sidecar's own boot delay before it polls
       AUTOHEAL_DEFAULT_STOP_TIMEOUT: "30"      # graceful stop before kill
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
