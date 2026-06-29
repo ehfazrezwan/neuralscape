@@ -493,7 +493,11 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
 
     try:
         if name == "recall_memories":
-            results = _service.search(
+            # Run the synchronous, graph-backed search in a worker thread so a
+            # slow read can't freeze the MCP server's event loop (which would
+            # stall concurrent fire-and-forget writes and time them out).
+            results = await asyncio.to_thread(
+                _service.search,
                 query=arguments["query"],
                 user_id=user_id,
                 project_id=arguments.get("project_id"),
@@ -551,7 +555,8 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                         )
                     except ValueError:
                         sync_v2["expires_at"] = None
-                memories = _service.store_raw(
+                memories = await asyncio.to_thread(
+                    _service.store_raw,
                     content=arguments["content"],
                     user_id=user_id,
                     category=category,
@@ -581,7 +586,8 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             except (ConnectionError, OSError) as e:
                 # Redis unavailable — fall back to synchronous storage
                 logger.warning(f"Redis unavailable, falling back to sync store: {e}")
-                memories = _service.extract_and_store(
+                memories = await asyncio.to_thread(
+                    _service.extract_and_store,
                     messages=arguments["messages"],
                     user_id=user_id,
                     project_id=arguments.get("project_id"),
@@ -633,7 +639,8 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             # Default to a small bounded page so a large project doesn't overflow
             # the agent tool-result token limit (a 218-memory project at limit=100
             # was ~112K chars); callers can raise limit / page with offset.
-            context = _service.get_project_context(
+            context = await asyncio.to_thread(
+                _service.get_project_context,
                 user_id=user_id,
                 project_id=arguments["project_id"],
                 limit=arguments.get("limit", 25),
@@ -656,7 +663,8 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps(output, default=str))]
 
         elif name == "search_knowledge_graph":
-            results = _service.search_graph(
+            results = await asyncio.to_thread(
+                _service.search_graph,
                 query=arguments["query"],
                 user_id=user_id,
                 project_id=arguments.get("project_id"),
@@ -665,7 +673,8 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps(results, default=str))]
 
         elif name == "list_memories":
-            results = _service.list_memories(
+            results = await asyncio.to_thread(
+                _service.list_memories,
                 user_id=user_id,
                 scope=arguments.get("scope"),
                 category=arguments.get("category"),
@@ -676,15 +685,16 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps(output, default=str))]
 
         elif name == "list_projects":
-            projects = _service.list_projects(user_id=user_id)
+            projects = await asyncio.to_thread(_service.list_projects, user_id=user_id)
             return [TextContent(type="text", text=json.dumps({"projects": projects}, default=str))]
 
         elif name == "delete_memories":
             memory_id = arguments.get("memory_id")
             if memory_id:
-                result = _service.delete_memory(memory_id)
+                result = await asyncio.to_thread(_service.delete_memory, memory_id)
             else:
-                result = _service.delete_memories(
+                result = await asyncio.to_thread(
+                    _service.delete_memories,
                     user_id=user_id,
                     scope=arguments.get("scope"),
                     category=arguments.get("category"),

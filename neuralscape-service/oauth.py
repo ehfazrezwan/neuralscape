@@ -49,6 +49,18 @@ from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from config import settings
+import identity_store
+from login_providers import (
+    AuthorizeContext,
+    GoogleProvider,
+    LoginError,
+    LoginNeedsLink,
+    SupabaseProvider,
+    _supabase_finish_page,
+    get_login_provider,
+    sign_link_ticket,
+    verify_link_ticket,
+)
 from tokens import issue_user_token, sign_payload, verify_payload, verify_user_token
 
 logger = logging.getLogger(__name__)
@@ -283,6 +295,15 @@ _CONSENT_PAGE = """<!doctype html>
          border-radius: 10px; padding: 10px 12px; margin: 14px 0 0; }}
   .hint {{ font-size: 12px; color: #7b8198; }}
   code {{ background:#0d0f16; padding:1px 5px; border-radius:5px; font-size:12px; }}
+  .provider-btn {{ display:flex; align-items:center; justify-content:center; gap:8px;
+           width:100%; box-sizing:border-box; margin-top:8px; padding:11px; font-size:14px;
+           font-weight:600; text-decoration:none; border-radius:10px; background:#fff;
+           color:#1f2330; border:1px solid #d6d9e0; cursor:pointer; }}
+  .provider-btn:hover {{ background:#f1f3f7; }}
+  .divider {{ display:flex; align-items:center; text-align:center; color:#7b8198;
+           font-size:12px; margin:20px 0 4px; }}
+  .divider::before, .divider::after {{ content:""; flex:1; border-top:1px solid #262b38; }}
+  .divider span {{ padding:0 10px; }}
 </style>
 </head>
 <body>
@@ -290,7 +311,14 @@ _CONSENT_PAGE = """<!doctype html>
     <h1>Connect Neuralscape memory</h1>
     <p class="who">{client_label} is requesting access to your Neuralscape memories.</p>
     {error_html}
-    <form method="post" action="/oauth/authorize">
+    <!--PROVIDER_BLOCK-->
+    <!--DIVIDER-->
+    <!--TOKEN_FORM-->
+  </div>
+</body>
+</html>"""
+
+_TOKEN_FORM = """<form method="post" action="/oauth/authorize">
       <input type="hidden" name="client_id" value="{client_id}">
       <input type="hidden" name="redirect_uri" value="{redirect_uri}">
       <input type="hidden" name="state" value="{state}">
@@ -298,13 +326,10 @@ _CONSENT_PAGE = """<!doctype html>
       <input type="hidden" name="code_challenge_method" value="{code_challenge_method}">
       <input type="hidden" name="resource" value="{resource}">
       <label for="token">Your Neuralscape access token</label>
-      <textarea id="token" name="token" placeholder="paste the token your admin issued you" autofocus></textarea>
+      <textarea id="token" name="token" placeholder="paste the token your admin issued you"></textarea>
       <p class="hint">Issued by your team admin via <code>issue_user_token.py</code>. You only paste this once.</p>
       <button type="submit">Authorize</button>
-    </form>
-  </div>
-</body>
-</html>"""
+    </form>"""
 
 
 def _render_consent(
@@ -318,24 +343,45 @@ def _render_consent(
     client_label: str = "Claude",
     error: str | None = None,
     status_code: int = 200,
+    provider_block: str = "",
+    show_token_form: bool = True,
 ) -> HTMLResponse:
+    """Render the consent page composing an optional provider login button
+    (Google/Supabase) and/or the admin-token paste form, with a divider between
+    them when both are present."""
     error_html = f'<div class="err">{html.escape(error)}</div>' if error else ""
     page = _CONSENT_PAGE.format(
         client_label=html.escape(client_label),
-        client_id=html.escape(client_id),
-        redirect_uri=html.escape(redirect_uri),
-        state=html.escape(state or ""),
-        code_challenge=html.escape(code_challenge or ""),
-        code_challenge_method=html.escape(code_challenge_method or ""),
-        resource=html.escape(resource or ""),
         error_html=error_html,
+    )
+    token_form = ""
+    if show_token_form:
+        token_form = _TOKEN_FORM.format(
+            client_id=html.escape(client_id),
+            redirect_uri=html.escape(redirect_uri),
+            state=html.escape(state or ""),
+            code_challenge=html.escape(code_challenge or ""),
+            code_challenge_method=html.escape(code_challenge_method or ""),
+            resource=html.escape(resource or ""),
+        )
+    divider = (
+        '<div class="divider"><span>or paste an access token</span></div>'
+        if provider_block and token_form
+        else ""
+    )
+    page = (
+        page.replace("<!--PROVIDER_BLOCK-->", provider_block)
+        .replace("<!--DIVIDER-->", divider)
+        .replace("<!--TOKEN_FORM-->", token_form)
     )
     return HTMLResponse(content=page, status_code=status_code)
 
 
 @router.get("/oauth/authorize", response_model=None)
 async def authorize(request: Request) -> HTMLResponse | JSONResponse:
-    """Render the consent (token-paste) page after validating the request."""
+    """Validate the authorize request, then hand the human-login step to the
+    configured provider (token-paste page, Google redirect, or Supabase
+    sign-in page per AUTH_PROVIDER)."""
     if not oauth_enabled():
         return _not_configured()
     q = request.query_params
@@ -368,6 +414,23 @@ async def authorize(request: Request) -> HTMLResponse | JSONResponse:
             content={"error": "invalid_request", "error_description": "PKCE S256 required"},
         )
 
+    # Compose the consent page: the configured provider contributes a login
+    # button (Google / Supabase), and — unless explicitly disabled — the
+    # admin-token paste form is shown alongside it. Everything validated above
+    # (client, redirect_uri, PKCE) is preserved across any external IdP redirect
+    # inside the provider's signed login-state token.
+    ctx = AuthorizeContext(
+        client_id=client_id,
+        redirect_uri=redirect_uri,
+        state=state,
+        code_challenge=code_challenge,
+        code_challenge_method=code_challenge_method,
+        resource=resource,
+    )
+    provider_block = get_login_provider().consent_block(ctx)
+    # The token-paste box always shows in token mode; under a federated provider
+    # it shows unless the deployer turned it off.
+    show_token_form = settings.auth_provider == "token" or settings.auth_allow_token_paste
     return _render_consent(
         client_id=client_id,
         redirect_uri=redirect_uri,
@@ -375,6 +438,8 @@ async def authorize(request: Request) -> HTMLResponse | JSONResponse:
         code_challenge=code_challenge,
         code_challenge_method=code_challenge_method,
         resource=resource,
+        provider_block=provider_block,
+        show_token_form=show_token_form,
     )
 
 
@@ -389,9 +454,19 @@ async def authorize_submit(
     code_challenge_method: str = Form("S256"),
     resource: str = Form(""),
 ) -> HTMLResponse | RedirectResponse | JSONResponse:
-    """Validate the pasted login token and issue an authorization code."""
+    """Validate the pasted login token and issue an authorization code.
+
+    Available under any AUTH_PROVIDER so admin-issued tokens remain a login
+    option alongside Google/Supabase — unless the deployer disabled the paste
+    box via AUTH_ALLOW_TOKEN_PASTE for a provider-only login screen."""
     if not oauth_enabled():
         return _not_configured()
+    if settings.auth_provider != "token" and not settings.auth_allow_token_paste:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_request",
+                     "error_description": "token login is disabled on this deployment"},
+        )
 
     client = _decode_client(client_id)
     if client is None:
@@ -416,30 +491,208 @@ async def authorize_submit(
             status_code=400,
         )
 
-    user_id = payload["user_id"]
+    ctx = AuthorizeContext(
+        client_id=client_id,
+        redirect_uri=redirect_uri,
+        state=state,
+        code_challenge=code_challenge,
+        code_challenge_method=code_challenge_method,
+        resource=resource,
+    )
+    return _issue_code_and_redirect(ctx, payload["user_id"])
+
+
+def _issue_code_and_redirect(ctx: AuthorizeContext, user_id: str) -> RedirectResponse:
+    """Mint a PKCE-bound authorization code for ``user_id`` and 303 back to the
+    MCP client's redirect_uri. Shared by every login provider — the only thing
+    that varies upstream is how ``user_id`` was authenticated."""
     code = sign_payload(
         {
             "typ": "code",
             "user_id": user_id,
-            "client_id": client_id,
-            "redirect_uri": redirect_uri,
-            "code_challenge": code_challenge,
+            "client_id": ctx.client_id,
+            "redirect_uri": ctx.redirect_uri,
+            "code_challenge": ctx.code_challenge,
             "jti": secrets.token_urlsafe(12),
             "exp": int(time.time()) + _CODE_TTL,
         },
         _secret(),
     )
-
     # Build the query with proper percent-encoding: an opaque `state` may carry
     # reserved characters (&, =, #, spaces) that would otherwise corrupt the
     # client's CSRF/state check when concatenated raw.
     params = {"code": code}
-    if state:
-        params["state"] = state
-    sep = "&" if "?" in redirect_uri else "?"
-    location = f"{redirect_uri}{sep}{urlencode(params)}"
+    if ctx.state:
+        params["state"] = ctx.state
+    sep = "&" if "?" in ctx.redirect_uri else "?"
+    location = f"{ctx.redirect_uri}{sep}{urlencode(params)}"
     # 303 so the browser issues a GET to the client's redirect URI.
     return RedirectResponse(url=location, status_code=303)
+
+
+def _login_error_page(err: LoginError) -> HTMLResponse:
+    """Render a login failure (allowlist denial, verification failure) as a
+    simple page rather than a raw JSON blob the user lands on mid-browser-flow."""
+    safe = html.escape(err.message)
+    page = (
+        "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<title>Sign-in failed</title><style>"
+        ":root{color-scheme:light dark;}"
+        "body{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;"
+        "margin:0;min-height:100vh;display:grid;place-items:center;background:#0b0d12;color:#e7e9ee;}"
+        ".card{width:min(440px,92vw);background:#151821;border:1px solid #262b38;border-radius:16px;"
+        "padding:28px;box-shadow:0 12px 40px rgba(0,0,0,.45);}"
+        "h1{font-size:19px;margin:0 0 8px;}p{font-size:14px;color:#aab1c2;}"
+        "</style></head><body><div class='card'><h1>Sign-in failed</h1>"
+        f"<p>{safe}</p></div></body></html>"
+    )
+    return HTMLResponse(content=page, status_code=err.status)
+
+
+# ── self-service link (claim an existing account) ─────────────────────────
+
+_LINK_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Link your Neuralscape account</title><style>
+  :root {{ color-scheme: light dark; }}
+  body {{ font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+         margin:0; min-height:100vh; display:grid; place-items:center; background:#0b0d12; color:#e7e9ee; }}
+  .card {{ width:min(460px,92vw); background:#151821; border:1px solid #262b38; border-radius:16px;
+          padding:28px; box-shadow:0 12px 40px rgba(0,0,0,.45); }}
+  h1 {{ font-size:19px; margin:0 0 4px; }}
+  p {{ font-size:14px; line-height:1.5; color:#aab1c2; margin:8px 0; }}
+  .who {{ font-size:13px; color:#8b93a7; }}
+  textarea {{ width:100%; box-sizing:border-box; min-height:78px; resize:vertical;
+             font-family:ui-monospace,Menlo,monospace; font-size:12px; background:#0d0f16;
+             color:#e7e9ee; border:1px solid #2c3242; border-radius:10px; padding:10px; }}
+  button {{ margin-top:12px; width:100%; padding:11px; font-size:14px; font-weight:600; border:0;
+           border-radius:10px; cursor:pointer; }}
+  .primary {{ background:#5b7cfa; color:#fff; }} .primary:hover {{ background:#4f70ee; }}
+  .secondary {{ background:#fff; color:#1f2330; border:1px solid #d6d9e0; }}
+  .divider {{ display:flex; align-items:center; color:#7b8198; font-size:12px; margin:20px 0 6px; }}
+  .divider::before, .divider::after {{ content:""; flex:1; border-top:1px solid #262b38; }}
+  .divider span {{ padding:0 10px; }}
+  .hint {{ font-size:12px; color:#7b8198; }} code {{ background:#0d0f16; padding:1px 5px; border-radius:5px; }}
+  .err {{ background:#2a1518; border:1px solid #5b2a2f; color:#ffb4b4; font-size:13px;
+         border-radius:10px; padding:10px 12px; margin:14px 0 0; }}
+</style></head><body><div class="card">
+  <h1>Welcome to Neuralscape</h1>
+  <p class="who">Signed in as <b>{email}</b>. First time here — how should we set up your memory?</p>
+  {error_html}
+  <form method="post" action="/oauth/link">
+    <input type="hidden" name="ticket" value="{ticket}">
+    <input type="hidden" name="action" value="new">
+    <button class="primary" type="submit">Continue as a new account (<code>{suggested}</code>)</button>
+  </form>
+  <div class="divider"><span>or link an existing account</span></div>
+  <form method="post" action="/oauth/link">
+    <input type="hidden" name="ticket" value="{ticket}">
+    <input type="hidden" name="action" value="link">
+    <p class="hint">Already have Neuralscape memories under another id? Paste an access
+       token for it (from <code>issue_user_token.py</code>) to link this Google account to it.</p>
+    <textarea name="token" placeholder="paste an existing access token to link"></textarea>
+    <button class="secondary" type="submit">Link to that account</button>
+  </form>
+</div></body></html>"""
+
+
+def _render_link_page(ticket: str, email: str, suggested: str,
+                      error: str | None = None, status_code: int = 200) -> HTMLResponse:
+    error_html = f'<div class="err">{html.escape(error)}</div>' if error else ""
+    page = _LINK_PAGE.format(
+        email=html.escape(email), ticket=html.escape(ticket),
+        suggested=html.escape(suggested), error_html=error_html,
+    )
+    return HTMLResponse(content=page, status_code=status_code)
+
+
+async def _finish_login(result) -> HTMLResponse | RedirectResponse:
+    """Turn a provider login result into the right response: issue the code
+    (linked), render the link page (first login), or show the error."""
+    if isinstance(result, LoginError):
+        return _login_error_page(result)
+    if isinstance(result, LoginNeedsLink):
+        ticket = sign_link_ticket(result, _secret())
+        return _render_link_page(ticket, result.email, result.suggested_user_id)
+    return _issue_code_and_redirect(result.ctx, result.user_id)
+
+
+# ── federated login callbacks (google / supabase) ────────────────────────
+
+
+@router.get("/oauth/google/callback", response_model=None)
+async def google_callback(request: Request) -> RedirectResponse | HTMLResponse | JSONResponse:
+    """Google OIDC redirect target: verify the id_token, allowlist-check the
+    email, then continue the MCP flow (or show the first-login link page)."""
+    if not oauth_enabled():
+        return _not_configured()
+    if settings.auth_provider != "google":
+        return JSONResponse(status_code=404, content={"detail": "google login not enabled"})
+    return await _finish_login(await GoogleProvider().complete(request))
+
+
+@router.get("/oauth/supabase/callback", response_model=None)
+async def supabase_callback_get(request: Request) -> HTMLResponse | JSONResponse:
+    """Supabase redirect target (browser): render the page that exchanges the
+    PKCE code for a session and POSTs the access token back to the server."""
+    if not oauth_enabled():
+        return _not_configured()
+    if settings.auth_provider != "supabase":
+        return JSONResponse(status_code=404, content={"detail": "supabase login not enabled"})
+    return HTMLResponse(_supabase_finish_page())
+
+
+@router.post("/oauth/supabase/callback", response_model=None)
+async def supabase_callback_post(request: Request) -> RedirectResponse | HTMLResponse | JSONResponse:
+    """Verify the posted Supabase session JWT, then continue the MCP flow."""
+    if not oauth_enabled():
+        return _not_configured()
+    if settings.auth_provider != "supabase":
+        return JSONResponse(status_code=404, content={"detail": "supabase login not enabled"})
+    return await _finish_login(await SupabaseProvider().complete(request))
+
+
+@router.post("/oauth/link", response_model=None)
+async def oauth_link(
+    request: Request,
+    ticket: str = Form(...),
+    action: str = Form("new"),
+    token: str = Form(""),
+) -> RedirectResponse | HTMLResponse | JSONResponse:
+    """Finalize a first-login link decision, then issue the auth code.
+
+    The signed ticket binds the verified Google/Supabase ``sub``+``email`` and
+    the original authorize context. ``action=link`` claims an existing id by
+    proving ownership with that id's admin token; ``action=new`` provisions the
+    suggested slug. Either way the (sub, email) → user_id mapping is persisted
+    so subsequent logins skip this page."""
+    if not oauth_enabled():
+        return _not_configured()
+    claims = verify_link_ticket(ticket, _secret())
+    if claims is None:
+        return _login_error_page(LoginError("This link request expired. Please sign in again.", 400))
+
+    ctx = claims["ctx"]
+    sub = claims.get("sub") or None
+    email = claims.get("email") or None
+
+    if action == "link":
+        payload = verify_user_token(token.strip(), _secret()) if token.strip() else None
+        if payload is None:
+            return _render_link_page(
+                ticket, email or "", claims.get("suggested_user_id", ""),
+                error="That token is invalid or expired. Paste a valid access token, or continue as a new account.",
+                status_code=400,
+            )
+        user_id = payload["user_id"]
+    else:
+        user_id = claims.get("suggested_user_id") or ""
+        if not user_id:
+            return _login_error_page(LoginError("Could not determine an account id.", 400))
+
+    await identity_store.link(user_id, sub=sub, email=email)
+    return _issue_code_and_redirect(ctx, user_id)
 
 
 # ── token endpoint ───────────────────────────────────────────────────────

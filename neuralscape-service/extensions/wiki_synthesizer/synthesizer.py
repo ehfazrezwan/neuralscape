@@ -55,6 +55,9 @@ class PageResult:
     wiki_path: str
     created: bool
     source_memory_count: int
+    # True when the page's source memory-id set was unchanged since the last
+    # synthesis, so the expensive LLM merge + write was skipped.
+    skipped_unchanged: bool = False
 
 
 @dataclass(slots=True)
@@ -63,6 +66,7 @@ class SynthesisResult:
     pages_updated: int = 0
     memories_processed: int = 0
     pages_skipped_empty: int = 0
+    pages_skipped_unchanged: int = 0
     errors: list[str] = None  # type: ignore[assignment]
     pages: list[PageResult] = None  # type: ignore[assignment]
 
@@ -87,6 +91,7 @@ class LastRunSnapshot:
     pages_updated: int = 0
     memories_processed: int = 0
     pages_skipped_empty: int = 0
+    pages_skipped_unchanged: int = 0
     errors: list[str] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
@@ -107,6 +112,7 @@ def get_last_run_snapshot() -> dict:
         "pages_updated": _LAST_RUN.pages_updated,
         "memories_processed": _LAST_RUN.memories_processed,
         "pages_skipped_empty": _LAST_RUN.pages_skipped_empty,
+        "pages_skipped_unchanged": _LAST_RUN.pages_skipped_unchanged,
         "errors": list(_LAST_RUN.errors),
     }
 
@@ -117,6 +123,7 @@ async def synthesize_all(
     settings: SynthesizerSettings = synthesizer_settings,
     only_category: str | None = None,
     dry_run: bool = False,
+    force: bool = False,
 ) -> SynthesisResult:
     """Run one full synthesis pass over every shared ``(group_id × category)``.
 
@@ -166,6 +173,7 @@ async def synthesize_all(
                     group_id=group_id,
                     category=category,
                     dry_run=dry_run,
+                    force=force,
                 )
             except Exception as exc:
                 logger.exception(
@@ -180,6 +188,11 @@ async def synthesize_all(
             if page is None:
                 result.pages_skipped_empty += 1
                 continue
+            if page.skipped_unchanged:
+                # Source memory set unchanged → no LLM merge ran. Don't count
+                # it as an update or re-count its memories as processed.
+                result.pages_skipped_unchanged += 1
+                continue
             if page.created:
                 result.pages_created += 1
             else:
@@ -188,9 +201,10 @@ async def synthesize_all(
             result.pages.append(page)
 
     logger.info(
-        "synthesis complete: created=%d updated=%d memories=%d skipped=%d errors=%d",
+        "synthesis complete: created=%d updated=%d unchanged=%d memories=%d skipped_empty=%d errors=%d",
         result.pages_created,
         result.pages_updated,
+        result.pages_skipped_unchanged,
         result.memories_processed,
         result.pages_skipped_empty,
         len(result.errors),
@@ -209,6 +223,7 @@ def _record_last_run(result: SynthesisResult, started: datetime) -> None:
     _LAST_RUN.pages_updated = result.pages_updated
     _LAST_RUN.memories_processed = result.memories_processed
     _LAST_RUN.pages_skipped_empty = result.pages_skipped_empty
+    _LAST_RUN.pages_skipped_unchanged = result.pages_skipped_unchanged
     _LAST_RUN.errors = list(result.errors)
 
 
@@ -219,6 +234,7 @@ async def _synthesize_category_page(
     group_id: str,
     category: str,
     dry_run: bool,
+    force: bool = False,
 ) -> PageResult | None:
     """Synthesize one ``(group_id, category)`` wiki page.
 
@@ -246,6 +262,29 @@ async def _synthesize_category_page(
     existing_text = _safe_read_text(page_path)
     fm, existing_body = split_existing_page(existing_text)
     prior_count = int(fm.get("synthesis_count") or 0)
+
+    # ── Incremental skip ──
+    # Re-synthesis is an expensive LLM merge (the dominant cost of this cron —
+    # it re-rendered every page every run). If the exact set of source memory
+    # ids is unchanged since the last synthesis of this page, the merge would
+    # reproduce the same page, so skip it. New/removed memories change the set
+    # and trigger a refresh. (Rare in-place content edits to an existing
+    # memory_id are intentionally not detected — they keep the same id.)
+    if existing_text and not force:
+        prior_ids = _parse_id_list(fm.get("source_memory_ids", ""))
+        if prior_ids and prior_ids == set(memory_ids):
+            logger.debug(
+                "synthesis skipped (unchanged): %s/%s (%d memories)",
+                group_id, category, len(memory_ids),
+            )
+            return PageResult(
+                category=category,
+                group_id=group_id,
+                wiki_path=rel_path,
+                created=False,
+                source_memory_count=len(memories),
+                skipped_unchanged=True,
+            )
 
     title = category_page_title(category, group_id)
     prompt = INCREMENTAL_MERGE_PROMPT.format(
@@ -300,6 +339,19 @@ async def _synthesize_category_page(
 
 
 # ── Helpers ────────────────────────────────────────────────────────
+
+
+def _parse_id_list(raw: str) -> set[str]:
+    """Parse a frontmatter ``source_memory_ids`` flow-list into a set of ids.
+
+    ``render_page`` writes the ids as an inline YAML flow sequence
+    (``[id1, id2, ...]``) and ``split_existing_page`` hands it back as that
+    raw string. Returns an empty set for missing/empty/``[]`` values.
+    """
+    if not raw:
+        return set()
+    inner = raw.strip().lstrip("[").rstrip("]")
+    return {part.strip() for part in inner.split(",") if part.strip()}
 
 
 async def _list_shared_group_ids(service: MemoryService) -> list[str]:

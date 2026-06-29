@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Neuralscape Benchmark</title>
+  <script src="/static/chart.umd.min.js"></script>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+           background: #0d1117; color: #c9d1d9; }
+    header { padding: 16px 24px; border-bottom: 1px solid #21262d; }
+    header h1 { margin: 0; font-size: 18px; }
+    header p { margin: 4px 0 0; color: #8b949e; font-size: 12px; }
+    .layout { display: grid; grid-template-columns: 300px 1fr; min-height: calc(100vh - 64px); }
+    aside { border-right: 1px solid #21262d; padding: 16px; overflow-y: auto; }
+    main { padding: 24px; }
+    h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .05em; color: #8b949e; margin: 24px 0 8px; }
+    .run { padding: 8px 10px; border: 1px solid #21262d; border-radius: 6px; margin-bottom: 6px; cursor: pointer; }
+    .run:hover { border-color: #388bfd; }
+    .run.sel { border-color: #388bfd; background: #161b22; }
+    .run .lbl { font-weight: 600; word-break: break-all; }
+    .run .meta { color: #8b949e; font-size: 11px; }
+    .pill { display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 10px; background: #21262d; }
+    .pill.compare { background: #1f6feb33; color: #79c0ff; }
+    .card { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    label { display: block; font-size: 11px; color: #8b949e; margin: 6px 0 2px; }
+    input, select { width: 100%; padding: 6px; background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; }
+    button { margin-top: 10px; padding: 7px 12px; background: #238636; color: #fff; border: 0; border-radius: 6px; cursor: pointer; }
+    button.secondary { background: #30363d; }
+    button:disabled { opacity: .5; cursor: default; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid #21262d; }
+    .up { color: #3fb950; } .down { color: #f85149; } .muted { color: #8b949e; }
+    .note { font-size: 11px; color: #8b949e; }
+    .row { display: flex; gap: 8px; align-items: end; }
+    .row > div { flex: 1; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Neuralscape Performance Benchmark</h1>
+    <p>Read/write latency, read-under-write contention, throughput — and dev-vs-perf A/B.</p>
+  </header>
+  <div class="layout">
+    <aside>
+      <div class="card">
+        <strong>Run a benchmark</strong>
+        <label>Target URL</label>
+        <input id="t-url" value="http://localhost:8199" />
+        <label>Label</label>
+        <input id="t-label" value="dev-live" />
+        <div class="row">
+          <div><label>Profile</label>
+            <select id="t-profile"><option>light</option><option>full</option></select></div>
+          <div><label>Live baseline?</label>
+            <select id="t-live"><option value="false">no</option><option value="true">yes</option></select></div>
+        </div>
+        <button id="run-btn">Run</button>
+      </div>
+      <div class="card">
+        <strong>Multi-user stress</strong>
+        <label>Target URL</label>
+        <input id="s-url" value="http://localhost:8199" />
+        <label>Label</label>
+        <input id="s-label" value="dev-stress" />
+        <div class="row">
+          <div><label>Users</label><input id="s-users" type="number" value="8" /></div>
+          <div><label>Duration (s)</label><input id="s-dur" type="number" value="15" /></div>
+        </div>
+        <label>Profile</label>
+        <select id="s-profile"><option>light</option><option>full</option></select>
+        <button id="stress-btn">Run stress</button>
+        <p class="note">N users × workers hitting reads+writes concurrently; reports throughput, errors, and per-user fairness.</p>
+      </div>
+      <div class="card">
+        <strong>Run A/B (builds stacks)</strong>
+        <label>Candidate branch</label>
+        <input id="ab-cand" value="perf/write-read-isolation" />
+        <label>Baseline URL (optional, live)</label>
+        <input id="ab-baseurl" value="http://localhost:8199" />
+        <label>Profile</label>
+        <select id="ab-profile"><option>light</option><option>full</option></select>
+        <button id="ab-btn" class="secondary">Run A/B</button>
+        <p class="note">Heavy: builds Docker stacks + needs GOOGLE_API_KEY. Watch the terminal.</p>
+      </div>
+      <h2>Runs</h2>
+      <div id="runs"></div>
+    </aside>
+    <main>
+      <div id="view"><p class="muted">Select a run on the left, or pick two runs to compare.</p></div>
+    </main>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

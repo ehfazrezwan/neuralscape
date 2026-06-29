@@ -91,13 +91,19 @@ services:
       NEO4J_DATABASE: ${NEO4J_DATABASE:-memory}
       QDRANT_URL: http://qdrant:6333
       REDIS_URL: redis://redis:6379
-      GEMINI_LLM_MODEL: ${SMALL_MODEL_NAME:-gemini-3-flash-preview}
+      GEMINI_LLM_MODEL: ${GEMINI_LLM_MODEL:-gemini-3.1-flash-lite}
       GEMINI_EMBEDDER_MODEL: ${EMBEDDING_MODEL_NAME:-gemini-embedding-001}
       MCP_TRANSPORT: http
       OBSIDIAN_VAULT_PATH: /data/vault
     volumes:
       - ${OBSIDIAN_VAULT_PATH:-./vault}:/data/vault
     restart: unless-stopped
+    # Docker's restart policy only fires on container EXIT, not on a failing
+    # healthcheck — a wedged-but-running API (e.g. after the host sleeps) would
+    # otherwise stay wedged/unresponsive. The `autoheal` sidecar restarts it on
+    # unhealthy. Reverse-DNS label so it can't collide with another stack's.
+    labels:
+      com.neuralscape.autoheal: "true"
     deploy:
       resources:
         limits:
@@ -112,6 +118,11 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
+      # Slow first boot (spaCy/fastembed load, backend connections) must not
+      # count failed checks toward `retries` — otherwise autoheal would restart
+      # the API mid-initialization. This is the per-container startup grace;
+      # AUTOHEAL_START_PERIOD on the sidecar is unrelated (its own boot delay).
+      start_period: 90s
 
   neuralscape-worker:
     build:
@@ -133,7 +144,53 @@ services:
       NEO4J_DATABASE: ${NEO4J_DATABASE:-memory}
       QDRANT_URL: http://qdrant:6333
       REDIS_URL: redis://redis:6379
-      GEMINI_LLM_MODEL: ${SMALL_MODEL_NAME:-gemini-3-flash-preview}
+      GEMINI_LLM_MODEL: ${GEMINI_LLM_MODEL:-gemini-3.1-flash-lite}
+      GEMINI_EMBEDDER_MODEL: ${EMBEDDING_MODEL_NAME:-gemini-embedding-001}
+      OBSIDIAN_VAULT_PATH: /data/vault
+    volumes:
+      - ${OBSIDIAN_VAULT_PATH:-./vault}:/data/vault
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import sys; sys.exit(0)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── Dedicated graph / heavy-work worker ─────────────────────────
+  # Consumes the graph queue (GRAPH_QUEUE_NAME): slow Graphiti graph
+  # enrichment per write + the expensive dedup / wiki-synth crons.
+  # Isolated from neuralscape-worker so a 12-minute wiki-synth run or a
+  # burst of graph writes can't starve fast vector writes/reads.
+  neuralscape-graph-worker:
+    build:
+      context: .
+      dockerfile: neuralscape-service/Dockerfile
+      target: runtime
+    command: ["arq", "worker.GraphWorkerSettings"]
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      NEO4J_URI: neo4j://neo4j:7687
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-neuralscape}
+      NEO4J_DATABASE: ${NEO4J_DATABASE:-memory}
+      QDRANT_URL: http://qdrant:6333
+      REDIS_URL: redis://redis:6379
+      GEMINI_LLM_MODEL: ${GEMINI_LLM_MODEL:-gemini-3.1-flash-lite}
       GEMINI_EMBEDDER_MODEL: ${EMBEDDING_MODEL_NAME:-gemini-embedding-001}
       OBSIDIAN_VAULT_PATH: /data/vault
     volumes:
@@ -228,7 +285,7 @@ services:
       NEO4J_DATABASE: ${NEO4J_DATABASE:-memory}
       QDRANT_URL: http://qdrant:6333
       REDIS_URL: redis://redis:6379
-      GEMINI_LLM_MODEL: ${SMALL_MODEL_NAME:-gemini-3-flash-preview}
+      GEMINI_LLM_MODEL: ${GEMINI_LLM_MODEL:-gemini-3.1-flash-lite}
       GEMINI_EMBEDDER_MODEL: ${EMBEDDING_MODEL_NAME:-gemini-embedding-001}
       OBSIDIAN_VAULT_PATH: /data/vault
       PYTHONDONTWRITEBYTECODE: "1"
@@ -240,6 +297,35 @@ services:
       # the Linux venv built into the image.
       - ./neuralscape-service:/app/neuralscape-service
       - test_venv:/app/neuralscape-service/.venv
+
+  # ── Autoheal ────────────────────────────────────────────────────
+  # Restarts any container labelled `com.neuralscape.autoheal=true` whose Docker
+  # healthcheck reports `unhealthy`. Docker's own `restart: unless-stopped` only
+  # fires on process EXIT, so a wedged-but-running API (e.g. after the host
+  # sleeps and its event loop / backend connections go stale) would otherwise
+  # stay wedged/unresponsive until a manual restart. Scoped by a reverse-DNS
+  # label (NOT "all") so it never touches unrelated containers on the host.
+  autoheal:
+    # Pinned by digest: this container has the Docker socket (root-equivalent on
+    # the host), so a mutable :latest tag is a supply-chain risk. Digest is
+    # willfarrell/autoheal:latest as of 2026-06-29; bump deliberately.
+    image: willfarrell/autoheal@sha256:3fd4d591075224304e95d92af8619adda1fe6e1469587e8b5230d946b0926f00
+    restart: unless-stopped
+    # Only needs the Docker Unix socket; no webhook/notifications are
+    # configured, so deny it network access entirely.
+    network_mode: "none"
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: com.neuralscape.autoheal  # only this stack's containers
+      AUTOHEAL_INTERVAL: "15"                  # seconds between health polls
+      AUTOHEAL_START_PERIOD: "90"              # sidecar's own boot delay before it polls
+      AUTOHEAL_DEFAULT_STOP_TIMEOUT: "30"      # graceful stop before kill
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   neo4j_data:

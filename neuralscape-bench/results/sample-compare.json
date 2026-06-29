@@ -1,0 +1,702 @@
+{
+  "baseline": {
+    "label": "dev@da54615",
+    "target_url": "http://localhost:8199",
+    "profile": "full",
+    "timestamp": "2026-06-22T03:00:00+00:00",
+    "metrics": {
+      "write": {
+        "enqueue_ms": {
+          "count": 50,
+          "p50": 8,
+          "p95": 22,
+          "p99": 40,
+          "mean": 8,
+          "min": 5,
+          "max": 45
+        },
+        "e2e_ms": {
+          "count": 5,
+          "p50": 118000,
+          "p95": 142000,
+          "p99": 160000,
+          "mean": 118000,
+          "min": 117950,
+          "max": 160050
+        },
+        "e2e_attempts": 5,
+        "e2e_completed": 5,
+        "e2e_timeouts": 0,
+        "e2e_failed": 0,
+        "enqueue_errors": 0
+      },
+      "read": {
+        "search": {
+          "count": 50,
+          "p50": 36.0,
+          "p95": 90,
+          "p99": 125.99999999999999,
+          "mean": 45.0,
+          "min": 18.0,
+          "max": 144.0,
+          "errors": 0
+        },
+        "graph_search": {
+          "count": 50,
+          "p50": 128.0,
+          "p95": 320,
+          "p99": 480.0,
+          "mean": 160.0,
+          "min": 64.0,
+          "max": 544.0,
+          "errors": 0
+        },
+        "list": {
+          "count": 50,
+          "p50": 24,
+          "p95": 58,
+          "p99": 80,
+          "mean": 30,
+          "min": 15,
+          "max": 95,
+          "errors": 0
+        },
+        "context": {
+          "count": 50,
+          "p50": 42,
+          "p95": 105,
+          "p99": 150,
+          "mean": 55,
+          "min": 25,
+          "max": 170,
+          "errors": 0
+        }
+      },
+      "contention": {
+        "unloaded": {
+          "count": 40,
+          "p50": 45.0,
+          "p95": 90,
+          "p99": 117.0,
+          "mean": 54.0,
+          "min": 27.0,
+          "max": 125.99999999999999
+        },
+        "loaded": {
+          "count": 40,
+          "p50": 205.0,
+          "p95": 410,
+          "p99": 533.0,
+          "mean": 246.0,
+          "min": 123.0,
+          "max": 574.0
+        },
+        "loaded_over_unloaded_p95": 4.56
+      },
+      "throughput": {
+        "reads_per_sec": 140,
+        "read_errors": 0,
+        "writes_per_sec": 0.5,
+        "write_errors": 0
+      }
+    },
+    "notes": [
+      "live baseline"
+    ]
+  },
+  "candidate": {
+    "label": "perf/write-read-isolation@300c529",
+    "target_url": "http://localhost:8299",
+    "profile": "full",
+    "timestamp": "2026-06-22T03:30:00+00:00",
+    "metrics": {
+      "write": {
+        "enqueue_ms": {
+          "count": 50,
+          "p50": 7,
+          "p95": 20,
+          "p99": 35,
+          "mean": 7,
+          "min": 4,
+          "max": 40
+        },
+        "e2e_ms": {
+          "count": 10,
+          "p50": 650,
+          "p95": 900,
+          "p99": 1200,
+          "mean": 650,
+          "min": 600,
+          "max": 1250
+        },
+        "e2e_attempts": 10,
+        "e2e_completed": 10,
+        "e2e_timeouts": 0,
+        "e2e_failed": 0,
+        "enqueue_errors": 0
+      },
+      "read": {
+        "search": {
+          "count": 50,
+          "p50": 31.200000000000003,
+          "p95": 78,
+          "p99": 109.19999999999999,
+          "mean": 39.0,
+          "min": 15.600000000000001,
+          "max": 124.80000000000001,
+          "errors": 0
+        },
+        "graph_search": {
+          "count": 50,
+          "p50": 120.0,
+          "p95": 300,
+          "p99": 450.0,
+          "mean": 150.0,
+          "min": 60.0,
+          "max": 510.0,
+          "errors": 0
+        },
+        "list": {
+          "count": 50,
+          "p50": 24,
+          "p95": 58,
+          "p99": 80,
+          "mean": 30,
+          "min": 15,
+          "max": 95,
+          "errors": 0
+        },
+        "context": {
+          "count": 50,
+          "p50": 42,
+          "p95": 105,
+          "p99": 150,
+          "mean": 55,
+          "min": 25,
+          "max": 170,
+          "errors": 0
+        }
+      },
+      "contention": {
+        "unloaded": {
+          "count": 40,
+          "p50": 40.0,
+          "p95": 80,
+          "p99": 104.0,
+          "mean": 48.0,
+          "min": 24.0,
+          "max": 112.0
+        },
+        "loaded": {
+          "count": 40,
+          "p50": 60.0,
+          "p95": 120,
+          "p99": 156.0,
+          "mean": 72.0,
+          "min": 36.0,
+          "max": 168.0
+        },
+        "loaded_over_unloaded_p95": 1.5
+      },
+      "throughput": {
+        "reads_per_sec": 150,
+        "read_errors": 0,
+        "writes_per_sec": 9.0,
+        "write_errors": 0
+      }
+    },
+    "notes": []
+  },
+  "comparison": {
+    "contention.loaded.count": {
+      "baseline": 40.0,
+      "candidate": 40.0,
+      "delta": 0.0,
+      "pct_change": 0.0,
+      "improved": false
+    },
+    "contention.loaded.max": {
+      "baseline": 574.0,
+      "candidate": 168.0,
+      "delta": -406.0,
+      "pct_change": -70.7,
+      "improved": true
+    },
+    "contention.loaded.mean": {
+      "baseline": 246.0,
+      "candidate": 72.0,
+      "delta": -174.0,
+      "pct_change": -70.7,
+      "improved": true
+    },
+    "contention.loaded.min": {
+      "baseline": 123.0,
+      "candidate": 36.0,
+      "delta": -87.0,
+      "pct_change": -70.7,
+      "improved": true
+    },
+    "contention.loaded.p50": {
+      "baseline": 205.0,
+      "candidate": 60.0,
+      "delta": -145.0,
+      "pct_change": -70.7,
+      "improved": true
+    },
+    "contention.loaded.p95": {
+      "baseline": 410.0,
+      "candidate": 120.0,
+      "delta": -290.0,
+      "pct_change": -70.7,
+      "improved": true
+    },
+    "contention.loaded.p99": {
+      "baseline": 533.0,
+      "candidate": 156.0,
+      "delta": -377.0,
+      "pct_change": -70.7,
+      "improved": true
+    },
+    "contention.loaded_over_unloaded_p95": {
+      "baseline": 4.56,
+      "candidate": 1.5,
+      "delta": -3.06,
+      "pct_change": -67.1,
+      "improved": true
+    },
+    "contention.unloaded.count": {
+      "baseline": 40.0,
+      "candidate": 40.0,
+      "delta": 0.0,
+      "pct_change": 0.0,
+      "improved": false
+    },
+    "contention.unloaded.max": {
+      "baseline": 126.0,
+      "candidate": 112.0,
+      "delta": -14.0,
+      "pct_change": -11.1,
+      "improved": true
+    },
+    "contention.unloaded.mean": {
+      "baseline": 54.0,
+      "candidate": 48.0,
+      "delta": -6.0,
+      "pct_change": -11.1,
+      "improved": true
+    },
+    "contention.unloaded.min": {
+      "baseline": 27.0,
+      "candidate": 24.0,
+      "delta": -3.0,
+      "pct_change": -11.1,
+      "improved": true
+    },
+    "contention.unloaded.p50": {
+      "baseline": 45.0,
+      "candidate": 40.0,
+      "delta": -5.0,
+      "pct_change": -11.1,
+      "improved": true
+    },
+    "contention.unloaded.p95": {
+      "baseline": 90.0,
+      "candidate": 80.0,
+      "delta": -10.0,
+      "pct_change": -11.1,
+      "improved": true
+    },
+    "contention.unloaded.p99": {
+      "baseline": 117.0,
+      "candidate": 104.0,
+      "delta": -13.0,
+      "pct_change": -11.1,
+      "improved": true
+    },
+    "read.context.count": {
+      "baseline": 50.0,
+      "candidate": 50.0,
+      "delta": 0.0,
+      "pct_change": 0.0,
+      "improved": false
+    },
+    "read.context.errors": {
+      "baseline": 0.0,
+      "candidate": 0.0,
+      "delta": 0.0,
+      "pct_change": null,
+      "improved": false
+    },
+    "read.context.max": {
+      "baseline": 170.0,
+      "candidate": 170.0,
+      "delta": 0.0,
+      "pct_change": 0.0,
+      "improved": false
+    },
+    "read.context.mean": {
+      "baseline": 55.0,
+      "candidate": 55.0,
+      "delta": 0.0,
+      "pct_change": 0.0,
+      "improved": false
+    },
+    "read.context.min": {
+      "baseline": 25.0,
+      "candidate": 25.0,
+      "delta": 0.0,
+      "pct_change": 0.0,
+      "improved": false
+    },
+    "read.context.p50": {
+      "baseline": 42.0,
+      "candidate": 42.0,
+      "delta": 0.0,
+      "pct_change": 0.0,
+      "improved": false
+    },
+    "read.context.p95": {
+      "baseline": 105.0,
+      "candidate": 105.0,
+      "delta": 0.0,
+      "pct_change": 0.0,
+      "improved": false
+    },
+    "read.context.p99": {
+      "baseline": 150.0,
+      "candidate": 150.0,
+      "delta": 0.0,
+      "pct_change": 0.0,
+      "improved": false
+    },
+    "read.graph_search.count": {
+      "baseline": 50.0,
+      "candidate": 50.0,
+      "delta": 0.0,
+      "pct_change": 0.0,
+      "improved": false
+    },
+    "read.graph_search.errors": {
+      "baseline": 0.0,
+      "candidate": 0.0,
+      "delta": 0.0,
+      "pct_change": null,
+      "improved": false
+    },
+    "read.graph_search.max": {
+      "baseline": 544.0,
+      "candidate": 510.0,
+      "delta": -34.0,
+      "pct_change": -6.2,
+      "improved": true
+    },
+    "read.graph_search.mean": {
+      "baseline": 160.0,
+      "candidate": 150.0,
+      "delta": -10.0,
+      "pct_change": -6.2,
+      "improved": true
+    },
+    "read.graph_search.min": {
+      "baseline": 64.0,
+      "candidate": 60.0,
+      "delta": -4.0,
+      "pct_change": -6.2,
+      "improved": true
+    },
+    "read.graph_search.p50": {
+      "baseline": 128.0,
+      "candidate": 120.0,
+      "delta": -8.0,
+      "pct_change": -6.2,
+      "improved": true
+    },
+    "read.graph_search.p95": {
+      "baseline": 320.0,
+      "candidate": 300.0,
+      "delta": -20.0,
+      "pct_change": -6.2,
+      "improved": true
+    },
+    "read.graph_search.p99": {
+      "baseline": 480.0,
+      "candidate": 450.0,
+      "delta": -30.0,
+      "pct_change": -6.2,
+      "improved": true
+    },
+    "read.list.count": {
+      "baseline": 50.0,
+      "candidate": 50.0,
+      "delta": 0.0,
+      "pct_change": 0.0,
+      "improved": false
+    },
+    "read.list.errors": {
+      "baseline": 0.0,
+      "candidate": 0.0,
+      "delta": 0.0,
+      "pct_change": null,
+      "improved": false
+    },
+    "read.list.max": {
+      "baseline": 95.0,
+      "candidate": 95.0,
+      "delta": 0.0,
+      "pct_change": 0.0,
+      "improved": false
+    },
+    "read.list.mean": {
+      "baseline": 30.0,
+      "candidate": 30.0,
+      "delta": 0.0,
+      "pct_change": 0.0,
+      "improved": false
+    },
+    "read.list.min": {
+      "baseline": 15.0,
+      "candidate": 15.0,
+      "delta": 0.0,
+      "pct_change": 0.0,
+      "improved": false
+    },
+    "read.list.p50": {
+      "baseline": 24.0,
+      "candidate": 24.0,
+      "delta": 0.0,
+      "pct_change": 0.0,
+      "improved": false
+    },
+    "read.list.p95": {
+      "baseline": 58.0,
+      "candidate": 58.0,
+      "delta": 0.0,
+      "pct_change": 0.0,
+      "improved": false
+    },
+    "read.list.p99": {
+      "baseline": 80.0,
+      "candidate": 80.0,
+      "delta": 0.0,
+      "pct_change": 0.0,
+      "improved": false
+    },
+    "read.search.count": {
+      "baseline": 50.0,
+      "candidate": 50.0,
+      "delta": 0.0,
+      "pct_change": 0.0,
+      "improved": false
+    },
+    "read.search.errors": {
+      "baseline": 0.0,
+      "candidate": 0.0,
+      "delta": 0.0,
+      "pct_change": null,
+      "improved": false
+    },
+    "read.search.max": {
+      "baseline": 144.0,
+      "candidate": 124.8,
+      "delta": -19.2,
+      "pct_change": -13.3,
+      "improved": true
+    },
+    "read.search.mean": {
+      "baseline": 45.0,
+      "candidate": 39.0,
+      "delta": -6.0,
+      "pct_change": -13.3,
+      "improved": true
+    },
+    "read.search.min": {
+      "baseline": 18.0,
+      "candidate": 15.6,
+      "delta": -2.4,
+      "pct_change": -13.3,
+      "improved": true
+    },
+    "read.search.p50": {
+      "baseline": 36.0,
+      "candidate": 31.2,
+      "delta": -4.8,
+      "pct_change": -13.3,
+      "improved": true
+    },
+    "read.search.p95": {
+      "baseline": 90.0,
+      "candidate": 78.0,
+      "delta": -12.0,
+      "pct_change": -13.3,
+      "improved": true
+    },
+    "read.search.p99": {
+      "baseline": 126.0,
+      "candidate": 109.2,
+      "delta": -16.8,
+      "pct_change": -13.3,
+      "improved": true
+    },
+    "throughput.read_errors": {
+      "baseline": 0.0,
+      "candidate": 0.0,
+      "delta": 0.0,
+      "pct_change": null,
+      "improved": false
+    },
+    "throughput.reads_per_sec": {
+      "baseline": 140.0,
+      "candidate": 150.0,
+      "delta": 10.0,
+      "pct_change": 7.1,
+      "improved": true
+    },
+    "throughput.write_errors": {
+      "baseline": 0.0,
+      "candidate": 0.0,
+      "delta": 0.0,
+      "pct_change": null,
+      "improved": false
+    },
+    "throughput.writes_per_sec": {
+      "baseline": 0.5,
+      "candidate": 9.0,
+      "delta": 8.5,
+      "pct_change": 1700.0,
+      "improved": true
+    },
+    "write.e2e_attempts": {
+      "baseline": 5.0,
+      "candidate": 10.0,
+      "delta": 5.0,
+      "pct_change": 100.0,
+      "improved": false
+    },
+    "write.e2e_completed": {
+      "baseline": 5.0,
+      "candidate": 10.0,
+      "delta": 5.0,
+      "pct_change": 100.0,
+      "improved": false
+    },
+    "write.e2e_failed": {
+      "baseline": 0.0,
+      "candidate": 0.0,
+      "delta": 0.0,
+      "pct_change": null,
+      "improved": false
+    },
+    "write.e2e_ms.count": {
+      "baseline": 5.0,
+      "candidate": 10.0,
+      "delta": 5.0,
+      "pct_change": 100.0,
+      "improved": false
+    },
+    "write.e2e_ms.max": {
+      "baseline": 160050.0,
+      "candidate": 1250.0,
+      "delta": -158800.0,
+      "pct_change": -99.2,
+      "improved": true
+    },
+    "write.e2e_ms.mean": {
+      "baseline": 118000.0,
+      "candidate": 650.0,
+      "delta": -117350.0,
+      "pct_change": -99.4,
+      "improved": true
+    },
+    "write.e2e_ms.min": {
+      "baseline": 117950.0,
+      "candidate": 600.0,
+      "delta": -117350.0,
+      "pct_change": -99.5,
+      "improved": true
+    },
+    "write.e2e_ms.p50": {
+      "baseline": 118000.0,
+      "candidate": 650.0,
+      "delta": -117350.0,
+      "pct_change": -99.4,
+      "improved": true
+    },
+    "write.e2e_ms.p95": {
+      "baseline": 142000.0,
+      "candidate": 900.0,
+      "delta": -141100.0,
+      "pct_change": -99.4,
+      "improved": true
+    },
+    "write.e2e_ms.p99": {
+      "baseline": 160000.0,
+      "candidate": 1200.0,
+      "delta": -158800.0,
+      "pct_change": -99.2,
+      "improved": true
+    },
+    "write.e2e_timeouts": {
+      "baseline": 0.0,
+      "candidate": 0.0,
+      "delta": 0.0,
+      "pct_change": null,
+      "improved": false
+    },
+    "write.enqueue_errors": {
+      "baseline": 0.0,
+      "candidate": 0.0,
+      "delta": 0.0,
+      "pct_change": null,
+      "improved": false
+    },
+    "write.enqueue_ms.count": {
+      "baseline": 50.0,
+      "candidate": 50.0,
+      "delta": 0.0,
+      "pct_change": 0.0,
+      "improved": false
+    },
+    "write.enqueue_ms.max": {
+      "baseline": 45.0,
+      "candidate": 40.0,
+      "delta": -5.0,
+      "pct_change": -11.1,
+      "improved": true
+    },
+    "write.enqueue_ms.mean": {
+      "baseline": 8.0,
+      "candidate": 7.0,
+      "delta": -1.0,
+      "pct_change": -12.5,
+      "improved": true
+    },
+    "write.enqueue_ms.min": {
+      "baseline": 5.0,
+      "candidate": 4.0,
+      "delta": -1.0,
+      "pct_change": -20.0,
+      "improved": true
+    },
+    "write.enqueue_ms.p50": {
+      "baseline": 8.0,
+      "candidate": 7.0,
+      "delta": -1.0,
+      "pct_change": -12.5,
+      "improved": true
+    },
+    "write.enqueue_ms.p95": {
+      "baseline": 22.0,
+      "candidate": 20.0,
+      "delta": -2.0,
+      "pct_change": -9.1,
+      "improved": true
+    },
+    "write.enqueue_ms.p99": {
+      "baseline": 40.0,
+      "candidate": 35.0,
+      "delta": -5.0,
+      "pct_change": -12.5,
+      "improved": true
+    }
+  }
+}
