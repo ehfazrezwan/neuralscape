@@ -1258,33 +1258,39 @@ class MemoryService:
         # happen once across both pools below.
         want_personal = visibility != MemoryVisibility.SHARED.value
         if want_personal and user_id:
-            if project_id and not scope:
-                # Dual-scope: this user's project-scoped + global memories.
-                vector_responses.extend(
-                    self._search_personal_pool(
-                        m=m, user_id=user_id, query_embedding=query_embedding,
-                        project_id=project_id, categories=categories, scope=None,
-                        domain=domain, observation_type=observation_type,
-                        concepts=concepts, limit=limit,
+            # Failure isolation: a transient Qdrant error in the personal
+            # pool must not abort the whole recall — degrade to shared/graph
+            # results instead, matching the shared-pool/graph paths below.
+            try:
+                if project_id and not scope:
+                    # Dual-scope: this user's project-scoped + global memories.
+                    vector_responses.extend(
+                        self._search_personal_pool(
+                            m=m, user_id=user_id, query_embedding=query_embedding,
+                            project_id=project_id, categories=categories, scope=None,
+                            domain=domain, observation_type=observation_type,
+                            concepts=concepts, limit=limit,
+                        )
                     )
-                )
-                vector_responses.extend(
-                    self._search_personal_pool(
-                        m=m, user_id=user_id, query_embedding=query_embedding,
-                        project_id=None, categories=categories, scope="global",
-                        domain=domain, observation_type=observation_type,
-                        concepts=concepts, limit=limit,
+                    vector_responses.extend(
+                        self._search_personal_pool(
+                            m=m, user_id=user_id, query_embedding=query_embedding,
+                            project_id=None, categories=categories, scope="global",
+                            domain=domain, observation_type=observation_type,
+                            concepts=concepts, limit=limit,
+                        )
                     )
-                )
-            else:
-                vector_responses.extend(
-                    self._search_personal_pool(
-                        m=m, user_id=user_id, query_embedding=query_embedding,
-                        project_id=project_id, categories=categories, scope=scope,
-                        domain=domain, observation_type=observation_type,
-                        concepts=concepts, limit=limit,
+                else:
+                    vector_responses.extend(
+                        self._search_personal_pool(
+                            m=m, user_id=user_id, query_embedding=query_embedding,
+                            project_id=project_id, categories=categories, scope=scope,
+                            domain=domain, observation_type=observation_type,
+                            concepts=concepts, limit=limit,
+                        )
                     )
-                )
+            except Exception as e:
+                logger.warning(f"Personal-pool search failed (non-critical): {e}")
 
         # ── Shared pool: direct Qdrant, no user_id namespace ───────
         # Bypass mem0's wrapper because shared memories span multiple
@@ -1299,7 +1305,13 @@ class MemoryService:
         # memories that should still be visible (the graph read-set
         # already covers both via `_get_group_ids`). The downstream
         # dedup at line ~1094 collapses any overlap.
-        want_shared = include_shared and visibility != MemoryVisibility.PRIVATE.value
+        # An explicit `visibility="shared"` selects the shared pool even when
+        # `include_shared=False` — otherwise the vector path would suppress the
+        # shared pool while the graph path (which keys off `visibility==shared`)
+        # still returns it, yielding inconsistent/partial results.
+        want_shared = visibility == MemoryVisibility.SHARED.value or (
+            include_shared and visibility != MemoryVisibility.PRIVATE.value
+        )
         if want_shared:
             try:
                 if project_id and not scope:
