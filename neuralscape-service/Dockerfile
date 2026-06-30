@@ -16,6 +16,8 @@ COPY graphiti/graphiti_core/ graphiti/graphiti_core/
 COPY mem0/mem0/ mem0/mem0/
 COPY neuralscape-service/*.py neuralscape-service/
 COPY neuralscape-service/extensions/ neuralscape-service/extensions/
+COPY neuralscape-service/ingest/ neuralscape-service/ingest/
+COPY neuralscape-service/connectors/ neuralscape-service/connectors/
 
 # Install all dependencies using uv from the neuralscape-service project
 RUN cd neuralscape-service && uv sync --frozen --no-dev
@@ -54,6 +56,8 @@ COPY mem0/mem0/ mem0/mem0/
 COPY mem0/pyproject.toml mem0/
 COPY neuralscape-service/*.py neuralscape-service/
 COPY neuralscape-service/extensions/ neuralscape-service/extensions/
+COPY neuralscape-service/ingest/ neuralscape-service/ingest/
+COPY neuralscape-service/connectors/ neuralscape-service/connectors/
 # Operator-facing scripts (relocate_vault_to_raw, issue_user_token,
 # migrate_graph_groups, bulk_promote_visibility). Production operators
 # invoke these in-container; without this copy they had to docker-cp
@@ -98,6 +102,8 @@ COPY graphiti/graphiti_core/ graphiti/graphiti_core/
 COPY mem0/mem0/ mem0/mem0/
 COPY neuralscape-service/*.py neuralscape-service/
 COPY neuralscape-service/extensions/ neuralscape-service/extensions/
+COPY neuralscape-service/ingest/ neuralscape-service/ingest/
+COPY neuralscape-service/connectors/ neuralscape-service/connectors/
 
 # Resolve WITH dev deps so pytest, pytest-asyncio, etc. are available.
 RUN cd neuralscape-service && uv sync --frozen
