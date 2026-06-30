@@ -318,7 +318,16 @@ services:
       AUTOHEAL_CONTAINER_LABEL: com.neuralscape.autoheal  # only this stack's containers
       AUTOHEAL_INTERVAL: "15"                  # seconds between health polls
       AUTOHEAL_START_PERIOD: "90"              # sidecar's own boot delay before it polls
-      AUTOHEAL_DEFAULT_STOP_TIMEOUT: "30"      # graceful stop before kill
+      # An already-unhealthy/wedged API has nothing worth draining — SIGKILL it
+      # fast rather than waiting out a graceful shutdown that may never finish.
+      AUTOHEAL_DEFAULT_STOP_TIMEOUT: "10"      # SIGTERM grace before SIGKILL
+      # MUST exceed STOP_TIMEOUT + container start time. autoheal restarts via a
+      # single blocking `curl` to Docker's /restart endpoint (stop, then start);
+      # if CURL_TIMEOUT <= STOP_TIMEOUT the curl aborts the moment the stop
+      # window closes — BEFORE start completes — and every restart of a
+      # slow-stopping container is logged "failed" and retried in a churn loop
+      # (the bug that left the wedged API unrestarted). 60s gives ample headroom.
+      CURL_TIMEOUT: "60"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     logging:
