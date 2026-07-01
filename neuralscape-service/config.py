@@ -206,6 +206,22 @@ class Settings(BaseSettings):
     # Format: "alice@example.com:alice,ops@example.com:ops-bot"
     auth_identity_map: str = ""
 
+    # ── Dictator role + authoritative "standard" memory tier ─────────────
+    # Feature-flagged OFF by default so the public/generic build behaves
+    # identically until a deployment opts in.
+    #   standards_enabled  → turns on the `standard` visibility tier: a
+    #     dictator-only authoritative pool that every caller reads and that is
+    #     always injected at session start (see the plugin + /v1/context).
+    #   processes_enabled  → turns on the process registry (list_processes /
+    #     get_process) built on top of `standard`-tier memories tagged
+    #     `process:<slug>`.
+    #   dictator_user_ids  → CSV allowlist of user_ids permitted to WRITE
+    #     `standard`-tier memories (and to delete them). Everyone else can only
+    #     read them. Empty means nobody can write standards.
+    standards_enabled: bool = False
+    processes_enabled: bool = False
+    dictator_user_ids: str = ""   # e.g. "mark,alice"
+
     # Service
     host: str = "0.0.0.0"
     port: int = 8199
@@ -300,6 +316,15 @@ class Settings(BaseSettings):
             if email and user_id:
                 out[email] = user_id
         return out
+
+    # ── dictator role helpers ────────────────────────────────────────────
+    def dictator_user_ids_set(self) -> set[str]:
+        """Parsed CSV of user_ids allowed to write `standard`-tier memories."""
+        return {u.strip() for u in self.dictator_user_ids.split(",") if u.strip()}
+
+    def is_dictator(self, user_id: str | None) -> bool:
+        """True iff `user_id` is an authorized dictator (may write standards)."""
+        return bool(user_id) and user_id in self.dictator_user_ids_set()
 
     def validate_required(self) -> None:
         """Validate that all required configuration fields are set.
