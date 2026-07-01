@@ -255,6 +255,10 @@ class TaskManager:
                 return job, status
             if fallback is None:
                 fallback = job
+        # _candidate_queues() always yields at least the main queue, so fallback
+        # is set — but construct one defensively to keep the (Job, _) contract.
+        if fallback is None:
+            fallback = Job(task_id, redis=self.pool, _queue_name=settings.arq_queue_name)
         return fallback, JobStatus.not_found
 
     async def get_status(self, task_id: str) -> dict:

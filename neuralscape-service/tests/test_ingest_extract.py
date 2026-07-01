@@ -117,13 +117,24 @@ class TestStorage:
         # Another user cannot locate alice's artifact by id.
         assert find_artifact(art.file_id, "bob", settings) is None
 
+    def test_find_artifact_requires_exact_hex_id(self, settings):
+        art = store_artifact(b"payload", "p.md", "alice", None, "domain_knowledge", settings)
+        # A prefix of the real id must NOT resolve (no prefix-glob matching).
+        assert find_artifact(art.file_id[:8], "alice", settings) is None
+        # Non-hex / malformed ids are rejected outright.
+        assert find_artifact("../../etc/passwd", "alice", settings) is None
+        assert find_artifact("nothex-nothex-16", "alice", settings) is None
+        # The exact 16-hex id still resolves.
+        assert find_artifact(art.file_id, "alice", settings)[0] == art.abs_path
+
     def test_source_ref_references_artifact(self, settings):
         art = store_artifact(b"z", "z.md", "alice", None, "domain_knowledge", settings)
         ref = artifact_source_ref(art, connector_type="manual")
         assert ref["connector_type"] == "manual"
         assert ref["stored_path"] == art.rel_path
-        assert ref["url"].endswith(art.file_id)
-        assert ref["retrieval"]["args"]["file_id"] == art.file_id
+        # Re-fetch mechanism is the REST url; no phantom MCP retrieval handle.
+        assert ref["url"] == f"/v1/ingest/artifacts/{art.file_id}"
+        assert "retrieval" not in ref
 
     def test_path_traversal_in_ids_is_neutralized(self, settings):
         # Malicious user/project/category segments must not escape the root.

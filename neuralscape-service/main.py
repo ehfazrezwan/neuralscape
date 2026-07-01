@@ -901,49 +901,19 @@ async def v1_ingest_files(
     graph facts. Parsing runs on the dedicated ingest worker (not this request),
     so a large batch never blocks the API. Returns one task_id per file to poll.
     """
+    # ── Validate form fields up-front (parity with the Pydantic endpoints) ──
+    if scope not in ("global", "project"):
+        raise HTTPException(status_code=400, detail="scope must be 'global' or 'project'")
     if scope == "project" and not project_id:
         raise HTTPException(status_code=400, detail="project_id is required when scope='project'")
+    if category not in MEMORY_CATEGORIES:
+        raise HTTPException(status_code=400, detail=f"Invalid category '{category}'")
+    if visibility is not None and visibility not in ("private", "shared"):
+        raise HTTPException(status_code=400, detail="visibility must be 'private' or 'shared'")
 
     resolved_user_id = _resolve_user_id(request, user_id)
     max_file_bytes = settings.ingest_max_file_mb * 1024 * 1024
-
-    # Expand each upload (a zip yields its members; anything else is itself).
-    from ingest.archive import ArchiveError, ArchiveTooLarge, is_zip, iter_archive
-
-    members: list[tuple[str, bytes]] = []
-    for upload in files:
-        data = await upload.read()
-        name = upload.filename or "upload"
-        if is_zip(data) and name.lower().endswith(".zip"):
-            try:
-                members.extend(
-                    iter_archive(
-                        data,
-                        max_file_bytes=max_file_bytes,
-                        max_files=settings.ingest_max_files,
-                        max_total_uncompressed_bytes=settings.ingest_max_archive_uncompressed_mb
-                        * 1024 * 1024,
-                    )
-                )
-            except ArchiveTooLarge as e:
-                raise HTTPException(status_code=413, detail=str(e))
-            except ArchiveError as e:
-                raise HTTPException(status_code=400, detail=str(e))
-        else:
-            if len(data) > max_file_bytes:
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"'{name}' exceeds the {settings.ingest_max_file_mb}MB per-file limit",
-                )
-            members.append((name, data))
-
-    if not members:
-        raise HTTPException(status_code=400, detail="No ingestible files found in the upload")
-    if len(members) > settings.ingest_max_files:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Upload contains {len(members)} files, over the {settings.ingest_max_files} limit",
-        )
+    max_request_bytes = settings.ingest_max_request_mb * 1024 * 1024
 
     options = {
         "category": category,
@@ -958,13 +928,33 @@ async def v1_ingest_files(
     }
     options = {k: v for k, v in options.items() if v is not None}
 
+    from ingest.archive import ArchiveError, ArchiveTooLarge, is_zip, iter_archive
     from ingest.storage import artifact_source_ref, store_artifact
 
-    enqueued = []
-    for name, data in members:
-        # Persist the file to the shared volume; hand the worker a path (not
-        # bytes) so large files don't travel through Redis, and stamp a
-        # source_ref that points back to the stored artifact.
+    enqueued: list[dict] = []
+    totals = {"files": 0, "bytes": 0}
+
+    async def _store_and_enqueue(name: str, data: bytes) -> None:
+        """Persist one file + enqueue its ingest job, enforcing request caps.
+
+        Called incrementally per upload / per zip member so we never hold the
+        whole request in memory at once.
+        """
+        totals["files"] += 1
+        if totals["files"] > settings.ingest_max_files:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Upload exceeds the {settings.ingest_max_files}-file limit",
+            )
+        totals["bytes"] += len(data)
+        if totals["bytes"] > max_request_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Upload exceeds the {settings.ingest_max_request_mb}MB total-request limit",
+            )
+        # Persist to the shared volume; hand the worker a path (not bytes) so
+        # large files don't travel through Redis, and stamp a source_ref that
+        # points back to the stored artifact.
         payload = {"filename": name, "options": options, "user_id": resolved_user_id}
         if settings.ingest_storage_enabled:
             art = await asyncio.to_thread(
@@ -982,8 +972,38 @@ async def v1_ingest_files(
         enqueued.append({
             "filename": name,
             "task_id": task_id,
-            "file_id": payload.get("source_ref", {}).get("external_id"),
+            "file_id": payload["source_ref"]["external_id"],
         })
+
+    # Process each upload as it arrives — a zip is expanded and its members
+    # handled one at a time; anything else is handled as a single file.
+    for upload in files:
+        data = await upload.read()
+        name = upload.filename or "upload"
+        if is_zip(data) and name.lower().endswith(".zip"):
+            try:
+                for member_name, member_data in iter_archive(
+                    data,
+                    max_file_bytes=max_file_bytes,
+                    max_files=settings.ingest_max_files,
+                    max_total_uncompressed_bytes=settings.ingest_max_archive_uncompressed_mb
+                    * 1024 * 1024,
+                ):
+                    await _store_and_enqueue(member_name, member_data)
+            except ArchiveTooLarge as e:
+                raise HTTPException(status_code=413, detail=str(e))
+            except ArchiveError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+        else:
+            if len(data) > max_file_bytes:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"'{name}' exceeds the {settings.ingest_max_file_mb}MB per-file limit",
+                )
+            await _store_and_enqueue(name, data)
+
+    if not enqueued:
+        raise HTTPException(status_code=400, detail="No ingestible files found in the upload")
 
     return JSONResponse(status_code=202, content={"files": enqueued, "count": len(enqueued)})
 

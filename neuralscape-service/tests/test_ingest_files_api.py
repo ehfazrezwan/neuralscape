@@ -19,11 +19,13 @@ from main import app
 def _tmp_storage(tmp_path):
     """Point artifact storage at a tmp dir for the duration of each test."""
     from config import settings
-    saved = settings.ingest_storage_dir
+    saved_dir = settings.ingest_storage_dir
+    saved_enabled = settings.ingest_storage_enabled
     settings.ingest_storage_dir = str(tmp_path)
     settings.ingest_storage_enabled = True
     yield
-    settings.ingest_storage_dir = saved
+    settings.ingest_storage_dir = saved_dir
+    settings.ingest_storage_enabled = saved_enabled
 
 
 @pytest.fixture
@@ -111,6 +113,39 @@ class TestIngestFiles:
     def test_download_missing_is_404(self, client):
         resp = client.get("/v1/ingest/artifacts/deadbeef", params={"user_id": "alice"})
         assert resp.status_code == 404
+
+    def test_invalid_form_fields_rejected(self, client, monkeypatch):
+        monkeypatch.setattr(
+            main._task_manager, "enqueue_ingest_file", AsyncMock(return_value="ns-1")
+        )
+        f = [("files", ("a.md", b"hi", "text/markdown"))]
+        # bad category
+        r = client.post("/v1/ingest/files", data={"user_id": "alice", "category": "not_a_cat"}, files=f)
+        assert r.status_code == 400
+        # bad scope
+        r = client.post("/v1/ingest/files", data={"user_id": "alice", "scope": "weird"}, files=f)
+        assert r.status_code == 400
+        # bad visibility
+        r = client.post("/v1/ingest/files", data={"user_id": "alice", "visibility": "public"}, files=f)
+        assert r.status_code == 400
+
+    def test_total_request_cap(self, client, monkeypatch):
+        from config import settings
+        monkeypatch.setattr(
+            main._task_manager, "enqueue_ingest_file", AsyncMock(return_value="ns-1")
+        )
+        monkeypatch.setattr(settings, "ingest_max_request_mb", 1)  # 1 MB total
+        # Two 700KB files individually pass the per-file cap but together exceed 1MB.
+        blob = b"x" * (700 * 1024)
+        resp = client.post(
+            "/v1/ingest/files",
+            data={"user_id": "alice"},
+            files=[
+                ("files", ("a.md", blob, "text/markdown")),
+                ("files", ("b.md", blob, "text/markdown")),
+            ],
+        )
+        assert resp.status_code == 413
 
     def test_oversize_file_rejected(self, client, monkeypatch):
         from config import settings

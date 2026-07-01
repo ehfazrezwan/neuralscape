@@ -119,7 +119,8 @@ class Settings(BaseSettings):
     # Upload guardrails (also bound zip-bomb blast radius).
     ingest_max_file_mb: int = 25  # reject a single member larger than this
     ingest_max_files: int = 200  # max files (post zip-expansion) per request
-    ingest_max_archive_uncompressed_mb: int = 200  # total unzipped size cap
+    ingest_max_archive_uncompressed_mb: int = 200  # total unzipped size cap (per zip)
+    ingest_max_request_mb: int = 500  # total bytes processed per upload request
     # Uploaded files and manually-provided context are persisted as artifacts on
     # disk (a mounted volume), organized into per-user/project/category
     # subfolders. Each produced memory's source_ref then references the stored

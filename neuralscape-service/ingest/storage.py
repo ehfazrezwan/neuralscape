@@ -29,6 +29,8 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 _SAFE_SEGMENT = re.compile(r"[^A-Za-z0-9._-]+")
+# Artifact ids are md5(content)[:16] — exactly 16 lowercase hex chars.
+_FILE_ID_RE = re.compile(r"[0-9a-f]{16}")
 _GLOBAL = "_global"
 
 
@@ -87,7 +89,12 @@ def store_artifact(
     if not str(abs_path).startswith(str(root) + os.sep):
         raise ValueError(f"Refusing to write artifact outside storage root: {rel}")
     abs_path.parent.mkdir(parents=True, exist_ok=True)
-    abs_path.write_bytes(data)
+    # Write to a unique temp file then atomically rename into place, so a
+    # concurrent same-hash upload can never expose a partially-written file to a
+    # reader (the ingest worker). os.replace is atomic within a filesystem.
+    tmp_path = abs_path.with_name(f".{disk_name}.{os.getpid()}.tmp")
+    tmp_path.write_bytes(data)
+    os.replace(tmp_path, abs_path)
     logger.info("Stored ingest artifact %s (%d bytes) → %s", file_id, len(data), rel)
     return StoredArtifact(
         file_id=file_id,
@@ -112,15 +119,18 @@ def find_artifact(file_id: str, user_id: str, settings) -> tuple[str, str] | Non
 
     Owner-scoped by construction: only searches under the caller's ``{user_id}``
     subtree, so one user can't fetch another's artifact by guessing a hash.
+
+    ``file_id`` must be the exact 16-hex content hash and is matched against the
+    filename *stem* (``{file_id}`` or ``{file_id}.<ext>``) — never a prefix — so a
+    short/partial id can't resolve to an unrelated artifact.
     """
-    safe_id = _safe(file_id)
-    if not safe_id:
+    if not _FILE_ID_RE.fullmatch(file_id or ""):
         return None
     user_root = (_root(settings) / _safe(user_id, "anon")).resolve()
     if not user_root.is_dir():
         return None
-    for match in user_root.glob(f"**/{safe_id}*"):
-        if match.is_file():
+    for match in user_root.rglob("*"):
+        if match.is_file() and (match.stem == file_id or match.name == file_id):
             return str(match), match.name
     return None
 
@@ -132,6 +142,9 @@ def artifact_source_ref(
     extra: dict | None = None,
 ) -> dict:
     """Build a source_ref that references a stored artifact + a download handle."""
+    # Re-fetch mechanism is the REST download endpoint carried in `url`
+    # (GET /v1/ingest/artifacts/{file_id}); we deliberately omit a `retrieval`
+    # MCP handle since there is no MCP tool that streams artifact bytes.
     ref = {
         "connector_id": connector_type,
         "connector_type": connector_type,
@@ -140,11 +153,6 @@ def artifact_source_ref(
         "title": art.filename,
         "url": f"/v1/ingest/artifacts/{art.file_id}",
         "stored_path": art.rel_path,
-        "retrieval": {
-            "mcp_server": "neuralscape",
-            "tool": "fetch_artifact",
-            "args": {"file_id": art.file_id},
-        },
     }
     if extra:
         ref.update(extra)
