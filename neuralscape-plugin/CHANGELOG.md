@@ -4,6 +4,29 @@ All notable changes to the `neuralscape` Claude plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.5.0] - 2026-07-01
+
+### Added
+
+- **`/neuralscape:ingest` skill.** Loads files, folders, a `.zip`, or a block of
+  pasted context into memory. In Claude Code (service URL + `curl`) it uploads to
+  the new `POST /v1/ingest/files` endpoint so binaries (PDF, MS Office, HTML) are
+  parsed server-side; in Cowork (no filesystem) it ingests pasted text via the
+  new MCP `ingest_text` tool. Content is chunked into passages + distilled facts.
+- **`ingest_text` MCP tool** (tool count 9 → 10). Manually provide a block of
+  context; it's persisted as a Markdown artifact and the memories reference it.
+
+### Changed
+
+- Ingested files and manual context are now **stored as artifacts** on a server
+  volume (organized into `{user}/{project}/{category}/` subfolders) and every
+  produced memory's `source_ref` points back to the artifact
+  (`GET /v1/ingest/artifacts/{file_id}`) — nothing is ingested sourcelessly.
+- Rich-format parsing (PDF + MS Office docx/xlsx/pptx + HTML) is handled by a
+  **Docling** container, with an in-process MarkItDown fallback.
+- Bulk ingestion + connector sync moved to a **dedicated ingest worker/queue**,
+  isolated from latency-sensitive memory reads/writes.
+
 ## [2.4.0] - 2026-06-15
 
 ### Changed
