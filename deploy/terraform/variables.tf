@@ -82,3 +82,22 @@ variable "extra_secret_ids" {
   type        = list(string)
   default     = []
 }
+
+# ── Backup for GKE (optional) ───────────────────────────────────────
+variable "enable_gke_backup" {
+  description = "Create a Backup for GKE plan for the namespace (requires the cluster's Backup for GKE add-on)."
+  type        = bool
+  default     = false
+}
+
+variable "gke_backup_retain_days" {
+  description = "Retention (days) for scheduled backups."
+  type        = number
+  default     = 30
+}
+
+variable "gke_backup_cron" {
+  description = "Cron schedule (UTC) for backups."
+  type        = string
+  default     = "0 3 * * *"
+}
