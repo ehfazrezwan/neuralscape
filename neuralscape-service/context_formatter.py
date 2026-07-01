@@ -68,14 +68,14 @@ def format_standards_block(
         "personal preferences and project conventions. Follow them unless the "
         "user explicitly overrides them in this session."
     )
+    # Standards are BINDING and always injected in full — they are exempt from
+    # the ordinary context char budget (see format_context_for_injection). We do
+    # NOT truncate: dropping an authoritative directive (or, worse, emitting a
+    # header with no rules when the first one is large) would silently weaken the
+    # contract. The set size is bounded by governance, not by this formatter.
     lines: list[str] = [header, ""]
-    total = 0
     for mem in standards:
-        line = f"- {mem.memory}"
-        if total + len(line) > max_chars:
-            break
-        lines.append(line)
-        total += len(line)
+        lines.append(f"- {mem.memory}")
     return "\n".join(lines)
 
 

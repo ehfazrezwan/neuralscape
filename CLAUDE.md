@@ -50,7 +50,7 @@ uv run pytest tests/test_async_pipeline.py -v -s
 
 - **`main.py`** — FastAPI app. Legacy endpoints at root, v1 endpoints at `/v1/*`. Also mounts MCP HTTP transport at `/mcp/`. Health checks at `/health` and `/api/v1/health`.
 - **`memory_service.py`** — Core business logic. Handles extraction (via Gemini LLM), storage (Qdrant + Neo4j), search, dedup, and graph re-ingestion. This is the largest file (~1200 LOC).
-- **`mcp_server.py`** — MCP server with 10 tools. Supports both stdio and Streamable HTTP transports.
+- **`mcp_server.py`** — MCP server with 12 tools. Supports both stdio and Streamable HTTP transports.
 - **`worker.py`** — ARQ background workers on three isolated queues: `WorkerSettings` (fast vector writes/reads + conversation tasks), `GraphWorkerSettings` (slow Graphiti enrichment + dedup/wiki-synth crons), and `IngestWorkerSettings` (bulk document/file ingest + connector sync). Isolation keeps a folder ingest or heavy graph write from starving latency-sensitive reads/writes.
 - **`ingest/`** — document/file ingestion: `chunking.py` (paragraph-aware chunker), `extract.py` (rich formats → Markdown via a Docling container, MarkItDown in-process fallback), `archive.py` (zip expansion + bomb guards), `storage.py` (persist uploads as artifacts on a volume, organized by user/project/category, referenced back via source_ref), `pipeline.py` (chunk → passages + distilled facts).
 - **`config.py`** — Pydantic Settings. All configuration via env vars. Builds the mem0 config dict.

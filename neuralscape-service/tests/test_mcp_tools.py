@@ -82,7 +82,7 @@ class TestListTools:
         # the handler runs, so a stale ['private','shared'] enum silently blocks
         # writing/filtering the 'standard' tier even for a dictator.
         tools = {t.name: t for t in await mcp_server.list_tools()}
-        for name in ("remember", "recall_memories", "ingest_document"):
+        for name in ("remember", "recall_memories", "ingest_document", "ingest_text"):
             enum = tools[name].inputSchema["properties"]["visibility"]["enum"]
             assert "standard" in enum, f"{name} visibility enum missing 'standard': {enum}"
 

@@ -21,9 +21,6 @@ import { CATEGORY_LABELS, CATEGORY_ORDER } from "../types.js";
 
 // Target max tokens for injection (~4 chars per token)
 const MAX_CHARS = 8000;
-// Reserved budget for authoritative standards, on top of MAX_CHARS. Standards
-// are binding and must never be truncated away by a large recalled context.
-const STANDARDS_MAX_CHARS = 3000;
 
 function formatStandards(standards: NeuralscapeMemory[] | undefined): string {
   if (!standards || standards.length === 0) return "";
@@ -36,12 +33,12 @@ function formatStandards(standards: NeuralscapeMemory[] | undefined): string {
       "user explicitly overrides them in this session.",
     "",
   ];
-  let total = 0;
+  // Standards are BINDING and injected in full — exempt from the ordinary
+  // context budget. Never truncate: dropping a directive (or emitting a
+  // header-only block when the first rule is large) would silently weaken the
+  // contract. The set size is bounded by governance, not by this hook.
   for (const mem of standards) {
-    const line = `- ${mem.memory}`;
-    if (total + line.length > STANDARDS_MAX_CHARS) break;
-    lines.push(line);
-    total += line.length;
+    lines.push(`- ${mem.memory}`);
   }
   return lines.join("\n");
 }

@@ -26,6 +26,19 @@ class TestFormatStandardsBlock:
         assert "OVERRIDE" in block
         assert "- Always use the Opti deck template" in block
 
+    def test_oversized_standard_not_dropped(self):
+        # A single directive larger than any reserved budget must still be emitted
+        # in full — never a header-only block (CR: don't drop an oversized standard).
+        long_rule = "y" * 5000
+        block = format_standards_block([_mem(long_rule)], max_chars=100)
+        assert long_rule in block
+
+    def test_all_standards_emitted_no_truncation(self):
+        rules = [_mem(f"Rule number {i}") for i in range(50)]
+        block = format_standards_block(rules, max_chars=100)
+        for i in range(50):
+            assert f"Rule number {i}" in block
+
 
 class TestContextInjectionWithStandards:
     def test_standards_prepended_above_context(self):

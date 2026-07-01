@@ -18,6 +18,30 @@ def _qresult(hits):
     return r
 
 
+def _all_field_keys(qf) -> set[str]:
+    """Recursively collect every FieldCondition.key in a (possibly nested) Filter.
+
+    The enrichment filter uses per-pool sub-Filters in `should` (personal/shared
+    project-scoped, standard unscoped), so keys can live one level deep.
+    """
+    from qdrant_client.models import FieldCondition, Filter
+
+    keys: set[str] = set()
+
+    def _walk(f):
+        if f is None:
+            return
+        for group in (getattr(f, "must", None), getattr(f, "should", None), getattr(f, "must_not", None)):
+            for c in group or []:
+                if isinstance(c, FieldCondition):
+                    keys.add(c.key)
+                elif isinstance(c, Filter):
+                    _walk(c)
+
+    _walk(qf)
+    return keys
+
+
 def _classify_pool_calls(qp_mock):
     """Split mocked ``query_points`` calls into (personal, shared) by filter.
 
@@ -2281,10 +2305,11 @@ class TestGraphEnrichment:
         semantically similar memory in another project — regression for
         CR-11 / CP-05.
 
-        Multi-user model: filter is now a Qdrant `should` (user_id=caller
-        OR visibility=shared) plus a `must` (project_id) when present.
+        Multi-user model: filter is a Qdrant `should` of per-pool sub-Filters
+        (personal/shared each carry the project_id constraint; the standard pool
+        is global/unscoped). When project_id is supplied it appears in those
+        nested sub-filters.
         """
-        from qdrant_client.models import FieldCondition
         from schemas import MemoryResponse
         service._memory.embedding_model.embed.return_value = [0.1] * 768
         service._memory.vector_store.client = MagicMock()
@@ -2294,16 +2319,11 @@ class TestGraphEnrichment:
             graph_responses, user_id="ehfaz", project_id="neuralscape",
         )
         qf = service._memory.vector_store.client.query_points.call_args[1]["query_filter"]
-        must_keys = {
-            c.key for c in (qf.must or [])
-            if isinstance(c, FieldCondition)
-        }
-        assert "metadata.project_id" in must_keys
+        assert "metadata.project_id" in _all_field_keys(qf)
 
     def test_global_scope_uses_user_or_shared_filter(self, service):
         """Without project_id, the filter has caller's user_id OR shared
         visibility in the should clause and no project constraint."""
-        from qdrant_client.models import FieldCondition
         from schemas import MemoryResponse
         service._memory.embedding_model.embed.return_value = [0.1] * 768
         service._memory.vector_store.client = MagicMock()
@@ -2313,18 +2333,40 @@ class TestGraphEnrichment:
             graph_responses, user_id="ehfaz", project_id=None,
         )
         qf = service._memory.vector_store.client.query_points.call_args[1]["query_filter"]
-        should_keys = {
-            c.key for c in (qf.should or [])
-            if isinstance(c, FieldCondition)
-        }
-        assert "user_id" in should_keys
-        assert "metadata.visibility" in should_keys
-        # No project_id constraint in must when project_id was not supplied
-        must = qf.must or []
-        assert not any(
-            isinstance(c, FieldCondition) and c.key == "metadata.project_id"
-            for c in must
+        keys = _all_field_keys(qf)
+        assert "user_id" in keys
+        assert "metadata.visibility" in keys
+        # No project_id constraint anywhere when project_id was not supplied.
+        assert "metadata.project_id" not in keys
+
+    def test_standard_pool_included_when_enabled(self, service, monkeypatch):
+        """With standards enabled, enrichment adds a global (unscoped) standard
+        sub-filter so standard-origin graph edges recover their v2 metadata (CR #7)."""
+        from qdrant_client.models import FieldCondition, Filter
+        from schemas import MemoryResponse, MemoryVisibility
+        from config import settings as _settings
+        monkeypatch.setattr(_settings, "standards_enabled", True)
+        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        service._memory.vector_store.client = MagicMock()
+        service._memory.vector_store.client.query_points.return_value = _qresult([])
+        service._enrich_graph_with_v2(
+            [MemoryResponse(id="g1", memory="x", source="graph")],
+            user_id="ehfaz", project_id="neuralscape",
         )
+        qf = service._memory.vector_store.client.query_points.call_args[1]["query_filter"]
+
+        def _has_standard_unscoped(f) -> bool:
+            for sub in (f.should or []):
+                if not isinstance(sub, Filter):
+                    continue
+                conds = sub.must or []
+                vals = {getattr(getattr(c, "match", None), "value", None) for c in conds if isinstance(c, FieldCondition)}
+                proj = any(isinstance(c, FieldCondition) and c.key == "metadata.project_id" for c in conds)
+                if MemoryVisibility.STANDARD.value in vals and not proj:
+                    return True
+            return False
+
+        assert _has_standard_unscoped(qf)
 
 
 class TestGraphFilterByV2:
@@ -2953,7 +2995,6 @@ class TestGraphEnrichmentMultiUser:
 
     def test_filter_uses_should_clause_for_user_or_shared(self, service):
         """The Qdrant filter must accept either caller's user_id or shared-pool."""
-        from qdrant_client.models import Filter, FieldCondition, MatchValue
         service._memory.embedding_model.embed.return_value = [0.1] * 768
         service._memory.vector_store.client = MagicMock()
         service._memory.vector_store.client.query_points.return_value = _qresult([])
@@ -2961,13 +3002,10 @@ class TestGraphEnrichmentMultiUser:
         service._enrich_graph_with_v2(responses, user_id="alice", project_id=None)
 
         qf = service._memory.vector_store.client.query_points.call_args[1]["query_filter"]
-        # The should clause should contain user_id=alice OR visibility=shared
-        should_keys = {
-            c.key for c in qf.should
-            if isinstance(c, FieldCondition)
-        }
-        assert "user_id" in should_keys
-        assert "metadata.visibility" in should_keys
+        # The should clause (nested per-pool sub-filters) covers user_id OR shared.
+        keys = _all_field_keys(qf)
+        assert "user_id" in keys
+        assert "metadata.visibility" in keys
 
 
 class TestDeletedMsg:

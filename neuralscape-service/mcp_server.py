@@ -1,4 +1,8 @@
-"""MCP server exposing neuralscape memory operations as 7 tools.
+"""MCP server exposing neuralscape memory operations as 12 tools.
+
+Tools: recall_memories, remember, remember_conversation, ingest_document,
+ingest_text, get_project_context, search_knowledge_graph, list_memories,
+list_projects, delete_memories, list_processes, get_process.
 
 Supports both stdio transport (local Claude Code) and Streamable HTTP
 transport (remote agent access via /mcp/ endpoint on port 8199).

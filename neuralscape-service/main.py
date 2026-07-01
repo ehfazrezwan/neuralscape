@@ -772,7 +772,7 @@ async def v1_store_raw_memory(req: RawMemoryRequest, request: Request):
         try:
             memories = await asyncio.to_thread(_service.store_raw, **sync_kwargs)
         except PermissionError as pe:
-            raise HTTPException(status_code=403, detail=str(pe))
+            raise HTTPException(status_code=403, detail=str(pe)) from pe
         return JSONResponse(
             status_code=200,
             content=StoreMemoryResponse(memories=memories).model_dump(exclude_none=True),
@@ -1207,7 +1207,7 @@ async def v1_store_raw_batch(req: RawMemoryBatchRequest, request: Request):
         try:
             _authorize_standard_write(d["user_id"], d.get("visibility"))
         except HTTPException as he:
-            raise HTTPException(status_code=he.status_code, detail=f"Item {idx}: {he.detail}")
+            raise HTTPException(status_code=he.status_code, detail=f"Item {idx}: {he.detail}") from he
 
     try:
         task_id = await _task_manager.enqueue_raw_batch(items=items_payload)
@@ -1512,7 +1512,7 @@ async def v1_delete_memory(memory_id: str, request: Request):
     try:
         return await asyncio.to_thread(_service.delete_memory, memory_id, caller)
     except PermissionError as pe:
-        raise HTTPException(status_code=403, detail=str(pe))
+        raise HTTPException(status_code=403, detail=str(pe)) from pe
     except Exception:
         logger.exception("v1 delete_memory failed")
         raise HTTPException(status_code=500, detail="Failed to delete memory")

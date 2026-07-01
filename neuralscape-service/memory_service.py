@@ -779,7 +779,8 @@ class MemoryService:
         # ── Content-hash dedup ──
         # Skip insert if this exact (user_id, scope, hash) already exists.
         existing = self._find_by_content_hash(
-            user_id=user_id, content_hash=content_hash, scope=scope, project_id=project_id
+            user_id=user_id, content_hash=content_hash, scope=scope,
+            project_id=project_id, visibility=effective_visibility,
         )
         if existing is not None:
             logger.info(
@@ -1134,12 +1135,18 @@ class MemoryService:
         content_hash: str,
         scope: str,
         project_id: str | None = None,
+        visibility: str | None = None,
     ) -> MemoryResponse | None:
-        """Look up a memory by (user_id, hash, scope) for dedup.
+        """Look up a memory by (user_id, hash, scope, visibility) for dedup.
 
         Returns the existing MemoryResponse on hit, or None if not found.
         Failures here are non-fatal — we'd rather risk a duplicate than
         block an insert.
+
+        ``visibility`` is part of the key: the same text at two different tiers
+        (e.g. a dictator's private note vs. an authoritative ``standard``) are
+        distinct memories, so a ``standard`` write must not dedup onto a
+        pre-existing ``private``/``shared`` row of the same content.
         """
         try:
             from qdrant_client.models import FieldCondition, Filter, MatchValue
@@ -1150,6 +1157,8 @@ class MemoryService:
                 FieldCondition(key="hash", match=MatchValue(value=content_hash)),
                 FieldCondition(key="metadata.scope", match=MatchValue(value=scope)),
             ]
+            if visibility is not None:
+                must.append(FieldCondition(key="metadata.visibility", match=MatchValue(value=visibility)))
             if scope == "project" and project_id:
                 must.append(FieldCondition(key="metadata.project_id", match=MatchValue(value=project_id)))
             points, _ = client.scroll(
@@ -1749,32 +1758,35 @@ class MemoryService:
                 continue
             try:
                 embedding = m.embedding_model.embed(resp.memory, memory_action="search")
-                # Qdrant filter: (user_id=caller) OR (metadata.visibility=shared),
-                # both optionally constrained to the active project. Qdrant's
-                # `should` is OR-of-conditions; `must` AND's the rest.
-                should_conditions = []
+                # Enrichment source = OR of per-pool sub-filters (Qdrant `should`
+                # accepts nested Filters). Personal + shared are constrained to the
+                # active project; the authoritative STANDARD pool is always global
+                # (no project_id), so it must NOT carry the project constraint —
+                # otherwise standard-origin graph edges never match their source
+                # and lose their v2 metadata / get dropped by v2 filters.
+                proj = (
+                    [FieldCondition(key="metadata.project_id", match=MatchValue(value=project_id))]
+                    if project_id else []
+                )
+                should_filters: list = []
                 if user_id:
-                    should_conditions.append(
-                        FieldCondition(key="user_id", match=MatchValue(value=user_id))
+                    should_filters.append(
+                        Filter(must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))] + proj)
                     )
-                should_conditions.append(
-                    FieldCondition(
+                should_filters.append(
+                    Filter(must=[FieldCondition(
                         key="metadata.visibility",
                         match=MatchValue(value=MemoryVisibility.SHARED.value),
-                    )
+                    )] + proj)
                 )
-                must_conditions = []
-                if project_id:
-                    must_conditions.append(
-                        FieldCondition(
-                            key="metadata.project_id",
-                            match=MatchValue(value=project_id),
-                        )
+                if settings.standards_enabled:
+                    should_filters.append(
+                        Filter(must=[FieldCondition(
+                            key="metadata.visibility",
+                            match=MatchValue(value=MemoryVisibility.STANDARD.value),
+                        )])
                     )
-                qf = Filter(
-                    should=should_conditions,
-                    must=must_conditions if must_conditions else None,
-                )
+                qf = Filter(should=should_filters)
                 # qdrant-client v1.13+ replaced `.search()` with `.query_points()`.
                 result = client.query_points(
                     collection_name=settings.qdrant_collection,
@@ -2363,11 +2375,18 @@ class MemoryService:
     # Authoritative standards + processes (dictator tier)
     # ──────────────────────────────────────────────
 
+    # Hard safety ceiling on a full standards scroll — standards are authoritative
+    # and must all be injected, but this bounds a pathological runaway.
+    _STANDARD_SCROLL_MAX = 5000
+
     def _scroll_standard(self, must_extra: list, limit: int = 500) -> list:
-        """Scroll Qdrant for standard-tier points matching extra conditions.
+        """Scroll ALL standard-tier points matching extra conditions (paginated).
 
         Returns raw Qdrant points (visibility=standard AND all `must_extra`).
-        Empty on any error so callers degrade gracefully.
+        Pages through Qdrant so the authoritative set is returned in full (up to
+        a safety ceiling), rather than silently truncating at a single page —
+        binding directives must not be dropped. Empty on any error so callers
+        degrade gracefully.
 
         Verbatim ``passage`` chunks are EXCLUDED: every scroll caller
         (session-start standards injection, process enumeration) wants distilled
@@ -2390,27 +2409,42 @@ class MemoryService:
             FieldCondition(key="metadata.memory_kind", match=MatchValue(value="passage"))
         ]
         try:
-            points, _ = client.scroll(
-                collection_name=settings.qdrant_collection,
-                scroll_filter=Filter(must=must, must_not=must_not),
-                limit=limit,
-                with_payload=True,
-            )
-            return points or []
+            scroll_filter = Filter(must=must, must_not=must_not)
+            page_size = max(1, min(limit, 500))
+            collected: list = []
+            offset = None
+            while len(collected) < self._STANDARD_SCROLL_MAX:
+                points, offset = client.scroll(
+                    collection_name=settings.qdrant_collection,
+                    scroll_filter=scroll_filter,
+                    limit=page_size,
+                    offset=offset,
+                    with_payload=True,
+                )
+                collected.extend(points or [])
+                if offset is None or not points:
+                    break
+            if len(collected) >= self._STANDARD_SCROLL_MAX:
+                logger.warning(
+                    "Standard scroll hit the %d-row safety ceiling; some standards may be omitted.",
+                    self._STANDARD_SCROLL_MAX,
+                )
+            return collected
         except Exception as e:
             logger.warning(f"Standard-tier scroll failed (non-critical): {e}")
             return []
 
     def _get_standards(
-        self, project_id: str | None = None, limit: int = 200
+        self, project_id: str | None = None
     ) -> list[MemoryResponse]:
-        """Fetch authoritative standard-tier memories (dictator-written).
+        """Fetch ALL authoritative standard-tier memories (dictator-written).
 
         Standards are org-wide by definition — always stored at global scope
-        (see ``store_raw``) — so this returns the global standard pool,
+        (see ``store_raw``) — so this returns the FULL global standard pool,
         newest-first, regardless of ``project_id`` (kept for signature
         symmetry). NOT filtered by caller: standards are readable by everyone.
-        Empty when the tier is disabled.
+        Returned unpaginated (binding directives must all be injected; the scroll
+        applies only a high safety ceiling). Empty when the tier is disabled.
         """
         if not settings.standards_enabled:
             return []
@@ -2418,7 +2452,6 @@ class MemoryService:
 
         raw = self._scroll_standard(
             [FieldCondition(key="metadata.scope", match=MatchValue(value="global"))],
-            limit=limit,
         )
         seen: set[str] = set()
         out: list[MemoryResponse] = []
@@ -2440,7 +2473,7 @@ class MemoryService:
                 )
             )
         out.sort(key=lambda r: str(getattr(r, "created_at", "") or ""), reverse=True)
-        return out[:limit]
+        return out
 
     @staticmethod
     def _tags_of(response: MemoryResponse) -> list[str]:
