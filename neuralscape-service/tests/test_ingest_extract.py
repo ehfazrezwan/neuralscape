@@ -1,0 +1,189 @@
+"""Tests for ingest.extract (tiered parsing), ingest.storage (artifacts), and
+ingest.archive (zip expansion + bomb guards)."""
+
+import io
+import zipfile
+from types import SimpleNamespace
+
+import pytest
+
+from ingest.archive import ArchiveError, ArchiveTooLarge, is_zip, iter_archive
+from ingest.extract import UnsupportedFile, extract_text
+from ingest.storage import (
+    artifact_source_ref,
+    find_artifact,
+    read_artifact,
+    store_artifact,
+)
+
+
+@pytest.fixture
+def settings(tmp_path):
+    """Minimal settings stub: storage in a tmp dir, Docling disabled."""
+    return SimpleNamespace(
+        ingest_storage_dir=str(tmp_path),
+        ingest_storage_enabled=True,
+        docling_enabled=False,
+        docling_url="",
+        docling_timeout_s=5,
+    )
+
+
+# ── extract_text tiers ──
+
+class TestExtractText:
+    def test_plain_markdown_read_as_is(self, settings):
+        text, dt = extract_text("notes.md", b"# Title\n\nbody", settings)
+        assert dt == "plain"
+        assert text == "# Title\n\nbody"
+
+    def test_plain_txt_latin1_fallback(self, settings):
+        # 0xff is invalid UTF-8 — must not raise, decodes via latin-1.
+        text, dt = extract_text("a.txt", b"caf\xe9", settings)
+        assert dt == "plain"
+        assert "caf" in text
+
+    def test_empty_file_raises(self, settings):
+        with pytest.raises(UnsupportedFile):
+            extract_text("empty.md", b"", settings)
+
+    def test_rich_docx_uses_markitdown_when_docling_off(self, settings, monkeypatch):
+        # Docling disabled → falls back to MarkItDown; stub it so no real parse.
+        import ingest.extract as extract_mod
+
+        monkeypatch.setattr(
+            extract_mod, "_markitdown_convert", lambda data, ext: "converted markdown"
+        )
+        text, dt = extract_text("report.docx", b"PK\x03\x04fake", settings)
+        assert dt == "markitdown"
+        assert text == "converted markdown"
+
+    def test_rich_prefers_docling_when_available(self, settings, monkeypatch):
+        import ingest.extract as extract_mod
+
+        settings.docling_enabled = True
+        settings.docling_url = "http://docling:5001"
+        monkeypatch.setattr(
+            extract_mod, "_docling_convert", lambda data, fn, s: "# docling md"
+        )
+        # If Docling wins, MarkItDown must not be consulted.
+        monkeypatch.setattr(
+            extract_mod, "_markitdown_convert",
+            lambda *a: pytest.fail("MarkItDown should not run when Docling succeeds"),
+        )
+        text, dt = extract_text("report.pdf", b"%PDF-1.4", settings)
+        assert dt == "docling"
+        assert text == "# docling md"
+
+    def test_unparseable_binary_raises(self, settings, monkeypatch):
+        import ingest.extract as extract_mod
+
+        monkeypatch.setattr(extract_mod, "_markitdown_convert", lambda data, ext: None)
+        with pytest.raises(UnsupportedFile):
+            extract_text("mystery.pdf", b"\x00\x01\x02binary", settings)
+
+    def test_unknown_extension_textual_is_decoded(self, settings):
+        text, dt = extract_text("data.weird", b"just text", settings)
+        assert dt == "decoded"
+        assert text == "just text"
+
+    def test_unknown_extension_binary_raises(self, settings):
+        with pytest.raises(UnsupportedFile):
+            extract_text("blob.weird", b"\x00\xff\x00binary", settings)
+
+
+# ── storage round-trip + provenance ──
+
+class TestStorage:
+    def test_store_read_roundtrip_with_category_subfolder(self, settings):
+        art = store_artifact(b"hello", "n.md", "alice", "proj1", "tech_stack", settings)
+        assert "alice" in art.rel_path
+        assert "proj1" in art.rel_path
+        assert "tech_stack" in art.rel_path
+        assert read_artifact(art.rel_path, settings) == b"hello"
+
+    def test_global_when_no_project(self, settings):
+        art = store_artifact(b"x", "n.md", "alice", None, "preference", settings)
+        assert "_global" in art.rel_path
+
+    def test_identical_bytes_same_file_id(self, settings):
+        a1 = store_artifact(b"same", "a.md", "alice", None, "domain_knowledge", settings)
+        a2 = store_artifact(b"same", "b.md", "alice", None, "domain_knowledge", settings)
+        assert a1.file_id == a2.file_id
+
+    def test_find_artifact_owner_scoped(self, settings):
+        art = store_artifact(b"secret", "s.md", "alice", None, "domain_knowledge", settings)
+        assert find_artifact(art.file_id, "alice", settings)[0] == art.abs_path
+        # Another user cannot locate alice's artifact by id.
+        assert find_artifact(art.file_id, "bob", settings) is None
+
+    def test_source_ref_references_artifact(self, settings):
+        art = store_artifact(b"z", "z.md", "alice", None, "domain_knowledge", settings)
+        ref = artifact_source_ref(art, connector_type="manual")
+        assert ref["connector_type"] == "manual"
+        assert ref["stored_path"] == art.rel_path
+        assert ref["url"].endswith(art.file_id)
+        assert ref["retrieval"]["args"]["file_id"] == art.file_id
+
+    def test_path_traversal_in_ids_is_neutralized(self, settings):
+        # Malicious user/project/category segments must not escape the root.
+        art = store_artifact(b"x", "../../etc/passwd", "../../evil", "..", "..", settings)
+        assert read_artifact(art.rel_path, settings) == b"x"
+        assert ".." not in art.rel_path.split("/")
+
+
+# ── archive expansion + guards ──
+
+def _zip(members: dict[str, bytes]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        for name, data in members.items():
+            z.writestr(name, data)
+    return buf.getvalue()
+
+
+class TestArchive:
+    def test_is_zip(self):
+        assert is_zip(_zip({"a.md": b"x"}))
+        assert not is_zip(b"not a zip")
+
+    def test_skips_macosx_dotfiles_dirs_nested(self):
+        data = _zip({
+            "doc.md": b"hi",
+            "__MACOSX/._doc.md": b"junk",
+            ".DS_Store": b"junk",
+            "sub/": b"",
+            "sub/nested.zip": b"junk",
+            "sub/real.txt": b"ok",
+        })
+        members = dict(iter_archive(
+            data, max_file_bytes=10_000, max_files=50, max_total_uncompressed_bytes=1_000_000
+        ))
+        assert set(members) == {"doc.md", "sub/real.txt"}
+
+    def test_per_file_cap(self):
+        data = _zip({"big.md": b"x" * 500})
+        with pytest.raises(ArchiveTooLarge):
+            list(iter_archive(
+                data, max_file_bytes=100, max_files=50, max_total_uncompressed_bytes=10_000
+            ))
+
+    def test_total_uncompressed_cap(self):
+        data = _zip({f"f{i}.md": b"x" * 100 for i in range(10)})
+        with pytest.raises(ArchiveTooLarge):
+            list(iter_archive(
+                data, max_file_bytes=1_000, max_files=50, max_total_uncompressed_bytes=250
+            ))
+
+    def test_member_count_cap(self):
+        data = _zip({f"f{i}.md": b"x" for i in range(10)})
+        with pytest.raises(ArchiveTooLarge):
+            list(iter_archive(
+                data, max_file_bytes=1_000, max_files=3, max_total_uncompressed_bytes=10_000
+            ))
+
+    def test_bad_zip_raises(self):
+        with pytest.raises(ArchiveError):
+            list(iter_archive(
+                b"not a zip", max_file_bytes=1_000, max_files=3, max_total_uncompressed_bytes=10_000
+            ))
