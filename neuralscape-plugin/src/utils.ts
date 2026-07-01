@@ -119,6 +119,10 @@ export interface ContextResponse {
   user_id: string;
   project_id?: string;
   categories: Record<string, NeuralscapeMemory[]>;
+  // Authoritative org standards (visibility=standard). Rendered as a binding
+  // block that overrides personal preferences on conflict. Empty unless the
+  // server has STANDARDS_ENABLED.
+  standards?: NeuralscapeMemory[];
 }
 
 // ── Stdin Parsing ────────────────────────────────────────────────

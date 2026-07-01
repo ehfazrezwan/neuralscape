@@ -1,8 +1,8 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "neuralscape",
-  "version": "2.5.0",
-  "description": "Persistent agentic memory for Claude Code and Claude Cowork. Multi-user support: each user has personal memory (only they can read it) plus access to a shared team knowledge pool. In Claude Code, plugin hooks auto-capture conversations + per-tool observations and recall context on session start; in Claude Cowork (which does not run plugin hooks), the cross-platform recall/remember/save-session/project/ingest skills drive the same loop through the MCP connector. The ingest skill loads files, folders, or pasted context (Markdown/HTML/PDF/MS-Office) into memory. Exposes 10 MCP tools (recall_memories, remember, remember_conversation, ingest_document, ingest_text, get_project_context, search_knowledge_graph, list_memories, list_projects, delete_memories).",
+  "version": "2.6.0",
+  "description": "Persistent agentic memory for Claude Code and Claude Cowork. Multi-user support: each user has personal memory (only they can read it) plus access to a shared team knowledge pool and an optional authoritative 'standard' tier of org rules and selectable team processes set by a designated dictator. In Claude Code, plugin hooks auto-capture conversations + per-tool observations and recall context on session start; in Claude Cowork (which does not run plugin hooks), the cross-platform recall/remember/save-session/project/ingest/process skills drive the same loop through the MCP connector. The ingest skill loads files, folders, or pasted context (Markdown/HTML/PDF/MS-Office) into memory; the process skill runs a defined team process and pulls its standards. Exposes 12 MCP tools (recall_memories, remember, remember_conversation, ingest_document, ingest_text, get_project_context, search_knowledge_graph, list_memories, list_projects, list_processes, get_process, delete_memories).",
   "author": {
     "name": "Ehfaz Rezwan",
     "email": "ehfaz.rezwan@gmail.com"

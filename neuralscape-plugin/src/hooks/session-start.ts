@@ -21,6 +21,30 @@ import { CATEGORY_LABELS, CATEGORY_ORDER } from "../types.js";
 
 // Target max tokens for injection (~4 chars per token)
 const MAX_CHARS = 8000;
+// Reserved budget for authoritative standards, on top of MAX_CHARS. Standards
+// are binding and must never be truncated away by a large recalled context.
+const STANDARDS_MAX_CHARS = 3000;
+
+function formatStandards(standards: NeuralscapeMemory[] | undefined): string {
+  if (!standards || standards.length === 0) return "";
+  const lines: string[] = [
+    "# ⚖️ Neuralscape AUTHORITATIVE Standards (binding)",
+    "",
+    "These are organization standards set by a Neuralscape dictator. They are " +
+      "BINDING directives, not preferences. On any conflict they OVERRIDE " +
+      "personal preferences and project conventions. Follow them unless the " +
+      "user explicitly overrides them in this session.",
+    "",
+  ];
+  let total = 0;
+  for (const mem of standards) {
+    const line = `- ${mem.memory}`;
+    if (total + line.length > STANDARDS_MAX_CHARS) break;
+    lines.push(line);
+    total += line.length;
+  }
+  return lines.join("\n");
+}
 
 function formatMemories(categories: Record<string, NeuralscapeMemory[]>): string {
   const sections: string[] = [];
@@ -106,9 +130,16 @@ async function main(): Promise<void> {
       logError("listPendingBuffers failed (non-critical)", error);
     }
 
-    // Format and inject
+    // Format and inject. Standards are prepended (outside the MAX_CHARS budget)
+    // as a binding block so they are never truncated by recalled context.
+    const standardsBlock = formatStandards(context.standards);
     const formatted = formatMemories(context.categories || {});
-    const combined = (formatted || "") + pendingNote;
+    const contextBody = standardsBlock
+      ? formatted
+        ? `${standardsBlock}\n\n---\n\n${formatted}`
+        : standardsBlock
+      : formatted;
+    const combined = (contextBody || "") + pendingNote;
     if (combined.trim()) {
       outputWithContext(combined);
     } else {
