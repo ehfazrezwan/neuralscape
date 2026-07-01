@@ -86,7 +86,7 @@ uv run pytest tests/test_async_pipeline.py -v -s
 
 ## Claude Code / Cowork Plugin
 
-The **neuralscape plugin** gives Claude Code automatic, persistent memory: lifecycle hooks plus nine user-facing slash commands (plus an internal `compile-observations` helper the hooks/`capture` invoke) plus the eight Neuralscape MCP tools auto-wired on install.
+The **neuralscape plugin** gives Claude Code automatic, persistent memory: lifecycle hooks plus ten user-facing slash commands (including `/neuralscape:ingest` for files/folders/pasted context; plus an internal `compile-observations` helper the hooks/`capture` invoke) plus the ten Neuralscape MCP tools auto-wired on install.
 
 > **Claude Cowork:** Cowork does **not** run plugin hooks ([#27398](https://github.com/anthropics/claude-code/issues/27398)), so the automatic inject/capture loop below does not fire there. Cowork is supported via a remote **MCP OAuth connector** plus a standing-context "memory protocol" that drives recall/capture through the MCP tools. See **[COWORK.md](./COWORK.md)** — that is the supported Cowork path, not this hook-based one.
 
@@ -174,17 +174,26 @@ troubleshooting: **[AUTH.md](./AUTH.md)**.
 
 ## MCP Server
 
-8 tools exposed via MCP for direct use by AI agents:
+10 tools exposed via MCP for direct use by AI agents:
 
 | Tool | Mode | Purpose |
 |---|---|---|
 | `recall_memories` | sync | Semantic search across global + project memories. Agents should call this before starting work. |
 | `remember` | async | Store a single categorized fact. Set `wait: true` to block until stored. |
 | `remember_conversation` | async | Bulk extract from conversation messages via LLM. Set `wait: true` to block. |
+| `ingest_document` | async | Ingest a fetched document (with a connector source_ref) → passages + facts. |
+| `ingest_text` | async | Manually provide a block of context → persisted as an artifact + passages + facts. |
 | `get_project_context` | sync | Bootstrap: load all user prefs + project context organized by category. |
 | `search_knowledge_graph` | sync | Graph-based entity/relationship search. |
 | `list_memories` | sync | List/inspect stored memories with filters. |
+| `list_projects` | sync | List the caller's distinct project ids. |
 | `delete_memories` | sync | Delete by ID or by filters. |
+
+**Document & file ingestion** (REST): `POST /v1/ingest/text` (manual context),
+`POST /v1/ingest/files` (multipart — files, folders, or a `.zip`; parses
+Markdown/HTML/PDF/MS-Office server-side via Docling), and `GET
+/v1/ingest/artifacts/{file_id}` to fetch a stored source back. Ingestion runs on
+a dedicated worker (`uv run arq worker.IngestWorkerSettings`).
 
 ### Claude Code (stdio)
 
@@ -286,7 +295,7 @@ There are two approaches to giving Claude Code persistent memory. Use either or 
 
 The neuralscape plugin handles context injection and conversation capture automatically via lifecycle hooks. See the [Claude Code / Cowork Plugin](#claude-code--cowork-plugin) section above for installation.
 
-Once installed, the plugin loads on every session across all projects. The plugin's `.mcp.json` also auto-wires the eight Neuralscape MCP tools, so the manual MCP setup below is redundant if you've installed the plugin. The MCP-only path remains documented for setups that can't run a plugin.
+Once installed, the plugin loads on every session across all projects. The plugin's `.mcp.json` also auto-wires the ten Neuralscape MCP tools, so the manual MCP setup below is redundant if you've installed the plugin. The MCP-only path remains documented for setups that can't run a plugin.
 
 ### Approach 2: MCP server + CLAUDE.md instructions
 
