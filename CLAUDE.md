@@ -20,8 +20,10 @@ docker compose up neo4j redis qdrant -d
 # Run the API server
 uv run python main.py
 
-# Run the ARQ background worker (separate terminal)
-uv run arq worker.WorkerSettings
+# Run the ARQ background workers (separate terminals)
+uv run arq worker.WorkerSettings         # fast: vector writes/reads, conversation tasks
+uv run arq worker.GraphWorkerSettings    # slow: Graphiti graph enrichment + heavy crons
+uv run arq worker.IngestWorkerSettings   # bulk document/file ingest + connector sync
 
 # Run MCP server in stdio mode
 uv run python mcp_server.py
@@ -48,8 +50,9 @@ uv run pytest tests/test_async_pipeline.py -v -s
 
 - **`main.py`** — FastAPI app. Legacy endpoints at root, v1 endpoints at `/v1/*`. Also mounts MCP HTTP transport at `/mcp/`. Health checks at `/health` and `/api/v1/health`.
 - **`memory_service.py`** — Core business logic. Handles extraction (via Gemini LLM), storage (Qdrant + Neo4j), search, dedup, and graph re-ingestion. This is the largest file (~1200 LOC).
-- **`mcp_server.py`** — MCP server with 7 tools. Supports both stdio and Streamable HTTP transports.
-- **`worker.py`** — ARQ background worker. Processes `process_memory_store` and `process_memory_raw` tasks. Runs periodic dedup cron job (every 6 hours).
+- **`mcp_server.py`** — MCP server with 10 tools. Supports both stdio and Streamable HTTP transports.
+- **`worker.py`** — ARQ background workers on three isolated queues: `WorkerSettings` (fast vector writes/reads + conversation tasks), `GraphWorkerSettings` (slow Graphiti enrichment + dedup/wiki-synth crons), and `IngestWorkerSettings` (bulk document/file ingest + connector sync). Isolation keeps a folder ingest or heavy graph write from starving latency-sensitive reads/writes.
+- **`ingest/`** — document/file ingestion: `chunking.py` (paragraph-aware chunker), `extract.py` (rich formats → Markdown via a Docling container, MarkItDown in-process fallback), `archive.py` (zip expansion + bomb guards), `storage.py` (persist uploads as artifacts on a volume, organized by user/project/category, referenced back via source_ref), `pipeline.py` (chunk → passages + distilled facts).
 - **`config.py`** — Pydantic Settings. All configuration via env vars. Builds the mem0 config dict.
 - **`schemas.py`** — 13 memory categories organized by type (semantic, project, episodic, procedural, working). Pydantic request/response models.
 - **`prompts.py`** — LLM extraction prompts and category parsers.
@@ -60,6 +63,7 @@ uv run pytest tests/test_async_pipeline.py -v -s
 
 - **Write path**: Client → API/MCP → Redis queue → 202 → ARQ Worker → Gemini extraction → Qdrant + Neo4j → Redis status → poll for result
 - **Read path**: Client → API/MCP → MemoryService → Qdrant + Neo4j → 200 OK (synchronous)
+- **Ingest path**: Client → `POST /v1/ingest/{text,files}` (or MCP `ingest_text`) → file persisted as an artifact on the storage volume → 202 → **ingest** queue → Ingest Worker (Docling/MarkItDown parse → chunk → passages + distilled facts, each stamped with a source_ref pointing back to the artifact). A dedicated queue so bulk ingest never blocks the fast paths.
 
 ### Memory Model
 
@@ -133,4 +137,4 @@ Tests are in `neuralscape-service/tests/`. Unit tests mock all external services
 
 ## Docker
 
-`docker compose up` starts the full stack (neo4j, redis, qdrant, neuralscape API, neuralscape-worker). The API runs on port 8199.
+`docker compose up` starts the full stack (neo4j, redis, qdrant, docling, neuralscape API, neuralscape-worker, neuralscape-graph-worker, neuralscape-ingest-worker). The API runs on port 8199; Docling on 5001. The API and ingest worker share the `ingest_data` volume for uploaded artifacts.

@@ -38,6 +38,7 @@ spec:
           volumeMounts:
             - name: vault
               mountPath: /data/vault
+            {{- include "neuralscape.ingestVolumeMount" . | nindent 12 }}
           resources:
             {{- toYaml .Values.api.resources | nindent 12 }}
           readinessProbe:
@@ -60,3 +61,4 @@ spec:
         # enable the synthesizer and want the vault shared + persistent.
         - name: vault
           emptyDir: {}
+        {{- include "neuralscape.ingestVolume" . | nindent 8 }}

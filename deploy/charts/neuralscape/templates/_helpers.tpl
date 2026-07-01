@@ -51,3 +51,23 @@ env:
       secretKeyRef: { name: {{ $.Values.secretName }}, key: {{ .secretKey }} }
   {{- end }}
 {{- end -}}
+
+{{/*
+Shared ingest-artifact volume mount + volume, used by BOTH the API (writes) and
+the ingest worker (reads). Uses the RWX PVC when ingestStorage is enabled, else
+a per-pod emptyDir (dev only — not shared across pods).
+*/}}
+{{- define "neuralscape.ingestVolumeMount" -}}
+- name: ingest
+  mountPath: {{ .Values.config.INGEST_STORAGE_DIR | default "/data/ingest" }}
+{{- end -}}
+
+{{- define "neuralscape.ingestVolume" -}}
+- name: ingest
+  {{- if .Values.ingestStorage.enabled }}
+  persistentVolumeClaim:
+    claimName: {{ .Values.ingestStorage.existingClaim | default "neuralscape-ingest" }}
+  {{- else }}
+  emptyDir: {}
+  {{- end }}
+{{- end -}}

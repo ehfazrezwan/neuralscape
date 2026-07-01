@@ -76,6 +76,15 @@ class Settings(BaseSettings):
     # GRAPH_QUEUE_NAME=neuralscape:queue and register process_graph_enrichment
     # on WorkerSettings.
     graph_queue_name: str = "neuralscape:graph"
+    # Bulk document/file ingestion runs on its OWN queue so a folder/zip ingest
+    # (chunking + Docling parse + LLM fact extraction) can't starve latency-
+    # sensitive vector writes/reads on the main queue. Consumed by
+    # `arq worker.IngestWorkerSettings` — that worker MUST be running (see the
+    # docker-compose neuralscape-ingest-worker) or ingest/connector-sync jobs
+    # queue unconsumed. To collapse back onto the main worker, set
+    # INGEST_QUEUE_NAME=neuralscape:queue and register the ingest tasks on
+    # WorkerSettings.
+    ingest_queue_name: str = "neuralscape:ingest"
     arq_max_retries: int = 3
     arq_job_timeout: int = 300  # 5 min max per task
 
@@ -97,6 +106,30 @@ class Settings(BaseSettings):
     connectors_enabled: bool = False
     vault_key: str = ""  # NEURALSCAPE_VAULT_KEY — required when connectors_enabled
     connector_sync_cron_hours: int = 6  # interval (hours) the sync cron fires
+
+    # ── Document/file ingestion ───────────────────────────────────────
+    # Rich formats (PDF, MS Office docx/xlsx/pptx, HTML, …) are converted to
+    # Markdown by a `docling-serve` container (the preferred, AI-grade path).
+    # When it's disabled or unreachable, ingestion falls back to the in-process
+    # MarkItDown parser so uploads never hard-fail. Plain text/markdown is read
+    # directly and never touches either.
+    docling_enabled: bool = True
+    docling_url: str = "http://docling:5001"  # empty disables → MarkItDown fallback
+    docling_timeout_s: int = 120  # per-file convert timeout (heavy PDFs are slow)
+    # Upload guardrails (also bound zip-bomb blast radius).
+    ingest_max_file_mb: int = 25  # reject a single member larger than this
+    ingest_max_files: int = 200  # max files (post zip-expansion) per request
+    ingest_max_archive_uncompressed_mb: int = 200  # total unzipped size cap (per zip)
+    ingest_max_request_mb: int = 500  # total bytes processed per upload request
+    # Uploaded files and manually-provided context are persisted as artifacts on
+    # disk (a mounted volume), organized into per-user/project/category
+    # subfolders. Each produced memory's source_ref then references the stored
+    # artifact (path + a /v1/ingest/artifacts/{id} download handle) so it's
+    # traceable and re-fetchable. The API and ingest worker MUST share this
+    # volume (RWX) — the API writes the file, the worker reads it back to parse.
+    # (Object storage — GCS/S3 — is a later swap behind this same interface.)
+    ingest_storage_enabled: bool = True
+    ingest_storage_dir: str = "~/.neuralscape/ingest"  # volume mount in prod
 
     # Auth
     # Legacy single shared API key. When set without `neuralscape_user_token_secret`,
@@ -204,6 +237,22 @@ class Settings(BaseSettings):
     def _validate_positive_ttl(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("OAuth token TTLs must be > 0 seconds")
+        return value
+
+    @field_validator(
+        "docling_timeout_s",
+        "ingest_max_file_mb",
+        "ingest_max_files",
+        "ingest_max_archive_uncompressed_mb",
+        "ingest_max_request_mb",
+    )
+    @classmethod
+    def _validate_positive_ingest_limit(cls, value: int, info) -> int:
+        # These feed the Docling timeout and the zip guardrails; a 0/negative
+        # value would time out every conversion or invert the archive checks, and
+        # only surface as a runtime failure after deploy. Reject at startup.
+        if value <= 0:
+            raise ValueError(f"{info.field_name} must be > 0")
         return value
 
     @field_validator("auth_provider")

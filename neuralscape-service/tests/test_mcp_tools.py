@@ -45,9 +45,9 @@ def mock_task_manager():
 
 class TestListTools:
     @pytest.mark.asyncio
-    async def test_returns_9_tools(self):
+    async def test_returns_10_tools(self):
         tools = await mcp_server.list_tools()
-        assert len(tools) == 9
+        assert len(tools) == 10
 
     @pytest.mark.asyncio
     async def test_tool_names(self):
@@ -58,6 +58,7 @@ class TestListTools:
             "remember",
             "remember_conversation",
             "ingest_document",
+            "ingest_text",
             "get_project_context",
             "search_knowledge_graph",
             "list_memories",

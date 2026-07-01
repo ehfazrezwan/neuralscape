@@ -34,6 +34,10 @@ config:
   GEMINI_LLM_MODEL: "gemini-3-flash-preview"
   GEMINI_LLM_FALLBACK_MODEL: "gemini-2.5-flash"
   GEMINI_EMBEDDER_MODEL: "gemini-embedding-001"
+  # Document/file ingestion: artifact storage volume + Docling converter.
+  INGEST_STORAGE_DIR: "/data/ingest"
+  DOCLING_ENABLED: "true"
+  DOCLING_URL: "http://docling:5001"
   # Auth. Default is token-paste (no external IdP). Set AUTH_PROVIDER=google and
   # AUTH_ALLOWED_DOMAINS in a private overlay for consent-screen login.
   AUTH_PROVIDER: "token"
@@ -85,3 +89,41 @@ graphWorker:
   resources:
     requests: { cpu: "250m", memory: "1Gi" }
     limits: { cpu: "1000m", memory: "2Gi" }
+
+# Dedicated ingest worker: bulk document/file ingest + connector sync, isolated
+# from the fast worker so a folder/zip upload can't starve vector writes/reads.
+ingestWorker:
+  replicaCount: 1
+  resources:
+    requests: { cpu: "250m", memory: "1Gi" }
+    limits: { cpu: "1000m", memory: "2Gi" }
+
+# Docling document converter (rich formats → Markdown). The preferred extractor;
+# the ingest worker falls back to in-process MarkItDown when it's disabled/down.
+# CPU/RAM-heavy (ML models) — size for the workload in a private overlay.
+docling:
+  enabled: true
+  image:
+    repository: ghcr.io/docling-project/docling-serve
+    tag: latest
+    pullPolicy: IfNotPresent
+  replicaCount: 1
+  port: 5001
+  resources:
+    requests: { cpu: "500m", memory: "2Gi" }
+    limits: { cpu: "2000m", memory: "4Gi" }
+
+# Shared artifact storage for uploaded files (the API writes them, the ingest
+# worker reads them back to parse). It needs ReadWriteMany so BOTH pods can mount
+# it (e.g. Filestore on GKE) — a plain default (RWO) StorageClass would leave the
+# PVC Pending. So this is OFF by default: a bare `helm install` runs fine and the
+# app falls back to shipping file bytes through Redis (INGEST_STORAGE_ENABLED is
+# tied to this flag in the ConfigMap — see configmap.yaml). For production file
+# ingest, provide an RWX `storageClass` (or `existingClaim`) and set enabled=true.
+ingestStorage:
+  enabled: false
+  create: true
+  existingClaim: ""
+  accessMode: ReadWriteMany
+  storageClass: ""
+  size: 10Gi

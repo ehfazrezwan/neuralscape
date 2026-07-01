@@ -188,7 +188,17 @@ SOURCE_TYPE_VOCAB: set[str] = {
 MEMORY_KIND_VOCAB: set[str] = {"fact", "passage"}
 
 # Connector adapter types recognised by the ingest/connector subsystem.
-CONNECTOR_TYPE_VOCAB: set[str] = {"google_drive", "notion", "generic_rest", "mcp"}
+# `manual` = content a user provided directly (pasted context); `file_upload` =
+# a file/zip the user uploaded. Both are first-class origins that don't come from
+# a configured external connector, so their memories carry a synthetic source_ref.
+CONNECTOR_TYPE_VOCAB: set[str] = {
+    "google_drive",
+    "notion",
+    "generic_rest",
+    "mcp",
+    "manual",
+    "file_upload",
+}
 
 
 # ──────────────────────────────────────────────
@@ -273,6 +283,7 @@ class SourceDescriptor(BaseModel):
     chunk_index: int | None = Field(default=None, ge=0, description="Position of this passage within the parent doc")
     span: list[int] | None = Field(default=None, max_length=2, description="[start_char, end_char] within the parent")
     content_hash: str | None = Field(default=None, max_length=64)
+    stored_path: str | None = Field(default=None, max_length=1000, description="Path to the persisted artifact within the ingest storage volume")
     revision: str | None = Field(default=None, max_length=200, description="Source-side version (etag / last_edited_time)")
     last_synced_at: str | None = Field(default=None, description="ISO 8601 timestamp of last sync from source")
     retrieval: RetrievalHandle | None = None
@@ -435,6 +446,50 @@ class IngestDocumentRequest(BaseModel):
     def _validate_category(cls, v: str) -> str:
         if v not in MEMORY_CATEGORIES:
             raise ValueError(f"Invalid category '{v}'. Must be one of: {list(MEMORY_CATEGORIES.keys())}")
+        return v
+
+    @field_validator("scope")
+    @classmethod
+    def _validate_scope(cls, v: str) -> str:
+        if v not in ("global", "project"):
+            raise ValueError("scope must be 'global' or 'project'")
+        return v
+
+
+class IngestTextRequest(BaseModel):
+    """Manually provide a block of context — a first-class ingestion path.
+
+    Unlike :class:`IngestDocumentRequest`, no ``source`` descriptor is required:
+    the server fabricates a synthetic ``manual`` source_ref so the produced
+    memories still carry provenance ("manually provided") and backlink to a
+    stable parent id (the content hash). Same chunk→passages + distilled-facts
+    pipeline as document ingest; runs async on the ingest queue.
+    """
+    content: str = Field(min_length=1, max_length=2_000_000, description="The context text to ingest")
+    title: str | None = Field(default=None, max_length=1000, description="Human label for this context")
+    category: str = Field(default="domain_knowledge", description="Category for produced memories")
+    scope: str = Field(default="global", description="'global' or 'project'")
+    project_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+    user_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+    visibility: MemoryVisibility | None = Field(default=None)
+    extract_facts: bool = Field(default=True, description="Run LLM extraction to also store distilled facts")
+    index_passages: bool = Field(default=True, description="Chunk + store verbatim passages")
+    tags: list[str] | None = Field(default=None, max_length=20)
+    agent_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+    run_id: str | None = Field(default=None, max_length=100)
+
+    @field_validator("category")
+    @classmethod
+    def _validate_category(cls, v: str) -> str:
+        if v not in MEMORY_CATEGORIES:
+            raise ValueError(f"Invalid category '{v}'. Must be one of: {list(MEMORY_CATEGORIES.keys())}")
+        return v
+
+    @field_validator("scope")
+    @classmethod
+    def _validate_scope(cls, v: str) -> str:
+        if v not in ("global", "project"):
+            raise ValueError("scope must be 'global' or 'project'")
         return v
 
 

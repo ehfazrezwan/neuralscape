@@ -329,8 +329,11 @@ class TestGetStatus:
 class TestWaitForResult:
     @pytest.mark.asyncio
     async def test_returns_result_on_success(self, tm):
+        from arq.jobs import JobStatus
         with patch("task_manager.Job") as MockJob:
             instance = MockJob.return_value
+            # _find_job probes status across candidate queues before awaiting result.
+            instance.status = AsyncMock(return_value=JobStatus.complete)
             instance.result = AsyncMock(return_value={"memories": []})
             result = await tm.wait_for_result("task-x", timeout=5)
         assert result["status"] == "completed"
@@ -338,8 +341,10 @@ class TestWaitForResult:
 
     @pytest.mark.asyncio
     async def test_returns_failed_on_exception(self, tm):
+        from arq.jobs import JobStatus
         with patch("task_manager.Job") as MockJob:
             instance = MockJob.return_value
+            instance.status = AsyncMock(return_value=JobStatus.complete)
             instance.result = AsyncMock(side_effect=Exception("Worker crashed"))
             result = await tm.wait_for_result("task-y", timeout=5)
         assert result["status"] == "failed"

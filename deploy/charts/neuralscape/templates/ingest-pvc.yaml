@@ -1,0 +1,19 @@
+{{- if and .Values.ingestStorage.enabled .Values.ingestStorage.create (not .Values.ingestStorage.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: neuralscape-ingest
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: neuralscape-ingest
+    {{- include "neuralscape.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - {{ .Values.ingestStorage.accessMode }}
+  {{- if .Values.ingestStorage.storageClass }}
+  storageClassName: {{ .Values.ingestStorage.storageClass }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.ingestStorage.size }}
+{{- end }}
