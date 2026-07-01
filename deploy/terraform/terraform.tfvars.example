@@ -1,0 +1,21 @@
+# Copy to terraform.tfvars (gitignored) and fill in your environment. NONE of
+# these org-specific values are committed to this public repo.
+
+project_id   = "your-gcp-project"
+region       = "us-central1"
+cluster_name = "your-gke-cluster"
+
+# Public hostname (must be under a DNS zone external-dns manages on the cluster).
+neuralscape_domain = "neuralscape.example.com"
+
+# Image built + pushed to your Artifact Registry (see deploy/README.md "Build").
+image_repository = "REGION-docker.pkg.dev/PROJECT/REPO/neuralscape"
+image_tag        = "v1"
+
+# Optional: pin all pods to a specific node pool (labels are cluster-specific).
+# node_selector = { "some-pool-label" = "value" }
+
+# Optional overrides (defaults shown):
+# cluster_issuer     = "letsencrypt-prod"
+# secret_store_name  = "gcp-secret-manager"
+# cors_allow_origins = ["https://claude.ai", "https://claude.com"]

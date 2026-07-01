@@ -89,6 +89,28 @@ REDIS_URL          # Redis connection string
 QDRANT_URL         # Qdrant server URL (omit for local on-disk mode)
 ```
 
+## Public Repo — Deployment Secrecy (HARD RULE)
+
+**This is a public GitHub repo. NEVER commit organization- or deployment-specific
+details to it.** This applies to every deployment target, including the
+Optimizely and Digital Ambiance (DA) deployments.
+
+Forbidden in tracked files:
+- Company/org names tied to a deployment (e.g. `optimizely`, `optimizely.com`).
+- GCP project IDs, cluster names, state-bucket names, or other infra identifiers
+  (e.g. `iiis-492427`, `windmill-gke`, `svc-utility-belt`).
+- Internal project slugs / codenames (e.g. `lightpath`, `openclaw`).
+- Which external LLM gateway/endpoint or org we route inference through. (The
+  generic `LLM_GATEWAY_*` *feature flags* in `config.py` are fine — the
+  gateway's identity/URL is not.)
+
+Keep `deploy/` (Terraform + Helm + k8s) **generic and parameterized** with
+placeholder defaults (`project_id`, `neuralscape.example.com`, empty
+`nodeSelector`, partial TF backend). Real values are supplied only at deploy time
+inside the **private** org Git via `terraform.tfvars`, `backend.hcl`, and a
+private Helm values / kustomize overlay. Grep before pushing:
+`git grep -iE "optimizely|iiis-492427|windmill-gke|svc-utility-belt|lightpath"`.
+
 ## Git Workflow
 
 **NEVER commit directly to `dev` or `main`.** Always create a feature branch:

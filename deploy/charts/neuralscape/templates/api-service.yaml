@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: neuralscape-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: neuralscape-api
+    {{- include "neuralscape.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.api.service.type }}
+  selector:
+    app.kubernetes.io/name: neuralscape-api
+  ports:
+    - name: http
+      port: {{ .Values.api.service.port }}
+      targetPort: http
