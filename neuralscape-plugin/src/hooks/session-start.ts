@@ -33,10 +33,10 @@ function formatStandards(standards: NeuralscapeMemory[] | undefined): string {
       "user explicitly overrides them in this session.",
     "",
   ];
-  // Standards are BINDING and injected in full — exempt from the ordinary
-  // context budget. Never truncate: dropping a directive (or emitting a
-  // header-only block when the first rule is large) would silently weaken the
-  // contract. The set size is bounded by governance, not by this hook.
+  // `standards` here is the always-inject (critical) subset the server selects
+  // — BINDING and exempt from the ordinary context budget. Emit them all, never
+  // truncating (a header-only block would silently weaken the contract).
+  // Non-critical standards aren't dumped here; they surface via recall.
   for (const mem of standards) {
     lines.push(`- ${mem.memory}`);
   }

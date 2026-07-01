@@ -102,8 +102,16 @@ class TaskManager:
         duplicate enqueues of the same fact. v2 + multi-user fields are
         forwarded as a kwargs dict to the worker so the signature stays
         backward-compatible.
+
+        The job id includes visibility/scope/project_id so it stays at least as
+        granular as store_raw's content-hash dedup key. Otherwise a later write
+        of the SAME text at a different tier (e.g. a dictator promoting a private
+        note to a `standard`) would coalesce onto the earlier job's id and be
+        silently dropped by ARQ before ever reaching store_raw.
         """
-        job_id = _generate_job_id(f"raw:{content}", user_id)
+        job_id = _generate_job_id(
+            f"raw:{visibility}:{scope}:{project_id}:{content}", user_id
+        )
 
         v2_extras = {
             "domain": domain,
@@ -141,12 +149,16 @@ class TaskManager:
         """Enqueue a document-ingest task (chunk → passages + facts). Returns job_id.
 
         Deterministic job id from the content hash + connector instance so the
-        same document re-submitted by a re-sync coalesces onto one job.
+        same document re-submitted by a re-sync coalesces onto one job. Visibility
+        is part of the key so ingesting the same text at a different tier (e.g. a
+        dictator ingesting it as a `standard`) isn't coalesced onto an earlier
+        non-standard job and dropped.
         """
         content = doc.get("content", "")
         connector_id = (doc.get("source") or {}).get("connector_id", "")
+        visibility = doc.get("visibility")
         partition = doc.get("user_id") or "ingest"
-        job_id = _generate_job_id(f"ingest:{connector_id}:{content}", partition)
+        job_id = _generate_job_id(f"ingest:{visibility}:{connector_id}:{content}", partition)
 
         job = await self.pool.enqueue_job(
             "process_ingest_document",

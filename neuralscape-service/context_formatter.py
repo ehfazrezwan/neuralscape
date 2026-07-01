@@ -68,11 +68,13 @@ def format_standards_block(
         "personal preferences and project conventions. Follow them unless the "
         "user explicitly overrides them in this session."
     )
-    # Standards are BINDING and always injected in full — they are exempt from
-    # the ordinary context char budget (see format_context_for_injection). We do
-    # NOT truncate: dropping an authoritative directive (or, worse, emitting a
-    # header with no rules when the first one is large) would silently weaken the
-    # contract. The set size is bounded by governance, not by this formatter.
+    # The caller passes the always-inject (critical) subset of standards — see
+    # MemoryService._get_standards(critical_only=True). Those are BINDING and
+    # exempt from the ordinary context char budget, so we emit them ALL, never
+    # truncating: dropping an authoritative directive (or emitting a header with
+    # no rules when the first is large) would silently weaken the contract. The
+    # non-critical standards are not dumped here — they surface, relevance-ranked,
+    # via recall.
     lines: list[str] = [header, ""]
     for mem in standards:
         lines.append(f"- {mem.memory}")

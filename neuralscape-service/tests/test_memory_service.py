@@ -337,6 +337,25 @@ class TestContextStandards:
         ctx = service.get_global_context(user_id="alice")
         assert ctx.standards == []
 
+    def test_session_context_scrolls_only_critical_standards(self, service, monkeypatch):
+        # Hybrid: the always-on session-start block pulls ONLY critical-tagged
+        # standards; the rest surface via recall. Default is critical_only=True.
+        from config import settings
+        monkeypatch.setattr(settings, "standards_enabled", True)
+        service._memory.vector_store.client.scroll.return_value = ([], None)
+        service._get_standards(project_id=None)  # default critical_only=True
+        qf = service._memory.vector_store.client.scroll.call_args[1]["scroll_filter"]
+        keys = _all_field_keys(qf)
+        assert "metadata.tags" in keys, "critical-tag filter missing from session-start scroll"
+
+    def test_retrieve_all_standards_drops_critical_filter(self, service, monkeypatch):
+        from config import settings
+        monkeypatch.setattr(settings, "standards_enabled", True)
+        service._memory.vector_store.client.scroll.return_value = ([], None)
+        service._get_standards(project_id=None, critical_only=False)
+        qf = service._memory.vector_store.client.scroll.call_args[1]["scroll_filter"]
+        assert "metadata.tags" not in _all_field_keys(qf)
+
 
 class TestGetContext:
     def test_global_context_organizes_by_category(self, service):

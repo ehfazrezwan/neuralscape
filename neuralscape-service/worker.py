@@ -95,7 +95,19 @@ async def process_memory_raw(
     service: MemoryService = ctx["service"]
     v2_extras = v2_extras or {}
 
-    # Idempotency: check if identical content already exists for this user
+    # Resolve the requested effective visibility so the idempotency check below is
+    # visibility-aware. Without this, a dictator promoting existing private/shared
+    # text to a `standard` would match the old copy and be dropped before ever
+    # reaching store_raw (which is the tier-aware create path). Mirrors store_raw.
+    from schemas import default_visibility_for_category, normalize_visibility
+    _req_vis = v2_extras.get("visibility")
+    _eff_req_vis = (
+        normalize_visibility(_req_vis) if _req_vis
+        else default_visibility_for_category(category).value
+    )
+
+    # Idempotency: skip only when identical content already exists AT THE SAME
+    # visibility tier (a different-tier write is a distinct memory).
     try:
         existing = service.search(
             query=content,
@@ -104,7 +116,10 @@ async def process_memory_raw(
             limit=3,
         )
         for mem in existing:
-            if mem.memory.strip().lower() == content.strip().lower():
+            if (
+                mem.memory.strip().lower() == content.strip().lower()
+                and getattr(mem, "visibility", None) == _eff_req_vis
+            ):
                 logger.info(f"Skipping duplicate memory for user {user_id}: {content[:50]}...")
                 return {"memories": [mem.model_dump(exclude_none=True)], "deduplicated": True}
     except Exception as e:

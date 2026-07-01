@@ -103,6 +103,18 @@ class TestEnqueueRawV2:
         assert v2_extras["source_ref"] == src
 
     @pytest.mark.asyncio
+    async def test_job_id_differs_by_visibility(self, tm):
+        """Same text at different visibility tiers must get DISTINCT job ids, or
+        ARQ coalesces a standard-promotion onto the earlier private/shared job and
+        silently drops it before it reaches store_raw."""
+        tm.pool.enqueue_job.return_value = None
+        ids = {}
+        for vis in ("private", "standard"):
+            await tm.enqueue_raw(content="same text", user_id="d", category="convention", visibility=vis)
+            ids[vis] = tm.pool.enqueue_job.call_args[1]["_job_id"]
+        assert ids["private"] != ids["standard"]
+
+    @pytest.mark.asyncio
     async def test_connector_sync_job_id_matches_cron_scheme(self, tm):
         """enqueue_connector_sync uses the same sync-<id> job id as the cron (C2)."""
         tm.pool.enqueue_job.return_value = None

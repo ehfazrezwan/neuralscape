@@ -45,6 +45,11 @@ _JUNK_RE = re.compile("|".join(_JUNK_PATTERNS), re.IGNORECASE | re.MULTILINE)
 # All known project group IDs for multi-group episode cleanup
 ALL_KNOWN_PROJECTS = ["svc-utility-belt", "lightpath", "neuralscape", "openclaw"]
 
+# Tags that mark a `standard` as ALWAYS-INJECT (surfaced in the session-start
+# context regardless of relevance). Every other standard stays out of the
+# always-on block and instead surfaces on demand, relevance-ranked, via recall.
+_ALWAYS_INJECT_TAGS = ["critical", "always"]
+
 
 def _parse_expires_at(value) -> datetime | None:
     """Parse an `expires_at` payload value to an aware UTC datetime.
@@ -2435,24 +2440,35 @@ class MemoryService:
             return []
 
     def _get_standards(
-        self, project_id: str | None = None
+        self, project_id: str | None = None, critical_only: bool = True
     ) -> list[MemoryResponse]:
-        """Fetch ALL authoritative standard-tier memories (dictator-written).
+        """Fetch authoritative standard-tier memories (dictator-written).
 
         Standards are org-wide by definition — always stored at global scope
-        (see ``store_raw``) — so this returns the FULL global standard pool,
-        newest-first, regardless of ``project_id`` (kept for signature
-        symmetry). NOT filtered by caller: standards are readable by everyone.
-        Returned unpaginated (binding directives must all be injected; the scroll
-        applies only a high safety ceiling). Empty when the tier is disabled.
+        (see ``store_raw``) — so this returns the global standard pool,
+        newest-first, regardless of ``project_id`` (kept for signature symmetry).
+        NOT filtered by caller: standards are readable by everyone.
+
+        ``critical_only`` (default True) returns ONLY the always-inject subset —
+        standards tagged ``critical``/``always`` — so the always-on session-start
+        block stays small and doesn't dump the whole corpus into every session.
+        The rest of the standard pool still surfaces on demand, relevance-ranked,
+        through ``recall``/``search``. Pass ``critical_only=False`` to retrieve the
+        full set (admin/review). Empty when the tier is disabled.
         """
         if not settings.standards_enabled:
             return []
-        from qdrant_client.models import FieldCondition, MatchValue
+        from qdrant_client.models import FieldCondition, MatchAny, MatchValue
 
-        raw = self._scroll_standard(
-            [FieldCondition(key="metadata.scope", match=MatchValue(value="global"))],
-        )
+        must_extra = [FieldCondition(key="metadata.scope", match=MatchValue(value="global"))]
+        if critical_only:
+            must_extra.append(
+                FieldCondition(
+                    key="metadata.tags",
+                    match=MatchAny(any=list(_ALWAYS_INJECT_TAGS)),
+                )
+            )
+        raw = self._scroll_standard(must_extra)
         seen: set[str] = set()
         out: list[MemoryResponse] = []
         for hit in raw:
