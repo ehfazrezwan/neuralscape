@@ -36,6 +36,11 @@ spec:
         app.kubernetes.io/name: neo4j
         app.kubernetes.io/part-of: neuralscape
     spec:
+      # Neo4j treats every NEO4J_* env var as a config setting. Kubernetes'
+      # service-link injection creates NEO4J_PORT_7687_TCP_PORT etc. (the Service
+      # is named "neo4j"), which Neo4j rejects under strict validation. Disable
+      # service links so those are never injected.
+      enableServiceLinks: false
       securityContext:
         fsGroup: 7474
       containers:
@@ -47,13 +52,15 @@ spec:
           env:
             # Password from the ESO-synced Secret; NEO4J_AUTH is composed from it
             # via K8s dependent-env expansion ($(VAR) references an earlier env).
-            - name: NEO4J_PASSWORD_VALUE
+            # The intermediate var must NOT start with NEO4J_ — Neo4j would parse
+            # NEO4J_DB_PASSWORD as a config setting and fail strict validation.
+            - name: NS_DB_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: neuralscape-secrets
                   key: neo4j-password
             - name: NEO4J_AUTH
-              value: "neo4j/$(NEO4J_PASSWORD_VALUE)"
+              value: "neo4j/$(NS_DB_PASSWORD)"
             - name: NEO4J_initial_dbms_default__database
               value: "memory"
             # Heap + page cache tuned to fit the 2Gi limit (leave headroom for JVM
@@ -77,7 +84,7 @@ spec:
           readinessProbe:
             exec:
               command:
-                ["cypher-shell", "-u", "neo4j", "-p", "$(NEO4J_PASSWORD_VALUE)", "RETURN 1"]
+                ["cypher-shell", "-u", "neo4j", "-p", "$(NS_DB_PASSWORD)", "RETURN 1"]
             initialDelaySeconds: 20
             periodSeconds: 10
             timeoutSeconds: 5
