@@ -89,10 +89,13 @@ spec:
             exec:
               command:
                 ["sh", "-c", "cypher-shell -u neo4j -p \"$NS_DB_PASSWORD\" 'RETURN 1'"]
-            initialDelaySeconds: 20
-            periodSeconds: 10
-            timeoutSeconds: 5
-            failureThreshold: 12
+            # cypher-shell spins up a JVM inside the memory-tight container, which
+            # regularly takes >5s — a short timeout makes the probe flap and the
+            # pod never goes Ready even though Neo4j is up. Give it real headroom.
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 20
+            failureThreshold: 8
           livenessProbe:
             tcpSocket:
               port: 7687
