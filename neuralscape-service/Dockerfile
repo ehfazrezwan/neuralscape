@@ -75,7 +75,7 @@ WORKDIR /app/neuralscape-service
 
 # Run as non-root user
 RUN useradd -m -u 1000 appuser && \
-    mkdir -p /data/qdrant /data/vault && chown -R appuser:appuser /data /app
+    mkdir -p /data/qdrant /data/vault /data/ingest && chown -R appuser:appuser /data /app
 USER appuser
 
 EXPOSE 8199
@@ -137,7 +137,7 @@ WORKDIR /app/neuralscape-service
 # Same non-root user pattern as runtime, so file-permission behavior
 # during tests mirrors production.
 RUN useradd -m -u 1000 appuser && \
-    mkdir -p /data/qdrant /data/vault && chown -R appuser:appuser /data /app
+    mkdir -p /data/qdrant /data/vault /data/ingest && chown -R appuser:appuser /data /app
 USER appuser
 
 # Default to running the full suite minus the integration tests that
