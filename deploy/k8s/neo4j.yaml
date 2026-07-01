@@ -82,9 +82,13 @@ spec:
               memory: "2Gi"
               cpu: "1000m"
           readinessProbe:
+            # Wrapped in `sh -c` so $NS_DB_PASSWORD is expanded by the shell —
+            # Kubernetes only expands $(VAR) in a container's command/args, NOT in
+            # probe exec commands, so a bare $(NS_DB_PASSWORD) here would be passed
+            # literally and fail auth (locking the account via rate limiting).
             exec:
               command:
-                ["cypher-shell", "-u", "neo4j", "-p", "$(NS_DB_PASSWORD)", "RETURN 1"]
+                ["sh", "-c", "cypher-shell -u neo4j -p \"$NS_DB_PASSWORD\" 'RETURN 1'"]
             initialDelaySeconds: 20
             periodSeconds: 10
             timeoutSeconds: 5
