@@ -133,8 +133,9 @@ class TestProcessMemoryRaw:
 
     @pytest.mark.asyncio
     async def test_idempotency_returns_existing_on_match(self, ctx):
-        """If an identical-content memory already exists, skip storing and return it."""
-        existing = MemoryResponse(id="existing-1", memory="Prefers tabs", category="preference")
+        """If an identical-content memory at the SAME visibility exists, skip + return it."""
+        # preference defaults to private; the existing copy is private → same tier.
+        existing = MemoryResponse(id="existing-1", memory="Prefers tabs", category="preference", visibility="private")
         ctx["service"].search.return_value = [existing]
         result = await worker.process_memory_raw(
             ctx,
@@ -145,6 +146,28 @@ class TestProcessMemoryRaw:
         assert result.get("deduplicated") is True
         assert result["memories"][0]["id"] == "existing-1"
         ctx["service"].store_raw.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_idempotency_is_visibility_aware(self, ctx, monkeypatch):
+        """Promoting existing private/shared text to `standard` must NOT be treated
+        as a duplicate — the idempotency pre-check keys on visibility, so the
+        standard write proceeds to store_raw instead of being dropped."""
+        from config import settings
+        monkeypatch.setattr(settings, "standards_enabled", True)
+        monkeypatch.setattr(settings, "dictator_user_ids", "dictator-e2e")
+        existing_private = MemoryResponse(id="priv-1", memory="Ban force-push", category="convention", visibility="private")
+        ctx["service"].search.return_value = [existing_private]
+        ctx["service"].store_raw.return_value = ([MemoryResponse(id="std-1", memory="Ban force-push")], True)
+        result = await worker.process_memory_raw(
+            ctx,
+            content="Ban force-push",
+            user_id="dictator-e2e",
+            category="convention",
+            v2_extras={"visibility": "standard"},
+        )
+        assert "deduplicated" not in result           # not short-circuited
+        ctx["service"].store_raw.assert_called_once()  # proceeded to the tier-aware create
+        assert ctx["service"].store_raw.call_args[1]["visibility"] == "standard"
 
     @pytest.mark.asyncio
     async def test_idempotency_check_failure_proceeds_with_store(self, ctx):

@@ -54,6 +54,10 @@ The MCP `ingest_text` schema marks `user_id` required, but under token auth the 
 
 Don't ingest secrets. Skip files that are obviously credential stores (`.env`, key files, `*_rsa`) and redact API-key-shaped strings from pasted context. When content is sensitive, tell the user rather than silently ingesting it.
 
+## Ingesting standards (dictator-only)
+
+If the deployment has the authoritative **standard** tier enabled and the user is an authorized *dictator*, they can ingest org standards through this same pipeline by passing `visibility=standard` (a form field on `/v1/ingest/files`, or the `visibility` arg on `ingest_text`). The server rejects standard-tier ingests from non-dictators **up front** (403 / error), and standards are always stored global-scope. Standards surface **hybrid**: only those tagged **`critical`**/**`always`** are injected into every session's binding block (pass `tags:["critical"]` for non-negotiable rules); the rest surface relevance-ranked via recall. For a *single* directive, prefer `/neuralscape:remember` with `visibility=standard`; use this pipeline to bulk-ingest standards documents.
+
 ## Notes
 
 - Supported types: Markdown/`.txt`/`.rst` (read as-is), and PDF, MS Office (docx/xlsx/pptx), HTML (converted to Markdown server-side by Docling, with an in-process MarkItDown fallback). Per-file and archive size caps apply (default 25 MB/file, 200 files/request).

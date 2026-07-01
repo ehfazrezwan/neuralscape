@@ -64,6 +64,39 @@ Modules (`neuralscape-service/ingest/`):
 | `INGEST_MAX_FILES` | `200` | Max files per request (post zip-expansion). |
 | `INGEST_MAX_ARCHIVE_UNCOMPRESSED_MB` | `200` | Total unzipped-size cap. |
 
+## Ingesting authoritative standards
+
+When the `standard` tier is enabled (`STANDARDS_ENABLED=true`), a **dictator**
+(`DICTATOR_USER_IDS`) can bulk-ingest org standards through this same pipeline by
+passing `visibility=standard` (the `visibility` form field on `/v1/ingest/files`,
+or the arg on `ingest_text` / `ingest_document`). Enforcement:
+
+- **Authorship is gated at the API/MCP boundary** — a non-dictator (or a request
+  when the tier is disabled) is rejected **synchronously** (`403` / MCP error),
+  so no ingest jobs are enqueued only to fail later in the worker.
+- Standards are **always global-scope** (`store_raw` forces `scope=global`,
+  `project_id=None`) regardless of the scope field.
+- Verbatim **passages** stay in the standard pool for semantic `recall` but are
+  excluded from the always-on session block and from process bundles.
+
+### How standards surface (hybrid)
+
+To keep the always-on session-start context small as the standard set grows,
+standards surface in two ways:
+
+- **Always-injected (critical):** standards tagged **`critical`** or **`always`**
+  are injected into every session's binding-directive block regardless of
+  relevance. Tag the truly non-negotiable rules this way (or set `tags` when
+  ingesting a standards doc).
+- **On-demand (the rest):** every other standard surfaces **relevance-ranked**
+  through `recall`/`search` (which always searches the standard pool), not the
+  always-on block. Retrieve the full set explicitly for review via
+  `recall` with `visibility="standard"`.
+
+For a single directive prefer `remember` with `visibility=standard`
+(add `tags:["critical"]` to always-inject it); use this pipeline for standards
+**documents**.
+
 ## Deployment notes
 
 - Run the ingest worker: `uv run arq worker.IngestWorkerSettings` (compose:

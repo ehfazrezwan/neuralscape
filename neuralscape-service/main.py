@@ -44,6 +44,7 @@ from schemas import (
     IngestDocumentRequest,
     IngestTextRequest,
     MemoryResponse,
+    MemoryVisibility,
     RawMemoryBatchRequest,
     RawMemoryRequest,
     SearchMemoryRequest,
@@ -53,6 +54,7 @@ from schemas import (
     TaskAcceptedResponse,
     TaskStatusResponse,
     UpdateMemoryRequest,
+    normalize_visibility,
 )
 from task_manager import TaskManager
 
@@ -661,6 +663,25 @@ def _resolve_user_id(request: Request, body_user_id: str | None) -> str:
     return body_user_id or settings.default_user_id
 
 
+def _authorize_standard_write(user_id: str, visibility) -> None:
+    """Reject writes to the authoritative ``standard`` tier by non-dictators.
+
+    No-op unless the request targets ``visibility="standard"``. Called
+    synchronously before enqueue so the caller gets a 403 immediately instead
+    of a 202 followed by a silent worker failure. ``store_raw`` re-checks as a
+    backstop for the sync-fallback / worker paths.
+    """
+    if normalize_visibility(visibility) != MemoryVisibility.STANDARD.value:
+        return
+    if not settings.standards_enabled:
+        raise HTTPException(status_code=403, detail="The 'standard' visibility tier is disabled.")
+    if not settings.is_dictator(user_id):
+        raise HTTPException(
+            status_code=403,
+            detail=f"User {user_id!r} is not authorized to write 'standard'-tier memories.",
+        )
+
+
 # ── Remember ──────────────────────────────────
 
 
@@ -725,6 +746,8 @@ async def v1_store_raw_memory(req: RawMemoryRequest, request: Request):
 
     # Resolve identity from token (preferred) or body (legacy). Raises 400 on mismatch.
     resolved_user_id = _resolve_user_id(request, req.user_id)
+    # Authoritative-tier write-gate (synchronous 403 before enqueue).
+    _authorize_standard_write(resolved_user_id, req.visibility)
 
     # Build the kwargs once; passed through to both the queue path and the sync fallback.
     raw_kwargs = req.model_dump(exclude_none=True)
@@ -746,7 +769,10 @@ async def v1_store_raw_memory(req: RawMemoryRequest, request: Request):
                 )
             except ValueError:
                 sync_kwargs.pop("expires_at", None)
-        memories = await asyncio.to_thread(_service.store_raw, **sync_kwargs)
+        try:
+            memories = await asyncio.to_thread(_service.store_raw, **sync_kwargs)
+        except PermissionError as pe:
+            raise HTTPException(status_code=403, detail=str(pe)) from pe
         return JSONResponse(
             status_code=200,
             content=StoreMemoryResponse(memories=memories).model_dump(exclude_none=True),
@@ -775,6 +801,7 @@ async def v1_ingest_document(req: IngestDocumentRequest, request: Request):
         raise HTTPException(status_code=400, detail="project_id is required when scope='project'")
 
     resolved_user_id = _resolve_user_id(request, req.user_id)
+    _authorize_standard_write(resolved_user_id, req.visibility)
     doc = {
         "content": req.content,
         "source": req.source.model_dump(exclude_none=True),
@@ -838,6 +865,9 @@ async def v1_ingest_text(req: IngestTextRequest, request: Request):
         raise HTTPException(status_code=400, detail="project_id is required when scope='project'")
 
     resolved_user_id = _resolve_user_id(request, req.user_id)
+    # Reject non-dictator standard-tier ingests synchronously (else every
+    # produced job would fail later in the worker — a lost-job trap).
+    _authorize_standard_write(resolved_user_id, req.visibility)
 
     # Persist the pasted context as an artifact so its memories reference a real,
     # re-fetchable source (falls back to a hash-only ref when storage is off).
@@ -908,13 +938,18 @@ async def v1_ingest_files(
         raise HTTPException(status_code=400, detail="project_id is required when scope='project'")
     if category not in MEMORY_CATEGORIES:
         raise HTTPException(status_code=400, detail=f"Invalid category '{category}'")
-    if visibility is not None and visibility not in ("private", "shared"):
-        raise HTTPException(status_code=400, detail="visibility must be 'private' or 'shared'")
+    if visibility is not None and visibility not in ("private", "shared", "standard"):
+        raise HTTPException(status_code=400, detail="visibility must be 'private', 'shared', or 'standard'")
     parsed_tags = [t.strip() for t in tags.split(",") if t.strip()] if tags else None
     if parsed_tags and len(parsed_tags) > 20:
         raise HTTPException(status_code=400, detail="at most 20 tags are allowed")
 
     resolved_user_id = _resolve_user_id(request, user_id)
+    # Standard-tier ingestion (a dictator uploading org standards) is allowed, but
+    # only for authorized dictators — reject others synchronously so we don't
+    # enqueue a batch of jobs that each fail later in the worker. store_raw forces
+    # standards to global scope regardless of the scope form field.
+    _authorize_standard_write(resolved_user_id, visibility)
     max_file_bytes = settings.ingest_max_file_mb * 1024 * 1024
     max_request_bytes = settings.ingest_max_request_mb * 1024 * 1024
 
@@ -1167,6 +1202,13 @@ async def v1_store_raw_batch(req: RawMemoryBatchRequest, request: Request):
             d.setdefault("user_id", settings.default_user_id)
         items_payload.append(d)
 
+    # Authoritative-tier write-gate per item (synchronous 403 before enqueue).
+    for idx, d in enumerate(items_payload):
+        try:
+            _authorize_standard_write(d["user_id"], d.get("visibility"))
+        except HTTPException as he:
+            raise HTTPException(status_code=he.status_code, detail=f"Item {idx}: {he.detail}") from he
+
     try:
         task_id = await _task_manager.enqueue_raw_batch(items=items_payload)
     except (ConnectionError, OSError) as e:
@@ -1301,6 +1343,7 @@ async def v1_inject_context(
         formatted = format_context_for_injection(
             context.categories,
             max_chars=max_chars,
+            standards=context.standards,
         )
         return {"additionalContext": formatted}
     except HTTPException:
@@ -1362,6 +1405,45 @@ async def v1_list_projects(request: Request, user_id: str | None = Query(default
         raise HTTPException(status_code=500, detail="Failed to list projects")
 
 
+# ── Processes (dictator-authored authoritative playbooks) ─────────────
+
+
+@v1_router.get("/processes")
+async def v1_list_processes(
+    request: Request, project_id: str | None = Query(default=None)
+):
+    """List available dictator-authored processes ({slug, title}).
+
+    Empty unless PROCESSES_ENABLED. Powers the plugin's `process` picker.
+    """
+    _resolve_user_id(request, None)  # identity check (403/400 on bad token)
+    try:
+        processes = await asyncio.to_thread(_service.list_processes, project_id=project_id)
+        return {"processes": processes}
+    except Exception:
+        logger.exception("v1 list_processes failed")
+        raise HTTPException(status_code=500, detail="Failed to list processes")
+
+
+@v1_router.get("/processes/{slug}")
+async def v1_get_process(
+    slug: str, request: Request, project_id: str | None = Query(default=None)
+):
+    """Return a full process bundle by slug (definition + ordered steps).
+
+    404 when unknown or when PROCESSES_ENABLED is off.
+    """
+    _resolve_user_id(request, None)
+    try:
+        process = await asyncio.to_thread(_service.get_process, slug, project_id)
+    except Exception:
+        logger.exception("v1 get_process failed")
+        raise HTTPException(status_code=500, detail="Failed to load process")
+    if process is None:
+        raise HTTPException(status_code=404, detail=f"Process {slug!r} not found")
+    return process
+
+
 # ── Manage ────────────────────────────────────
 
 
@@ -1420,11 +1502,18 @@ async def v1_update_memory(memory_id: str, req: UpdateMemoryRequest):
 
 
 @v1_router.delete("/memories/{memory_id}")
-async def v1_delete_memory(memory_id: str):
-    """Delete a single memory by ID."""
+async def v1_delete_memory(memory_id: str, request: Request):
+    """Delete a single memory by ID.
+
+    Passes the caller identity so deletion of authoritative ``standard``-tier
+    memories can be restricted to dictators.
+    """
+    caller = _resolve_user_id(request, None)
     try:
-        return await asyncio.to_thread(_service.delete_memory, memory_id)
-    except Exception as e:
+        return await asyncio.to_thread(_service.delete_memory, memory_id, caller)
+    except PermissionError as pe:
+        raise HTTPException(status_code=403, detail=str(pe)) from pe
+    except Exception:
         logger.exception("v1 delete_memory failed")
         raise HTTPException(status_code=500, detail="Failed to delete memory")
 

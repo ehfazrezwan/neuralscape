@@ -21,6 +21,12 @@ class MemoryVisibility(str, Enum):
 
     - PRIVATE: only the writing user (`owner_user_id`) can read.
     - SHARED: any authenticated user in this Neuralscape instance can read.
+    - STANDARD: an *authoritative* pool readable by everyone but writable only
+      by a "dictator" (see `Settings.dictator_user_ids`). Standard memories are
+      organization rules/policies that always load at session start and take
+      precedence over personal preferences on conflict. Gated behind
+      `STANDARDS_ENABLED`; it is never a per-category default (explicit opt-in
+      only).
 
     Visibility is orthogonal to scope: a private memory can be `global`
     (cross-project for that user) or `project`-scoped; a shared memory can
@@ -40,6 +46,7 @@ class MemoryVisibility(str, Enum):
     """
     PRIVATE = "private"
     SHARED = "shared"
+    STANDARD = "standard"
 
     def __str__(self) -> str:
         return self.value
@@ -315,7 +322,7 @@ class StoreMemoryRequest(BaseModel):
     domain: str | None = Field(default=None, description="High-level life-context domain (memory-model v2)")
     visibility: MemoryVisibility | None = Field(
         default=None,
-        description="Multi-user model: who can read this memory. Defaults per-category.",
+        description="Multi-user model: who can read this memory. Defaults per-category. 'standard' is a dictator-only authoritative tier (requires STANDARDS_ENABLED).",
     )
 
     @field_validator("domain")
@@ -352,7 +359,7 @@ class RawMemoryRequest(BaseModel):
     run_id: str | None = Field(default=None, max_length=100)
     visibility: MemoryVisibility | None = Field(
         default=None,
-        description="Multi-user model: 'private' (owner only) or 'shared' (team-wide). Defaults per-category.",
+        description="Multi-user model: 'private' (owner only), 'shared' (team-wide), or 'standard' (dictator-only authoritative tier; requires STANDARDS_ENABLED). Defaults per-category.",
     )
 
     # Memory-model v2 (all optional)
@@ -554,7 +561,7 @@ class SearchMemoryRequest(BaseModel):
     # Multi-user pool selection
     visibility: MemoryVisibility | None = Field(
         default=None,
-        description="Restrict results to one pool: 'private' (yours only) or 'shared'. Default: both.",
+        description="Restrict results to one pool: 'private' (yours only), 'shared', or 'standard' (authoritative tier). Default: your private + shared (+ standard when enabled).",
     )
     include_shared: bool = Field(
         default=True,
@@ -701,6 +708,12 @@ class ContextResponse(BaseModel):
     user_id: str
     project_id: str | None = None
     categories: dict[str, list[MemoryResponse]] = Field(default_factory=dict)
+    # Authoritative org standards (visibility=standard). Always returned in
+    # full and never paginated/truncated — clients render these as binding
+    # directives that override personal preferences. Empty unless
+    # STANDARDS_ENABLED. Kept out of `categories` so a large standard set can't
+    # evict a caller's own recalled context.
+    standards: list[MemoryResponse] = Field(default_factory=list)
     # Pagination over the combined (global + project) memory set. The page is
     # sorted newest-first, so `offset`/`limit` page deterministically.
     total: int = 0
