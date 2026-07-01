@@ -202,6 +202,17 @@ from schemas import (
 
 logger = logging.getLogger(__name__)
 
+# Structured audit trail for authoritative-context serving (standards +
+# processes). Rendered as JSON in prod via logging_config; a plain stdlib
+# logger is used so this has no hard dependency on structlog being configured.
+import structlog  # noqa: E402
+
+_audit_log = structlog.get_logger("neuralscape.audit")
+
+# Process slugs are constrained to a tag-safe charset so Qdrant tag filters
+# match exactly and slugs round-trip cleanly through `process:<slug>` tags.
+_SLUG_RE = re.compile(r"^[a-z0-9_-]+$")
+
 
 def _build_group_id(
     visibility: str,
@@ -231,6 +242,11 @@ def _build_group_id(
         vis = normalize_visibility(visibility) or MemoryVisibility.PRIVATE.value
     except (ValueError, TypeError):
         vis = MemoryVisibility.PRIVATE.value
+    if vis == MemoryVisibility.STANDARD.value:
+        # Authoritative org-wide pool: dictator-written, everyone-readable.
+        if project_id:
+            return f"standard--project--{project_id}"
+        return "standard"
     if vis == MemoryVisibility.SHARED.value:
         if project_id:
             return f"shared--project--{project_id}"
@@ -248,15 +264,25 @@ def _get_group_ids(caller_user_id: str, project_id: str | None = None) -> list[s
     project-scoped equivalents when `project_id` is given. A read
     against this set returns the union of the caller's private memories
     and all shared memories (no cross-user private leakage).
+
+    When the `standard` tier is enabled, the authoritative pool is appended
+    for EVERY caller (including anonymous/legacy-key readers) so binding org
+    standards are always visible.
     """
+    def _standard_groups() -> list[str]:
+        if not settings.standards_enabled:
+            return []
+        return ["standard"] + ([f"standard--project--{project_id}"] if project_id else [])
+
     if not caller_user_id:
-        # Anonymous / unauthenticated readers see only the shared pool.
-        return ["shared"] + ([f"shared--project--{project_id}"] if project_id else [])
+        # Anonymous / unauthenticated readers see the shared + standard pools.
+        anon = ["shared"] + ([f"shared--project--{project_id}"] if project_id else [])
+        return anon + _standard_groups()
     group_ids = [f"user--{caller_user_id}", "shared"]
     if project_id:
         group_ids.append(f"user--{caller_user_id}--project--{project_id}")
         group_ids.append(f"shared--project--{project_id}")
-    return group_ids
+    return group_ids + _standard_groups()
 
 
 class MemoryService:
@@ -692,9 +718,6 @@ class MemoryService:
         if category not in MEMORY_CATEGORIES:
             raise ValueError(f"Invalid category: {category}. Must be one of: {list(MEMORY_CATEGORIES.keys())}")
 
-        if scope == "project" and not project_id:
-            raise ValueError("project_id is required when scope='project'")
-
         # Resolve visibility: explicit caller value > per-category default.
         # ``normalize_visibility`` handles MemoryVisibility enum, plain
         # str, and the legacy "MemoryVisibility.X" stringified-enum
@@ -702,11 +725,34 @@ class MemoryService:
         # regression). Without normalization, "MemoryVisibility.SHARED"
         # used to land in Qdrant metadata and break both the GET API
         # shape and the conversation_compiler event handler.
+        # Resolved BEFORE the scope check because standards force scope below.
         effective_visibility = (
             normalize_visibility(visibility)
             if visibility is not None
             else default_visibility_for_category(category).value
         )
+
+        # ── Authoritative "standard" tier: gate + force global scope ──
+        # The REST route / MCP tool gate this earlier and synchronously, but
+        # this covers every store path (worker, batch, sync-fallback) so a
+        # standard memory can only ever be written by an authorized dictator.
+        # Standards are org-wide by definition → always global scope, no
+        # project_id (so a project-category standard like a global `convention`
+        # doesn't inherit scope="project" and fail the project check below).
+        if effective_visibility == MemoryVisibility.STANDARD.value:
+            if not settings.standards_enabled:
+                raise PermissionError(
+                    "The 'standard' visibility tier is disabled (set STANDARDS_ENABLED=true)."
+                )
+            if not settings.is_dictator(user_id):
+                raise PermissionError(
+                    f"User {user_id!r} is not authorized to write 'standard'-tier memories."
+                )
+            scope = "global"
+            project_id = None
+
+        if scope == "project" and not project_id:
+            raise ValueError("project_id is required when scope='project'")
 
         m = self._get_memory()
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -890,14 +936,17 @@ class MemoryService:
         concepts: list[str] | None,
         limit: int,
         query_embedding: list[float] | None = None,
+        visibility_value: str = MemoryVisibility.SHARED.value,
     ) -> list[MemoryResponse]:
-        """Search Qdrant for shared-pool memories (any writer).
+        """Search Qdrant for cross-writer memories of a given visibility.
 
         Used by ``search()`` to deliver team-wide knowledge to all
         authenticated callers. Bypasses mem0's wrapper because that
-        wrapper enforces user_id namespacing — for the shared pool we
+        wrapper enforces user_id namespacing — for the shared/standard pools we
         explicitly want hits across writers, scoped by
-        ``metadata.visibility=shared`` plus any other supplied filters.
+        ``metadata.visibility=<visibility_value>`` plus any other supplied
+        filters. ``visibility_value`` selects the pool: ``"shared"`` (default,
+        team-wide) or ``"standard"`` (authoritative dictator-written).
 
         ``query_embedding`` lets the caller pass a precomputed query vector so a
         single ``search()`` doesn't re-embed the same query for every pool/scope
@@ -921,7 +970,7 @@ class MemoryService:
         must: list = [
             FieldCondition(
                 key="metadata.visibility",
-                match=MatchValue(value=MemoryVisibility.SHARED.value),
+                match=MatchValue(value=visibility_value),
             )
         ]
         if categories:
@@ -960,6 +1009,39 @@ class MemoryService:
             }
             out.append(self._mem_to_response(mem_dict))
         return out
+
+    def _search_standard_pool(
+        self,
+        m,
+        query: str,
+        project_id: str | None,
+        categories: list[str] | None,
+        scope: str | None,
+        domain: str | None,
+        observation_type: str | None,
+        concepts: list[str] | None,
+        limit: int,
+        query_embedding: list[float] | None = None,
+    ) -> list[MemoryResponse]:
+        """Search the authoritative ``standard``-tier pool (dictator-written).
+
+        Thin wrapper over ``_search_shared_pool`` that scopes to
+        ``metadata.visibility=standard``. Returned to every caller so binding
+        org standards surface in recall regardless of ``include_shared``.
+        """
+        return self._search_shared_pool(
+            m=m,
+            query=query,
+            project_id=project_id,
+            categories=categories,
+            scope=scope,
+            domain=domain,
+            observation_type=observation_type,
+            concepts=concepts,
+            limit=limit,
+            query_embedding=query_embedding,
+            visibility_value=MemoryVisibility.STANDARD.value,
+        )
 
     def _search_personal_pool(
         self,
@@ -1496,7 +1578,42 @@ class MemoryService:
             except Exception as e:
                 logger.warning(f"Shared-pool search failed (non-critical): {e}")
 
-        # Dedup across the two pools (caller's own shared writes match both).
+        # ── Standard pool: authoritative dictator-written memories ──────
+        # Always included when the tier is enabled (independent of
+        # include_shared), because org standards are binding and must surface
+        # in recall for everyone. Suppressed only when the caller explicitly
+        # narrowed to a different single pool (visibility=private/shared).
+        want_standard = settings.standards_enabled and visibility in (
+            None,
+            MemoryVisibility.STANDARD.value,
+        )
+        if want_standard:
+            try:
+                std_scope = None if (project_id and not scope) else scope
+                std_calls = (
+                    [(project_id, None), (None, "global")]
+                    if project_id and not scope
+                    else [(project_id, std_scope)]
+                )
+                for _pid, _scope in std_calls:
+                    vector_responses.extend(
+                        self._search_standard_pool(
+                            m=m,
+                            query=query,
+                            project_id=_pid,
+                            categories=categories,
+                            scope=_scope,
+                            domain=domain,
+                            observation_type=observation_type,
+                            concepts=concepts,
+                            limit=limit,
+                            query_embedding=query_embedding,
+                        )
+                    )
+            except Exception as e:
+                logger.warning(f"Standard-pool search failed (non-critical): {e}")
+
+        # Dedup across the pools (caller's own shared writes match both).
         seen_ids: set[str] = set()
         deduped: list[MemoryResponse] = []
         for r in vector_responses:
@@ -1745,21 +1862,31 @@ class MemoryService:
         unenriched row from the shared pool could slip into a
         private-only response.
         """
+        def _standard_groups() -> list[str]:
+            if not settings.standards_enabled:
+                return []
+            return ["standard"] + ([f"standard--project--{project_id}"] if project_id else [])
+
         if visibility == MemoryVisibility.PRIVATE.value:
             group_ids = [f"user--{user_id}"]
             if project_id:
                 group_ids.append(f"user--{user_id}--project--{project_id}")
+        elif visibility == MemoryVisibility.STANDARD.value:
+            group_ids = _standard_groups()
         elif visibility == MemoryVisibility.SHARED.value:
             group_ids = ["shared"]
             if project_id:
                 group_ids.append(f"shared--project--{project_id}")
         elif not include_shared:
             # No explicit visibility, but caller opted out of shared pool.
+            # Standards remain in-scope — they are binding and independent of
+            # the shared opt-out.
             group_ids = [f"user--{user_id}"]
             if project_id:
                 group_ids.append(f"user--{user_id}--project--{project_id}")
+            group_ids += _standard_groups()
         else:
-            # Default: full read-set (caller's private + shared pool).
+            # Default: full read-set (caller's private + shared + standard).
             group_ids = _get_group_ids(user_id, project_id)
 
         return self._do_graph_search(query=query, group_ids=group_ids, limit=limit)
@@ -2030,10 +2157,20 @@ class MemoryService:
         for cat, response in page:
             categories.setdefault(cat, []).append(response)
 
+        standards = self._get_standards(project_id=project_id)
+        if standards:
+            _audit_log.info(
+                "standards_served",
+                user_id=user_id,
+                project_id=project_id,
+                count=len(standards),
+            )
+
         return ContextResponse(
             user_id=user_id,
             project_id=project_id,
             categories=categories,
+            standards=standards,
             total=total,
             returned=len(page),
             offset=offset,
@@ -2067,12 +2204,19 @@ class MemoryService:
                 categories[cat] = []
             categories[cat].append(response)
 
+        standards = self._get_standards(project_id=None)
+        if standards:
+            _audit_log.info(
+                "standards_served", user_id=user_id, project_id=None, count=len(standards)
+            )
+
         # Global context isn't paged — report the full set so the pagination
         # metadata isn't misleading (total=0 with non-empty categories).
         count = len(memories)
         return ContextResponse(
             user_id=user_id,
             categories=categories,
+            standards=standards,
             total=count,
             returned=count,
             offset=0,
@@ -2198,6 +2342,194 @@ class MemoryService:
                 projects.add(pid)
         return sorted(projects)
 
+    # ──────────────────────────────────────────────
+    # Authoritative standards + processes (dictator tier)
+    # ──────────────────────────────────────────────
+
+    def _scroll_standard(self, must_extra: list, limit: int = 500) -> list:
+        """Scroll Qdrant for standard-tier points matching extra conditions.
+
+        Returns raw Qdrant points (visibility=standard AND all `must_extra`).
+        Empty on any error so callers degrade gracefully.
+        """
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+        m = self._get_memory()
+        client = m.vector_store.client
+        must = [
+            FieldCondition(
+                key="metadata.visibility",
+                match=MatchValue(value=MemoryVisibility.STANDARD.value),
+            )
+        ] + must_extra
+        try:
+            points, _ = client.scroll(
+                collection_name=settings.qdrant_collection,
+                scroll_filter=Filter(must=must),
+                limit=limit,
+                with_payload=True,
+            )
+            return points or []
+        except Exception as e:
+            logger.warning(f"Standard-tier scroll failed (non-critical): {e}")
+            return []
+
+    def _get_standards(
+        self, project_id: str | None = None, limit: int = 200
+    ) -> list[MemoryResponse]:
+        """Fetch authoritative standard-tier memories (dictator-written).
+
+        Standards are org-wide by definition — always stored at global scope
+        (see ``store_raw``) — so this returns the global standard pool,
+        newest-first, regardless of ``project_id`` (kept for signature
+        symmetry). NOT filtered by caller: standards are readable by everyone.
+        Empty when the tier is disabled.
+        """
+        if not settings.standards_enabled:
+            return []
+        from qdrant_client.models import FieldCondition, MatchValue
+
+        raw = self._scroll_standard(
+            [FieldCondition(key="metadata.scope", match=MatchValue(value="global"))],
+            limit=limit,
+        )
+        seen: set[str] = set()
+        out: list[MemoryResponse] = []
+        for hit in raw:
+            hid = str(getattr(hit, "id", ""))
+            if not hid or hid in seen:
+                continue
+            seen.add(hid)
+            payload = getattr(hit, "payload", None) or {}
+            out.append(
+                self._mem_to_response(
+                    {
+                        "id": hid,
+                        "memory": payload.get("data", ""),
+                        "metadata": payload.get("metadata", {}),
+                        "score": None,
+                        "created_at": payload.get("created_at"),
+                    }
+                )
+            )
+        out.sort(key=lambda r: str(getattr(r, "created_at", "") or ""), reverse=True)
+        return out[:limit]
+
+    @staticmethod
+    def _tags_of(response: MemoryResponse) -> list[str]:
+        return list(getattr(response, "tags", None) or [])
+
+    @staticmethod
+    def _slug_from_tags(tags: list[str]) -> str | None:
+        for t in tags:
+            if t.startswith("process:"):
+                slug = t.split(":", 1)[1].strip()
+                if slug:
+                    return slug
+        return None
+
+    @staticmethod
+    def _title_and_summary(content: str) -> tuple[str, str]:
+        """First content line = title; the remainder (trimmed) = a short summary.
+
+        The summary powers natural-language matching in the `/process` picker —
+        an agent maps a user's free-text request to the right process by title +
+        summary without needing the full bundle.
+        """
+        lines = [ln.strip() for ln in (content or "").strip().splitlines() if ln.strip()]
+        if not lines:
+            return "", ""
+        title = lines[0][:200]
+        summary = " ".join(lines[1:])[:400]
+        return title, summary
+
+    def list_processes(self, project_id: str | None = None) -> list[dict]:
+        """Enumerate available dictator-authored processes for the picker.
+
+        A process is a set of standard-tier memories sharing a
+        ``process:<slug>`` tag; its definition memory also carries the
+        ``process-def`` tag (title = first content line, the rest = summary).
+        Returns ``[{"slug","title","description"}]`` sorted by slug so the
+        `/process` skill can match a user's free-text request to a process.
+        Empty when processes are disabled. Mirrors ``list_projects``.
+        """
+        if not settings.processes_enabled:
+            return []
+        from qdrant_client.models import FieldCondition, MatchValue
+
+        # Standards are org-wide (global); project_id is accepted for API
+        # symmetry but doesn't scope the process registry.
+        must_extra = [FieldCondition(key="metadata.tags", match=MatchValue(value="process-def"))]
+        raw = self._scroll_standard(must_extra)
+        out: dict[str, dict] = {}
+        for hit in raw:
+            payload = getattr(hit, "payload", None) or {}
+            meta = payload.get("metadata", {}) or {}
+            slug = self._slug_from_tags(list(meta.get("tags") or []))
+            if not slug:
+                continue
+            title, summary = self._title_and_summary(payload.get("data", "") or "")
+            out.setdefault(slug, {"slug": slug, "title": title or slug, "description": summary})
+        return [out[s] for s in sorted(out)]
+
+    def get_process(self, slug: str, project_id: str | None = None) -> dict | None:
+        """Return a full process bundle by slug, or None if unknown/disabled.
+
+        Pulls EVERY standard-tier memory tagged ``process:<slug>`` and splits it:
+          - ``definition``  — the ``process-def`` memory (title + overview),
+          - ``steps``       — ``process-step:<NN>`` memories, ordered by index,
+          - ``guidelines``  — all OTHER standards tagged for the process (rules,
+            gates, tone/format constraints ingested for it).
+        This is how a process "pulls in its standards" so the `/process` skill
+        can inject them as an authoritative playbook. Emits a ``process_served``
+        audit event.
+        """
+        if not settings.processes_enabled:
+            return None
+        slug = (slug or "").strip()
+        if not slug or not _SLUG_RE.match(slug):
+            return None
+        from qdrant_client.models import FieldCondition, MatchValue
+
+        must_extra = [FieldCondition(key="metadata.tags", match=MatchValue(value=f"process:{slug}"))]
+        raw = self._scroll_standard(must_extra)
+        definition = ""
+        title = slug
+        steps: list[tuple[str, str]] = []  # (step-tag, content)
+        guidelines: list[str] = []
+        for hit in raw:
+            payload = getattr(hit, "payload", None) or {}
+            content = payload.get("data", "") or ""
+            tags = list((payload.get("metadata", {}) or {}).get("tags") or [])
+            if "process-def" in tags:
+                definition = content
+                t, _ = self._title_and_summary(content)
+                title = t or slug
+            else:
+                step_tag = next((t for t in tags if t.startswith("process-step:")), None)
+                if step_tag:
+                    steps.append((step_tag, content))
+                elif content.strip():
+                    # Any other standard tagged for this process is a guideline.
+                    guidelines.append(content)
+        if not definition and not steps and not guidelines:
+            return None
+        steps.sort(key=lambda st: st[0])
+        _audit_log.info(
+            "process_served",
+            slug=slug,
+            project_id=project_id,
+            steps=len(steps),
+            guidelines=len(guidelines),
+        )
+        return {
+            "slug": slug,
+            "title": title,
+            "definition": definition,
+            "steps": [c for _, c in steps],
+            "guidelines": guidelines,
+        }
+
     def update_memory(
         self,
         memory_id: str,
@@ -2242,12 +2574,30 @@ class MemoryService:
 
         return {"message": "Memory updated successfully"}
 
-    def delete_memory(self, memory_id: str) -> dict:
-        """Delete a single memory by ID from both vector store and graph."""
+    def delete_memory(self, memory_id: str, caller_user_id: str | None = None) -> dict:
+        """Delete a single memory by ID from both vector store and graph.
+
+        ``caller_user_id`` gates deletion of authoritative ``standard``-tier
+        memories to dictators. This is the only delete path with no user
+        namespacing (bulk deletes are already scoped by ``user_id``), so
+        without this check any caller could remove a binding standard by ID.
+        """
         m = self._get_memory()
 
         # First, get the memory content to find related graph edges
         mem = m.get(memory_id)
+
+        # Standard-tier delete protection: only a dictator may remove standards.
+        if mem is not None:
+            try:
+                vis = getattr(self._mem_to_response(mem), "visibility", None)
+            except Exception:
+                vis = None
+            if vis == MemoryVisibility.STANDARD.value and not settings.is_dictator(caller_user_id):
+                raise PermissionError(
+                    "Only a dictator may delete 'standard'-tier memories."
+                )
+
         result = m.delete(memory_id)
 
         # Expire related graph edges (soft-delete, non-critical)
@@ -2318,6 +2668,9 @@ class MemoryService:
                 if not include_shared and meta.get("visibility") == MemoryVisibility.SHARED.value:
                     skipped_shared += 1
                     continue
+                if meta.get("visibility") == MemoryVisibility.STANDARD.value and not settings.is_dictator(user_id):
+                    skipped_shared += 1
+                    continue
                 mid = mem_info["id"]
                 try:
                     m.vector_store.delete(mid)
@@ -2345,6 +2698,9 @@ class MemoryService:
         skipped_shared = 0
         for mem in memories:
             if not include_shared and getattr(mem, "visibility", None) == MemoryVisibility.SHARED.value:
+                skipped_shared += 1
+                continue
+            if getattr(mem, "visibility", None) == MemoryVisibility.STANDARD.value and not settings.is_dictator(user_id):
                 skipped_shared += 1
                 continue
             try:
@@ -3043,13 +3399,23 @@ class MemoryService:
         memories = self._scroll_all_user_memories(user_id, batch_size=batch_size)
         deleted_ids: set[str] = set()
 
+        def _pvis(payload: dict) -> str | None:
+            """Visibility of a raw Qdrant payload (handles mem0 double-wrap)."""
+            meta = payload.get("metadata", {}) or {}
+            if isinstance(meta.get("metadata"), dict):
+                meta = meta["metadata"]
+            return meta.get("visibility")
+
         # ── Phase 1: Exact dedup by hash ──
+        # Key on (hash, visibility) so a `standard` memory is never collapsed
+        # into an identically-worded `shared`/`private` one (different tiers are
+        # semantically distinct — a standard is binding, a shared note is not).
         exact_removed = 0
-        hash_groups: dict[str, list[dict]] = {}
+        hash_groups: dict[tuple, list[dict]] = {}
         for mem in memories:
             h = mem["payload"].get("hash")
             if h:
-                hash_groups.setdefault(h, []).append(mem)
+                hash_groups.setdefault((h, _pvis(mem["payload"])), []).append(mem)
 
         for h, group in hash_groups.items():
             if len(group) < 2:
@@ -3108,6 +3474,10 @@ class MemoryService:
                 if hit_id == mid or hit_id in deleted_ids:
                     continue
                 if hit_score < threshold:
+                    continue
+                # Never dedup across visibility tiers — a standard must not be
+                # merged into a shared/private near-duplicate (or vice-versa).
+                if _pvis(hit_payload) != _pvis(mem["payload"]):
                     continue
 
                 # Delete the older one
