@@ -60,3 +60,25 @@ variable "image_repository" {
   description = "Artifact Registry image for the API/worker (one image, multiple entrypoints), e.g. REGION-docker.pkg.dev/PROJECT/REPO/neuralscape."
   type        = string
 }
+
+# ── Generic passthroughs for a private overlay ──────────────────────
+# Let a private deployment inject extra config/secrets without this public
+# repo naming them (e.g. an LLM gateway). All default to empty.
+
+variable "extra_env" {
+  description = "Extra literal env vars for all workloads: list of { name, value }."
+  type        = list(object({ name = string, value = string }))
+  default     = []
+}
+
+variable "extra_env_secrets" {
+  description = "Extra env-from-secret for all workloads: list of { name, secretKey } (secretKey is a key in the neuralscape-secrets Secret)."
+  type        = list(object({ name = string, secretKey = string }))
+  default     = []
+}
+
+variable "extra_secret_ids" {
+  description = "Additional GCP Secret Manager secret ids to create (containers only), beyond the base set."
+  type        = list(string)
+  default     = []
+}

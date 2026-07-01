@@ -19,7 +19,9 @@ resource "helm_release" "neuralscape" {
         # defaults; wired here from the TF-created GSA at deploy time).
         gcpServiceAccountEmail = google_service_account.neuralscape.email
       }
-      nodeSelector = var.node_selector
+      nodeSelector    = var.node_selector
+      extraEnv        = var.extra_env
+      extraEnvSecrets = var.extra_env_secrets
       config = {
         NEURALSCAPE_PUBLIC_URL = "https://${var.neuralscape_domain}"
       }

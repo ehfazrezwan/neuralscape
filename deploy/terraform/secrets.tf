@@ -16,7 +16,7 @@ locals {
 }
 
 resource "google_secret_manager_secret" "neuralscape" {
-  for_each  = toset(local.neuralscape_secret_ids)
+  for_each  = toset(concat(local.neuralscape_secret_ids, var.extra_secret_ids))
   secret_id = each.value
   project   = var.project_id
 
