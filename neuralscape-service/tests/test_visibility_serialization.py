@@ -56,6 +56,42 @@ class TestMemoryVisibilityStringification:
         assert isinstance(MemoryVisibility.SHARED, str)
         assert isinstance(MemoryVisibility.PRIVATE, str)
 
+    def test_str_of_standard_returns_value_not_repr(self):
+        assert str(MemoryVisibility.STANDARD) == "standard"
+        assert MemoryVisibility.STANDARD == "standard"
+
+
+class TestStandardGroupIds:
+    """The authoritative `standard` tier gets its own Graphiti namespace."""
+
+    def test_build_group_id_standard_global(self):
+        from memory_service import _build_group_id
+
+        assert _build_group_id("standard", "mark", None) == "standard"
+
+    def test_build_group_id_standard_project(self):
+        from memory_service import _build_group_id
+
+        assert _build_group_id("standard", "mark", "svc") == "standard--project--svc"
+
+    def test_get_group_ids_includes_standard_when_enabled(self, monkeypatch):
+        from config import settings
+        from memory_service import _get_group_ids
+
+        monkeypatch.setattr(settings, "standards_enabled", True)
+        # Every caller — including anonymous — reads the standard pool.
+        assert "standard" in _get_group_ids("alice", None)
+        assert "standard" in _get_group_ids("", None)
+        assert "standard--project--svc" in _get_group_ids("alice", "svc")
+
+    def test_get_group_ids_omits_standard_when_disabled(self, monkeypatch):
+        from config import settings
+        from memory_service import _get_group_ids
+
+        monkeypatch.setattr(settings, "standards_enabled", False)
+        assert "standard" not in _get_group_ids("alice", None)
+        assert "standard--project--svc" not in _get_group_ids("alice", "svc")
+
 
 # ──────────────────────────────────────────────
 # normalize_visibility helper
@@ -73,6 +109,9 @@ class TestNormalizeVisibility:
     def test_canonical_string_passes_through(self):
         assert normalize_visibility("shared") == "shared"
         assert normalize_visibility("private") == "private"
+        assert normalize_visibility("standard") == "standard"
+        assert normalize_visibility(MemoryVisibility.STANDARD) == "standard"
+        assert normalize_visibility("MemoryVisibility.STANDARD") == "standard"
 
     def test_uppercase_string_is_lowercased(self):
         assert normalize_visibility("SHARED") == "shared"

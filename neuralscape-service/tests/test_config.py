@@ -158,3 +158,25 @@ class TestProviderToggle:
         off = _settings(llm_gateway_enabled=False).get_mem0_config()
         assert off["vector_store"]["config"]["embedding_model_dims"] == 768
         assert off["embedder"]["config"]["embedding_dims"] == 768
+
+
+class TestDictatorRole:
+    def test_flags_default_off(self):
+        cfg = _settings()
+        assert cfg.standards_enabled is False
+        assert cfg.processes_enabled is False
+        assert cfg.dictator_user_ids == ""
+        assert cfg.dictator_user_ids_set() == set()
+        assert cfg.is_dictator("mark") is False
+
+    def test_dictator_csv_parsed(self):
+        cfg = _settings(dictator_user_ids=" mark , alice ,")
+        assert cfg.dictator_user_ids_set() == {"mark", "alice"}
+        assert cfg.is_dictator("mark") is True
+        assert cfg.is_dictator("alice") is True
+        assert cfg.is_dictator("bob") is False
+
+    def test_is_dictator_none_or_empty(self):
+        cfg = _settings(dictator_user_ids="mark")
+        assert cfg.is_dictator(None) is False
+        assert cfg.is_dictator("") is False

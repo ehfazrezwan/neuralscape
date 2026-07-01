@@ -45,9 +45,9 @@ def mock_task_manager():
 
 class TestListTools:
     @pytest.mark.asyncio
-    async def test_returns_10_tools(self):
+    async def test_returns_12_tools(self):
         tools = await mcp_server.list_tools()
-        assert len(tools) == 10
+        assert len(tools) == 12
 
     @pytest.mark.asyncio
     async def test_tool_names(self):
@@ -63,6 +63,8 @@ class TestListTools:
             "search_knowledge_graph",
             "list_memories",
             "list_projects",
+            "list_processes",
+            "get_process",
             "delete_memories",
         }
         assert names == expected
@@ -73,6 +75,16 @@ class TestListTools:
         for tool in tools:
             assert tool.inputSchema is not None
             assert "properties" in tool.inputSchema
+
+    @pytest.mark.asyncio
+    async def test_visibility_enums_include_standard(self):
+        # Regression: the MCP SDK validates arguments against these enums BEFORE
+        # the handler runs, so a stale ['private','shared'] enum silently blocks
+        # writing/filtering the 'standard' tier even for a dictator.
+        tools = {t.name: t for t in await mcp_server.list_tools()}
+        for name in ("remember", "recall_memories", "ingest_document"):
+            enum = tools[name].inputSchema["properties"]["visibility"]["enum"]
+            assert "standard" in enum, f"{name} visibility enum missing 'standard': {enum}"
 
 
 # ──────────────────────────────────────────────
@@ -361,7 +373,8 @@ class TestDeleteMemoriesTool:
         })
         data = json.loads(result[0].text)
         assert "deleted" in data["message"].lower()
-        mock_mcp_service.delete_memory.assert_called_once_with("m1")
+        # Caller identity is now passed so standard-tier deletes can be gated.
+        mock_mcp_service.delete_memory.assert_called_once_with("m1", "ehfaz")
 
     @pytest.mark.asyncio
     async def test_bulk_delete(self, mock_mcp_service):
@@ -373,6 +386,79 @@ class TestDeleteMemoriesTool:
         })
         data = json.loads(result[0].text)
         assert "deleted" in data["message"].lower()
+
+
+class TestStandardWriteGate:
+    """The `remember` tool must reject non-dictator writes to the standard tier
+    BEFORE enqueue, returning an actionable error rather than a lost job."""
+
+    @pytest.mark.asyncio
+    async def test_disabled_tier_rejected(self, mock_mcp_service, mock_task_manager, monkeypatch):
+        monkeypatch.setattr(settings, "standards_enabled", False)
+        result = await mcp_server.call_tool("remember", {
+            "content": "All decks use the Opti template.",
+            "category": "convention",
+            "user_id": "mark",
+            "visibility": "standard",
+        })
+        data = json.loads(result[0].text)
+        assert "error" in data
+        mock_task_manager.enqueue_raw.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_dictator_rejected(self, mock_mcp_service, mock_task_manager, monkeypatch):
+        monkeypatch.setattr(settings, "standards_enabled", True)
+        monkeypatch.setattr(settings, "dictator_user_ids", "mark")
+        result = await mcp_server.call_tool("remember", {
+            "content": "All decks use the Opti template.",
+            "category": "convention",
+            "user_id": "alice",
+            "visibility": "standard",
+        })
+        data = json.loads(result[0].text)
+        assert "error" in data and "not authorized" in data["error"]
+        mock_task_manager.enqueue_raw.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_dictator_allowed(self, mock_mcp_service, mock_task_manager, monkeypatch):
+        monkeypatch.setattr(settings, "standards_enabled", True)
+        monkeypatch.setattr(settings, "dictator_user_ids", "mark")
+        result = await mcp_server.call_tool("remember", {
+            "content": "All decks use the Opti template.",
+            "category": "convention",
+            "user_id": "mark",
+            "visibility": "standard",
+        })
+        data = json.loads(result[0].text)
+        assert data.get("status") == "accepted"
+        mock_task_manager.enqueue_raw.assert_called_once()
+
+
+class TestProcessTools:
+    @pytest.mark.asyncio
+    async def test_list_processes(self, mock_mcp_service):
+        mock_mcp_service.list_processes.return_value = [{"slug": "qbr", "title": "Quarterly Business Review"}]
+        result = await mcp_server.call_tool("list_processes", {"project_id": "svc"})
+        data = json.loads(result[0].text)
+        assert data["processes"][0]["slug"] == "qbr"
+        mock_mcp_service.list_processes.assert_called_once_with(project_id="svc")
+
+    @pytest.mark.asyncio
+    async def test_get_process(self, mock_mcp_service):
+        mock_mcp_service.get_process.return_value = {
+            "slug": "qbr", "title": "QBR", "definition": "Run a QBR", "steps": ["a", "b"],
+        }
+        result = await mcp_server.call_tool("get_process", {"slug": "qbr"})
+        data = json.loads(result[0].text)
+        assert data["slug"] == "qbr" and data["steps"] == ["a", "b"]
+        mock_mcp_service.get_process.assert_called_once_with("qbr", None)
+
+    @pytest.mark.asyncio
+    async def test_get_process_unknown_returns_error(self, mock_mcp_service):
+        mock_mcp_service.get_process.return_value = None
+        result = await mcp_server.call_tool("get_process", {"slug": "nope"})
+        data = json.loads(result[0].text)
+        assert "error" in data
 
 
 class TestErrorHandling:

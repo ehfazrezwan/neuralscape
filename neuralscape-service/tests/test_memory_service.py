@@ -177,6 +177,74 @@ class TestStoreRaw:
         assert payload["metadata"]["tags"] == ["python", "backend"]
 
 
+class TestStandardTierWriteGate:
+    """store_raw is the backstop gate — only dictators may write standards."""
+
+    def test_disabled_tier_raises(self, service, monkeypatch):
+        from config import settings
+
+        monkeypatch.setattr(settings, "standards_enabled", False)
+        with pytest.raises(PermissionError, match="disabled"):
+            service.store_raw(
+                content="Org rule", user_id="mark", category="convention",
+                visibility="standard",
+            )
+
+    def test_non_dictator_raises(self, service, monkeypatch):
+        from config import settings
+
+        monkeypatch.setattr(settings, "standards_enabled", True)
+        monkeypatch.setattr(settings, "dictator_user_ids", "mark")
+        with pytest.raises(PermissionError, match="not authorized"):
+            service.store_raw(
+                content="Org rule", user_id="alice", category="convention",
+                visibility="standard",
+            )
+
+    def test_dictator_writes_standard(self, service, monkeypatch):
+        from config import settings
+
+        monkeypatch.setattr(settings, "standards_enabled", True)
+        monkeypatch.setattr(settings, "dictator_user_ids", "mark")
+        service._memory.vector_store.client.scroll.return_value = ([], None)
+        result = service.store_raw(
+            content="Org rule", user_id="mark", category="convention",
+            visibility="standard",
+        )
+        assert result[0].visibility == "standard"
+        payload = service._memory.vector_store.insert.call_args[1]["payloads"][0]
+        assert payload["metadata"]["visibility"] == "standard"
+
+    def test_non_standard_writes_unaffected(self, service, monkeypatch):
+        from config import settings
+
+        # Even with the tier off, ordinary shared/private writes still work.
+        monkeypatch.setattr(settings, "standards_enabled", False)
+        service._memory.vector_store.client.scroll.return_value = ([], None)
+        result = service.store_raw(
+            content="Team convention", user_id="alice", category="convention",
+        )
+        assert result[0].visibility == "shared"
+
+    def test_standard_forced_to_global_scope(self, service, monkeypatch):
+        # Standards are org-wide: a project scope+id must be coerced to global,
+        # not fail the "project_id required" check. (Regression: agents write
+        # org conventions, a project-category, with no project.)
+        from config import settings
+
+        monkeypatch.setattr(settings, "standards_enabled", True)
+        monkeypatch.setattr(settings, "dictator_user_ids", "mark")
+        service._memory.vector_store.client.scroll.return_value = ([], None)
+        result = service.store_raw(
+            content="Org rule", user_id="mark", category="convention",
+            visibility="standard", scope="project", project_id="svc",
+        )
+        assert result[0].scope == "global"
+        payload = service._memory.vector_store.insert.call_args[1]["payloads"][0]
+        assert payload["metadata"]["scope"] == "global"
+        assert payload["metadata"]["project_id"] is None
+
+
 class TestSearch:
     def test_basic_search(self, service):
         hit = MagicMock()
@@ -217,6 +285,33 @@ class TestSearch:
             if isinstance(c, FieldCondition) and c.key == "metadata.category"
         ]
         assert cats and cats[0].match.any == ["preference", "convention"]
+
+
+class TestContextStandards:
+    """Authoritative standards ride in ContextResponse.standards, always-on."""
+
+    def test_global_context_populates_standards_when_enabled(self, service, monkeypatch):
+        from config import settings
+
+        monkeypatch.setattr(settings, "standards_enabled", True)
+        service._memory.get_all.return_value = {"results": []}
+        # _get_standards scrolls for visibility=standard.
+        service._memory.vector_store.client.scroll.return_value = (
+            [_point("s1", "Always use the Opti template",
+                    {"visibility": "standard", "scope": "global"})],
+            None,
+        )
+        ctx = service.get_global_context(user_id="alice")
+        assert len(ctx.standards) == 1
+        assert ctx.standards[0].memory == "Always use the Opti template"
+
+    def test_global_context_empty_standards_when_disabled(self, service, monkeypatch):
+        from config import settings
+
+        monkeypatch.setattr(settings, "standards_enabled", False)
+        service._memory.get_all.return_value = {"results": []}
+        ctx = service.get_global_context(user_id="alice")
+        assert ctx.standards == []
 
 
 class TestGetContext:
@@ -289,6 +384,122 @@ class TestGetContext:
         assert ctx.returned == 2
         assert ctx.limit is None
         assert ctx.has_more is False
+
+
+def _point(mem_id: str, data: str, metadata: dict):
+    """Build a Qdrant scroll/query point-like object (.id, .payload, .score)."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        id=mem_id,
+        score=None,
+        payload={"data": data, "metadata": metadata, "created_at": "2026-07-01T00:00:00Z"},
+    )
+
+
+class TestStandardDeleteGate:
+    """Only a dictator may delete a standard-tier memory by ID."""
+
+    def _standard_mem(self):
+        return {"id": "s1", "memory": "Org rule", "metadata": {"visibility": "standard"}}
+
+    def test_non_dictator_delete_rejected(self, service, monkeypatch):
+        from config import settings
+
+        monkeypatch.setattr(settings, "dictator_user_ids", "mark")
+        service._memory.get.return_value = self._standard_mem()
+        with pytest.raises(PermissionError, match="dictator"):
+            service.delete_memory("s1", caller_user_id="alice")
+        service._memory.delete.assert_not_called()
+
+    def test_dictator_delete_allowed(self, service, monkeypatch):
+        from config import settings
+
+        monkeypatch.setattr(settings, "dictator_user_ids", "mark")
+        service._memory.get.return_value = self._standard_mem()
+        service._memory.delete.return_value = {"message": "deleted"}
+        service.delete_memory("s1", caller_user_id="mark")
+        service._memory.delete.assert_called_once_with("s1")
+
+    def test_non_standard_delete_unaffected(self, service):
+        service._memory.get.return_value = {
+            "id": "p1", "memory": "note", "metadata": {"visibility": "private"}
+        }
+        service._memory.delete.return_value = {"message": "deleted"}
+        service.delete_memory("p1", caller_user_id="anyone")
+        service._memory.delete.assert_called_once_with("p1")
+
+
+class TestProcesses:
+    def test_disabled_returns_empty(self, service, monkeypatch):
+        from config import settings
+
+        monkeypatch.setattr(settings, "processes_enabled", False)
+        assert service.list_processes() == []
+        assert service.get_process("qbr") is None
+
+    def test_list_processes(self, service, monkeypatch):
+        from config import settings
+
+        monkeypatch.setattr(settings, "processes_enabled", True)
+        pts = [
+            _point("d1", "Quarterly Business Review\nRun a QBR",
+                   {"tags": ["process", "process:qbr", "process-def"], "visibility": "standard"}),
+        ]
+        service._memory.vector_store.client.scroll.return_value = (pts, None)
+        out = service.list_processes()
+        assert out == [{"slug": "qbr", "title": "Quarterly Business Review", "description": "Run a QBR"}]
+
+    def test_get_process_orders_steps_and_collects_guidelines(self, service, monkeypatch):
+        from config import settings
+
+        monkeypatch.setattr(settings, "processes_enabled", True)
+        pts = [
+            _point("s2", "Second step",
+                   {"tags": ["process", "process:qbr", "process-step:02"], "visibility": "standard"}),
+            _point("d1", "QBR\nDefinition text",
+                   {"tags": ["process", "process:qbr", "process-def"], "visibility": "standard"}),
+            _point("s1", "First step",
+                   {"tags": ["process", "process:qbr", "process-step:01"], "visibility": "standard"}),
+            # a standard tagged for the process but not def/step → a guideline
+            _point("g1", "Confirm the product focus before running.",
+                   {"tags": ["process", "process:qbr"], "visibility": "standard"}),
+        ]
+        service._memory.vector_store.client.scroll.return_value = (pts, None)
+        proc = service.get_process("qbr")
+        assert proc["slug"] == "qbr"
+        assert proc["title"] == "QBR"
+        assert proc["definition"] == "QBR\nDefinition text"
+        assert proc["steps"] == ["First step", "Second step"]
+        assert proc["guidelines"] == ["Confirm the product focus before running."]
+
+    def test_get_process_guidelines_only(self, service, monkeypatch):
+        # A process with guidelines but no def/steps is still valid.
+        from config import settings
+
+        monkeypatch.setattr(settings, "processes_enabled", True)
+        pts = [
+            _point("g1", "No em dashes; 2-line max on subtitles.",
+                   {"tags": ["process", "process:tone"], "visibility": "standard"}),
+        ]
+        service._memory.vector_store.client.scroll.return_value = (pts, None)
+        proc = service.get_process("tone")
+        assert proc is not None
+        assert proc["guidelines"] == ["No em dashes; 2-line max on subtitles."]
+        assert proc["steps"] == []
+
+    def test_get_process_rejects_bad_slug(self, service, monkeypatch):
+        from config import settings
+
+        monkeypatch.setattr(settings, "processes_enabled", True)
+        assert service.get_process("Bad Slug!") is None
+
+    def test_get_process_unknown_returns_none(self, service, monkeypatch):
+        from config import settings
+
+        monkeypatch.setattr(settings, "processes_enabled", True)
+        service._memory.vector_store.client.scroll.return_value = ([], None)
+        assert service.get_process("ghost") is None
 
 
 class TestCRUD:
