@@ -298,6 +298,42 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="ingest_text",
+            description=(
+                "Manually provide a block of context to remember — a first-class ingestion path. "
+                "Use this when the user pastes notes, documentation, a transcript, or any longer "
+                "passage they want indexed. The text is persisted as a Markdown artifact on the "
+                "server (organized by user/project/category) and the produced memories reference "
+                "it, so it's fully traceable. It's chunked into verbatim passages AND distilled "
+                "into atomic facts (same pipeline as ingest_document). "
+                "For a single short fact prefer 'remember'; for pasted longer context use this."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "The context text to ingest"},
+                    "title": {"type": "string", "description": "Optional human label for this context"},
+                    "user_id": {
+                        "type": "string",
+                        "description": "User ID. OPTIONAL over an authenticated connector — the token identity is used and this is ignored.",
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "Category for produced memories (default: domain_knowledge)",
+                        "enum": list(MEMORY_CATEGORIES.keys()),
+                    },
+                    "project_id": {"type": "string", "description": "Project id (sets project scope)"},
+                    "scope": {"type": "string", "enum": ["global", "project"]},
+                    "visibility": {"type": "string", "enum": ["private", "shared"]},
+                    "extract_facts": {"type": "boolean", "description": "Also run LLM extraction for distilled facts (default true)"},
+                    "index_passages": {"type": "boolean", "description": "Chunk + store verbatim passages (default true)"},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                    "wait": {"type": "boolean", "description": "Wait for ingest to finish before returning. Default false."},
+                },
+                "required": ["content"],
+            },
+        ),
+        Tool(
             name="get_project_context",
             description=(
                 "Load the full context for a project: all user preferences (global) plus "
@@ -619,6 +655,65 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 "extract_facts": arguments.get("extract_facts", True),
                 "index_passages": arguments.get("index_passages", True),
             }
+            doc = {k: v for k, v in doc.items() if v is not None}
+
+            try:
+                task_id = await _task_manager.enqueue_ingest_document(doc)
+            except (ConnectionError, OSError) as e:
+                logger.warning(f"Redis unavailable, falling back to sync ingest: {e}")
+                from ingest.pipeline import IngestDoc, ingest_document
+                result = ingest_document(_service, IngestDoc(**doc))
+                return [TextContent(type="text", text=json.dumps({"status": "completed", "result": result, "fallback": "sync"}, default=str))]
+
+            if wait:
+                result = await _task_manager.wait_for_result(task_id)
+                return [TextContent(type="text", text=json.dumps({"status": result["status"], "task_id": task_id, "result": result.get("result")}, default=str))]
+
+            return [TextContent(type="text", text=json.dumps({"status": "accepted", "task_id": task_id}, default=str))]
+
+        elif name == "ingest_text":
+            wait = arguments.get("wait", False)
+            content = arguments["content"]
+            scope = arguments.get("scope")
+            project_id = arguments.get("project_id")
+            category = arguments.get("category", "domain_knowledge")
+            if not scope:
+                scope = "project" if project_id else "global"
+
+            # Persist the context as an artifact so its memories reference a real,
+            # re-fetchable source (falls back to a hash-only ref when storage off).
+            if settings.ingest_storage_enabled:
+                from ingest.storage import artifact_source_ref, store_artifact
+                fname = (arguments.get("title") or "context") + ".md"
+                art = await asyncio.to_thread(
+                    store_artifact, content.encode(), fname, user_id, project_id, category, settings,
+                )
+                source_ref = artifact_source_ref(art, connector_type="manual")
+            else:
+                import hashlib as _hashlib
+                from datetime import datetime as _dt, timezone as _tz
+                digest = _hashlib.md5(content.encode()).hexdigest()[:16]
+                source_ref = {
+                    "connector_id": "manual",
+                    "connector_type": "manual",
+                    "external_id": digest,
+                    "parent_id": digest,
+                    "title": arguments.get("title"),
+                    "last_synced_at": _dt.now(_tz.utc).isoformat(),
+                }
+            doc = {
+                "content": content,
+                "source": source_ref,
+                "user_id": user_id,
+                "category": category,
+                "scope": scope,
+                "project_id": project_id,
+                "visibility": arguments.get("visibility"),
+                "tags": arguments.get("tags"),
+                "extract_facts": arguments.get("extract_facts", True),
+                "index_passages": arguments.get("index_passages", True),
+            }
+            # source is a dict with None title possibly — keep it; drop top-level Nones only.
             doc = {k: v for k, v in doc.items() if v is not None}
 
             try:

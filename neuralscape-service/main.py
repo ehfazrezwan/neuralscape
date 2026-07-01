@@ -5,12 +5,23 @@ categories, and a shared MemoryService business logic layer.
 """
 
 import asyncio
+import base64
+import hashlib
 import logging
 import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
+from fastapi import (
+    APIRouter,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -31,6 +42,7 @@ from schemas import (
     ContextResponse,
     GraphSearchRequest,
     IngestDocumentRequest,
+    IngestTextRequest,
     MemoryResponse,
     RawMemoryBatchRequest,
     RawMemoryRequest,
@@ -792,6 +804,211 @@ async def v1_ingest_document(req: IngestDocumentRequest, request: Request):
         task_id=task_id,
         poll_url=f"/v1/memories/status/{task_id}",
     )
+
+
+def _fallback_source_ref(content: bytes | str, title: str | None, connector_type: str) -> dict:
+    """Synthetic provenance used only when artifact storage is disabled.
+
+    Every ingested memory still needs a ``source_ref`` to be traceable; when we
+    aren't persisting an artifact, the best we can do is a content-hash backlink.
+    """
+    raw = content.encode() if isinstance(content, str) else content
+    digest = hashlib.md5(raw).hexdigest()[:16]
+    return {
+        "connector_id": connector_type,
+        "connector_type": connector_type,
+        "external_id": digest,
+        "parent_id": digest,
+        "title": title,
+        "last_synced_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@v1_router.post("/ingest/text", status_code=202)
+async def v1_ingest_text(req: IngestTextRequest, request: Request):
+    """Manually provide a block of context — a first-class ingestion path.
+
+    The context is persisted as a Markdown artifact on the storage volume
+    (organized by user/project/category) and the produced memories reference it,
+    so manual context is just as traceable as an uploaded file. Chunks into
+    passages + distils LLM facts; async (202 + poll) on the dedicated ingest
+    queue; idempotent via content-hash dedup.
+    """
+    if req.scope == "project" and not req.project_id:
+        raise HTTPException(status_code=400, detail="project_id is required when scope='project'")
+
+    resolved_user_id = _resolve_user_id(request, req.user_id)
+
+    # Persist the pasted context as an artifact so its memories reference a real,
+    # re-fetchable source (falls back to a hash-only ref when storage is off).
+    if settings.ingest_storage_enabled:
+        from ingest.storage import artifact_source_ref, store_artifact
+
+        fname = (req.title or "context") + ".md"
+        art = await asyncio.to_thread(
+            store_artifact, req.content.encode(), fname, resolved_user_id,
+            req.project_id, req.category, settings,
+        )
+        source_ref = artifact_source_ref(art, connector_type="manual")
+    else:
+        source_ref = _fallback_source_ref(req.content, req.title, "manual")
+
+    doc = {
+        "content": req.content,
+        "source": source_ref,
+        "user_id": resolved_user_id,
+        "category": req.category,
+        "scope": req.scope,
+        "project_id": req.project_id,
+        "visibility": req.visibility.value if req.visibility else None,
+        "tags": req.tags,
+        "agent_id": req.agent_id,
+        "run_id": req.run_id,
+        "extract_facts": req.extract_facts,
+        "index_passages": req.index_passages,
+    }
+    doc = {k: v for k, v in doc.items() if v is not None}
+
+    try:
+        task_id = await _task_manager.enqueue_ingest_document(doc)
+    except (ConnectionError, OSError) as e:
+        logger.warning(f"Redis unavailable, falling back to sync ingest: {e}")
+        from ingest.pipeline import IngestDoc, ingest_document
+
+        result = await asyncio.to_thread(ingest_document, _service, IngestDoc(**doc))
+        return JSONResponse(status_code=200, content={"status": "ok", **result})
+
+    return TaskAcceptedResponse(task_id=task_id, poll_url=f"/v1/memories/status/{task_id}")
+
+
+@v1_router.post("/ingest/files", status_code=202)
+async def v1_ingest_files(
+    request: Request,
+    files: list[UploadFile] = File(..., description="One or more files, or a .zip to expand"),
+    category: str = Form("domain_knowledge"),
+    scope: str = Form("global"),
+    project_id: str | None = Form(None),
+    user_id: str | None = Form(None),
+    visibility: str | None = Form(None),
+    tags: str | None = Form(None, description="Comma-separated tags"),
+    extract_facts: bool = Form(True),
+    index_passages: bool = Form(True),
+):
+    """Upload one or more files (or a zip / zipped folder) to ingest into memory.
+
+    Zips are expanded server-side; each resulting file is parsed (Docling →
+    Markdown, MarkItDown fallback), chunked into passages, and distilled into
+    graph facts. Parsing runs on the dedicated ingest worker (not this request),
+    so a large batch never blocks the API. Returns one task_id per file to poll.
+    """
+    if scope == "project" and not project_id:
+        raise HTTPException(status_code=400, detail="project_id is required when scope='project'")
+
+    resolved_user_id = _resolve_user_id(request, user_id)
+    max_file_bytes = settings.ingest_max_file_mb * 1024 * 1024
+
+    # Expand each upload (a zip yields its members; anything else is itself).
+    from ingest.archive import ArchiveError, ArchiveTooLarge, is_zip, iter_archive
+
+    members: list[tuple[str, bytes]] = []
+    for upload in files:
+        data = await upload.read()
+        name = upload.filename or "upload"
+        if is_zip(data) and name.lower().endswith(".zip"):
+            try:
+                members.extend(
+                    iter_archive(
+                        data,
+                        max_file_bytes=max_file_bytes,
+                        max_files=settings.ingest_max_files,
+                        max_total_uncompressed_bytes=settings.ingest_max_archive_uncompressed_mb
+                        * 1024 * 1024,
+                    )
+                )
+            except ArchiveTooLarge as e:
+                raise HTTPException(status_code=413, detail=str(e))
+            except ArchiveError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+        else:
+            if len(data) > max_file_bytes:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"'{name}' exceeds the {settings.ingest_max_file_mb}MB per-file limit",
+                )
+            members.append((name, data))
+
+    if not members:
+        raise HTTPException(status_code=400, detail="No ingestible files found in the upload")
+    if len(members) > settings.ingest_max_files:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Upload contains {len(members)} files, over the {settings.ingest_max_files} limit",
+        )
+
+    options = {
+        "category": category,
+        "scope": scope,
+        "project_id": project_id,
+        "visibility": visibility,
+        "tags": [t.strip() for t in tags.split(",") if t.strip()] if tags else None,
+        "extract_facts": extract_facts,
+        "index_passages": index_passages,
+        "agent_id": None,
+        "run_id": None,
+    }
+    options = {k: v for k, v in options.items() if v is not None}
+
+    from ingest.storage import artifact_source_ref, store_artifact
+
+    enqueued = []
+    for name, data in members:
+        # Persist the file to the shared volume; hand the worker a path (not
+        # bytes) so large files don't travel through Redis, and stamp a
+        # source_ref that points back to the stored artifact.
+        payload = {"filename": name, "options": options, "user_id": resolved_user_id}
+        if settings.ingest_storage_enabled:
+            art = await asyncio.to_thread(
+                store_artifact, data, name, resolved_user_id, project_id, category, settings,
+            )
+            payload["stored_path"] = art.rel_path
+            payload["source_ref"] = artifact_source_ref(art, connector_type="file_upload")
+        else:
+            payload["data_b64"] = base64.b64encode(data).decode()
+            payload["source_ref"] = _fallback_source_ref(data, name, "file_upload")
+        try:
+            task_id = await _task_manager.enqueue_ingest_file(payload)
+        except (ConnectionError, OSError) as e:
+            raise HTTPException(status_code=503, detail=f"Ingest queue unavailable: {e}")
+        enqueued.append({
+            "filename": name,
+            "task_id": task_id,
+            "file_id": payload.get("source_ref", {}).get("external_id"),
+        })
+
+    return JSONResponse(status_code=202, content={"files": enqueued, "count": len(enqueued)})
+
+
+@v1_router.get("/ingest/artifacts/{file_id}")
+async def v1_get_artifact(
+    file_id: str,
+    request: Request,
+    user_id: str | None = Query(None),
+):
+    """Download a previously ingested artifact by id (owner-scoped).
+
+    This is the ``url`` / retrieval handle stamped onto every file-ingested
+    memory's source_ref, so an agent or user can fetch the original file back.
+    """
+    from fastapi.responses import FileResponse
+
+    from ingest.storage import find_artifact
+
+    caller = _resolve_user_id(request, user_id)
+    found = await asyncio.to_thread(find_artifact, file_id, caller, settings)
+    if not found:
+        raise HTTPException(status_code=404, detail=f"Artifact '{file_id}' not found")
+    abs_path, filename = found
+    return FileResponse(abs_path, filename=filename)
 
 
 # ── Connectors (data-layer sources) ──────────────

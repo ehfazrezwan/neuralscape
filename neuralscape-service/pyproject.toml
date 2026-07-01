@@ -40,6 +40,14 @@ dependencies = [
     # for Google's token exchange — pinned explicitly since we import it.
     "pyjwt[crypto]>=2.9",
     "httpx>=0.27.0",
+    # ── Document/file ingestion ──
+    # Parses multipart file uploads on the /v1/ingest/files endpoint.
+    "python-multipart>=0.0.9",
+    # In-process fallback parser for rich formats (PDF + MS Office docx/xlsx/pptx)
+    # when the preferred docling-serve container is disabled or unreachable. HTML
+    # is handled by markitdown too. The heavy/optional extras (audio, youtube) are
+    # intentionally excluded to keep the image lean.
+    "markitdown[docx,pptx,xlsx,xls,pdf]>=0.0.1a3",
 ]
 
 [tool.hatch.build.targets.wheel]

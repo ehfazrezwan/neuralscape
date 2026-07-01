@@ -294,6 +294,69 @@ async def process_ingest_document(ctx: dict, doc: dict) -> dict:
     return result
 
 
+async def process_ingest_file(ctx: dict, payload: dict) -> dict:
+    """Background task: parse an uploaded file's bytes → text → passages + facts.
+
+    ``payload`` is ``{filename, source_ref, options, user_id, ...}`` plus EITHER
+    ``stored_path`` (the artifact's path on the shared volume — preferred) or
+    ``data_b64`` (inline bytes, used only when artifact storage is disabled).
+    Parsing (Docling / MarkItDown) and chunking both run here on the dedicated
+    ingest worker, so a large PDF or a whole folder never blocks the fast queue.
+    A file that no parser can handle is reported as skipped rather than failing
+    the whole job.
+    """
+    import base64
+
+    from ingest.extract import UnsupportedFile, extract_text
+    from ingest.pipeline import IngestDoc, ingest_document
+    from ingest.storage import read_artifact
+
+    service: MemoryService = ctx["service"]
+    filename = payload.get("filename", "upload")
+    if payload.get("stored_path"):
+        data = await asyncio.to_thread(read_artifact, payload["stored_path"], settings)
+    else:
+        data = base64.b64decode(payload["data_b64"])
+    options = payload.get("options", {})
+
+    try:
+        text, doc_type = await asyncio.to_thread(extract_text, filename, data, settings)
+    except UnsupportedFile as e:
+        logger.warning("Ingest file skipped (%s): %s", filename, e)
+        return {"filename": filename, "skipped": True, "reason": str(e)}
+
+    ingest_doc = IngestDoc(
+        content=text,
+        source=payload["source_ref"],
+        user_id=payload["user_id"],
+        category=options.get("category", "domain_knowledge"),
+        scope=options.get("scope", "global"),
+        project_id=options.get("project_id"),
+        visibility=options.get("visibility"),
+        tags=options.get("tags"),
+        agent_id=options.get("agent_id"),
+        run_id=options.get("run_id"),
+        extract_facts=options.get("extract_facts", True),
+        index_passages=options.get("index_passages", True),
+    )
+    result = await asyncio.to_thread(ingest_document, service, ingest_doc)
+
+    registry = ctx.get("extension_registry")
+    if registry and result.get("memory_ids"):
+        await registry.emit_event("memory_stored", {
+            "user_id": payload["user_id"],
+            "memory_id": result["memory_ids"][0],
+            "content": f"[ingest:{doc_type}] {filename} → "
+                       f"{result['passages']} passages + {result['facts']} facts",
+            "category": options.get("category", "domain_knowledge"),
+            "scope": options.get("scope", "global"),
+            "project_id": options.get("project_id"),
+            "source": "ingest",
+        })
+
+    return {"filename": filename, "doc_type": doc_type, **result}
+
+
 async def process_graph_enrichment(
     ctx: dict,
     memory_id: str,
@@ -586,6 +649,7 @@ async def connector_sync_cron(ctx: dict) -> dict:
             "process_connector_sync",
             rec["connector_id"],
             _job_id=f"sync-{rec['connector_id']}",
+            _queue_name=settings.ingest_queue_name,
         )
         enqueued += 1
     logger.info(f"Connector sync cron: enqueued {enqueued} connector(s)")
@@ -645,16 +709,15 @@ class WorkerSettings:
     """Light/fast worker: vector writes, reads, conversation tasks, light crons.
 
     The slow Graphiti work (per-write graph enrichment + the heavy dedup /
-    wiki-synth crons) lives on GraphWorkerSettings instead, so a burst of graph
-    writes or a 12-minute wiki-synth run can't starve fast writes here. Run with
-    ``arq worker.WorkerSettings``.
+    wiki-synth crons) lives on GraphWorkerSettings, and bulk document/file
+    ingestion + connector sync live on IngestWorkerSettings — so neither a burst
+    of graph writes, a 12-minute wiki-synth run, nor a folder ingest can starve
+    the fast writes/reads here. Run with ``arq worker.WorkerSettings``.
     """
     functions = [
         process_memory_store,
         process_memory_raw,
         process_memory_raw_batch,
-        process_ingest_document,
-        process_connector_sync,
         process_conversation_flush,
         process_conversation_compile,
     ]
@@ -724,6 +787,31 @@ class GraphWorkerSettings:
             max_tries=1,
             run_at_startup=False,
         ),
+    ]
+    on_startup = startup
+    on_shutdown = shutdown
+    redis_settings = parse_redis_settings()
+    queue_name = settings.graph_queue_name
+    max_jobs = 4
+    job_timeout = 900  # graph.add + entity extraction can run several minutes
+    max_tries = settings.arq_max_retries
+
+
+class IngestWorkerSettings:
+    """Ingestion worker: bulk document/file ingest + connector sync.
+
+    Consumes the dedicated ingest queue so a folder/zip upload (chunking +
+    Docling parse + LLM fact extraction) or a connector re-sync runs here,
+    isolated from the latency-sensitive vector writes/reads on WorkerSettings.
+    Run with ``arq worker.IngestWorkerSettings``. ``max_jobs`` is low to bound
+    concurrent Docling/Gemini calls; ``job_timeout`` is generous for large files.
+    """
+    functions = [
+        process_ingest_document,
+        process_ingest_file,
+        process_connector_sync,
+    ]
+    cron_jobs = [
         cron(
             connector_sync_cron,
             hour=set(_connector_sync_cron_hours()),
@@ -737,7 +825,7 @@ class GraphWorkerSettings:
     on_startup = startup
     on_shutdown = shutdown
     redis_settings = parse_redis_settings()
-    queue_name = settings.graph_queue_name
-    max_jobs = 4
-    job_timeout = 900  # graph.add + entity extraction can run several minutes
+    queue_name = settings.ingest_queue_name
+    max_jobs = 3
+    job_timeout = 900  # a large PDF parse + fact extraction can run minutes
     max_tries = settings.arq_max_retries

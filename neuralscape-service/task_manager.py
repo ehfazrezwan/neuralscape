@@ -152,6 +152,33 @@ class TaskManager:
             "process_ingest_document",
             doc,
             _job_id=job_id,
+            _queue_name=settings.ingest_queue_name,
+        )
+        if job is None:
+            return job_id
+        return job.job_id
+
+    async def enqueue_ingest_file(self, payload: dict) -> str:
+        """Enqueue a single-file ingest task (parse → passages + facts). Returns job_id.
+
+        ``payload`` carries ``{filename, source_ref, options}`` plus either
+        ``stored_path`` or ``data_b64``. The job id is deterministic from the
+        artifact's content hash (source_ref.external_id) + owner so re-uploading
+        the same file coalesces onto one job (idempotent). Runs on the ingest queue.
+        """
+        partition = payload.get("user_id") or "ingest"
+        content_key = (payload.get("source_ref") or {}).get("external_id") or payload.get(
+            "stored_path"
+        ) or payload.get("data_b64", "")
+        job_id = _generate_job_id(
+            f"ingest-file:{payload.get('filename', '')}:{content_key}",
+            partition,
+        )
+        job = await self.pool.enqueue_job(
+            "process_ingest_file",
+            payload,
+            _job_id=job_id,
+            _queue_name=settings.ingest_queue_name,
         )
         if job is None:
             return job_id
@@ -171,6 +198,7 @@ class TaskManager:
             "process_connector_sync",
             connector_id,
             _job_id=job_id,
+            _queue_name=settings.ingest_queue_name,
         )
         if job is None:
             return job_id
@@ -202,14 +230,40 @@ class TaskManager:
             return job_id
         return job.job_id
 
+    def _candidate_queues(self) -> list[str]:
+        """Queues a poll-able job could live on (main + ingest), de-duplicated.
+
+        Ingest/connector-sync jobs run on a dedicated queue, so status polling
+        must look there too or ``/v1/memories/status/{id}`` would report every
+        ingest job as not_found.
+        """
+        queues = [settings.arq_queue_name, settings.ingest_queue_name]
+        seen: set[str] = set()
+        return [q for q in queues if not (q in seen or seen.add(q))]
+
+    async def _find_job(self, task_id: str) -> tuple[Job, JobStatus]:
+        """Return the (job, status) for ``task_id``, searching candidate queues.
+
+        Returns the first queue where the job is known; falls back to a
+        main-queue job with not_found status if it's on none of them.
+        """
+        fallback: Job | None = None
+        for queue_name in self._candidate_queues():
+            job = Job(task_id, redis=self.pool, _queue_name=queue_name)
+            status = await job.status()
+            if status != JobStatus.not_found:
+                return job, status
+            if fallback is None:
+                fallback = job
+        return fallback, JobStatus.not_found
+
     async def get_status(self, task_id: str) -> dict:
         """Get task status from ARQ/Redis.
 
         Returns:
             Dict with task_id, status, result, error keys.
         """
-        job = Job(task_id, redis=self.pool, _queue_name=settings.arq_queue_name)
-        status = await job.status()
+        job, status = await self._find_job(task_id)
 
         api_status = _STATUS_MAP.get(status, "not_found")
 
@@ -237,7 +291,7 @@ class TaskManager:
 
         Used by MCP tools with wait=true.
         """
-        job = Job(task_id, redis=self.pool, _queue_name=settings.arq_queue_name)
+        job, _ = await self._find_job(task_id)
         try:
             result = await job.result(timeout=timeout)
             return {
