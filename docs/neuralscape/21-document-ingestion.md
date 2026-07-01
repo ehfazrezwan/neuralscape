@@ -62,7 +62,9 @@ Modules (`neuralscape-service/ingest/`):
 | `DOCLING_TIMEOUT_S` | `120` | Per-file convert timeout. |
 | `INGEST_MAX_FILE_MB` | `25` | Reject a single file larger than this. |
 | `INGEST_MAX_FILES` | `200` | Max files per request (post zip-expansion). |
-| `INGEST_MAX_ARCHIVE_UNCOMPRESSED_MB` | `200` | Total unzipped-size cap. |
+| `INGEST_MAX_ARCHIVE_UNCOMPRESSED_MB` | `200` | Total unzipped-size cap (per zip). |
+| `INGEST_MAX_REQUEST_MB` | `500` | Total bytes processed per upload request. |
+| `INGEST_STORAGE_ENABLED` | `true` | Persist uploads/context as artifacts (else ship bytes through Redis). |
 
 ## Ingesting authoritative standards
 
@@ -110,3 +112,25 @@ For a single directive prefer `remember` with `visibility=standard`
   PVC (e.g. Filestore on GKE) — see `ingestStorage` in the Helm values.
 - Object storage (GCS/S3) is a later swap behind the small `ingest/storage.py`
   interface.
+
+## Known limitations / future work
+
+- **File upload from Claude Cowork is not supported.** Uploading files/folders
+  goes through the `POST /v1/ingest/files` multipart endpoint, which the
+  `/neuralscape:ingest` skill drives with `curl` in **Claude Code** (where a
+  service URL + bearer token are available). In **Cowork** the only
+  authenticated channel is the OAuth MCP connector, whose token isn't exposed to
+  a skill's shell — and MCP tool calls carry JSON, not binary — so neither raw
+  multipart nor a tool call can carry an uploaded file there. Cowork can still
+  ingest **pasted text** via the `ingest_text` MCP tool; local **text/markdown**
+  files could be read and passed to `ingest_text` too.
+- **To close this later, the options are:** an `ingest_file` MCP tool that takes
+  a base64 payload over the authenticated MCP channel (works for small–medium
+  files; base64 + MCP payload limits rule out large binaries like a multi-MB
+  PPTX), or a presigned-upload-URL flow (handles large files, needs object
+  storage). Deferred until there's a concrete need.
+- **Artifact re-fetch is provenance-only.** Each memory's `source_ref.url`
+  (`/v1/ingest/artifacts/{file_id}`) serves the original file (authenticated,
+  owner-scoped). A Claude Code agent can `curl` it; there is no MCP tool that
+  streams artifact bytes, so it's not a first-class fetch flow in Cowork. The
+  primary reuse path is recalling the stored passages/facts, not re-downloading.
