@@ -79,10 +79,11 @@ async def list_tools() -> list[Tool]:
                     "visibility": {
                         "type": "string",
                         "description": (
-                            "Multi-user: restrict to 'private' (caller's own memories only) "
-                            "or 'shared' (team-wide pool only). Default: both pools merged."
+                            "Multi-user: restrict to 'private' (caller's own memories only), "
+                            "'shared' (team-wide pool only), or 'standard' (authoritative "
+                            "dictator-set pool). Default: private + shared + standard merged."
                         ),
-                        "enum": ["private", "shared"],
+                        "enum": ["private", "shared", "standard"],
                     },
                     "include_shared": {
                         "type": "boolean",
@@ -186,12 +187,14 @@ async def list_tools() -> list[Tool]:
                     "visibility": {
                         "type": "string",
                         "description": (
-                            "Multi-user: 'private' (only the writer reads) or 'shared' "
-                            "(any authenticated user reads). Defaults per-category — "
-                            "preference/personal_fact/etc. default private; tech_stack/"
-                            "convention/architecture/decision/etc. default shared."
+                            "Multi-user: 'private' (only the writer reads), 'shared' "
+                            "(any authenticated user reads), or 'standard' (an authoritative "
+                            "org rule — writable ONLY by a dictator; requires STANDARDS_ENABLED). "
+                            "Defaults per-category — preference/personal_fact/etc. default "
+                            "private; tech_stack/convention/architecture/decision/etc. default "
+                            "shared. 'standard' is never a default; set it explicitly."
                         ),
-                        "enum": ["private", "shared"],
+                        "enum": ["private", "shared", "standard"],
                     },
                     "wait": {
                         "type": "boolean",
@@ -288,7 +291,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "project_id": {"type": "string", "description": "Project id (sets project scope)"},
                     "scope": {"type": "string", "enum": ["global", "project"]},
-                    "visibility": {"type": "string", "enum": ["private", "shared"]},
+                    "visibility": {"type": "string", "enum": ["private", "shared", "standard"]},
                     "extract_facts": {"type": "boolean", "description": "Also run LLM extraction for distilled facts (default true)"},
                     "index_passages": {"type": "boolean", "description": "Chunk + store verbatim passages (default true)"},
                     "tags": {"type": "array", "items": {"type": "string"}},
@@ -458,6 +461,46 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="list_processes",
+            description=(
+                "List the team processes available to run — named, authoritative "
+                "playbooks defined by a Neuralscape dictator (e.g. a standard "
+                "consulting workflow). Use this when the user wants to start or pick a "
+                "defined process, or describes a task that might match one. Returns "
+                "[{slug, title, description}] — match the user's request against title "
+                "+ description to pick the best process, then call get_process(slug). "
+                "Empty when the process feature is disabled."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string", "description": "Caller user ID (optional under token auth)"},
+                    "project_id": {"type": "string", "description": "Optional project scope"},
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="get_process",
+            description=(
+                "Load a dictator-authored process playbook by slug, pulling in ALL the "
+                "standards recorded for it: its definition, ordered steps, and guidelines "
+                "(rules/gates/tone constraints). These are AUTHORITATIVE — when running a "
+                "process, follow its steps in order, honor its guidelines, and let them "
+                "override personal preferences on conflict. Returns {slug, title, "
+                "definition, steps[], guidelines[]}."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "slug": {"type": "string", "description": "Process slug from list_processes"},
+                    "user_id": {"type": "string", "description": "Caller user ID (optional under token auth)"},
+                    "project_id": {"type": "string", "description": "Optional project scope"},
+                },
+                "required": ["slug"],
+            },
+        ),
+        Tool(
             name="delete_memories",
             description=(
                 "Delete memories by ID or by filters. Use with caution — deleted memories "
@@ -555,6 +598,10 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             scope = default_scope_for_category(category).value
             if project_id and category not in GLOBAL_CATEGORIES:
                 scope = "project"
+            # Standards are always org-wide/global — the server (store_raw)
+            # enforces scope="global" for visibility="standard" regardless of
+            # category, so a project-category standard (e.g. a global convention)
+            # doesn't get a spurious scope="project".
 
             # Memory-model v2 + multi-user fields (all optional)
             v2_fields = {
@@ -567,6 +614,18 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 "expires_at": arguments.get("expires_at"),
                 "visibility": arguments.get("visibility"),
             }
+
+            # Authoritative-tier write-gate: only dictators may write standards.
+            # Return an actionable error to the model *before* enqueue so a
+            # rejected write isn't lost as a silent background failure.
+            from schemas import MemoryVisibility, normalize_visibility
+            if normalize_visibility(arguments.get("visibility")) == MemoryVisibility.STANDARD.value:
+                if not settings.standards_enabled:
+                    return [TextContent(type="text", text=json.dumps(
+                        {"error": "The 'standard' visibility tier is disabled (STANDARDS_ENABLED=false)."}))]
+                if not settings.is_dictator(user_id):
+                    return [TextContent(type="text", text=json.dumps(
+                        {"error": f"User {user_id!r} is not authorized to write 'standard'-tier memories."}))]
 
             try:
                 task_id = await _task_manager.enqueue_raw(
@@ -800,10 +859,26 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             projects = await asyncio.to_thread(_service.list_projects, user_id=user_id)
             return [TextContent(type="text", text=json.dumps({"projects": projects}, default=str))]
 
+        elif name == "list_processes":
+            processes = await asyncio.to_thread(
+                _service.list_processes, project_id=arguments.get("project_id")
+            )
+            return [TextContent(type="text", text=json.dumps({"processes": processes}, default=str))]
+
+        elif name == "get_process":
+            process = await asyncio.to_thread(
+                _service.get_process, arguments["slug"], arguments.get("project_id")
+            )
+            if process is None:
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": f"Process {arguments['slug']!r} not found or processes are disabled."}))]
+            return [TextContent(type="text", text=json.dumps(process, default=str))]
+
         elif name == "delete_memories":
             memory_id = arguments.get("memory_id")
             if memory_id:
-                result = await asyncio.to_thread(_service.delete_memory, memory_id)
+                # Pass caller identity so standard-tier deletes are gated to dictators.
+                result = await asyncio.to_thread(_service.delete_memory, memory_id, user_id)
             else:
                 result = await asyncio.to_thread(
                     _service.delete_memories,
