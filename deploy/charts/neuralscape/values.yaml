@@ -1,0 +1,87 @@
+# Neuralscape app-tier values. The stateful backends (Neo4j/Qdrant/Redis), the
+# namespace, and the `neuralscape-secrets` Secret are managed OUTSIDE this chart
+# (deploy/k8s/) — this chart deploys the API + workers + their ServiceAccount.
+#
+# Defaults here are GENERIC. Environment-specific values (image repo, public URL,
+# node pool, GCP service account, auth domains) are supplied at deploy time from
+# a private overlay / terraform.tfvars — never committed to this public repo.
+
+image:
+  repository: neuralscape/neuralscape
+  tag: latest
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  name: neuralscape-sa
+  # Set to a GCP service account email to enable Workload Identity (wired
+  # automatically by deploy/terraform). Empty = a plain ServiceAccount.
+  gcpServiceAccountEmail: ""
+
+# Optional nodeSelector for all pods (node-pool labels are cluster-specific).
+# Empty = schedule anywhere. Set via a private overlay to pin to a pool.
+nodeSelector: {}
+
+# In-cluster backend addresses (match the Services in deploy/k8s/).
+config:
+  NEO4J_URI: "neo4j://neo4j:7687"
+  NEO4J_USER: "neo4j"
+  NEO4J_DATABASE: "memory"
+  QDRANT_URL: "http://qdrant:6333"
+  REDIS_URL: "redis://redis:6379"
+  MCP_TRANSPORT: "http"
+  LOG_LEVEL: "INFO"
+  LOG_FORMAT: "json"
+  GEMINI_LLM_MODEL: "gemini-3-flash-preview"
+  GEMINI_LLM_FALLBACK_MODEL: "gemini-2.5-flash"
+  GEMINI_EMBEDDER_MODEL: "gemini-embedding-001"
+  # Auth. Default is token-paste (no external IdP). Set AUTH_PROVIDER=google and
+  # AUTH_ALLOWED_DOMAINS in a private overlay for consent-screen login.
+  AUTH_PROVIDER: "token"
+  # Public HTTPS URL (must match the ingress host). Enables the OAuth AS when set
+  # together with the user-token secret.
+  NEURALSCAPE_PUBLIC_URL: "https://neuralscape.example.com"
+  OBSIDIAN_VAULT_PATH: "/data/vault"
+
+# Keys read from the ESO-synced `neuralscape-secrets` Secret (deploy/k8s/).
+secretName: neuralscape-secrets
+
+# Generic passthroughs for a private overlay to inject extra config/secrets into
+# every workload without this public chart naming them.
+#   extraEnv:        list of { name, value } → literal env vars
+#   extraEnvSecrets: list of { name, secretKey } → env from a key in secretName
+# Example (set in a private values overlay, not here):
+#   extraEnv:
+#     - { name: SOME_FEATURE_ENABLED, value: "true" }
+#   extraEnvSecrets:
+#     - { name: SOME_UPSTREAM_URL, secretKey: some-upstream-url }
+#     - { name: SOME_UPSTREAM_TOKEN, secretKey: some-upstream-token }
+extraEnv: []
+extraEnvSecrets: []
+
+api:
+  replicaCount: 1
+  containerPort: 8199
+  service:
+    type: ClusterIP
+    port: 80
+  resources:
+    requests: { cpu: "250m", memory: "1Gi" }
+    limits: { cpu: "1000m", memory: "2Gi" }
+  autoscaling:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 3
+    targetCPUUtilizationPercentage: 75
+    targetMemoryUtilizationPercentage: 80
+
+worker:
+  replicaCount: 1
+  resources:
+    requests: { cpu: "250m", memory: "1Gi" }
+    limits: { cpu: "1000m", memory: "2Gi" }
+
+graphWorker:
+  replicaCount: 1
+  resources:
+    requests: { cpu: "250m", memory: "1Gi" }
+    limits: { cpu: "1000m", memory: "2Gi" }
