@@ -75,6 +75,15 @@ class TestIngestText:
         })
         assert resp.status_code == 422  # schema validator rejects it
 
+    def test_standard_text_ingest_requires_dictator(self, client, monkeypatch):
+        from config import settings
+        monkeypatch.setattr(main._task_manager, "enqueue_ingest_document", AsyncMock(return_value="ns-1"))
+        monkeypatch.setattr(settings, "standards_enabled", True)
+        monkeypatch.setattr(settings, "dictator_user_ids", "alice")
+        base = {"content": "All PRs must be reviewed.", "visibility": "standard"}
+        assert client.post("/v1/ingest/text", json={**base, "user_id": "bob"}).status_code == 403
+        assert client.post("/v1/ingest/text", json={**base, "user_id": "alice"}).status_code == 202
+
 
 class TestIngestFiles:
     def test_multi_file_and_zip_expansion(self, client, monkeypatch):
@@ -154,6 +163,28 @@ class TestIngestFiles:
             ],
         )
         assert resp.status_code == 413
+
+    def test_standard_ingest_requires_dictator(self, client, monkeypatch):
+        from config import settings
+        monkeypatch.setattr(main._task_manager, "enqueue_ingest_file", AsyncMock(return_value="ns-1"))
+        monkeypatch.setattr(settings, "standards_enabled", True)
+        monkeypatch.setattr(settings, "dictator_user_ids", "alice")
+        f = [("files", ("std.md", b"the rule", "text/markdown"))]
+        # non-dictator → 403 (rejected synchronously, no lost jobs)
+        r = client.post("/v1/ingest/files", data={"user_id": "bob", "visibility": "standard"}, files=f)
+        assert r.status_code == 403
+        # dictator → accepted
+        r = client.post("/v1/ingest/files", data={"user_id": "alice", "visibility": "standard"}, files=f)
+        assert r.status_code == 202
+
+    def test_standard_ingest_rejected_when_tier_disabled(self, client, monkeypatch):
+        from config import settings
+        monkeypatch.setattr(main._task_manager, "enqueue_ingest_file", AsyncMock(return_value="ns-1"))
+        monkeypatch.setattr(settings, "standards_enabled", False)
+        monkeypatch.setattr(settings, "dictator_user_ids", "alice")
+        f = [("files", ("std.md", b"the rule", "text/markdown"))]
+        r = client.post("/v1/ingest/files", data={"user_id": "alice", "visibility": "standard"}, files=f)
+        assert r.status_code == 403
 
     def test_oversize_file_rejected(self, client, monkeypatch):
         from config import settings

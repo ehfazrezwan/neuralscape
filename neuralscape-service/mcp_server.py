@@ -30,6 +30,27 @@ _service = MemoryService()
 _task_manager = TaskManager()
 
 
+def _standard_write_error(visibility, user_id: str) -> list[TextContent] | None:
+    """Return an MCP error payload if a ``standard``-tier write isn't allowed.
+
+    Returns ``None`` when the write is permitted (not a standard, or the caller
+    is an authorized dictator). Gating happens BEFORE enqueue on every MCP write
+    path so a rejected authoritative write fails fast rather than as a silent
+    background job failure.
+    """
+    from schemas import MemoryVisibility, normalize_visibility
+
+    if normalize_visibility(visibility) != MemoryVisibility.STANDARD.value:
+        return None
+    if not settings.standards_enabled:
+        return [TextContent(type="text", text=json.dumps(
+            {"error": "The 'standard' visibility tier is disabled (STANDARDS_ENABLED=false)."}))]
+    if not settings.is_dictator(user_id):
+        return [TextContent(type="text", text=json.dumps(
+            {"error": f"User {user_id!r} is not authorized to write 'standard'-tier memories."}))]
+    return None
+
+
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     return [
@@ -327,7 +348,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "project_id": {"type": "string", "description": "Project id (sets project scope)"},
                     "scope": {"type": "string", "enum": ["global", "project"]},
-                    "visibility": {"type": "string", "enum": ["private", "shared"]},
+                    "visibility": {"type": "string", "enum": ["private", "shared", "standard"]},
                     "extract_facts": {"type": "boolean", "description": "Also run LLM extraction for distilled facts (default true)"},
                     "index_passages": {"type": "boolean", "description": "Chunk + store verbatim passages (default true)"},
                     "tags": {"type": "array", "items": {"type": "string"}},
@@ -698,6 +719,10 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
 
         elif name == "ingest_document":
             wait = arguments.get("wait", False)
+            # Gate standard-tier ingests before enqueue (else the job fails later).
+            _err = _standard_write_error(arguments.get("visibility"), user_id)
+            if _err:
+                return _err
             scope = arguments.get("scope")
             project_id = arguments.get("project_id")
             if not scope:
@@ -750,6 +775,10 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 return [TextContent(type="text", text=json.dumps({"status": "error", "error": str(e)}, default=str))]
             if req.scope == "project" and not req.project_id:
                 return [TextContent(type="text", text=json.dumps({"status": "error", "error": "project_id is required when scope='project'"}, default=str))]
+            # Gate standard-tier ingests before enqueue (else the job fails later).
+            _err = _standard_write_error(req.visibility, user_id)
+            if _err:
+                return _err
 
             content = req.content
             category = req.category

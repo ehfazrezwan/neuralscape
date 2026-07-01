@@ -82,6 +82,24 @@ def _is_junk_fact(content: str) -> bool:
     return bool(_JUNK_RE.search(stripped))
 
 
+def _deleted_msg(noun: str, deleted: int, skipped_shared: int, skipped_standard: int) -> str:
+    """Human-readable summary for a filtered delete, naming each preserved tier.
+
+    Standards and shared writes are preserved for different reasons (dictator-only
+    vs. team-owned), so report them separately rather than lumping standards under
+    "shared".
+    """
+    msg = f"Deleted {deleted} {noun}"
+    preserved = []
+    if skipped_shared:
+        preserved.append(f"{skipped_shared} shared")
+    if skipped_standard:
+        preserved.append(f"{skipped_standard} standard")
+    if preserved:
+        msg += f" (preserved {', '.join(preserved)})"
+    return msg
+
+
 def _clean_conversation_for_graph(messages: list[dict]) -> list[dict]:
     """Filter junk lines from conversation messages before graph ingestion.
 
@@ -1589,27 +1607,26 @@ class MemoryService:
         )
         if want_standard:
             try:
-                std_scope = None if (project_id and not scope) else scope
-                std_calls = (
-                    [(project_id, None), (None, "global")]
-                    if project_id and not scope
-                    else [(project_id, std_scope)]
-                )
-                for _pid, _scope in std_calls:
-                    vector_responses.extend(
-                        self._search_standard_pool(
-                            m=m,
-                            query=query,
-                            project_id=_pid,
-                            categories=categories,
-                            scope=_scope,
-                            domain=domain,
-                            observation_type=observation_type,
-                            concepts=concepts,
-                            limit=limit,
-                            query_embedding=query_embedding,
-                        )
+                # Standards are ALWAYS written global-scope with no project_id
+                # (store_raw forces this), so the standard pool must NOT inherit
+                # the caller's scope/project_id — doing so returns zero standards
+                # for a project-scoped recall and breaks the everyone-reads-
+                # standards guarantee. Query the pool unscoped; it's already
+                # filtered to visibility=standard.
+                vector_responses.extend(
+                    self._search_standard_pool(
+                        m=m,
+                        query=query,
+                        project_id=None,
+                        categories=categories,
+                        scope=None,
+                        domain=domain,
+                        observation_type=observation_type,
+                        concepts=concepts,
+                        limit=limit,
+                        query_embedding=query_embedding,
                     )
+                )
             except Exception as e:
                 logger.warning(f"Standard-pool search failed (non-critical): {e}")
 
@@ -2351,6 +2368,13 @@ class MemoryService:
 
         Returns raw Qdrant points (visibility=standard AND all `must_extra`).
         Empty on any error so callers degrade gracefully.
+
+        Verbatim ``passage`` chunks are EXCLUDED: every scroll caller
+        (session-start standards injection, process enumeration) wants distilled
+        directives/definitions, not raw document chunks. When a dictator ingests
+        a standards document its passages still live in the standard pool for
+        semantic ``recall`` (via ``_search_standard_pool``) — they just don't
+        flood the always-on standards block or a process bundle.
         """
         from qdrant_client.models import FieldCondition, Filter, MatchValue
 
@@ -2362,10 +2386,13 @@ class MemoryService:
                 match=MatchValue(value=MemoryVisibility.STANDARD.value),
             )
         ] + must_extra
+        must_not = [
+            FieldCondition(key="metadata.memory_kind", match=MatchValue(value="passage"))
+        ]
         try:
             points, _ = client.scroll(
                 collection_name=settings.qdrant_collection,
-                scroll_filter=Filter(must=must),
+                scroll_filter=Filter(must=must, must_not=must_not),
                 limit=limit,
                 with_payload=True,
             )
@@ -2661,6 +2688,7 @@ class MemoryService:
             )
             deleted_count = 0
             skipped_shared = 0
+            skipped_standard = 0
             for mem_info in memories_to_delete:
                 meta = mem_info.get("metadata", {}) or {}
                 if isinstance(meta.get("metadata"), dict):
@@ -2669,7 +2697,7 @@ class MemoryService:
                     skipped_shared += 1
                     continue
                 if meta.get("visibility") == MemoryVisibility.STANDARD.value and not settings.is_dictator(user_id):
-                    skipped_shared += 1
+                    skipped_standard += 1
                     continue
                 mid = mem_info["id"]
                 try:
@@ -2681,10 +2709,7 @@ class MemoryService:
                     deleted_count += 1
                 except Exception as e:
                     logger.warning(f"Failed to delete null-category memory {mid}: {e}")
-            msg = f"Deleted {deleted_count} null-category memories"
-            if skipped_shared:
-                msg += f" (preserved {skipped_shared} shared)"
-            return {"message": msg}
+            return {"message": _deleted_msg("null-category memories", deleted_count, skipped_shared, skipped_standard)}
 
         # For filtered deletes, we need to list then delete individually
         memories = self.list_memories(
@@ -2696,12 +2721,13 @@ class MemoryService:
 
         deleted_count = 0
         skipped_shared = 0
+        skipped_standard = 0
         for mem in memories:
             if not include_shared and getattr(mem, "visibility", None) == MemoryVisibility.SHARED.value:
                 skipped_shared += 1
                 continue
             if getattr(mem, "visibility", None) == MemoryVisibility.STANDARD.value and not settings.is_dictator(user_id):
-                skipped_shared += 1
+                skipped_standard += 1
                 continue
             try:
                 # Get full memory for graph cleanup before deleting
@@ -2713,10 +2739,7 @@ class MemoryService:
             except Exception as e:
                 logger.warning(f"Failed to delete memory {mem.id}: {e}")
 
-        msg = f"Deleted {deleted_count} memories"
-        if skipped_shared:
-            msg += f" (preserved {skipped_shared} shared)"
-        return {"message": msg}
+        return {"message": _deleted_msg("memories", deleted_count, skipped_shared, skipped_standard)}
 
     def _delete_private_only(self, user_id: str) -> dict:
         """Delete every PRIVATE memory the user owns; leave shared writes alone.

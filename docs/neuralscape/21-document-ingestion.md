@@ -64,6 +64,26 @@ Modules (`neuralscape-service/ingest/`):
 | `INGEST_MAX_FILES` | `200` | Max files per request (post zip-expansion). |
 | `INGEST_MAX_ARCHIVE_UNCOMPRESSED_MB` | `200` | Total unzipped-size cap. |
 
+## Ingesting authoritative standards
+
+When the `standard` tier is enabled (`STANDARDS_ENABLED=true`), a **dictator**
+(`DICTATOR_USER_IDS`) can bulk-ingest org standards through this same pipeline by
+passing `visibility=standard` (the `visibility` form field on `/v1/ingest/files`,
+or the arg on `ingest_text` / `ingest_document`). Enforcement:
+
+- **Authorship is gated at the API/MCP boundary** — a non-dictator (or a request
+  when the tier is disabled) is rejected **synchronously** (`403` / MCP error),
+  so no ingest jobs are enqueued only to fail later in the worker.
+- Standards are **always global-scope** (`store_raw` forces `scope=global`,
+  `project_id=None`) regardless of the scope field.
+- The distilled **facts** from ingested standards join the always-injected
+  authoritative context at session start; the verbatim **passages** stay in the
+  standard pool for semantic `recall` but are excluded from the always-on block
+  and from process bundles (so a large doc can't flood session context).
+
+For a single directive prefer `remember` with `visibility=standard`; use this
+pipeline for standards **documents**.
+
 ## Deployment notes
 
 - Run the ingest worker: `uv run arq worker.IngestWorkerSettings` (compose:

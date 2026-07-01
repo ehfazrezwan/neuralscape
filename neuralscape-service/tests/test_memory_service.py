@@ -2968,3 +2968,19 @@ class TestGraphEnrichmentMultiUser:
         }
         assert "user_id" in should_keys
         assert "metadata.visibility" in should_keys
+
+
+class TestDeletedMsg:
+    """_deleted_msg reports standards and shared as SEPARATE preserved tiers (CR #3/#4)."""
+
+    def test_reports_standard_separately(self):
+        from memory_service import _deleted_msg
+        assert _deleted_msg("memories", 3, 2, 1) == "Deleted 3 memories (preserved 2 shared, 1 standard)"
+
+    def test_standard_only(self):
+        from memory_service import _deleted_msg
+        assert _deleted_msg("memories", 0, 0, 4) == "Deleted 0 memories (preserved 4 standard)"
+
+    def test_none_preserved(self):
+        from memory_service import _deleted_msg
+        assert _deleted_msg("null-category memories", 5, 0, 0) == "Deleted 5 null-category memories"

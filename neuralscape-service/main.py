@@ -865,6 +865,9 @@ async def v1_ingest_text(req: IngestTextRequest, request: Request):
         raise HTTPException(status_code=400, detail="project_id is required when scope='project'")
 
     resolved_user_id = _resolve_user_id(request, req.user_id)
+    # Reject non-dictator standard-tier ingests synchronously (else every
+    # produced job would fail later in the worker — a lost-job trap).
+    _authorize_standard_write(resolved_user_id, req.visibility)
 
     # Persist the pasted context as an artifact so its memories reference a real,
     # re-fetchable source (falls back to a hash-only ref when storage is off).
@@ -935,13 +938,18 @@ async def v1_ingest_files(
         raise HTTPException(status_code=400, detail="project_id is required when scope='project'")
     if category not in MEMORY_CATEGORIES:
         raise HTTPException(status_code=400, detail=f"Invalid category '{category}'")
-    if visibility is not None and visibility not in ("private", "shared"):
-        raise HTTPException(status_code=400, detail="visibility must be 'private' or 'shared'")
+    if visibility is not None and visibility not in ("private", "shared", "standard"):
+        raise HTTPException(status_code=400, detail="visibility must be 'private', 'shared', or 'standard'")
     parsed_tags = [t.strip() for t in tags.split(",") if t.strip()] if tags else None
     if parsed_tags and len(parsed_tags) > 20:
         raise HTTPException(status_code=400, detail="at most 20 tags are allowed")
 
     resolved_user_id = _resolve_user_id(request, user_id)
+    # Standard-tier ingestion (a dictator uploading org standards) is allowed, but
+    # only for authorized dictators — reject others synchronously so we don't
+    # enqueue a batch of jobs that each fail later in the worker. store_raw forces
+    # standards to global scope regardless of the scope form field.
+    _authorize_standard_write(resolved_user_id, visibility)
     max_file_bytes = settings.ingest_max_file_mb * 1024 * 1024
     max_request_bytes = settings.ingest_max_request_mb * 1024 * 1024
 
