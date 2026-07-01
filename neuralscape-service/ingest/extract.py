@@ -148,8 +148,9 @@ def extract_text(filename: str, data: bytes, settings) -> tuple[str, str]:
         if md is not None:
             return md, "markitdown"
         # No parser succeeded — last resort: if the bytes are actually text
-        # (e.g. an extensionless plain file), decode; otherwise give up.
-        if ext == "" and _looks_textual(data):
+        # (a .csv/.html/extensionless plain file that both parsers choked on),
+        # decode directly so uploads never hard-fail. Otherwise give up.
+        if _looks_textual(data):
             return _decode_text(data), "decoded"
         raise UnsupportedFile(
             f"Could not extract text from '{filename}' "

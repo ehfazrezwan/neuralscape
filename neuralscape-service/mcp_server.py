@@ -662,7 +662,8 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             except (ConnectionError, OSError) as e:
                 logger.warning(f"Redis unavailable, falling back to sync ingest: {e}")
                 from ingest.pipeline import IngestDoc, ingest_document
-                result = ingest_document(_service, IngestDoc(**doc))
+                # Offload the blocking ingest so it doesn't stall the async MCP loop.
+                result = await asyncio.to_thread(ingest_document, _service, IngestDoc(**doc))
                 return [TextContent(type="text", text=json.dumps({"status": "completed", "result": result, "fallback": "sync"}, default=str))]
 
             if wait:
@@ -672,19 +673,34 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps({"status": "accepted", "task_id": task_id}, default=str))]
 
         elif name == "ingest_text":
+            from pydantic import ValidationError
+            from schemas import IngestTextRequest
+
             wait = arguments.get("wait", False)
-            content = arguments["content"]
-            scope = arguments.get("scope")
-            project_id = arguments.get("project_id")
-            category = arguments.get("category", "domain_knowledge")
-            if not scope:
-                scope = "project" if project_id else "global"
+            # Infer scope (project when a project_id is present) before validating.
+            raw = dict(arguments)
+            if not raw.get("scope"):
+                raw["scope"] = "project" if raw.get("project_id") else "global"
+            # Validate with the shared schema so MCP callers can't bypass the REST
+            # limits/enums (invalid scope/category/visibility, oversized content).
+            try:
+                req = IngestTextRequest(
+                    **{k: v for k, v in raw.items() if k in IngestTextRequest.model_fields}
+                )
+            except ValidationError as e:
+                return [TextContent(type="text", text=json.dumps({"status": "error", "error": str(e)}, default=str))]
+            if req.scope == "project" and not req.project_id:
+                return [TextContent(type="text", text=json.dumps({"status": "error", "error": "project_id is required when scope='project'"}, default=str))]
+
+            content = req.content
+            category = req.category
+            project_id = req.project_id
 
             # Persist the context as an artifact so its memories reference a real,
             # re-fetchable source (falls back to a hash-only ref when storage off).
             if settings.ingest_storage_enabled:
                 from ingest.storage import artifact_source_ref, store_artifact
-                fname = (arguments.get("title") or "context") + ".md"
+                fname = (req.title or "context") + ".md"
                 art = await asyncio.to_thread(
                     store_artifact, content.encode(), fname, user_id, project_id, category, settings,
                 )
@@ -692,13 +708,13 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             else:
                 import hashlib as _hashlib
                 from datetime import datetime as _dt, timezone as _tz
-                digest = _hashlib.md5(content.encode()).hexdigest()[:16]
+                digest = _hashlib.sha256(content.encode()).hexdigest()[:16]
                 source_ref = {
                     "connector_id": "manual",
                     "connector_type": "manual",
                     "external_id": digest,
                     "parent_id": digest,
-                    "title": arguments.get("title"),
+                    "title": req.title,
                     "last_synced_at": _dt.now(_tz.utc).isoformat(),
                 }
             doc = {
@@ -706,12 +722,12 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 "source": source_ref,
                 "user_id": user_id,
                 "category": category,
-                "scope": scope,
+                "scope": req.scope,
                 "project_id": project_id,
-                "visibility": arguments.get("visibility"),
-                "tags": arguments.get("tags"),
-                "extract_facts": arguments.get("extract_facts", True),
-                "index_passages": arguments.get("index_passages", True),
+                "visibility": req.visibility.value if req.visibility else None,
+                "tags": req.tags,
+                "extract_facts": req.extract_facts,
+                "index_passages": req.index_passages,
             }
             # source is a dict with None title possibly — keep it; drop top-level Nones only.
             doc = {k: v for k, v in doc.items() if v is not None}
@@ -721,7 +737,8 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             except (ConnectionError, OSError) as e:
                 logger.warning(f"Redis unavailable, falling back to sync ingest: {e}")
                 from ingest.pipeline import IngestDoc, ingest_document
-                result = ingest_document(_service, IngestDoc(**doc))
+                # Offload the blocking ingest so it doesn't stall the async MCP loop.
+                result = await asyncio.to_thread(ingest_document, _service, IngestDoc(**doc))
                 return [TextContent(type="text", text=json.dumps({"status": "completed", "result": result, "fallback": "sync"}, default=str))]
 
             if wait:

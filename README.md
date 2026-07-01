@@ -116,6 +116,7 @@ both Claude Code and Claude Cowork:
 | `/neuralscape:save-session` | Extract + store facts from the conversation | Both (MCP) |
 | `/neuralscape:project` | List / pick / create the project to scope memory to | Both (MCP) |
 | `/neuralscape:search` | Inline memory recall (`recall_memories`; `/v1/search` as CLI fast path) | Both (MCP) |
+| `/neuralscape:ingest` | Ingest files/folders/zips or pasted context (Markdown/HTML/PDF/MS-Office) | Both (MCP) |
 | `/neuralscape:ns-status` | Reachability check + config display | Both (degrades) |
 | `/neuralscape:ns-config` | Show URL / user_id / API-key state (or connector mode) without leaking secrets | Both (degrades) |
 | `/neuralscape:sync` | Manually flush the current conversation (delegates to `save-session` in Cowork) | Both |

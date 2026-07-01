@@ -9,3 +9,7 @@ data:
   {{- range $k, $v := .Values.config }}
   {{ $k }}: {{ $v | quote }}
   {{- end }}
+  # Tie the app's artifact-storage mode to whether a shared RWX volume exists.
+  # Without one (ingestStorage.enabled=false) the API must NOT write artifacts to
+  # an unshared emptyDir the worker can't read — it ships bytes through Redis instead.
+  INGEST_STORAGE_ENABLED: {{ .Values.ingestStorage.enabled | quote }}

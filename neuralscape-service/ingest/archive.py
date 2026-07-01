@@ -35,7 +35,14 @@ class ArchiveTooLarge(ArchiveError):
 
 
 def is_zip(data: bytes) -> bool:
-    """Cheap magic-byte check for a ZIP archive (PK\\x03\\x04 / empty / spanned)."""
+    """Cheap magic-byte check for a ZIP container (starts with ``PK``).
+
+    NOTE: OOXML files (``.docx``/``.xlsx``/``.pptx``) are ZIP containers too, so a
+    true result does NOT mean the upload should be *expanded*. Callers must also
+    gate on the filename (``.zip``) before treating a file as an archive —
+    otherwise an Office document's internals would be expanded instead of being
+    handed to the parser. See ``main.v1_ingest_files``.
+    """
     return data[:2] == b"PK"
 
 
@@ -87,28 +94,33 @@ def iter_archive(
             name = info.filename
             if _skip_member(name):
                 continue
-            # Trust the declared uncompressed size for an up-front bomb check,
-            # then verify against the bytes actually read.
+            # Cheap fast-fail on the declared size — but never TRUST it. A forged
+            # central-directory size could under-report to slip past the caps, so
+            # we enforce the real limits on the bytes actually decompressed below.
             if info.file_size > max_file_bytes:
                 raise ArchiveTooLarge(
                     f"Archive member '{name}' is {info.file_size} bytes, "
                     f"over the {max_file_bytes}-byte per-file limit"
                 )
-            total += info.file_size
-            if total > max_total_uncompressed_bytes:
-                raise ArchiveTooLarge(
-                    f"Archive uncompressed size exceeds the "
-                    f"{max_total_uncompressed_bytes}-byte limit"
-                )
             if yielded >= max_files:
                 raise ArchiveTooLarge(
                     f"Archive contains more than {max_files} ingestible files"
                 )
-            member = zf.read(info)
-            # Defensive: a lying header could under-report file_size.
+            # Stream-read at most max_file_bytes+1 so a lying header can't force us
+            # to materialize an unbounded member in memory.
+            with zf.open(info) as fh:
+                member = fh.read(max_file_bytes + 1)
             if len(member) > max_file_bytes:
                 raise ArchiveTooLarge(
-                    f"Archive member '{name}' expanded past the per-file limit"
+                    f"Archive member '{name}' expanded past the "
+                    f"{max_file_bytes}-byte per-file limit"
+                )
+            # Enforce the cumulative cap on ACTUAL decompressed bytes.
+            total += len(member)
+            if total > max_total_uncompressed_bytes:
+                raise ArchiveTooLarge(
+                    f"Archive uncompressed size exceeds the "
+                    f"{max_total_uncompressed_bytes}-byte limit"
                 )
             yielded += 1
             yield name, member

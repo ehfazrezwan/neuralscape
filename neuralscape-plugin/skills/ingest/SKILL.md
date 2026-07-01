@@ -5,7 +5,7 @@ description: Ingest files, folders, or a block of pasted context into Neuralscap
 
 # Neuralscape — Ingest
 
-Bring larger content into memory: uploaded **files** (a folder or a `.zip`, or individual Markdown/HTML/PDF/Office files) or a **manually-pasted block of context**. Ingested content is chunked into verbatim passages **and** distilled into graph facts, and every produced memory references a stored source artifact you can fetch back.
+Bring larger content into memory: uploaded **files** (a folder or a `.zip`, or individual Markdown/HTML/PDF/Office files) or a **manually-pasted block of context**. Ingested content is chunked into verbatim passages **and** distilled into graph facts. When the server has artifact storage enabled, every produced memory references a stored source artifact you can fetch back; if storage is disabled, memories instead carry a lightweight content-hash provenance ref (no re-fetchable file).
 
 Two mechanisms, chosen by what's actually available (probe the artifact, not the platform):
 

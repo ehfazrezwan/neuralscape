@@ -239,6 +239,22 @@ class Settings(BaseSettings):
             raise ValueError("OAuth token TTLs must be > 0 seconds")
         return value
 
+    @field_validator(
+        "docling_timeout_s",
+        "ingest_max_file_mb",
+        "ingest_max_files",
+        "ingest_max_archive_uncompressed_mb",
+        "ingest_max_request_mb",
+    )
+    @classmethod
+    def _validate_positive_ingest_limit(cls, value: int, info) -> int:
+        # These feed the Docling timeout and the zip guardrails; a 0/negative
+        # value would time out every conversion or invert the archive checks, and
+        # only surface as a runtime failure after deploy. Reject at startup.
+        if value <= 0:
+            raise ValueError(f"{info.field_name} must be > 0")
+        return value
+
     @field_validator("auth_provider")
     @classmethod
     def _validate_auth_provider(cls, value: str) -> str:

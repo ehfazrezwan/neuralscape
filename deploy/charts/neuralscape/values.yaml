@@ -114,11 +114,14 @@ docling:
     limits: { cpu: "2000m", memory: "4Gi" }
 
 # Shared artifact storage for uploaded files (the API writes them, the ingest
-# worker reads them back to parse). Needs ReadWriteMany so both pods mount it
-# (e.g. Filestore on GKE). Give an existingClaim, or let the chart create a PVC.
-# enabled=false → an emptyDir per pod (single-pod dev only; NOT shared).
+# worker reads them back to parse). It needs ReadWriteMany so BOTH pods can mount
+# it (e.g. Filestore on GKE) — a plain default (RWO) StorageClass would leave the
+# PVC Pending. So this is OFF by default: a bare `helm install` runs fine and the
+# app falls back to shipping file bytes through Redis (INGEST_STORAGE_ENABLED is
+# tied to this flag in the ConfigMap — see configmap.yaml). For production file
+# ingest, provide an RWX `storageClass` (or `existingClaim`) and set enabled=true.
 ingestStorage:
-  enabled: true
+  enabled: false
   create: true
   existingClaim: ""
   accessMode: ReadWriteMany

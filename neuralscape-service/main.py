@@ -813,7 +813,7 @@ def _fallback_source_ref(content: bytes | str, title: str | None, connector_type
     aren't persisting an artifact, the best we can do is a content-hash backlink.
     """
     raw = content.encode() if isinstance(content, str) else content
-    digest = hashlib.md5(raw).hexdigest()[:16]
+    digest = hashlib.sha256(raw).hexdigest()[:16]
     return {
         "connector_id": connector_type,
         "connector_type": connector_type,
@@ -910,6 +910,9 @@ async def v1_ingest_files(
         raise HTTPException(status_code=400, detail=f"Invalid category '{category}'")
     if visibility is not None and visibility not in ("private", "shared"):
         raise HTTPException(status_code=400, detail="visibility must be 'private' or 'shared'")
+    parsed_tags = [t.strip() for t in tags.split(",") if t.strip()] if tags else None
+    if parsed_tags and len(parsed_tags) > 20:
+        raise HTTPException(status_code=400, detail="at most 20 tags are allowed")
 
     resolved_user_id = _resolve_user_id(request, user_id)
     max_file_bytes = settings.ingest_max_file_mb * 1024 * 1024
@@ -920,7 +923,7 @@ async def v1_ingest_files(
         "scope": scope,
         "project_id": project_id,
         "visibility": visibility,
-        "tags": [t.strip() for t in tags.split(",") if t.strip()] if tags else None,
+        "tags": parsed_tags,
         "extract_facts": extract_facts,
         "index_passages": index_passages,
         "agent_id": None,

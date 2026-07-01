@@ -448,6 +448,13 @@ class IngestDocumentRequest(BaseModel):
             raise ValueError(f"Invalid category '{v}'. Must be one of: {list(MEMORY_CATEGORIES.keys())}")
         return v
 
+    @field_validator("scope")
+    @classmethod
+    def _validate_scope(cls, v: str) -> str:
+        if v not in ("global", "project"):
+            raise ValueError("scope must be 'global' or 'project'")
+        return v
+
 
 class IngestTextRequest(BaseModel):
     """Manually provide a block of context — a first-class ingestion path.
@@ -476,6 +483,13 @@ class IngestTextRequest(BaseModel):
     def _validate_category(cls, v: str) -> str:
         if v not in MEMORY_CATEGORIES:
             raise ValueError(f"Invalid category '{v}'. Must be one of: {list(MEMORY_CATEGORIES.keys())}")
+        return v
+
+    @field_validator("scope")
+    @classmethod
+    def _validate_scope(cls, v: str) -> str:
+        if v not in ("global", "project"):
+            raise ValueError("scope must be 'global' or 'project'")
         return v
 
 

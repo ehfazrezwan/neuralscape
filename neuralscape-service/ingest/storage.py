@@ -29,7 +29,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 _SAFE_SEGMENT = re.compile(r"[^A-Za-z0-9._-]+")
-# Artifact ids are md5(content)[:16] — exactly 16 lowercase hex chars.
+# Artifact ids are sha256(content)[:16] — exactly 16 lowercase hex chars.
 _FILE_ID_RE = re.compile(r"[0-9a-f]{16}")
 _GLOBAL = "_global"
 
@@ -75,7 +75,7 @@ def store_artifact(
     Idempotent: identical bytes hash to the same ``file_id`` and overwrite the
     same path harmlessly.
     """
-    file_id = hashlib.md5(data).hexdigest()[:16]
+    file_id = hashlib.sha256(data).hexdigest()[:16]
     disk_name, ext = _safe_filename(filename, file_id)
     rel = os.path.join(
         _safe(user_id, "anon"),
@@ -129,7 +129,11 @@ def find_artifact(file_id: str, user_id: str, settings) -> tuple[str, str] | Non
     user_root = (_root(settings) / _safe(user_id, "anon")).resolve()
     if not user_root.is_dir():
         return None
-    for match in user_root.rglob("*"):
+    # Sort for a deterministic result: identical bytes hash to the same file_id,
+    # so if the same content was stored under different category/project folders
+    # every match has identical bytes — sorting just makes which path we return
+    # stable rather than filesystem-order-dependent.
+    for match in sorted(user_root.rglob("*")):
         if match.is_file() and (match.stem == file_id or match.name == file_id):
             return str(match), match.name
     return None
@@ -145,6 +149,10 @@ def artifact_source_ref(
     # Re-fetch mechanism is the REST download endpoint carried in `url`
     # (GET /v1/ingest/artifacts/{file_id}); we deliberately omit a `retrieval`
     # MCP handle since there is no MCP tool that streams artifact bytes.
+    # NOTE: the internal stored_path is intentionally NOT persisted here — it
+    # would leak the {user}/{project}/{category} layout into user-visible (and
+    # possibly shared) memory metadata. The worker gets stored_path from the
+    # queue payload; only file_id is needed to download.
     ref = {
         "connector_id": connector_type,
         "connector_type": connector_type,
@@ -152,7 +160,6 @@ def artifact_source_ref(
         "parent_id": art.file_id,
         "title": art.filename,
         "url": f"/v1/ingest/artifacts/{art.file_id}",
-        "stored_path": art.rel_path,
     }
     if extra:
         ref.update(extra)

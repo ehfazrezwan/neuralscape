@@ -57,8 +57,9 @@ class TestIngestText:
         doc = enqueue.await_args.args[0]
         # The produced job must reference a real, stored artifact — not sourceless.
         assert doc["source"]["connector_type"] == "manual"
-        assert doc["source"]["stored_path"]
         assert doc["source"]["url"].startswith("/v1/ingest/artifacts/")
+        # Internal storage path must not leak into user-visible provenance.
+        assert "stored_path" not in doc["source"]
 
     def test_project_scope_requires_project_id(self, client, monkeypatch):
         monkeypatch.setattr(main._task_manager, "enqueue_ingest_document", AsyncMock())
@@ -66,6 +67,13 @@ class TestIngestText:
             "content": "x", "scope": "project", "user_id": "alice",
         })
         assert resp.status_code == 400
+
+    def test_invalid_scope_rejected(self, client, monkeypatch):
+        monkeypatch.setattr(main._task_manager, "enqueue_ingest_document", AsyncMock())
+        resp = client.post("/v1/ingest/text", json={
+            "content": "x", "scope": "projcet", "user_id": "alice",  # typo
+        })
+        assert resp.status_code == 422  # schema validator rejects it
 
 
 class TestIngestFiles:

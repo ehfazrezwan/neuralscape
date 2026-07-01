@@ -20,8 +20,10 @@ memory reads/writes.
 | MCP `ingest_document` | A fetched document with an explicit connector `source_ref`. |
 | `/neuralscape:ingest` skill | Client-side: uploads files/folders (CLI) or ingests pasted text (both platforms). |
 
-All write endpoints return **202** and enqueue onto the ingest queue; poll
-`/v1/memories/status/{task_id}` for `{passages, facts}` counts.
+These write endpoints normally return **202** and enqueue onto the ingest queue;
+poll `/v1/memories/status/{task_id}` for `{passages, facts}` counts. (If Redis is
+unavailable, `/v1/ingest/text` and `/v1/ingest/document` fall back to running the
+ingest inline and return **200** with the result.)
 
 ## Pipeline
 

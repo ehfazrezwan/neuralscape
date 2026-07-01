@@ -82,6 +82,15 @@ class TestExtractText:
         with pytest.raises(UnsupportedFile):
             extract_text("mystery.pdf", b"\x00\x01\x02binary", settings)
 
+    def test_rich_textual_fallback_when_parsers_miss(self, settings, monkeypatch):
+        # A .csv/.html whose parsers both fail must still decode (never hard-fail),
+        # not just extensionless files.
+        import ingest.extract as extract_mod
+        monkeypatch.setattr(extract_mod, "_markitdown_convert", lambda data, ext: None)
+        text, dt = extract_text("data.csv", b"a,b,c\n1,2,3", settings)
+        assert dt == "decoded"
+        assert "a,b,c" in text
+
     def test_unknown_extension_textual_is_decoded(self, settings):
         text, dt = extract_text("data.weird", b"just text", settings)
         assert dt == "decoded"
@@ -131,10 +140,16 @@ class TestStorage:
         art = store_artifact(b"z", "z.md", "alice", None, "domain_knowledge", settings)
         ref = artifact_source_ref(art, connector_type="manual")
         assert ref["connector_type"] == "manual"
-        assert ref["stored_path"] == art.rel_path
         # Re-fetch mechanism is the REST url; no phantom MCP retrieval handle.
         assert ref["url"] == f"/v1/ingest/artifacts/{art.file_id}"
         assert "retrieval" not in ref
+        # Internal storage layout must NOT leak into user-visible provenance.
+        assert "stored_path" not in ref
+
+    def test_file_id_is_sha256_hex(self, settings):
+        import hashlib
+        art = store_artifact(b"hash me", "h.md", "alice", None, "domain_knowledge", settings)
+        assert art.file_id == hashlib.sha256(b"hash me").hexdigest()[:16]
 
     def test_path_traversal_in_ids_is_neutralized(self, settings):
         # Malicious user/project/category segments must not escape the root.
