@@ -105,6 +105,16 @@ encoded as hard `REQUIRES` edges — the `edge_type_map` constrains
 `(Setup, SupportResistanceZone)` to `[REQUIRES]` so a compiled strategy can't
 fire a setup out of context.
 
+**Doctrine vs worked examples (`is_example`).** Books teach through worked
+examples on historical charts ("EUR/USD prints a kangaroo tail at the 1.0560
+support level"), and Graphiti will happily instantiate that example zone as an
+entity — instance-level illustration masquerading as type-level knowledge. The
+price-context entities (`Setup`, `SupportResistanceZone`, `MarketRegime`,
+`EntryCondition`, `StopLoss`, `TakeProfit`, `ExitCondition`) therefore carry an
+`is_example` attribute, and `CUSTOM_EXTRACTION_INSTRUCTIONS` tells the model to
+prefer extracting the general concept and to mark unavoidable example entities
+`is_example=true`. Consumers: see the contract in the Bellwether bridge section.
+
 > **#1111 hedge.** Graphiti has a known gap populating *custom edge attributes*.
 > So all load-bearing, compiler-facing data (`rule_ast`, `executable_expression`,
 > offsets, anchors) lives on **entity** nodes; edge types are thin markers.
@@ -197,3 +207,13 @@ Bellwether's `Strategy`/`OrderIntent`), reading the strategy graph via the
 Neuralscape MCP tools. NS owns the semantic + procedural layers (ontology,
 provenance, synthesis); Bellwether owns execution + validation (CPCV/DSR/PBO,
 written back as `Backtest` nodes). The strategy graph is the interchange format.
+
+**Consumer contract — example instances are citations, not data.** Any numeric
+price level, date, or instrument snapshot found on a graph node is a citation
+of the source book's charts, frozen at its print date — **never** live market
+knowledge. Retrieval-flavored consumers (chart agents, context injectors) MUST
+filter or explicitly discount nodes with `is_example: true`, and should treat
+any zone whose name embeds a literal price as suspect even when unmarked
+(pre-`is_example` ingests). The compiler is structurally safe — it consumes
+`rule_ast`/`executable_expression`, where zones are runtime variables — but
+must not resolve a zone variable against an example node's literal level.
