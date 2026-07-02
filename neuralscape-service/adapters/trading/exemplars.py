@@ -176,7 +176,10 @@ def _find_exemplar_point(service, *, external_id: str, user_id: str, with_payloa
 
         from config import settings as core_settings
 
-        client = service._memory.vector_store.client
+        # _get_memory() lazily initializes; the raw attribute is None on a
+        # service that hasn't served a request yet (same fix as the strategy
+        # synthesizer's scroll — never deref ._memory directly).
+        client = service._get_memory().vector_store.client
         points, _ = client.scroll(
             collection_name=core_settings.qdrant_collection,
             scroll_filter=Filter(must=[

@@ -175,6 +175,9 @@ def test_find_existing_exemplar_matches_image_hash(tmp_path):
     mem = _Mem()
     mem.vector_store = vs
     svc._memory = mem
+    # Mirror MemoryService: lookups go through _get_memory() (lazy init),
+    # never the raw ._memory attribute.
+    svc._get_memory = lambda: svc._memory
 
     found = ex.find_existing_exemplar(svc, image_bytes=PNG, user_id="u1")
     assert found == "prior-mem"

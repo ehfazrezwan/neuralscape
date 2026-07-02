@@ -158,6 +158,33 @@ class TestExtractTextAndImages:
         text, dt, images = extract_text_and_images("notes.md", b"# hi", settings)
         assert (dt, images) == ("plain", [])
 
+    def test_distinct_images_sharing_a_prefix_both_survive(self, settings, monkeypatch):
+        # Dedup must key on a full content digest — two same-format charts share
+        # PNG signature/IHDR headers, so a byte-prefix key would drop one.
+        import base64
+        from ingest.extract import extract_text_and_images
+        import ingest.extract as extract_mod
+
+        settings.docling_enabled = True
+        settings.docling_url = "http://docling:5001"
+        shared_prefix = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+        img_a = shared_prefix + b"AAAA"
+        img_b = shared_prefix + b"BBBB"
+        uris = [
+            "data:image/png;base64," + base64.b64encode(img).decode()
+            for img in (img_a, img_b)
+        ]
+        payload = {"document": {"md_content": "# md", "pictures": [
+            {"image": {"uri": uris[0]}}, {"image": {"uri": uris[1]}},
+        ]}}
+        monkeypatch.setattr(extract_mod, "_docling_post", lambda *a, **k: payload)
+        _, _, images = extract_text_and_images("book.pdf", b"%PDF-1.4", settings)
+        assert len(images) == 2
+        # And true duplicates are still collapsed.
+        payload["document"]["pictures"].append({"image": {"uri": uris[0]}})
+        _, _, images = extract_text_and_images("book.pdf", b"%PDF-1.4", settings)
+        assert len(images) == 2
+
 
 # ── storage round-trip + provenance ──
 

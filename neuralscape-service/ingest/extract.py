@@ -225,6 +225,8 @@ def _page_ref_from(container: dict) -> str | None:
 
 def _harvest_images(payload: dict, filename: str) -> list[dict]:
     """Collect embedded figures from a docling payload as ``{"bytes","ext","page_ref"}``."""
+    import hashlib
+
     images: list[dict] = []
     seen: set[bytes] = set()
     for uri, container in _walk_data_uris(payload):
@@ -232,7 +234,10 @@ def _harvest_images(payload: dict, filename: str) -> list[dict]:
         if decoded is None:
             continue
         img_bytes, ext = decoded
-        digest = img_bytes[:64]
+        # Dedup on a real content digest — a byte-prefix would collide for
+        # distinct images sharing format headers (PNG signature + IHDR),
+        # silently dropping exemplars.
+        digest = hashlib.sha256(img_bytes).digest()
         if digest in seen:
             continue
         seen.add(digest)

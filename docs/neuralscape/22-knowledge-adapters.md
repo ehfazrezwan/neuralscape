@@ -30,8 +30,11 @@ equivalent to the pre-adapter path.
 - REST: `POST /v1/ingest`, `/v1/ingest/text`, `/v1/ingest/files` accept an
   `adapter` field/form-field.
 - MCP: `ingest_document` and `ingest_text` take an `adapter` argument.
-- Unknown/typo'd adapter names **degrade to `default`** — a stale value never
-  fails an ingest.
+- Unknown adapter names are **rejected loudly (400/422) at the REST/MCP request
+  boundary** — a typo'd adapter silently ingesting without the taxonomy/ontology
+  the caller asked for would be worse than an error. Only **worker-side**
+  resolution degrades to `default`, and only for jobs already queued when an
+  adapter was removed.
 
 ```bash
 curl -F 'files=@naked-forex.pdf' \
