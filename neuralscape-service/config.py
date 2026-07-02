@@ -131,6 +131,25 @@ class Settings(BaseSettings):
     ingest_storage_enabled: bool = True
     ingest_storage_dir: str = "~/.neuralscape/ingest"  # volume mount in prod
 
+    # ── Visual setup exemplars (VISUAL_EXEMPLARS_SPEC) ───────────────
+    # The trading adapter can extract chart images from a book, store the bytes,
+    # vision-describe each with a multimodal model, and index the description as a
+    # normal memory (category `setup`, tag `visual_exemplar`) + a VisualExemplar
+    # graph node. Dark by default. v1 storage = a local dir addressed by a
+    # file:// URI (source_ref.stored_path); swap to S3/MinIO later behind the
+    # same stored_path interface by changing only exemplar_store helpers.
+    exemplar_store_enabled: bool = False
+    exemplar_store_dir: str = "~/.neuralscape/exemplars"  # object store (local, v1)
+    # Request figure/picture extraction from docling-serve so PDF images are
+    # available to the exemplar pipeline (adds latency; only needed with
+    # exemplar_store_enabled).
+    docling_extract_images: bool = False
+    # Multimodal model that describes a setup image. Routed through the LLM
+    # gateway (llm_gateway_*) which is what fronts Opus 4.8; empty ⇒ the gateway's
+    # default llm model. Book-exemplar and live-chart reads must share this model
+    # so their descriptions land in one visual vocabulary.
+    exemplar_vision_model: str = ""
+
     # Auth
     # Legacy single shared API key. When set without `neuralscape_user_token_secret`,
     # all requests must present this exact token in `Authorization: Bearer ...` and

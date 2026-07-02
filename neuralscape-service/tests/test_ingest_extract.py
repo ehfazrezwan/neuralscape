@@ -101,6 +101,64 @@ class TestExtractText:
             extract_text("blob.weird", b"\x00\xff\x00binary", settings)
 
 
+# ── extract_text_and_images (single-conversion path) ──
+
+class TestExtractTextAndImages:
+    def _payload(self):
+        import base64
+
+        png_uri = "data:image/png;base64," + base64.b64encode(b"\x89PNGfake").decode()
+        return {
+            "document": {
+                "md_content": "# book md",
+                "pictures": [{"image": {"uri": png_uri}, "prov": [{"page_no": 8}]}],
+            }
+        }
+
+    def test_one_docling_call_yields_text_and_images(self, settings, monkeypatch):
+        from ingest.extract import extract_text_and_images
+        import ingest.extract as extract_mod
+
+        settings.docling_enabled = True
+        settings.docling_url = "http://docling:5001"
+        calls = {"n": 0}
+
+        def _fake_post(data, filename, s, embed_images=False):
+            calls["n"] += 1
+            assert embed_images is True  # figures requested on the same call
+            return self._payload()
+
+        monkeypatch.setattr(extract_mod, "_docling_post", _fake_post)
+        text, dt, images = extract_text_and_images("book.pdf", b"%PDF-1.4", settings)
+        assert calls["n"] == 1  # THE point: exactly one conversion
+        assert dt == "docling" and text == "# book md"
+        assert len(images) == 1
+        assert images[0]["ext"] == "png"
+        assert images[0]["page_ref"] == "p.8"
+
+    def test_falls_back_to_markitdown_keeping_harvested_images(self, settings, monkeypatch):
+        from ingest.extract import extract_text_and_images
+        import ingest.extract as extract_mod
+
+        settings.docling_enabled = True
+        settings.docling_url = "http://docling:5001"
+        payload = self._payload()
+        payload["document"]["md_content"] = ""  # docling parsed images but no text
+        monkeypatch.setattr(
+            extract_mod, "_docling_post", lambda *a, **k: payload
+        )
+        monkeypatch.setattr(extract_mod, "_markitdown_convert", lambda d, e: "mid text")
+        text, dt, images = extract_text_and_images("book.pdf", b"%PDF-1.4", settings)
+        assert dt == "markitdown" and text == "mid text"
+        assert len(images) == 1  # figures from the docling payload survive
+
+    def test_plain_files_have_no_images(self, settings):
+        from ingest.extract import extract_text_and_images
+
+        text, dt, images = extract_text_and_images("notes.md", b"# hi", settings)
+        assert (dt, images) == ("plain", [])
+
+
 # ── storage round-trip + provenance ──
 
 class TestStorage:

@@ -21,6 +21,7 @@ import io
 import logging
 import mimetypes
 import os
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -67,12 +68,13 @@ def _looks_textual(data: bytes) -> bool:
         return False
 
 
-def _docling_convert(data: bytes, filename: str, settings) -> str | None:
-    """Convert via docling-serve. Returns Markdown, or None if unavailable/failed.
+def _docling_post(data: bytes, filename: str, settings, embed_images: bool = False) -> dict | None:
+    """POST a file to docling-serve; return the parsed JSON payload or None.
 
-    POSTs the file to ``{docling_url}/v1/convert/file`` requesting Markdown and
-    reads ``document.md_content`` from the response. Any error (disabled, network,
-    non-200, empty result) returns None so the caller falls back to MarkItDown.
+    One shared round-trip for both the text and image paths — a book PDF takes
+    minutes to parse, so callers that want both must not convert twice. With
+    ``embed_images`` the response carries figures as base64 data-URIs. Any error
+    (disabled, network, non-200) returns None so callers fall back.
     """
     if not settings.docling_enabled or not settings.docling_url:
         return None
@@ -81,28 +83,42 @@ def _docling_convert(data: bytes, filename: str, settings) -> str | None:
 
     mimetype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     url = settings.docling_url.rstrip("/") + "/v1/convert/file"
+    form: dict = {"to_formats": "md"}
+    if embed_images:
+        form["image_export_mode"] = "embedded"
     try:
         with httpx.Client(timeout=settings.docling_timeout_s) as client:
             resp = client.post(
                 url,
                 files={"files": (os.path.basename(filename), data, mimetype)},
-                data={"to_formats": "md"},
+                data=form,
             )
             resp.raise_for_status()
-            payload = resp.json()
+            return resp.json()
     except Exception as e:  # noqa: BLE001 — any failure → fallback path
         logger.warning("Docling convert failed for %s (%s); falling back", filename, e)
         return None
 
+
+def _md_from_payload(payload: dict) -> str | None:
+    """Pull the Markdown text out of a docling-serve response payload."""
     # Single-file responses use `document`; some builds wrap in `documents`.
     doc = payload.get("document")
     if doc is None:
         docs = payload.get("documents") or []
         doc = docs[0] if docs else {}
     md = (doc or {}).get("md_content") or (doc or {}).get("text_content")
-    if not md or not md.strip():
-        logger.warning("Docling returned no content for %s; falling back", filename)
+    return md if md and md.strip() else None
+
+
+def _docling_convert(data: bytes, filename: str, settings) -> str | None:
+    """Convert via docling-serve. Returns Markdown, or None if unavailable/failed."""
+    payload = _docling_post(data, filename, settings)
+    if payload is None:
         return None
+    md = _md_from_payload(payload)
+    if md is None:
+        logger.warning("Docling returned no content for %s; falling back", filename)
     return md
 
 
@@ -121,6 +137,172 @@ def _markitdown_convert(data: bytes, ext: str) -> str | None:
         return None
     text = getattr(result, "text_content", None) or getattr(result, "markdown", None)
     return text if text and text.strip() else None
+
+
+def _data_uri_to_bytes(uri: str) -> tuple[bytes, str] | None:
+    """Decode a ``data:image/…;base64,…`` URI into ``(bytes, ext)``; None if not one."""
+    import base64
+    import re as _re
+
+    m = _re.match(r"^data:image/(?P<sub>[a-zA-Z0-9.+-]+);base64,(?P<b64>.+)$", uri, _re.DOTALL)
+    if not m:
+        return None
+    sub = m.group("sub").lower()
+    ext = {"jpeg": "jpg", "svg+xml": "svg"}.get(sub, sub)
+    try:
+        return base64.b64decode(m.group("b64")), ext
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# An image data-URI, either standing alone or inline inside Markdown/JSON text.
+# Base64 charset only — stops cleanly at the closing ')' / quote / whitespace.
+_DATA_URI_RE = re.compile(r"data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+")
+
+
+def _walk_data_uris(obj) -> list[tuple[str, dict]]:
+    """Recursively collect ``(data_uri, containing_dict)`` pairs from a JSON blob.
+
+    Robust to docling-serve schema drift: we don't hard-code the pictures path,
+    just find every embedded image data-URI and keep its parent object so we can
+    read a nearby caption/page number when present. Handles BOTH shapes seen in
+    the wild (verified live during E2E):
+
+    - a standalone string value (a ``pictures[].image.uri`` entry), and
+    - data-URIs **inlined inside a larger string** — with
+      ``image_export_mode=embedded`` docling-serve embeds figures directly into
+      ``md_content`` as ``![Image](data:image/png;base64,…)``.
+    """
+    found: list[tuple[str, dict]] = []
+
+    def _rec(node, container):
+        if isinstance(node, str):
+            if "data:image/" in node:
+                ctr = container if isinstance(container, dict) else {}
+                for m in _DATA_URI_RE.finditer(node):
+                    found.append((m.group(0), ctr))
+        elif isinstance(node, dict):
+            # A dict carrying provenance/caption is the picture container for its
+            # whole subtree (the data-URI usually sits under a nested `image` key).
+            new_container = node if ("prov" in node or "caption" in node) else container
+            for v in node.values():
+                _rec(v, new_container)
+        elif isinstance(node, list):
+            for v in node:
+                _rec(v, container)
+
+    _rec(obj, {})
+    return found
+
+
+def _strip_inline_image_uris(md: str) -> str:
+    """Replace inline image data-URIs in Markdown with a plain placeholder.
+
+    With ``image_export_mode=embedded`` the figures arrive base64-inlined in the
+    Markdown itself; left in place they would flow into passage chunking as
+    megabytes of base64 noise. The images are harvested separately — the text
+    keeps only a marker where each figure sat.
+    """
+    return _DATA_URI_RE.sub("image", md)
+
+
+def _page_ref_from(container: dict) -> str | None:
+    """Best-effort page/caption extraction from a docling picture container."""
+    prov = container.get("prov")
+    page = None
+    if isinstance(prov, list) and prov and isinstance(prov[0], dict):
+        page = prov[0].get("page_no") or prov[0].get("page")
+    caption = container.get("caption")
+    if isinstance(caption, dict):
+        caption = caption.get("text")
+    bits = []
+    if page is not None:
+        bits.append(f"p.{page}")
+    if isinstance(caption, str) and caption.strip():
+        bits.append(caption.strip())
+    return " — ".join(bits) if bits else None
+
+
+def _harvest_images(payload: dict, filename: str) -> list[dict]:
+    """Collect embedded figures from a docling payload as ``{"bytes","ext","page_ref"}``."""
+    images: list[dict] = []
+    seen: set[bytes] = set()
+    for uri, container in _walk_data_uris(payload):
+        decoded = _data_uri_to_bytes(uri)
+        if decoded is None:
+            continue
+        img_bytes, ext = decoded
+        digest = img_bytes[:64]
+        if digest in seen:
+            continue
+        seen.add(digest)
+        images.append({"bytes": img_bytes, "ext": ext, "page_ref": _page_ref_from(container)})
+    logger.info("Docling image extraction: %d image(s) from %s", len(images), filename)
+    return images
+
+
+def extract_images(data: bytes, filename: str, settings) -> list[dict]:
+    """Extract embedded figures/pictures from a document via docling-serve.
+
+    Returns a list of ``{"bytes", "ext", "page_ref"}`` (empty when disabled,
+    unavailable, or the doc has no images). Best-effort: any failure returns
+    ``[]`` so image extraction never breaks a text ingest.
+
+    NOTE: this is a standalone Docling round-trip. Callers that also need the
+    document text should use :func:`extract_text_and_images` — one conversion
+    for both — instead of pairing this with ``extract_text``.
+    """
+    if not settings.docling_extract_images:
+        return []
+    payload = _docling_post(data, filename, settings, embed_images=True)
+    if payload is None:
+        return []
+    return _harvest_images(payload, filename)
+
+
+def extract_text_and_images(filename: str, data: bytes, settings) -> tuple[str, str, list[dict]]:
+    """Turn a file into text AND its embedded figures with ONE Docling conversion.
+
+    Returns ``(text, doc_type, images)``. A book PDF takes minutes per Docling
+    parse, so the text+images case must not convert twice. Fallback order
+    mirrors :func:`extract_text`; images are only available on the Docling path
+    (MarkItDown/decode fallbacks return whatever images the failed-but-parsed
+    Docling payload yielded, usually ``[]``).
+
+    Raises:
+        UnsupportedFile: same contract as :func:`extract_text`.
+    """
+    if not data:
+        raise UnsupportedFile(f"'{filename}' is empty")
+
+    ext = _ext(filename)
+    if ext in PLAIN_EXTS:
+        return _decode_text(data), "plain", []
+
+    if ext in RICH_EXTS or ext == "":
+        images: list[dict] = []
+        payload = _docling_post(data, filename, settings, embed_images=True)
+        if payload is not None:
+            images = _harvest_images(payload, filename)
+            md = _md_from_payload(payload)
+            if md is not None:
+                # Embedded mode inlines figures into the Markdown as base64 —
+                # strip them so passage chunking sees prose, not image bytes.
+                return _strip_inline_image_uris(md), "docling", images
+            logger.warning("Docling returned no content for %s; falling back", filename)
+        md = _markitdown_convert(data, ext)
+        if md is not None:
+            return md, "markitdown", images
+        if _looks_textual(data):
+            return _decode_text(data), "decoded", images
+        raise UnsupportedFile(
+            f"Could not extract text from '{filename}' "
+            f"(Docling unavailable and MarkItDown could not parse it)"
+        )
+
+    if _looks_textual(data):
+        return _decode_text(data), "decoded", []
+    raise UnsupportedFile(f"Unsupported file type '{ext}' for '{filename}'")
 
 
 def extract_text(filename: str, data: bytes, settings) -> tuple[str, str]:
