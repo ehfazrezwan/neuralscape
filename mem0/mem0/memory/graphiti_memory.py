@@ -312,12 +312,32 @@ class MemoryGraph:
             })
         return results
 
-    def add(self, data, filters):
+    def add(
+        self,
+        data,
+        filters,
+        entity_types=None,
+        edge_types=None,
+        edge_type_map=None,
+        excluded_entity_types=None,
+        custom_extraction_instructions=None,
+    ):
         """Add data to the graph via Graphiti's add_episode.
 
         Args:
             data (str): The data to add to the graph.
             filters (dict): Filters with user_id, agent_id, run_id.
+            entity_types (dict[str, type[BaseModel]] | None): Optional custom
+                Graphiti entity types (a knowledge adapter's ontology). None ⇒
+                Graphiti's built-in generic extraction (current behavior).
+            edge_types (dict[str, type[BaseModel]] | None): Optional custom edge
+                types.
+            edge_type_map (dict[tuple[str, str], list[str]] | None): Optional
+                map of (source_type, target_type) → allowed edge type names.
+            excluded_entity_types (list[str] | None): Optional entity type names
+                to drop from the graph.
+            custom_extraction_instructions (str | None): Optional extra guidance
+                injected into Graphiti's extraction prompts.
 
         Returns:
             dict: {"deleted_entities": [...], "added_entities": [...]}
@@ -326,6 +346,20 @@ class MemoryGraph:
         group_id = self._get_group_id(filters)
         source_description = self._build_source_description(filters)
         now = datetime.now(timezone.utc)
+
+        # Only forward custom-ontology kwargs when supplied so the default path
+        # is byte-for-byte the pre-adapter add_episode call.
+        episode_kwargs = {}
+        if entity_types is not None:
+            episode_kwargs["entity_types"] = entity_types
+        if edge_types is not None:
+            episode_kwargs["edge_types"] = edge_types
+        if edge_type_map is not None:
+            episode_kwargs["edge_type_map"] = edge_type_map
+        if excluded_entity_types is not None:
+            episode_kwargs["excluded_entity_types"] = excluded_entity_types
+        if custom_extraction_instructions is not None:
+            episode_kwargs["custom_extraction_instructions"] = custom_extraction_instructions
 
         async def _add():
             result = await self.graphiti.add_episode(
@@ -336,6 +370,7 @@ class MemoryGraph:
                 source=EpisodeType.text,
                 group_id=group_id,
                 update_communities=self._update_communities,
+                **episode_kwargs,
             )
 
             added = []
