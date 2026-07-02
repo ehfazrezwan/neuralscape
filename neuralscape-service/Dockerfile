@@ -16,6 +16,7 @@ COPY graphiti/graphiti_core/ graphiti/graphiti_core/
 COPY mem0/mem0/ mem0/mem0/
 COPY neuralscape-service/*.py neuralscape-service/
 COPY neuralscape-service/extensions/ neuralscape-service/extensions/
+COPY neuralscape-service/adapters/ neuralscape-service/adapters/
 COPY neuralscape-service/ingest/ neuralscape-service/ingest/
 COPY neuralscape-service/connectors/ neuralscape-service/connectors/
 
@@ -56,6 +57,7 @@ COPY mem0/mem0/ mem0/mem0/
 COPY mem0/pyproject.toml mem0/
 COPY neuralscape-service/*.py neuralscape-service/
 COPY neuralscape-service/extensions/ neuralscape-service/extensions/
+COPY neuralscape-service/adapters/ neuralscape-service/adapters/
 COPY neuralscape-service/ingest/ neuralscape-service/ingest/
 COPY neuralscape-service/connectors/ neuralscape-service/connectors/
 # Operator-facing scripts (relocate_vault_to_raw, issue_user_token,
@@ -75,7 +77,7 @@ WORKDIR /app/neuralscape-service
 
 # Run as non-root user
 RUN useradd -m -u 1000 appuser && \
-    mkdir -p /data/qdrant /data/vault /data/ingest && chown -R appuser:appuser /data /app
+    mkdir -p /data/qdrant /data/vault /data/ingest /data/exemplars && chown -R appuser:appuser /data /app
 USER appuser
 
 EXPOSE 8199
@@ -102,6 +104,7 @@ COPY graphiti/graphiti_core/ graphiti/graphiti_core/
 COPY mem0/mem0/ mem0/mem0/
 COPY neuralscape-service/*.py neuralscape-service/
 COPY neuralscape-service/extensions/ neuralscape-service/extensions/
+COPY neuralscape-service/adapters/ neuralscape-service/adapters/
 COPY neuralscape-service/ingest/ neuralscape-service/ingest/
 COPY neuralscape-service/connectors/ neuralscape-service/connectors/
 
@@ -137,7 +140,7 @@ WORKDIR /app/neuralscape-service
 # Same non-root user pattern as runtime, so file-permission behavior
 # during tests mirrors production.
 RUN useradd -m -u 1000 appuser && \
-    mkdir -p /data/qdrant /data/vault /data/ingest && chown -R appuser:appuser /data /app
+    mkdir -p /data/qdrant /data/vault /data/ingest /data/exemplars && chown -R appuser:appuser /data /app
 USER appuser
 
 # Default to running the full suite minus the integration tests that

@@ -640,7 +640,7 @@ class MemoryService:
 
         return stored
 
-    def extract_facts_only(self, text: str) -> list[tuple[str, str]]:
+    def extract_facts_only(self, text: str, extractor=None) -> list[tuple[str, str]]:
         """Run LLM fact extraction over a block of text and return (category, content) tuples.
 
         Reuses the same Gemini extraction + junk filter as ``extract_and_store``
@@ -648,10 +648,20 @@ class MemoryService:
         pipeline stores them with ``source_type="imported"`` and the document's
         ``source_ref``). Returns ``[]`` on extraction failure (logged), so a
         flaky LLM call degrades to passages-only rather than failing ingest.
+
+        ``extractor`` is an optional :class:`ingest.extractors.FactExtractor`
+        supplied by a knowledge adapter — it owns the extraction *prompt* and the
+        *parse* of the response. When ``None`` (the default), behavior is
+        byte-for-byte the coding-assistant extractor: the LLM client, retries,
+        model selection, and junk filter below are shared across all adapters so
+        only the taxonomy/prompt varies, never the envelope.
         """
         if not text or not text.strip():
             return []
-        extraction_messages = build_extraction_messages([{"role": "user", "content": text}])
+        if extractor is not None:
+            extraction_messages = extractor.build_messages(text)
+        else:
+            extraction_messages = build_extraction_messages([{"role": "user", "content": text}])
         client = self._get_genai_client()
         try:
             from google.genai.types import GenerateContentConfig, HttpOptions
@@ -666,7 +676,10 @@ class MemoryService:
                 operation="LLM extraction (ingest)",
                 fallback_model=settings.gemini_llm_fallback_model,
             )
-            parsed_facts = parse_extraction_response(response.text)
+            if extractor is not None:
+                parsed_facts = extractor.parse(response.text)
+            else:
+                parsed_facts = parse_extraction_response(response.text)
         except Exception as e:
             logger.error(f"Ingest extraction failed: {e}")
             return []
@@ -702,6 +715,10 @@ class MemoryService:
         # enrichment for genuinely new rows (not content-hash dedup hits).
         add_to_graph: bool = True,
         return_created: bool = False,
+        # Knowledge-adapter graph ontology (Graphiti custom types), resolved
+        # per-ingest and forwarded to enrich_graph → add_episode. None ⇒
+        # Graphiti's built-in generic extraction (every regular memory write).
+        graph_ontology: dict | None = None,
     ) -> list[MemoryResponse] | tuple[list[MemoryResponse], bool]:
         """Store a single pre-categorized fact directly (no LLM extraction).
 
@@ -867,6 +884,7 @@ class MemoryService:
                 visibility=effective_visibility,
                 memory_id=mid,
                 source_ref=source_ref,
+                graph_ontology=graph_ontology,
             )
 
         responses = [
@@ -904,6 +922,7 @@ class MemoryService:
         visibility: str,
         memory_id: str,
         source_ref: dict | None = None,
+        graph_ontology: dict | None = None,
     ) -> bool:
         """Add content to the knowledge graph + attach memory_id back-refs.
 
@@ -912,6 +931,13 @@ class MemoryService:
         since Graphiti entity extraction is slow (~minutes, Gemini-gated) and
         must not block the fast vector write or the API/MCP event loop.
         Best-effort: logs and swallows errors, never raises.
+
+        ``graph_ontology`` is an optional dict of Graphiti custom-type kwargs
+        (``entity_types``/``edge_types``/``edge_type_map``/
+        ``excluded_entity_types``/``custom_extraction_instructions``) supplied by
+        a knowledge adapter and resolved *per ingest*. When None (the default,
+        and every regular memory write), the graph write is byte-for-byte the
+        pre-adapter path.
 
         Returns True if the graph write actually succeeded, False if it was
         skipped (no graph configured) or swallowed an error. Callers use this
@@ -931,6 +957,7 @@ class MemoryService:
                 data=content,
                 filters={"user_id": user_id, "group_id": group_id},
                 operation="enrich_graph add",
+                **(graph_ontology or {}),
             )
             # Best-effort: attach memory_id back-reference onto the entity nodes
             # Graphiti just created in this group, so the wiki synthesizer can

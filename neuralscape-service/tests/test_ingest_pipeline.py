@@ -33,9 +33,14 @@ class FakeService:
 
     def store_raw(self, **kwargs):
         self.store_calls.append(kwargs)
-        return [MemoryResponse(id=f"id-{len(self.store_calls)}", memory=kwargs["content"])]
+        responses = [MemoryResponse(id=f"id-{len(self.store_calls)}", memory=kwargs["content"])]
+        # Mirror MemoryService.store_raw's contract: (responses, created) when
+        # return_created=True (the pipeline's facts path relies on this).
+        if kwargs.get("return_created"):
+            return responses, True
+        return responses
 
-    def extract_facts_only(self, text):
+    def extract_facts_only(self, text, extractor=None):
         return list(self._facts)
 
 
@@ -91,13 +96,22 @@ class TestIngestDocument:
 
     def test_facts_use_parent_descriptor_no_chunk_fields(self):
         svc = FakeService(facts=[("preference", "Likes dark mode.")])
-        ingest_document(svc, _doc("hello world", index_passages=False))
+        result = ingest_document(svc, _doc("hello world", index_passages=False))
         fact_calls = [c for c in svc.store_calls if c["memory_kind"] == "fact"]
         assert len(fact_calls) == 1
         sr = fact_calls[0]["source_ref"]
         assert "chunk_index" not in sr
-        assert fact_calls[0]["add_to_graph"] is True
+        # Facts are stored vector-fast with graph enrichment DEFERRED: the
+        # store call itself is add_to_graph=False, and the pipeline returns a
+        # graph_jobs entry for the caller (ingest worker) to enqueue.
+        assert fact_calls[0]["add_to_graph"] is False
+        assert fact_calls[0]["return_created"] is True
         assert fact_calls[0]["source_type"] == "imported"
+        assert len(result["graph_jobs"]) == 1
+        job = result["graph_jobs"][0]
+        assert job["content"] == "Likes dark mode."
+        assert job["source_ref"]["parent_id"] == "page-1"
+        assert result["adapter"] == "default"
 
     def test_extract_facts_false_skips_extraction(self):
         svc = FakeService(facts=[("domain_knowledge", "should not be stored")])

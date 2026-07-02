@@ -276,6 +276,72 @@ class TestProcessGraphEnrichment:
         assert result == {"memory_id": "gone", "enriched": False, "skipped": "memory_missing"}
         ctx["service"].enrich_graph.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_adapter_name_resolves_ontology(self, ctx):
+        """A queued adapter name is re-resolved to the full ontology kwargs."""
+        await worker.process_graph_enrichment(
+            ctx, memory_id="m", content="c", user_id="u",
+            source_ref={"connector_id": "book", "connector_type": "file_upload"},
+            adapter="trading_strategy",
+        )
+        kwargs = ctx["service"].enrich_graph.call_args[1]
+        assert kwargs["source_ref"]["connector_id"] == "book"
+        onto = kwargs["graph_ontology"]
+        assert onto is not None and "Setup" in onto["entity_types"]
+
+    @pytest.mark.asyncio
+    async def test_no_adapter_means_no_ontology(self, ctx):
+        await worker.process_graph_enrichment(ctx, memory_id="m", content="c", user_id="u")
+        assert ctx["service"].enrich_graph.call_args[1]["graph_ontology"] is None
+
+
+class TestEnqueueGraphJobs:
+    """_enqueue_graph_jobs — the ingest-side half of deferred fact enrichment."""
+
+    _JOB = {
+        "memory_id": "f1", "content": "fact", "user_id": "u",
+        "project_id": "p", "visibility": "shared",
+        "source_ref": {"connector_id": "c", "connector_type": "manual"},
+    }
+
+    @pytest.mark.asyncio
+    async def test_enqueues_onto_graph_queue_with_adapter(self, ctx):
+        from config import settings
+        n = await worker._enqueue_graph_jobs(ctx, [dict(self._JOB)], adapter="trading_strategy")
+        assert n == 1
+        args, kwargs = ctx["redis"].enqueue_job.call_args
+        assert args[0] == "process_graph_enrichment"
+        assert args[1] == "f1"
+        assert args[7] == "trading_strategy"  # adapter name rides in the job
+        assert kwargs["_queue_name"] == settings.graph_queue_name
+
+    @pytest.mark.asyncio
+    async def test_enqueue_failure_falls_back_to_inline_enrich(self, ctx):
+        ctx["redis"].enqueue_job.side_effect = ConnectionError("down")
+        n = await worker._enqueue_graph_jobs(ctx, [dict(self._JOB)], adapter=None)
+        assert n == 0
+        ctx["service"].enrich_graph.assert_called_once()
+        assert ctx["service"].enrich_graph.call_args[1]["memory_id"] == "f1"
+
+    @pytest.mark.asyncio
+    async def test_ingest_document_defers_graph_jobs(self, ctx, monkeypatch):
+        """process_ingest_document enqueues the pipeline's graph_jobs and strips
+        them from the client-facing result."""
+        fake_result = {
+            "passages": 0, "facts": 1, "memory_ids": ["f1"], "parent_id": "p",
+            "graph_jobs": [dict(self._JOB)], "adapter": "default",
+        }
+        monkeypatch.setattr(
+            "ingest.pipeline.ingest_document", lambda service, doc: dict(fake_result)
+        )
+        result = await worker.process_ingest_document(ctx, {
+            "content": "x", "source": {"connector_id": "c", "connector_type": "manual"},
+            "user_id": "u",
+        })
+        assert "graph_jobs" not in result
+        assert result["graph_jobs_enqueued"] == 1
+        assert ctx["redis"].enqueue_job.await_count == 1
+
 
 class TestWorkerTopology:
     def test_graph_worker_owns_graph_queue_and_enrichment(self):

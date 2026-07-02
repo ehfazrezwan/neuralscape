@@ -21,7 +21,9 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from ingest.chunking import chunk_text
+from adapters import get_adapter
+from ingest.chunking_strategies import get_chunking_strategy
+from ingest.extractors import get_extractor
 from schemas import (
     GLOBAL_CATEGORIES,
     PROJECT_CATEGORIES,
@@ -52,9 +54,12 @@ class IngestDoc:
     run_id: str | None = None
     extract_facts: bool = True
     index_passages: bool = True
-    # Chunking knobs (fall back to chunker defaults when None)
+    # Chunking knobs (fall back to the adapter's defaults when None)
     max_chars: int | None = None
     overlap: int | None = None
+    # Knowledge adapter selecting the taxonomy / chunker / extractor / graph
+    # ontology. "default" reproduces today's behavior exactly.
+    adapter: str = "default"
 
 
 def _fact_scope(category: str, project_id: str | None) -> tuple[str, str | None]:
@@ -79,6 +84,11 @@ def ingest_document(service, doc: IngestDoc) -> dict:
     Returns:
         ``{"passages": int, "facts": int, "memory_ids": [...], "parent_id": str}``.
     """
+    # Resolve the knowledge adapter (taxonomy / chunker / extractor / graph
+    # ontology). An unknown name degrades to the default, so a stale adapter=
+    # value never fails an ingest.
+    adapter = get_adapter(doc.adapter)
+
     base = dict(doc.source)  # shallow copy — we never mutate the caller's dict
     # Stamp sync time once for the whole document.
     base.setdefault("last_synced_at", datetime.now(timezone.utc).isoformat())
@@ -93,12 +103,10 @@ def ingest_document(service, doc: IngestDoc) -> dict:
 
     # ── Passages (verbatim, vector-only) ──
     if doc.index_passages:
-        kwargs = {}
-        if doc.max_chars is not None:
-            kwargs["max_chars"] = doc.max_chars
-        if doc.overlap is not None:
-            kwargs["overlap"] = doc.overlap
-        for chunk in chunk_text(doc.content, **kwargs):
+        chunker = get_chunking_strategy(adapter.chunking_strategy)
+        max_chars = doc.max_chars if doc.max_chars is not None else adapter.default_max_chars
+        overlap = doc.overlap if doc.overlap is not None else adapter.default_overlap
+        for chunk in chunker.chunk(doc.content, max_chars=max_chars, overlap=overlap):
             chunk_source = {
                 **base,
                 "chunk_index": chunk.index,
@@ -127,12 +135,20 @@ def ingest_document(service, doc: IngestDoc) -> dict:
                 logger.warning(f"Passage store failed (chunk {chunk.index}): {e}")
 
     # ── Facts (LLM-distilled, graph-linked) ──
+    # Facts are stored vector-only here (fast), with graph enrichment DEFERRED:
+    # each newly-created fact yields a ``graph_jobs`` entry the caller enqueues
+    # onto the graph queue (worker re-resolves the adapter's ontology by name).
+    # Inline graph.add at book scale (hundreds of facts × ~minutes of Graphiti
+    # extraction each) would blow the ingest job timeout and re-run the whole
+    # parse on every ARQ retry. Dedup hits (created=False) produce no job —
+    # they're already in the graph.
+    graph_jobs: list[dict] = []
     if doc.extract_facts:
-        facts = service.extract_facts_only(doc.content)
+        facts = service.extract_facts_only(doc.content, extractor=get_extractor(adapter.extractor))
         for category, content in facts:
             scope_val, fact_pid = _fact_scope(category, doc.project_id)
             try:
-                stored = service.store_raw(
+                stored, created = service.store_raw(
                     content=content,
                     user_id=doc.user_id,
                     category=category,
@@ -145,20 +161,37 @@ def ingest_document(service, doc: IngestDoc) -> dict:
                     visibility=doc.visibility,
                     memory_kind="fact",
                     source_ref=base,
-                    add_to_graph=True,
+                    add_to_graph=False,
+                    return_created=True,
                 )
                 memory_ids.extend(m.id for m in stored)
                 fact_count += len(stored)
+                if created:
+                    for m in stored:
+                        graph_jobs.append({
+                            "memory_id": m.id,
+                            "content": content,
+                            "user_id": doc.user_id,
+                            "project_id": fact_pid,
+                            "visibility": getattr(m, "visibility", None),
+                            "source_ref": base,
+                        })
             except Exception as e:
                 logger.warning(f"Fact store failed ({category}): {e}")
 
     logger.info(
         f"Ingested doc parent_id={parent_id} → {passage_count} passages + {fact_count} facts "
-        f"(connector={base.get('connector_type')}/{base.get('connector_id')})"
+        f"({len(graph_jobs)} graph jobs deferred, "
+        f"connector={base.get('connector_type')}/{base.get('connector_id')})"
     )
     return {
         "passages": passage_count,
         "facts": fact_count,
         "memory_ids": memory_ids,
         "parent_id": parent_id,
+        # Deferred graph-enrichment payloads + the adapter whose ontology applies.
+        # Callers (the ingest worker) enqueue these onto the graph queue and then
+        # drop the key from any client-facing result.
+        "graph_jobs": graph_jobs,
+        "adapter": adapter.name,
     }

@@ -4,18 +4,14 @@ import json
 import logging
 import re
 
-from schemas import MEMORY_CATEGORIES, MemoryScope, default_scope_for_category
+from schemas import MEMORY_CATEGORIES
 
 logger = logging.getLogger(__name__)
 
-
-# ──────────────────────────────────────────────
-# Default scope mapping
-# ──────────────────────────────────────────────
-
-DEFAULT_SCOPE_FOR_CATEGORY: dict[str, MemoryScope] = {
-    cat: default_scope_for_category(cat) for cat in MEMORY_CATEGORIES
-}
+# NOTE: no frozen snapshot of MEMORY_CATEGORIES here — knowledge adapters extend
+# the taxonomy at import time (schemas.register_categories), so any dict
+# comprehension over it at module import would silently go stale. Use
+# schemas.default_scope_for_category() (a function) for scope lookups.
 
 
 # ──────────────────────────────────────────────

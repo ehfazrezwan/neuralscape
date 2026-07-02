@@ -152,13 +152,18 @@ class TaskManager:
         same document re-submitted by a re-sync coalesces onto one job. Visibility
         is part of the key so ingesting the same text at a different tier (e.g. a
         dictator ingesting it as a `standard`) isn't coalesced onto an earlier
-        non-standard job and dropped.
+        non-standard job and dropped. The knowledge adapter is part of the key for
+        the same reason — re-ingesting the same content under a different adapter
+        (different taxonomy/extractor/ontology) is a distinct job, not a duplicate.
         """
         content = doc.get("content", "")
         connector_id = (doc.get("source") or {}).get("connector_id", "")
         visibility = doc.get("visibility")
+        adapter = doc.get("adapter", "default")
         partition = doc.get("user_id") or "ingest"
-        job_id = _generate_job_id(f"ingest:{visibility}:{connector_id}:{content}", partition)
+        job_id = _generate_job_id(
+            f"ingest:{visibility}:{adapter}:{connector_id}:{content}", partition
+        )
 
         job = await self.pool.enqueue_job(
             "process_ingest_document",
@@ -176,14 +181,20 @@ class TaskManager:
         ``payload`` carries ``{filename, source_ref, options}`` plus either
         ``stored_path`` or ``data_b64``. The job id is deterministic from the
         artifact's content hash (source_ref.external_id) + owner so re-uploading
-        the same file coalesces onto one job (idempotent). Runs on the ingest queue.
+        the same file coalesces onto one job (idempotent). Visibility and the
+        knowledge adapter are part of the key so the same file uploaded at a
+        different tier or under a different adapter is a distinct job, not
+        coalesced onto (and dropped by) an earlier one. Runs on the ingest queue.
         """
         partition = payload.get("user_id") or "ingest"
+        options = payload.get("options") or {}
+        visibility = options.get("visibility")
+        adapter = options.get("adapter", "default")
         content_key = (payload.get("source_ref") or {}).get("external_id") or payload.get(
             "stored_path"
         ) or payload.get("data_b64", "")
         job_id = _generate_job_id(
-            f"ingest-file:{payload.get('filename', '')}:{content_key}",
+            f"ingest-file:{visibility}:{adapter}:{payload.get('filename', '')}:{content_key}",
             partition,
         )
         job = await self.pool.enqueue_job(

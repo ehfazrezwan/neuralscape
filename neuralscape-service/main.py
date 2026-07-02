@@ -25,6 +25,7 @@ from fastapi import (
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+import adapters  # noqa: F401 — registers knowledge-adapter taxonomies at import (deterministic MEMORY_CATEGORIES)
 from config import settings
 from extensions import ExtensionRegistry
 from extensions.events import EventType, EVENT_PAYLOAD_MODELS
@@ -815,6 +816,7 @@ async def v1_ingest_document(req: IngestDocumentRequest, request: Request):
         "run_id": req.run_id,
         "extract_facts": req.extract_facts,
         "index_passages": req.index_passages,
+        "adapter": req.adapter,
     }
     doc = {k: v for k, v in doc.items() if v is not None}
 
@@ -825,6 +827,14 @@ async def v1_ingest_document(req: IngestDocumentRequest, request: Request):
         from ingest.pipeline import IngestDoc, ingest_document
 
         result = await asyncio.to_thread(ingest_document, _service, IngestDoc(**doc))
+        # Redis is down (that's why we're in the sync fallback), so the deferred
+        # graph jobs can't be enqueued — report them honestly as skipped instead
+        # of returning full job payloads. These facts stay vector-only until a
+        # graph backfill/re-ingest.
+        _skipped = len(result.pop("graph_jobs", []) or [])
+        if _skipped:
+            logger.warning(f"Sync-fallback ingest: {_skipped} fact graph enrichment(s) skipped (Redis down)")
+            result["graph_jobs_skipped"] = _skipped
         return JSONResponse(status_code=200, content={"status": "ok", **result})
 
     return TaskAcceptedResponse(
@@ -896,6 +906,7 @@ async def v1_ingest_text(req: IngestTextRequest, request: Request):
         "run_id": req.run_id,
         "extract_facts": req.extract_facts,
         "index_passages": req.index_passages,
+        "adapter": req.adapter,
     }
     doc = {k: v for k, v in doc.items() if v is not None}
 
@@ -906,6 +917,14 @@ async def v1_ingest_text(req: IngestTextRequest, request: Request):
         from ingest.pipeline import IngestDoc, ingest_document
 
         result = await asyncio.to_thread(ingest_document, _service, IngestDoc(**doc))
+        # Redis is down (that's why we're in the sync fallback), so the deferred
+        # graph jobs can't be enqueued — report them honestly as skipped instead
+        # of returning full job payloads. These facts stay vector-only until a
+        # graph backfill/re-ingest.
+        _skipped = len(result.pop("graph_jobs", []) or [])
+        if _skipped:
+            logger.warning(f"Sync-fallback ingest: {_skipped} fact graph enrichment(s) skipped (Redis down)")
+            result["graph_jobs_skipped"] = _skipped
         return JSONResponse(status_code=200, content={"status": "ok", **result})
 
     return TaskAcceptedResponse(task_id=task_id, poll_url=f"/v1/memories/status/{task_id}")
@@ -923,6 +942,7 @@ async def v1_ingest_files(
     tags: str | None = Form(None, description="Comma-separated tags"),
     extract_facts: bool = Form(True),
     index_passages: bool = Form(True),
+    adapter: str = Form("default", description="Knowledge adapter (e.g. 'default', 'trading_strategy')"),
 ):
     """Upload one or more files (or a zip / zipped folder) to ingest into memory.
 
@@ -943,6 +963,12 @@ async def v1_ingest_files(
     parsed_tags = [t.strip() for t in tags.split(",") if t.strip()] if tags else None
     if parsed_tags and len(parsed_tags) > 20:
         raise HTTPException(status_code=400, detail="at most 20 tags are allowed")
+    try:
+        from schemas import validate_adapter_name
+
+        validate_adapter_name(adapter)
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve)) from ve
 
     resolved_user_id = _resolve_user_id(request, user_id)
     # Standard-tier ingestion (a dictator uploading org standards) is allowed, but
@@ -961,6 +987,7 @@ async def v1_ingest_files(
         "tags": parsed_tags,
         "extract_facts": extract_facts,
         "index_passages": index_passages,
+        "adapter": adapter,
         "agent_id": None,
         "run_id": None,
     }
@@ -1067,6 +1094,42 @@ async def v1_get_artifact(
         raise HTTPException(status_code=404, detail=f"Artifact '{file_id}' not found")
     abs_path, filename = found
     return FileResponse(abs_path, filename=filename)
+
+
+@v1_router.get("/ingest/exemplars/{image_id}")
+async def v1_get_exemplar_image(
+    image_id: str,
+    request: Request,
+    user_id: str | None = Query(None),
+):
+    """Download a visual-exemplar image by its image id (owner-scoped).
+
+    ``image_id`` is the ``source_ref.external_id`` stamped on the exemplar
+    memory (the image's content hash). Resolution goes THROUGH the memory —
+    the caller can only fetch images referenced by an exemplar they own — so
+    a foreign/unknown id 404s rather than probing the store. This is the
+    retrieval path a consuming agent (e.g. a chart-vision few-shot) uses to
+    pull exemplar image bytes over HTTP; requires the API container to mount
+    the exemplar volume (see docker-compose / EXEMPLAR_STORE_DIR).
+    """
+    from fastapi.responses import Response
+
+    from adapters.trading.exemplars import find_exemplar_uri, read_exemplar_image
+
+    if not settings.exemplar_store_enabled:
+        raise HTTPException(status_code=404, detail="Exemplar store is disabled")
+    caller = _resolve_user_id(request, user_id)
+    uri = await asyncio.to_thread(find_exemplar_uri, _service, image_id=image_id, user_id=caller)
+    if not uri:
+        raise HTTPException(status_code=404, detail=f"Exemplar '{image_id}' not found")
+    try:
+        data = await asyncio.to_thread(read_exemplar_image, uri, settings)
+    except (ValueError, FileNotFoundError) as e:
+        raise HTTPException(status_code=404, detail=f"Exemplar '{image_id}' not found") from e
+    ext = uri.rsplit(".", 1)[-1].lower()
+    media = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+             "gif": "image/gif", "webp": "image/webp"}.get(ext, "application/octet-stream")
+    return Response(content=data, media_type=media)
 
 
 # ── Connectors (data-layer sources) ──────────────
