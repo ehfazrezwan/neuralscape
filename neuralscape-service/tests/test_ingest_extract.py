@@ -158,6 +158,21 @@ class TestExtractTextAndImages:
         text, dt, images = extract_text_and_images("notes.md", b"# hi", settings)
         assert (dt, images) == ("plain", [])
 
+    def test_page_offset_rebases_figure_page_refs(self, settings, monkeypatch):
+        # A slice of a larger book (pages 61-80 uploaded with page_offset=60)
+        # must report the ORIGINAL book's page numbers in provenance.
+        from ingest.extract import extract_text_and_images
+        import ingest.extract as extract_mod
+
+        settings.docling_enabled = True
+        settings.docling_url = "http://docling:5001"
+        monkeypatch.setattr(extract_mod, "_docling_post", lambda *a, **k: self._payload())
+        _, _, images = extract_text_and_images("book.pdf", b"%PDF-1.4", settings, page_offset=60)
+        assert images[0]["page_ref"] == "p.68"  # slice p.8 + offset 60
+        # Default (no offset) stays slice-relative.
+        _, _, images = extract_text_and_images("book.pdf", b"%PDF-1.4", settings)
+        assert images[0]["page_ref"] == "p.8"
+
     def test_distinct_images_sharing_a_prefix_both_survive(self, settings, monkeypatch):
         # Dedup must key on a full content digest — two same-format charts share
         # PNG signature/IHDR headers, so a byte-prefix key would drop one.

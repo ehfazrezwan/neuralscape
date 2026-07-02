@@ -206,8 +206,14 @@ def _strip_inline_image_uris(md: str) -> str:
     return _DATA_URI_RE.sub("image", md)
 
 
-def _page_ref_from(container: dict) -> str | None:
-    """Best-effort page/caption extraction from a docling picture container."""
+def _page_ref_from(container: dict, page_offset: int = 0) -> str | None:
+    """Best-effort page/caption extraction from a docling picture container.
+
+    ``page_offset`` is added to the parsed page number — a document ingested
+    as slices of a larger original (a chaptered book split to fit the ingest
+    job timeout) reports slice-relative pages, and the offset restores the
+    original's numbering.
+    """
     prov = container.get("prov")
     page = None
     if isinstance(prov, list) and prov and isinstance(prov[0], dict):
@@ -217,13 +223,19 @@ def _page_ref_from(container: dict) -> str | None:
         caption = caption.get("text")
     bits = []
     if page is not None:
+        try:
+            page = int(page)
+        except (TypeError, ValueError):
+            pass  # non-numeric page marker — keep as-is
+        else:
+            page = page + page_offset
         bits.append(f"p.{page}")
     if isinstance(caption, str) and caption.strip():
         bits.append(caption.strip())
     return " — ".join(bits) if bits else None
 
 
-def _harvest_images(payload: dict, filename: str) -> list[dict]:
+def _harvest_images(payload: dict, filename: str, page_offset: int = 0) -> list[dict]:
     """Collect embedded figures from a docling payload as ``{"bytes","ext","page_ref"}``."""
     import hashlib
 
@@ -241,12 +253,14 @@ def _harvest_images(payload: dict, filename: str) -> list[dict]:
         if digest in seen:
             continue
         seen.add(digest)
-        images.append({"bytes": img_bytes, "ext": ext, "page_ref": _page_ref_from(container)})
+        images.append(
+            {"bytes": img_bytes, "ext": ext, "page_ref": _page_ref_from(container, page_offset)}
+        )
     logger.info("Docling image extraction: %d image(s) from %s", len(images), filename)
     return images
 
 
-def extract_images(data: bytes, filename: str, settings) -> list[dict]:
+def extract_images(data: bytes, filename: str, settings, page_offset: int = 0) -> list[dict]:
     """Extract embedded figures/pictures from a document via docling-serve.
 
     Returns a list of ``{"bytes", "ext", "page_ref"}`` (empty when disabled,
@@ -262,17 +276,20 @@ def extract_images(data: bytes, filename: str, settings) -> list[dict]:
     payload = _docling_post(data, filename, settings, embed_images=True)
     if payload is None:
         return []
-    return _harvest_images(payload, filename)
+    return _harvest_images(payload, filename, page_offset)
 
 
-def extract_text_and_images(filename: str, data: bytes, settings) -> tuple[str, str, list[dict]]:
+def extract_text_and_images(
+    filename: str, data: bytes, settings, page_offset: int = 0
+) -> tuple[str, str, list[dict]]:
     """Turn a file into text AND its embedded figures with ONE Docling conversion.
 
     Returns ``(text, doc_type, images)``. A book PDF takes minutes per Docling
     parse, so the text+images case must not convert twice. Fallback order
     mirrors :func:`extract_text`; images are only available on the Docling path
     (MarkItDown/decode fallbacks return whatever images the failed-but-parsed
-    Docling payload yielded, usually ``[]``).
+    Docling payload yielded, usually ``[]``). ``page_offset`` rebases figure
+    page refs when the file is a slice of a larger original.
 
     Raises:
         UnsupportedFile: same contract as :func:`extract_text`.
@@ -288,7 +305,7 @@ def extract_text_and_images(filename: str, data: bytes, settings) -> tuple[str, 
         images: list[dict] = []
         payload = _docling_post(data, filename, settings, embed_images=True)
         if payload is not None:
-            images = _harvest_images(payload, filename)
+            images = _harvest_images(payload, filename, page_offset)
             md = _md_from_payload(payload)
             if md is not None:
                 # Embedded mode inlines figures into the Markdown as base64 —

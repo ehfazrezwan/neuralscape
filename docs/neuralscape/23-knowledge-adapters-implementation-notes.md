@@ -208,6 +208,9 @@ Caught (bugs no unit test could see):
 - **Private memories reach vault playbooks** (per-owner folders, one volume).
   Single-user OK; filter to shared or split the vault before multi-user.
 - **`page_ref` is None for md-inline images** (no `prov` container to read).
+  When `prov` *is* present but the file is a slice of a larger book, pass
+  `page_offset` at upload to rebase refs (added post-merge after the first
+  live book ingest).
 - **v1 exemplar recall is a text proxy**; CLIP image embeddings deferred.
 - **Naked Forex ingest itself** awaits the PDF; Phases 5–6 (compiler,
   ensembles) live in Bellwether. The strategy graph is the interchange format.

@@ -472,7 +472,11 @@ async def process_ingest_file(ctx: dict, payload: dict) -> dict:
     try:
         if want_exemplars:
             text, doc_type, images = await asyncio.to_thread(
-                extract_text_and_images, filename, data, settings
+                extract_text_and_images,
+                filename,
+                data,
+                settings,
+                options.get("page_offset") or 0,
             )
         else:
             text, doc_type = await asyncio.to_thread(extract_text, filename, data, settings)
