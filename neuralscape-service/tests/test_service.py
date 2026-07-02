@@ -442,7 +442,15 @@ class TestV1Categories:
         assert data["status"] == "ok"
         assert "preference" in data["categories"]
         assert "tech_stack" in data["categories"]
-        assert len(data["categories"]) == 13
+        # The core 13 are always present. Knowledge adapters (e.g. the trading
+        # adapter) additively register more categories, so assert the core set
+        # is a subset rather than an exact count.
+        core = {
+            "preference", "personal_fact", "technical_skill", "domain_knowledge",
+            "tech_stack", "convention", "architecture", "dependency",
+            "decision", "interaction", "workflow", "procedure", "task_context",
+        }
+        assert core <= set(data["categories"])
 
 
 class TestV1AsyncMemoryStatus:

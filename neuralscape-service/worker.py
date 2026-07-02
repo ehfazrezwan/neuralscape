@@ -10,6 +10,7 @@ from datetime import datetime
 
 from arq.cron import cron
 
+import adapters  # noqa: F401 — registers knowledge-adapter taxonomies at import (deterministic MEMORY_CATEGORIES across all workers)
 from config import parse_redis_settings, settings
 from memory_service import MemoryService
 
@@ -264,12 +265,67 @@ async def process_memory_raw_batch(ctx: dict, items: list[dict]) -> dict:
     return {"memories": [m.model_dump(exclude_none=True) for m in memories]}
 
 
+async def _enqueue_graph_jobs(ctx: dict, jobs: list[dict], adapter: str | None) -> int:
+    """Enqueue deferred graph-enrichment jobs produced by ``ingest_document``.
+
+    One ``process_graph_enrichment`` job per newly-created fact, onto the graph
+    queue, carrying the knowledge-adapter *name* (the worker re-resolves the
+    ontology). Mirrors process_memory_raw's fallback: if an enqueue fails, the
+    fact is enriched inline (in a thread) rather than silently never reaching
+    the graph — a dedup'd re-ingest returns created=False and would never
+    re-produce the job. Returns the number successfully enqueued.
+    """
+    service: MemoryService = ctx["service"]
+    enqueued = 0
+    for job in jobs:
+        try:
+            await ctx["redis"].enqueue_job(
+                "process_graph_enrichment",
+                job["memory_id"],
+                job["content"],
+                job["user_id"],
+                job.get("project_id"),
+                job.get("visibility"),
+                job.get("source_ref"),
+                adapter,
+                _queue_name=settings.graph_queue_name,
+            )
+            enqueued += 1
+        except Exception as e:
+            logger.warning(
+                f"Graph enqueue failed for ingested fact {job['memory_id']}; "
+                f"enriching inline as fallback: {e}"
+            )
+            try:
+                graph_ontology = None
+                if adapter:
+                    from adapters import get_adapter
+
+                    graph_ontology = get_adapter(adapter).graph_ontology_kwargs()
+                await asyncio.to_thread(
+                    service.enrich_graph,
+                    content=job["content"],
+                    user_id=job["user_id"],
+                    project_id=job.get("project_id"),
+                    visibility=job.get("visibility") or "private",
+                    memory_id=job["memory_id"],
+                    source_ref=job.get("source_ref"),
+                    graph_ontology=graph_ontology,
+                )
+            except Exception as e2:  # noqa: BLE001 — enrichment is best-effort
+                logger.warning(
+                    f"Inline graph-enrichment fallback also failed for {job['memory_id']}: {e2}"
+                )
+    return enqueued
+
+
 async def process_ingest_document(ctx: dict, doc: dict) -> dict:
     """Background task: ingest a document into passages + distilled facts.
 
     ``doc`` is the serialized :class:`ingest.pipeline.IngestDoc` field set
     (content, source descriptor, user_id, category, scope, options). Re-ingest
-    is idempotent via content-hash dedup in ``store_raw``.
+    is idempotent via content-hash dedup in ``store_raw``. Fact graph enrichment
+    is deferred onto the graph queue (see ``_enqueue_graph_jobs``).
     """
     from ingest.pipeline import IngestDoc, ingest_document
 
@@ -289,8 +345,17 @@ async def process_ingest_document(ctx: dict, doc: dict) -> dict:
         index_passages=doc.get("index_passages", True),
         max_chars=doc.get("max_chars"),
         overlap=doc.get("overlap"),
+        adapter=doc.get("adapter", "default"),
     )
     result = await asyncio.to_thread(ingest_document, service, ingest_doc)
+
+    # Defer fact graph enrichment onto the graph queue (adapter name rides along
+    # so the graph worker re-resolves the ontology). The raw job payloads are
+    # popped — clients polling the task result get a count, not full contents.
+    graph_jobs = result.pop("graph_jobs", [])
+    result["graph_jobs_enqueued"] = await _enqueue_graph_jobs(
+        ctx, graph_jobs, adapter=result.get("adapter")
+    )
 
     # Emit a single summary event so extensions know an ingest landed. We don't
     # emit one event per passage — a large doc would flood the vault writer.
@@ -309,6 +374,67 @@ async def process_ingest_document(ctx: dict, doc: dict) -> dict:
     return result
 
 
+async def _ingest_exemplars(
+    ctx: dict, service, images: list[dict], filename: str, options: dict, *, user_id: str
+) -> list[dict]:
+    """Index a trading-book file's chart images as visual exemplars.
+
+    ``images`` are the figures already harvested by the caller's (single)
+    Docling conversion — ``{"bytes", "ext", "page_ref"}`` each. Every image is
+    stored, vision-described (multimodal, via the gateway), and written as a
+    setup/visual_exemplar memory + VisualExemplar graph node (enrichment
+    deferred onto the graph queue, same as ingested facts). Re-ingested images
+    are skipped via the image-hash dedup lookup — the vision description is
+    nondeterministic, so the memory body's content hash can't be relied on for
+    idempotency. Best-effort.
+    """
+    from adapters.trading.exemplars import find_existing_exemplar, ingest_exemplar
+
+    if not images:
+        return []
+
+    # Strategy name for grouping comes from a `strategy:<name>` upload tag.
+    strategy_name = None
+    for tag in options.get("tags") or []:
+        if isinstance(tag, str) and tag.startswith("strategy:"):
+            strategy_name = tag[len("strategy:"):].strip() or None
+            break
+
+    summaries: list[dict] = []
+    graph_jobs: list[dict] = []
+    for img in images:
+        try:
+            existing = await asyncio.to_thread(
+                find_existing_exemplar, service, image_bytes=img["bytes"], user_id=user_id
+            )
+            if existing:
+                summaries.append({"memory_ids": [existing], "deduped": True})
+                continue
+            summary = await asyncio.to_thread(
+                ingest_exemplar,
+                service,
+                image_bytes=img["bytes"],
+                ext=img["ext"],
+                settings=settings,
+                strategy_name=strategy_name,
+                page_ref=img.get("page_ref"),
+                user_id=user_id,
+                project_id=options.get("project_id"),
+                scope=options.get("scope", "global"),
+                visibility=options.get("visibility"),
+                add_to_graph=False,
+            )
+            job = summary.pop("graph_job", None)
+            if job:
+                graph_jobs.append(job)
+            summaries.append(summary)
+        except Exception:  # noqa: BLE001
+            logger.warning("Exemplar ingest failed for one image in %s", filename, exc_info=True)
+    if graph_jobs:
+        await _enqueue_graph_jobs(ctx, graph_jobs, adapter="trading_strategy")
+    return summaries
+
+
 async def process_ingest_file(ctx: dict, payload: dict) -> dict:
     """Background task: parse an uploaded file's bytes → text → passages + facts.
 
@@ -322,7 +448,7 @@ async def process_ingest_file(ctx: dict, payload: dict) -> dict:
     """
     import base64
 
-    from ingest.extract import UnsupportedFile, extract_text
+    from ingest.extract import UnsupportedFile, extract_text, extract_text_and_images
     from ingest.pipeline import IngestDoc, ingest_document
     from ingest.storage import read_artifact
 
@@ -334,8 +460,22 @@ async def process_ingest_file(ctx: dict, payload: dict) -> dict:
         data = base64.b64decode(payload["data_b64"])
     options = payload.get("options", {})
 
+    # When visual exemplars apply, one Docling conversion yields BOTH the text
+    # and the embedded figures — a book PDF takes minutes per parse, so the
+    # text and image paths must not each convert separately.
+    want_exemplars = (
+        options.get("adapter") == "trading_strategy"
+        and settings.exemplar_store_enabled
+        and settings.docling_extract_images
+    )
+    images: list[dict] = []
     try:
-        text, doc_type = await asyncio.to_thread(extract_text, filename, data, settings)
+        if want_exemplars:
+            text, doc_type, images = await asyncio.to_thread(
+                extract_text_and_images, filename, data, settings
+            )
+        else:
+            text, doc_type = await asyncio.to_thread(extract_text, filename, data, settings)
     except UnsupportedFile as e:
         logger.warning("Ingest file skipped (%s): %s", filename, e)
         return {"filename": filename, "skipped": True, "reason": str(e)}
@@ -353,8 +493,29 @@ async def process_ingest_file(ctx: dict, payload: dict) -> dict:
         run_id=options.get("run_id"),
         extract_facts=options.get("extract_facts", True),
         index_passages=options.get("index_passages", True),
+        adapter=options.get("adapter", "default"),
     )
     result = await asyncio.to_thread(ingest_document, service, ingest_doc)
+
+    # Defer fact graph enrichment onto the graph queue (see _enqueue_graph_jobs).
+    graph_jobs = result.pop("graph_jobs", [])
+    result["graph_jobs_enqueued"] = await _enqueue_graph_jobs(
+        ctx, graph_jobs, adapter=result.get("adapter")
+    )
+
+    # ── Visual setup exemplars (trading adapter only) ──
+    # Vision-describe the figures harvested above and index each as a
+    # setup/visual_exemplar memory + VisualExemplar graph node. Best-effort —
+    # never fails the text ingest.
+    if want_exemplars and images:
+        try:
+            exemplars = await _ingest_exemplars(
+                ctx, service, images, filename, options, user_id=payload["user_id"]
+            )
+            if exemplars:
+                result["exemplars"] = exemplars
+        except Exception:  # noqa: BLE001
+            logger.warning("Exemplar ingestion failed for %s (non-fatal)", filename, exc_info=True)
 
     registry = ctx.get("extension_registry")
     if registry and result.get("memory_ids"):
@@ -379,6 +540,8 @@ async def process_graph_enrichment(
     user_id: str,
     project_id: str | None = None,
     visibility: str | None = None,
+    source_ref: dict | None = None,
+    adapter: str | None = None,
 ) -> dict:
     """Background task: add a stored memory's content to the knowledge graph.
 
@@ -390,6 +553,12 @@ async def process_graph_enrichment(
     in the result (``enriched``) and log dropped enrichments so a silent run of
     transient Gemini 503s (which leave memories vector-only) is observable rather
     than masquerading as success.
+
+    ``source_ref`` (connector provenance) rides along so the ``(:Source)`` node /
+    ``DERIVED_FROM`` back-reference is attached even on the deferred path.
+    ``adapter`` is a knowledge-adapter *name* — the ontology itself isn't
+    queue-serializable (Pydantic classes, tuple-keyed maps), so the worker
+    re-resolves it here; an unknown/stale name degrades to no custom types.
     """
     service: MemoryService = ctx["service"]
     # Guard against a delete/expiry that happened while this job sat in the
@@ -403,6 +572,11 @@ async def process_graph_enrichment(
             memory_id,
         )
         return {"memory_id": memory_id, "enriched": False, "skipped": "memory_missing"}
+    graph_ontology = None
+    if adapter:
+        from adapters import get_adapter
+
+        graph_ontology = get_adapter(adapter).graph_ontology_kwargs()
     enriched = await asyncio.to_thread(
         service.enrich_graph,
         content=content,
@@ -410,6 +584,8 @@ async def process_graph_enrichment(
         project_id=project_id,
         visibility=visibility or "private",
         memory_id=memory_id,
+        source_ref=source_ref,
+        graph_ontology=graph_ontology,
     )
     if not enriched:
         logger.warning(
@@ -451,6 +627,29 @@ async def synthesize_topical_wikis_cron(ctx: dict) -> dict:
     }
 
 
+async def synthesize_strategy_playbooks_cron(ctx: dict) -> dict:
+    """Cron job: merge trading rule memories into canonical strategy playbooks.
+
+    Gated by ``STRATEGY_SYNTHESIZER_ENABLED``; the synthesizer returns an empty
+    result when disabled, so this wrapper just forwards. Runs on the graph
+    worker (slow queue), staggered against the wiki-synth cron.
+    """
+    from extensions.strategy_synthesizer.config import strategy_synthesizer_settings
+    from extensions.strategy_synthesizer.synthesizer import synthesize_all
+
+    if not strategy_synthesizer_settings.enabled:
+        return {"skipped": True, "reason": "STRATEGY_SYNTHESIZER_ENABLED=false"}
+    service: MemoryService = ctx["service"]
+    result = await synthesize_all(service=service, settings=strategy_synthesizer_settings)
+    return {
+        "playbooks_created": result.playbooks_created,
+        "playbooks_updated": result.playbooks_updated,
+        "playbooks_skipped_unchanged": result.playbooks_skipped_unchanged,
+        "memories_processed": result.memories_processed,
+        "errors": result.errors,
+    }
+
+
 def _generate_job_id(content: str, user_id: str) -> str:
     """Generate a deterministic job ID from content + user_id."""
     h = hashlib.sha256(f"{user_id}:{content}".encode()).hexdigest()[:16]
@@ -468,6 +667,19 @@ def _synthesizer_cron_hours() -> list[int]:
     from extensions.wiki_synthesizer.config import synthesizer_settings
 
     interval = max(1, min(24, synthesizer_settings.cron_hours))
+    return list(range(0, 24, interval))
+
+
+def _strategy_synthesizer_cron_hours() -> list[int]:
+    """Resolve the hours the strategy-playbook synthesizer cron fires.
+
+    ``STRATEGY_SYNTHESIZER_CRON_HOURS`` is an interval in hours (default 6),
+    translated to arq's discrete hour-of-day set. Fires at :55 to stagger after
+    the wiki-synth (:45) and dedup (:00) crons on the same graph worker.
+    """
+    from extensions.strategy_synthesizer.config import strategy_synthesizer_settings
+
+    interval = max(1, min(24, strategy_synthesizer_settings.cron_hours))
     return list(range(0, 24, interval))
 
 
@@ -631,7 +843,12 @@ async def process_connector_sync(ctx: dict, connector_id: str) -> dict:
                 project_id=record.get("default_project_id"),
                 visibility=record.get("default_visibility"),
             )
-            await asyncio.to_thread(ingest_document, service, doc)
+            _ing = await asyncio.to_thread(ingest_document, service, doc)
+            # Same deferral as file/document ingest: fact graph writes go to
+            # the graph queue rather than running inline in the sync loop.
+            await _enqueue_graph_jobs(
+                ctx, _ing.pop("graph_jobs", []), adapter=_ing.get("adapter")
+            )
             if r.revision:
                 revisions[r.external_id] = r.revision
             synced += 1
@@ -797,6 +1014,17 @@ class GraphWorkerSettings:
             # body evaluation time.
             hour=set(_synthesizer_cron_hours()),
             minute=45,
+            timeout=1800,
+            unique=True,
+            max_tries=1,
+            run_at_startup=False,
+        ),
+        cron(
+            synthesize_strategy_playbooks_cron,
+            # Staggered to :55 so it runs after the wiki-synth (:45) and dedup
+            # (:00) crons rather than contending for the same Gemini budget.
+            hour=set(_strategy_synthesizer_cron_hours()),
+            minute=55,
             timeout=1800,
             unique=True,
             max_tries=1,

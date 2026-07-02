@@ -131,6 +131,60 @@ class TestIngestFiles:
         resp = client.get("/v1/ingest/artifacts/deadbeef", params={"user_id": "alice"})
         assert resp.status_code == 404
 
+    def test_unknown_adapter_form_field_is_400(self, client, monkeypatch):
+        # A typo'd adapter must fail loudly, not silently ingest with default.
+        monkeypatch.setattr(
+            main._task_manager, "enqueue_ingest_file", AsyncMock(return_value="ns-1")
+        )
+        resp = client.post(
+            "/v1/ingest/files",
+            data={"user_id": "alice", "adapter": "trading-strategy"},  # hyphen typo
+            files=[("files", ("doc.md", b"x", "text/markdown"))],
+        )
+        assert resp.status_code == 400
+        assert "Unknown adapter" in resp.json()["detail"]
+
+    def test_known_adapter_form_field_accepted(self, client, monkeypatch):
+        enqueue = AsyncMock(return_value="ns-1")
+        monkeypatch.setattr(main._task_manager, "enqueue_ingest_file", enqueue)
+        resp = client.post(
+            "/v1/ingest/files",
+            data={"user_id": "alice", "adapter": "trading_strategy"},
+            files=[("files", ("doc.md", b"x", "text/markdown"))],
+        )
+        assert resp.status_code == 202
+        assert enqueue.await_args.args[0]["options"]["adapter"] == "trading_strategy"
+
+
+class TestExemplarDownload:
+    def test_roundtrip_owner_scoped(self, client, monkeypatch, tmp_path):
+        from config import settings as cfg
+        from adapters.trading import exemplars as ex
+
+        monkeypatch.setattr(cfg, "exemplar_store_enabled", True)
+        monkeypatch.setattr(cfg, "exemplar_store_dir", str(tmp_path))
+        png = b"\x89PNG\r\n\x1a\nimage-bytes"
+        uri = ex.store_exemplar_image(png, "png", cfg)
+        image_id = ex.image_hash(png)
+        # Owner-scoped resolution: only alice's lookup resolves the URI.
+        monkeypatch.setattr(
+            ex, "find_exemplar_uri",
+            lambda service, *, image_id, user_id: uri if user_id == "alice" else None,
+        )
+        ok = client.get(f"/v1/ingest/exemplars/{image_id}", params={"user_id": "alice"})
+        assert ok.status_code == 200
+        assert ok.content == png
+        assert ok.headers["content-type"] == "image/png"
+        other = client.get(f"/v1/ingest/exemplars/{image_id}", params={"user_id": "bob"})
+        assert other.status_code == 404
+
+    def test_disabled_store_is_404(self, client, monkeypatch):
+        from config import settings as cfg
+
+        monkeypatch.setattr(cfg, "exemplar_store_enabled", False)
+        resp = client.get("/v1/ingest/exemplars/abc123", params={"user_id": "alice"})
+        assert resp.status_code == 404
+
     def test_invalid_form_fields_rejected(self, client, monkeypatch):
         monkeypatch.setattr(
             main._task_manager, "enqueue_ingest_file", AsyncMock(return_value="ns-1")

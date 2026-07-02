@@ -18,6 +18,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
+import adapters  # noqa: F401 — registers knowledge-adapter taxonomies at import (deterministic MEMORY_CATEGORIES + tool enums)
 from config import settings
 from memory_service import MemoryService
 from schemas import MEMORY_CATEGORIES
@@ -320,6 +321,7 @@ async def list_tools() -> list[Tool]:
                     "extract_facts": {"type": "boolean", "description": "Also run LLM extraction for distilled facts (default true)"},
                     "index_passages": {"type": "boolean", "description": "Chunk + store verbatim passages (default true)"},
                     "tags": {"type": "array", "items": {"type": "string"}},
+                    "adapter": {"type": "string", "description": "Knowledge adapter selecting taxonomy/chunker/extractor/graph-ontology (e.g. 'default', 'trading_strategy'). Default 'default'."},
                     "wait": {"type": "boolean", "description": "Wait for ingest to finish before returning. Default false."},
                 },
                 "required": ["content", "source"],
@@ -356,6 +358,7 @@ async def list_tools() -> list[Tool]:
                     "extract_facts": {"type": "boolean", "description": "Also run LLM extraction for distilled facts (default true)"},
                     "index_passages": {"type": "boolean", "description": "Chunk + store verbatim passages (default true)"},
                     "tags": {"type": "array", "items": {"type": "string"}},
+                    "adapter": {"type": "string", "description": "Knowledge adapter selecting taxonomy/chunker/extractor/graph-ontology (e.g. 'default', 'trading_strategy'). Default 'default'."},
                     "wait": {"type": "boolean", "description": "Wait for ingest to finish before returning. Default false."},
                 },
                 "required": ["content"],
@@ -727,6 +730,14 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             _err = _standard_write_error(arguments.get("visibility"), user_id)
             if _err:
                 return _err
+            # Reject unknown adapters loudly — a silent degrade-to-default would
+            # ingest without the taxonomy/ontology the caller asked for.
+            try:
+                from schemas import validate_adapter_name
+
+                validate_adapter_name(arguments.get("adapter", "default"))
+            except ValueError as ve:
+                return [TextContent(type="text", text=json.dumps({"status": "error", "error": str(ve)}))]
             scope = arguments.get("scope")
             project_id = arguments.get("project_id")
             if not scope:
@@ -742,6 +753,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 "tags": arguments.get("tags"),
                 "extract_facts": arguments.get("extract_facts", True),
                 "index_passages": arguments.get("index_passages", True),
+                "adapter": arguments.get("adapter", "default"),
             }
             doc = {k: v for k, v in doc.items() if v is not None}
 
@@ -752,6 +764,10 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 from ingest.pipeline import IngestDoc, ingest_document
                 # Offload the blocking ingest so it doesn't stall the async MCP loop.
                 result = await asyncio.to_thread(ingest_document, _service, IngestDoc(**doc))
+                _skipped = len(result.pop("graph_jobs", []) or [])
+                if _skipped:
+                    logger.warning(f"Sync-fallback ingest: {_skipped} fact graph enrichment(s) skipped (Redis down)")
+                    result["graph_jobs_skipped"] = _skipped
                 return [TextContent(type="text", text=json.dumps({"status": "completed", "result": result, "fallback": "sync"}, default=str))]
 
             if wait:
@@ -820,6 +836,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 "tags": req.tags,
                 "extract_facts": req.extract_facts,
                 "index_passages": req.index_passages,
+                "adapter": req.adapter,
             }
             # source is a dict with None title possibly — keep it; drop top-level Nones only.
             doc = {k: v for k, v in doc.items() if v is not None}
@@ -831,6 +848,10 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 from ingest.pipeline import IngestDoc, ingest_document
                 # Offload the blocking ingest so it doesn't stall the async MCP loop.
                 result = await asyncio.to_thread(ingest_document, _service, IngestDoc(**doc))
+                _skipped = len(result.pop("graph_jobs", []) or [])
+                if _skipped:
+                    logger.warning(f"Sync-fallback ingest: {_skipped} fact graph enrichment(s) skipped (Redis down)")
+                    result["graph_jobs_skipped"] = _skipped
                 return [TextContent(type="text", text=json.dumps({"status": "completed", "result": result, "fallback": "sync"}, default=str))]
 
             if wait:
