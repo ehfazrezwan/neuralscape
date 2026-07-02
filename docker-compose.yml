@@ -124,9 +124,14 @@ services:
       # Ingest artifact storage — shared with neuralscape-ingest-worker so the
       # API writes uploaded files and the worker reads them back to parse.
       INGEST_STORAGE_DIR: /data/ingest
+      # Exemplar store — shared with the ingest worker (which writes images) so
+      # GET /v1/ingest/exemplars/{id} can serve them. Dark by default.
+      EXEMPLAR_STORE_ENABLED: ${EXEMPLAR_STORE_ENABLED:-false}
+      EXEMPLAR_STORE_DIR: /data/exemplars
     volumes:
       - ${OBSIDIAN_VAULT_PATH:-./vault}:/data/vault
       - ingest_data:/data/ingest
+      - exemplar_data:/data/exemplars
     restart: unless-stopped
     # Docker's restart policy only fires on container EXIT, not on a failing
     # healthcheck — a wedged-but-running API (e.g. after the host sleeps) would
@@ -223,6 +228,9 @@ services:
       GEMINI_LLM_MODEL: ${GEMINI_LLM_MODEL:-gemini-3.1-flash-lite}
       GEMINI_EMBEDDER_MODEL: ${EMBEDDING_MODEL_NAME:-gemini-embedding-001}
       OBSIDIAN_VAULT_PATH: /data/vault
+      # Cumulative synthesizers (both dark by default; enable via .env).
+      WIKI_SYNTHESIZER_ENABLED: ${WIKI_SYNTHESIZER_ENABLED:-false}
+      STRATEGY_SYNTHESIZER_ENABLED: ${STRATEGY_SYNTHESIZER_ENABLED:-false}
     volumes:
       - ${OBSIDIAN_VAULT_PATH:-./vault}:/data/vault
     restart: unless-stopped
@@ -273,9 +281,15 @@ services:
       INGEST_STORAGE_DIR: /data/ingest
       DOCLING_ENABLED: ${DOCLING_ENABLED:-true}
       DOCLING_URL: ${DOCLING_URL:-http://docling:5001}
+      # Visual setup exemplars (trading adapter; dark by default). When enabled,
+      # PDF chart images are extracted, vision-described, and stored here.
+      EXEMPLAR_STORE_ENABLED: ${EXEMPLAR_STORE_ENABLED:-false}
+      EXEMPLAR_STORE_DIR: /data/exemplars
+      DOCLING_EXTRACT_IMAGES: ${DOCLING_EXTRACT_IMAGES:-false}
     volumes:
       - ${OBSIDIAN_VAULT_PATH:-./vault}:/data/vault
       - ingest_data:/data/ingest
+      - exemplar_data:/data/exemplars
     restart: unless-stopped
     deploy:
       resources:
@@ -422,4 +436,5 @@ volumes:
   qdrant_data:
   redis_data:
   ingest_data:
+  exemplar_data:
   test_venv:
