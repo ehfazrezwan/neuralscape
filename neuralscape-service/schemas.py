@@ -147,6 +147,38 @@ def default_scope_for_category(category: str) -> MemoryScope:
     return MemoryScope.GLOBAL
 
 
+def register_categories(
+    categories: dict[str, str],
+    *,
+    global_categories: set[str] | None = None,
+    project_categories: set[str] | None = None,
+    vault_paths: dict[str, str] | None = None,
+) -> None:
+    """Extend the shared taxonomy with a knowledge adapter's categories.
+
+    Adapters (see :mod:`adapters`) call this at import so that their categories
+    become first-class citizens of the *fixed envelope*: ``store_raw``'s
+    membership check, the ingest request validators, and the fact parser all
+    read the same module-level registries mutated here. Purely **additive** —
+    it never removes or reassigns the core 13, so nothing regresses.
+
+    Idempotent: re-registering the same category updates its description in
+    place. Categories left out of ``global_categories``/``project_categories``
+    stay *flexible* (scope follows the caller's ``project_id`` — the same rule
+    the ingest pipeline applies to ``domain_knowledge``).
+    """
+    MEMORY_CATEGORIES.update(categories)
+    if global_categories:
+        GLOBAL_CATEGORIES.update(global_categories)
+    if project_categories:
+        PROJECT_CATEGORIES.update(project_categories)
+    # Categories that are neither global nor project are flexible.
+    flexible = set(categories) - GLOBAL_CATEGORIES - PROJECT_CATEGORIES
+    FLEXIBLE_CATEGORIES.update(flexible)
+    if vault_paths:
+        CATEGORY_VAULT_PATHS.update(vault_paths)
+
+
 # Vault folder paths for each category (mirrors neuralscape-plugin/src/types.ts)
 CATEGORY_VAULT_PATHS: dict[str, str] = {
     "preference": "Semantic/Preferences",
@@ -254,6 +286,24 @@ def default_visibility_for_category(category: str) -> MemoryVisibility:
 
 # Reusable field constraints
 _ID_PATTERN = r"^[a-zA-Z0-9_.\-]+$"
+
+
+def validate_adapter_name(v: str) -> str:
+    """Reject unknown knowledge-adapter names at the request boundary.
+
+    A typo'd ``adapter`` must fail loudly here (422) — silently degrading to the
+    default adapter would ingest a document *without* the taxonomy/ontology the
+    caller asked for, which is far worse than an error. (The worker-side
+    ``get_adapter`` still degrades gracefully, but only for jobs already queued
+    when an adapter was removed.) Imported lazily: ``adapters`` imports this
+    module at import time, so a top-level import here would be circular.
+    """
+    from adapters import list_adapters
+
+    known = list_adapters()
+    if v not in known:
+        raise ValueError(f"Unknown adapter '{v}'. Available: {known}")
+    return v
 
 
 # ──────────────────────────────────────────────
@@ -447,6 +497,11 @@ class IngestDocumentRequest(BaseModel):
     tags: list[str] | None = Field(default=None, max_length=20)
     agent_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
     run_id: str | None = Field(default=None, max_length=100)
+    adapter: str = Field(
+        default="default",
+        max_length=100,
+        description="Knowledge adapter selecting taxonomy/chunker/extractor/graph-ontology (e.g. 'default', 'trading_strategy').",
+    )
 
     @field_validator("category")
     @classmethod
@@ -461,6 +516,11 @@ class IngestDocumentRequest(BaseModel):
         if v not in ("global", "project"):
             raise ValueError("scope must be 'global' or 'project'")
         return v
+
+    @field_validator("adapter")
+    @classmethod
+    def _validate_adapter(cls, v: str) -> str:
+        return validate_adapter_name(v)
 
 
 class IngestTextRequest(BaseModel):
@@ -484,6 +544,11 @@ class IngestTextRequest(BaseModel):
     tags: list[str] | None = Field(default=None, max_length=20)
     agent_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
     run_id: str | None = Field(default=None, max_length=100)
+    adapter: str = Field(
+        default="default",
+        max_length=100,
+        description="Knowledge adapter selecting taxonomy/chunker/extractor/graph-ontology (e.g. 'default', 'trading_strategy').",
+    )
 
     @field_validator("category")
     @classmethod
@@ -498,6 +563,11 @@ class IngestTextRequest(BaseModel):
         if v not in ("global", "project"):
             raise ValueError("scope must be 'global' or 'project'")
         return v
+
+    @field_validator("adapter")
+    @classmethod
+    def _validate_adapter(cls, v: str) -> str:
+        return validate_adapter_name(v)
 
 
 class ConnectorConfigRequest(BaseModel):
@@ -548,7 +618,9 @@ class SearchMemoryRequest(BaseModel):
     query: str = Field(min_length=1, max_length=2000)
     user_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
     project_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
-    categories: list[str] | None = Field(default=None, max_length=13)
+    # Item cap sized for the core 13 + adapter-registered categories (e.g. the
+    # 12 trading categories) so a filter can name every known category.
+    categories: list[str] | None = Field(default=None, max_length=40)
     scope: str | None = None
     limit: int = Field(default=10, ge=1, le=100)
 
