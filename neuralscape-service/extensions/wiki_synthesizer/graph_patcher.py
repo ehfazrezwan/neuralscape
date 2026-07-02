@@ -21,11 +21,19 @@ write/synthesis must not fail just because a Cypher hop didn't land.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import random
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)
+
+# Deadlock retries for the shared-node MERGE in attach_source_ref: concurrent
+# graph jobs from the same file all MERGE the same (:Source) node, and Neo4j
+# resolves the lock cycle by aborting one transaction with a TransientError.
+# Retrying after a short jittered backoff is the documented client remedy.
+_SOURCE_ATTACH_RETRIES = 3
 
 
 # Window for "freshly written by this task" — we identify newly-created
@@ -149,22 +157,30 @@ async def attach_source_ref(
     MERGE (n)-[:DERIVED_FROM]->(s)
     RETURN count(n) AS patched
     """
+    from neo4j.exceptions import TransientError
+
     try:
-        async with driver.session() as session:
-            result = await session.run(
-                cypher,
-                connector_id=connector_id,
-                source_key=source_key,
-                connector_type=source_ref.get("connector_type"),
-                url=source_ref.get("url"),
-                title=source_ref.get("title"),
-                external_id=source_ref.get("external_id"),
-                last_synced_at=source_ref.get("last_synced_at"),
-                group_id=group_id,
-                lower_bound=lower_bound,
-            )
-            record = await result.single()
-            return int(record["patched"]) if record else 0
+        for attempt in range(_SOURCE_ATTACH_RETRIES + 1):
+            try:
+                async with driver.session() as session:
+                    result = await session.run(
+                        cypher,
+                        connector_id=connector_id,
+                        source_key=source_key,
+                        connector_type=source_ref.get("connector_type"),
+                        url=source_ref.get("url"),
+                        title=source_ref.get("title"),
+                        external_id=source_ref.get("external_id"),
+                        last_synced_at=source_ref.get("last_synced_at"),
+                        group_id=group_id,
+                        lower_bound=lower_bound,
+                    )
+                    record = await result.single()
+                    return int(record["patched"]) if record else 0
+            except TransientError:
+                if attempt == _SOURCE_ATTACH_RETRIES:
+                    raise
+                await asyncio.sleep(0.2 * (2**attempt) + random.uniform(0, 0.2))
     except Exception:
         logger.warning(
             "attach_source_ref failed for connector_id=%s group_id=%s (non-fatal)",
@@ -172,7 +188,7 @@ async def attach_source_ref(
             group_id,
             exc_info=True,
         )
-        return 0
+    return 0
 
 
 async def patch_wiki_path(

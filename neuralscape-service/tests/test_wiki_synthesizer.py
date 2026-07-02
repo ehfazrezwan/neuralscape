@@ -19,6 +19,7 @@ pytest.importorskip("fcntl")  # writer primitives are POSIX-only
 from extensions.wiki_synthesizer.config import SynthesizerSettings
 from extensions.wiki_synthesizer.graph_patcher import (
     attach_memory_id,
+    attach_source_ref,
     patch_wiki_path,
     patch_wiki_path_by_memory_ids,
 )
@@ -341,6 +342,76 @@ class TestGraphPatcher:
             owner_user_id="ehfaz",
             write_started_at=datetime.now(timezone.utc),
         ) == 0
+
+    @pytest.mark.asyncio
+    async def test_attach_source_ref_retries_deadlocks_then_succeeds(self):
+        """Concurrent graph jobs MERGEing the same (:Source) node deadlock in
+        Neo4j (TransientError); the attach must retry, not drop the backlink."""
+        from neo4j.exceptions import TransientError
+
+        record = {"patched": 4}
+
+        class _Result:
+            async def single(self):
+                return record
+
+        attempts = {"n": 0}
+
+        class _Session:
+            async def __aenter__(self):
+                attempts["n"] += 1
+                if attempts["n"] <= 2:
+                    raise TransientError("deadlock detected")
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def run(self, *args, **kwargs):
+                return _Result()
+
+        class _Driver:
+            def session(self):
+                return _Session()
+
+        n = await attach_source_ref(
+            _Driver(),
+            group_id="shared",
+            memory_id="mem-1",
+            source_ref={"connector_id": "file_upload", "external_id": "abc123"},
+            write_started_at=datetime.now(timezone.utc),
+        )
+        assert n == 4
+        assert attempts["n"] == 3  # two deadlocks + one success
+
+    @pytest.mark.asyncio
+    async def test_attach_source_ref_exhausted_deadlocks_swallowed(self, monkeypatch):
+        from neo4j.exceptions import TransientError
+
+        import extensions.wiki_synthesizer.graph_patcher as gp
+
+        monkeypatch.setattr(gp, "_SOURCE_ATTACH_RETRIES", 1)
+
+        class _Session:
+            async def __aenter__(self):
+                raise TransientError("deadlock detected")
+
+            async def __aexit__(self, *a):
+                return False
+
+        class _Driver:
+            def session(self):
+                return _Session()
+
+        # Best-effort contract holds: exhausted retries log + return 0.
+        n = await attach_source_ref(
+            _Driver(),
+            group_id="shared",
+            memory_id="mem-1",
+            source_ref={"connector_id": "file_upload", "external_id": "abc123"},
+            write_started_at=datetime.now(timezone.utc),
+        )
+        assert n == 0
 
     @pytest.mark.asyncio
     async def test_patch_wiki_path_returns_patched_count(self):
