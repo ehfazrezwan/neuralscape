@@ -943,6 +943,14 @@ async def v1_ingest_files(
     extract_facts: bool = Form(True),
     index_passages: bool = Form(True),
     adapter: str = Form("default", description="Knowledge adapter (e.g. 'default', 'trading_strategy')"),
+    page_offset: int = Form(
+        0,
+        description=(
+            "Added to figure page numbers in provenance refs. Use when uploading "
+            "a slice of a larger document (e.g. pages 61-80 of a book → 60) so "
+            "exemplar page refs stay relative to the original."
+        ),
+    ),
 ):
     """Upload one or more files (or a zip / zipped folder) to ingest into memory.
 
@@ -963,6 +971,8 @@ async def v1_ingest_files(
     parsed_tags = [t.strip() for t in tags.split(",") if t.strip()] if tags else None
     if parsed_tags and len(parsed_tags) > 20:
         raise HTTPException(status_code=400, detail="at most 20 tags are allowed")
+    if not 0 <= page_offset <= 100_000:
+        raise HTTPException(status_code=400, detail="page_offset must be between 0 and 100000")
     try:
         from schemas import validate_adapter_name
 
@@ -988,6 +998,7 @@ async def v1_ingest_files(
         "extract_facts": extract_facts,
         "index_passages": index_passages,
         "adapter": adapter,
+        "page_offset": page_offset or None,  # omitted when 0 (the default)
         "agent_id": None,
         "run_id": None,
     }

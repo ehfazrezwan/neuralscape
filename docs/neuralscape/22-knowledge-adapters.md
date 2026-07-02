@@ -168,6 +168,12 @@ Notes:
 - Re-ingesting a book does **not** duplicate exemplars: the vision description is
   nondeterministic, so idempotency keys on the **image content hash**
   (`source_ref.external_id`) via a pre-store lookup, not on the memory body.
+- Book-scale PDFs are best uploaded as page-range **slices** (a single 290-page
+  job would blow the ingest `job_timeout`) under one `strategy:` tag. Pass
+  `page_offset` per slice (pages 61–80 → `page_offset=60`) so exemplar
+  `page_ref`s stay relative to the original book, not the slice; the offset is
+  part of the deterministic job-id, so re-uploading a slice with a corrected
+  offset is a new job, not a coalesced dup.
 - Image bytes are retrievable over HTTP: `GET /v1/ingest/exemplars/{image_id}`
   (owner-scoped — resolution goes through the caller's exemplar memory). The API
   container mounts the exemplar volume for this.

@@ -111,6 +111,35 @@ class TestIngestFiles:
             assert payload["stored_path"]
             assert payload["source_ref"]["connector_type"] == "file_upload"
 
+    def test_page_offset_reaches_worker_options(self, client, monkeypatch):
+        enqueue = AsyncMock(return_value="ns-1")
+        monkeypatch.setattr(main._task_manager, "enqueue_ingest_file", enqueue)
+        resp = client.post(
+            "/v1/ingest/files",
+            data={"user_id": "alice", "page_offset": "60"},
+            files=[("files", ("slice.pdf", b"%PDF-1.4 fake", "application/pdf"))],
+        )
+        assert resp.status_code == 202, resp.text
+        assert enqueue.await_args.args[0]["options"]["page_offset"] == 60
+
+    def test_page_offset_default_omitted_and_negative_rejected(self, client, monkeypatch):
+        enqueue = AsyncMock(return_value="ns-1")
+        monkeypatch.setattr(main._task_manager, "enqueue_ingest_file", enqueue)
+        ok = client.post(
+            "/v1/ingest/files",
+            data={"user_id": "alice"},
+            files=[("files", ("doc.md", b"x", "text/markdown"))],
+        )
+        assert ok.status_code == 202
+        # Default 0 stays out of options → job-id key unchanged for plain uploads.
+        assert "page_offset" not in enqueue.await_args.args[0]["options"]
+        bad = client.post(
+            "/v1/ingest/files",
+            data={"user_id": "alice", "page_offset": "-5"},
+            files=[("files", ("doc.md", b"x", "text/markdown"))],
+        )
+        assert bad.status_code == 400
+
     def test_download_roundtrip(self, client, monkeypatch):
         monkeypatch.setattr(
             main._task_manager, "enqueue_ingest_file", AsyncMock(return_value="ns-1")

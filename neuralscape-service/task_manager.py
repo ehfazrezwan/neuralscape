@@ -181,20 +181,23 @@ class TaskManager:
         ``payload`` carries ``{filename, source_ref, options}`` plus either
         ``stored_path`` or ``data_b64``. The job id is deterministic from the
         artifact's content hash (source_ref.external_id) + owner so re-uploading
-        the same file coalesces onto one job (idempotent). Visibility and the
-        knowledge adapter are part of the key so the same file uploaded at a
-        different tier or under a different adapter is a distinct job, not
+        the same file coalesces onto one job (idempotent). Every option that
+        changes the write's *semantics* must be part of the key — visibility,
+        the knowledge adapter, and page_offset — so the same file uploaded at a
+        different tier / adapter / page numbering is a distinct job, not
         coalesced onto (and dropped by) an earlier one. Runs on the ingest queue.
         """
         partition = payload.get("user_id") or "ingest"
         options = payload.get("options") or {}
         visibility = options.get("visibility")
         adapter = options.get("adapter", "default")
+        page_offset = options.get("page_offset") or 0
         content_key = (payload.get("source_ref") or {}).get("external_id") or payload.get(
             "stored_path"
         ) or payload.get("data_b64", "")
         job_id = _generate_job_id(
-            f"ingest-file:{visibility}:{adapter}:{payload.get('filename', '')}:{content_key}",
+            f"ingest-file:{visibility}:{adapter}:{page_offset}:"
+            f"{payload.get('filename', '')}:{content_key}",
             partition,
         )
         job = await self.pool.enqueue_job(

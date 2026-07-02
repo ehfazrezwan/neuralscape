@@ -115,6 +115,25 @@ class TestEnqueueRawV2:
         assert ids["private"] != ids["standard"]
 
     @pytest.mark.asyncio
+    async def test_ingest_file_job_id_differs_by_page_offset(self, tm):
+        """Same file re-uploaded with a corrected page_offset must be a NEW job —
+        page_offset changes exemplar provenance content, so coalescing onto the
+        earlier job's cached result would silently drop the correction."""
+        tm.pool.enqueue_job.return_value = None
+        ids = {}
+        for offset in (0, 60):
+            payload = {
+                "filename": "slice.pdf",
+                "user_id": "d",
+                "source_ref": {"external_id": "samehash"},
+                "options": {"visibility": "shared", "adapter": "trading_strategy",
+                            **({"page_offset": offset} if offset else {})},
+            }
+            await tm.enqueue_ingest_file(payload)
+            ids[offset] = tm.pool.enqueue_job.call_args.kwargs["_job_id"]
+        assert ids[0] != ids[60]
+
+    @pytest.mark.asyncio
     async def test_connector_sync_job_id_matches_cron_scheme(self, tm):
         """enqueue_connector_sync uses the same sync-<id> job id as the cron (C2)."""
         tm.pool.enqueue_job.return_value = None
