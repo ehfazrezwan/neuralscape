@@ -67,6 +67,19 @@ def test_edge_types_are_thin_markers():
     assert "executable_expression" in ENTITY_TYPES["StopLoss"].model_fields
 
 
+def test_example_instances_are_markable_and_instructed():
+    """Worked examples ('1.0560 support level') must be distinguishable from
+    doctrine: price-context entities carry is_example, and the extraction
+    instructions tell the model to prefer concepts / mark unavoidable examples."""
+    from adapters.trading.ontology import CUSTOM_EXTRACTION_INSTRUCTIONS
+
+    for et in ("Setup", "SupportResistanceZone", "MarketRegime",
+               "EntryCondition", "StopLoss", "TakeProfit", "ExitCondition"):
+        assert "is_example" in ENTITY_TYPES[et].model_fields, et
+    assert "is_example=true" in CUSTOM_EXTRACTION_INSTRUCTIONS
+    assert "worked example" in CUSTOM_EXTRACTION_INSTRUCTIONS.lower()
+
+
 # ── Section-aware chunking ─────────────────────────────────────────
 
 

@@ -25,6 +25,19 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+# Trading books teach through worked examples ("EUR/USD prints a kangaroo tail
+# at the 1.0560 support level…"). Those illustrations must never masquerade as
+# doctrine: a retrieval consumer that reads "1.0560 support level" as a live
+# zone is being biased by a chart frozen at the book's print date. Entities
+# that can capture such instances carry this flag so consumers can filter or
+# discount them (type-level knowledge vs instance-level illustration).
+_IS_EXAMPLE_DESC = (
+    "true when this node captures a worked example / illustration from the "
+    "text (a specific historical price level, date, or trade walkthrough) "
+    "rather than general doctrine. Example nodes are citations of the book's "
+    "charts, never live market knowledge."
+)
+
 
 # ── Entity types ────────────────────────────────────────────────────
 
@@ -55,6 +68,7 @@ class Setup(BaseModel):
     aliases: str | None = Field(default=None, description="Other names for the same pattern (e.g. 'pin bar' for kangaroo tail)")
     source_quote: str | None = Field(default=None, description="Verbatim book text defining the setup")
     page_ref: str | None = Field(default=None, description="Page/chapter citation, e.g. 'Ch8 p.142'")
+    is_example: bool | None = Field(default=None, description=_IS_EXAMPLE_DESC)
 
 
 class SupportResistanceZone(BaseModel):
@@ -67,6 +81,7 @@ class SupportResistanceZone(BaseModel):
     zone_kind: str | None = Field(default=None, description="'support', 'resistance', 'round_number', 'trendline'")
     how_identified: str | None = Field(default=None, description="How the zone is drawn/located")
     membership_test: str | None = Field(default=None, description="Predicate deciding whether a price is 'on' the zone")
+    is_example: bool | None = Field(default=None, description=_IS_EXAMPLE_DESC)
 
 
 class MarketRegime(BaseModel):
@@ -77,6 +92,7 @@ class MarketRegime(BaseModel):
 
     regime_kind: str | None = Field(default=None, description="e.g. 'trend', 'range', 'exhaustion', 'session'")
     detection: str | None = Field(default=None, description="How to detect this regime")
+    is_example: bool | None = Field(default=None, description=_IS_EXAMPLE_DESC)
 
 
 class EntryCondition(BaseModel):
@@ -93,6 +109,7 @@ class EntryCondition(BaseModel):
     executable_expression: str | None = Field(default=None, description="e.g. 'buy_stop = pattern.high + offset_pips'")
     source_quote: str | None = Field(default=None, description="Verbatim book text")
     page_ref: str | None = Field(default=None, description="Page/chapter citation")
+    is_example: bool | None = Field(default=None, description=_IS_EXAMPLE_DESC)
 
 
 class StopLoss(BaseModel):
@@ -104,6 +121,7 @@ class StopLoss(BaseModel):
     executable_expression: str | None = Field(default=None, description="e.g. 'stop = pattern.low - offset_pips'")
     source_quote: str | None = Field(default=None, description="Verbatim book text")
     page_ref: str | None = Field(default=None, description="Page/chapter citation")
+    is_example: bool | None = Field(default=None, description=_IS_EXAMPLE_DESC)
 
 
 class TakeProfit(BaseModel):
@@ -114,6 +132,7 @@ class TakeProfit(BaseModel):
     executable_expression: str | None = Field(default=None, description="Target price expression")
     source_quote: str | None = Field(default=None, description="Verbatim book text")
     page_ref: str | None = Field(default=None, description="Page/chapter citation")
+    is_example: bool | None = Field(default=None, description=_IS_EXAMPLE_DESC)
 
 
 class ExitCondition(BaseModel):
@@ -124,6 +143,7 @@ class ExitCondition(BaseModel):
     executable_expression: str | None = Field(default=None, description="Exit logic expression")
     source_quote: str | None = Field(default=None, description="Verbatim book text")
     page_ref: str | None = Field(default=None, description="Page/chapter citation")
+    is_example: bool | None = Field(default=None, description=_IS_EXAMPLE_DESC)
 
 
 class RiskRule(BaseModel):
@@ -382,5 +402,14 @@ CUSTOM_EXTRACTION_INSTRUCTIONS = (
     "prints on a zone), risk rules, and timeframes. Preserve exact price offsets, "
     "anchors, and any executable expressions on the entity attributes. When a page "
     "or chapter is identifiable, record it as page_ref, and keep the verbatim book "
-    "wording as source_quote."
+    "wording as source_quote. "
+    "CRITICAL — doctrine vs worked examples: the book teaches through worked "
+    "examples on historical charts ('EUR/USD prints a kangaroo tail at the 1.0560 "
+    "support level'). Specific price levels, dates, and trade walkthroughs from "
+    "such examples are ILLUSTRATIONS, not knowledge. Prefer extracting the general "
+    "concept (a 'support zone', not a '1.0560 support level'); when an "
+    "example-specific entity is still worth keeping for its pedagogical value, set "
+    "is_example=true on it so consumers never mistake a chart frozen at the book's "
+    "print date for live market data. Never attach a literal example price to a "
+    "concept entity's name."
 )
