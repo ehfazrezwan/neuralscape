@@ -35,6 +35,10 @@ logger = logging.getLogger(__name__)
 # Retrying after a short jittered backoff is the documented client remedy.
 _SOURCE_ATTACH_RETRIES = 3
 
+# Indirection so tests can stub the backoff (no real sleeps, no jitter
+# nondeterminism) without patching the global asyncio module.
+_backoff_sleep = asyncio.sleep
+
 
 # Window for "freshly written by this task" — we identify newly-created
 # nodes by matching their `created_at` against this many seconds before
@@ -180,7 +184,7 @@ async def attach_source_ref(
             except TransientError:
                 if attempt == _SOURCE_ATTACH_RETRIES:
                     raise
-                await asyncio.sleep(0.2 * (2**attempt) + random.uniform(0, 0.2))
+                await _backoff_sleep(0.2 * (2**attempt) + random.uniform(0, 0.2))
     except Exception:
         logger.warning(
             "attach_source_ref failed for connector_id=%s group_id=%s (non-fatal)",

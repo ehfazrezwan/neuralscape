@@ -344,10 +344,15 @@ class TestGraphPatcher:
         ) == 0
 
     @pytest.mark.asyncio
-    async def test_attach_source_ref_retries_deadlocks_then_succeeds(self):
+    async def test_attach_source_ref_retries_deadlocks_then_succeeds(self, monkeypatch):
         """Concurrent graph jobs MERGEing the same (:Source) node deadlock in
         Neo4j (TransientError); the attach must retry, not drop the backlink."""
         from neo4j.exceptions import TransientError
+
+        import extensions.wiki_synthesizer.graph_patcher as gp
+
+        # Stub the backoff — the retry loop is what's under test, not the wait.
+        monkeypatch.setattr(gp, "_backoff_sleep", AsyncMock())
 
         record = {"patched": 4}
 
@@ -391,6 +396,7 @@ class TestGraphPatcher:
         import extensions.wiki_synthesizer.graph_patcher as gp
 
         monkeypatch.setattr(gp, "_SOURCE_ATTACH_RETRIES", 1)
+        monkeypatch.setattr(gp, "_backoff_sleep", AsyncMock())
 
         class _Session:
             async def __aenter__(self):

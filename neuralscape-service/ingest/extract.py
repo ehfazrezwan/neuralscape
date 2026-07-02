@@ -224,9 +224,11 @@ def _page_ref_from(container: dict, page_offset: int = 0) -> str | None:
     bits = []
     if page is not None:
         try:
-            page = int(page) + page_offset
+            page = int(page)
         except (TypeError, ValueError):
             pass  # non-numeric page marker — keep as-is
+        else:
+            page = page + page_offset
         bits.append(f"p.{page}")
     if isinstance(caption, str) and caption.strip():
         bits.append(caption.strip())
