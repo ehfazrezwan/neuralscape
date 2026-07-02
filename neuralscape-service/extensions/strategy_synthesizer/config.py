@@ -28,10 +28,12 @@ class StrategySynthesizerSettings(BaseSettings):
     )
 
     max_memories_per_playbook: int = Field(
-        default=200, ge=1, le=2000,
+        default=500, ge=1, le=2000,
         description=(
             "Hard ceiling on how many source memories a single strategy playbook "
-            "may aggregate (a book can produce a lot of rules)."
+            "may aggregate. A single trading book yields ~250 rule + exemplar "
+            "memories (Naked Forex: 247), so 200 truncated real books; 500 fits "
+            "a book plus follow-up notes while still bounding the merge prompt."
         ),
     )
 
