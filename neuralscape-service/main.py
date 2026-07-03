@@ -47,14 +47,15 @@ from schemas import (
     MemoryResponse,
     MemoryVisibility,
     RawMemoryBatchRequest,
+    PatchMemoryRequest,
     RawMemoryRequest,
+    RetagRequest,
     SearchMemoryRequest,
     SearchMemoryResponse,
     StoreMemoryRequest,
     StoreMemoryResponse,
     TaskAcceptedResponse,
     TaskStatusResponse,
-    UpdateMemoryRequest,
     normalize_visibility,
 )
 from task_manager import TaskManager
@@ -1557,22 +1558,98 @@ async def v1_get_memory(memory_id: str):
     return result
 
 
-@v1_router.put("/memories/{memory_id}")
-async def v1_update_memory(memory_id: str, req: UpdateMemoryRequest):
-    """Update a memory's content or category."""
+@v1_router.patch("/memories/{memory_id}")
+@v1_router.put("/memories/{memory_id}")  # transitional alias for the old update route
+async def v1_patch_memory(memory_id: str, req: PatchMemoryRequest, request: Request):
+    """Partially update a memory (metadata and/or content).
+
+    True PATCH semantics: only fields present in the request body are applied;
+    an explicit ``null`` clears the field where legal. The vector-store write
+    is synchronous (200 + the updated memory); any knowledge-graph work
+    (content re-ingest, project/visibility partition migration) is enqueued on
+    the graph queue and reported via ``graph`` / ``graph_task_id``.
+
+    Permission model: shared memories take metadata edits from any
+    authenticated user; content and visibility edits are owner-or-dictator;
+    private is owner-only; standard tier is dictator-only.
+    """
+    caller = _resolve_user_id(request, req.user_id)
+    changes = {k: getattr(req, k) for k in req.model_fields_set if k != "user_id"}
+    if not changes:
+        raise HTTPException(status_code=400, detail="No fields to update — provide at least one field")
     try:
-        return await asyncio.to_thread(
-            _service.update_memory,
-            memory_id=memory_id,
-            content=req.content,
-            category=req.category,
-            tags=req.tags,
-        )
+        result = await asyncio.to_thread(_service.patch_memory, memory_id, caller, changes)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except PermissionError as pe:
+        raise HTTPException(status_code=403, detail=str(pe)) from pe
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.exception("v1 update_memory failed")
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("v1 patch_memory failed")
         raise HTTPException(status_code=500, detail="Failed to update memory")
+
+    graph = result["graph"]
+    graph_task_id = None
+    if result.get("graph_job"):
+        try:
+            graph_task_id = await _task_manager.enqueue_graph_enrichment(**result["graph_job"])
+            graph = graph.replace("_pending", "_queued")
+        except Exception as e:
+            # Never run Graphiti inline on a request thread — report honestly instead.
+            logger.warning(f"Graph enqueue failed for edited memory {memory_id}: {e}")
+            graph = "enqueue_failed"
+
+    mem = result.get("memory")
+    return {
+        "status": "ok",
+        "memory": mem.model_dump(exclude_none=True) if mem is not None else None,
+        "graph": graph,
+        "graph_task_id": graph_task_id,
+    }
+
+
+@v1_router.post("/memories/retag", status_code=202)
+async def v1_retag_memories(req: RetagRequest, request: Request):
+    """Bulk retag memories matching a filter set (async, 202 + poll).
+
+    Filters AND together; ops are add_tags / remove_tags / set_category /
+    set_project_id (explicit null clears). Content and visibility are not
+    bulk-editable. ``dry_run=true`` returns matched/would-update counts
+    synchronously without writing.
+    """
+    caller = _resolve_user_id(request, req.user_id)
+    filters = req.filters.model_dump(exclude_none=True, mode="json")
+    ops = req.ops.model_dump(exclude_none=True, mode="json")
+    if "set_project_id" in req.ops.model_fields_set:
+        ops["set_project_id"] = req.ops.set_project_id  # preserve explicit-null (clear)
+
+    if req.dry_run:
+        result = await asyncio.to_thread(_service.retag_memories, caller, filters, ops, True)
+        result.pop("graph_jobs", None)
+        return JSONResponse(status_code=200, content=result)
+
+    try:
+        task_id = await _task_manager.enqueue_retag(caller, filters, ops)
+    except (ConnectionError, OSError) as e:
+        if "set_project_id" in ops:
+            # A project change migrates graph partitions, which needs the graph
+            # queue — without Redis there is no safe sync fallback.
+            raise HTTPException(
+                status_code=503,
+                detail="Retag with set_project_id requires the task queue (Redis unavailable)",
+            ) from e
+        logger.warning(f"Redis unavailable, running retag synchronously: {e}")
+        result = await asyncio.to_thread(_service.retag_memories, caller, filters, ops, False)
+        result.pop("graph_jobs", None)
+        return JSONResponse(status_code=200, content=result)
+
+    return TaskAcceptedResponse(
+        task_id=task_id,
+        poll_url=f"/v1/memories/status/{task_id}",
+    )
 
 
 @v1_router.delete("/memories/{memory_id}")

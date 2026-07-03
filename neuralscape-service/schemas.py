@@ -752,10 +752,6 @@ class PatchMemoryRequest(BaseModel):
         return v
 
 
-# Transitional alias — removed together with the PUT handler swap in main.py.
-UpdateMemoryRequest = PatchMemoryRequest
-
-
 class RetagFilters(BaseModel):
     """Filter set selecting the memories a bulk retag applies to (AND semantics)."""
     scope: str | None = None
