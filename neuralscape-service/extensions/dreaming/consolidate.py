@@ -142,6 +142,9 @@ def enumerate_pools(service, *, batch_size: int = 500) -> dict[str, PoolBatch]:
                     "source_type": meta.get("source_type"),
                     "observation_type": meta.get("observation_type"),
                     "hash": payload.get("hash"),
+                    # Reinforcement counter (A2): how many times this fact was
+                    # re-derived/deduped onto this row. Feeds promotion scoring.
+                    "times_derived": meta.get("times_derived"),
                 }
             )
         if offset is None:
@@ -304,12 +307,22 @@ async def apply_actions(
             if a_type == "merge":
                 survivor = act["survivor_id"]
                 losers = [m for m in act["memory_ids"] if m != survivor]
+                # Reinforcement-aware merge (A2): the survivor's counter
+                # becomes the SUM of every merged row's times_derived —
+                # folding N observations into one row must not forget that
+                # the fact was observed N times. Read live from Qdrant (not
+                # the staged batch) so write-path bumps since staging count.
+                merged_times_derived = await asyncio.to_thread(
+                    _sum_times_derived, service, act["memory_ids"]
+                )
                 # A1 provenance: the survivor's derived_from records the folded-in
                 # loser ids (unioned with any prior premises, same upsert as the
-                # content rewrite so there's no read-modify-write race).
+                # content rewrite so there's no read-modify-write race). The
+                # summed times_derived rides along in the same upsert.
                 await asyncio.to_thread(
                     _rewrite_content, service, survivor, act["content"],
                     derived_from_add=losers,
+                    extra_meta={"times_derived": merged_times_derived},
                 )
                 for mid in losers:
                     await asyncio.to_thread(_tombstone, service, mid, superseded_by=survivor)
@@ -353,6 +366,7 @@ def _rewrite_content(
     *,
     reframed: bool = False,
     derived_from_add: list[str] | None = None,
+    extra_meta: dict | None = None,
 ) -> None:
     """Update a memory's text in place: re-embed + overwrite payload data.
 
@@ -361,6 +375,8 @@ def _rewrite_content(
     ``derived_from_add`` (MERGE) unions premise ids into the survivor's
     ``metadata.derived_from`` — read-merge-write like ``_tombstone``, but
     folded into this upsert so provenance and content land atomically.
+    Any ``extra_meta`` patch (e.g. the merge branch's summed
+    ``times_derived``) lands in the same upsert too.
     """
     from config import settings as core_settings
 
@@ -383,6 +399,8 @@ def _rewrite_content(
         existing = meta.get("derived_from") or []
         # union, order-preserving (existing premises first), dedup'd
         meta["derived_from"] = list(dict.fromkeys([*existing, *derived_from_add]))
+    if extra_meta:
+        meta.update(extra_meta)
     payload["metadata"] = meta
     payload["data"] = new_content
     payload["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -418,6 +436,41 @@ def _tombstone(service, memory_id: str, *, superseded_by: str | None, pruned: bo
         payload={"metadata": _merged_metadata(client, memory_id, patch)},
         points=[memory_id],
     )
+
+
+def _times_derived_of(meta: dict | None) -> int:
+    """``times_derived`` of a metadata dict — absent/invalid ⇒ 1 (seen once)."""
+    try:
+        return max(1, int((meta or {}).get("times_derived") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _sum_times_derived(service, memory_ids: list[str]) -> int:
+    """Sum the reinforcement counters of a merge set (A2).
+
+    Rows that can't be retrieved still count as 1 — a merge decision proves
+    each id was a live observation moments ago, and undercounting would
+    silently shrink the survivor's reinforcement.
+    """
+    from config import settings as core_settings
+
+    client = service._memory.vector_store.client
+    found: dict[str, int] = {}
+    try:
+        points = client.retrieve(
+            collection_name=core_settings.qdrant_collection,
+            ids=list(memory_ids),
+            with_payload=True,
+            with_vectors=False,
+        )
+        for pt in points or []:
+            found[str(getattr(pt, "id", ""))] = _times_derived_of(
+                (getattr(pt, "payload", None) or {}).get("metadata")
+            )
+    except Exception:
+        logger.warning("times_derived retrieve failed; defaulting to 1 per row", exc_info=True)
+    return sum(found.get(str(mid), 1) for mid in memory_ids)
 
 
 def _merged_metadata(client, memory_id: str, patch: dict) -> dict:
