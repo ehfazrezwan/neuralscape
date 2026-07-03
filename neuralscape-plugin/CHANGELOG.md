@@ -4,6 +4,21 @@ All notable changes to the `neuralscape` Claude plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.7.1] - 2026-07-03
+
+### Fixed
+
+- **Marketplace installs were broken: hook bundles were never shipped.**
+  `neuralscape-plugin/.gitignore` excluded `scripts/*.js` — the esbuild output
+  the hooks actually invoke (`node "${CLAUDE_PLUGIN_ROOT}/scripts/*.js"`). A
+  fresh install from the git marketplace therefore had **no `scripts/`
+  directory at all**, and every prompt surfaced `UserPromptSubmitHookError`
+  (SessionStart/PostToolUse/Stop failed too, just less visibly). The built
+  bundles are now committed; rebuild with `npm run build` whenever `src/`
+  changes.
+- `package.json` version brought in line with the plugin manifest (was stuck
+  at 2.4.0).
+
 ## [2.7.0] - 2026-07-03
 
 ### Added
