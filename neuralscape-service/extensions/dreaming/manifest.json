@@ -1,0 +1,7 @@
+{
+  "name": "dreaming",
+  "version": "0.1.0",
+  "description": "Background memory consolidation: light/deep/REM sweep that merges duplicates, resolves contradictions non-destructively, reframes stale tenses, and reflects new insights back into the store.",
+  "author": "Neuralscape",
+  "hooks": []
+}
