@@ -173,9 +173,11 @@ def stage_pool(
     rows whose retention strength fell below the prune threshold or that
     carry a passed future-date (reframe candidates surface via the LLM
     reading their content — we just make sure old rows are visible to it).
-    Dream-authored memories are excluded from staging entirely (feedback-
-    loop guard, spec §9) except as invalidation targets — the LLM sees
-    them but they are marked.
+    Dream-authored memories get two guards: *fresh* ones are excluded from
+    staging and from the volume count entirely (feedback-loop guard, spec
+    §9), while *older* ones may re-enter via the weak-retention path so
+    stale insights can decay out (PRUNE/INVALIDATE) — but they are never
+    merge material (``decide`` enforces that).
     """
     now = time.time()
     ids = [m["memory_id"] for m in batch.memories]
@@ -223,10 +225,19 @@ async def decide(batch: PoolBatch, llm_call) -> list[dict]:
     raw = await llm_call(prompt)
     actions = parse_json_response(raw, key="actions")
     known_ids = {m["memory_id"] for m in batch.memories}
+    dream_ids = {
+        m["memory_id"] for m in batch.memories if m.get("source_type") == "dream"
+    }
     valid: list[dict] = []
     for act in actions:
         a_type = act.get("type")
         mids = [m for m in (act.get("memory_ids") or []) if m in known_ids]
+        if a_type == "merge":
+            # Enforce the prompt contract in code: dream-authored insights
+            # are never merge material (re-consolidating consolidations is
+            # the feedback loop the staging guard exists to prevent). They
+            # remain valid PRUNE/INVALIDATE targets.
+            mids = [m for m in mids if m not in dream_ids]
         if a_type not in (_DESTRUCTIVE | _REVERSIBLE) or not mids:
             continue
         act["memory_ids"] = mids

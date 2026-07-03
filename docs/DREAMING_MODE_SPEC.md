@@ -1,7 +1,8 @@
 # Spec: Dreaming Mode for Neuralscape
 
 **Audience:** a Claude Code session working in the `neuralscape` repo.
-**Status:** design + implementation plan. Nothing here is built yet.
+**Status:** implemented (2026-07-03, `extensions/dreaming/`). Kept as the design reference —
+where this document and the code disagree, the code wins.
 **Author:** distilled from a study of three shipped "dreaming" systems + the memory-consolidation
 literature, mapped onto Neuralscape's existing seams.
 

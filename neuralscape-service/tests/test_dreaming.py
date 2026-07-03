@@ -292,6 +292,31 @@ async def test_decide_validates_ids_and_shapes():
     assert actions[1]["confidence"] == 0.0  # unparseable → 0.0
 
 
+@pytest.mark.asyncio
+async def test_decide_never_merges_dream_memories():
+    """Prompt contract enforced in code: dream rows aren't merge material."""
+    mems = [
+        {"memory_id": "a", "content": "x", "created_at": "2026-07-01T00:00:00+00:00"},
+        {"memory_id": "b", "content": "y", "created_at": "2026-07-02T00:00:00+00:00"},
+        {"memory_id": "d1", "content": "insight", "source_type": "dream",
+         "created_at": "2026-06-01T00:00:00+00:00"},
+    ]
+    llm = AsyncMock(return_value=json.dumps({"actions": [
+        # dream id silently dropped from the merge → still valid a+b merge
+        {"type": "merge", "memory_ids": ["a", "b", "d1"], "survivor_id": "a",
+         "content": "merged", "confidence": 0.9},
+        # merge collapses to a single non-dream id → rejected outright
+        {"type": "merge", "memory_ids": ["b", "d1"], "survivor_id": "b",
+         "content": "bad merge", "confidence": 0.9},
+        # dream rows stay valid PRUNE/INVALIDATE targets
+        {"type": "prune", "memory_ids": ["d1"], "confidence": 0.95},
+    ]}))
+    actions = await consolidate.decide(_batch(mems), llm)
+    assert [a["type"] for a in actions] == ["merge", "prune"]
+    assert actions[0]["memory_ids"] == ["a", "b"]
+    assert actions[1]["memory_ids"] == ["d1"]
+
+
 def test_split_by_posture_hybrid():
     actions = [
         {"type": "merge", "confidence": 0.1},            # reversible → apply
