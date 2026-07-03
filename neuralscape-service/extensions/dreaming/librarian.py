@@ -223,6 +223,12 @@ def _one_line(text: str, limit: int = 180) -> str:
     return t if len(t) <= limit else t[: limit - 1].rstrip() + "…"
 
 
+def _wikilink(title: str) -> str:
+    """[[Page]] when the title already is its page name, else [[Page|Title]]."""
+    page = _slug_title(title)
+    return f"[[{page}]]" if page == title else f"[[{page}|{title}]]"
+
+
 # ── Skeleton parsing / rendering (B2) ───────────────────────────────
 
 
@@ -719,9 +725,7 @@ def _write_hub(target: Path, hub_name: str | None, atomic_write) -> None:
         counts = f"{e['memories']} memories" if e["memories"] else "no memories yet"
         if e["last_dreamt"]:
             counts += f", dreamt {e['last_dreamt']}"
-        lines.append(
-            f"- [[{_slug_title(e['title'])}|{e['title']}]] — {e['summary']} _({counts})_"
-        )
+        lines.append(f"- {_wikilink(e['title'])} — {e['summary']} _({counts})_")
     lines += ["", "Back to [[Home]].", ""]
     atomic_write(target / f"{hub_name}.md", "\n".join(lines))
 
@@ -774,9 +778,7 @@ def _write_home(
         if entries:
             lines += [f"## {section}", ""]
             for e in entries:
-                lines.append(
-                    f"- [[{_slug_title(e['title'])}|{e['title']}]] — {e['summary']}"
-                )
+                lines.append(f"- {_wikilink(e['title'])} — {e['summary']}")
             lines.append("")
     if (vault / "Dreams").exists():
         lines += ["## Dream journal", "", "Recent sweeps live in `Dreams/`.", ""]

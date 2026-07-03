@@ -356,6 +356,47 @@ async def test_decide_never_merges_dream_memories():
     assert actions[1]["memory_ids"] == ["d1"]
 
 
+def test_reconcile_batch_folds_applied_actions_into_staged_dicts():
+    mems = [
+        {"memory_id": "surv", "content": "old survivor text"},
+        {"memory_id": "loser", "content": "duplicate"},
+        {"memory_id": "stale", "content": "contradicted"},
+        {"memory_id": "noise", "content": "ok"},
+        {"memory_id": "future", "content": "will do X in July"},
+        {"memory_id": "untouched", "content": "keep me"},
+    ]
+    batch = _batch(mems)
+    applied = [
+        {"type": "merge", "memory_ids": ["surv", "loser"], "survivor_id": "surv",
+         "content": "merged text"},
+        {"type": "invalidate", "memory_ids": ["stale"]},
+        {"type": "prune", "memory_ids": ["noise"]},
+        {"type": "temporal_reframe", "memory_ids": ["future"], "content": "did X in July"},
+    ]
+    assert consolidate.reconcile_batch(batch, applied) == 3  # loser, stale, noise
+    by_id = {m["memory_id"]: m for m in batch.memories}
+    assert by_id["surv"]["content"] == "merged text"
+    assert not by_id["surv"].get("dream_tombstoned")
+    assert by_id["loser"]["dream_tombstoned"]
+    assert by_id["stale"]["dream_tombstoned"]
+    assert by_id["noise"]["dream_tombstoned"]
+    assert by_id["future"]["content"] == "did X in July"
+    assert "dream_tombstoned" not in by_id["untouched"]
+
+
+@pytest.mark.asyncio
+async def test_reflect_excludes_rows_consumed_this_sweep():
+    mems = [
+        {"memory_id": "a", "content": "x", "source_type": "explicit"},
+        {"memory_id": "b", "content": "y", "source_type": "explicit"},
+        {"memory_id": "c", "content": "z", "source_type": "explicit",
+         "dream_tombstoned": True},
+    ]
+    llm = AsyncMock()  # only 2 live candidates < 3 → no reflection call at all
+    assert await reflect.reflect(_batch(mems), llm, max_insights=5) == []
+    llm.assert_not_awaited()
+
+
 def test_split_by_posture_hybrid():
     actions = [
         {"type": "merge", "confidence": 0.1},            # reversible → apply

@@ -41,8 +41,13 @@ logger = logging.getLogger(__name__)
 
 async def reflect(batch: PoolBatch, llm_call, *, max_insights: int) -> list[dict]:
     """Run the reflection pass; returns validated insight dicts."""
-    # Reflection needs enough substrate to infer across.
-    candidates = [m for m in batch.memories if m.get("source_type") != "dream"]
+    # Reflection needs enough substrate to infer across. Rows consumed by
+    # this sweep's own consolidation (marked via reconcile_batch) are not
+    # substrate — an invalidated fact must not seed a fresh insight.
+    candidates = [
+        m for m in batch.memories
+        if m.get("source_type") != "dream" and not m.get("dream_tombstoned")
+    ]
     if len(candidates) < 3:
         return []
     now = datetime.now(timezone.utc)
