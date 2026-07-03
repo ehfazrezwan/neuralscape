@@ -136,6 +136,27 @@ Write-path internals (extraction, dedup, persistence) live in [memory-service-co
 - **Length limits**: `user_id` 1-100, `project_id` ≤100, `agent_id` ≤100, `content` 1-10000, `query` 1-2000, `messages` list ≤500, `tags` ≤20, `limit` 1-100, context `max_chars` 500-32000.
 - **No `@field_validator` decorators** in `schemas.py` — category validation is enforced at the service layer (`prompts.py:69-89`), which falls back to `personal_fact` on unknown input rather than raising.
 
+## Editing memories
+
+Memories are editable **in place** — `PATCH /v1/memories/{id}` (MCP `edit_memory`) for a single memory, `POST /v1/memories/retag` (MCP `retag_memories`) for filter-based bulk metadata ops. An edit preserves the memory's ID, `owner_user_id`, and `created_at`; delete+recreate is never required and would lose all three.
+
+### Permission matrix
+
+| Tier | Metadata (tags / category / project_id / v2 fields) | Content | Visibility |
+|---|---|---|---|
+| `shared` | any authenticated user (housekeeping is collaborative) | owner or dictator | owner or dictator |
+| `private` (incl. legacy null) | owner or dictator | owner or dictator | owner or dictator |
+| `standard` | dictator only | dictator only | dictator only |
+
+`owner_user_id` is never editable, and `scope` is never accepted directly — it is re-derived from the effective category + project_id on every edit (project categories require a project_id; global categories force global scope; flexible categories follow project_id).
+
+### Cross-stack consistency
+
+- **tags / category / v2 fields** are not stored in Neo4j → a retag is a pure Qdrant payload patch (embeddings untouched, since content is unchanged).
+- **project_id / visibility** are part of the graph `group_id` partition → an edit soft-expires the memory's old edges and enqueues a re-ingest into the new group on the graph queue. Entity-node group_ids are never mutated in place (nodes are shared across memories).
+- **content** re-embeds synchronously and enqueues a graph re-ingest so Graphiti's contradiction detection expires stale facts. Content edits are blocked on `passage` memories (verbatim chunks of an ingested artifact — re-ingest the source instead).
+- **Synthesizer consumers** (wiki, strategy playbooks) pick retags up at their next cron: a changed source set defeats the idempotent skip, so affected pages re-synthesize. Pages built under the old grouping remain (versioned, append-only).
+
 ## Legacy vs v1 surfaces
 
 The FastAPI app exposes two parallel surfaces. Legacy root paths (`/memories`, `/search`) are thin mem0 passthroughs: no scoping, no categories, arbitrary metadata dicts. The `/v1/*` endpoints are the structured surface — explicit `category`, `scope`, `project_id`, typed metadata, and async-by-default writes returning `202` plus a `task_id` to poll. New integrations should target v1; see [service-architecture](./02-service-architecture.md) for routing details.

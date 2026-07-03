@@ -32,6 +32,10 @@ _task_manager = TaskManager()                   # mcp_server.py:29
 | 5 | `search_knowledge_graph` | `query`, `user_id` | `project_id`, `limit` (10) | `.search_graph()` | sync |
 | 6 | `list_memories` | `user_id` | `scope`, `category`, `project_id`, `limit` (100) | `.list_memories()` | sync |
 | 7 | `delete_memories` | `user_id` | `memory_id`, `scope`, `category`, `project_id`, `filter_null_category` | `.delete_memory()` / `.delete_memories()` | sync |
+| 8 | `edit_memory` | `memory_id` | `content`, `category`, `project_id`, `tags[]`, `visibility`, v2 fields (`domain`, `observation_type`, `concepts`, `confidence`, `expires_at`) | `.patch_memory()` | sync + graph job |
+| 9 | `retag_memories` | ≥1 filter, ≥1 op | filters: `scope`, `category`, `project_id`, `visibility`, `tags_contains[]`; ops: `add_tags[]`, `remove_tags[]`, `set_category`, `set_project_id`; `dry_run` | `.retag_memories()` / `enqueue_retag()` | async (dry_run sync) |
+
+(The table lists the founding tool set plus the edit tools; the live server has 14 tools — later additions `ingest_document`, `ingest_text`, `list_projects`, `list_processes`, and `get_process` are covered in [21-document-ingestion](./21-document-ingestion.md) and the processes docs.)
 
 All tool handlers return `list[TextContent]` containing a single `TextContent(type="text", text=json.dumps(...))`. Tool definitions are at `neuralscape-service/mcp_server.py:32-294`; dispatch lives in the `call_tool` handler at `neuralscape-service/mcp_server.py:297-434`.
 
@@ -48,6 +52,14 @@ All tool handlers return `list[TextContent]` containing a single `TextContent(ty
 ### Delete tool
 
 `delete_memories` accepts either a single `memory_id` (which short-circuits all other filters) or a filter combination of `scope`, `category`, `project_id`, and `filter_null_category` (`mcp_server.py:415-427`). Its description warns: *"Use with caution — deleted memories cannot be recovered."*
+
+### Edit tools
+
+`edit_memory` patches a single memory **in place** — the memory keeps its ID, author (`owner_user_id`), and `created_at`, which is exactly what the old delete+recreate workaround destroyed. Changes are presence-keyed (an explicit `null` clears a clearable field; an omitted field is untouched), `scope` is always re-derived from the effective category + project_id, and any knowledge-graph work (content re-ingest, project/visibility partition migration) is enqueued on the graph queue and reported back as `graph` / `graph_task_id` — never run inline.
+
+`retag_memories` is the bulk-housekeeping counterpart: AND-semantics filters select the rows, ops (`add_tags` / `remove_tags` / `set_category` / `set_project_id`) mutate them, and `dry_run: true` previews `matched`/`updated` counts synchronously. The real run returns `{"status": "accepted", "task_id"}` like every other bulk write. At least one filter is required — unfiltered whole-store sweeps are refused at the boundary.
+
+**Permission split (both tools, enforced in `MemoryService`):** shared memories accept *metadata* edits (tags/category/project_id/v2 fields) from any authenticated teammate, but *content* and *visibility* changes are owner-or-dictator; private memories are owner-only; `standard`-tier is dictator-only. Other users' private memories never enter a retag's candidate set (the scroll filter admits only the shared/standard pools plus the caller's own rows), so even the skip counters can't leak their existence. Content edits are blocked on `passage` memories — they mirror an ingested artifact; re-ingest the corrected source instead.
 
 ## Transports
 
