@@ -22,27 +22,47 @@ from extensions.dreaming.consolidate import PoolBatch
 
 
 class FakeRedis:
-    """Minimal in-memory stand-in for the sync redis client."""
+    """Minimal in-memory stand-in for the sync redis client.
+
+    Tracks ``px`` expiries with a monotonic-ish clock so the lock's
+    stale-reclaim path (``SET NX PX``) is actually testable.
+    """
 
     def __init__(self):
         self.kv: dict[str, str] = {}
+        self.expiries: dict[str, float] = {}  # key → unix deadline
         self.hashes: dict[str, dict] = {}
         self.hll: dict[str, set] = {}
 
+    def _alive(self, key) -> bool:
+        if key not in self.kv:
+            return False
+        deadline = self.expiries.get(key)
+        if deadline is not None and time.time() >= deadline:
+            self.kv.pop(key, None)
+            self.expiries.pop(key, None)
+            return False
+        return True
+
     def get(self, key):
-        return self.kv.get(key)
+        return self.kv.get(key) if self._alive(key) else None
 
     def set(self, key, value, nx=False, px=None):
-        if nx and key in self.kv:
+        if nx and self._alive(key):
             return False
         self.kv[key] = value
+        if px is not None:
+            self.expiries[key] = time.time() + px / 1000.0
+        else:
+            self.expiries.pop(key, None)
         return True
 
     def delete(self, key):
         self.kv.pop(key, None)
+        self.expiries.pop(key, None)
 
     def exists(self, key):
-        return key in self.kv
+        return self._alive(key)
 
     def pipeline(self, transaction=False):
         return FakePipeline(self)
@@ -122,11 +142,36 @@ def test_volume_gate():
 
 def test_lock_exclusive_and_released():
     r = FakeRedis()
-    assert gate.acquire_lock(r, "shared")
-    assert not gate.acquire_lock(r, "shared")  # held
+    token = gate.acquire_lock(r, "shared")
+    assert token
+    assert gate.acquire_lock(r, "shared") is None  # held
     assert gate.is_locked(r, "shared")
-    gate.release_lock(r, "shared")
+    gate.release_lock(r, "shared", token)
     assert gate.acquire_lock(r, "shared")  # reacquirable
+
+
+def test_lock_release_is_owner_safe():
+    """A stale holder's release must not clear a reacquired lock."""
+    r = FakeRedis()
+    stale_token = gate.acquire_lock(r, "shared")
+    r.expiries["dreaming:lock:shared"] = 0.0  # simulate the PX window lapsing
+    fresh_token = gate.acquire_lock(r, "shared")  # reclaimed by another worker
+    assert fresh_token and fresh_token != stale_token
+
+    gate.release_lock(r, "shared", stale_token)  # zombie sweep finishes late
+    assert gate.is_locked(r, "shared")  # fresh owner keeps the lock
+
+    gate.release_lock(r, "shared", fresh_token)
+    assert not gate.is_locked(r, "shared")
+
+
+def test_lock_stale_reclaim_via_px_expiry(monkeypatch):
+    """A crashed sweep's lock is reclaimable once the PX window lapses."""
+    monkeypatch.setattr(gate, "_LOCK_STALE_MS", 1)
+    r = FakeRedis()
+    assert gate.acquire_lock(r, "shared")
+    time.sleep(0.005)  # outlive the 1ms stale window; no release_lock call
+    assert gate.acquire_lock(r, "shared")
 
 
 def test_completion_resets_time_gate():

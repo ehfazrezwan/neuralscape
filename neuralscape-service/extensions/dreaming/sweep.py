@@ -191,7 +191,8 @@ async def _dream_pool(
             return report
 
     # 2. lock (shared with the dedup cron's semantic-skip check)
-    if not gate.acquire_lock(redis, pool):
+    lock_token = gate.acquire_lock(redis, pool)
+    if not lock_token:
         report.status, report.reason = "locked", "another sweep holds the pool lock"
         return report
 
@@ -297,4 +298,4 @@ async def _dream_pool(
         report.errors.append(exc.__class__.__name__)
         return report
     finally:
-        gate.release_lock(redis, pool)
+        gate.release_lock(redis, pool, lock_token)
