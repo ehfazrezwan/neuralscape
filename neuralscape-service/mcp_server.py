@@ -579,6 +579,75 @@ async def list_tools() -> list[Tool]:
                 "required": [],
             },
         ),
+        Tool(
+            name="edit_memory",
+            description=(
+                "Partially update an existing memory in place — the memory keeps its ID, "
+                "author, and creation time (no lossy delete+recreate). Only the fields you "
+                "pass are changed; pass null to clear a clearable field (project_id, tags, "
+                "expires_at, domain, observation_type, concepts, confidence). Scope is "
+                "re-derived from category + project_id automatically. Permission model: "
+                "SHARED memories accept metadata edits (tags/category/project_id/v2 fields) "
+                "from any authenticated teammate — housekeeping is collaborative — but "
+                "content and visibility changes are owner-or-dictator only. PRIVATE "
+                "memories are owner-only; 'standard' tier is dictator-only. Content edits "
+                "are blocked on 'passage' memories (verbatim chunks of an ingested "
+                "artifact — re-ingest the corrected source instead). Graph impact is "
+                "handled automatically: content or project/visibility changes enqueue a "
+                "background knowledge-graph re-ingest (reported as graph_task_id)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "memory_id": {"type": "string", "description": "ID of the memory to edit"},
+                    "content": {"type": "string", "description": "New memory text (re-embeds; owner/dictator only)"},
+                    "category": {"type": "string", "description": "New category (must be a registered category)"},
+                    "project_id": {"type": ["string", "null"], "description": "New project ID; null clears it"},
+                    "tags": {"type": ["array", "null"], "items": {"type": "string"}, "description": "Full replacement tags list; null clears"},
+                    "visibility": {"type": "string", "enum": ["private", "shared", "standard"], "description": "New visibility tier (owner/dictator only; 'standard' is dictator-only)"},
+                    "domain": {"type": ["string", "null"], "description": "Memory-model v2 life-context domain"},
+                    "observation_type": {"type": ["string", "null"], "description": "Memory-model v2 observation shape"},
+                    "concepts": {"type": ["array", "null"], "items": {"type": "string"}, "description": "Memory-model v2 concept tags (max 5)"},
+                    "confidence": {"type": ["number", "null"], "description": "Memory-model v2 confidence 0.0-1.0"},
+                    "expires_at": {"type": ["string", "null"], "description": "ISO 8601 expiry; null clears"},
+                    "user_id": {"type": "string", "description": "Caller user ID (optional under token auth)"},
+                },
+                "required": ["memory_id"],
+            },
+        ),
+        Tool(
+            name="retag_memories",
+            description=(
+                "Bulk-edit organizational metadata on every memory matching a filter set — "
+                "the housekeeping tool for stamping a project code or tag across many "
+                "memories at once. Filters AND together (scope, category, project_id, "
+                "visibility, tags_contains); at least one is required (no whole-store "
+                "sweeps). Ops: add_tags, remove_tags, set_category, set_project_id "
+                "(null clears the project). Content and visibility are NOT bulk-editable. "
+                "Memories keep their ID, author, and creation time. Other users' private "
+                "memories are never touched (or counted); per-row permission and validity "
+                "violations are skipped and reported as skipped_forbidden/skipped_invalid. "
+                "Start with dry_run=true to preview matched/updated counts, then run for "
+                "real (returns a task_id to poll — writes are async)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "scope": {"type": "string", "enum": ["global", "project"], "description": "Filter: memories with this scope"},
+                    "category": {"type": "string", "description": "Filter: memories with this category"},
+                    "project_id": {"type": "string", "description": "Filter: memories in this project"},
+                    "visibility": {"type": "string", "enum": ["private", "shared", "standard"], "description": "Filter: memories at this visibility tier"},
+                    "tags_contains": {"type": "array", "items": {"type": "string"}, "description": "Filter: memories carrying ALL of these tags"},
+                    "add_tags": {"type": "array", "items": {"type": "string"}, "description": "Op: tags to add to each matched memory"},
+                    "remove_tags": {"type": "array", "items": {"type": "string"}, "description": "Op: tags to remove from each matched memory"},
+                    "set_category": {"type": "string", "description": "Op: replace the category on each matched memory"},
+                    "set_project_id": {"type": ["string", "null"], "description": "Op: replace the project ID (null clears it)"},
+                    "dry_run": {"type": "boolean", "description": "Preview counts without writing (default false)"},
+                    "user_id": {"type": "string", "description": "Caller user ID (optional under token auth)"},
+                },
+                "required": [],
+            },
+        ),
     ]
 
 
@@ -944,6 +1013,78 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                     include_shared=arguments.get("include_shared", False),
                 )
             return [TextContent(type="text", text=json.dumps(result, default=str))]
+
+        elif name == "edit_memory":
+            # Presence-keyed changes: the raw arguments dict distinguishes an
+            # explicit null (clear the field) from an omitted field.
+            _EDITABLE = (
+                "content", "category", "project_id", "tags", "visibility",
+                "domain", "observation_type", "concepts", "confidence", "expires_at",
+            )
+            changes = {k: arguments[k] for k in _EDITABLE if k in arguments}
+            if not changes:
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": "No fields to update — provide at least one editable field"}))]
+            try:
+                result = await asyncio.to_thread(
+                    _service.patch_memory, arguments["memory_id"], user_id, changes
+                )
+            except (LookupError, PermissionError, ValueError) as e:
+                return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+
+            graph = result["graph"]
+            graph_task_id = None
+            if result.get("graph_job"):
+                try:
+                    graph_task_id = await _task_manager.enqueue_graph_enrichment(
+                        **result["graph_job"]
+                    )
+                    graph = graph.replace("_pending", "_queued")
+                except Exception as e:
+                    logger.warning(f"Graph enqueue failed for edited memory: {e}")
+                    graph = "enqueue_failed"
+            mem = result.get("memory")
+            return [TextContent(type="text", text=json.dumps({
+                "status": "ok",
+                "memory": mem.model_dump(exclude_none=True) if mem is not None else None,
+                "graph": graph,
+                "graph_task_id": graph_task_id,
+            }, default=str))]
+
+        elif name == "retag_memories":
+            filters = {
+                k: arguments[k]
+                for k in ("scope", "category", "project_id", "visibility", "tags_contains")
+                if arguments.get(k) is not None
+            }
+            ops = {
+                k: arguments[k]
+                for k in ("add_tags", "remove_tags", "set_category")
+                if arguments.get(k)
+            }
+            if "set_project_id" in arguments:
+                ops["set_project_id"] = arguments["set_project_id"]
+            if not filters:
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": "At least one filter is required — refusing an unfiltered retag sweep"}))]
+            if not ops:
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": "At least one operation is required (add_tags/remove_tags/set_category/set_project_id)"}))]
+            overlap = set(ops.get("add_tags") or []) & set(ops.get("remove_tags") or [])
+            if overlap:
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": f"Tags cannot be both added and removed: {sorted(overlap)}"}))]
+
+            if arguments.get("dry_run"):
+                result = await asyncio.to_thread(
+                    _service.retag_memories, user_id, filters, ops, True
+                )
+                result.pop("graph_jobs", None)
+                return [TextContent(type="text", text=json.dumps(result, default=str))]
+
+            task_id = await _task_manager.enqueue_retag(user_id, filters, ops)
+            return [TextContent(type="text", text=json.dumps(
+                {"status": "accepted", "task_id": task_id}))]
 
         else:
             return [TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]
