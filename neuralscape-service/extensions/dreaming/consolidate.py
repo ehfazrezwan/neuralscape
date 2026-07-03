@@ -109,12 +109,11 @@ def enumerate_pools(service, *, batch_size: int = 500) -> dict[str, PoolBatch]:
                 continue  # already consolidated away
             owner = meta.get("owner_user_id") or payload.get("user_id")
             project_id = meta.get("project_id")
+            is_shared = visibility == "shared"
             key = pool_key(
-                visibility="shared" if visibility == "shared" else "private",
-                owner_user_id=owner,
+                visibility="shared" if is_shared else "private",
+                owner_user_id=None if is_shared else owner,
                 project_id=project_id,
-            ) if visibility != "shared" else pool_key(
-                visibility="shared", owner_user_id=None, project_id=project_id
             )
             batch = pools.get(key)
             if batch is None:

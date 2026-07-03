@@ -230,7 +230,7 @@ One new extension, `extensions/dreaming/`, running a **light → deep → REM** 
 gated by a cheap-then-expensive gate economy, writing through Graphiti invalidation + Qdrant, and
 emitting a human-readable diary.
 
-```
+```text
                           ┌─────────────────────── dreaming cron (slow queue) ───────────────────────┐
  recall traces ─┐         │  gate economy (§3.1)                                                       │
  daily logs ────┼──▶ LIGHT (stage) ──▶ DEEP (consolidate + promote) ──▶ REM (reflect) ──▶ diary       │
