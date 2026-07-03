@@ -27,7 +27,8 @@ The 20 public methods cluster into six functional groups. Most callers (REST han
 | Read | `get_global_context` | `memory_service.py:803-833` | Global only, bucketed by category |
 | CRUD | `get_memory` | `memory_service.py:839-845` | Single memory by ID |
 | CRUD | `list_memories` | `memory_service.py:847-873` | Filter by scope/category/project |
-| CRUD | `update_memory` | `memory_service.py:875-912` | Updates; triggers graph re-ingest |
+| CRUD | `patch_memory` | `memory_service.py` | Presence-keyed partial update; permission-gated; returns a deferred graph job |
+| CRUD | `retag_memories` | `memory_service.py` | Bulk metadata ops over a filter set; per-row permission/validity skip counters |
 | CRUD | `delete_memory` | `memory_service.py:914-929` | Vector delete + soft-delete edges |
 | CRUD | `delete_memories` | `memory_service.py:931-992` | Bulk delete with filters |
 | Graph | `get_graph_nodes` | `memory_service.py:1055-1084` | Entity nodes by group_id |

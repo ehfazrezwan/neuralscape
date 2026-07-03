@@ -319,6 +319,38 @@ async def _enqueue_graph_jobs(ctx: dict, jobs: list[dict], adapter: str | None) 
     return enqueued
 
 
+async def process_memory_retag(
+    ctx: dict,
+    caller_user_id: str,
+    filters: dict,
+    ops: dict,
+) -> dict:
+    """Background task: bulk-retag memories matching a filter set.
+
+    Runs on the fast queue — the retag itself is a Qdrant scroll +
+    per-point set_payload (milliseconds each). When a project change moves
+    memories between graph group_id partitions, the service returns one
+    graph job per moved memory; those fan out onto the graph queue via
+    ``_enqueue_graph_jobs`` (with its inline-enrichment fallback) so the
+    slow Graphiti re-ingest never runs here.
+    """
+    service: MemoryService = ctx["service"]
+    result = await asyncio.to_thread(
+        service.retag_memories, caller_user_id, filters, ops
+    )
+    graph_jobs = result.pop("graph_jobs", [])
+    result["graph_jobs_enqueued"] = (
+        await _enqueue_graph_jobs(ctx, graph_jobs, None) if graph_jobs else 0
+    )
+    logger.info(
+        "Retag complete: matched=%s updated=%s forbidden=%s invalid=%s graph_jobs=%s",
+        result.get("matched"), result.get("updated"),
+        result.get("skipped_forbidden"), result.get("skipped_invalid"),
+        result["graph_jobs_enqueued"],
+    )
+    return result
+
+
 async def process_ingest_document(ctx: dict, doc: dict) -> dict:
     """Background task: ingest a document into passages + distilled facts.
 
@@ -954,6 +986,7 @@ class WorkerSettings:
         process_memory_store,
         process_memory_raw,
         process_memory_raw_batch,
+        process_memory_retag,
         process_conversation_flush,
         process_conversation_compile,
     ]

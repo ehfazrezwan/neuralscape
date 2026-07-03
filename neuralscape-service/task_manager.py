@@ -256,6 +256,67 @@ class TaskManager:
             return job_id
         return job.job_id
 
+    async def enqueue_retag(self, caller_user_id: str, filters: dict, ops: dict) -> str:
+        """Enqueue a bulk retag task on the fast queue. Returns job_id.
+
+        Canonical-JSON job id (sort_keys) so two *different* retags can never
+        collide while an identical replay coalesces within ARQ's dedup window
+        — the same guarantee enqueue_raw_batch relies on.
+        """
+        canonical = json.dumps(
+            {"filters": filters, "ops": ops}, sort_keys=True, separators=(",", ":")
+        )
+        job_id = _generate_job_id(f"retag:{canonical}", caller_user_id or "anon")
+        job = await self.pool.enqueue_job(
+            "process_memory_retag",
+            caller_user_id,
+            filters,
+            ops,
+            _job_id=job_id,
+        )
+        if job is None:
+            return job_id
+        return job.job_id
+
+    async def enqueue_graph_enrichment(
+        self,
+        memory_id: str,
+        content: str,
+        user_id: str,
+        project_id: str | None = None,
+        visibility: str | None = None,
+        source_ref: dict | None = None,
+    ) -> str:
+        """Enqueue a graph re-ingest for an edited memory (graph queue). Returns job_id.
+
+        Used by the memory-edit paths: after a content change or a
+        project/visibility partition migration, the memory's content must be
+        re-ingested into Graphiti (contradiction detection / new group_id)
+        without ever blocking a request thread. The job id keys on the target
+        state (memory + visibility + project + content hash) so a second edit
+        of the same memory to a *different* state is a distinct job, while a
+        replay of the same edit coalesces.
+        """
+        content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
+        job_id = _generate_job_id(
+            f"graph-edit:{memory_id}:{visibility}:{project_id}:{content_hash}", user_id
+        )
+        job = await self.pool.enqueue_job(
+            "process_graph_enrichment",
+            memory_id,
+            content,
+            user_id,
+            project_id,
+            visibility,
+            source_ref,
+            None,  # adapter — regular memories carry no knowledge-adapter ontology
+            _job_id=job_id,
+            _queue_name=settings.graph_queue_name,
+        )
+        if job is None:
+            return job_id
+        return job.job_id
+
     def _candidate_queues(self) -> list[str]:
         """Queues a poll-able job could live on (main + ingest), de-duplicated.
 

@@ -343,6 +343,49 @@ class TestEnqueueGraphJobs:
         assert ctx["redis"].enqueue_job.await_count == 1
 
 
+class TestProcessMemoryRetag:
+    @pytest.mark.asyncio
+    async def test_runs_service_and_reports_counts(self, ctx):
+        ctx["service"].retag_memories.return_value = {
+            "matched": 3, "updated": 2, "skipped_forbidden": 1,
+            "skipped_invalid": 0, "graph_jobs": [], "dry_run": False,
+        }
+        result = await worker.process_memory_retag(
+            ctx, "robb", {"category": "decision"}, {"add_tags": ["t"]}
+        )
+        ctx["service"].retag_memories.assert_called_once_with(
+            "robb", {"category": "decision"}, {"add_tags": ["t"]}
+        )
+        assert result["updated"] == 2
+        assert result["graph_jobs_enqueued"] == 0
+        assert "graph_jobs" not in result
+
+    @pytest.mark.asyncio
+    async def test_fans_graph_jobs_out_to_graph_queue(self, ctx):
+        from config import settings
+
+        jobs = [
+            {"memory_id": f"m{i}", "content": "c", "user_id": "e",
+             "project_id": "bon002", "visibility": "shared", "source_ref": None}
+            for i in range(2)
+        ]
+        ctx["service"].retag_memories.return_value = {
+            "matched": 2, "updated": 2, "skipped_forbidden": 0,
+            "skipped_invalid": 0, "graph_jobs": jobs, "dry_run": False,
+        }
+        result = await worker.process_memory_retag(
+            ctx, "robb", {"category": "decision"}, {"set_project_id": "bon002"}
+        )
+        assert result["graph_jobs_enqueued"] == 2
+        assert ctx["redis"].enqueue_job.await_count == 2
+        kwargs = ctx["redis"].enqueue_job.call_args[1]
+        assert kwargs["_queue_name"] == settings.graph_queue_name
+
+    def test_registered_on_fast_worker(self):
+        assert worker.process_memory_retag in worker.WorkerSettings.functions
+        assert worker.process_memory_retag not in worker.GraphWorkerSettings.functions
+
+
 class TestWorkerTopology:
     def test_graph_worker_owns_graph_queue_and_enrichment(self):
         from config import settings

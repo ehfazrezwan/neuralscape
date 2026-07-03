@@ -51,6 +51,8 @@ class WorkerSettings:
     functions = [
         process_memory_store,
         process_memory_raw,
+        process_memory_raw_batch,
+        process_memory_retag,
         process_conversation_flush,
         process_conversation_compile,
     ]
@@ -114,6 +116,10 @@ for mem in existing:
 Before storing, the worker performs a vector search and case-insensitively compares the top hits against the new content. If an exact (whitespace- and case-normalised) match exists, it short-circuits and returns the existing memory with `deduplicated: True`. This is in addition to the deterministic-job-ID dedup at the enqueue layer — they catch different cases. Job-ID dedup catches a client retrying the *same* request; idempotency catches a client posting the same fact twice through different code paths or sessions.
 
 Failures of the idempotency search are logged and swallowed: better to risk a duplicate than to drop a write because Qdrant blipped.
+
+### process_memory_retag
+
+The bulk memory-edit job (`POST /v1/memories/retag`, MCP `retag_memories`). Runs on the **fast queue** because the retag itself is a Qdrant scroll + per-point `set_payload` (milliseconds each); when a `set_project_id` op moves memories between graph `group_id` partitions, the service returns one graph job per moved memory and the worker fans them out onto the **graph queue** via `_enqueue_graph_jobs` — the slow Graphiti re-ingest never runs on the fast worker. Job id is a canonical-JSON hash of `{filters, ops}` + caller, so two different retags can't collide while an identical replay coalesces. Single-memory edits (`PATCH /v1/memories/{id}`) don't have a worker function at all: the vector write is synchronous in the request, and only the graph half is enqueued via `TaskManager.enqueue_graph_enrichment` (job id keyed on the edit's *target state* — memory + visibility + project + content hash).
 
 ## TaskManager: Deterministic Job IDs
 

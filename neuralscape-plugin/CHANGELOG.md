@@ -4,6 +4,32 @@ All notable changes to the `neuralscape` Claude plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.7.0] - 2026-07-03
+
+### Added
+
+- **`edit_memory` + `retag_memories` MCP tools** (tool count 12 → 14). Memories
+  are now editable **in place** — ID, author, and creation time all preserved —
+  instead of the lossy delete+recreate workaround. `edit_memory` patches a
+  single memory (content, category, project_id, tags, visibility, v2 fields;
+  explicit `null` clears a field); `retag_memories` bulk-applies metadata ops
+  (add/remove tags, set category/project) over a filter set with a `dry_run`
+  preview — the housekeeping tool for stamping a project code across a whole
+  ingest.
+- **Permission split for shared memories.** Organizational metadata
+  (tags/category/project) on shared memories is editable by any authenticated
+  teammate; content and visibility changes remain owner-or-dictator; private
+  memories stay owner-only; the `standard` tier stays dictator-only.
+
+### Fixed
+
+- Content edits through the service previously **wiped all Neuralscape
+  metadata** on the memory (category, scope, tags, visibility, owner) — the
+  nested metadata is now merged through, and graph work (content re-ingest,
+  project/visibility partition migration) runs on the graph queue instead of
+  the request thread.
+- Marketplace/plugin version desync (2.5.0 vs 2.6.0) — both now 2.7.0.
+
 ## [2.5.0] - 2026-07-01
 
 ### Added

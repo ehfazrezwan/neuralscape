@@ -120,7 +120,8 @@ Request models (`schemas.py:109-175`):
 - **`RawMemoryRequest`** (121-134) — pre-categorized single fact: `content` (1-10000 chars), `user_id`, `category`, `scope` (default `"global"`), optional `project_id`/`tags` (≤20)/`agent_id`/`run_id`.
 - **`SearchMemoryRequest`** (137-144) — `query` (1-2000), `user_id`, optional `project_id`, `categories` (≤13), `scope`, `limit` (1-100, default 10).
 - **`GraphSearchRequest`** (147-156) — Graphiti-only search with optional `search_config` override.
-- **`UpdateMemoryRequest`** (159-163) — partial update of `content`/`category`/`tags`.
+- **`PatchMemoryRequest`** — presence-keyed partial update (`content`, `category`, `project_id`, `tags`, `visibility`, v2 fields); handlers read `model_fields_set` so explicit `null` (clear) is distinct from absent. Replaced `UpdateMemoryRequest`.
+- **`RetagRequest`** (`RetagFilters` + `RetagOps`) — bulk retag; a model validator requires ≥1 *effective* (non-empty) filter and ≥1 op, and rejects `add_tags ∩ remove_tags`.
 - **`BulkDeleteRequest`** (166-175) — filtered bulk delete; `filter_null_category` restricts to memories missing a category. `include_shared` (default `False`) gates whether the caller's *shared* writes are removed: by default shared memories are preserved on every bulk path (team artifacts shouldn't be wipeable by one user's sweep, including via the MCP `delete_memories` tool an LLM agent can trigger).
 
 Response models (`schemas.py:183-234`):
@@ -134,7 +135,28 @@ Write-path internals (extraction, dedup, persistence) live in [memory-service-co
 
 - **ID pattern** (`schemas.py:106`): `_ID_PATTERN = r"^[a-zA-Z0-9_.\-]+$"` applied to `user_id`, `project_id`, and `agent_id` (not `run_id`).
 - **Length limits**: `user_id` 1-100, `project_id` ≤100, `agent_id` ≤100, `content` 1-10000, `query` 1-2000, `messages` list ≤500, `tags` ≤20, `limit` 1-100, context `max_chars` 500-32000.
-- **No `@field_validator` decorators** in `schemas.py` — category validation is enforced at the service layer (`prompts.py:69-89`), which falls back to `personal_fact` on unknown input rather than raising.
+- **Vocab validators**: `schemas.py` carries `@field_validator`s for the memory-model v2 controlled vocabularies (`domain`, `observation_type`, `concepts`, `source_type`, `memory_kind`) and `@model_validator`s for retag shape. *Category* validation, by contrast, is enforced at the service layer — `MEMORY_CATEGORIES` is extended by knowledge adapters at import, so membership must be checked at call time; the extraction parser (`prompts.py`) falls back to `personal_fact` on unknown input rather than raising.
+
+## Editing memories
+
+Memories are editable **in place** — `PATCH /v1/memories/{id}` (MCP `edit_memory`) for a single memory, `POST /v1/memories/retag` (MCP `retag_memories`) for filter-based bulk metadata ops. An edit preserves the memory's ID, `owner_user_id`, and `created_at`; delete+recreate is never required and would lose all three.
+
+### Permission matrix
+
+| Tier | Metadata (tags / category / project_id / v2 fields) | Content | Visibility |
+|---|---|---|---|
+| `shared` | any authenticated user (housekeeping is collaborative) | owner or dictator | owner or dictator |
+| `private` (incl. legacy null) | owner or dictator | owner or dictator | owner or dictator |
+| `standard` | dictator only | dictator only | dictator only |
+
+`owner_user_id` is never editable, and `scope` is never accepted directly — it is re-derived from the effective category + project_id on every edit (project categories require a project_id; global categories force global scope; flexible categories follow project_id).
+
+### Cross-stack consistency
+
+- **tags / category / v2 fields** are not stored in Neo4j → retagging those fields is a pure Qdrant payload patch (embeddings untouched, since content is unchanged). A retag whose ops include `set_project_id` is the exception — it takes the partition-migration path below for each moved memory.
+- **project_id / visibility** are part of the graph `group_id` partition → an edit soft-expires the memory's old edges and enqueues a re-ingest into the new group on the graph queue. Entity-node group_ids are never mutated in place (nodes are shared across memories).
+- **content** re-embeds synchronously and enqueues a graph re-ingest so Graphiti's contradiction detection expires stale facts. Content edits are blocked on `passage` memories (verbatim chunks of an ingested artifact — re-ingest the source instead).
+- **Synthesizer consumers** (wiki, strategy playbooks) pick retags up at their next cron: a changed source set defeats the idempotent skip, so affected pages re-synthesize. Pages built under the old grouping remain (versioned, append-only).
 
 ## Legacy vs v1 surfaces
 

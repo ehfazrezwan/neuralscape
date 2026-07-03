@@ -13,8 +13,8 @@
     {
       "name": "neuralscape",
       "source": "./neuralscape-plugin",
-      "description": "Persistent agentic memory for Claude (Code + Cowork). In Claude Code, hooks auto-capture conversations and recall context on session start; in Cowork (no plugin hooks), the cross-platform skills (recall/remember/save-session/project/ingest) drive memory via the bundled OAuth MCP connector. The ingest skill loads files/folders/pasted context (Markdown/HTML/PDF/MS-Office). Exposes 10 MCP tools.",
-      "version": "2.5.0",
+      "description": "Persistent agentic memory for Claude (Code + Cowork). In Claude Code, hooks auto-capture conversations and recall context on session start; in Cowork (no plugin hooks), the cross-platform skills (recall/remember/save-session/project/ingest) drive memory via the bundled OAuth MCP connector. The ingest skill loads files/folders/pasted context (Markdown/HTML/PDF/MS-Office). Exposes 14 MCP tools.",
+      "version": "2.7.0",
       "license": "MIT",
       "keywords": [
         "memory",
