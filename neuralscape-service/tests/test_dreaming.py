@@ -733,7 +733,8 @@ async def test_librarian_writes_topics_hub_and_home(tmp_path):
     hub = (tdir / "scope.md").read_text()
     assert "[[TURN and ICE Connectivity|TURN & ICE Connectivity]]" in hub
     home = (tmp_path / "Home.md").read_text()
-    assert "[[scope]] (2 topics)" in home
+    assert "| Hub | Pages | Memories | Last dreamt |" in home
+    assert "| [[scope]] | 2 | 4 |" in home          # MOC counts row
 
     # idempotent second pass: same id sets → all skipped, no LLM merges
     before = calls["n"]
