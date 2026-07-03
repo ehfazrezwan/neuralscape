@@ -346,3 +346,94 @@ def _delta_seconds(seconds: int):
     from datetime import timedelta
 
     return timedelta(seconds=seconds)
+
+
+# ── Dreaming additions ──────────────────────────────────────────────
+
+
+async def invalidate_memory_graph(
+    driver: Any,
+    *,
+    group_id: str,
+    memory_id: str,
+    superseded_by: str | None = None,
+    now: datetime | None = None,
+) -> int:
+    """Bi-temporally invalidate a memory's graph facts (never delete).
+
+    Sets ``invalid_at``/``expired_at`` on every RELATES_TO edge touching a
+    node stamped with this ``memory_id`` (see ``attach_memory_id``), and
+    marks the nodes themselves ``dream_superseded_by`` so a graph walk can
+    hop to the survivor. History is preserved — this is Graphiti's own
+    contradiction semantics driven from the dreaming deep phase.
+
+    Returns the number of edges invalidated (0 on any failure — best-effort
+    like every helper in this module).
+    """
+    ts = (now or datetime.now(timezone.utc)).isoformat()
+    cypher = """
+    MATCH (n {group_id: $group_id, memory_id: $memory_id})
+    OPTIONAL MATCH (n)-[r:RELATES_TO]-()
+    WHERE r.invalid_at IS NULL
+    SET r.invalid_at = $ts, r.expired_at = $ts
+    SET n.dream_superseded_by = $superseded_by, n.dream_invalidated_at = $ts
+    RETURN count(r) AS edges
+    """
+    try:
+        async with driver.session() as session:
+            cursor = await session.run(
+                cypher,
+                group_id=group_id,
+                memory_id=memory_id,
+                ts=ts,
+                superseded_by=superseded_by or "",
+            )
+            records = await cursor.data()
+            return int(records[0]["edges"]) if records else 0
+    except Exception:
+        logger.warning(
+            "invalidate_memory_graph failed for %s/%s (non-fatal)",
+            group_id,
+            memory_id,
+            exc_info=True,
+        )
+        return 0
+
+
+async def patch_dream_path_by_memory_ids(
+    driver: Any,
+    *,
+    memory_ids: Iterable[str],
+    dream_path: str,
+    group_id: str,
+) -> int:
+    """Stamp ``dream_path`` on every node whose memory contributed to a
+    dream-diary page — the dreaming analog of ``patch_wiki_path_by_memory_ids``."""
+    ids = [m for m in memory_ids if m]
+    if not ids:
+        return 0
+    ts = datetime.now(timezone.utc).isoformat()
+    cypher = """
+    MATCH (n {group_id: $group_id})
+    WHERE n.memory_id IN $memory_ids
+    SET n.dream_path = $dream_path, n.dreamt_at = $ts
+    RETURN count(n) AS patched
+    """
+    try:
+        async with driver.session() as session:
+            cursor = await session.run(
+                cypher,
+                group_id=group_id,
+                memory_ids=ids,
+                dream_path=dream_path,
+                ts=ts,
+            )
+            records = await cursor.data()
+            return int(records[0]["patched"]) if records else 0
+    except Exception:
+        logger.warning(
+            "patch_dream_path_by_memory_ids failed for %s (non-fatal)",
+            group_id,
+            exc_info=True,
+        )
+        return 0

@@ -1,7 +1,0 @@
-{
-  "name": "wiki-synthesizer",
-  "version": "0.1.0",
-  "description": "Periodic synthesizer that turns shared memories into topical wiki pages in the Obsidian vault. Walks Graphiti communities per category, incrementally merges new memories into existing wiki content via Gemini, and patches Graphiti nodes with wiki_path back-references.",
-  "author": "ehfaz",
-  "hooks": []
-}

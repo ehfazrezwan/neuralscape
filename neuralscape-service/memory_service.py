@@ -497,8 +497,8 @@ class MemoryService:
         """
         if not (self._graphiti and self._bridge):
             return
-        from extensions.wiki_synthesizer.config import synthesizer_settings
-        from extensions.wiki_synthesizer.graph_patcher import (
+        from extensions.dreaming.config import dreaming_settings as synthesizer_settings
+        from extensions.dreaming.graph_patcher import (
             attach_memory_id,
             attach_source_ref,
         )
@@ -1065,6 +1065,10 @@ class MemoryService:
                 match=MatchValue(value=visibility_value),
             )
         ]
+        # Dreaming: exclude reversible consolidation tombstones from recall.
+        must_not = [
+            FieldCondition(key="metadata.dream_tombstoned", match=MatchValue(value=True))
+        ]
         if categories:
             must.append(FieldCondition(key="metadata.category", match=MatchAny(any=categories)))
         if scope:
@@ -1083,7 +1087,7 @@ class MemoryService:
         result = client.query_points(
             collection_name=settings.qdrant_collection,
             query=embedding,
-            query_filter=Filter(must=must),
+            query_filter=Filter(must=must, must_not=must_not),
             limit=limit,
             with_payload=True,
         )
@@ -1167,6 +1171,11 @@ class MemoryService:
 
         client = m.vector_store.client
         must: list = [FieldCondition(key="user_id", match=MatchValue(value=user_id))]
+        # Dreaming: rows consolidated away by a sweep stay in Qdrant as
+        # reversible tombstones but are excluded from live recall.
+        must_not = [
+            FieldCondition(key="metadata.dream_tombstoned", match=MatchValue(value=True))
+        ]
         if categories:
             must.append(FieldCondition(key="metadata.category", match=MatchAny(any=categories)))
         if scope:
@@ -1183,7 +1192,7 @@ class MemoryService:
         result = client.query_points(
             collection_name=settings.qdrant_collection,
             query=query_embedding,
-            query_filter=Filter(must=must),
+            query_filter=Filter(must=must, must_not=must_not),
             limit=limit,
             with_payload=True,
         )
@@ -1795,7 +1804,19 @@ class MemoryService:
         elif memory_kind == "passage":
             combined = [r for r in combined if r.memory_kind == "passage"]
 
-        return combined[:limit]
+        results = combined[:limit]
+
+        # Dreaming: fire-and-forget recall trace (reinforcement signal for
+        # the dream sweep's promotion/retention scoring). Runs on a daemon
+        # thread inside log_recall — never blocks or fails the read.
+        try:
+            from extensions.dreaming.traces import log_recall
+
+            log_recall([r.id for r in results if r.id], query)
+        except Exception:
+            pass
+
+        return results
 
     # Minimum vector similarity for graph→source enrichment to be trusted.
     # Below this, the "source" is just the nearest unrelated memory and we
@@ -3837,12 +3858,18 @@ class MemoryService:
 
         return list(user_ids)
 
-    def dedup_memories(self, user_id: str) -> dict:
+    def dedup_memories(self, user_id: str, *, semantic: bool = True) -> dict:
         """Remove duplicate memories for a user in two phases.
 
         Phase 1 — Exact: group by payload hash, keep newest, delete rest.
         Phase 2 — Semantic: for each remaining memory, search for near-duplicates
                   above the cosine threshold, delete the older one.
+
+        ``semantic=False`` skips phase 2. The dreaming sweep's MERGE action
+        supersedes it when ``DREAMING_ENABLED=true``: where this phase
+        hard-deletes the older near-duplicate (losing any unique details it
+        held), the dream merge folds those details into the survivor and
+        tombstones reversibly. The lossless exact-hash phase always runs.
 
         Returns:
             Dict with user_id, exact_duplicates_removed, semantic_duplicates_removed,
@@ -3894,6 +3921,14 @@ class MemoryService:
 
         # ── Phase 2: Semantic dedup ──
         semantic_removed = 0
+        if not semantic:
+            return {
+                "user_id": user_id,
+                "exact_duplicates_removed": exact_removed,
+                "semantic_duplicates_removed": 0,
+                "semantic_skipped": "superseded by dreaming MERGE",
+                "total_checked": len(memories),
+            }
         remaining = [mem for mem in memories if mem["id"] not in deleted_ids]
 
         for mem in remaining:

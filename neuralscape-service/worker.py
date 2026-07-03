@@ -642,25 +642,48 @@ async def expire_old_memories_cron(ctx: dict) -> dict:
     return result
 
 
-async def synthesize_topical_wikis_cron(ctx: dict) -> dict:
-    """Cron job: synthesize shared memories into topical wiki pages.
+async def run_dream_sweep(
+    ctx: dict,
+    pool: str | None = None,
+    dry_run: bool = False,
+    force: bool = False,
+) -> dict:
+    """Background task: one dreaming sweep, enqueued by the admin endpoint.
 
-    Gated by ``WIKI_SYNTHESIZER_ENABLED``; the synthesizer itself returns
-    an empty result when disabled, so this wrapper just forwards.
+    The API endpoint returns 202 and enqueues here instead of sweeping
+    in-process: a sweep is minutes of LLM + store work, and running it on
+    the API's event loop starves /health (autoheal then restarts the
+    container mid-sweep — observed live 2026-07-03).
     """
-    from extensions.wiki_synthesizer.config import synthesizer_settings
-    from extensions.wiki_synthesizer.synthesizer import synthesize_all
+    from extensions.dreaming.config import dreaming_settings
+    from extensions.dreaming.sweep import dream_all
 
-    if not synthesizer_settings.enabled:
-        return {"skipped": True, "reason": "WIKI_SYNTHESIZER_ENABLED=false"}
     service: MemoryService = ctx["service"]
-    result = await synthesize_all(service=service, settings=synthesizer_settings)
-    return {
-        "pages_created": result.pages_created,
-        "pages_updated": result.pages_updated,
-        "memories_processed": result.memories_processed,
-        "errors": result.errors,
-    }
+    run = await dream_all(
+        service=service,
+        settings=dreaming_settings,
+        dry_run=dry_run,
+        only_pool=pool,
+        force=force,
+    )
+    return run.to_dict()
+
+
+async def dream_sweep_cron(ctx: dict) -> dict:
+    """Cron job: run one dreaming sweep (light → deep → REM per pool).
+
+    Gated by ``DREAMING_ENABLED``; per-pool time/volume gates inside the
+    sweep keep quiet pools cheap (one Redis read + at most one scroll).
+    Replaces the wiki_synthesizer cron — see docs/DREAMING_MODE_SPEC.md.
+    """
+    from extensions.dreaming.config import dreaming_settings
+    from extensions.dreaming.sweep import dream_all
+
+    if not dreaming_settings.enabled:
+        return {"skipped": True, "reason": "DREAMING_ENABLED=false"}
+    service: MemoryService = ctx["service"]
+    run = await dream_all(service=service, settings=dreaming_settings)
+    return run.to_dict()["totals"] | {"run_id": run.run_id}
 
 
 async def synthesize_strategy_playbooks_cron(ctx: dict) -> dict:
@@ -692,18 +715,21 @@ def _generate_job_id(content: str, user_id: str) -> str:
     return f"raw-{h}"
 
 
-def _synthesizer_cron_hours() -> list[int]:
-    """Resolve the hours the wiki-synthesizer cron fires.
+def _dreaming_cron_hours() -> list[int]:
+    """Resolve the hours the dreaming sweep cron fires.
 
-    ``WIKI_SYNTHESIZER_CRON_HOURS`` is an interval in hours (default 6).
-    We translate it into the discrete hour-of-day set that arq's `cron`
-    accepts. Starts at 03:45 + offset to stagger with the dedup
-    (hour=dedup_cron_hours) and the expire (hour={3}) crons.
+    ``DREAMING_CRON_HOURS`` is an interval in hours (default 24 = nightly
+    at :35 past the anchor hour). Translated into the discrete hour-of-day
+    set arq's `cron` accepts, anchored at ``DREAMING_CRON_ANCHOR_HOUR``
+    (default 3 — after the dedup (:00) and expiry (:15) crons; the worker
+    clock is normally UTC, so non-UTC operators set the anchor to land the
+    sweep in their local quiet hours).
     """
-    from extensions.wiki_synthesizer.config import synthesizer_settings
+    from extensions.dreaming.config import dreaming_settings
 
-    interval = max(1, min(24, synthesizer_settings.cron_hours))
-    return list(range(0, 24, interval))
+    anchor = dreaming_settings.cron_anchor_hour % 24
+    interval = max(1, min(24, dreaming_settings.cron_hours))
+    return [(anchor + h) % 24 for h in range(0, 24, interval)]
 
 
 def _strategy_synthesizer_cron_hours() -> list[int]:
@@ -798,15 +824,27 @@ async def auto_compile_check(ctx: dict) -> dict | None:
 
 
 async def dedup_all_memories(ctx: dict) -> dict:
-    """Cron job: deduplicate Qdrant memories for every user."""
+    """Cron job: deduplicate Qdrant memories for every user.
+
+    When dreaming is enabled the lossy semantic phase is skipped — the
+    dream sweep's MERGE action supersedes it (folds unique details into
+    the survivor instead of hard-deleting the older near-duplicate). The
+    lossless exact-hash phase always runs.
+    """
+    from extensions.dreaming.config import dreaming_settings
+
     service: MemoryService = ctx["service"]
+    semantic = not dreaming_settings.enabled
     user_ids = service.get_all_user_ids(batch_size=settings.dedup_batch_size)
-    logger.info(f"Dedup cron: found {len(user_ids)} users")
+    logger.info(
+        f"Dedup cron: found {len(user_ids)} users (semantic phase "
+        f"{'on' if semantic else 'off — dreaming owns near-dup merges'})"
+    )
 
     results = []
     for uid in user_ids:
         try:
-            result = service.dedup_memories(uid)
+            result = service.dedup_memories(uid, semantic=semantic)
             results.append(result)
             removed = result["exact_duplicates_removed"] + result["semantic_duplicates_removed"]
             if removed:
@@ -1031,6 +1069,7 @@ class GraphWorkerSettings:
     """
     functions = [
         process_graph_enrichment,
+        run_dream_sweep,
     ]
     cron_jobs = [
         cron(
@@ -1043,15 +1082,14 @@ class GraphWorkerSettings:
             run_at_startup=False,
         ),
         cron(
-            synthesize_topical_wikis_cron,
+            dream_sweep_cron,
             # Imported lazily so importing worker.py doesn't load the
-            # synthesizer's whole settings tree before the worker is
-            # actually instantiated. Cadence is read directly from the env
-            # var here because cron() needs a concrete value at class
-            # body evaluation time.
-            hour=set(_synthesizer_cron_hours()),
-            minute=45,
-            timeout=1800,
+            # dreaming settings tree before the worker is actually
+            # instantiated. :35 staggers after dedup (:00) and expiry
+            # (:15), before the strategy-playbook synth (:55).
+            hour=set(_dreaming_cron_hours()),
+            minute=35,
+            timeout=3600,
             unique=True,
             max_tries=1,
             run_at_startup=False,

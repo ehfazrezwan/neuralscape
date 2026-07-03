@@ -402,9 +402,9 @@ class TestWorkerTopology:
         light_crons = {c.coroutine.__name__ for c in worker.WorkerSettings.cron_jobs}
         graph_crons = {c.coroutine.__name__ for c in worker.GraphWorkerSettings.cron_jobs}
         assert "dedup_all_memories" in graph_crons
-        assert "synthesize_topical_wikis_cron" in graph_crons
+        assert "dream_sweep_cron" in graph_crons
         assert "dedup_all_memories" not in light_crons
-        assert "synthesize_topical_wikis_cron" not in light_crons
+        assert "dream_sweep_cron" not in light_crons
 
     @pytest.mark.asyncio
     async def test_emits_memory_stored_event_when_registry_present(self, ctx_with_registry):
