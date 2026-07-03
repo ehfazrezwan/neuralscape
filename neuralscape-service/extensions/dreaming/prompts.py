@@ -80,10 +80,16 @@ Rules:
 - category: one of {categories}.
 - At most {max_insights} insights; fewer is fine; an empty list is fine.
 - Do not restate any single memory — an insight must ADD something.
+- epistemic_level: how the insight follows from its cited sources.
+  "deductive" = strictly entailed by the specific cited memories taken together
+  (if they are true, the insight must be true). "inductive" = a generalization
+  from a recurring pattern across >= 2 cited memories (probable, not entailed).
+  When unsure, omit the field.
 
 Output schema:
 {{"insights": [{{"content": "...", "lens": "pattern|failure",
-  "category": "...", "source_memory_ids": ["..."], "confidence": 0.0}}]}}
+  "category": "...", "source_memory_ids": ["..."],
+  "epistemic_level": "deductive|inductive", "confidence": 0.0}}]}}
 
 MEMORIES (id | created | category | content):
 {memories_block}

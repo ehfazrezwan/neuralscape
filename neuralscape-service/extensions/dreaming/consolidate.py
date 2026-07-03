@@ -304,7 +304,13 @@ async def apply_actions(
             if a_type == "merge":
                 survivor = act["survivor_id"]
                 losers = [m for m in act["memory_ids"] if m != survivor]
-                await asyncio.to_thread(_rewrite_content, service, survivor, act["content"])
+                # A1 provenance: the survivor's derived_from records the folded-in
+                # loser ids (unioned with any prior premises, same upsert as the
+                # content rewrite so there's no read-modify-write race).
+                await asyncio.to_thread(
+                    _rewrite_content, service, survivor, act["content"],
+                    derived_from_add=losers,
+                )
                 for mid in losers:
                     await asyncio.to_thread(_tombstone, service, mid, superseded_by=survivor)
                     await _graph_invalidate(service, batch.group_id, mid, superseded_by=survivor)
@@ -340,11 +346,21 @@ async def apply_actions(
 # ── Apply primitives (Qdrant + graph) ───────────────────────────────
 
 
-def _rewrite_content(service, memory_id: str, new_content: str, *, reframed: bool = False) -> None:
+def _rewrite_content(
+    service,
+    memory_id: str,
+    new_content: str,
+    *,
+    reframed: bool = False,
+    derived_from_add: list[str] | None = None,
+) -> None:
     """Update a memory's text in place: re-embed + overwrite payload data.
 
     Atomic from the reader's perspective (single upsert). ``updated_at``
     and the dreaming provenance markers ride along in metadata.
+    ``derived_from_add`` (MERGE) unions premise ids into the survivor's
+    ``metadata.derived_from`` — read-merge-write like ``_tombstone``, but
+    folded into this upsert so provenance and content land atomically.
     """
     from config import settings as core_settings
 
@@ -363,6 +379,10 @@ def _rewrite_content(service, memory_id: str, new_content: str, *, reframed: boo
     meta["dream_rewritten_at"] = datetime.now(timezone.utc).isoformat()
     if reframed:
         meta["dream_temporal_reframed"] = True
+    if derived_from_add:
+        existing = meta.get("derived_from") or []
+        # union, order-preserving (existing premises first), dedup'd
+        meta["derived_from"] = list(dict.fromkeys([*existing, *derived_from_add]))
     payload["metadata"] = meta
     payload["data"] = new_content
     payload["updated_at"] = datetime.now(timezone.utc).isoformat()
