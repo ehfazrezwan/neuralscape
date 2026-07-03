@@ -209,6 +209,8 @@ OBSERVATION_TYPE_VOCAB: set[str] = {
     "bugfix", "feature", "refactor", "decision", "discovery",
     "gotcha", "pattern", "trade_off", "research_note",
     "meeting_outcome", "task_plan", "fact",
+    # dreaming: higher-order insight synthesized by the REM phase
+    "reflection",
 }
 
 CONCEPT_VOCAB: set[str] = {
@@ -219,6 +221,9 @@ CONCEPT_VOCAB: set[str] = {
 
 SOURCE_TYPE_VOCAB: set[str] = {
     "conversation", "tool_extraction", "explicit", "imported", "compiler",
+    # dreaming: authored by the background consolidation sweep. Excluded
+    # from the next sweep's LIGHT intake (feedback-loop guard).
+    "dream",
 }
 
 # memory_kind distinguishes a distilled atomic fact from a verbatim passage
