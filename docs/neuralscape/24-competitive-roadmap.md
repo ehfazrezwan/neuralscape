@@ -232,13 +232,20 @@ Neuralscape stores the knowledge *about* the code.** Concretely, two items:
 
 **F1. `graphify` ingest extractor + `code_graph` knowledge adapter.**
 A new adapter under `adapters/code_graph/` (the `trading_strategy` seam), plus an extractor in
-`ingest/extractors.py` that accepts Graphify output files (`graph.json`, `GRAPH_REPORT.md`):
+`ingest/extractors.py` that accepts Graphify output files (`graph.json`, `GRAPH_REPORT.md`).
+**Use Graphify as a library, don't rebuild it**: it ships on PyPI (`graphifyy`) — add it as an
+optional dependency (extra: `code-graph`) and call its Python API/CLI both to *produce* graphs
+(NS can trigger `graphify extract` on an ingested repo, headless) and to *read* them (its own
+loaders/query layer over `graph.json` instead of hand-rolled parsing). NS-side code is limited
+to the mapping layer: Graphify records → NS memories/ontology. Degrade gracefully when the
+extra isn't installed (extractor registers only if importable):
 - **Do NOT mirror the raw code graph into Graphiti** — it is huge, churns with every commit,
   and Graphify already serves it better over MCP. Ingest the *stable semantic layer* only:
   LLM-labeled communities (module purposes), god nodes, surprising cross-module connections,
   extracted rationale/comment nodes (`# NOTE:` / `# HACK:` become memories), and the
   GRAPH_REPORT insights — each stamped with a `source_ref` whose retrieval handle points at
-  the Graphify MCP server / `graph.json` path so agents can re-fetch live structure.
+  **NS's own code-graph endpoint** (which resolves against `graph.json` via the library), so
+  agents re-fetch live structure without ever leaving the NS surface.
 - **Confidence-tag mapping onto A1's epistemic levels**: `EXTRACTED → explicit`,
   `INFERRED → deductive` (with reduced confidence), `AMBIGUOUS → stored only above a
   configurable floor, flagged for the dreaming sweep's contradiction pass`.
@@ -246,15 +253,18 @@ A new adapter under `adapters/code_graph/` (the `trading_strategy` seam), plus a
   hotspot) registered via `register_categories`; Graphiti ontology gets `Module`, `Symbol`
   (sparingly — hubs only), `depends_on`-style relations for the ingested summary layer.
 
-**F2. Coding-domain deferral policy.**
-When Graphify is present for a project (`graphify-out/` or its MCP server configured), NS
-components treat it as the source of truth for code structure: the plugin's skills/hooks answer
-"how does X connect to Y" via Graphify's MCP tools instead of storing structural facts as
-memories; extraction demotes purely-structural observations (they'd rot) in favor of decisions,
-gotchas, and rationale; the dreaming librarian's project hub links out to Graphify's Obsidian/
-HTML exports rather than duplicating them. `sync`-style liveness: a dreaming sweep step flags
-memories whose `source_ref` points at Graphify nodes that no longer exist in the current
-`graph.json` (the code moved on) as INVALIDATE candidates.
+**F2. Coding-domain deferral policy — behind the NS surface.**
+**The interaction interface is ALWAYS Neuralscape.** Graphify is an internal engine, never a
+parallel endpoint agents talk to: NS exposes code-structure tools on its *own* MCP/REST surface
+(`query_code_graph`, `get_code_neighbors`, `code_path` — thin delegations to the `graphifyy`
+library over the project's `graph.json`), so clients keep exactly one memory interface. Within
+that: when a project has a Graphify graph, NS treats it as the source of truth for code
+structure — recall/extraction demote purely-structural observations (they'd rot) in favor of
+decisions, gotchas, and rationale; code-structure questions route to the delegation tools; the
+dreaming librarian's project hub links out to Graphify's Obsidian/HTML exports rather than
+duplicating them. `sync`-style liveness: a dreaming sweep step flags memories whose
+`source_ref` points at Graphify nodes that no longer exist in the current `graph.json` (the
+code moved on) as INVALIDATE candidates.
 
 *Tests:* F1 unit (extractor parses fixture graph.json/report; epistemic mapping; node-liveness
 diff), E2E (ingest a small fixture repo's Graphify output → memories + source_refs resolve);
