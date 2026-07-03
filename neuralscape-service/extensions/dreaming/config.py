@@ -162,10 +162,18 @@ class DreamingSettings(BaseSettings):
         ),
     )
 
-    # ── Diary ──
+    # ── Vault output ──
     obsidian_vault_path: str = Field(
         default="/data/vault",
         description="Root of the Obsidian vault (same value as the conversation_compiler).",
+    )
+    vault_pages_enabled: bool = Field(
+        default=True,
+        description=(
+            "Write humane topic pages (Projects/<pid>/<Topic>.md + hubs + "
+            "Home.md) after each sweep — the wiki_synthesizer's successor "
+            "output. The dream diary under Dreams/ is written regardless."
+        ),
     )
 
     dry_run_default: bool = Field(

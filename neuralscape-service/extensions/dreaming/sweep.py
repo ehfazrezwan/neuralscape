@@ -22,7 +22,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 
-from . import consolidate, gate, reflect
+from . import consolidate, gate, librarian, reflect
 from .config import DreamingSettings, dreaming_settings
 
 logger = logging.getLogger(__name__)
@@ -40,6 +40,8 @@ class PoolReport:
     applied: int = 0
     reported: int = 0
     insights: int = 0
+    pages_written: int = 0
+    pages_skipped: int = 0
     errors: list[str] = field(default_factory=list)
     diary_path: str | None = None
 
@@ -251,7 +253,24 @@ async def _dream_pool(
             )
             report.insights = len(stored) if not dry_run else len(insights)
 
-        # 8. diary (review surface; never a promotion source)
+        # 8. librarian: humane topic pages (the wiki_synthesizer successor)
+        if settings.vault_pages_enabled:
+            try:
+                from config import settings as core_settings
+
+                lib = await librarian.update_vault(
+                    batch, llm_call,
+                    vault=settings.vault_path,
+                    operator_user_id=core_settings.default_user_id,
+                    dry_run=dry_run,
+                )
+                report.pages_written = lib["pages_written"]
+                report.pages_skipped = lib["pages_skipped"]
+            except Exception:
+                logger.exception("librarian pass failed for pool %s (non-fatal)", pool)
+                report.errors.append("librarian")
+
+        # 9. diary (review surface; never a promotion source)
         entry = reflect.render_diary_entry(
             pool=pool,
             run_id="dry-run" if dry_run else "sweep",
