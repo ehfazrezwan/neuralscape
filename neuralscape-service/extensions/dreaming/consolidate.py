@@ -275,9 +275,16 @@ async def apply_actions(
     *,
     dry_run: bool,
 ) -> ActionResult:
-    """Apply consolidation actions to Qdrant + the graph."""
+    """Apply consolidation actions to Qdrant + the graph.
+
+    Every sync primitive (Qdrant round-trips, embedding calls, deletes)
+    runs via ``asyncio.to_thread`` — the sweep must never starve the host
+    event loop (the API's /health endpoint shares it, and autoheal
+    restarts the container when health stalls).
+    """
+    import asyncio
+
     result = ActionResult()
-    by_id = {m["memory_id"]: m for m in batch.memories}
     for act in actions:
         try:
             if dry_run:
@@ -287,14 +294,14 @@ async def apply_actions(
             if a_type == "merge":
                 survivor = act["survivor_id"]
                 losers = [m for m in act["memory_ids"] if m != survivor]
-                _rewrite_content(service, survivor, act["content"])
+                await asyncio.to_thread(_rewrite_content, service, survivor, act["content"])
                 for mid in losers:
-                    _tombstone(service, mid, superseded_by=survivor)
+                    await asyncio.to_thread(_tombstone, service, mid, superseded_by=survivor)
                     await _graph_invalidate(service, batch.group_id, mid, superseded_by=survivor)
             elif a_type == "invalidate":
                 superseded_by = act.get("superseded_by_id")
                 for mid in act["memory_ids"]:
-                    _tombstone(service, mid, superseded_by=superseded_by)
+                    await asyncio.to_thread(_tombstone, service, mid, superseded_by=superseded_by)
                     await _graph_invalidate(
                         service, batch.group_id, mid, superseded_by=superseded_by
                     )
@@ -303,18 +310,20 @@ async def apply_actions(
                     if act.get("contains_secret"):
                         # The one irreversible case: secrets must not persist,
                         # not even as tombstones.
-                        service.delete_memory(mid)
+                        await asyncio.to_thread(service.delete_memory, mid)
                     else:
-                        _tombstone(service, mid, superseded_by=None, pruned=True)
+                        await asyncio.to_thread(_tombstone, service, mid, superseded_by=None, pruned=True)
                         await _graph_invalidate(service, batch.group_id, mid, superseded_by=None)
             elif a_type in ("rewrite", "temporal_reframe"):
                 for mid in act["memory_ids"]:
-                    _rewrite_content(service, mid, act["content"], reframed=(a_type == "temporal_reframe"))
+                    await asyncio.to_thread(
+                        _rewrite_content, service, mid, act["content"],
+                        reframed=(a_type == "temporal_reframe"),
+                    )
             result.applied.append(act)
         except Exception as exc:
             logger.exception("dream action failed: %s", act.get("type"))
             result.errors.append(f"{act.get('type')}:{act.get('memory_ids')}: {exc.__class__.__name__}")
-            _ = by_id  # keep for future per-memory error context
     return result
 
 

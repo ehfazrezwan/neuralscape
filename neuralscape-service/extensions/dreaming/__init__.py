@@ -22,7 +22,7 @@ from extensions.base import ExtensionManifest
 from memory_service import MemoryService
 
 from .config import dreaming_settings
-from .sweep import dream_all, get_last_run
+from .sweep import get_last_run
 
 logger = logging.getLogger(__name__)
 
@@ -85,23 +85,40 @@ class DreamingExtension:
     def get_routes(self) -> Optional[APIRouter]:
         router = APIRouter(tags=["dreaming"])
 
-        @router.post("/run")
+        @router.post("/run", status_code=202)
         async def run_dream(req: DreamRequest):
-            """Trigger one dreaming sweep (synchronous; use dry_run to tune)."""
+            """Enqueue one dreaming sweep onto the graph worker (202 + poll).
+
+            Never sweeps in-process: a sweep is minutes of LLM + store
+            work, and on the API's event loop it starves /health until
+            autoheal restarts the container (observed live 2026-07-03).
+            Poll GET /status for the DreamRun result.
+            """
             if not dreaming_settings.enabled and not req.force:
                 return {
-                    "run_id": None,
-                    "pools": [],
+                    "job_id": None,
                     "error": "DREAMING_ENABLED=false — set the env var (or force=true) to run",
                 }
-            run = await dream_all(
-                service=self.service,
-                settings=dreaming_settings,
-                dry_run=req.dry_run,
-                only_pool=req.pool,
-                force=req.force,
-            )
-            return run.to_dict()
+            from arq import create_pool
+
+            from config import parse_redis_settings, settings as core_settings
+
+            arq_pool = await create_pool(parse_redis_settings())
+            try:
+                job = await arq_pool.enqueue_job(
+                    "run_dream_sweep",
+                    req.pool,
+                    req.dry_run,
+                    req.force,
+                    _queue_name=core_settings.graph_queue_name,
+                )
+            finally:
+                await arq_pool.close()
+            return {
+                "job_id": job.job_id if job else None,
+                "status": "enqueued",
+                "poll": "/v1/extensions/dreaming/status",
+            }
 
         @router.get("/status")
         async def dream_status():

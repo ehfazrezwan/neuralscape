@@ -642,6 +642,33 @@ async def expire_old_memories_cron(ctx: dict) -> dict:
     return result
 
 
+async def run_dream_sweep(
+    ctx: dict,
+    pool: str | None = None,
+    dry_run: bool = False,
+    force: bool = False,
+) -> dict:
+    """Background task: one dreaming sweep, enqueued by the admin endpoint.
+
+    The API endpoint returns 202 and enqueues here instead of sweeping
+    in-process: a sweep is minutes of LLM + store work, and running it on
+    the API's event loop starves /health (autoheal then restarts the
+    container mid-sweep — observed live 2026-07-03).
+    """
+    from extensions.dreaming.config import dreaming_settings
+    from extensions.dreaming.sweep import dream_all
+
+    service: MemoryService = ctx["service"]
+    run = await dream_all(
+        service=service,
+        settings=dreaming_settings,
+        dry_run=dry_run,
+        only_pool=pool,
+        force=force,
+    )
+    return run.to_dict()
+
+
 async def dream_sweep_cron(ctx: dict) -> dict:
     """Cron job: run one dreaming sweep (light → deep → REM per pool).
 
@@ -1039,6 +1066,7 @@ class GraphWorkerSettings:
     """
     functions = [
         process_graph_enrichment,
+        run_dream_sweep,
     ]
     cron_jobs = [
         cron(
