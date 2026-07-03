@@ -38,7 +38,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-USER = "dreamer-e2e"
+# Overridable so parallel E2E runs (e.g. two feature branches sharing the
+# same backing Redis) don't contend on one pool's gate/lock keys.
+USER = os.environ.get("DREAMING_E2E_USER", "dreamer-e2e")
 POOL = f"user--{USER}"
 
 CHECKS: list[tuple[str, bool, str]] = []
@@ -114,8 +116,8 @@ async def main() -> int:
     import redis as redis_lib
 
     r = redis_lib.Redis.from_url(settings.redis_url)
-    for pat in ("dreaming:gate:user--dreamer-e2e*", "dreaming:lock:user--dreamer-e2e*",
-                "dreaming:staged_ids:user--dreamer-e2e*"):
+    for pat in (f"dreaming:gate:{POOL}*", f"dreaming:lock:{POOL}*",
+                f"dreaming:staged_ids:{POOL}*"):
         for k in r.scan_iter(pat):
             r.delete(k)
 
@@ -209,7 +211,9 @@ async def main() -> int:
         check("reasoning chain resolves insight → seeded premises", False,
               "no dream insight returned")
 
-    diary = dreaming_settings.dreams_dir / "user-dreamer-e2e.md"
+    from extensions.dreaming.reflect import diary_page_path
+
+    diary = diary_page_path(dreaming_settings.dreams_dir, POOL)
     check("diary written", diary.exists(), str(diary))
     check("DreamRun in Redis", (get_last_run() or {}).get("run_id") == run.run_id)
 
