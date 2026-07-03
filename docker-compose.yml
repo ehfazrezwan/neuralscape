@@ -121,6 +121,10 @@ services:
       GEMINI_EMBEDDER_MODEL: ${EMBEDDING_MODEL_NAME:-gemini-embedding-001}
       MCP_TRANSPORT: http
       OBSIDIAN_VAULT_PATH: /data/vault
+      # Dreaming admin surface (/v1/extensions/dreaming/*) runs sweeps
+      # in-process, so the API needs the same toggles as the graph worker.
+      DREAMING_ENABLED: ${DREAMING_ENABLED:-false}
+      DREAMING_OBSIDIAN_VAULT_PATH: /data/vault
       # Ingest artifact storage — shared with neuralscape-ingest-worker so the
       # API writes uploaded files and the worker reads them back to parse.
       INGEST_STORAGE_DIR: /data/ingest
@@ -228,8 +232,12 @@ services:
       GEMINI_LLM_MODEL: ${GEMINI_LLM_MODEL:-gemini-3.1-flash-lite}
       GEMINI_EMBEDDER_MODEL: ${EMBEDDING_MODEL_NAME:-gemini-embedding-001}
       OBSIDIAN_VAULT_PATH: /data/vault
-      # Cumulative synthesizers (both dark by default; enable via .env).
-      WIKI_SYNTHESIZER_ENABLED: ${WIKI_SYNTHESIZER_ENABLED:-false}
+      # Background synthesis (dark by default; enable via .env).
+      # Dreaming replaces the retired wiki synthesizer — the sweep runs on
+      # this worker (nightly), so its settings must land here. The vault
+      # path rides the OBSIDIAN_VAULT_PATH mount above.
+      DREAMING_ENABLED: ${DREAMING_ENABLED:-false}
+      DREAMING_OBSIDIAN_VAULT_PATH: /data/vault
       STRATEGY_SYNTHESIZER_ENABLED: ${STRATEGY_SYNTHESIZER_ENABLED:-false}
     volumes:
       - ${OBSIDIAN_VAULT_PATH:-./vault}:/data/vault

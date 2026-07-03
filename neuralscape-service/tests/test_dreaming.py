@@ -427,3 +427,104 @@ def test_pool_key_shapes():
     assert consolidate.pool_key(visibility="shared", owner_user_id=None, project_id="p") == "shared--project--p"
     assert consolidate.pool_key(visibility="private", owner_user_id="u", project_id=None) == "user--u"
     assert consolidate.pool_key(visibility="private", owner_user_id="u", project_id="p") == "user--u--project--p"
+
+
+# ── Librarian (humane vault) ────────────────────────────────────────
+
+
+def _lib_batch(memories, *, visibility="shared", project_id="scope", owner=None):
+    return PoolBatch(
+        pool="p", group_id="p", visibility=visibility,
+        owner_user_id=owner, project_id=project_id, memories=memories,
+    )
+
+
+def test_pool_dir_routing(tmp_path):
+    from extensions.dreaming import librarian as lib
+
+    shared_proj = _lib_batch([], visibility="shared", project_id="scope")
+    assert lib.pool_dir(tmp_path, shared_proj, "ehfaz") == tmp_path / "Projects" / "scope"
+    shared_global = _lib_batch([], visibility="shared", project_id=None)
+    assert lib.pool_dir(tmp_path, shared_global, "ehfaz") == tmp_path / "Knowledge"
+    mine = _lib_batch([], visibility="private", project_id=None, owner="ehfaz")
+    assert lib.pool_dir(tmp_path, mine, "ehfaz") == tmp_path / "Me"
+    theirs = _lib_batch([], visibility="private", project_id=None, owner="someone-else")
+    assert lib.pool_dir(tmp_path, theirs, "ehfaz") is None  # never in my vault
+
+
+def test_slug_title():
+    from extensions.dreaming.librarian import _slug_title
+
+    assert _slug_title("TURN & ICE Connectivity") == "TURN and ICE Connectivity"
+    assert _slug_title("LoRA: Restyling!") == "LoRA Restyling"
+    assert _slug_title("///") == "Untitled"
+
+
+@pytest.mark.asyncio
+async def test_librarian_writes_topics_hub_and_home(tmp_path):
+    from extensions.dreaming import librarian as lib
+
+    mems = [
+        {"memory_id": "a", "content": "TURN server DNS is broken on RunPod",
+         "category": "architecture", "created_at": "2026-07-01"},
+        {"memory_id": "b", "content": "Cloudflare TURN is the fallback path",
+         "category": "architecture", "created_at": "2026-07-02"},
+        {"memory_id": "c", "content": "LoRA restyle needs trigger words",
+         "category": "procedure", "created_at": "2026-07-03"},
+        {"memory_id": "d", "content": "Use runtime_peft for live LoRA scale",
+         "category": "procedure", "created_at": "2026-07-03"},
+    ]
+    calls = {"n": 0}
+
+    async def llm(prompt):
+        calls["n"] += 1
+        if "librarian of a personal knowledge vault" in prompt:
+            return json.dumps({"topics": [
+                {"title": "TURN & ICE Connectivity", "summary": "How TURN works here.",
+                 "memory_ids": ["a", "b"]},
+                {"title": "LoRA Restyling", "summary": "Restyle workflow.",
+                 "memory_ids": ["c", "d"]},
+                {"title": "Stray", "summary": "too few ids", "memory_ids": ["a"]},
+            ]})
+        return "A narrative body linking [[LoRA Restyling]]."
+
+    out = await lib.update_vault(
+        _lib_batch(mems), llm, vault=tmp_path, operator_user_id="ehfaz", dry_run=False,
+    )
+    assert out["pages_written"] == 2
+    tdir = tmp_path / "Projects" / "scope"
+    page = (tdir / "TURN and ICE Connectivity.md").read_text()
+    assert "source_memory_ids: [a, b]" in page
+    assert "# TURN & ICE Connectivity" in page
+    assert "[[scope]]" in page                      # hub backlink
+    hub = (tdir / "scope.md").read_text()
+    assert "[[TURN and ICE Connectivity|TURN & ICE Connectivity]]" in hub
+    home = (tmp_path / "Home.md").read_text()
+    assert "[[scope]] (2 topics)" in home
+
+    # idempotent second pass: same id sets → all skipped, no LLM merges
+    before = calls["n"]
+    out2 = await lib.update_vault(
+        _lib_batch(mems), llm, vault=tmp_path, operator_user_id="ehfaz", dry_run=False,
+    )
+    assert out2["pages_written"] == 0
+    assert out2["pages_skipped"] == 2
+    assert calls["n"] == before + 1  # only the cluster call, zero merges
+
+
+@pytest.mark.asyncio
+async def test_librarian_dry_run_writes_nothing(tmp_path):
+    from extensions.dreaming import librarian as lib
+
+    async def llm(prompt):
+        if "librarian" in prompt:
+            return json.dumps({"topics": [{"title": "T", "summary": "s",
+                                           "memory_ids": ["a", "b"]}]})
+        return "body"
+
+    mems = [{"memory_id": i, "content": f"c{i}", "category": "decision"} for i in "ab"]
+    out = await lib.update_vault(
+        _lib_batch(mems), llm, vault=tmp_path, operator_user_id="e", dry_run=True,
+    )
+    assert out["pages_written"] == 1
+    assert not (tmp_path / "Projects").exists()
