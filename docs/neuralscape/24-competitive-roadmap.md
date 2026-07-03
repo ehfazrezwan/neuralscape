@@ -49,7 +49,7 @@ These are the moats. Roadmap items must not regress them.
 | No provenance DAG on derived memories (insight → premise links) | Honcho `source_ids` + `get_reasoning_chain` | High |
 | No epistemic status on memories (explicit vs deduced vs induced) | Honcho `level` | High |
 | Dedup discards reinforcement signal instead of counting it | Honcho `times_derived` | High |
-| Dreaming is a fixed cron, not activity-aware | Honcho threshold + cooldown + idle-cancel | High |
+| Dreaming can consolidate a pool mid-write-burst (no settling guard) | Honcho threshold + cooldown + idle-cancel | Medium |
 | Recall returns full content per hit — no index-first retrieval economics | claude-mem progressive disclosure, MemPalace closets | High |
 | No timeline retrieval dimension ("what happened around X?") | claude-mem `timeline` | High |
 | Vault lacks a ranked entry-point narrative and predictable page skeleton | MemPalace L0/L1 + halls | High (user-priority) |
@@ -98,13 +98,16 @@ survivor instead of silently dropping. Feed it into the existing promotion score
 reinforcement term) and recall ranking.
 *Tests:* unit (counter merge), E2E (re-storing the same fact N times ranks it above a one-off).
 
-**A3. Activity-aware dream scheduling.**
-Keep the cron as a floor, add the Honcho trigger on top: per-pool pending-dream marker when
-`new_memories ≥ threshold AND hours_since ≥ cooldown`, executed only after an idle window
-(no writes to the pool for N minutes; new writes reset the timer). Manual
-`schedule_dream(pool)` MCP tool. Pending-task dedup via the existing Redis gate keys.
-*Tests:* unit (trigger state machine with fake clock), E2E (write burst → idle → sweep fires; write
-during idle window → sweep deferred).
+**A3 (slimmed). Settling guard + manual trigger.**
+Full activity-aware scheduling (event-driven threshold triggers, idle timers with
+cancel-on-write) is deferred: the time + volume gates already exist, the nightly cron is
+anchored to the operator's quiet hours, and queue isolation covers resource contention — the
+big machinery only pays off for always-on multi-agent deployments (revisit alongside E6).
+What ships now is the correctness kernel:
+- **Settling guard** (~10 lines in the sweep): a pool written to within the last N minutes is
+  deferred to the next pass with status `"settling"` — never consolidate mid-conversation.
+- **`schedule_dream(pool)` MCP tool** exposing the existing admin trigger to agents.
+*Tests:* unit (settling window with fake clock), E2E (fresh write defers the pool; quiet pool dreams).
 
 **A4. Salience dynamics (Hebbian / Ebbinghaus / spacing).**
 Port MemPalace's ~100-line `dynamics.py` math onto the existing recall traces: strength +δ per
@@ -205,22 +208,23 @@ turned on, since that is the differentiator the benchmarks under-measure.
 
 ## 5. Build order for the ship loop
 
-Priority interleaves "dreaming to par" (Phase A) with the user-priority vault work (Phase B):
+Priority interleaves "dreaming to parity" (Phase A) with the user-priority vault work (Phase B).
+A3 was slimmed to a settling guard + manual trigger and folded into the salience PR, which
+pulls the vault work two slots earlier:
 
 | # | Item | Branch |
 |---|---|---|
 | 1 | A1 provenance + epistemic level | `feat/memory-provenance` |
 | 2 | A2 reinforcement dedup | `feat/reinforcement-dedup` |
-| 3 | A3 activity-aware scheduling | `feat/dream-scheduling` |
-| 4 | A4 salience dynamics | `feat/salience-dynamics` |
-| 5 | B1+B2 Home story + page skeleton | `feat/vault-essential-story` |
-| 6 | B3+B4 bridges, faded, identity card | `feat/vault-bridges-card` |
-| 7 | C1+C2 index recall + timeline | `feat/retrieval-economics` |
-| 8 | C3+C4 tiers + checkpoint | `feat/recall-tiers` |
-| 9 | D1+D2 plugin injection + summaries | `feat/plugin-disclosure` |
-| 10 | D3+D4 read gate + hygiene | `feat/plugin-read-gate` |
-| 11 | A5 + E1+E2 surprisal, stream, economics | `feat/observability` |
-| 12 | E3–E5 context assembler, custom instructions, benchmarks | `feat/platform-proof` |
+| 3 | B1+B2 Home story + page skeleton | `feat/vault-essential-story` |
+| 4 | B3+B4 bridges, faded, identity card | `feat/vault-bridges-card` |
+| 5 | A4 salience dynamics + A3-lite settling guard | `feat/salience-dynamics` |
+| 6 | C1+C2 index recall + timeline | `feat/retrieval-economics` |
+| 7 | C3+C4 tiers + checkpoint | `feat/recall-tiers` |
+| 8 | D1+D2 plugin injection + summaries | `feat/plugin-disclosure` |
+| 9 | D3+D4 read gate + hygiene | `feat/plugin-read-gate` |
+| 10 | A5 + E1+E2 surprisal, stream, economics | `feat/observability` |
+| 11 | E3–E5 context assembler, custom instructions, benchmarks | `feat/platform-proof` |
 
 Loop per item: worktree off `dev` → build → unit + isolated-compose E2E (one Neuralscape
 deployment at a time) → PR to `dev` → CodeRabbit/Copilot review → address → merge → next.
