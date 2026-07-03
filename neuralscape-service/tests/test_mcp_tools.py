@@ -47,9 +47,9 @@ def mock_task_manager():
 
 class TestListTools:
     @pytest.mark.asyncio
-    async def test_returns_14_tools(self):
+    async def test_returns_15_tools(self):
         tools = await mcp_server.list_tools()
-        assert len(tools) == 14
+        assert len(tools) == 15
 
     @pytest.mark.asyncio
     async def test_tool_names(self):
@@ -70,6 +70,7 @@ class TestListTools:
             "delete_memories",
             "edit_memory",
             "retag_memories",
+            "get_reasoning_chain",
         }
         assert names == expected
 
@@ -613,3 +614,43 @@ class TestErrorHandling:
         data = json.loads(result[0].text)
         assert "error" in data
         assert "Database connection failed" in data["error"]
+
+
+class TestGetReasoningChainTool:
+    @pytest.mark.asyncio
+    async def test_returns_chain(self, mock_mcp_service):
+        mock_mcp_service.get_reasoning_chain.return_value = {
+            "memory_id": "m1", "content": "insight",
+            "epistemic_level": "inductive",
+            "children": [
+                {"memory_id": "p1", "content": "premise",
+                 "epistemic_level": "explicit", "children": []},
+            ],
+        }
+        result = await mcp_server.call_tool(
+            "get_reasoning_chain", {"memory_id": "m1", "max_depth": 5}
+        )
+        data = json.loads(result[0].text)
+        assert data["status"] == "ok"
+        assert data["chain"]["epistemic_level"] == "inductive"
+        assert data["chain"]["children"][0]["memory_id"] == "p1"
+        mock_mcp_service.get_reasoning_chain.assert_called_once_with("m1", 5)
+
+    @pytest.mark.asyncio
+    async def test_clamps_max_depth_and_defaults(self, mock_mcp_service):
+        mock_mcp_service.get_reasoning_chain.return_value = {"memory_id": "m1", "children": []}
+        await mcp_server.call_tool("get_reasoning_chain", {"memory_id": "m1"})
+        assert mock_mcp_service.get_reasoning_chain.call_args[0][1] == 3
+        await mcp_server.call_tool(
+            "get_reasoning_chain", {"memory_id": "m1", "max_depth": 99}
+        )
+        assert mock_mcp_service.get_reasoning_chain.call_args[0][1] == 10
+
+    @pytest.mark.asyncio
+    async def test_missing_memory_returns_error(self, mock_mcp_service):
+        mock_mcp_service.get_reasoning_chain.return_value = None
+        result = await mcp_server.call_tool(
+            "get_reasoning_chain", {"memory_id": "ghost"}
+        )
+        data = json.loads(result[0].text)
+        assert "error" in data and "ghost" in data["error"]

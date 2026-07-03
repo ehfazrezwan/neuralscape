@@ -1558,6 +1558,26 @@ async def v1_get_memory(memory_id: str):
     return result
 
 
+@v1_router.get("/memories/{memory_id}/reasoning_chain")
+async def v1_get_reasoning_chain(
+    memory_id: str,
+    max_depth: int = Query(default=3, ge=1, le=10),
+):
+    """Walk a memory's ``derived_from`` provenance into a reasoning tree.
+
+    Returns ``{status, chain}`` where ``chain`` is a recursive
+    ``{memory_id, content, epistemic_level, children}`` tree resolving the
+    premises a derived memory (dream MERGE survivor, REM insight, or any
+    write that supplied ``derived_from``) was built from. Cycle-protected
+    and capped (~50 nodes); leaves may carry ``missing`` / ``cycle`` /
+    ``truncated`` markers. 404 when the root memory doesn't exist.
+    """
+    chain = await asyncio.to_thread(_service.get_reasoning_chain, memory_id, max_depth)
+    if chain is None:
+        raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
+    return {"status": "ok", "chain": chain}
+
+
 @v1_router.patch("/memories/{memory_id}")
 @v1_router.put("/memories/{memory_id}")  # transitional alias for the old update route
 async def v1_patch_memory(memory_id: str, req: PatchMemoryRequest, request: Request):
