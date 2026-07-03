@@ -230,6 +230,45 @@ def test_promotion_score_weights_and_bounds():
     assert cold < hot
 
 
+def test_promotion_score_monotonic_in_times_derived_and_bounded():
+    """A2: reinforcement raises the score, saturates, never breaks [0, 1]."""
+    now = time.time()
+
+    def score(td, **kw):
+        return scoring.promotion_score(times_derived=td, now=now, **kw)
+
+    base = dict(relevance=0.5, recall_count=3, unique_query_count=2,
+                last_recalled_at=now - 86400, created_at=now - 7 * 86400,
+                merged_source_count=1, concept_count=2)
+    s1, s2, s5, s50 = (score(td, **base) for td in (1, 2, 5, 50))
+    assert s1 < s2 < s5 < s50            # strictly monotonic
+    assert 0.0 <= s1 and s50 <= 1.0      # bounded
+    # saturating curve: each extra derivation is worth less than the last
+    assert (s2 - s1) > (s50 - s5) / 45
+
+    # even a maxed-out memory with a huge counter stays within [0, 1]
+    maxed = scoring.promotion_score(
+        relevance=1.0, recall_count=1000, unique_query_count=1000,
+        last_recalled_at=now, created_at=now, merged_source_count=1000,
+        concept_count=100, times_derived=10_000, now=now,
+    )
+    assert maxed <= 1.0
+
+    # feature-safe defaults: td=1 and td=0/absent are all no-ops
+    assert score(1, **base) == score(0, **base) == scoring.promotion_score(now=now, times_derived=1, **base)
+
+
+def test_score_memory_reads_times_derived_from_row():
+    now = time.time()
+    row = {"memory_id": "m1", "created_at": "2026-07-01T00:00:00+00:00",
+           "confidence": 0.9, "concepts": ["pattern"]}
+    plain = scoring.score_memory(dict(row), {}, now=now)
+    reinforced = scoring.score_memory({**row, "times_derived": 6}, {}, now=now)
+    garbage = scoring.score_memory({**row, "times_derived": "junk"}, {}, now=now)
+    assert reinforced["promotion_score"] > plain["promotion_score"]
+    assert garbage["promotion_score"] == plain["promotion_score"]  # invalid → 1
+
+
 def test_retention_strength_decays_and_reinforces():
     now = time.time()
     fresh = scoring.retention_strength(
@@ -333,6 +372,84 @@ def test_split_by_posture_hybrid():
     assert len(to_apply) == 4
     assert len(to_report) == 2
     assert all(a["type"] in ("invalidate", "prune") for a in to_report)
+
+
+@pytest.mark.asyncio
+async def test_apply_actions_merge_sums_times_derived():
+    """A2: the merge survivor's counter = SUM of all merged rows' counters."""
+    payloads = {
+        "a": {"data": "x", "metadata": {"times_derived": 2}},
+        "b": {"data": "y", "metadata": {}},                      # absent → 1
+        "c": {"data": "z", "metadata": {"times_derived": 3}},
+    }
+
+    def _retrieve(collection_name=None, ids=None, **kwargs):
+        out = []
+        for mid in ids or []:
+            if mid in payloads:
+                pt = MagicMock()
+                pt.id = mid
+                pt.payload = payloads[mid]
+                out.append(pt)
+        return out
+
+    client = MagicMock()
+    client.retrieve.side_effect = _retrieve
+    service = MagicMock()
+    service._memory.vector_store.client = client
+    service._get_memory.return_value.vector_store.client = client
+    service._get_memory.return_value.embedding_model.embed.return_value = [0.1] * 8
+    service._bridge = None  # skip graph invalidation (unit scope)
+
+    result = await consolidate.apply_actions(
+        service,
+        _batch([{"memory_id": m, "content": payloads[m]["data"]} for m in payloads]),
+        [{"type": "merge", "memory_ids": ["a", "b", "c"], "survivor_id": "a",
+          "content": "merged fact", "confidence": 0.9}],
+        dry_run=False,
+    )
+
+    assert not result.errors
+    # survivor rewritten via upsert with the summed counter: 2 + 1 + 3 = 6
+    upserted = client.upsert.call_args.kwargs["points"][0]
+    assert upserted.id == "a"
+    assert upserted.payload["data"] == "merged fact"
+    assert upserted.payload["metadata"]["times_derived"] == 6
+    # losers tombstoned, not counted twice
+    tombstoned = {
+        call.kwargs["points"][0]: call.kwargs["payload"]["metadata"]
+        for call in client.set_payload.call_args_list
+    }
+    assert set(tombstoned) == {"b", "c"}
+    assert all(meta["superseded_by"] == "a" for meta in tombstoned.values())
+
+
+@pytest.mark.asyncio
+async def test_apply_actions_merge_defaults_missing_rows_to_one():
+    """Rows that vanish between staging and apply still count as 1 each."""
+    client = MagicMock()
+    client.retrieve.side_effect = (
+        lambda collection_name=None, ids=None, **kw: (
+            [MagicMock(id="a", payload={"data": "x", "metadata": {}})]
+            if "a" in (ids or []) else []
+        )
+    )
+    service = MagicMock()
+    service._memory.vector_store.client = client
+    service._get_memory.return_value.vector_store.client = client
+    service._get_memory.return_value.embedding_model.embed.return_value = [0.1] * 8
+    service._bridge = None
+
+    await consolidate.apply_actions(
+        service,
+        _batch([{"memory_id": "a", "content": "x"}, {"memory_id": "gone", "content": "y"}]),
+        [{"type": "merge", "memory_ids": ["a", "gone"], "survivor_id": "a",
+          "content": "merged", "confidence": 0.9}],
+        dry_run=False,
+    )
+
+    upserted = client.upsert.call_args.kwargs["points"][0]
+    assert upserted.payload["metadata"]["times_derived"] == 2  # a(1) + gone(1)
 
 
 @pytest.mark.asyncio
