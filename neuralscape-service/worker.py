@@ -719,14 +719,17 @@ def _dreaming_cron_hours() -> list[int]:
     """Resolve the hours the dreaming sweep cron fires.
 
     ``DREAMING_CRON_HOURS`` is an interval in hours (default 24 = nightly
-    at 03:35). Translated into the discrete hour-of-day set arq's `cron`
-    accepts, anchored at 3 so the nightly default lands after the dedup
-    (:00) and expiry (:15) crons.
+    at :35 past the anchor hour). Translated into the discrete hour-of-day
+    set arq's `cron` accepts, anchored at ``DREAMING_CRON_ANCHOR_HOUR``
+    (default 3 — after the dedup (:00) and expiry (:15) crons; the worker
+    clock is normally UTC, so non-UTC operators set the anchor to land the
+    sweep in their local quiet hours).
     """
     from extensions.dreaming.config import dreaming_settings
 
+    anchor = dreaming_settings.cron_anchor_hour % 24
     interval = max(1, min(24, dreaming_settings.cron_hours))
-    return [(3 + h) % 24 for h in range(0, 24, interval)]
+    return [(anchor + h) % 24 for h in range(0, 24, interval)]
 
 
 def _strategy_synthesizer_cron_hours() -> list[int]:

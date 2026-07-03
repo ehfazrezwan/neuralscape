@@ -34,6 +34,18 @@ class DreamingSettings(BaseSettings):
         ),
     )
 
+    cron_anchor_hour: int = Field(
+        default=3,
+        ge=0,
+        le=23,
+        description=(
+            "Hour-of-day (worker clock, normally UTC) the sweep cadence is "
+            "anchored to. Containers run on UTC, so operators away from UTC "
+            "should set this so the nightly sweep lands in their quiet "
+            "hours — e.g. 21 puts the default nightly run at 03:35 UTC+6."
+        ),
+    )
+
     # ── Gate economy (cheap → expensive; see gate.py) ──
     min_hours: float = Field(
         default=24.0,

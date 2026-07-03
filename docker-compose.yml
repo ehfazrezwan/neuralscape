@@ -121,8 +121,10 @@ services:
       GEMINI_EMBEDDER_MODEL: ${EMBEDDING_MODEL_NAME:-gemini-embedding-001}
       MCP_TRANSPORT: http
       OBSIDIAN_VAULT_PATH: /data/vault
-      # Dreaming admin surface (/v1/extensions/dreaming/*) runs sweeps
-      # in-process, so the API needs the same toggles as the graph worker.
+      # Dreaming admin surface (/v1/extensions/dreaming/*) enqueues sweeps
+      # onto the graph worker rather than running them in-process (an
+      # in-process sweep starves /health until autoheal kills the API).
+      # The API still needs these to validate /run and report /status.
       DREAMING_ENABLED: ${DREAMING_ENABLED:-false}
       DREAMING_OBSIDIAN_VAULT_PATH: /data/vault
       # Ingest artifact storage — shared with neuralscape-ingest-worker so the
@@ -238,6 +240,9 @@ services:
       # path rides the OBSIDIAN_VAULT_PATH mount above.
       DREAMING_ENABLED: ${DREAMING_ENABLED:-false}
       DREAMING_OBSIDIAN_VAULT_PATH: /data/vault
+      # Containers run on UTC — set the anchor so the nightly sweep lands
+      # at a quiet local hour (e.g. 21 ⇒ 03:35 at UTC+6). Default 03:35 UTC.
+      DREAMING_CRON_ANCHOR_HOUR: ${DREAMING_CRON_ANCHOR_HOUR:-3}
       STRATEGY_SYNTHESIZER_ENABLED: ${STRATEGY_SYNTHESIZER_ENABLED:-false}
     volumes:
       - ${OBSIDIAN_VAULT_PATH:-./vault}:/data/vault
