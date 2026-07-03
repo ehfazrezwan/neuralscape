@@ -116,11 +116,11 @@ def render_memories_block(memories: list[dict], *, include_strength: bool = True
     return "\n".join(lines) if lines else "(no memories)"
 
 
-def parse_json_response(raw: str, *, key: str) -> list[dict]:
-    """Parse an LLM JSON response defensively; returns [] on garbage.
+def _extract_json(raw: str):
+    """Best-effort JSON object extraction from an LLM response.
 
     Tolerates markdown fences and leading/trailing prose around the JSON
-    object — models drift, the sweep must not crash.
+    object — models drift, the sweep must not crash. Returns None on garbage.
     """
     text = (raw or "").strip()
     if text.startswith("```"):
@@ -129,10 +129,23 @@ def parse_json_response(raw: str, *, key: str) -> list[dict]:
             text = text[4:]
     start, end = text.find("{"), text.rfind("}")
     if start == -1 or end <= start:
-        return []
+        return None
     try:
-        obj = json.loads(text[start : end + 1])
+        return json.loads(text[start : end + 1])
     except json.JSONDecodeError:
+        return None
+
+
+def parse_json_response(raw: str, *, key: str) -> list[dict]:
+    """Parse an LLM JSON response defensively; returns [] on garbage."""
+    obj = _extract_json(raw)
+    if not isinstance(obj, dict):
         return []
     items = obj.get(key)
     return [i for i in items if isinstance(i, dict)] if isinstance(items, list) else []
+
+
+def parse_json_object(raw: str) -> dict:
+    """Parse an LLM response expected to be one JSON object; {} on garbage."""
+    obj = _extract_json(raw)
+    return obj if isinstance(obj, dict) else {}
