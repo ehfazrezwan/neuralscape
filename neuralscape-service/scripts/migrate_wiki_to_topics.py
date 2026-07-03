@@ -119,7 +119,7 @@ async def migrate_scope(scope: str, pages: list[Path], vault: Path, *, apply: bo
             categories=[],
             hub_link=hub,
             version=1,
-        ).replace("---\n\n# ", f"migrated: true\n---\n\n# ", 1)
+        ).replace("---\n\n# ", "migrated: true\n---\n\n# ", 1)
         out_path = target / f"{_slug_title(title)}.md"
         if apply:
             _atomic_write(out_path, page)
@@ -168,10 +168,18 @@ async def main() -> int:
 
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
         archive = vault / "_archive" / f"Wiki-pre-dreaming-{stamp}"
-        archive.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(wiki), str(archive))
+        archive.mkdir(parents=True, exist_ok=True)
+        # Archive ONLY the scopes that migrated — failed scopes keep their
+        # legacy pages under Wiki/ so a retry can pick them up (a wholesale
+        # move would silently orphan them inside _archive/).
+        for r in ok:
+            src = wiki / r["scope"]
+            if src.exists():
+                shutil.move(str(src), str(archive / r["scope"]))
+        if not any(wiki.rglob("*")):
+            wiki.rmdir()
         _write_home(vault, _atomic_write)
-        print(f"\nlegacy tree archived → {archive}")
+        print(f"\nmigrated scopes archived → {archive}")
 
     print(f"\nmigrated {len(ok)}/{len(results)} scopes, "
           f"{sum(r.get('topics', 0) for r in ok)} topic pages")

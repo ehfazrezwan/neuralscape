@@ -53,8 +53,8 @@ def seed(service) -> dict[str, str]:
         "dup_old": ("preference", "User prefers Python 3.12 for backend development, especially with FastAPI"),
         "dup_new": ("preference", "The user likes to use Python 3.12 for backend work"),
         # contradiction pair
-        "contra_old": ("decision", "Neuralscape is deployed with Docker Compose on a single VM only"),
-        "contra_new": ("decision", "As of late June 2026, Neuralscape is deployed on Kubernetes (GKE) via Terraform and Helm"),
+        "contra_old": ("decision", "The demo service is deployed as a single-node setup only"),
+        "contra_new": ("decision", "As of late June 2026, the demo service is deployed on a managed orchestration cluster via IaC tooling"),
         # passed future date → temporal reframe
         "future": ("task_context", "User is planning to write the dreaming-mode spec in early July 2026"),
         # 3-memory pattern → reflection substrate
