@@ -2904,7 +2904,14 @@ class MemoryService:
             must.append(FieldCondition(key="metadata.visibility", match=MatchValue(value=filters["visibility"])))
         for tag in filters.get("tags_contains") or []:
             must.append(FieldCondition(key="metadata.tags", match=MatchValue(value=tag)))
-        # Candidate set = shared ∪ standard ∪ the caller's own rows. This keeps
+        # Service-side backstop for the request-boundary sweep guard: worker and
+        # MCP paths hand this raw dicts, and falsey filter values ("" / []) are
+        # skipped above — without this check they'd select every candidate row.
+        if not must:
+            raise ValueError(
+                "At least one effective filter is required — refusing an unfiltered retag sweep"
+            )
+        # Candidate set = shared OR standard OR the caller's own rows. This keeps
         # other users' PRIVATE memories out entirely (no permission-skip count
         # leakage; legacy null-visibility rows are covered by the user_id clause).
         should = [

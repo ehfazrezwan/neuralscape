@@ -934,6 +934,15 @@ class TestRetagMemories:
         with pytest.raises(ValueError, match="Invalid category"):
             service.retag_memories("robb", {"category": "decision"}, {"set_category": "bogus"})
 
+    def test_retag_service_guard_rejects_empty_effective_filters(self, service):
+        """REGRESSION: worker/MCP paths hand retag_memories raw dicts, and
+        falsey filter values ("" / []) build no Qdrant condition — the service
+        must refuse rather than sweep every candidate row."""
+        for filters in ({}, {"tags_contains": []}, {"category": ""}, {"scope": None}):
+            with pytest.raises(ValueError, match="unfiltered retag sweep"):
+                service.retag_memories("robb", filters, {"add_tags": ["t"]})
+        service._memory.vector_store.client.scroll.assert_not_called()
+
 
 class TestExtractAndStore:
     def test_extraction_batch_stores_categorized_facts(self, service):

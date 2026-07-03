@@ -1571,7 +1571,8 @@ async def v1_patch_memory(memory_id: str, req: PatchMemoryRequest, request: Requ
 
     Permission model: shared memories take metadata edits from any
     authenticated user; content and visibility edits are owner-or-dictator;
-    private is owner-only; standard tier is dictator-only.
+    private is owner-only; standard tier is dictator-only. Dictators override
+    every tier (the same admin escape hatch the delete path has).
     """
     caller = _resolve_user_id(request, req.user_id)
     changes = {k: getattr(req, k) for k in req.model_fields_set if k != "user_id"}
@@ -1587,9 +1588,9 @@ async def v1_patch_memory(memory_id: str, req: PatchMemoryRequest, request: Requ
         raise HTTPException(status_code=400, detail=str(e)) from e
     except HTTPException:
         raise
-    except Exception:
+    except Exception as e:
         logger.exception("v1 patch_memory failed")
-        raise HTTPException(status_code=500, detail="Failed to update memory")
+        raise HTTPException(status_code=500, detail="Failed to update memory") from e
 
     graph = result["graph"]
     graph_task_id = None

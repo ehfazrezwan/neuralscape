@@ -515,7 +515,7 @@ class TestV1Retag:
         })
         assert resp.status_code == 202
         assert resp.json()["task_id"] == "test-task-id-retag"
-        caller, filters, ops = mock_task_manager.enqueue_retag.await_args.args
+        _caller, filters, ops = mock_task_manager.enqueue_retag.await_args.args
         assert filters == {"project_id": "neuralscape"}
         assert ops == {"add_tags": ["project:bon002"]}
         mock_service.retag_memories.assert_not_called()
@@ -549,6 +549,17 @@ class TestV1Retag:
             "filters": {}, "ops": {"add_tags": ["t"]},
         })
         assert resp.status_code == 422
+
+    def test_retag_empty_filter_values_rejected(self, client, mock_task_manager):
+        """REGRESSION: `tags_contains: []` / `category: ""` produce no Qdrant
+        condition downstream — counting them as 'a filter is present' would
+        turn a supposedly filtered retag into an unfiltered sweep."""
+        for filters in ({"tags_contains": []}, {"category": ""}):
+            resp = client.post("/v1/memories/retag", json={
+                "filters": filters, "ops": {"add_tags": ["t"]},
+            })
+            assert resp.status_code == 422, filters
+        mock_task_manager.enqueue_retag.assert_not_awaited()
 
     def test_retag_requires_an_op(self, client):
         resp = client.post("/v1/memories/retag", json={

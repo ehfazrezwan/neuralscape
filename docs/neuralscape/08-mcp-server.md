@@ -9,7 +9,7 @@ source: handwritten
 
 ## Overview
 
-Neuralscape ships an [MCP](https://modelcontextprotocol.io) server built on the official **MCP Python SDK** (`mcp>=1.0.0`, not FastMCP). It exposes the same `MemoryService` business logic that backs the REST API, but as a tool-only surface for AI agents. Seven tools cover read, write, and delete operations across the global/project memory model. The server runs over two transports: **stdio** (for local Claude Code attachment) and **Streamable HTTP** (mounted at `/mcp/` on the FastAPI app for remote agents).
+Neuralscape ships an [MCP](https://modelcontextprotocol.io) server built on the official **MCP Python SDK** (`mcp>=1.0.0`, not FastMCP). It exposes the same `MemoryService` business logic that backs the REST API, but as a tool-only surface for AI agents. Fourteen tools cover read, write, edit, ingest, and delete operations across the global/project memory model. The server runs over two transports: **stdio** (for local Claude Code attachment) and **Streamable HTTP** (mounted at `/mcp/` on the FastAPI app for remote agents).
 
 The server is defined in `neuralscape-service/mcp_server.py:1-476`. Module-level singletons share state with the rest of the service:
 

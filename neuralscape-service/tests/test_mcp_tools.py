@@ -501,6 +501,16 @@ class TestRetagMemoriesTool:
         mock_task_manager.enqueue_retag.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_retag_empty_filter_values_treated_as_absent(self, mock_task_manager):
+        """REGRESSION: `tags_contains: []` must not satisfy the filter guard —
+        it builds no Qdrant condition and would sweep."""
+        result = await mcp_server.call_tool("retag_memories", {
+            "user_id": "robb", "tags_contains": [], "add_tags": ["t"],
+        })
+        assert "filter" in json.loads(result[0].text)["error"]
+        mock_task_manager.enqueue_retag.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_retag_null_set_project_preserved(self, mock_task_manager):
         await mcp_server.call_tool("retag_memories", {
             "user_id": "robb",

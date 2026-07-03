@@ -755,11 +755,11 @@ class PatchMemoryRequest(BaseModel):
 class RetagFilters(BaseModel):
     """Filter set selecting the memories a bulk retag applies to (AND semantics)."""
     scope: str | None = None
-    category: str | None = None
+    category: str | None = Field(default=None, min_length=1)
     project_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
     visibility: MemoryVisibility | None = None
     tags_contains: list[str] | None = Field(
-        default=None, max_length=10,
+        default=None, min_length=1, max_length=10,
         description="Only memories carrying ALL of these tags match",
     )
 
@@ -771,8 +771,11 @@ class RetagFilters(BaseModel):
         return v
 
     def any_set(self) -> bool:
+        # Truthiness, not `is not None`: an empty string / empty list produces
+        # NO Qdrant filter condition downstream, so counting it as "a filter is
+        # present" would let `{"tags_contains": []}` bypass the sweep guard.
         return any(
-            getattr(self, f) is not None
+            bool(getattr(self, f))
             for f in ("scope", "category", "project_id", "visibility", "tags_contains")
         )
 

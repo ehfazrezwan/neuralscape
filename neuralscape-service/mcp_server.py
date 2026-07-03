@@ -1052,10 +1052,13 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             }, default=str))]
 
         elif name == "retag_memories":
+            # Truthiness, not `is not None`: an empty string / empty list would
+            # produce no Qdrant condition in the service and turn a "filtered"
+            # retag into an unfiltered sweep.
             filters = {
                 k: arguments[k]
                 for k in ("scope", "category", "project_id", "visibility", "tags_contains")
-                if arguments.get(k) is not None
+                if arguments.get(k)
             }
             ops = {
                 k: arguments[k]
