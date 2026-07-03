@@ -15,7 +15,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from extensions.base import ExtensionManifest
@@ -95,10 +95,10 @@ class DreamingExtension:
             Poll GET /status for the DreamRun result.
             """
             if not dreaming_settings.enabled and not req.force:
-                return {
-                    "job_id": None,
-                    "error": "DREAMING_ENABLED=false — set the env var (or force=true) to run",
-                }
+                raise HTTPException(
+                    status_code=409,
+                    detail="DREAMING_ENABLED=false — set the env var (or force=true) to run",
+                )
             from arq import create_pool
 
             from config import parse_redis_settings, settings as core_settings
