@@ -3,7 +3,7 @@
 from datetime import datetime
 from enum import Enum
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # ──────────────────────────────────────────────
@@ -693,11 +693,138 @@ class GraphSearchRequest(BaseModel):
     )
 
 
-class UpdateMemoryRequest(BaseModel):
-    """Update a memory's content or category."""
-    content: str | None = Field(default=None, max_length=10000)
+class PatchMemoryRequest(BaseModel):
+    """Partially update a memory (true PATCH semantics).
+
+    Only fields the caller actually sent are applied — handlers must read
+    ``model_fields_set`` so an explicit ``null`` (clear the field, where legal)
+    is distinguishable from an omitted field. ``scope`` is never accepted: it
+    is always re-derived server-side from the effective category + project_id,
+    exactly as on write. ``owner_user_id`` is never editable.
+
+    Permission model (enforced in the service):
+    - shared memories: any authenticated user may edit organizational metadata
+      (tags/category/project_id/v2 fields); content and visibility edits are
+      owner-or-dictator.
+    - private memories: owner only.
+    - standard tier: dictator only.
+    """
+    user_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+    content: str | None = Field(default=None, min_length=1, max_length=10000)
     category: str | None = None
-    tags: list[str] | None = Field(default=None, max_length=20)
+    project_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+    tags: list[str] | None = Field(default=None, max_length=20, description="Full replacement of the tags list")
+    visibility: MemoryVisibility | None = None
+
+    # Memory-model v2 (all optional)
+    domain: str | None = None
+    observation_type: str | None = None
+    concepts: list[str] | None = Field(default=None, max_length=5)
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    expires_at: datetime | None = None
+
+    @field_validator("domain")
+    @classmethod
+    def _validate_domain(cls, v: str | None) -> str | None:
+        if v is not None and v not in DOMAIN_VOCAB:
+            raise ValueError(f"Invalid domain '{v}'. Must be one of: {sorted(DOMAIN_VOCAB)}")
+        return v
+
+    @field_validator("observation_type")
+    @classmethod
+    def _validate_observation_type(cls, v: str | None) -> str | None:
+        if v is not None and v not in OBSERVATION_TYPE_VOCAB:
+            raise ValueError(
+                f"Invalid observation_type '{v}'. Must be one of: {sorted(OBSERVATION_TYPE_VOCAB)}"
+            )
+        return v
+
+    @field_validator("concepts")
+    @classmethod
+    def _validate_concepts(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return v
+        unknown = [c for c in v if c not in CONCEPT_VOCAB]
+        if unknown:
+            raise ValueError(
+                f"Unknown concepts: {unknown}. Must be from: {sorted(CONCEPT_VOCAB)}"
+            )
+        return v
+
+
+# Transitional alias — removed together with the PUT handler swap in main.py.
+UpdateMemoryRequest = PatchMemoryRequest
+
+
+class RetagFilters(BaseModel):
+    """Filter set selecting the memories a bulk retag applies to (AND semantics)."""
+    scope: str | None = None
+    category: str | None = None
+    project_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+    visibility: MemoryVisibility | None = None
+    tags_contains: list[str] | None = Field(
+        default=None, max_length=10,
+        description="Only memories carrying ALL of these tags match",
+    )
+
+    @field_validator("scope")
+    @classmethod
+    def _validate_scope(cls, v: str | None) -> str | None:
+        if v is not None and v not in {"global", "project"}:
+            raise ValueError("scope must be 'global' or 'project'")
+        return v
+
+    def any_set(self) -> bool:
+        return any(
+            getattr(self, f) is not None
+            for f in ("scope", "category", "project_id", "visibility", "tags_contains")
+        )
+
+
+class RetagOps(BaseModel):
+    """Operations a bulk retag applies to each matched memory.
+
+    ``set_project_id`` supports explicit-null clearing: send the key with
+    ``null`` to remove the project assignment (handlers read
+    ``model_fields_set``). Visibility and content are deliberately NOT bulk
+    operations — those are sensitive, single-memory edits.
+    """
+    add_tags: list[str] | None = Field(default=None, max_length=20)
+    remove_tags: list[str] | None = Field(default=None, max_length=20)
+    set_project_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+    set_category: str | None = None
+
+    def any_set(self) -> bool:
+        return bool(
+            self.add_tags or self.remove_tags or self.set_category
+            or "set_project_id" in self.model_fields_set
+        )
+
+
+class RetagRequest(BaseModel):
+    """Bulk retag memories matching a filter set (async, 202 + poll).
+
+    Requires at least one filter — an unfiltered whole-store sweep is refused
+    at the request boundary, mirroring the bulk-delete safety posture.
+    """
+    user_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+    filters: RetagFilters
+    ops: RetagOps
+    dry_run: bool = Field(
+        default=False,
+        description="When True, report matched/would_update counts without writing",
+    )
+
+    @model_validator(mode="after")
+    def _validate_shape(self) -> "RetagRequest":
+        if not self.filters.any_set():
+            raise ValueError("At least one filter is required — refusing an unfiltered retag sweep")
+        if not self.ops.any_set():
+            raise ValueError("At least one operation is required")
+        overlap = set(self.ops.add_tags or []) & set(self.ops.remove_tags or [])
+        if overlap:
+            raise ValueError(f"Tags cannot be both added and removed: {sorted(overlap)}")
+        return self
 
 
 class BulkDeleteRequest(BaseModel):
