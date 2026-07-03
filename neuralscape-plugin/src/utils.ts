@@ -56,6 +56,11 @@ const NEURALSCAPE_URL = (
 
 const NEURALSCAPE_API_KEY = readConfig("API_KEY", "");
 
+// Deliberate zero-config fallback: an unconfigured install identifies as the
+// OS username so hook captures stay continuous on single-user/local servers.
+// Removing it would orphan memories existing installs stored under that id.
+// Token-authenticated servers ignore client-claimed ids (identity comes from
+// the Bearer token), so this can't spoof identity on multi-user deployments.
 const NEURALSCAPE_USER_ID =
   readConfig("USER_ID", "") ||
   process.env.USER?.trim() ||
