@@ -1865,90 +1865,10 @@ async def v1_emit_extension_event(req: EmitEventRequest):
     }
 
 
-class SynthesizeRequest(BaseModel):
-    """Body for POST /v1/admin/synthesize."""
-
-    category: str | None = Field(
-        default=None,
-        description="Restrict synthesis to a single NeuralScape category. None = all categories.",
-    )
-    dry_run: bool = Field(
-        default=False,
-        description=(
-            "When true, do everything except write to the vault and patch Neo4j. "
-            "The response still reports what would have happened."
-        ),
-    )
-
-
-@v1_router.post("/admin/synthesize")
-async def v1_admin_synthesize(req: SynthesizeRequest):
-    """Manually trigger one wiki-synthesis pass.
-
-    Gated by ``WIKI_SYNTHESIZER_ENABLED`` — when disabled, the response
-    contains zero pages and an explanatory error. Useful for development
-    and for one-shot synthesis after a content backfill.
-    """
-    from extensions.wiki_synthesizer.config import synthesizer_settings
-    from extensions.wiki_synthesizer.synthesizer import synthesize_all
-
-    if not synthesizer_settings.enabled:
-        return {
-            "pages_created": 0,
-            "pages_updated": 0,
-            "memories_processed": 0,
-            "pages_skipped_empty": 0,
-            "errors": ["WIKI_SYNTHESIZER_ENABLED=false — set the env var to true to run"],
-            "pages": [],
-        }
-
-    result = await synthesize_all(
-        service=_service,
-        settings=synthesizer_settings,
-        only_category=req.category,
-        dry_run=req.dry_run,
-    )
-    return {
-        "pages_created": result.pages_created,
-        "pages_updated": result.pages_updated,
-        "memories_processed": result.memories_processed,
-        "pages_skipped_empty": result.pages_skipped_empty,
-        "errors": result.errors,
-        "pages": [
-            {
-                "category": p.category,
-                "group_id": p.group_id,
-                "wiki_path": p.wiki_path,
-                "created": p.created,
-                "source_memory_count": p.source_memory_count,
-            }
-            for p in result.pages
-        ],
-    }
-
-
-@v1_router.get("/admin/synthesize/status")
-async def v1_admin_synthesize_status():
-    """Return the most recent synthesis-run state plus current config.
-
-    Process-local: when the API and worker are separate processes, each
-    has its own ``last_run`` snapshot. The API process reports runs
-    triggered through ``POST /v1/admin/synthesize``; the worker process
-    reports its cron runs. Cross-process unification is a follow-up.
-    """
-    from extensions.wiki_synthesizer.config import synthesizer_settings
-    from extensions.wiki_synthesizer.synthesizer import get_last_run_snapshot
-
-    return {
-        "enabled": synthesizer_settings.enabled,
-        "cron_hours": synthesizer_settings.cron_hours,
-        "max_memories_per_page": synthesizer_settings.max_memories_per_page,
-        "gemini_timeout_seconds": synthesizer_settings.gemini_timeout_seconds,
-        "gemini_max_retries": synthesizer_settings.gemini_max_retries,
-        "attach_window_seconds": synthesizer_settings.attach_window_seconds,
-        "wiki_dir": str(synthesizer_settings.wiki_dir),
-        "last_run": get_last_run_snapshot(),
-    }
+# The wiki_synthesizer's /admin/synthesize endpoints were retired with the
+# extension itself — dreaming (its successor) exposes its admin surface at
+# /v1/extensions/dreaming/run and /v1/extensions/dreaming/status via the
+# extension-route mount. See docs/DREAMING_MODE_SPEC.md.
 
 
 # Mount v1 router
