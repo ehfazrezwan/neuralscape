@@ -644,90 +644,6 @@ class TestCRUD:
         service._get_graphiti = MagicMock(return_value=None)
         assert service.list_projects(user_id="ehfaz") == []
 
-    def test_update_memory(self, service):
-        service._memory.get.return_value = {
-            "id": "m1",
-            "memory": "Old content",
-            "user_id": "ehfaz",
-            "metadata": {"scope": "global", "category": "preference"},
-        }
-        service._memory.update.return_value = {"message": "Memory updated successfully!"}
-        result = service.update_memory(memory_id="m1", content="Updated content")
-        service._memory.update.assert_called_once_with("m1", "Updated content")
-
-    def test_update_memory_reingests_into_graph(self, service):
-        """When content is updated, the new content should be re-ingested into
-        the knowledge graph so Graphiti can expire contradicting edges.
-
-        Multi-user model: group_id is namespaced by visibility + owner_user_id,
-        so a legacy memory (no `metadata.visibility` set) is treated as
-        ``private`` and writes to ``user--{owner_user_id}--project--{pid}``.
-        """
-        service._memory.get.return_value = {
-            "id": "m1",
-            "memory": "User prefers dark mode",
-            "user_id": "ehfaz",
-            "metadata": {
-                "scope": "project",
-                "category": "preference",
-                "project_id": "p1",
-                "owner_user_id": "ehfaz",
-                # No visibility set → defaults to private
-            },
-        }
-        service._memory.update.return_value = {"message": "Memory updated successfully!"}
-
-        service.update_memory(memory_id="m1", content="User prefers light mode")
-
-        service._memory.graph.add.assert_called_once_with(
-            data="User prefers light mode",
-            filters={"user_id": "ehfaz", "group_id": "user--ehfaz--project--p1"},
-        )
-
-    def test_update_memory_uses_shared_group_for_shared_memories(self, service):
-        """A memory tagged `visibility=shared` re-ingests under the shared group_id."""
-        service._memory.get.return_value = {
-            "id": "m2",
-            "memory": "Project uses FastAPI",
-            "user_id": "alice",
-            "metadata": {
-                "scope": "project",
-                "category": "tech_stack",
-                "project_id": "neuralscape",
-                "visibility": "shared",
-                "owner_user_id": "alice",
-            },
-        }
-        service._memory.update.return_value = {"message": "ok"}
-        service.update_memory(memory_id="m2", content="Project uses FastAPI 0.116")
-        service._memory.graph.add.assert_called_once_with(
-            data="Project uses FastAPI 0.116",
-            filters={"user_id": "alice", "group_id": "shared--project--neuralscape"},
-        )
-
-    def test_update_memory_skips_graph_for_metadata_only(self, service):
-        """Metadata-only updates (no content) should not trigger graph re-ingestion."""
-        service.update_memory(memory_id="m1", category="preference")
-        service._memory.graph.add.assert_not_called()
-
-    def test_update_memory_graph_failure_noncritical(self, service):
-        """Graph re-ingestion failure should not prevent the update from succeeding."""
-        service._memory.get.return_value = {
-            "id": "m1",
-            "memory": "Old content",
-            "user_id": "ehfaz",
-            "metadata": {"scope": "global"},
-        }
-        service._memory.update.return_value = {"message": "Memory updated successfully!"}
-        service._memory.graph.add.side_effect = Exception("Neo4j connection refused")
-
-        result = service.update_memory(memory_id="m1", content="New content")
-        assert result["message"] == "Memory updated successfully"
-
-    def test_update_memory_rejects_invalid_category(self, service):
-        with pytest.raises(ValueError, match="Invalid category"):
-            service.update_memory(memory_id="m1", category="bogus")
-
     def test_delete_memory(self, service):
         service._memory.delete.return_value = {"message": "Memory deleted successfully!"}
         result = service.delete_memory("m1")
@@ -763,6 +679,260 @@ class TestCRUD:
         service._memory.delete.return_value = {"message": "deleted"}
         result = service.delete_memories(user_id="ehfaz", scope="global")
         assert service._memory.delete.call_count == 2
+
+
+def _edit_point(pid="m1", data="Old content", meta=None, user_id="ehfaz"):
+    """Fake Qdrant point for vector_store.get in patch/retag tests."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        id=pid,
+        payload={
+            "data": data,
+            "hash": "h",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "user_id": user_id,
+            "metadata": meta if meta is not None else {},
+        },
+    )
+
+
+_SHARED_META = {
+    "scope": "project",
+    "category": "decision",
+    "project_id": "neuralscape",
+    "owner_user_id": "javi",
+    "visibility": "shared",
+    "tags": ["old-tag"],
+}
+
+
+class TestPatchMemory:
+    @pytest.fixture(autouse=True)
+    def _stub_response(self, service):
+        # patch_memory returns get_memory() at the end; keep it out of scope here.
+        service.get_memory = MagicMock(return_value=MagicMock(name="MemoryResponse"))
+        service._expire_graph_edges_for_memory = MagicMock()
+
+    def test_metadata_only_patch_merges_and_preserves(self, service):
+        """A retag goes through set_payload with the full merged metadata —
+        untouched keys (owner, visibility, category) survive."""
+        service._memory.vector_store.get.return_value = _edit_point(meta=dict(_SHARED_META))
+        result = service.patch_memory("m1", "robb", {"tags": ["project:bon002"]})
+
+        service._memory.update.assert_not_called()
+        call = service._memory.vector_store.update.call_args
+        assert call.args[0] == "m1" or call.kwargs.get("vector_id") == "m1"
+        new_meta = call.kwargs["payload"]["metadata"]
+        assert new_meta["tags"] == ["project:bon002"]
+        assert new_meta["owner_user_id"] == "javi"          # preserved
+        assert new_meta["visibility"] == "shared"            # preserved
+        assert new_meta["category"] == "decision"            # preserved
+        assert "updated_at" in call.kwargs["payload"]
+        assert result["graph"] == "unchanged" and result["graph_job"] is None
+
+    def test_content_edit_passes_merged_metadata_to_mem0(self, service):
+        """REGRESSION: mem0's _update_memory rebuilds the ENTIRE payload from
+        its metadata kwarg — the old update_memory passed none, wiping every
+        NS metadata field on any content edit."""
+        meta = dict(_SHARED_META, owner_user_id="ehfaz")
+        service._memory.vector_store.get.return_value = _edit_point(meta=meta)
+        result = service.patch_memory("m1", "ehfaz", {"content": "New content"})
+
+        call = service._memory.update.call_args
+        assert call.args[:2] == ("m1", "New content")
+        nested = call.kwargs["metadata"]["metadata"]
+        assert nested["category"] == "decision"
+        assert nested["owner_user_id"] == "ehfaz"
+        assert nested["visibility"] == "shared"
+        assert nested["tags"] == ["old-tag"]
+        assert result["graph"] == "reingest_pending"
+        assert result["graph_job"]["content"] == "New content"
+        service._expire_graph_edges_for_memory.assert_not_called()
+
+    def test_teammate_may_edit_shared_metadata(self, service):
+        service._memory.vector_store.get.return_value = _edit_point(meta=dict(_SHARED_META))
+        service.patch_memory("m1", "robb", {"tags": ["x"], "category": "convention"})
+
+    def test_teammate_cannot_edit_shared_content(self, service):
+        service._memory.vector_store.get.return_value = _edit_point(meta=dict(_SHARED_META))
+        with pytest.raises(PermissionError, match="owner"):
+            service.patch_memory("m1", "robb", {"content": "rewritten"})
+
+    def test_teammate_cannot_edit_shared_visibility(self, service):
+        service._memory.vector_store.get.return_value = _edit_point(meta=dict(_SHARED_META))
+        with pytest.raises(PermissionError, match="owner"):
+            service.patch_memory("m1", "robb", {"visibility": "private"})
+
+    def test_stranger_cannot_edit_private(self, service):
+        meta = dict(_SHARED_META, visibility="private", owner_user_id="javi")
+        service._memory.vector_store.get.return_value = _edit_point(meta=meta)
+        with pytest.raises(PermissionError):
+            service.patch_memory("m1", "robb", {"tags": ["x"]})
+
+    def test_legacy_null_visibility_treated_as_private(self, service):
+        meta = {"category": "decision", "owner_user_id": "javi"}
+        service._memory.vector_store.get.return_value = _edit_point(meta=meta)
+        with pytest.raises(PermissionError):
+            service.patch_memory("m1", "robb", {"tags": ["x"]})
+
+    def test_standard_tier_requires_dictator(self, service, monkeypatch):
+        import memory_service as ms
+        meta = dict(_SHARED_META, visibility="standard", owner_user_id="boss")
+        service._memory.vector_store.get.return_value = _edit_point(meta=meta)
+        with pytest.raises(PermissionError, match="dictator"):
+            service.patch_memory("m1", "boss", {"tags": ["x"]})  # even the owner
+        monkeypatch.setattr(ms.settings, "dictator_user_ids", "boss")
+        service.patch_memory("m1", "boss", {"tags": ["x"]})
+
+    def test_project_category_requires_project_id(self, service):
+        meta = {"category": "decision", "owner_user_id": "ehfaz", "visibility": "private"}
+        service._memory.vector_store.get.return_value = _edit_point(meta=meta)
+        with pytest.raises(ValueError, match="project_id is required"):
+            service.patch_memory("m1", "ehfaz", {"category": "tech_stack"})
+
+    def test_project_category_with_project_in_same_patch(self, service):
+        meta = {"category": "decision", "owner_user_id": "ehfaz", "visibility": "private"}
+        service._memory.vector_store.get.return_value = _edit_point(meta=meta)
+        service.patch_memory("m1", "ehfaz", {"category": "tech_stack", "project_id": "p1"})
+        new_meta = service._memory.vector_store.update.call_args.kwargs["payload"]["metadata"]
+        assert new_meta["scope"] == "project" and new_meta["project_id"] == "p1"
+
+    def test_clearing_project_id_flips_flexible_scope_to_global(self, service):
+        meta = dict(_SHARED_META, owner_user_id="ehfaz", visibility="private")
+        service._memory.vector_store.get.return_value = _edit_point(meta=meta)
+        result = service.patch_memory("m1", "ehfaz", {"project_id": None})
+        new_meta = service._memory.vector_store.update.call_args.kwargs["payload"]["metadata"]
+        assert new_meta["scope"] == "global" and new_meta["project_id"] is None
+        # private user--ehfaz--project--neuralscape → user--ehfaz: partition moved
+        assert result["graph"] == "migration_pending"
+
+    def test_category_cannot_be_cleared(self, service):
+        service._memory.vector_store.get.return_value = _edit_point(meta=dict(_SHARED_META))
+        with pytest.raises(ValueError, match="cannot be cleared"):
+            service.patch_memory("m1", "javi", {"category": None})
+
+    def test_passage_content_edit_blocked_metadata_ok(self, service):
+        meta = dict(_SHARED_META, owner_user_id="ehfaz", memory_kind="passage")
+        service._memory.vector_store.get.return_value = _edit_point(meta=meta)
+        with pytest.raises(ValueError, match="passage"):
+            service.patch_memory("m1", "ehfaz", {"content": "rewritten chunk"})
+        service.patch_memory("m1", "ehfaz", {"tags": ["ok"]})  # metadata still fine
+
+    def test_partition_migration_expires_and_returns_graph_job(self, service):
+        meta = dict(_SHARED_META, owner_user_id="ehfaz")
+        service._memory.vector_store.get.return_value = _edit_point(meta=meta)
+        result = service.patch_memory("m1", "ehfaz", {"project_id": "bon002"})
+
+        service._expire_graph_edges_for_memory.assert_called_once()
+        expired_mem = service._expire_graph_edges_for_memory.call_args.args[0]
+        assert expired_mem["metadata"]["project_id"] == "neuralscape"  # OLD partition
+        job = result["graph_job"]
+        assert job == {
+            "memory_id": "m1",
+            "content": "Old content",
+            "user_id": "ehfaz",
+            "project_id": "bon002",
+            "visibility": "shared",
+            "source_ref": None,
+        }
+        assert result["graph"] == "migration_pending"
+
+    def test_not_found_raises_lookup_error(self, service):
+        service._memory.vector_store.get.return_value = None
+        with pytest.raises(LookupError):
+            service.patch_memory("nope", "ehfaz", {"tags": ["x"]})
+
+
+class TestRetagMemories:
+    @staticmethod
+    def _scroll_returning(service, points):
+        service._memory.vector_store.client.scroll.return_value = (points, None)
+
+    def test_retag_adds_and_removes_tags(self, service):
+        pts = [
+            _edit_point("m1", meta=dict(_SHARED_META)),
+            _edit_point("m2", meta=dict(_SHARED_META, tags=["old-tag", "keep"])),
+        ]
+        self._scroll_returning(service, pts)
+        result = service.retag_memories(
+            "robb",
+            {"project_id": "neuralscape"},
+            {"add_tags": ["project:bon002"], "remove_tags": ["old-tag"]},
+        )
+        assert result["matched"] == 2 and result["updated"] == 2
+        payloads = [c.kwargs["payload"]["metadata"] for c in
+                    service._memory.vector_store.update.call_args_list]
+        assert payloads[0]["tags"] == ["project:bon002"]
+        assert payloads[1]["tags"] == ["keep", "project:bon002"]
+        assert result["graph_jobs"] == []  # no project change → no graph work
+
+    def test_retag_skips_forbidden_and_counts(self, service):
+        pts = [
+            _edit_point("m1", meta=dict(_SHARED_META)),  # shared → editable
+            _edit_point("m2", meta=dict(_SHARED_META, visibility="standard")),  # dictator-only
+        ]
+        self._scroll_returning(service, pts)
+        result = service.retag_memories("robb", {"category": "decision"}, {"add_tags": ["t"]})
+        assert result["matched"] == 2
+        assert result["updated"] == 1
+        assert result["skipped_forbidden"] == 1
+
+    def test_retag_noop_rows_matched_not_updated(self, service):
+        pts = [_edit_point("m1", meta=dict(_SHARED_META, tags=["already"]))]
+        self._scroll_returning(service, pts)
+        result = service.retag_memories("robb", {"category": "decision"}, {"add_tags": ["already"]})
+        assert result["matched"] == 1 and result["updated"] == 0
+        service._memory.vector_store.update.assert_not_called()
+
+    def test_retag_dry_run_writes_nothing(self, service):
+        pts = [_edit_point("m1", meta=dict(_SHARED_META))]
+        self._scroll_returning(service, pts)
+        result = service.retag_memories(
+            "robb", {"category": "decision"}, {"add_tags": ["t"]}, dry_run=True
+        )
+        assert result["updated"] == 1 and result["dry_run"] is True
+        service._memory.vector_store.update.assert_not_called()
+
+    def test_retag_project_change_produces_graph_jobs(self, service):
+        service._expire_graph_edges_for_memory = MagicMock()
+        pts = [_edit_point("m1", meta=dict(_SHARED_META))]
+        self._scroll_returning(service, pts)
+        result = service.retag_memories(
+            "robb", {"project_id": "neuralscape"}, {"set_project_id": "bon002"}
+        )
+        assert result["updated"] == 1
+        service._expire_graph_edges_for_memory.assert_called_once()
+        assert result["graph_jobs"][0]["project_id"] == "bon002"
+        assert result["graph_jobs"][0]["visibility"] == "shared"
+
+    def test_retag_invalid_matrix_skipped(self, service):
+        # decision (no project) → tech_stack requires a project_id: skipped_invalid
+        meta = {"category": "decision", "owner_user_id": "ehfaz", "visibility": "shared"}
+        self._scroll_returning(service, [_edit_point("m1", meta=meta)])
+        result = service.retag_memories("ehfaz", {"category": "decision"}, {"set_category": "tech_stack"})
+        assert result["skipped_invalid"] == 1 and result["updated"] == 0
+
+    def test_retag_candidate_filter_excludes_other_private(self, service):
+        """The scroll filter's should-clause admits only shared/standard pools
+        plus the caller's own rows — other users' private memories never enter
+        the candidate set."""
+        from qdrant_client.models import FieldCondition, Filter
+
+        self._scroll_returning(service, [])
+        service.retag_memories("robb", {"category": "decision"}, {"add_tags": ["t"]})
+        scroll_filter = service._memory.vector_store.client.scroll.call_args.kwargs["scroll_filter"]
+        vis_values = [
+            c.match.value for c in scroll_filter.should if isinstance(c, FieldCondition)
+        ]
+        assert set(vis_values) == {"shared", "standard"}
+        own_rows = [c for c in scroll_filter.should if isinstance(c, Filter)]
+        assert own_rows and own_rows[0].must[0].key == "user_id"
+        assert own_rows[0].must[0].match.value == "robb"
+
+    def test_retag_rejects_invalid_category_upfront(self, service):
+        with pytest.raises(ValueError, match="Invalid category"):
+            service.retag_memories("robb", {"category": "decision"}, {"set_category": "bogus"})
 
 
 class TestExtractAndStore:

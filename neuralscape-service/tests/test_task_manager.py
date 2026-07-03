@@ -266,6 +266,66 @@ class TestEnqueueRawBatch:
 # ──────────────────────────────────────────────
 
 
+class TestEnqueueRetag:
+    _FILTERS = {"project_id": "neuralscape", "category": "decision"}
+    _OPS = {"add_tags": ["project:bon002"]}
+
+    @pytest.mark.asyncio
+    async def test_dispatches_on_fast_queue(self, tm):
+        tm.pool.enqueue_job.return_value = None
+        await tm.enqueue_retag("robb", dict(self._FILTERS), dict(self._OPS))
+        positional = tm.pool.enqueue_job.call_args[0]
+        assert positional[0] == "process_memory_retag"
+        assert positional[1] == "robb"
+        assert positional[2] == self._FILTERS
+        assert positional[3] == self._OPS
+        # Fast queue: no _queue_name override
+        assert "_queue_name" not in tm.pool.enqueue_job.call_args[1]
+
+    @pytest.mark.asyncio
+    async def test_job_id_deterministic_and_key_order_insensitive(self, tm):
+        tm.pool.enqueue_job.return_value = None
+        a = await tm.enqueue_retag("robb", {"category": "decision", "project_id": "p"}, dict(self._OPS))
+        b = await tm.enqueue_retag("robb", {"project_id": "p", "category": "decision"}, dict(self._OPS))
+        assert a == b  # canonical JSON: dict key order can't fork the id
+
+    @pytest.mark.asyncio
+    async def test_distinct_retags_get_distinct_ids(self, tm):
+        tm.pool.enqueue_job.return_value = None
+        a = await tm.enqueue_retag("robb", dict(self._FILTERS), {"add_tags": ["x"]})
+        b = await tm.enqueue_retag("robb", dict(self._FILTERS), {"add_tags": ["y"]})
+        c = await tm.enqueue_retag("javi", dict(self._FILTERS), {"add_tags": ["x"]})
+        assert len({a, b, c}) == 3
+
+
+class TestEnqueueGraphEnrichmentForEdit:
+    @pytest.mark.asyncio
+    async def test_dispatches_on_graph_queue(self, tm):
+        from config import settings
+
+        tm.pool.enqueue_job.return_value = None
+        await tm.enqueue_graph_enrichment(
+            "m1", "new content", "ehfaz", "p1", "shared", None
+        )
+        positional = tm.pool.enqueue_job.call_args[0]
+        kwargs = tm.pool.enqueue_job.call_args[1]
+        assert positional[0] == "process_graph_enrichment"
+        assert positional[1:8] == ("m1", "new content", "ehfaz", "p1", "shared", None, None)
+        assert kwargs["_queue_name"] == settings.graph_queue_name
+
+    @pytest.mark.asyncio
+    async def test_job_id_keys_on_target_state(self, tm):
+        """Editing the same memory to a DIFFERENT state must be a new job;
+        replaying the same edit coalesces."""
+        tm.pool.enqueue_job.return_value = None
+        a = await tm.enqueue_graph_enrichment("m1", "c", "e", "p1", "shared")
+        replay = await tm.enqueue_graph_enrichment("m1", "c", "e", "p1", "shared")
+        diff_project = await tm.enqueue_graph_enrichment("m1", "c", "e", "p2", "shared")
+        diff_content = await tm.enqueue_graph_enrichment("m1", "c2", "e", "p1", "shared")
+        assert a == replay
+        assert len({a, diff_project, diff_content}) == 3
+
+
 class TestEnqueueStore:
     @pytest.mark.asyncio
     async def test_dispatches_with_messages(self, tm):

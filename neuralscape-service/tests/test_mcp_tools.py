@@ -26,6 +26,8 @@ def mock_task_manager():
     mock_tm = MagicMock(name="TaskManager")
     mock_tm.enqueue_raw = AsyncMock(return_value="task-123")
     mock_tm.enqueue_store = AsyncMock(return_value="task-456")
+    mock_tm.enqueue_retag = AsyncMock(return_value="task-retag")
+    mock_tm.enqueue_graph_enrichment = AsyncMock(return_value="task-graph")
     mock_tm.wait_for_result = AsyncMock(return_value={
         "task_id": "task-123",
         "status": "completed",
@@ -45,9 +47,9 @@ def mock_task_manager():
 
 class TestListTools:
     @pytest.mark.asyncio
-    async def test_returns_12_tools(self):
+    async def test_returns_14_tools(self):
         tools = await mcp_server.list_tools()
-        assert len(tools) == 12
+        assert len(tools) == 14
 
     @pytest.mark.asyncio
     async def test_tool_names(self):
@@ -66,6 +68,8 @@ class TestListTools:
             "list_processes",
             "get_process",
             "delete_memories",
+            "edit_memory",
+            "retag_memories",
         }
         assert names == expected
 
@@ -386,6 +390,125 @@ class TestDeleteMemoriesTool:
         })
         data = json.loads(result[0].text)
         assert "deleted" in data["message"].lower()
+
+
+class TestEditMemoryTool:
+    @pytest.mark.asyncio
+    async def test_edit_metadata(self, mock_mcp_service, mock_task_manager):
+        mock_mcp_service.patch_memory.return_value = {
+            "memory": MemoryResponse(id="m1", memory="x", category="decision"),
+            "graph_job": None,
+            "graph": "unchanged",
+        }
+        result = await mcp_server.call_tool("edit_memory", {
+            "memory_id": "m1",
+            "user_id": "robb",
+            "tags": ["project:bon002"],
+        })
+        data = json.loads(result[0].text)
+        assert data["status"] == "ok" and data["graph"] == "unchanged"
+        # Presence-keyed: only the sent field reaches the service
+        args = mock_mcp_service.patch_memory.call_args.args
+        assert args == ("m1", "robb", {"tags": ["project:bon002"]})
+        mock_task_manager.enqueue_graph_enrichment.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_edit_explicit_null_clears(self, mock_mcp_service):
+        mock_mcp_service.patch_memory.return_value = {
+            "memory": None, "graph_job": None, "graph": "unchanged",
+        }
+        await mcp_server.call_tool("edit_memory", {
+            "memory_id": "m1", "user_id": "e", "project_id": None,
+        })
+        assert mock_mcp_service.patch_memory.call_args.args[2] == {"project_id": None}
+
+    @pytest.mark.asyncio
+    async def test_edit_enqueues_graph_job(self, mock_mcp_service, mock_task_manager):
+        job = {"memory_id": "m1", "content": "new", "user_id": "e",
+               "project_id": "p1", "visibility": "shared", "source_ref": None}
+        mock_mcp_service.patch_memory.return_value = {
+            "memory": None, "graph_job": job, "graph": "migration_pending",
+        }
+        result = await mcp_server.call_tool("edit_memory", {
+            "memory_id": "m1", "user_id": "e", "project_id": "p1",
+        })
+        data = json.loads(result[0].text)
+        assert data["graph"] == "migration_queued"
+        assert data["graph_task_id"] == "task-graph"
+        mock_task_manager.enqueue_graph_enrichment.assert_awaited_once_with(**job)
+
+    @pytest.mark.asyncio
+    async def test_edit_permission_error_surfaced(self, mock_mcp_service):
+        mock_mcp_service.patch_memory.side_effect = PermissionError(
+            "Only the memory's owner may edit its content"
+        )
+        result = await mcp_server.call_tool("edit_memory", {
+            "memory_id": "m1", "user_id": "robb", "content": "rewrite",
+        })
+        data = json.loads(result[0].text)
+        assert "owner" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_edit_no_fields_rejected(self, mock_mcp_service):
+        result = await mcp_server.call_tool("edit_memory", {"memory_id": "m1", "user_id": "e"})
+        data = json.loads(result[0].text)
+        assert "error" in data
+        mock_mcp_service.patch_memory.assert_not_called()
+
+
+class TestRetagMemoriesTool:
+    @pytest.mark.asyncio
+    async def test_retag_enqueues(self, mock_mcp_service, mock_task_manager):
+        result = await mcp_server.call_tool("retag_memories", {
+            "user_id": "robb",
+            "project_id": "neuralscape",
+            "add_tags": ["project:bon002"],
+        })
+        data = json.loads(result[0].text)
+        assert data == {"status": "accepted", "task_id": "task-retag"}
+        caller, filters, ops = mock_task_manager.enqueue_retag.await_args.args
+        assert caller == "robb"
+        assert filters == {"project_id": "neuralscape"}
+        assert ops == {"add_tags": ["project:bon002"]}
+        mock_mcp_service.retag_memories.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_retag_dry_run_synchronous(self, mock_mcp_service, mock_task_manager):
+        mock_mcp_service.retag_memories.return_value = {
+            "matched": 3, "updated": 2, "skipped_forbidden": 1,
+            "skipped_invalid": 0, "graph_jobs": [], "dry_run": True,
+        }
+        result = await mcp_server.call_tool("retag_memories", {
+            "user_id": "robb",
+            "category": "decision",
+            "add_tags": ["t"],
+            "dry_run": True,
+        })
+        data = json.loads(result[0].text)
+        assert data["matched"] == 3 and "graph_jobs" not in data
+        mock_task_manager.enqueue_retag.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_retag_requires_filter_and_op(self, mock_task_manager):
+        no_filter = await mcp_server.call_tool("retag_memories", {
+            "user_id": "robb", "add_tags": ["t"],
+        })
+        assert "filter" in json.loads(no_filter[0].text)["error"]
+        no_op = await mcp_server.call_tool("retag_memories", {
+            "user_id": "robb", "category": "decision",
+        })
+        assert "operation" in json.loads(no_op[0].text)["error"]
+        mock_task_manager.enqueue_retag.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_retag_null_set_project_preserved(self, mock_task_manager):
+        await mcp_server.call_tool("retag_memories", {
+            "user_id": "robb",
+            "tags_contains": ["strategy:naked-forex"],
+            "set_project_id": None,
+        })
+        _, _, ops = mock_task_manager.enqueue_retag.await_args.args
+        assert ops == {"set_project_id": None}
 
 
 class TestStandardWriteGate:
