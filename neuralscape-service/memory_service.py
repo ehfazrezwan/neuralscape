@@ -6,6 +6,7 @@ Both REST endpoints and MCP tools call into this same MemoryService.
 import hashlib
 import json
 import logging
+import math
 import random
 import re
 import threading
@@ -77,6 +78,52 @@ def _parse_expires_at(value) -> datetime | None:
     except ValueError:
         return None
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+# ── Reinforcement-aware dedup (times_derived) ──────────────────────────
+# When a duplicate is detected — at write time (content-hash short-circuit),
+# in the dedup cron, or by a dreaming MERGE — the survivor's
+# `metadata.times_derived` counter absorbs the dropped duplicate(s) instead
+# of silently discarding the reinforcement signal (inspired by Honcho's
+# times_derived). The counter feeds the dreaming promotion score and a small
+# deterministic recall re-rank boost below.
+
+# Recall boost strength: boosted = score * (1 + K * log1p(times_derived - 1)).
+# k=0.05 keeps the boost gentle — a memory reinforced 10× gets ~+12%, enough
+# to outrank a one-off at comparable cosine similarity without letting
+# repetition drown out relevance. `times_derived - 1` (the count of *extra*
+# derivations) means unreinforced/legacy rows keep their raw score exactly.
+REINFORCEMENT_BOOST_K = 0.05
+
+
+def _times_derived_from_metadata(metadata: dict | None) -> int:
+    """Read `times_derived` out of a memory's metadata dict (min 1).
+
+    Handles the mem0 double-wrap (`{"metadata": {"metadata": {...}}}`) and
+    treats absent/invalid values as 1 (a memory observed exactly once), so
+    legacy rows never need a migration.
+    """
+    meta = metadata or {}
+    if isinstance(meta.get("metadata"), dict):
+        meta = meta["metadata"]
+    try:
+        return max(1, int(meta.get("times_derived") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _reinforcement_boost(score: float | None, metadata: dict | None) -> float | None:
+    """Apply the deterministic reinforcement re-rank boost to a vector score.
+
+    Feature-safe: None scores pass through, and times_derived <= 1 (including
+    every legacy row without the field) returns the score unchanged.
+    """
+    if score is None:
+        return None
+    times_derived = _times_derived_from_metadata(metadata)
+    if times_derived <= 1:
+        return score
+    return score * (1.0 + REINFORCEMENT_BOOST_K * math.log1p(times_derived - 1))
 
 
 def _is_junk_fact(content: str) -> bool:
@@ -866,6 +913,9 @@ class MemoryService:
             logger.info(
                 f"Dedup hit for user={user_id} hash={content_hash[:8]}... — returning existing id={existing.id}"
             )
+            # Reinforcement-aware dedup: the caller just re-derived this exact
+            # fact — count it on the survivor instead of discarding the signal.
+            self._bump_times_derived(existing.id, 1)
             # created=False → caller must NOT re-enqueue graph enrichment.
             return ([existing], False) if return_created else [existing]
 
@@ -1120,11 +1170,14 @@ class MemoryService:
         out: list[MemoryResponse] = []
         for hit in hits:
             payload = getattr(hit, "payload", None) or {}
+            metadata = payload.get("metadata", {})
             mem_dict = {
                 "id": str(getattr(hit, "id", "")),
                 "memory": payload.get("data", ""),
-                "metadata": payload.get("metadata", {}),
-                "score": getattr(hit, "score", None),
+                "metadata": metadata,
+                # Reinforcement-aware recall: memories that survived N dedup
+                # collapses rank slightly above one-offs at equal similarity.
+                "score": _reinforcement_boost(getattr(hit, "score", None), metadata),
                 "created_at": payload.get("created_at"),
             }
             out.append(self._mem_to_response(mem_dict))
@@ -1225,11 +1278,15 @@ class MemoryService:
         out: list[MemoryResponse] = []
         for hit in hits:
             payload = getattr(hit, "payload", None) or {}
+            metadata = payload.get("metadata", {})
             mem_dict = {
                 "id": str(getattr(hit, "id", "")),
                 "memory": payload.get("data", ""),
-                "metadata": payload.get("metadata", {}),
-                "score": getattr(hit, "score", None),
+                "metadata": metadata,
+                # Same reinforcement boost as the shared/standard pools — the
+                # re-rank must be identical across pools or a reinforced
+                # private memory would lose to its unreinforced shared twin.
+                "score": _reinforcement_boost(getattr(hit, "score", None), metadata),
                 "created_at": payload.get("created_at"),
             }
             out.append(self._mem_to_response(mem_dict))
@@ -1305,6 +1362,41 @@ class MemoryService:
         except Exception as e:
             logger.warning(f"Content-hash dedup lookup failed (non-fatal): {e}")
             return None
+
+    def _bump_times_derived(self, memory_id: str, add: int = 1) -> None:
+        """Increment ``metadata.times_derived`` on a surviving memory.
+
+        Called when a duplicate of ``memory_id`` was detected and dropped —
+        the reinforcement is counted on the survivor instead of discarded.
+        Read-merge-write of the nested metadata dict (Qdrant's ``set_payload``
+        replaces top-level keys wholesale, so the merge is mandatory —
+        mirrors ``extensions/dreaming/consolidate._merged_metadata``).
+
+        Best-effort: losing a reinforcement tick must never block a write or
+        a dedup pass, so every failure is swallowed with a warning.
+        """
+        if add <= 0:
+            return
+        try:
+            client = self._memory.vector_store.client
+            collection = settings.qdrant_collection
+            points = client.retrieve(
+                collection_name=collection,
+                ids=[memory_id],
+                with_payload=True,
+                with_vectors=False,
+            )
+            if not points:
+                return
+            meta = dict((points[0].payload or {}).get("metadata") or {})
+            meta["times_derived"] = _times_derived_from_metadata(meta) + add
+            client.set_payload(
+                collection_name=collection,
+                payload={"metadata": meta},
+                points=[memory_id],
+            )
+        except Exception as e:
+            logger.warning(f"times_derived bump failed for {memory_id} (non-fatal): {e}")
 
     def store_raw_batch(
         self,
@@ -4016,6 +4108,12 @@ class MemoryService:
                 key=lambda x: x["payload"].get("created_at", ""),
                 reverse=True,
             )
+            survivor = group[0]
+            # Reinforcement-aware dedup: each dropped duplicate is a repeated
+            # observation of the same fact. The survivor absorbs the counters
+            # of every row it replaces (sum semantics — a dropped row may
+            # itself have accumulated write-path reinforcements).
+            reinforcement = 0
             for dup in group[1:]:
                 mid = dup["id"]
                 if mid in deleted_ids:
@@ -4024,8 +4122,13 @@ class MemoryService:
                     self._delete_qdrant_memory_with_graph_cleanup(mid, dup["payload"])
                     deleted_ids.add(mid)
                     exact_removed += 1
+                    reinforcement += _times_derived_from_metadata(
+                        dup["payload"].get("metadata")
+                    )
                 except Exception as e:
                     logger.warning(f"Failed to delete exact dup {mid}: {e}")
+            if reinforcement:
+                self._bump_times_derived(survivor["id"], reinforcement)
 
         # ── Phase 2: Semantic dedup ──
         semantic_removed = 0
@@ -4082,8 +4185,10 @@ class MemoryService:
                 # Delete the older one
                 mem_created = mem["payload"].get("created_at", "")
                 hit_created = hit_payload.get("created_at", "")
-                older_id, older_payload = (
-                    (hit_id, hit_payload) if hit_created <= mem_created else (mid, mem["payload"])
+                older_id, older_payload, newer_id = (
+                    (hit_id, hit_payload, mid)
+                    if hit_created <= mem_created
+                    else (mid, mem["payload"], hit_id)
                 )
 
                 if older_id in deleted_ids:
@@ -4092,6 +4197,12 @@ class MemoryService:
                     self._delete_qdrant_memory_with_graph_cleanup(older_id, older_payload)
                     deleted_ids.add(older_id)
                     semantic_removed += 1
+                    # Same reinforcement transfer as the exact phase: the
+                    # near-duplicate we just dropped was a repeated
+                    # observation — its counter moves to the survivor.
+                    self._bump_times_derived(
+                        newer_id, _times_derived_from_metadata(older_payload.get("metadata"))
+                    )
                 except Exception as e:
                     logger.warning(f"Failed to delete semantic dup {older_id}: {e}")
 
