@@ -179,6 +179,7 @@ The plugin reads from `userConfig` prompts (modern) or env vars (legacy fallback
 | Service URL | `CLAUDE_PLUGIN_OPTION_URL` | `NEURALSCAPE_URL` |
 | API key | `CLAUDE_PLUGIN_OPTION_API_KEY` (sensitive — keychain-stored) | `NEURALSCAPE_API_KEY` |
 | User ID | `CLAUDE_PLUGIN_OPTION_USER_ID` | `NEURALSCAPE_USER_ID` |
+|  | *Default when unset:* the hooks fall back to the **OS username** (`$USER` / `$USERNAME`) so zero-config local installs keep a stable identity. Set it explicitly on shared machines or if your OS username isn't the id you want memories filed under. Servers with token auth derive identity from the Bearer token and ignore client-claimed ids. | |
 | Compile threshold (obs) | `CLAUDE_PLUGIN_OPTION_COMPILE_THRESHOLD` (default `25`) | `NEURALSCAPE_COMPILE_THRESHOLD` |
 | Compile age (minutes) | `CLAUDE_PLUGIN_OPTION_COMPILE_AGE_MIN` (default `30`) | `NEURALSCAPE_COMPILE_AGE_MIN` |
 
