@@ -586,7 +586,7 @@ class _FakeIngestService:
             return stored, True
         return stored
 
-    def extract_facts_only(self, text, extractor=None):
+    def extract_facts_only(self, text, extractor=None, user_id=None, project_id=None):
         return [("domain_knowledge", f"Distilled: {text.strip().splitlines()[-1][:40]}")]
 
 

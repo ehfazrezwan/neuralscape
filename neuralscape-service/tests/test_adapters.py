@@ -106,7 +106,7 @@ class _RecordingService:
         self._facts = [("decision", "Chose X over Y because Z")]
         self.extractor_seen = "unset"
 
-    def extract_facts_only(self, text, extractor=None):
+    def extract_facts_only(self, text, extractor=None, user_id=None, project_id=None):
         # Record which extractor the pipeline resolved for this adapter.
         self.extractor_seen = extractor.__class__.__name__ if extractor else None
         return self._facts
