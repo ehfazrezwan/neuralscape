@@ -56,11 +56,11 @@ def _code_graph_tool_names() -> set[str]:
 
 class TestListTools:
     @pytest.mark.asyncio
-    async def test_returns_19_core_tools(self):
-        # 19 core tools + the 3 code-graph delegation tools (= 22) when the
+    async def test_returns_22_core_tools(self):
+        # 22 core tools + the 3 code-graph delegation tools (= 25) when the
         # optional graphifyy extra is installed (dev installs have it).
         tools = await mcp_server.list_tools()
-        assert len(tools) == 19 + len(_code_graph_tool_names())
+        assert len(tools) == 22 + len(_code_graph_tool_names())
 
     @pytest.mark.asyncio
     async def test_tool_names(self):
@@ -86,6 +86,9 @@ class TestListTools:
             "get_reasoning_chain",
             "schedule_dream",
             "get_card",
+            "ask_memory",
+            "checkpoint",
+            "queue_status",
         } | _code_graph_tool_names()
         assert names == expected
 
