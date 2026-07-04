@@ -32,18 +32,26 @@ _MISSING_EXTRA_MSG = (
 
 
 def code_graph_available() -> bool:
-    """True when the optional ``graphifyy`` library is importable.
+    """True when the optional ``graphifyy`` library is actually importable.
 
-    Checked via ``find_spec`` so merely probing availability (e.g. on every
-    MCP ``list_tools`` call) never pays graphify's import cost; the actual
-    import happens lazily inside the gated modules. Tests simulate the
-    missing-extra case by poisoning ``sys.modules["graphify"]`` /
-    monkeypatching this function.
+    ``find_spec`` first, as the cheap negative (probing availability on every
+    MCP ``list_tools`` call must not pay an import attempt when the extra
+    plainly isn't installed) — then a real ``import`` so a broken/partial
+    install reports unavailable and degrades cleanly instead of surfacing
+    ImportErrors from the gated tools/routes. The import is a no-op after the
+    first success (``sys.modules`` cache). Tests simulate the missing-extra
+    case by poisoning ``sys.modules["graphify"]``.
     """
     try:
-        return importlib.util.find_spec("graphify") is not None
+        if importlib.util.find_spec("graphify") is None:
+            return False
     except (ImportError, ValueError):
         return False
+    try:
+        import graphify  # noqa: F401 — availability == real importability
+    except Exception:  # noqa: BLE001 — any broken install ⇒ unavailable
+        return False
+    return True
 
 
 def register() -> bool:
@@ -54,12 +62,9 @@ def register() -> bool:
     clear, non-exception log line — when the ``code-graph`` extra is absent.
     """
     if not code_graph_available():
+        # Covers both "extra not installed" and "installed but broken" —
+        # code_graph_available() performs a real import attempt.
         logger.info(_MISSING_EXTRA_MSG)
-        return False
-    try:
-        import graphify  # noqa: F401 — confirm the import actually succeeds
-    except Exception:  # noqa: BLE001 — a broken install must not crash adapters
-        logger.warning(_MISSING_EXTRA_MSG, exc_info=True)
         return False
     from adapters.code_graph import profile
 
