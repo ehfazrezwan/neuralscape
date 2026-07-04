@@ -57,6 +57,8 @@ class TestListTools:
         names = {t.name for t in tools}
         expected = {
             "recall_memories",
+            "get_memories",
+            "timeline",
             "remember",
             "remember_conversation",
             "ingest_document",
