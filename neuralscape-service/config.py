@@ -3,7 +3,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from arq.connections import RedisSettings
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
@@ -166,8 +166,10 @@ class Settings(BaseSettings):
     savings_rederivation_multiplier: float = 10.0
 
     # ── Session summarizer slots + context assembler (roadmap E3) ─────
-    # Per-session rolling summaries, maintained on the FAST worker queue as
-    # conversation writes cross message-count thresholds. Two slots per
+    # Per-session rolling summaries, refreshed as conversation writes cross
+    # message-count thresholds. The refresh jobs run on the GRAPH worker
+    # queue (audit 27 #24) — they're Gemini-bound with no latency SLO, so
+    # they must not compete with latency-sensitive writes for fast slots. Two slots per
     # session — `short` (refreshed every ~short_every messages, capped at
     # short_max_tokens) and `long` (every ~long_every, long_max_tokens) —
     # each REPLACED on refresh via recursive compression (new summary =
@@ -183,6 +185,18 @@ class Settings(BaseSettings):
     # messages (LTRIM), and expire all per-session keys after this many days.
     session_buffer_max_messages: int = 400
     session_ttl_days: int = 30
+
+    # ── Windowed conversation extraction (audit 27 #22) ───────────────
+    # A single extraction LLM call over a whole session silently caps out at
+    # a few dozen facts (one JSON response), and one failure zeroes the whole
+    # conversation. Long conversations are therefore split into windows of
+    # `extraction_window_messages` messages with `extraction_window_overlap`
+    # messages of overlap (so a fact straddling a boundary is seen by both
+    # windows; the write-path content-hash dedup collapses the duplicates),
+    # one extraction call per window, facts unioned. Conversations at or
+    # under one window are byte-identical to the unwindowed path.
+    extraction_window_messages: int = 30
+    extraction_window_overlap: int = 2
 
     # ── Custom extraction instructions (roadmap E4) ───────────────────
     # Operator-supplied guidance appended to the extraction prompt as a
@@ -430,6 +444,34 @@ class Settings(BaseSettings):
         if value <= 0:
             raise ValueError(f"{info.field_name} must be > 0")
         return value
+
+    @field_validator("extraction_window_messages")
+    @classmethod
+    def _validate_extraction_window(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("EXTRACTION_WINDOW_MESSAGES must be >= 1")
+        return value
+
+    @field_validator("extraction_window_overlap")
+    @classmethod
+    def _validate_extraction_overlap(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("EXTRACTION_WINDOW_OVERLAP must be >= 0")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_extraction_windowing(self) -> "Settings":
+        # Cross-field check (Copilot review, PR #124): overlap >= window
+        # would make the split non-advancing. The splitter also clamps
+        # defensively, but nonsense config must be rejected at startup, not
+        # silently reinterpreted.
+        if self.extraction_window_overlap >= self.extraction_window_messages:
+            raise ValueError(
+                "EXTRACTION_WINDOW_OVERLAP must be < EXTRACTION_WINDOW_MESSAGES "
+                f"(got overlap={self.extraction_window_overlap}, "
+                f"window={self.extraction_window_messages})"
+            )
+        return self
 
     @field_validator("auth_provider")
     @classmethod

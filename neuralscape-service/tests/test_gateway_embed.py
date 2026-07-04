@@ -92,11 +92,15 @@ class TestEmbeddingBatchSize:
         emb = _embedder(embedding_batch_size=1)
         result = emb.embed_batch(TEXTS)
         assert result == [_vec(t) for t in TEXTS]
-        assert emb.client.embeddings.create.call_count == len(TEXTS)
-        for call, text in zip(
-            emb.client.embeddings.create.call_args_list, TEXTS, strict=True
-        ):
-            assert call.kwargs["input"] == [text]
+        assert len(emb.client.embeddings.create.call_args_list) == len(TEXTS)
+        # Per-item calls now run on a thread pool (audit 27 #20), so the CALL
+        # order is nondeterministic — but each call is single-input and the
+        # RESULT order (asserted above) is preserved.
+        sent = sorted(
+            call.kwargs["input"][0]
+            for call in emb.client.embeddings.create.call_args_list
+        )
+        assert sent == sorted(TEXTS)
 
     def test_batch_size_one_matches_batched_output(self):
         batched = _embedder().embed_batch(TEXTS)

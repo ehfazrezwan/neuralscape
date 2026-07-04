@@ -1809,10 +1809,20 @@ class TestContentHashDedup:
 
 
 class TestStoreRawBatch:
-    """Memory-model v2 — batch storage of pre-categorized facts."""
+    """Memory-model v2 — batch storage of pre-categorized facts.
+
+    Two-pass batch (audit 27 #20): items embed via ONE embed_batch call
+    (not per-item .embed), so these tests mock embed_batch.
+    """
+
+    @staticmethod
+    def _mock_batch_embed(service):
+        service._memory.embedding_model.embed_batch.side_effect = (
+            lambda texts, **kw: [[0.1] * 768 for _ in texts]
+        )
 
     def test_stores_each_item(self, service):
-        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        self._mock_batch_embed(service)
         service._memory.vector_store.client = MagicMock()
         service._memory.vector_store.client.scroll.return_value = ([], None)
 
@@ -1832,7 +1842,7 @@ class TestStoreRawBatch:
 
     def test_continues_on_per_item_error(self, service):
         """A bad item must not block the rest of the batch."""
-        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        self._mock_batch_embed(service)
         service._memory.vector_store.client = MagicMock()
         service._memory.vector_store.client.scroll.return_value = ([], None)
 
@@ -1848,7 +1858,7 @@ class TestStoreRawBatch:
 
     def test_handles_iso_string_expires_at(self, service):
         """expires_at can arrive as ISO string after JSON enqueue — should round-trip."""
-        service._memory.embedding_model.embed.return_value = [0.1] * 768
+        self._mock_batch_embed(service)
         service._memory.vector_store.client = MagicMock()
         service._memory.vector_store.client.scroll.return_value = ([], None)
 
