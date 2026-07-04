@@ -871,6 +871,19 @@ class RetagRequest(BaseModel):
         return self
 
 
+class GetMemoriesRequest(BaseModel):
+    """Batch-fetch full memory payloads by id (retrieval economics C1, layer 3).
+
+    Bounded to 50 ids per call. Visibility is enforced per id: the caller can
+    only read their own memories plus the shared (and, when enabled, standard)
+    pools — unreadable ids are reported in ``missing`` exactly like nonexistent
+    ones, so the endpoint can't be used as an existence oracle for other
+    users' private memories.
+    """
+    ids: list[str] = Field(min_length=1, max_length=50, description="Memory IDs to fetch (max 50)")
+    user_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+
+
 class BulkDeleteRequest(BaseModel):
     """Bulk delete memories with filters."""
     user_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
@@ -976,6 +989,17 @@ class SearchIndexResponse(BaseModel):
     status: str = "ok"
     index_only: bool = True
     results: list[IndexRow] = Field(default_factory=list)
+
+
+class GetMemoriesResponse(BaseModel):
+    """Batch-get response (C1 layer 3).
+
+    ``missing`` lists ids that don't exist *or* that the caller may not read —
+    deliberately indistinguishable (no existence oracle).
+    """
+    status: str = "ok"
+    results: list[MemoryResponse] = Field(default_factory=list)
+    missing: list[str] = Field(default_factory=list)
 
 
 class ContextResponse(BaseModel):

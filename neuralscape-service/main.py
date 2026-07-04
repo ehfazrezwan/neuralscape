@@ -42,6 +42,8 @@ from schemas import (
     CategoryListResponse,
     ConnectorConfigRequest,
     ContextResponse,
+    GetMemoriesRequest,
+    GetMemoriesResponse,
     GraphSearchRequest,
     IndexRow,
     IngestDocumentRequest,
@@ -1361,6 +1363,28 @@ async def v1_search_memories(
     except Exception as e:
         logger.exception("v1 search failed")
         raise HTTPException(status_code=500, detail="Memory search failed")
+
+
+@v1_router.post("/memories/batch-get", response_model=GetMemoriesResponse)
+async def v1_batch_get_memories(req: GetMemoriesRequest, request: Request):
+    """Batch-fetch full memory payloads by id (C1, layer 3 of the contract).
+
+    The intended workflow: search with `index_only=true`, filter the index
+    rows, then fetch only the chosen ids here (max 50 per call). Visibility
+    is enforced per id — ids the caller may not read come back in `missing`,
+    indistinguishable from nonexistent ones.
+    """
+    caller = _resolve_user_id(request, req.user_id)
+    try:
+        out = await asyncio.to_thread(_service.get_memories_by_ids, req.ids, caller)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("v1 batch-get failed")
+        raise HTTPException(status_code=500, detail="Failed to fetch memories") from e
+    return GetMemoriesResponse(results=out["results"], missing=out["missing"])
 
 
 @v1_router.post("/graph/search")

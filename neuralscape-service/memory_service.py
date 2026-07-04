@@ -315,6 +315,10 @@ from schemas import (
 
 logger = logging.getLogger(__name__)
 
+# Retrieval economics (C1) bound: max ids per batch-get call.
+# Shared by REST + MCP boundaries.
+GET_MEMORIES_MAX_IDS = 50
+
 # Structured audit trail for authoritative-context serving (standards +
 # processes). Rendered as JSON in prod via logging_config; a plain stdlib
 # logger is used so this has no hard dependency on structlog being configured.
@@ -2618,6 +2622,109 @@ class MemoryService:
         if root.get("missing"):
             return None
         return root
+
+    # ──────────────────────────────────────────────
+    # Retrieval economics (C1 batch get)
+    # ──────────────────────────────────────────────
+
+    @staticmethod
+    def _payload_readable_by(payload: dict, caller_user_id: str | None) -> bool:
+        """Whether ``caller_user_id`` may read a Qdrant point's payload.
+
+        Mirrors the pool rules of ``search()``: you can always read what you
+        own (top-level ``user_id`` namespace or ``metadata.owner_user_id``);
+        everyone reads ``shared``; everyone reads ``standard`` when the tier
+        is enabled. Legacy rows without a visibility field are de-facto
+        private to their writer.
+        """
+        if caller_user_id and payload.get("user_id") == caller_user_id:
+            return True
+        meta = payload.get("metadata") or {}
+        if isinstance(meta.get("metadata"), dict):
+            meta = meta["metadata"]
+        if caller_user_id and meta.get("owner_user_id") == caller_user_id:
+            return True
+        vis = meta.get("visibility")
+        if vis == MemoryVisibility.SHARED.value:
+            return True
+        if vis == MemoryVisibility.STANDARD.value and settings.standards_enabled:
+            return True
+        return False
+
+    def _point_to_response(self, point) -> MemoryResponse:
+        """Convert a raw Qdrant point (retrieve/scroll result) to a MemoryResponse."""
+        payload = getattr(point, "payload", None) or {}
+        return self._mem_to_response(
+            {
+                "id": str(getattr(point, "id", "")),
+                "memory": payload.get("data", ""),
+                "metadata": payload.get("metadata", {}) or {},
+                "created_at": payload.get("created_at"),
+                "updated_at": payload.get("updated_at"),
+            }
+        )
+
+    def get_memories_by_ids(
+        self, ids: list[str], caller_user_id: str | None
+    ) -> dict:
+        """Batch-fetch full memory payloads by id (C1, layer 3 of the contract).
+
+        One Qdrant ``retrieve`` round-trip for up to ``GET_MEMORIES_MAX_IDS``
+        ids. Per-id visibility is enforced with the same rules as search's
+        pools; ids the caller may not read are reported in ``missing``
+        exactly like nonexistent ids, so this can't be used as an existence
+        oracle for other users' private memories. Input order is preserved
+        in ``results`` (minus misses); duplicate ids are collapsed.
+
+        Returns ``{"results": [MemoryResponse...], "missing": [id...]}``.
+        Raises ValueError on an empty or oversized id list.
+        """
+        if not ids:
+            raise ValueError("ids must be a non-empty list")
+        if len(ids) > GET_MEMORIES_MAX_IDS:
+            raise ValueError(
+                f"At most {GET_MEMORIES_MAX_IDS} ids per call (got {len(ids)})"
+            )
+        ordered = list(dict.fromkeys(str(i) for i in ids))
+
+        # Qdrant point ids are UUIDs (or ints) — a malformed id would 400 the
+        # whole retrieve, so route those straight to `missing` instead.
+        valid: list[str] = []
+        malformed: list[str] = []
+        for mid in ordered:
+            try:
+                uuid.UUID(mid)
+                valid.append(mid)
+            except (ValueError, AttributeError, TypeError):
+                malformed.append(mid)
+
+        m = self._get_memory()
+        points = []
+        if valid:
+            points = m.vector_store.client.retrieve(
+                collection_name=settings.qdrant_collection,
+                ids=valid,
+                with_payload=True,
+                with_vectors=False,
+            )
+        by_id = {str(getattr(p, "id", "")): p for p in points or []}
+
+        results: list[MemoryResponse] = []
+        missing: list[str] = list(malformed)
+        for mid in ordered:
+            if mid in malformed:
+                continue
+            point = by_id.get(mid)
+            if point is None:
+                missing.append(mid)
+                continue
+            payload = getattr(point, "payload", None) or {}
+            if not self._payload_readable_by(payload, caller_user_id):
+                # Deliberately indistinguishable from not-found.
+                missing.append(mid)
+                continue
+            results.append(self._point_to_response(point))
+        return {"results": results, "missing": missing}
 
     def list_memories(
         self,

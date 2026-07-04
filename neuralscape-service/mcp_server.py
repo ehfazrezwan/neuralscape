@@ -138,6 +138,35 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="get_memories",
+            description=(
+                "Batch-fetch FULL memory payloads by id (layer 3 of the index-first workflow: "
+                "recall_memories(index_only=true) → filter the index → get_memories for the chosen ids). "
+                "Returns every stored field — content, category, tags, memory-model v2 fields, provenance "
+                "(derived_from, epistemic_level, source_ref), visibility, owner. Max 50 ids per call. "
+                "Ids that don't exist or that you may not read (another user's private memory) are "
+                "returned in 'missing'. NEVER fetch full details without filtering the index first — "
+                "each full payload costs 5-20x an index row."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": 50,
+                        "description": "Memory IDs to fetch (from index rows, timeline rows, or related_memory_ids)",
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "Caller user ID (optional under token auth)",
+                    },
+                },
+                "required": ["ids"],
+            },
+        ),
+        Tool(
             name="remember",
             description=(
                 "Store a single categorized fact about the user or project. Use this when you learn "
@@ -833,6 +862,22 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                     default=str, ensure_ascii=False))]
             output = [r.model_dump(exclude_none=True) for r in results]
             return [TextContent(type="text", text=json.dumps(output, default=str))]
+
+        elif name == "get_memories":
+            ids = arguments.get("ids")
+            if not isinstance(ids, list) or not ids or not all(isinstance(i, str) for i in ids):
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": "ids must be a non-empty list of memory-id strings"}))]
+            try:
+                out = await asyncio.to_thread(_service.get_memories_by_ids, ids, user_id)
+            except ValueError as e:
+                return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+            return [TextContent(type="text", text=json.dumps(
+                {
+                    "results": [r.model_dump(exclude_none=True) for r in out["results"]],
+                    "missing": out["missing"],
+                },
+                default=str))]
 
         elif name == "remember":
             # Determine scope from category
