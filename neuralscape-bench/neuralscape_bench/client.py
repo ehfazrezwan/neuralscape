@@ -72,10 +72,13 @@ class NeuralscapeClient:
         r.raise_for_status()
         return r.json()
 
-    async def extract_write(self, messages: list[dict], *, user_id: str, project_id: str | None = None) -> dict:
+    async def extract_write(self, messages: list[dict], *, user_id: str, project_id: str | None = None,
+                            run_id: str | None = None) -> dict:
         body: dict = {"messages": messages, "user_id": user_id}
         if project_id:
             body["project_id"] = project_id
+        if run_id:
+            body["run_id"] = run_id
         r = await self._http.post("/v1/memories", json=body)
         r.raise_for_status()
         return r.json()
@@ -116,6 +119,17 @@ class NeuralscapeClient:
         if project_id:
             body["project_id"] = project_id
         r = await self._http.post("/v1/graph/search", json=body)
+        r.raise_for_status()
+        return r.json()
+
+    async def ask(self, question: str, *, user_id: str, project_id: str | None = None,
+                  reasoning_level: str = "high") -> dict:
+        """POST /v1/ask — reasoning-tiered question answering (C3). Sync 200."""
+        body: dict = {"question": question, "user_id": user_id,
+                      "reasoning_level": reasoning_level}
+        if project_id:
+            body["project_id"] = project_id
+        r = await self._http.post("/v1/ask", json=body)
         r.raise_for_status()
         return r.json()
 
