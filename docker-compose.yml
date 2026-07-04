@@ -26,7 +26,7 @@ services:
       retries: 10
 
   redis:
-    image: redis:7-alpine
+    image: redis:7.4-alpine  # pinned: floating :7 crossed into RSALv2/SSPLv1 at 7.4 — see THIRD_PARTY_NOTICES.md; Valkey is the BSD fallback
     ports:
       - "6379:6379"
     volumes:
