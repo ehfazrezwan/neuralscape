@@ -114,8 +114,24 @@ Port MemPalace's ~100-line `dynamics.py` math onto the existing recall traces: s
 co-recall (capped), stability grows only on reinforcements ≥1h apart, exponential decay,
 **floor 0.05 — never zero**. Replaces the current single half-life knob as the input to
 promotion/prune scoring.
-*Tests:* pure-function unit suite (bounds, spacing effect, floor), plus a sweep E2E asserting a
-frequently-co-recalled pair resists pruning.
+
+*Recall-safety guardrails (contractual — the implementation MUST honor all three):*
+1. **Salience never gates retrieval.** It shapes consolidation and vault presentation only.
+   Any influence on search ranking is a bounded, logarithmic tie-breaker
+   (`score * (1 + k*log1p(strength_signal))`, `k` config-exposed, conservative default,
+   zero disables it) — relevance always dominates; a faded-but-relevant memory must beat a
+   hot-but-mediocre one.
+2. **Low strength only nominates for PRUNE — never executes it.** The existing gates stay:
+   the consolidation LLM must independently concur, destructive actions below the confidence
+   threshold go to shadow-report, and pruning applies a reversible tombstone — content is
+   never deleted outright.
+3. **No rich-get-richer runaway.** Strength increments saturate (hard cap), and the
+   query-diversity term keeps single-query hammering from compounding. No
+   retrieval-induced-inhibition: memories dim only from their own disuse, never because a
+   sibling was recalled.
+*Tests:* pure-function unit suite (bounds, spacing effect, floor), guardrail tests (faded
+memory still returned & ranked above weaker matches; k=0 is a no-op), plus a sweep E2E
+asserting a frequently-co-recalled pair resists pruning.
 
 **A5. Surprisal-targeted REM (lite).**
 Score staged memories for novelty (distance to pool centroid — cheap version of Honcho's cover
@@ -204,6 +220,57 @@ turned on, since that is the differentiator the benchmarks under-measure.
 **E6. (v2, design-first) Observer/observed perspective scoping** — directional memories keyed by
 (observer, observed). Unlocks multi-agent products; needs a spec pass before code.
 
+### Phase F — Code-graph knowledge adapter (Graphify)
+
+[Graphify](https://github.com/safishamsi/graphify) (MIT, ~77k ★) turns a folder of code, docs,
+schemas, and media into a queryable knowledge graph — tree-sitter AST parsing for 36 languages
+(offline, no LLM for code), community detection, an MCP server (`query_graph`, `get_node`,
+`get_neighbors`, `shortest_path`), and exports including `graph.json`, Cypher for Neo4j, and an
+Obsidian vault. Every edge carries a confidence tag: `EXTRACTED | INFERRED | AMBIGUOUS`.
+
+The maintainer decision: **coding-domain knowledge defers to Graphify for code *structure*;
+Neuralscape stores the knowledge *about* the code.** Concretely, two items:
+
+**F1. `graphify` ingest extractor + `code_graph` knowledge adapter.**
+A new adapter under `adapters/code_graph/` (the `trading_strategy` seam), plus an extractor in
+`ingest/extractors.py` that accepts Graphify output files (`graph.json`, `GRAPH_REPORT.md`).
+**Use Graphify as a library, don't rebuild it**: it ships on PyPI (`graphifyy`) — add it as an
+optional dependency (extra: `code-graph`) and call its Python API/CLI both to *produce* graphs
+(NS can trigger `graphify extract` on an ingested repo, headless) and to *read* them (its own
+loaders/query layer over `graph.json` instead of hand-rolled parsing). NS-side code is limited
+to the mapping layer: Graphify records → NS memories/ontology. Degrade gracefully when the
+extra isn't installed (extractor registers only if importable):
+- **Do NOT mirror the raw code graph into Graphiti** — it is huge, churns with every commit,
+  and Graphify already serves it better over MCP. Ingest the *stable semantic layer* only:
+  LLM-labeled communities (module purposes), god nodes, surprising cross-module connections,
+  extracted rationale/comment nodes (`# NOTE:` / `# HACK:` become memories), and the
+  GRAPH_REPORT insights — each stamped with a `source_ref` whose retrieval handle points at
+  **NS's own code-graph endpoint** (which resolves against `graph.json` via the library), so
+  agents re-fetch live structure without ever leaving the NS surface.
+- **Confidence-tag mapping onto A1's epistemic levels**: `EXTRACTED → explicit`,
+  `INFERRED → deductive` (with reduced confidence), `AMBIGUOUS → stored only above a
+  configurable floor, flagged for the dreaming sweep's contradiction pass`.
+- Adapter taxonomy/ontology: code-native categories (module, boundary, invariant, rationale,
+  hotspot) registered via `register_categories`; Graphiti ontology gets `Module`, `Symbol`
+  (sparingly — hubs only), `depends_on`-style relations for the ingested summary layer.
+
+**F2. Coding-domain deferral policy — behind the NS surface.**
+**The interaction interface is ALWAYS Neuralscape.** Graphify is an internal engine, never a
+parallel endpoint agents talk to: NS exposes code-structure tools on its *own* MCP/REST surface
+(`query_code_graph`, `get_code_neighbors`, `code_path` — thin delegations to the `graphifyy`
+library over the project's `graph.json`), so clients keep exactly one memory interface. Within
+that: when a project has a Graphify graph, NS treats it as the source of truth for code
+structure — recall/extraction demote purely-structural observations (they'd rot) in favor of
+decisions, gotchas, and rationale; code-structure questions route to the delegation tools; the
+dreaming librarian's project hub links out to Graphify's Obsidian/HTML exports rather than
+duplicating them. `sync`-style liveness: a dreaming sweep step flags memories whose
+`source_ref` points at Graphify nodes that no longer exist in the current `graph.json` (the
+code moved on) as INVALIDATE candidates.
+
+*Tests:* F1 unit (extractor parses fixture graph.json/report; epistemic mapping; node-liveness
+diff), E2E (ingest a small fixture repo's Graphify output → memories + source_refs resolve);
+F2 is mostly plugin/prompt policy — assert extraction skip-rules and hub link rendering.
+
 ---
 
 ## 5. Build order for the ship loop
@@ -219,12 +286,13 @@ pulls the vault work two slots earlier:
 | 3 | B1+B2 Home story + page skeleton | `feat/vault-essential-story` |
 | 4 | B3+B4 bridges, faded, identity card | `feat/vault-bridges-card` |
 | 5 | A4 salience dynamics + A3-lite settling guard | `feat/salience-dynamics` |
-| 6 | C1+C2 index recall + timeline | `feat/retrieval-economics` |
-| 7 | C3+C4 tiers + checkpoint | `feat/recall-tiers` |
-| 8 | D1+D2 plugin injection + summaries | `feat/plugin-disclosure` |
-| 9 | D3+D4 read gate + hygiene | `feat/plugin-read-gate` |
-| 10 | A5 + E1+E2 surprisal, stream, economics | `feat/observability` |
-| 11 | E3–E5 context assembler, custom instructions, benchmarks | `feat/platform-proof` |
+| 6 | F1 graphify extractor + code_graph adapter | `feat/code-graph-adapter` |
+| 7 | C1+C2 index recall + timeline | `feat/retrieval-economics` |
+| 8 | C3+C4 tiers + checkpoint | `feat/recall-tiers` |
+| 9 | D1+D2 plugin injection + summaries + F2 deferral policy | `feat/plugin-disclosure` |
+| 10 | D3+D4 read gate + hygiene | `feat/plugin-read-gate` |
+| 11 | A5 + E1+E2 surprisal, stream, economics | `feat/observability` |
+| 12 | E3–E5 context assembler, custom instructions, benchmarks | `feat/platform-proof` |
 
 Loop per item: worktree off `dev` → build → unit + isolated-compose E2E (one Neuralscape
 deployment at a time) → PR to `dev` → CodeRabbit/Copilot review → address → merge → next.
