@@ -123,7 +123,8 @@ promotion/prune scoring.
    hot-but-mediocre one.
 2. **Low strength only nominates for PRUNE — never executes it.** The existing gates stay:
    the consolidation LLM must independently concur, destructive actions below the confidence
-   threshold go to shadow-report, and pruning tombstones (reversible), never deletes.
+   threshold go to shadow-report, and pruning applies a reversible tombstone — content is
+   never deleted outright.
 3. **No rich-get-richer runaway.** Strength increments saturate (hard cap), and the
    query-diversity term keeps single-query hammering from compounding. No
    retrieval-induced-inhibition: memories dim only from their own disuse, never because a
@@ -225,7 +226,7 @@ turned on, since that is the differentiator the benchmarks under-measure.
 schemas, and media into a queryable knowledge graph — tree-sitter AST parsing for 36 languages
 (offline, no LLM for code), community detection, an MCP server (`query_graph`, `get_node`,
 `get_neighbors`, `shortest_path`), and exports including `graph.json`, Cypher for Neo4j, and an
-Obsidian vault. Every inferred edge carries a confidence tag: `EXTRACTED | INFERRED | AMBIGUOUS`.
+Obsidian vault. Every edge carries a confidence tag: `EXTRACTED | INFERRED | AMBIGUOUS`.
 
 The maintainer decision: **coding-domain knowledge defers to Graphify for code *structure*;
 Neuralscape stores the knowledge *about* the code.** Concretely, two items:
