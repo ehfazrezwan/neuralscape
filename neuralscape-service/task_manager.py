@@ -215,6 +215,36 @@ class TaskManager:
             return job_id
         return job.job_id
 
+    async def enqueue_ingest_okf_bundle(self, payload: dict) -> str:
+        """Enqueue a whole-bundle OKF ingest task. Returns job_id.
+
+        Same payload contract as ``enqueue_ingest_file`` (the artifact is
+        the bundle zip), but the worker walks it as ONE knowledge bundle.
+        The deterministic id is namespaced apart from the per-file task
+        (``ingest-okf:``) and keys on scope/project/visibility so the same
+        bundle imported into a different pool is a distinct job rather
+        than being coalesced onto (and dropped by) an earlier one.
+        """
+        partition = payload.get("user_id") or "ingest"
+        options = payload.get("options") or {}
+        content_key = (payload.get("source_ref") or {}).get("external_id") or payload.get(
+            "stored_path"
+        ) or payload.get("data_b64", "")
+        job_id = _generate_job_id(
+            f"ingest-okf:{options.get('visibility')}:{options.get('scope')}:"
+            f"{options.get('project_id')}:{payload.get('filename', '')}:{content_key}",
+            partition,
+        )
+        job = await self.pool.enqueue_job(
+            "process_ingest_okf_bundle",
+            payload,
+            _job_id=job_id,
+            _queue_name=settings.ingest_queue_name,
+        )
+        if job is None:
+            return job_id
+        return job.job_id
+
     async def enqueue_connector_sync(self, connector_id: str) -> str:
         """Enqueue a connector sync task. Returns job_id.
 
