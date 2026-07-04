@@ -29,6 +29,53 @@ def _rebuild_category_index(registry) -> None:
         logger.warning("Failed to rebuild category index (non-critical)", exc_info=True)
 
 
+async def _note_session_messages(
+    ctx: dict, user_id: str, session_id: str | None, messages: list[dict]
+) -> None:
+    """E3: buffer a conversation write's messages for its session and enqueue
+    summary-slot refreshes when the message count crosses a threshold.
+
+    Runs on the fast queue alongside the write that triggered it. The
+    refresh job id is deterministic per (session, slot, threshold bucket)
+    so a burst of writes crossing the same threshold coalesces onto one
+    job. Best-effort — session bookkeeping never fails a store.
+    """
+    if not session_id or not settings.session_summary_enabled:
+        return
+    import session_summarizer as ss
+
+    try:
+        count, due = await asyncio.to_thread(
+            ss.record_messages, user_id, session_id, messages
+        )
+        for slot in due:
+            bucket = count // ss.slot_interval(slot)
+            await ctx["redis"].enqueue_job(
+                "process_session_summary",
+                user_id,
+                session_id,
+                slot,
+                _job_id=f"sess-{ss._safe(user_id)}-{ss._safe(session_id)}-{slot}-{bucket}",
+            )
+    except Exception:  # noqa: BLE001 — summarization is best-effort
+        logger.warning("session summary trigger failed (non-fatal)", exc_info=True)
+
+
+async def process_session_summary(
+    ctx: dict, user_id: str, session_id: str, slot: str
+) -> dict:
+    """Background task (fast queue): refresh one session summary slot.
+
+    Recursive compression — prior slot text + only the messages since that
+    slot's last refresh. The slot is REPLACED in Redis (TTL'd); it is never
+    stored as a memory row (see session_summarizer.py for the decision).
+    """
+    from extensions.conversation_compiler.compile import _async_call_gemini
+    from session_summarizer import refresh_slot
+
+    return await refresh_slot(user_id, session_id, slot, llm_call=_async_call_gemini)
+
+
 async def process_memory_store(
     ctx: dict,
     messages: list[dict],
@@ -39,6 +86,9 @@ async def process_memory_store(
 ) -> dict:
     """Background task: LLM extraction + store each fact."""
     service: MemoryService = ctx["service"]
+    # E3: conversation writes feed the per-session summary slots (run_id is
+    # the session identifier on this path).
+    await _note_session_messages(ctx, user_id, run_id, messages)
     # Offload the synchronous, network-bound work (LLM extraction + embedding +
     # Qdrant insert) to a thread so it doesn't block the ARQ event loop and
     # serialize other concurrent jobs. (process_memory_raw_batch already does this.)
@@ -886,6 +936,13 @@ async def process_conversation_flush(
     writer: ObsidianWriter = ctx.get("compiler_writer") or ObsidianWriter()
     ctx.setdefault("compiler_writer", writer)
 
+    # E3: the flush path's session_id feeds the same summary slots as run_id
+    # does on the extraction path (one session concept, two entry points).
+    await _note_session_messages(ctx, user_id, session_id, [
+        {"role": "user", "content": user_message},
+        {"role": "assistant", "content": assistant_response},
+    ])
+
     result = await flush_conversation_turn(
         user_message=user_message,
         assistant_response=assistant_response,
@@ -1200,6 +1257,7 @@ class WorkerSettings:
         process_memory_retag,
         process_conversation_flush,
         process_conversation_compile,
+        process_session_summary,
     ]
     cron_jobs = [
         cron(

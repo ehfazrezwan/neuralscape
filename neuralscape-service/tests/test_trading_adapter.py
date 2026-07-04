@@ -154,7 +154,7 @@ class _RecordingService:
         self.calls: list[dict] = []
         self._facts = facts
 
-    def extract_facts_only(self, text, extractor=None):
+    def extract_facts_only(self, text, extractor=None, user_id=None, project_id=None):
         # The adapter must resolve the trading extractor.
         assert extractor.__class__.__name__ == "TradingStrategyExtractor"
         return self._facts

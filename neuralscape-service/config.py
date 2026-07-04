@@ -149,6 +149,34 @@ class Settings(BaseSettings):
     # fact's stored token count. Never blended into the measured headline.
     savings_rederivation_multiplier: float = 10.0
 
+    # ── Session summarizer slots + context assembler (roadmap E3) ─────
+    # Per-session rolling summaries, maintained on the FAST worker queue as
+    # conversation writes cross message-count thresholds. Two slots per
+    # session — `short` (refreshed every ~short_every messages, capped at
+    # short_max_tokens) and `long` (every ~long_every, long_max_tokens) —
+    # each REPLACED on refresh via recursive compression (new summary =
+    # prior summary + messages since). Slots + the raw message buffer live
+    # in Redis only (TTL'd), never as searchable memory rows — see
+    # session_summarizer.py for the rationale.
+    session_summary_enabled: bool = True
+    session_summary_short_every: int = 20
+    session_summary_long_every: int = 60
+    session_summary_short_max_tokens: int = 1000
+    session_summary_long_max_tokens: int = 4000
+    # Rolling per-session message buffer: keep at most this many recent
+    # messages (LTRIM), and expire all per-session keys after this many days.
+    session_buffer_max_messages: int = 400
+    session_ttl_days: int = 30
+
+    # ── Custom extraction instructions (roadmap E4) ───────────────────
+    # Operator-supplied guidance appended to the extraction prompt as a
+    # clearly-delimited addendum ("OPERATOR GUIDANCE"). Per-user (self-set)
+    # and per-project (dictator-only — mirrors the standards write gate).
+    # Token-budget enforced at save time; the JSON output contract is
+    # never overridable (see prompts.append_operator_guidance).
+    extraction_instructions_enabled: bool = True
+    extraction_instructions_max_tokens: int = 2000
+
     # ── Data-layer connectors ─────────────────────────────────────────
     # When enabled, the service hosts connectors (Notion/Drive/MCP/REST),
     # stores their credentials encrypted in the vault, and runs a periodic

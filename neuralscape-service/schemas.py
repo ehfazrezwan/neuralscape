@@ -1149,6 +1149,88 @@ class ContextResponse(BaseModel):
     has_more: bool = False
 
 
+ASSEMBLE_FORMATS: tuple[str, ...] = ("plain", "anthropic", "openai")
+
+
+class AssembleContextRequest(BaseModel):
+    """Token-budgeted prompt-ready context bundle (roadmap E3).
+
+    ``budget_tokens`` bounds the WHOLE served bundle. Sections: recent
+    session messages (~60% of the working budget), the session's rolling
+    summary slot (~40%), the identity card, and — when ``query`` is given —
+    compact relevant-memory index rows. ``session_id`` is the conversation
+    identifier the write path carries (``run_id`` on POST /v1/memories,
+    ``session_id`` on the conversation-flush path). Sync read; REST only.
+    """
+    budget_tokens: int = Field(ge=100, le=1_000_000)
+    user_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+    session_id: str | None = Field(default=None, max_length=100)
+    project_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+    query: str | None = Field(default=None, max_length=2000)
+    format: str = Field(
+        default="plain",
+        description="Provider formatter: plain | anthropic | openai",
+    )
+
+    @field_validator("format")
+    @classmethod
+    def _validate_format(cls, v: str) -> str:
+        if v not in ASSEMBLE_FORMATS:
+            raise ValueError(
+                f"Invalid format '{v}'. Must be one of: {list(ASSEMBLE_FORMATS)}"
+            )
+        return v
+
+
+class AssembleContextResponse(BaseModel):
+    """The assembled bundle + per-section token accounting (E3).
+
+    ``bundle`` shape depends on ``format``: ``{"text": ...}`` for plain,
+    ``{"system", "messages"}`` for anthropic, ``{"messages"}`` for openai.
+    ``used_tokens`` ≤ ``budget_tokens`` always. ``savings`` /
+    ``savings_detail`` carry the measured E2 ledger entry (baseline = full
+    transcript + full query-hit content; served = the bundle) — None when
+    the meter is off.
+    """
+    status: str = "ok"
+    user_id: str
+    session_id: str | None = None
+    format: str = "plain"
+    budget_tokens: int
+    used_tokens: int
+    sections: dict = Field(default_factory=dict)
+    bundle: dict = Field(default_factory=dict)
+    savings: str | None = None
+    savings_detail: SavingsDetail | None = None
+
+
+class ExtractionInstructionsRequest(BaseModel):
+    """Set (or clear) custom extraction instructions (roadmap E4).
+
+    Without ``project_id`` this targets the caller's own per-user guidance;
+    with ``project_id`` it targets the project-wide guidance (dictator-only,
+    mirroring the standards write gate). Empty/whitespace ``instructions``
+    clears the setting. The token budget
+    (``EXTRACTION_INSTRUCTIONS_MAX_TOKENS``, default 2,000) is enforced at
+    save time.
+    """
+    instructions: str = Field(max_length=20_000)
+    user_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+    project_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+
+
+class ExtractionInstructionsResponse(BaseModel):
+    """One scope's stored extraction instructions (E4). ``instructions`` is
+    None when unset/cleared."""
+    status: str = "ok"
+    scope: str  # "user" | "project"
+    target_id: str
+    instructions: str | None = None
+    tokens: int = 0
+    updated_at: str | None = None
+    updated_by: str | None = None
+
+
 class AskMemoryResponse(BaseModel):
     """Synthesized answer over the caller's memories (C3).
 

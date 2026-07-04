@@ -40,7 +40,7 @@ class FakeService:
             return responses, True
         return responses
 
-    def extract_facts_only(self, text, extractor=None):
+    def extract_facts_only(self, text, extractor=None, user_id=None, project_id=None):
         return list(self._facts)
 
 
