@@ -248,7 +248,7 @@ class TestEvidenceBudget:
     def _timestamped_rows(self, n: int):
         """n rows with strictly ascending timestamps (id order = age order)."""
         return [
-            _mem(f"mem-{i:03d}", f"fact number {i}",
+            _mem(f"mem-{i:03d}", f"fact number {i:03d} stands alone",
                  f"2026-01-01T{i // 60:02d}:{i % 60:02d}:00+00:00")
             for i in range(n)
         ]
@@ -360,6 +360,61 @@ class TestEvidenceClip:
         body = rendered.split(") ", 1)[1]
         clipped = body[: -len(" …")]
         assert clipped.endswith("word")  # cut on a whole word
+
+
+# ──────────────────────────────────────────────
+# Cross-source dedup (audit 27 #17): a Graphiti edge and its Qdrant twin
+# arriving in different passes collapse to ONE evidence row (vector wins)
+# ──────────────────────────────────────────────
+
+
+class TestCrossSourceDedup:
+    @pytest.mark.asyncio
+    async def test_graph_then_vector_twin_collapses_to_vector_row(self):
+        """Graph edge lands first, its vector twin in a later pass — the
+        vector row (richer metadata) replaces the graph one."""
+        graph_row = _graph_mem("graph-uuid-1", "alice moved to berlin")
+        vector_row = _mem("vector-id-1", "Alice moved to Berlin.")
+        svc = _service()
+        svc.search.side_effect = [
+            [graph_row],   # initial semantic pass
+            [vector_row],  # update-language pass
+        ]
+        llm = _answer_llm("Berlin [vector-id-1]", ["vector-id-1"])
+        out = await ask_memory(svc, question="Where does Alice live now?",
+                               user_id="u", reasoning_level="low", llm_call=llm)
+        assert out["memories_considered"] == 1
+        assert "[vector-id-1]" in llm.prompts[0]
+        assert "[graph-uuid-1]" not in llm.prompts[0]
+        assert out["citations"] == ["vector-id-1"]
+
+    @pytest.mark.asyncio
+    async def test_vector_then_graph_twin_drops_the_graph_row(self):
+        vector_row = _mem("vector-id-1", "Alice moved to Berlin.")
+        graph_row = _graph_mem("graph-uuid-1", "alice moved to berlin")
+        svc = _service()
+        svc.search.side_effect = [
+            [vector_row],
+            [graph_row],
+        ]
+        llm = _answer_llm("Berlin [vector-id-1]", ["vector-id-1"])
+        out = await ask_memory(svc, question="Where does Alice live now?",
+                               user_id="u", reasoning_level="low", llm_call=llm)
+        assert out["memories_considered"] == 1
+        assert "[vector-id-1]" in llm.prompts[0]
+        assert "[graph-uuid-1]" not in llm.prompts[0]
+
+    @pytest.mark.asyncio
+    async def test_distinct_rows_are_not_collapsed(self):
+        svc = _service()
+        svc.search.side_effect = [
+            [_mem("m1", "Alice moved to Berlin.")],
+            [_mem("m2", "Bob works at the bakery.")],
+        ]
+        llm = _answer_llm("ans", ["m1", "m2"])
+        out = await ask_memory(svc, question="Where does Alice live now?",
+                               user_id="u", reasoning_level="low", llm_call=llm)
+        assert out["memories_considered"] == 2
 
 
 # ──────────────────────────────────────────────

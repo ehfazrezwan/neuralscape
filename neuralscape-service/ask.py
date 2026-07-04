@@ -361,14 +361,43 @@ async def ask_memory(
             f"Must be one of: {list(REASONING_TIERS)}"
         )
 
+    # Cross-source dedup (audit 27 #17): a Graphiti edge and its Qdrant twin
+    # arriving in DIFFERENT passes dodge search's per-pass dedup and would
+    # occupy two evidence rows. Reuse the service layer's content-match rule
+    # so both dedup passes agree on what "the same fact" means.
+    from memory_service import MemoryService
+
     searches: list[str] = []
     evidence: dict[str, object] = {}
+    content_index: dict[str, str] = {}  # normalized content -> evidence id
     keyword_ids: list[str] = []
 
     def _merge(results) -> None:
         for r in results or []:
-            if getattr(r, "id", None) and getattr(r, "memory", None):
-                evidence.setdefault(r.id, r)
+            if not (getattr(r, "id", None) and getattr(r, "memory", None)):
+                continue
+            if r.id in evidence:
+                continue
+            normalized = MemoryService.normalize_memory_content(r.memory)
+            twin_norm = MemoryService.find_duplicate_content(
+                normalized, content_index
+            )
+            if twin_norm is None:
+                evidence[r.id] = r
+                content_index[normalized] = r.id
+                continue
+            # Content twin: prefer the vector row (richer metadata) over
+            # its graph counterpart; otherwise keep the incumbent.
+            twin_id = content_index[twin_norm]
+            incumbent = evidence[twin_id]
+            if (
+                getattr(r, "source", None) == "vector"
+                and getattr(incumbent, "source", None) != "vector"
+            ):
+                del evidence[twin_id]
+                del content_index[twin_norm]
+                evidence[r.id] = r
+                content_index[normalized] = r.id
 
     async def _semantic(query: str) -> None:
         searches.append(query)

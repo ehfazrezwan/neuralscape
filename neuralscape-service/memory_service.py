@@ -4892,6 +4892,25 @@ class MemoryService:
         memories = self._extract_memory_list(results)
         return [self._mem_to_response(mem) for mem in memories]
 
+    @staticmethod
+    def normalize_memory_content(text: str) -> str:
+        """Normalize memory content for cross-source duplicate detection."""
+        return (text or "").strip().lower()
+
+    @staticmethod
+    def find_duplicate_content(normalized: str, candidates) -> str | None:
+        """Return the first candidate that content-matches ``normalized``.
+
+        A match is exact equality or a substring in either direction — the
+        same rule ``_deduplicate_responses`` uses to collapse a Graphiti
+        edge against its Qdrant twin. Shared with the ask path (audit 27
+        #17) so both dedup passes agree on what "the same fact" means.
+        """
+        for other in candidates:
+            if normalized == other or normalized in other or other in normalized:
+                return other
+        return None
+
     def _deduplicate_responses(
         self,
         vector_responses: list[MemoryResponse],
@@ -4919,17 +4938,12 @@ class MemoryService:
 
         # Index vector content for fuzzy matching
         for vr in vector_responses:
-            seen_content.add(vr.memory.strip().lower())
+            seen_content.add(self.normalize_memory_content(vr.memory))
 
         for gr in graph_responses:
-            normalized = gr.memory.strip().lower()
+            normalized = self.normalize_memory_content(gr.memory)
             # Skip if exact or substring match with any vector result
-            is_duplicate = False
-            for vc in seen_content:
-                if normalized == vc or normalized in vc or vc in normalized:
-                    is_duplicate = True
-                    break
-            if not is_duplicate:
+            if self.find_duplicate_content(normalized, seen_content) is None:
                 unique_graph.append(gr)
                 seen_content.add(normalized)
 
