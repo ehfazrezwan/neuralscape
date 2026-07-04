@@ -700,3 +700,13 @@ neuralscape/
 
 - **`mem0/memory/graphiti_memory.py` is net-new NS code** — it has never existed in mem0's upstream history. It is the adapter we wrote to present Graphiti as a mem0 graph provider, not a patched upstream file.
 - **mem0 deleted its entire self-hostable OSS graph layer upstream** (PR #4805 / `a488e190`, 2026-04-14, the "v3 pipeline"): `mem0/graphs/` plus `graph_memory.py` / `memgraph_memory.py` etc. were removed and graph memory became a hosted-Platform-only feature. We restore and maintain that layer (Neo4j/Memgraph/Neptune/Kuzu providers + a `GraphStoreFactory`) ourselves, and our `Memory` re-attach shim in `memory_service.py` bolts it onto a mem0 core that no longer has a `.graph` concept. Every upstream sync re-grafts this layer — see `docs/neuralscape/14-upstream-delta-report.md` for the full risk surface.
+
+## License
+
+Neuralscape is licensed under the [Elastic License 2.0](./LICENSE) — free to
+use, modify, and self-host. The headline limitation is that you may not offer
+Neuralscape itself to third parties as a hosted or managed service; ELv2 also
+requires preserving license/copyright notices and forbids circumventing any
+license-key functionality — see [LICENSE](./LICENSE) for the full terms. The
+vendored `mem0/` and `graphiti/` subtrees remain Apache-2.0 (see
+[THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md)).
