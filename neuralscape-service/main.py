@@ -35,27 +35,40 @@ from memory_service import MemoryService
 # Configure structured logging before anything else
 configure_logging()
 from context_formatter import format_context_for_injection
+from index_format import index_row
 from schemas import (
     MEMORY_CATEGORIES,
+    AskMemoryRequest,
+    AskMemoryResponse,
     BulkDeleteRequest,
     CategoryListResponse,
+    CheckpointRequest,
+    CheckpointResponse,
+    CheckpointVerdict,
     ConnectorConfigRequest,
     ContextResponse,
+    GetMemoriesRequest,
+    GetMemoriesResponse,
     GraphSearchRequest,
+    IndexRow,
     IngestDocumentRequest,
     IngestTextRequest,
     MemoryResponse,
     MemoryVisibility,
+    QueueStatusResponse,
     RawMemoryBatchRequest,
     PatchMemoryRequest,
     RawMemoryRequest,
     RetagRequest,
+    SearchIndexResponse,
     SearchMemoryRequest,
     SearchMemoryResponse,
     StoreMemoryRequest,
     StoreMemoryResponse,
     TaskAcceptedResponse,
     TaskStatusResponse,
+    TimelineRequest,
+    TimelineResponse,
     normalize_visibility,
 )
 from task_manager import TaskManager
@@ -1172,6 +1185,116 @@ async def v1_get_exemplar_image(
     return Response(content=data, media_type=media)
 
 
+# ── Code-graph delegation (Graphify behind the NS surface) ──────────
+# Roadmap F2 hard rule: the interaction interface is ALWAYS Neuralscape.
+# These routes are thin delegations to the graphifyy library over a
+# graph.json — the REST twins of the query_code_graph / get_code_neighbors /
+# code_path MCP tools, and the resolution target of every code-graph
+# memory's source_ref url. Graphs resolve by owner-scoped artifact graph_id
+# (an ingested bundle) or the deployment-configured default path only —
+# never an arbitrary caller-supplied filesystem path.
+
+
+def _code_graph_or_501():
+    """Return the code-graph query module or raise 501 when the extra is absent."""
+    from adapters.code_graph import _MISSING_EXTRA_MSG, code_graph_available
+
+    if not code_graph_available():
+        raise HTTPException(status_code=501, detail=_MISSING_EXTRA_MSG)
+    from adapters.code_graph import query as cg_query
+
+    return cg_query
+
+
+def _map_code_graph_error(e: Exception) -> HTTPException:
+    from adapters.code_graph.query import CodeGraphNotConfigured
+
+    if isinstance(e, CodeGraphNotConfigured):
+        return HTTPException(status_code=400, detail=str(e))
+    return HTTPException(status_code=404, detail=str(e))
+
+
+@v1_router.get("/code-graph/query")
+async def v1_code_graph_query(
+    request: Request,
+    question: str = Query(..., min_length=1, max_length=2000),
+    mode: str = Query("bfs", pattern="^(bfs|dfs)$"),
+    depth: int = Query(3, ge=1, le=6),
+    token_budget: int = Query(2000, ge=100, le=20000),
+    graph_id: str | None = Query(None, description="Artifact id of an ingested graph.json bundle (owner-scoped); omit for the configured default graph"),
+    user_id: str | None = Query(None),
+):
+    """Search the code graph (BFS/DFS from scored seeds) — Graphify's query, NS's surface."""
+    cg = _code_graph_or_501()
+    caller = _resolve_user_id(request, user_id)
+    try:
+        text = await asyncio.to_thread(
+            cg.query_code_graph,
+            question,
+            user_id=caller,
+            settings=settings,
+            graph_id=graph_id,
+            mode=mode,
+            depth=depth,
+            token_budget=token_budget,
+        )
+    except cg.CodeGraphError as e:
+        raise _map_code_graph_error(e) from e
+    return {"result": text, "graph_id": graph_id}
+
+
+@v1_router.get("/code-graph/neighbors")
+async def v1_code_graph_neighbors(
+    request: Request,
+    label: str = Query(..., min_length=1, max_length=500),
+    relation_filter: str = Query("", max_length=100),
+    graph_id: str | None = Query(None),
+    user_id: str | None = Query(None),
+):
+    """Direct in/out neighbors of one code-graph node, with relation + confidence tags."""
+    cg = _code_graph_or_501()
+    caller = _resolve_user_id(request, user_id)
+    try:
+        text = await asyncio.to_thread(
+            cg.get_code_neighbors,
+            label,
+            user_id=caller,
+            settings=settings,
+            graph_id=graph_id,
+            relation_filter=relation_filter,
+        )
+    except cg.CodeGraphError as e:
+        raise _map_code_graph_error(e) from e
+    return {"result": text, "graph_id": graph_id}
+
+
+@v1_router.get("/code-graph/path")
+async def v1_code_graph_path(
+    request: Request,
+    source: str = Query(..., min_length=1, max_length=500),
+    target: str = Query(..., min_length=1, max_length=500),
+    max_hops: int = Query(8, ge=1, le=32),
+    graph_id: str | None = Query(None),
+    user_id: str | None = Query(None),
+):
+    """Shortest connection path between two code-graph symbols (how does A reach B?)."""
+    cg = _code_graph_or_501()
+    caller = _resolve_user_id(request, user_id)
+    try:
+        text = await asyncio.to_thread(
+            cg.code_path,
+            source,
+            target,
+            user_id=caller,
+            settings=settings,
+            graph_id=graph_id,
+            max_hops=max_hops,
+        )
+    except cg.CodeGraphError as e:
+        raise _map_code_graph_error(e) from e
+    return {"result": text, "graph_id": graph_id}
+
+
 # ── Connectors (data-layer sources) ──────────────
 
 
@@ -1340,7 +1463,11 @@ async def v1_get_task_status(task_id: str):
 # ── Recall ────────────────────────────────────
 
 
-@v1_router.post("/search", response_model=SearchMemoryResponse)
+# Union response model: Pydantic v2 smart-union validates the returned model
+# instance against its exact member type (a SearchMemoryResponse can never be
+# coerced into SearchIndexResponse or vice versa — IndexRow requires `title`,
+# full results carry `memory`), so both modes stay first-class in OpenAPI.
+@v1_router.post("/search", response_model=SearchMemoryResponse | SearchIndexResponse)
 async def v1_search_memories(req: SearchMemoryRequest, request: Request):
     """Semantic search with scope/category filters.
 
@@ -1351,6 +1478,11 @@ async def v1_search_memories(req: SearchMemoryRequest, request: Request):
     shared pool. Pass `visibility="private"` to restrict to personal only,
     `visibility="shared"` to restrict to the team pool, or
     `include_shared=False` to skip the shared pool entirely.
+
+    Retrieval economics (C1): pass `index_only=true` to get compact index
+    rows ({id, title, category, glyph, age, tokens, score}) instead of full
+    payloads — filter the index, then batch-fetch via
+    POST /v1/memories/batch-get.
     """
     user_id = _resolve_user_id(request, req.user_id)
     try:
@@ -1369,12 +1501,197 @@ async def v1_search_memories(req: SearchMemoryRequest, request: Request):
             visibility=req.visibility.value if req.visibility else None,
             include_shared=req.include_shared,
         )
+        if req.index_only:
+            return SearchIndexResponse(
+                results=[IndexRow(**index_row(r)) for r in results]
+            )
         return SearchMemoryResponse(results=results)
     except HTTPException:
         raise
     except Exception as e:
         logger.exception("v1 search failed")
         raise HTTPException(status_code=500, detail="Memory search failed")
+
+
+@v1_router.post("/memories/batch-get", response_model=GetMemoriesResponse)
+async def v1_batch_get_memories(req: GetMemoriesRequest, request: Request):
+    """Batch-fetch full memory payloads by id (C1, layer 3 of the contract).
+
+    The intended workflow: search with `index_only=true`, filter the index
+    rows, then fetch only the chosen ids here (max 50 per call). Visibility
+    is enforced per id — ids the caller may not read come back in `missing`,
+    indistinguishable from nonexistent ones.
+    """
+    caller = _resolve_user_id(request, req.user_id)
+    try:
+        out = await asyncio.to_thread(_service.get_memories_by_ids, req.ids, caller)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("v1 batch-get failed")
+        raise HTTPException(status_code=500, detail="Failed to fetch memories") from e
+    return GetMemoriesResponse(results=out["results"], missing=out["missing"])
+
+
+@v1_router.post("/timeline", response_model=TimelineResponse)
+async def v1_timeline(req: TimelineRequest, request: Request):
+    """Chronological window around an anchor memory (C2).
+
+    `anchor` is a memory id (UUID) or a search query (resolved to its best
+    vector hit). Returns ±`depth` caller-visible memories around the anchor
+    in created_at order as compact index rows, the anchor row marked with
+    `anchor: true`. Answers "what was happening around X?" — dream insights
+    and session-context memories interleave naturally. 404 when the anchor
+    can't be resolved (unknown id, unreadable id, or no search hit).
+    """
+    caller = _resolve_user_id(request, req.user_id)
+    try:
+        out = await asyncio.to_thread(
+            _service.timeline,
+            anchor=req.anchor,
+            user_id=caller,
+            depth=req.depth,
+            project_id=req.project_id,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("v1 timeline failed")
+        raise HTTPException(status_code=500, detail="Timeline failed") from e
+    if out is None:
+        raise HTTPException(
+            status_code=404, detail=f"Timeline anchor {req.anchor!r} could not be resolved"
+        )
+    anchor_id = out["anchor_id"]
+    rows = [
+        IndexRow(**index_row(m, anchor=(m.id == anchor_id)))
+        for m in out["memories"]
+    ]
+    return TimelineResponse(anchor_id=anchor_id, results=rows)
+
+
+# ── Ask (C3: reasoning-tiered question answering) ──
+
+
+@v1_router.post("/ask", response_model=AskMemoryResponse)
+async def v1_ask_memory(req: AskMemoryRequest, request: Request):
+    """Answer a question from the caller's memories (C3).
+
+    ``reasoning_level`` (minimal | low | medium | high) jointly selects
+    retrieval breadth, the answering LLM's follow-up-search budget,
+    thinking depth, and the output cap. Dialectic disciplines: grep-first
+    for enumeration questions, forced update-language passes, surface-both
+    on contradictions (preferring the newer fact), and strict abstention —
+    "I don't know" comes back as ``abstained: true``, never a fabrication.
+    Citations only ever contain retrieved memory ids. Sync per NS
+    convention (reads return 200 directly); each LLM call is capped by the
+    tier's ``ASK_TIMEOUT_*_S``.
+    """
+    from ask import AskUnavailable, ask_memory
+
+    user_id = _resolve_user_id(request, req.user_id)
+    try:
+        out = await ask_memory(
+            _service,
+            question=req.question,
+            user_id=user_id,
+            reasoning_level=req.reasoning_level,
+            project_id=req.project_id,
+        )
+    except AskUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("v1 ask failed")
+        raise HTTPException(status_code=500, detail="Ask failed") from e
+    return AskMemoryResponse(**out)
+
+
+# ── Checkpoint + queue visibility (C4) ──
+
+
+@v1_router.post("/checkpoint", status_code=202, response_model=CheckpointResponse)
+async def v1_checkpoint(req: CheckpointRequest, request: Request):
+    """Batch-save up to 25 memories + an optional session note in one call (C4).
+
+    Per-item content-hash dedup runs synchronously BEFORE enqueue (the
+    verdicts come back immediately); non-duplicates are dispatched as ONE
+    background batch job — 202 + a single task id, never blocking on
+    extraction. When every item is a duplicate and there's no session
+    note, returns 200 with ``task_id: null`` (nothing to enqueue). Falls
+    back to synchronous storage if Redis is unavailable.
+    """
+    import checkpoint as checkpoint_mod
+
+    user_id = _resolve_user_id(request, req.user_id)
+    try:
+        prepared = await asyncio.to_thread(
+            checkpoint_mod.prepare_checkpoint, _service, req, user_id
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+
+    verdicts = [CheckpointVerdict(**v) for v in prepared["verdicts"]]
+    common = {
+        "verdicts": verdicts,
+        "duplicates": prepared["duplicates"],
+        "session_note_included": prepared["session_note_included"],
+        "enqueued": len(prepared["to_enqueue"]),
+    }
+    if not prepared["to_enqueue"]:
+        return JSONResponse(
+            status_code=200,
+            content=CheckpointResponse(
+                status="ok", task_id=None, poll_url=None, **common
+            ).model_dump(exclude_none=True),
+        )
+
+    try:
+        task_id = await _task_manager.enqueue_raw_batch(items=prepared["to_enqueue"])
+    except (ConnectionError, OSError) as e:
+        logger.warning(f"Redis unavailable, falling back to sync checkpoint store: {e}")
+        await asyncio.to_thread(_service.store_raw_batch, prepared["to_enqueue"])
+        return JSONResponse(
+            status_code=200,
+            content=CheckpointResponse(
+                status="completed", task_id=None, poll_url=None, **common
+            ).model_dump(exclude_none=True),
+        )
+
+    return CheckpointResponse(
+        task_id=task_id,
+        poll_url=f"/v1/memories/status/{task_id}",
+        **common,
+    )
+
+
+@v1_router.get("/queue/status", response_model=QueueStatusResponse)
+async def v1_queue_status(request: Request, user_id: str | None = Query(default=None)):
+    """Aggregate queue view for the caller (C4 queue visibility).
+
+    Counts the caller's recently-enqueued tasks by live ARQ status
+    (queued/processing/completed/failed, plus expired-out-of-Redis),
+    reports instance-wide pending depth per queue, and a ``caught_up``
+    boolean — one poll for "is my work done?" instead of one per task.
+    """
+    caller = _resolve_user_id(request, user_id)
+    try:
+        out = await _task_manager.get_queue_status(caller)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("v1 queue status failed")
+        raise HTTPException(status_code=500, detail="Queue status failed") from e
+    return QueueStatusResponse(**out)
 
 
 @v1_router.post("/graph/search")

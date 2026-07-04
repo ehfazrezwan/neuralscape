@@ -256,6 +256,9 @@ CONNECTOR_TYPE_VOCAB: set[str] = {
     "manual",
     "file_upload",
     "okf_bundle",
+    # Graphify code-graph bundles (graph.json + GRAPH_REPORT.md); memories
+    # resolve back through NS's /v1/code-graph/* surface (Phase F1).
+    "code_graph",
 }
 
 
@@ -678,6 +681,17 @@ class SearchMemoryRequest(BaseModel):
         description="When false, exclude shared-pool memories entirely (search personal only).",
     )
 
+    # Retrieval economics (C1): index-first recall
+    index_only: bool = Field(
+        default=False,
+        description=(
+            "When true, return compact index rows ({id, title, category, glyph, "
+            "age, tokens, score}) instead of full memory payloads — ~50-100 "
+            "tokens per hit. Filter the index, then batch-fetch the chosen ids "
+            "via POST /v1/memories/batch-get."
+        ),
+    )
+
     @field_validator("domain")
     @classmethod
     def _validate_domain(cls, v: str | None) -> str | None:
@@ -864,6 +878,105 @@ class RetagRequest(BaseModel):
         return self
 
 
+class GetMemoriesRequest(BaseModel):
+    """Batch-fetch full memory payloads by id (retrieval economics C1, layer 3).
+
+    Bounded to 50 ids per call. Visibility is enforced per id: the caller can
+    only read their own memories plus the shared (and, when enabled, standard)
+    pools — unreadable ids are reported in ``missing`` exactly like nonexistent
+    ones, so the endpoint can't be used as an existence oracle for other
+    users' private memories.
+    """
+    ids: list[str] = Field(min_length=1, max_length=50, description="Memory IDs to fetch (max 50)")
+    user_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+
+
+class TimelineRequest(BaseModel):
+    """Chronological window around an anchor memory (retrieval economics C2).
+
+    ``anchor`` is either a memory id (UUID) or a natural-language query — a
+    query resolves to its best vector search hit. The response is ±``depth``
+    memories around the anchor in created_at order, each rendered as a compact
+    index row, with the anchor row marked.
+    """
+    anchor: str = Field(min_length=1, max_length=2000, description="Memory ID (UUID) or search query")
+    depth: int = Field(default=10, ge=1, le=50, description="Memories to include on each side of the anchor")
+    project_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+    user_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+
+
+REASONING_LEVELS: tuple[str, ...] = ("minimal", "low", "medium", "high")
+
+
+class AskMemoryRequest(BaseModel):
+    """Question-answering pass over the caller's memories (roadmap C3).
+
+    ``reasoning_level`` jointly selects retrieval breadth, the answering
+    LLM's follow-up-search budget (iteration cap), thinking depth, and the
+    output cap — see ``ask.REASONING_TIERS``. Reads are sync per NS
+    convention: the endpoint returns the synthesized answer directly.
+    """
+    question: str = Field(min_length=1, max_length=2000)
+    user_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+    project_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+    reasoning_level: str = Field(
+        default="low",
+        description="minimal | low | medium | high — jointly selects retrieval breadth, tool budget, thinking depth, and output cap",
+    )
+
+    @field_validator("reasoning_level")
+    @classmethod
+    def _validate_reasoning_level(cls, v: str) -> str:
+        if v not in REASONING_LEVELS:
+            raise ValueError(
+                f"Invalid reasoning_level '{v}'. Must be one of: {list(REASONING_LEVELS)}"
+            )
+        return v
+
+
+class SessionNote(BaseModel):
+    """Structured end-of-session note saved alongside a checkpoint (C4).
+
+    Stored as a single ``task_context`` memory with
+    ``observation_type="meeting_outcome"`` so the next session's context
+    injection surfaces it. At least one field must be non-empty.
+    """
+    request: str | None = Field(default=None, max_length=4000, description="What the user asked for this session")
+    learned: str | None = Field(default=None, max_length=4000, description="What was learned/discovered")
+    completed: str | None = Field(default=None, max_length=4000, description="What got done")
+    next_steps: str | None = Field(default=None, max_length=4000, description="What should happen next")
+
+    @model_validator(mode="after")
+    def _at_least_one(self) -> "SessionNote":
+        if not any(
+            (getattr(self, f) or "").strip()
+            for f in ("request", "learned", "completed", "next_steps")
+        ):
+            raise ValueError("session_note must set at least one of request/learned/completed/next_steps")
+        return self
+
+
+class CheckpointRequest(BaseModel):
+    """Batch save: up to 25 memories + an optional session note in ONE call (C4).
+
+    Per-item content-hash dedup runs BEFORE enqueue (verdicts come back in
+    the 202 response); non-duplicates are dispatched as a single background
+    batch job — one task id, one tool card in MCP hosts, never blocks on
+    extraction.
+    """
+    memories: list[RawMemoryRequest] = Field(default_factory=list, max_length=25)
+    session_note: SessionNote | None = None
+    user_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+    # Default project for the session note (items carry their own project_id).
+    project_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+
+    @model_validator(mode="after")
+    def _not_empty(self) -> "CheckpointRequest":
+        if not self.memories and self.session_note is None:
+            raise ValueError("checkpoint requires at least one memory or a session_note")
+        return self
+
+
 class BulkDeleteRequest(BaseModel):
     """Bulk delete memories with filters."""
     user_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
@@ -929,6 +1042,11 @@ class MemoryResponse(BaseModel):
     visibility: str | None = None
     owner_user_id: str | None = None
 
+    # Retrieval economics (C1): distilled at write time; null on legacy
+    # memories (index renderers recompute the heuristic on the fly).
+    title: str | None = None
+    token_estimate: int | None = None
+
 
 class StoreMemoryResponse(BaseModel):
     status: str = "ok"
@@ -940,6 +1058,48 @@ class SearchMemoryResponse(BaseModel):
     status: str = "ok"
     results: list[MemoryResponse] = Field(default_factory=list)
     graph_results: list[dict] | None = None
+
+
+class IndexRow(BaseModel):
+    """Compact index representation of one memory (~50-100 tokens rendered).
+
+    The map, not the path: enough to decide whether the full payload is worth
+    fetching (title + category + observation-type glyph + age + token cost),
+    never the payload itself. ``anchor`` is only set on timeline responses.
+    """
+    id: str
+    title: str
+    category: str | None = None
+    glyph: str | None = None
+    age: str | None = None
+    tokens: int | None = None
+    score: float | None = None
+    anchor: bool | None = None
+
+
+class SearchIndexResponse(BaseModel):
+    """Response for index-only search (C1 layer 1)."""
+    status: str = "ok"
+    index_only: bool = True
+    results: list[IndexRow] = Field(default_factory=list)
+
+
+class GetMemoriesResponse(BaseModel):
+    """Batch-get response (C1 layer 3).
+
+    ``missing`` lists ids that don't exist *or* that the caller may not read —
+    deliberately indistinguishable (no existence oracle).
+    """
+    status: str = "ok"
+    results: list[MemoryResponse] = Field(default_factory=list)
+    missing: list[str] = Field(default_factory=list)
+
+
+class TimelineResponse(BaseModel):
+    """Chronological window around an anchor memory (C2), oldest first."""
+    status: str = "ok"
+    anchor_id: str
+    results: list[IndexRow] = Field(default_factory=list)
 
 
 class ContextResponse(BaseModel):
@@ -961,6 +1121,65 @@ class ContextResponse(BaseModel):
     offset: int = 0
     limit: int | None = None
     has_more: bool = False
+
+
+class AskMemoryResponse(BaseModel):
+    """Synthesized answer over the caller's memories (C3).
+
+    ``citations`` only ever contains ids that were actually retrieved as
+    evidence — model-fabricated ids are filtered out. ``abstained`` is True
+    when the honest answer is "I don't know" (a first-class outcome, not an
+    error). ``searches`` lists every retrieval pass performed (semantic,
+    update-language, and grep-style keyword passes).
+    """
+    status: str = "ok"
+    reasoning_level: str
+    answer: str
+    citations: list[str] = Field(default_factory=list)
+    abstained: bool = False
+    searches: list[str] = Field(default_factory=list)
+    memories_considered: int = 0
+
+
+class CheckpointVerdict(BaseModel):
+    """Per-item dedup verdict from the checkpoint pre-check (C4)."""
+    index: int
+    verdict: str  # "new" | "duplicate"
+    existing_id: str | None = None
+
+
+class CheckpointResponse(BaseModel):
+    """202 response for a checkpoint batch save (C4).
+
+    One task id for the whole batch (null when every item was a duplicate
+    and there was no session note — nothing to enqueue). ``verdicts`` are
+    index-aligned with the request's ``memories`` list.
+    """
+    status: str = "accepted"
+    task_id: str | None = None
+    poll_url: str | None = None
+    verdicts: list[CheckpointVerdict] = Field(default_factory=list)
+    enqueued: int = 0
+    duplicates: int = 0
+    session_note_included: bool = False
+
+
+class QueueStatusResponse(BaseModel):
+    """Aggregate task-queue view for one caller (C4 queue visibility).
+
+    ``counts`` aggregates the caller's tasks enqueued within the recent
+    window (tracked at enqueue time): queued/processing/completed/failed,
+    plus ``expired`` for results that aged out of Redis. ``queues`` reports
+    instance-wide queue depths (pending jobs) per queue. ``caught_up`` is
+    True when the caller has nothing queued or in flight.
+    """
+    status: str = "ok"
+    user_id: str
+    window_seconds: int
+    tracked: int = 0
+    counts: dict[str, int] = Field(default_factory=dict)
+    queues: dict[str, int] = Field(default_factory=dict)
+    caught_up: bool = True
 
 
 class TaskAcceptedResponse(BaseModel):

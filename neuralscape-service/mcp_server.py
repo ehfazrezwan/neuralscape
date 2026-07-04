@@ -1,9 +1,16 @@
-"""MCP server exposing neuralscape memory operations as 17 tools.
+"""MCP server exposing neuralscape memory operations as 22 core tools.
 
-Tools: recall_memories, remember, remember_conversation, ingest_document,
-ingest_text, get_project_context, search_knowledge_graph, list_memories,
-list_projects, delete_memories, list_processes, get_process, edit_memory,
-retag_memories, get_reasoning_chain, schedule_dream, get_card.
+Core tools (22): recall_memories, get_memories, timeline, remember,
+remember_conversation, ingest_document, ingest_text, get_project_context,
+search_knowledge_graph, list_memories, list_projects, delete_memories,
+list_processes, get_process, edit_memory, retag_memories,
+get_reasoning_chain, schedule_dream, get_card, ask_memory, checkpoint,
+queue_status.
+
+Plus three code-graph delegation tools over an ingested/configured Graphify
+graph.json — query_code_graph, get_code_neighbors, code_path (NS's own
+surface — clients never talk to Graphify's MCP server directly) — registered
+when the optional ``code-graph`` extra is installed (dev installs have it).
 
 Supports both stdio transport (local Claude Code) and Streamable HTTP
 transport (remote agent access via /mcp/ endpoint on port 8199).
@@ -66,14 +73,19 @@ async def list_tools() -> list[Tool]:
                 "Search across the user's global and project-specific memories using semantic search. "
                 "ALWAYS call this tool before starting work on a task to load relevant context about "
                 "user preferences, project conventions, tech stack, and past decisions. "
+                "PREFER the token-efficient 3-layer workflow: (1) search with index_only=true to get a "
+                "compact index — {id, title, category, glyph, age, tokens, score} per hit, ~50-100 tokens "
+                "each instead of full payloads; (2) filter the index by title/category/age/token cost; "
+                "(3) call get_memories(ids=[...]) for full payloads of ONLY the hits you actually need. "
+                "NEVER fetch full details without filtering first when you expect many hits. "
                 "When project_id is provided, searches both global user memories and project-specific memories, "
                 "returning the most relevant results sorted by relevance score. "
-                "Results include a 'source' field: 'graph' results come from the knowledge graph and reflect "
-                "the latest contradiction-resolved state; 'vector' results come from the vector store. "
-                "When vector and graph results conflict, prefer graph-sourced results as authoritative. "
-                "Memories ingested from a data layer carry a 'source_ref' (origin url/connector + a "
-                "'retrieval' handle {mcp_server, tool, args}); use that handle to fetch the original "
-                "source or more context when a result references external content."
+                "Full (non-index) results include a 'source' field: 'graph' results come from the knowledge "
+                "graph and reflect the latest contradiction-resolved state; 'vector' results come from the "
+                "vector store. When vector and graph results conflict, prefer graph-sourced results as "
+                "authoritative. Memories ingested from a data layer carry a 'source_ref' (origin "
+                "url/connector + a 'retrieval' handle {mcp_server, tool, args}); use that handle to fetch "
+                "the original source or more context when a result references external content."
             ),
             inputSchema={
                 "type": "object",
@@ -119,8 +131,84 @@ async def list_tools() -> list[Tool]:
                             "(search caller's private memories only). Default: true."
                         ),
                     },
+                    "index_only": {
+                        "type": "boolean",
+                        "description": (
+                            "When true, return compact index rows ({id, title, category, "
+                            "glyph, age, tokens, score}) instead of full payloads — "
+                            "~50-100 tokens per hit. Filter these, then call "
+                            "get_memories(ids=[...]) for the few you need. Default: false."
+                        ),
+                    },
                 },
                 "required": ["query"],
+            },
+        ),
+        Tool(
+            name="get_memories",
+            description=(
+                "Batch-fetch FULL memory payloads by id (layer 3 of the index-first workflow: "
+                "recall_memories(index_only=true) → filter the index → get_memories for the chosen ids). "
+                "Returns every stored field — content, category, tags, memory-model v2 fields, provenance "
+                "(derived_from, epistemic_level, source_ref), visibility, owner. Max 50 ids per call. "
+                "Ids that don't exist or that you may not read (another user's private memory) are "
+                "returned in 'missing'. NEVER fetch full details without filtering the index first — "
+                "each full payload costs 5-20x an index row."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": 50,
+                        "description": "Memory IDs to fetch (from index rows, timeline rows, or related_memory_ids)",
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "Caller user ID (optional under token auth)",
+                    },
+                },
+                "required": ["ids"],
+            },
+        ),
+        Tool(
+            name="timeline",
+            description=(
+                "Chronological window around an anchor memory: what was happening before and after it. "
+                "The anchor is a memory id (UUID) or a natural-language query (resolved to the best "
+                "search hit). Returns up to ±depth caller-visible memories around the anchor in "
+                "created_at order as compact index rows ({id, title, category, glyph, age, tokens}), "
+                "the anchor marked with anchor:true. Dream insights and session-context memories "
+                "interleave naturally. Use it for \"what was happening around X?\", standups, and "
+                "weekly digests; follow up with get_memories(ids=[...]) for the rows worth reading "
+                "in full."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "anchor": {
+                        "type": "string",
+                        "description": "Memory ID (UUID) or a search query to anchor the window on",
+                    },
+                    "depth": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "default": 10,
+                        "description": "Memories to include on each side of the anchor (default 10)",
+                    },
+                    "project_id": {
+                        "type": "string",
+                        "description": "Optional project scope (includes that project's + global memories)",
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "Caller user ID (optional under token auth)",
+                    },
+                },
+                "required": ["anchor"],
             },
         ),
         Tool(
@@ -775,6 +863,228 @@ async def list_tools() -> list[Tool]:
                 "required": [],
             },
         ),
+        Tool(
+            name="ask_memory",
+            description=(
+                "Ask a question and get a direct ANSWER synthesized from the caller's stored "
+                "memories (instead of raw search hits — use recall_memories when you want the "
+                "memories themselves). reasoning_level jointly selects retrieval breadth, the "
+                "answering model's follow-up-search budget, thinking depth, and answer length: "
+                "'minimal' = one search + direct answer (fastest/cheapest); 'low' = adds a forced "
+                "update-language pass + 1 follow-up search; 'medium' = adds a grep-style exact-"
+                "keyword pass + 2 follow-ups; 'high' = full iterative search loop (4 follow-ups). "
+                "Disciplines baked in: enumeration/counting questions get exact-match passes and a "
+                "dedup table before any count; newer facts supersede older ones; contradictions "
+                "are surfaced BOTH-with-timestamps preferring the newer; \"I don't know\" is "
+                "returned honestly (abstained: true) rather than fabricating. The answer cites "
+                "memory ids inline and 'citations' only ever contains ids that were actually "
+                "retrieved."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The question to answer from stored memories",
+                    },
+                    "reasoning_level": {
+                        "type": "string",
+                        "enum": ["minimal", "low", "medium", "high"],
+                        "default": "low",
+                        "description": (
+                            "Effort knob: minimal (single search, direct answer), low, "
+                            "medium, high (iterative search loop + exact-match passes)"
+                        ),
+                    },
+                    "project_id": {
+                        "type": "string",
+                        "description": "Optional project scope (searches that project's + global memories)",
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "Caller user ID (optional under token auth)",
+                    },
+                },
+                "required": ["question"],
+            },
+        ),
+        Tool(
+            name="checkpoint",
+            description=(
+                "Batch-save up to 25 memories PLUS an optional structured session note in ONE "
+                "call (one tool card, one background task id) — use this at the end of a session "
+                "instead of many individual remember calls. Each item is {content, category, plus "
+                "any memory-model v2 fields (tags, domain, observation_type, concepts, "
+                "confidence, visibility, project_id, ...)}. Per-item content-hash dedup runs "
+                "BEFORE enqueue and the verdicts come back immediately (verdict: 'new' | "
+                "'duplicate' with the existing_id), then the non-duplicates are stored as one "
+                "async batch job (poll the task_id, or just continue — writes never block on "
+                "extraction). session_note is {request, learned, completed, next_steps} and is "
+                "stored as a single task_context memory (observation_type=meeting_outcome) so the "
+                "next session picks it up."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "memories": {
+                        "type": "array",
+                        "maxItems": 25,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string", "description": "The fact to remember"},
+                                "category": {
+                                    "type": "string",
+                                    "enum": list(MEMORY_CATEGORIES.keys()),
+                                },
+                                "project_id": {"type": "string"},
+                                "tags": {"type": "array", "items": {"type": "string"}},
+                                "domain": {"type": "string"},
+                                "observation_type": {"type": "string"},
+                                "concepts": {"type": "array", "items": {"type": "string"}},
+                                "source_type": {"type": "string"},
+                                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                                "expires_at": {"type": "string"},
+                                "visibility": {"type": "string", "enum": ["private", "shared", "standard"]},
+                            },
+                            "required": ["content", "category"],
+                        },
+                        "description": "Memories to save (≤25). Dedup verdicts are returned per item.",
+                    },
+                    "session_note": {
+                        "type": "object",
+                        "properties": {
+                            "request": {"type": "string", "description": "What the user asked for this session"},
+                            "learned": {"type": "string", "description": "What was learned/discovered"},
+                            "completed": {"type": "string", "description": "What got done"},
+                            "next_steps": {"type": "string", "description": "What should happen next"},
+                        },
+                        "description": "Optional structured end-of-session note (stored as one task_context memory)",
+                    },
+                    "project_id": {
+                        "type": "string",
+                        "description": "Default project for the session note (items carry their own project_id)",
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "Caller user ID (optional under token auth)",
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="queue_status",
+            description=(
+                "Aggregate view of the caller's recent background tasks across the memory "
+                "queues — ONE call for \"is my work done?\" instead of polling per task id. "
+                "Returns counts of the caller's recently-enqueued tasks by live status "
+                "(queued/processing/completed/failed + expired-out-of-Redis), instance-wide "
+                "pending depth per queue (main/graph/ingest), and a caught_up boolean that is "
+                "true when nothing of the caller's is queued or in flight. Use it after a "
+                "checkpoint or bulk ingest before querying what was stored."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "Caller user ID (optional under token auth)",
+                    },
+                },
+                "required": [],
+            },
+        ),
+    ] + _code_graph_tools()
+
+
+# Shared schema fragments for the code-graph delegation tools. These tools are
+# NS's own surface over a Graphify code graph (roadmap F2 hard rule: agents
+# never talk to Graphify's MCP server directly) and register only when the
+# optional graphifyy library is installed.
+_CODE_GRAPH_COMMON_PROPS = {
+    "graph_id": {
+        "type": "string",
+        "description": (
+            "graph_id of an ingested code-graph bundle (the artifact id stamped "
+            "into code-graph memories' source_ref; owner-scoped). Omit to use "
+            "the server's configured default graph."
+        ),
+    },
+    "user_id": {
+        "type": "string",
+        "description": "Caller user ID (optional under token auth); scopes graph_id resolution.",
+    },
+}
+
+
+def _code_graph_tools() -> list[Tool]:
+    """The three code-graph delegation tools, when the code-graph extra is installed."""
+    from adapters.code_graph import code_graph_available
+
+    if not code_graph_available():
+        return []
+    return [
+        Tool(
+            name="query_code_graph",
+            description=(
+                "Search a project's code knowledge graph (built by Graphify, served "
+                "by Neuralscape) with BFS/DFS traversal from the best-matching nodes. "
+                "Use this — not recalled memories — for CODE STRUCTURE questions "
+                "(what calls X, what's in module Y): the graph reflects the code as "
+                "analyzed, while structural memories would rot. Memories whose "
+                "source_ref retrieval handle names this tool re-fetch live structure "
+                "through it."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "Natural-language question or keyword search over the code graph"},
+                    "mode": {"type": "string", "enum": ["bfs", "dfs"], "default": "bfs", "description": "bfs=broad context, dfs=trace a specific path"},
+                    "depth": {"type": "integer", "default": 3, "description": "Traversal depth (1-6)"},
+                    "token_budget": {"type": "integer", "default": 2000, "description": "Max output tokens"},
+                    **_CODE_GRAPH_COMMON_PROPS,
+                },
+                "required": ["question"],
+            },
+        ),
+        Tool(
+            name="get_code_neighbors",
+            description=(
+                "List the direct incoming/outgoing neighbors of one code-graph node "
+                "(function/class/file/module) with each edge's relation and "
+                "confidence tag (EXTRACTED/INFERRED/AMBIGUOUS). The precise tool for "
+                "'what directly touches X?'."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string", "description": "Node label or id to look up (e.g. 'MemoryEngine')"},
+                    "relation_filter": {"type": "string", "description": "Only edges whose relation contains this substring (e.g. 'call')"},
+                    **_CODE_GRAPH_COMMON_PROPS,
+                },
+                "required": ["label"],
+            },
+        ),
+        Tool(
+            name="code_path",
+            description=(
+                "Shortest connection path between two code-graph symbols — how does "
+                "A reach B? Each hop shows the relation and its confidence tag. "
+                "Useful for tracing an unexpected coupling flagged in a 'boundary' "
+                "memory back through the actual code structure."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string", "description": "Label of the starting symbol"},
+                    "target": {"type": "string", "description": "Label of the target symbol"},
+                    "max_hops": {"type": "integer", "default": 8, "description": "Give up beyond this many hops (1-32)"},
+                    **_CODE_GRAPH_COMMON_PROPS,
+                },
+                "required": ["source", "target"],
+            },
+        ),
     ]
 
 
@@ -809,8 +1119,64 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 visibility=arguments.get("visibility"),
                 include_shared=arguments.get("include_shared", True),
             )
+            if arguments.get("index_only"):
+                from index_format import index_row
+
+                rows = [index_row(r) for r in results]
+                return [TextContent(type="text", text=json.dumps(
+                    {"index_only": True, "results": rows,
+                     "hint": "Filter these rows, then call get_memories(ids=[...]) for full payloads."},
+                    default=str, ensure_ascii=False))]
             output = [r.model_dump(exclude_none=True) for r in results]
             return [TextContent(type="text", text=json.dumps(output, default=str))]
+
+        elif name == "get_memories":
+            ids = arguments.get("ids")
+            if not isinstance(ids, list) or not ids or not all(isinstance(i, str) for i in ids):
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": "ids must be a non-empty list of memory-id strings"}))]
+            try:
+                out = await asyncio.to_thread(_service.get_memories_by_ids, ids, user_id)
+            except ValueError as e:
+                return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+            return [TextContent(type="text", text=json.dumps(
+                {
+                    "results": [r.model_dump(exclude_none=True) for r in out["results"]],
+                    "missing": out["missing"],
+                },
+                default=str))]
+
+        elif name == "timeline":
+            from index_format import index_row
+
+            anchor = arguments.get("anchor")
+            if not anchor or not isinstance(anchor, str):
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": "anchor must be a memory id (UUID) or a search query"}))]
+            try:
+                depth = int(arguments.get("depth", 10))
+            except (TypeError, ValueError):
+                depth = 10
+            try:
+                out = await asyncio.to_thread(
+                    _service.timeline,
+                    anchor=anchor,
+                    user_id=user_id,
+                    depth=depth,
+                    project_id=arguments.get("project_id"),
+                )
+            except ValueError as e:
+                return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+            if out is None:
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": f"Timeline anchor {anchor!r} could not be resolved "
+                              "(unknown id, unreadable id, or no search hit)"}))]
+            anchor_id = out["anchor_id"]
+            rows = [index_row(mem, anchor=(mem.id == anchor_id)) for mem in out["memories"]]
+            return [TextContent(type="text", text=json.dumps(
+                {"anchor_id": anchor_id, "results": rows,
+                 "hint": "Rows are oldest→newest. Call get_memories(ids=[...]) for full payloads."},
+                default=str, ensure_ascii=False))]
 
         elif name == "remember":
             # Determine scope from category
@@ -1252,6 +1618,57 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps(
                 {"status": "accepted", "task_id": task_id}))]
 
+        elif name in ("query_code_graph", "get_code_neighbors", "code_path"):
+            # NS-surface delegations to the graphifyy library (roadmap F2:
+            # the interaction interface is ALWAYS Neuralscape). Availability-
+            # gated: without the optional extra these tools aren't listed, but
+            # a stale client may still call them — answer with the remedy.
+            from adapters.code_graph import _MISSING_EXTRA_MSG, code_graph_available
+
+            if not code_graph_available():
+                return [TextContent(type="text", text=json.dumps({"error": _MISSING_EXTRA_MSG}))]
+            from adapters.code_graph.query import (
+                CodeGraphError,
+                code_path,
+                get_code_neighbors,
+                query_code_graph,
+            )
+
+            try:
+                if name == "query_code_graph":
+                    text = await asyncio.to_thread(
+                        query_code_graph,
+                        arguments["question"],
+                        user_id=user_id,
+                        settings=settings,
+                        graph_id=arguments.get("graph_id"),
+                        mode=arguments.get("mode", "bfs"),
+                        depth=arguments.get("depth", 3),
+                        token_budget=arguments.get("token_budget", 2000),
+                    )
+                elif name == "get_code_neighbors":
+                    text = await asyncio.to_thread(
+                        get_code_neighbors,
+                        arguments["label"],
+                        user_id=user_id,
+                        settings=settings,
+                        graph_id=arguments.get("graph_id"),
+                        relation_filter=arguments.get("relation_filter", ""),
+                    )
+                else:  # code_path
+                    text = await asyncio.to_thread(
+                        code_path,
+                        arguments["source"],
+                        arguments["target"],
+                        user_id=user_id,
+                        settings=settings,
+                        graph_id=arguments.get("graph_id"),
+                        max_hops=arguments.get("max_hops", 8),
+                    )
+            except CodeGraphError as e:
+                return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+            return [TextContent(type="text", text=text)]
+
         elif name == "schedule_dream":
             # Mirrors POST /v1/extensions/dreaming/run: never sweep in-process
             # (a sweep is minutes of LLM + store work) — enqueue onto the graph
@@ -1321,6 +1738,82 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                     {"error": f"No identity card for pool {pool!r} yet — "
                               "the dreaming sweep builds cards"}))]
             return [TextContent(type="text", text=json.dumps(view))]
+
+        elif name == "ask_memory":
+            from ask import REASONING_TIERS, AskUnavailable, ask_memory
+
+            question = arguments.get("question")
+            if not question or not isinstance(question, str):
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": "question must be a non-empty string"}))]
+            level = arguments.get("reasoning_level", "low")
+            if level not in REASONING_TIERS:
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": f"Invalid reasoning_level {level!r}. "
+                              f"Must be one of: {list(REASONING_TIERS)}"}))]
+            try:
+                out = await ask_memory(
+                    _service,
+                    question=question,
+                    user_id=user_id,
+                    reasoning_level=level,
+                    project_id=arguments.get("project_id"),
+                )
+            except AskUnavailable as e:
+                return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+            return [TextContent(type="text", text=json.dumps(out, default=str, ensure_ascii=False))]
+
+        elif name == "checkpoint":
+            import checkpoint as checkpoint_mod
+
+            from pydantic import ValidationError
+            from schemas import CheckpointRequest
+
+            # Validate with the shared schema so MCP callers get the same
+            # ≤25 bound / per-item field validation as the REST route.
+            try:
+                req = CheckpointRequest(
+                    **{k: v for k, v in arguments.items() if k in CheckpointRequest.model_fields}
+                )
+            except ValidationError as e:
+                return [TextContent(type="text", text=json.dumps(
+                    {"status": "error", "error": str(e)}, default=str))]
+            try:
+                prepared = await asyncio.to_thread(
+                    checkpoint_mod.prepare_checkpoint, _service, req, user_id
+                )
+            except (ValueError, PermissionError) as e:
+                return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+
+            common = {
+                "verdicts": prepared["verdicts"],
+                "duplicates": prepared["duplicates"],
+                "session_note_included": prepared["session_note_included"],
+                "enqueued": len(prepared["to_enqueue"]),
+            }
+            if not prepared["to_enqueue"]:
+                return [TextContent(type="text", text=json.dumps(
+                    {"status": "ok", "task_id": None, **common,
+                     "hint": "Every item was already stored — nothing enqueued."},
+                    default=str))]
+            try:
+                task_id = await _task_manager.enqueue_raw_batch(items=prepared["to_enqueue"])
+            except (ConnectionError, OSError) as e:
+                logger.warning(f"Redis unavailable, falling back to sync checkpoint store: {e}")
+                memories = await asyncio.to_thread(
+                    _service.store_raw_batch, prepared["to_enqueue"]
+                )
+                return [TextContent(type="text", text=json.dumps(
+                    {"status": "completed", "task_id": None, **common,
+                     "stored": len(memories), "fallback": "sync"},
+                    default=str))]
+            return [TextContent(type="text", text=json.dumps(
+                {"status": "accepted", "task_id": task_id, **common}, default=str))]
+
+        elif name == "queue_status":
+            out = await _task_manager.get_queue_status(user_id)
+            return [TextContent(type="text", text=json.dumps(
+                {"status": "ok", **out}, default=str))]
 
         else:
             return [TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]

@@ -98,6 +98,30 @@ class Settings(BaseSettings):
     dedup_batch_size: int = 100
     dedup_cron_hours: set = {0, 6, 12, 18}
 
+    # ── Ask / reasoning tiers (roadmap C3) ────────────────────────────
+    # Per-tier cap on a single answering-LLM call (seconds). The total ask
+    # budget is bounded by this times the tier's iteration cap (see
+    # ask.REASONING_TIERS) — higher tiers may loop through follow-up
+    # searches, so they get a roomier per-call cap too.
+    ask_timeout_minimal_s: int = 20
+    ask_timeout_low_s: int = 40
+    ask_timeout_medium_s: int = 75
+    ask_timeout_high_s: int = 120
+
+    # ── Queue visibility (roadmap C4) ─────────────────────────────────
+    # Window (seconds) of recently-enqueued tasks aggregated by
+    # GET /v1/queue/status. Matches ARQ's default keep_result TTL (3600s):
+    # older results have expired out of Redis anyway and would only ever
+    # report as "expired".
+    queue_status_window_s: int = 3600
+    # When set, workers POST a small {"event": "queue.empty", ...} JSON to
+    # this URL whenever a finished job leaves its queue empty — so
+    # ingest-then-query flows can stop polling per task. Empty = off.
+    # Only absolute http(s) URLs are contacted; redirects are never
+    # followed; delivery is a fire-and-forget 5s-capped daemon thread
+    # (see webhooks.py).
+    webhook_queue_empty_url: str = ""
+
     # ── Data-layer connectors ─────────────────────────────────────────
     # When enabled, the service hosts connectors (Notion/Drive/MCP/REST),
     # stores their credentials encrypted in the vault, and runs a periodic
@@ -149,6 +173,37 @@ class Settings(BaseSettings):
     # default llm model. Book-exemplar and live-chart reads must share this model
     # so their descriptions land in one visual vocabulary.
     exemplar_vision_model: str = ""
+
+    # ── Code-graph adapter (Graphify, Phase F1) ──────────────────────
+    # NS uses Graphify (PyPI: graphifyy, optional `code-graph` extra) as a
+    # library over a `graph.json` code graph. The interaction surface is ALWAYS
+    # Neuralscape: the query_code_graph / get_code_neighbors / code_path
+    # MCP tools + /v1/code-graph/* REST routes delegate to the library — agents
+    # never talk to Graphify's own MCP server.
+    #
+    # Default graph.json the code-graph query tools resolve against when the
+    # caller doesn't pass a graph_id (an ingested bundle's artifact id). Empty ⇒
+    # no default graph; tools then require graph_id. Per-project graphs need no
+    # setting: each ingested graph.json is an owner-scoped artifact addressed by
+    # its graph_id (stamped into every produced memory's source_ref).
+    code_graph_json_path: str = ""
+    # Confidence assigned per Graphify edge/insight confidence tag (F1 epistemic
+    # mapping): EXTRACTED → epistemic_level="explicit", INFERRED → "deductive"
+    # with reduced confidence, AMBIGUOUS → stored only when its assigned
+    # confidence clears `code_graph_ambiguous_floor` — with the defaults below
+    # (0.3 < 0.5) AMBIGUOUS-derived memories are DROPPED. Lower the floor (or
+    # raise the ambiguous confidence) to keep them; kept ones are tagged
+    # `ambiguous` for the dreaming sweep's contradiction pass.
+    code_graph_extracted_confidence: float = 0.9
+    code_graph_inferred_confidence: float = 0.6
+    code_graph_ambiguous_confidence: float = 0.3
+    code_graph_ambiguous_floor: float = 0.5
+    # Caps for the semantic layer distilled from one graph.json (bound the blast
+    # radius of a huge graph — we ingest the STABLE summary, never the raw graph).
+    code_graph_max_communities: int = 50
+    code_graph_max_god_nodes: int = 10
+    code_graph_max_surprises: int = 10
+    code_graph_max_rationale: int = 100
 
     # Auth
     # Legacy single shared API key. When set without `neuralscape_user_token_secret`,
@@ -286,6 +341,21 @@ class Settings(BaseSettings):
         # These feed the Docling timeout and the zip guardrails; a 0/negative
         # value would time out every conversion or invert the archive checks, and
         # only surface as a runtime failure after deploy. Reject at startup.
+        if value <= 0:
+            raise ValueError(f"{info.field_name} must be > 0")
+        return value
+
+    @field_validator(
+        "ask_timeout_minimal_s",
+        "ask_timeout_low_s",
+        "ask_timeout_medium_s",
+        "ask_timeout_high_s",
+        "queue_status_window_s",
+    )
+    @classmethod
+    def _validate_positive_ask_limits(cls, value: int, info) -> int:
+        # A 0/negative timeout would fail every answering call (or make the
+        # queue-status window empty) and only surface at request time.
         if value <= 0:
             raise ValueError(f"{info.field_name} must be > 0")
         return value

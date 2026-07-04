@@ -494,6 +494,51 @@ async def process_ingest_file(ctx: dict, payload: dict) -> dict:
         data = base64.b64decode(payload["data_b64"])
     options = payload.get("options", {})
 
+    # ── Graphify bundle members (graph.json / GRAPH_REPORT.md) ──
+    # A graphify-out/ upload (zip-expanded or as loose files) is detected by
+    # its canonical filenames. graph.json is distilled into its STABLE
+    # semantic layer only (never mirrored raw — it churns per commit and stays
+    # queryable live via the query_code_graph tools); GRAPH_REPORT.md is
+    # upgraded onto the code_graph adapter's section chunker + report
+    # extractor and then flows through the normal text pipeline below.
+    from adapters.code_graph import code_graph_available
+    from ingest.code_graph import detect_graphify_member, ingest_code_graph_json
+
+    graphify_kind = detect_graphify_member(filename, data)
+    if graphify_kind == "graph":
+        if not code_graph_available():
+            # Graceful degradation (no crash): the optional graphifyy library
+            # isn't installed, and ingesting a graph.json as prose would only
+            # produce megabytes of JSON noise — skip with an honest reason.
+            reason = (
+                "graph.json detected but the code-graph extra is not installed "
+                "(uv sync --extra code-graph); skipping instead of ingesting raw JSON"
+            )
+            logger.warning("Ingest file skipped (%s): %s", filename, reason)
+            return {"filename": filename, "skipped": True, "reason": reason}
+        result = await asyncio.to_thread(ingest_code_graph_json, service, data, payload)
+        graph_jobs = result.pop("graph_jobs", [])
+        result["graph_jobs_enqueued"] = await _enqueue_graph_jobs(
+            ctx, graph_jobs, adapter=result.get("adapter")
+        )
+        registry = ctx.get("extension_registry")
+        if registry and result.get("memory_ids"):
+            await registry.emit_event("memory_stored", {
+                "user_id": payload["user_id"],
+                "memory_id": result["memory_ids"][0],
+                "content": f"[ingest:code_graph] {filename} → {result['facts']} semantic facts",
+                "category": options.get("category", "domain_knowledge"),
+                "scope": options.get("scope", "global"),
+                "project_id": options.get("project_id"),
+                "source": "ingest",
+            })
+        return {"filename": filename, "doc_type": "code_graph", **result}
+    if graphify_kind == "report" and code_graph_available():
+        # Only upgrade from the default adapter — an explicit adapter choice
+        # (e.g. a deliberate re-ingest under another taxonomy) wins.
+        if options.get("adapter", "default") == "default":
+            options = {**options, "adapter": "code_graph"}
+
     # When visual exemplars apply, one Docling conversion yields BOTH the text
     # and the embedded figures — a book PDF takes minutes per parse, so the
     # text and image paths must not each convert separately.
@@ -1046,6 +1091,56 @@ def _connector_sync_cron_hours() -> list[int]:
     return list(range(0, 24, interval))
 
 
+def _make_after_job_end(queue_name: str):
+    """Build the per-queue ``after_job_end`` hook: queue.empty webhook (C4).
+
+    After ARQ records a job's result (so the queue sorted set no longer
+    contains it), check whether this worker's queue is now empty; if so —
+    and ``WEBHOOK_QUEUE_EMPTY_URL`` is configured — POST a small
+    ``queue.empty`` JSON event so ingest-then-query flows can stop polling
+    per task. The event carries the finishing job's owner (via the
+    ``ns:task-user:`` reverse map task_manager writes at enqueue), so a
+    consumer can match it to their own work. Delivery is SSRF-guarded and
+    fire-and-forget (see webhooks.py); the hook itself swallows every
+    error — observability must never fail a job.
+    """
+    async def after_job_end(ctx: dict) -> None:
+        url = settings.webhook_queue_empty_url
+        if not url:
+            return
+        try:
+            redis = ctx.get("redis")
+            if redis is None:
+                return
+            depth = await redis.zcard(queue_name)
+            if depth:
+                return
+            user_id = None
+            job_id = ctx.get("job_id")
+            if job_id:
+                try:
+                    raw = await redis.get(f"ns:task-user:{job_id}")
+                    if raw:
+                        user_id = raw.decode() if isinstance(raw, bytes) else str(raw)
+                except Exception:  # noqa: BLE001 — attribution is best-effort
+                    pass
+            from datetime import timezone
+
+            from webhooks import fire_queue_empty
+
+            fire_queue_empty(url, {
+                "event": "queue.empty",
+                "queue": queue_name,
+                "job_id": job_id,
+                "user_id": user_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+        except Exception:  # noqa: BLE001
+            logger.debug("queue.empty webhook check failed (non-fatal)", exc_info=True)
+
+    return after_job_end
+
+
 async def startup(ctx: dict) -> None:
     """Worker startup: initialize MemoryService + extension registry."""
     logger.info("ARQ worker starting up...")
@@ -1130,6 +1225,7 @@ class WorkerSettings:
     on_shutdown = shutdown
     redis_settings = parse_redis_settings()
     queue_name = settings.arq_queue_name
+    after_job_end = _make_after_job_end(settings.arq_queue_name)
     max_jobs = 10
     job_timeout = settings.arq_job_timeout
     max_tries = settings.arq_max_retries  # keep light-queue retry behavior unchanged
@@ -1188,6 +1284,7 @@ class GraphWorkerSettings:
     on_shutdown = shutdown
     redis_settings = parse_redis_settings()
     queue_name = settings.graph_queue_name
+    after_job_end = _make_after_job_end(settings.graph_queue_name)
     max_jobs = 4
     job_timeout = 900  # graph.add + entity extraction can run several minutes
     max_tries = settings.arq_max_retries
@@ -1223,6 +1320,7 @@ class IngestWorkerSettings:
     on_shutdown = shutdown
     redis_settings = parse_redis_settings()
     queue_name = settings.ingest_queue_name
+    after_job_end = _make_after_job_end(settings.ingest_queue_name)
     max_jobs = 3
     job_timeout = 900  # a large PDF parse + fact extraction can run minutes
     max_tries = settings.arq_max_retries

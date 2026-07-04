@@ -59,6 +59,14 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
 ]
+# Code-graph knowledge adapter (Phase F1): uses Graphify (PyPI: graphifyy) as a
+# library to read/query `graph.json` code graphs and distill their stable
+# semantic layer into memories. OPTIONAL — everything degrades gracefully (the
+# code_graph adapter, ingest extractor, and MCP/REST code-graph tools simply
+# don't register) when this extra isn't installed.
+code-graph = [
+    "graphifyy>=0.9.5",
+]
 
 [tool.uv.sources]
 graphiti-core = { path = "../graphiti", editable = true }
@@ -69,6 +77,9 @@ dev = [
     "httpx>=0.28.1",
     "pytest>=9.0.2",
     "pytest-asyncio>=1.3.0",
+    # Dev installs get the code-graph extra so the adapter/tool tests exercise
+    # the real graphifyy library (production keeps it opt-in via the extra).
+    "graphifyy>=0.9.5",
 ]
 
 [tool.pytest.ini_options]

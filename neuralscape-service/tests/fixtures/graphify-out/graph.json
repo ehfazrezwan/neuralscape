@@ -1,0 +1,162 @@
+{
+  "directed": true,
+  "multigraph": false,
+  "graph": {},
+  "nodes": [
+    {
+      "id": "src/svc/engine.py",
+      "label": "engine.py",
+      "file_type": "code",
+      "source_file": "src/svc/engine.py",
+      "source_location": "L1",
+      "community": 0,
+      "community_name": "Memory engine",
+      "norm_label": "engine.py"
+    },
+    {
+      "id": "src/api/handlers.py",
+      "label": "handlers.py",
+      "file_type": "code",
+      "source_file": "src/api/handlers.py",
+      "source_location": "L1",
+      "community": 1,
+      "community_name": "HTTP API",
+      "norm_label": "handlers.py"
+    },
+    {
+      "id": "engine.MemoryEngine",
+      "label": "MemoryEngine",
+      "file_type": "code",
+      "source_file": "src/svc/engine.py",
+      "source_location": "L10",
+      "community": 0,
+      "community_name": "Memory engine",
+      "norm_label": "memoryengine"
+    },
+    {
+      "id": "engine.MemoryEngine.store",
+      "label": ".store()",
+      "file_type": "code",
+      "source_file": "src/svc/engine.py",
+      "source_location": "L22",
+      "community": 0,
+      "community_name": "Memory engine",
+      "norm_label": ".store()"
+    },
+    {
+      "id": "engine.MemoryEngine.search",
+      "label": ".search()",
+      "file_type": "code",
+      "source_file": "src/svc/engine.py",
+      "source_location": "L31",
+      "community": 0,
+      "community_name": "Memory engine",
+      "norm_label": ".search()"
+    },
+    {
+      "id": "engine.rebuild_index",
+      "label": "rebuild_index()",
+      "file_type": "code",
+      "source_file": "src/svc/engine.py",
+      "source_location": "L44",
+      "community": 0,
+      "community_name": "Memory engine",
+      "norm_label": "rebuild_index()"
+    },
+    {
+      "id": "handlers.handle_query",
+      "label": "handle_query()",
+      "file_type": "code",
+      "source_file": "src/api/handlers.py",
+      "source_location": "L8",
+      "community": 1,
+      "community_name": "HTTP API",
+      "norm_label": "handle_query()"
+    },
+    {
+      "id": "handlers.audit_log",
+      "label": "audit_log()",
+      "file_type": "code",
+      "source_file": "src/api/handlers.py",
+      "source_location": "L30",
+      "community": 1,
+      "community_name": "HTTP API",
+      "norm_label": "audit_log()"
+    },
+    {
+      "id": "engine.rationale.41",
+      "label": "# HACK: rebuild the whole index because the vector store lacks partial updates",
+      "file_type": "rationale",
+      "source_file": "src/svc/engine.py",
+      "source_location": "L41",
+      "community": 0,
+      "community_name": "Memory engine",
+      "norm_label": "# hack: rebuild the whole index because the vector store lacks partial updates"
+    }
+  ],
+  "links": [
+    {
+      "source": "src/svc/engine.py",
+      "target": "engine.MemoryEngine",
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "weight": 1.0
+    },
+    {
+      "source": "engine.MemoryEngine",
+      "target": "engine.MemoryEngine.store",
+      "relation": "method",
+      "confidence": "EXTRACTED",
+      "weight": 1.0
+    },
+    {
+      "source": "engine.MemoryEngine",
+      "target": "engine.MemoryEngine.search",
+      "relation": "method",
+      "confidence": "EXTRACTED",
+      "weight": 1.0
+    },
+    {
+      "source": "engine.rebuild_index",
+      "target": "engine.MemoryEngine",
+      "relation": "calls",
+      "confidence": "EXTRACTED",
+      "weight": 1.0
+    },
+    {
+      "source": "src/api/handlers.py",
+      "target": "handlers.handle_query",
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "weight": 1.0
+    },
+    {
+      "source": "src/api/handlers.py",
+      "target": "handlers.audit_log",
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "weight": 1.0
+    },
+    {
+      "source": "handlers.handle_query",
+      "target": "engine.MemoryEngine",
+      "relation": "calls",
+      "confidence": "INFERRED",
+      "weight": 0.8
+    },
+    {
+      "source": "handlers.audit_log",
+      "target": "engine.rebuild_index",
+      "relation": "calls",
+      "confidence": "AMBIGUOUS",
+      "weight": 0.4
+    },
+    {
+      "source": "engine.rationale.41",
+      "target": "engine.rebuild_index",
+      "relation": "rationale_for",
+      "confidence": "EXTRACTED",
+      "weight": 1.0
+    }
+  ]
+}
