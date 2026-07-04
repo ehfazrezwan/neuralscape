@@ -1319,10 +1319,12 @@ async def v1_get_task_status(task_id: str):
 # ── Recall ────────────────────────────────────
 
 
-@v1_router.post("/search", response_model=None)
-async def v1_search_memories(
-    req: SearchMemoryRequest, request: Request
-) -> SearchMemoryResponse | SearchIndexResponse:
+# Union response model: Pydantic v2 smart-union validates the returned model
+# instance against its exact member type (a SearchMemoryResponse can never be
+# coerced into SearchIndexResponse or vice versa — IndexRow requires `title`,
+# full results carry `memory`), so both modes stay first-class in OpenAPI.
+@v1_router.post("/search", response_model=SearchMemoryResponse | SearchIndexResponse)
+async def v1_search_memories(req: SearchMemoryRequest, request: Request):
     """Semantic search with scope/category filters.
 
     When project_id is provided, searches both global and project memories.

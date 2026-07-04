@@ -2909,7 +2909,10 @@ class MemoryService:
                 with_vectors=False,
             )
             collected.extend(page or [])
-            if not offset:
+            # `is None`, not truthiness: Qdrant's next-page offset is a point
+            # id, and integer point ids can legitimately be 0 (falsy) — a
+            # truthiness check would end pagination early on such stores.
+            if offset is None:
                 break
 
         def _created(p):
