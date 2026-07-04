@@ -350,6 +350,38 @@ class TestHonestSweepStatus:
         assert await consolidate.decide(batch, AsyncMock(return_value='{"actions": []}')) == []
 
     @pytest.mark.asyncio
+    async def test_decide_raises_on_non_object_action_entries(self):
+        """Copilot on PR #125: a parseable-but-malformed list like
+        {"actions": ["oops"]} must NOT be silently filtered down to a
+        completed empty decision — that reintroduces the exact silent-no-op
+        mode this defect fixed. Any non-object entry means the model never
+        produced a valid decision."""
+        batch = _fresh_batch()
+        with pytest.raises(consolidate.DreamLLMFailure):
+            await consolidate.decide(batch, AsyncMock(return_value='{"actions": ["oops"]}'))
+        # one garbage entry poisons the whole decision, even alongside a
+        # well-formed action — the response as a whole is untrustworthy
+        mixed = json.dumps({"actions": [
+            {"type": "invalidate", "memory_ids": ["m0"],
+             "superseded_by_id": "m1", "confidence": 0.9},
+            "oops",
+        ]})
+        with pytest.raises(consolidate.DreamLLMFailure):
+            await consolidate.decide(batch, AsyncMock(return_value=mixed))
+
+    @pytest.mark.asyncio
+    async def test_malformed_action_entries_fail_pool_without_stamping_gate(self, tmp_path):
+        redis = FakeRedis()
+        report = await sweep._dream_pool(
+            service=MagicMock(), settings=_sweep_settings(tmp_path), redis=redis,
+            llm_call=AsyncMock(return_value='{"actions": ["oops"]}'),
+            batch=_fresh_batch(), dry_run=False, force=False,
+        )
+        assert report.status == "sweep_failed"
+        assert gate.get_gate_state(redis, "shared")["last_dreamt_at"] == 0.0
+        assert redis.get("dreaming:staged_ids:shared") is None
+
+    @pytest.mark.asyncio
     async def test_reflection_llm_failure_is_nonfatal_after_consolidation(self, tmp_path):
         """Consolidation applied, then the reflection LLM dies: the pool still
         completes (its actions are already written) with the error recorded."""

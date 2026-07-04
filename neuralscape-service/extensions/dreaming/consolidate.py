@@ -354,7 +354,16 @@ async def decide(batch: PoolBatch, llm_call) -> list[dict]:
     obj = parse_json_object(raw)
     if not isinstance(obj.get("actions"), list):
         raise DreamLLMFailure("unparseable consolidation LLM response (no action list)")
-    actions = [a for a in obj["actions"] if isinstance(a, dict)]
+    actions = obj["actions"]
+    if any(not isinstance(a, dict) for a in actions):
+        # Copilot on PR #125: silently filtering non-object entries (e.g.
+        # {"actions": ["oops"]}) would turn a malformed response into a
+        # "completed empty decision" and stamp the gate — the exact silent
+        # no-op mode this guard exists to prevent. One garbage entry means
+        # the model never produced a trustworthy decision.
+        raise DreamLLMFailure(
+            "malformed consolidation LLM response (non-object action entries)"
+        )
     known_ids = {m["memory_id"] for m in batch.memories}
     dream_ids = {
         m["memory_id"] for m in batch.memories if m.get("source_type") == "dream"
