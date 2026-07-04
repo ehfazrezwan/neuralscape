@@ -185,6 +185,17 @@ def category_for_type(type_value: str | None) -> str | None:
     exact = _TYPE_CATEGORIES.get(key)
     if exact:
         return exact
+    # Adapter-registered categories round-trip through their title-cased
+    # type (type_for_category("visual_exemplar") == "Visual Exemplar"):
+    # reverse the transform and accept any currently-registered category.
+    snake = re.sub(r"\s+", "_", key)
+    try:
+        from schemas import MEMORY_CATEGORIES
+
+        if snake in MEMORY_CATEGORIES:
+            return snake
+    except Exception:  # pragma: no cover — schemas is always importable in-service
+        pass
     # Also match our page-kind types when a Neuralscape vault is re-ingested.
     for kind, t in PAGE_KIND_TYPES.items():
         if key == t.casefold():

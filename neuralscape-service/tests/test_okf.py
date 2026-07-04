@@ -32,6 +32,7 @@ SERVICE_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_category_type_mapping_round_trips_all_core_categories():
+    import adapters  # noqa: F401 — register adapter taxonomies (deterministic set)
     from schemas import MEMORY_CATEGORIES
 
     for category in MEMORY_CATEGORIES:
