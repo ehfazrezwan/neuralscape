@@ -60,22 +60,35 @@ def promotion_score(
     created_at: float = 0.0,
     merged_source_count: int = 0,
     concept_count: int = 0,
+    times_derived: int = 1,
     now: float,
     recency_half_life_days: float = 14.0,
 ) -> float:
-    """Weighted promotion score in [0, 1]."""
+    """Weighted promotion score in [0, 1].
+
+    ``times_derived`` (A2, reinforcement-aware dedup) folds into the
+    *consolidation* term: a fact re-derived N times and collapsed onto one
+    row is evidence-equivalent to a fact merged from N source rows — both
+    say "independent observations converged here". The extra derivations
+    (``times_derived - 1``; 1 means observed once ⇒ no signal) add to
+    ``merged_source_count`` inside the same saturating curve, so the term
+    stays bounded, the weight structure is unchanged, and the score remains
+    monotonic in ``times_derived`` within [0, 1].
+    """
     anchor = last_recalled_at or created_at
     if anchor > 0:
         age_days = max(0.0, (now - anchor) / 86400.0)
         recency = 0.5 ** (age_days / recency_half_life_days)
     else:
         recency = 0.0
+    reinforcement = max(0, times_derived - 1)
     return (
         WEIGHTS["relevance"] * max(0.0, min(1.0, relevance))
         + WEIGHTS["frequency"] * _saturate(recall_count, _FREQ_K)
         + WEIGHTS["query_diversity"] * _saturate(unique_query_count, _DIVERSITY_K)
         + WEIGHTS["recency"] * recency
-        + WEIGHTS["consolidation"] * _saturate(merged_source_count, _CONSOLIDATION_K)
+        + WEIGHTS["consolidation"]
+        * _saturate(merged_source_count + reinforcement, _CONSOLIDATION_K)
         + WEIGHTS["richness"] * min(1.0, concept_count / _RICHNESS_MAX)
     )
 
@@ -115,12 +128,16 @@ def score_memory(mem: dict, traces: dict, *, now: float | None = None,
     """Score one staged memory dict against its trace aggregates.
 
     ``mem`` needs: memory_id, created_at (ISO), confidence?, concepts?,
-    related_memory_ids?, mean_relevance? (from trace-time scores when
-    available). Returns ``{promotion_score, retention_strength}``.
+    related_memory_ids?, times_derived?, mean_relevance? (from trace-time
+    scores when available). Returns ``{promotion_score, retention_strength}``.
     """
     now = datetime.now(timezone.utc).timestamp() if now is None else now
     created = _parse_ts(mem.get("created_at"))
     t = traces.get(mem.get("memory_id") or "", {})
+    try:
+        times_derived = max(1, int(mem.get("times_derived") or 1))
+    except (TypeError, ValueError):
+        times_derived = 1
     return {
         "promotion_score": promotion_score(
             relevance=float(mem.get("mean_relevance") or 0.0),
@@ -130,6 +147,7 @@ def score_memory(mem: dict, traces: dict, *, now: float | None = None,
             created_at=created,
             merged_source_count=len(mem.get("related_memory_ids") or []),
             concept_count=len(mem.get("concepts") or []),
+            times_derived=times_derived,
             now=now,
         ),
         "retention_strength": retention_strength(

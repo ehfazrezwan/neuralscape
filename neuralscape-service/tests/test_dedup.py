@@ -1,10 +1,17 @@
 """Tests for Qdrant memory deduplication."""
 
+import math
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from memory_service import MemoryService
+from memory_service import (
+    REINFORCEMENT_BOOST_K,
+    MemoryService,
+    _reinforcement_boost,
+    _times_derived_from_metadata,
+)
+from schemas import MemoryResponse
 
 
 # ──────────────────────────────────────────────
@@ -371,3 +378,224 @@ class TestDedupAllMemories:
         assert result["users_processed"] == 2
         # Bob's results should be counted even though Alice failed
         assert result["total_exact_removed"] == 2
+
+
+# ──────────────────────────────────────────────
+# Reinforcement-aware dedup (times_derived) — A2
+# ──────────────────────────────────────────────
+
+
+def _set_retrieve(service, payload_by_id: dict):
+    """Make client.retrieve return real point mocks for known ids."""
+
+    def _retrieve(collection_name=None, ids=None, **kwargs):
+        out = []
+        for mid in ids or []:
+            if mid in payload_by_id:
+                out.append(_make_point(mid, payload_by_id[mid]))
+        return out
+
+    service._memory.vector_store.client.retrieve.side_effect = _retrieve
+
+
+class TestTimesDerivedHelpers:
+    def test_defaults_to_one(self):
+        assert _times_derived_from_metadata(None) == 1
+        assert _times_derived_from_metadata({}) == 1
+        assert _times_derived_from_metadata({"times_derived": None}) == 1
+        assert _times_derived_from_metadata({"times_derived": "garbage"}) == 1
+        assert _times_derived_from_metadata({"times_derived": 0}) == 1
+
+    def test_reads_value_and_unwraps_double_metadata(self):
+        assert _times_derived_from_metadata({"times_derived": 4}) == 4
+        # mem0 double-wrap: {"metadata": {"metadata": {...}}}
+        assert _times_derived_from_metadata({"metadata": {"times_derived": 3}}) == 3
+
+    def test_boost_is_noop_for_unreinforced_and_none(self):
+        assert _reinforcement_boost(None, {"times_derived": 9}) is None
+        assert _reinforcement_boost(0.8, None) == 0.8
+        assert _reinforcement_boost(0.8, {"times_derived": 1}) == 0.8
+
+    def test_boost_formula_and_monotonicity(self):
+        base = 0.8
+        b3 = _reinforcement_boost(base, {"times_derived": 3})
+        b10 = _reinforcement_boost(base, {"times_derived": 10})
+        assert b3 == pytest.approx(base * (1 + REINFORCEMENT_BOOST_K * math.log1p(2)))
+        assert base < b3 < b10  # monotonic in times_derived
+        assert b10 < base * 1.2  # k=0.05 stays a small nudge
+
+
+class TestExactDedupReinforcement:
+    def test_survivor_absorbs_dropped_counters(self, service):
+        """3 exact copies → survivor's times_derived becomes the group sum."""
+        memories = [
+            _make_point("p1", {"user_id": "u1", "hash": "abc", "data": "fact",
+                               "created_at": "2025-01-01T00:00:00", "metadata": {}}),
+            _make_point("p2", {"user_id": "u1", "hash": "abc", "data": "fact",
+                               "created_at": "2025-03-01T00:00:00", "metadata": {}}),
+            _make_point("p3", {"user_id": "u1", "hash": "abc", "data": "fact",
+                               "created_at": "2025-06-01T00:00:00", "metadata": {"scope": "global"}}),
+        ]
+        service._memory.vector_store.client.scroll.return_value = (memories, None)
+        _set_retrieve(service, {"p3": {"metadata": {"scope": "global"}}})
+
+        result = service.dedup_memories("u1", semantic=False)
+
+        assert result["exact_duplicates_removed"] == 2
+        service._memory.vector_store.client.set_payload.assert_called_once()
+        kwargs = service._memory.vector_store.client.set_payload.call_args.kwargs
+        assert kwargs["points"] == ["p3"]
+        # survivor(1) + p1(1) + p2(1) = 3; merge preserved existing metadata
+        assert kwargs["payload"]["metadata"]["times_derived"] == 3
+        assert kwargs["payload"]["metadata"]["scope"] == "global"
+
+    def test_dropped_duplicate_counters_sum_not_count(self, service):
+        """A dropped dup that already accumulated reinforcements transfers
+        its full counter — sum semantics, same rule as the dreaming MERGE."""
+        memories = [
+            _make_point("p1", {"user_id": "u1", "hash": "abc", "data": "fact",
+                               "created_at": "2025-01-01T00:00:00",
+                               "metadata": {"times_derived": 4}}),
+            _make_point("p2", {"user_id": "u1", "hash": "abc", "data": "fact",
+                               "created_at": "2025-06-01T00:00:00",
+                               "metadata": {"times_derived": 2}}),
+        ]
+        service._memory.vector_store.client.scroll.return_value = (memories, None)
+        _set_retrieve(service, {"p2": {"metadata": {"times_derived": 2}}})
+
+        service.dedup_memories("u1", semantic=False)
+
+        kwargs = service._memory.vector_store.client.set_payload.call_args.kwargs
+        assert kwargs["points"] == ["p2"]
+        assert kwargs["payload"]["metadata"]["times_derived"] == 6  # 2 + 4
+
+    def test_no_duplicates_no_bump(self, service):
+        memories = [
+            _make_point("p1", {"user_id": "u1", "hash": "aaa", "data": "f1",
+                               "created_at": "2025-01-01T00:00:00", "metadata": {}}),
+        ]
+        service._memory.vector_store.client.scroll.return_value = (memories, None)
+
+        service.dedup_memories("u1", semantic=False)
+
+        service._memory.vector_store.client.set_payload.assert_not_called()
+
+    def test_bump_failure_never_blocks_dedup(self, service):
+        memories = [
+            _make_point("p1", {"user_id": "u1", "hash": "abc", "data": "fact",
+                               "created_at": "2025-01-01T00:00:00", "metadata": {}}),
+            _make_point("p2", {"user_id": "u1", "hash": "abc", "data": "fact",
+                               "created_at": "2025-06-01T00:00:00", "metadata": {}}),
+        ]
+        service._memory.vector_store.client.scroll.return_value = (memories, None)
+        service._memory.vector_store.client.retrieve.side_effect = Exception("Qdrant down")
+
+        result = service.dedup_memories("u1", semantic=False)
+
+        assert result["exact_duplicates_removed"] == 1  # delete still happened
+
+
+class TestSemanticDedupReinforcement:
+    def test_newer_near_duplicate_absorbs_older_counter(self, service):
+        memories = [
+            _make_point("p1", {"user_id": "u1", "hash": "aaa",
+                               "data": "User prefers dark mode",
+                               "created_at": "2025-01-01T00:00:00",
+                               "metadata": {"times_derived": 3}}),
+            _make_point("p2", {"user_id": "u1", "hash": "bbb",
+                               "data": "The user likes dark mode",
+                               "created_at": "2025-06-01T00:00:00", "metadata": {}}),
+        ]
+        service._memory.vector_store.client.scroll.return_value = (memories, None)
+        hit = _make_hit("p2", 0.97, {"user_id": "u1", "data": "The user likes dark mode",
+                                     "created_at": "2025-06-01T00:00:00", "metadata": {}})
+        service._memory.vector_store.search.side_effect = [[hit], []]
+        _set_retrieve(service, {"p2": {"metadata": {}}})
+
+        result = service.dedup_memories("u1")
+
+        assert result["semantic_duplicates_removed"] == 1
+        kwargs = service._memory.vector_store.client.set_payload.call_args.kwargs
+        assert kwargs["points"] == ["p2"]
+        assert kwargs["payload"]["metadata"]["times_derived"] == 4  # 1 + 3
+
+
+class TestWritePathReinforcement:
+    def test_store_raw_dedup_hit_bumps_existing(self, service):
+        existing = MemoryResponse(
+            id="exist1", memory="User prefers dark mode", category="preference",
+            scope="global", source="vector", created_at="2025-01-01T00:00:00",
+        )
+        _set_retrieve(service, {"exist1": {"metadata": {"category": "preference"}}})
+
+        with patch.object(service, "_find_by_content_hash", return_value=existing):
+            responses, created = service.store_raw(
+                content="User prefers dark mode", user_id="u1",
+                category="preference", return_created=True,
+            )
+
+        assert created is False
+        assert responses[0].id == "exist1"
+        kwargs = service._memory.vector_store.client.set_payload.call_args.kwargs
+        assert kwargs["points"] == ["exist1"]
+        assert kwargs["payload"]["metadata"]["times_derived"] == 2
+        # dedup hit must not insert a new row
+        service._memory.vector_store.insert.assert_not_called()
+
+    def test_store_raw_new_memory_does_not_bump(self, service):
+        service._memory.vector_store.client.scroll.return_value = ([], None)
+        service._memory.embedding_model.embed.return_value = [0.1] * 8
+
+        service.store_raw(
+            content="Brand new fact", user_id="u1",
+            category="preference", add_to_graph=False,
+        )
+
+        service._memory.vector_store.client.set_payload.assert_not_called()
+        service._memory.vector_store.insert.assert_called_once()
+
+
+class TestSearchReinforcementBoost:
+    def _hits(self):
+        # A: higher raw similarity, never reinforced.
+        # B: slightly lower similarity, reinforced 10×.
+        hit_a = _make_hit("a", 0.80, {"data": "one-off fact", "created_at": "2025-01-01",
+                                      "metadata": {"category": "preference"}})
+        hit_b = _make_hit("b", 0.78, {"data": "reinforced fact", "created_at": "2025-01-01",
+                                      "metadata": {"category": "preference",
+                                                   "times_derived": 10}})
+        return [hit_a, hit_b]
+
+    def test_personal_pool_boost_reorders(self, service):
+        result = MagicMock()
+        result.points = self._hits()
+        service._memory.vector_store.client.query_points.return_value = result
+
+        out = service._search_personal_pool(
+            m=service._memory, user_id="u1", query_embedding=[0.1] * 8,
+            project_id=None, categories=None, scope=None, domain=None,
+            observation_type=None, concepts=None, limit=10,
+        )
+
+        scores = {r.id: r.score for r in out}
+        assert scores["a"] == 0.80  # absent field → raw score untouched
+        expected_b = 0.78 * (1 + REINFORCEMENT_BOOST_K * math.log1p(9))
+        assert scores["b"] == pytest.approx(expected_b)
+        assert scores["b"] > scores["a"]  # reinforced row outranks the one-off
+
+    def test_shared_pool_applies_identical_boost(self, service):
+        result = MagicMock()
+        result.points = self._hits()
+        service._memory.vector_store.client.query_points.return_value = result
+
+        out = service._search_shared_pool(
+            m=service._memory, query="q", project_id=None, categories=None,
+            scope=None, domain=None, observation_type=None, concepts=None,
+            limit=10, query_embedding=[0.1] * 8,
+        )
+
+        scores = {r.id: r.score for r in out}
+        assert scores["a"] == 0.80
+        assert scores["b"] == pytest.approx(
+            0.78 * (1 + REINFORCEMENT_BOOST_K * math.log1p(9))
+        )
