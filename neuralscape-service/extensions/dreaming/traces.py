@@ -38,6 +38,11 @@ _DYN_KEY = "dreaming:dyn"
 # it never blocks interpreter shutdown.
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dream-trace")
 
+# Audit 27 #13: bound the queue. Traces are best-effort by contract — when
+# the worker can't keep up (dead/slow Redis), new traces are DROPPED with a
+# debug log instead of growing an unbounded backlog in process memory.
+MAX_PENDING_TRACES = 1000
+
 _redis_client = None
 
 
@@ -61,10 +66,21 @@ def query_hash(query: str) -> str:
 
 
 def log_recall(memory_ids: list[str], query: str, *, ttl_days: int = 30) -> None:
-    """Fire-and-forget a recall trace. NEVER raises; never blocks the read."""
+    """Fire-and-forget a recall trace. NEVER raises; never blocks the read.
+
+    Drops the trace (debug log) when the queue is at MAX_PENDING_TRACES —
+    a backlog that deep means Redis is down/stalled, and traces are a
+    best-effort reinforcement signal, never worth unbounded memory.
+    """
     if not memory_ids:
         return
     try:
+        if _executor._work_queue.qsize() >= MAX_PENDING_TRACES:
+            logger.debug(
+                "recall-trace queue full (>= %d) — dropping trace",
+                MAX_PENDING_TRACES,
+            )
+            return
         _executor.submit(_write_trace, list(memory_ids), query, ttl_days)
     except Exception:  # executor shut down at interpreter exit — drop it
         pass

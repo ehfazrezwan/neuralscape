@@ -159,12 +159,16 @@ async def process_memory_raw(
 
     # Idempotency: skip only when identical content already exists AT THE SAME
     # visibility tier (a different-tier write is a distinct memory).
+    # vector_only (audit 27 #12): this is an internal near-dupe probe — it
+    # must not pay the graph pass + edge enrichment of a full hybrid recall,
+    # and must not pollute the dreaming recall traces.
     try:
         existing = service.search(
             query=content,
             user_id=user_id,
             project_id=project_id,
             limit=3,
+            vector_only=True,
         )
         for mem in existing:
             if (

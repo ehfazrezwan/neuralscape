@@ -23,6 +23,25 @@ from config import settings
 _TRANSIENT_PATTERNS = ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "rate limit", "overloaded", "capacity", "timed out", "timeout")
 
 
+# ── Overlapped graph pass (audit 27 #9) ────────────────────────────────
+# search() used to run its vector pools to completion and only then start
+# the Graphiti pass — wall time was vector + graph even though the two legs
+# are independent once the query embed exists. The graph leg now runs on
+# this small dedicated pool while the calling thread works the vector legs,
+# and is joined right before the weave. Threads here spend their life
+# blocked on the Graphiti bridge future, so a modest pool bounds concurrent
+# graph fan-out without ever serializing a single search.
+from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
+
+_GRAPH_SEARCH_POOL = _ThreadPoolExecutor(
+    max_workers=16, thread_name_prefix="graph-search"
+)
+# The bridge call inside _do_graph_search already enforces its own 30s
+# timeout; this outer join is belt-and-suspenders so a wedged bridge thread
+# can never hang a read indefinitely.
+_GRAPH_SEARCH_JOIN_TIMEOUT_S = 45.0
+
+
 def _is_transient(exc: Exception) -> bool:
     """Check if an exception looks like a transient/retryable API error."""
     msg = str(exc)
@@ -2049,6 +2068,9 @@ class MemoryService:
         # Multi-user pool selection
         visibility: str | None = None,
         include_shared: bool = True,
+        # Internal write-path mode (audit 27 #12): vector pools only — no
+        # graph pass, no graph enrichment, no recall-trace logging.
+        vector_only: bool = False,
     ) -> list[MemoryResponse]:
         """Semantic search across memories with scope/category filters.
 
@@ -2066,6 +2088,12 @@ class MemoryService:
         When project_id is provided, both pools search project+global memories
         for that project (existing dual-scope merge preserved per pool).
 
+        ``vector_only=True`` is the internal write-path mode: the raw-write
+        idempotency check needs a cheap semantic near-dupe probe, not a full
+        hybrid recall — it skips the graph pass, graph enrichment, and the
+        dreaming recall trace (an internal probe must not reinforce
+        salience).
+
         Returns:
             List of matching memory responses sorted by score.
         """
@@ -2077,6 +2105,24 @@ class MemoryService:
         # Memory.search + shared-pool call re-embedded the same query — 4-5
         # embeds per recall — and the embed round-trip dominates read latency.
         query_embedding = m.embedding_model.embed(query, memory_action="search")
+
+        # Audit 27 #9: kick the graph pass off NOW, on its own thread, so it
+        # overlaps the vector pool queries below (the legs are independent —
+        # Graphiti embeds the query itself). Joined right before the weave.
+        graph_future = None
+        if not vector_only:
+            try:
+                graph_future = _GRAPH_SEARCH_POOL.submit(
+                    self._search_graph_for_visibility,
+                    query=query,
+                    user_id=user_id,
+                    project_id=project_id,
+                    limit=limit,
+                    visibility=visibility,
+                    include_shared=include_shared,
+                )
+            except Exception as e:
+                logger.warning(f"Graph search submit failed (non-critical): {e}")
 
         vector_responses: list[MemoryResponse] = []
 
@@ -2234,37 +2280,39 @@ class MemoryService:
         deduped.sort(key=lambda r: r.score or 0.0, reverse=True)
         vector_responses = deduped[:limit]
 
-        # Also query the knowledge graph and merge edge facts.
-        # Multi-user: when caller restricted the visibility, restrict the
-        # graph search's group_ids to match — otherwise the graph would
-        # walk the full read-set (caller's private + shared) and we'd
+        # Join the knowledge-graph pass started above and merge edge facts.
+        # Multi-user: when caller restricted the visibility, the graph search
+        # already restricted its group_ids to match — otherwise the graph
+        # would walk the full read-set (caller's private + shared) and we'd
         # have to retroactively filter, which is unreliable for graph
         # rows whose enriched visibility ends up as None.
         graph_responses: list[MemoryResponse] = []
-        try:
-            graph_results = self._search_graph_for_visibility(
-                query=query,
-                user_id=user_id,
-                project_id=project_id,
-                limit=limit,
-                visibility=visibility,
-                include_shared=include_shared,
-            )
-            for edge in graph_results.get("edges", []):
-                graph_responses.append(
-                    MemoryResponse(
-                        id=edge.get("uuid", ""),
-                        memory=edge.get("fact", edge.get("name", "")),
-                        source="graph",
-                    )
+        if graph_future is not None:
+            try:
+                graph_results = graph_future.result(
+                    timeout=_GRAPH_SEARCH_JOIN_TIMEOUT_S
                 )
-        except Exception as e:
-            logger.warning(f"Graph search failed during recall (non-critical): {e}")
+                for edge in graph_results.get("edges", []):
+                    graph_responses.append(
+                        MemoryResponse(
+                            id=edge.get("uuid", ""),
+                            memory=edge.get("fact", edge.get("name", "")),
+                            source="graph",
+                        )
+                    )
+            except Exception as e:
+                logger.warning(f"Graph search failed during recall (non-critical): {e}")
 
         # Memory-model v2: enrich graph results with v2 metadata from their
         # nearest source memory, then apply the same v2 filters to graph rows.
         # Graphiti's edge schema doesn't carry v2 fields natively — we recover
         # them by semantic match against the Qdrant store.
+        #
+        # Audit 27 #7: enrichment only runs when something actually consumes
+        # the recovered fields — an active v2 filter, or a memory_kind=
+        # "passage" filter (passage-ness lives on the source memory). A plain
+        # recall used to pay a per-edge embed + Qdrant query here purely to
+        # decorate graph rows nobody filtered on.
         v2_filter_active = bool(domain or observation_type or concepts)
         if graph_responses and v2_filter_active:
             graph_responses = self._enrich_and_filter_graph(
@@ -2315,12 +2363,23 @@ class MemoryService:
         # Dreaming: fire-and-forget recall trace (reinforcement signal for
         # the dream sweep's promotion/retention scoring). Runs on a daemon
         # thread inside log_recall — never blocks or fails the read.
-        try:
-            from extensions.dreaming.traces import log_recall
+        #
+        # Audit 27 #13: skipped entirely unless something CONSUMES the traces
+        # — the dream sweep (dreaming enabled) or the bounded salience
+        # tie-breaker (salience_recall_k > 0). With both off, log_recall was
+        # ~5N+4 Redis writes per search feeding a store nothing ever read.
+        # Internal vector_only probes (write-side idempotency checks) never
+        # log — they aren't user recalls and must not reinforce salience.
+        if not vector_only:
+            try:
+                from extensions.dreaming.config import dreaming_settings
 
-            log_recall([r.id for r in results if r.id], query)
-        except Exception:
-            pass
+                if dreaming_settings.enabled or float(dreaming_settings.salience_recall_k) > 0.0:
+                    from extensions.dreaming.traces import log_recall
+
+                    log_recall([r.id for r in results if r.id], query)
+            except Exception:
+                pass
 
         return results
 
