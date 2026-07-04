@@ -35,6 +35,11 @@ Design rules:
   backlinks become the navigation surface.
 - **Idempotent per topic** — a topic whose ``source_memory_ids`` set is
   unchanged since its last write is skipped (no LLM merge).
+- **Dim, don't delete** (B3b): memories whose retention strength fell
+  below the prune threshold but survived consolidation drop out of the
+  main sections and re-render as one-liners inside a collapsed
+  ``> [!note]- Faded`` callout at the bottom of their topic page — they
+  fade from view, never from the page.
 - **Pool isolation** (spec §4.2): shared pools render under Projects/ or
   Knowledge/; ONLY the operator's own private pool renders under Me/ —
   other users' private pools never land in the operator's vault.
@@ -93,6 +98,14 @@ _ESSENTIAL_KEY = "dreaming:essential:{pool}"
 _ESSENTIAL_TTL = 60 * 60 * 24 * 45  # stale pools self-clean out of the story
 
 _IDENTITY_CATEGORIES = ("personal_fact", "preference")
+
+# ── Faded section (B3b) ─────────────────────────────────────────────
+
+#: Markers bracketing the collapsed Faded callout so other passes (the
+#: bridges patcher) can locate it without parsing markdown structure.
+FADED_START = "<!-- ns:faded -->"
+FADED_END = "<!-- /ns:faded -->"
+_FADED_CALLOUT_TITLE = "> [!note]- Faded"
 
 
 TOPIC_CLUSTER_PROMPT = """\
@@ -225,18 +238,21 @@ def _one_line(text: str, limit: int = 180) -> str:
 
 
 def _content_fingerprint(memories: list[dict]) -> str:
-    """Order-independent digest of a topic's (id, content) pairs.
+    """Order-independent digest of a topic's (id, content, faded) triples.
 
     The idempotent skip compares this alongside the id set: a memory
     rewritten in place (same id, new text — e.g. by this sweep's own
     REWRITE/MERGE reconciliation) must re-render its page even though the
-    ``source_memory_ids`` set is unchanged.
+    ``source_memory_ids`` set is unchanged. The faded flag participates
+    too — a row crossing the retention threshold changes the rendering
+    (main section → Faded callout) with identical ids and content.
     """
     digest = hashlib.sha256()
     for mem in sorted(memories, key=lambda m: m.get("memory_id") or ""):
         digest.update((mem.get("memory_id") or "").encode())
         digest.update(b"\x00")
         digest.update((mem.get("content") or "").strip().encode())
+        digest.update(b"F" if mem.get("dream_faded") else b"-")
         digest.update(b"\x01")
     return digest.hexdigest()[:16]
 
@@ -377,6 +393,7 @@ def render_topic_page(
     body: str = "",
     known_pages=(),
     content_hash: str = "",
+    faded_lines: list[str] | None = None,
     now: datetime | None = None,
 ) -> str:
     """Render one topic page.
@@ -386,6 +403,10 @@ def render_topic_page(
     with empty sections omitted. The legacy ``body`` path renders a raw
     markdown body verbatim (used by the wiki migration script; such pages
     are restructured into the skeleton on their next dream).
+
+    ``faded_lines`` (B3b) render as a collapsed Obsidian callout at the
+    bottom of the body — dimmed rows leave the main sections but never
+    the page.
     """
     ts = (now or datetime.now(timezone.utc)).isoformat()
     tags = " ".join(sorted({f"#{c}" for c in categories if c}))
@@ -402,6 +423,15 @@ def render_topic_page(
             body_lines += [f"## {section}", "", text, ""]
     if body.strip() and not sections:
         body_lines += [body.strip(), ""]
+    if faded_lines:
+        body_lines += [
+            FADED_START,
+            _FADED_CALLOUT_TITLE,
+            "> Dimmed, not deleted — below the retention threshold.",
+            *(f"> - {_one_line(line, 200)}" for line in faded_lines),
+            FADED_END,
+            "",
+        ]
     while body_lines and not body_lines[-1]:
         body_lines.pop()
 
@@ -442,6 +472,7 @@ async def update_vault(
     operator_user_id: str,
     dry_run: bool,
     redis=None,
+    faded_threshold: float | None = None,
 ) -> dict:
     """Cluster the pool's staged memories into topics and update pages.
 
@@ -452,6 +483,12 @@ async def update_vault(
     When ``redis`` is provided, the pool's top promotion-scored lines are
     persisted under ``dreaming:essential:{pool}`` so Home.md's Essential
     Story can rank across pools without re-scrolling them.
+
+    ``faded_threshold`` (B3b, normally the sweep's prune-strength
+    threshold): live rows whose ``retention_strength`` sits below it are
+    *faded* — they still cluster into topics but are excluded from the
+    merge LLM, the main sections, the Essential Story and the identity
+    block, rendering instead as one-liners in the collapsed Faded callout.
     """
     from extensions.conversation_compiler.obsidian_writer import _atomic_write
 
@@ -463,6 +500,11 @@ async def update_vault(
         m for m in batch.memories
         if not m.get("dream_tombstoned") and (m.get("content") or "").strip()
     ]
+    if faded_threshold is not None:
+        for mem in live:
+            strength = mem.get("retention_strength")
+            if isinstance(strength, (int, float)) and strength < faded_threshold:
+                mem["dream_faded"] = True
     if len(live) < 2:
         return out
 
@@ -507,21 +549,30 @@ async def update_vault(
         siblings = [s for s in sibling_titles if s != page_name]
         if hub_name:
             siblings.append(hub_name)
-        raw_merge = await llm_call(TOPIC_MERGE_PROMPT.format(
-            title=title,
-            siblings=", ".join(f"[[{s}]]" for s in siblings) or "(none)",
-            existing_body=existing_body or "(empty — first synthesis)",
-            memories_block=render_memories_block(mems, include_strength=False),
-        ))
-        if not (raw_merge or "").strip():
-            continue  # LLM exhausted its retries — leave the page alone
-        parsed = parse_merge_response(raw_merge)
-        if parsed is None:
-            logger.warning(
-                "topic merge for %r returned no usable skeleton — falling back "
-                "to category bucketing", title,
-            )
-            parsed = fallback_structure(mems)
+        # Faded rows (B3b) never reach the merge LLM or the main sections;
+        # they become one-liners in the collapsed callout instead.
+        active = [m for m in mems if not m.get("dream_faded")]
+        faded = [m for m in mems if m.get("dream_faded")]
+        faded_lines = [_one_line(m.get("content") or "", 200) for m in faded]
+        if active:
+            raw_merge = await llm_call(TOPIC_MERGE_PROMPT.format(
+                title=title,
+                siblings=", ".join(f"[[{s}]]" for s in siblings) or "(none)",
+                existing_body=existing_body or "(empty — first synthesis)",
+                memories_block=render_memories_block(active, include_strength=False),
+            ))
+            if not (raw_merge or "").strip():
+                continue  # LLM exhausted its retries — leave the page alone
+            parsed = parse_merge_response(raw_merge)
+            if parsed is None:
+                logger.warning(
+                    "topic merge for %r returned no usable skeleton — falling back "
+                    "to category bucketing", title,
+                )
+                parsed = fallback_structure(active)
+        else:
+            # every row faded — no LLM pass, the page is just the callout
+            parsed = ([], {})
         index_card, sections = parsed
         rendered = render_topic_page(
             title=title,
@@ -535,6 +586,7 @@ async def update_vault(
             version=int(fm.get("version") or 0) + 1,
             known_pages=siblings,
             content_hash=fingerprint,
+            faded_lines=faded_lines,
         )
         if not dry_run:
             _atomic_write(path, rendered)
@@ -563,6 +615,9 @@ def _essential_candidates(valid_topics, known: dict[str, dict]) -> list[dict]:
     state, retention fallback otherwise — B1: "top memories *by
     salience*"), with ``promotion_score`` as the fallback for staged rows
     scored before the salience field existed.
+
+    Faded rows never make the story — Home is the wake-up stack, and a
+    memory dimmed below the retention threshold has no business there.
     """
 
     def _rank(mem: dict) -> float:
@@ -578,6 +633,8 @@ def _essential_candidates(valid_topics, known: dict[str, dict]) -> list[dict]:
     for title, page_name, ids, _summary in valid_topics:
         for mid in ids:
             mem = known[mid]
+            if mem.get("dream_faded"):
+                continue
             out.append(
                 {
                     "score": round(_rank(mem), 4),
@@ -634,6 +691,7 @@ def _identity_lines(memories: list[dict]) -> list[str]:
         m for m in memories
         if (m.get("category") or "") in _IDENTITY_CATEGORIES
         and (m.get("content") or "").strip()
+        and not m.get("dream_faded")
     ]
     candidates.sort(key=lambda m: float(m.get("promotion_score") or 0.0), reverse=True)
     return [f"- {_one_line(m['content'], 160)}" for m in candidates[:IDENTITY_MAX_LINES]]
@@ -683,7 +741,7 @@ def _hub_stats(directory: Path) -> tuple[int, int, str]:
     if not directory.exists():
         return 0, 0, "—"
     for path in sorted(directory.glob("*.md")):
-        if path.stem == directory.name:  # the hub itself
+        if path.stem == directory.name or path.stem == "Card":  # hub / identity card
             continue
         try:
             fm, _ = split_page(path.read_text(encoding="utf-8"))
@@ -732,7 +790,7 @@ def _list_topic_pages(directory: Path) -> list[dict]:
     if not directory.exists():
         return pages
     for path in sorted(directory.glob("*.md")):
-        if path.stem == directory.name:  # the hub itself
+        if path.stem == directory.name or path.stem == "Card":  # hub / identity card
             continue
         fm, _ = split_page(path.read_text(encoding="utf-8"))
         pages.append(

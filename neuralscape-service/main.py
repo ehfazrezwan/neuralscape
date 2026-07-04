@@ -35,13 +35,17 @@ from memory_service import MemoryService
 # Configure structured logging before anything else
 configure_logging()
 from context_formatter import format_context_for_injection
+from index_format import index_row
 from schemas import (
     MEMORY_CATEGORIES,
     BulkDeleteRequest,
     CategoryListResponse,
     ConnectorConfigRequest,
     ContextResponse,
+    GetMemoriesRequest,
+    GetMemoriesResponse,
     GraphSearchRequest,
+    IndexRow,
     IngestDocumentRequest,
     IngestTextRequest,
     MemoryResponse,
@@ -50,12 +54,15 @@ from schemas import (
     PatchMemoryRequest,
     RawMemoryRequest,
     RetagRequest,
+    SearchIndexResponse,
     SearchMemoryRequest,
     SearchMemoryResponse,
     StoreMemoryRequest,
     StoreMemoryResponse,
     TaskAcceptedResponse,
     TaskStatusResponse,
+    TimelineRequest,
+    TimelineResponse,
     normalize_visibility,
 )
 from task_manager import TaskManager
@@ -1422,7 +1429,11 @@ async def v1_get_task_status(task_id: str):
 # ── Recall ────────────────────────────────────
 
 
-@v1_router.post("/search", response_model=SearchMemoryResponse)
+# Union response model: Pydantic v2 smart-union validates the returned model
+# instance against its exact member type (a SearchMemoryResponse can never be
+# coerced into SearchIndexResponse or vice versa — IndexRow requires `title`,
+# full results carry `memory`), so both modes stay first-class in OpenAPI.
+@v1_router.post("/search", response_model=SearchMemoryResponse | SearchIndexResponse)
 async def v1_search_memories(req: SearchMemoryRequest, request: Request):
     """Semantic search with scope/category filters.
 
@@ -1433,6 +1444,11 @@ async def v1_search_memories(req: SearchMemoryRequest, request: Request):
     shared pool. Pass `visibility="private"` to restrict to personal only,
     `visibility="shared"` to restrict to the team pool, or
     `include_shared=False` to skip the shared pool entirely.
+
+    Retrieval economics (C1): pass `index_only=true` to get compact index
+    rows ({id, title, category, glyph, age, tokens, score}) instead of full
+    payloads — filter the index, then batch-fetch via
+    POST /v1/memories/batch-get.
     """
     user_id = _resolve_user_id(request, req.user_id)
     try:
@@ -1451,12 +1467,77 @@ async def v1_search_memories(req: SearchMemoryRequest, request: Request):
             visibility=req.visibility.value if req.visibility else None,
             include_shared=req.include_shared,
         )
+        if req.index_only:
+            return SearchIndexResponse(
+                results=[IndexRow(**index_row(r)) for r in results]
+            )
         return SearchMemoryResponse(results=results)
     except HTTPException:
         raise
     except Exception as e:
         logger.exception("v1 search failed")
         raise HTTPException(status_code=500, detail="Memory search failed")
+
+
+@v1_router.post("/memories/batch-get", response_model=GetMemoriesResponse)
+async def v1_batch_get_memories(req: GetMemoriesRequest, request: Request):
+    """Batch-fetch full memory payloads by id (C1, layer 3 of the contract).
+
+    The intended workflow: search with `index_only=true`, filter the index
+    rows, then fetch only the chosen ids here (max 50 per call). Visibility
+    is enforced per id — ids the caller may not read come back in `missing`,
+    indistinguishable from nonexistent ones.
+    """
+    caller = _resolve_user_id(request, req.user_id)
+    try:
+        out = await asyncio.to_thread(_service.get_memories_by_ids, req.ids, caller)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("v1 batch-get failed")
+        raise HTTPException(status_code=500, detail="Failed to fetch memories") from e
+    return GetMemoriesResponse(results=out["results"], missing=out["missing"])
+
+
+@v1_router.post("/timeline", response_model=TimelineResponse)
+async def v1_timeline(req: TimelineRequest, request: Request):
+    """Chronological window around an anchor memory (C2).
+
+    `anchor` is a memory id (UUID) or a search query (resolved to its best
+    vector hit). Returns ±`depth` caller-visible memories around the anchor
+    in created_at order as compact index rows, the anchor row marked with
+    `anchor: true`. Answers "what was happening around X?" — dream insights
+    and session-context memories interleave naturally. 404 when the anchor
+    can't be resolved (unknown id, unreadable id, or no search hit).
+    """
+    caller = _resolve_user_id(request, req.user_id)
+    try:
+        out = await asyncio.to_thread(
+            _service.timeline,
+            anchor=req.anchor,
+            user_id=caller,
+            depth=req.depth,
+            project_id=req.project_id,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("v1 timeline failed")
+        raise HTTPException(status_code=500, detail="Timeline failed") from e
+    if out is None:
+        raise HTTPException(
+            status_code=404, detail=f"Timeline anchor {req.anchor!r} could not be resolved"
+        )
+    anchor_id = out["anchor_id"]
+    rows = [
+        IndexRow(**index_row(m, anchor=(m.id == anchor_id)))
+        for m in out["memories"]
+    ]
+    return TimelineResponse(anchor_id=anchor_id, results=rows)
 
 
 @v1_router.post("/graph/search")
