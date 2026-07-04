@@ -97,15 +97,35 @@ export const MODIFY_OBSERVATION_TYPES = new Set<string>(["bugfix", "feature", "r
 export const MODIFY_VERB_RE =
   /\b(edit(?:ed|ing)?|modif(?:y|ied|ying)|fix(?:ed|ing|es)?|refactor(?:ed|ing)?|rewr(?:ote|itten|ite)|implement(?:ed|ing)?|updat(?:ed|ing)|chang(?:ed|ing)|creat(?:ed|ing)|add(?:ed|ing)|renam(?:ed|ing)|delet(?:ed|ing)|remov(?:ed|ing)|wrote|patch(?:ed|ing|es)?)\b/i;
 
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Token-boundary matcher for a basename: `utils.ts` must not match
+ * `data.ts`-style suffixes (no filename char before) or `utils.tsx`-style
+ * extensions (no word char / dash after; a trailing `.` — sentence
+ * punctuation — is fine). Case-insensitive.
+ */
+export function basenameMatchRe(basename: string): RegExp {
+  return new RegExp(`(?<![\\w.-])${escapeRegExp(basename)}(?![\\w-])`, "i");
+}
+
+/** Everything a memory can reference a file through: content, title, tags. */
+export function memoryHaystack(mem: NeuralscapeMemory): string {
+  return `${mem.memory ?? ""}\n${mem.title ?? ""}\n${(mem.tags ?? []).join("\n")}`;
+}
+
 /**
  * Verification filter: does this memory actually reference the file?
- * Content, title, and tags are checked for the basename (case-insensitive).
+ * Content, title, and tags are checked for the basename as a whole token
+ * (case-insensitive) — substring hits like `a.ts` inside `data.ts` don't
+ * count.
  */
 export function referencesFile(mem: NeuralscapeMemory, filePath: string): boolean {
-  const base = fileNameOf(filePath).toLowerCase();
+  const base = fileNameOf(filePath);
   if (!base) return false;
-  const hay = `${mem.memory ?? ""}\n${mem.title ?? ""}\n${(mem.tags ?? []).join("\n")}`.toLowerCase();
-  return hay.includes(base);
+  return basenameMatchRe(base).test(memoryHaystack(mem));
 }
 
 /** 2 = modify-typed observation, 1 = modify verbs in content, 0 = read-only. */
@@ -144,11 +164,15 @@ export function rankFileMemories(
     .filter((m) => referencesFile(m, filePath))
     .map((m) => {
       const ts = m.created_at ? new Date(m.created_at).getTime() : Number.NEGATIVE_INFINITY;
+      // Rank over the SAME haystack the verification filter used
+      // (content + title + tags) so a memory referencing the file via its
+      // title isn't scored as maximally non-specific.
+      const hay = memoryHaystack(m);
       return {
         m,
         mod: modifiedScore(m),
-        files: distinctFileMentions(m.memory) || Number.MAX_SAFE_INTEGER,
-        tailHit: tail && (m.memory ?? "").toLowerCase().includes(tail) ? 1 : 0,
+        files: distinctFileMentions(hay) || Number.MAX_SAFE_INTEGER,
+        tailHit: tail && hay.toLowerCase().includes(tail) ? 1 : 0,
         ts: Number.isNaN(ts) ? Number.NEGATIVE_INFINITY : ts,
       };
     });

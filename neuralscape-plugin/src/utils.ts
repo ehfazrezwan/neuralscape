@@ -227,10 +227,26 @@ export function getExcludedProjectGlobs(): string[] {
     .filter(Boolean);
 }
 
+// isProjectExcluded runs in hook hot paths (once per PostToolUse event) —
+// cache the compiled regexes keyed by the raw glob list so config parsing
+// and RegExp construction happen once per process, not once per tool call.
+let excludedGlobCacheKey: string | null = null;
+let excludedGlobCache: RegExp[] = [];
+
+function getExcludedProjectRegexps(): RegExp[] {
+  const globs = getExcludedProjectGlobs();
+  const key = globs.join(",");
+  if (key !== excludedGlobCacheKey) {
+    excludedGlobCacheKey = key;
+    excludedGlobCache = globs.map(globToRegExp);
+  }
+  return excludedGlobCache;
+}
+
 /** True when the resolved project id matches any excluded-projects glob. */
 export function isProjectExcluded(projectId: string | undefined): boolean {
   if (!projectId) return false;
-  return getExcludedProjectGlobs().some((g) => globToRegExp(g).test(projectId));
+  return getExcludedProjectRegexps().some((re) => re.test(projectId));
 }
 
 // ── Privacy: <private> tag redaction (roadmap D4) ────────────────

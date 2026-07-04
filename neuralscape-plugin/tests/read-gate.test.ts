@@ -189,6 +189,20 @@ describe("referencesFile", () => {
   it("rejects memories that never mention the file", () => {
     expect(referencesFile(UNRELATED, TARGET)).toBe(false);
   });
+
+  it("rejects substring false positives (a.ts inside data.ts, x.ts inside x.tsx)", () => {
+    // basename `a.ts` must NOT match `data.ts`
+    expect(referencesFile(mem({ memory: "refactored data.ts today" }), "/repo/a.ts")).toBe(false);
+    // basename `target-module.ts` must NOT match `target-module.tsx`
+    expect(referencesFile(mem({ memory: "see target-module.tsx for the JSX port" }), TARGET)).toBe(false);
+    // ...nor `x.target-module.ts` (a different dotted file)
+    expect(referencesFile(mem({ memory: "generated x.target-module.ts stub" }), TARGET)).toBe(false);
+  });
+
+  it("accepts token matches with path prefixes and sentence punctuation", () => {
+    expect(referencesFile(mem({ memory: "fixed src/gate/target-module.ts." }), TARGET)).toBe(true);
+    expect(referencesFile(mem({ memory: "(target-module.ts)" }), TARGET)).toBe(true);
+  });
 });
 
 describe("modifiedScore", () => {
@@ -247,6 +261,25 @@ describe("rankFileMemories", () => {
     );
     expect(rankFileMemories(many, TARGET)).toHaveLength(10);
     expect(rankFileMemories(many, TARGET, 3)).toHaveLength(3);
+  });
+
+  it("ranks title/tag-referenced memories on the same haystack as verification", () => {
+    // References the file ONLY via title — must not be scored as
+    // maximally non-specific and pushed below a broad content mention.
+    const titleOnly = mem({
+      id: "m-title-only",
+      memory: "The retry queue must be drained before shutdown.",
+      title: "target-module.ts retry-queue contract",
+      created_at: "2026-07-01T00:00:00Z",
+    });
+    const broad = mem({
+      id: "m-broad",
+      memory:
+        "Survey: target-module.ts, alpha.py, beta.go, gamma.rs and delta.java each satisfy the worker interface.",
+      created_at: "2026-07-03T00:00:00Z",
+    });
+    const ranked = rankFileMemories([broad, titleOnly], TARGET);
+    expect(ranked.map((m) => m.id)).toEqual(["m-title-only", "m-broad"]);
   });
 
   it("orders equal scores by recency", () => {
