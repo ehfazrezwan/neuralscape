@@ -66,14 +66,19 @@ async def list_tools() -> list[Tool]:
                 "Search across the user's global and project-specific memories using semantic search. "
                 "ALWAYS call this tool before starting work on a task to load relevant context about "
                 "user preferences, project conventions, tech stack, and past decisions. "
+                "PREFER the token-efficient 3-layer workflow: (1) search with index_only=true to get a "
+                "compact index — {id, title, category, glyph, age, tokens, score} per hit, ~50-100 tokens "
+                "each instead of full payloads; (2) filter the index by title/category/age/token cost; "
+                "(3) call get_memories(ids=[...]) for full payloads of ONLY the hits you actually need. "
+                "NEVER fetch full details without filtering first when you expect many hits. "
                 "When project_id is provided, searches both global user memories and project-specific memories, "
                 "returning the most relevant results sorted by relevance score. "
-                "Results include a 'source' field: 'graph' results come from the knowledge graph and reflect "
-                "the latest contradiction-resolved state; 'vector' results come from the vector store. "
-                "When vector and graph results conflict, prefer graph-sourced results as authoritative. "
-                "Memories ingested from a data layer carry a 'source_ref' (origin url/connector + a "
-                "'retrieval' handle {mcp_server, tool, args}); use that handle to fetch the original "
-                "source or more context when a result references external content."
+                "Full (non-index) results include a 'source' field: 'graph' results come from the knowledge "
+                "graph and reflect the latest contradiction-resolved state; 'vector' results come from the "
+                "vector store. When vector and graph results conflict, prefer graph-sourced results as "
+                "authoritative. Memories ingested from a data layer carry a 'source_ref' (origin "
+                "url/connector + a 'retrieval' handle {mcp_server, tool, args}); use that handle to fetch "
+                "the original source or more context when a result references external content."
             ),
             inputSchema={
                 "type": "object",
@@ -117,6 +122,15 @@ async def list_tools() -> list[Tool]:
                         "description": (
                             "When false, exclude the shared team pool entirely "
                             "(search caller's private memories only). Default: true."
+                        ),
+                    },
+                    "index_only": {
+                        "type": "boolean",
+                        "description": (
+                            "When true, return compact index rows ({id, title, category, "
+                            "glyph, age, tokens, score}) instead of full payloads — "
+                            "~50-100 tokens per hit. Filter these, then call "
+                            "get_memories(ids=[...]) for the few you need. Default: false."
                         ),
                     },
                 },
@@ -809,6 +823,14 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 visibility=arguments.get("visibility"),
                 include_shared=arguments.get("include_shared", True),
             )
+            if arguments.get("index_only"):
+                from index_format import index_row
+
+                rows = [index_row(r) for r in results]
+                return [TextContent(type="text", text=json.dumps(
+                    {"index_only": True, "results": rows,
+                     "hint": "Filter these rows, then call get_memories(ids=[...]) for full payloads."},
+                    default=str, ensure_ascii=False))]
             output = [r.model_dump(exclude_none=True) for r in results]
             return [TextContent(type="text", text=json.dumps(output, default=str))]
 

@@ -674,6 +674,17 @@ class SearchMemoryRequest(BaseModel):
         description="When false, exclude shared-pool memories entirely (search personal only).",
     )
 
+    # Retrieval economics (C1): index-first recall
+    index_only: bool = Field(
+        default=False,
+        description=(
+            "When true, return compact index rows ({id, title, category, glyph, "
+            "age, tokens, score}) instead of full memory payloads — ~50-100 "
+            "tokens per hit. Filter the index, then batch-fetch the chosen ids "
+            "via POST /v1/memories/batch-get."
+        ),
+    )
+
     @field_validator("domain")
     @classmethod
     def _validate_domain(cls, v: str | None) -> str | None:
@@ -941,6 +952,30 @@ class SearchMemoryResponse(BaseModel):
     status: str = "ok"
     results: list[MemoryResponse] = Field(default_factory=list)
     graph_results: list[dict] | None = None
+
+
+class IndexRow(BaseModel):
+    """Compact index representation of one memory (~50-100 tokens rendered).
+
+    The map, not the path: enough to decide whether the full payload is worth
+    fetching (title + category + observation-type glyph + age + token cost),
+    never the payload itself. ``anchor`` is only set on timeline responses.
+    """
+    id: str
+    title: str
+    category: str | None = None
+    glyph: str | None = None
+    age: str | None = None
+    tokens: int | None = None
+    score: float | None = None
+    anchor: bool | None = None
+
+
+class SearchIndexResponse(BaseModel):
+    """Response for index-only search (C1 layer 1)."""
+    status: str = "ok"
+    index_only: bool = True
+    results: list[IndexRow] = Field(default_factory=list)
 
 
 class ContextResponse(BaseModel):

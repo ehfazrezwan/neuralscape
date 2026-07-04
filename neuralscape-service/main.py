@@ -35,6 +35,7 @@ from memory_service import MemoryService
 # Configure structured logging before anything else
 configure_logging()
 from context_formatter import format_context_for_injection
+from index_format import index_row
 from schemas import (
     MEMORY_CATEGORIES,
     BulkDeleteRequest,
@@ -42,6 +43,7 @@ from schemas import (
     ConnectorConfigRequest,
     ContextResponse,
     GraphSearchRequest,
+    IndexRow,
     IngestDocumentRequest,
     IngestTextRequest,
     MemoryResponse,
@@ -50,6 +52,7 @@ from schemas import (
     PatchMemoryRequest,
     RawMemoryRequest,
     RetagRequest,
+    SearchIndexResponse,
     SearchMemoryRequest,
     SearchMemoryResponse,
     StoreMemoryRequest,
@@ -1312,8 +1315,10 @@ async def v1_get_task_status(task_id: str):
 # ── Recall ────────────────────────────────────
 
 
-@v1_router.post("/search", response_model=SearchMemoryResponse)
-async def v1_search_memories(req: SearchMemoryRequest, request: Request):
+@v1_router.post("/search", response_model=None)
+async def v1_search_memories(
+    req: SearchMemoryRequest, request: Request
+) -> SearchMemoryResponse | SearchIndexResponse:
     """Semantic search with scope/category filters.
 
     When project_id is provided, searches both global and project memories.
@@ -1323,6 +1328,11 @@ async def v1_search_memories(req: SearchMemoryRequest, request: Request):
     shared pool. Pass `visibility="private"` to restrict to personal only,
     `visibility="shared"` to restrict to the team pool, or
     `include_shared=False` to skip the shared pool entirely.
+
+    Retrieval economics (C1): pass `index_only=true` to get compact index
+    rows ({id, title, category, glyph, age, tokens, score}) instead of full
+    payloads — filter the index, then batch-fetch via
+    POST /v1/memories/batch-get.
     """
     user_id = _resolve_user_id(request, req.user_id)
     try:
@@ -1341,6 +1351,10 @@ async def v1_search_memories(req: SearchMemoryRequest, request: Request):
             visibility=req.visibility.value if req.visibility else None,
             include_shared=req.include_shared,
         )
+        if req.index_only:
+            return SearchIndexResponse(
+                results=[IndexRow(**index_row(r)) for r in results]
+            )
         return SearchMemoryResponse(results=results)
     except HTTPException:
         raise
