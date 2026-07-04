@@ -2537,14 +2537,18 @@ class MemoryService:
         from graphiti_core.search.search_config import SearchConfig
         from graphiti_core.search.search_config_recipes import EDGE_HYBRID_SEARCH_RRF
 
+        # Audit 27 #10: EDGE_HYBRID_SEARCH_RRF is a module-level singleton
+        # shared across every thread — mutating its `.limit` in place let a
+        # concurrent delete (limit=5) clamp a live search's graph fan-out.
+        # Always work on a deep copy.
         if search_config:
             try:
                 config = SearchConfig(**search_config)
             except (TypeError, ValueError) as e:
                 logger.warning(f"Invalid search_config, falling back to default: {e}")
-                config = EDGE_HYBRID_SEARCH_RRF
+                config = EDGE_HYBRID_SEARCH_RRF.model_copy(deep=True)
         else:
-            config = EDGE_HYBRID_SEARCH_RRF
+            config = EDGE_HYBRID_SEARCH_RRF.model_copy(deep=True)
         config.limit = limit
 
         try:
@@ -2678,14 +2682,16 @@ class MemoryService:
         # cross-user `"global"`/`"project--..."` group_ids.
         group_ids = _get_group_ids(user_id, project_id)
 
+        # Audit 27 #10: never mutate the shared module-level recipe singleton
+        # — deep-copy before setting the per-call limit.
         if search_config:
             try:
                 config = SearchConfig(**search_config)
             except (TypeError, ValueError) as e:
                 logger.warning(f"Invalid search_config, falling back to default: {e}")
-                config = EDGE_HYBRID_SEARCH_RRF
+                config = EDGE_HYBRID_SEARCH_RRF.model_copy(deep=True)
         else:
-            config = EDGE_HYBRID_SEARCH_RRF
+            config = EDGE_HYBRID_SEARCH_RRF.model_copy(deep=True)
 
         config.limit = limit
 
@@ -4746,7 +4752,9 @@ class MemoryService:
         try:
             from graphiti_core.search.search_config_recipes import EDGE_HYBRID_SEARCH_RRF
 
-            config = EDGE_HYBRID_SEARCH_RRF
+            # Audit 27 #10: deep-copy — mutating the shared singleton here
+            # clamped every concurrent search's graph fan-out to 5.
+            config = EDGE_HYBRID_SEARCH_RRF.model_copy(deep=True)
             config.limit = 5
 
             metadata = mem.get("metadata", {}) or {}
