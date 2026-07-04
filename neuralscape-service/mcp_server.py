@@ -1215,11 +1215,9 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 {"status": "accepted", "task_id": task_id}))]
 
         elif name == "get_card":
-            from extensions.dreaming.card import (
-                card_read_allowed,
-                load_card,
-                resolve_card_pool,
-            )
+            from functools import partial
+
+            from extensions.dreaming.card import build_card_view, resolve_card_pool
             from extensions.dreaming.sweep import _get_redis
 
             pool = resolve_card_pool(
@@ -1230,29 +1228,29 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             if not pool:
                 return [TextContent(type="text", text=json.dumps(
                     {"error": "Cannot resolve a pool — pass project_id or pool"}))]
-            # Private-card reads are gated on the caller's EFFECTIVE
-            # identity (`user_id` above): a verified token identity wins
-            # and cannot be overridden by arguments; legacy shared-key /
-            # stdio callers are scoped to the user they claimed — the
+            # Shared read contract with the REST route (build_card_view):
+            # private cards gate on the caller's EFFECTIVE identity
+            # (`user_id` above) — a verified token identity wins and
+            # cannot be overridden by arguments; legacy shared-key /
+            # stdio callers are scoped to the user they claimed, the
             # same trust model as every other read tool on this surface.
-            if not card_read_allowed(
-                pool, user_id, is_dictator=settings.is_dictator(user_id)
-            ):
+            view = await asyncio.to_thread(
+                partial(
+                    build_card_view,
+                    pool,
+                    user_id,
+                    is_dictator=settings.is_dictator(user_id),
+                    redis=_get_redis(),
+                )
+            )
+            if view["status"] == "forbidden":
                 return [TextContent(type="text", text=json.dumps(
                     {"error": "Another user's private card is not readable"}))]
-            data = await asyncio.to_thread(load_card, _get_redis(), pool)
-            lines = (data or {}).get("lines") or []
-            if not lines:
+            if view["status"] == "not_found":
                 return [TextContent(type="text", text=json.dumps(
                     {"error": f"No identity card for pool {pool!r} yet — "
                               "the dreaming sweep builds cards"}))]
-            return [TextContent(type="text", text=json.dumps({
-                "status": "ok",
-                "pool": pool,
-                "card": "\n".join(lines),
-                "lines": lines,
-                "updated_at": (data or {}).get("updated_at"),
-            }))]
+            return [TextContent(type="text", text=json.dumps(view))]
 
         else:
             return [TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]

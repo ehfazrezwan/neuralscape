@@ -150,15 +150,22 @@ def compute_bridges(
             for b in group[i + 1:]:
                 _connect(a, b, "same subject")
 
-    # 1b. shared source memories across hubs
-    for i, a in enumerate(pages):
-        if not a.source_ids:
-            continue
-        for b in pages[i + 1:]:
-            shared = a.source_ids & b.source_ids
-            if shared:
-                n = len(shared)
-                _connect(a, b, f"shares {n} source memor{'y' if n == 1 else 'ies'}")
+    # 1b. shared source memories across hubs — indexed by memory_id so the
+    # scan stays proportional to actual overlaps, not O(pages²)
+    by_memory: dict[str, list[TopicPage]] = {}
+    for page in pages:
+        for mid in page.source_ids:
+            by_memory.setdefault(mid, []).append(page)
+    shared_counts: dict[tuple[str, str], int] = {}
+    for holders in by_memory.values():
+        for i, a in enumerate(holders):
+            for b in holders[i + 1:]:
+                if a.hub != b.hub:
+                    key = _pair_key(a, b)
+                    shared_counts[key] = shared_counts.get(key, 0) + 1
+    for (rel_a, rel_b), n in shared_counts.items():
+        _connect(by_rel[rel_a], by_rel[rel_b],
+                 f"shares {n} source memor{'y' if n == 1 else 'ies'}")
 
     # 2. graph enrichment: entities spanning pools → the pages holding them
     for row in graph_rows or []:

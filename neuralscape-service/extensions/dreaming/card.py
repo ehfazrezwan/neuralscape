@@ -103,7 +103,7 @@ def parse_card_response(raw: str) -> list[str]:
     obj = parse_json_object(raw)
     card = obj.get("card")
     if isinstance(card, list):
-        return [l for l in card if isinstance(l, str)]
+        return [line for line in card if isinstance(line, str)]
     return (raw or "").splitlines()
 
 
@@ -181,6 +181,29 @@ def load_card(redis, pool: str) -> dict | None:
         return None
 
 
+def build_card_view(pool: str, caller_user_id: str | None, *, is_dictator: bool, redis) -> dict:
+    """The shared read contract for both surfaces (REST route + MCP tool).
+
+    Centralizes the authorization gate and the response shape so the two
+    surfaces cannot silently diverge. ``status`` is one of ``forbidden``
+    (private card, wrong caller), ``not_found`` (no card yet), or ``ok``
+    (with ``pool`` / ``lines`` / ``card`` / ``updated_at``).
+    """
+    if not card_read_allowed(pool, caller_user_id, is_dictator=is_dictator):
+        return {"status": "forbidden"}
+    data = load_card(redis, pool)
+    lines = (data or {}).get("lines") or []
+    if not lines:
+        return {"status": "not_found"}
+    return {
+        "status": "ok",
+        "pool": pool,
+        "lines": lines,
+        "card": "\n".join(lines),
+        "updated_at": (data or {}).get("updated_at"),
+    }
+
+
 def _store_card(redis, pool: str, record: dict) -> None:
     try:
         redis.set(_CARD_KEY.format(pool=pool), json.dumps(record))
@@ -242,6 +265,7 @@ async def update_card(
     vault: Path,
     operator_user_id: str,
     dry_run: bool,
+    render_files: bool = True,
 ) -> dict:
     """Maintain one pool's identity card from the staged batch + prior card.
 
@@ -249,10 +273,16 @@ async def update_card(
     *unchanged* = inputs identical, LLM skipped; *stable* = LLM ran but
     reproduced the prior card (updated_at preserved); *updated* = the
     card actually changed.
+
+    ``render_files=False`` keeps the card Redis-only (the sweep passes
+    ``vault_pages_enabled`` here — an operator who disabled vault output
+    must not find Card.md files appearing under the vault path anyway).
     """
     qualifies, file_path = card_target(vault, batch, operator_user_id)
     if not qualifies:
         return {"status": "skipped", "reason": "pool carries no card"}
+    if not render_files:
+        file_path = None
 
     live = [
         m for m in batch.memories

@@ -602,6 +602,32 @@ async def test_card_dry_run_writes_nothing(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_card_render_files_false_is_redis_only(tmp_path):
+    redis = FakeRedis()
+    llm, _ = _card_llm(["IDENTITY: Ehfaz is a founding engineer"])
+    out = await cardmod.update_card(
+        _card_batch(), llm, redis=redis, vault=tmp_path,
+        operator_user_id="op", dry_run=False, render_files=False,
+    )
+    assert out["status"] == "updated"
+    assert "dreaming:card:user--op" in redis.data     # pinned artifact kept
+    assert not list(tmp_path.rglob("*.md"))           # nothing under the vault
+
+
+def test_build_card_view_shared_contract():
+    redis = FakeRedis()
+    redis.set("dreaming:card:user--bob", json.dumps(
+        {"lines": ["IDENTITY: Bob"], "updated_at": "2026-07-04"}))
+    ok = cardmod.build_card_view("user--bob", "bob", is_dictator=False, redis=redis)
+    assert ok == {"status": "ok", "pool": "user--bob", "lines": ["IDENTITY: Bob"],
+                  "card": "IDENTITY: Bob", "updated_at": "2026-07-04"}
+    assert cardmod.build_card_view(
+        "user--bob", "eve", is_dictator=False, redis=redis)["status"] == "forbidden"
+    assert cardmod.build_card_view(
+        "user--nobody", "nobody", is_dictator=False, redis=redis)["status"] == "not_found"
+
+
+@pytest.mark.asyncio
 async def test_card_tombstoned_rows_excluded(tmp_path):
     redis = FakeRedis()
     seen = {}

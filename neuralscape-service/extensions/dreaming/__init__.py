@@ -154,10 +154,11 @@ class DreamingExtension:
             legacy read path); otherwise the configured default applies.
             """
             import asyncio
+            from functools import partial
 
             from config import settings as core_settings
 
-            from .card import card_read_allowed, load_card
+            from .card import build_card_view
             from .sweep import _get_redis
 
             caller = (
@@ -165,25 +166,24 @@ class DreamingExtension:
                 or user_id
                 or core_settings.default_user_id
             )
-            if not card_read_allowed(
-                pool, caller, is_dictator=core_settings.is_dictator(caller)
-            ):
+            view = await asyncio.to_thread(
+                partial(
+                    build_card_view,
+                    pool,
+                    caller,
+                    is_dictator=core_settings.is_dictator(caller),
+                    redis=_get_redis(),
+                )
+            )
+            if view["status"] == "forbidden":
                 raise HTTPException(
                     status_code=403,
                     detail="Another user's private card is not readable",
                 )
-            data = await asyncio.to_thread(load_card, _get_redis(), pool)
-            lines = (data or {}).get("lines") or []
-            if not lines:
+            if view["status"] == "not_found":
                 raise HTTPException(
                     status_code=404, detail=f"No identity card for pool {pool!r}"
                 )
-            return {
-                "status": "ok",
-                "pool": pool,
-                "lines": lines,
-                "card": "\n".join(lines),
-                "updated_at": (data or {}).get("updated_at"),
-            }
+            return view
 
         return router

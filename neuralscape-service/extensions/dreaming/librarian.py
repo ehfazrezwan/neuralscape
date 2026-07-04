@@ -428,7 +428,7 @@ def render_topic_page(
             FADED_START,
             _FADED_CALLOUT_TITLE,
             "> Dimmed, not deleted — below the retention threshold.",
-            *(f"> - {_one_line(l, 200)}" for l in faded_lines),
+            *(f"> - {_one_line(line, 200)}" for line in faded_lines),
             FADED_END,
             "",
         ]

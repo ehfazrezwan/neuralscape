@@ -314,6 +314,9 @@ async def _dream_pool(
                     vault=settings.vault_path,
                     operator_user_id=core_settings.default_user_id,
                     dry_run=dry_run,
+                    # Vault output off ⇒ cards stay Redis-only; no Card.md
+                    # files may appear under a disabled vault path.
+                    render_files=settings.vault_pages_enabled,
                 )
                 report.card_status = card_out.get("status", "")
             except Exception:
