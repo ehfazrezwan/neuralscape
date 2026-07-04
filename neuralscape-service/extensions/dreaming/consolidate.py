@@ -630,6 +630,13 @@ def _tombstone(
     ``secret_claim`` (audit 27 #25) records a below-confidence-gate
     ``contains_secret`` claim on the tombstone so a later sweep can
     re-examine it instead of the claim being silently dropped.
+
+    Atomic nested-key merge (audit 27 #30): ``set_payload`` with
+    ``key="metadata"`` merges ONLY the patch keys into the nested dict
+    server-side — no read-modify-write of the whole metadata dict, so a
+    concurrent patcher (e.g. the write path bumping ``times_derived``)
+    can't have its keys clobbered by a stale snapshot, and vice versa.
+    Mirrors ``MemoryService._revive_if_tombstoned``.
     """
     from config import settings as core_settings
 
@@ -647,8 +654,9 @@ def _tombstone(
         patch["dream_secret_claim"] = secret_claim
     client.set_payload(
         collection_name=core_settings.qdrant_collection,
-        payload={"metadata": _merged_metadata(client, memory_id, patch)},
+        payload=patch,
         points=[memory_id],
+        key="metadata",
     )
 
 
@@ -685,23 +693,6 @@ def _sum_times_derived(service, memory_ids: list[str]) -> int:
     except Exception:
         logger.warning("times_derived retrieve failed; defaulting to 1 per row", exc_info=True)
     return sum(found.get(str(mid), 1) for mid in memory_ids)
-
-
-def _merged_metadata(client, memory_id: str, patch: dict) -> dict:
-    """Read-modify-write the nested metadata dict (set_payload replaces keys wholesale)."""
-    from config import settings as core_settings
-
-    points = client.retrieve(
-        collection_name=core_settings.qdrant_collection,
-        ids=[memory_id],
-        with_payload=True,
-        with_vectors=False,
-    )
-    meta = {}
-    if points:
-        meta = dict((points[0].payload or {}).get("metadata") or {})
-    meta.update(patch)
-    return meta
 
 
 async def _graph_invalidate(service, group_id: str, memory_id: str, *, superseded_by: str | None) -> int:

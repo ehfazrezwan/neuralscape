@@ -629,3 +629,65 @@ def _light_batch(n: int, *, pool: str = "shared") -> PoolBatch:
         for i in range(n)
     ]
     return _batch(mems, pool=pool)
+
+
+# ══════════════════════════════════════════════
+# #30 — metadata patches must be nested-key, not whole-dict replacement
+# ══════════════════════════════════════════════
+
+
+class TestNestedMetadataPatches:
+    """Pre-fix: the tombstone and the times_derived bump each did a
+    read-modify-write of the WHOLE nested metadata dict — two concurrent
+    patchers (dream sweep vs write-path dedup) clobbered each other's
+    keys (a tombstone could resurrect a stale counter; a bump could erase
+    a fresh tombstone). PR #121 introduced the nested-key pattern for
+    tombstone revival; these close the remainder.
+    """
+
+    def test_tombstone_patches_only_its_own_keys(self):
+        service, client = _apply_service({
+            "m1": {"data": "x", "metadata": {
+                "category": "preference", "times_derived": 7,
+            }},
+        })
+        consolidate._tombstone(service, "m1", superseded_by="s1", pruned=True)
+        kwargs = client.set_payload.call_args.kwargs
+        # nested-key merge: Qdrant merges into `metadata` server-side —
+        # unrelated keys (a concurrent bump's counter) can't be clobbered.
+        assert kwargs.get("key") == "metadata"
+        patch = kwargs["payload"]
+        assert patch["dream_tombstoned"] is True
+        assert patch["superseded_by"] == "s1"
+        assert patch["dream_pruned"] is True
+        assert "superseded_at" in patch
+        assert "category" not in patch
+        assert "times_derived" not in patch
+
+    def test_tombstone_needs_no_read_before_write(self):
+        """The nested-key patch removed the read half of the race: no
+        retrieve round-trip, nothing stale to write back."""
+        service, client = _apply_service({})
+        consolidate._tombstone(service, "m1", superseded_by=None)
+        client.retrieve.assert_not_called()
+        assert client.set_payload.call_args.kwargs.get("key") == "metadata"
+
+    def test_bump_times_derived_patches_only_the_counter(self):
+        from memory_service import MemoryService
+
+        svc = MemoryService()
+        svc._memory = MagicMock(name="Memory")
+        pt = MagicMock()
+        pt.payload = {"data": "x", "metadata": {
+            "times_derived": 2, "category": "preference",
+            "dream_tombstoned": False,
+        }}
+        client = svc._memory.vector_store.client
+        client.retrieve.return_value = [pt]
+
+        svc._bump_times_derived("m1", 3)
+
+        kwargs = client.set_payload.call_args.kwargs
+        assert kwargs.get("key") == "metadata"
+        assert kwargs["payload"] == {"times_derived": 5}
+        assert kwargs["points"] == ["m1"]

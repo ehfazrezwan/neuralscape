@@ -468,9 +468,9 @@ async def test_apply_actions_merge_sums_times_derived():
     assert upserted.id == "a"
     assert upserted.payload["data"] == "merged fact"
     assert upserted.payload["metadata"]["times_derived"] == 6
-    # losers tombstoned, not counted twice
+    # losers tombstoned, not counted twice (nested-key patch, audit 27 #30)
     tombstoned = {
-        call.kwargs["points"][0]: call.kwargs["payload"]["metadata"]
+        call.kwargs["points"][0]: call.kwargs["payload"]
         for call in client.set_payload.call_args_list
     }
     assert set(tombstoned) == {"b", "c"}
