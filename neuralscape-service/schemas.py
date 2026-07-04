@@ -245,6 +245,9 @@ MEMORY_KIND_VOCAB: set[str] = {"fact", "passage"}
 # `manual` = content a user provided directly (pasted context); `file_upload` =
 # a file/zip the user uploaded. Both are first-class origins that don't come from
 # a configured external connector, so their memories carry a synthetic source_ref.
+# `okf_bundle` = a concept document imported from an Open Knowledge Format
+# bundle (directory or zip); external_id is the concept ID, parent_id the
+# bundle URI/path.
 CONNECTOR_TYPE_VOCAB: set[str] = {
     "google_drive",
     "notion",
@@ -252,6 +255,7 @@ CONNECTOR_TYPE_VOCAB: set[str] = {
     "mcp",
     "manual",
     "file_upload",
+    "okf_bundle",
     # Graphify code-graph bundles (graph.json + GRAPH_REPORT.md); memories
     # resolve back through NS's /v1/code-graph/* surface (Phase F1).
     "code_graph",

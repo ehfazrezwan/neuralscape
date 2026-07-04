@@ -616,6 +616,82 @@ async def process_ingest_file(ctx: dict, payload: dict) -> dict:
     return {"filename": filename, "doc_type": doc_type, **result}
 
 
+async def process_ingest_okf_bundle(ctx: dict, payload: dict) -> dict:
+    """Background task: walk + ingest an uploaded OKF bundle zip.
+
+    ``payload`` mirrors ``process_ingest_file`` ({filename, source_ref,
+    options, user_id} plus ``stored_path`` or ``data_b64``), but the zip is
+    treated as ONE knowledge bundle: concepts are parsed with their
+    frontmatter, types map to categories (heuristics + a single batched
+    LLM fallback), cross-links become graph relationship hints, and every
+    memory's source_ref carries {bundle URI/path, concept ID}.
+    """
+    import base64
+
+    from ingest.okf_bundle import (
+        default_type_llm,
+        ingest_okf_bundle,
+        load_bundle_zip,
+    )
+    from ingest.storage import read_artifact
+
+    service: MemoryService = ctx["service"]
+    filename = payload.get("filename", "bundle.zip")
+    if payload.get("stored_path"):
+        data = await asyncio.to_thread(read_artifact, payload["stored_path"], settings)
+    else:
+        data = base64.b64decode(payload["data_b64"])
+    options = payload.get("options", {})
+
+    files = await asyncio.to_thread(
+        load_bundle_zip,
+        data,
+        max_file_bytes=settings.ingest_max_file_mb * 1024 * 1024,
+        max_files=settings.ingest_max_files,
+        max_total_uncompressed_bytes=settings.ingest_max_archive_uncompressed_mb * 1024 * 1024,
+    )
+    if not files:
+        return {"filename": filename, "skipped": True, "reason": "no markdown members in bundle"}
+
+    source_ref = payload.get("source_ref") or {}
+    bundle_uri = source_ref.get("url") or payload.get("stored_path") or filename
+    result = await asyncio.to_thread(
+        ingest_okf_bundle,
+        service,
+        files=files,
+        bundle_uri=bundle_uri,
+        # The artifact download endpoint (API-relative) — preserved on every
+        # concept's source_ref.url so the bundle stays re-fetchable.
+        bundle_url=source_ref.get("url"),
+        user_id=payload["user_id"],
+        scope=options.get("scope", "global"),
+        project_id=options.get("project_id"),
+        visibility=options.get("visibility"),
+        tags=options.get("tags"),
+        extract_facts=options.get("extract_facts", True),
+        index_passages=options.get("index_passages", True),
+        llm_call=default_type_llm(service),
+    )
+
+    graph_jobs = result.pop("graph_jobs", [])
+    result["graph_jobs_enqueued"] = await _enqueue_graph_jobs(ctx, graph_jobs, adapter=None)
+
+    registry = ctx.get("extension_registry")
+    if registry and result.get("memory_ids"):
+        await registry.emit_event("memory_stored", {
+            "user_id": payload["user_id"],
+            "memory_id": result["memory_ids"][0],
+            "content": f"[ingest:okf] {filename} → {result['concepts']} concepts, "
+                       f"{result['passages']} passages + {result['facts']} facts",
+            "category": options.get("category", "domain_knowledge"),
+            "scope": options.get("scope", "global"),
+            "project_id": options.get("project_id"),
+            "source": "ingest",
+        })
+
+    return {"filename": filename, **result}
+
+
 async def process_graph_enrichment(
     ctx: dict,
     memory_id: str,
@@ -1226,6 +1302,7 @@ class IngestWorkerSettings:
     functions = [
         process_ingest_document,
         process_ingest_file,
+        process_ingest_okf_bundle,
         process_connector_sync,
     ]
     cron_jobs = [

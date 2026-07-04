@@ -1024,11 +1024,13 @@ async def v1_ingest_files(
     enqueued: list[dict] = []
     totals = {"files": 0, "bytes": 0}
 
-    async def _store_and_enqueue(name: str, data: bytes) -> None:
+    async def _store_and_enqueue(name: str, data: bytes, *, okf_bundle: bool = False) -> None:
         """Persist one file + enqueue its ingest job, enforcing request caps.
 
         Called incrementally per upload / per zip member so we never hold the
-        whole request in memory at once.
+        whole request in memory at once. ``okf_bundle=True`` stores the zip as
+        ONE artifact and enqueues the whole-bundle OKF walker instead of the
+        per-file parser.
         """
         totals["files"] += 1
         if totals["files"] > settings.ingest_max_files:
@@ -1045,18 +1047,22 @@ async def v1_ingest_files(
         # Persist to the shared volume; hand the worker a path (not bytes) so
         # large files don't travel through Redis, and stamp a source_ref that
         # points back to the stored artifact.
+        connector_type = "okf_bundle" if okf_bundle else "file_upload"
         payload = {"filename": name, "options": options, "user_id": resolved_user_id}
         if settings.ingest_storage_enabled:
             art = await asyncio.to_thread(
                 store_artifact, data, name, resolved_user_id, project_id, category, settings,
             )
             payload["stored_path"] = art.rel_path
-            payload["source_ref"] = artifact_source_ref(art, connector_type="file_upload")
+            payload["source_ref"] = artifact_source_ref(art, connector_type=connector_type)
         else:
             payload["data_b64"] = base64.b64encode(data).decode()
-            payload["source_ref"] = _fallback_source_ref(data, name, "file_upload")
+            payload["source_ref"] = _fallback_source_ref(data, name, connector_type)
         try:
-            task_id = await _task_manager.enqueue_ingest_file(payload)
+            if okf_bundle:
+                task_id = await _task_manager.enqueue_ingest_okf_bundle(payload)
+            else:
+                task_id = await _task_manager.enqueue_ingest_file(payload)
         except (ConnectionError, OSError) as e:
             raise HTTPException(status_code=503, detail=f"Ingest queue unavailable: {e}")
         enqueued.append({
@@ -1071,6 +1077,28 @@ async def v1_ingest_files(
         data = await upload.read()
         name = upload.filename or "upload"
         if is_zip(data) and name.lower().endswith(".zip"):
+            # OKF detection first: a zipped OKF bundle (root okf_version
+            # marker, or typed frontmatter across its markdown members) is
+            # ingested as ONE knowledge bundle — concepts keep their types,
+            # cross-links become graph hints — instead of as loose files.
+            from ingest.okf_bundle import is_okf_bundle, load_bundle_zip
+
+            try:
+                okf_files = await asyncio.to_thread(
+                    load_bundle_zip,
+                    data,
+                    max_file_bytes=max_file_bytes,
+                    max_files=settings.ingest_max_files,
+                    max_total_uncompressed_bytes=settings.ingest_max_archive_uncompressed_mb
+                    * 1024 * 1024,
+                )
+            except ArchiveTooLarge as e:
+                raise HTTPException(status_code=413, detail=str(e))
+            except ArchiveError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            if okf_files and is_okf_bundle(okf_files):
+                await _store_and_enqueue(name, data, okf_bundle=True)
+                continue
             try:
                 for member_name, member_data in iter_archive(
                     data,
@@ -1837,6 +1865,66 @@ async def v1_get_process(
 
 
 # ── Manage ────────────────────────────────────
+
+
+# ── OKF bundle export (G1) ───────────────────────
+
+
+@v1_router.get("/export/okf")
+async def v1_export_okf(
+    request: Request,
+    project_id: str | None = Query(default=None, max_length=100),
+    scope: str | None = Query(default=None),
+    visibility: str | None = Query(default=None),
+    user_id: str | None = Query(default=None, max_length=100),
+):
+    """Download the caller's readable memories as an OKF v0.1 bundle zip.
+
+    One concept document per live memory (frontmatter type from the
+    category mapping, the full NS envelope as extension keys), per-folder
+    ``index.md`` progressive disclosure, the bundle-root version marker,
+    and a ``log.md`` history. Visibility is enforced by construction:
+    the caller's effective identity (token > body > default — the same
+    precedence every read path uses) selects the personal pool, and
+    ``visibility=shared`` builds a team bundle from the shared pool
+    alone, so private memories can never appear in a shared bundle.
+    """
+    if scope is not None and scope not in ("global", "project"):
+        raise HTTPException(status_code=400, detail="scope must be 'global' or 'project'")
+    if visibility is not None and visibility not in ("private", "shared"):
+        raise HTTPException(status_code=400, detail="visibility must be 'private' or 'shared'")
+    resolved_user_id = _resolve_user_id(request, user_id)
+
+    from okf.export import export_bundle
+
+    try:
+        data, stats = await asyncio.to_thread(
+            export_bundle,
+            _service,
+            user_id=resolved_user_id,
+            project_id=project_id,
+            scope=scope,
+            visibility=visibility,
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("OKF export failed")
+        raise HTTPException(status_code=500, detail="Failed to build OKF bundle")
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    filename = f"okf-bundle-{stamp}.zip"
+    from fastapi.responses import Response as FastAPIResponse
+
+    return FastAPIResponse(
+        content=data,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-OKF-Concepts": str(stats["concepts"]),
+            "X-OKF-Files": str(stats["files"]),
+        },
+    )
 
 
 @v1_router.get("/memories", response_model=list[MemoryResponse])

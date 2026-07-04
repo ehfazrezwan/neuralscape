@@ -192,6 +192,22 @@ async def dream_all(
             logger.exception("bridges pass failed (non-fatal)")
             run.bridges = {"error": "bridges"}
 
+    # OKF bundle metadata: refresh per-folder index files + the root
+    # version marker once per sweep, AFTER the card/diary/bridges passes
+    # so their pages are listed too. Byte-idempotent (zero steady-state
+    # churn); best-effort.
+    if (
+        settings.vault_pages_enabled
+        and not dry_run
+        and any(p.status == "dreamt" for p in run.pools)
+    ):
+        try:
+            from okf.vault import refresh_bundle_indexes
+
+            await asyncio.to_thread(refresh_bundle_indexes, settings.vault_path)
+        except Exception:
+            logger.warning("okf bundle index refresh failed (non-fatal)", exc_info=True)
+
     run.finished_at = datetime.now(timezone.utc).isoformat()
     _save_run(redis, run)
     totals = run.to_dict()["totals"]
@@ -352,6 +368,16 @@ async def _dream_pool(
                 settings.dreams_dir, pool, entry,
                 source_memory_ids=staged_ids,
             )
+            # OKF §7: the diary doubles as bundle history — mirror this
+            # sweep into the vault-root log.md (best-effort).
+            if report.diary_path:
+                await asyncio.to_thread(
+                    reflect.update_vault_log,
+                    settings.vault_path, pool,
+                    diary_rel=report.diary_path,
+                    applied=report.applied,
+                    insights=report.insights,
+                )
             try:
                 redis.set(ids_key, json.dumps(staged_ids))
             except Exception:

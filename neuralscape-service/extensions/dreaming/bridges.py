@@ -38,6 +38,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from okf.translate import is_reserved_filename
+
 from .librarian import FADED_START, _parse_id_list, split_page
 
 logger = logging.getLogger(__name__)
@@ -90,6 +92,8 @@ def scan_topic_pages(vault: Path) -> list[TopicPage]:
             return
         for path in sorted(directory.glob("*.md")):
             if path.stem == directory.name or path.stem == "Card":
+                continue
+            if is_reserved_filename(path.name):  # OKF index.md / log.md
                 continue
             try:
                 fm, _ = split_page(path.read_text(encoding="utf-8"))

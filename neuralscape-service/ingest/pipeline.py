@@ -60,6 +60,11 @@ class IngestDoc:
     # Knowledge adapter selecting the taxonomy / chunker / extractor / graph
     # ontology. "default" reproduces today's behavior exactly.
     adapter: str = "default"
+    # Envelope-level chunking-strategy override (registry id). Set by callers
+    # whose *format* dictates the chunker independent of any domain adapter —
+    # e.g. the OKF bundle walker's frontmatter-aware strategy. None defers to
+    # the adapter's strategy (today's behavior).
+    chunking_strategy: str | None = None
 
 
 def _fact_scope(category: str, project_id: str | None) -> tuple[str, str | None]:
@@ -103,7 +108,7 @@ def ingest_document(service, doc: IngestDoc) -> dict:
 
     # ── Passages (verbatim, vector-only) ──
     if doc.index_passages:
-        chunker = get_chunking_strategy(adapter.chunking_strategy)
+        chunker = get_chunking_strategy(doc.chunking_strategy or adapter.chunking_strategy)
         max_chars = doc.max_chars if doc.max_chars is not None else adapter.default_max_chars
         overlap = doc.overlap if doc.overlap is not None else adapter.default_overlap
         for chunk in chunker.chunk(doc.content, max_chars=max_chars, overlap=overlap):
