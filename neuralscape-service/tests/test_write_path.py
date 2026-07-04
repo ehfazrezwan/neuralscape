@@ -667,3 +667,38 @@ class TestStoreRawBatchTwoPass:
         assert results == []
         service._bump_times_derived.assert_not_called()
 
+
+# ──────────────────────────────────────────────
+# #22 — windowing config validation (Copilot review, PR #124)
+# ──────────────────────────────────────────────
+
+
+class TestExtractionWindowConfigValidation:
+    """Overlap >= window must be rejected at startup (cross-field check)."""
+
+    @pytest.fixture(autouse=True)
+    def _hermetic_env(self, monkeypatch):
+        for var in ("EXTRACTION_WINDOW_MESSAGES", "EXTRACTION_WINDOW_OVERLAP"):
+            monkeypatch.delenv(var, raising=False)
+
+    @staticmethod
+    def _settings(**kw):
+        from config import Settings
+
+        return Settings(_env_file=None, **kw)
+
+    def test_overlap_equal_to_window_rejected(self):
+        with pytest.raises(Exception, match="EXTRACTION_WINDOW_OVERLAP"):
+            self._settings(extraction_window_messages=10, extraction_window_overlap=10)
+
+    def test_overlap_greater_than_window_rejected(self):
+        with pytest.raises(Exception, match="EXTRACTION_WINDOW_OVERLAP"):
+            self._settings(extraction_window_messages=10, extraction_window_overlap=12)
+
+    def test_valid_overlap_accepted(self):
+        s = self._settings(extraction_window_messages=10, extraction_window_overlap=9)
+        assert s.extraction_window_overlap == 9
+
+    def test_negative_overlap_still_rejected(self):
+        with pytest.raises(Exception, match="EXTRACTION_WINDOW_OVERLAP"):
+            self._settings(extraction_window_overlap=-1)

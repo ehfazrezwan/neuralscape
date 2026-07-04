@@ -3,7 +3,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from arq.connections import RedisSettings
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
@@ -455,11 +455,23 @@ class Settings(BaseSettings):
     @field_validator("extraction_window_overlap")
     @classmethod
     def _validate_extraction_overlap(cls, value: int) -> int:
-        # Overlap >= window would make the split non-advancing; the splitter
-        # also clamps defensively, but reject nonsense config at startup.
         if value < 0:
             raise ValueError("EXTRACTION_WINDOW_OVERLAP must be >= 0")
         return value
+
+    @model_validator(mode="after")
+    def _validate_extraction_windowing(self) -> "Settings":
+        # Cross-field check (Copilot review, PR #124): overlap >= window
+        # would make the split non-advancing. The splitter also clamps
+        # defensively, but nonsense config must be rejected at startup, not
+        # silently reinterpreted.
+        if self.extraction_window_overlap >= self.extraction_window_messages:
+            raise ValueError(
+                "EXTRACTION_WINDOW_OVERLAP must be < EXTRACTION_WINDOW_MESSAGES "
+                f"(got overlap={self.extraction_window_overlap}, "
+                f"window={self.extraction_window_messages})"
+            )
+        return self
 
     @field_validator("auth_provider")
     @classmethod
