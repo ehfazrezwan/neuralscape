@@ -98,6 +98,30 @@ class Settings(BaseSettings):
     dedup_batch_size: int = 100
     dedup_cron_hours: set = {0, 6, 12, 18}
 
+    # ── Ask / reasoning tiers (roadmap C3) ────────────────────────────
+    # Per-tier cap on a single answering-LLM call (seconds). The total ask
+    # budget is bounded by this times the tier's iteration cap (see
+    # ask.REASONING_TIERS) — higher tiers may loop through follow-up
+    # searches, so they get a roomier per-call cap too.
+    ask_timeout_minimal_s: int = 20
+    ask_timeout_low_s: int = 40
+    ask_timeout_medium_s: int = 75
+    ask_timeout_high_s: int = 120
+
+    # ── Queue visibility (roadmap C4) ─────────────────────────────────
+    # Window (seconds) of recently-enqueued tasks aggregated by
+    # GET /v1/queue/status. Matches ARQ's default keep_result TTL (3600s):
+    # older results have expired out of Redis anyway and would only ever
+    # report as "expired".
+    queue_status_window_s: int = 3600
+    # When set, workers POST a small {"event": "queue.empty", ...} JSON to
+    # this URL whenever a finished job leaves its queue empty — so
+    # ingest-then-query flows can stop polling per task. Empty = off.
+    # Only absolute http(s) URLs are contacted; redirects are never
+    # followed; delivery is a fire-and-forget 5s-capped daemon thread
+    # (see webhooks.py).
+    webhook_queue_empty_url: str = ""
+
     # ── Data-layer connectors ─────────────────────────────────────────
     # When enabled, the service hosts connectors (Notion/Drive/MCP/REST),
     # stores their credentials encrypted in the vault, and runs a periodic
@@ -317,6 +341,21 @@ class Settings(BaseSettings):
         # These feed the Docling timeout and the zip guardrails; a 0/negative
         # value would time out every conversion or invert the archive checks, and
         # only surface as a runtime failure after deploy. Reject at startup.
+        if value <= 0:
+            raise ValueError(f"{info.field_name} must be > 0")
+        return value
+
+    @field_validator(
+        "ask_timeout_minimal_s",
+        "ask_timeout_low_s",
+        "ask_timeout_medium_s",
+        "ask_timeout_high_s",
+        "queue_status_window_s",
+    )
+    @classmethod
+    def _validate_positive_ask_limits(cls, value: int, info) -> int:
+        # A 0/negative timeout would fail every answering call (or make the
+        # queue-status window empty) and only surface at request time.
         if value <= 0:
             raise ValueError(f"{info.field_name} must be > 0")
         return value
