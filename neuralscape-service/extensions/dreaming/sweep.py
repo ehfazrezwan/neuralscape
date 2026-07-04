@@ -7,7 +7,8 @@ the API process and the graph worker report the same state (unlike the
 wiki_synthesizer's process-local snapshot).
 
 Cheap-to-expensive ordering per pool:
-  time gate (Redis read) → lock → LIGHT scroll+stage → volume gate →
+  time gate (Redis read) → settling guard (in-memory) → lock →
+  LIGHT scroll+stage → volume gate →
   idempotent skip (unchanged staged-id set) → DEEP LLM decide/apply →
   REM reflect/store → diary → gate completion stamp.
 """
@@ -34,7 +35,7 @@ _STAGED_IDS_KEY = "dreaming:staged_ids:{pool}"
 @dataclass(slots=True)
 class PoolReport:
     pool: str
-    status: str                       # dreamt | gated | locked | skipped_unchanged | error
+    status: str                       # dreamt | gated | settling | locked | skipped_unchanged | error
     reason: str = ""
     staged: int = 0
     applied: int = 0
@@ -63,7 +64,9 @@ class DreamRun:
             "pools": [asdict(p) for p in self.pools],
             "totals": {
                 "pools_dreamt": sum(1 for p in self.pools if p.status == "dreamt"),
-                "pools_gated": sum(1 for p in self.pools if p.status in ("gated", "locked")),
+                "pools_gated": sum(
+                    1 for p in self.pools if p.status in ("gated", "settling", "locked")
+                ),
                 "actions_applied": sum(p.applied for p in self.pools),
                 "actions_reported": sum(p.reported for p in self.pools),
                 "insights_stored": sum(p.insights for p in self.pools),
@@ -190,6 +193,17 @@ async def _dream_pool(
             report.status, report.reason = "gated", decision.reason
             return report
 
+    # 1b. settling guard (A3-lite): a pool written to within the last
+    #     DREAMING_SETTLING_MINUTES is mid-conversation — never consolidate
+    #     a thought while it's still forming. Defer to the next pass.
+    if not force:
+        decision = gate.check_settling_gate(
+            batch.memories, settling_minutes=settings.settling_minutes
+        )
+        if not decision.proceed:
+            report.status, report.reason = "settling", decision.reason
+            return report
+
     # 2. lock (shared with the dedup cron's semantic-skip check)
     lock_token = gate.acquire_lock(redis, pool)
     if not lock_token:
@@ -208,6 +222,7 @@ async def _dream_pool(
             max_memories=settings.max_memories_per_pool,
             strength_half_life_days=settings.strength_half_life_days,
             prune_strength_threshold=settings.prune_strength_threshold,
+            dynamics_enabled=settings.dynamics_enabled,
         )
         report.staged = len(batch.memories)
 

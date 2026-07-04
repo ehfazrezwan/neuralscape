@@ -56,11 +56,11 @@ def _code_graph_tool_names() -> set[str]:
 
 class TestListTools:
     @pytest.mark.asyncio
-    async def test_returns_15_core_tools(self):
-        # 15 core tools + the code-graph delegation tools when the optional
+    async def test_returns_16_core_tools(self):
+        # 16 core tools + the code-graph delegation tools when the optional
         # graphifyy extra is installed (dev installs have it).
         tools = await mcp_server.list_tools()
-        assert len(tools) == 15 + len(_code_graph_tool_names())
+        assert len(tools) == 16 + len(_code_graph_tool_names())
 
     @pytest.mark.asyncio
     async def test_tool_names(self):
@@ -82,6 +82,7 @@ class TestListTools:
             "edit_memory",
             "retag_memories",
             "get_reasoning_chain",
+            "schedule_dream",
         } | _code_graph_tool_names()
         assert names == expected
 
@@ -703,3 +704,65 @@ class TestRememberProvenanceValidation:
         kwargs = mock_task_manager.enqueue_raw.call_args[1]
         assert kwargs["derived_from"] == ["m1", "m2"]
         assert kwargs["epistemic_level"] == "deductive"
+
+
+# ──────────────────────────────────────────────
+# schedule_dream (A3-lite manual trigger)
+# ──────────────────────────────────────────────
+
+
+class TestScheduleDreamTool:
+    @pytest.mark.asyncio
+    async def test_refuses_when_dreaming_disabled(self, monkeypatch):
+        from extensions.dreaming.config import dreaming_settings
+
+        monkeypatch.setattr(dreaming_settings, "enabled", False)
+        result = await mcp_server.call_tool("schedule_dream", {})
+        data = json.loads(result[0].text)
+        assert "error" in data and "DREAMING_ENABLED" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_enqueues_onto_graph_queue(self, monkeypatch):
+        """The tool goes through the same arq path as the /run route:
+        run_dream_sweep(pool, dry_run, force) on the graph worker queue."""
+        from extensions.dreaming.config import dreaming_settings
+
+        monkeypatch.setattr(dreaming_settings, "enabled", True)
+        arq_pool = MagicMock()
+        arq_pool.enqueue_job = AsyncMock(return_value=MagicMock(job_id="job-1"))
+        arq_pool.close = AsyncMock()
+        import arq
+
+        monkeypatch.setattr(arq, "create_pool", AsyncMock(return_value=arq_pool))
+
+        result = await mcp_server.call_tool(
+            "schedule_dream", {"pool": "user--alice", "dry_run": True}
+        )
+        data = json.loads(result[0].text)
+        assert data == {
+            "status": "enqueued",
+            "job_id": "job-1",
+            "poll": "/v1/extensions/dreaming/status",
+        }
+        args, kwargs = arq_pool.enqueue_job.call_args
+        assert args == ("run_dream_sweep", "user--alice", True, False)
+        assert kwargs["_queue_name"] == settings.graph_queue_name
+        arq_pool.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_force_bypasses_disabled_and_forwards(self, monkeypatch):
+        from extensions.dreaming.config import dreaming_settings
+
+        monkeypatch.setattr(dreaming_settings, "enabled", False)
+        arq_pool = MagicMock()
+        arq_pool.enqueue_job = AsyncMock(return_value=MagicMock(job_id="job-2"))
+        arq_pool.close = AsyncMock()
+        import arq
+
+        monkeypatch.setattr(arq, "create_pool", AsyncMock(return_value=arq_pool))
+
+        result = await mcp_server.call_tool("schedule_dream", {"force": True})
+        data = json.loads(result[0].text)
+        assert data["status"] == "enqueued" and data["job_id"] == "job-2"
+        args, _ = arq_pool.enqueue_job.call_args
+        assert args == ("run_dream_sweep", None, False, True)

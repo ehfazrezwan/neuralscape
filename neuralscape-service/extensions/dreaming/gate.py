@@ -10,7 +10,9 @@ pool — are impossible.
 Gate order is cheap → expensive:
 
 1. **Time** (one Redis read): hours since the pool's last completed dream.
-2. **Volume** (counted during the LIGHT scroll, passed in by the caller):
+2. **Settling** (A3-lite, pure arithmetic over the already-scrolled pool):
+   a pool written to in the last N minutes is mid-conversation — defer.
+3. **Volume** (counted during the LIGHT scroll, passed in by the caller):
    new/changed memories since the last dream.
 
 The session gate from the reference (``minSessions``) has no analog here —
@@ -65,6 +67,41 @@ def check_time_gate(redis, pool: str, *, min_hours: float, now: float | None = N
     hours_since = (now - float(state.get("last_dreamt_at") or 0.0)) / 3600.0
     if hours_since < min_hours:
         return GateDecision(False, f"time: {hours_since:.1f}h < {min_hours}h")
+    return GateDecision(True)
+
+
+def check_settling_gate(
+    memories: list[dict], *, settling_minutes: float, now: float | None = None
+) -> GateDecision:
+    """A3-lite settling guard: defer pools that took a write moments ago.
+
+    "Consolidate settled data" (Honcho): a pool whose newest
+    ``created_at``/``updated_at`` is younger than ``settling_minutes`` is
+    likely mid-conversation — dreaming over it would consolidate a
+    thought while it's still forming. Pure arithmetic over the batch the
+    caller already scrolled; the sweep reports status ``"settling"`` and
+    retries next pass. ``force=true`` bypasses (the caller simply doesn't
+    invoke this); ``settling_minutes <= 0`` disables the guard.
+    """
+    from .scoring import _parse_ts
+
+    if settling_minutes <= 0:
+        return GateDecision(True)
+    now = time.time() if now is None else now
+    last_write = 0.0
+    for mem in memories or []:
+        for field in ("created_at", "updated_at"):
+            last_write = max(last_write, _parse_ts(mem.get(field)))
+    if last_write <= 0:
+        return GateDecision(True)
+    # Clamp: a future timestamp (clock skew / bad payload) is still "written
+    # just now" — defer with a sane 0.0m reason rather than a negative delta.
+    minutes_since = max(0.0, (now - last_write) / 60.0)
+    if minutes_since < settling_minutes:
+        return GateDecision(
+            False,
+            f"settling: last write {minutes_since:.1f}m ago < {settling_minutes:g}m",
+        )
     return GateDecision(True)
 
 
