@@ -122,6 +122,13 @@ class Settings(BaseSettings):
     # (see webhooks.py).
     webhook_queue_empty_url: str = ""
 
+    # ── Observability: SSE live stream (roadmap E1) ───────────────────
+    # When enabled, memory events (memory_stored, dream actions applied,
+    # insights stored, checkpoint batches) are mirrored onto Redis pub/sub
+    # channels and served to authenticated callers at GET /v1/stream.
+    # Publishing is fire-and-forget: a down Redis never breaks a write.
+    event_stream_enabled: bool = True
+
     # ── Observability: token-economics telemetry (roadmap E2) ─────────
     # The honest meter. When enabled: token_estimate upgrades to REAL
     # tiktoken counts at write time, every recall op records a measured

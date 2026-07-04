@@ -7,6 +7,7 @@ categories, and a shared MemoryService business logic layer.
 import asyncio
 import base64
 import hashlib
+import json
 import logging
 import threading
 from contextlib import asynccontextmanager
@@ -22,7 +23,7 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 import adapters  # noqa: F401 — registers knowledge-adapter taxonomies at import (deterministic MEMORY_CATEGORIES)
@@ -1611,6 +1612,8 @@ async def v1_ask_memory(req: AskMemoryRequest, request: Request):
     except Exception as e:
         logger.exception("v1 ask failed")
         raise HTTPException(status_code=500, detail="Ask failed") from e
+
+    out.pop("_evidence_tokens", None)
     return AskMemoryResponse(**out)
 
 
@@ -1667,10 +1670,85 @@ async def v1_checkpoint(req: CheckpointRequest, request: Request):
             ).model_dump(exclude_none=True),
         )
 
+    # E1: stream the checkpoint batch (fire-and-forget, private to the
+    # caller — the per-item memory_stored events follow from the worker).
+    from event_stream import publish_event
+
+    publish_event("checkpoint_saved", {
+        "user_id": user_id,
+        "visibility": "private",
+        "enqueued": len(prepared["to_enqueue"]),
+        "duplicates": prepared["duplicates"],
+        "task_id": task_id,
+    })
+
     return CheckpointResponse(
         task_id=task_id,
         poll_url=f"/v1/memories/status/{task_id}",
         **common,
+    )
+
+
+# ── Live event stream (E1) + savings metrics (E2) ──
+
+
+@v1_router.get("/stream")
+async def v1_event_stream(request: Request, user_id: str | None = Query(default=None)):
+    """SSE live feed of the caller's memory events (E1).
+
+    ``text/event-stream`` of memory_stored, dream_actions_applied,
+    insights_stored and checkpoint_saved events. Visibility is enforced at
+    publish time (private events are only ever published to their owner's
+    channel — see event_stream.channel_for) and re-checked per message on
+    the subscribe side (event_stream.visible_to). The caller sees exactly
+    two channels: their own and the shared pool. A ``: keep-alive`` comment
+    goes out roughly every 20s; client disconnect tears the subscription
+    down within ~1s.
+    """
+    import redis.asyncio as aioredis
+
+    import event_stream as es
+
+    caller = _resolve_user_id(request, user_id)
+    if not settings.event_stream_enabled:
+        raise HTTPException(status_code=503, detail="Event stream is disabled")
+
+    client = aioredis.from_url(settings.redis_url)
+    pubsub = client.pubsub()
+    try:
+        await pubsub.subscribe(es.SHARED_CHANNEL, f"{es.CHANNEL_PREFIX}{caller}")
+    except Exception as e:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+        raise HTTPException(status_code=503, detail="Event stream unavailable") from e
+
+    async def _gen():
+        try:
+            async for frame in es.sse_event_stream(
+                pubsub, caller, request.is_disconnected
+            ):
+                yield frame
+        finally:
+            try:
+                await pubsub.unsubscribe()
+                await pubsub.aclose()
+            except Exception:
+                pass
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+
+    return StreamingResponse(
+        _gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

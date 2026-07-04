@@ -167,7 +167,7 @@ async def dream_all(
     for pool_key, batch in sorted(pools.items()):
         report = await _dream_pool(
             service=service, settings=settings, redis=redis, llm_call=llm_call,
-            batch=batch, dry_run=dry_run, force=force,
+            batch=batch, dry_run=dry_run, force=force, run_id=run.run_id,
         )
         run.pools.append(report)
 
@@ -221,7 +221,8 @@ async def dream_all(
 
 
 async def _dream_pool(
-    *, service, settings: DreamingSettings, redis, llm_call, batch, dry_run: bool, force: bool
+    *, service, settings: DreamingSettings, redis, llm_call, batch, dry_run: bool,
+    force: bool, run_id: str = "",
 ) -> PoolReport:
     pool = batch.pool
     report = PoolReport(pool=pool, status="error")
@@ -303,6 +304,24 @@ async def _dream_pool(
         # pages and in Home's Essential Story until the next sweep.
         consolidate.reconcile_batch(batch, applied.applied)
 
+        # E1: mirror applied consolidation onto the live event stream
+        # (fire-and-forget; channel routing enforces pool visibility).
+        if applied.applied and not dry_run:
+            from event_stream import publish_event
+
+            publish_event("dream_actions_applied", {
+                "pool": pool,
+                "run_id": run_id,
+                "visibility": batch.visibility,
+                "user_id": batch.owner_user_id,
+                "project_id": batch.project_id,
+                "applied": len(applied.applied),
+                "reported": len(to_report),
+                "action_types": sorted({
+                    a.get("type") for a in applied.applied if a.get("type")
+                }),
+            })
+
         # 7. REM: reflect + store insights
         insights: list[dict] = []
         if settings.reflection_enabled:
@@ -333,6 +352,20 @@ async def _dream_pool(
                 reflect.store_insights, service, batch, insights, dry_run=dry_run
             )
             report.insights = len(stored) if not dry_run else len(insights)
+
+            # E1: stream the stored insights (fire-and-forget).
+            if stored and not dry_run:
+                from event_stream import publish_event
+
+                publish_event("insights_stored", {
+                    "pool": pool,
+                    "run_id": run_id,
+                    "visibility": batch.visibility,
+                    "user_id": batch.owner_user_id,
+                    "project_id": batch.project_id,
+                    "count": len(stored),
+                    "memory_ids": stored,
+                })
 
         # 8. librarian: humane topic pages (the wiki_synthesizer successor)
         if settings.vault_pages_enabled:

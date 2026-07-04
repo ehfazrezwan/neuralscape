@@ -244,6 +244,19 @@ class ExtensionRegistry:
         Returns:
             EmitResult with non-None responses and the count of extensions notified.
         """
+        # E1: mirror memory events onto the live SSE stream. Every worker
+        # write path funnels its memory_stored emission through this method,
+        # so one fire-and-forget hook covers them all. Channel routing
+        # enforces visibility at publish time (see event_stream.channel_for);
+        # failures are swallowed inside publish_event.
+        if event_type == "memory_stored":
+            try:
+                from event_stream import publish_event
+
+                publish_event(event_type, payload)
+            except Exception:
+                logger.debug("event-stream mirror failed (non-fatal)", exc_info=True)
+
         responses: list[dict] = []
         notified_count = 0
         for name, entry in self._extensions.items():
