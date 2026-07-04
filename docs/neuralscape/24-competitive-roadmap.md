@@ -275,7 +275,7 @@ F2 is mostly plugin/prompt policy — assert extraction skip-rules and hub link 
 
 **G1. OKF edge interop — spec-conformant bundle export + ingest.**
 Google's Open Knowledge Format (`GoogleCloudPlatform/knowledge-catalog`, Apache-2.0, v0.1
-draft, 6k★ in two months) specifies knowledge as markdown + YAML frontmatter bundles with
+draft, 6k ★ in two months) specifies knowledge as markdown + YAML frontmatter bundles with
 `index.md` progressive disclosure and `log.md` history — i.e., a spec for what our vault
 almost already is. Two boundary features, zero envelope changes. **Export:** make the vault
 render OKF-conformant (required `type:` from category/page-kind, `description`, ISO
@@ -294,7 +294,7 @@ import of Dataplex/Unity Catalog exports and LLM-wiki repos. All OKF name mappin
 one translation module (the spec may still rename `type`→`kind`); explicitly **no** `okf`
 knowledge adapter — OKF defines no taxonomy/ontology, so it's an envelope concern, not a
 domain seam.
-*Tests:* unit (frontmatter conformance per §9 — every exported non-reserved .md has parseable
+*Tests:* unit (frontmatter conformance per §9 — every exported non-reserved `.md` file has parseable
 frontmatter + non-empty `type`; index/log structure; `type`→category mapping table; private
 memories never in shared bundles), round-trip E2E (export a seeded project → re-ingest the
 bundle into a clean stack → recall parity on distilled facts; ingest the repo's shipped GA4
