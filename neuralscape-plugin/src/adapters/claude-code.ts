@@ -186,6 +186,27 @@ export async function extractClaudeCodeTurns(
 }
 
 /**
+ * Read ALL user/assistant turn pairs of a session transcript from the
+ * beginning, ignoring (and never touching) the flush offset. Used by the
+ * SessionEnd summary hook (roadmap D2), which needs the whole session to
+ * build its structured note — unlike the flush path, it is not
+ * incremental. Returns [] when the transcript is missing/unreadable.
+ */
+export async function extractAllTurnPairs(
+  raw: Record<string, unknown>
+): Promise<Array<{ user: string; assistant: string }>> {
+  const transcriptPath = raw.transcript_path as string | undefined;
+  if (!transcriptPath) return [];
+  try {
+    const content = await readFile(transcriptPath, "utf-8");
+    return parseTranscript(content, 0).turns;
+  } catch (error) {
+    logError("Failed to read transcript for session summary", error);
+    return [];
+  }
+}
+
+/**
  * Extract session-end metadata from a Claude Code Stop event.
  */
 export function extractClaudeCodeSessionEnd(
