@@ -925,6 +925,11 @@ class MemoryResponse(BaseModel):
     visibility: str | None = None
     owner_user_id: str | None = None
 
+    # Retrieval economics (C1): distilled at write time; null on legacy
+    # memories (index renderers recompute the heuristic on the fly).
+    title: str | None = None
+    token_estimate: int | None = None
+
 
 class StoreMemoryResponse(BaseModel):
     status: str = "ok"

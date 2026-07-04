@@ -294,6 +294,7 @@ def retry_transient(
                 raise
 
     raise last_exc  # type: ignore[misc]
+from index_format import distill_title, estimate_tokens
 from prompts import (
     build_extraction_messages,
     parse_extraction_response,
@@ -964,6 +965,12 @@ class MemoryService:
         mid = str(uuid.uuid4())
         embedding = m.embedding_model.embed(content, memory_action="add")
 
+        # Retrieval economics (C1): distill a ~10-word title + token cost at
+        # write time so index-only recall never has to fetch/parse content.
+        # Pure heuristics — no LLM call on the hot write path.
+        title = distill_title(content)
+        token_estimate = estimate_tokens(content)
+
         metadata: dict = {
             "scope": scope,
             "category": category,
@@ -974,6 +981,9 @@ class MemoryService:
             # Multi-user model: who owns this memory + who can read it.
             "owner_user_id": user_id,
             "visibility": effective_visibility,
+            # Retrieval economics (C1): index-row fields
+            "title": title,
+            "token_estimate": token_estimate,
         }
         if tags:
             metadata["tags"] = tags
@@ -1064,6 +1074,8 @@ class MemoryService:
                 source_ref=source_ref,
                 visibility=effective_visibility,
                 owner_user_id=user_id,
+                title=title,
+                token_estimate=token_estimate,
             )
         ]
         # created=True → a new row was written, so the caller should enqueue
@@ -1399,6 +1411,8 @@ class MemoryService:
                 source_ref=metadata.get("source_ref"),
                 visibility=metadata.get("visibility"),
                 owner_user_id=metadata.get("owner_user_id"),
+                title=metadata.get("title"),
+                token_estimate=metadata.get("token_estimate"),
             )
         except Exception as e:
             logger.warning(f"Content-hash dedup lookup failed (non-fatal): {e}")
@@ -1641,6 +1655,9 @@ class MemoryService:
                     # "explicit" (A1). Derived levels are stamped by their
                     # authors (dreaming reflection/merge), never here.
                     "epistemic_level": "explicit",
+                    # Retrieval economics (C1): index-row fields (heuristic, no LLM)
+                    "title": distill_title(content),
+                    "token_estimate": estimate_tokens(content),
                     **({"source_type": source_type} if source_type is not None else {}),
                     **({"memory_kind": memory_kind} if memory_kind is not None else {}),
                     **({"source_ref": source_ref} if source_ref else {}),
@@ -1685,6 +1702,8 @@ class MemoryService:
                     epistemic_level="explicit",
                     memory_kind=memory_kind,
                     source_ref=source_ref,
+                    title=distill_title(content),
+                    token_estimate=estimate_tokens(content),
                 )
             )
 
@@ -3073,6 +3092,12 @@ class MemoryService:
         # store_raw always writes the project_id key (None when global) — keep that shape.
         new_meta["project_id"] = new_meta.get("project_id")
 
+        # Retrieval economics (C1): a content edit invalidates the write-time
+        # title/token_estimate — refresh them from the new content.
+        if edits_content:
+            new_meta["title"] = distill_title(changes["content"])
+            new_meta["token_estimate"] = estimate_tokens(changes["content"])
+
         now_iso = datetime.now(timezone.utc).isoformat()
         if edits_content:
             # Full mem0 update: re-embed + BM25 refresh + history. Passing the
@@ -3840,6 +3865,8 @@ class MemoryService:
             source_ref=metadata.get("source_ref"),
             visibility=metadata.get("visibility"),
             owner_user_id=metadata.get("owner_user_id"),
+            title=metadata.get("title"),
+            token_estimate=metadata.get("token_estimate"),
         )
 
     def _result_to_responses(
