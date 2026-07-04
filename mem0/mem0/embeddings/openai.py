@@ -92,6 +92,15 @@ class OpenAIEmbedding(EmbeddingBase):
         retried per item; any other failure propagates to the caller.
         """
         configured = getattr(self.config, "embedding_batch_size", None)
+        if configured is not None:
+            # Env/JSON-driven configs may carry a string — fail with a clear
+            # error instead of a TypeError inside min() below.
+            try:
+                configured = int(configured)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"embedding_batch_size must be an integer, got {configured!r}"
+                ) from None
         max_batch = max(1, min(configured or self.DEFAULT_MAX_BATCH, self.DEFAULT_MAX_BATCH))
         texts = [text.replace("\n", " ") for text in texts]
         all_embeddings = []

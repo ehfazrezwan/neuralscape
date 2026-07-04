@@ -93,7 +93,9 @@ class TestEmbeddingBatchSize:
         result = emb.embed_batch(TEXTS)
         assert result == [_vec(t) for t in TEXTS]
         assert emb.client.embeddings.create.call_count == len(TEXTS)
-        for call, text in zip(emb.client.embeddings.create.call_args_list, TEXTS):
+        for call, text in zip(
+            emb.client.embeddings.create.call_args_list, TEXTS, strict=True
+        ):
             assert call.kwargs["input"] == [text]
 
     def test_batch_size_one_matches_batched_output(self):
@@ -110,6 +112,18 @@ class TestEmbeddingBatchSize:
         emb = _embedder(embedding_batch_size=0)  # falsy → provider default
         emb.embed_batch(TEXTS)
         assert emb.client.embeddings.create.call_count == 1
+
+    def test_string_batch_size_coerced_to_int(self):
+        """Env/JSON-driven configs may carry '1' — coerced, not TypeError'd."""
+        emb = _embedder(embedding_batch_size="1")
+        result = emb.embed_batch(TEXTS)
+        assert result == [_vec(t) for t in TEXTS]
+        assert emb.client.embeddings.create.call_count == len(TEXTS)
+
+    def test_non_numeric_batch_size_raises_clear_error(self):
+        emb = _embedder(embedding_batch_size="lots")
+        with pytest.raises(ValueError, match="embedding_batch_size"):
+            emb.embed_batch(TEXTS)
 
     def test_config_without_field_uses_default(self):
         """Defensive getattr: a config object predating the NS field still batches."""

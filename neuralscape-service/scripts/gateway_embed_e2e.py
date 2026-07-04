@@ -27,23 +27,25 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+RUN = uuid.uuid4().hex[:8]
+USER = f"gatewayfix-e2e-user-{RUN}"
+
 # Hermetic regardless of the sourced .env: no MCP HTTP app at import time,
 # never the operator's real vault, auth bypassed, graphiti never routed
 # through the gateway for this proof.
+_vault_dir = tempfile.mkdtemp(prefix=f"gatewayfix-e2e-vault-{RUN}-")
 os.environ["MCP_TRANSPORT"] = "stdio"
-os.environ["OBSIDIAN_VAULT_PATH"] = "/tmp/gatewayfix-e2e-vault"
-os.environ["DREAMING_OBSIDIAN_VAULT_PATH"] = "/tmp/gatewayfix-e2e-vault"
+os.environ["OBSIDIAN_VAULT_PATH"] = _vault_dir
+os.environ["DREAMING_OBSIDIAN_VAULT_PATH"] = _vault_dir
 os.environ["AUTH_PROVIDER"] = "token"
 os.environ["NEURALSCAPE_API_KEY"] = ""
 os.environ["NEURALSCAPE_USER_TOKEN_SECRET"] = ""
 os.environ["LLM_GATEWAY_GRAPHITI_ENABLED"] = "false"
-
-RUN = uuid.uuid4().hex[:8]
-USER = f"gatewayfix-e2e-user-{RUN}"
 
 # A conversation that extracts MULTIPLE facts — the batched embed call is the
 # whole point (a single-fact extraction embeds one input and never trips the
