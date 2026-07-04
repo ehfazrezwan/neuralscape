@@ -86,8 +86,37 @@ def pool_key(*, visibility: str, owner_user_id: str | None, project_id: str | No
     return f"user--{uid}--project--{project_id}" if project_id else f"user--{uid}"
 
 
+# Audit 27 #29: the enumeration scroll pulls ONLY the fields the cheap
+# gates consume (pool identity + timestamps + the staging guards' flags) —
+# never row contents. Quiet pools are gated out on these light rows alone;
+# a pool's full rows are hydrated by id (``hydrate_pool``) only after the
+# time/settling/volume gates all pass.
+_LIGHT_SCROLL_FIELDS = [
+    "user_id",
+    "created_at",
+    "updated_at",
+    "metadata.visibility",
+    "metadata.owner_user_id",
+    "metadata.project_id",
+    "metadata.dream_tombstoned",
+    "metadata.source_type",
+    # legacy double-wrapped rows keep their inner dict reachable
+    "metadata.metadata",
+]
+
+
+def _unwrap_meta(payload: dict) -> dict:
+    meta = payload.get("metadata", {}) or {}
+    if isinstance(meta.get("metadata"), dict):  # mem0 double-wrap
+        meta = meta["metadata"]
+    return meta
+
+
 def enumerate_pools(service, *, batch_size: int = 500) -> dict[str, PoolBatch]:
-    """One Qdrant scroll over the collection, grouped into pools.
+    """One LIGHT Qdrant scroll over the collection, grouped into pools.
+
+    Rows carry identity + timestamp fields only (audit 27 #29) — call
+    :func:`hydrate_pool` after the cheap gates pass to fetch full rows.
 
     ``standard``-tier memories are excluded entirely — authoritative
     dictator content is read-only to dreaming (§4.2). Rows already
@@ -106,14 +135,12 @@ def enumerate_pools(service, *, batch_size: int = 500) -> dict[str, PoolBatch]:
             scroll_filter=Filter(must=[]),
             limit=batch_size,
             offset=offset,
-            with_payload=True,
+            with_payload=_LIGHT_SCROLL_FIELDS,
             with_vectors=False,
         )
         for point in points or []:
             payload = getattr(point, "payload", None) or {}
-            meta = payload.get("metadata", {}) or {}
-            if isinstance(meta.get("metadata"), dict):  # mem0 double-wrap
-                meta = meta["metadata"]
+            meta = _unwrap_meta(payload)
             visibility = meta.get("visibility") or "private"
             if visibility == "standard":
                 continue  # authoritative tier: read-only to dreaming
@@ -140,28 +167,97 @@ def enumerate_pools(service, *, batch_size: int = 500) -> dict[str, PoolBatch]:
             batch.memories.append(
                 {
                     "memory_id": str(getattr(point, "id", "") or ""),
-                    "content": payload.get("data", "") or "",
-                    "category": meta.get("category"),
                     "visibility": visibility,
                     "owner_user_id": owner,
                     "project_id": project_id,
-                    "scope": meta.get("scope"),
                     "created_at": payload.get("created_at"),
                     "updated_at": payload.get("updated_at"),
-                    "confidence": meta.get("confidence"),
-                    "concepts": meta.get("concepts"),
-                    "related_memory_ids": meta.get("related_memory_ids"),
                     "source_type": meta.get("source_type"),
-                    "observation_type": meta.get("observation_type"),
-                    "hash": payload.get("hash"),
-                    # Reinforcement counter (A2): how many times this fact was
-                    # re-derived/deduped onto this row. Feeds promotion scoring.
-                    "times_derived": meta.get("times_derived"),
                 }
             )
         if offset is None:
             break
     return pools
+
+
+def count_new_memories(memories: list[dict], *, last_dreamt_at: float) -> int:
+    """Cheap volume pre-gate over light rows (audit 27 #29).
+
+    Mirrors :func:`stage_pool`'s ``new_count`` exactly: rows changed since
+    the last dream, EXCLUDING fresh dream-authored insights (a sweep's own
+    writes must never trigger the next sweep — same feedback-loop guard).
+    """
+    count = 0
+    for mem in memories:
+        changed_at = max(_parse_ts(mem.get("created_at")), _parse_ts(mem.get("updated_at")))
+        if changed_at > last_dreamt_at and mem.get("source_type") != "dream":
+            count += 1
+    return count
+
+
+def hydrate_pool(service, batch: PoolBatch, *, batch_size: int = 500) -> PoolBatch:
+    """Fetch full rows for a pool that passed the cheap gates (audit 27 #29).
+
+    Retrieves the light rows' payloads by id and rebuilds the full staging
+    dicts (content, category, scoring inputs). Rows deleted between
+    enumeration and hydration are dropped. Rows that already carry content
+    (pre-hydrated batches from tests/admin paths) pass through untouched —
+    hydration is idempotent.
+    """
+    from config import settings as core_settings
+
+    need = [m["memory_id"] for m in batch.memories if "content" not in m]
+    if not need:
+        return batch
+
+    client = service._memory.vector_store.client
+    payloads: dict[str, dict] = {}
+    for i in range(0, len(need), batch_size):
+        points = client.retrieve(
+            collection_name=core_settings.qdrant_collection,
+            ids=need[i : i + batch_size],
+            with_payload=True,
+            with_vectors=False,
+        )
+        for point in points or []:
+            payloads[str(getattr(point, "id", "") or "")] = (
+                getattr(point, "payload", None) or {}
+            )
+
+    hydrated: list[dict] = []
+    for mem in batch.memories:
+        if "content" in mem:
+            hydrated.append(mem)
+            continue
+        payload = payloads.get(mem["memory_id"])
+        if payload is None:
+            continue  # deleted since enumeration
+        meta = _unwrap_meta(payload)
+        visibility = meta.get("visibility") or "private"
+        hydrated.append(
+            {
+                "memory_id": mem["memory_id"],
+                "content": payload.get("data", "") or "",
+                "category": meta.get("category"),
+                "visibility": visibility,
+                "owner_user_id": meta.get("owner_user_id") or payload.get("user_id"),
+                "project_id": meta.get("project_id"),
+                "scope": meta.get("scope"),
+                "created_at": payload.get("created_at"),
+                "updated_at": payload.get("updated_at"),
+                "confidence": meta.get("confidence"),
+                "concepts": meta.get("concepts"),
+                "related_memory_ids": meta.get("related_memory_ids"),
+                "source_type": meta.get("source_type"),
+                "observation_type": meta.get("observation_type"),
+                "hash": payload.get("hash"),
+                # Reinforcement counter (A2): how many times this fact was
+                # re-derived/deduped onto this row. Feeds promotion scoring.
+                "times_derived": meta.get("times_derived"),
+            }
+        )
+    batch.memories = hydrated
+    return batch
 
 
 def _parse_ts(value) -> float:

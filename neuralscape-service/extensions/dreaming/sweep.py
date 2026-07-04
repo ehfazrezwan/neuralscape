@@ -6,9 +6,12 @@ economy runs the full cycle. The ``DreamRun`` record persists to Redis so
 the API process and the graph worker report the same state (unlike the
 wiki_synthesizer's process-local snapshot).
 
-Cheap-to-expensive ordering per pool:
-  time gate (Redis read) → settling guard (in-memory) → lock →
-  LIGHT scroll+stage → volume gate →
+Cheap-to-expensive ordering per pool (audit 27 #29: every gate below runs
+on the LIGHT enumeration rows — identity + timestamps, no contents; full
+rows are hydrated only after all three gates pass):
+  time gate (Redis read) → settling guard (in-memory) →
+  volume pre-gate (in-memory) → lock → hydrate + stage →
+  volume gate (hydrated recount) →
   idempotent skip (unchanged staged-id set) → DEEP LLM decide/apply →
   REM reflect/store → diary → gate completion stamp.
 """
@@ -251,12 +254,29 @@ async def _dream_pool(
     # 1b. settling guard (A3-lite): a pool written to within the last
     #     DREAMING_SETTLING_MINUTES is mid-conversation — never consolidate
     #     a thought while it's still forming. Defer to the next pass.
+    #     Runs on the LIGHT enumeration rows (timestamps only).
     if not force:
         decision = gate.check_settling_gate(
             batch.memories, settling_minutes=settings.settling_minutes
         )
         if not decision.proceed:
             report.status, report.reason = "settling", decision.reason
+            return report
+
+    # 1c. cheap volume pre-gate (audit 27 #29): counted from the light rows
+    #     + one Redis read — a quiet pool is skipped before its full rows
+    #     are ever pulled into worker RAM (and before any lock churn).
+    state = gate.get_gate_state(redis, pool)
+    last_dreamt_at = float(state.get("last_dreamt_at") or 0.0)
+    if not force:
+        decision = gate.check_volume_gate(
+            consolidate.count_new_memories(
+                batch.memories, last_dreamt_at=last_dreamt_at
+            ),
+            min_new_memories=settings.min_new_memories,
+        )
+        if not decision.proceed:
+            report.status, report.reason = "gated", decision.reason
             return report
 
     # 2. lock (shared with the dedup cron's semantic-skip check)
@@ -266,10 +286,8 @@ async def _dream_pool(
         return report
 
     try:
-        state = gate.get_gate_state(redis, pool)
-        last_dreamt_at = float(state.get("last_dreamt_at") or 0.0)
-
-        # 3. LIGHT: stage + score
+        # 3. hydrate (full rows, only now) + LIGHT stage/score
+        batch = await asyncio.to_thread(consolidate.hydrate_pool, service, batch)
         batch = await asyncio.to_thread(
             consolidate.stage_pool,
             batch, redis,
@@ -281,7 +299,8 @@ async def _dream_pool(
         )
         report.staged = len(batch.memories)
 
-        # 4. expensive volume gate (count came free with the LIGHT scroll)
+        # 4. authoritative volume gate (recomputed on the hydrated rows —
+        #    the pre-gate at 1c used the light enumeration snapshot)
         if not force:
             decision = gate.check_volume_gate(
                 batch.new_count, min_new_memories=settings.min_new_memories

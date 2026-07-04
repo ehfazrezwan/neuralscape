@@ -469,3 +469,163 @@ class TestFactScopedInvalidation:
             driver, group_id="g", memory_id="m",
         )
         assert edges == 0
+
+
+# ══════════════════════════════════════════════
+# #29 — cheap gates run BEFORE any full-row materialization
+# ══════════════════════════════════════════════
+
+
+def _scroll_service(points: list) -> tuple[MagicMock, MagicMock]:
+    client = MagicMock()
+    client.scroll.return_value = (points, None)
+    service = MagicMock()
+    service._memory.vector_store.client = client
+    return service, client
+
+
+def _point(mid: str, payload: dict):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(id=mid, payload=payload)
+
+
+class TestGatesBeforeScroll:
+    """Pre-fix: ``enumerate_pools`` scrolled every pool's FULL rows
+    (``with_payload=True``) into worker RAM before any gate ran — a sweep
+    over all-quiet pools still materialized the whole collection.
+    """
+
+    def test_enumeration_scroll_is_light(self):
+        """The enumeration scroll must not pull row contents — only the
+        identity/timestamp fields the cheap gates consume."""
+        service, client = _scroll_service([
+            _point("m1", {
+                "user_id": "u1", "created_at": _iso(3600),
+                "metadata": {"visibility": "shared", "source_type": "explicit"},
+            }),
+        ])
+        consolidate.enumerate_pools(service)
+        with_payload = client.scroll.call_args.kwargs["with_payload"]
+        assert with_payload is not True, (
+            "enumeration must scroll a restricted field selector, not full payloads"
+        )
+        assert isinstance(with_payload, list)
+        assert "data" not in with_payload  # never the content
+
+    @pytest.mark.asyncio
+    async def test_time_gated_pool_is_never_hydrated(self, tmp_path):
+        redis = FakeRedis()
+        gate.record_completion(redis, "shared")  # dreamt moments ago
+        service, client = _scroll_service([])
+        llm = AsyncMock()
+        report = await sweep._dream_pool(
+            service=service,
+            settings=_sweep_settings(tmp_path, min_hours=24.0),
+            redis=redis, llm_call=llm,
+            batch=_light_batch(3), dry_run=False, force=False,
+        )
+        assert report.status == "gated" and "time" in report.reason
+        client.retrieve.assert_not_called()  # full rows never fetched
+        llm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_quiet_pool_volume_pregate_skips_hydration_and_lock(self, tmp_path):
+        """A pool with nothing new since its last dream is skipped from the
+        light rows alone — no full-row fetch, no pool lock churn."""
+        redis = FakeRedis()
+        gate.record_completion(redis, "shared", now=time.time() - 48 * 3600)
+        service, client = _scroll_service([])
+        # light rows all older than the last dream → new_count == 0
+        batch = _batch([
+            {"memory_id": f"m{i}", "created_at": _iso(90 * 24 * 3600),
+             "updated_at": None, "source_type": "explicit"}
+            for i in range(3)
+        ])
+        llm = AsyncMock()
+        report = await sweep._dream_pool(
+            service=service,
+            settings=_sweep_settings(tmp_path, min_new_memories=1),
+            redis=redis, llm_call=llm, batch=batch, dry_run=False, force=False,
+        )
+        assert report.status == "gated" and "volume" in report.reason
+        client.retrieve.assert_not_called()
+        assert not gate.is_locked(redis, "shared")  # never even locked
+        llm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_active_pool_hydrates_full_rows_before_the_llm(self, tmp_path):
+        """Light rows that pass the gates are hydrated by id — the LLM must
+        see real content, fetched only now."""
+        redis = FakeRedis()
+        service, client = _scroll_service([])
+        client.retrieve.side_effect = lambda collection_name=None, ids=None, **kw: [
+            _point(mid, {
+                "data": f"the actual fact behind {mid}",
+                "created_at": _iso(3600), "user_id": "u1",
+                "metadata": {"visibility": "shared", "category": "decision",
+                             "source_type": "explicit"},
+            })
+            for mid in (ids or [])
+        ]
+        prompts_seen: list[str] = []
+
+        async def llm(prompt):
+            prompts_seen.append(prompt)
+            return '{"actions": []}'
+
+        report = await sweep._dream_pool(
+            service=service, settings=_sweep_settings(tmp_path), redis=redis,
+            llm_call=llm, batch=_light_batch(2), dry_run=False, force=False,
+        )
+        assert report.status == "dreamt"
+        assert client.retrieve.called  # hydration happened
+        retrieved_ids = {
+            mid for c in client.retrieve.call_args_list for mid in c.kwargs["ids"]
+        }
+        assert {"m0", "m1"} <= retrieved_ids
+        # and the consolidation prompt saw the hydrated content
+        assert "the actual fact behind m0" in prompts_seen[0]
+
+    @pytest.mark.asyncio
+    async def test_hydration_skips_rows_deleted_since_enumeration(self, tmp_path):
+        service, client = _scroll_service([])
+        client.retrieve.side_effect = lambda collection_name=None, ids=None, **kw: [
+            _point("m0", {
+                "data": "still here", "created_at": _iso(3600), "user_id": "u1",
+                "metadata": {"visibility": "shared", "source_type": "explicit"},
+            })
+        ]
+        batch = consolidate.hydrate_pool(service, _light_batch(2))
+        assert [m["memory_id"] for m in batch.memories] == ["m0"]
+        assert batch.memories[0]["content"] == "still here"
+
+    def test_prehydrated_batches_pass_through_untouched(self):
+        """Batches whose rows already carry content (tests, admin runs) must
+        not trigger a second fetch."""
+        service, client = _scroll_service([])
+        full = _fresh_batch(2)
+        before = [dict(m) for m in full.memories]
+        out = consolidate.hydrate_pool(service, full)
+        assert out.memories == before
+        client.retrieve.assert_not_called()
+
+    def test_count_new_memories_mirrors_stage_pool(self):
+        now_new = {"memory_id": "a", "created_at": _iso(60), "source_type": "explicit"}
+        old = {"memory_id": "b", "created_at": _iso(90 * 24 * 3600), "source_type": "explicit"}
+        fresh_dream = {"memory_id": "c", "created_at": _iso(60), "source_type": "dream"}
+        last = time.time() - 24 * 3600
+        assert consolidate.count_new_memories(
+            [now_new, old, fresh_dream], last_dreamt_at=last
+        ) == 1  # the dream-authored row must not re-trigger the sweep
+
+
+def _light_batch(n: int, *, pool: str = "shared") -> PoolBatch:
+    """What enumerate_pools yields post-fix: identity + timestamps, NO content."""
+    mems = [
+        {"memory_id": f"m{i}", "created_at": _iso(3600 + i), "updated_at": None,
+         "source_type": "explicit", "visibility": "shared",
+         "owner_user_id": None, "project_id": None}
+        for i in range(n)
+    ]
+    return _batch(mems, pool=pool)
