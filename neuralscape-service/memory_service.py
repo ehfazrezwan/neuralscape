@@ -2335,12 +2335,18 @@ class MemoryService:
                 domain=domain,
                 observation_type=observation_type,
                 concepts=concepts,
+                visibility=visibility,
+                include_shared=include_shared,
             )
         elif graph_responses and memory_kind == "passage":
             # The passage filter below reads memory_kind off each row, which
             # for graph rows only exists via source-memory enrichment.
             graph_responses = self._enrich_graph_with_v2(
-                graph_responses, user_id=user_id, project_id=project_id
+                graph_responses,
+                user_id=user_id,
+                project_id=project_id,
+                visibility=visibility,
+                include_shared=include_shared,
             )
 
         # Multi-user model: post-filter graph rows by enriched visibility.
@@ -2406,6 +2412,8 @@ class MemoryService:
         graph_responses: list[MemoryResponse],
         user_id: str,
         project_id: str | None,
+        visibility: str | None = None,
+        include_shared: bool = True,
     ) -> list[MemoryResponse]:
         """For each graph edge, find its nearest Qdrant source memory and
         copy that source's v2 metadata onto the graph response — only when
@@ -2423,10 +2431,16 @@ class MemoryService:
         ``query_batch_points`` round trip. Any failure leaves the rows
         un-enriched (never breaks the read).
 
-        Multi-user model: enrichment can use either the caller's private
-        memories OR shared-pool memories (a graph edge for a shared fact
-        should pick up the shared source's metadata). Restricts to the
-        active project_id when supplied so v2 filter parity holds.
+        Multi-user model: the enrichment source filter mirrors the EXACT
+        read-set of the calling search (``visibility``/``include_shared``
+        select the same pools ``_search_graph_for_visibility`` scoped its
+        group_ids to). A private-only or ``include_shared=False`` recall
+        must never pick up a shared row's metadata (visibility /
+        owner_user_id) for its graph rows — the graph edges themselves
+        came from the narrowed group_ids, and enriching them from a wider
+        pool would mislabel rows (or get them dropped by the post-filter).
+        Restricts to the active project_id when supplied so v2 filter
+        parity holds.
         """
         from qdrant_client.models import (
             FieldCondition,
@@ -2438,6 +2452,21 @@ class MemoryService:
         enrichable = [(i, r.memory) for i, r in enumerate(graph_responses) if r.memory]
         if not enrichable:
             return graph_responses
+
+        # Pool selection — parity with _search_graph_for_visibility:
+        #   private  → caller's own rows only
+        #   shared   → shared pool only
+        #   standard → standard pool only
+        #   include_shared=False (no explicit visibility) → personal + standard
+        #   default  → personal + shared + standard
+        want_personal = visibility in (None, MemoryVisibility.PRIVATE.value)
+        want_shared = visibility == MemoryVisibility.SHARED.value or (
+            visibility is None and include_shared
+        )
+        want_standard = settings.standards_enabled and visibility in (
+            None,
+            MemoryVisibility.STANDARD.value,
+        )
 
         try:
             m = self._get_memory()
@@ -2464,23 +2493,29 @@ class MemoryService:
                 if project_id else []
             )
             should_filters: list = []
-            if user_id:
+            if want_personal and user_id:
                 should_filters.append(
                     Filter(must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))] + proj)
                 )
-            should_filters.append(
-                Filter(must=[FieldCondition(
-                    key="metadata.visibility",
-                    match=MatchValue(value=MemoryVisibility.SHARED.value),
-                )] + proj)
-            )
-            if settings.standards_enabled:
+            if want_shared:
+                should_filters.append(
+                    Filter(must=[FieldCondition(
+                        key="metadata.visibility",
+                        match=MatchValue(value=MemoryVisibility.SHARED.value),
+                    )] + proj)
+                )
+            if want_standard:
                 should_filters.append(
                     Filter(must=[FieldCondition(
                         key="metadata.visibility",
                         match=MatchValue(value=MemoryVisibility.STANDARD.value),
                     )])
                 )
+            if not should_filters:
+                # No readable enrichment pool (e.g. private-only with no
+                # user_id) — leave the rows un-enriched rather than querying
+                # unfiltered.
+                return graph_responses
             qf = Filter(should=should_filters)
 
             requests = [
@@ -2557,13 +2592,20 @@ class MemoryService:
         domain: str | None,
         observation_type: str | None,
         concepts: list[str] | None,
+        visibility: str | None = None,
+        include_shared: bool = True,
     ) -> list[MemoryResponse]:
         """Enrich graph rows with v2 metadata, then drop rows that don't match
         the supplied filter. Used when the caller passes domain/observation_type/
-        concepts in SearchMemoryRequest.
+        concepts in SearchMemoryRequest. ``visibility``/``include_shared``
+        scope the enrichment source to the calling search's read-set.
         """
         enriched = self._enrich_graph_with_v2(
-            graph_responses, user_id=user_id, project_id=project_id
+            graph_responses,
+            user_id=user_id,
+            project_id=project_id,
+            visibility=visibility,
+            include_shared=include_shared,
         )
         out: list[MemoryResponse] = []
         for resp in enriched:

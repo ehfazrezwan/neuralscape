@@ -180,6 +180,167 @@ class TestBatchedGraphEnrichment:
         assert service._memory.embedding_model.embed_batch.call_count == 1
 
 
+def _pool_clauses(qf) -> set:
+    """The pool selectors present in an enrichment should-filter:
+    'personal' (a user_id condition) plus any visibility match values
+    ('shared' / 'standard')."""
+    from qdrant_client.models import FieldCondition, Filter
+
+    pools: set = set()
+    for sub in qf.should or []:
+        if not isinstance(sub, Filter):
+            continue
+        for c in sub.must or []:
+            if isinstance(c, FieldCondition):
+                if c.key == "user_id":
+                    pools.add("personal")
+                elif c.key == "metadata.visibility":
+                    pools.add(getattr(c.match, "value", None))
+    return pools
+
+
+class TestEnrichmentPoolScoping:
+    """Copilot review (PR #121): the enrichment source filter must mirror
+    the EXACT read-set of the calling search. Pre-fix it unconditionally
+    included the shared pool, so a private-only / include_shared=False
+    recall could copy a shared row's metadata (visibility, owner_user_id)
+    onto its graph rows — mislabeling them or getting them dropped by the
+    visibility post-filter.
+    """
+
+    SHARED_META = {
+        "visibility": "shared",
+        "owner_user_id": "bob",
+        "domain": "coding",
+    }
+
+    def _rows(self, n=1):
+        return [
+            MemoryResponse(id=f"g{i}", memory=f"graph fact {i}", source="graph")
+            for i in range(n)
+        ]
+
+    def _wire(self, service, n=1):
+        service._memory.embedding_model.embed_batch.return_value = [[0.1] * 8] * n
+        service._memory.vector_store.client.query_batch_points.return_value = [
+            SimpleNamespace(points=[]) for _ in range(n)
+        ]
+
+    def _request_filter(self, service):
+        kwargs = service._memory.vector_store.client.query_batch_points.call_args.kwargs
+        return kwargs["requests"][0].filter
+
+    def _wire_filter_respecting_shared_source(self, service):
+        """query_batch_points fake that HONORS the filter: the shared-pool
+        source hit is only returned when the request filter actually
+        selects the shared pool."""
+        shared_hit = SimpleNamespace(
+            id="s1", score=0.95, payload={"data": "s", "metadata": dict(self.SHARED_META)}
+        )
+
+        def _qbp(collection_name=None, requests=None, **kw):
+            return [
+                SimpleNamespace(
+                    points=[shared_hit] if "shared" in _pool_clauses(req.filter) else []
+                )
+                for req in requests
+            ]
+
+        service._memory.embedding_model.embed_batch.side_effect = (
+            lambda texts, **kw: [[0.1] * 8] * len(texts)
+        )
+        service._memory.vector_store.client.query_batch_points.side_effect = _qbp
+
+    def test_include_shared_false_excludes_shared_sources(self, service):
+        self._wire(service)
+
+        service._enrich_graph_with_v2(
+            self._rows(), user_id="u1", project_id=None, include_shared=False
+        )
+
+        pools = _pool_clauses(self._request_filter(service))
+        assert "shared" not in pools
+        assert "personal" in pools
+
+    def test_private_visibility_scopes_to_personal_pool_only(self, service):
+        self._wire(service)
+
+        service._enrich_graph_with_v2(
+            self._rows(), user_id="u1", project_id=None, visibility="private"
+        )
+
+        assert _pool_clauses(self._request_filter(service)) == {"personal"}
+
+    def test_shared_visibility_scopes_to_shared_pool_only(self, service):
+        self._wire(service)
+
+        service._enrich_graph_with_v2(
+            self._rows(), user_id="u1", project_id=None, visibility="shared"
+        )
+
+        assert _pool_clauses(self._request_filter(service)) == {"shared"}
+
+    def test_default_read_set_unchanged(self, service, monkeypatch):
+        from config import settings as _settings
+
+        monkeypatch.setattr(_settings, "standards_enabled", True)
+        self._wire(service)
+
+        service._enrich_graph_with_v2(self._rows(), user_id="u1", project_id=None)
+
+        assert _pool_clauses(self._request_filter(service)) == {
+            "personal",
+            "shared",
+            "standard",
+        }
+
+    def test_shared_metadata_never_attached_without_shared_pool(self, service):
+        """Behavioral: with a source store where the graph edge's nearest
+        match is a SHARED memory, an include_shared=False enrichment must
+        leave the row untouched, while the default read-set picks it up."""
+        self._wire_filter_respecting_shared_source(service)
+
+        narrowed = service._enrich_graph_with_v2(
+            self._rows(), user_id="u1", project_id=None, include_shared=False
+        )
+        assert narrowed[0].visibility is None
+        assert narrowed[0].owner_user_id is None
+        assert narrowed[0].domain is None
+
+        full = service._enrich_graph_with_v2(
+            self._rows(), user_id="u1", project_id=None
+        )
+        assert full[0].visibility == "shared"
+        assert full[0].owner_user_id == "bob"
+        assert full[0].domain == "coding"
+
+    def test_search_threads_pool_context_into_v2_filter_enrichment(self, service):
+        with patch.object(
+            service, "_search_graph_for_visibility", return_value=_graph_result(_edges(1))
+        ), patch.object(
+            service, "_enrich_and_filter_graph", return_value=[]
+        ) as spy:
+            service.search(
+                query="q", user_id="u1", limit=5, domain="coding", include_shared=False
+            )
+
+        assert spy.call_args.kwargs["include_shared"] is False
+        assert spy.call_args.kwargs["visibility"] is None
+
+    def test_search_threads_pool_context_into_passage_enrichment(self, service):
+        with patch.object(
+            service, "_search_graph_for_visibility", return_value=_graph_result(_edges(1))
+        ), patch.object(
+            service, "_enrich_graph_with_v2", side_effect=lambda rows, **kw: rows
+        ) as spy:
+            service.search(
+                query="q", user_id="u1", limit=5, memory_kind="passage",
+                visibility="private",
+            )
+
+        assert spy.call_args.kwargs["visibility"] == "private"
+
+
 # ══════════════════════════════════════════════
 # Defect 9 — vector and graph passes overlapped, not serialized
 # ══════════════════════════════════════════════
