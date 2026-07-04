@@ -103,7 +103,13 @@ def _community_facts(G: nx.Graph, settings) -> list[SemanticFact]:
         if not name:
             # Unlabeled community — a bare cluster id is structure, not knowledge.
             continue
-        labels = [str(G.nodes[n].get("label", n)) for n in members]
+        labels = [
+            str(G.nodes[n].get("label", n))
+            for n in members
+            # Rationale nodes are long comment strings — they get their own
+            # `rationale` facts and would only bloat the member list here.
+            if G.nodes[n].get("file_type") != "rationale"
+        ]
         key_members = ", ".join(sorted(labels)[:8])
         facts.append(
             SemanticFact(
@@ -129,6 +135,11 @@ def _god_node_facts(G: nx.Graph, settings) -> list[SemanticFact]:
     for gn in _god_nodes(G, top_n=settings.code_graph_max_god_nodes):
         nid = gn["id"]
         data = G.nodes.get(nid, {})
+        # The library ranks by degree without a floor; on a small graph that
+        # would crown leaf nodes. A "hub" needs at least 3 connections, and
+        # rationale nodes are comments, never abstractions.
+        if data.get("file_type") == "rationale" or gn.get("degree", 0) < 3:
+            continue
         src = data.get("source_file") or "unknown source"
         community = data.get("community_name")
         where = f" in module '{community}'" if community else ""
