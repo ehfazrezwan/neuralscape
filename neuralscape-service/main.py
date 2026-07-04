@@ -41,6 +41,8 @@ from schemas import (
     MEMORY_CATEGORIES,
     AskMemoryRequest,
     AskMemoryResponse,
+    AssembleContextRequest,
+    AssembleContextResponse,
     BulkDeleteRequest,
     CategoryListResponse,
     CheckpointRequest,
@@ -1928,6 +1930,49 @@ async def v1_inject_context(
     except Exception as e:
         logger.exception("v1 inject_context failed")
         raise HTTPException(status_code=500, detail="Failed to generate injection context")
+
+
+@v1_router.post("/context/assemble", response_model=AssembleContextResponse)
+async def v1_assemble_context(req: AssembleContextRequest, request: Request):
+    """Token-budgeted prompt-ready context bundle (E3). Additive — the
+    existing GET /v1/context/* surface is unchanged.
+
+    Sections under the hard ``budget_tokens`` cap: recent session messages
+    (~60% of the working budget), the session's rolling summary slot
+    (~40%; the summarizer maintains `short`/`long` slots asynchronously as
+    conversation writes cross message-count thresholds), the identity
+    card, and — when ``query`` is given — compact relevant-memory index
+    rows. ``format`` selects the provider shape (plain | anthropic |
+    openai). Every response is ledgered through the savings meter
+    (baseline = full transcript + full query-hit content vs. the bundle
+    actually served). Sync read per NS convention; REST only (no MCP tool
+    — the plugin consumes this endpoint).
+    """
+    from context_assembler import assemble_context
+
+    user_id = _resolve_user_id(request, req.user_id)
+    try:
+        out = await asyncio.to_thread(
+            assemble_context,
+            _service,
+            user_id=user_id,
+            budget_tokens=req.budget_tokens,
+            session_id=req.session_id,
+            project_id=req.project_id,
+            query=req.query,
+            fmt=req.format,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("v1 assemble_context failed")
+        raise HTTPException(status_code=500, detail="Context assembly failed") from e
+    detail = out.pop("savings_detail", None)
+    return AssembleContextResponse(
+        **out, savings_detail=SavingsDetail(**detail) if detail else None
+    )
 
 
 @v1_router.get("/context/{project_id}", response_model=ContextResponse)

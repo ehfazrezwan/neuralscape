@@ -210,6 +210,21 @@ def measure_ask(baseline_tokens: int, answer_text: str | None) -> SavingsEvent |
     )
 
 
+def measure_assemble(
+    baseline_tokens: int, served_tokens: int
+) -> SavingsEvent | None:
+    """Measure one context-assemble op (E3): baseline = the full session
+    transcript + full content of every relevant hit (what a memoryless
+    client would inject), served = the token-budgeted bundle actually
+    returned. Both sides arrive precomputed (the assembler already counts
+    every section it serves), so this is arithmetic, not tokenization."""
+    if not _meter_enabled():
+        return None
+    return _make_event(
+        "context_assemble", max(0, int(baseline_tokens)), max(0, int(served_tokens)), 0
+    )
+
+
 def format_savings_line(event: SavingsEvent) -> str:
     """The compact honest headline: 'saved ~N tokens (X%), net of overhead'.
 
