@@ -37,7 +37,7 @@ from datetime import datetime, timezone
 
 from .prompts import CONSOLIDATION_PROMPT, parse_json_response, render_memories_block
 from .scoring import score_memory
-from .traces import read_aggregates
+from .traces import read_aggregates, read_dynamics
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +169,7 @@ def stage_pool(
     max_memories: int,
     strength_half_life_days: float,
     prune_strength_threshold: float,
+    dynamics_enabled: bool = True,
 ) -> PoolBatch:
     """LIGHT: filter + score one pool's staged batch in place.
 
@@ -181,16 +182,24 @@ def stage_pool(
     §9), while *older* ones may re-enter via the weak-retention path so
     stale insights can decay out (PRUNE/INVALIDATE) — but they are never
     merge material (``decide`` enforces that).
+
+    When ``dynamics_enabled``, retention strength is salience-dynamics-
+    driven for memories with a recorded state (A4) — so a frequently
+    co-recalled pair resists the weak-retention path while an untouched
+    sibling decays into it. Low strength only NOMINATES for prune here;
+    the LLM pass and the confidence gate still stand (§A4 guardrail 2).
     """
     now = time.time()
     ids = [m["memory_id"] for m in batch.memories]
     traces = read_aggregates(redis, ids)
+    dynamics_states = read_dynamics(redis, ids) if dynamics_enabled else {}
 
     staged: list[dict] = []
     new_count = 0
     for mem in batch.memories:
         scores = score_memory(
-            mem, traces, now=now, strength_half_life_days=strength_half_life_days
+            mem, traces, now=now, strength_half_life_days=strength_half_life_days,
+            dynamics_states=dynamics_states,
         )
         mem.update(scores)
         changed_at = max(_parse_ts(mem.get("created_at")), _parse_ts(mem.get("updated_at")))

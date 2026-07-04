@@ -95,6 +95,62 @@ class DreamingSettings(BaseSettings):
         ),
     )
 
+    # ── Salience dynamics (A4; see dynamics.py) ──
+    dynamics_enabled: bool = Field(
+        default=True,
+        description=(
+            "Use recall-driven salience dynamics (strength / stability / "
+            "decay) as the retention-strength input to promotion/prune "
+            "scoring. When False — and for any memory without a recorded "
+            "dynamics state — scoring falls back to the legacy single-"
+            "half-life Ebbinghaus path. Never gates retrieval either way."
+        ),
+    )
+    dynamics_strength_delta: float = Field(
+        default=0.05,
+        ge=0.0,
+        description=(
+            "Strength increment per recall; a co-recalled memory (returned "
+            "together with a sibling by the same query) earns the same "
+            "again. Recalls by an already-seen query are damped so "
+            "single-query hammering cannot compound."
+        ),
+    )
+    dynamics_strength_cap: float = Field(
+        default=5.0,
+        gt=0.0,
+        description=(
+            "Hard cap on accumulated strength — reinforcement saturates "
+            "(guardrail: no rich-get-richer runaway)."
+        ),
+    )
+    salience_recall_k: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=0.1,
+        description=(
+            "Bounded recall tie-breaker: score * (1 + k*log1p(strength "
+            "signal)). 0.0 (default) disables it entirely — the search "
+            "path then stays byte-identical and Redis-free. Hard-bounded "
+            "at 0.1 (≤ ~16% boost at the strength cap) and 0.05 is the "
+            "recommended ceiling: relevance must always dominate; "
+            "salience shapes consolidation and vault presentation, never "
+            "gates retrieval."
+        ),
+    )
+
+    # ── Settling guard (A3-lite; see gate.check_settling_gate) ──
+    settling_minutes: float = Field(
+        default=30.0,
+        ge=0.0,
+        description=(
+            "Defer a pool whose latest write (created_at/updated_at) is "
+            "younger than this — never consolidate mid-conversation. The "
+            "pool reports status 'settling' and is retried next pass; "
+            "force=true bypasses; 0 disables the guard."
+        ),
+    )
+
     # ── Promotion gates (deep phase) ──
     min_recall_count: int = Field(
         default=2,
