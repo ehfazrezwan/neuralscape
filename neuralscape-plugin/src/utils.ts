@@ -110,7 +110,8 @@ export interface HookOutput {
 
 export interface NeuralscapeMemory {
   id: string;
-  memory: string;
+  /** Full content. Absent/empty on index-level rows (`fields=index`). */
+  memory?: string;
   category?: string;
   scope?: string;
   project_id?: string;
@@ -710,6 +711,59 @@ export async function recordGatedFile(sessionId: string, filePath: string): Prom
     await writeFile(getReadGateStatePath(sessionId), JSON.stringify([...gated]), "utf-8");
   } catch (error) {
     logError("recordGatedFile failed", error);
+  }
+}
+
+// ── Read-gate session index cache (audit 27 #31) ─────────────────
+//
+// The candidate-memory fetch happens AT MOST ONCE per session: the first
+// gateable Read fetches the index-level rows and caches them here; every
+// later Read (any file) matches against the cache with zero network I/O.
+// A failed/timed-out fetch caches a failure sentinel — the gate then stays
+// quiet for the rest of the session instead of re-paying the round trip on
+// every large-file Read while the service is down.
+
+export interface ReadGateIndexCache {
+  /** False when the one fetch failed/timed out (gate stays quiet). */
+  ok: boolean;
+  fetchedAt: string;
+  rows: NeuralscapeMemory[];
+}
+
+export function getReadGateCachePath(sessionId: string): string {
+  return pathJoin(getObservationDir(), `${safeSessionName(sessionId)}.readgate-index.json`);
+}
+
+export async function loadReadGateIndexCache(
+  sessionId: string,
+): Promise<ReadGateIndexCache | null> {
+  try {
+    const raw = await readFile(getReadGateCachePath(sessionId), "utf-8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && typeof parsed.ok === "boolean") {
+      return {
+        ok: parsed.ok,
+        fetchedAt: typeof parsed.fetchedAt === "string" ? parsed.fetchedAt : "",
+        rows: Array.isArray(parsed.rows) ? (parsed.rows as NeuralscapeMemory[]) : [],
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveReadGateIndexCache(
+  sessionId: string,
+  ok: boolean,
+  rows: NeuralscapeMemory[],
+): Promise<void> {
+  try {
+    await mkdir(getObservationDir(), { recursive: true });
+    const payload: ReadGateIndexCache = { ok, fetchedAt: new Date().toISOString(), rows };
+    await writeFile(getReadGateCachePath(sessionId), JSON.stringify(payload), "utf-8");
+  } catch (error) {
+    logError("saveReadGateIndexCache failed", error);
   }
 }
 

@@ -237,7 +237,7 @@ export function renderEscalationFooter(codeGraphAvailable: boolean): string {
     `3. **Expand** the few that matter: \`${MCP}get_memories\` with \`ids: [...]\` (the \`#id\` values above; batch up to 50).`,
     `4. **History** around a moment: \`${MCP}timeline\` with \`anchor\` = a memory id or query.`,
     "",
-    "Never expand rows speculatively — fetch full payloads only for memories you will actually use.",
+    "Prefer the index for broad scans, but expand any row whose title looks relevant — titles are lossy ~10-word summaries, so don't rule a memory out from its title alone. Economics: an index row costs ~10 tokens, a full payload ~50-500.",
   ];
   if (codeGraphAvailable) {
     lines.push(

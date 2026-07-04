@@ -20,9 +20,11 @@ beforeAll(() => {
 const readGate = await import("../src/core/read-gate.js");
 const {
   DEFAULT_READ_GATE_MIN_BYTES,
+  DEFAULT_READ_GATE_TIME_BUDGET_MS,
   GATE_BYPASS_EXTENSIONS,
   MODIFY_OBSERVATION_TYPES,
-  buildDenyOutput,
+  READ_GATE_FETCH_LIMIT,
+  buildSteerOutput,
   distinctFileMentions,
   fileNameOf,
   isBypassedExtension,
@@ -31,11 +33,12 @@ const {
   rankFileMemories,
   referencesFile,
   renderGateRow,
-  renderReadGateReason,
+  renderReadGateContext,
+  tailMatchRe,
 } = readGate;
 
 const preToolUse = await import("../src/hooks/pre-tool-use.js");
-const { getReadGateEnabled, getReadGateMinBytes, targetFilePath } = preToolUse;
+const { getReadGateEnabled, getReadGateMinBytes, getReadGateTimeBudgetMs, targetFilePath } = preToolUse;
 
 const postToolUse = await import("../src/hooks/post-tool-use.js");
 const { DENY_TOOLS, getSkipTools, shouldCapture } = postToolUse;
@@ -109,14 +112,14 @@ const MODIFIED_BUGFIX = mem({
 
 const MODIFIED_VERB_ONLY = mem({
   id: "m-verb",
-  memory: "Updated target-module.ts and three siblings (a.ts, b.ts, c.ts) to the new logging API.",
+  memory: "Updated gate/target-module.ts and three siblings (a.ts, b.ts, c.ts) to the new logging API.",
   observation_type: "discovery",
   created_at: "2026-07-03T09:00:00Z",
 });
 
 const READ_ONLY_SPECIFIC = mem({
   id: "m-read-specific",
-  memory: "target-module.ts exposes the retry queue; consumers must drain it before shutdown.",
+  memory: "gate/target-module.ts exposes the retry queue; consumers must drain it before shutdown.",
   observation_type: "discovery",
   created_at: "2026-07-03T12:00:00Z",
 });
@@ -124,7 +127,7 @@ const READ_ONLY_SPECIFIC = mem({
 const READ_ONLY_BROAD = mem({
   id: "m-read-broad",
   memory:
-    "Survey: target-module.ts, alpha.py, beta.go, gamma.rs and delta.java each satisfy the worker interface differently.",
+    "Survey: gate/target-module.ts, alpha.py, beta.go, gamma.rs and delta.java each satisfy the worker interface differently.",
   observation_type: "research_note",
   created_at: "2026-07-03T13:00:00Z",
 });
@@ -143,9 +146,12 @@ describe("fileNameOf / pathTail", () => {
     expect(fileNameOf("")).toBe("");
   });
 
-  it("pathTail keeps the last two segments", () => {
+  it("pathTail keeps the last n segments, empty when the path is shallower", () => {
     expect(pathTail("/repo/src/gate/target-module.ts")).toBe("gate/target-module.ts");
-    expect(pathTail("solo.ts")).toBe("solo.ts");
+    expect(pathTail("/repo/src/gate/target-module.ts", 3)).toBe("src/gate/target-module.ts");
+    // A single-segment path has no dir/basename tail — callers fall back to
+    // the basename matcher.
+    expect(pathTail("solo.ts")).toBe("");
   });
 });
 
@@ -172,36 +178,58 @@ describe("isBypassedExtension", () => {
 
 // ── Reference + ranking signals ──────────────────────────────────
 
-describe("referencesFile", () => {
-  it("accepts basename mentions in content", () => {
+describe("referencesFile (path-tail matching, audit 27 #32)", () => {
+  it("accepts dir/basename tail mentions in content", () => {
     expect(referencesFile(MODIFIED_BUGFIX, TARGET)).toBe(true);
+    expect(referencesFile(mem({ memory: "fixed gate/target-module.ts today" }), TARGET)).toBe(true);
+  });
+
+  it("REJECTS bare-basename mentions when the target path has directories", () => {
+    // The pre-audit basename matcher fired on every same-named file in the
+    // repo; a bare `target-module.ts` no longer counts as a reference to
+    // /repo/src/gate/target-module.ts.
+    expect(referencesFile(mem({ memory: "notes on target-module.ts alone" }), TARGET)).toBe(false);
+    expect(referencesFile(mem({ memory: "x", title: "notes on target-module.ts" }), TARGET)).toBe(false);
+  });
+
+  it("falls back to the basename for single-segment target paths", () => {
+    expect(referencesFile(mem({ memory: "notes on solo.ts here" }), "solo.ts")).toBe(true);
+    expect(referencesFile(mem({ memory: "notes on solo.tsx here" }), "solo.ts")).toBe(false);
   });
 
   it("accepts mentions via title or tags", () => {
-    expect(referencesFile(mem({ memory: "x", title: "notes on target-module.ts" }), TARGET)).toBe(true);
-    expect(referencesFile(mem({ memory: "x", tags: ["target-module.ts"] }), TARGET)).toBe(true);
+    expect(referencesFile(mem({ memory: "x", title: "notes on gate/target-module.ts" }), TARGET)).toBe(true);
+    expect(referencesFile(mem({ memory: "x", tags: ["gate/target-module.ts"] }), TARGET)).toBe(true);
   });
 
-  it("is case-insensitive", () => {
-    expect(referencesFile(mem({ memory: "See TARGET-MODULE.TS for details" }), TARGET)).toBe(true);
+  it("is case-insensitive and separator-tolerant", () => {
+    expect(referencesFile(mem({ memory: "See GATE/TARGET-MODULE.TS for details" }), TARGET)).toBe(true);
+    expect(referencesFile(mem({ memory: "See gate\\target-module.ts on Windows" }), TARGET)).toBe(true);
   });
 
   it("rejects memories that never mention the file", () => {
     expect(referencesFile(UNRELATED, TARGET)).toBe(false);
   });
 
-  it("rejects substring false positives (a.ts inside data.ts, x.ts inside x.tsx)", () => {
-    // basename `a.ts` must NOT match `data.ts`
-    expect(referencesFile(mem({ memory: "refactored data.ts today" }), "/repo/a.ts")).toBe(false);
-    // basename `target-module.ts` must NOT match `target-module.tsx`
-    expect(referencesFile(mem({ memory: "see target-module.tsx for the JSX port" }), TARGET)).toBe(false);
-    // ...nor `x.target-module.ts` (a different dotted file)
-    expect(referencesFile(mem({ memory: "generated x.target-module.ts stub" }), TARGET)).toBe(false);
+  it("rejects substring false positives", () => {
+    // tail `repo/a.ts` must NOT match `repo/data.ts`
+    expect(referencesFile(mem({ memory: "refactored repo/data.ts today" }), "/repo/a.ts")).toBe(false);
+    // tail must NOT match the `.tsx` extension superset
+    expect(referencesFile(mem({ memory: "see gate/target-module.tsx for the JSX port" }), TARGET)).toBe(false);
+    // ...nor a different dotted file in the same dir
+    expect(referencesFile(mem({ memory: "generated gate/x.target-module.ts stub" }), TARGET)).toBe(false);
+    // ...nor a partial dir-segment prefix (irrigate/ vs gate/)
+    expect(referencesFile(mem({ memory: "see irrigate/target-module.ts" }), TARGET)).toBe(false);
   });
 
-  it("accepts token matches with path prefixes and sentence punctuation", () => {
+  it("accepts token matches with longer path prefixes and sentence punctuation", () => {
     expect(referencesFile(mem({ memory: "fixed src/gate/target-module.ts." }), TARGET)).toBe(true);
-    expect(referencesFile(mem({ memory: "(target-module.ts)" }), TARGET)).toBe(true);
+    expect(referencesFile(mem({ memory: "(gate/target-module.ts)" }), TARGET)).toBe(true);
+  });
+
+  it("tailMatchRe is exposed for the ranking pass", () => {
+    expect(tailMatchRe("gate/target-module.ts").test("in src/gate/target-module.ts today")).toBe(true);
+    expect(tailMatchRe("gate/target-module.ts").test("in target-module.ts alone")).toBe(false);
   });
 });
 
@@ -257,7 +285,7 @@ describe("rankFileMemories", () => {
 
   it("caps the result list", () => {
     const many = Array.from({ length: 30 }, (_, i) =>
-      mem({ id: `m-${i}`, memory: `note ${i} about target-module.ts` }),
+      mem({ id: `m-${i}`, memory: `note ${i} about gate/target-module.ts` }),
     );
     expect(rankFileMemories(many, TARGET)).toHaveLength(10);
     expect(rankFileMemories(many, TARGET, 3)).toHaveLength(3);
@@ -269,13 +297,13 @@ describe("rankFileMemories", () => {
     const titleOnly = mem({
       id: "m-title-only",
       memory: "The retry queue must be drained before shutdown.",
-      title: "target-module.ts retry-queue contract",
+      title: "gate/target-module.ts retry-queue contract",
       created_at: "2026-07-01T00:00:00Z",
     });
     const broad = mem({
       id: "m-broad",
       memory:
-        "Survey: target-module.ts, alpha.py, beta.go, gamma.rs and delta.java each satisfy the worker interface.",
+        "Survey: gate/target-module.ts, alpha.py, beta.go, gamma.rs and delta.java each satisfy the worker interface.",
       created_at: "2026-07-03T00:00:00Z",
     });
     const ranked = rankFileMemories([broad, titleOnly], TARGET);
@@ -283,15 +311,15 @@ describe("rankFileMemories", () => {
   });
 
   it("orders equal scores by recency", () => {
-    const older = mem({ id: "m-old", memory: "target-module.ts holds the retry queue.", created_at: "2026-06-01T00:00:00Z" });
-    const newer = mem({ id: "m-new", memory: "target-module.ts holds the retry queue.", created_at: "2026-07-01T00:00:00Z" });
-    const undated = mem({ id: "m-undated", memory: "target-module.ts holds the retry queue.", created_at: undefined });
+    const older = mem({ id: "m-old", memory: "gate/target-module.ts holds the retry queue.", created_at: "2026-06-01T00:00:00Z" });
+    const newer = mem({ id: "m-new", memory: "gate/target-module.ts holds the retry queue.", created_at: "2026-07-01T00:00:00Z" });
+    const undated = mem({ id: "m-undated", memory: "gate/target-module.ts holds the retry queue.", created_at: undefined });
     const ranked = rankFileMemories([older, undated, newer], TARGET);
     expect(ranked.map((m) => m.id)).toEqual(["m-new", "m-old", "m-undated"]);
   });
 });
 
-// ── Rendering + deny shape ───────────────────────────────────────
+// ── Rendering + steering shape (audit 27 #32: steer, never block) ─
 
 describe("renderGateRow", () => {
   it("renders `#id | when | title | ~tokens`", () => {
@@ -308,48 +336,68 @@ describe("renderGateRow", () => {
   });
 });
 
-describe("renderReadGateReason", () => {
+describe("renderReadGateContext", () => {
   const now = new Date("2026-07-04T09:00:00Z");
 
-  it("includes the path, size, rows, escalation menu, and the exact override", () => {
-    const reason = renderReadGateReason(TARGET, 4096, [MODIFIED_BUGFIX, READ_ONLY_SPECIFIC], now);
-    expect(reason).toContain("[Neuralscape Read Gate]");
-    expect(reason).toContain("`" + TARGET + "`");
-    expect(reason).toContain("4.0 KB");
-    expect(reason).toContain("2 stored memories reference this file");
-    expect(reason).toContain("`#id | when | title | ~tokens`");
-    expect(reason).toContain("#m-bugfix | 2d |");
-    expect(reason).toContain("mcp__plugin_neuralscape_neuralscape__get_memories");
-    expect(reason).toContain("mcp__plugin_neuralscape_neuralscape__timeline");
-    expect(reason).toContain("index_only: true");
-    expect(reason).toContain("Read the same path again");
+  it("includes the path, rows, and escalation menu — and never a skip/override framing", () => {
+    const context = renderReadGateContext(TARGET, [MODIFIED_BUGFIX, READ_ONLY_SPECIFIC], now);
+    expect(context).toContain("[Neuralscape]");
+    expect(context).toContain("`" + TARGET + "`");
+    expect(context).toContain("2 stored memories reference");
+    expect(context).toContain("`#id | when | title | ~tokens`");
+    expect(context).toContain("#m-bugfix | 2d |");
+    expect(context).toContain("mcp__plugin_neuralscape_neuralscape__get_memories");
+    expect(context).toContain("mcp__plugin_neuralscape_neuralscape__timeline");
+    expect(context).toContain("index_only: true");
+    // The Read is NOT skipped or substituted — no deny/override language.
+    expect(context).not.toContain("Skipped reading");
+    expect(context).not.toContain("Read the same path again");
   });
 
   it("uses singular phrasing for one memory", () => {
-    const reason = renderReadGateReason(TARGET, 2000, [MODIFIED_BUGFIX], now);
-    expect(reason).toContain("1 stored memory references this file");
+    const context = renderReadGateContext(TARGET, [MODIFIED_BUGFIX], now);
+    expect(context).toContain("1 stored memory references");
   });
 
   it("redacts <private> spans coming back from the server", () => {
     const leaky = mem({
       id: "m-leak",
-      memory: "target-module.ts stores the key <private>sk-super-secret</private> at boot.",
+      memory: "gate/target-module.ts stores the key <private>sk-super-secret</private> at boot.",
     });
-    const reason = renderReadGateReason(TARGET, 2000, [leaky], now);
-    expect(reason).not.toContain("sk-super-secret");
-    expect(reason).toContain("[redacted]");
+    const context = renderReadGateContext(TARGET, [leaky], now);
+    expect(context).not.toContain("sk-super-secret");
+    expect(context).toContain("[redacted]");
   });
 });
 
-describe("buildDenyOutput", () => {
-  it("matches the PreToolUse hooks-API deny shape", () => {
-    expect(buildDenyOutput("why")).toEqual({
+describe("buildSteerOutput", () => {
+  it("emits additionalContext with NO permission decision (steer, never block)", () => {
+    const out = buildSteerOutput("ctx") as {
+      hookSpecificOutput: Record<string, unknown>;
+    };
+    expect(out).toEqual({
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
-        permissionDecision: "deny",
-        permissionDecisionReason: "why",
+        additionalContext: "ctx",
       },
     });
+    expect(out.hookSpecificOutput.permissionDecision).toBeUndefined();
+  });
+});
+
+describe("hot-path budgets (audit 27 #31)", () => {
+  it("caps the one session fetch at a sane row count", () => {
+    expect(READ_GATE_FETCH_LIMIT).toBeLessThanOrEqual(200);
+  });
+
+  it("has a hard time budget with a config override", () => {
+    expect(DEFAULT_READ_GATE_TIME_BUDGET_MS).toBe(2000);
+    expect(getReadGateTimeBudgetMs()).toBe(2000);
+    process.env.NEURALSCAPE_READ_GATE_TIME_BUDGET_MS = "750";
+    expect(getReadGateTimeBudgetMs()).toBe(750);
+    process.env.NEURALSCAPE_READ_GATE_TIME_BUDGET_MS = "banana";
+    expect(getReadGateTimeBudgetMs()).toBe(2000);
+    delete process.env.NEURALSCAPE_READ_GATE_TIME_BUDGET_MS;
   });
 });
 
