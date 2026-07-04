@@ -173,8 +173,9 @@ async def test_merge_stamps_survivor_with_loser_ids():
     point = client.upsert.call_args[1]["points"][0]
     assert point.payload["metadata"]["derived_from"] == ["l1", "l2"]
     assert point.payload["data"] == "merged"
-    # losers tombstoned toward the survivor
-    tombstoned = [c[1]["payload"]["metadata"] for c in client.set_payload.call_args_list]
+    # losers tombstoned toward the survivor (nested-key patch, audit 27 #30)
+    tombstoned = [c[1]["payload"] for c in client.set_payload.call_args_list]
+    assert all(c[1]["key"] == "metadata" for c in client.set_payload.call_args_list)
     assert all(meta["dream_tombstoned"] and meta["superseded_by"] == "surv"
                for meta in tombstoned)
 

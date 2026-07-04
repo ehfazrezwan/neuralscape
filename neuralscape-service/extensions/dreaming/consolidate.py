@@ -13,8 +13,10 @@ gate → report only), and applies:
 - merge            → survivor rewritten (fold-in), losers tombstoned +
                      graph-invalidated (bi-temporal, reversible)
 - invalidate       → tombstone + graph invalid_at (reversible)
-- prune            → secrets: hard-delete (the one irreversible case);
-                     everything else: tombstone + invalidate
+- prune            → gate-cleared secrets: hard-delete (the one
+                     irreversible case, confidence-gated like every other
+                     destructive action); everything else — including
+                     below-gate secret claims — tombstone + invalidate
 - rewrite          → content updated in place (re-embedded)
 - temporal_reframe → content updated in place (re-embedded)
 
@@ -35,7 +37,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from .prompts import CONSOLIDATION_PROMPT, parse_json_response, render_memories_block
+from .prompts import CONSOLIDATION_PROMPT, parse_json_object, render_memories_block
 from .scoring import score_memory
 from .traces import read_aggregates, read_dynamics
 
@@ -43,6 +45,16 @@ logger = logging.getLogger(__name__)
 
 _DESTRUCTIVE = {"invalidate", "prune"}
 _REVERSIBLE = {"merge", "rewrite", "temporal_reframe"}
+
+
+class DreamLLMFailure(RuntimeError):
+    """The dream LLM errored, timed out, or returned garbage (audit 27 #27).
+
+    Distinct from a valid empty decision (``{"actions": []}``): this means
+    the pool was never actually examined, so callers must NOT stamp the
+    pool's gate or count the sweep as "dreamt" — the cron retries next
+    cycle instead of a broken LLM silently disabling consolidation forever.
+    """
 
 
 @dataclass(slots=True)
@@ -74,8 +86,37 @@ def pool_key(*, visibility: str, owner_user_id: str | None, project_id: str | No
     return f"user--{uid}--project--{project_id}" if project_id else f"user--{uid}"
 
 
+# Audit 27 #29: the enumeration scroll pulls ONLY the fields the cheap
+# gates consume (pool identity + timestamps + the staging guards' flags) —
+# never row contents. Quiet pools are gated out on these light rows alone;
+# a pool's full rows are hydrated by id (``hydrate_pool``) only after the
+# time/settling/volume gates all pass.
+_LIGHT_SCROLL_FIELDS = [
+    "user_id",
+    "created_at",
+    "updated_at",
+    "metadata.visibility",
+    "metadata.owner_user_id",
+    "metadata.project_id",
+    "metadata.dream_tombstoned",
+    "metadata.source_type",
+    # legacy double-wrapped rows keep their inner dict reachable
+    "metadata.metadata",
+]
+
+
+def _unwrap_meta(payload: dict) -> dict:
+    meta = payload.get("metadata", {}) or {}
+    if isinstance(meta.get("metadata"), dict):  # mem0 double-wrap
+        meta = meta["metadata"]
+    return meta
+
+
 def enumerate_pools(service, *, batch_size: int = 500) -> dict[str, PoolBatch]:
-    """One Qdrant scroll over the collection, grouped into pools.
+    """One LIGHT Qdrant scroll over the collection, grouped into pools.
+
+    Rows carry identity + timestamp fields only (audit 27 #29) — call
+    :func:`hydrate_pool` after the cheap gates pass to fetch full rows.
 
     ``standard``-tier memories are excluded entirely — authoritative
     dictator content is read-only to dreaming (§4.2). Rows already
@@ -94,14 +135,12 @@ def enumerate_pools(service, *, batch_size: int = 500) -> dict[str, PoolBatch]:
             scroll_filter=Filter(must=[]),
             limit=batch_size,
             offset=offset,
-            with_payload=True,
+            with_payload=_LIGHT_SCROLL_FIELDS,
             with_vectors=False,
         )
         for point in points or []:
             payload = getattr(point, "payload", None) or {}
-            meta = payload.get("metadata", {}) or {}
-            if isinstance(meta.get("metadata"), dict):  # mem0 double-wrap
-                meta = meta["metadata"]
+            meta = _unwrap_meta(payload)
             visibility = meta.get("visibility") or "private"
             if visibility == "standard":
                 continue  # authoritative tier: read-only to dreaming
@@ -128,28 +167,97 @@ def enumerate_pools(service, *, batch_size: int = 500) -> dict[str, PoolBatch]:
             batch.memories.append(
                 {
                     "memory_id": str(getattr(point, "id", "") or ""),
-                    "content": payload.get("data", "") or "",
-                    "category": meta.get("category"),
                     "visibility": visibility,
                     "owner_user_id": owner,
                     "project_id": project_id,
-                    "scope": meta.get("scope"),
                     "created_at": payload.get("created_at"),
                     "updated_at": payload.get("updated_at"),
-                    "confidence": meta.get("confidence"),
-                    "concepts": meta.get("concepts"),
-                    "related_memory_ids": meta.get("related_memory_ids"),
                     "source_type": meta.get("source_type"),
-                    "observation_type": meta.get("observation_type"),
-                    "hash": payload.get("hash"),
-                    # Reinforcement counter (A2): how many times this fact was
-                    # re-derived/deduped onto this row. Feeds promotion scoring.
-                    "times_derived": meta.get("times_derived"),
                 }
             )
         if offset is None:
             break
     return pools
+
+
+def count_new_memories(memories: list[dict], *, last_dreamt_at: float) -> int:
+    """Cheap volume pre-gate over light rows (audit 27 #29).
+
+    Mirrors :func:`stage_pool`'s ``new_count`` exactly: rows changed since
+    the last dream, EXCLUDING fresh dream-authored insights (a sweep's own
+    writes must never trigger the next sweep — same feedback-loop guard).
+    """
+    count = 0
+    for mem in memories:
+        changed_at = max(_parse_ts(mem.get("created_at")), _parse_ts(mem.get("updated_at")))
+        if changed_at > last_dreamt_at and mem.get("source_type") != "dream":
+            count += 1
+    return count
+
+
+def hydrate_pool(service, batch: PoolBatch, *, batch_size: int = 500) -> PoolBatch:
+    """Fetch full rows for a pool that passed the cheap gates (audit 27 #29).
+
+    Retrieves the light rows' payloads by id and rebuilds the full staging
+    dicts (content, category, scoring inputs). Rows deleted between
+    enumeration and hydration are dropped. Rows that already carry content
+    (pre-hydrated batches from tests/admin paths) pass through untouched —
+    hydration is idempotent.
+    """
+    from config import settings as core_settings
+
+    need = [m["memory_id"] for m in batch.memories if "content" not in m]
+    if not need:
+        return batch
+
+    client = service._memory.vector_store.client
+    payloads: dict[str, dict] = {}
+    for i in range(0, len(need), batch_size):
+        points = client.retrieve(
+            collection_name=core_settings.qdrant_collection,
+            ids=need[i : i + batch_size],
+            with_payload=True,
+            with_vectors=False,
+        )
+        for point in points or []:
+            payloads[str(getattr(point, "id", "") or "")] = (
+                getattr(point, "payload", None) or {}
+            )
+
+    hydrated: list[dict] = []
+    for mem in batch.memories:
+        if "content" in mem:
+            hydrated.append(mem)
+            continue
+        payload = payloads.get(mem["memory_id"])
+        if payload is None:
+            continue  # deleted since enumeration
+        meta = _unwrap_meta(payload)
+        visibility = meta.get("visibility") or "private"
+        hydrated.append(
+            {
+                "memory_id": mem["memory_id"],
+                "content": payload.get("data", "") or "",
+                "category": meta.get("category"),
+                "visibility": visibility,
+                "owner_user_id": meta.get("owner_user_id") or payload.get("user_id"),
+                "project_id": meta.get("project_id"),
+                "scope": meta.get("scope"),
+                "created_at": payload.get("created_at"),
+                "updated_at": payload.get("updated_at"),
+                "confidence": meta.get("confidence"),
+                "concepts": meta.get("concepts"),
+                "related_memory_ids": meta.get("related_memory_ids"),
+                "source_type": meta.get("source_type"),
+                "observation_type": meta.get("observation_type"),
+                "hash": payload.get("hash"),
+                # Reinforcement counter (A2): how many times this fact was
+                # re-derived/deduped onto this row. Feeds promotion scoring.
+                "times_derived": meta.get("times_derived"),
+            }
+        )
+    batch.memories = hydrated
+    return batch
 
 
 def _parse_ts(value) -> float:
@@ -225,7 +333,13 @@ def stage_pool(
 
 
 async def decide(batch: PoolBatch, llm_call) -> list[dict]:
-    """Run the consolidation decision pass. Returns validated actions."""
+    """Run the consolidation decision pass. Returns validated actions.
+
+    Raises :class:`DreamLLMFailure` when the response is empty or garbage
+    (audit 27 #27) — "the LLM never examined this pool" must be
+    distinguishable from "the LLM examined it and chose no actions"
+    (``{"actions": []}``), because only the latter is a completed sweep.
+    """
     if not batch.memories:
         return []
     now = datetime.now(timezone.utc)
@@ -235,7 +349,21 @@ async def decide(batch: PoolBatch, llm_call) -> list[dict]:
         memories_block=render_memories_block(batch.memories),
     )
     raw = await llm_call(prompt)
-    actions = parse_json_response(raw, key="actions")
+    if not (raw or "").strip():
+        raise DreamLLMFailure("empty consolidation LLM response")
+    obj = parse_json_object(raw)
+    if not isinstance(obj.get("actions"), list):
+        raise DreamLLMFailure("unparseable consolidation LLM response (no action list)")
+    actions = obj["actions"]
+    if any(not isinstance(a, dict) for a in actions):
+        # Copilot on PR #125: silently filtering non-object entries (e.g.
+        # {"actions": ["oops"]}) would turn a malformed response into a
+        # "completed empty decision" and stamp the gate — the exact silent
+        # no-op mode this guard exists to prevent. One garbage entry means
+        # the model never produced a trustworthy decision.
+        raise DreamLLMFailure(
+            "malformed consolidation LLM response (non-object action entries)"
+        )
     known_ids = {m["memory_id"] for m in batch.memories}
     dream_ids = {
         m["memory_id"] for m in batch.memories if m.get("source_type") == "dream"
@@ -274,16 +402,24 @@ def split_by_posture(actions: list[dict], *, auto_apply_confidence: float) -> tu
 
     Reversible actions always apply. Destructive actions apply only at or
     above the confidence gate — below it they are reported (shadow trial).
-    Secret prunes always apply regardless (safety exception).
+
+    Secret claims (audit 27 #25): ``contains_secret`` is an unvalidated LLM
+    field, and the secret prune is the ONE irreversible primitive — so it
+    must pass the same confidence gate as every other destructive action.
+    A below-gate secret claim is still acted on (a possible credential is
+    never left fully live) but *downgraded* to the reversible path:
+    ``apply_actions`` tombstones instead of hard-deleting and records the
+    claim in metadata so a later sweep can re-examine it.
     """
     to_apply: list[dict] = []
     to_report: list[dict] = []
     for act in actions:
         if act["type"] in _REVERSIBLE:
             to_apply.append(act)
-        elif act.get("contains_secret"):
-            to_apply.append(act)
         elif act["confidence"] >= auto_apply_confidence:
+            to_apply.append(act)
+        elif act.get("contains_secret"):
+            act["secret_claim_downgraded"] = True
             to_apply.append(act)
         else:
             to_report.append(act)
@@ -382,12 +518,25 @@ async def apply_actions(
                     )
             elif a_type == "prune":
                 for mid in act["memory_ids"]:
-                    if act.get("contains_secret"):
-                        # The one irreversible case: secrets must not persist,
-                        # not even as tombstones.
+                    if act.get("contains_secret") and not act.get("secret_claim_downgraded"):
+                        # The one irreversible case: gate-cleared secrets must
+                        # not persist, not even as tombstones.
                         await asyncio.to_thread(service.delete_memory, mid)
                     else:
-                        await asyncio.to_thread(_tombstone, service, mid, superseded_by=None, pruned=True)
+                        # Below-gate secret claims ride the reversible path
+                        # (audit 27 #25): tombstone + record the claim for a
+                        # later sweep to re-examine at higher confidence.
+                        secret_claim = None
+                        if act.get("contains_secret"):
+                            secret_claim = {
+                                "contains_secret": True,
+                                "confidence": act.get("confidence"),
+                                "claimed_at": datetime.now(timezone.utc).isoformat(),
+                            }
+                        await asyncio.to_thread(
+                            _tombstone, service, mid, superseded_by=None,
+                            pruned=True, secret_claim=secret_claim,
+                        )
                         await _graph_invalidate(service, batch.group_id, mid, superseded_by=None)
             elif a_type in ("rewrite", "temporal_reframe"):
                 for mid in act["memory_ids"]:
@@ -438,6 +587,13 @@ def _rewrite_content(
         raise ValueError(f"memory {memory_id} not found for rewrite")
     payload = dict(points[0].payload or {})
     meta = dict(payload.get("metadata") or {})
+    # Audit 27 #26: rewrites must be reversible. Stash the pre-rewrite text
+    # as one level of undo (a newer rewrite overwrites an older stash). A
+    # no-op rewrite (identical text) keeps the existing stash — clobbering
+    # it with a copy of the current text would destroy the undo point.
+    prev_content = payload.get("data")
+    if prev_content and prev_content != new_content:
+        meta["dream_prev_content"] = prev_content
     meta["dream_rewritten_at"] = datetime.now(timezone.utc).isoformat()
     if reframed:
         meta["dream_temporal_reframed"] = True
@@ -467,11 +623,29 @@ def _rewrite_content(
     )
 
 
-def _tombstone(service, memory_id: str, *, superseded_by: str | None, pruned: bool = False) -> None:
+def _tombstone(
+    service,
+    memory_id: str,
+    *,
+    superseded_by: str | None,
+    pruned: bool = False,
+    secret_claim: dict | None = None,
+) -> None:
     """Mark a Qdrant row consolidated-away without deleting it.
 
     The search path excludes ``metadata.dream_tombstoned=true`` rows; the
     row (and its graph history) remains for audit/reversal.
+
+    ``secret_claim`` (audit 27 #25) records a below-confidence-gate
+    ``contains_secret`` claim on the tombstone so a later sweep can
+    re-examine it instead of the claim being silently dropped.
+
+    Atomic nested-key merge (audit 27 #30): ``set_payload`` with
+    ``key="metadata"`` merges ONLY the patch keys into the nested dict
+    server-side — no read-modify-write of the whole metadata dict, so a
+    concurrent patcher (e.g. the write path bumping ``times_derived``)
+    can't have its keys clobbered by a stale snapshot, and vice versa.
+    Mirrors ``MemoryService._revive_if_tombstoned``.
     """
     from config import settings as core_settings
 
@@ -485,10 +659,13 @@ def _tombstone(service, memory_id: str, *, superseded_by: str | None, pruned: bo
         patch["superseded_by"] = superseded_by
     if pruned:
         patch["dream_pruned"] = True
+    if secret_claim:
+        patch["dream_secret_claim"] = secret_claim
     client.set_payload(
         collection_name=core_settings.qdrant_collection,
-        payload={"metadata": _merged_metadata(client, memory_id, patch)},
+        payload=patch,
         points=[memory_id],
+        key="metadata",
     )
 
 
@@ -525,23 +702,6 @@ def _sum_times_derived(service, memory_ids: list[str]) -> int:
     except Exception:
         logger.warning("times_derived retrieve failed; defaulting to 1 per row", exc_info=True)
     return sum(found.get(str(mid), 1) for mid in memory_ids)
-
-
-def _merged_metadata(client, memory_id: str, patch: dict) -> dict:
-    """Read-modify-write the nested metadata dict (set_payload replaces keys wholesale)."""
-    from config import settings as core_settings
-
-    points = client.retrieve(
-        collection_name=core_settings.qdrant_collection,
-        ids=[memory_id],
-        with_payload=True,
-        with_vectors=False,
-    )
-    meta = {}
-    if points:
-        meta = dict((points[0].payload or {}).get("metadata") or {})
-    meta.update(patch)
-    return meta
 
 
 async def _graph_invalidate(service, group_id: str, memory_id: str, *, superseded_by: str | None) -> int:

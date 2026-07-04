@@ -6,9 +6,12 @@ economy runs the full cycle. The ``DreamRun`` record persists to Redis so
 the API process and the graph worker report the same state (unlike the
 wiki_synthesizer's process-local snapshot).
 
-Cheap-to-expensive ordering per pool:
-  time gate (Redis read) → settling guard (in-memory) → lock →
-  LIGHT scroll+stage → volume gate →
+Cheap-to-expensive ordering per pool (audit 27 #29: every gate below runs
+on the LIGHT enumeration rows — identity + timestamps, no contents; full
+rows are hydrated only after all three gates pass):
+  time gate (Redis read) → settling guard (in-memory) →
+  volume pre-gate (in-memory) → lock → hydrate + stage →
+  volume gate (hydrated recount) →
   idempotent skip (unchanged staged-id set) → DEEP LLM decide/apply →
   REM reflect/store → diary → gate completion stamp.
 """
@@ -35,7 +38,7 @@ _STAGED_IDS_KEY = "dreaming:staged_ids:{pool}"
 @dataclass(slots=True)
 class PoolReport:
     pool: str
-    status: str                       # dreamt | gated | settling | locked | skipped_unchanged | error
+    status: str                       # dreamt | gated | settling | locked | skipped_unchanged | sweep_failed | error
     reason: str = ""
     staged: int = 0
     applied: int = 0
@@ -69,6 +72,11 @@ class DreamRun:
                 "pools_dreamt": sum(1 for p in self.pools if p.status == "dreamt"),
                 "pools_gated": sum(
                     1 for p in self.pools if p.status in ("gated", "settling", "locked")
+                ),
+                # LLM never examined the pool — gate unstamped, cron retries
+                # next cycle (audit 27 #27).
+                "pools_failed": sum(
+                    1 for p in self.pools if p.status in ("sweep_failed", "error")
                 ),
                 "actions_applied": sum(p.applied for p in self.pools),
                 "actions_reported": sum(p.reported for p in self.pools),
@@ -105,7 +113,13 @@ def _save_run(redis, run: DreamRun) -> None:
 
 
 async def _make_llm_call(settings: DreamingSettings):
-    """Build the retrying/timeout-wrapped LLM callable for this sweep."""
+    """Build the retrying/timeout-wrapped LLM callable for this sweep.
+
+    Exhaustion raises :class:`consolidate.DreamLLMFailure` instead of
+    returning ``""`` (audit 27 #27) — a silent empty string used to parse
+    to "0 actions", stamping the pool's gate and reporting "dreamt" while
+    a broken LLM disabled consolidation forever.
+    """
     from extensions.conversation_compiler.compile import _async_call_gemini
 
     async def call(prompt: str) -> str:
@@ -125,7 +139,10 @@ async def _make_llm_call(settings: DreamingSettings):
                 if attempt + 1 < attempts:
                     await asyncio.sleep(2 ** attempt)
         logger.error("dream LLM call exhausted %d attempts: %s", attempts, last_exc)
-        return ""
+        raise consolidate.DreamLLMFailure(
+            f"llm exhausted {attempts} attempts: "
+            f"{last_exc.__class__.__name__ if last_exc else 'unknown'}"
+        )
 
     return call
 
@@ -212,10 +229,10 @@ async def dream_all(
     _save_run(redis, run)
     totals = run.to_dict()["totals"]
     logger.info(
-        "dream sweep %s complete: dreamt=%d gated=%d applied=%d reported=%d insights=%d errors=%d",
+        "dream sweep %s complete: dreamt=%d gated=%d failed=%d applied=%d reported=%d insights=%d errors=%d",
         run.run_id, totals["pools_dreamt"], totals["pools_gated"],
-        totals["actions_applied"], totals["actions_reported"],
-        totals["insights_stored"], totals["errors"],
+        totals["pools_failed"], totals["actions_applied"],
+        totals["actions_reported"], totals["insights_stored"], totals["errors"],
     )
     return run
 
@@ -237,12 +254,29 @@ async def _dream_pool(
     # 1b. settling guard (A3-lite): a pool written to within the last
     #     DREAMING_SETTLING_MINUTES is mid-conversation — never consolidate
     #     a thought while it's still forming. Defer to the next pass.
+    #     Runs on the LIGHT enumeration rows (timestamps only).
     if not force:
         decision = gate.check_settling_gate(
             batch.memories, settling_minutes=settings.settling_minutes
         )
         if not decision.proceed:
             report.status, report.reason = "settling", decision.reason
+            return report
+
+    # 1c. cheap volume pre-gate (audit 27 #29): counted from the light rows
+    #     + one Redis read — a quiet pool is skipped before its full rows
+    #     are ever pulled into worker RAM (and before any lock churn).
+    state = gate.get_gate_state(redis, pool)
+    last_dreamt_at = float(state.get("last_dreamt_at") or 0.0)
+    if not force:
+        decision = gate.check_volume_gate(
+            consolidate.count_new_memories(
+                batch.memories, last_dreamt_at=last_dreamt_at
+            ),
+            min_new_memories=settings.min_new_memories,
+        )
+        if not decision.proceed:
+            report.status, report.reason = "gated", decision.reason
             return report
 
     # 2. lock (shared with the dedup cron's semantic-skip check)
@@ -252,10 +286,8 @@ async def _dream_pool(
         return report
 
     try:
-        state = gate.get_gate_state(redis, pool)
-        last_dreamt_at = float(state.get("last_dreamt_at") or 0.0)
-
-        # 3. LIGHT: stage + score
+        # 3. hydrate (full rows, only now) + LIGHT stage/score
+        batch = await asyncio.to_thread(consolidate.hydrate_pool, service, batch)
         batch = await asyncio.to_thread(
             consolidate.stage_pool,
             batch, redis,
@@ -267,7 +299,8 @@ async def _dream_pool(
         )
         report.staged = len(batch.memories)
 
-        # 4. expensive volume gate (count came free with the LIGHT scroll)
+        # 4. authoritative volume gate (recomputed on the hydrated rows —
+        #    the pre-gate at 1c used the light enumeration snapshot)
         if not force:
             decision = gate.check_volume_gate(
                 batch.new_count, min_new_memories=settings.min_new_memories
@@ -289,8 +322,17 @@ async def _dream_pool(
             report.status, report.reason = "skipped_unchanged", "staged id set unchanged"
             return report
 
-        # 6. DEEP: decide + hybrid-posture apply
-        actions = await consolidate.decide(batch, llm_call)
+        # 6. DEEP: decide + hybrid-posture apply. An LLM failure here means
+        #    the pool was never examined — report sweep_failed WITHOUT
+        #    stamping the gate or the staged-id marker, so the next cron
+        #    cycle retries (audit 27 #27). A valid {"actions": []} decision
+        #    still flows through as a completed sweep.
+        try:
+            actions = await consolidate.decide(batch, llm_call)
+        except consolidate.DreamLLMFailure as exc:
+            logger.error("dream consolidation LLM failed for pool %s: %s", pool, exc)
+            report.status, report.reason = "sweep_failed", f"consolidation LLM: {exc}"
+            return report
         to_apply, to_report = consolidate.split_by_posture(
             actions, auto_apply_confidence=settings.auto_apply_confidence
         )
@@ -344,13 +386,27 @@ async def _dream_pool(
                         "surprisal pass failed for pool %s (non-fatal); "
                         "reflection substrate stays uniform", pool, exc_info=True,
                     )
-            insights = await reflect.reflect(
-                batch, llm_call, max_insights=settings.max_reflections_per_pool,
-                surprisal_top_k=settings.surprisal_top_k,
-            )
-            stored = await asyncio.to_thread(
-                reflect.store_insights, service, batch, insights, dry_run=dry_run
-            )
+            # Reflection is best-effort ONCE consolidation has applied: an
+            # LLM failure here must not fail the pool (the writes already
+            # landed) but is recorded honestly instead of masquerading as
+            # "no insights tonight".
+            stored: list[str] = []
+            try:
+                insights = await reflect.reflect(
+                    batch, llm_call, max_insights=settings.max_reflections_per_pool,
+                    surprisal_top_k=settings.surprisal_top_k,
+                )
+            except consolidate.DreamLLMFailure:
+                logger.warning(
+                    "reflection LLM failed for pool %s (non-fatal; "
+                    "consolidation already applied)", pool,
+                )
+                report.errors.append("reflection_llm")
+                insights = []
+            if insights:
+                stored = await asyncio.to_thread(
+                    reflect.store_insights, service, batch, insights, dry_run=dry_run
+                )
             report.insights = len(stored) if not dry_run else len(insights)
 
             # E1: stream the stored insights (fire-and-forget).

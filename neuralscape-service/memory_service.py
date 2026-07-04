@@ -2005,9 +2005,15 @@ class MemoryService:
 
         Called when a duplicate of ``memory_id`` was detected and dropped —
         the reinforcement is counted on the survivor instead of discarded.
-        Read-merge-write of the nested metadata dict (Qdrant's ``set_payload``
-        replaces top-level keys wholesale, so the merge is mandatory —
-        mirrors ``extensions/dreaming/consolidate._merged_metadata``).
+
+        Audit 27 #30: the write is an atomic nested-key merge
+        (``set_payload`` with ``key="metadata"`` carrying ONLY
+        ``times_derived``) — a concurrent patcher's keys (e.g. a dream
+        tombstone landing between our read and write) can never be
+        clobbered by a whole replaced metadata dict. The counter value
+        itself still needs a read (Qdrant has no atomic increment), so two
+        simultaneous bumps can lose a tick — bounded, and strictly better
+        than losing arbitrary foreign keys.
 
         Best-effort: losing a reinforcement tick must never block a write or
         a dedup pass, so every failure is swallowed with a warning.
@@ -2025,12 +2031,12 @@ class MemoryService:
             )
             if not points:
                 return
-            meta = dict((points[0].payload or {}).get("metadata") or {})
-            meta["times_derived"] = _times_derived_from_metadata(meta) + add
+            meta = (points[0].payload or {}).get("metadata") or {}
             client.set_payload(
                 collection_name=collection,
-                payload={"metadata": meta},
+                payload={"times_derived": _times_derived_from_metadata(meta) + add},
                 points=[memory_id],
+                key="metadata",
             )
         except Exception as e:
             logger.warning(f"times_derived bump failed for {memory_id} (non-fatal): {e}")
