@@ -22,9 +22,11 @@ import {
   type ContextResponse,
   type NeuralscapeMemory,
   MalformedHookInputError,
+  getFailLoudThreshold,
   getProjectId,
   getUserId,
   hasUserId,
+  isProjectExcluded,
   listPendingBuffers,
   logError,
   neuralscapeGet,
@@ -32,6 +34,8 @@ import {
   outputWithContext,
   parseStdinStrict,
   readConfig,
+  recordTransportFailure,
+  resetTransportFailures,
 } from "../utils.js";
 
 import {
@@ -72,6 +76,24 @@ export function getCodeGraphMode(): "auto" | "on" | "off" {
   const raw = readConfig("CODE_GRAPH", "auto").toLowerCase();
   if (raw === "on" || raw === "off") return raw;
   return "auto";
+}
+
+// ── Fail-loud unreachable notice (roadmap D4) ────────────────────
+
+/**
+ * The one-line notice injected when NS is unreachable. Below the fail-loud
+ * threshold it's the generic degrade line; at/after the threshold it names
+ * the consecutive-failure count and points at `docker compose ps` so a dead
+ * stack stops failing silently. Either way the hook exits 0.
+ */
+export function buildUnreachableNotice(count: number, threshold: number): string {
+  if (count >= threshold) {
+    return (
+      `[neuralscape] memory service unreachable for ${count} consecutive events — ` +
+      "check `docker compose ps` (or your service URL). Continuing without memory context."
+    );
+  }
+  return "[neuralscape] memory service unreachable — continuing without memory context.";
 }
 
 // ── Legacy full-content formatting (CONTEXT_MODE=full) ───────────
@@ -272,6 +294,13 @@ async function main(): Promise<void> {
     const userId = getUserId();
     const projectId = getProjectId(input.cwd);
 
+    // Excluded projects (D4): no disclosure fetch, no injection.
+    if (isProjectExcluded(projectId)) {
+      logError(`project '${projectId}' matches EXCLUDED_PROJECTS — skipping context injection`);
+      outputContinue();
+      return;
+    }
+
     // Kick everything off in parallel; the context fetch is the only one
     // whose failure degrades the whole injection.
     const contextPromise: Promise<ContextResponse> = projectId
@@ -305,11 +334,13 @@ async function main(): Promise<void> {
       context = await contextPromise;
     } catch {
       // NS unreachable — never block session start: one-line notice, exit 0.
-      outputWithContext(
-        "[neuralscape] memory service unreachable — continuing without memory context.",
-      );
+      // The consecutive-failure counter upgrades the notice to fail-loud
+      // once the streak crosses FAIL_LOUD_THRESHOLD (D4).
+      const count = await recordTransportFailure();
+      outputWithContext(buildUnreachableNotice(count, getFailLoudThreshold()));
       return;
     }
+    await resetTransportFailures();
 
     // Detect any unprocessed observation buffers left behind by prior sessions
     // and ask Claude to compile them before responding to the user.
