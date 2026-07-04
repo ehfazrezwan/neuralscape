@@ -1138,6 +1138,13 @@ class MemoryService:
             # Reinforcement-aware dedup: the caller just re-derived this exact
             # fact — count it on the survivor instead of discarding the signal.
             self._bump_times_derived(existing.id, 1)
+            # Audit 27 #5: if the survivor was dream-tombstoned, re-derivation
+            # resurrects it — otherwise this dedup short-circuit silently
+            # swallows the write while the fact stays excluded from recall.
+            # Runs AFTER the bump: the bump's read-merge-write could otherwise
+            # re-persist the stale tombstone flag it read moments earlier.
+            if self._revive_if_tombstoned(existing.id):
+                existing.revived = True
             # created=False → caller must NOT re-enqueue graph enrichment.
             return ([existing], False) if return_created else [existing]
 
@@ -1664,6 +1671,55 @@ class MemoryService:
         except Exception as e:
             logger.warning(f"Content-hash dedup lookup failed (non-fatal): {e}")
             return None
+
+    def _revive_if_tombstoned(self, memory_id: str) -> bool:
+        """Resurrect a dream-tombstoned dedup survivor (audit 27 #5).
+
+        ``_find_by_content_hash`` matches tombstoned rows too — before this
+        existed, re-storing a fact the dreaming sweep had tombstoned was
+        silently swallowed by the dedup short-circuit and the fact stayed
+        excluded from recall forever (search filters
+        ``metadata.dream_tombstoned=true``). Revival semantics:
+        re-derivation is fresh evidence the fact is live, so the tombstone
+        flag is cleared and the row becomes recallable again.
+
+        The clear is an atomic nested-key merge (``set_payload`` with
+        ``key="metadata"``) rather than a read-merge-write of the whole
+        metadata dict, so it can't race a concurrent metadata patch into
+        resurrecting stale fields.
+
+        Returns True if a tombstone was actually cleared. Best-effort:
+        failures log and return False — a lost revival must never block
+        the write path.
+        """
+        try:
+            client = self._memory.vector_store.client
+            collection = settings.qdrant_collection
+            points = client.retrieve(
+                collection_name=collection,
+                ids=[memory_id],
+                with_payload=True,
+                with_vectors=False,
+            )
+            if not points:
+                return False
+            meta = (points[0].payload or {}).get("metadata") or {}
+            if not meta.get("dream_tombstoned"):
+                return False
+            client.set_payload(
+                collection_name=collection,
+                payload={
+                    "dream_tombstoned": False,
+                    "dream_revived_at": datetime.now(timezone.utc).isoformat(),
+                },
+                points=[memory_id],
+                key="metadata",
+            )
+            logger.info(f"Revived dream-tombstoned memory {memory_id} on re-derivation")
+            return True
+        except Exception as e:
+            logger.warning(f"Tombstone revival failed for {memory_id} (non-fatal): {e}")
+            return False
 
     def _bump_times_derived(self, memory_id: str, add: int = 1) -> None:
         """Increment ``metadata.times_derived`` on a surviving memory.

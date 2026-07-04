@@ -386,3 +386,103 @@ class TestReinforcementBoostGating:
         boosted = _reinforcement_boost(0.80, {"times_derived": 5})
         assert boosted == pytest.approx(0.80 * (1 + 0.02 * math.log1p(4)))
 
+
+# ══════════════════════════════════════════════
+# Defect 5 — tombstone dedup black hole → revival semantics
+# ══════════════════════════════════════════════
+
+
+class TestTombstoneRevival:
+    """Pre-fix: `_find_by_content_hash` matched dream-tombstoned rows, so
+    re-storing a tombstoned fact returned the (recall-excluded) survivor
+    unchanged — the fact stayed unrecallable forever
+    (test_restoring_tombstoned_fact_revives_it failed: tombstone never
+    cleared, ``revived`` never set).
+    """
+
+    def _wire_retrieve(self, service, meta):
+        pt = MagicMock()
+        pt.id = "t1"
+        pt.payload = {"data": "fact", "metadata": meta}
+        service._memory.vector_store.client.retrieve.return_value = [pt]
+
+    def test_restoring_tombstoned_fact_revives_it(self, service):
+        existing = MemoryResponse(
+            id="t1", memory="User prefers dark mode", category="preference",
+            scope="global", source="vector",
+        )
+        self._wire_retrieve(
+            service,
+            {"category": "preference", "dream_tombstoned": True,
+             "superseded_at": "2026-06-01T00:00:00+00:00"},
+        )
+
+        with patch.object(service, "_find_by_content_hash", return_value=existing):
+            responses, created = service.store_raw(
+                content="User prefers dark mode", user_id="u1",
+                category="preference", return_created=True,
+            )
+
+        assert created is False
+        assert responses[0].revived is True
+        # tombstone cleared via an atomic nested-key merge (key="metadata"),
+        # NOT a whole-metadata replacement.
+        set_payload_calls = (
+            service._memory.vector_store.client.set_payload.call_args_list
+        )
+        revive_calls = [
+            c for c in set_payload_calls if c.kwargs.get("key") == "metadata"
+        ]
+        assert len(revive_calls) == 1
+        assert revive_calls[0].kwargs["payload"]["dream_tombstoned"] is False
+        assert revive_calls[0].kwargs["points"] == ["t1"]
+        # dedup hit still must not insert a duplicate row
+        service._memory.vector_store.insert.assert_not_called()
+        # re-derivation still reinforces the survivor
+        bump_calls = [
+            c for c in set_payload_calls if c.kwargs.get("key") != "metadata"
+        ]
+        assert bump_calls and bump_calls[0].kwargs["payload"]["metadata"][
+            "times_derived"
+        ] == 2
+
+    def test_live_dedup_hit_is_not_marked_revived(self, service):
+        existing = MemoryResponse(
+            id="t1", memory="fact", category="preference", scope="global",
+            source="vector",
+        )
+        self._wire_retrieve(service, {"category": "preference"})
+
+        with patch.object(service, "_find_by_content_hash", return_value=existing):
+            responses, created = service.store_raw(
+                content="fact", user_id="u1", category="preference",
+                return_created=True,
+            )
+
+        assert created is False
+        assert not responses[0].revived
+        revive_calls = [
+            c
+            for c in service._memory.vector_store.client.set_payload.call_args_list
+            if c.kwargs.get("key") == "metadata"
+        ]
+        assert revive_calls == []
+
+    def test_revival_failure_never_blocks_the_write(self, service):
+        existing = MemoryResponse(
+            id="t1", memory="fact", category="preference", scope="global",
+            source="vector",
+        )
+        service._memory.vector_store.client.retrieve.side_effect = RuntimeError(
+            "qdrant down"
+        )
+
+        with patch.object(service, "_find_by_content_hash", return_value=existing):
+            responses, created = service.store_raw(
+                content="fact", user_id="u1", category="preference",
+                return_created=True,
+            )
+
+        assert created is False
+        assert responses[0].id == "t1"
+
