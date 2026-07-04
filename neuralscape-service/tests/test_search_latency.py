@@ -495,6 +495,24 @@ class TestTelemetryExecutor:
         assert telemetry.submit(lambda: None) is False
         assert submitted == []
 
+    def test_uninspectable_queue_still_submits(self, monkeypatch):
+        """Copilot review (PR #121): the drop bound rides the executor's
+        PRIVATE _work_queue — when that internal isn't inspectable, submit
+        anyway (drop only when the depth is readable); otherwise all
+        telemetry would be silently disabled."""
+        import telemetry
+
+        executed = []
+
+        class StubExecutor:  # deliberately has NO _work_queue attribute
+            def submit(self, fn, *args, **kwargs):
+                fn(*args, **kwargs)  # run inline so the test can observe it
+
+        monkeypatch.setattr(telemetry, "_executor", StubExecutor())
+
+        assert telemetry.submit(lambda: executed.append(1)) is True
+        assert executed == [1]
+
 
 # ══════════════════════════════════════════════
 # Defect 11b — savings meter off the hot path (REST + MCP)
@@ -915,6 +933,24 @@ class TestRecallTraceGating:
             submit=lambda *a, **k: submitted.append(a),
         )
         monkeypatch.setattr(traces, "_executor", fake)
+
+        traces.log_recall(["m1"], "query")
+
+        assert len(submitted) == 1
+
+    def test_uninspectable_queue_still_queues_trace(self, monkeypatch):
+        """Copilot review (PR #121): same guard as telemetry.submit — an
+        executor whose private _work_queue can't be read must still accept
+        the trace (drop only when the depth is readable)."""
+        import extensions.dreaming.traces as traces
+
+        submitted = []
+
+        class StubExecutor:  # deliberately has NO _work_queue attribute
+            def submit(self, *args, **kwargs):
+                submitted.append(args)
+
+        monkeypatch.setattr(traces, "_executor", StubExecutor())
 
         traces.log_recall(["m1"], "query")
 

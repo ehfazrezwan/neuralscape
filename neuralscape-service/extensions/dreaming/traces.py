@@ -65,17 +65,32 @@ def query_hash(query: str) -> str:
     return hashlib.sha256(query.strip().lower().encode()).hexdigest()[:16]
 
 
+def _pending_trace_count() -> int | None:
+    """Best-effort queue depth via the executor's private ``_work_queue``.
+
+    ``None`` when uninspectable (a future Python renaming the internal, or
+    a test double) — the caller must then SUBMIT rather than drop: the
+    bound is an overload guard, not a reason to silently disable traces.
+    """
+    try:
+        return _executor._work_queue.qsize()
+    except Exception:
+        return None
+
+
 def log_recall(memory_ids: list[str], query: str, *, ttl_days: int = 30) -> None:
     """Fire-and-forget a recall trace. NEVER raises; never blocks the read.
 
     Drops the trace (debug log) when the queue is at MAX_PENDING_TRACES —
     a backlog that deep means Redis is down/stalled, and traces are a
-    best-effort reinforcement signal, never worth unbounded memory.
+    best-effort reinforcement signal, never worth unbounded memory. The
+    drop policy only applies when the queue depth is readable.
     """
     if not memory_ids:
         return
     try:
-        if _executor._work_queue.qsize() >= MAX_PENDING_TRACES:
+        pending = _pending_trace_count()
+        if pending is not None and pending >= MAX_PENDING_TRACES:
             logger.debug(
                 "recall-trace queue full (>= %d) — dropping trace",
                 MAX_PENDING_TRACES,
