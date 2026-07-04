@@ -183,18 +183,22 @@ class TestSearchLoop:
     @pytest.mark.asyncio
     async def test_minimal_never_loops_even_if_llm_asks(self):
         svc = _service([_mem("m1", "x")])
+        prompts: list[str] = []
         responses = iter([
             json.dumps({"action": "search", "query": "more"}),
             json.dumps({"action": "answer", "answer": "done", "citations": []}),
         ])
 
         async def llm(prompt: str) -> str:
-            # minimal's prompt must not offer the search action at all
-            assert '"action": "search"' not in prompt.split("QUESTION:")[1] or True
+            prompts.append(prompt)
             return next(responses)
 
         out = await ask_memory(svc, question="q?", user_id="u",
                                reasoning_level="minimal", llm_call=llm)
+        # minimal's output contract never offers the search action.
+        instructions = prompts[0].split("QUESTION:")[1]
+        assert '"action": "search"' not in instructions
+        assert '"action": "answer"' in instructions
         # The search request is not honored (budget 0) — one forced answer pass.
         assert svc.search.call_count == 1
         assert out["answer"] == "done"
