@@ -704,7 +704,9 @@ neuralscape/
 ## License
 
 Neuralscape is licensed under the [Elastic License 2.0](./LICENSE) — free to
-use, modify, and self-host; the one restriction is offering Neuralscape itself
-to third parties as a hosted or managed service. The vendored `mem0/` and
-`graphiti/` subtrees remain Apache-2.0 (see
+use, modify, and self-host. The headline limitation is that you may not offer
+Neuralscape itself to third parties as a hosted or managed service; ELv2 also
+requires preserving license/copyright notices and forbids circumventing any
+license-key functionality — see [LICENSE](./LICENSE) for the full terms. The
+vendored `mem0/` and `graphiti/` subtrees remain Apache-2.0 (see
 [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md)).
