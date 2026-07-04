@@ -102,7 +102,11 @@ class GeminiJudge:
         prompt = render_judge_prompt(qa, model_answer)
         body = {
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.0, "maxOutputTokens": 256},
+            # thinkingBudget 0: on thinking-enabled Gemini models (2.5-flash+)
+            # thoughts otherwise consume the output cap and truncate the JSON
+            # verdict mid-object (observed: ~20% unparseable on DMR).
+            "generationConfig": {"temperature": 0.0, "maxOutputTokens": 1024,
+                                 "thinkingConfig": {"thinkingBudget": 0}},
         }
         url = _GEMINI_URL.format(model=self.model)
         delay = 2.0
