@@ -236,13 +236,16 @@ def _input_hash(memories: list[dict], prior_lines: list[str]) -> str:
 
 def render_card_md(pool: str, lines: list[str], updated_at: str) -> str:
     """``Card.md`` — grammar lines verbatim (greppable, injectable as-is)."""
+    from okf import translate as okf_translate
+
     return "\n".join([
-        "---",
-        "title: Card",
-        f"pool: {pool}",
-        f"updated: {updated_at}",
-        f"lines: {len(lines)}",
-        "---",
+        okf_translate.concept_frontmatter(
+            page_kind="card",
+            title="Card",
+            description="Pinned identity card — grammar-constrained grounding lines.",
+            timestamp=updated_at,
+            extensions={"pool": pool, "updated": updated_at, "lines": len(lines)},
+        ),
         "",
         "# Card",
         "",

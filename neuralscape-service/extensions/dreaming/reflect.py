@@ -31,6 +31,7 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
+from okf import translate as okf_translate
 from schemas import MEMORY_CATEGORIES
 
 from .consolidate import PoolBatch
@@ -201,14 +202,20 @@ def write_diary(
         prior = existing[idx:] if idx != -1 else ""
     entries = [e for e in ("## Dream" + p for p in prior.split("## Dream")[1:]) if e.strip()]
     entries = entries[: keep_entries - 1]
+    ts = datetime.now(timezone.utc).isoformat()
     fm = "\n".join(
         [
-            "---",
-            f"title: {title}",
-            f"pool: {pool}",
-            f"source_memory_ids: [{', '.join(source_memory_ids)}]",
-            f"last_dreamt: {datetime.now(timezone.utc).isoformat()}",
-            "---",
+            okf_translate.concept_frontmatter(
+                page_kind="diary",
+                title=title,
+                description=f"Dream sweep history for the {pool} pool.",
+                timestamp=ts,
+                extensions={
+                    "pool": pool,
+                    "source_memory_ids": f"[{', '.join(source_memory_ids)}]",
+                    "last_dreamt": ts,
+                },
+            ),
             "",
             f"# {title}",
             "",
@@ -221,3 +228,47 @@ def write_diary(
     except Exception:
         logger.warning("diary write failed for %s (non-fatal)", pool, exc_info=True)
         return None
+
+
+# ── Vault-root update log (OKF §7 — the diary's history, spec-shaped) ─
+
+
+def update_vault_log(
+    vault_root: Path,
+    pool: str,
+    *,
+    diary_rel: str,
+    applied: int,
+    insights: int,
+    keep_days: int = 30,
+    now: datetime | None = None,
+) -> None:
+    """Record this sweep in the bundle-root ``log.md`` (§7 format).
+
+    The dream diary pages under ``Dreams/`` stay the rich per-pool review
+    surface; this log is the spec-shaped chronological history that makes
+    the vault a self-describing bundle: date-grouped entries, newest date
+    first, each line pointing at the pool's diary. Old dates are trimmed
+    beyond ``keep_days`` (the DreamRun record in Redis is the machine log).
+    Best-effort — failures never break the sweep.
+    """
+    from extensions.conversation_compiler.obsidian_writer import _atomic_write
+
+    try:
+        path = Path(vault_root) / okf_translate.LOG_FILENAME
+        today = (now or datetime.now(timezone.utc)).date().isoformat()
+        entry = okf_translate.log_entry(
+            "Update",
+            f"Dreamt the `{pool}` pool — {applied} consolidated, {insights} "
+            f"reflection{'s' if insights != 1 else ''} ([diary](/{diary_rel})).",
+        )
+        existing = path.read_text(encoding="utf-8") if path.exists() else ""
+        dated = okf_translate.parse_log(existing)
+        if dated and dated[0][0] == today:
+            dated[0][1].insert(0, entry)
+        else:
+            dated.insert(0, (today, [entry]))
+        dated = dated[:keep_days]
+        _atomic_write(path, okf_translate.render_log("Vault Update Log", dated))
+    except Exception:
+        logger.warning("vault log update failed for %s (non-fatal)", pool, exc_info=True)

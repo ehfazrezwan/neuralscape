@@ -1522,6 +1522,66 @@ async def v1_get_process(
 # ── Manage ────────────────────────────────────
 
 
+# ── OKF bundle export (G1) ───────────────────────
+
+
+@v1_router.get("/export/okf")
+async def v1_export_okf(
+    request: Request,
+    project_id: str | None = Query(default=None, max_length=100),
+    scope: str | None = Query(default=None),
+    visibility: str | None = Query(default=None),
+    user_id: str | None = Query(default=None, max_length=100),
+):
+    """Download the caller's readable memories as an OKF v0.1 bundle zip.
+
+    One concept document per live memory (frontmatter type from the
+    category mapping, the full NS envelope as extension keys), per-folder
+    ``index.md`` progressive disclosure, the bundle-root version marker,
+    and a ``log.md`` history. Visibility is enforced by construction:
+    the caller's effective identity (token > body > default — the same
+    precedence every read path uses) selects the personal pool, and
+    ``visibility=shared`` builds a team bundle from the shared pool
+    alone, so private memories can never appear in a shared bundle.
+    """
+    if scope is not None and scope not in ("global", "project"):
+        raise HTTPException(status_code=400, detail="scope must be 'global' or 'project'")
+    if visibility is not None and visibility not in ("private", "shared"):
+        raise HTTPException(status_code=400, detail="visibility must be 'private' or 'shared'")
+    resolved_user_id = _resolve_user_id(request, user_id)
+
+    from okf.export import export_bundle
+
+    try:
+        data, stats = await asyncio.to_thread(
+            export_bundle,
+            _service,
+            user_id=resolved_user_id,
+            project_id=project_id,
+            scope=scope,
+            visibility=visibility,
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("OKF export failed")
+        raise HTTPException(status_code=500, detail="Failed to build OKF bundle")
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    filename = f"okf-bundle-{stamp}.zip"
+    from fastapi.responses import Response as FastAPIResponse
+
+    return FastAPIResponse(
+        content=data,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-OKF-Concepts": str(stats["concepts"]),
+            "X-OKF-Files": str(stats["files"]),
+        },
+    )
+
+
 @v1_router.get("/memories", response_model=list[MemoryResponse])
 async def v1_list_memories(
     request: Request,

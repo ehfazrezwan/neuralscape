@@ -54,6 +54,8 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from okf import translate as okf_translate
+
 from .consolidate import PoolBatch
 from .prompts import parse_json_object, parse_json_response
 
@@ -220,7 +222,14 @@ def split_page(content: str) -> tuple[dict, str]:
     for line in m.group("fm").splitlines():
         if ":" in line:
             k, v = line.split(":", 1)
-            fm[k.strip()] = v.strip()
+            v = v.strip()
+            # The OKF-conformant renderer YAML-quotes values that need it
+            # (timestamps, titles with colons); unwrap so line-oriented
+            # readers keep seeing the raw value.
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+                inner = v[1:-1]
+                v = inner.replace("''", "'") if v[0] == "'" else inner
+            fm[k.strip()] = v
     return fm, m.group("body").lstrip("\n")
 
 
@@ -237,6 +246,16 @@ def _one_line(text: str, limit: int = 180) -> str:
     return t if len(t) <= limit else t[: limit - 1].rstrip() + "…"
 
 
+#: Render-schema salt folded into every content fingerprint. Bumping it
+#: invalidates all stored ``content_hash`` values at once, forcing every
+#: topic page to regenerate exactly ONCE under a new page layout and then
+#: go stable again. "okf1" = the OKF-conformant frontmatter rollout (G1):
+#: pages rendered before it lack the required ``type``/``description``/
+#: ``timestamp`` fields, and the idempotent skip would otherwise preserve
+#: them as non-conformant forever.
+_RENDER_SCHEMA_SALT = b"okf1"
+
+
 def _content_fingerprint(memories: list[dict]) -> str:
     """Order-independent digest of a topic's (id, content, faded) triples.
 
@@ -246,8 +265,11 @@ def _content_fingerprint(memories: list[dict]) -> str:
     ``source_memory_ids`` set is unchanged. The faded flag participates
     too — a row crossing the retention threshold changes the rendering
     (main section → Faded callout) with identical ids and content.
+    The render-schema salt participates deliberately — see its docstring.
     """
     digest = hashlib.sha256()
+    digest.update(_RENDER_SCHEMA_SALT)
+    digest.update(b"\x00")
     for mem in sorted(memories, key=lambda m: m.get("memory_id") or ""):
         digest.update((mem.get("memory_id") or "").encode())
         digest.update(b"\x00")
@@ -435,16 +457,27 @@ def render_topic_page(
     while body_lines and not body_lines[-1]:
         body_lines.pop()
 
+    # OKF-conformant frontmatter (G1): required type + recommended
+    # title/description/tags/timestamp come from the translation module;
+    # the NS page envelope (summary/pool/source ids/hash/version) rides
+    # along as spec-permitted extension keys.
+    frontmatter = okf_translate.concept_frontmatter(
+        page_kind="topic",
+        title=title,
+        description=summary or f"Topic page dreamt from {len(memory_ids)} memories.",
+        tags=categories,
+        timestamp=ts,
+        extensions={
+            "summary": summary,
+            "pool": pool,
+            "source_memory_ids": f"[{', '.join(memory_ids)}]",
+            "content_hash": content_hash or None,
+            "last_dreamt": ts,
+            "version": version,
+        },
+    )
     lines = [
-        "---",
-        f"title: {title}",
-        f"summary: {summary}",
-        f"pool: {pool}",
-        f"source_memory_ids: [{', '.join(memory_ids)}]",
-        *( [f"content_hash: {content_hash}"] if content_hash else [] ),
-        f"last_dreamt: {ts}",
-        f"version: {version}",
-        "---",
+        frontmatter,
         "",
         f"# {title}",
         "",
@@ -602,6 +635,14 @@ async def update_vault(
                 identity_lines = _identity_lines(live) or None
             _write_hub(target, hub_name, _atomic_write)
             _write_home(vault, _atomic_write, redis=redis, identity_lines=identity_lines)
+            # OKF bundle surface (G1): per-folder index.md + the root
+            # version marker. Byte-idempotent — steady state writes nothing.
+            try:
+                from okf.vault import refresh_bundle_indexes
+
+                refresh_bundle_indexes(vault)
+            except Exception:
+                logger.warning("okf bundle index refresh failed (non-fatal)", exc_info=True)
     return out
 
 
@@ -743,6 +784,8 @@ def _hub_stats(directory: Path) -> tuple[int, int, str]:
     for path in sorted(directory.glob("*.md")):
         if path.stem == directory.name or path.stem == "Card":  # hub / identity card
             continue
+        if okf_translate.is_reserved_filename(path.name):  # index.md / log.md
+            continue
         try:
             fm, _ = split_page(path.read_text(encoding="utf-8"))
         except Exception:
@@ -792,6 +835,8 @@ def _list_topic_pages(directory: Path) -> list[dict]:
     for path in sorted(directory.glob("*.md")):
         if path.stem == directory.name or path.stem == "Card":  # hub / identity card
             continue
+        if okf_translate.is_reserved_filename(path.name):  # index.md / log.md
+            continue
         fm, _ = split_page(path.read_text(encoding="utf-8"))
         pages.append(
             {
@@ -809,13 +854,19 @@ def _write_hub(target: Path, hub_name: str | None, atomic_write) -> None:
     if not hub_name:
         return
     entries = _list_topic_pages(target)
+    ts = datetime.now(timezone.utc).isoformat()
     lines = [
-        "---",
-        f"title: {hub_name}",
-        f"pages: {len(entries)}",
-        f"memories: {sum(e['memories'] for e in entries)}",
-        f"last_dreamt: {datetime.now(timezone.utc).isoformat()}",
-        "---",
+        okf_translate.concept_frontmatter(
+            page_kind="hub",
+            title=hub_name,
+            description=f"What the memory system knows about {hub_name}, by subject.",
+            timestamp=ts,
+            extensions={
+                "pages": len(entries),
+                "memories": sum(e["memories"] for e in entries),
+                "last_dreamt": ts,
+            },
+        ),
         "",
         f"# {hub_name}",
         "",
@@ -856,11 +907,15 @@ def _write_home(
     if not identity:
         identity = _parse_identity_block(previous)
 
+    ts = datetime.now(timezone.utc).isoformat()
     lines = [
-        "---",
-        "title: Home",
-        f"last_dreamt: {datetime.now(timezone.utc).isoformat()}",
-        "---",
+        okf_translate.concept_frontmatter(
+            page_kind="home",
+            title="Home",
+            description="The wake-up stack: operator identity, essential story, and the map of content.",
+            timestamp=ts,
+            extensions={"last_dreamt": ts},
+        ),
         "",
         "# Home",
         "",
