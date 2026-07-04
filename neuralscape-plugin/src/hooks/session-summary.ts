@@ -31,10 +31,13 @@ import {
   getProjectId,
   getUserId,
   hasUserId,
+  isProjectExcluded,
   logError,
   neuralscapePost,
   outputContinue,
   parseStdinStrict,
+  recordTransportFailure,
+  resetTransportFailures,
 } from "../utils.js";
 
 /** Parse the session's observation buffer (already-truncated → []). */
@@ -77,6 +80,11 @@ async function main(): Promise<void> {
     if (!hasUserId()) return;
 
     const sessionId = (raw.session_id as string | undefined) || "unknown";
+    const projectId = getProjectId(raw.cwd as string | undefined);
+
+    // Excluded projects (D4): no session note leaves an excluded project.
+    if (isProjectExcluded(projectId)) return;
+
     const turns = await extractAllTurnPairs(raw);
     const observations = await readObservationRows(sessionId);
 
@@ -84,15 +92,17 @@ async function main(): Promise<void> {
     if (!note) return; // trivial session — nothing worth carrying forward
 
     const userId = getUserId();
-    const projectId = getProjectId(raw.cwd as string | undefined);
 
     try {
       await neuralscapePost(
         "/v1/checkpoint",
         buildCheckpointPayload(note, userId, projectId),
       );
+      await resetTransportFailures();
     } catch (error) {
       // Transport failure → notice + exit 0 (never block session teardown).
+      // Counted toward the fail-loud threshold surfaced at next SessionStart.
+      await recordTransportFailure();
       logError("session summary checkpoint failed (service unreachable?)", error);
       return;
     }

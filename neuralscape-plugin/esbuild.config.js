@@ -1,6 +1,7 @@
 import * as esbuild from "esbuild";
 
 const entryPoints = [
+  "src/hooks/pre-tool-use.ts",
   "src/hooks/session-start.ts",
   "src/hooks/conversation-turn.ts",
   "src/hooks/session-end.ts",

@@ -1,6 +1,18 @@
 {
-  "description": "Neuralscape memory hooks — progressive-disclosure context injection, conversation capture, PostToolUse observation buffering, and SessionEnd structured summaries",
+  "description": "Neuralscape memory hooks — progressive-disclosure context injection, PreToolUse file read gate, conversation capture, PostToolUse observation buffering, and SessionEnd structured summaries",
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/pre-tool-use.js\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "SessionStart": [
       {
         "matcher": ".*",

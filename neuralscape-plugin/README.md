@@ -2,7 +2,7 @@
 
 Persistent agentic memory for **Claude Code** and **Claude Cowork**, backed by your own Neuralscape service (FastAPI + mem0 + Graphiti). In Claude Code, plugin hooks auto-capture your conversations and recall relevant context on every session start; in Claude Cowork (which doesn't run plugin hooks), the cross-platform skills drive the same recall/capture loop on demand through the MCP connector. Exposes the 8 Neuralscape MCP tools.
 
-- **What you get:** **progressive-disclosure memory injection** on `SessionStart` (a budget-bounded, day-grouped index of your memories — the map, not the payloads — plus your identity card and a "Previously…" block from the last session), conversation flush + compile on `Stop`, a **structured session summary** stored via one `checkpoint` call on `SessionEnd`, **incremental tool-observation capture on `PostToolUse` + threshold-driven compile on `UserPromptSubmit`** (no extra API cost — runs on your subscription), cross-platform MCP-driven skills (`recall`, `remember`, `save-session`, `project`, `search`, `ns-status`, `ns-config`) plus Claude-Code capture skills (`sync`, `capture`), and the Neuralscape MCP toolkit auto-wired via `.mcp.json`.
+- **What you get:** **progressive-disclosure memory injection** on `SessionStart` (a budget-bounded, day-grouped index of your memories — the map, not the payloads — plus your identity card and a "Previously…" block from the last session), a **File Read Gate** on `PreToolUse(Read)` (large files that already have memories get a ranked per-file memory timeline instead of a raw re-read — re-Read to override), conversation flush + compile on `Stop`, a **structured session summary** stored via one `checkpoint` call on `SessionEnd`, **incremental tool-observation capture on `PostToolUse` + threshold-driven compile on `UserPromptSubmit`** (no extra API cost — runs on your subscription), cross-platform MCP-driven skills (`recall`, `remember`, `save-session`, `project`, `search`, `ns-status`, `ns-config`) plus Claude-Code capture skills (`sync`, `capture`), and the Neuralscape MCP toolkit auto-wired via `.mcp.json`.
 - **Where it stores:** in your own Neuralscape deployment. The plugin never sends data anywhere else.
 - **Cost:** zero additional. The plugin is a thin client over your service.
 
@@ -100,7 +100,7 @@ dynamic client registration and PKCE are automatic.
 .claude/plugins/cache/neuralscape-plugins/neuralscape/2.4.0/
 ├── .claude-plugin/plugin.json    manifest with userConfig (hooks) prompts
 ├── .mcp.json                      bundled OAuth MCP connector at the baked <URL>/mcp/
-├── hooks/hooks.json               SessionStart, PostToolUse, UserPromptSubmit, Stop, SessionEnd
+├── hooks/hooks.json               SessionStart, PreToolUse (Read), PostToolUse, UserPromptSubmit, Stop, SessionEnd
 ├── skills/{recall,remember,save-session,project,search,ns-status,ns-config,sync,capture,compile-observations}/SKILL.md
 ├── scripts/                       built hook bundles
 └── LICENSE / CHANGELOG.md
@@ -111,7 +111,8 @@ The plugin reaches your service via these calls:
 | Trigger | Endpoint | Purpose |
 |---|---|---|
 | SessionStart | `GET /v1/context/{project_id}` or `/v1/context/global` (+ `GET /v1/extensions/dreaming/card`, `GET /v1/code-graph/query` probe) | **Index mode (default):** inject a day-grouped, budget-bounded memory *index* (`#id \| time \| type \| title \| ~tokens`) with a savings header, the identity card(s) when the dreaming sweep has built them, a "Previously…" block from the last session note, and an escalation footer teaching `recall_memories(index_only=true)` → `get_memories(ids=[...])` → `timeline`. `CONTEXT_MODE=full` restores legacy full-content injection. Also flags any pending observation buffers from prior sessions. |
-| PostToolUse | (none — local file write) | Append `{tool, input, output, ts, project_id}` to per-session JSONL buffer. Filters read-only tools and trivial Bash commands; truncates large outputs. |
+| PreToolUse (Read) | `GET /v1/memories` (newest-first, project-scoped) | **File Read Gate:** when the target file is larger than `READ_GATE_MIN_BYTES` and stored memories reference it, the read is denied and replaced with a ranked per-file memory timeline (`#id \| when \| title \| ~tokens`) plus an escalation menu (`get_memories` → `timeline` → full re-Read). Fires at most once per file per session; the second Read of the same path always passes. |
+| PostToolUse | (none — local file write) | Append `{tool, input, output, ts, project_id}` to per-session JSONL buffer. Filters read-only tools, harness plumbing (`SKIP_TOOLS`), and trivial Bash commands; truncates large outputs. |
 | UserPromptSubmit | (none — local check) | When the buffer crosses the threshold (default 25 obs or 30 min old), prepends an `additionalContext` instruction asking Claude to compile the buffer using the `compile-observations` skill before responding. |
 | compile-observations skill | `POST /v1/memories/raw` (via `mcp__plugin_neuralscape_neuralscape__remember`) | Claude reads the buffer, applies the quality rubric, and submits one wiki-quality memory per significant work unit. Backend embeds and stores — **no Gemini call**. |
 | Stop (per turn) | `POST /v1/extensions/conversation-compiler/flush` | Stream each user/assistant pair to Gemini extraction (legacy conversation-driven memory). |
@@ -186,6 +187,11 @@ The plugin reads from `userConfig` prompts (modern) or env vars (legacy fallback
 | SessionStart context mode | `CLAUDE_PLUGIN_OPTION_CONTEXT_MODE` (`index` default \| `full` legacy) | `NEURALSCAPE_CONTEXT_MODE` |
 | Index budget (tokens) | `CLAUDE_PLUGIN_OPTION_INDEX_BUDGET_TOKENS` (default `1500`) | `NEURALSCAPE_INDEX_BUDGET_TOKENS` |
 | Code-graph deferral | `CLAUDE_PLUGIN_OPTION_CODE_GRAPH` (`auto` default \| `on` \| `off`) | `NEURALSCAPE_CODE_GRAPH` |
+| File read gate | `CLAUDE_PLUGIN_OPTION_READ_GATE_ENABLED` (default `true`) | `NEURALSCAPE_READ_GATE_ENABLED` |
+| Read gate min size (bytes) | `CLAUDE_PLUGIN_OPTION_READ_GATE_MIN_BYTES` (default `1500`) | `NEURALSCAPE_READ_GATE_MIN_BYTES` |
+| Excluded projects (globs) | `CLAUDE_PLUGIN_OPTION_EXCLUDED_PROJECTS` (comma-separated, `*`/`?` wildcards) | `NEURALSCAPE_EXCLUDED_PROJECTS` (or `NS_EXCLUDED_PROJECTS`) |
+| Extra skip-tools (capture) | `CLAUDE_PLUGIN_OPTION_SKIP_TOOLS` (comma-separated, additive) | `NEURALSCAPE_SKIP_TOOLS` |
+| Fail-loud threshold | `CLAUDE_PLUGIN_OPTION_FAIL_LOUD_THRESHOLD` (default `3`) | `NEURALSCAPE_FAIL_LOUD_THRESHOLD` |
 
 To change settings after install:
 
@@ -215,6 +221,54 @@ basenames and memories fragment). Resolution precedence:
 3. **The git repo root basename** (walk up for `.git`).
 4. **The working-directory basename** (legacy fallback).
 
+## File Read Gate (PreToolUse)
+
+When Claude is about to `Read` a file **larger than `READ_GATE_MIN_BYTES`
+(default 1500)** that Neuralscape already holds memories about, the gate
+denies the read and substitutes a ranked per-file memory timeline — the
+memories usually answer the question for a fraction of the tokens:
+
+```text
+[Neuralscape Read Gate] Skipped reading `src/worker.ts` (14.2 KB) — 3 stored memories reference this file. …
+
+`#id | when | title | ~tokens`
+#a1b2… | 2d | 🐛 Fixed queue-starvation race in worker.ts | ~120
+#c3d4… | 5d | 🔍 worker.ts drains the retry queue before shutdown | ~90
+
+Details: get_memories with ids for full payloads; timeline for surrounding history; …
+Override: just Read the same path again — the retry is always allowed …
+```
+
+Behavior details:
+
+- **Ranking:** memories that *modified* the file (`observation_type` in
+  bugfix/feature/refactor, or modification verbs in the content) outrank ones
+  that merely read it; memories mentioning fewer files rank higher
+  (specificity); capped at 10 rows.
+- **File-reference signal:** NS memories carry no structured
+  `files_read`/`files_modified` metadata — paths survive only in memory
+  content/title/tags. The gate fetches the newest 500 project-scoped
+  memories (the fast `GET /v1/memories` list, ~100ms; the hybrid
+  `POST /v1/search` also runs a Graphiti pass whose latency routinely
+  exceeds the PreToolUse budget) and keeps only ones that literally contain
+  the file's basename. That is the strongest signal the current memory
+  schema provides.
+- **Never in your way:** fires at most **once per file per session**; the
+  **second Read of the same path always passes** (that *is* the override —
+  just read again). Small files, binary/media extensions, excluded projects,
+  and an unreachable service all bypass the gate entirely (allow, exit 0).
+- Disable with `READ_GATE_ENABLED=false`; tune the size floor with
+  `READ_GATE_MIN_BYTES`.
+
+## Excluded projects
+
+Set `EXCLUDED_PROJECTS` to comma-separated project-id globs (`*` and `?`
+wildcards, case-insensitive — e.g. `scratch-*,client-secret`) and every
+capturing hook honors it: PostToolUse observation capture, Stop conversation
+flush, the SessionEnd session note, SessionStart context injection, and the
+read gate all skip matching projects entirely. `NS_EXCLUDED_PROJECTS` works
+as an env-var alias.
+
 ## Privacy: `<private>` tags
 
 Wrap anything in `<private>…</private>` and the plugin will never store or
@@ -232,9 +286,10 @@ code:
 
 | Failure | Behavior | Exit code |
 |---|---|---|
-| Neuralscape unreachable / transport error | Continue without memory. SessionStart injects a one-line `[neuralscape] memory service unreachable` notice; other hooks log to stderr. The session is NEVER blocked. | `0` |
+| Neuralscape unreachable / transport error | Continue without memory. SessionStart injects a one-line `[neuralscape] memory service unreachable` notice; other hooks log to stderr; the read gate allows the read. The session is NEVER blocked. | `0` |
+| Neuralscape unreachable for `FAIL_LOUD_THRESHOLD` (default 3) **consecutive** events | Fail loud instead of staying quietly degraded: the next SessionStart notice names the streak — `unreachable for N consecutive events — check docker compose ps`. Any successful call resets the counter. | `0` |
 | Malformed hook stdin (not valid JSON — a client bug) | Fail loud so the bug is visible instead of silently swallowed. | `2` on hooks where exit 2 cannot block (`SessionStart`, `SessionEnd`, `PostToolUse`) |
-| Malformed stdin on `Stop` / `UserPromptSubmit` | Exit 2 has *blocking* semantics on these events (it would force Claude to continue, or erase the user's prompt), so the never-block principle wins: log to stderr, exit `0`. | `0` |
+| Malformed stdin on `Stop` / `UserPromptSubmit` / `PreToolUse` | Exit 2 has *blocking* semantics on these events (it would force Claude to continue, erase the user's prompt, or deny the tool call), so the never-block principle wins: log to stderr, exit `0`. | `0` |
 | Hook-internal error (our bug) | Logged to stderr, session continues. | `0` |
 
 ## Troubleshooting
@@ -260,7 +315,7 @@ npm run watch      # rebuild on save
 npm run package    # build a clean installable zip under dist/
 ```
 
-The TypeScript source lives in `src/`. esbuild bundles six entry points (`session-start.ts`, `conversation-turn.ts`, `session-end.ts`, `session-summary.ts`, `post-tool-use.ts`, `user-prompt-submit.ts`) into `scripts/*.js` (ESM, Node 18+, minified). Built scripts are **committed** (marketplace installs pull raw from git) — rebuild with `npm run build` whenever `src/` changes.
+The TypeScript source lives in `src/`. esbuild bundles seven entry points (`pre-tool-use.ts`, `session-start.ts`, `conversation-turn.ts`, `session-end.ts`, `session-summary.ts`, `post-tool-use.ts`, `user-prompt-submit.ts`) into `scripts/*.js` (ESM, Node 18+, minified). Built scripts are **committed** (marketplace installs pull raw from git) — rebuild with `npm run build` whenever `src/` changes.
 
 Unit tests run with vitest: `npm test` (builds first, then runs the pure-logic suites plus subprocess tests that assert the exit-code taxonomy against the built bundles). Coverage: `npm run test:coverage`.
 

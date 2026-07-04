@@ -4,6 +4,50 @@ All notable changes to the `neuralscape` Claude plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.9.0] - 2026-07-04
+
+### Added
+
+- **File Read Gate (roadmap D3).** A new `PreToolUse` hook on the `Read` tool
+  (`scripts/pre-tool-use.js`): when the target file is larger than
+  `READ_GATE_MIN_BYTES` (default 1500) and Neuralscape memories reference it
+  (recency-bounded `GET /v1/memories` fetch + basename verification — NS
+  memories carry no structured `files_read`/`files_modified` metadata, so a
+  literal content mention is the strongest signal, and the hybrid search's
+  Graphiti pass is too slow for a PreToolUse budget), the read is denied and
+  replaced with a ranked per-file memory
+  timeline (`#id | when | title | ~tokens`) plus an escalation menu
+  (`get_memories` → `timeline` → `recall_memories(index_only=true)`).
+  Ranking prefers memories that *modified* the file (modify-typed
+  observations, then modification verbs) and more file-specific observations;
+  capped at 10 rows. Hard safety rules: at most once per file per session
+  (state-file dedup) — the second Read of the same path ALWAYS passes (the
+  override is simply reading again); small files, binary/media extensions,
+  excluded projects, and an unreachable service bypass entirely (allow,
+  exit 0). Config: `READ_GATE_ENABLED` (default true), `READ_GATE_MIN_BYTES`.
+- **Excluded-project globs (roadmap D4).** `EXCLUDED_PROJECTS`
+  (comma-separated, `*`/`?` wildcards, case-insensitive;
+  `NS_EXCLUDED_PROJECTS` env alias) is honored by every capturing hook:
+  PostToolUse observation capture, the Stop conversation flush, the
+  SessionEnd session note, SessionStart context injection, and the read gate.
+- **Skip-tools list for observation capture (roadmap D4).** The PostToolUse
+  built-in skip set now also drops harness plumbing observed as noise in real
+  buffers (`Skill`, `ToolSearch`, `AskUserQuestion`, `TaskUpdate`, `TaskStop`,
+  `TaskList`, `Workflow`, `Monitor`, `WaitForMcpServers`); `SKIP_TOOLS` adds
+  more names without replacing the defaults.
+- **Fail-loud unreachable threshold (roadmap D4).** Hooks count CONSECUTIVE
+  transport failures in a small state file (any success resets it). Once the
+  streak reaches `FAIL_LOUD_THRESHOLD` (default 3), the SessionStart notice
+  upgrades to `unreachable for N consecutive events — check docker compose
+  ps` instead of the generic degrade line. Exit codes are unchanged (always
+  0 — never block).
+
+### Changed
+
+- The hook exit-code taxonomy gains the PreToolUse rule: malformed stdin
+  exits 0 there (exit 2 would BLOCK the tool call, so the never-block
+  principle wins, same as Stop/UserPromptSubmit).
+
 ## [2.8.0] - 2026-07-04
 
 ### Added

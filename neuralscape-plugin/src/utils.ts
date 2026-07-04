@@ -202,6 +202,53 @@ export async function parseStdinStrict(): Promise<HookInput> {
 }
 /* v8 ignore stop */
 
+// ── Excluded projects (roadmap D4) ───────────────────────────────
+//
+// Comma-separated globs of project ids the plugin must never capture from
+// or inject into. Config: EXCLUDED_PROJECTS (CLAUDE_PLUGIN_OPTION_ /
+// NEURALSCAPE_ prefixes), plus the roadmap-spelled `NS_EXCLUDED_PROJECTS`
+// raw env var as an alias. Matching is case-insensitive; `*` and `?` are
+// the only wildcards.
+
+/** Compile one project glob to an anchored, case-insensitive RegExp. */
+export function globToRegExp(glob: string): RegExp {
+  const escaped = glob
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*/g, ".*")
+    .replace(/\?/g, ".");
+  return new RegExp(`^${escaped}$`, "i");
+}
+
+export function getExcludedProjectGlobs(): string[] {
+  const raw = readConfig("EXCLUDED_PROJECTS", "") || process.env.NS_EXCLUDED_PROJECTS?.trim() || "";
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+// isProjectExcluded runs in hook hot paths (once per PostToolUse event) —
+// cache the compiled regexes keyed by the raw glob list so config parsing
+// and RegExp construction happen once per process, not once per tool call.
+let excludedGlobCacheKey: string | null = null;
+let excludedGlobCache: RegExp[] = [];
+
+function getExcludedProjectRegexps(): RegExp[] {
+  const globs = getExcludedProjectGlobs();
+  const key = globs.join(",");
+  if (key !== excludedGlobCacheKey) {
+    excludedGlobCacheKey = key;
+    excludedGlobCache = globs.map(globToRegExp);
+  }
+  return excludedGlobCache;
+}
+
+/** True when the resolved project id matches any excluded-projects glob. */
+export function isProjectExcluded(projectId: string | undefined): boolean {
+  if (!projectId) return false;
+  return getExcludedProjectRegexps().some((re) => re.test(projectId));
+}
+
 // ── Privacy: <private> tag redaction (roadmap D4) ────────────────
 
 /**
@@ -559,6 +606,98 @@ export async function markBufferStale(sessionId: string): Promise<void> {
     await writeFile(getStaleMarkerPath(sessionId), new Date().toISOString(), "utf-8");
   } catch (error) {
     logError("markBufferStale failed", error);
+  }
+}
+
+// ── Fail-loud transport-failure counter (roadmap D4) ─────────────
+//
+// A tiny state file counting CONSECUTIVE Neuralscape-unreachable events
+// across hooks. Any hook that hits a transport failure increments it; any
+// successful call resets it. When the count reaches the threshold, the
+// SessionStart notice upgrades from the generic one-liner to a fail-loud
+// "unreachable for N events — check `docker compose ps`" message. All
+// still exit 0 — the counter changes the message, never the contract.
+
+export const DEFAULT_FAIL_LOUD_THRESHOLD = 3;
+
+export function getFailLoudThreshold(): number {
+  const parsed = parseInt(readConfig("FAIL_LOUD_THRESHOLD", ""), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_FAIL_LOUD_THRESHOLD;
+}
+
+/** Counter lives next to the observation buffers (same data dir). */
+export function getFailureCounterPath(): string {
+  return pathJoin(getObservationDir(), "unreachable.count");
+}
+
+export async function getTransportFailureCount(): Promise<number> {
+  try {
+    const raw = await readFile(getFailureCounterPath(), "utf-8");
+    const parsed = parseInt(raw.trim(), 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** Increment the consecutive-failure counter; returns the new count. */
+export async function recordTransportFailure(): Promise<number> {
+  try {
+    const next = (await getTransportFailureCount()) + 1;
+    await mkdir(getObservationDir(), { recursive: true });
+    await writeFile(getFailureCounterPath(), String(next), "utf-8");
+    return next;
+  } catch (error) {
+    logError("recordTransportFailure failed", error);
+    return 1;
+  }
+}
+
+/** Any successful NS call resets the streak. */
+export async function resetTransportFailures(): Promise<void> {
+  try {
+    await unlink(getFailureCounterPath());
+  } catch {
+    // no counter — already clean
+  }
+}
+
+// ── Read-gate session state (roadmap D3) ─────────────────────────
+//
+// Session-scoped dedup: the gate fires at most once per file per session.
+// The state file records every path already checked (denied or not), so a
+// second Read of the same path — the user/agent override — always passes,
+// and repeated large-file reads don't pay the search round-trip again.
+
+function safeSessionName(sessionId: string): string {
+  return sessionId.replace(/[^A-Za-z0-9._-]/g, "_") || "unknown";
+}
+
+export function getReadGateStatePath(sessionId: string): string {
+  return pathJoin(getObservationDir(), `${safeSessionName(sessionId)}.readgate.json`);
+}
+
+export async function loadGatedFiles(sessionId: string): Promise<Set<string>> {
+  try {
+    const raw = await readFile(getReadGateStatePath(sessionId), "utf-8");
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      return new Set(parsed.filter((p): p is string => typeof p === "string"));
+    }
+    return new Set();
+  } catch {
+    return new Set();
+  }
+}
+
+export async function recordGatedFile(sessionId: string, filePath: string): Promise<void> {
+  try {
+    const gated = await loadGatedFiles(sessionId);
+    gated.add(filePath);
+    await mkdir(getObservationDir(), { recursive: true });
+    await writeFile(getReadGateStatePath(sessionId), JSON.stringify([...gated]), "utf-8");
+  } catch (error) {
+    logError("recordGatedFile failed", error);
   }
 }
 

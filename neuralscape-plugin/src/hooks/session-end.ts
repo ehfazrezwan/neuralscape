@@ -19,7 +19,9 @@ import { flushTurns } from "../core/flush.js";
 import {
   getBufferPath,
   getBufferStats,
+  getProjectId,
   hasUserId,
+  isProjectExcluded,
   logError,
   markBufferStale,
   outputContinue,
@@ -38,6 +40,10 @@ async function main(): Promise<void> {
 
   try {
     const raw = (await parseStdin()) as Record<string, unknown>;
+
+    // Excluded projects (D4): no conversation capture leaves an excluded project.
+    if (isProjectExcluded(getProjectId(raw.cwd as string | undefined))) return;
+
     const client = detectClient(raw);
 
     // Claude Code: flush all turns from transcript before compiling.

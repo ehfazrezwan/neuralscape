@@ -11,8 +11,10 @@ export default defineConfig({
       include: [
         "src/utils.ts",
         "src/core/disclosure.ts",
+        "src/core/read-gate.ts",
         "src/core/session-note.ts",
         "src/hooks/post-tool-use.ts",
+        "src/hooks/pre-tool-use.ts",
         "src/hooks/session-start.ts",
         "src/hooks/user-prompt-submit.ts",
       ],

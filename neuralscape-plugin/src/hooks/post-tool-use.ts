@@ -15,15 +15,21 @@ import {
   getProjectId,
   getUserId,
   hasUserId,
+  isProjectExcluded,
   logError,
   outputContinue,
   parseStdinStrict,
   pickRelevantInput,
+  readConfig,
   redactPrivate,
   truncateOutput,
 } from "../utils.js";
 
-// Tools whose outputs are not worth capturing — read-only or already-managed.
+// Tools whose outputs are not worth capturing — read-only, already-managed,
+// or pure harness plumbing. The plumbing set (Skill, ToolSearch,
+// AskUserQuestion, Task*/Workflow/Monitor, WaitForMcpServers) was chosen by
+// inspecting real observation buffers: those rows are UI/orchestration
+// noise that compile-observations always skips anyway (roadmap D4).
 export const DENY_TOOLS = new Set<string>([
   "Read",
   "Glob",
@@ -36,7 +42,26 @@ export const DENY_TOOLS = new Set<string>([
   "EnterPlanMode",
   "EnterWorktree",
   "ExitWorktree",
+  "Skill", // the tools the skill runs get captured; the invocation is noise
+  "ToolSearch",
+  "AskUserQuestion",
+  "TaskUpdate",
+  "TaskStop",
+  "TaskList",
+  "Workflow",
+  "Monitor",
+  "WaitForMcpServers",
 ]);
+
+/** DENY_TOOLS plus any user-configured additions (SKIP_TOOLS, comma-separated). */
+export function getSkipTools(): Set<string> {
+  const extra = readConfig("SKIP_TOOLS", "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (extra.length === 0) return DENY_TOOLS;
+  return new Set([...DENY_TOOLS, ...extra]);
+}
 
 // Bash commands that are routine inspection/navigation — skip.
 export const BORING_BASH_RE =
@@ -75,7 +100,10 @@ function normalizePath(p: string): string {
 export function shouldCapture(input: HookInput): boolean {
   const toolName = input.tool_name;
   if (!toolName) return false;
-  if (DENY_TOOLS.has(toolName)) return false;
+  if (getSkipTools().has(toolName)) return false;
+  // Excluded projects (D4): never capture anything from a project matching
+  // an EXCLUDED_PROJECTS glob.
+  if (isProjectExcluded(getProjectId(input.cwd))) return false;
   // Skip Neuralscape's own MCP tools to avoid recording our own writes.
   if (toolName.startsWith(NEURALSCAPE_TOOL_PREFIX)) return false;
   if (toolName === "Bash") {
