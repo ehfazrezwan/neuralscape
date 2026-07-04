@@ -93,7 +93,16 @@ def _parse_expires_at(value) -> datetime | None:
 # to outrank a one-off at comparable cosine similarity without letting
 # repetition drown out relevance. `times_derived - 1` (the count of *extra*
 # derivations) means unreinforced/legacy rows keep their raw score exactly.
+#
+# Audit 27 #4: the live value comes from `settings.reinforcement_boost_k`
+# (env REINFORCEMENT_BOOST_K; 0 disables byte-identically) — this constant
+# is only the historical default / test reference. `times_derived` is
+# clamped at REINFORCEMENT_TIMES_DERIVED_CAP and the boosted score capped
+# at 1.0, so an over-reinforced mediocre hit (e.g. 0.80 cosine, td=30) can
+# no longer outrank a plainly better one (0.90, td=1), and returned scores
+# stay in the cosine range.
 REINFORCEMENT_BOOST_K = 0.05
+REINFORCEMENT_TIMES_DERIVED_CAP = 10
 
 
 # ── Hybrid recall: dense + BM25 lexical rank fusion (audit 27 #1) ──────
@@ -167,13 +176,29 @@ def _reinforcement_boost(score: float | None, metadata: dict | None) -> float | 
 
     Feature-safe: None scores pass through, and times_derived <= 1 (including
     every legacy row without the field) returns the score unchanged.
+
+    Audit 27 #4 guardrails:
+    - k comes from ``settings.reinforcement_boost_k``; k <= 0 returns the
+      raw score immediately (byte-identical disable path).
+    - effective times_derived clamps at REINFORCEMENT_TIMES_DERIVED_CAP
+      (=10 ⇒ max lift ≈ +12% at the default k), so unbounded reinforcement
+      can never drown out relevance.
+    - the boosted score caps at 1.0 — recall scores stay cosine-shaped.
     """
     if score is None:
         return None
-    times_derived = _times_derived_from_metadata(metadata)
+    try:
+        k = float(settings.reinforcement_boost_k)
+    except (AttributeError, TypeError, ValueError):
+        k = REINFORCEMENT_BOOST_K
+    if k <= 0.0:
+        return score
+    times_derived = min(
+        _times_derived_from_metadata(metadata), REINFORCEMENT_TIMES_DERIVED_CAP
+    )
     if times_derived <= 1:
         return score
-    return score * (1.0 + REINFORCEMENT_BOOST_K * math.log1p(times_derived - 1))
+    return min(1.0, score * (1.0 + k * math.log1p(times_derived - 1)))
 
 
 def _salience_tiebreak(responses: list) -> list:

@@ -334,3 +334,55 @@ class TestInvalidatedEdgeFilter:
             sf.expired_at[0][0].comparison_operator is ComparisonOperator.is_null
         )
 
+
+# ══════════════════════════════════════════════
+# Defect 4 — times_derived boost: gated, capped, configurable
+# ══════════════════════════════════════════════
+
+
+class TestReinforcementBoostGating:
+    """Pre-fix: k=0.05 was hard-coded and times_derived unbounded — a
+    0.80-cosine hit with td=30 boosted to ~0.937 and beat a 0.90 correct
+    hit, and boosted scores exceeded 1.0
+    (test_capped_td_cannot_flip_correct_ordering failed pre-fix).
+    """
+
+    def test_capped_td_cannot_flip_correct_ordering(self):
+        wrong = _reinforcement_boost(0.80, {"times_derived": 30})
+        right = _reinforcement_boost(0.90, {"times_derived": 1})
+        # Pre-fix: 0.80 * (1 + 0.05*ln(31)) ≈ 0.937 > 0.90 — ordering flipped.
+        assert wrong < right
+        # td clamps at 10 → max lift ≈ +12%
+        assert wrong == pytest.approx(
+            0.80 * (1 + REINFORCEMENT_BOOST_K * math.log1p(9))
+        )
+
+    def test_boosted_score_capped_at_one(self):
+        assert _reinforcement_boost(0.97, {"times_derived": 10}) == 1.0
+
+    def test_k_zero_disables_byte_identically(self, monkeypatch, service):
+        from config import settings
+
+        monkeypatch.setattr(settings, "reinforcement_boost_k", 0.0)
+        assert _reinforcement_boost(0.80, {"times_derived": 30}) == 0.80
+
+        # Through the pool: returned scores are byte-identical to raw hits.
+        hits = [
+            _make_hit("a", 0.80, _payload("one-off")),
+            _make_hit("b", 0.78, _payload("reinforced", times_derived=30)),
+        ]
+        service._memory.vector_store.client.query_points.return_value = _qresult(hits)
+        out = service._search_personal_pool(
+            m=service._memory, user_id="u1", query_embedding=[0.1] * 8,
+            project_id=None, categories=None, scope=None, domain=None,
+            observation_type=None, concepts=None, limit=10,
+        )
+        assert {r.id: r.score for r in out} == {"a": 0.80, "b": 0.78}
+
+    def test_k_configurable_via_settings(self, monkeypatch):
+        from config import settings
+
+        monkeypatch.setattr(settings, "reinforcement_boost_k", 0.02)
+        boosted = _reinforcement_boost(0.80, {"times_derived": 5})
+        assert boosted == pytest.approx(0.80 * (1 + 0.02 * math.log1p(4)))
+
