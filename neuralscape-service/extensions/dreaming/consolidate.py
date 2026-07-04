@@ -461,6 +461,13 @@ def _rewrite_content(
         raise ValueError(f"memory {memory_id} not found for rewrite")
     payload = dict(points[0].payload or {})
     meta = dict(payload.get("metadata") or {})
+    # Audit 27 #26: rewrites must be reversible. Stash the pre-rewrite text
+    # as one level of undo (a newer rewrite overwrites an older stash). A
+    # no-op rewrite (identical text) keeps the existing stash — clobbering
+    # it with a copy of the current text would destroy the undo point.
+    prev_content = payload.get("data")
+    if prev_content and prev_content != new_content:
+        meta["dream_prev_content"] = prev_content
     meta["dream_rewritten_at"] = datetime.now(timezone.utc).isoformat()
     if reframed:
         meta["dream_temporal_reframed"] = True

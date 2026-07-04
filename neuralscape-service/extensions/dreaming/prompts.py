@@ -24,9 +24,11 @@ Current date: {today}
 
 Actions (use exactly these types):
 - "merge": two or more memories state the same fact. Pick the most complete as
-  survivor; fold every unique detail from the others into "content" (max ~60
-  words, self-contained). List ALL involved ids in "memory_ids"; put the survivor
-  in "survivor_id".
+  survivor; fold every unique detail from the others into "content". The merged
+  "content" must be self-contained and MUST preserve every concrete fact,
+  identifier, number, date, URL, and proper noun that appears in ANY of the
+  merged memories — completeness beats brevity; never paraphrase a detail away.
+  List ALL involved ids in "memory_ids"; put the survivor in "survivor_id".
 - "invalidate": a memory is contradicted by a NEWER memory in the batch. The
   older one goes in "memory_ids" (the superseding one in "superseded_by_id").
 - "prune": credentials/secrets/API keys ("contains_secret": true), pure noise

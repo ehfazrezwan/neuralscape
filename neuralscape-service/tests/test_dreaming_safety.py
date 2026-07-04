@@ -158,3 +158,89 @@ class TestSecretGateBypass:
             to_apply, dry_run=False,
         )
         service.delete_memory.assert_not_called()
+
+
+# ══════════════════════════════════════════════
+# #26 — rewrites keep one level of undo; merge prompt preserves facts
+# ══════════════════════════════════════════════
+
+
+class TestReversibleRewrites:
+    """Pre-fix: REWRITE/REFRAME/MERGE-survivor rewrites overwrote
+    ``payload["data"]`` destroying the original text at any confidence,
+    and the merge prompt's ~60-word cap guaranteed fact/keyword loss.
+    """
+
+    def _service(self, payload):
+        pt = MagicMock()
+        pt.payload = payload
+        client = MagicMock()
+        client.retrieve.return_value = [pt]
+        service = MagicMock()
+        service._get_memory.return_value.vector_store.client = client
+        service._get_memory.return_value.embedding_model.embed.return_value = [0.1] * 8
+        return service, client
+
+    def test_rewrite_stashes_prev_content(self):
+        old = "User works at OldCorp on the Berlin team"
+        service, client = self._service({"data": old, "metadata": {}})
+        consolidate._rewrite_content(service, "m1", "User works at Acme")
+        point = client.upsert.call_args.kwargs["points"][0]
+        assert point.payload["data"] == "User works at Acme"
+        assert point.payload["metadata"]["dream_prev_content"] == old
+
+    def test_rewrite_overwrites_older_stash_one_level_of_undo(self):
+        service, client = self._service({
+            "data": "current text",
+            "metadata": {"dream_prev_content": "ancient stash"},
+        })
+        consolidate._rewrite_content(service, "m1", "newest text")
+        point = client.upsert.call_args.kwargs["points"][0]
+        assert point.payload["metadata"]["dream_prev_content"] == "current text"
+
+    def test_noop_rewrite_keeps_existing_stash(self):
+        """Rewriting to identical text must not clobber the undo point with
+        a copy of itself."""
+        service, client = self._service({
+            "data": "same text",
+            "metadata": {"dream_prev_content": "useful older stash"},
+        })
+        consolidate._rewrite_content(service, "m1", "same text")
+        point = client.upsert.call_args.kwargs["points"][0]
+        assert point.payload["metadata"]["dream_prev_content"] == "useful older stash"
+
+    def test_rewrite_still_recomputes_hash(self):
+        """Regression guard on the audit-#6 fix (PR #120): the stash must
+        ride the SAME upsert that recomputes the content hash."""
+        from memory_service import content_hash
+
+        service, client = self._service({"data": "old", "hash": "stale", "metadata": {}})
+        consolidate._rewrite_content(service, "m1", "fresh text")
+        point = client.upsert.call_args.kwargs["points"][0]
+        assert point.payload["hash"] == content_hash("fresh text")
+        assert point.payload["metadata"]["dream_prev_content"] == "old"
+
+    @pytest.mark.asyncio
+    async def test_merge_survivor_stashes_prev_content(self):
+        service, client = _apply_service({
+            "surv": {"data": "original survivor text", "metadata": {}},
+            "loser": {"data": "duplicate", "metadata": {}},
+        })
+        await consolidate.apply_actions(
+            service,
+            _batch([{"memory_id": "surv", "content": "original survivor text"},
+                    {"memory_id": "loser", "content": "duplicate"}]),
+            [{"type": "merge", "memory_ids": ["surv", "loser"], "survivor_id": "surv",
+              "content": "merged fact", "confidence": 0.9}],
+            dry_run=False,
+        )
+        point = client.upsert.call_args.kwargs["points"][0]
+        assert point.payload["metadata"]["dream_prev_content"] == "original survivor text"
+
+    def test_merge_prompt_has_no_word_cap_and_demands_preservation(self):
+        text = prompts.CONSOLIDATION_PROMPT
+        assert "60" not in text  # the ~60-word survivor budget is gone
+        lowered = text.lower()
+        assert "preserve" in lowered
+        assert "proper noun" in lowered
+        assert "identifier" in lowered
