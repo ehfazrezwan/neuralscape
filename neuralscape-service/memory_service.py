@@ -3009,6 +3009,98 @@ class MemoryService:
             "memories": [*before, anchor_mem, *after],
         }
 
+    def keyword_search(
+        self,
+        user_id: str,
+        terms: list[str],
+        project_id: str | None = None,
+        limit: int = 20,
+    ) -> list[MemoryResponse]:
+        """Grep-style exact/keyword scan over caller-visible memories (C3).
+
+        Case-insensitive substring match: a memory matches when its content
+        contains ANY of ``terms``. This is the dialectic discipline for
+        enumeration/counting questions — embeddings under-recall exhaustive
+        "list every X" sets, so the ask path runs this exact pass *before*
+        semantic search and dedups the union.
+
+        Visibility mirrors search's pool union (caller's own rows at any
+        visibility + shared + standard-when-enabled; ``project_id`` adds the
+        project+global dual scope) and dream-tombstoned rows are excluded —
+        the same rules as ``_timeline_filter``. Bounded scan: pages of
+        ``_TIMELINE_FALLBACK_PAGE`` up to ``_TIMELINE_FALLBACK_CAP`` points,
+        stopping early once ``limit`` matches are found. Results carry no
+        score (exact matches aren't ranked).
+        """
+        lowered = [t.lower() for t in terms if t and t.strip()]
+        if not lowered:
+            return []
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+        client = self._get_memory().vector_store.client
+
+        visibility_should = [
+            FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+            FieldCondition(
+                key="metadata.visibility",
+                match=MatchValue(value=MemoryVisibility.SHARED.value),
+            ),
+        ]
+        if settings.standards_enabled:
+            visibility_should.append(
+                FieldCondition(
+                    key="metadata.visibility",
+                    match=MatchValue(value=MemoryVisibility.STANDARD.value),
+                )
+            )
+        must: list = [Filter(should=visibility_should)]
+        if project_id:
+            must.append(
+                Filter(
+                    should=[
+                        FieldCondition(
+                            key="metadata.project_id",
+                            match=MatchValue(value=project_id),
+                        ),
+                        FieldCondition(
+                            key="metadata.scope", match=MatchValue(value="global")
+                        ),
+                    ]
+                )
+            )
+        flt = Filter(
+            must=must,
+            must_not=[
+                FieldCondition(
+                    key="metadata.dream_tombstoned", match=MatchValue(value=True)
+                )
+            ],
+        )
+
+        matches: list[MemoryResponse] = []
+        offset = None
+        scanned = 0
+        while scanned < self._TIMELINE_FALLBACK_CAP and len(matches) < limit:
+            page, offset = client.scroll(
+                collection_name=settings.qdrant_collection,
+                scroll_filter=flt,
+                limit=self._TIMELINE_FALLBACK_PAGE,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for pt in page or []:
+                content = ((getattr(pt, "payload", None) or {}).get("data") or "").lower()
+                if any(t in content for t in lowered):
+                    matches.append(self._point_to_response(pt))
+                    if len(matches) >= limit:
+                        break
+            scanned += len(page or [])
+            # `is None`, not truthiness — integer point-id offsets can be 0.
+            if offset is None:
+                break
+        return matches
+
     def list_memories(
         self,
         user_id: str,
