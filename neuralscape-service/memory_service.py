@@ -217,6 +217,42 @@ def _salience_tiebreak(responses: list) -> list:
     return responses
 
 
+def _live_edges_filter():
+    """Graphiti ``SearchFilters`` selecting only bi-temporally LIVE edges.
+
+    Excludes any edge with a non-null ``invalid_at`` or ``expired_at`` —
+    i.e. facts the dreaming sweep (or Graphiti's own contradiction
+    handling) has invalidated/superseded (audit 27 #3). Built per call:
+    SearchFilters is a mutable pydantic model and a shared singleton
+    could be mutated by a concurrent caller.
+    """
+    from graphiti_core.search.search_filters import (
+        ComparisonOperator,
+        DateFilter,
+        SearchFilters,
+    )
+
+    return SearchFilters(
+        invalid_at=[[DateFilter(comparison_operator=ComparisonOperator.is_null)]],
+        expired_at=[[DateFilter(comparison_operator=ComparisonOperator.is_null)]],
+    )
+
+
+def _edge_is_invalidated(edge) -> bool:
+    """True when a graph edge carries a bi-temporal invalidation stamp.
+
+    Post-filter companion to ``_live_edges_filter`` for result paths where
+    the Cypher-level filter may not have applied. Only real timestamp
+    values (datetime or non-empty string) count — mock/partial edge
+    objects without the attribute are treated as live.
+    """
+    for attr in ("invalid_at", "expired_at"):
+        value = getattr(edge, attr, None)
+        if isinstance(value, datetime) or (isinstance(value, str) and value.strip()):
+            return True
+    return False
+
+
 def _is_junk_fact(content: str) -> bool:
     """Return True if an extracted fact is a raw event log rather than contextual knowledge."""
     stripped = content.strip()
@@ -2419,11 +2455,23 @@ class MemoryService:
 
         try:
             results = self._run_on_bridge(
-                g.search_(query=query, config=config, group_ids=group_ids)
+                g.search_(
+                    query=query,
+                    config=config,
+                    group_ids=group_ids,
+                    # Audit 27 #3: bi-temporal liveness — edges the dreaming
+                    # sweep stamped invalid_at/expired_at (INVALIDATE / PRUNE /
+                    # MERGE, see extensions/dreaming/graph_patcher.py) must not
+                    # surface as live facts and eat top-k slots.
+                    search_filter=_live_edges_filter(),
+                )
             )
             edges = [
                 {"uuid": e.uuid, "name": e.name, "fact": e.fact}
                 for e in results.edges
+                # Belt-and-suspenders: some drivers/recipes skip the Cypher
+                # filter constructor, so drop stamped edges here too.
+                if not _edge_is_invalidated(e)
             ]
             nodes = [
                 {"uuid": n.uuid, "name": n.name, "summary": n.summary}

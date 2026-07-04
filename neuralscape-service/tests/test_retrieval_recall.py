@@ -275,3 +275,62 @@ class TestVectorGraphWeave:
         result = self.svc._deduplicate_responses(self._vector(2), self._graph(2))
         assert [r.source for r in result] == ["vector", "vector", "graph", "graph"]
 
+
+# ══════════════════════════════════════════════
+# Defect 3 — bi-temporally invalidated graph edges filtered
+# ══════════════════════════════════════════════
+
+
+def _edge(uuid, fact, invalid_at=None, expired_at=None):
+    return SimpleNamespace(
+        uuid=uuid, name=fact, fact=fact, invalid_at=invalid_at, expired_at=expired_at
+    )
+
+
+class TestInvalidatedEdgeFilter:
+    """Pre-fix: `_do_graph_search` passed no SearchFilters and never looked
+    at invalid_at/expired_at, so edges the dreaming sweep bi-temporally
+    invalidated kept surfacing (test_invalidated_edges_excluded failed with
+    all three uuids present).
+    """
+
+    def _wire(self, service, edges):
+        results = SimpleNamespace(edges=edges, nodes=[], episodes=[], communities=[])
+        service._run_on_bridge = MagicMock(return_value=results)
+
+    def test_invalidated_edges_excluded(self, service):
+        live = _edge("e-live", "Alice works at Acme")
+        invalidated = _edge(
+            "e-dead", "Alice works at OldCorp",
+            invalid_at=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        )
+        expired = _edge(
+            "e-exp", "stale relation", expired_at="2026-01-01T00:00:00+00:00"
+        )
+        self._wire(service, [live, invalidated, expired])
+
+        with patch.object(service, "_enrich_graph_results"):
+            out = service._do_graph_search(
+                query="alice", group_ids=["user--u1"], limit=10
+            )
+
+        assert [e["uuid"] for e in out["edges"]] == ["e-live"]
+
+    def test_search_filter_requests_null_invalid_and_expired(self, service):
+        """The Graphiti query itself must carry the is-null SearchFilters so
+        the DB never returns invalidated edges in the first place."""
+        from graphiti_core.search.search_filters import ComparisonOperator
+
+        self._wire(service, [])
+        with patch.object(service, "_enrich_graph_results"):
+            service._do_graph_search(query="q", group_ids=["shared"], limit=5)
+
+        sf = service._graphiti.search_.call_args.kwargs["search_filter"]
+        assert sf is not None
+        assert (
+            sf.invalid_at[0][0].comparison_operator is ComparisonOperator.is_null
+        )
+        assert (
+            sf.expired_at[0][0].comparison_operator is ComparisonOperator.is_null
+        )
+
