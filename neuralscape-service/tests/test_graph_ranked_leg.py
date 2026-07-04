@@ -207,3 +207,175 @@ class TestGraphEdgeScoring:
         assert service._memory.embedding_model.embed.call_count == 1
         assert service._memory.embedding_model.embed_batch.call_count == 0
         assert service._memory.vector_store.client.query_batch_points.call_count <= 1
+
+
+# ══════════════════════════════════════════════
+# Part 2 — rank fusion replaces the cap-append weave
+# ══════════════════════════════════════════════
+
+
+def _vec_rows(scores, prefix="v"):
+    return [
+        MemoryResponse(
+            id=f"{prefix}{i}", memory=f"vector fact {prefix}{i}", score=s,
+            source="vector",
+        )
+        for i, s in enumerate(scores)
+    ]
+
+
+def _graph_rows(scores, prefix="g"):
+    return [
+        MemoryResponse(
+            id=f"{prefix}{i}", memory=f"graph relation {prefix}{i}", score=s,
+            source="graph",
+        )
+        for i, s in enumerate(scores)
+    ]
+
+
+class TestRankFusionWeave:
+    """The #120 weave capped graph rows at ``max(1, limit // 4)`` slots and
+    appended them after every vector hit regardless of merit. With real
+    cosine scores on the graph leg (part 1), the two legs fuse by
+    rank/merit: NO quota, NO cap — graph rows take whatever slots their
+    fused rank earns."""
+
+    def setup_method(self):
+        self.svc = MemoryService()
+
+    def test_strong_graph_edges_can_claim_majority_of_topk(self):
+        """Impossible under the cap (max 2 graph rows at limit=10): six
+        graph edges scoring above every vector hit must take six of the
+        top ten slots."""
+        vector = _vec_rows([0.80 - i * 0.01 for i in range(10)])  # 0.80..0.71
+        graph = _graph_rows([0.97 - i * 0.01 for i in range(6)])  # 0.97..0.92
+
+        result = self.svc._deduplicate_responses(vector, graph, limit=10)
+
+        assert len(result) == 10
+        graph_kept = [r.id for r in result if r.source == "graph"]
+        assert graph_kept == [f"g{i}" for i in range(6)], (
+            "strong graph edges must claim the slots their merit earns"
+        )
+        assert sum(1 for r in result if r.source == "graph") > 10 // 2
+        # and they sit ABOVE the weaker vector hits, in score order
+        assert [r.id for r in result[:6]] == [f"g{i}" for i in range(6)]
+
+    def test_weak_graph_edges_never_displace_strong_vector_hits(self):
+        """The old 1:1 interleave defect must not regress: low-cosine graph
+        rows rank below every stronger vector hit."""
+        vector = _vec_rows([0.95 - i * 0.01 for i in range(10)])  # 0.95..0.86
+        graph = _graph_rows([0.25 - i * 0.01 for i in range(6)])  # weak
+
+        result = self.svc._deduplicate_responses(vector, graph, limit=10)
+
+        assert [r.id for r in result] == [f"v{i}" for i in range(10)]
+
+    def test_mixed_strength_graph_interleaves_on_merit(self):
+        vector = _vec_rows([0.90, 0.80, 0.70])
+        graph = _graph_rows([0.85, 0.10])
+
+        result = self.svc._deduplicate_responses(vector, graph, limit=5)
+
+        assert [r.id for r in result] == ["v0", "g0", "v1", "v2", "g1"]
+
+    def test_unscored_graph_rows_still_rank_last(self):
+        """Edges without a stored embedding (score=None) keep the legacy
+        behavior: after every scored vector hit, never displacing them."""
+        vector = _vec_rows([0.9, 0.8])
+        graph = _graph_rows([None, None])
+
+        result = self.svc._deduplicate_responses(vector, graph, limit=10)
+
+        assert [r.id for r in result] == ["v0", "v1", "g0", "g1"]
+
+    def test_native_scores_survive_fusion(self):
+        """Rows keep their native scores (vector cosine / graph cosine) —
+        the fused rank orders the list but never overwrites score."""
+        vector = _vec_rows([0.80])
+        graph = _graph_rows([0.95])
+
+        result = self.svc._deduplicate_responses(vector, graph, limit=10)
+
+        assert [r.id for r in result] == ["g0", "v0"]
+        assert result[0].score == pytest.approx(0.95)
+        assert result[1].score == pytest.approx(0.80)
+
+    def test_deterministic_tiebreak_vector_first_then_id(self):
+        vector = _vec_rows([0.5])
+        graph = [
+            MemoryResponse(id="gb", memory="relation bee", score=0.5, source="graph"),
+            MemoryResponse(id="ga", memory="relation ay", score=0.5, source="graph"),
+        ]
+
+        result = self.svc._deduplicate_responses(vector, graph, limit=10)
+
+        # exact tie at 0.5: vector row first, then graph rows by id
+        assert [r.id for r in result] == ["v0", "ga", "gb"]
+
+    def test_corroborating_graph_twin_boosts_its_vector_row(self):
+        """A graph edge dropped as a content twin of a vector row still
+        contributes its reciprocal-rank weight to that row — leg agreement
+        ranks up (same philosophy as _rrf_fuse), content identity dedup
+        unchanged."""
+        vector = [
+            MemoryResponse(id="v0", memory="unrelated but slightly stronger fact",
+                           score=0.800, source="vector"),
+            MemoryResponse(id="v1", memory="User prefers tabs over spaces",
+                           score=0.795, source="vector"),
+        ]
+        graph = [
+            MemoryResponse(id="g0", memory="prefers tabs", score=0.99, source="graph"),
+        ]
+
+        result = self.svc._deduplicate_responses(vector, graph, limit=10)
+
+        # twin dropped (vector row preferred) …
+        assert [r.id for r in result] == ["v1", "v0"]
+        # … and the corroborated row overtook the near-tie, score untouched
+        assert result[0].score == pytest.approx(0.795)
+
+    def test_substring_dedup_still_prefers_vector_twin(self):
+        vector = [
+            MemoryResponse(id="v0", memory="User prefers tabs over spaces",
+                           score=0.9, source="vector")
+        ]
+        graph = [
+            MemoryResponse(id="g0", memory="prefers tabs", score=0.99, source="graph")
+        ]
+
+        result = self.svc._deduplicate_responses(vector, graph, limit=10)
+
+        assert [r.id for r in result] == ["v0"]
+
+    def test_no_limit_returns_full_fused_list(self):
+        vector = _vec_rows([0.9, 0.5])
+        graph = _graph_rows([0.7])
+
+        result = self.svc._deduplicate_responses(vector, graph)
+
+        assert [r.id for r in result] == ["v0", "g0", "v1"]
+
+    def test_end_to_end_strong_graph_majority_through_search(self, service):
+        """Full search(): strong graph edges outrank weak vector hits in the
+        returned top-k — red under the cap-append weave."""
+        hits = [
+            _make_hit(f"v{i}", 0.60 - i * 0.01, _payload(f"weak vector fact {i}"))
+            for i in range(6)
+        ]
+        service._memory.vector_store.client.query_points.return_value = _qresult(hits)
+        edges = [
+            _edge(f"g{i}", f"strong graph fact {i}", [1.0, 0.0, 0.1 * i])
+            for i in range(6)
+        ]  # cosines 1.0 .. ~0.89 — all above the 0.60 vector ceiling
+        with patch.object(
+            service, "_search_graph_for_visibility", return_value=_graph_result(edges)
+        ):
+            results = service.search(
+                query="q", user_id="u1", visibility="private", limit=8
+            )
+
+        graph_kept = sum(1 for r in results if r.source == "graph")
+        assert graph_kept > 8 // 2
+        assert results[0].source == "graph"

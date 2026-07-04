@@ -194,6 +194,14 @@ class TestVectorGraphWeave:
     limit=10 with 6 graph rows, vector ranks 6-10 were evicted by unranked
     relation strings (and the method took no ``limit`` at all, so these
     tests raised TypeError before the fix).
+
+    Graph-ranked-leg update: the interim cap-append weave (graph capped at
+    ``max(1, limit // 4)`` slots) was replaced by merit fusion — graph rows
+    now carry real cosine scores and take whatever slots their fused rank
+    earns (see tests/test_graph_ranked_leg.py). The invariant THESE tests
+    pin is unchanged: unscored (score=None) graph rows never displace
+    ranked vector hits. The two cap-reservation tests were adapted to the
+    merit semantics: no slots are reserved for unscored graph rows anymore.
     """
 
     def setup_method(self):
@@ -216,10 +224,11 @@ class TestVectorGraphWeave:
             for i in range(n)
         ]
 
-    def test_vector_ranks_survive_and_graph_capped(self):
-        """10 scored vector hits + 6 graph rows at limit=10: at least
-        ceil(3*limit/4) vector hits survive, in ranked order, and graph
-        rows come after them (pre-fix weave kept only v0-v4)."""
+    def test_vector_ranks_survive_unscored_graph(self):
+        """10 scored vector hits + 6 UNSCORED graph rows at limit=10: every
+        ranked vector hit survives in order — unranked relation strings
+        earn no slots on merit (pre-#120 the 1:1 weave kept only v0-v4;
+        the interim cap reserved them 2 slots regardless of merit)."""
         limit = 10
         result = self.svc._deduplicate_responses(
             self._vector(10), self._graph(6), limit=limit
@@ -228,12 +237,8 @@ class TestVectorGraphWeave:
         assert len(result) == limit
         vector_survivors = [r for r in result if r.source == "vector"]
         assert len(vector_survivors) >= math.ceil(3 * limit / 4)  # >= 8
-        # ranked order preserved, graph strictly after every vector hit
-        assert [r.id for r in vector_survivors] == [f"v{i}" for i in range(8)]
-        first_graph = next(i for i, r in enumerate(result) if r.source == "graph")
-        assert all(r.source == "graph" for r in result[first_graph:])
-        # graph rows capped at max(1, limit // 4)
-        assert sum(1 for r in result if r.source == "graph") <= max(1, limit // 4)
+        # ranked order preserved, all ten scored hits beat score-less rows
+        assert [r.id for r in vector_survivors] == [f"v{i}" for i in range(10)]
 
     def test_graph_fills_shortfall_when_vector_underfills(self):
         result = self.svc._deduplicate_responses(
@@ -244,13 +249,22 @@ class TestVectorGraphWeave:
         assert sum(1 for r in result if r.source == "graph") == 6
         assert len(result) == 9
 
-    def test_vector_reclaims_unused_graph_reservation(self):
+    def test_scored_vector_fills_limit_over_unscored_graph(self):
+        """Merit semantics: nothing is reserved for the graph leg — an
+        unscored graph row only enters when the scored rows don't already
+        fill the limit."""
         result = self.svc._deduplicate_responses(
             self._vector(10), self._graph(1), limit=10
         )
 
         assert len(result) == 10
-        assert sum(1 for r in result if r.source == "vector") == 9
+        assert sum(1 for r in result if r.source == "vector") == 10
+
+        # with headroom, the unscored graph row still rides along at the tail
+        result = self.svc._deduplicate_responses(
+            self._vector(9), self._graph(1), limit=10
+        )
+        assert len(result) == 10
         assert result[-1].source == "graph"
 
     def test_limit_one_prefers_the_top_vector_hit(self):

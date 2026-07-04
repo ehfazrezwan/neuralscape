@@ -4995,51 +4995,71 @@ class MemoryService:
         graph_responses: list[MemoryResponse],
         limit: int | None = None,
     ) -> list[MemoryResponse]:
-        """Deduplicate and weave vector and graph results (audit 27 #2).
+        """Fuse the vector and graph legs into one merit-ranked list.
 
-        Removes graph results whose content closely matches a vector result,
-        then appends the surviving graph rows AFTER the vector hits: scored
-        vector hits keep their ranked order and take priority. The old 1:1
-        positional interleave let unranked (score=None) relation strings
-        evict up to half of the ranked vector top-k after the caller's
-        ``[:limit]`` cut.
+        Graph is a FIRST-CLASS RANKED leg: with part-1 cosine scores on the
+        edges (stored ``fact_embedding`` × the query vector), both legs
+        carry scores in the SAME Gemini cosine space, so ranks are computed
+        on the merged score scale — NO quota and NO cap. Strong graph rows
+        take the majority of top-k when they earn it; weak ones sink below
+        every stronger vector hit. (Literal per-leg reciprocal-rank fusion
+        can't do either: a full vector leg mathematically pins graph at a
+        50/50 alternation regardless of magnitude, which both re-creates
+        the audit-27 #2 interleave defect for weak edges and forbids a
+        graph majority for strong ones.)
 
-        When ``limit`` is given, graph rows are capped at
-        ``max(1, limit // 4)`` slots within the limit — except they may
-        additionally fill any shortfall when the vector legs returned fewer
-        than ``limit`` hits. Vector hits are only ever displaced down to
-        ``limit - cap`` slots (e.g. 8 of 10 at the default k=10), never
-        below.
+        This replaces the interim #120 weave (graph appended after vector,
+        capped at ``max(1, limit // 4)``) which itself replaced the 1:1
+        positional interleave that let score=None relation strings evict
+        ranked vector hits. Unscored graph rows (no stored embedding) still
+        rank at the bottom — exactly the old append behavior.
+
+        Content-identity dedup is unchanged: a graph edge whose fact is an
+        exact/substring twin of a vector row is dropped (the vector row is
+        the richer record) — but the twin still credits its vector row with
+        an ``_rrf_fuse``-style reciprocal-rank corroboration bonus
+        ``1/(RRF_K + graph_rank + 1)``: leg agreement ranks up. Each row
+        keeps its NATIVE score; the fused value only orders the list.
+        Ties break deterministically: vector leg first, then id.
         """
-        seen_content: set[str] = set()
-        unique_graph: list[MemoryResponse] = []
+        # Graph leg ranked by its cosine scores (strongest first, unscored
+        # last, stable) — this rank drives both graph-vs-graph twin
+        # preference and the corroboration bonus.
+        graph_leg = sorted(
+            graph_responses,
+            key=lambda r: (r.score is None, -(r.score or 0.0)),
+        )
 
-        # Index vector content for fuzzy matching
+        # entries: {"row", "leg" (0=vector, 1=graph), "fused"}
+        entries: list[dict] = []
+        # normalized content -> entry index (insertion-ordered so substring
+        # twin resolution is deterministic: first matching row wins).
+        norm_to_idx: dict[str, int] = {}
+
         for vr in vector_responses:
-            seen_content.add(self.normalize_memory_content(vr.memory))
+            norm_to_idx.setdefault(
+                self.normalize_memory_content(vr.memory), len(entries)
+            )
+            entries.append({"row": vr, "leg": 0, "fused": float(vr.score or 0.0)})
 
-        for gr in graph_responses:
+        for rank, gr in enumerate(graph_leg):
             normalized = self.normalize_memory_content(gr.memory)
-            # Skip if exact or substring match with any vector result
-            if self.find_duplicate_content(normalized, seen_content) is None:
-                unique_graph.append(gr)
-                seen_content.add(normalized)
+            twin_norm = self.find_duplicate_content(normalized, norm_to_idx.keys())
+            if twin_norm is not None:
+                # Content twin: drop the graph row, credit the survivor with
+                # this edge's reciprocal-rank weight (corroboration).
+                entries[norm_to_idx[twin_norm]]["fused"] += 1.0 / (
+                    RRF_K + rank + 1
+                )
+                continue
+            norm_to_idx.setdefault(normalized, len(entries))
+            entries.append({"row": gr, "leg": 1, "fused": float(gr.score or 0.0)})
 
-        if limit is None:
-            # No budget context (legacy callers): vector first, graph after.
-            return vector_responses + unique_graph
-
-        # Graph reservation: max(1, limit // 4) slots, but never the vector
-        # top hit's slot (at limit=1 the single ranked vector hit wins).
-        graph_cap = max(1, limit // 4)
-        if vector_responses:
-            graph_cap = min(graph_cap, limit - 1)
-        vector_target = min(len(vector_responses), max(limit - graph_cap, 0))
-        # Graph rows fill their reservation plus any vector shortfall;
-        # vector reclaims reserved slots the graph leg can't use.
-        graph_take = min(len(unique_graph), limit - vector_target)
-        vector_kept = vector_responses[: limit - graph_take]
-        return vector_kept + unique_graph[:graph_take]
+        entries.sort(
+            key=lambda e: (-e["fused"], e["leg"], str(e["row"].id or ""))
+        )
+        fused = [e["row"] for e in entries]
+        return fused if limit is None else fused[:limit]
 
     def _expire_graph_edges_for_memory(self, mem: dict) -> None:
         """Soft-delete graph edges related to a memory by setting expired_at."""
