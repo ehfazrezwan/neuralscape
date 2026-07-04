@@ -728,8 +728,14 @@ class MemoryService:
             )
             parsed_facts = parse_extraction_response(response.text)
         except Exception as e:
-            logger.error(f"LLM extraction failed for user {user_id}: {e}")
-            return []
+            # Loud failure: propagate so the ARQ job (and task status) reports
+            # failed instead of completing with zero facts. A silent [] here
+            # masked real outages (the caller can't tell "nothing worth
+            # extracting" from "extraction is down").
+            logger.error(
+                f"LLM extraction failed for user {user_id}: {e}", exc_info=True
+            )
+            raise
 
         # Filter out junk facts from extraction
         pre_filter_count = len(parsed_facts)
@@ -746,7 +752,12 @@ class MemoryService:
             logger.info("No facts extracted from conversation")
             return []
 
-        # Step 2: Batch-store all facts (single embed + single Qdrant upsert)
+        # Step 2: Batch-store all facts (single embed + single Qdrant upsert).
+        # A failure here (embedding, Qdrant) must PROPAGATE: the previous
+        # except-and-continue silently stored zero facts while the task
+        # reported success — exactly what hid the gateway's single-input
+        # embed rejection in production. Raising fails the ARQ job, so
+        # /v1/memories/status/{task_id} reports status=failed with the error.
         try:
             stored = self._batch_store_facts(
                 facts=parsed_facts,
@@ -757,8 +768,12 @@ class MemoryService:
                 source="conversation",
             )
         except Exception as e:
-            logger.error(f"Batch store failed: {e}")
-            stored = []
+            logger.error(
+                f"Batch store failed for user {user_id}: {e} — "
+                f"{len(parsed_facts)} extracted facts were NOT stored",
+                exc_info=True,
+            )
+            raise
 
         # Step 3: Add cleaned conversation text to knowledge graph.
         # Conversation extractions are personal (private) by default — the

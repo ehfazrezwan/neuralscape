@@ -981,18 +981,18 @@ class TestExtractAndStore:
         # Returns 2 MemoryResponse objects
         assert len(results) == 2
 
-    def test_extraction_returns_empty_on_llm_error(self, service):
+    def test_extraction_raises_on_llm_error(self, service):
+        """LLM failure must propagate (fail the ARQ job / task status) — a
+        silent [] made a broken extraction pipeline look like success."""
         mock_client = MagicMock()
         service._genai_model = mock_client
         mock_client.models.generate_content.side_effect = Exception("API error")
 
-        results = service.extract_and_store(
-            messages=[{"role": "user", "content": "hello"}],
-            user_id="ehfaz",
-        )
-
-        # Should return empty list instead of falling back to m.add()
-        assert results == []
+        with pytest.raises(Exception, match="API error"):
+            service.extract_and_store(
+                messages=[{"role": "user", "content": "hello"}],
+                user_id="ehfaz",
+            )
         service._memory.add.assert_not_called()
 
     def test_extraction_still_calls_graph_add(self, service):
