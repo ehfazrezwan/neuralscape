@@ -208,8 +208,26 @@ failures).
 ### Phase E — Platform & proof
 
 **E1. SSE live stream** (`/v1/stream`) + minimal single-page feed — the "it's alive" demo.
-**E2. Token-economics telemetry**: `discovery_tokens` vs recall tokens; savings surfaced in the
-injected header and `/status`.
+**E2. Token-economics telemetry** (amended per LeanCTX research, 2026-07 — their honest-meter
+methodology, our stronger counterfactual):
+- Count real tokens with `tiktoken` (`o200k_base`, configurable); never estimate. `token_estimate`
+  stamped at write (shipped with C1) upgrades to a real count here.
+- Per recall, compute both payloads: `baseline_tokens` (full content of all hits) vs
+  `served_tokens` (index rows + memories actually expanded). `saved = baseline − served` — a
+  *measured* counterfactual (index-first recall computes both sides for free), not a model.
+- Report `net_tokens_saved` = saved − NS's own injected overhead (tool schemas/instructions,
+  measured per release and CI-gated to only shrink, plus index-row cost). **Signed; may go
+  negative** — the meter must never overclaim.
+- Keep "re-derivation savings" (tokens to re-read the sources a memory distilled) as a separate,
+  clearly-labeled *estimated* field; never blend it into the measured headline.
+- Persist savings events to an append-only per-user/project ledger (Redis stream):
+  `{ts, op, baseline, served, overhead, net}`; cumulative totals in `/v1/metrics` + a
+  per-response savings line ("saved ~N tokens (X%), net of overhead").
+- Deferred: hash-chained + Ed25519-signed ledger snapshots (offline-verifiable proof; enables
+  outcome-based pricing). Deferred: OCP Evidence Chain records if that draft gains a second
+  implementation.
+- Micro-item: publish a `lean-ctx-addon.toml` for NS's MCP server to the LeanCTX addon registry
+  (distribution shelf-space next to other memory systems; zero code dependency).
 **E3. Session summarizer slots**: recursive short/long summaries per conversation with a
 token-budgeted `get_context` assembler.
 **E4. Custom extraction instructions** per project/user (bounded token budget) — the lightweight
