@@ -425,6 +425,52 @@ async def test_apply_actions_merge_sums_times_derived():
 
 
 @pytest.mark.asyncio
+async def test_apply_actions_merge_stamps_provenance_and_reinforcement():
+    """A1 + A2 together: a single MERGE upsert carries BOTH the loser-id
+    derived_from union and the summed times_derived counter."""
+    payloads = {
+        "a": {"data": "x", "metadata": {"times_derived": 2, "derived_from": ["seed"]}},
+        "b": {"data": "y", "metadata": {"times_derived": 3}},
+    }
+
+    def _retrieve(collection_name=None, ids=None, **kwargs):
+        out = []
+        for mid in ids or []:
+            if mid in payloads:
+                pt = MagicMock()
+                pt.id = mid
+                pt.payload = payloads[mid]
+                out.append(pt)
+        return out
+
+    client = MagicMock()
+    client.retrieve.side_effect = _retrieve
+    service = MagicMock()
+    service._memory.vector_store.client = client
+    service._get_memory.return_value.vector_store.client = client
+    service._get_memory.return_value.embedding_model.embed.return_value = [0.1] * 8
+    service._bridge = None
+
+    result = await consolidate.apply_actions(
+        service,
+        _batch([{"memory_id": m, "content": payloads[m]["data"]} for m in payloads]),
+        [{"type": "merge", "memory_ids": ["a", "b"], "survivor_id": "a",
+          "content": "merged fact", "confidence": 0.9}],
+        dry_run=False,
+    )
+
+    assert not result.errors
+    # exactly one upsert: content + provenance + reinforcement land atomically
+    assert client.upsert.call_count == 1
+    upserted = client.upsert.call_args.kwargs["points"][0]
+    assert upserted.id == "a"
+    assert upserted.payload["data"] == "merged fact"
+    meta = upserted.payload["metadata"]
+    assert meta["derived_from"] == ["seed", "b"]   # union, existing first
+    assert meta["times_derived"] == 5              # 2 + 3
+
+
+@pytest.mark.asyncio
 async def test_apply_actions_merge_defaults_missing_rows_to_one():
     """Rows that vanish between staging and apply still count as 1 each."""
     client = MagicMock()
