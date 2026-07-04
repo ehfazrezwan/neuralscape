@@ -70,9 +70,11 @@ async def answer_one(client: NeuralscapeClient, data: SuiteData, qa: QAItem, *,
         record["retrieval_ms"] = round((time.perf_counter() - t0) * 1000, 1)
         record["retrieved"] = len(hits)
         record["attributed_sessions"] = [s for s in attributed if s]
-        hit = recall_at_k(attributed, qa.evidence_session_ids, k)
-        # Abstention questions have no ground-truth location — skip (LME rule).
-        record["retrieval_hit"] = None if qa.is_abstention else hit
+        # recall_at_k returns None when the item carries no gold evidence —
+        # which is how LongMemEval's *_abs instances are skipped (their
+        # answer_session_ids are empty). Suites that DO annotate evidence on
+        # abstention questions (e.g. BEAM gold_ids) still get scored.
+        record["retrieval_hit"] = recall_at_k(attributed, qa.evidence_session_ids, k)
     except Exception as e:  # noqa: BLE001 — a failed probe must not kill the run
         record["retrieval_error"] = str(e)[:200]
         record["retrieval_hit"] = None

@@ -75,6 +75,17 @@ def fetch_file(url: str, dest: Path, *, expected_sha256: str | None = None,
                     f"{dest.name}: sha256 mismatch (have {actual[:12]}…, "
                     f"expected {expected_sha256[:12]}…). Delete the file to re-fetch."
                 )
+        # Backfill the provenance record if it's missing (file pre-existing /
+        # copied in / manifest deleted) — the sha256 guarantee must hold for
+        # every file the loaders will read, not just ones we downloaded.
+        if dest.name not in load_download_manifest(dest.parent):
+            _record(dest.parent, dest.name, {
+                "url": url,
+                "sha256": sha256_file(dest),
+                "bytes": dest.stat().st_size,
+                "fetched_at": datetime.now(timezone.utc).isoformat(),
+                "note": "pre-existing file; checksum recorded without re-download",
+            })
         return dest
 
     _log(f"{url} → {dest}")

@@ -100,6 +100,23 @@ class CostEstimate:
         }
 
 
+def _extract_calls(data: SuiteData) -> int:
+    """Number of /v1/memories calls ingestion will actually make.
+
+    A session longer than the service's message cap is split into multiple
+    calls (see ingest._batches) — each call pays the prompt overhead, so the
+    per-session count under-estimates suites with very long sessions.
+    """
+    from math import ceil
+
+    from neuralscape_bench.accuracy.ingest import MAX_MESSAGES_PER_CALL
+
+    return sum(
+        max(1, ceil(len(s.turns) / MAX_MESSAGES_PER_CALL))
+        for c in data.conversations for s in c.sessions
+    )
+
+
 def estimate_suite_cost(data: SuiteData, *, model: CostModel = CostModel()) -> CostEstimate:
     stats = data.stats()
     conv_tokens = int(stats["conversation_chars"] / model.chars_per_token)
@@ -107,7 +124,7 @@ def estimate_suite_cost(data: SuiteData, *, model: CostModel = CostModel()) -> C
     n_questions = stats["qa_items"]
 
     ingest_in = int(conv_tokens * model.ingest_llm_passes
-                    + n_sessions * model.ingest_prompt_overhead_tokens)
+                    + _extract_calls(data) * model.ingest_prompt_overhead_tokens)
     ingest_out = int(conv_tokens * model.ingest_output_ratio)
     return CostEstimate(
         suite=data.suite,

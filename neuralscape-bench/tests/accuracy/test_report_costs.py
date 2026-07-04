@@ -101,3 +101,31 @@ def test_markdown_all_not_yet_run():
                   "ConvoMem", "MemBench"):
         assert label in md
     assert "*not yet run*" in md
+
+
+def test_cost_estimate_counts_multi_batch_sessions():
+    """A session over the message cap pays prompt overhead once per call."""
+    from neuralscape_bench.accuracy.costs import _extract_calls
+    from neuralscape_bench.accuracy.ingest import MAX_MESSAGES_PER_CALL
+
+    long_turns = tuple(Turn(role="user", content="x") for _ in range(MAX_MESSAGES_PER_CALL + 5))
+    data = SuiteData(suite="s", conversations=[
+        Conversation(conv_id="c", sessions=(
+            Session(session_id="s1", turns=long_turns),        # 2 calls
+            Session(session_id="s2", turns=long_turns[:3]),    # 1 call
+        )),
+    ])
+    assert _extract_calls(data) == 3
+
+
+def test_fetch_file_backfills_manifest_for_preexisting_file(tmp_path):
+    from neuralscape_bench.accuracy.download import fetch_file, load_download_manifest
+
+    dest = tmp_path / "data.json"
+    dest.write_text('{"ok": true}')
+    out = fetch_file("https://example.invalid/data.json", dest)  # no network: early return
+    assert out == dest
+    manifest = load_download_manifest(tmp_path)
+    assert "data.json" in manifest
+    assert manifest["data.json"]["sha256"]
+    assert manifest["data.json"]["note"].startswith("pre-existing")
