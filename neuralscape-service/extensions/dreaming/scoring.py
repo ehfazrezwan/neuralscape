@@ -6,17 +6,22 @@ Two derived quantities per memory:
   (relevance .30, frequency .24, query-diversity .15, recency .15,
   consolidation .10, conceptual richness .06). Orders deep-phase work and
   gates reinforcement-based promotion.
-- **Retention strength** (MemoryBank / Ebbinghaus, arXiv 2305.10250) —
-  confidence-seeded strength that decays on a forgetting curve from the
-  last recall (or creation) and is reinforced by recall count. Memories
-  below ``prune_strength_threshold`` become PRUNE *candidates* — the LLM
-  pass and the confidence gate still have to concur.
+- **Retention strength** — dynamics-driven when the memory has a
+  persisted salience-dynamics state (A4, dynamics.py: recall-reinforced
+  strength × stability-modulated decay, floored at 0.05); otherwise the
+  legacy MemoryBank / Ebbinghaus path (arXiv 2305.10250) — confidence-
+  seeded strength decaying on a single half-life from the last recall (or
+  creation), reinforced by recall count. Either way, memories below
+  ``prune_strength_threshold`` only become PRUNE *candidates* — the LLM
+  pass and the confidence gate still have to concur (§A4 guardrail 2).
 """
 
 from __future__ import annotations
 
 import math
 from datetime import datetime, timezone
+
+from .dynamics import salience as dynamics_salience
 
 WEIGHTS = {
     "relevance": 0.30,
@@ -124,12 +129,22 @@ def retention_strength(
 
 
 def score_memory(mem: dict, traces: dict, *, now: float | None = None,
-                 strength_half_life_days: float = 45.0) -> dict:
+                 strength_half_life_days: float = 45.0,
+                 dynamics_states: dict | None = None) -> dict:
     """Score one staged memory dict against its trace aggregates.
 
     ``mem`` needs: memory_id, created_at (ISO), confidence?, concepts?,
     related_memory_ids?, times_derived?, mean_relevance? (from trace-time
-    scores when available). Returns ``{promotion_score, retention_strength}``.
+    scores when available). ``dynamics_states`` maps memory_id →
+    :class:`~.dynamics.DynamicsState`; when this memory has one, its
+    retention strength is dynamics-driven (A4), otherwise the legacy
+    single-half-life path applies — ``strength_half_life_days`` serves
+    both (the dynamics path stretches it by stability).
+
+    Returns ``{promotion_score, retention_strength, salience}``.
+    ``salience`` mirrors ``retention_strength`` — one number, two
+    consumers: the PRUNE-nomination threshold in stage_pool and the
+    vault's Essential Story ranking (librarian).
     """
     now = datetime.now(timezone.utc).timestamp() if now is None else now
     created = _parse_ts(mem.get("created_at"))
@@ -138,6 +153,20 @@ def score_memory(mem: dict, traces: dict, *, now: float | None = None,
         times_derived = max(1, int(mem.get("times_derived") or 1))
     except (TypeError, ValueError):
         times_derived = 1
+    state = (dynamics_states or {}).get(mem.get("memory_id") or "")
+    if state is not None:
+        retention = dynamics_salience(
+            state, now=now, base_half_life_days=strength_half_life_days
+        )
+    else:
+        retention = retention_strength(
+            base_confidence=mem.get("confidence"),
+            recall_count=t.get("recall_count", 0),
+            last_recalled_at=t.get("last_recalled_at", 0.0),
+            created_at=created,
+            now=now,
+            half_life_days=strength_half_life_days,
+        )
     return {
         "promotion_score": promotion_score(
             relevance=float(mem.get("mean_relevance") or 0.0),
@@ -150,12 +179,6 @@ def score_memory(mem: dict, traces: dict, *, now: float | None = None,
             times_derived=times_derived,
             now=now,
         ),
-        "retention_strength": retention_strength(
-            base_confidence=mem.get("confidence"),
-            recall_count=t.get("recall_count", 0),
-            last_recalled_at=t.get("last_recalled_at", 0.0),
-            created_at=created,
-            now=now,
-            half_life_days=strength_half_life_days,
-        ),
+        "retention_strength": retention,
+        "salience": retention,
     }

@@ -126,6 +126,47 @@ def _reinforcement_boost(score: float | None, metadata: dict | None) -> float | 
     return score * (1.0 + REINFORCEMENT_BOOST_K * math.log1p(times_derived - 1))
 
 
+def _salience_tiebreak(responses: list) -> list:
+    """A4 guardrail 1: bounded logarithmic salience tie-breaker on recall.
+
+    OFF by default (``DREAMING_SALIENCE_RECALL_K=0.0``) — and when off (or
+    on any failure) this returns immediately, without touching Redis or
+    the responses, so the default search path is byte-identical to a
+    world without salience dynamics. When enabled the boost is
+    ``score * (1 + k*log1p(strength_signal))``: a small, bounded
+    multiplicative lift (the config caps k at 0.1 ⇒ ≤ ~16% at the strength
+    cap) so relevance dominates — a faded-but-relevant memory beats a
+    hot-but-mediocre one at any permitted k. Salience never *gates*
+    retrieval: nothing is dropped or filtered here, the boost only
+    re-orders results whose relevance scores are already close.
+    (Distinct from the ``times_derived`` boost above: that is
+    reinforcement-by-dedup stored on the row; this is recall-frequency
+    strength from the dreaming traces — the two signals never double-count
+    one another.)
+    """
+    try:
+        from extensions.dreaming.config import dreaming_settings
+
+        k = float(dreaming_settings.salience_recall_k)
+    except Exception:
+        return responses
+    if k <= 0.0 or not responses:
+        return responses
+    try:
+        from extensions.dreaming.traces import get_strength_signals
+
+        signals = get_strength_signals([r.id for r in responses if r.id])
+        if not signals:
+            return responses
+        for r in responses:
+            signal = signals.get(r.id or "", 0.0)
+            if r.score is not None and signal > 0.0:
+                r.score = r.score * (1.0 + k * math.log1p(signal))
+    except Exception:
+        logger.debug("salience tie-break skipped (non-fatal)", exc_info=True)
+    return responses
+
+
 def _is_junk_fact(content: str) -> bool:
     """Return True if an extracted fact is a raw event log rather than contextual knowledge."""
     stripped = content.strip()
@@ -1853,6 +1894,8 @@ class MemoryService:
             if r.id and r.id not in seen_ids:
                 seen_ids.add(r.id)
                 deduped.append(r)
+        # A4 salience tie-breaker (opt-in; k=0 default returns untouched).
+        deduped = _salience_tiebreak(deduped)
         deduped.sort(key=lambda r: r.score or 0.0, reverse=True)
         vector_responses = deduped[:limit]
 

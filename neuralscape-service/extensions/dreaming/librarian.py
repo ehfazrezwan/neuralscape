@@ -609,11 +609,26 @@ async def update_vault(
 
 
 def _essential_candidates(valid_topics, known: dict[str, dict]) -> list[dict]:
-    """The pool's top promotion-scored one-liners, wikilink-ready.
+    """The pool's top one-liners, wikilink-ready.
+
+    Ranked by ``salience`` (A4 dynamics-driven when the memory has recall
+    state, retention fallback otherwise — B1: "top memories *by
+    salience*"), with ``promotion_score`` as the fallback for staged rows
+    scored before the salience field existed.
 
     Faded rows never make the story — Home is the wake-up stack, and a
     memory dimmed below the retention threshold has no business there.
     """
+
+    def _rank(mem: dict) -> float:
+        val = mem.get("salience")
+        if val is None:
+            val = mem.get("promotion_score") or 0.0
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return 0.0
+
     out: list[dict] = []
     for title, page_name, ids, _summary in valid_topics:
         for mid in ids:
@@ -622,7 +637,7 @@ def _essential_candidates(valid_topics, known: dict[str, dict]) -> list[dict]:
                 continue
             out.append(
                 {
-                    "score": round(float(mem.get("promotion_score") or 0.0), 4),
+                    "score": round(_rank(mem), 4),
                     "text": _one_line(mem.get("content") or "", 200),
                     "page": page_name,
                     "title": title,

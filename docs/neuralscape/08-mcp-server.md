@@ -35,7 +35,7 @@ _task_manager = TaskManager()                   # mcp_server.py:29
 | 8 | `edit_memory` | `memory_id` | `content`, `category`, `project_id`, `tags[]`, `visibility`, v2 fields (`domain`, `observation_type`, `concepts`, `confidence`, `expires_at`) | `.patch_memory()` | sync + graph job |
 | 9 | `retag_memories` | ≥1 filter, ≥1 op | filters: `scope`, `category`, `project_id`, `visibility`, `tags_contains[]`; ops: `add_tags[]`, `remove_tags[]`, `set_category`, `set_project_id`; `dry_run` | `.retag_memories()` / `enqueue_retag()` | async (dry_run sync) |
 
-(The table lists the founding tool set plus the edit tools; the live server has 14 tools — later additions `ingest_document`, `ingest_text`, `list_projects`, `list_processes`, and `get_process` are covered in [21-document-ingestion](./21-document-ingestion.md) and the processes docs.)
+(The table lists the founding tool set plus the edit tools; the live server has 17 tools — later additions `ingest_document`, `ingest_text`, `list_projects`, `list_processes`, `get_process`, `get_reasoning_chain`, `schedule_dream`, and `get_card` are covered in [21-document-ingestion](./21-document-ingestion.md) and the processes docs.)
 
 All tool handlers return `list[TextContent]` containing a single `TextContent(type="text", text=json.dumps(...))`. Tool definitions are at `neuralscape-service/mcp_server.py:32-294`; dispatch lives in the `call_tool` handler at `neuralscape-service/mcp_server.py:297-434`.
 

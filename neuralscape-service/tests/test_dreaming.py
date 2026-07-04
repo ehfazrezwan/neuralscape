@@ -76,6 +76,10 @@ class FakeRedis:
 
 
 class FakePipeline:
+    """Returns ONE result per queued op, like a real redis pipeline —
+    the trace writer positionally reads the PFADD replies (novelty flags
+    for the salience dynamics), so result alignment matters."""
+
     def __init__(self, r: FakeRedis):
         self.r = r
         self.ops: list = []
@@ -90,7 +94,7 @@ class FakePipeline:
         self.ops.append(("pfadd", key, value))
 
     def expire(self, key, ttl):
-        pass
+        self.ops.append(("expire", key, ttl))
 
     def hmget(self, key, fields):
         self.ops.append(("hmget", key, tuple(fields)))
@@ -104,10 +108,18 @@ class FakePipeline:
             if op[0] == "hincrby":
                 h = self.r.hashes.setdefault(op[1], {})
                 h[op[2]] = int(h.get(op[2], 0)) + op[3]
+                results.append(h[op[2]])
             elif op[0] == "hset":
+                existed = op[2] in self.r.hashes.get(op[1], {})
                 self.r.hashes.setdefault(op[1], {})[op[2]] = op[3]
+                results.append(0 if existed else 1)
             elif op[0] == "pfadd":
-                self.r.hll.setdefault(op[1], set()).add(op[2])
+                hll = self.r.hll.setdefault(op[1], set())
+                added = op[2] not in hll
+                hll.add(op[2])
+                results.append(1 if added else 0)
+            elif op[0] == "expire":
+                results.append(True)
             elif op[0] == "hmget":
                 h = self.r.hashes.get(op[1], {})
                 results.append([h.get(f) for f in op[2]])
