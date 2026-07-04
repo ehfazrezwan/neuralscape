@@ -143,7 +143,10 @@ class TestDeduplicateResponses:
         assert "vector" in sources
         assert "graph" in sources
 
-    def test_interleaves_results(self):
+    def test_vector_hits_precede_graph_rows(self):
+        """Audit 27 #2: ranked vector hits keep priority — graph rows are
+        appended after them, never positionally interleaved (the old 1:1
+        weave let unranked relation strings evict ranked vector hits)."""
         vector = [
             MemoryResponse(id="v1", memory="Fact A", source="vector"),
             MemoryResponse(id="v2", memory="Fact B", source="vector"),
@@ -154,11 +157,8 @@ class TestDeduplicateResponses:
         ]
         result = self.svc._deduplicate_responses(vector, graph)
         assert len(result) == 4
-        # Should be: v1, g1, v2, g2
-        assert result[0].id == "v1"
-        assert result[1].id == "g1"
-        assert result[2].id == "v2"
-        assert result[3].id == "g2"
+        # Should be: v1, v2, g1, g2 — vector first, graph after
+        assert [r.id for r in result] == ["v1", "v2", "g1", "g2"]
 
     def test_case_insensitive_dedup(self):
         vector = [MemoryResponse(id="v1", memory="PREFERS TABS", source="vector")]

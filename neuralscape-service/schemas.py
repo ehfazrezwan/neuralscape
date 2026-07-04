@@ -1050,6 +1050,12 @@ class MemoryResponse(BaseModel):
     title: str | None = None
     token_estimate: int | None = None
 
+    # Dedup revival (audit 27 #5): True only on a store response whose
+    # content-hash dedup hit a dream-tombstoned row — re-deriving the fact
+    # resurrected it (tombstone cleared, recallable again). Null on every
+    # other response (searches, plain dedup hits, new inserts).
+    revived: bool | None = None
+
 
 class StoreMemoryResponse(BaseModel):
     status: str = "ok"

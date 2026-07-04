@@ -93,7 +93,66 @@ def _parse_expires_at(value) -> datetime | None:
 # to outrank a one-off at comparable cosine similarity without letting
 # repetition drown out relevance. `times_derived - 1` (the count of *extra*
 # derivations) means unreinforced/legacy rows keep their raw score exactly.
+#
+# Audit 27 #4: the live value comes from `settings.reinforcement_boost_k`
+# (env REINFORCEMENT_BOOST_K; 0 disables byte-identically) — this constant
+# is only the historical default / test reference. `times_derived` is
+# clamped at REINFORCEMENT_TIMES_DERIVED_CAP and the boosted score capped
+# at 1.0, so an over-reinforced mediocre hit (e.g. 0.80 cosine, td=30) can
+# no longer outrank a plainly better one (0.90, td=1), and returned scores
+# stay in the cosine range.
 REINFORCEMENT_BOOST_K = 0.05
+REINFORCEMENT_TIMES_DERIVED_CAP = 10
+
+
+# ── Hybrid recall: dense + BM25 lexical rank fusion (audit 27 #1) ──────
+# Commit 7024a81 ("embed once") replaced mem0-v3 hybrid search with a
+# dense-only exactly-k query per pool, silently amputating the BM25 leg —
+# sparse vectors were still WRITTEN on every insert (mem0 fork qdrant.py)
+# but never queried, so proper-noun recall collapsed. The helpers below
+# restore a lexical pass per pool and fuse the two legs by reciprocal rank
+# BEFORE the pool merge, keeping the single query embed.
+
+# Standard RRF constant (Cormack et al.): a hit at 0-based rank r
+# contributes 1 / (RRF_K + r + 1).
+RRF_K = 60
+
+
+def _rrf_fuse(dense_hits: list, lexical_hits: list, limit: int) -> list[dict]:
+    """Rank-fuse one pool's dense and lexical (BM25) hit lists.
+
+    Returns up to ``limit`` entries ``{"hit", "dense", "rrf"}`` ordered by
+    summed reciprocal-rank score; a hit present in both legs accumulates
+    both contributions, so leg agreement ranks it up. ``dense`` marks
+    entries whose ``hit.score`` is a real cosine similarity — lexical-only
+    entries carry a raw BM25 score that is NOT cosine-comparable, so the
+    caller imputes a presentation score for those. With an empty lexical
+    list this is an order-preserving passthrough of the dense ranking
+    (1/(k+r) is strictly decreasing and the sort is stable).
+    """
+    fused: dict[str, dict] = {}
+    for rank, hit in enumerate(dense_hits):
+        hid = str(getattr(hit, "id", ""))
+        fused[hid] = {"hit": hit, "dense": True, "rrf": 1.0 / (RRF_K + rank + 1)}
+    for rank, hit in enumerate(lexical_hits):
+        hid = str(getattr(hit, "id", ""))
+        entry = fused.get(hid)
+        if entry is None:
+            fused[hid] = {"hit": hit, "dense": False, "rrf": 1.0 / (RRF_K + rank + 1)}
+        else:
+            entry["rrf"] += 1.0 / (RRF_K + rank + 1)
+    ordered = sorted(fused.values(), key=lambda e: e["rrf"], reverse=True)
+    return ordered[:limit]
+
+
+def _dense_score_floor(dense_hits: list) -> float | None:
+    """Weakest cosine score in a pool's dense leg (imputed score for
+    lexical-only hits: presence via a strong keyword match is worth at
+    least as much as the pool's weakest dense candidate — never more)."""
+    scores = [
+        s for s in (getattr(h, "score", None) for h in dense_hits) if s is not None
+    ]
+    return min(scores) if scores else None
 
 
 def _times_derived_from_metadata(metadata: dict | None) -> int:
@@ -117,13 +176,29 @@ def _reinforcement_boost(score: float | None, metadata: dict | None) -> float | 
 
     Feature-safe: None scores pass through, and times_derived <= 1 (including
     every legacy row without the field) returns the score unchanged.
+
+    Audit 27 #4 guardrails:
+    - k comes from ``settings.reinforcement_boost_k``; k <= 0 returns the
+      raw score immediately (byte-identical disable path).
+    - effective times_derived clamps at REINFORCEMENT_TIMES_DERIVED_CAP
+      (=10 ⇒ max lift ≈ +12% at the default k), so unbounded reinforcement
+      can never drown out relevance.
+    - the boosted score caps at 1.0 — recall scores stay cosine-shaped.
     """
     if score is None:
         return None
-    times_derived = _times_derived_from_metadata(metadata)
+    try:
+        k = float(settings.reinforcement_boost_k)
+    except (AttributeError, TypeError, ValueError):
+        k = REINFORCEMENT_BOOST_K
+    if k <= 0.0:
+        return score
+    times_derived = min(
+        _times_derived_from_metadata(metadata), REINFORCEMENT_TIMES_DERIVED_CAP
+    )
     if times_derived <= 1:
         return score
-    return score * (1.0 + REINFORCEMENT_BOOST_K * math.log1p(times_derived - 1))
+    return min(1.0, score * (1.0 + k * math.log1p(times_derived - 1)))
 
 
 def _salience_tiebreak(responses: list) -> list:
@@ -165,6 +240,55 @@ def _salience_tiebreak(responses: list) -> list:
     except Exception:
         logger.debug("salience tie-break skipped (non-fatal)", exc_info=True)
     return responses
+
+
+def content_hash(content: str) -> str:
+    """Canonical content hash for write-path dedup (audit 27 #6).
+
+    The service-layer writers of ``payload["hash"]`` — store_raw, the
+    conversation batch path, checkpoints, and the dreaming rewrite (which
+    re-embeds new text in place) — all route through this helper; new
+    writers should too. The exact-dedup cron groups rows by this value and
+    hard-deletes "duplicates", so a stale or divergent hash silently
+    corrupts dedup in both directions.
+    """
+    return hashlib.md5(content.encode()).hexdigest()
+
+
+def _live_edges_filter():
+    """Graphiti ``SearchFilters`` selecting only bi-temporally LIVE edges.
+
+    Excludes any edge with a non-null ``invalid_at`` or ``expired_at`` —
+    i.e. facts the dreaming sweep (or Graphiti's own contradiction
+    handling) has invalidated/superseded (audit 27 #3). Built per call:
+    SearchFilters is a mutable pydantic model and a shared singleton
+    could be mutated by a concurrent caller.
+    """
+    from graphiti_core.search.search_filters import (
+        ComparisonOperator,
+        DateFilter,
+        SearchFilters,
+    )
+
+    return SearchFilters(
+        invalid_at=[[DateFilter(comparison_operator=ComparisonOperator.is_null)]],
+        expired_at=[[DateFilter(comparison_operator=ComparisonOperator.is_null)]],
+    )
+
+
+def _edge_is_invalidated(edge) -> bool:
+    """True when a graph edge carries a bi-temporal invalidation stamp.
+
+    Post-filter companion to ``_live_edges_filter`` for result paths where
+    the Cypher-level filter may not have applied. Only real timestamp
+    values (datetime or non-empty string) count — mock/partial edge
+    objects without the attribute are treated as live.
+    """
+    for attr in ("invalid_at", "expired_at"):
+        value = getattr(edge, attr, None)
+        if isinstance(value, datetime) or (isinstance(value, str) and value.strip()):
+            return True
+    return False
 
 
 def _is_junk_fact(content: str) -> bool:
@@ -1012,21 +1136,28 @@ class MemoryService:
 
         m = self._get_memory()
         now_iso = datetime.now(timezone.utc).isoformat()
-        content_hash = hashlib.md5(content.encode()).hexdigest()
+        chash = content_hash(content)
 
         # ── Content-hash dedup ──
         # Skip insert if this exact (user_id, scope, hash) already exists.
         existing = self._find_by_content_hash(
-            user_id=user_id, content_hash=content_hash, scope=scope,
+            user_id=user_id, content_hash=chash, scope=scope,
             project_id=project_id, visibility=effective_visibility,
         )
         if existing is not None:
             logger.info(
-                f"Dedup hit for user={user_id} hash={content_hash[:8]}... — returning existing id={existing.id}"
+                f"Dedup hit for user={user_id} hash={chash[:8]}... — returning existing id={existing.id}"
             )
             # Reinforcement-aware dedup: the caller just re-derived this exact
             # fact — count it on the survivor instead of discarding the signal.
             self._bump_times_derived(existing.id, 1)
+            # Audit 27 #5: if the survivor was dream-tombstoned, re-derivation
+            # resurrects it — otherwise this dedup short-circuit silently
+            # swallows the write while the fact stays excluded from recall.
+            # Runs AFTER the bump: the bump's read-merge-write could otherwise
+            # re-persist the stale tombstone flag it read moments earlier.
+            if self._revive_if_tombstoned(existing.id):
+                existing.revived = True
             # created=False → caller must NOT re-enqueue graph enrichment.
             return ([existing], False) if return_created else [existing]
 
@@ -1084,7 +1215,7 @@ class MemoryService:
 
         payload = {
             "data": content,
-            "hash": content_hash,
+            "hash": chash,
             "created_at": now_iso,
             "user_id": user_id,
             "agent_id": agent_id,
@@ -1280,30 +1411,82 @@ class MemoryService:
 
         # qdrant-client v1.13+ removed `.search()` in favor of `.query_points()`;
         # the response wraps hits in a `.points` attribute.
+        qfilter = Filter(must=must, must_not=must_not)
         result = client.query_points(
             collection_name=settings.qdrant_collection,
             query=embedding,
-            query_filter=Filter(must=must, must_not=must_not),
+            query_filter=qfilter,
             limit=limit,
             with_payload=True,
         )
-        hits = getattr(result, "points", result) or []
+        dense_hits = list(getattr(result, "points", result) or [])
+
+        # Hybrid recall (audit 27 #1): BM25 lexical leg under the SAME
+        # filter, rank-fused with the dense leg before the pool merge.
+        lexical_hits = self._lexical_pool_hits(m, query, qfilter, limit)
+        fused = _rrf_fuse(dense_hits, lexical_hits, limit)
+        dense_floor = _dense_score_floor(dense_hits)
 
         out: list[MemoryResponse] = []
-        for hit in hits:
+        for entry in fused:
+            hit = entry["hit"]
             payload = getattr(hit, "payload", None) or {}
             metadata = payload.get("metadata", {})
+            # Lexical-only hits carry a raw BM25 score (not cosine-comparable);
+            # impute the pool's dense floor so the cross-pool score sort stays
+            # meaningful without ever letting a keyword match outrank a
+            # stronger dense hit on score alone.
+            raw_score = getattr(hit, "score", None) if entry["dense"] else dense_floor
             mem_dict = {
                 "id": str(getattr(hit, "id", "")),
                 "memory": payload.get("data", ""),
                 "metadata": metadata,
                 # Reinforcement-aware recall: memories that survived N dedup
                 # collapses rank slightly above one-offs at equal similarity.
-                "score": _reinforcement_boost(getattr(hit, "score", None), metadata),
+                "score": _reinforcement_boost(raw_score, metadata),
                 "created_at": payload.get("created_at"),
             }
             out.append(self._mem_to_response(mem_dict))
         return out
+
+    def _lexical_pool_hits(self, m, query: str, query_filter, limit: int) -> list:
+        """BM25 lexical leg for one pool (audit 27 #1).
+
+        Runs a sparse-vector keyword query against the collection's
+        ``bm25`` named-vector slot using the SAME payload filter as the
+        pool's dense pass, so the lexical leg can never widen
+        visibility/scope. Degrades to an empty list (dense-only search,
+        no error) when:
+
+        - the collection predates the v3 hybrid schema (no ``bm25`` sparse
+          slot — the mem0 fork detects this at startup via
+          ``_has_bm25_slot``),
+        - the configured vector store isn't the NS mem0 Qdrant fork,
+        - the query is empty or sparse encoding fails,
+        - the Qdrant call errors — recall must never break on the lexical
+          extra.
+        """
+        vs = m.vector_store
+        # `is True` (not truthiness): only the fork sets a real bool; any
+        # other store lacks the attribute and must skip the sparse leg.
+        if not query or getattr(vs, "_has_bm25_slot", False) is not True:
+            return []
+        try:
+            sparse = vs._encode_bm25(query)
+            if sparse is None:
+                return []
+            result = vs.client.query_points(
+                collection_name=settings.qdrant_collection,
+                query=sparse,
+                using="bm25",
+                query_filter=query_filter,
+                limit=limit,
+                with_payload=True,
+            )
+            return list(getattr(result, "points", result) or [])
+        except Exception as e:
+            logger.debug(f"BM25 lexical leg failed (non-fatal, dense-only): {e}")
+            return []
 
     def _search_standard_pool(
         self,
@@ -1350,6 +1533,7 @@ class MemoryService:
         observation_type: str | None,
         concepts: list[str] | None,
         limit: int,
+        query: str = "",
     ) -> list[MemoryResponse]:
         """Search Qdrant for the caller's own memories using a precomputed vector.
 
@@ -1360,6 +1544,9 @@ class MemoryService:
         single ``search()`` embeds the query ONCE and reuses ``query_embedding``
         across every pool/scope, instead of re-embedding per ``Memory.search``
         call (the embed round-trip dominates read latency).
+
+        ``query`` (raw text) feeds the BM25 lexical leg only — sparse
+        encoding is lexical, not an embed round-trip. Empty ⇒ dense-only.
         """
         from qdrant_client.models import (
             FieldCondition,
@@ -1388,19 +1575,30 @@ class MemoryService:
         if concepts:
             must.append(FieldCondition(key="metadata.concepts", match=MatchAny(any=concepts)))
 
+        qfilter = Filter(must=must, must_not=must_not)
         result = client.query_points(
             collection_name=settings.qdrant_collection,
             query=query_embedding,
-            query_filter=Filter(must=must, must_not=must_not),
+            query_filter=qfilter,
             limit=limit,
             with_payload=True,
         )
-        hits = getattr(result, "points", result) or []
+        dense_hits = list(getattr(result, "points", result) or [])
+
+        # Hybrid recall (audit 27 #1): BM25 lexical leg under the SAME
+        # filter, rank-fused with the dense leg before the pool merge.
+        lexical_hits = self._lexical_pool_hits(m, query, qfilter, limit)
+        fused = _rrf_fuse(dense_hits, lexical_hits, limit)
+        dense_floor = _dense_score_floor(dense_hits)
 
         out: list[MemoryResponse] = []
-        for hit in hits:
+        for entry in fused:
+            hit = entry["hit"]
             payload = getattr(hit, "payload", None) or {}
             metadata = payload.get("metadata", {})
+            # Lexical-only hits: impute the pool's dense floor (see
+            # _search_shared_pool for the rationale).
+            raw_score = getattr(hit, "score", None) if entry["dense"] else dense_floor
             mem_dict = {
                 "id": str(getattr(hit, "id", "")),
                 "memory": payload.get("data", ""),
@@ -1408,7 +1606,7 @@ class MemoryService:
                 # Same reinforcement boost as the shared/standard pools — the
                 # re-rank must be identical across pools or a reinforced
                 # private memory would lose to its unreinforced shared twin.
-                "score": _reinforcement_boost(getattr(hit, "score", None), metadata),
+                "score": _reinforcement_boost(raw_score, metadata),
                 "created_at": payload.get("created_at"),
             }
             out.append(self._mem_to_response(mem_dict))
@@ -1486,6 +1684,55 @@ class MemoryService:
         except Exception as e:
             logger.warning(f"Content-hash dedup lookup failed (non-fatal): {e}")
             return None
+
+    def _revive_if_tombstoned(self, memory_id: str) -> bool:
+        """Resurrect a dream-tombstoned dedup survivor (audit 27 #5).
+
+        ``_find_by_content_hash`` matches tombstoned rows too — before this
+        existed, re-storing a fact the dreaming sweep had tombstoned was
+        silently swallowed by the dedup short-circuit and the fact stayed
+        excluded from recall forever (search filters
+        ``metadata.dream_tombstoned=true``). Revival semantics:
+        re-derivation is fresh evidence the fact is live, so the tombstone
+        flag is cleared and the row becomes recallable again.
+
+        The clear is an atomic nested-key merge (``set_payload`` with
+        ``key="metadata"``) rather than a read-merge-write of the whole
+        metadata dict, so it can't race a concurrent metadata patch into
+        resurrecting stale fields.
+
+        Returns True if a tombstone was actually cleared. Best-effort:
+        failures log and return False — a lost revival must never block
+        the write path.
+        """
+        try:
+            client = self._memory.vector_store.client
+            collection = settings.qdrant_collection
+            points = client.retrieve(
+                collection_name=collection,
+                ids=[memory_id],
+                with_payload=True,
+                with_vectors=False,
+            )
+            if not points:
+                return False
+            meta = (points[0].payload or {}).get("metadata") or {}
+            if not meta.get("dream_tombstoned"):
+                return False
+            client.set_payload(
+                collection_name=collection,
+                payload={
+                    "dream_tombstoned": False,
+                    "dream_revived_at": datetime.now(timezone.utc).isoformat(),
+                },
+                points=[memory_id],
+                key="metadata",
+            )
+            logger.info(f"Revived dream-tombstoned memory {memory_id} on re-derivation")
+            return True
+        except Exception as e:
+            logger.warning(f"Tombstone revival failed for {memory_id} (non-fatal): {e}")
+            return False
 
     def _bump_times_derived(self, memory_id: str, add: int = 1) -> None:
         """Increment ``metadata.times_derived`` on a surviving memory.
@@ -1708,7 +1955,7 @@ class MemoryService:
             mid = str(uuid.uuid4())
             payload = {
                 "data": content,
-                "hash": hashlib.md5(content.encode()).hexdigest(),
+                "hash": content_hash(content),
                 "created_at": now_iso,
                 "user_id": user_id,
                 "agent_id": agent_id,
@@ -1849,7 +2096,7 @@ class MemoryService:
                             m=m, user_id=user_id, query_embedding=query_embedding,
                             project_id=project_id, categories=categories, scope=None,
                             domain=domain, observation_type=observation_type,
-                            concepts=concepts, limit=limit,
+                            concepts=concepts, limit=limit, query=query,
                         )
                     )
                     vector_responses.extend(
@@ -1857,7 +2104,7 @@ class MemoryService:
                             m=m, user_id=user_id, query_embedding=query_embedding,
                             project_id=None, categories=categories, scope="global",
                             domain=domain, observation_type=observation_type,
-                            concepts=concepts, limit=limit,
+                            concepts=concepts, limit=limit, query=query,
                         )
                     )
                 else:
@@ -1866,7 +2113,7 @@ class MemoryService:
                             m=m, user_id=user_id, query_embedding=query_embedding,
                             project_id=project_id, categories=categories, scope=scope,
                             domain=domain, observation_type=observation_type,
-                            concepts=concepts, limit=limit,
+                            concepts=concepts, limit=limit, query=query,
                         )
                     )
             except Exception as e:
@@ -2049,8 +2296,11 @@ class MemoryService:
                 if r.visibility == visibility or r.visibility is None
             ]
 
-        # Deduplicate and enforce caller's limit
-        combined = self._deduplicate_responses(vector_responses, graph_responses)
+        # Deduplicate and enforce caller's limit — ranked vector hits keep
+        # priority; graph rows are appended after, capped within the limit.
+        combined = self._deduplicate_responses(
+            vector_responses, graph_responses, limit=limit
+        )
 
         # memory_kind filter (data-layer connectors). Legacy memories have no
         # memory_kind, so a "fact" filter treats null as fact (back-compat);
@@ -2299,11 +2549,23 @@ class MemoryService:
 
         try:
             results = self._run_on_bridge(
-                g.search_(query=query, config=config, group_ids=group_ids)
+                g.search_(
+                    query=query,
+                    config=config,
+                    group_ids=group_ids,
+                    # Audit 27 #3: bi-temporal liveness — edges the dreaming
+                    # sweep stamped invalid_at/expired_at (INVALIDATE / PRUNE /
+                    # MERGE, see extensions/dreaming/graph_patcher.py) must not
+                    # surface as live facts and eat top-k slots.
+                    search_filter=_live_edges_filter(),
+                )
             )
             edges = [
                 {"uuid": e.uuid, "name": e.name, "fact": e.fact}
                 for e in results.edges
+                # Belt-and-suspenders: some drivers/recipes skip the Cypher
+                # filter constructor, so drop stamped edges here too.
+                if not _edge_is_invalidated(e)
             ]
             nodes = [
                 {"uuid": n.uuid, "name": n.name, "summary": n.summary}
@@ -4423,11 +4685,23 @@ class MemoryService:
         self,
         vector_responses: list[MemoryResponse],
         graph_responses: list[MemoryResponse],
+        limit: int | None = None,
     ) -> list[MemoryResponse]:
-        """Deduplicate and interleave vector and graph results.
+        """Deduplicate and weave vector and graph results (audit 27 #2).
 
         Removes graph results whose content closely matches a vector result,
-        then interleaves the remaining results (vector-1, graph-1, vector-2, ...).
+        then appends the surviving graph rows AFTER the vector hits: scored
+        vector hits keep their ranked order and take priority. The old 1:1
+        positional interleave let unranked (score=None) relation strings
+        evict up to half of the ranked vector top-k after the caller's
+        ``[:limit]`` cut.
+
+        When ``limit`` is given, graph rows are capped at
+        ``max(1, limit // 4)`` slots within the limit — except they may
+        additionally fill any shortfall when the vector legs returned fewer
+        than ``limit`` hits. Vector hits are only ever displaced down to
+        ``limit - cap`` slots (e.g. 8 of 10 at the default k=10), never
+        below.
         """
         seen_content: set[str] = set()
         unique_graph: list[MemoryResponse] = []
@@ -4448,18 +4722,21 @@ class MemoryService:
                 unique_graph.append(gr)
                 seen_content.add(normalized)
 
-        # Interleave: vector-1, graph-1, vector-2, graph-2, ...
-        interleaved: list[MemoryResponse] = []
-        vi, gi = 0, 0
-        while vi < len(vector_responses) or gi < len(unique_graph):
-            if vi < len(vector_responses):
-                interleaved.append(vector_responses[vi])
-                vi += 1
-            if gi < len(unique_graph):
-                interleaved.append(unique_graph[gi])
-                gi += 1
+        if limit is None:
+            # No budget context (legacy callers): vector first, graph after.
+            return vector_responses + unique_graph
 
-        return interleaved
+        # Graph reservation: max(1, limit // 4) slots, but never the vector
+        # top hit's slot (at limit=1 the single ranked vector hit wins).
+        graph_cap = max(1, limit // 4)
+        if vector_responses:
+            graph_cap = min(graph_cap, limit - 1)
+        vector_target = min(len(vector_responses), max(limit - graph_cap, 0))
+        # Graph rows fill their reservation plus any vector shortfall;
+        # vector reclaims reserved slots the graph leg can't use.
+        graph_take = min(len(unique_graph), limit - vector_target)
+        vector_kept = vector_responses[: limit - graph_take]
+        return vector_kept + unique_graph[:graph_take]
 
     def _expire_graph_edges_for_memory(self, mem: dict) -> None:
         """Soft-delete graph edges related to a memory by setting expired_at."""

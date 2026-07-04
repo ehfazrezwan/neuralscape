@@ -449,6 +449,14 @@ def _rewrite_content(
         meta.update(extra_meta)
     payload["metadata"] = meta
     payload["data"] = new_content
+    # Audit 27 #6: the content hash MUST follow the content. A stale hash
+    # corrupts write-path dedup (a re-store of the new text isn't caught;
+    # a re-store of the OLD text wrongly short-circuits onto this row) and
+    # the exact-dedup cron, which groups by hash and hard-deletes
+    # "duplicates". Same helper as store_raw — never a re-implementation.
+    from memory_service import content_hash
+
+    payload["hash"] = content_hash(new_content)
     payload["updated_at"] = datetime.now(timezone.utc).isoformat()
     vector = m.embedding_model.embed(new_content, memory_action="update")
     from qdrant_client.models import PointStruct

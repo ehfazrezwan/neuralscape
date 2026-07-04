@@ -105,6 +105,15 @@ class Settings(BaseSettings):
     dedup_batch_size: int = 100
     dedup_cron_hours: set = {0, 6, 12, 18}
 
+    # ── Reinforcement-aware recall boost (times_derived) ──────────────
+    # Strength k of the deterministic recall re-rank
+    # boosted = score * (1 + k * log1p(min(times_derived, 10) - 1)),
+    # final score capped at 1.0. Env: REINFORCEMENT_BOOST_K. Default 0.05
+    # (max lift ≈ +12% at the times_derived cap); 0 disables the boost with
+    # a byte-identical scoring path (same kill-switch pattern as
+    # DREAMING_SALIENCE_RECALL_K).
+    reinforcement_boost_k: float = 0.05
+
     # ── Ask / reasoning tiers (roadmap C3) ────────────────────────────
     # Per-tier cap on a single answering-LLM call (seconds). The total ask
     # budget is bounded by this times the tier's iteration cap (see
