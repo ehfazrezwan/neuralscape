@@ -1,0 +1,149 @@
+{
+  "model": [
+    "4.0 chars/token",
+    "ingest: 3.5 LLM input passes/session (+600 prompt tokens/call), output=12% of input",
+    "ask(high): 12000 in / 500 out per question",
+    "judge: 450 in / 40 out per question",
+    "pricing: $0.3/M in, $2.5/M out (Gemini 2.5 Flash list \u2014 override for other models)"
+  ],
+  "suites": [
+    {
+      "suite": "locomo",
+      "sessions": 272,
+      "questions": 1986,
+      "tokens": {
+        "ingest_input": 914618,
+        "ingest_output": 25762,
+        "answer_input": 23832000,
+        "answer_output": 993000,
+        "judge_input": 893700,
+        "judge_output": 79440,
+        "total_input": 25640318,
+        "total_output": 1098202
+      },
+      "estimated_usd": 10.44,
+      "assumptions": [
+        "4.0 chars/token",
+        "ingest: 3.5 LLM input passes/session (+600 prompt tokens/call), output=12% of input",
+        "ask(high): 12000 in / 500 out per question",
+        "judge: 450 in / 40 out per question",
+        "pricing: $0.3/M in, $2.5/M out (Gemini 2.5 Flash list \u2014 override for other models)"
+      ]
+    },
+    {
+      "suite": "longmemeval_s",
+      "sessions": 23867,
+      "questions": 500,
+      "tokens": {
+        "ingest_input": 228387861,
+        "ingest_output": 7339462,
+        "answer_input": 6000000,
+        "answer_output": 250000,
+        "judge_input": 225000,
+        "judge_output": 20000,
+        "total_input": 234612861,
+        "total_output": 7609462
+      },
+      "estimated_usd": 89.41,
+      "assumptions": [
+        "4.0 chars/token",
+        "ingest: 3.5 LLM input passes/session (+600 prompt tokens/call), output=12% of input",
+        "ask(high): 12000 in / 500 out per question",
+        "judge: 450 in / 40 out per question",
+        "pricing: $0.3/M in, $2.5/M out (Gemini 2.5 Flash list \u2014 override for other models)"
+      ]
+    },
+    {
+      "suite": "dmr",
+      "sessions": 2500,
+      "questions": 500,
+      "tokens": {
+        "ingest_input": 4699490,
+        "ingest_output": 109696,
+        "answer_input": 6000000,
+        "answer_output": 250000,
+        "judge_input": 225000,
+        "judge_output": 20000,
+        "total_input": 10924490,
+        "total_output": 379696
+      },
+      "estimated_usd": 4.23,
+      "assumptions": [
+        "4.0 chars/token",
+        "ingest: 3.5 LLM input passes/session (+600 prompt tokens/call), output=12% of input",
+        "ask(high): 12000 in / 500 out per question",
+        "judge: 450 in / 40 out per question",
+        "pricing: $0.3/M in, $2.5/M out (Gemini 2.5 Flash list \u2014 override for other models)"
+      ]
+    },
+    {
+      "suite": "beam",
+      "sessions": 170,
+      "questions": 400,
+      "tokens": {
+        "ingest_input": 10804723,
+        "ingest_output": 366950,
+        "answer_input": 4800000,
+        "answer_output": 200000,
+        "judge_input": 180000,
+        "judge_output": 16000,
+        "total_input": 15784723,
+        "total_output": 582950
+      },
+      "estimated_usd": 6.19,
+      "assumptions": [
+        "4.0 chars/token",
+        "ingest: 3.5 LLM input passes/session (+600 prompt tokens/call), output=12% of input",
+        "ask(high): 12000 in / 500 out per question",
+        "judge: 450 in / 40 out per question",
+        "pricing: $0.3/M in, $2.5/M out (Gemini 2.5 Flash list \u2014 override for other models)"
+      ]
+    },
+    {
+      "suite": "convomem",
+      "sessions": 1253,
+      "questions": 1047,
+      "tokens": {
+        "ingest_input": 5807266,
+        "ingest_output": 173330,
+        "answer_input": 12564000,
+        "answer_output": 523500,
+        "judge_input": 471150,
+        "judge_output": 41880,
+        "total_input": 18842416,
+        "total_output": 738710
+      },
+      "estimated_usd": 7.5,
+      "assumptions": [
+        "4.0 chars/token",
+        "ingest: 3.5 LLM input passes/session (+600 prompt tokens/call), output=12% of input",
+        "ask(high): 12000 in / 500 out per question",
+        "judge: 450 in / 40 out per question",
+        "pricing: $0.3/M in, $2.5/M out (Gemini 2.5 Flash list \u2014 override for other models)"
+      ]
+    },
+    {
+      "suite": "membench",
+      "sessions": 4500,
+      "questions": 3500,
+      "tokens": {
+        "ingest_input": 19181433,
+        "ingest_output": 565077,
+        "answer_input": 42000000,
+        "answer_output": 1750000,
+        "judge_input": 1575000,
+        "judge_output": 140000,
+        "total_input": 62756433,
+        "total_output": 2455077
+      },
+      "estimated_usd": 24.96,
+      "assumptions": [
+        "4.0 chars/token",
+        "ingest: 3.5 LLM input passes/session (+600 prompt tokens/call), output=12% of input",
+        "ask(high): 12000 in / 500 out per question",
+        "judge: 450 in / 40 out per question",
+        "pricing: $0.3/M in, $2.5/M out (Gemini 2.5 Flash list \u2014 override for other models)"
+      ]
+    }
+  ]
+}
