@@ -10,7 +10,10 @@ export default defineConfig({
       reporter: ["text", "text-summary"],
       include: [
         "src/utils.ts",
+        "src/core/disclosure.ts",
+        "src/core/session-note.ts",
         "src/hooks/post-tool-use.ts",
+        "src/hooks/session-start.ts",
         "src/hooks/user-prompt-submit.ts",
       ],
       // Per-file thresholds tuned to match what we built on this branch.
