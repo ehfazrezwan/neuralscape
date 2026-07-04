@@ -355,7 +355,7 @@ class TestOverheadConstants:
         )
 
 
-# ── REST surface: index_only carries the savings line ────────────────
+# ── REST surface: index_only meters off the hot path (audit 27 #11) ──
 
 
 class TestRestSavingsLine:
@@ -367,7 +367,13 @@ class TestRestSavingsLine:
 
         return TestClient(main.app, raise_server_exceptions=False), main
 
-    def test_index_only_response_includes_savings(self, client):
+    def test_index_only_ledgered_off_the_hot_path(self, client):
+        """Audit 27 #11: measurement + ledger append moved to the telemetry
+        executor — the response no longer blocks on (or carries) the savings
+        line, but the honest event still lands in the ledger with the full
+        rendered body measured as overhead."""
+        import telemetry
+
         test_client, main_mod = client
         hits = [
             _hit("11111111-1111-1111-1111-111111111111", "long content " * 40, token_estimate=400),
@@ -379,17 +385,22 @@ class TestRestSavingsLine:
                 "/v1/search",
                 json={"query": "content", "user_id": "alice", "index_only": True},
             )
+            telemetry.flush()
         assert resp.status_code == 200
         body = resp.json()
         assert body["index_only"] is True
-        assert body["savings"].startswith("saved ~")
-        assert body["savings"].endswith("net of overhead")
-        detail = body["savings_detail"]
-        assert detail["baseline_tokens"] == 750
-        assert detail["served_tokens"] == 0
-        assert detail["net_tokens_saved"] == 750 - detail["overhead_tokens"]
+        # The per-recall line/detail are no longer served on the response —
+        # totals surface via GET /v1/metrics instead.
+        assert body.get("savings") is None
+        assert body.get("savings_detail") is None
         rec.assert_called_once()
         assert rec.call_args.args[0] == "alice"
+        event = rec.call_args.args[1]
+        assert event.op == "search_index"
+        assert event.baseline_tokens == 750
+        assert event.served_tokens == 0
+        assert event.overhead_tokens > 0  # rendered body measured verbatim
+        assert event.net_tokens_saved == 750 - event.overhead_tokens
 
     def test_index_only_meter_disabled_no_savings_fields(self, client):
         test_client, main_mod = client

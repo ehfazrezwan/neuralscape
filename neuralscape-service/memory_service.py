@@ -23,6 +23,25 @@ from config import settings
 _TRANSIENT_PATTERNS = ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "rate limit", "overloaded", "capacity", "timed out", "timeout")
 
 
+# ── Overlapped graph pass (audit 27 #9) ────────────────────────────────
+# search() used to run its vector pools to completion and only then start
+# the Graphiti pass — wall time was vector + graph even though the two legs
+# are independent once the query embed exists. The graph leg now runs on
+# this small dedicated pool while the calling thread works the vector legs,
+# and is joined right before the weave. Threads here spend their life
+# blocked on the Graphiti bridge future, so a modest pool bounds concurrent
+# graph fan-out without ever serializing a single search.
+from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
+
+_GRAPH_SEARCH_POOL = _ThreadPoolExecutor(
+    max_workers=16, thread_name_prefix="graph-search"
+)
+# The bridge call inside _do_graph_search already enforces its own 30s
+# timeout; this outer join is belt-and-suspenders so a wedged bridge thread
+# can never hang a read indefinitely.
+_GRAPH_SEARCH_JOIN_TIMEOUT_S = 45.0
+
+
 def _is_transient(exc: Exception) -> bool:
     """Check if an exception looks like a transient/retryable API error."""
     msg = str(exc)
@@ -153,6 +172,16 @@ def _dense_score_floor(dense_hits: list) -> float | None:
         s for s in (getattr(h, "score", None) for h in dense_hits) if s is not None
     ]
     return min(scores) if scores else None
+
+
+def _mem_is_tombstoned(mem: dict) -> bool:
+    """Whether a mem0 memory dict carries the dreaming consolidation
+    tombstone (``metadata.dream_tombstoned``), handling mem0's potential
+    ``{"metadata": {"metadata": {...}}}`` double-wrap."""
+    meta = mem.get("metadata") or {}
+    if isinstance(meta.get("metadata"), dict):
+        meta = meta["metadata"]
+    return bool(meta.get("dream_tombstoned"))
 
 
 def _times_derived_from_metadata(metadata: dict | None) -> int:
@@ -2049,6 +2078,9 @@ class MemoryService:
         # Multi-user pool selection
         visibility: str | None = None,
         include_shared: bool = True,
+        # Internal write-path mode (audit 27 #12): vector pools only — no
+        # graph pass, no graph enrichment, no recall-trace logging.
+        vector_only: bool = False,
     ) -> list[MemoryResponse]:
         """Semantic search across memories with scope/category filters.
 
@@ -2066,10 +2098,19 @@ class MemoryService:
         When project_id is provided, both pools search project+global memories
         for that project (existing dual-scope merge preserved per pool).
 
+        ``vector_only=True`` is the internal write-path mode: the raw-write
+        idempotency check needs a cheap semantic near-dupe probe, not a full
+        hybrid recall — it skips the graph pass, graph enrichment, and the
+        dreaming recall trace (an internal probe must not reinforce
+        salience).
+
         Returns:
             List of matching memory responses sorted by score.
         """
         m = self._get_memory()
+        # Lazily ensure keyword/bool payload indexes for the hot-path filters
+        # (audit 27 #14) — one attempt per service instance, never fatal.
+        self._ensure_filter_indexes()
 
         # Embed the query ONCE and reuse the vector across every pool/scope
         # below. Both pools query Qdrant directly with this precomputed vector
@@ -2077,6 +2118,24 @@ class MemoryService:
         # Memory.search + shared-pool call re-embedded the same query — 4-5
         # embeds per recall — and the embed round-trip dominates read latency.
         query_embedding = m.embedding_model.embed(query, memory_action="search")
+
+        # Audit 27 #9: kick the graph pass off NOW, on its own thread, so it
+        # overlaps the vector pool queries below (the legs are independent —
+        # Graphiti embeds the query itself). Joined right before the weave.
+        graph_future = None
+        if not vector_only:
+            try:
+                graph_future = _GRAPH_SEARCH_POOL.submit(
+                    self._search_graph_for_visibility,
+                    query=query,
+                    user_id=user_id,
+                    project_id=project_id,
+                    limit=limit,
+                    visibility=visibility,
+                    include_shared=include_shared,
+                )
+            except Exception as e:
+                logger.warning(f"Graph search submit failed (non-critical): {e}")
 
         vector_responses: list[MemoryResponse] = []
 
@@ -2234,37 +2293,39 @@ class MemoryService:
         deduped.sort(key=lambda r: r.score or 0.0, reverse=True)
         vector_responses = deduped[:limit]
 
-        # Also query the knowledge graph and merge edge facts.
-        # Multi-user: when caller restricted the visibility, restrict the
-        # graph search's group_ids to match — otherwise the graph would
-        # walk the full read-set (caller's private + shared) and we'd
+        # Join the knowledge-graph pass started above and merge edge facts.
+        # Multi-user: when caller restricted the visibility, the graph search
+        # already restricted its group_ids to match — otherwise the graph
+        # would walk the full read-set (caller's private + shared) and we'd
         # have to retroactively filter, which is unreliable for graph
         # rows whose enriched visibility ends up as None.
         graph_responses: list[MemoryResponse] = []
-        try:
-            graph_results = self._search_graph_for_visibility(
-                query=query,
-                user_id=user_id,
-                project_id=project_id,
-                limit=limit,
-                visibility=visibility,
-                include_shared=include_shared,
-            )
-            for edge in graph_results.get("edges", []):
-                graph_responses.append(
-                    MemoryResponse(
-                        id=edge.get("uuid", ""),
-                        memory=edge.get("fact", edge.get("name", "")),
-                        source="graph",
-                    )
+        if graph_future is not None:
+            try:
+                graph_results = graph_future.result(
+                    timeout=_GRAPH_SEARCH_JOIN_TIMEOUT_S
                 )
-        except Exception as e:
-            logger.warning(f"Graph search failed during recall (non-critical): {e}")
+                for edge in graph_results.get("edges", []):
+                    graph_responses.append(
+                        MemoryResponse(
+                            id=edge.get("uuid", ""),
+                            memory=edge.get("fact", edge.get("name", "")),
+                            source="graph",
+                        )
+                    )
+            except Exception as e:
+                logger.warning(f"Graph search failed during recall (non-critical): {e}")
 
         # Memory-model v2: enrich graph results with v2 metadata from their
         # nearest source memory, then apply the same v2 filters to graph rows.
         # Graphiti's edge schema doesn't carry v2 fields natively — we recover
         # them by semantic match against the Qdrant store.
+        #
+        # Audit 27 #7: enrichment only runs when something actually consumes
+        # the recovered fields — an active v2 filter, or a memory_kind=
+        # "passage" filter (passage-ness lives on the source memory). A plain
+        # recall used to pay a per-edge embed + Qdrant query here purely to
+        # decorate graph rows nobody filtered on.
         v2_filter_active = bool(domain or observation_type or concepts)
         if graph_responses and v2_filter_active:
             graph_responses = self._enrich_and_filter_graph(
@@ -2274,12 +2335,18 @@ class MemoryService:
                 domain=domain,
                 observation_type=observation_type,
                 concepts=concepts,
+                visibility=visibility,
+                include_shared=include_shared,
             )
-        elif graph_responses:
-            # No v2 filter active, but still enrich so callers see v2 fields
-            # surfaced on graph rows when their source memory has them.
+        elif graph_responses and memory_kind == "passage":
+            # The passage filter below reads memory_kind off each row, which
+            # for graph rows only exists via source-memory enrichment.
             graph_responses = self._enrich_graph_with_v2(
-                graph_responses, user_id=user_id, project_id=project_id
+                graph_responses,
+                user_id=user_id,
+                project_id=project_id,
+                visibility=visibility,
+                include_shared=include_shared,
             )
 
         # Multi-user model: post-filter graph rows by enriched visibility.
@@ -2315,12 +2382,23 @@ class MemoryService:
         # Dreaming: fire-and-forget recall trace (reinforcement signal for
         # the dream sweep's promotion/retention scoring). Runs on a daemon
         # thread inside log_recall — never blocks or fails the read.
-        try:
-            from extensions.dreaming.traces import log_recall
+        #
+        # Audit 27 #13: skipped entirely unless something CONSUMES the traces
+        # — the dream sweep (dreaming enabled) or the bounded salience
+        # tie-breaker (salience_recall_k > 0). With both off, log_recall was
+        # ~5N+4 Redis writes per search feeding a store nothing ever read.
+        # Internal vector_only probes (write-side idempotency checks) never
+        # log — they aren't user recalls and must not reinforce salience.
+        if not vector_only:
+            try:
+                from extensions.dreaming.config import dreaming_settings
 
-            log_recall([r.id for r in results if r.id], query)
-        except Exception:
-            pass
+                if dreaming_settings.enabled or float(dreaming_settings.salience_recall_k) > 0.0:
+                    from extensions.dreaming.traces import log_recall
+
+                    log_recall([r.id for r in results if r.id], query)
+            except Exception:
+                pass
 
         return results
 
@@ -2334,6 +2412,8 @@ class MemoryService:
         graph_responses: list[MemoryResponse],
         user_id: str,
         project_id: str | None,
+        visibility: str | None = None,
+        include_shared: bool = True,
     ) -> list[MemoryResponse]:
         """For each graph edge, find its nearest Qdrant source memory and
         copy that source's v2 metadata onto the graph response — only when
@@ -2341,60 +2421,118 @@ class MemoryService:
 
         Memory-model v2 augmentation: Graphiti edges don't carry domain /
         observation_type / concepts natively, but they're derived from
-        source memories that do. We do a top-1 vector search per edge to
-        recover those fields. ~10ms per edge at typical limits.
+        source memories that do. We do a top-1 vector match per edge to
+        recover those fields.
 
-        Multi-user model: enrichment can use either the caller's private
-        memories OR shared-pool memories (a graph edge for a shared fact
-        should pick up the shared source's metadata). Restricts to the
-        active project_id when supplied so v2 filter parity holds.
+        Audit 27 #7: this used to embed + query Qdrant once per edge,
+        sequentially — 10 edges meant 10 Gemini round-trips + 10 Qdrant
+        queries (3-12s of the measured hybrid-search latency). All edge
+        texts now go through ONE ``embed_batch`` call and ONE Qdrant
+        ``query_batch_points`` round trip. Any failure leaves the rows
+        un-enriched (never breaks the read).
+
+        Multi-user model: the enrichment source filter mirrors the EXACT
+        read-set of the calling search (``visibility``/``include_shared``
+        select the same pools ``_search_graph_for_visibility`` scoped its
+        group_ids to). A private-only or ``include_shared=False`` recall
+        must never pick up a shared row's metadata (visibility /
+        owner_user_id) for its graph rows — the graph edges themselves
+        came from the narrowed group_ids, and enriching them from a wider
+        pool would mislabel rows (or get them dropped by the post-filter).
+        Restricts to the active project_id when supplied so v2 filter
+        parity holds.
         """
-        from qdrant_client.models import FieldCondition, Filter, MatchValue
+        from qdrant_client.models import (
+            FieldCondition,
+            Filter,
+            MatchValue,
+            QueryRequest,
+        )
 
-        m = self._get_memory()
-        client = m.vector_store.client
-        for resp in graph_responses:
-            if not resp.memory:
-                continue
-            try:
-                embedding = m.embedding_model.embed(resp.memory, memory_action="search")
-                # Enrichment source = OR of per-pool sub-filters (Qdrant `should`
-                # accepts nested Filters). Personal + shared are constrained to the
-                # active project; the authoritative STANDARD pool is always global
-                # (no project_id), so it must NOT carry the project constraint —
-                # otherwise standard-origin graph edges never match their source
-                # and lose their v2 metadata / get dropped by v2 filters.
-                proj = (
-                    [FieldCondition(key="metadata.project_id", match=MatchValue(value=project_id))]
-                    if project_id else []
+        enrichable = [(i, r.memory) for i, r in enumerate(graph_responses) if r.memory]
+        if not enrichable:
+            return graph_responses
+
+        # Pool selection — parity with _search_graph_for_visibility:
+        #   private  → caller's own rows only
+        #   shared   → shared pool only
+        #   standard → standard pool only
+        #   include_shared=False (no explicit visibility) → personal + standard
+        #   default  → personal + shared + standard
+        want_personal = visibility in (None, MemoryVisibility.PRIVATE.value)
+        want_shared = visibility == MemoryVisibility.SHARED.value or (
+            visibility is None and include_shared
+        )
+        want_standard = settings.standards_enabled and visibility in (
+            None,
+            MemoryVisibility.STANDARD.value,
+        )
+
+        try:
+            m = self._get_memory()
+            client = m.vector_store.client
+
+            texts = [text for _, text in enrichable]
+            embed_batch = getattr(m.embedding_model, "embed_batch", None)
+            if callable(embed_batch):
+                embeddings = embed_batch(texts, memory_action="search")
+            else:  # embedder without a batch API — degrade to per-text embeds
+                embeddings = [
+                    m.embedding_model.embed(t, memory_action="search") for t in texts
+                ]
+
+            # Enrichment source = OR of per-pool sub-filters (Qdrant `should`
+            # accepts nested Filters). Personal + shared are constrained to the
+            # active project; the authoritative STANDARD pool is always global
+            # (no project_id), so it must NOT carry the project constraint —
+            # otherwise standard-origin graph edges never match their source
+            # and lose their v2 metadata / get dropped by v2 filters. The
+            # filter is identical for every edge, so it is built ONCE.
+            proj = (
+                [FieldCondition(key="metadata.project_id", match=MatchValue(value=project_id))]
+                if project_id else []
+            )
+            should_filters: list = []
+            if want_personal and user_id:
+                should_filters.append(
+                    Filter(must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))] + proj)
                 )
-                should_filters: list = []
-                if user_id:
-                    should_filters.append(
-                        Filter(must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))] + proj)
-                    )
+            if want_shared:
                 should_filters.append(
                     Filter(must=[FieldCondition(
                         key="metadata.visibility",
                         match=MatchValue(value=MemoryVisibility.SHARED.value),
                     )] + proj)
                 )
-                if settings.standards_enabled:
-                    should_filters.append(
-                        Filter(must=[FieldCondition(
-                            key="metadata.visibility",
-                            match=MatchValue(value=MemoryVisibility.STANDARD.value),
-                        )])
-                    )
-                qf = Filter(should=should_filters)
-                # qdrant-client v1.13+ replaced `.search()` with `.query_points()`.
-                result = client.query_points(
-                    collection_name=settings.qdrant_collection,
-                    query=embedding,
-                    query_filter=qf,
-                    limit=1,
-                    with_payload=True,
+            if want_standard:
+                should_filters.append(
+                    Filter(must=[FieldCondition(
+                        key="metadata.visibility",
+                        match=MatchValue(value=MemoryVisibility.STANDARD.value),
+                    )])
                 )
+            if not should_filters:
+                # No readable enrichment pool (e.g. private-only with no
+                # user_id) — leave the rows un-enriched rather than querying
+                # unfiltered.
+                return graph_responses
+            qf = Filter(should=should_filters)
+
+            requests = [
+                QueryRequest(query=emb, filter=qf, limit=1, with_payload=True)
+                for emb in embeddings
+            ]
+            batch_results = client.query_batch_points(
+                collection_name=settings.qdrant_collection,
+                requests=requests,
+            )
+        except Exception as e:
+            logger.debug(f"Graph enrichment skipped (batch failed): {e}")
+            return graph_responses
+
+        for (idx, _), result in zip(enrichable, batch_results):
+            resp = graph_responses[idx]
+            try:
                 hits = getattr(result, "points", result) or []
                 if not hits:
                     continue
@@ -2454,13 +2592,20 @@ class MemoryService:
         domain: str | None,
         observation_type: str | None,
         concepts: list[str] | None,
+        visibility: str | None = None,
+        include_shared: bool = True,
     ) -> list[MemoryResponse]:
         """Enrich graph rows with v2 metadata, then drop rows that don't match
         the supplied filter. Used when the caller passes domain/observation_type/
-        concepts in SearchMemoryRequest.
+        concepts in SearchMemoryRequest. ``visibility``/``include_shared``
+        scope the enrichment source to the calling search's read-set.
         """
         enriched = self._enrich_graph_with_v2(
-            graph_responses, user_id=user_id, project_id=project_id
+            graph_responses,
+            user_id=user_id,
+            project_id=project_id,
+            visibility=visibility,
+            include_shared=include_shared,
         )
         out: list[MemoryResponse] = []
         for resp in enriched:
@@ -2537,14 +2682,18 @@ class MemoryService:
         from graphiti_core.search.search_config import SearchConfig
         from graphiti_core.search.search_config_recipes import EDGE_HYBRID_SEARCH_RRF
 
+        # Audit 27 #10: EDGE_HYBRID_SEARCH_RRF is a module-level singleton
+        # shared across every thread — mutating its `.limit` in place let a
+        # concurrent delete (limit=5) clamp a live search's graph fan-out.
+        # Always work on a deep copy.
         if search_config:
             try:
                 config = SearchConfig(**search_config)
             except (TypeError, ValueError) as e:
                 logger.warning(f"Invalid search_config, falling back to default: {e}")
-                config = EDGE_HYBRID_SEARCH_RRF
+                config = EDGE_HYBRID_SEARCH_RRF.model_copy(deep=True)
         else:
-            config = EDGE_HYBRID_SEARCH_RRF
+            config = EDGE_HYBRID_SEARCH_RRF.model_copy(deep=True)
         config.limit = limit
 
         try:
@@ -2678,14 +2827,16 @@ class MemoryService:
         # cross-user `"global"`/`"project--..."` group_ids.
         group_ids = _get_group_ids(user_id, project_id)
 
+        # Audit 27 #10: never mutate the shared module-level recipe singleton
+        # — deep-copy before setting the per-call limit.
         if search_config:
             try:
                 config = SearchConfig(**search_config)
             except (TypeError, ValueError) as e:
                 logger.warning(f"Invalid search_config, falling back to default: {e}")
-                config = EDGE_HYBRID_SEARCH_RRF
+                config = EDGE_HYBRID_SEARCH_RRF.model_copy(deep=True)
         else:
-            config = EDGE_HYBRID_SEARCH_RRF
+            config = EDGE_HYBRID_SEARCH_RRF.model_copy(deep=True)
 
         config.limit = limit
 
@@ -3078,6 +3229,52 @@ class MemoryService:
         # own fallback if the index genuinely isn't there.
         self._created_at_index_ok = True
 
+    # Hot-path payload filters that deserve keyword/bool indexes (audit 27
+    # #14): every pool query carries a dream_tombstoned must_not, the shared/
+    # standard pools filter on visibility, and dual-scope merges filter on
+    # scope — all unindexed meant full payload scans on every search.
+    _FILTER_INDEX_FIELDS = (
+        ("metadata.dream_tombstoned", "bool"),
+        ("metadata.visibility", "keyword"),
+        ("metadata.scope", "keyword"),
+    )
+
+    def _ensure_filter_indexes(self) -> None:
+        """Best-effort: ensure payload indexes on the hot-path filter fields.
+
+        Same pattern as ``_ensure_created_at_index``: idempotent server-side,
+        attempted once per service instance, ``wait=False`` so index builds
+        never block the first read, and any failure degrades to Qdrant's
+        unindexed filtering rather than raising.
+        """
+        if getattr(self, "_filter_indexes_ok", False):
+            return
+        # Mark attempted FIRST — a flaky Qdrant must not re-pay this on
+        # every subsequent search.
+        self._filter_indexes_ok = True
+        try:
+            from qdrant_client.models import PayloadSchemaType
+
+            schema_by_name = {
+                "bool": PayloadSchemaType.BOOL,
+                "keyword": PayloadSchemaType.KEYWORD,
+            }
+            client = self._get_memory().vector_store.client
+            for field_name, schema_name in self._FILTER_INDEX_FIELDS:
+                try:
+                    client.create_payload_index(
+                        collection_name=settings.qdrant_collection,
+                        field_name=field_name,
+                        field_schema=schema_by_name[schema_name],
+                        wait=False,
+                    )
+                except Exception as e:
+                    logger.debug(
+                        f"payload index ensure failed for {field_name} (non-fatal): {e}"
+                    )
+        except Exception as e:
+            logger.debug(f"filter payload index ensure failed (non-fatal): {e}")
+
     def _timeline_filter(
         self,
         user_id: str,
@@ -3418,9 +3615,17 @@ class MemoryService:
         category: str | None = None,
         project_id: str | None = None,
         limit: int = 100,
+        include_tombstoned: bool = False,
     ) -> list[MemoryResponse]:
-        """List memories with optional filters."""
+        """List memories with optional filters.
+
+        Audit 27 #14: rows the dreaming sweep consolidated away
+        (``metadata.dream_tombstoned=true``) are excluded from listings by
+        default, matching every recall path. ``include_tombstoned=True`` is
+        the audit escape hatch — it returns the raw set, tombstones included.
+        """
         m = self._get_memory()
+        self._ensure_filter_indexes()
 
         # mem0 v2.0.2 ``get_all`` rejects top-level entity kwargs and
         # renamed ``limit`` -> ``top_k`` on its Qdrant wrapper. Same drift
@@ -3440,6 +3645,12 @@ class MemoryService:
         )
 
         memories = self._extract_memory_list(result)
+        if not include_tombstoned:
+            # mem0's filter dict can't express a must_not, so the tombstone
+            # exclusion happens here. Tombstones are rare (reversible dream
+            # consolidations), so under-filling `limit` slightly beats a
+            # second round trip.
+            memories = [mem for mem in memories if not _mem_is_tombstoned(mem)]
         return [self._mem_to_response(mem) for mem in memories]
 
     def list_projects(self, user_id: str) -> list[str]:
@@ -4746,7 +4957,9 @@ class MemoryService:
         try:
             from graphiti_core.search.search_config_recipes import EDGE_HYBRID_SEARCH_RRF
 
-            config = EDGE_HYBRID_SEARCH_RRF
+            # Audit 27 #10: deep-copy — mutating the shared singleton here
+            # clamped every concurrent search's graph fan-out to 5.
+            config = EDGE_HYBRID_SEARCH_RRF.model_copy(deep=True)
             config.limit = 5
 
             metadata = mem.get("metadata", {}) or {}
