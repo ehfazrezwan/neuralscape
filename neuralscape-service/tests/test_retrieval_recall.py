@@ -486,3 +486,55 @@ class TestTombstoneRevival:
         assert created is False
         assert responses[0].id == "t1"
 
+
+# ══════════════════════════════════════════════
+# Defect 6 — dream rewrite recomputes the content hash
+# ══════════════════════════════════════════════
+
+
+class TestDreamRewriteHash:
+    """Pre-fix: `_rewrite_content` overwrote payload["data"] but left the
+    old payload["hash"], corrupting write-path dedup and the exact-dedup
+    cron (which groups by hash and hard-deletes 'duplicates')
+    (test_rewrite_recomputes_hash failed with the stale hash).
+    """
+
+    def test_rewrite_recomputes_hash(self, service):
+        from extensions.dreaming.consolidate import _rewrite_content
+
+        old = "User works at OldCorp"
+        pt = MagicMock()
+        pt.payload = {
+            "data": old,
+            "hash": hashlib.md5(old.encode()).hexdigest(),
+            "metadata": {},
+        }
+        service._memory.vector_store.client.retrieve.return_value = [pt]
+        service._memory.embedding_model.embed.return_value = [0.2] * 8
+
+        new = "User works at Acme (since 2026-06)"
+        _rewrite_content(service, "m1", new)
+
+        point = service._memory.vector_store.client.upsert.call_args.kwargs[
+            "points"
+        ][0]
+        assert point.payload["data"] == new
+        assert point.payload["hash"] == hashlib.md5(new.encode()).hexdigest()
+
+    def test_rewrite_hash_matches_store_raw_hash(self, service):
+        """The rewrite must use the SAME hashing helper as store_raw — if the
+        write path ever changes algorithm, the rewrite follows."""
+        from extensions.dreaming.consolidate import _rewrite_content
+        from memory_service import content_hash
+
+        pt = MagicMock()
+        pt.payload = {"data": "x", "hash": "stale", "metadata": {}}
+        service._memory.vector_store.client.retrieve.return_value = [pt]
+        service._memory.embedding_model.embed.return_value = [0.2] * 8
+
+        _rewrite_content(service, "m1", "fresh text")
+
+        point = service._memory.vector_store.client.upsert.call_args.kwargs[
+            "points"
+        ][0]
+        assert point.payload["hash"] == content_hash("fresh text")

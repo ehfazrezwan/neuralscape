@@ -242,6 +242,18 @@ def _salience_tiebreak(responses: list) -> list:
     return responses
 
 
+def content_hash(content: str) -> str:
+    """Canonical content hash for write-path dedup (audit 27 #6).
+
+    Every writer of ``payload["hash"]`` MUST use this helper — store_raw,
+    the conversation batch path, checkpoints, and the dreaming rewrite
+    (which re-embeds new text in place). The exact-dedup cron groups rows
+    by this value and hard-deletes "duplicates", so a stale or divergent
+    hash silently corrupts dedup in both directions.
+    """
+    return hashlib.md5(content.encode()).hexdigest()
+
+
 def _live_edges_filter():
     """Graphiti ``SearchFilters`` selecting only bi-temporally LIVE edges.
 
@@ -1123,17 +1135,17 @@ class MemoryService:
 
         m = self._get_memory()
         now_iso = datetime.now(timezone.utc).isoformat()
-        content_hash = hashlib.md5(content.encode()).hexdigest()
+        chash = content_hash(content)
 
         # ── Content-hash dedup ──
         # Skip insert if this exact (user_id, scope, hash) already exists.
         existing = self._find_by_content_hash(
-            user_id=user_id, content_hash=content_hash, scope=scope,
+            user_id=user_id, content_hash=chash, scope=scope,
             project_id=project_id, visibility=effective_visibility,
         )
         if existing is not None:
             logger.info(
-                f"Dedup hit for user={user_id} hash={content_hash[:8]}... — returning existing id={existing.id}"
+                f"Dedup hit for user={user_id} hash={chash[:8]}... — returning existing id={existing.id}"
             )
             # Reinforcement-aware dedup: the caller just re-derived this exact
             # fact — count it on the survivor instead of discarding the signal.
@@ -1202,7 +1214,7 @@ class MemoryService:
 
         payload = {
             "data": content,
-            "hash": content_hash,
+            "hash": chash,
             "created_at": now_iso,
             "user_id": user_id,
             "agent_id": agent_id,
@@ -1942,7 +1954,7 @@ class MemoryService:
             mid = str(uuid.uuid4())
             payload = {
                 "data": content,
-                "hash": hashlib.md5(content.encode()).hexdigest(),
+                "hash": content_hash(content),
                 "created_at": now_iso,
                 "user_id": user_id,
                 "agent_id": agent_id,
