@@ -35,7 +35,7 @@ _STAGED_IDS_KEY = "dreaming:staged_ids:{pool}"
 @dataclass(slots=True)
 class PoolReport:
     pool: str
-    status: str                       # dreamt | gated | settling | locked | skipped_unchanged | error
+    status: str                       # dreamt | gated | settling | locked | skipped_unchanged | sweep_failed | error
     reason: str = ""
     staged: int = 0
     applied: int = 0
@@ -69,6 +69,11 @@ class DreamRun:
                 "pools_dreamt": sum(1 for p in self.pools if p.status == "dreamt"),
                 "pools_gated": sum(
                     1 for p in self.pools if p.status in ("gated", "settling", "locked")
+                ),
+                # LLM never examined the pool — gate unstamped, cron retries
+                # next cycle (audit 27 #27).
+                "pools_failed": sum(
+                    1 for p in self.pools if p.status in ("sweep_failed", "error")
                 ),
                 "actions_applied": sum(p.applied for p in self.pools),
                 "actions_reported": sum(p.reported for p in self.pools),
@@ -105,7 +110,13 @@ def _save_run(redis, run: DreamRun) -> None:
 
 
 async def _make_llm_call(settings: DreamingSettings):
-    """Build the retrying/timeout-wrapped LLM callable for this sweep."""
+    """Build the retrying/timeout-wrapped LLM callable for this sweep.
+
+    Exhaustion raises :class:`consolidate.DreamLLMFailure` instead of
+    returning ``""`` (audit 27 #27) — a silent empty string used to parse
+    to "0 actions", stamping the pool's gate and reporting "dreamt" while
+    a broken LLM disabled consolidation forever.
+    """
     from extensions.conversation_compiler.compile import _async_call_gemini
 
     async def call(prompt: str) -> str:
@@ -125,7 +136,10 @@ async def _make_llm_call(settings: DreamingSettings):
                 if attempt + 1 < attempts:
                     await asyncio.sleep(2 ** attempt)
         logger.error("dream LLM call exhausted %d attempts: %s", attempts, last_exc)
-        return ""
+        raise consolidate.DreamLLMFailure(
+            f"llm exhausted {attempts} attempts: "
+            f"{last_exc.__class__.__name__ if last_exc else 'unknown'}"
+        )
 
     return call
 
@@ -212,10 +226,10 @@ async def dream_all(
     _save_run(redis, run)
     totals = run.to_dict()["totals"]
     logger.info(
-        "dream sweep %s complete: dreamt=%d gated=%d applied=%d reported=%d insights=%d errors=%d",
+        "dream sweep %s complete: dreamt=%d gated=%d failed=%d applied=%d reported=%d insights=%d errors=%d",
         run.run_id, totals["pools_dreamt"], totals["pools_gated"],
-        totals["actions_applied"], totals["actions_reported"],
-        totals["insights_stored"], totals["errors"],
+        totals["pools_failed"], totals["actions_applied"],
+        totals["actions_reported"], totals["insights_stored"], totals["errors"],
     )
     return run
 
@@ -289,8 +303,17 @@ async def _dream_pool(
             report.status, report.reason = "skipped_unchanged", "staged id set unchanged"
             return report
 
-        # 6. DEEP: decide + hybrid-posture apply
-        actions = await consolidate.decide(batch, llm_call)
+        # 6. DEEP: decide + hybrid-posture apply. An LLM failure here means
+        #    the pool was never examined — report sweep_failed WITHOUT
+        #    stamping the gate or the staged-id marker, so the next cron
+        #    cycle retries (audit 27 #27). A valid {"actions": []} decision
+        #    still flows through as a completed sweep.
+        try:
+            actions = await consolidate.decide(batch, llm_call)
+        except consolidate.DreamLLMFailure as exc:
+            logger.error("dream consolidation LLM failed for pool %s: %s", pool, exc)
+            report.status, report.reason = "sweep_failed", f"consolidation LLM: {exc}"
+            return report
         to_apply, to_report = consolidate.split_by_posture(
             actions, auto_apply_confidence=settings.auto_apply_confidence
         )
@@ -344,13 +367,27 @@ async def _dream_pool(
                         "surprisal pass failed for pool %s (non-fatal); "
                         "reflection substrate stays uniform", pool, exc_info=True,
                     )
-            insights = await reflect.reflect(
-                batch, llm_call, max_insights=settings.max_reflections_per_pool,
-                surprisal_top_k=settings.surprisal_top_k,
-            )
-            stored = await asyncio.to_thread(
-                reflect.store_insights, service, batch, insights, dry_run=dry_run
-            )
+            # Reflection is best-effort ONCE consolidation has applied: an
+            # LLM failure here must not fail the pool (the writes already
+            # landed) but is recorded honestly instead of masquerading as
+            # "no insights tonight".
+            stored: list[str] = []
+            try:
+                insights = await reflect.reflect(
+                    batch, llm_call, max_insights=settings.max_reflections_per_pool,
+                    surprisal_top_k=settings.surprisal_top_k,
+                )
+            except consolidate.DreamLLMFailure:
+                logger.warning(
+                    "reflection LLM failed for pool %s (non-fatal; "
+                    "consolidation already applied)", pool,
+                )
+                report.errors.append("reflection_llm")
+                insights = []
+            if insights:
+                stored = await asyncio.to_thread(
+                    reflect.store_insights, service, batch, insights, dry_run=dry_run
+                )
             report.insights = len(stored) if not dry_run else len(insights)
 
             # E1: stream the stored insights (fire-and-forget).

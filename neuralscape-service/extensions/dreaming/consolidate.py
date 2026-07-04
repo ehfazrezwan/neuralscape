@@ -37,7 +37,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from .prompts import CONSOLIDATION_PROMPT, parse_json_response, render_memories_block
+from .prompts import CONSOLIDATION_PROMPT, parse_json_object, render_memories_block
 from .scoring import score_memory
 from .traces import read_aggregates, read_dynamics
 
@@ -45,6 +45,16 @@ logger = logging.getLogger(__name__)
 
 _DESTRUCTIVE = {"invalidate", "prune"}
 _REVERSIBLE = {"merge", "rewrite", "temporal_reframe"}
+
+
+class DreamLLMFailure(RuntimeError):
+    """The dream LLM errored, timed out, or returned garbage (audit 27 #27).
+
+    Distinct from a valid empty decision (``{"actions": []}``): this means
+    the pool was never actually examined, so callers must NOT stamp the
+    pool's gate or count the sweep as "dreamt" — the cron retries next
+    cycle instead of a broken LLM silently disabling consolidation forever.
+    """
 
 
 @dataclass(slots=True)
@@ -227,7 +237,13 @@ def stage_pool(
 
 
 async def decide(batch: PoolBatch, llm_call) -> list[dict]:
-    """Run the consolidation decision pass. Returns validated actions."""
+    """Run the consolidation decision pass. Returns validated actions.
+
+    Raises :class:`DreamLLMFailure` when the response is empty or garbage
+    (audit 27 #27) — "the LLM never examined this pool" must be
+    distinguishable from "the LLM examined it and chose no actions"
+    (``{"actions": []}``), because only the latter is a completed sweep.
+    """
     if not batch.memories:
         return []
     now = datetime.now(timezone.utc)
@@ -237,7 +253,12 @@ async def decide(batch: PoolBatch, llm_call) -> list[dict]:
         memories_block=render_memories_block(batch.memories),
     )
     raw = await llm_call(prompt)
-    actions = parse_json_response(raw, key="actions")
+    if not (raw or "").strip():
+        raise DreamLLMFailure("empty consolidation LLM response")
+    obj = parse_json_object(raw)
+    if not isinstance(obj.get("actions"), list):
+        raise DreamLLMFailure("unparseable consolidation LLM response (no action list)")
+    actions = [a for a in obj["actions"] if isinstance(a, dict)]
     known_ids = {m["memory_id"] for m in batch.memories}
     dream_ids = {
         m["memory_id"] for m in batch.memories if m.get("source_type") == "dream"

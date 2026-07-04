@@ -244,3 +244,141 @@ class TestReversibleRewrites:
         assert "preserve" in lowered
         assert "proper noun" in lowered
         assert "identifier" in lowered
+
+
+# ══════════════════════════════════════════════
+# #27 — a broken LLM must not silently disable consolidation
+# ══════════════════════════════════════════════
+
+
+def _sweep_settings(tmp_path, **overrides) -> DreamingSettings:
+    base = dict(
+        _env_file=None, enabled=True, min_hours=0.0, min_new_memories=1,
+        settling_minutes=0.0, reflection_enabled=False,
+        vault_pages_enabled=False, identity_card_enabled=False,
+        dynamics_enabled=False, surprisal_top_k=0,
+        obsidian_vault_path=str(tmp_path),
+    )
+    base.update(overrides)
+    return DreamingSettings(**base)
+
+
+def _fresh_batch(n: int = 1, *, pool: str = "shared") -> PoolBatch:
+    mems = [
+        {"memory_id": f"m{i}", "content": f"fact number {i}",
+         "created_at": _iso(3600 + i), "confidence": 0.9,
+         "source_type": "explicit", "visibility": "shared",
+         "category": "decision"}
+        for i in range(n)
+    ]
+    return _batch(mems, pool=pool)
+
+
+class TestHonestSweepStatus:
+    """Pre-fix: an LLM-exhausted call returned "" → decide() parsed it to 0
+    actions → the pool reported "dreamt" and the time gate was stamped — a
+    broken LLM silently disabled consolidation forever (and, with dreaming
+    enabled, semantic dedup too).
+    """
+
+    @pytest.mark.asyncio
+    async def test_empty_llm_response_fails_pool_without_stamping_gate(self, tmp_path):
+        redis = FakeRedis()
+        report = await sweep._dream_pool(
+            service=MagicMock(), settings=_sweep_settings(tmp_path), redis=redis,
+            llm_call=AsyncMock(return_value=""), batch=_fresh_batch(),
+            dry_run=False, force=False,
+        )
+        assert report.status == "sweep_failed"
+        assert report.reason  # the failure cause is surfaced
+        # the time gate was NOT stamped — the cron retries next cycle
+        assert gate.get_gate_state(redis, "shared")["last_dreamt_at"] == 0.0
+        # the idempotent-skip marker was NOT written either
+        assert redis.get("dreaming:staged_ids:shared") is None
+
+    @pytest.mark.asyncio
+    async def test_garbage_llm_response_fails_pool(self, tmp_path):
+        redis = FakeRedis()
+        report = await sweep._dream_pool(
+            service=MagicMock(), settings=_sweep_settings(tmp_path), redis=redis,
+            llm_call=AsyncMock(return_value="I'm sorry, I cannot help with that."),
+            batch=_fresh_batch(), dry_run=False, force=False,
+        )
+        assert report.status == "sweep_failed"
+        assert gate.get_gate_state(redis, "shared")["last_dreamt_at"] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_explicit_no_actions_still_counts_as_dreamt(self, tmp_path):
+        """An LLM that examined the pool and chose no actions IS a completed
+        sweep — the gate must stamp so the pool rests until the next window."""
+        redis = FakeRedis()
+        report = await sweep._dream_pool(
+            service=MagicMock(), settings=_sweep_settings(tmp_path), redis=redis,
+            llm_call=AsyncMock(return_value='{"actions": []}'),
+            batch=_fresh_batch(), dry_run=False, force=False,
+        )
+        assert report.status == "dreamt"
+        assert gate.get_gate_state(redis, "shared")["last_dreamt_at"] > 0.0
+
+    @pytest.mark.asyncio
+    async def test_exhausted_llm_call_raises_instead_of_returning_empty(
+        self, tmp_path, monkeypatch
+    ):
+        async def _always_down(prompt):
+            raise RuntimeError("gemini 503")
+
+        monkeypatch.setattr(
+            "extensions.conversation_compiler.compile._async_call_gemini",
+            _always_down,
+        )
+        settings = _sweep_settings(tmp_path, llm_max_retries=0, llm_timeout_seconds=30)
+        call = await sweep._make_llm_call(settings)
+        with pytest.raises(consolidate.DreamLLMFailure):
+            await call("consolidate this")
+
+    @pytest.mark.asyncio
+    async def test_decide_raises_on_empty_and_garbage(self):
+        batch = _fresh_batch()
+        with pytest.raises(consolidate.DreamLLMFailure):
+            await consolidate.decide(batch, AsyncMock(return_value=""))
+        with pytest.raises(consolidate.DreamLLMFailure):
+            await consolidate.decide(batch, AsyncMock(return_value="no json here"))
+        # a parseable object without an action list is garbage too
+        with pytest.raises(consolidate.DreamLLMFailure):
+            await consolidate.decide(batch, AsyncMock(return_value='{"result": "ok"}'))
+        # ...but an explicit empty decision is a valid outcome
+        assert await consolidate.decide(batch, AsyncMock(return_value='{"actions": []}')) == []
+
+    @pytest.mark.asyncio
+    async def test_reflection_llm_failure_is_nonfatal_after_consolidation(self, tmp_path):
+        """Consolidation applied, then the reflection LLM dies: the pool still
+        completes (its actions are already written) with the error recorded."""
+        redis = FakeRedis()
+        calls = {"n": 0}
+
+        async def llm(prompt):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return '{"actions": []}'
+            raise consolidate.DreamLLMFailure("llm exhausted")
+
+        report = await sweep._dream_pool(
+            service=MagicMock(), settings=_sweep_settings(
+                tmp_path, reflection_enabled=True
+            ),
+            redis=redis, llm_call=llm, batch=_fresh_batch(4),
+            dry_run=False, force=False,
+        )
+        assert report.status == "dreamt"
+        assert "reflection_llm" in report.errors
+        assert report.insights == 0
+
+    def test_run_totals_surface_failed_pools(self):
+        run = sweep.DreamRun(run_id="r", started_at="now")
+        run.pools = [
+            sweep.PoolReport(pool="a", status="sweep_failed", reason="llm empty"),
+            sweep.PoolReport(pool="b", status="dreamt"),
+        ]
+        totals = run.to_dict()["totals"]
+        assert totals["pools_failed"] == 1
+        assert totals["pools_dreamt"] == 1
