@@ -1,9 +1,9 @@
-"""MCP server exposing neuralscape memory operations as 15 tools.
+"""MCP server exposing neuralscape memory operations as 16 tools.
 
 Tools: recall_memories, remember, remember_conversation, ingest_document,
 ingest_text, get_project_context, search_knowledge_graph, list_memories,
 list_projects, delete_memories, list_processes, get_process, edit_memory,
-retag_memories, get_reasoning_chain.
+retag_memories, get_reasoning_chain, get_card.
 
 Supports both stdio transport (local Claude Code) and Streamable HTTP
 transport (remote agent access via /mcp/ endpoint on port 8199).
@@ -701,6 +701,42 @@ async def list_tools() -> list[Tool]:
                 "required": [],
             },
         ),
+        Tool(
+            name="get_card",
+            description=(
+                "Fetch the pinned identity card for a user or project — a grammar-"
+                "constrained grounding artifact (max 40 lines of 'IDENTITY: / "
+                "ATTRIBUTE: / RELATIONSHIP: / INSTRUCTION:') maintained by the "
+                "dreaming sweep. Inject it at SESSION START for always-available "
+                "grounding: who the user/project is, stable traits, and standing "
+                "instructions — without spending a search. With no arguments it "
+                "returns the calling user's card; pass project_id for a project's "
+                "card. Cards are pinned artifacts, never searchable memories; "
+                "returns an error when no card exists yet (the nightly sweep "
+                "builds them)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project whose card to fetch (mutually exclusive with pool)",
+                    },
+                    "pool": {
+                        "type": "string",
+                        "description": (
+                            "Advanced: explicit pool key ('user--<uid>' or "
+                            "'shared--project--<pid>'). Overrides project_id."
+                        ),
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "Caller user ID (optional under token auth)",
+                    },
+                },
+                "required": [],
+            },
+        ),
     ]
 
 
@@ -1177,6 +1213,43 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             task_id = await _task_manager.enqueue_retag(user_id, filters, ops)
             return [TextContent(type="text", text=json.dumps(
                 {"status": "accepted", "task_id": task_id}))]
+
+        elif name == "get_card":
+            from extensions.dreaming.card import (
+                card_read_allowed,
+                load_card,
+                resolve_card_pool,
+            )
+            from extensions.dreaming.sweep import _get_redis
+
+            pool = resolve_card_pool(
+                user_id=user_id,
+                project_id=arguments.get("project_id"),
+                pool=arguments.get("pool"),
+            )
+            if not pool:
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": "Cannot resolve a pool — pass project_id or pool"}))]
+            # Token identity (not the argument) gates private-card reads.
+            caller = current_user_id.get()
+            if not card_read_allowed(
+                pool, caller, is_dictator=settings.is_dictator(caller)
+            ):
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": "Another user's private card is not readable"}))]
+            data = await asyncio.to_thread(load_card, _get_redis(), pool)
+            lines = (data or {}).get("lines") or []
+            if not lines:
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": f"No identity card for pool {pool!r} yet — "
+                              "the dreaming sweep builds cards"}))]
+            return [TextContent(type="text", text=json.dumps({
+                "status": "ok",
+                "pool": pool,
+                "card": "\n".join(lines),
+                "lines": lines,
+                "updated_at": (data or {}).get("updated_at"),
+            }))]
 
         else:
             return [TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]

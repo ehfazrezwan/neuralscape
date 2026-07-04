@@ -131,8 +131,50 @@ class DreamingExtension:
                 "auto_apply_confidence": dreaming_settings.auto_apply_confidence,
                 "prune_strength_threshold": dreaming_settings.prune_strength_threshold,
                 "reflection_enabled": dreaming_settings.reflection_enabled,
+                "bridges_enabled": dreaming_settings.bridges_enabled,
+                "identity_card_enabled": dreaming_settings.identity_card_enabled,
                 "dreams_dir": str(dreaming_settings.dreams_dir),
                 "last_run": get_last_run(),
+            }
+
+        @router.get("/card")
+        async def get_identity_card(pool: str):
+            """The pinned identity card for one pool (B4).
+
+            ``pool`` is a pool key (``user--<uid>`` or
+            ``shared--project--<pid>``). Returns the grammar-constrained
+            lines for session-start injection; 404 when the sweep hasn't
+            produced a card for that pool yet. Cards are pinned artifacts
+            in Redis — never searchable memories.
+            """
+            import asyncio
+
+            from auth import current_user_id
+            from config import settings as core_settings
+
+            from .card import card_read_allowed, load_card
+            from .sweep import _get_redis
+
+            caller = current_user_id.get()
+            if not card_read_allowed(
+                pool, caller, is_dictator=core_settings.is_dictator(caller)
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Another user's private card is not readable",
+                )
+            data = await asyncio.to_thread(load_card, _get_redis(), pool)
+            lines = (data or {}).get("lines") or []
+            if not lines:
+                raise HTTPException(
+                    status_code=404, detail=f"No identity card for pool {pool!r}"
+                )
+            return {
+                "status": "ok",
+                "pool": pool,
+                "lines": lines,
+                "card": "\n".join(lines),
+                "updated_at": (data or {}).get("updated_at"),
             }
 
         return router
