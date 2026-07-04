@@ -314,6 +314,23 @@ class TestRankFusionWeave:
         # exact tie at 0.5: vector row first, then graph rows by id
         assert [r.id for r in result] == ["v0", "ga", "gb"]
 
+    def test_unscored_rows_never_tie_above_scored_zero_rows(self):
+        """Copilot on PR #123: an unscored (score=None) graph row got a
+        fused value of 0.0 and could out-tiebreak a legitimately scored
+        0.0 row via the id sort. Scored rows must rank first."""
+        vector = [
+            MemoryResponse(id="z-scored", memory="scored but zero fact",
+                           score=0.0, source="vector"),
+        ]
+        graph = [
+            MemoryResponse(id="a-unscored", memory="relation with no score",
+                           score=None, source="graph"),
+        ]
+
+        result = self.svc._deduplicate_responses(vector, graph, limit=10)
+
+        assert [r.id for r in result] == ["z-scored", "a-unscored"]
+
     def test_corroborating_graph_twin_boosts_its_vector_row(self):
         """A graph edge dropped as a content twin of a vector row still
         contributes its reciprocal-rank weight to that row — leg agreement

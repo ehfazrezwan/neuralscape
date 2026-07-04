@@ -5117,8 +5117,15 @@ class MemoryService:
             norm_to_idx.setdefault(normalized, len(entries))
             entries.append({"row": gr, "leg": 1, "fused": float(gr.score or 0.0)})
 
+        # Unscored (score=None) rows sort strictly below scored rows even at
+        # a fused value of 0.0 — the id tie-break must never lift them.
         entries.sort(
-            key=lambda e: (-e["fused"], e["leg"], str(e["row"].id or ""))
+            key=lambda e: (
+                e["row"].score is None and e["fused"] == 0.0,
+                -e["fused"],
+                e["leg"],
+                str(e["row"].id or ""),
+            )
         )
         fused = [e["row"] for e in entries]
         return fused if limit is None else fused[:limit]
