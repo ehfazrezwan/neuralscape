@@ -128,8 +128,28 @@ def build_event(event_type: str, payload: dict) -> dict:
     return event
 
 
+def publish_event_bg(event_type: str, payload: dict) -> None:
+    """Publish without ever touching the caller's thread/event loop.
+
+    Audit 27 #11: ``publish_event`` does sync Redis I/O (2s timeouts) — on
+    the API event loop or the worker's per-fact fan-out that stalls real
+    work. This variant hands the publish to the shared telemetry executor
+    (bounded, single worker, drop-on-overflow) and returns immediately.
+    Never raises.
+    """
+    try:
+        import telemetry
+
+        telemetry.submit(publish_event, event_type, payload)
+    except Exception:
+        logger.debug("event-stream bg publish dispatch failed (non-fatal)", exc_info=True)
+
+
 def publish_event(event_type: str, payload: dict) -> bool:
     """Fire-and-forget publish onto the visibility-routed channel.
+
+    Synchronous Redis I/O — call :func:`publish_event_bg` from any latency-
+    sensitive path (API routes, worker fan-outs).
 
     Never raises — a down Redis or a serialization hiccup is logged at
     debug and swallowed (the stream is an observability surface, not a

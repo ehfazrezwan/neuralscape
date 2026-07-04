@@ -249,6 +249,12 @@ class TestRegistryMirror:
         payload = {"user_id": "alice", "memory_id": "m1", "visibility": "private"}
         with patch("event_stream.publish_event") as pub:
             await registry.emit_event("memory_stored", payload)
+            # Audit 27 #11: the mirror is dispatched via the telemetry
+            # executor (publish_event_bg), not called inline on the worker
+            # loop — drain it before asserting.
+            import telemetry
+
+            telemetry.flush()
         pub.assert_called_once_with("memory_stored", payload)
 
     @pytest.mark.asyncio

@@ -43,37 +43,56 @@ _service = MemoryService()
 _task_manager = TaskManager()
 
 
-def _meter_mcp_index(op: str, user_id: str, hits, body: dict):
-    """E2: measure + ledger one index-serving MCP recall (sync; thread it).
+def _meter_mcp_index_bg(op: str, user_id: str, hits, body: dict) -> None:
+    """E2: measure + ledger one index-serving MCP recall — entirely off the
+    hot path (audit 27 #11).
 
     ``hits`` are full MemoryResponse objects (stored write-time token counts
-    = measured baseline); ``body`` is the EXACT response body about to be
-    served (rows + hint + wrapper keys, before the savings fields are
-    attached) — the whole thing is NS-injected overhead, so it is measured
-    verbatim rather than approximated by the rows alone (never overclaim).
-    The savings line/detail added afterwards are covered by the measured
-    SAVINGS_LINE_OVERHEAD_TOKENS constant. Returns (savings line, detail
-    dict) or (None, None) when the savings meter is disabled.
+    = measured baseline); ``body`` is the EXACT response body being served
+    (rows + hint + wrapper keys) — the whole thing is NS-injected overhead,
+    so it is measured verbatim rather than approximated by the rows alone
+    (never overclaim).
+
+    Serialization + tokenization + the Redis ledger append run on the shared
+    telemetry executor: a slow Redis/tokenizer can no longer delay the tool
+    response, and a meter exception can never fail a successful recall.
+    Trade-off (deliberate): the response body no longer carries the
+    per-recall ``savings`` line/detail — the measurement still lands in the
+    ledger and surfaces via GET /v1/metrics.
     """
-    import savings_meter as sm
 
-    payload = json.dumps(body, default=str, ensure_ascii=False)
-    event = sm.measure_recall(
-        op, hits, index_payload=payload, include_line_overhead=True
-    )
-    if event is None:
-        return None, None
-    sm.record_event(user_id, event)
-    return sm.format_savings_line(event), event.detail()
+    def _measure_and_record() -> None:
+        import savings_meter as sm
+
+        payload = json.dumps(body, default=str, ensure_ascii=False)
+        event = sm.measure_recall(op, hits, index_payload=payload)
+        if event is not None:
+            sm.record_event(user_id, event)
+
+    try:
+        import telemetry
+
+        telemetry.submit(_measure_and_record)
+    except Exception:
+        logger.debug("savings metering dispatch failed (non-fatal)", exc_info=True)
 
 
-def _meter_mcp_full(op: str, user_id: str, hits) -> None:
-    """E2: ledger a full-payload MCP recall (served == baseline)."""
-    import savings_meter as sm
+def _meter_mcp_full_bg(op: str, user_id: str, hits) -> None:
+    """E2: ledger a full-payload MCP recall (served == baseline) off the hot path."""
 
-    event = sm.measure_recall(op, hits, served_full=True)
-    if event is not None:
-        sm.record_event(user_id, event)
+    def _measure_and_record() -> None:
+        import savings_meter as sm
+
+        event = sm.measure_recall(op, hits, served_full=True)
+        if event is not None:
+            sm.record_event(user_id, event)
+
+    try:
+        import telemetry
+
+        telemetry.submit(_measure_and_record)
+    except Exception:
+        logger.debug("savings metering dispatch failed (non-fatal)", exc_info=True)
 
 
 def _standard_write_error(visibility, user_id: str) -> list[TextContent] | None:
@@ -1162,16 +1181,12 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                     "index_only": True, "results": rows,
                     "hint": "Filter these rows, then call get_memories(ids=[...]) for full payloads.",
                 }
-                # E2: honest savings line + ledger entry for this recall.
-                line, detail = await asyncio.to_thread(
-                    _meter_mcp_index, "search_index", user_id, results, body
-                )
-                if line is not None:
-                    body["savings"] = line
-                    body["savings_detail"] = detail
+                # E2: honest ledger entry for this recall — measured and
+                # recorded off the hot path (audit 27 #11).
+                _meter_mcp_index_bg("search_index", user_id, results, body)
                 return [TextContent(type="text", text=json.dumps(
                     body, default=str, ensure_ascii=False))]
-            await asyncio.to_thread(_meter_mcp_full, "search", user_id, results)
+            _meter_mcp_full_bg("search", user_id, results)
             output = [r.model_dump(exclude_none=True) for r in results]
             return [TextContent(type="text", text=json.dumps(output, default=str))]
 
@@ -1184,9 +1199,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 out = await asyncio.to_thread(_service.get_memories_by_ids, ids, user_id)
             except ValueError as e:
                 return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
-            await asyncio.to_thread(
-                _meter_mcp_full, "get_memories", user_id, out["results"]
-            )
+            _meter_mcp_full_bg("get_memories", user_id, out["results"])
             return [TextContent(type="text", text=json.dumps(
                 {
                     "results": [r.model_dump(exclude_none=True) for r in out["results"]],
@@ -1225,12 +1238,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 "anchor_id": anchor_id, "results": rows,
                 "hint": "Rows are oldest→newest. Call get_memories(ids=[...]) for full payloads.",
             }
-            line, detail = await asyncio.to_thread(
-                _meter_mcp_index, "timeline", user_id, out["memories"], body
-            )
-            if line is not None:
-                body["savings"] = line
-                body["savings_detail"] = detail
+            _meter_mcp_index_bg("timeline", user_id, out["memories"], body)
             return [TextContent(type="text", text=json.dumps(
                 body, default=str, ensure_ascii=False))]
 
@@ -1820,17 +1828,24 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
 
             # E2: ledger the ask (baseline = retrieved evidence, served =
             # answer). `_evidence_tokens` is internal — popped, never served.
+            # Values captured before dispatch; measured/recorded off the hot
+            # path on the telemetry executor (audit 27 #11).
+            evidence_tokens = int(out.pop("_evidence_tokens", 0) or 0)
+            answer_text = out.get("answer") or ""
+
             def _meter_ask() -> None:
                 import savings_meter as sm
 
-                event = sm.measure_ask(
-                    int(out.get("_evidence_tokens", 0) or 0), out.get("answer") or ""
-                )
+                event = sm.measure_ask(evidence_tokens, answer_text)
                 if event is not None:
                     sm.record_event(user_id, event)
 
-            await asyncio.to_thread(_meter_ask)
-            out.pop("_evidence_tokens", None)
+            try:
+                import telemetry
+
+                telemetry.submit(_meter_ask)
+            except Exception:
+                logger.debug("ask metering dispatch failed (non-fatal)", exc_info=True)
             return [TextContent(type="text", text=json.dumps(out, default=str, ensure_ascii=False))]
 
         elif name == "checkpoint":
