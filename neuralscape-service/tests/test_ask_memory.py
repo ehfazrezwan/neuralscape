@@ -127,9 +127,11 @@ class TestRetrievalPasses:
 
     @pytest.mark.asyncio
     async def test_low_adds_update_language_pass(self):
+        """Temporal question at low tier → the update-language recency pass
+        runs (atemporal questions skip it — see TestUpdatePassGating)."""
         svc = _service([_mem("m1", "fact")])
         llm = _answer_llm("ans", ["m1"])
-        out = await ask_memory(svc, question="When is the sync?", user_id="u",
+        out = await ask_memory(svc, question="Was the sync rescheduled?", user_id="u",
                                reasoning_level="low", llm_call=llm)
         assert svc.search.call_count == 2
         update_query = svc.search.call_args_list[1].kwargs["query"]
@@ -181,7 +183,8 @@ class TestSearchLoop:
             calls["n"] += 1
             return json.dumps({"action": "search", "query": f"follow-up {calls['n']}"})
 
-        out = await ask_memory(svc, question="q?", user_id="u",
+        # Temporal question so the (gated) update pass still runs.
+        out = await ask_memory(svc, question="What is the latest plan?", user_id="u",
                                reasoning_level="high", llm_call=greedy_llm)
         tier = REASONING_TIERS["high"]
         # Semantic passes: initial + update + at most `extra_searches` follow-ups.
@@ -233,7 +236,8 @@ class TestSearchLoop:
         async def llm(prompt: str) -> str:
             return next(responses)
 
-        out = await ask_memory(svc, question="q?", user_id="u",
+        # Temporal question so the (gated) update pass still runs.
+        out = await ask_memory(svc, question="Where do we meet now?", user_id="u",
                                reasoning_level="low", llm_call=llm)
         assert svc.search.call_count == 3
         assert svc.search.call_args_list[2].kwargs["query"] == "narrower"
@@ -463,6 +467,65 @@ class TestKeywordPromptHonesty:
 
 
 # ──────────────────────────────────────────────
+# Update-pass gating (audit 27 #19): the forced update-language search
+# only runs when temporal cues appear in the question or first-pass evidence
+# ──────────────────────────────────────────────
+
+
+class TestUpdatePassGating:
+    @pytest.mark.asyncio
+    async def test_atemporal_question_skips_update_pass(self):
+        svc = _service([_mem("m1", "Alice's favorite color is teal.")])
+        llm = _answer_llm("teal [m1]", ["m1"])
+        out = await ask_memory(svc, question="What is Alice's favorite color?",
+                               user_id="u", reasoning_level="low", llm_call=llm)
+        assert svc.search.call_count == 1  # no update pass issued
+        assert out["searches"] == ["What is Alice's favorite color?"]
+        assert out["skipped_passes"] == ["update"]
+
+    @pytest.mark.asyncio
+    async def test_temporal_question_runs_update_pass(self):
+        svc = _service([_mem("m1", "Alice lives in Berlin.")])
+        llm = _answer_llm("Berlin [m1]", ["m1"])
+        out = await ask_memory(svc, question="Where does Alice live now?",
+                               user_id="u", reasoning_level="low", llm_call=llm)
+        assert svc.search.call_count == 2
+        assert out["skipped_passes"] == []
+
+    @pytest.mark.asyncio
+    async def test_update_language_in_first_pass_evidence_triggers_pass(self):
+        """Atemporal question, but the evidence itself mentions a change —
+        the recency pass still runs."""
+        svc = _service([_mem("m1", "The sync was rescheduled to Thursday.")])
+        llm = _answer_llm("Thursday [m1]", ["m1"])
+        out = await ask_memory(svc, question="What day is the sync?",
+                               user_id="u", reasoning_level="low", llm_call=llm)
+        assert svc.search.call_count == 2
+        assert out["skipped_passes"] == []
+
+    def test_update_language_heuristic(self):
+        yes = [
+            "Where does Alice live now?",
+            "When did we switch banks?",
+            "Do I still go to that gym?",
+            "What did the plan used to cost?",
+            "Has the standup been rescheduled?",
+            "What is the latest deploy target?",
+            "Did the office move?",
+            "Is she not at that job anymore?",
+        ]
+        no = [
+            "What is Alice's favorite color?",
+            "How many movies did I watch?",  # 'movies' must not match 'move'
+            "Who owns the staging cluster?",
+        ]
+        for q in yes:
+            assert ask_mod._has_update_language(q), q
+        for q in no:
+            assert not ask_mod._has_update_language(q), q
+
+
+# ──────────────────────────────────────────────
 # Abstention (dialectic discipline 4)
 # ──────────────────────────────────────────────
 
@@ -625,6 +688,7 @@ class TestAskSurfaces:
                 "status": "ok", "reasoning_level": "high", "answer": "42 [m1]",
                 "citations": ["m1"], "abstained": False,
                 "searches": ["q"], "memories_considered": 3,
+                "skipped_passes": ["update"],
             }
 
         monkeypatch.setattr(ask_mod, "ask_memory", fake_ask)
@@ -636,6 +700,7 @@ class TestAskSurfaces:
         assert resp.status_code == 200
         body = resp.json()
         assert body["answer"] == "42 [m1]" and body["citations"] == ["m1"]
+        assert body["skipped_passes"] == ["update"]  # gating is visible in meta
 
     def test_rest_route_invalid_level_422(self):
         from fastapi.testclient import TestClient

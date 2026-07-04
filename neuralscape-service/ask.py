@@ -7,9 +7,10 @@ knob — ``minimal | low | medium | high`` — jointly selects:
 - **retrieval breadth**: how many hits each search pass pulls;
 - **tool budget / iteration cap**: whether (and how many times) the
   answering LLM may request follow-up searches;
-- **mechanical passes**: a forced update-language search (so newer facts
-  supersede older ones) and a grep-style exact-keyword pass (embeddings
-  under-recall exhaustive enumeration sets);
+- **mechanical passes**: an update-language search, gated on temporal cues
+  in the question or first-pass evidence (so newer facts supersede older
+  ones without diluting atemporal asks), and a grep-style exact-keyword
+  pass (embeddings under-recall exhaustive enumeration sets);
 - **thinking depth**: prompt verbosity;
 - **output cap**: maximum answer length.
 
@@ -56,7 +57,7 @@ class ReasoningTier:
     search_limit: int      # retrieval breadth per search pass
     extra_searches: int    # LLM-directed follow-up searches (iteration cap)
     keyword_pass: bool     # grep-style exact-match pass over visible memories
-    update_pass: bool      # forced update-language semantic pass
+    update_pass: bool      # update-language semantic pass (gated on temporal cues)
     max_answer_words: int  # output cap (instructed + clipped as a backstop)
 
     @property
@@ -84,6 +85,23 @@ REASONING_TIERS: dict[str, ReasoningTier] = {
 
 # Update-language terms appended for the forced recency pass (discipline 2).
 _UPDATE_TERMS = "changed updated rescheduled moved now currently latest"
+
+# Temporal/update cues that justify spending a full hybrid search on the
+# recency pass (audit 27 #19): change verbs, "now/currently/latest/still/
+# anymore/no longer/used to", and question forms like "when did …". An
+# atemporal ask ("what is X's favorite color") skips the pass — appending
+# update terms to an off-topic question only diluted the evidence.
+_UPDATE_LANGUAGE_RE = re.compile(
+    r"\b(chang(?:e[ds]?|ing)|updat(?:e[ds]?|ing)|mov(?:e[ds]?|ing)|"
+    r"reschedul(?:e[ds]?|ing)|now|currently|latest|still|anymore|any more|"
+    r"no longer|used to|when did)\b",
+    re.IGNORECASE,
+)
+
+
+def _has_update_language(text: str) -> bool:
+    """Whether ``text`` carries a temporal/update cue (discipline 2 gate)."""
+    return bool(_UPDATE_LANGUAGE_RE.search(text or ""))
 
 # Enumeration/counting intent (discipline 1).
 _ENUMERATION_RE = re.compile(
@@ -454,9 +472,20 @@ async def ask_memory(
     # ── Semantic pass (always) ──
     await _semantic(question)
 
-    # ── Discipline 2: forced update-language pass ──
+    # ── Discipline 2: update-language pass, gated on temporal cues ──
+    # (audit 27 #19) Runs only when the question or the first-pass evidence
+    # signals the answer may have changed; otherwise the pass is skipped
+    # (recorded in `skipped_passes`) and its hybrid-search cost saved.
+    skipped_passes: list[str] = []
     if tier.update_pass:
-        await _semantic(f"{question} {_UPDATE_TERMS}")
+        temporal = _has_update_language(question) or any(
+            _has_update_language(getattr(m, "memory", None) or "")
+            for m in evidence.values()
+        )
+        if temporal:
+            await _semantic(f"{question} {_UPDATE_TERMS}")
+        else:
+            skipped_passes.append("update")
 
     # ── Strict abstention short-circuit: nothing retrieved at all ──
     if not evidence:
@@ -468,6 +497,7 @@ async def ask_memory(
             "abstained": True,
             "searches": searches,
             "memories_considered": 0,
+            "skipped_passes": skipped_passes,
             "_evidence_tokens": 0,
         }
 
@@ -538,5 +568,6 @@ async def ask_memory(
         "abstained": abstained,
         "searches": searches,
         "memories_considered": len(evidence),
+        "skipped_passes": skipped_passes,
         "_evidence_tokens": evidence_tokens,
     }
