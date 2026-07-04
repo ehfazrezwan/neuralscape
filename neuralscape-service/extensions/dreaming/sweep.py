@@ -23,7 +23,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 
-from . import bridges, card, consolidate, gate, librarian, reflect
+from . import bridges, card, consolidate, gate, librarian, reflect, surprisal
 from .config import DreamingSettings, dreaming_settings
 
 logger = logging.getLogger(__name__)
@@ -167,7 +167,7 @@ async def dream_all(
     for pool_key, batch in sorted(pools.items()):
         report = await _dream_pool(
             service=service, settings=settings, redis=redis, llm_call=llm_call,
-            batch=batch, dry_run=dry_run, force=force,
+            batch=batch, dry_run=dry_run, force=force, run_id=run.run_id,
         )
         run.pools.append(report)
 
@@ -221,7 +221,8 @@ async def dream_all(
 
 
 async def _dream_pool(
-    *, service, settings: DreamingSettings, redis, llm_call, batch, dry_run: bool, force: bool
+    *, service, settings: DreamingSettings, redis, llm_call, batch, dry_run: bool,
+    force: bool, run_id: str = "",
 ) -> PoolReport:
     pool = batch.pool
     report = PoolReport(pool=pool, status="error")
@@ -303,16 +304,68 @@ async def _dream_pool(
         # pages and in Home's Essential Story until the next sweep.
         consolidate.reconcile_batch(batch, applied.applied)
 
+        # E1: mirror applied consolidation onto the live event stream
+        # (fire-and-forget; channel routing enforces pool visibility).
+        if applied.applied and not dry_run:
+            from event_stream import publish_event
+
+            publish_event("dream_actions_applied", {
+                "pool": pool,
+                "run_id": run_id,
+                "visibility": batch.visibility,
+                "user_id": batch.owner_user_id,
+                "project_id": batch.project_id,
+                "applied": len(applied.applied),
+                "reported": len(to_report),
+                "action_types": sorted({
+                    a.get("type") for a in applied.applied if a.get("type")
+                }),
+            })
+
         # 7. REM: reflect + store insights
         insights: list[dict] = []
         if settings.reflection_enabled:
+            # A5: surprisal-targeted REM. One batched vector retrieve, then
+            # each staged dict gains a `surprisal` score (cosine distance
+            # from the pool centroid); reflect() biases its substrate toward
+            # the top-K anomalies. top_k=0 skips everything — no fetch, no
+            # keys, byte-identical uniform substrate. Failures are non-fatal
+            # (reflection proceeds uniform).
+            if settings.surprisal_top_k > 0:
+                try:
+                    vectors = await asyncio.to_thread(
+                        surprisal.fetch_vectors,
+                        service,
+                        [m["memory_id"] for m in batch.memories],
+                    )
+                    surprisal.annotate(batch.memories, vectors)
+                except Exception:
+                    logger.warning(
+                        "surprisal pass failed for pool %s (non-fatal); "
+                        "reflection substrate stays uniform", pool, exc_info=True,
+                    )
             insights = await reflect.reflect(
-                batch, llm_call, max_insights=settings.max_reflections_per_pool
+                batch, llm_call, max_insights=settings.max_reflections_per_pool,
+                surprisal_top_k=settings.surprisal_top_k,
             )
             stored = await asyncio.to_thread(
                 reflect.store_insights, service, batch, insights, dry_run=dry_run
             )
             report.insights = len(stored) if not dry_run else len(insights)
+
+            # E1: stream the stored insights (fire-and-forget).
+            if stored and not dry_run:
+                from event_stream import publish_event
+
+                publish_event("insights_stored", {
+                    "pool": pool,
+                    "run_id": run_id,
+                    "visibility": batch.visibility,
+                    "user_id": batch.owner_user_id,
+                    "project_id": batch.project_id,
+                    "count": len(stored),
+                    "memory_ids": stored,
+                })
 
         # 8. librarian: humane topic pages (the wiki_synthesizer successor)
         if settings.vault_pages_enabled:

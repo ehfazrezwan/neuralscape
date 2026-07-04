@@ -48,6 +48,7 @@ dependencies = [
     # is handled by markitdown too. The heavy/optional extras (audio, youtube) are
     # intentionally excluded to keep the image lean.
     "markitdown[docx,pptx,xlsx,xls,pdf]>=0.0.1a3",
+    "tiktoken>=0.13.0",
 ]
 
 [tool.hatch.build.targets.wheel]

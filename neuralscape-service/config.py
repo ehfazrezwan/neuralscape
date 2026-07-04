@@ -122,6 +122,33 @@ class Settings(BaseSettings):
     # (see webhooks.py).
     webhook_queue_empty_url: str = ""
 
+    # ── Observability: SSE live stream (roadmap E1) ───────────────────
+    # When enabled, memory events (memory_stored, dream actions applied,
+    # insights stored, checkpoint batches) are mirrored onto Redis pub/sub
+    # channels and served to authenticated callers at GET /v1/stream.
+    # Publishing is fire-and-forget: a down Redis never breaks a write.
+    event_stream_enabled: bool = True
+
+    # ── Observability: token-economics telemetry (roadmap E2) ─────────
+    # The honest meter. When enabled: token_estimate upgrades to REAL
+    # tiktoken counts at write time, every recall op records a measured
+    # {baseline, served, overhead, net} savings event to an append-only
+    # per-user Redis stream, and index_only/timeline responses carry a
+    # compact savings line. `net` is SIGNED and may go negative — the
+    # meter never overclaims. Kill-switch: when False there are ZERO
+    # tokenizer calls anywhere on the hot path (write-time stamping falls
+    # back to the cheap len/4 heuristic) and no ledger writes.
+    savings_meter_enabled: bool = True
+    # tiktoken encoding used for all real token counts.
+    savings_tokenizer: str = "o200k_base"
+    # Approximate (~) cap on each per-user ledger stream (XADD maxlen).
+    savings_ledger_maxlen: int = 100_000
+    # Heuristic multiplier for the CLEARLY-LABELED-ESTIMATED
+    # `rederivation_savings_estimate` field: tokens an agent would burn
+    # re-deriving/re-discovering a fact from sources ≈ multiplier × the
+    # fact's stored token count. Never blended into the measured headline.
+    savings_rederivation_multiplier: float = 10.0
+
     # ── Data-layer connectors ─────────────────────────────────────────
     # When enabled, the service hosts connectors (Notion/Drive/MCP/REST),
     # stores their credentials encrypted in the vault, and runs a periodic

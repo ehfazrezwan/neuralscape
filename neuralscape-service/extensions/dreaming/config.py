@@ -174,6 +174,19 @@ class DreamingSettings(BaseSettings):
         le=25,
         description="Ceiling on new insight memories a single sweep may write per pool.",
     )
+    surprisal_top_k: int = Field(
+        default=12,
+        ge=0,
+        description=(
+            "Surprisal-targeted REM (A5): before reflection, staged memories "
+            "are scored for novelty (cosine distance from the pool's "
+            "embedding centroid — one batched Qdrant vector retrieve) and "
+            "the reflection substrate is biased toward the top-K anomalies "
+            "(moved to the front; nothing is dropped). 0 disables the pass "
+            "entirely — no vector fetch, and the substrate stays byte-"
+            "identical to the uniform behavior."
+        ),
+    )
 
     # ── Batch / scroll limits ──
     max_memories_per_pool: int = Field(

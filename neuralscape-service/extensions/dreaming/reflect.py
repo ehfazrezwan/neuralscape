@@ -36,11 +36,14 @@ from schemas import MEMORY_CATEGORIES
 
 from .consolidate import PoolBatch
 from .prompts import REFLECTION_PROMPT, parse_json_response, render_memories_block
+from .surprisal import bias_substrate
 
 logger = logging.getLogger(__name__)
 
 
-async def reflect(batch: PoolBatch, llm_call, *, max_insights: int) -> list[dict]:
+async def reflect(
+    batch: PoolBatch, llm_call, *, max_insights: int, surprisal_top_k: int = 0
+) -> list[dict]:
     """Run the reflection pass; returns validated insight dicts."""
     # Reflection needs enough substrate to infer across. Rows consumed by
     # this sweep's own consolidation (marked via reconcile_batch) are not
@@ -51,6 +54,10 @@ async def reflect(batch: PoolBatch, llm_call, *, max_insights: int) -> list[dict
     ]
     if len(candidates) < 3:
         return []
+    # A5: bias the substrate toward the top-K anomalies (surprisal scores
+    # stamped by the sweep). 0 ⇒ identity — the memories block is rendered
+    # from the exact same list, byte-identical to the uniform path.
+    candidates = bias_substrate(candidates, surprisal_top_k)
     now = datetime.now(timezone.utc)
     prompt = REFLECTION_PROMPT.format(
         today=now.date().isoformat(),
