@@ -2379,12 +2379,35 @@ class TestParseExpiresAt:
 # ──────────────────────────────────────────────
 
 
+def _wire_enrichment(service, per_edge_hits):
+    """Wire the BATCHED enrichment path (audit 27 #7): one embed_batch call
+    + one query_batch_points round trip. ``per_edge_hits`` is a list of hit
+    lists, one per enrichable graph row, in order."""
+    from types import SimpleNamespace
+
+    service._memory.vector_store.client = MagicMock()
+    service._memory.embedding_model.embed_batch.return_value = [
+        [0.1] * 8 for _ in per_edge_hits
+    ]
+    service._memory.vector_store.client.query_batch_points.return_value = [
+        SimpleNamespace(points=list(hits)) for hits in per_edge_hits
+    ]
+
+
+def _enrichment_filter(service):
+    """The shared per-edge filter from the single batched Qdrant call."""
+    kwargs = service._memory.vector_store.client.query_batch_points.call_args.kwargs
+    return kwargs["requests"][0].filter
+
+
 class TestGraphEnrichment:
     """Memory-model v2 — _enrich_graph_with_v2 and _enrich_and_filter_graph.
 
     Graphiti edges don't carry v2 fields natively; we recover them by top-1
     semantic search against Qdrant, gated by a similarity threshold so we
-    never propagate metadata from an unrelated nearest neighbor.
+    never propagate metadata from an unrelated nearest neighbor. Audit 27
+    #7: recovery is BATCHED — one embed_batch + one query_batch_points for
+    the whole edge set, never per-edge round trips.
     """
 
     def _hit(self, score: float, metadata: dict, data: str = "x"):
@@ -2396,16 +2419,14 @@ class TestGraphEnrichment:
 
     def test_high_similarity_match_copies_v2_fields(self, service):
         from schemas import MemoryResponse
-        service._memory.embedding_model.embed.return_value = [0.1] * 768
-        service._memory.vector_store.client = MagicMock()
-        service._memory.vector_store.client.query_points.return_value = _qresult([
+        _wire_enrichment(service, [[
             self._hit(0.95, {
                 "category": "decision", "scope": "global",
                 "domain": "meeting", "observation_type": "meeting_outcome",
                 "concepts": ["blocker"], "source_type": "tool_extraction",
                 "confidence": 0.8,
             })
-        ])
+        ]])
         graph_responses = [MemoryResponse(id="g1", memory="OKR was shifted", source="graph")]
         result = service._enrich_graph_with_v2(graph_responses, user_id="u", project_id=None)
         assert result[0].domain == "meeting"
@@ -2418,12 +2439,10 @@ class TestGraphEnrichment:
 
     def test_below_threshold_does_not_enrich(self, service):
         from schemas import MemoryResponse
-        service._memory.embedding_model.embed.return_value = [0.1] * 768
         # Score 0.5 is below default 0.7 threshold
-        service._memory.vector_store.client = MagicMock()
-        service._memory.vector_store.client.query_points.return_value = _qresult([
+        _wire_enrichment(service, [[
             self._hit(0.5, {"domain": "coding", "observation_type": "decision"})
-        ])
+        ]])
         graph_responses = [MemoryResponse(id="g1", memory="unrelated graph fact", source="graph")]
         result = service._enrich_graph_with_v2(graph_responses, user_id="u", project_id=None)
         # Below threshold → fields stay None
@@ -2432,20 +2451,14 @@ class TestGraphEnrichment:
 
     def test_no_hits_skips_enrichment(self, service):
         from schemas import MemoryResponse
-        service._memory.embedding_model.embed.return_value = [0.1] * 768
-        service._memory.vector_store.client = MagicMock()
-        service._memory.vector_store.client.query_points.return_value = _qresult([])
+        _wire_enrichment(service, [[]])
         graph_responses = [MemoryResponse(id="g1", memory="lonely graph fact", source="graph")]
         result = service._enrich_graph_with_v2(graph_responses, user_id="u", project_id=None)
         assert result[0].domain is None
 
     def test_does_not_overwrite_existing_v2_fields(self, service):
         from schemas import MemoryResponse
-        service._memory.embedding_model.embed.return_value = [0.1] * 768
-        service._memory.vector_store.client = MagicMock()
-        service._memory.vector_store.client.query_points.return_value = _qresult([
-            self._hit(0.95, {"domain": "research"})
-        ])
+        _wire_enrichment(service, [[self._hit(0.95, {"domain": "research"})]])
         graph_responses = [
             MemoryResponse(id="g1", memory="x", source="graph", domain="coding"),
         ]
@@ -2456,11 +2469,9 @@ class TestGraphEnrichment:
     def test_handles_double_wrapped_metadata(self, service):
         """mem0 sometimes nests metadata under metadata.metadata — unwrap it."""
         from schemas import MemoryResponse
-        service._memory.embedding_model.embed.return_value = [0.1] * 768
-        service._memory.vector_store.client = MagicMock()
-        service._memory.vector_store.client.query_points.return_value = _qresult([
+        _wire_enrichment(service, [[
             self._hit(0.95, {"metadata": {"domain": "ops", "observation_type": "feature"}})
-        ])
+        ]])
         graph_responses = [MemoryResponse(id="g1", memory="x", source="graph")]
         result = service._enrich_graph_with_v2(graph_responses, user_id="u", project_id=None)
         assert result[0].domain == "ops"
@@ -2468,18 +2479,18 @@ class TestGraphEnrichment:
 
     def test_skips_empty_memory_text(self, service):
         from schemas import MemoryResponse
-        service._memory.vector_store.client = MagicMock()
-        service._memory.vector_store.client.query_points.return_value = _qresult([])
+        _wire_enrichment(service, [])
         graph_responses = [MemoryResponse(id="g1", memory="", source="graph")]
         result = service._enrich_graph_with_v2(graph_responses, user_id="u", project_id=None)
-        # Empty memory: never hits the search, fields stay None
+        # No enrichable rows: never embeds, never queries, fields stay None
         assert result[0].domain is None
-        service._memory.embedding_model.embed.assert_not_called()
+        service._memory.embedding_model.embed_batch.assert_not_called()
+        service._memory.vector_store.client.query_batch_points.assert_not_called()
 
-    def test_swallows_per_row_errors(self, service):
-        """A failure on one row doesn't abort the whole enrichment pass."""
+    def test_swallows_batch_errors(self, service):
+        """A batch-embed failure leaves rows un-enriched, never raises."""
         from schemas import MemoryResponse
-        service._memory.embedding_model.embed.side_effect = Exception("embed fail")
+        service._memory.embedding_model.embed_batch.side_effect = Exception("embed fail")
         graph_responses = [MemoryResponse(id="g1", memory="x", source="graph")]
         # Should not raise
         result = service._enrich_graph_with_v2(graph_responses, user_id="u", project_id=None)
@@ -2488,14 +2499,27 @@ class TestGraphEnrichment:
     def test_dict_hit_format_supported(self, service):
         """Some Qdrant client versions return dicts instead of ScoredPoint."""
         from schemas import MemoryResponse
-        service._memory.embedding_model.embed.return_value = [0.1] * 768
-        service._memory.vector_store.client = MagicMock()
-        service._memory.vector_store.client.query_points.return_value = _qresult([
+        _wire_enrichment(service, [[
             {"score": 0.9, "payload": {"metadata": {"domain": "writing"}}}
-        ])
+        ]])
         graph_responses = [MemoryResponse(id="g1", memory="x", source="graph")]
         result = service._enrich_graph_with_v2(graph_responses, user_id="u", project_id=None)
         assert result[0].domain == "writing"
+
+    def test_one_batch_call_for_many_edges(self, service):
+        """Audit 27 #7: N edges = 1 embed_batch call + 1 query_batch_points
+        call (the old code did N of each, sequentially)."""
+        from schemas import MemoryResponse
+        _wire_enrichment(service, [[self._hit(0.9, {"domain": "coding"})]] * 10)
+        rows = [
+            MemoryResponse(id=f"g{i}", memory=f"fact {i}", source="graph")
+            for i in range(10)
+        ]
+        service._enrich_graph_with_v2(rows, user_id="u", project_id=None)
+        assert service._memory.embedding_model.embed_batch.call_count == 1
+        assert service._memory.vector_store.client.query_batch_points.call_count == 1
+        service._memory.embedding_model.embed.assert_not_called()
+        service._memory.vector_store.client.query_points.assert_not_called()
 
     def test_project_scope_added_to_lookup_filter(self, service):
         """When project_id is supplied, the enrichment lookup must constrain
@@ -2509,28 +2533,24 @@ class TestGraphEnrichment:
         nested sub-filters.
         """
         from schemas import MemoryResponse
-        service._memory.embedding_model.embed.return_value = [0.1] * 768
-        service._memory.vector_store.client = MagicMock()
-        service._memory.vector_store.client.query_points.return_value = _qresult([])
+        _wire_enrichment(service, [[]])
         graph_responses = [MemoryResponse(id="g1", memory="x", source="graph")]
         service._enrich_graph_with_v2(
             graph_responses, user_id="ehfaz", project_id="neuralscape",
         )
-        qf = service._memory.vector_store.client.query_points.call_args[1]["query_filter"]
+        qf = _enrichment_filter(service)
         assert "metadata.project_id" in _all_field_keys(qf)
 
     def test_global_scope_uses_user_or_shared_filter(self, service):
         """Without project_id, the filter has caller's user_id OR shared
         visibility in the should clause and no project constraint."""
         from schemas import MemoryResponse
-        service._memory.embedding_model.embed.return_value = [0.1] * 768
-        service._memory.vector_store.client = MagicMock()
-        service._memory.vector_store.client.query_points.return_value = _qresult([])
+        _wire_enrichment(service, [[]])
         graph_responses = [MemoryResponse(id="g1", memory="x", source="graph")]
         service._enrich_graph_with_v2(
             graph_responses, user_id="ehfaz", project_id=None,
         )
-        qf = service._memory.vector_store.client.query_points.call_args[1]["query_filter"]
+        qf = _enrichment_filter(service)
         keys = _all_field_keys(qf)
         assert "user_id" in keys
         assert "metadata.visibility" in keys
@@ -2544,14 +2564,12 @@ class TestGraphEnrichment:
         from schemas import MemoryResponse, MemoryVisibility
         from config import settings as _settings
         monkeypatch.setattr(_settings, "standards_enabled", True)
-        service._memory.embedding_model.embed.return_value = [0.1] * 768
-        service._memory.vector_store.client = MagicMock()
-        service._memory.vector_store.client.query_points.return_value = _qresult([])
+        _wire_enrichment(service, [[]])
         service._enrich_graph_with_v2(
             [MemoryResponse(id="g1", memory="x", source="graph")],
             user_id="ehfaz", project_id="neuralscape",
         )
-        qf = service._memory.vector_store.client.query_points.call_args[1]["query_filter"]
+        qf = _enrichment_filter(service)
 
         def _has_standard_unscoped(f) -> bool:
             for sub in (f.should or []):
@@ -2578,13 +2596,11 @@ class TestGraphFilterByV2:
 
     def test_domain_filter_drops_non_match(self, service):
         from schemas import MemoryResponse
-        service._memory.embedding_model.embed.return_value = [0.1] * 768
         # Two graph rows, one source has domain=coding, the other meeting
-        service._memory.vector_store.client = MagicMock()
-        service._memory.vector_store.client.query_points.side_effect = [
+        _wire_enrichment(service, [
             [self._hit(0.9, {"domain": "coding", "observation_type": "decision"})],
             [self._hit(0.9, {"domain": "meeting", "observation_type": "meeting_outcome"})],
-        ]
+        ])
         graph_responses = [
             MemoryResponse(id="g1", memory="fact1", source="graph"),
             MemoryResponse(id="g2", memory="fact2", source="graph"),
@@ -2598,12 +2614,10 @@ class TestGraphFilterByV2:
 
     def test_observation_type_filter_drops_non_match(self, service):
         from schemas import MemoryResponse
-        service._memory.embedding_model.embed.return_value = [0.1] * 768
-        service._memory.vector_store.client = MagicMock()
-        service._memory.vector_store.client.query_points.side_effect = [
+        _wire_enrichment(service, [
             [self._hit(0.9, {"observation_type": "bugfix"})],
             [self._hit(0.9, {"observation_type": "feature"})],
-        ]
+        ])
         graph_responses = [
             MemoryResponse(id="g1", memory="fact1", source="graph"),
             MemoryResponse(id="g2", memory="fact2", source="graph"),
@@ -2617,13 +2631,11 @@ class TestGraphFilterByV2:
 
     def test_concepts_filter_keeps_overlap(self, service):
         from schemas import MemoryResponse
-        service._memory.embedding_model.embed.return_value = [0.1] * 768
-        service._memory.vector_store.client = MagicMock()
-        service._memory.vector_store.client.query_points.side_effect = [
+        _wire_enrichment(service, [
             [self._hit(0.9, {"concepts": ["gotcha", "pattern"]})],
             [self._hit(0.9, {"concepts": ["how-it-works"]})],
             [self._hit(0.9, {})],  # no concepts at all
-        ]
+        ])
         graph_responses = [
             MemoryResponse(id="g1", memory="a", source="graph"),
             MemoryResponse(id="g2", memory="b", source="graph"),
@@ -2639,12 +2651,10 @@ class TestGraphFilterByV2:
     def test_below_threshold_falls_off_when_filtering(self, service):
         """Rows whose source match is below threshold get None'd, then filter drops them."""
         from schemas import MemoryResponse
-        service._memory.embedding_model.embed.return_value = [0.1] * 768
-        service._memory.vector_store.client = MagicMock()
-        service._memory.vector_store.client.query_points.side_effect = [
+        _wire_enrichment(service, [
             [self._hit(0.95, {"domain": "coding"})],  # passes threshold
             [self._hit(0.4, {"domain": "coding"})],   # below threshold → not enriched
-        ]
+        ])
         graph_responses = [
             MemoryResponse(id="g1", memory="related", source="graph"),
             MemoryResponse(id="g2", memory="unrelated", source="graph"),
@@ -2657,14 +2667,12 @@ class TestGraphFilterByV2:
 
     def test_combined_filters_all_must_match(self, service):
         from schemas import MemoryResponse
-        service._memory.embedding_model.embed.return_value = [0.1] * 768
-        service._memory.vector_store.client = MagicMock()
-        service._memory.vector_store.client.query_points.side_effect = [
+        _wire_enrichment(service, [
             [self._hit(0.9, {"domain": "coding", "observation_type": "decision",
                              "concepts": ["why-it-exists"]})],
             [self._hit(0.9, {"domain": "coding", "observation_type": "bugfix",
                              "concepts": ["why-it-exists"]})],
-        ]
+        ])
         graph_responses = [
             MemoryResponse(id="g1", memory="a", source="graph"),
             MemoryResponse(id="g2", memory="b", source="graph"),
@@ -3193,13 +3201,11 @@ class TestGraphEnrichmentMultiUser:
 
     def test_filter_uses_should_clause_for_user_or_shared(self, service):
         """The Qdrant filter must accept either caller's user_id or shared-pool."""
-        service._memory.embedding_model.embed.return_value = [0.1] * 768
-        service._memory.vector_store.client = MagicMock()
-        service._memory.vector_store.client.query_points.return_value = _qresult([])
+        _wire_enrichment(service, [[]])
         responses = [MemoryResponse(id="g1", memory="fact1", source="graph")]
         service._enrich_graph_with_v2(responses, user_id="alice", project_id=None)
 
-        qf = service._memory.vector_store.client.query_points.call_args[1]["query_filter"]
+        qf = _enrichment_filter(service)
         # The should clause (nested per-pool sub-filters) covers user_id OR shared.
         keys = _all_field_keys(qf)
         assert "user_id" in keys

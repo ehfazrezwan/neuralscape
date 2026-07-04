@@ -2275,9 +2275,9 @@ class MemoryService:
                 observation_type=observation_type,
                 concepts=concepts,
             )
-        elif graph_responses:
-            # No v2 filter active, but still enrich so callers see v2 fields
-            # surfaced on graph rows when their source memory has them.
+        elif graph_responses and memory_kind == "passage":
+            # The passage filter below reads memory_kind off each row, which
+            # for graph rows only exists via source-memory enrichment.
             graph_responses = self._enrich_graph_with_v2(
                 graph_responses, user_id=user_id, project_id=project_id
             )
@@ -2341,60 +2341,91 @@ class MemoryService:
 
         Memory-model v2 augmentation: Graphiti edges don't carry domain /
         observation_type / concepts natively, but they're derived from
-        source memories that do. We do a top-1 vector search per edge to
-        recover those fields. ~10ms per edge at typical limits.
+        source memories that do. We do a top-1 vector match per edge to
+        recover those fields.
+
+        Audit 27 #7: this used to embed + query Qdrant once per edge,
+        sequentially — 10 edges meant 10 Gemini round-trips + 10 Qdrant
+        queries (3-12s of the measured hybrid-search latency). All edge
+        texts now go through ONE ``embed_batch`` call and ONE Qdrant
+        ``query_batch_points`` round trip. Any failure leaves the rows
+        un-enriched (never breaks the read).
 
         Multi-user model: enrichment can use either the caller's private
         memories OR shared-pool memories (a graph edge for a shared fact
         should pick up the shared source's metadata). Restricts to the
         active project_id when supplied so v2 filter parity holds.
         """
-        from qdrant_client.models import FieldCondition, Filter, MatchValue
+        from qdrant_client.models import (
+            FieldCondition,
+            Filter,
+            MatchValue,
+            QueryRequest,
+        )
 
-        m = self._get_memory()
-        client = m.vector_store.client
-        for resp in graph_responses:
-            if not resp.memory:
-                continue
-            try:
-                embedding = m.embedding_model.embed(resp.memory, memory_action="search")
-                # Enrichment source = OR of per-pool sub-filters (Qdrant `should`
-                # accepts nested Filters). Personal + shared are constrained to the
-                # active project; the authoritative STANDARD pool is always global
-                # (no project_id), so it must NOT carry the project constraint —
-                # otherwise standard-origin graph edges never match their source
-                # and lose their v2 metadata / get dropped by v2 filters.
-                proj = (
-                    [FieldCondition(key="metadata.project_id", match=MatchValue(value=project_id))]
-                    if project_id else []
+        enrichable = [(i, r.memory) for i, r in enumerate(graph_responses) if r.memory]
+        if not enrichable:
+            return graph_responses
+
+        try:
+            m = self._get_memory()
+            client = m.vector_store.client
+
+            texts = [text for _, text in enrichable]
+            embed_batch = getattr(m.embedding_model, "embed_batch", None)
+            if callable(embed_batch):
+                embeddings = embed_batch(texts, memory_action="search")
+            else:  # embedder without a batch API — degrade to per-text embeds
+                embeddings = [
+                    m.embedding_model.embed(t, memory_action="search") for t in texts
+                ]
+
+            # Enrichment source = OR of per-pool sub-filters (Qdrant `should`
+            # accepts nested Filters). Personal + shared are constrained to the
+            # active project; the authoritative STANDARD pool is always global
+            # (no project_id), so it must NOT carry the project constraint —
+            # otherwise standard-origin graph edges never match their source
+            # and lose their v2 metadata / get dropped by v2 filters. The
+            # filter is identical for every edge, so it is built ONCE.
+            proj = (
+                [FieldCondition(key="metadata.project_id", match=MatchValue(value=project_id))]
+                if project_id else []
+            )
+            should_filters: list = []
+            if user_id:
+                should_filters.append(
+                    Filter(must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))] + proj)
                 )
-                should_filters: list = []
-                if user_id:
-                    should_filters.append(
-                        Filter(must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))] + proj)
-                    )
+            should_filters.append(
+                Filter(must=[FieldCondition(
+                    key="metadata.visibility",
+                    match=MatchValue(value=MemoryVisibility.SHARED.value),
+                )] + proj)
+            )
+            if settings.standards_enabled:
                 should_filters.append(
                     Filter(must=[FieldCondition(
                         key="metadata.visibility",
-                        match=MatchValue(value=MemoryVisibility.SHARED.value),
-                    )] + proj)
+                        match=MatchValue(value=MemoryVisibility.STANDARD.value),
+                    )])
                 )
-                if settings.standards_enabled:
-                    should_filters.append(
-                        Filter(must=[FieldCondition(
-                            key="metadata.visibility",
-                            match=MatchValue(value=MemoryVisibility.STANDARD.value),
-                        )])
-                    )
-                qf = Filter(should=should_filters)
-                # qdrant-client v1.13+ replaced `.search()` with `.query_points()`.
-                result = client.query_points(
-                    collection_name=settings.qdrant_collection,
-                    query=embedding,
-                    query_filter=qf,
-                    limit=1,
-                    with_payload=True,
-                )
+            qf = Filter(should=should_filters)
+
+            requests = [
+                QueryRequest(query=emb, filter=qf, limit=1, with_payload=True)
+                for emb in embeddings
+            ]
+            batch_results = client.query_batch_points(
+                collection_name=settings.qdrant_collection,
+                requests=requests,
+            )
+        except Exception as e:
+            logger.debug(f"Graph enrichment skipped (batch failed): {e}")
+            return graph_responses
+
+        for (idx, _), result in zip(enrichable, batch_results):
+            resp = graph_responses[idx]
+            try:
                 hits = getattr(result, "points", result) or []
                 if not hits:
                     continue
