@@ -47,9 +47,9 @@ def mock_task_manager():
 
 class TestListTools:
     @pytest.mark.asyncio
-    async def test_returns_17_tools(self):
+    async def test_returns_19_tools(self):
         tools = await mcp_server.list_tools()
-        assert len(tools) == 17
+        assert len(tools) == 19
 
     @pytest.mark.asyncio
     async def test_tool_names(self):
