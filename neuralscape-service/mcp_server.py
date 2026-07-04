@@ -1,10 +1,11 @@
-"""MCP server exposing neuralscape memory operations as 22 tools.
+"""MCP server exposing neuralscape memory operations as 22 core tools.
 
-Core tools (19): recall_memories, get_memories, timeline, remember,
+Core tools (22): recall_memories, get_memories, timeline, remember,
 remember_conversation, ingest_document, ingest_text, get_project_context,
 search_knowledge_graph, list_memories, list_projects, delete_memories,
 list_processes, get_process, edit_memory, retag_memories,
-get_reasoning_chain, schedule_dream, get_card.
+get_reasoning_chain, schedule_dream, get_card, ask_memory, checkpoint,
+queue_status.
 
 Plus three code-graph delegation tools over an ingested/configured Graphify
 graph.json — query_code_graph, get_code_neighbors, code_path (NS's own
@@ -862,6 +863,138 @@ async def list_tools() -> list[Tool]:
                 "required": [],
             },
         ),
+        Tool(
+            name="ask_memory",
+            description=(
+                "Ask a question and get a direct ANSWER synthesized from the caller's stored "
+                "memories (instead of raw search hits — use recall_memories when you want the "
+                "memories themselves). reasoning_level jointly selects retrieval breadth, the "
+                "answering model's follow-up-search budget, thinking depth, and answer length: "
+                "'minimal' = one search + direct answer (fastest/cheapest); 'low' = adds a forced "
+                "update-language pass + 1 follow-up search; 'medium' = adds a grep-style exact-"
+                "keyword pass + 2 follow-ups; 'high' = full iterative search loop (4 follow-ups). "
+                "Disciplines baked in: enumeration/counting questions get exact-match passes and a "
+                "dedup table before any count; newer facts supersede older ones; contradictions "
+                "are surfaced BOTH-with-timestamps preferring the newer; \"I don't know\" is "
+                "returned honestly (abstained: true) rather than fabricating. The answer cites "
+                "memory ids inline and 'citations' only ever contains ids that were actually "
+                "retrieved."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The question to answer from stored memories",
+                    },
+                    "reasoning_level": {
+                        "type": "string",
+                        "enum": ["minimal", "low", "medium", "high"],
+                        "default": "low",
+                        "description": (
+                            "Effort knob: minimal (single search, direct answer), low, "
+                            "medium, high (iterative search loop + exact-match passes)"
+                        ),
+                    },
+                    "project_id": {
+                        "type": "string",
+                        "description": "Optional project scope (searches that project's + global memories)",
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "Caller user ID (optional under token auth)",
+                    },
+                },
+                "required": ["question"],
+            },
+        ),
+        Tool(
+            name="checkpoint",
+            description=(
+                "Batch-save up to 25 memories PLUS an optional structured session note in ONE "
+                "call (one tool card, one background task id) — use this at the end of a session "
+                "instead of many individual remember calls. Each item is {content, category, plus "
+                "any memory-model v2 fields (tags, domain, observation_type, concepts, "
+                "confidence, visibility, project_id, ...)}. Per-item content-hash dedup runs "
+                "BEFORE enqueue and the verdicts come back immediately (verdict: 'new' | "
+                "'duplicate' with the existing_id), then the non-duplicates are stored as one "
+                "async batch job (poll the task_id, or just continue — writes never block on "
+                "extraction). session_note is {request, learned, completed, next_steps} and is "
+                "stored as a single task_context memory (observation_type=meeting_outcome) so the "
+                "next session picks it up."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "memories": {
+                        "type": "array",
+                        "maxItems": 25,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string", "description": "The fact to remember"},
+                                "category": {
+                                    "type": "string",
+                                    "enum": list(MEMORY_CATEGORIES.keys()),
+                                },
+                                "project_id": {"type": "string"},
+                                "tags": {"type": "array", "items": {"type": "string"}},
+                                "domain": {"type": "string"},
+                                "observation_type": {"type": "string"},
+                                "concepts": {"type": "array", "items": {"type": "string"}},
+                                "source_type": {"type": "string"},
+                                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                                "expires_at": {"type": "string"},
+                                "visibility": {"type": "string", "enum": ["private", "shared", "standard"]},
+                            },
+                            "required": ["content", "category"],
+                        },
+                        "description": "Memories to save (≤25). Dedup verdicts are returned per item.",
+                    },
+                    "session_note": {
+                        "type": "object",
+                        "properties": {
+                            "request": {"type": "string", "description": "What the user asked for this session"},
+                            "learned": {"type": "string", "description": "What was learned/discovered"},
+                            "completed": {"type": "string", "description": "What got done"},
+                            "next_steps": {"type": "string", "description": "What should happen next"},
+                        },
+                        "description": "Optional structured end-of-session note (stored as one task_context memory)",
+                    },
+                    "project_id": {
+                        "type": "string",
+                        "description": "Default project for the session note (items carry their own project_id)",
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "Caller user ID (optional under token auth)",
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="queue_status",
+            description=(
+                "Aggregate view of the caller's recent background tasks across the memory "
+                "queues — ONE call for \"is my work done?\" instead of polling per task id. "
+                "Returns counts of the caller's recently-enqueued tasks by live status "
+                "(queued/processing/completed/failed + expired-out-of-Redis), instance-wide "
+                "pending depth per queue (main/graph/ingest), and a caught_up boolean that is "
+                "true when nothing of the caller's is queued or in flight. Use it after a "
+                "checkpoint or bulk ingest before querying what was stored."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "Caller user ID (optional under token auth)",
+                    },
+                },
+                "required": [],
+            },
+        ),
     ] + _code_graph_tools()
 
 
@@ -1605,6 +1738,82 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                     {"error": f"No identity card for pool {pool!r} yet — "
                               "the dreaming sweep builds cards"}))]
             return [TextContent(type="text", text=json.dumps(view))]
+
+        elif name == "ask_memory":
+            from ask import REASONING_TIERS, AskUnavailable, ask_memory
+
+            question = arguments.get("question")
+            if not question or not isinstance(question, str):
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": "question must be a non-empty string"}))]
+            level = arguments.get("reasoning_level", "low")
+            if level not in REASONING_TIERS:
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": f"Invalid reasoning_level {level!r}. "
+                              f"Must be one of: {list(REASONING_TIERS)}"}))]
+            try:
+                out = await ask_memory(
+                    _service,
+                    question=question,
+                    user_id=user_id,
+                    reasoning_level=level,
+                    project_id=arguments.get("project_id"),
+                )
+            except AskUnavailable as e:
+                return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+            return [TextContent(type="text", text=json.dumps(out, default=str, ensure_ascii=False))]
+
+        elif name == "checkpoint":
+            import checkpoint as checkpoint_mod
+
+            from pydantic import ValidationError
+            from schemas import CheckpointRequest
+
+            # Validate with the shared schema so MCP callers get the same
+            # ≤25 bound / per-item field validation as the REST route.
+            try:
+                req = CheckpointRequest(
+                    **{k: v for k, v in arguments.items() if k in CheckpointRequest.model_fields}
+                )
+            except ValidationError as e:
+                return [TextContent(type="text", text=json.dumps(
+                    {"status": "error", "error": str(e)}, default=str))]
+            try:
+                prepared = await asyncio.to_thread(
+                    checkpoint_mod.prepare_checkpoint, _service, req, user_id
+                )
+            except (ValueError, PermissionError) as e:
+                return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+
+            common = {
+                "verdicts": prepared["verdicts"],
+                "duplicates": prepared["duplicates"],
+                "session_note_included": prepared["session_note_included"],
+                "enqueued": len(prepared["to_enqueue"]),
+            }
+            if not prepared["to_enqueue"]:
+                return [TextContent(type="text", text=json.dumps(
+                    {"status": "ok", "task_id": None, **common,
+                     "hint": "Every item was already stored — nothing enqueued."},
+                    default=str))]
+            try:
+                task_id = await _task_manager.enqueue_raw_batch(items=prepared["to_enqueue"])
+            except (ConnectionError, OSError) as e:
+                logger.warning(f"Redis unavailable, falling back to sync checkpoint store: {e}")
+                memories = await asyncio.to_thread(
+                    _service.store_raw_batch, prepared["to_enqueue"]
+                )
+                return [TextContent(type="text", text=json.dumps(
+                    {"status": "completed", "task_id": None, **common,
+                     "stored": len(memories), "fallback": "sync"},
+                    default=str))]
+            return [TextContent(type="text", text=json.dumps(
+                {"status": "accepted", "task_id": task_id, **common}, default=str))]
+
+        elif name == "queue_status":
+            out = await _task_manager.get_queue_status(user_id)
+            return [TextContent(type="text", text=json.dumps(
+                {"status": "ok", **out}, default=str))]
 
         else:
             return [TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]

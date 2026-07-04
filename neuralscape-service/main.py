@@ -38,8 +38,13 @@ from context_formatter import format_context_for_injection
 from index_format import index_row
 from schemas import (
     MEMORY_CATEGORIES,
+    AskMemoryRequest,
+    AskMemoryResponse,
     BulkDeleteRequest,
     CategoryListResponse,
+    CheckpointRequest,
+    CheckpointResponse,
+    CheckpointVerdict,
     ConnectorConfigRequest,
     ContextResponse,
     GetMemoriesRequest,
@@ -50,6 +55,7 @@ from schemas import (
     IngestTextRequest,
     MemoryResponse,
     MemoryVisibility,
+    QueueStatusResponse,
     RawMemoryBatchRequest,
     PatchMemoryRequest,
     RawMemoryRequest,
@@ -1538,6 +1544,126 @@ async def v1_timeline(req: TimelineRequest, request: Request):
         for m in out["memories"]
     ]
     return TimelineResponse(anchor_id=anchor_id, results=rows)
+
+
+# ── Ask (C3: reasoning-tiered question answering) ──
+
+
+@v1_router.post("/ask", response_model=AskMemoryResponse)
+async def v1_ask_memory(req: AskMemoryRequest, request: Request):
+    """Answer a question from the caller's memories (C3).
+
+    ``reasoning_level`` (minimal | low | medium | high) jointly selects
+    retrieval breadth, the answering LLM's follow-up-search budget,
+    thinking depth, and the output cap. Dialectic disciplines: grep-first
+    for enumeration questions, forced update-language passes, surface-both
+    on contradictions (preferring the newer fact), and strict abstention —
+    "I don't know" comes back as ``abstained: true``, never a fabrication.
+    Citations only ever contain retrieved memory ids. Sync per NS
+    convention (reads return 200 directly); each LLM call is capped by the
+    tier's ``ASK_TIMEOUT_*_S``.
+    """
+    from ask import AskUnavailable, ask_memory
+
+    user_id = _resolve_user_id(request, req.user_id)
+    try:
+        out = await ask_memory(
+            _service,
+            question=req.question,
+            user_id=user_id,
+            reasoning_level=req.reasoning_level,
+            project_id=req.project_id,
+        )
+    except AskUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("v1 ask failed")
+        raise HTTPException(status_code=500, detail="Ask failed") from e
+    return AskMemoryResponse(**out)
+
+
+# ── Checkpoint + queue visibility (C4) ──
+
+
+@v1_router.post("/checkpoint", status_code=202, response_model=CheckpointResponse)
+async def v1_checkpoint(req: CheckpointRequest, request: Request):
+    """Batch-save up to 25 memories + an optional session note in one call (C4).
+
+    Per-item content-hash dedup runs synchronously BEFORE enqueue (the
+    verdicts come back immediately); non-duplicates are dispatched as ONE
+    background batch job — 202 + a single task id, never blocking on
+    extraction. When every item is a duplicate and there's no session
+    note, returns 200 with ``task_id: null`` (nothing to enqueue). Falls
+    back to synchronous storage if Redis is unavailable.
+    """
+    import checkpoint as checkpoint_mod
+
+    user_id = _resolve_user_id(request, req.user_id)
+    try:
+        prepared = await asyncio.to_thread(
+            checkpoint_mod.prepare_checkpoint, _service, req, user_id
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+
+    verdicts = [CheckpointVerdict(**v) for v in prepared["verdicts"]]
+    common = {
+        "verdicts": verdicts,
+        "duplicates": prepared["duplicates"],
+        "session_note_included": prepared["session_note_included"],
+        "enqueued": len(prepared["to_enqueue"]),
+    }
+    if not prepared["to_enqueue"]:
+        return JSONResponse(
+            status_code=200,
+            content=CheckpointResponse(
+                status="ok", task_id=None, poll_url=None, **common
+            ).model_dump(exclude_none=True),
+        )
+
+    try:
+        task_id = await _task_manager.enqueue_raw_batch(items=prepared["to_enqueue"])
+    except (ConnectionError, OSError) as e:
+        logger.warning(f"Redis unavailable, falling back to sync checkpoint store: {e}")
+        await asyncio.to_thread(_service.store_raw_batch, prepared["to_enqueue"])
+        return JSONResponse(
+            status_code=200,
+            content=CheckpointResponse(
+                status="completed", task_id=None, poll_url=None, **common
+            ).model_dump(exclude_none=True),
+        )
+
+    return CheckpointResponse(
+        task_id=task_id,
+        poll_url=f"/v1/memories/status/{task_id}",
+        **common,
+    )
+
+
+@v1_router.get("/queue/status", response_model=QueueStatusResponse)
+async def v1_queue_status(request: Request, user_id: str | None = Query(default=None)):
+    """Aggregate queue view for the caller (C4 queue visibility).
+
+    Counts the caller's recently-enqueued tasks by live ARQ status
+    (queued/processing/completed/failed, plus expired-out-of-Redis),
+    reports instance-wide pending depth per queue, and a ``caught_up``
+    boolean — one poll for "is my work done?" instead of one per task.
+    """
+    caller = _resolve_user_id(request, user_id)
+    try:
+        out = await _task_manager.get_queue_status(caller)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("v1 queue status failed")
+        raise HTTPException(status_code=500, detail="Queue status failed") from e
+    return QueueStatusResponse(**out)
 
 
 @v1_router.post("/graph/search")
