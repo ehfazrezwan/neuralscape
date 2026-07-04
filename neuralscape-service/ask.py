@@ -159,22 +159,41 @@ def _make_llm_call(tier: ReasoningTier):
 
 
 def _evidence_rows(evidence: dict, keyword_ids: list[str], enumeration: bool) -> list:
-    """Order evidence for the prompt.
+    """Select and order evidence for the prompt (audit 27 #15).
 
-    Chronological ascending (timestamps drive the recency/contradiction
-    disciplines). For enumeration questions the exact-keyword hits are
-    listed FIRST — the discipline is exact-before-semantic, and list-position
-    is how an LLM weighs evidence.
+    When over the row budget, the keep-set is chosen by priority —
+    keyword-pass hits first, then highest search score, then newest —
+    instead of the old ascending-sort + head-truncation, which silently
+    dropped the NEWEST facts (and let timestamp-less graph rows, whose
+    sort key was "", eat the budget from the front).
+
+    Survivors are then re-sorted chronologically ASCENDING for rendering
+    (timestamps drive the recency/contradiction disciplines); rows with no
+    timestamp sort LAST, not first. For enumeration questions the
+    exact-keyword hits are listed FIRST — the discipline is
+    exact-before-semantic, and list-position is how an LLM weighs evidence.
     """
     def _created(mem) -> str:
         return str(getattr(mem, "created_at", None) or "")
 
-    rows = sorted(evidence.values(), key=_created)
+    rows = list(evidence.values())
+
+    if len(rows) > _EVIDENCE_MAX_ROWS:
+        kw_set = set(keyword_ids)
+        # Three stable sorts, applied lowest-priority first:
+        rows.sort(key=_created, reverse=True)  # newest first ("" sorts last)
+        rows.sort(key=lambda m: (getattr(m, "score", None) is None,
+                                 -(getattr(m, "score", None) or 0.0)))
+        rows.sort(key=lambda m: m.id not in kw_set)  # keyword hits first
+        rows = rows[:_EVIDENCE_MAX_ROWS]
+
+    # Chronological ascending for the prompt; timestamp-less survivors last.
+    rows.sort(key=lambda m: (0, _created(m)) if _created(m) else (1, ""))
     if enumeration and keyword_ids:
         kw = [m for m in rows if m.id in keyword_ids]
         rest = [m for m in rows if m.id not in keyword_ids]
         rows = kw + rest
-    return rows[:_EVIDENCE_MAX_ROWS]
+    return rows
 
 
 def _render_evidence(rows: list) -> str:

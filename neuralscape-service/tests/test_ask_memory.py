@@ -31,6 +31,14 @@ def _mem(mid: str, content: str, created_at: str = "2026-07-01T00:00:00+00:00") 
     )
 
 
+def _graph_mem(mid: str, content: str) -> MemoryResponse:
+    """A graph-sourced row: no timestamp, no score (Graphiti edge shape)."""
+    return MemoryResponse(
+        id=mid, memory=content, category="relation", source="graph",
+        created_at=None, score=None,
+    )
+
+
 def _service(search_results=None, keyword_results=None) -> MagicMock:
     svc = MagicMock(name="MemoryService")
     svc.search.return_value = search_results if search_results is not None else []
@@ -228,6 +236,74 @@ class TestSearchLoop:
         assert svc.search.call_args_list[2].kwargs["query"] == "narrower"
         assert out["memories_considered"] == 2
         assert set(out["citations"]) == {"m1", "m2"}  # follow-up hit is citable
+
+
+# ──────────────────────────────────────────────
+# Evidence budget (audit 27 #15): over budget, keep by priority
+# (keyword hits > score > newest), render survivors chronologically
+# ──────────────────────────────────────────────
+
+
+class TestEvidenceBudget:
+    def _timestamped_rows(self, n: int):
+        """n rows with strictly ascending timestamps (id order = age order)."""
+        return [
+            _mem(f"mem-{i:03d}", f"fact number {i}",
+                 f"2026-01-01T{i // 60:02d}:{i % 60:02d}:00+00:00")
+            for i in range(n)
+        ]
+
+    def test_budget_overflow_keeps_newest_rows(self):
+        """130 ascending-timestamp rows → the NEWEST 120 survive the cut
+        (pre-fix the ascending sort + head-truncation kept the OLDEST)."""
+        rows = self._timestamped_rows(130)
+        evidence = {m.id: m for m in rows}
+        out = ask_mod._evidence_rows(evidence, [], False)
+        ids = [m.id for m in out]
+        assert len(ids) == ask_mod._EVIDENCE_MAX_ROWS
+        assert "mem-129" in ids  # newest row survives
+        assert "mem-000" not in ids  # oldest rows are the ones cut
+        # Survivors re-sorted chronologically ascending for the prompt.
+        assert ids == [f"mem-{i:03d}" for i in range(10, 130)]
+
+    @pytest.mark.asyncio
+    async def test_budget_overflow_newest_rows_reach_the_prompt(self):
+        rows = self._timestamped_rows(130)
+        svc = _service(rows)
+        llm = _answer_llm("ans", ["mem-129"])
+        await ask_memory(svc, question="q?", user_id="u",
+                         reasoning_level="minimal", llm_call=llm)
+        assert "[mem-129]" in llm.prompts[0]
+        assert "[mem-000]" not in llm.prompts[0]
+
+    def test_timestampless_graph_rows_do_not_eat_the_budget(self):
+        """Over budget, unscored timestamp-less graph rows are lowest
+        priority (pre-fix their '' sort key put them FIRST in the keep-set)."""
+        rows = self._timestamped_rows(120)
+        graph = [_graph_mem(f"g-{i}", f"relation {i}") for i in range(5)]
+        evidence = {m.id: m for m in graph + rows}  # graph rows arrive first
+        out = ask_mod._evidence_rows(evidence, [], False)
+        ids = [m.id for m in out]
+        assert len(ids) == ask_mod._EVIDENCE_MAX_ROWS
+        assert not [i for i in ids if i.startswith("g-")]
+        assert "mem-119" in ids
+
+    def test_timestampless_rows_render_last_when_under_budget(self):
+        rows = self._timestamped_rows(3)
+        graph = [_graph_mem("g-1", "relation one")]
+        evidence = {m.id: m for m in graph + rows}
+        ids = [m.id for m in ask_mod._evidence_rows(evidence, [], False)]
+        assert ids == ["mem-000", "mem-001", "mem-002", "g-1"]
+
+    def test_keyword_hits_survive_the_cut_even_when_old(self):
+        rows = self._timestamped_rows(130)
+        evidence = {m.id: m for m in rows}
+        out = ask_mod._evidence_rows(evidence, ["mem-000"], False)
+        ids = [m.id for m in out]
+        assert "mem-000" in ids  # keyword hit outranks recency
+        assert "mem-010" not in ids  # the extra slot comes from the oldest non-kw row
+        # Chronological rendering puts the surviving old kw hit first.
+        assert ids[0] == "mem-000"
 
 
 # ──────────────────────────────────────────────
