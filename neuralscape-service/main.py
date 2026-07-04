@@ -1465,19 +1465,22 @@ async def v1_get_task_status(task_id: str):
 # ── Recall ────────────────────────────────────
 
 
-def _meter_index_recall(op: str, user_id: str, hits, rows) -> tuple[str | None, "SavingsDetail | None"]:
+def _meter_index_recall(op: str, user_id: str, hits, response) -> tuple[str | None, "SavingsDetail | None"]:
     """E2: measure + ledger one index-serving recall (sync; call in a thread).
 
-    ``hits`` are the full MemoryResponse objects behind ``rows`` (their stored
-    write-time token counts are the measured baseline); ``rows`` are the
-    IndexRow models actually served — rendered here once and counted as NS
-    overhead. Returns (savings line, detail) or (None, None) when the meter
-    is disabled or the ledger write is skipped.
+    ``hits`` are the full MemoryResponse objects behind the index rows (their
+    stored write-time token counts are the measured baseline); ``response``
+    is the EXACT response model about to be served (rows + wrapper keys,
+    before the savings fields are attached) — the whole rendered body is
+    NS-injected overhead, measured verbatim rather than approximated by the
+    rows alone (never overclaim). The savings line/detail added afterwards
+    are covered by the measured SAVINGS_LINE_OVERHEAD_TOKENS constant.
+    Returns (savings line, detail) or (None, None) when the meter is off.
     """
     import savings_meter as sm
 
     payload = json.dumps(
-        [r.model_dump(exclude_none=True) for r in rows], ensure_ascii=False
+        response.model_dump(exclude_none=True), default=str, ensure_ascii=False
     )
     event = sm.measure_recall(
         op, hits, index_payload=payload, include_line_overhead=True
@@ -1536,11 +1539,13 @@ async def v1_search_memories(req: SearchMemoryRequest, request: Request):
             include_shared=req.include_shared,
         )
         if req.index_only:
-            rows = [IndexRow(**index_row(r)) for r in results]
-            line, detail = await asyncio.to_thread(
-                _meter_index_recall, "search_index", user_id, results, rows
+            response = SearchIndexResponse(
+                results=[IndexRow(**index_row(r)) for r in results]
             )
-            return SearchIndexResponse(results=rows, savings=line, savings_detail=detail)
+            response.savings, response.savings_detail = await asyncio.to_thread(
+                _meter_index_recall, "search_index", user_id, results, response
+            )
+            return response
         await asyncio.to_thread(_meter_full_recall, "search", user_id, results)
         return SearchMemoryResponse(results=results)
     except HTTPException:
@@ -1605,16 +1610,17 @@ async def v1_timeline(req: TimelineRequest, request: Request):
             status_code=404, detail=f"Timeline anchor {req.anchor!r} could not be resolved"
         )
     anchor_id = out["anchor_id"]
-    rows = [
-        IndexRow(**index_row(m, anchor=(m.id == anchor_id)))
-        for m in out["memories"]
-    ]
-    line, detail = await asyncio.to_thread(
-        _meter_index_recall, "timeline", caller, out["memories"], rows
+    response = TimelineResponse(
+        anchor_id=anchor_id,
+        results=[
+            IndexRow(**index_row(m, anchor=(m.id == anchor_id)))
+            for m in out["memories"]
+        ],
     )
-    return TimelineResponse(
-        anchor_id=anchor_id, results=rows, savings=line, savings_detail=detail
+    response.savings, response.savings_detail = await asyncio.to_thread(
+        _meter_index_recall, "timeline", caller, out["memories"], response
     )
+    return response
 
 
 # ── Ask (C3: reasoning-tiered question answering) ──

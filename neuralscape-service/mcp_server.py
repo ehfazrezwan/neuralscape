@@ -43,17 +43,21 @@ _service = MemoryService()
 _task_manager = TaskManager()
 
 
-def _meter_mcp_index(op: str, user_id: str, hits, rows: list[dict]):
+def _meter_mcp_index(op: str, user_id: str, hits, body: dict):
     """E2: measure + ledger one index-serving MCP recall (sync; thread it).
 
     ``hits`` are full MemoryResponse objects (stored write-time token counts
-    = measured baseline); ``rows`` the plain index-row dicts actually served
-    (counted as NS-injected overhead). Returns (savings line, detail dict)
-    or (None, None) when the savings meter is disabled.
+    = measured baseline); ``body`` is the EXACT response body about to be
+    served (rows + hint + wrapper keys, before the savings fields are
+    attached) — the whole thing is NS-injected overhead, so it is measured
+    verbatim rather than approximated by the rows alone (never overclaim).
+    The savings line/detail added afterwards are covered by the measured
+    SAVINGS_LINE_OVERHEAD_TOKENS constant. Returns (savings line, detail
+    dict) or (None, None) when the savings meter is disabled.
     """
     import savings_meter as sm
 
-    payload = json.dumps(rows, default=str, ensure_ascii=False)
+    payload = json.dumps(body, default=str, ensure_ascii=False)
     event = sm.measure_recall(
         op, hits, index_payload=payload, include_line_overhead=True
     )
@@ -1158,7 +1162,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 }
                 # E2: honest savings line + ledger entry for this recall.
                 line, detail = await asyncio.to_thread(
-                    _meter_mcp_index, "search_index", user_id, results, rows
+                    _meter_mcp_index, "search_index", user_id, results, body
                 )
                 if line is not None:
                     body["savings"] = line
@@ -1220,7 +1224,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 "hint": "Rows are oldest→newest. Call get_memories(ids=[...]) for full payloads.",
             }
             line, detail = await asyncio.to_thread(
-                _meter_mcp_index, "timeline", user_id, out["memories"], rows
+                _meter_mcp_index, "timeline", user_id, out["memories"], body
             )
             if line is not None:
                 body["savings"] = line

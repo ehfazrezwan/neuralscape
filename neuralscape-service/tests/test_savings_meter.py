@@ -88,6 +88,15 @@ class TestCountAndStamp:
         hit = _hit("m1", "legacy row without a stored count")
         assert sm.hit_tokens(hit) == sm.count_tokens("legacy row without a stored count")
 
+    def test_hit_tokens_zero_stamp_is_present_not_missing(self, monkeypatch):
+        """A stored token_estimate of 0 is a value, not an absence — it must
+        never trigger a hot-path re-tokenization (Copilot review, PR #115)."""
+        tripwire = MagicMock(side_effect=AssertionError("re-tokenized a stamped row"))
+        monkeypatch.setattr(sm, "count_tokens", tripwire)
+        hit = _hit("m1", "some content", token_estimate=0)
+        assert sm.hit_tokens(hit) == 0
+        tripwire.assert_not_called()
+
 
 # ── Measurement math ─────────────────────────────────────────────────
 

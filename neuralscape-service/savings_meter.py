@@ -113,13 +113,17 @@ def stamp_tokens(content: str | None) -> int:
 
 def hit_tokens(mem) -> int:
     """Token cost of one hit's full content — the stored write-time count
-    when present (no tokenizer call), else counted now."""
+    when present (no tokenizer call), else counted now.
+
+    Any non-None stored value counts as present — including 0 — so a
+    malformed/zero legacy stamp never silently re-tokenizes content on the
+    hot path (the "baselines ride stored counts" guarantee)."""
     stored = getattr(mem, "token_estimate", None)
-    if stored:
+    if stored is not None:
         try:
             return max(0, int(stored))
         except (TypeError, ValueError):
-            pass
+            pass  # not coercible — fall back to counting
     return count_tokens(getattr(mem, "memory", None) or "")
 
 
