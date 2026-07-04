@@ -205,6 +205,28 @@ def _format_bundle(fmt: str, grounding: str, messages: list[dict]):
     return {"text": text}
 
 
+def _served_tokens(fmt: str, bundle: dict) -> int:
+    """Token cost of the bundle AS SERVED (headers/framing included).
+
+    - plain: the whole rendered text;
+    - anthropic/openai: the grounding/system text plus each message's
+      ``role: content`` cost (+1 joining separator each) — the same
+      per-message arithmetic the fill loop budgets with.
+    """
+    if fmt == "plain":
+        return ss.text_tokens(bundle.get("text") or "")
+    if fmt == "anthropic":
+        system = bundle.get("system") or ""
+        msgs = bundle.get("messages") or []
+    else:  # openai — system rides as messages[0]
+        msgs = bundle.get("messages") or []
+        system = ""
+    total = ss.text_tokens(system)
+    for m in msgs:
+        total += ss.text_tokens(f"{m.get('role', '')}: {m.get('content', '')}") + 1
+    return total
+
+
 def assemble_context(
     service,
     *,
@@ -264,7 +286,13 @@ def assemble_context(
 
     grounding = _grounding_text(card_lines, summary_text, summary_slot, index_lines)
     bundle = _format_bundle(fmt, grounding, messages)
-    used_tokens = card_used + index_used + summary_used + messages_used
+    # ``used_tokens`` measures the bundle AS SERVED — framing/headers
+    # included, not just the section contents — so it is the honest
+    # ``served`` side of the meter and stays consistent with the rendered
+    # payload. Fits the budget by construction: the section fills came out
+    # of ``budget - FRAMING_OVERHEAD_TOKENS`` and the real framing is
+    # smaller than that allowance.
+    used_tokens = _served_tokens(fmt, bundle)
 
     # ── E2 ledger: baseline vs served, measured (see module docstring) ──
     import savings_meter as sm

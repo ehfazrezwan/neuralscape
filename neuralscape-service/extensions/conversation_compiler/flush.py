@@ -182,7 +182,7 @@ async def flush_conversation_turn(
         if guidance:
             prompt = append_operator_guidance(prompt, guidance)
     except Exception:  # noqa: BLE001 — guidance is best-effort, never blocks a flush
-        logger.warning("operator-guidance resolve failed (non-fatal)")
+        logger.warning("operator-guidance resolve failed (non-fatal)", exc_info=True)
 
     try:
         from .compile import _async_call_gemini

@@ -211,6 +211,19 @@ class TestRefreshSlot:
         out = await ss.refresh_slot("u1", "s1", "medium", AsyncMock(), redis=r)
         assert out["status"] == "skipped"
 
+    @pytest.mark.asyncio
+    async def test_empty_buffer_read_does_not_advance_through(self, r):
+        """A lost/failed buffer read (count says 20, list empty) must NOT
+        advance {slot}_through — that would permanently skip summarizing
+        messages this pass never saw."""
+        r.hincrby(ss.meta_key("u1", "s1"), "count", 20)  # count without buffer
+        llm = AsyncMock(return_value="should not run")
+        out = await ss.refresh_slot("u1", "s1", "short", llm, redis=r)
+        assert out["status"] == "failed"
+        llm.assert_not_awaited()
+        meta = r.hgetall(ss.meta_key("u1", "s1"))
+        assert meta.get(b"short_through") is None  # untouched
+
 
 # ──────────────────────────────────────────────
 # Worker trigger

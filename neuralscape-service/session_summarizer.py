@@ -324,6 +324,17 @@ async def refresh_slot(
     new_messages = await asyncio.to_thread(
         get_recent_messages, user_id, session_id, since, r
     )
+    if not new_messages:
+        # ``since > 0`` says messages arrived, yet the buffer read came back
+        # empty — a transient Redis failure or a lost/expired buffer.
+        # Bail WITHOUT advancing ``{slot}_through``: advancing here would
+        # permanently skip summarizing messages this pass never saw. The
+        # next threshold crossing (or a retry) picks them up.
+        logger.warning(
+            "summary refresh for %s slot found no buffered messages despite "
+            "count-through=%d — not advancing through_count", slot, since,
+        )
+        return {"status": "failed", "reason": "buffer read empty"}
     prior = await asyncio.to_thread(load_slot, user_id, session_id, slot, r)
     prior_text = (prior or {}).get("text") or "(no prior summary)"
     max_tokens = slot_max_tokens(slot)

@@ -139,6 +139,19 @@ class TestBudget:
         out = _assemble(r, budget_tokens=1000)
         assert out["sections"]["summary_slot"] == "short"
 
+    def test_used_tokens_measures_rendered_bundle(self, r):
+        """used_tokens is the bundle AS SERVED (headers included), not just
+        the raw section contents — so served/meter/budget stay consistent."""
+        _seed_session(r, 10, 20)
+        _seed_slot(r, "short", 50)
+        _seed_card(r)
+        out = _assemble(r, budget_tokens=4000, fmt="plain")
+        assert out["used_tokens"] == ss.text_tokens(out["bundle"]["text"])
+        s = out["sections"]
+        content_only = (s["card_tokens"] + s["index_tokens"]
+                        + s["summary_tokens"] + s["messages_tokens"])
+        assert out["used_tokens"] > content_only  # headers are counted
+
     def test_empty_session_and_no_card_still_ok(self, r):
         out = _assemble(r, session_id=None)
         assert out["status"] == "ok"
