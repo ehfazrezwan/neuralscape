@@ -319,6 +319,8 @@ The `hooks/hooks.json` manifest now declares **four** hook events (was two):
 | `UserPromptSubmit` | `scripts/user-prompt-submit.js` | Threshold-based trigger that asks Claude to compile the buffer before responding | No |
 | `Stop` | `scripts/session-end.js` | Conversation-compiler flush + drop a `.stale` marker on any non-empty observation buffer | Yes |
 
+*(v2.8 adds a fifth event, `SessionEnd` → `scripts/session-summary.js` — see the v2.8 section below.)*
+
 ### PostToolUse hook (`src/hooks/post-tool-use.ts`)
 
 Pure recorder. No HTTP, no LLM, fast. Filtering rules at the gate:
@@ -425,6 +427,35 @@ The plugin's `.mcp.json` template (`Authorization: Bearer ${user_config.API_KEY}
 ### Compile-observations skill default visibility
 
 The compile-observations skill is updated (in v2.2) to set `visibility` on every memory it writes. Per-category defaults match the table in [03-memory-model](./03-memory-model.md): private for `preference` / `personal_fact` / `task_context`; shared for `tech_stack` / `convention` / `architecture` / `decision` etc. The model can override per-memory when the default is wrong for a specific work unit. See `neuralscape-plugin/skills/compile-observations/SKILL.md` for the rubric.
+
+## Progressive disclosure + structured session summaries (v2.8)
+
+Ships roadmap items D1, D2, the F2 client-side policy, and the D4 hygiene quick wins (see [24-competitive-roadmap](./24-competitive-roadmap.md)).
+
+### SessionStart: the index, not the payloads (D1)
+
+`CONTEXT_MODE=index` (the default) replaces full-content injection with a progressive-disclosure block assembled by `src/core/disclosure.ts` (pure, fixture-tested) from the same `GET /v1/context/*` response:
+
+1. **Binding standards** — unchanged contract, never truncated, outside every budget.
+2. **Identity card(s)** (B4) — `GET /v1/extensions/dreaming/card?pool=shared--project--<pid>` and `pool=user--<uid>`, injected verbatim when the dreaming sweep has produced them (silently absent otherwise).
+3. **"Previously…"** (D2) — the newest `session_note`-tagged `task_context` memory, parsed back into `{request, investigated, learned, completed, next_steps}` and rendered next-steps-first. Excluded from the index table (no double render).
+4. **Memory index** — day-grouped `#id | time | glyph category | title | ~tokens` rows (server-stamped C1 titles/token_estimates preferred, client heuristic for legacy rows), newest first, bounded by `INDEX_BUDGET_TOKENS` (default 1500). Headed by the measured savings line `index: N memories, ~X tokens vs ~Y full (Z% saved)`; clipped rows are pointed at index-first recall.
+5. **Escalation footer** — teaches scan → `recall_memories(index_only=true)` → `get_memories(ids=[...])` → `timeline`, and (F2) when the service resolves a Graphify code graph (`CODE_GRAPH=auto` probes `GET /v1/code-graph/query` at session start), directs code-*structure* questions to `query_code_graph` / `get_code_neighbors` / `code_path` and forbids storing purely-structural facts.
+
+When the service is unreachable, SessionStart injects a one-line `[neuralscape] memory service unreachable` notice and exits 0 — session start is never blocked.
+
+### SessionEnd: ONE checkpoint session note (D2)
+
+`scripts/session-summary.js` fires once per session (clear/logout/exit — unlike `Stop`, which fires per assistant turn). It reads the full transcript plus the session's observation buffer, distills `{request, investigated, learned, completed, next_steps}` with deterministic heuristics in `src/core/session-note.ts` (no LLM), and stores it via ONE `POST /v1/checkpoint` call with `memories: []` — observation-derived memories still belong exclusively to the compile-observations flow, so nothing is double-stored. The server renders the note as a single `task_context` memory tagged `session_note` (`observation_type=meeting_outcome`); the next SessionStart turns it into the "Previously…" block.
+
+### Capture hygiene (D4)
+
+- `redactPrivate()` in `src/utils.ts` strips `<private>…</private>` spans (case-insensitive, fail-closed on unclosed tags) from observation rows before they hit disk, from conversation turns before `/flush`, and from session-note fields before `/checkpoint`.
+- Exit-code taxonomy: transport failure → exit 0 (+ notice), malformed hook stdin → exit 2 on hooks where exit 2 cannot block (`SessionStart`/`SessionEnd`/`PostToolUse`); `Stop` and `UserPromptSubmit` stay exit-0-lenient because exit 2 there has blocking semantics. The full table lives in the plugin README.
+
+### Tests
+
+`npm test` in `neuralscape-plugin/` builds the bundles, runs the pure-logic suites (`tests/disclosure.test.ts`, `tests/session-note.test.ts` — index rendering under budget, savings header, F2 footer, note round-trip, redaction) and subprocess tests (`tests/hook-exit-codes.test.ts`) that assert the exit-code taxonomy against the built `scripts/*.js`.
 
 ## Related
 

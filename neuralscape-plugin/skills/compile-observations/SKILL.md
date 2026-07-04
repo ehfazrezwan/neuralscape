@@ -49,6 +49,7 @@ A memory is significant if it satisfies AT LEAST ONE:
 - Anything tied to *this* session that won't matter in 30 days.
 - Anything containing `<private>`, an API-key shape (`sk-...`, `gsk_...`, `ghp_...`, etc.), passwords, or env-var values.
 - Tool errors that don't reveal anything — but DO keep errors that surface a real bug or constraint.
+- **Purely structural code observations** — "module A imports B", "function X calls Y", file/class inventories, dependency lists derivable from the code itself. Structure rots with every commit; re-derive it from the code (or, when the project has a Graphify code graph behind Neuralscape, from the `query_code_graph` / `get_code_neighbors` / `code_path` MCP tools — the session context says so when one is available). What DOESN'T rot — and is always worth storing — is the knowledge *about* the structure: the decision that put a boundary somewhere, the gotcha in how two modules interact, the rationale a comment can't hold.
 
 ## Tone & format
 

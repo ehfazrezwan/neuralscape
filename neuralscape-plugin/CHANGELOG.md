@@ -4,6 +4,50 @@ All notable changes to the `neuralscape` Claude plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.0] - 2026-07-04
+
+### Added
+
+- **Progressive-disclosure SessionStart injection (roadmap D1).** The default
+  `CONTEXT_MODE=index` now injects the *map*, not the memories: a day-grouped
+  index table (`#id | time | type | title | ~tokens`) built from the recalled
+  context, topped by the dreaming sweep's identity card(s) when available, a
+  savings header (`index: N memories, ~X tokens vs ~Y full`), and an
+  escalation footer teaching index → `recall_memories(index_only=true)` →
+  `get_memories(ids=[...])` → `timeline`. Budget-bounded via
+  `INDEX_BUDGET_TOKENS` (default 1500). `CONTEXT_MODE=full` restores the
+  legacy full-content injection.
+- **Structured session summaries + "Previously…" continuity (roadmap D2).** A
+  new `SessionEnd` hook (`scripts/session-summary.js`) distills the session
+  into `{request, investigated, learned, completed, next_steps}` from the
+  transcript + observation buffer (deterministic, no LLM) and stores it via
+  ONE `POST /v1/checkpoint` call as a `session_note`. The next SessionStart
+  parses the latest note back into a compact "Previously…" block, next steps
+  first. Dense memories still come from compile-observations — the note is a
+  continuity artifact, never a duplicate store.
+- **F2 code-graph deferral policy.** When the service reports a resolvable
+  Graphify code graph (`CODE_GRAPH=auto` probes at session start; `on`/`off`
+  override), the escalation footer directs code-*structure* questions to the
+  NS `query_code_graph` / `get_code_neighbors` / `code_path` tools, and the
+  compile-observations rubric demotes purely-structural observations
+  (structure rots; decisions/gotchas/rationale don't).
+- **`<private>…</private>` redaction (roadmap D4).** Redacted in everything
+  the plugin stores or transmits: PostToolUse observation rows (before they
+  hit disk), conversation-compiler flush bodies, and session-note fields.
+  Fail-closed: an unclosed `<private>` redacts to end-of-text.
+- **Hook exit-code taxonomy (roadmap D4)**, documented in the README:
+  transport failure → exit 0 + a one-line notice (never block the session),
+  malformed hook stdin → exit 2 (client bug, fail loud) on hooks where exit 2
+  cannot block (SessionStart / SessionEnd / PostToolUse); Stop and
+  UserPromptSubmit stay exit-0-lenient because exit 2 there has blocking
+  semantics.
+
+### Changed
+
+- SessionStart degrades explicitly when the service is down: a one-line
+  `[neuralscape] memory service unreachable` notice is injected instead of a
+  silent skip.
+
 ## [2.7.1] - 2026-07-03
 
 ### Fixed
