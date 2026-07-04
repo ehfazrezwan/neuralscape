@@ -198,6 +198,13 @@ class Settings(BaseSettings):
     extraction_window_messages: int = 30
     extraction_window_overlap: int = 2
 
+    # ── Known project slugs ────────────────────────────────────────────
+    # Comma-separated project slugs this deployment knows about, used for
+    # project_id inference from memory content and multi-group episode
+    # cleanup. Deployment-specific — supply via KNOWN_PROJECT_SLUGS at
+    # deploy time; never hardcode real project names in this public repo.
+    known_project_slugs: str = "neuralscape"
+
     # ── Custom extraction instructions (roadmap E4) ───────────────────
     # Operator-supplied guidance appended to the extraction prompt as a
     # clearly-delimited addendum ("OPERATOR GUIDANCE"). Per-user (self-set)
@@ -458,6 +465,16 @@ class Settings(BaseSettings):
         if value < 0:
             raise ValueError("EXTRACTION_WINDOW_OVERLAP must be >= 0")
         return value
+
+    @property
+    def known_projects(self) -> list[str]:
+        """KNOWN_PROJECT_SLUGS as a normalized, deduplicated list."""
+        seen: list[str] = []
+        for slug in self.known_project_slugs.split(","):
+            s = slug.strip().lower()
+            if s and s not in seen:
+                seen.append(s)
+        return seen
 
     @model_validator(mode="after")
     def _validate_extraction_windowing(self) -> "Settings":
