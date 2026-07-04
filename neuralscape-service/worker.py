@@ -615,6 +615,9 @@ async def process_ingest_okf_bundle(ctx: dict, payload: dict) -> dict:
         service,
         files=files,
         bundle_uri=bundle_uri,
+        # The artifact download endpoint (API-relative) — preserved on every
+        # concept's source_ref.url so the bundle stays re-fetchable.
+        bundle_url=source_ref.get("url"),
         user_id=payload["user_id"],
         scope=options.get("scope", "global"),
         project_id=options.get("project_id"),

@@ -623,6 +623,31 @@ def test_ingest_okf_bundle_stamps_source_ref_and_links():
     assert "references and relates to" in link_calls[0]["content"]
 
 
+def test_ingest_okf_bundle_preserves_artifact_download_url():
+    from ingest.okf_bundle import ingest_okf_bundle
+
+    service = _FakeIngestService()
+    ingest_okf_bundle(
+        service,
+        files={"a.md": BUNDLE_FILES["a.md"]},
+        bundle_uri="artifacts/alice/bundle.zip",
+        bundle_url="/v1/ingest/artifacts/abc123",
+        user_id="alice",
+    )
+    for call in service.store_calls:
+        assert (call.get("source_ref") or {}).get("url") == "/v1/ingest/artifacts/abc123"
+
+
+def test_split_page_decodes_double_quoted_yaml_escapes():
+    from extensions.dreaming import librarian as lib
+
+    page = '---\ntitle: "He said \\"go\\": now"\nsummary: \'it\'\'s fine\'\n---\n\nbody'
+    fm, body = lib.split_page(page)
+    assert fm["title"] == 'He said "go": now'
+    assert fm["summary"] == "it's fine"
+    assert body == "body"
+
+
 def test_ingest_real_ga4_sample_bundle_if_present():
     sample = Path("/tmp/knowledge-catalog/okf/bundles/ga4")
     if not sample.exists():

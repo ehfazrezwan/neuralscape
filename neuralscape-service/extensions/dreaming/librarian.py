@@ -54,6 +54,8 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+import yaml
+
 from okf import translate as okf_translate
 
 from .consolidate import PoolBatch
@@ -225,10 +227,18 @@ def split_page(content: str) -> tuple[dict, str]:
             v = v.strip()
             # The OKF-conformant renderer YAML-quotes values that need it
             # (timestamps, titles with colons); unwrap so line-oriented
-            # readers keep seeing the raw value.
+            # readers keep seeing the raw value. Quoted scalars decode via
+            # YAML (handles single-quote doubling AND double-quote escape
+            # sequences); quoting guarantees the result stays a string, so
+            # no timestamp→datetime coercion can occur.
             if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
-                inner = v[1:-1]
-                v = inner.replace("''", "'") if v[0] == "'" else inner
+                try:
+                    parsed = yaml.safe_load(v)
+                    if isinstance(parsed, str):
+                        v = parsed
+                except yaml.YAMLError:
+                    inner = v[1:-1]
+                    v = inner.replace("''", "'") if v[0] == "'" else inner
             fm[k.strip()] = v
     return fm, m.group("body").lstrip("\n")
 

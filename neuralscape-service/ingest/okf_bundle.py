@@ -288,9 +288,16 @@ def default_type_llm(service) -> Callable[[str], str]:
 
 
 def _concept_source(
-    concept: OkfConcept, *, bundle_uri: str, bundle_name: str
+    concept: OkfConcept, *, bundle_uri: str, bundle_name: str, bundle_url: str | None = None
 ) -> dict:
-    """The ``source_ref`` for one concept: {bundle URI/path, concept ID}."""
+    """The ``source_ref`` for one concept: {bundle URI/path, concept ID}.
+
+    ``bundle_url`` is the retrievable link for the bundle artifact (an
+    absolute URL, or an API-relative download endpoint like the artifact
+    route) — preserved verbatim so the memory stays re-fetchable. When
+    absent, an absolute ``bundle_uri`` doubles as the url; a bare
+    filesystem path stays out of the url field (it isn't clickable).
+    """
     source: dict = {
         "connector_id": bundle_name,
         "connector_type": "okf_bundle",
@@ -299,8 +306,9 @@ def _concept_source(
         "title": concept.title or concept.concept_id,
         "last_synced_at": datetime.now(timezone.utc).isoformat(),
     }
-    if "://" in bundle_uri:
-        source["url"] = bundle_uri
+    url = bundle_url or (bundle_uri if "://" in bundle_uri else None)
+    if url:
+        source["url"] = url
     return source
 
 
@@ -309,6 +317,7 @@ def ingest_okf_bundle(
     *,
     files: Mapping[str, str],
     bundle_uri: str,
+    bundle_url: str | None = None,
     user_id: str,
     scope: str = "global",
     project_id: str | None = None,
@@ -350,7 +359,9 @@ def ingest_okf_bundle(
             continue
         doc = IngestDoc(
             content=concept.text,
-            source=_concept_source(concept, bundle_uri=bundle_uri, bundle_name=bundle_name),
+            source=_concept_source(
+                concept, bundle_uri=bundle_uri, bundle_name=bundle_name, bundle_url=bundle_url,
+            ),
             user_id=user_id,
             category=concept.category or _DEFAULT_CATEGORY,
             scope=scope,
@@ -413,7 +424,8 @@ def ingest_okf_bundle(
                 memory_kind="fact",
                 related_memory_ids=related,
                 source_ref=_concept_source(
-                    concept, bundle_uri=bundle_uri, bundle_name=bundle_name
+                    concept, bundle_uri=bundle_uri, bundle_name=bundle_name,
+                    bundle_url=bundle_url,
                 ),
                 add_to_graph=False,
                 return_created=True,
@@ -437,7 +449,8 @@ def ingest_okf_bundle(
                         "project_id": project_id if scope == "project" else None,
                         "visibility": getattr(m, "visibility", None),
                         "source_ref": _concept_source(
-                            concept, bundle_uri=bundle_uri, bundle_name=bundle_name
+                            concept, bundle_uri=bundle_uri, bundle_name=bundle_name,
+                            bundle_url=bundle_url,
                         ),
                     })
 
