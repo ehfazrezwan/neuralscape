@@ -13,8 +13,10 @@ gate → report only), and applies:
 - merge            → survivor rewritten (fold-in), losers tombstoned +
                      graph-invalidated (bi-temporal, reversible)
 - invalidate       → tombstone + graph invalid_at (reversible)
-- prune            → secrets: hard-delete (the one irreversible case);
-                     everything else: tombstone + invalidate
+- prune            → gate-cleared secrets: hard-delete (the one
+                     irreversible case, confidence-gated like every other
+                     destructive action); everything else — including
+                     below-gate secret claims — tombstone + invalidate
 - rewrite          → content updated in place (re-embedded)
 - temporal_reframe → content updated in place (re-embedded)
 
@@ -274,16 +276,24 @@ def split_by_posture(actions: list[dict], *, auto_apply_confidence: float) -> tu
 
     Reversible actions always apply. Destructive actions apply only at or
     above the confidence gate — below it they are reported (shadow trial).
-    Secret prunes always apply regardless (safety exception).
+
+    Secret claims (audit 27 #25): ``contains_secret`` is an unvalidated LLM
+    field, and the secret prune is the ONE irreversible primitive — so it
+    must pass the same confidence gate as every other destructive action.
+    A below-gate secret claim is still acted on (a possible credential is
+    never left fully live) but *downgraded* to the reversible path:
+    ``apply_actions`` tombstones instead of hard-deleting and records the
+    claim in metadata so a later sweep can re-examine it.
     """
     to_apply: list[dict] = []
     to_report: list[dict] = []
     for act in actions:
         if act["type"] in _REVERSIBLE:
             to_apply.append(act)
-        elif act.get("contains_secret"):
-            to_apply.append(act)
         elif act["confidence"] >= auto_apply_confidence:
+            to_apply.append(act)
+        elif act.get("contains_secret"):
+            act["secret_claim_downgraded"] = True
             to_apply.append(act)
         else:
             to_report.append(act)
@@ -382,12 +392,25 @@ async def apply_actions(
                     )
             elif a_type == "prune":
                 for mid in act["memory_ids"]:
-                    if act.get("contains_secret"):
-                        # The one irreversible case: secrets must not persist,
-                        # not even as tombstones.
+                    if act.get("contains_secret") and not act.get("secret_claim_downgraded"):
+                        # The one irreversible case: gate-cleared secrets must
+                        # not persist, not even as tombstones.
                         await asyncio.to_thread(service.delete_memory, mid)
                     else:
-                        await asyncio.to_thread(_tombstone, service, mid, superseded_by=None, pruned=True)
+                        # Below-gate secret claims ride the reversible path
+                        # (audit 27 #25): tombstone + record the claim for a
+                        # later sweep to re-examine at higher confidence.
+                        secret_claim = None
+                        if act.get("contains_secret"):
+                            secret_claim = {
+                                "contains_secret": True,
+                                "confidence": act.get("confidence"),
+                                "claimed_at": datetime.now(timezone.utc).isoformat(),
+                            }
+                        await asyncio.to_thread(
+                            _tombstone, service, mid, superseded_by=None,
+                            pruned=True, secret_claim=secret_claim,
+                        )
                         await _graph_invalidate(service, batch.group_id, mid, superseded_by=None)
             elif a_type in ("rewrite", "temporal_reframe"):
                 for mid in act["memory_ids"]:
@@ -467,11 +490,22 @@ def _rewrite_content(
     )
 
 
-def _tombstone(service, memory_id: str, *, superseded_by: str | None, pruned: bool = False) -> None:
+def _tombstone(
+    service,
+    memory_id: str,
+    *,
+    superseded_by: str | None,
+    pruned: bool = False,
+    secret_claim: dict | None = None,
+) -> None:
     """Mark a Qdrant row consolidated-away without deleting it.
 
     The search path excludes ``metadata.dream_tombstoned=true`` rows; the
     row (and its graph history) remains for audit/reversal.
+
+    ``secret_claim`` (audit 27 #25) records a below-confidence-gate
+    ``contains_secret`` claim on the tombstone so a later sweep can
+    re-examine it instead of the claim being silently dropped.
     """
     from config import settings as core_settings
 
@@ -485,6 +519,8 @@ def _tombstone(service, memory_id: str, *, superseded_by: str | None, pruned: bo
         patch["superseded_by"] = superseded_by
     if pruned:
         patch["dream_pruned"] = True
+    if secret_claim:
+        patch["dream_secret_claim"] = secret_claim
     client.set_payload(
         collection_name=core_settings.qdrant_collection,
         payload={"metadata": _merged_metadata(client, memory_id, patch)},
