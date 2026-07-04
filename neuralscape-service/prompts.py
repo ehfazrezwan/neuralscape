@@ -159,6 +159,35 @@ def parse_extraction_response(response_text: str) -> list[tuple[str, str]]:
     return [parse_category_from_fact(f) for f in facts if f and isinstance(f, str)]
 
 
+def split_into_windows(
+    messages: list[dict],
+    window_size: int,
+    overlap: int,
+) -> list[list[dict]]:
+    """Split conversation messages into overlapping extraction windows (audit 27 #22).
+
+    A single extraction call over a long session caps out at a few dozen
+    facts (one JSON response) and one failure zeroes everything. Windowing
+    bounds each call's input; the small overlap lets a fact whose evidence
+    straddles a boundary be seen by both windows (the write path's
+    content-hash dedup collapses the resulting duplicates).
+
+    Conversations at or under ``window_size`` return ``[messages]`` — the
+    single-window path is byte-identical to unwindowed extraction.
+    """
+    if window_size <= 0 or len(messages) <= window_size:
+        return [messages]
+    # Clamp so the split always advances even on nonsense overlap config.
+    overlap = max(0, min(overlap, window_size - 1))
+    step = window_size - overlap
+    windows: list[list[dict]] = []
+    for start in range(0, len(messages), step):
+        windows.append(messages[start : start + window_size])
+        if start + window_size >= len(messages):
+            break
+    return windows
+
+
 def build_extraction_messages(
     conversation_messages: list[dict],
     operator_guidance: str | None = None,

@@ -867,8 +867,16 @@ class MemoryService:
         project_id: str | None = None,
         agent_id: str | None = None,
         run_id: str | None = None,
-    ) -> list[MemoryResponse]:
+        return_stats: bool = False,
+    ) -> list[MemoryResponse] | tuple[list[MemoryResponse], dict]:
         """Extract facts from conversation via LLM, then store each with category metadata.
+
+        Long conversations are split into overlapping extraction windows
+        (audit 27 #22) — one LLM call per window, facts unioned; a
+        conversation at or under one window (``EXTRACTION_WINDOW_MESSAGES``)
+        is byte-identical to the unwindowed path. One failed window degrades
+        to a partial result (reported via ``return_stats``); only ALL windows
+        failing raises — preserving the post-#118 loud-failure semantics.
 
         Args:
             messages: Conversation messages [{role, content}, ...]
@@ -876,47 +884,78 @@ class MemoryService:
             project_id: Optional project identifier
             agent_id: Optional agent identifier for provenance
             run_id: Optional session identifier
+            return_stats: When True, returns ``(memories, stats)`` where
+                stats is ``{windows_total, windows_failed, window_errors}``
+                so the worker can surface partial extraction in the task
+                result. Default False keeps the legacy list return.
 
         Returns:
-            List of stored memory responses.
+            List of stored memory responses (or ``(list, stats)`` when
+            ``return_stats=True``).
         """
         m = self._get_memory()
 
-        # Step 1: Call Gemini for fact extraction. E4: operator-supplied
-        # extraction instructions (per-project + per-user, composed) ride
-        # along as a clearly-delimited addendum that can steer fact
-        # selection/phrasing but never the JSON output contract.
+        # Step 1: Call Gemini for fact extraction, one call per window.
+        # E4: operator-supplied extraction instructions (per-project +
+        # per-user, composed) ride along as a clearly-delimited addendum on
+        # EVERY window's prompt — they steer fact selection/phrasing but
+        # never the JSON output contract.
         from extraction_settings import resolve_instructions
+        from prompts import split_into_windows
 
         operator_guidance = resolve_instructions(user_id, project_id)
-        extraction_messages = build_extraction_messages(
-            messages, operator_guidance=operator_guidance
+        windows = split_into_windows(
+            messages,
+            settings.extraction_window_messages,
+            settings.extraction_window_overlap,
         )
         client = self._get_genai_client()
 
-        try:
-            from google.genai.types import GenerateContentConfig, HttpOptions
+        from google.genai.types import GenerateContentConfig, HttpOptions
 
-            response = retry_transient(
-                client.models.generate_content,
-                model=settings.gemini_llm_model,
-                contents=extraction_messages[0]["content"],
-                config=GenerateContentConfig(
-                    http_options=HttpOptions(timeout=60_000),  # milliseconds
-                ),
-                operation="LLM extraction",
-                fallback_model=settings.gemini_llm_fallback_model,
+        parsed_facts: list[tuple[str, str]] = []
+        window_errors: list[str] = []
+        last_exc: Exception | None = None
+        for w_idx, window_messages in enumerate(windows):
+            extraction_messages = build_extraction_messages(
+                window_messages, operator_guidance=operator_guidance
             )
-            parsed_facts = parse_extraction_response(response.text)
-        except Exception as e:
-            # Loud failure: propagate so the ARQ job (and task status) reports
-            # failed instead of completing with zero facts. A silent [] here
-            # masked real outages (the caller can't tell "nothing worth
-            # extracting" from "extraction is down").
-            logger.error(
-                f"LLM extraction failed for user {user_id}: {e}", exc_info=True
-            )
-            raise
+            try:
+                response = retry_transient(
+                    client.models.generate_content,
+                    model=settings.gemini_llm_model,
+                    contents=extraction_messages[0]["content"],
+                    config=GenerateContentConfig(
+                        http_options=HttpOptions(timeout=60_000),  # milliseconds
+                    ),
+                    operation="LLM extraction",
+                    fallback_model=settings.gemini_llm_fallback_model,
+                )
+                parsed_facts.extend(parse_extraction_response(response.text))
+            except Exception as e:
+                # One window failing must not zero the whole session — keep
+                # the other windows' facts and report the failure honestly
+                # in the task result (see return_stats).
+                last_exc = e
+                window_errors.append(f"window {w_idx + 1}/{len(windows)}: {e}")
+                logger.error(
+                    f"LLM extraction failed for window {w_idx + 1}/{len(windows)} "
+                    f"(user {user_id}): {e}",
+                    exc_info=True,
+                )
+        if window_errors and len(window_errors) == len(windows):
+            # Loud failure: EVERY window failed → propagate so the ARQ job
+            # (and task status) reports failed instead of completing with
+            # zero facts. A silent [] here masked real outages (the caller
+            # can't tell "nothing worth extracting" from "extraction is
+            # down"). For a single-window conversation this is exactly the
+            # pre-windowing behavior.
+            raise last_exc
+        stats = {
+            "windows_total": len(windows),
+            "windows_failed": len(window_errors),
+            "window_errors": window_errors,
+        }
 
         # Filter out junk facts from extraction
         pre_filter_count = len(parsed_facts)
@@ -931,7 +970,7 @@ class MemoryService:
 
         if not parsed_facts:
             logger.info("No facts extracted from conversation")
-            return []
+            return ([], stats) if return_stats else []
 
         # Step 2: Batch-store all facts (single embed + single Qdrant upsert).
         # A failure here (embedding, Qdrant) must PROPAGATE: the previous
@@ -956,7 +995,9 @@ class MemoryService:
             )
             raise
 
-        # Step 3: Add cleaned conversation text to knowledge graph.
+        # Step 3: Add cleaned conversation text to knowledge graph — ONE
+        # episode for the whole conversation regardless of extraction
+        # windowing (Graphiti handles its own entity windowing internally).
         # Conversation extractions are personal (private) by default — the
         # caller's spoken context isn't team-shared automatically.
         group_id = _build_group_id(
@@ -972,33 +1013,93 @@ class MemoryService:
         graph_write_started_at = datetime.now(timezone.utc)
         try:
             if self._graphiti and self._bridge and raw_text.strip():
-                retry_transient(
-                    self._memory.graph.add,
-                    data=raw_text,
-                    filters={"user_id": user_id, "group_id": group_id},
-                    operation="graph storage (extract_and_store)",
-                )
-                # 1-episode → N-memories shape: a single graph.add produces
-                # entities that could legitimately belong to any of the N
-                # extracted memories. We call attach_memory_id once per
-                # stored memory; the Cypher uses ``coalesce(memory_id,
-                # $memory_id)``, so the first call wins and later calls are
-                # no-ops on the same node. The result is each fresh entity
-                # carries one representative memory_id from the batch — not
-                # a perfect mapping, but enough for the wiki synthesizer
-                # to walk community → source memory.
-                for mem in stored:
-                    self._attach_memory_id_to_graph_nodes(
-                        group_id=group_id,
-                        memory_id=getattr(mem, "id", "") or "",
-                        visibility=MemoryVisibility.PRIVATE.value,
-                        owner_user_id=user_id,
-                        write_started_at=graph_write_started_at,
+                # Idempotency key (audit 27 #21): the episode name is derived
+                # from the cleaned conversation + group, not the wall clock —
+                # an ARQ retry / resubmission of the same conversation re-derives
+                # the same name and is skipped by the existence probe below
+                # instead of minting a duplicate episode (the 4,999
+                # double-episode mechanism).
+                episode_key = hashlib.sha256(
+                    f"{raw_text}\n{group_id}".encode()
+                ).hexdigest()
+                episode_name = f"mem0_episode_{episode_key[:32]}"
+                if self._graph_episode_exists(group_id, episode_name):
+                    logger.info(
+                        f"Skipping graph episode for user {user_id} — episode "
+                        f"{episode_name} already exists in group {group_id} "
+                        f"(re-run of an already-ingested conversation)"
                     )
+                else:
+                    retry_transient(
+                        self._memory.graph.add,
+                        data=raw_text,
+                        filters={"user_id": user_id, "group_id": group_id},
+                        episode_name=episode_name,
+                        operation="graph storage (extract_and_store)",
+                    )
+                    # 1-episode → N-memories shape: a single graph.add produces
+                    # entities that could legitimately belong to any of the N
+                    # extracted memories. We call attach_memory_id once per
+                    # stored memory; the Cypher uses ``coalesce(memory_id,
+                    # $memory_id)``, so the first call wins and later calls are
+                    # no-ops on the same node. The result is each fresh entity
+                    # carries one representative memory_id from the batch — not
+                    # a perfect mapping, but enough for the wiki synthesizer
+                    # to walk community → source memory.
+                    for mem in stored:
+                        self._attach_memory_id_to_graph_nodes(
+                            group_id=group_id,
+                            memory_id=getattr(mem, "id", "") or "",
+                            visibility=MemoryVisibility.PRIVATE.value,
+                            owner_user_id=user_id,
+                            write_started_at=graph_write_started_at,
+                        )
         except Exception as e:
             logger.warning(f"Graph storage failed (non-critical): {e}")
 
-        return stored
+        return (stored, stats) if return_stats else stored
+
+    def _graph_episode_exists(self, group_id: str, episode_name: str) -> bool:
+        """One cheap Cypher lookup: does an Episodic node with this
+        idempotency-keyed name already exist in the group? (audit 27 #21)
+
+        Fail-OPEN: any error (bridge down, Neo4j hiccup, timeout) returns
+        False so a broken probe degrades to today's behavior — a possible
+        duplicate episode — rather than silently dropping the graph write.
+        """
+        if not (self._graphiti and self._bridge):
+            return False
+        # _run_on_bridge submits onto self._bridge._loop; if that isn't a real
+        # event loop (e.g. a mocked bridge in unit tests, or a half-initialized
+        # adapter), run_coroutine_threadsafe would park on future.result() until
+        # the timeout. Bail out fail-open immediately instead.
+        import asyncio as _asyncio
+
+        if not isinstance(getattr(self._bridge, "_loop", None), _asyncio.AbstractEventLoop):
+            return False
+        cypher = (
+            "MATCH (e:Episodic {group_id: $group_id, name: $name}) "
+            "RETURN e.uuid AS uuid LIMIT 1"
+        )
+
+        async def _run():
+            async with self._graphiti.driver.session() as session:
+                result = await session.run(cypher, group_id=group_id, name=episode_name)
+                return await result.data()
+
+        # Built separately so it can be .close()d if _run_on_bridge raises
+        # before awaiting (avoids "coroutine never awaited" warnings — same
+        # convention as _attach_memory_id_to_graph_nodes).
+        coro = _run()
+        try:
+            records = self._run_on_bridge(coro, timeout=10.0) or []
+            return bool(records)
+        except Exception:
+            coro.close()
+            logger.debug(
+                "graph episode idempotency lookup failed (fail-open)", exc_info=True
+            )
+            return False
 
     def extract_facts_only(
         self,
@@ -1143,6 +1244,87 @@ class MemoryService:
             Both paths use `source="vector"`; callers that need to distinguish
             should compare the returned `id` against their expected new UUID.
         """
+        # Validation + visibility/scope resolution + content-hash dedup live in
+        # _prepare_raw_store so store_raw_batch shares them without paying a
+        # per-item embed round trip (audit 27 #20 — two-pass batch stores).
+        prepared, existing = self._prepare_raw_store(
+            content=content,
+            user_id=user_id,
+            category=category,
+            scope=scope,
+            project_id=project_id,
+            tags=tags,
+            agent_id=agent_id,
+            run_id=run_id,
+            domain=domain,
+            observation_type=observation_type,
+            concepts=concepts,
+            source_type=source_type,
+            related_memory_ids=related_memory_ids,
+            confidence=confidence,
+            expires_at=expires_at,
+            derived_from=derived_from,
+            epistemic_level=epistemic_level,
+            visibility=visibility,
+            memory_kind=memory_kind,
+            source_ref=source_ref,
+        )
+        if existing is not None:
+            # created=False → caller must NOT re-enqueue graph enrichment.
+            return ([existing], False) if return_created else [existing]
+
+        # ── Direct embed + Qdrant insert (bypass m.add) ──
+        m = self._get_memory()
+        embedding = m.embedding_model.embed(content, memory_action="add")
+        self._finalize_raw_store(
+            prepared,
+            embedding,
+            add_to_graph=add_to_graph,
+            graph_ontology=graph_ontology,
+        )
+
+        responses = [prepared["response"]]
+        # created=True → a new row was written, so the caller should enqueue
+        # graph enrichment (when it deferred it via add_to_graph=False).
+        return (responses, True) if return_created else responses
+
+    def _prepare_raw_store(
+        self,
+        *,
+        content: str,
+        user_id: str,
+        category: str,
+        scope: str = "global",
+        project_id: str | None = None,
+        tags: list[str] | None = None,
+        agent_id: str | None = None,
+        run_id: str | None = None,
+        domain: str | None = None,
+        observation_type: str | None = None,
+        concepts: list[str] | None = None,
+        source_type: str | None = None,
+        related_memory_ids: list[str] | None = None,
+        confidence: float | None = None,
+        expires_at: datetime | None = None,
+        derived_from: list[str] | None = None,
+        epistemic_level: str | None = None,
+        visibility: str | None = None,
+        memory_kind: str | None = None,
+        source_ref: dict | None = None,
+    ) -> tuple[dict | None, MemoryResponse | None]:
+        """Validate + resolve + dedup one raw store; everything except the embed.
+
+        Shared by ``store_raw`` (single, embeds inline) and
+        ``store_raw_batch`` (two-pass: prepares every item first, then ONE
+        ``embed_batch`` call — audit 27 #20). Returns ``(prepared, existing)``
+        where exactly one side is non-None:
+
+        - ``existing``: content-hash dedup hit — ``times_derived`` already
+          bumped (and a dream tombstone revived) on the survivor.
+        - ``prepared``: dict carrying the ready-to-insert payload, the
+          ready-to-return :class:`MemoryResponse`, and the fields
+          ``_finalize_raw_store`` needs for the graph write.
+        """
         if category not in MEMORY_CATEGORIES:
             raise ValueError(f"Invalid category: {category}. Must be one of: {list(MEMORY_CATEGORIES.keys())}")
         if epistemic_level is not None and epistemic_level not in EPISTEMIC_LEVEL_VOCAB:
@@ -1191,7 +1373,6 @@ class MemoryService:
         if scope == "project" and not project_id:
             raise ValueError("project_id is required when scope='project'")
 
-        m = self._get_memory()
         now_iso = datetime.now(timezone.utc).isoformat()
         chash = content_hash(content)
 
@@ -1215,12 +1396,9 @@ class MemoryService:
             # re-persist the stale tombstone flag it read moments earlier.
             if self._revive_if_tombstoned(existing.id):
                 existing.revived = True
-            # created=False → caller must NOT re-enqueue graph enrichment.
-            return ([existing], False) if return_created else [existing]
+            return (None, existing)
 
-        # ── Direct embed + Qdrant insert (bypass m.add) ──
         mid = str(uuid.uuid4())
-        embedding = m.embedding_model.embed(content, memory_action="add")
 
         # Retrieval economics (C1): distill a ~10-word title + token cost at
         # write time so index-only recall never has to fetch/parse content.
@@ -1280,14 +1458,76 @@ class MemoryService:
             "metadata": metadata,
         }
 
+        response = MemoryResponse(
+            id=mid,
+            memory=content,
+            category=category,
+            scope=scope,
+            project_id=project_id,
+            tags=tags,
+            source="vector",
+            created_at=now_iso,
+            domain=domain,
+            observation_type=observation_type,
+            concepts=concepts,
+            source_type=source_type,
+            related_memory_ids=related_memory_ids,
+            confidence=confidence,
+            expires_at=expires_at.isoformat() if expires_at and hasattr(expires_at, "isoformat") else None,
+            derived_from=derived_from,
+            epistemic_level=epistemic_level,
+            memory_kind=memory_kind,
+            source_ref=source_ref,
+            visibility=effective_visibility,
+            owner_user_id=user_id,
+            title=title,
+            token_estimate=token_estimate,
+        )
+
+        prepared = {
+            "mid": mid,
+            "content": content,
+            "payload": payload,
+            "response": response,
+            "now_iso": now_iso,
+            # (user, hash, scope, project, visibility) — the dedup identity,
+            # exposed so store_raw_batch can collapse in-batch duplicates.
+            "dedup_key": (user_id, chash, scope, project_id, effective_visibility),
+            # Fields _finalize_raw_store needs for the graph write.
+            "user_id": user_id,
+            "project_id": project_id,
+            "effective_visibility": effective_visibility,
+            "source_ref": source_ref,
+        }
+        return (prepared, None)
+
+    def _finalize_raw_store(
+        self,
+        prepared: dict,
+        embedding: list[float],
+        *,
+        add_to_graph: bool = True,
+        graph_ontology: dict | None = None,
+    ) -> None:
+        """Insert + history + (optional) graph write for a prepared raw store.
+
+        The other half of :meth:`_prepare_raw_store` — takes the embedding
+        from the caller so ``store_raw`` can embed one text inline while
+        ``store_raw_batch`` supplies vectors from a single ``embed_batch``
+        call (audit 27 #20).
+        """
+        m = self._get_memory()
+        mid = prepared["mid"]
+        content = prepared["content"]
+
         m.vector_store.insert(
             vectors=[embedding],
             ids=[mid],
-            payloads=[payload],
+            payloads=[prepared["payload"]],
         )
 
         try:
-            m.db.add_history(mid, None, content, "ADD", created_at=now_iso)
+            m.db.add_history(mid, None, content, "ADD", created_at=prepared["now_iso"])
         except Exception as e:
             logger.warning(f"History record failed for {mid}: {e}")
 
@@ -1300,44 +1540,13 @@ class MemoryService:
         if add_to_graph:
             self.enrich_graph(
                 content=content,
-                user_id=user_id,
-                project_id=project_id,
-                visibility=effective_visibility,
+                user_id=prepared["user_id"],
+                project_id=prepared["project_id"],
+                visibility=prepared["effective_visibility"],
                 memory_id=mid,
-                source_ref=source_ref,
+                source_ref=prepared["source_ref"],
                 graph_ontology=graph_ontology,
             )
-
-        responses = [
-            MemoryResponse(
-                id=mid,
-                memory=content,
-                category=category,
-                scope=scope,
-                project_id=project_id,
-                tags=tags,
-                source="vector",
-                created_at=now_iso,
-                domain=domain,
-                observation_type=observation_type,
-                concepts=concepts,
-                source_type=source_type,
-                related_memory_ids=related_memory_ids,
-                confidence=confidence,
-                expires_at=expires_at.isoformat() if expires_at and hasattr(expires_at, "isoformat") else None,
-                derived_from=derived_from,
-                epistemic_level=epistemic_level,
-                memory_kind=memory_kind,
-                source_ref=source_ref,
-                visibility=effective_visibility,
-                owner_user_id=user_id,
-                title=title,
-                token_estimate=token_estimate,
-            )
-        ]
-        # created=True → a new row was written, so the caller should enqueue
-        # graph enrichment (when it deferred it via add_to_graph=False).
-        return (responses, True) if return_created else responses
 
     def enrich_graph(
         self,
@@ -1832,19 +2041,36 @@ class MemoryService:
     ) -> list[MemoryResponse]:
         """Store multiple pre-categorized facts (memory-model v2).
 
-        Each item is a dict matching RawMemoryRequest's shape. Reuses
-        ``store_raw`` per item so dedup, validation, and graph ingestion
-        stay consistent. Single network round-trip from the caller.
+        Each item is a dict matching RawMemoryRequest's shape. Two-pass
+        (audit 27 #20): pass 1 validates + content-hash dedups every item via
+        the same ``_prepare_raw_store`` that ``store_raw`` uses; pass 2 embeds
+        ALL new items in ONE ``embed_batch`` call, then inserts and
+        graph-enriches per item. Previously each item paid its own serial
+        embed round trip — a 25-item checkpoint was 25 embed RTTs on the
+        gateway path.
 
-        Args:
-            items: list of dicts with at least content/user_id/category, plus
-                any v2 optional fields. Each item is independent; one bad item
-                won't block the others (we collect errors but continue).
+        Semantics preserved from the per-item path:
+
+        - duplicates (pre-existing rows OR repeats within the batch) return
+          the surviving row and bump its ``times_derived``;
+        - per-item results in input order (failed items dropped);
+        - one bad item won't block the others.
+
+        The single ``embed_batch`` failure mode is deliberately LOUD (fails
+        the whole batch before any insert) — the content-hash dedup makes the
+        ARQ retry safe, so partial-batch silent loss is the worse trade.
 
         Returns:
-            Flattened list of MemoryResponse objects across all successful items.
+            List of MemoryResponse objects for successful items, input order.
         """
-        results: list[MemoryResponse] = []
+        m = self._get_memory()
+
+        # ── Pass 1: validate + dedup, collect ready-to-insert items ──
+        # Slots: ("new", prepared) | ("dup", response) | ("batchdup", prepared)
+        # | ("skip", None) — batchdup is a repeat WITHIN this batch of a new
+        # item; its bump/response resolve in pass 2, after the survivor exists.
+        entries: list[tuple[str, object]] = []
+        seen_new: dict[tuple, dict] = {}
         for idx, item in enumerate(items):
             try:
                 # Convert ISO string -> datetime if needed (came in via JSON)
@@ -1855,7 +2081,7 @@ class MemoryService:
                         expires_at = _dt.fromisoformat(expires_at.replace("Z", "+00:00"))
                     except ValueError:
                         expires_at = None
-                stored = self.store_raw(
+                prepared, existing = self._prepare_raw_store(
                     content=item["content"],
                     user_id=item["user_id"],
                     category=item["category"],
@@ -1877,10 +2103,50 @@ class MemoryService:
                     memory_kind=item.get("memory_kind"),
                     source_ref=item.get("source_ref"),
                 )
-                results.extend(stored)
+                if existing is not None:
+                    entries.append(("dup", existing))
+                elif prepared["dedup_key"] in seen_new:
+                    # Repeat of an item earlier in THIS batch: the sequential
+                    # path deduped it onto the just-inserted first occurrence.
+                    entries.append(("batchdup", seen_new[prepared["dedup_key"]]))
+                else:
+                    seen_new[prepared["dedup_key"]] = prepared
+                    entries.append(("new", prepared))
             except Exception as e:
                 logger.warning(f"Batch item {idx} failed (continuing): {e}")
-        logger.info(f"store_raw_batch: stored {len(results)} memories from {len(items)} items")
+                entries.append(("skip", None))
+
+        # ── Pass 2: ONE batch embed for all new items, then per-item work ──
+        new_texts = [p["content"] for kind, p in entries if kind == "new"]
+        embeddings = (
+            m.embedding_model.embed_batch(new_texts, memory_action="add")
+            if new_texts
+            else []
+        )
+        emb_iter = iter(embeddings)
+
+        results: list[MemoryResponse] = []
+        for idx, (kind, obj) in enumerate(entries):
+            if kind == "skip":
+                continue
+            if kind == "dup":
+                results.append(obj)
+                continue
+            if kind == "batchdup":
+                # Survivor was inserted earlier in this pass — count the
+                # repeat on it, mirroring the old sequential dedup behavior.
+                self._bump_times_derived(obj["mid"], 1)
+                results.append(obj["response"])
+                continue
+            try:
+                self._finalize_raw_store(obj, next(emb_iter))
+                results.append(obj["response"])
+            except Exception as e:
+                logger.warning(f"Batch item {idx} failed (continuing): {e}")
+        logger.info(
+            f"store_raw_batch: stored {len(results)} memories from {len(items)} items "
+            f"(1 embed_batch call for {len(new_texts)} new)"
+        )
         return results
 
     def expire_old_memories(self, batch_size: int = 100) -> dict:
@@ -1964,6 +2230,18 @@ class MemoryService:
         ingestion.  The caller is responsible for a separate graph.add() call
         with the full conversation text.
 
+        Content-hash dedup (audit 27 #21): before inserting, each fact is
+        checked against (user, hash, scope, project) via
+        ``_find_by_content_hash`` — an ARQ retry after a partial upsert (or a
+        client resubmission) no longer duplicates facts under fresh UUIDs.
+        Dedup hits bump ``times_derived`` on the survivor (and revive a
+        dream-tombstoned one) exactly like the raw path, and the survivor is
+        returned in the fact's slot. Duplicates WITHIN the batch (extraction
+        window overlap re-deriving the same fact) collapse to the first
+        occurrence without a bump — one conversation isn't independent
+        re-derivation evidence. The N dedup probes are single indexed Qdrant
+        scrolls (~ms each), noise next to the embed + LLM calls on this path.
+
         Args:
             facts: List of (category, content) tuples.
             user_id: User identifier.
@@ -1973,7 +2251,8 @@ class MemoryService:
             source: Provenance tag for metadata.
 
         Returns:
-            List of MemoryResponse objects for stored facts.
+            List of MemoryResponse objects for stored facts (new rows and
+            dedup survivors, in input order; in-batch duplicates dropped).
         """
         if not facts:
             return []
@@ -1981,11 +2260,15 @@ class MemoryService:
         m = self._get_memory()
         now_iso = datetime.now(timezone.utc).isoformat()
 
-        # ── Build per-fact metadata, IDs, and texts ──
+        # ── Build per-fact metadata, IDs, and texts (dedup-first) ──
         texts: list[str] = []
         memory_ids: list[str] = []
         payloads: list[dict] = []
         fact_meta: list[tuple[str, str, str | None]] = []  # (category, scope, project_id) per fact
+        # Ordered slots: ("new", index-into-texts) | ("dup", existing response)
+        ordered: list[tuple[str, object]] = []
+        seen_in_batch: set[tuple[str, str, str | None]] = set()
+        dedup_hits = 0
 
         for category, content in facts:
             scope = default_scope_for_category(category)
@@ -2009,16 +2292,46 @@ class MemoryService:
                         f"Content snippet: '{content[:80]}'. Storing as global scope."
                     )
 
+            scope_val = scope.value if isinstance(scope, MemoryScope) else scope
+            chash = content_hash(content)
+
+            # In-batch duplicate (extraction-window overlap): keep the first.
+            batch_key = (chash, scope_val, fact_project_id)
+            if batch_key in seen_in_batch:
+                continue
+            seen_in_batch.add(batch_key)
+
+            # Storage-level idempotency (audit 27 #21). visibility=None on
+            # purpose: conversation-path rows don't stamp metadata.visibility,
+            # so a visibility condition would never match them.
+            existing = self._find_by_content_hash(
+                user_id=user_id,
+                content_hash=chash,
+                scope=scope_val,
+                project_id=fact_project_id,
+                visibility=None,
+            )
+            if existing is not None:
+                # Same reinforcement semantics as the raw path: count the
+                # re-derivation on the survivor, resurrect it if a dream
+                # sweep had tombstoned it (audit 27 #5 applies here too).
+                self._bump_times_derived(existing.id, 1)
+                if self._revive_if_tombstoned(existing.id):
+                    existing.revived = True
+                dedup_hits += 1
+                ordered.append(("dup", existing))
+                continue
+
             mid = str(uuid.uuid4())
             payload = {
                 "data": content,
-                "hash": content_hash(content),
+                "hash": chash,
                 "created_at": now_iso,
                 "user_id": user_id,
                 "agent_id": agent_id,
                 "run_id": run_id,
                 "metadata": {
-                    "scope": scope.value if isinstance(scope, MemoryScope) else scope,
+                    "scope": scope_val,
                     "category": category,
                     "project_id": fact_project_id,
                     "agent_id": agent_id,
@@ -2040,28 +2353,36 @@ class MemoryService:
             texts.append(content)
             memory_ids.append(mid)
             payloads.append(payload)
-            fact_meta.append((category, scope.value if isinstance(scope, MemoryScope) else scope, fact_project_id))
+            fact_meta.append((category, scope_val, fact_project_id))
+            ordered.append(("new", len(texts) - 1))
 
-        # ── Single batch embed ──
-        embeddings = m.embedding_model.embed_batch(texts, memory_action="add")
+        # ── Single batch embed + single Qdrant upsert (new facts only) ──
+        # Skipped entirely when everything dedup'd — a straight ARQ re-run of
+        # an already-stored conversation inserts ZERO new points.
+        if texts:
+            embeddings = m.embedding_model.embed_batch(texts, memory_action="add")
+            m.vector_store.insert(
+                vectors=embeddings,
+                ids=memory_ids,
+                payloads=payloads,
+            )
 
-        # ── Single Qdrant upsert ──
-        m.vector_store.insert(
-            vectors=embeddings,
-            ids=memory_ids,
-            payloads=payloads,
-        )
+            # ── Record history entries ──
+            for mid, content in zip(memory_ids, texts):
+                try:
+                    m.db.add_history(mid, None, content, "ADD", created_at=now_iso)
+                except Exception as e:
+                    logger.warning(f"History record failed for {mid}: {e}")
 
-        # ── Record history entries ──
-        for mid, content in zip(memory_ids, texts):
-            try:
-                m.db.add_history(mid, None, content, "ADD", created_at=now_iso)
-            except Exception as e:
-                logger.warning(f"History record failed for {mid}: {e}")
-
-        # ── Build responses ──
+        # ── Build responses (input order: new rows + dedup survivors) ──
         responses: list[MemoryResponse] = []
-        for mid, content, (category, scope_val, fact_pid) in zip(memory_ids, texts, fact_meta):
+        for kind, ref in ordered:
+            if kind == "dup":
+                responses.append(ref)  # the existing MemoryResponse
+                continue
+            idx = ref
+            mid, content = memory_ids[idx], texts[idx]
+            category, scope_val, fact_pid = fact_meta[idx]
             responses.append(
                 MemoryResponse(
                     id=mid,
@@ -2081,8 +2402,8 @@ class MemoryService:
             )
 
         logger.info(
-            f"Batch-stored {len(responses)} facts for user={user_id} "
-            f"(1 embed call, 1 Qdrant upsert)"
+            f"Batch-stored {len(texts)} new facts for user={user_id} "
+            f"({dedup_hits} content-hash dedup hits; 1 embed call, 1 Qdrant upsert)"
         )
         return responses
 
