@@ -22,7 +22,6 @@ from __future__ import annotations
 from adapters.base import KnowledgeAdapter, register_adapter
 from ingest.chunking_strategies import register_chunking_strategy
 from ingest.extractors import register_extractor
-from schemas import register_categories
 
 from adapters.code_graph import ADAPTER_NAME
 from adapters.code_graph.chunking import (
@@ -50,18 +49,20 @@ CODE_GRAPH_CATEGORIES: dict[str, str] = {
 
 def register() -> KnowledgeAdapter:
     """Register categories, chunker, extractor, and the adapter. Idempotent."""
-    # Code-graph categories are knowledge about a specific codebase — keep them
-    # flexible (scope follows the caller's project_id, like domain_knowledge).
-    # Not added to CATEGORY_VAULT_PATHS (see module docstring).
-    register_categories(CODE_GRAPH_CATEGORIES)
-
     register_chunking_strategy(GraphReportSectionStrategy.name, GraphReportSectionStrategy())
     register_extractor(CodeGraphReportExtractor.name, CodeGraphReportExtractor())
 
+    # Code-graph categories describe ONE specific codebase — the profile
+    # declares them project-scoped (audit 27 #36), so
+    # ``default_scope_for_category`` answers PROJECT instead of the old
+    # accidental global default. Taxonomy registration (incl. scope) happens
+    # inside ``register_adapter`` — the profile is the source of truth.
+    # Not added to CATEGORY_VAULT_PATHS (see module docstring).
     adapter = KnowledgeAdapter(
         name=ADAPTER_NAME,
         version="1.0",
         categories=dict(CODE_GRAPH_CATEGORIES),
+        project_categories=frozenset(CODE_GRAPH_CATEGORIES),
         chunking_strategy=GraphReportSectionStrategy.name,
         default_max_chars=REPORT_MAX_CHARS,
         default_overlap=REPORT_OVERLAP,

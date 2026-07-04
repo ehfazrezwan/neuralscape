@@ -21,7 +21,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from adapters import get_adapter
+from adapters import require_adapter
 from ingest.chunking_strategies import get_chunking_strategy
 from ingest.extractors import get_extractor
 from schemas import (
@@ -90,9 +90,13 @@ def ingest_document(service, doc: IngestDoc) -> dict:
         ``{"passages": int, "facts": int, "memory_ids": [...], "parent_id": str}``.
     """
     # Resolve the knowledge adapter (taxonomy / chunker / extractor / graph
-    # ontology). An unknown name degrades to the default, so a stale adapter=
-    # value never fails an ingest.
-    adapter = get_adapter(doc.adapter)
+    # ontology). STRICT (audit 27 #36): a queued job whose adapter isn't
+    # registered in this worker (failed import / missing optional extra /
+    # removed adapter) fails the task with a clear error — silently falling
+    # back to the default taxonomy would ingest under the wrong
+    # taxonomy/ontology. Request-time typos are already rejected with a 422
+    # by ``schemas.validate_adapter_name`` before anything is enqueued.
+    adapter = require_adapter(doc.adapter)
 
     base = dict(doc.source)  # shallow copy — we never mutate the caller's dict
     # Stamp sync time once for the whole document.
