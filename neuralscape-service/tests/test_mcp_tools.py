@@ -45,11 +45,22 @@ def mock_task_manager():
 # ──────────────────────────────────────────────
 
 
+def _code_graph_tool_names() -> set[str]:
+    """The conditional code-graph delegation tools (need the graphifyy extra)."""
+    from adapters.code_graph import code_graph_available
+
+    if not code_graph_available():
+        return set()
+    return {"query_code_graph", "get_code_neighbors", "code_path"}
+
+
 class TestListTools:
     @pytest.mark.asyncio
-    async def test_returns_19_tools(self):
+    async def test_returns_19_core_tools(self):
+        # 19 core tools + the 3 code-graph delegation tools (= 22) when the
+        # optional graphifyy extra is installed (dev installs have it).
         tools = await mcp_server.list_tools()
-        assert len(tools) == 19
+        assert len(tools) == 19 + len(_code_graph_tool_names())
 
     @pytest.mark.asyncio
     async def test_tool_names(self):
@@ -75,7 +86,7 @@ class TestListTools:
             "get_reasoning_chain",
             "schedule_dream",
             "get_card",
-        }
+        } | _code_graph_tool_names()
         assert names == expected
 
     @pytest.mark.asyncio

@@ -150,6 +150,37 @@ class Settings(BaseSettings):
     # so their descriptions land in one visual vocabulary.
     exemplar_vision_model: str = ""
 
+    # ── Code-graph adapter (Graphify, Phase F1) ──────────────────────
+    # NS uses Graphify (PyPI: graphifyy, optional `code-graph` extra) as a
+    # library over a `graph.json` code graph. The interaction surface is ALWAYS
+    # Neuralscape: the query_code_graph / get_code_neighbors / code_path
+    # MCP tools + /v1/code-graph/* REST routes delegate to the library — agents
+    # never talk to Graphify's own MCP server.
+    #
+    # Default graph.json the code-graph query tools resolve against when the
+    # caller doesn't pass a graph_id (an ingested bundle's artifact id). Empty ⇒
+    # no default graph; tools then require graph_id. Per-project graphs need no
+    # setting: each ingested graph.json is an owner-scoped artifact addressed by
+    # its graph_id (stamped into every produced memory's source_ref).
+    code_graph_json_path: str = ""
+    # Confidence assigned per Graphify edge/insight confidence tag (F1 epistemic
+    # mapping): EXTRACTED → epistemic_level="explicit", INFERRED → "deductive"
+    # with reduced confidence, AMBIGUOUS → stored only when its assigned
+    # confidence clears `code_graph_ambiguous_floor` — with the defaults below
+    # (0.3 < 0.5) AMBIGUOUS-derived memories are DROPPED. Lower the floor (or
+    # raise the ambiguous confidence) to keep them; kept ones are tagged
+    # `ambiguous` for the dreaming sweep's contradiction pass.
+    code_graph_extracted_confidence: float = 0.9
+    code_graph_inferred_confidence: float = 0.6
+    code_graph_ambiguous_confidence: float = 0.3
+    code_graph_ambiguous_floor: float = 0.5
+    # Caps for the semantic layer distilled from one graph.json (bound the blast
+    # radius of a huge graph — we ingest the STABLE summary, never the raw graph).
+    code_graph_max_communities: int = 50
+    code_graph_max_god_nodes: int = 10
+    code_graph_max_surprises: int = 10
+    code_graph_max_rationale: int = 100
+
     # Auth
     # Legacy single shared API key. When set without `neuralscape_user_token_secret`,
     # all requests must present this exact token in `Authorization: Bearer ...` and

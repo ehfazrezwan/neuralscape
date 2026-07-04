@@ -252,6 +252,9 @@ CONNECTOR_TYPE_VOCAB: set[str] = {
     "mcp",
     "manual",
     "file_upload",
+    # Graphify code-graph bundles (graph.json + GRAPH_REPORT.md); memories
+    # resolve back through NS's /v1/code-graph/* surface (Phase F1).
+    "code_graph",
 }
 
 
