@@ -170,8 +170,19 @@ async def flush_conversation_turn(
         user_id=user_id,
     )
 
-    # Step 1: Call Gemini for extraction
+    # Step 1: Call Gemini for extraction. E4: operator extraction
+    # instructions (per-project + per-user) ride along as the OPERATOR
+    # GUIDANCE addendum — same contract guard as the main extraction prompt.
     prompt = _build_extraction_prompt(user_message, assistant_response, channel)
+    try:
+        from extraction_settings import resolve_instructions
+        from prompts import append_operator_guidance
+
+        guidance = resolve_instructions(user_id, project_id)
+        if guidance:
+            prompt = append_operator_guidance(prompt, guidance)
+    except Exception:  # noqa: BLE001 — guidance is best-effort, never blocks a flush
+        logger.warning("operator-guidance resolve failed (non-fatal)")
 
     try:
         from .compile import _async_call_gemini

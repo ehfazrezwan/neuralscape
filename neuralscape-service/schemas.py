@@ -1204,6 +1204,33 @@ class AssembleContextResponse(BaseModel):
     savings_detail: SavingsDetail | None = None
 
 
+class ExtractionInstructionsRequest(BaseModel):
+    """Set (or clear) custom extraction instructions (roadmap E4).
+
+    Without ``project_id`` this targets the caller's own per-user guidance;
+    with ``project_id`` it targets the project-wide guidance (dictator-only,
+    mirroring the standards write gate). Empty/whitespace ``instructions``
+    clears the setting. The token budget
+    (``EXTRACTION_INSTRUCTIONS_MAX_TOKENS``, default 2,000) is enforced at
+    save time.
+    """
+    instructions: str = Field(max_length=20_000)
+    user_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+    project_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+
+
+class ExtractionInstructionsResponse(BaseModel):
+    """One scope's stored extraction instructions (E4). ``instructions`` is
+    None when unset/cleared."""
+    status: str = "ok"
+    scope: str  # "user" | "project"
+    target_id: str
+    instructions: str | None = None
+    tokens: int = 0
+    updated_at: str | None = None
+    updated_by: str | None = None
+
+
 class AskMemoryResponse(BaseModel):
     """Synthesized answer over the caller's memories (C3).
 

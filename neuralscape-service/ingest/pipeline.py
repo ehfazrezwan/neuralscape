@@ -149,7 +149,14 @@ def ingest_document(service, doc: IngestDoc) -> dict:
     # they're already in the graph.
     graph_jobs: list[dict] = []
     if doc.extract_facts:
-        facts = service.extract_facts_only(doc.content, extractor=get_extractor(adapter.extractor))
+        # E4: user/project ride along so operator extraction instructions
+        # compose with the adapter's own prompt (adapter first, addendum after).
+        facts = service.extract_facts_only(
+            doc.content,
+            extractor=get_extractor(adapter.extractor),
+            user_id=doc.user_id,
+            project_id=doc.project_id,
+        )
         for category, content in facts:
             scope_val, fact_pid = _fact_scope(category, doc.project_id)
             try:

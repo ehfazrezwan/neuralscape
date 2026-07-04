@@ -701,8 +701,16 @@ class MemoryService:
         """
         m = self._get_memory()
 
-        # Step 1: Call Gemini for fact extraction
-        extraction_messages = build_extraction_messages(messages)
+        # Step 1: Call Gemini for fact extraction. E4: operator-supplied
+        # extraction instructions (per-project + per-user, composed) ride
+        # along as a clearly-delimited addendum that can steer fact
+        # selection/phrasing but never the JSON output contract.
+        from extraction_settings import resolve_instructions
+
+        operator_guidance = resolve_instructions(user_id, project_id)
+        extraction_messages = build_extraction_messages(
+            messages, operator_guidance=operator_guidance
+        )
         client = self._get_genai_client()
 
         try:
@@ -796,7 +804,13 @@ class MemoryService:
 
         return stored
 
-    def extract_facts_only(self, text: str, extractor=None) -> list[tuple[str, str]]:
+    def extract_facts_only(
+        self,
+        text: str,
+        extractor=None,
+        user_id: str | None = None,
+        project_id: str | None = None,
+    ) -> list[tuple[str, str]]:
         """Run LLM fact extraction over a block of text and return (category, content) tuples.
 
         Reuses the same Gemini extraction + junk filter as ``extract_and_store``
@@ -811,6 +825,11 @@ class MemoryService:
         byte-for-byte the coding-assistant extractor: the LLM client, retries,
         model selection, and junk filter below are shared across all adapters so
         only the taxonomy/prompt varies, never the envelope.
+
+        ``user_id`` / ``project_id`` scope the E4 operator guidance lookup:
+        when set, the composed custom extraction instructions are appended
+        to the prompt as the OPERATOR GUIDANCE addendum — AFTER the adapter's
+        own prompt, so instructions compose with (never replace) adapters.
         """
         if not text or not text.strip():
             return []
@@ -818,6 +837,16 @@ class MemoryService:
             extraction_messages = extractor.build_messages(text)
         else:
             extraction_messages = build_extraction_messages([{"role": "user", "content": text}])
+        # E4: operator guidance rides after the (possibly adapter-owned)
+        # prompt. Best-effort — resolve failure means no addendum.
+        from extraction_settings import resolve_instructions
+        from prompts import append_operator_guidance
+
+        operator_guidance = resolve_instructions(user_id, project_id)
+        if operator_guidance:
+            extraction_messages[0]["content"] = append_operator_guidance(
+                extraction_messages[0]["content"], operator_guidance
+            )
         client = self._get_genai_client()
         try:
             from google.genai.types import GenerateContentConfig, HttpOptions

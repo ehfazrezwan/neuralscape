@@ -168,6 +168,15 @@ class Settings(BaseSettings):
     session_buffer_max_messages: int = 400
     session_ttl_days: int = 30
 
+    # ── Custom extraction instructions (roadmap E4) ───────────────────
+    # Operator-supplied guidance appended to the extraction prompt as a
+    # clearly-delimited addendum ("OPERATOR GUIDANCE"). Per-user (self-set)
+    # and per-project (dictator-only — mirrors the standards write gate).
+    # Token-budget enforced at save time; the JSON output contract is
+    # never overridable (see prompts.append_operator_guidance).
+    extraction_instructions_enabled: bool = True
+    extraction_instructions_max_tokens: int = 2000
+
     # ── Data-layer connectors ─────────────────────────────────────────
     # When enabled, the service hosts connectors (Notion/Drive/MCP/REST),
     # stores their credentials encrypted in the vault, and runs a periodic

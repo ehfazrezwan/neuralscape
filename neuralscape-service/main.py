@@ -50,6 +50,8 @@ from schemas import (
     CheckpointVerdict,
     ConnectorConfigRequest,
     ContextResponse,
+    ExtractionInstructionsRequest,
+    ExtractionInstructionsResponse,
     GetMemoriesRequest,
     GetMemoriesResponse,
     GraphSearchRequest,
@@ -2025,6 +2027,119 @@ async def v1_list_projects(request: Request, user_id: str | None = Query(default
     except Exception as e:
         logger.exception("v1 list_projects failed")
         raise HTTPException(status_code=500, detail="Failed to list projects")
+
+
+# ── Settings: custom extraction instructions (E4) ─────────────────────
+
+
+def _instructions_scope(user_id: str, project_id: str | None) -> tuple[str, str]:
+    """(scope, target_id) for an extraction-instructions request."""
+    if project_id:
+        return "project", project_id
+    return "user", user_id
+
+
+@v1_router.put(
+    "/settings/extraction-instructions",
+    response_model=ExtractionInstructionsResponse,
+)
+async def v1_put_extraction_instructions(
+    req: ExtractionInstructionsRequest, request: Request
+):
+    """Set (or clear) custom extraction instructions (E4).
+
+    Per-user guidance (no ``project_id``) is self-service — the caller sets
+    their own. Project-wide guidance (``project_id`` given) shapes what
+    gets extracted for EVERY member's writes to that project, so it is
+    dictator-only — mirroring the standards write gate
+    (``_authorize_standard_write``); unlike the `standard` tier it does not
+    require STANDARDS_ENABLED, because guidance is useful without the
+    authoritative memory pool. Empty/whitespace ``instructions`` clears.
+    The token budget (≤ EXTRACTION_INSTRUCTIONS_MAX_TOKENS) is enforced
+    here, at save time — 400 with the measured count when exceeded.
+    """
+    import extraction_settings as es
+
+    if not settings.extraction_instructions_enabled:
+        raise HTTPException(
+            status_code=403, detail="Custom extraction instructions are disabled."
+        )
+    user_id = _resolve_user_id(request, req.user_id)
+    if req.project_id and not settings.is_dictator(user_id):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"User {user_id!r} is not authorized to set project-wide "
+                "extraction instructions (dictator-only, mirroring the "
+                "standards write gate)."
+            ),
+        )
+    scope, target_id = _instructions_scope(user_id, req.project_id)
+    try:
+        record = await asyncio.to_thread(
+            es.set_instructions,
+            user_id=None if req.project_id else user_id,
+            project_id=req.project_id,
+            instructions=req.instructions,
+            updated_by=user_id,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("v1 put extraction-instructions failed")
+        raise HTTPException(status_code=500, detail="Failed to store instructions") from e
+    return ExtractionInstructionsResponse(
+        scope=scope,
+        target_id=target_id,
+        instructions=record.get("instructions"),
+        tokens=int(record.get("tokens") or 0),
+        updated_at=record.get("updated_at"),
+        updated_by=record.get("updated_by"),
+    )
+
+
+@v1_router.get(
+    "/settings/extraction-instructions",
+    response_model=ExtractionInstructionsResponse,
+)
+async def v1_get_extraction_instructions(
+    request: Request,
+    user_id: str | None = Query(default=None),
+    project_id: str | None = Query(default=None),
+):
+    """Read one scope's extraction instructions (E4).
+
+    Without ``project_id``: the caller's own per-user guidance. With
+    ``project_id``: the project-wide guidance (readable by any
+    authenticated caller — it shapes shared extraction, so members may
+    inspect what a dictator set).
+    """
+    import extraction_settings as es
+
+    resolved_user_id = _resolve_user_id(request, user_id)
+    scope, target_id = _instructions_scope(resolved_user_id, project_id)
+    try:
+        record = await asyncio.to_thread(
+            es.get_instructions,
+            user_id=None if project_id else resolved_user_id,
+            project_id=project_id,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("v1 get extraction-instructions failed")
+        raise HTTPException(status_code=500, detail="Failed to read instructions") from e
+    record = record or {}
+    return ExtractionInstructionsResponse(
+        scope=scope,
+        target_id=target_id,
+        instructions=record.get("instructions"),
+        tokens=int(record.get("tokens") or 0),
+        updated_at=record.get("updated_at"),
+        updated_by=record.get("updated_by"),
+    )
 
 
 # ── Processes (dictator-authored authoritative playbooks) ─────────────
