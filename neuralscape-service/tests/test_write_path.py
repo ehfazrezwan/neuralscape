@@ -626,3 +626,44 @@ class TestStoreRawBatchTwoPass:
         results = service.store_raw_batch(items)
         assert len(results) == 2
         assert service._memory.vector_store.insert.call_count == 2
+
+    def test_embedding_count_mismatch_fails_before_any_insert(self, service):
+        """Copilot review (PR #124): a mismatched embed_batch return used to
+        exhaust the iterator mid-pass — StopIteration was swallowed as a
+        per-item failure and items were silently dropped. Must fail LOUDLY,
+        naming both counts, before any insert."""
+        service._find_by_content_hash = lambda **kw: None
+        contents = [f"Mismatch fact number {i} here" for i in range(3)]
+        service._memory.embedding_model.embed_batch.side_effect = (
+            lambda texts, **kw: [[0.1] * 768 for _ in texts][:-1]  # one short
+        )
+        with pytest.raises(RuntimeError, match="embed") as exc:
+            service.store_raw_batch(self._items(contents))
+        assert "2" in str(exc.value) and "3" in str(exc.value)
+        service._memory.vector_store.insert.assert_not_called()
+
+    def test_empty_embedding_return_fails_loudly(self, service):
+        service._find_by_content_hash = lambda **kw: None
+        contents = ["Only fact in this batch here"]
+        service._memory.embedding_model.embed_batch.side_effect = (
+            lambda texts, **kw: []
+        )
+        with pytest.raises(RuntimeError, match="embed"):
+            service.store_raw_batch(self._items(contents))
+        service._memory.vector_store.insert.assert_not_called()
+
+    def test_batchdup_not_reported_when_survivor_store_failed(self, service):
+        """Copilot review (PR #124): a batchdup whose survivor's insert failed
+        must not bump a nonexistent row or fabricate a response for a row
+        that was never stored — it is itself a per-item failure."""
+        contents = ["Repeated checkpoint fact", "Repeated checkpoint fact"]
+        service._find_by_content_hash = lambda **kw: None
+        service._bump_times_derived = MagicMock()
+        service._revive_if_tombstoned = MagicMock(return_value=False)
+        service._memory.vector_store.insert.side_effect = Exception("qdrant down")
+
+        results = service.store_raw_batch(self._items(contents))
+
+        assert results == []
+        service._bump_times_derived.assert_not_called()
+

@@ -2123,9 +2123,20 @@ class MemoryService:
             if new_texts
             else []
         )
+        # Loud contract check BEFORE any insert (Copilot review, PR #124): a
+        # short/empty/overlong return would otherwise exhaust (or misalign)
+        # the iterator mid-pass — StopIteration swallowed as a per-item
+        # failure, items silently dropped or paired with the wrong vectors.
+        if len(embeddings) != len(new_texts):
+            raise RuntimeError(
+                f"store_raw_batch: embed_batch returned {len(embeddings)} "
+                f"embeddings for {len(new_texts)} new texts — refusing to "
+                f"insert any item of this batch"
+            )
         emb_iter = iter(embeddings)
 
         results: list[MemoryResponse] = []
+        finalized_mids: set[str] = set()
         for idx, (kind, obj) in enumerate(entries):
             if kind == "skip":
                 continue
@@ -2135,11 +2146,21 @@ class MemoryService:
             if kind == "batchdup":
                 # Survivor was inserted earlier in this pass — count the
                 # repeat on it, mirroring the old sequential dedup behavior.
+                # If the survivor's store FAILED, this repeat failed too:
+                # never bump a nonexistent row or report a response for a
+                # row that was never stored (Copilot review, PR #124).
+                if obj["mid"] not in finalized_mids:
+                    logger.warning(
+                        f"Batch item {idx} failed (continuing): duplicate of "
+                        f"an item in this batch whose store failed"
+                    )
+                    continue
                 self._bump_times_derived(obj["mid"], 1)
                 results.append(obj["response"])
                 continue
             try:
                 self._finalize_raw_store(obj, next(emb_iter))
+                finalized_mids.add(obj["mid"])
                 results.append(obj["response"])
             except Exception as e:
                 logger.warning(f"Batch item {idx} failed (continuing): {e}")
