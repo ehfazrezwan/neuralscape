@@ -294,7 +294,11 @@ def retry_transient(
                 raise
 
     raise last_exc  # type: ignore[misc]
-from index_format import distill_title, estimate_tokens
+from index_format import distill_title, estimate_tokens  # noqa: F401 — estimate_tokens re-exported for legacy callers/tests
+# E2: write-time token stamping — a REAL tiktoken count when the savings
+# meter is enabled, the len/4 heuristic when it's off (zero tokenizer calls).
+# The stored field keeps its `token_estimate` name either way.
+from savings_meter import stamp_tokens
 from prompts import (
     build_extraction_messages,
     parse_extraction_response,
@@ -990,7 +994,7 @@ class MemoryService:
         # write time so index-only recall never has to fetch/parse content.
         # Pure heuristics — no LLM call on the hot write path.
         title = distill_title(content)
-        token_estimate = estimate_tokens(content)
+        token_estimate = stamp_tokens(content)
 
         metadata: dict = {
             "scope": scope,
@@ -1678,7 +1682,7 @@ class MemoryService:
                     "epistemic_level": "explicit",
                     # Retrieval economics (C1): index-row fields (heuristic, no LLM)
                     "title": distill_title(content),
-                    "token_estimate": estimate_tokens(content),
+                    "token_estimate": stamp_tokens(content),
                     **({"source_type": source_type} if source_type is not None else {}),
                     **({"memory_kind": memory_kind} if memory_kind is not None else {}),
                     **({"source_ref": source_ref} if source_ref else {}),
@@ -1724,7 +1728,7 @@ class MemoryService:
                     memory_kind=memory_kind,
                     source_ref=source_ref,
                     title=distill_title(content),
-                    token_estimate=estimate_tokens(content),
+                    token_estimate=stamp_tokens(content),
                 )
             )
 
@@ -3578,7 +3582,7 @@ class MemoryService:
         # title/token_estimate — refresh them from the new content.
         if edits_content:
             new_meta["title"] = distill_title(changes["content"])
-            new_meta["token_estimate"] = estimate_tokens(changes["content"])
+            new_meta["token_estimate"] = stamp_tokens(changes["content"])
 
         now_iso = datetime.now(timezone.utc).isoformat()
         if edits_content:

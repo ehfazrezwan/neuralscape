@@ -374,6 +374,7 @@ async def ask_memory(
             "abstained": True,
             "searches": searches,
             "memories_considered": 0,
+            "_evidence_tokens": 0,
         }
 
     call = llm_call or _make_llm_call(tier)
@@ -418,6 +419,21 @@ async def ask_memory(
         answer = "I don't know — the evidence did not yield an answer."
         abstained = True
 
+    # E2: measured token baseline of everything retrieved as evidence — the
+    # cost a memoryless caller would have paid to read it all. Internal key
+    # (leading underscore): the endpoint pops it for the savings ledger
+    # before building AskMemoryResponse. Stored write-time counts mean this
+    # is arithmetic, not tokenization; skipped entirely when the meter is
+    # off (kill-switch = zero tokenizer calls even for legacy rows).
+    from config import settings as _settings
+    from savings_meter import hit_tokens
+
+    evidence_tokens = (
+        sum(hit_tokens(m) for m in evidence.values())
+        if _settings.savings_meter_enabled
+        else 0
+    )
+
     return {
         "status": "ok",
         "reasoning_level": tier.name,
@@ -426,4 +442,5 @@ async def ask_memory(
         "abstained": abstained,
         "searches": searches,
         "memories_considered": len(evidence),
+        "_evidence_tokens": evidence_tokens,
     }
