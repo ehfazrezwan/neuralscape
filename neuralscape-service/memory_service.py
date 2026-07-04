@@ -164,6 +164,34 @@ def _rrf_fuse(dense_hits: list, lexical_hits: list, limit: int) -> list[dict]:
     return ordered[:limit]
 
 
+def _unit_cosine(a: list, b: list) -> float | None:
+    """Cosine similarity between two vectors, clamped to [0, 1].
+
+    Used to score graph edges with their STORED ``fact_embedding`` against
+    the query vector ``search()`` already computed — pure local arithmetic,
+    no embed/API calls. Both vectors live in the same Gemini embedding
+    space as the Qdrant rows, so the result is directly comparable to the
+    vector leg's cosine scores. Returns ``None`` on any malformed input
+    (empty, length mismatch, zero norm, non-numeric) — an unscorable edge
+    must degrade to the legacy unscored path, never break the read.
+    """
+    try:
+        if not a or not b or len(a) != len(b):
+            return None
+        dot = 0.0
+        norm_a = 0.0
+        norm_b = 0.0
+        for x, y in zip(a, b):
+            dot += x * y
+            norm_a += x * x
+            norm_b += y * y
+        if norm_a <= 0.0 or norm_b <= 0.0:
+            return None
+        return max(0.0, min(1.0, dot / math.sqrt(norm_a * norm_b)))
+    except (TypeError, ValueError):
+        return None
+
+
 def _dense_score_floor(dense_hits: list) -> float | None:
     """Weakest cosine score in a pool's dense leg (imputed score for
     lexical-only hits: presence via a strong keyword match is worth at
@@ -2300,19 +2328,36 @@ class MemoryService:
         # have to retroactively filter, which is unreliable for graph
         # rows whose enriched visibility ends up as None.
         graph_responses: list[MemoryResponse] = []
+        # Stored fact_embeddings, index-aligned with graph_responses — reused
+        # below for the zero-embed twin decoration (query_batch_points with
+        # these vectors instead of re-embedding edge facts).
+        graph_edge_embeddings: list[list | None] = []
         if graph_future is not None:
             try:
                 graph_results = graph_future.result(
                     timeout=_GRAPH_SEARCH_JOIN_TIMEOUT_S
                 )
                 for edge in graph_results.get("edges", []):
+                    # Graph as a ranked leg: score each edge with its STORED
+                    # fact_embedding (piggybacked on the enrichment Cypher in
+                    # _enrich_graph_results) against the query vector computed
+                    # once above — local cosine in the same Gemini space as
+                    # the vector rows, clamped to [0, 1]. Edges without a
+                    # stored embedding stay unscored (rank last on merit).
+                    emb = edge.get("fact_embedding") or None
                     graph_responses.append(
                         MemoryResponse(
                             id=edge.get("uuid", ""),
                             memory=edge.get("fact", edge.get("name", "")),
                             source="graph",
+                            score=(
+                                _unit_cosine(query_embedding, emb)
+                                if emb is not None
+                                else None
+                            ),
                         )
                     )
+                    graph_edge_embeddings.append(emb)
             except Exception as e:
                 logger.warning(f"Graph search failed during recall (non-critical): {e}")
 
@@ -2747,14 +2792,23 @@ class MemoryService:
         edges: list[dict],
         communities: list[dict],
     ) -> None:
-        """Annotate graph search results with ``memory_id`` + ``wiki_path``.
+        """Annotate graph search results with ``memory_id`` + ``wiki_path``,
+        and edges additionally with their stored ``fact_embedding``.
 
-        Both fields are added by the wiki synthesizer's Cypher patchers
-        (``attach_memory_id`` and ``patch_wiki_path``) as top-level Neo4j
-        properties, but Graphiti's ORM doesn't rehydrate them. We do one
-        extra Cypher round-trip per result set to fetch the values by
-        UUID, then mutate the dicts in place. Failure logs and leaves
-        the original dicts unchanged.
+        ``memory_id``/``wiki_path`` are added by the wiki synthesizer's
+        Cypher patchers (``attach_memory_id`` and ``patch_wiki_path``) as
+        top-level Neo4j properties, but Graphiti's ORM doesn't rehydrate
+        them. We do one extra Cypher round-trip per result set to fetch the
+        values by UUID, then mutate the dicts in place.
+
+        The same round trip piggybacks ``e.fact_embedding`` for RELATES_TO
+        edges (graph-as-a-ranked-leg): Graphiti's search return path
+        deliberately omits the stored embedding
+        (``get_entity_edge_return_query``), and re-embedding edge facts
+        would cost one Gemini call per search. The UNION arm below matches
+        relationships by uuid (indexed: Graphiti's ``relation_uuid`` range
+        index) — zero additional round trips, no Graphiti subtree change.
+        Failure logs and leaves the original dicts unchanged.
         """
         all_uuids: list[str] = []
         for collection in (nodes, edges, communities):
@@ -2771,7 +2825,15 @@ class MemoryService:
         WHERE n.uuid IN $uuids
         RETURN n.uuid AS uuid,
                n.memory_id AS memory_id,
-               n.wiki_path AS wiki_path
+               n.wiki_path AS wiki_path,
+               null AS fact_embedding
+        UNION ALL
+        MATCH ()-[e:RELATES_TO]->()
+        WHERE e.uuid IN $uuids
+        RETURN e.uuid AS uuid,
+               e.memory_id AS memory_id,
+               e.wiki_path AS wiki_path,
+               e.fact_embedding AS fact_embedding
         """
 
         async def _run():
@@ -2794,6 +2856,8 @@ class MemoryService:
                     item["memory_id"] = rec["memory_id"]
                 if rec.get("wiki_path"):
                     item["wiki_path"] = rec["wiki_path"]
+                if rec.get("fact_embedding"):
+                    item["fact_embedding"] = rec["fact_embedding"]
 
     def search_graph(
         self,
