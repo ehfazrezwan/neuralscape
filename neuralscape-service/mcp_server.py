@@ -5,6 +5,11 @@ ingest_text, get_project_context, search_knowledge_graph, list_memories,
 list_projects, delete_memories, list_processes, get_process, edit_memory,
 retag_memories, get_reasoning_chain.
 
+Plus, when the optional ``code-graph`` extra is installed, three code-graph
+delegation tools over an ingested/configured Graphify graph.json:
+query_code_graph, get_code_neighbors, code_path (NS's own surface — clients
+never talk to Graphify's MCP server directly).
+
 Supports both stdio transport (local Claude Code) and Streamable HTTP
 transport (remote agent access via /mcp/ endpoint on port 8199).
 """
@@ -701,6 +706,96 @@ async def list_tools() -> list[Tool]:
                 "required": [],
             },
         ),
+    ] + _code_graph_tools()
+
+
+# Shared schema fragments for the code-graph delegation tools. These tools are
+# NS's own surface over a Graphify code graph (roadmap F2 hard rule: agents
+# never talk to Graphify's MCP server directly) and register only when the
+# optional graphifyy library is installed.
+_CODE_GRAPH_COMMON_PROPS = {
+    "graph_id": {
+        "type": "string",
+        "description": (
+            "graph_id of an ingested code-graph bundle (the artifact id stamped "
+            "into code-graph memories' source_ref; owner-scoped). Omit to use "
+            "the server's configured default graph."
+        ),
+    },
+    "user_id": {
+        "type": "string",
+        "description": "Caller user ID (optional under token auth); scopes graph_id resolution.",
+    },
+}
+
+
+def _code_graph_tools() -> list[Tool]:
+    """The three code-graph delegation tools, when the code-graph extra is installed."""
+    from adapters.code_graph import code_graph_available
+
+    if not code_graph_available():
+        return []
+    return [
+        Tool(
+            name="query_code_graph",
+            description=(
+                "Search a project's code knowledge graph (built by Graphify, served "
+                "by Neuralscape) with BFS/DFS traversal from the best-matching nodes. "
+                "Use this — not recalled memories — for CODE STRUCTURE questions "
+                "(what calls X, what's in module Y): the graph reflects the code as "
+                "analyzed, while structural memories would rot. Memories whose "
+                "source_ref retrieval handle names this tool re-fetch live structure "
+                "through it."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "Natural-language question or keyword search over the code graph"},
+                    "mode": {"type": "string", "enum": ["bfs", "dfs"], "default": "bfs", "description": "bfs=broad context, dfs=trace a specific path"},
+                    "depth": {"type": "integer", "default": 3, "description": "Traversal depth (1-6)"},
+                    "token_budget": {"type": "integer", "default": 2000, "description": "Max output tokens"},
+                    **_CODE_GRAPH_COMMON_PROPS,
+                },
+                "required": ["question"],
+            },
+        ),
+        Tool(
+            name="get_code_neighbors",
+            description=(
+                "List the direct incoming/outgoing neighbors of one code-graph node "
+                "(function/class/file/module) with each edge's relation and "
+                "confidence tag (EXTRACTED/INFERRED/AMBIGUOUS). The precise tool for "
+                "'what directly touches X?'."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string", "description": "Node label or id to look up (e.g. 'MemoryEngine')"},
+                    "relation_filter": {"type": "string", "description": "Only edges whose relation contains this substring (e.g. 'call')"},
+                    **_CODE_GRAPH_COMMON_PROPS,
+                },
+                "required": ["label"],
+            },
+        ),
+        Tool(
+            name="code_path",
+            description=(
+                "Shortest connection path between two code-graph symbols — how does "
+                "A reach B? Each hop shows the relation and its confidence tag. "
+                "Useful for tracing an unexpected coupling flagged in a 'boundary' "
+                "memory back through the actual code structure."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string", "description": "Label of the starting symbol"},
+                    "target": {"type": "string", "description": "Label of the target symbol"},
+                    "max_hops": {"type": "integer", "default": 8, "description": "Give up beyond this many hops (1-32)"},
+                    **_CODE_GRAPH_COMMON_PROPS,
+                },
+                "required": ["source", "target"],
+            },
+        ),
     ]
 
 
@@ -1177,6 +1272,57 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             task_id = await _task_manager.enqueue_retag(user_id, filters, ops)
             return [TextContent(type="text", text=json.dumps(
                 {"status": "accepted", "task_id": task_id}))]
+
+        elif name in ("query_code_graph", "get_code_neighbors", "code_path"):
+            # NS-surface delegations to the graphifyy library (roadmap F2:
+            # the interaction interface is ALWAYS Neuralscape). Availability-
+            # gated: without the optional extra these tools aren't listed, but
+            # a stale client may still call them — answer with the remedy.
+            from adapters.code_graph import _MISSING_EXTRA_MSG, code_graph_available
+
+            if not code_graph_available():
+                return [TextContent(type="text", text=json.dumps({"error": _MISSING_EXTRA_MSG}))]
+            from adapters.code_graph.query import (
+                CodeGraphError,
+                code_path,
+                get_code_neighbors,
+                query_code_graph,
+            )
+
+            try:
+                if name == "query_code_graph":
+                    text = await asyncio.to_thread(
+                        query_code_graph,
+                        arguments["question"],
+                        user_id=user_id,
+                        settings=settings,
+                        graph_id=arguments.get("graph_id"),
+                        mode=arguments.get("mode", "bfs"),
+                        depth=arguments.get("depth", 3),
+                        token_budget=arguments.get("token_budget", 2000),
+                    )
+                elif name == "get_code_neighbors":
+                    text = await asyncio.to_thread(
+                        get_code_neighbors,
+                        arguments["label"],
+                        user_id=user_id,
+                        settings=settings,
+                        graph_id=arguments.get("graph_id"),
+                        relation_filter=arguments.get("relation_filter", ""),
+                    )
+                else:  # code_path
+                    text = await asyncio.to_thread(
+                        code_path,
+                        arguments["source"],
+                        arguments["target"],
+                        user_id=user_id,
+                        settings=settings,
+                        graph_id=arguments.get("graph_id"),
+                        max_hops=arguments.get("max_hops", 8),
+                    )
+            except CodeGraphError as e:
+                return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+            return [TextContent(type="text", text=text)]
 
         else:
             return [TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]

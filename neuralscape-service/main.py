@@ -1144,6 +1144,116 @@ async def v1_get_exemplar_image(
     return Response(content=data, media_type=media)
 
 
+# ── Code-graph delegation (Graphify behind the NS surface) ──────────
+# Roadmap F2 hard rule: the interaction interface is ALWAYS Neuralscape.
+# These routes are thin delegations to the graphifyy library over a
+# graph.json — the REST twins of the query_code_graph / get_code_neighbors /
+# code_path MCP tools, and the resolution target of every code-graph
+# memory's source_ref url. Graphs resolve by owner-scoped artifact graph_id
+# (an ingested bundle) or the deployment-configured default path only —
+# never an arbitrary caller-supplied filesystem path.
+
+
+def _code_graph_or_501():
+    """Return the code-graph query module or raise 501 when the extra is absent."""
+    from adapters.code_graph import _MISSING_EXTRA_MSG, code_graph_available
+
+    if not code_graph_available():
+        raise HTTPException(status_code=501, detail=_MISSING_EXTRA_MSG)
+    from adapters.code_graph import query as cg_query
+
+    return cg_query
+
+
+def _map_code_graph_error(e: Exception) -> HTTPException:
+    from adapters.code_graph.query import CodeGraphNotConfigured
+
+    if isinstance(e, CodeGraphNotConfigured):
+        return HTTPException(status_code=400, detail=str(e))
+    return HTTPException(status_code=404, detail=str(e))
+
+
+@v1_router.get("/code-graph/query")
+async def v1_code_graph_query(
+    request: Request,
+    question: str = Query(..., min_length=1, max_length=2000),
+    mode: str = Query("bfs", pattern="^(bfs|dfs)$"),
+    depth: int = Query(3, ge=1, le=6),
+    token_budget: int = Query(2000, ge=100, le=20000),
+    graph_id: str | None = Query(None, description="Artifact id of an ingested graph.json bundle (owner-scoped); omit for the configured default graph"),
+    user_id: str | None = Query(None),
+):
+    """Search the code graph (BFS/DFS from scored seeds) — Graphify's query, NS's surface."""
+    cg = _code_graph_or_501()
+    caller = _resolve_user_id(request, user_id)
+    try:
+        text = await asyncio.to_thread(
+            cg.query_code_graph,
+            question,
+            user_id=caller,
+            settings=settings,
+            graph_id=graph_id,
+            mode=mode,
+            depth=depth,
+            token_budget=token_budget,
+        )
+    except cg.CodeGraphError as e:
+        raise _map_code_graph_error(e) from e
+    return {"result": text, "graph_id": graph_id}
+
+
+@v1_router.get("/code-graph/neighbors")
+async def v1_code_graph_neighbors(
+    request: Request,
+    label: str = Query(..., min_length=1, max_length=500),
+    relation_filter: str = Query("", max_length=100),
+    graph_id: str | None = Query(None),
+    user_id: str | None = Query(None),
+):
+    """Direct in/out neighbors of one code-graph node, with relation + confidence tags."""
+    cg = _code_graph_or_501()
+    caller = _resolve_user_id(request, user_id)
+    try:
+        text = await asyncio.to_thread(
+            cg.get_code_neighbors,
+            label,
+            user_id=caller,
+            settings=settings,
+            graph_id=graph_id,
+            relation_filter=relation_filter,
+        )
+    except cg.CodeGraphError as e:
+        raise _map_code_graph_error(e) from e
+    return {"result": text, "graph_id": graph_id}
+
+
+@v1_router.get("/code-graph/path")
+async def v1_code_graph_path(
+    request: Request,
+    source: str = Query(..., min_length=1, max_length=500),
+    target: str = Query(..., min_length=1, max_length=500),
+    max_hops: int = Query(8, ge=1, le=32),
+    graph_id: str | None = Query(None),
+    user_id: str | None = Query(None),
+):
+    """Shortest connection path between two code-graph symbols (how does A reach B?)."""
+    cg = _code_graph_or_501()
+    caller = _resolve_user_id(request, user_id)
+    try:
+        text = await asyncio.to_thread(
+            cg.code_path,
+            source,
+            target,
+            user_id=caller,
+            settings=settings,
+            graph_id=graph_id,
+            max_hops=max_hops,
+        )
+    except cg.CodeGraphError as e:
+        raise _map_code_graph_error(e) from e
+    return {"result": text, "graph_id": graph_id}
+
+
 # ── Connectors (data-layer sources) ──────────────
 
 
