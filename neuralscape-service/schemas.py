@@ -942,6 +942,7 @@ class SessionNote(BaseModel):
     injection surfaces it. At least one field must be non-empty.
     """
     request: str | None = Field(default=None, max_length=4000, description="What the user asked for this session")
+    investigated: str | None = Field(default=None, max_length=4000, description="What was explored/read/probed along the way")
     learned: str | None = Field(default=None, max_length=4000, description="What was learned/discovered")
     completed: str | None = Field(default=None, max_length=4000, description="What got done")
     next_steps: str | None = Field(default=None, max_length=4000, description="What should happen next")
@@ -950,9 +951,11 @@ class SessionNote(BaseModel):
     def _at_least_one(self) -> "SessionNote":
         if not any(
             (getattr(self, f) or "").strip()
-            for f in ("request", "learned", "completed", "next_steps")
+            for f in ("request", "investigated", "learned", "completed", "next_steps")
         ):
-            raise ValueError("session_note must set at least one of request/learned/completed/next_steps")
+            raise ValueError(
+                "session_note must set at least one of request/investigated/learned/completed/next_steps"
+            )
         return self
 
 
