@@ -23,7 +23,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 
-from . import bridges, card, consolidate, gate, librarian, reflect
+from . import bridges, card, consolidate, gate, librarian, reflect, surprisal
 from .config import DreamingSettings, dreaming_settings
 
 logger = logging.getLogger(__name__)
@@ -306,8 +306,28 @@ async def _dream_pool(
         # 7. REM: reflect + store insights
         insights: list[dict] = []
         if settings.reflection_enabled:
+            # A5: surprisal-targeted REM. One batched vector retrieve, then
+            # each staged dict gains a `surprisal` score (cosine distance
+            # from the pool centroid); reflect() biases its substrate toward
+            # the top-K anomalies. top_k=0 skips everything — no fetch, no
+            # keys, byte-identical uniform substrate. Failures are non-fatal
+            # (reflection proceeds uniform).
+            if settings.surprisal_top_k > 0:
+                try:
+                    vectors = await asyncio.to_thread(
+                        surprisal.fetch_vectors,
+                        service,
+                        [m["memory_id"] for m in batch.memories],
+                    )
+                    surprisal.annotate(batch.memories, vectors)
+                except Exception:
+                    logger.warning(
+                        "surprisal pass failed for pool %s (non-fatal); "
+                        "reflection substrate stays uniform", pool, exc_info=True,
+                    )
             insights = await reflect.reflect(
-                batch, llm_call, max_insights=settings.max_reflections_per_pool
+                batch, llm_call, max_insights=settings.max_reflections_per_pool,
+                surprisal_top_k=settings.surprisal_top_k,
             )
             stored = await asyncio.to_thread(
                 reflect.store_insights, service, batch, insights, dry_run=dry_run
