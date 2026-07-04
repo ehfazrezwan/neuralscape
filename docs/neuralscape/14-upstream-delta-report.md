@@ -109,6 +109,8 @@ mem0 native `search("")` now raises. **Action:** audit NS recall paths that coul
 | `utils/factory.py` | Adds `GraphStoreFactory` (incl. `"graphiti"`) | **Yes:** #5447/#4030/#5190 touch Llm/Embedder factories, **not** GraphStoreFactory | **LOW–MEDIUM** — likely auto-mergeable |
 | `embeddings/gemini.py` | Adds batched `embed_batch()` | **Yes: #5609** adds upstream's own — convergent | **MEDIUM–HIGH** — take upstream's |
 | `embeddings/base.py` | Tightens `embed_batch` signature | No | **LOW** |
+| `embeddings/openai.py` | `embed_batch` honors `config.embedding_batch_size` (client-side chunk size, clamped 1–100) and falls back to per-item embeds when a batched call is rejected with a single-input error. Needed because the gateway's Vertex embedding endpoint accepts only ONE input per request — with `LLM_GATEWAY_ENABLED` the batched call 400'd and conversation extraction silently stored zero facts. NS wiring: `EMBEDDER_MAX_BATCH_SIZE` in service `config.py` (gateway embedder block defaults it to 1). | Upstream has the same `embed_batch` (MAX_BATCH=100 chunking) — re-apply this diff on sync | **MEDIUM** — small self-contained diff in one method + one helper |
+| `configs/embeddings/base.py` | Adds `embedding_batch_size: Optional[int] = None` to `BaseEmbedderConfig` (consumed by `embeddings/openai.py` above) | No | **LOW** — additive kwarg |
 | `pyproject.toml` | `[graphiti]` extra + `[tool.uv.sources]` editable | **Yes, heavily** (2.0.7 bump, `vector_stores`→`vector-stores` #4934, CVE bumps) | **HIGH** — near-certain conflict every sync; `[tool.uv.sources]` is load-bearing |
 
 ### graphiti — Saga/reference_time/extraction cluster (the dominant conflict)

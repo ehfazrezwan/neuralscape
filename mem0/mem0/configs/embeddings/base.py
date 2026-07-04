@@ -40,6 +40,11 @@ class BaseEmbedderConfig(ABC):
         aws_access_key_id: Optional[str] = None,
         aws_secret_access_key: Optional[str] = None,
         aws_region: Optional[str] = None,
+        # NS fork: max inputs per embed_batch API call (client-side chunking).
+        # None → provider default. Set to 1 for OpenAI-compatible backends that
+        # accept only one input per request (e.g. a Vertex gemini-embedding-001
+        # gateway endpoint).
+        embedding_batch_size: Optional[int] = None,
     ):
         """
         Initializes a configuration class instance for the Embeddings.
@@ -107,4 +112,7 @@ class BaseEmbedderConfig(ABC):
         self.aws_access_key_id = aws_access_key_id
         self.aws_secret_access_key = aws_secret_access_key
         self.aws_region = aws_region or os.environ.get("AWS_REGION") or "us-west-2"
+
+        # NS fork: embed_batch chunk size (see param doc above)
+        self.embedding_batch_size = embedding_batch_size
 
