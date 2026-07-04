@@ -461,14 +461,23 @@ class TestFactScopedInvalidation:
     derived from the tombstoned memory's own episode(s).
     """
 
+    @staticmethod
+    def _edge_queries(driver):
+        return [(c, p) for c, p in driver.log if "RELATES_TO" in c]
+
+    @staticmethod
+    def _node_queries(driver):
+        return [(c, p) for c, p in driver.log if "dream_superseded_by" in c]
+
     @pytest.mark.asyncio
     async def test_invalidation_is_episode_scoped_not_node_adjacent(self):
         driver = _FakeDriver()
         await graph_patcher.invalidate_memory_graph(
             driver, group_id="user--u1", memory_id="mem-1", superseded_by="mem-2",
         )
-        assert driver.log, "no cypher was issued"
-        cypher, params = driver.log[0]
+        edge_queries = self._edge_queries(driver)
+        assert edge_queries, "no edge-invalidation cypher was issued"
+        cypher, params = edge_queries[0]
         # Scoping anchor: the memory's own Episodic node(s), then only edges
         # whose episode provenance is contained in that set.
         assert "Episodic" in cypher
@@ -482,16 +491,42 @@ class TestFactScopedInvalidation:
         assert params["memory_id"] == "mem-1"
 
     @pytest.mark.asyncio
+    async def test_node_marking_is_unconditional_own_statement(self):
+        """Copilot on PR #125: node marking must not be gated behind the
+        edge-scoping match — with zero qualifying edges (or an empty
+        episode set, the documented fail-safe) the tombstoned memory's
+        nodes still get their ``dream_superseded_by`` hop marker. The
+        marking is its own statement, referencing neither the edge
+        pattern nor the episode set."""
+        driver = _FakeDriver(records=[{"edges": 0}])  # nothing invalidatable
+        await graph_patcher.invalidate_memory_graph(
+            driver, group_id="g", memory_id="m", superseded_by="s",
+        )
+        node_queries = self._node_queries(driver)
+        assert node_queries, "node marking was never issued"
+        cypher, params = node_queries[0]
+        # independent of the edge scoping: no edge pattern, no episode set
+        assert "RELATES_TO" not in cypher
+        assert "episodes" not in cypher and "eps" not in cypher
+        assert params["superseded_by"] == "s"
+        assert params["memory_id"] == "m"
+        # and it runs BEFORE the edge pass, so an edge-query failure can
+        # never skip it either
+        assert driver.log.index(node_queries[0]) < driver.log.index(
+            self._edge_queries(driver)[0]
+        )
+
+    @pytest.mark.asyncio
     async def test_nodes_still_marked_and_edge_count_returned(self):
         driver = _FakeDriver(records=[{"edges": 3}])
         edges = await graph_patcher.invalidate_memory_graph(
             driver, group_id="g", memory_id="m", superseded_by="s",
         )
         assert edges == 3
-        cypher, params = driver.log[0]
+        node_queries = self._node_queries(driver)
         # survivor hop marker is preserved (walkers jump tombstone → survivor)
-        assert "dream_superseded_by" in cypher
-        assert params["superseded_by"] == "s"
+        assert node_queries
+        assert node_queries[0][1]["superseded_by"] == "s"
 
     @pytest.mark.asyncio
     async def test_driver_failure_stays_nonfatal(self):

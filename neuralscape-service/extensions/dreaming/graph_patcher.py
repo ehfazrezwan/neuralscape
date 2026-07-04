@@ -382,15 +382,24 @@ async def invalidate_memory_graph(
       tombstoning each co-asserter in separate sweeps leaves the edge
       live (each pass sees the others' episodes as external evidence).
 
-    Entity nodes stamped with this ``memory_id`` still get the
-    ``dream_superseded_by`` hop marker (walker convenience, not an
-    invalidation).
+    Node marking is UNCONDITIONAL (Copilot, PR #125): entity/episodic
+    nodes stamped with this ``memory_id`` always get the
+    ``dream_superseded_by`` hop marker — a walker convenience mirroring
+    the vector-side tombstone, not an invalidation — via its own
+    statement issued BEFORE the edge pass, so it can never be skipped by
+    edge-scoping outcomes (zero exclusively-derived edges, or the empty
+    episode set of the fail-safe case above) or an edge-query failure.
 
     Returns the number of edges invalidated (0 on any failure — best-effort
     like every helper in this module).
     """
     ts = (now or datetime.now(timezone.utc)).isoformat()
-    cypher = """
+    node_cypher = """
+    MATCH (n {group_id: $group_id, memory_id: $memory_id})
+    SET n.dream_superseded_by = $superseded_by, n.dream_invalidated_at = $ts
+    RETURN count(n) AS nodes
+    """
+    edge_cypher = """
     OPTIONAL MATCH (ep:Episodic {group_id: $group_id, memory_id: $memory_id})
     WITH collect(ep.uuid) AS eps
     OPTIONAL MATCH ()-[r:RELATES_TO {group_id: $group_id}]->()
@@ -399,19 +408,22 @@ async def invalidate_memory_graph(
       AND size(coalesce(r.episodes, [])) > 0
       AND all(x IN coalesce(r.episodes, []) WHERE x IN eps)
     SET r.invalid_at = $ts, r.expired_at = $ts
-    WITH count(r) AS edges
-    OPTIONAL MATCH (n {group_id: $group_id, memory_id: $memory_id})
-    SET n.dream_superseded_by = $superseded_by, n.dream_invalidated_at = $ts
-    RETURN edges
+    RETURN count(r) AS edges
     """
     try:
         async with driver.session() as session:
-            cursor = await session.run(
-                cypher,
+            await session.run(
+                node_cypher,
                 group_id=group_id,
                 memory_id=memory_id,
                 ts=ts,
                 superseded_by=superseded_by or "",
+            )
+            cursor = await session.run(
+                edge_cypher,
+                group_id=group_id,
+                memory_id=memory_id,
+                ts=ts,
             )
             records = await cursor.data()
             return int(records[0]["edges"]) if records else 0
