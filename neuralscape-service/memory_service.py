@@ -245,11 +245,12 @@ def _salience_tiebreak(responses: list) -> list:
 def content_hash(content: str) -> str:
     """Canonical content hash for write-path dedup (audit 27 #6).
 
-    Every writer of ``payload["hash"]`` MUST use this helper — store_raw,
-    the conversation batch path, checkpoints, and the dreaming rewrite
-    (which re-embeds new text in place). The exact-dedup cron groups rows
-    by this value and hard-deletes "duplicates", so a stale or divergent
-    hash silently corrupts dedup in both directions.
+    The service-layer writers of ``payload["hash"]`` — store_raw, the
+    conversation batch path, checkpoints, and the dreaming rewrite (which
+    re-embeds new text in place) — all route through this helper; new
+    writers should too. The exact-dedup cron groups rows by this value and
+    hard-deletes "duplicates", so a stale or divergent hash silently
+    corrupts dedup in both directions.
     """
     return hashlib.md5(content.encode()).hexdigest()
 
@@ -4699,7 +4700,8 @@ class MemoryService:
         ``max(1, limit // 4)`` slots within the limit — except they may
         additionally fill any shortfall when the vector legs returned fewer
         than ``limit`` hits. Vector hits are only ever displaced down to
-        ``limit - cap`` (= ceil(3·limit/4)), never below.
+        ``limit - cap`` slots (e.g. 8 of 10 at the default k=10), never
+        below.
         """
         seen_content: set[str] = set()
         unique_graph: list[MemoryResponse] = []
