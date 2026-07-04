@@ -31,10 +31,21 @@ def _mem(mid: str, content: str, created_at: str = "2026-07-01T00:00:00+00:00") 
     )
 
 
-def _service(search_results=None, keyword_results=None) -> MagicMock:
+def _graph_mem(mid: str, content: str) -> MemoryResponse:
+    """A graph-sourced row: no timestamp, no score (Graphiti edge shape)."""
+    return MemoryResponse(
+        id=mid, memory=content, category="relation", source="graph",
+        created_at=None, score=None,
+    )
+
+
+def _service(search_results=None, keyword_results=None, keyword_capped=False) -> MagicMock:
     svc = MagicMock(name="MemoryService")
     svc.search.return_value = search_results if search_results is not None else []
-    svc.keyword_search.return_value = keyword_results if keyword_results is not None else []
+    svc.keyword_search.return_value = (
+        keyword_results if keyword_results is not None else [],
+        keyword_capped,
+    )
     return svc
 
 
@@ -116,9 +127,11 @@ class TestRetrievalPasses:
 
     @pytest.mark.asyncio
     async def test_low_adds_update_language_pass(self):
+        """Temporal question at low tier → the update-language recency pass
+        runs (atemporal questions skip it — see TestUpdatePassGating)."""
         svc = _service([_mem("m1", "fact")])
         llm = _answer_llm("ans", ["m1"])
-        out = await ask_memory(svc, question="When is the sync?", user_id="u",
+        out = await ask_memory(svc, question="Was the sync rescheduled?", user_id="u",
                                reasoning_level="low", llm_call=llm)
         assert svc.search.call_count == 2
         update_query = svc.search.call_args_list[1].kwargs["query"]
@@ -170,7 +183,8 @@ class TestSearchLoop:
             calls["n"] += 1
             return json.dumps({"action": "search", "query": f"follow-up {calls['n']}"})
 
-        out = await ask_memory(svc, question="q?", user_id="u",
+        # Temporal question so the (gated) update pass still runs.
+        out = await ask_memory(svc, question="What is the latest plan?", user_id="u",
                                reasoning_level="high", llm_call=greedy_llm)
         tier = REASONING_TIERS["high"]
         # Semantic passes: initial + update + at most `extra_searches` follow-ups.
@@ -222,12 +236,293 @@ class TestSearchLoop:
         async def llm(prompt: str) -> str:
             return next(responses)
 
-        out = await ask_memory(svc, question="q?", user_id="u",
+        # Temporal question so the (gated) update pass still runs.
+        out = await ask_memory(svc, question="Where do we meet now?", user_id="u",
                                reasoning_level="low", llm_call=llm)
         assert svc.search.call_count == 3
         assert svc.search.call_args_list[2].kwargs["query"] == "narrower"
         assert out["memories_considered"] == 2
         assert set(out["citations"]) == {"m1", "m2"}  # follow-up hit is citable
+
+
+# ──────────────────────────────────────────────
+# Evidence budget (audit 27 #15): over budget, keep by priority
+# (keyword hits > score > newest), render survivors chronologically
+# ──────────────────────────────────────────────
+
+
+class TestEvidenceBudget:
+    def _timestamped_rows(self, n: int):
+        """n rows with strictly ascending timestamps (id order = age order)."""
+        return [
+            _mem(f"mem-{i:03d}", f"fact number {i:03d} stands alone",
+                 f"2026-01-01T{i // 60:02d}:{i % 60:02d}:00+00:00")
+            for i in range(n)
+        ]
+
+    def test_budget_overflow_keeps_newest_rows(self):
+        """130 ascending-timestamp rows → the NEWEST 120 survive the cut
+        (pre-fix the ascending sort + head-truncation kept the OLDEST)."""
+        rows = self._timestamped_rows(130)
+        evidence = {m.id: m for m in rows}
+        out = ask_mod._evidence_rows(evidence, [], False)
+        ids = [m.id for m in out]
+        assert len(ids) == ask_mod._EVIDENCE_MAX_ROWS
+        assert "mem-129" in ids  # newest row survives
+        assert "mem-000" not in ids  # oldest rows are the ones cut
+        # Survivors re-sorted chronologically ascending for the prompt.
+        assert ids == [f"mem-{i:03d}" for i in range(10, 130)]
+
+    @pytest.mark.asyncio
+    async def test_budget_overflow_newest_rows_reach_the_prompt(self):
+        rows = self._timestamped_rows(130)
+        svc = _service(rows)
+        llm = _answer_llm("ans", ["mem-129"])
+        await ask_memory(svc, question="q?", user_id="u",
+                         reasoning_level="minimal", llm_call=llm)
+        assert "[mem-129]" in llm.prompts[0]
+        assert "[mem-000]" not in llm.prompts[0]
+
+    def test_timestampless_graph_rows_do_not_eat_the_budget(self):
+        """Over budget, unscored timestamp-less graph rows are lowest
+        priority (pre-fix their '' sort key put them FIRST in the keep-set)."""
+        rows = self._timestamped_rows(120)
+        graph = [_graph_mem(f"g-{i}", f"relation {i}") for i in range(5)]
+        evidence = {m.id: m for m in graph + rows}  # graph rows arrive first
+        out = ask_mod._evidence_rows(evidence, [], False)
+        ids = [m.id for m in out]
+        assert len(ids) == ask_mod._EVIDENCE_MAX_ROWS
+        assert not [i for i in ids if i.startswith("g-")]
+        assert "mem-119" in ids
+
+    def test_timestampless_rows_render_last_when_under_budget(self):
+        rows = self._timestamped_rows(3)
+        graph = [_graph_mem("g-1", "relation one")]
+        evidence = {m.id: m for m in graph + rows}
+        ids = [m.id for m in ask_mod._evidence_rows(evidence, [], False)]
+        assert ids == ["mem-000", "mem-001", "mem-002", "g-1"]
+
+    def test_keyword_hits_survive_the_cut_even_when_old(self):
+        rows = self._timestamped_rows(130)
+        evidence = {m.id: m for m in rows}
+        out = ask_mod._evidence_rows(evidence, ["mem-000"], False)
+        ids = [m.id for m in out]
+        assert "mem-000" in ids  # keyword hit outranks recency
+        assert "mem-010" not in ids  # the extra slot comes from the oldest non-kw row
+        # Chronological rendering puts the surviving old kw hit first.
+        assert ids[0] == "mem-000"
+
+
+# ──────────────────────────────────────────────
+# Evidence clipping (audit 27 #16): passage rows get a 1500-char budget,
+# every row clips at a sentence boundary instead of mid-word
+# ──────────────────────────────────────────────
+
+
+def _passage(mid: str, content: str) -> MemoryResponse:
+    return MemoryResponse(
+        id=mid, memory=content, category="domain_knowledge", source="vector",
+        created_at="2026-07-01T00:00:00+00:00", score=0.9, memory_kind="passage",
+    )
+
+
+class TestEvidenceClip:
+    def test_passage_row_keeps_content_beyond_500_chars(self):
+        """Ingest passages default to 1500 chars; a fact-sized 500-char clip
+        hid two-thirds of every passage from the answerer."""
+        filler = "This is a filler sentence to pad out the passage body. "  # 56 chars
+        text = filler * 13 + "The vault access code is 9137. " + filler * 8
+        assert 700 < text.index("9137") < 800  # the answer sits past the old clip
+        rendered = ask_mod._render_evidence([_passage("p1", text)])
+        assert "The vault access code is 9137." in rendered
+
+    def test_fact_row_keeps_500_budget(self):
+        filler = "This is a filler sentence to pad out the fact body zzz. "  # 57 chars
+        text = filler * 13 + "The vault access code is 9137."
+        row = _mem("f1", text)
+        rendered = ask_mod._render_evidence([row])
+        assert "9137" not in rendered  # fact rows keep the tight budget
+        assert "…" in rendered
+
+    def test_fact_clip_lands_on_sentence_boundary(self):
+        # Sentences sized so char 500 falls mid-word: 57-char sentences →
+        # boundary at 456; the old code sliced blindly at 500.
+        filler = "This is a filler sentence to pad out the fact body zzz. "
+        text = (filler * 12).strip()
+        rendered = ask_mod._render_evidence([_mem("f1", text)])
+        assert rendered.rstrip().endswith("zzz. …")
+
+    def test_passage_over_budget_clips_at_sentence_boundary(self):
+        filler = "This is a filler sentence to pad out the passage body. "
+        text = (filler * 32).strip()  # ~1790 chars > 1500
+        rendered = ask_mod._render_evidence([_passage("p1", text)])
+        body = rendered.split(") ", 1)[1]
+        assert len(body) <= ask_mod._EVIDENCE_PASSAGE_CLIP + 2  # "+ …"
+        assert rendered.rstrip().endswith("body. …")
+
+    def test_clip_falls_back_to_whitespace_when_no_sentence_boundary(self):
+        text = "word " * 200  # no ". " anywhere, 1000 chars
+        rendered = ask_mod._render_evidence([_mem("f1", text.strip())])
+        assert "word  …" not in rendered  # no dangling partial token
+        body = rendered.split(") ", 1)[1]
+        clipped = body[: -len(" …")]
+        assert clipped.endswith("word")  # cut on a whole word
+
+
+# ──────────────────────────────────────────────
+# Cross-source dedup (audit 27 #17): a Graphiti edge and its Qdrant twin
+# arriving in different passes collapse to ONE evidence row (vector wins)
+# ──────────────────────────────────────────────
+
+
+class TestCrossSourceDedup:
+    @pytest.mark.asyncio
+    async def test_graph_then_vector_twin_collapses_to_vector_row(self):
+        """Graph edge lands first, its vector twin in a later pass — the
+        vector row (richer metadata) replaces the graph one."""
+        graph_row = _graph_mem("graph-uuid-1", "alice moved to berlin")
+        vector_row = _mem("vector-id-1", "Alice moved to Berlin.")
+        svc = _service()
+        svc.search.side_effect = [
+            [graph_row],   # initial semantic pass
+            [vector_row],  # update-language pass
+        ]
+        llm = _answer_llm("Berlin [vector-id-1]", ["vector-id-1"])
+        out = await ask_memory(svc, question="Where does Alice live now?",
+                               user_id="u", reasoning_level="low", llm_call=llm)
+        assert out["memories_considered"] == 1
+        assert "[vector-id-1]" in llm.prompts[0]
+        assert "[graph-uuid-1]" not in llm.prompts[0]
+        assert out["citations"] == ["vector-id-1"]
+
+    @pytest.mark.asyncio
+    async def test_vector_then_graph_twin_drops_the_graph_row(self):
+        vector_row = _mem("vector-id-1", "Alice moved to Berlin.")
+        graph_row = _graph_mem("graph-uuid-1", "alice moved to berlin")
+        svc = _service()
+        svc.search.side_effect = [
+            [vector_row],
+            [graph_row],
+        ]
+        llm = _answer_llm("Berlin [vector-id-1]", ["vector-id-1"])
+        out = await ask_memory(svc, question="Where does Alice live now?",
+                               user_id="u", reasoning_level="low", llm_call=llm)
+        assert out["memories_considered"] == 1
+        assert "[vector-id-1]" in llm.prompts[0]
+        assert "[graph-uuid-1]" not in llm.prompts[0]
+
+    @pytest.mark.asyncio
+    async def test_distinct_rows_are_not_collapsed(self):
+        svc = _service()
+        svc.search.side_effect = [
+            [_mem("m1", "Alice moved to Berlin.")],
+            [_mem("m2", "Bob works at the bakery.")],
+        ]
+        llm = _answer_llm("ans", ["m1", "m2"])
+        out = await ask_memory(svc, question="Where does Alice live now?",
+                               user_id="u", reasoning_level="low", llm_call=llm)
+        assert out["memories_considered"] == 2
+
+
+# ──────────────────────────────────────────────
+# Keyword-pass prompt honesty (audit 27 #18): a capped (partial) lexical
+# scan must not be endorsed as exact/exhaustive to the answering LLM
+# ──────────────────────────────────────────────
+
+
+class TestKeywordPromptHonesty:
+    @pytest.mark.asyncio
+    async def test_capped_scan_softens_prompt_language(self):
+        svc = _service([_mem("m1", "apple")], [_mem("k1", "banana")],
+                       keyword_capped=True)
+        llm = _answer_llm("2")
+        await ask_memory(svc, question="How many fruits did I mention?",
+                         user_id="u", reasoning_level="high", llm_call=llm)
+        prompt = llm.prompts[0]
+        assert "partial" in prompt.lower()
+        assert "Exact-keyword matches are listed first" not in prompt
+
+    @pytest.mark.asyncio
+    async def test_full_scan_keeps_exact_match_claim(self):
+        svc = _service([_mem("m1", "apple")], [_mem("k1", "banana")],
+                       keyword_capped=False)
+        llm = _answer_llm("2")
+        await ask_memory(svc, question="How many fruits did I mention?",
+                         user_id="u", reasoning_level="high", llm_call=llm)
+        prompt = llm.prompts[0]
+        assert "Exact-keyword matches are listed first" in prompt
+        assert "partial" not in prompt.lower()
+
+    @pytest.mark.asyncio
+    async def test_legacy_list_return_still_accepted(self):
+        """A test double (or older fork) returning a bare list instead of
+        (rows, capped) degrades to capped=False, not a crash."""
+        svc = _service([_mem("m1", "apple")])
+        svc.keyword_search.return_value = [_mem("k1", "banana")]
+        llm = _answer_llm("2")
+        out = await ask_memory(svc, question="How many fruits did I mention?",
+                               user_id="u", reasoning_level="high", llm_call=llm)
+        assert out["memories_considered"] == 2
+        assert "Exact-keyword matches are listed first" in llm.prompts[0]
+
+
+# ──────────────────────────────────────────────
+# Update-pass gating (audit 27 #19): the forced update-language search
+# only runs when temporal cues appear in the question or first-pass evidence
+# ──────────────────────────────────────────────
+
+
+class TestUpdatePassGating:
+    @pytest.mark.asyncio
+    async def test_atemporal_question_skips_update_pass(self):
+        svc = _service([_mem("m1", "Alice's favorite color is teal.")])
+        llm = _answer_llm("teal [m1]", ["m1"])
+        out = await ask_memory(svc, question="What is Alice's favorite color?",
+                               user_id="u", reasoning_level="low", llm_call=llm)
+        assert svc.search.call_count == 1  # no update pass issued
+        assert out["searches"] == ["What is Alice's favorite color?"]
+        assert out["skipped_passes"] == ["update"]
+
+    @pytest.mark.asyncio
+    async def test_temporal_question_runs_update_pass(self):
+        svc = _service([_mem("m1", "Alice lives in Berlin.")])
+        llm = _answer_llm("Berlin [m1]", ["m1"])
+        out = await ask_memory(svc, question="Where does Alice live now?",
+                               user_id="u", reasoning_level="low", llm_call=llm)
+        assert svc.search.call_count == 2
+        assert out["skipped_passes"] == []
+
+    @pytest.mark.asyncio
+    async def test_update_language_in_first_pass_evidence_triggers_pass(self):
+        """Atemporal question, but the evidence itself mentions a change —
+        the recency pass still runs."""
+        svc = _service([_mem("m1", "The sync was rescheduled to Thursday.")])
+        llm = _answer_llm("Thursday [m1]", ["m1"])
+        out = await ask_memory(svc, question="What day is the sync?",
+                               user_id="u", reasoning_level="low", llm_call=llm)
+        assert svc.search.call_count == 2
+        assert out["skipped_passes"] == []
+
+    def test_update_language_heuristic(self):
+        yes = [
+            "Where does Alice live now?",
+            "When did we switch banks?",
+            "Do I still go to that gym?",
+            "What did the plan used to cost?",
+            "Has the standup been rescheduled?",
+            "What is the latest deploy target?",
+            "Did the office move?",
+            "Is she not at that job anymore?",
+        ]
+        no = [
+            "What is Alice's favorite color?",
+            "How many movies did I watch?",  # 'movies' must not match 'move'
+            "Who owns the staging cluster?",
+        ]
+        for q in yes:
+            assert ask_mod._has_update_language(q), q
+        for q in no:
+            assert not ask_mod._has_update_language(q), q
 
 
 # ──────────────────────────────────────────────
@@ -393,6 +688,7 @@ class TestAskSurfaces:
                 "status": "ok", "reasoning_level": "high", "answer": "42 [m1]",
                 "citations": ["m1"], "abstained": False,
                 "searches": ["q"], "memories_considered": 3,
+                "skipped_passes": ["update"],
             }
 
         monkeypatch.setattr(ask_mod, "ask_memory", fake_ask)
@@ -404,6 +700,7 @@ class TestAskSurfaces:
         assert resp.status_code == 200
         body = resp.json()
         assert body["answer"] == "42 [m1]" and body["citations"] == ["m1"]
+        assert body["skipped_passes"] == ["update"]  # gating is visible in meta
 
     def test_rest_route_invalid_level_422(self):
         from fastapi.testclient import TestClient
@@ -488,29 +785,81 @@ class TestKeywordSearch:
             self._point("m1", "Deployed the Blue-Green pipeline"),
             self._point("m2", "Wrote docs about testing"),
         ])
-        out = svc.keyword_search("u", ["blue-green"])
+        out, capped = svc.keyword_search("u", ["blue-green"])
+        assert [m.id for m in out] == ["m1"]
+        assert capped is False
+
+    def test_terms_are_stripped_before_matching(self):
+        """Copilot on PR #122: " apples " passed the blank filter but kept
+        its spaces, so it could never substring-match "apples" in content."""
+        svc = self._service_with_points([
+            self._point("m1", "apples are great"),
+        ])
+        out, _ = svc.keyword_search("u", [" apples "])
         assert [m.id for m in out] == ["m1"]
 
-    def test_any_term_matches(self):
+    def test_two_terms_require_both(self):
+        """Audit 27 #18: single-common-term rows are noise, not exact
+        matches — with two terms a row must contain BOTH."""
         svc = self._service_with_points([
             self._point("m1", "apples are great"),
             self._point("m2", "bananas are fine"),
-            self._point("m3", "carrots though"),
+            self._point("m3", "apples and bananas smoothie"),
         ])
-        out = svc.keyword_search("u", ["apples", "bananas"])
-        assert {m.id for m in out} == {"m1", "m2"}
+        out, _ = svc.keyword_search("u", ["apples", "bananas"])
+        assert {m.id for m in out} == {"m3"}
+
+    def test_three_plus_terms_require_at_least_two(self):
+        svc = self._service_with_points([
+            self._point("m1", "apples alone here"),
+            self._point("m2", "apples and bananas together"),
+            self._point("m3", "bananas with carrots on top"),
+        ])
+        out, _ = svc.keyword_search("u", ["apples", "bananas", "carrots"])
+        assert {m.id for m in out} == {"m2", "m3"}
+
+    def test_single_term_still_matches_alone(self):
+        svc = self._service_with_points([
+            self._point("m1", "apples are great"),
+            self._point("m2", "carrots though"),
+        ])
+        out, _ = svc.keyword_search("u", ["apples"])
+        assert [m.id for m in out] == ["m1"]
+
+    def test_scan_capped_flag_set_when_point_cap_hit(self):
+        """Ten 500-point pages with more remaining → the 5000-point cap
+        terminated the scan; the caller must know it was partial."""
+        from memory_service import MemoryService
+
+        svc = self._service_with_points([])
+        pages = [
+            ([self._point(f"m{p}-{i}", "unrelated note") for i in range(500)], p + 1)
+            for p in range(10)
+        ]
+        svc._memory.vector_store.client.scroll.side_effect = pages
+        out, capped = svc.keyword_search("u", ["apples", "bananas"])
+        assert out == []
+        assert capped is True
+        assert MemoryService._TIMELINE_FALLBACK_CAP == 5000  # test models the real cap
+
+    def test_scan_not_capped_when_collection_exhausted(self):
+        svc = self._service_with_points([
+            self._point("m1", "apples and bananas"),
+        ])  # helper returns (points, None): collection fully scanned
+        _, capped = svc.keyword_search("u", ["apples", "bananas"])
+        assert capped is False
 
     def test_limit_respected(self):
         svc = self._service_with_points([
             self._point(f"m{i}", "deploy note") for i in range(10)
         ])
-        out = svc.keyword_search("u", ["deploy"], limit=3)
+        out, _ = svc.keyword_search("u", ["deploy"], limit=3)
         assert len(out) == 3
 
     def test_empty_terms_short_circuits(self):
         svc = self._service_with_points([])
-        assert svc.keyword_search("u", []) == []
-        assert svc.keyword_search("u", ["", "  "]) == []
+        assert svc.keyword_search("u", []) == ([], False)
+        assert svc.keyword_search("u", ["", "  "]) == ([], False)
         svc._memory.vector_store.client.scroll.assert_not_called()
 
     def test_filter_excludes_tombstones_and_scopes_visibility(self):
