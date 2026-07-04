@@ -96,6 +96,56 @@ def _parse_expires_at(value) -> datetime | None:
 REINFORCEMENT_BOOST_K = 0.05
 
 
+# ── Hybrid recall: dense + BM25 lexical rank fusion (audit 27 #1) ──────
+# Commit 7024a81 ("embed once") replaced mem0-v3 hybrid search with a
+# dense-only exactly-k query per pool, silently amputating the BM25 leg —
+# sparse vectors were still WRITTEN on every insert (mem0 fork qdrant.py)
+# but never queried, so proper-noun recall collapsed. The helpers below
+# restore a lexical pass per pool and fuse the two legs by reciprocal rank
+# BEFORE the pool merge, keeping the single query embed.
+
+# Standard RRF constant (Cormack et al.): a hit at 0-based rank r
+# contributes 1 / (RRF_K + r + 1).
+RRF_K = 60
+
+
+def _rrf_fuse(dense_hits: list, lexical_hits: list, limit: int) -> list[dict]:
+    """Rank-fuse one pool's dense and lexical (BM25) hit lists.
+
+    Returns up to ``limit`` entries ``{"hit", "dense", "rrf"}`` ordered by
+    summed reciprocal-rank score; a hit present in both legs accumulates
+    both contributions, so leg agreement ranks it up. ``dense`` marks
+    entries whose ``hit.score`` is a real cosine similarity — lexical-only
+    entries carry a raw BM25 score that is NOT cosine-comparable, so the
+    caller imputes a presentation score for those. With an empty lexical
+    list this is an order-preserving passthrough of the dense ranking
+    (1/(k+r) is strictly decreasing and the sort is stable).
+    """
+    fused: dict[str, dict] = {}
+    for rank, hit in enumerate(dense_hits):
+        hid = str(getattr(hit, "id", ""))
+        fused[hid] = {"hit": hit, "dense": True, "rrf": 1.0 / (RRF_K + rank + 1)}
+    for rank, hit in enumerate(lexical_hits):
+        hid = str(getattr(hit, "id", ""))
+        entry = fused.get(hid)
+        if entry is None:
+            fused[hid] = {"hit": hit, "dense": False, "rrf": 1.0 / (RRF_K + rank + 1)}
+        else:
+            entry["rrf"] += 1.0 / (RRF_K + rank + 1)
+    ordered = sorted(fused.values(), key=lambda e: e["rrf"], reverse=True)
+    return ordered[:limit]
+
+
+def _dense_score_floor(dense_hits: list) -> float | None:
+    """Weakest cosine score in a pool's dense leg (imputed score for
+    lexical-only hits: presence via a strong keyword match is worth at
+    least as much as the pool's weakest dense candidate — never more)."""
+    scores = [
+        s for s in (getattr(h, "score", None) for h in dense_hits) if s is not None
+    ]
+    return min(scores) if scores else None
+
+
 def _times_derived_from_metadata(metadata: dict | None) -> int:
     """Read `times_derived` out of a memory's metadata dict (min 1).
 
@@ -1280,30 +1330,82 @@ class MemoryService:
 
         # qdrant-client v1.13+ removed `.search()` in favor of `.query_points()`;
         # the response wraps hits in a `.points` attribute.
+        qfilter = Filter(must=must, must_not=must_not)
         result = client.query_points(
             collection_name=settings.qdrant_collection,
             query=embedding,
-            query_filter=Filter(must=must, must_not=must_not),
+            query_filter=qfilter,
             limit=limit,
             with_payload=True,
         )
-        hits = getattr(result, "points", result) or []
+        dense_hits = list(getattr(result, "points", result) or [])
+
+        # Hybrid recall (audit 27 #1): BM25 lexical leg under the SAME
+        # filter, rank-fused with the dense leg before the pool merge.
+        lexical_hits = self._lexical_pool_hits(m, query, qfilter, limit)
+        fused = _rrf_fuse(dense_hits, lexical_hits, limit)
+        dense_floor = _dense_score_floor(dense_hits)
 
         out: list[MemoryResponse] = []
-        for hit in hits:
+        for entry in fused:
+            hit = entry["hit"]
             payload = getattr(hit, "payload", None) or {}
             metadata = payload.get("metadata", {})
+            # Lexical-only hits carry a raw BM25 score (not cosine-comparable);
+            # impute the pool's dense floor so the cross-pool score sort stays
+            # meaningful without ever letting a keyword match outrank a
+            # stronger dense hit on score alone.
+            raw_score = getattr(hit, "score", None) if entry["dense"] else dense_floor
             mem_dict = {
                 "id": str(getattr(hit, "id", "")),
                 "memory": payload.get("data", ""),
                 "metadata": metadata,
                 # Reinforcement-aware recall: memories that survived N dedup
                 # collapses rank slightly above one-offs at equal similarity.
-                "score": _reinforcement_boost(getattr(hit, "score", None), metadata),
+                "score": _reinforcement_boost(raw_score, metadata),
                 "created_at": payload.get("created_at"),
             }
             out.append(self._mem_to_response(mem_dict))
         return out
+
+    def _lexical_pool_hits(self, m, query: str, query_filter, limit: int) -> list:
+        """BM25 lexical leg for one pool (audit 27 #1).
+
+        Runs a sparse-vector keyword query against the collection's
+        ``bm25`` named-vector slot using the SAME payload filter as the
+        pool's dense pass, so the lexical leg can never widen
+        visibility/scope. Degrades to an empty list (dense-only search,
+        no error) when:
+
+        - the collection predates the v3 hybrid schema (no ``bm25`` sparse
+          slot — the mem0 fork detects this at startup via
+          ``_has_bm25_slot``),
+        - the configured vector store isn't the NS mem0 Qdrant fork,
+        - the query is empty or sparse encoding fails,
+        - the Qdrant call errors — recall must never break on the lexical
+          extra.
+        """
+        vs = m.vector_store
+        # `is True` (not truthiness): only the fork sets a real bool; any
+        # other store lacks the attribute and must skip the sparse leg.
+        if not query or getattr(vs, "_has_bm25_slot", False) is not True:
+            return []
+        try:
+            sparse = vs._encode_bm25(query)
+            if sparse is None:
+                return []
+            result = vs.client.query_points(
+                collection_name=settings.qdrant_collection,
+                query=sparse,
+                using="bm25",
+                query_filter=query_filter,
+                limit=limit,
+                with_payload=True,
+            )
+            return list(getattr(result, "points", result) or [])
+        except Exception as e:
+            logger.debug(f"BM25 lexical leg failed (non-fatal, dense-only): {e}")
+            return []
 
     def _search_standard_pool(
         self,
@@ -1350,6 +1452,7 @@ class MemoryService:
         observation_type: str | None,
         concepts: list[str] | None,
         limit: int,
+        query: str = "",
     ) -> list[MemoryResponse]:
         """Search Qdrant for the caller's own memories using a precomputed vector.
 
@@ -1360,6 +1463,9 @@ class MemoryService:
         single ``search()`` embeds the query ONCE and reuses ``query_embedding``
         across every pool/scope, instead of re-embedding per ``Memory.search``
         call (the embed round-trip dominates read latency).
+
+        ``query`` (raw text) feeds the BM25 lexical leg only — sparse
+        encoding is lexical, not an embed round-trip. Empty ⇒ dense-only.
         """
         from qdrant_client.models import (
             FieldCondition,
@@ -1388,19 +1494,30 @@ class MemoryService:
         if concepts:
             must.append(FieldCondition(key="metadata.concepts", match=MatchAny(any=concepts)))
 
+        qfilter = Filter(must=must, must_not=must_not)
         result = client.query_points(
             collection_name=settings.qdrant_collection,
             query=query_embedding,
-            query_filter=Filter(must=must, must_not=must_not),
+            query_filter=qfilter,
             limit=limit,
             with_payload=True,
         )
-        hits = getattr(result, "points", result) or []
+        dense_hits = list(getattr(result, "points", result) or [])
+
+        # Hybrid recall (audit 27 #1): BM25 lexical leg under the SAME
+        # filter, rank-fused with the dense leg before the pool merge.
+        lexical_hits = self._lexical_pool_hits(m, query, qfilter, limit)
+        fused = _rrf_fuse(dense_hits, lexical_hits, limit)
+        dense_floor = _dense_score_floor(dense_hits)
 
         out: list[MemoryResponse] = []
-        for hit in hits:
+        for entry in fused:
+            hit = entry["hit"]
             payload = getattr(hit, "payload", None) or {}
             metadata = payload.get("metadata", {})
+            # Lexical-only hits: impute the pool's dense floor (see
+            # _search_shared_pool for the rationale).
+            raw_score = getattr(hit, "score", None) if entry["dense"] else dense_floor
             mem_dict = {
                 "id": str(getattr(hit, "id", "")),
                 "memory": payload.get("data", ""),
@@ -1408,7 +1525,7 @@ class MemoryService:
                 # Same reinforcement boost as the shared/standard pools — the
                 # re-rank must be identical across pools or a reinforced
                 # private memory would lose to its unreinforced shared twin.
-                "score": _reinforcement_boost(getattr(hit, "score", None), metadata),
+                "score": _reinforcement_boost(raw_score, metadata),
                 "created_at": payload.get("created_at"),
             }
             out.append(self._mem_to_response(mem_dict))
@@ -1849,7 +1966,7 @@ class MemoryService:
                             m=m, user_id=user_id, query_embedding=query_embedding,
                             project_id=project_id, categories=categories, scope=None,
                             domain=domain, observation_type=observation_type,
-                            concepts=concepts, limit=limit,
+                            concepts=concepts, limit=limit, query=query,
                         )
                     )
                     vector_responses.extend(
@@ -1857,7 +1974,7 @@ class MemoryService:
                             m=m, user_id=user_id, query_embedding=query_embedding,
                             project_id=None, categories=categories, scope="global",
                             domain=domain, observation_type=observation_type,
-                            concepts=concepts, limit=limit,
+                            concepts=concepts, limit=limit, query=query,
                         )
                     )
                 else:
@@ -1866,7 +1983,7 @@ class MemoryService:
                             m=m, user_id=user_id, query_embedding=query_embedding,
                             project_id=project_id, categories=categories, scope=scope,
                             domain=domain, observation_type=observation_type,
-                            concepts=concepts, limit=limit,
+                            concepts=concepts, limit=limit, query=query,
                         )
                     )
             except Exception as e:
