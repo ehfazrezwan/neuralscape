@@ -11,8 +11,13 @@ Usage (from neuralscape-service/, with Neo4j/Redis/Qdrant up):
     DREAMING_ENABLED=true \
     DREAMING_E2E_USER=bridges-e2e \
     DEFAULT_USER_ID=bridges-e2e \
+    DREAMING_AUTO_APPLY_CONFIDENCE=1.0 \
     DREAMING_OBSIDIAN_VAULT_PATH=/tmp/bridges-e2e-vault \
     uv run python scripts/bridges_card_e2e.py
+
+(DREAMING_AUTO_APPLY_CONFIDENCE=1.0 shadow-reports destructive actions so
+the deliberately weak seed row deterministically SURVIVES to fade instead
+of being pruned by an over-eager consolidation pass.)
 
 Flow:
 
@@ -66,8 +71,15 @@ def seed(service) -> dict[str, str]:
          "Cloudflare TURN credentials for alpha rotate daily via the deploy pipeline"),
         ("a_turn3", PROJ_A, "procedure", 0.9,
          "To debug alpha connectivity, check the Cloudflare TURN allocation logs first"),
-        ("a_weak", PROJ_A, "decision", 0.1,
-         "The team chose React over Svelte for the alpha dashboard after a brief evaluation"),
+        # dashboard pair: a strong companion so the clusterer forms a topic
+        # (>= 2 ids), plus the weak row that must land in the Faded callout.
+        # The weak fact must be DISTINCT from the strong one (no merge
+        # target — merges are reversible and always apply) and contradict
+        # nothing (no invalidate target); only its low confidence dims it.
+        ("a_dash", PROJ_A, "architecture", 0.9,
+         "The alpha dashboard is built with React, Vite, and Tailwind"),
+        ("a_weak", PROJ_A, "domain_knowledge", 0.1,
+         "An early alpha dashboard prototype shipped a CSV export button that was dropped"),
         # project beta — same subject, different pool
         ("b_turn1", PROJ_B, "architecture", 0.9,
          "Beta's edge nodes also depend on Cloudflare TURN for NAT traversal"),
@@ -101,6 +113,17 @@ def seed(service) -> dict[str, str]:
         ids[name] = res[0].id
         time.sleep(0.05)
     return ids
+
+
+def fetch_payload(service, mid: str) -> dict:
+    from config import settings
+
+    client = service._memory.vector_store.client
+    pts = client.retrieve(
+        collection_name=settings.qdrant_collection, ids=[mid],
+        with_payload=True, with_vectors=False,
+    )
+    return dict(pts[0].payload) if pts else {}
 
 
 def find_page_with(vault_dir, memory_id: str):
@@ -213,6 +236,11 @@ async def main() -> int:
         check("bridge block sits inside the managed markers", False, "pages missing")
 
     print("\n[4/5] faded + cards …")
+    weak_meta = fetch_payload(service, ids["a_weak"]).get("metadata") or {}
+    print("  a_weak store state:",
+          {k: weak_meta.get(k) for k in
+           ("dream_tombstoned", "dream_pruned", "superseded_by")},
+          "| alpha pages:", [p.name for p in sorted(dir_a.glob('*.md'))])
     weak_page = find_page_with(dir_a, ids["a_weak"])
     from extensions.dreaming.librarian import FADED_START
 
@@ -220,12 +248,12 @@ async def main() -> int:
 
     if weak_page is not None:
         text = weak_page.read_text()
-        has_callout = "> [!note]- Faded" in text and "Svelte" in text
+        has_callout = "> [!note]- Faded" in text and "CSV export" in text
         main_body = text.split(FADED_START)[0]
         check("weak row collapsed into the Faded callout",
               has_callout, weak_page.name)
         check("weak row absent from the main sections",
-              "Svelte" not in main_body)
+              "CSV export" not in main_body)
     else:
         # The consolidation LLM may have tombstoned the weak row outright
         # (it is a legit PRUNE candidate at strength ~0.1); that is the
