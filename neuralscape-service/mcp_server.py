@@ -1,9 +1,9 @@
-"""MCP server exposing neuralscape memory operations as 15 tools.
+"""MCP server exposing neuralscape memory operations as 16 tools.
 
 Tools: recall_memories, remember, remember_conversation, ingest_document,
 ingest_text, get_project_context, search_knowledge_graph, list_memories,
 list_projects, delete_memories, list_processes, get_process, edit_memory,
-retag_memories, get_reasoning_chain.
+retag_memories, get_reasoning_chain, schedule_dream.
 
 Supports both stdio transport (local Claude Code) and Streamable HTTP
 transport (remote agent access via /mcp/ endpoint on port 8199).
@@ -701,6 +701,44 @@ async def list_tools() -> list[Tool]:
                 "required": [],
             },
         ),
+        Tool(
+            name="schedule_dream",
+            description=(
+                "Schedule one dreaming consolidation sweep (A3-lite manual trigger). "
+                "Enqueues the sweep onto the background graph worker — the same path "
+                "as POST /v1/extensions/dreaming/run — and returns immediately with a "
+                "job id; poll /v1/extensions/dreaming/status for the DreamRun result. "
+                "The sweep merges duplicates, invalidates contradictions, prunes noise "
+                "(reversible tombstones), reframes stale tenses and stores reflection "
+                "insights, per pool. Per-pool gates still apply: time since last dream, "
+                "a settling guard (pools written to in the last ~30 minutes defer with "
+                "status 'settling'), and a minimum-new-memories volume gate — pass "
+                "force=true to bypass the gates (never the pool lock). Requires "
+                "DREAMING_ENABLED=true unless force=true."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "pool": {
+                        "type": "string",
+                        "description": (
+                            "Restrict the sweep to one pool key (e.g. 'shared', "
+                            "'shared--project--<pid>', 'user--<uid>', "
+                            "'user--<uid>--project--<pid>'). Omit to sweep all pools."
+                        ),
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "Plan and report every action without writing anything (default false)",
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Bypass the time/settling/volume gates — never the pool lock (default false)",
+                    },
+                },
+                "required": [],
+            },
+        ),
     ]
 
 
@@ -1177,6 +1215,38 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             task_id = await _task_manager.enqueue_retag(user_id, filters, ops)
             return [TextContent(type="text", text=json.dumps(
                 {"status": "accepted", "task_id": task_id}))]
+
+        elif name == "schedule_dream":
+            # Mirrors POST /v1/extensions/dreaming/run: never sweep in-process
+            # (a sweep is minutes of LLM + store work) — enqueue onto the graph
+            # worker's queue and let the caller poll the status endpoint.
+            from extensions.dreaming.config import dreaming_settings
+
+            force = bool(arguments.get("force", False))
+            if not dreaming_settings.enabled and not force:
+                return [TextContent(type="text", text=json.dumps({
+                    "error": "DREAMING_ENABLED=false — set the env var (or force=true) to run"
+                }))]
+            from arq import create_pool
+
+            from config import parse_redis_settings
+
+            arq_pool = await create_pool(parse_redis_settings())
+            try:
+                job = await arq_pool.enqueue_job(
+                    "run_dream_sweep",
+                    arguments.get("pool"),
+                    bool(arguments.get("dry_run", False)),
+                    force,
+                    _queue_name=settings.graph_queue_name,
+                )
+            finally:
+                await arq_pool.close()
+            return [TextContent(type="text", text=json.dumps({
+                "status": "enqueued",
+                "job_id": job.job_id if job else None,
+                "poll": "/v1/extensions/dreaming/status",
+            }))]
 
         else:
             return [TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]
