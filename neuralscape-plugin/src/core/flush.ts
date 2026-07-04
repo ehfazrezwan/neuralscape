@@ -12,6 +12,7 @@ import {
   isSystemMessage,
   logError,
   neuralscapePost,
+  redactPrivate,
 } from "../utils.js";
 import type { ConversationTurn } from "./types.js";
 
@@ -45,9 +46,10 @@ export async function flushTurns(turns: ConversationTurn[]): Promise<number> {
     if (shouldSkipTurn(turn)) continue;
 
     try {
+      // <private>…</private> spans never leave the machine (D4).
       await neuralscapePost("/v1/extensions/conversation-compiler/flush", {
-        user_message: turn.userMessage,
-        assistant_response: turn.assistantResponse,
+        user_message: redactPrivate(turn.userMessage),
+        assistant_response: redactPrivate(turn.assistantResponse),
         session_id: turn.sessionId,
         channel: turn.channel,
         timestamp: turn.timestamp,

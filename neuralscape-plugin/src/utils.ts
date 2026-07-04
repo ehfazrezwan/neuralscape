@@ -117,6 +117,10 @@ export interface NeuralscapeMemory {
   tags?: string[];
   created_at?: string;
   source?: string;
+  // Memory-model v2 / retrieval economics (C1) — null on legacy memories.
+  observation_type?: string | null;
+  title?: string | null;
+  token_estimate?: number | null;
 }
 
 export interface ContextResponse {
@@ -158,6 +162,61 @@ export async function parseStdin(): Promise<HookInput> {
   });
 }
 
+/**
+ * Thrown by parseStdinStrict when the hook payload isn't valid JSON.
+ * Per the hook exit-code taxonomy (see README), this is a CLIENT BUG:
+ * hooks that can safely fail loud exit 2 so the malformed input is
+ * surfaced instead of silently swallowed.
+ */
+export class MalformedHookInputError extends Error {
+  constructor(detail: string) {
+    super(`malformed hook input (client bug): ${detail}`);
+    this.name = "MalformedHookInputError";
+  }
+}
+
+/**
+ * Strict variant of parseStdin: rejects with MalformedHookInputError on
+ * empty or non-JSON stdin instead of resolving `{}`. New hooks use this
+ * to implement the exit-code taxonomy; parseStdin stays lenient for the
+ * legacy paths that must never change behavior mid-release.
+ */
+export async function parseStdinStrict(): Promise<HookInput> {
+  const data: string = await new Promise((resolve) => {
+    let buf = "";
+    process.stdin.setEncoding("utf-8");
+    process.stdin.on("data", (chunk: string) => {
+      buf += chunk;
+    });
+    process.stdin.on("end", () => resolve(buf));
+    if (process.stdin.readableEnded) resolve(buf);
+  });
+  if (!data.trim()) {
+    throw new MalformedHookInputError("empty stdin");
+  }
+  try {
+    return JSON.parse(data) as HookInput;
+  } catch {
+    throw new MalformedHookInputError("stdin is not valid JSON");
+  }
+}
+/* v8 ignore stop */
+
+// ── Privacy: <private> tag redaction (roadmap D4) ────────────────
+
+/**
+ * Redact `<private>…</private>` spans from text the plugin is about to
+ * store or transmit. Fail-closed: an unclosed `<private>` redacts to the
+ * end of the string. Case-insensitive. Idempotent.
+ */
+export function redactPrivate(text: string): string {
+  if (typeof text !== "string" || !/<private>/i.test(text)) return text;
+  return text
+    .replace(/<private>[\s\S]*?<\/private>/gi, "[redacted]")
+    .replace(/<private>[\s\S]*$/i, "[redacted]");
+}
+
+/* v8 ignore start — pre-existing utility, exercised by integration only */
 // ── Identity ─────────────────────────────────────────────────────
 
 export function getUserId(): string {
