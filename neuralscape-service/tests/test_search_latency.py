@@ -144,8 +144,16 @@ class TestBatchedGraphEnrichment:
 
     def test_search_skips_enrichment_when_no_v2_filter(self, service):
         """A plain search (no domain/observation_type/concepts) must not pay
-        any enrichment embeds or Qdrant queries for its graph rows — pre-fix
-        it embedded once per edge."""
+        any enrichment EMBED calls for its graph rows — pre-fix it embedded
+        once per edge.
+
+        Graph-ranked-leg update: decoration is always-on again, but it runs
+        off the STORED edge fact_embeddings (zero embed calls, one
+        query_batch_points). These edges carry no stored embedding — the
+        degraded legacy case — so a plain search leaves them undecorated
+        rather than falling back to embeds (see
+        tests/test_graph_ranked_leg.py::TestAlwaysOnDecoration for the
+        embedded-edge decoration path)."""
         with patch.object(
             service, "_search_graph_for_visibility", return_value=_graph_result(_edges(10))
         ):

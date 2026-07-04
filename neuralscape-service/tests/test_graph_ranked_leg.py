@@ -379,3 +379,217 @@ class TestRankFusionWeave:
         graph_kept = sum(1 for r in results if r.source == "graph")
         assert graph_kept > 8 // 2
         assert results[0].source == "graph"
+
+
+# ══════════════════════════════════════════════
+# Part 3 — always-on decoration, zero embed calls
+# ══════════════════════════════════════════════
+
+
+TWIN_META = {
+    "category": "decision",
+    "title": "Twin title",
+    "token_estimate": 12,
+    "domain": "coding",
+}
+
+
+def _twin_hit(hit_id="src-1", score=0.9, meta=None):
+    return SimpleNamespace(
+        id=hit_id,
+        score=score,
+        payload={
+            "data": "source memory text",
+            "created_at": "2026-06-30T00:00:00+00:00",
+            "metadata": dict(meta if meta is not None else TWIN_META),
+        },
+    )
+
+
+def _wire_twins(service, n, **kw):
+    service._memory.vector_store.client.query_batch_points.return_value = [
+        SimpleNamespace(points=[_twin_hit(**kw)]) for _ in range(n)
+    ]
+
+
+class TestAlwaysOnDecoration:
+    """#121 skipped graph-row decoration unless a v2 filter or passage
+    filter was active — plain searches returned bare relation strings with
+    no title/category/created_at, starving ask.py's chronological evidence
+    and the recall-index budget logic. With stored edge embeddings in hand
+    the Qdrant twin lookup costs ZERO embed API calls, so it runs on EVERY
+    search that returns graph edges."""
+
+    def test_plain_search_decorates_graph_rows(self, service):
+        """No v2 filter, no passage filter — pre-fix the twin lookup was
+        skipped entirely and every one of these fields stayed None."""
+        _wire_twins(service, 2)
+        edges = [_edge(f"g{i}", f"graph fact {i}", [1.0, 0.0, 0.0]) for i in range(2)]
+        with patch.object(
+            service, "_search_graph_for_visibility", return_value=_graph_result(edges)
+        ):
+            results = service.search(query="q", user_id="u1", limit=10)
+
+        graph_rows = [r for r in results if r.source == "graph"]
+        assert len(graph_rows) == 2
+        for r in graph_rows:
+            assert r.category == "decision"
+            assert r.title == "Twin title"
+            assert r.token_estimate == 12
+            assert r.created_at == "2026-06-30T00:00:00+00:00"
+            assert r.related_memory_ids == ["src-1"]
+
+    def test_decoration_queries_with_stored_vectors_not_new_embeds(self, service):
+        """The batch Qdrant lookup must carry the STORED fact_embeddings —
+        no embed API calls at all (better than #121's one batch call)."""
+        embs = [[1.0, 0.0, 0.1 * i] for i in range(3)]
+        _wire_twins(service, 3)
+        edges = [_edge(f"g{i}", f"graph fact {i}", embs[i]) for i in range(3)]
+        with patch.object(
+            service, "_search_graph_for_visibility", return_value=_graph_result(edges)
+        ):
+            service.search(query="q", user_id="u1", limit=10)
+
+        assert service._memory.embedding_model.embed.call_count == 1  # query only
+        assert service._memory.embedding_model.embed_batch.call_count == 0
+        kwargs = service._memory.vector_store.client.query_batch_points.call_args.kwargs
+        assert [req.query for req in kwargs["requests"]] == embs
+        assert all(req.limit == 1 for req in kwargs["requests"])
+
+    def test_embeddingless_edges_stay_cheap_on_plain_search(self, service):
+        """Degraded mode (no stored embedding, e.g. pre-Graphiti rows):
+        a plain search must NOT fall back to embed calls — the rows
+        surface unscored and undecorated, preserving #121's latency win."""
+        edges = [_edge(f"g{i}", f"graph fact {i}") for i in range(3)]
+        with patch.object(
+            service, "_search_graph_for_visibility", return_value=_graph_result(edges)
+        ):
+            results = service.search(query="q", user_id="u1", limit=10)
+
+        assert service._memory.embedding_model.embed.call_count == 1
+        assert service._memory.embedding_model.embed_batch.call_count == 0
+        assert service._memory.vector_store.client.query_batch_points.call_count == 0
+        assert sum(1 for r in results if r.source == "graph") == 3
+
+    def test_mixed_edges_decorate_only_stored_vector_rows(self, service):
+        _wire_twins(service, 1)
+        edges = [
+            _edge("g0", "embedded graph fact", [1.0, 0.0, 0.0]),
+            _edge("g1", "legacy graph fact"),
+        ]
+        with patch.object(
+            service, "_search_graph_for_visibility", return_value=_graph_result(edges)
+        ):
+            results = service.search(query="q", user_id="u1", limit=10)
+
+        kwargs = service._memory.vector_store.client.query_batch_points.call_args.kwargs
+        assert len(kwargs["requests"]) == 1  # only the stored-vector row
+        by_id = {r.id: r for r in results if r.source == "graph"}
+        assert by_id["g0"].category == "decision"
+        assert by_id["g1"].category is None
+        assert service._memory.embedding_model.embed_batch.call_count == 0
+
+    def test_v2_filter_path_still_embeds_missing_edges(self, service):
+        """Filter correctness beats latency: when domain/observation_type/
+        concepts are active, embedding-less edges still get the #121
+        batched embed fallback so the filter can see their metadata."""
+        service._memory.embedding_model.embed_batch.return_value = [[0.1] * 4]
+        _wire_twins(service, 1)
+        edges = [_edge("g0", "legacy graph fact")]
+        with patch.object(
+            service, "_search_graph_for_visibility", return_value=_graph_result(edges)
+        ):
+            results = service.search(query="q", user_id="u1", limit=10, domain="coding")
+
+        assert service._memory.embedding_model.embed_batch.call_count == 1
+        assert [r.id for r in results if r.source == "graph"] == ["g0"]
+
+    def test_decoration_preserves_pool_scoping(self, service):
+        """#121's pool scoping must thread through the always-on path: an
+        include_shared=False search never enriches from the shared pool."""
+        from qdrant_client.models import FieldCondition, Filter
+
+        _wire_twins(service, 1)
+        edges = [_edge("g0", "graph fact", [1.0, 0.0, 0.0])]
+        with patch.object(
+            service, "_search_graph_for_visibility", return_value=_graph_result(edges)
+        ):
+            service.search(query="q", user_id="u1", limit=10, include_shared=False)
+
+        qf = service._memory.vector_store.client.query_batch_points.call_args.kwargs[
+            "requests"
+        ][0].filter
+        pools = set()
+        for sub in qf.should or []:
+            if not isinstance(sub, Filter):
+                continue
+            for c in sub.must or []:
+                if isinstance(c, FieldCondition):
+                    if c.key == "user_id":
+                        pools.add("personal")
+                    elif c.key == "metadata.visibility":
+                        pools.add(getattr(c.match, "value", None))
+        assert "personal" in pools
+        assert "shared" not in pools
+
+    def test_low_similarity_twin_still_not_trusted(self, service):
+        """The 0.7 enrichment threshold survives the stored-vector path."""
+        _wire_twins(service, 1, score=0.4)
+        edges = [_edge("g0", "graph fact", [1.0, 0.0, 0.0])]
+        with patch.object(
+            service, "_search_graph_for_visibility", return_value=_graph_result(edges)
+        ):
+            results = service.search(query="q", user_id="u1", limit=10)
+
+        graph_rows = [r for r in results if r.source == "graph"]
+        assert graph_rows[0].category is None
+        assert graph_rows[0].related_memory_ids is None
+
+    def test_decoration_failure_never_breaks_search(self, service):
+        service._memory.vector_store.client.query_batch_points.side_effect = (
+            RuntimeError("qdrant down")
+        )
+        edges = [_edge("g0", "graph fact", [1.0, 0.0, 0.0])]
+        with patch.object(
+            service, "_search_graph_for_visibility", return_value=_graph_result(edges)
+        ):
+            results = service.search(query="q", user_id="u1", limit=10)
+
+        assert [r.id for r in results if r.source == "graph"] == ["g0"]
+
+    def test_vector_only_mode_stays_graph_free(self, service):
+        """The write-side idempotency probe must keep skipping the graph
+        pass AND its decoration."""
+        with patch.object(service, "_search_graph_for_visibility") as spy:
+            service.search(query="q", user_id="u1", limit=5, vector_only=True)
+
+        spy.assert_not_called()
+        assert service._memory.vector_store.client.query_batch_points.call_count == 0
+
+
+class TestPerformanceBudget:
+    """The whole feature adds at most ONE batched Qdrant query + local
+    arithmetic per search vs the #121 baseline: exactly one embed API call
+    (the query), zero embed_batch calls, one query_batch_points call."""
+
+    def test_graph_bearing_search_embed_and_query_budget(self, service):
+        hits = [
+            _make_hit(f"v{i}", 0.9 - i * 0.01, _payload(f"vector fact {i}"))
+            for i in range(4)
+        ]
+        service._memory.vector_store.client.query_points.return_value = _qresult(hits)
+        _wire_twins(service, 8)
+        edges = [
+            _edge(f"g{i}", f"graph fact {i}", [1.0, 0.0, 0.1 * i]) for i in range(8)
+        ]
+        with patch.object(
+            service, "_search_graph_for_visibility", return_value=_graph_result(edges)
+        ):
+            service.search(query="q", user_id="u1", limit=10)
+
+        # exactly ONE embed API call: the query embed
+        assert service._memory.embedding_model.embed.call_count == 1
+        # zero batch-embed API calls (better than #121's one)
+        assert service._memory.embedding_model.embed_batch.call_count == 0
+        # exactly ONE batched Qdrant round trip for the whole graph leg
+        assert service._memory.vector_store.client.query_batch_points.call_count == 1

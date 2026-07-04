@@ -2361,16 +2361,21 @@ class MemoryService:
             except Exception as e:
                 logger.warning(f"Graph search failed during recall (non-critical): {e}")
 
-        # Memory-model v2: enrich graph results with v2 metadata from their
-        # nearest source memory, then apply the same v2 filters to graph rows.
-        # Graphiti's edge schema doesn't carry v2 fields natively — we recover
-        # them by semantic match against the Qdrant store.
+        # Enrich graph rows with metadata from their nearest source memory
+        # (title/category/created_at/v2 fields + the twin back-reference).
+        # Graphiti's edge schema doesn't carry those fields natively — we
+        # recover them by semantic match against the Qdrant store.
         #
-        # Audit 27 #7: enrichment only runs when something actually consumes
-        # the recovered fields — an active v2 filter, or a memory_kind=
-        # "passage" filter (passage-ness lives on the source memory). A plain
-        # recall used to pay a per-edge embed + Qdrant query here purely to
-        # decorate graph rows nobody filtered on.
+        # Graph-ranked-leg: decoration is ALWAYS-ON again (audit 27 #7 had
+        # gated it behind a v2/passage filter because it cost one embed API
+        # call per edge, then #121 one batch call). With the STORED edge
+        # embeddings from part 1 the twin lookup is a single
+        # query_batch_points round trip and ZERO embed calls, so every
+        # search gets decorated graph rows (feeding ask.py's chronological
+        # evidence and the recall-index budget logic). Edges without a
+        # stored embedding only fall back to a batched embed when a filter
+        # actually needs their metadata (v2 filter / passage filter) —
+        # otherwise they stay undecorated rather than paying API calls.
         v2_filter_active = bool(domain or observation_type or concepts)
         if graph_responses and v2_filter_active:
             graph_responses = self._enrich_and_filter_graph(
@@ -2382,16 +2387,21 @@ class MemoryService:
                 concepts=concepts,
                 visibility=visibility,
                 include_shared=include_shared,
+                edge_embeddings=graph_edge_embeddings,
             )
-        elif graph_responses and memory_kind == "passage":
-            # The passage filter below reads memory_kind off each row, which
-            # for graph rows only exists via source-memory enrichment.
+        elif graph_responses:
             graph_responses = self._enrich_graph_with_v2(
                 graph_responses,
                 user_id=user_id,
                 project_id=project_id,
                 visibility=visibility,
                 include_shared=include_shared,
+                edge_embeddings=graph_edge_embeddings,
+                # The passage filter below reads memory_kind off each row,
+                # which for graph rows only exists via source-memory
+                # enrichment — worth a batched embed for embedding-less
+                # edges. A plain recall is not.
+                allow_embed_fallback=(memory_kind == "passage"),
             )
 
         # Multi-user model: post-filter graph rows by enriched visibility.
@@ -2459,22 +2469,32 @@ class MemoryService:
         project_id: str | None,
         visibility: str | None = None,
         include_shared: bool = True,
+        edge_embeddings: list | None = None,
+        allow_embed_fallback: bool = True,
     ) -> list[MemoryResponse]:
         """For each graph edge, find its nearest Qdrant source memory and
-        copy that source's v2 metadata onto the graph response — only when
-        the similarity score clears _GRAPH_ENRICH_THRESHOLD.
+        copy that source's metadata onto the graph response — only when
+        the similarity score clears _GRAPH_ENRICH_THRESHOLD. Recovered
+        fields: memory-model v2 (domain/observation_type/concepts/…),
+        presentation fields (title/category/created_at/token_estimate),
+        multi-user fields, and the twin's memory id (as
+        ``related_memory_ids``, the graph row's source back-reference).
 
-        Memory-model v2 augmentation: Graphiti edges don't carry domain /
-        observation_type / concepts natively, but they're derived from
-        source memories that do. We do a top-1 vector match per edge to
-        recover those fields.
+        Graph-ranked-leg: ``edge_embeddings`` (index-aligned with
+        ``graph_responses``) carries the STORED Graphiti ``fact_embedding``
+        per row — those rows are looked up with the stored vector and cost
+        ZERO embed API calls. Rows without one either fall back to a single
+        batched ``embed_batch`` call (``allow_embed_fallback=True``, the
+        #121 behavior — used when a v2/passage filter needs their metadata)
+        or stay un-enriched (``allow_embed_fallback=False``, the plain-
+        search hot path).
 
-        Audit 27 #7: this used to embed + query Qdrant once per edge,
-        sequentially — 10 edges meant 10 Gemini round-trips + 10 Qdrant
-        queries (3-12s of the measured hybrid-search latency). All edge
-        texts now go through ONE ``embed_batch`` call and ONE Qdrant
-        ``query_batch_points`` round trip. Any failure leaves the rows
-        un-enriched (never breaks the read).
+        Audit 27 #7 history: this used to embed + query Qdrant once per
+        edge, sequentially — 10 edges meant 10 Gemini round-trips + 10
+        Qdrant queries (3-12s of the measured hybrid-search latency). At
+        most ONE ``embed_batch`` call and exactly ONE Qdrant
+        ``query_batch_points`` round trip remain. Any failure leaves the
+        rows un-enriched (never breaks the read).
 
         Multi-user model: the enrichment source filter mirrors the EXACT
         read-set of the calling search (``visibility``/``include_shared``
@@ -2517,14 +2537,33 @@ class MemoryService:
             m = self._get_memory()
             client = m.vector_store.client
 
-            texts = [text for _, text in enrichable]
-            embed_batch = getattr(m.embedding_model, "embed_batch", None)
-            if callable(embed_batch):
-                embeddings = embed_batch(texts, memory_action="search")
-            else:  # embedder without a batch API — degrade to per-text embeds
-                embeddings = [
-                    m.embedding_model.embed(t, memory_action="search") for t in texts
-                ]
+            # Per-row lookup vector: prefer the STORED edge embedding (zero
+            # embed API calls); optionally batch-embed the leftovers.
+            provided: dict[int, list] = {}
+            if edge_embeddings:
+                for i, _ in enrichable:
+                    if i < len(edge_embeddings) and edge_embeddings[i]:
+                        provided[i] = edge_embeddings[i]
+            missing = [(i, text) for i, text in enrichable if i not in provided]
+            if missing and not allow_embed_fallback:
+                # Plain-search hot path: rows without a stored embedding
+                # stay un-enriched rather than paying embed API calls.
+                enrichable = [(i, t) for i, t in enrichable if i in provided]
+                missing = []
+            if missing:
+                texts = [text for _, text in missing]
+                embed_batch = getattr(m.embedding_model, "embed_batch", None)
+                if callable(embed_batch):
+                    embeddings = embed_batch(texts, memory_action="search")
+                else:  # embedder without a batch API — degrade to per-text embeds
+                    embeddings = [
+                        m.embedding_model.embed(t, memory_action="search")
+                        for t in texts
+                    ]
+                for (i, _), emb in zip(missing, embeddings):
+                    provided[i] = emb
+            if not enrichable:
+                return graph_responses
 
             # Enrichment source = OR of per-pool sub-filters (Qdrant `should`
             # accepts nested Filters). Personal + shared are constrained to the
@@ -2564,8 +2603,8 @@ class MemoryService:
             qf = Filter(should=should_filters)
 
             requests = [
-                QueryRequest(query=emb, filter=qf, limit=1, with_payload=True)
-                for emb in embeddings
+                QueryRequest(query=provided[i], filter=qf, limit=1, with_payload=True)
+                for i, _ in enrichable
             ]
             batch_results = client.query_batch_points(
                 collection_name=settings.qdrant_collection,
@@ -2595,6 +2634,24 @@ class MemoryService:
                 src_metadata = payload.get("metadata", {}) or {}
                 if isinstance(src_metadata.get("metadata"), dict):
                     src_metadata = src_metadata["metadata"]
+
+                # Presentation decoration (always-on again): timestamps feed
+                # ask.py's chronological evidence; title/token_estimate feed
+                # the recall-index budget logic; the twin's id is the graph
+                # row's source-memory back-reference.
+                if resp.created_at is None:
+                    resp.created_at = payload.get("created_at")
+                if resp.updated_at is None:
+                    resp.updated_at = payload.get("updated_at")
+                if resp.title is None:
+                    resp.title = src_metadata.get("title")
+                if resp.token_estimate is None:
+                    resp.token_estimate = src_metadata.get("token_estimate")
+                hit_id = getattr(hit, "id", None)
+                if hit_id is None and isinstance(hit, dict):
+                    hit_id = hit.get("id")
+                if resp.related_memory_ids is None and hit_id is not None:
+                    resp.related_memory_ids = [str(hit_id)]
 
                 # Copy v2 fields when source has them and graph response doesn't
                 if resp.domain is None:
@@ -2639,11 +2696,15 @@ class MemoryService:
         concepts: list[str] | None,
         visibility: str | None = None,
         include_shared: bool = True,
+        edge_embeddings: list | None = None,
     ) -> list[MemoryResponse]:
         """Enrich graph rows with v2 metadata, then drop rows that don't match
         the supplied filter. Used when the caller passes domain/observation_type/
         concepts in SearchMemoryRequest. ``visibility``/``include_shared``
         scope the enrichment source to the calling search's read-set.
+        ``edge_embeddings`` are the stored per-edge vectors (see
+        ``_enrich_graph_with_v2``); embed fallback stays allowed here —
+        filter correctness beats latency.
         """
         enriched = self._enrich_graph_with_v2(
             graph_responses,
@@ -2651,6 +2712,7 @@ class MemoryService:
             project_id=project_id,
             visibility=visibility,
             include_shared=include_shared,
+            edge_embeddings=edge_embeddings,
         )
         out: list[MemoryResponse] = []
         for resp in enriched:
