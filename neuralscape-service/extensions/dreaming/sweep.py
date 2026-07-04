@@ -86,12 +86,21 @@ class DreamRun:
         }
 
 
+# Cached module-level client (audit 27 #35): callers hit this per API call
+# (MCP get_card, status endpoints), and redis-py clients hold a thread-safe
+# connection pool — one client per process, not one per call.
+_redis_client = None
+
+
 def _get_redis():
-    import redis as redis_lib
+    global _redis_client
+    if _redis_client is None:
+        import redis as redis_lib
 
-    from config import settings as core_settings
+        from config import settings as core_settings
 
-    return redis_lib.Redis.from_url(core_settings.redis_url, socket_timeout=5)
+        _redis_client = redis_lib.Redis.from_url(core_settings.redis_url, socket_timeout=5)
+    return _redis_client
 
 
 def get_last_run(redis=None) -> dict | None:
