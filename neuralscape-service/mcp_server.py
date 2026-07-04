@@ -622,6 +622,13 @@ async def list_tools() -> list[Tool]:
                         "type": "integer",
                         "description": "Max results (default: 100)",
                     },
+                    "include_tombstoned": {
+                        "type": "boolean",
+                        "description": (
+                            "Audit escape hatch: include rows the dreaming sweep "
+                            "tombstoned (hidden by default). Default false."
+                        ),
+                    },
                 },
                 "required": [],
             },
@@ -1552,6 +1559,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 category=arguments.get("category"),
                 project_id=arguments.get("project_id"),
                 limit=arguments.get("limit", 100),
+                include_tombstoned=bool(arguments.get("include_tombstoned", False)),
             )
             output = [r.model_dump(exclude_none=True) for r in results]
             return [TextContent(type="text", text=json.dumps(output, default=str))]

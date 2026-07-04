@@ -174,6 +174,16 @@ def _dense_score_floor(dense_hits: list) -> float | None:
     return min(scores) if scores else None
 
 
+def _mem_is_tombstoned(mem: dict) -> bool:
+    """Whether a mem0 memory dict carries the dreaming consolidation
+    tombstone (``metadata.dream_tombstoned``), handling mem0's potential
+    ``{"metadata": {"metadata": {...}}}`` double-wrap."""
+    meta = mem.get("metadata") or {}
+    if isinstance(meta.get("metadata"), dict):
+        meta = meta["metadata"]
+    return bool(meta.get("dream_tombstoned"))
+
+
 def _times_derived_from_metadata(metadata: dict | None) -> int:
     """Read `times_derived` out of a memory's metadata dict (min 1).
 
@@ -2098,6 +2108,9 @@ class MemoryService:
             List of matching memory responses sorted by score.
         """
         m = self._get_memory()
+        # Lazily ensure keyword/bool payload indexes for the hot-path filters
+        # (audit 27 #14) — one attempt per service instance, never fatal.
+        self._ensure_filter_indexes()
 
         # Embed the query ONCE and reuse the vector across every pool/scope
         # below. Both pools query Qdrant directly with this precomputed vector
@@ -3174,6 +3187,52 @@ class MemoryService:
         # own fallback if the index genuinely isn't there.
         self._created_at_index_ok = True
 
+    # Hot-path payload filters that deserve keyword/bool indexes (audit 27
+    # #14): every pool query carries a dream_tombstoned must_not, the shared/
+    # standard pools filter on visibility, and dual-scope merges filter on
+    # scope — all unindexed meant full payload scans on every search.
+    _FILTER_INDEX_FIELDS = (
+        ("metadata.dream_tombstoned", "bool"),
+        ("metadata.visibility", "keyword"),
+        ("metadata.scope", "keyword"),
+    )
+
+    def _ensure_filter_indexes(self) -> None:
+        """Best-effort: ensure payload indexes on the hot-path filter fields.
+
+        Same pattern as ``_ensure_created_at_index``: idempotent server-side,
+        attempted once per service instance, ``wait=False`` so index builds
+        never block the first read, and any failure degrades to Qdrant's
+        unindexed filtering rather than raising.
+        """
+        if getattr(self, "_filter_indexes_ok", False):
+            return
+        # Mark attempted FIRST — a flaky Qdrant must not re-pay this on
+        # every subsequent search.
+        self._filter_indexes_ok = True
+        try:
+            from qdrant_client.models import PayloadSchemaType
+
+            schema_by_name = {
+                "bool": PayloadSchemaType.BOOL,
+                "keyword": PayloadSchemaType.KEYWORD,
+            }
+            client = self._get_memory().vector_store.client
+            for field_name, schema_name in self._FILTER_INDEX_FIELDS:
+                try:
+                    client.create_payload_index(
+                        collection_name=settings.qdrant_collection,
+                        field_name=field_name,
+                        field_schema=schema_by_name[schema_name],
+                        wait=False,
+                    )
+                except Exception as e:
+                    logger.debug(
+                        f"payload index ensure failed for {field_name} (non-fatal): {e}"
+                    )
+        except Exception as e:
+            logger.debug(f"filter payload index ensure failed (non-fatal): {e}")
+
     def _timeline_filter(
         self,
         user_id: str,
@@ -3514,9 +3573,17 @@ class MemoryService:
         category: str | None = None,
         project_id: str | None = None,
         limit: int = 100,
+        include_tombstoned: bool = False,
     ) -> list[MemoryResponse]:
-        """List memories with optional filters."""
+        """List memories with optional filters.
+
+        Audit 27 #14: rows the dreaming sweep consolidated away
+        (``metadata.dream_tombstoned=true``) are excluded from listings by
+        default, matching every recall path. ``include_tombstoned=True`` is
+        the audit escape hatch — it returns the raw set, tombstones included.
+        """
         m = self._get_memory()
+        self._ensure_filter_indexes()
 
         # mem0 v2.0.2 ``get_all`` rejects top-level entity kwargs and
         # renamed ``limit`` -> ``top_k`` on its Qdrant wrapper. Same drift
@@ -3536,6 +3603,12 @@ class MemoryService:
         )
 
         memories = self._extract_memory_list(result)
+        if not include_tombstoned:
+            # mem0's filter dict can't express a must_not, so the tombstone
+            # exclusion happens here. Tombstones are rare (reversible dream
+            # consolidations), so under-filling `limit` slightly beats a
+            # second round trip.
+            memories = [mem for mem in memories if not _mem_is_tombstoned(mem)]
         return [self._mem_to_response(mem) for mem in memories]
 
     def list_projects(self, user_id: str) -> list[str]:

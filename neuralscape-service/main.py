@@ -2275,6 +2275,13 @@ async def v1_list_memories(
     category: str | None = Query(default=None),
     project_id: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
+    include_tombstoned: bool = Query(
+        default=False,
+        description=(
+            "Audit escape hatch: include rows the dreaming sweep tombstoned "
+            "(hidden from listings and recall by default)."
+        ),
+    ),
 ):
     """List memories with filters (scope, category, project_id)."""
     resolved_user_id = _resolve_user_id(request, user_id)
@@ -2286,6 +2293,7 @@ async def v1_list_memories(
             category=category,
             project_id=project_id,
             limit=limit,
+            include_tombstoned=include_tombstoned,
         )
     except HTTPException:
         raise
