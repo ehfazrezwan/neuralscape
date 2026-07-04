@@ -281,6 +281,43 @@ def split_by_posture(actions: list[dict], *, auto_apply_confidence: float) -> tu
     return to_apply, to_report
 
 
+def reconcile_batch(batch: PoolBatch, applied: list[dict]) -> int:
+    """Fold applied actions back into the staged batch's in-memory dicts.
+
+    ``apply_actions`` writes to Qdrant/the graph but the batch dicts a
+    later pass reads (the librarian's topic pages and essential-story
+    lines) would otherwise still show the pre-consolidation view of the
+    same sweep: merge losers, invalidated and pruned rows as live, merge
+    survivors with their unfolded text. Marks consumed rows
+    ``dream_tombstoned`` and updates rewritten content in place; returns
+    the number of rows tombstoned.
+    """
+    tombstoned: set[str] = set()
+    rewritten: dict[str, str] = {}
+    for act in applied:
+        a_type = act.get("type")
+        ids = act.get("memory_ids") or []
+        if a_type == "merge":
+            survivor = act.get("survivor_id")
+            tombstoned.update(m for m in ids if m != survivor)
+            if survivor and (act.get("content") or "").strip():
+                rewritten[survivor] = act["content"]
+        elif a_type in ("invalidate", "prune"):
+            tombstoned.update(ids)
+        elif a_type in ("rewrite", "temporal_reframe"):
+            if (act.get("content") or "").strip():
+                rewritten.update({m: act["content"] for m in ids})
+    count = 0
+    for mem in batch.memories:
+        mid = mem.get("memory_id")
+        if mid in tombstoned:
+            mem["dream_tombstoned"] = True
+            count += 1
+        elif mid in rewritten:
+            mem["content"] = rewritten[mid]
+    return count
+
+
 async def apply_actions(
     service,
     batch: PoolBatch,

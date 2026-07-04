@@ -242,6 +242,11 @@ async def _dream_pool(
         report.applied = len(applied.applied)
         report.reported = len(to_report)
         report.errors.extend(applied.errors)
+        # Fold the applied actions into the staged dicts so the REM and
+        # librarian passes below see the post-consolidation view — without
+        # this, a row tombstoned seconds ago would still land on topic
+        # pages and in Home's Essential Story until the next sweep.
+        consolidate.reconcile_batch(batch, applied.applied)
 
         # 7. REM: reflect + store insights
         insights: list[dict] = []
@@ -264,6 +269,7 @@ async def _dream_pool(
                     vault=settings.vault_path,
                     operator_user_id=core_settings.default_user_id,
                     dry_run=dry_run,
+                    redis=redis,
                 )
                 report.pages_written = lib["pages_written"]
                 report.pages_skipped = lib["pages_skipped"]

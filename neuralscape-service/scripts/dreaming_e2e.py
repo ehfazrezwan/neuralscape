@@ -25,7 +25,12 @@ unique detail), a contradiction pair, a passed future-dated plan, a
                    insight self-labeled with an epistemic_level, and
                    get_reasoning_chain resolves the insight back to the
                    seeded premise memories
-4. second sweep (no force) → gated (volume) — the gate economy holds
+4. vault layout (v2) → Home.md carries the L0 identity block, the budget-
+                   bounded Essential Story and the MOC counts table; topic
+                   pages open with the index card and use the fixed
+                   five-section skeleton (run with DEFAULT_USER_ID=dreamer-e2e
+                   so the private pool renders under Me/)
+5. second sweep (no force) → gated (volume) — the gate economy holds
 """
 
 from __future__ import annotations
@@ -117,7 +122,7 @@ async def main() -> int:
 
     r = redis_lib.Redis.from_url(settings.redis_url)
     for pat in (f"dreaming:gate:{POOL}*", f"dreaming:lock:{POOL}*",
-                f"dreaming:staged_ids:{POOL}*"):
+                f"dreaming:staged_ids:{POOL}*", f"dreaming:essential:{POOL}*"):
         for k in r.scan_iter(pat):
             r.delete(k)
 
@@ -217,18 +222,76 @@ async def main() -> int:
     check("diary written", diary.exists(), str(diary))
     check("DreamRun in Redis", (get_last_run() or {}).get("run_id") == run.run_id)
 
+    print("\n[4b/5] vault v2 layout (Home story + skeleton) …")
+    from extensions.dreaming import librarian as lib
+
+    vault = dreaming_settings.vault_path
+    operator_is_pool_owner = settings.default_user_id == USER
+    home_path = vault / "Home.md"
+    me_pages = [
+        p for p in sorted((vault / "Me").glob("*.md"))
+        if (vault / "Me").exists()
+    ] if (vault / "Me").exists() else []
+    if report.pages_written and operator_is_pool_owner:
+        check("Home.md written", home_path.exists(), str(home_path))
+        home = home_path.read_text() if home_path.exists() else ""
+        check("Home: L0 identity block", lib._ID_START in home and lib._ID_END in home)
+        check("Home: Essential Story present", "## Essential Story" in home)
+        if "## Essential Story" in home:
+            story = home.split("## Essential Story", 1)[1]
+            story = "## Essential Story" + story.split("\n## ", 1)[0]
+            check("Home: story within budget",
+                  len(story.rstrip()) <= lib.HOME_STORY_BUDGET,
+                  f"{len(story.rstrip())} <= {lib.HOME_STORY_BUDGET} chars")
+            check("Home: story lines wikilinked", "]]" in story)
+        check("Home: MOC counts table",
+              "| Hub | Pages | Memories | Last dreamt |" in home)
+        check("Me/ topic pages written", len(me_pages) > 0,
+              f"{len(me_pages)} pages")
+        skeleton_ok = card_ok = False
+        for p in me_pages:
+            text = p.read_text()
+            headings = [l[3:] for l in text.splitlines() if l.startswith("## ")]
+            in_order = [h for h in headings if h in lib.SECTION_ORDER]
+            skeleton_ok = skeleton_ok or (
+                bool(in_order)
+                and in_order == sorted(in_order, key=list(lib.SECTION_ORDER).index)
+                and all(h in lib.SECTION_ORDER for h in headings)
+            )
+            card_ok = card_ok or "| What | Entities | Source |" in text
+        check("topic pages: fixed five-section skeleton in order", skeleton_ok)
+        check("topic pages: index-card table", card_ok)
+        essential_raw = r.get(f"dreaming:essential:{POOL}")
+        entries = json.loads(essential_raw) if essential_raw else []
+        check("essential lines persisted in Redis",
+              0 < len(entries) <= lib.HOME_STORY_TOP_N,
+              f"{len(entries)} lines")
+    else:
+        check("vault v2 layout (skipped)", False,
+              f"pages_written={report.pages_written}, "
+              f"DEFAULT_USER_ID={settings.default_user_id!r} (want {USER!r})")
+
     print("\n[5/5] second sweep without force → gate economy …")
     run2 = await dream_all(service=service, dry_run=False, only_pool=POOL, force=False)
     r2 = run2.pools[0] if run2.pools else None
     check("second sweep gated", r2 is not None and r2.status in ("gated", "skipped_unchanged"),
           f"{r2.status}: {r2.reason}" if r2 else "no pool report")
 
-    # cleanup
+    # cleanup — the essential key MUST go even when the Qdrant delete
+    # fails: Home.md's story scans every dreaming:essential:* key, so a
+    # leftover would leak seed lines into the next real vault
+    # regeneration on this Redis.
+    try:
+        for k in r.scan_iter(f"dreaming:essential:{POOL}*"):
+            r.delete(k)
+        print(f"\ncleaned up essential keys for {POOL}")
+    except Exception as exc:
+        print(f"\ncleanup warning (essential keys): {exc}")
     try:
         service._memory.vector_store.client.delete_collection(settings.qdrant_collection)
-        print(f"\ncleaned up collection {settings.qdrant_collection}")
+        print(f"cleaned up collection {settings.qdrant_collection}")
     except Exception as exc:
-        print(f"\ncleanup warning: {exc}")
+        print(f"cleanup warning (collection): {exc}")
 
     failed = [c for c in CHECKS if not c[1]]
     print(f"\n{'='*60}\nE2E: {len(CHECKS) - len(failed)}/{len(CHECKS)} checks passed")
