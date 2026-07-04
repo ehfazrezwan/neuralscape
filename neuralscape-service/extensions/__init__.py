@@ -247,13 +247,15 @@ class ExtensionRegistry:
         # E1: mirror memory events onto the live SSE stream. Every worker
         # write path funnels its memory_stored emission through this method,
         # so one fire-and-forget hook covers them all. Channel routing
-        # enforces visibility at publish time (see event_stream.channel_for);
-        # failures are swallowed inside publish_event.
+        # enforces visibility at publish time (see event_stream.channel_for).
+        # Audit 27 #11: dispatched via the shared telemetry executor — the
+        # per-fact fan-out used to do one sync Redis publish per memory on
+        # the worker loop (a batch of 25 facts = 25 blocking round trips).
         if event_type == "memory_stored":
             try:
-                from event_stream import publish_event
+                from event_stream import publish_event_bg
 
-                publish_event(event_type, payload)
+                publish_event_bg(event_type, payload)
             except Exception:
                 logger.debug("event-stream mirror failed (non-fatal)", exc_info=True)
 

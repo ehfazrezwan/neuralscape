@@ -1469,39 +1469,58 @@ async def v1_get_task_status(task_id: str):
 # ── Recall ────────────────────────────────────
 
 
-def _meter_index_recall(op: str, user_id: str, hits, response) -> tuple[str | None, "SavingsDetail | None"]:
-    """E2: measure + ledger one index-serving recall (sync; call in a thread).
+def _meter_index_recall_bg(op: str, user_id: str, hits, response) -> None:
+    """E2: measure + ledger one index-serving recall — entirely off the hot
+    path (audit 27 #11).
 
     ``hits`` are the full MemoryResponse objects behind the index rows (their
     stored write-time token counts are the measured baseline); ``response``
-    is the EXACT response model about to be served (rows + wrapper keys,
-    before the savings fields are attached) — the whole rendered body is
+    is the EXACT response model being served — the whole rendered body is
     NS-injected overhead, measured verbatim rather than approximated by the
-    rows alone (never overclaim). The savings line/detail added afterwards
-    are covered by the measured SAVINGS_LINE_OVERHEAD_TOKENS constant.
-    Returns (savings line, detail) or (None, None) when the meter is off.
+    rows alone (never overclaim).
+
+    The body serialization + tokenization AND the Redis ledger append run on
+    the shared telemetry executor: a slow Redis or tokenizer can no longer
+    delay the response, and a meter exception can never fail a successful
+    recall. Trade-off (deliberate): the response no longer carries the
+    per-recall ``savings`` line/detail — the honest measurement still lands
+    in the ledger and surfaces via GET /v1/metrics.
     """
-    import savings_meter as sm
 
-    payload = json.dumps(
-        response.model_dump(exclude_none=True), default=str, ensure_ascii=False
-    )
-    event = sm.measure_recall(
-        op, hits, index_payload=payload, include_line_overhead=True
-    )
-    if event is None:
-        return None, None
-    sm.record_event(user_id, event)
-    return sm.format_savings_line(event), SavingsDetail(**event.detail())
+    def _measure_and_record() -> None:
+        import savings_meter as sm
+
+        payload = json.dumps(
+            response.model_dump(exclude_none=True), default=str, ensure_ascii=False
+        )
+        event = sm.measure_recall(op, hits, index_payload=payload)
+        if event is not None:
+            sm.record_event(user_id, event)
+
+    try:
+        import telemetry
+
+        telemetry.submit(_measure_and_record)
+    except Exception:
+        logger.debug("savings metering dispatch failed (non-fatal)", exc_info=True)
 
 
-def _meter_full_recall(op: str, user_id: str, hits) -> None:
-    """E2: ledger a full-payload recall (served == baseline; sync, thread it)."""
-    import savings_meter as sm
+def _meter_full_recall_bg(op: str, user_id: str, hits) -> None:
+    """E2: ledger a full-payload recall (served == baseline) off the hot path."""
 
-    event = sm.measure_recall(op, hits, served_full=True)
-    if event is not None:
-        sm.record_event(user_id, event)
+    def _measure_and_record() -> None:
+        import savings_meter as sm
+
+        event = sm.measure_recall(op, hits, served_full=True)
+        if event is not None:
+            sm.record_event(user_id, event)
+
+    try:
+        import telemetry
+
+        telemetry.submit(_measure_and_record)
+    except Exception:
+        logger.debug("savings metering dispatch failed (non-fatal)", exc_info=True)
 
 
 # Union response model: Pydantic v2 smart-union validates the returned model
@@ -1546,11 +1565,9 @@ async def v1_search_memories(req: SearchMemoryRequest, request: Request):
             response = SearchIndexResponse(
                 results=[IndexRow(**index_row(r)) for r in results]
             )
-            response.savings, response.savings_detail = await asyncio.to_thread(
-                _meter_index_recall, "search_index", user_id, results, response
-            )
+            _meter_index_recall_bg("search_index", user_id, results, response)
             return response
-        await asyncio.to_thread(_meter_full_recall, "search", user_id, results)
+        _meter_full_recall_bg("search", user_id, results)
         return SearchMemoryResponse(results=results)
     except HTTPException:
         raise
@@ -1578,7 +1595,7 @@ async def v1_batch_get_memories(req: GetMemoriesRequest, request: Request):
     except Exception as e:
         logger.exception("v1 batch-get failed")
         raise HTTPException(status_code=500, detail="Failed to fetch memories") from e
-    await asyncio.to_thread(_meter_full_recall, "get_memories", caller, out["results"])
+    _meter_full_recall_bg("get_memories", caller, out["results"])
     return GetMemoriesResponse(results=out["results"], missing=out["missing"])
 
 
@@ -1621,9 +1638,7 @@ async def v1_timeline(req: TimelineRequest, request: Request):
             for m in out["memories"]
         ],
     )
-    response.savings, response.savings_detail = await asyncio.to_thread(
-        _meter_index_recall, "timeline", caller, out["memories"], response
-    )
+    _meter_index_recall_bg("timeline", caller, out["memories"], response)
     return response
 
 
@@ -1667,18 +1682,24 @@ async def v1_ask_memory(req: AskMemoryRequest, request: Request):
 
     # E2: ledger the ask — baseline = full content of everything retrieved
     # as evidence (precomputed from stored counts inside ask_memory), served
-    # = the synthesized answer actually returned.
+    # = the synthesized answer actually returned. Values are captured before
+    # dispatch so the fire-and-forget task never races the pop below.
+    evidence_tokens = int(out.pop("_evidence_tokens", 0) or 0)
+    answer_text = out.get("answer") or ""
+
     def _meter_ask() -> None:
         import savings_meter as sm
 
-        event = sm.measure_ask(
-            int(out.get("_evidence_tokens", 0) or 0), out.get("answer") or ""
-        )
+        event = sm.measure_ask(evidence_tokens, answer_text)
         if event is not None:
             sm.record_event(user_id, event)
 
-    await asyncio.to_thread(_meter_ask)
-    out.pop("_evidence_tokens", None)
+    try:
+        import telemetry
+
+        telemetry.submit(_meter_ask)
+    except Exception:
+        logger.debug("ask metering dispatch failed (non-fatal)", exc_info=True)
     return AskMemoryResponse(**out)
 
 
@@ -1737,9 +1758,11 @@ async def v1_checkpoint(req: CheckpointRequest, request: Request):
 
     # E1: stream the checkpoint batch (fire-and-forget, private to the
     # caller — the per-item memory_stored events follow from the worker).
-    from event_stream import publish_event
+    # Audit 27 #11: publish via the telemetry executor — publish_event does
+    # sync Redis I/O and must not run on the API event loop.
+    from event_stream import publish_event_bg
 
-    publish_event("checkpoint_saved", {
+    publish_event_bg("checkpoint_saved", {
         "user_id": user_id,
         "visibility": "private",
         "enqueued": len(prepared["to_enqueue"]),
@@ -2252,6 +2275,13 @@ async def v1_list_memories(
     category: str | None = Query(default=None),
     project_id: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
+    include_tombstoned: bool = Query(
+        default=False,
+        description=(
+            "Audit escape hatch: include rows the dreaming sweep tombstoned "
+            "(hidden from listings and recall by default)."
+        ),
+    ),
 ):
     """List memories with filters (scope, category, project_id)."""
     resolved_user_id = _resolve_user_id(request, user_id)
@@ -2263,6 +2293,7 @@ async def v1_list_memories(
             category=category,
             project_id=project_id,
             limit=limit,
+            include_tombstoned=include_tombstoned,
         )
     except HTTPException:
         raise

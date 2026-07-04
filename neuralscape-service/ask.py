@@ -7,9 +7,10 @@ knob — ``minimal | low | medium | high`` — jointly selects:
 - **retrieval breadth**: how many hits each search pass pulls;
 - **tool budget / iteration cap**: whether (and how many times) the
   answering LLM may request follow-up searches;
-- **mechanical passes**: a forced update-language search (so newer facts
-  supersede older ones) and a grep-style exact-keyword pass (embeddings
-  under-recall exhaustive enumeration sets);
+- **mechanical passes**: an update-language search, gated on temporal cues
+  in the question or first-pass evidence (so newer facts supersede older
+  ones without diluting atemporal asks), and a grep-style exact-keyword
+  pass (embeddings under-recall exhaustive enumeration sets);
 - **thinking depth**: prompt verbosity;
 - **output cap**: maximum answer length.
 
@@ -56,7 +57,7 @@ class ReasoningTier:
     search_limit: int      # retrieval breadth per search pass
     extra_searches: int    # LLM-directed follow-up searches (iteration cap)
     keyword_pass: bool     # grep-style exact-match pass over visible memories
-    update_pass: bool      # forced update-language semantic pass
+    update_pass: bool      # update-language semantic pass (gated on temporal cues)
     max_answer_words: int  # output cap (instructed + clipped as a backstop)
 
     @property
@@ -85,6 +86,23 @@ REASONING_TIERS: dict[str, ReasoningTier] = {
 # Update-language terms appended for the forced recency pass (discipline 2).
 _UPDATE_TERMS = "changed updated rescheduled moved now currently latest"
 
+# Temporal/update cues that justify spending a full hybrid search on the
+# recency pass (audit 27 #19): change verbs, "now/currently/latest/still/
+# anymore/no longer/used to", and question forms like "when did …". An
+# atemporal ask ("what is X's favorite color") skips the pass — appending
+# update terms to an off-topic question only diluted the evidence.
+_UPDATE_LANGUAGE_RE = re.compile(
+    r"\b(chang(?:e[ds]?|ing)|updat(?:e[ds]?|ing)|mov(?:e[ds]?|ing)|"
+    r"reschedul(?:e[ds]?|ing)|now|currently|latest|still|anymore|any more|"
+    r"no longer|used to|when did)\b",
+    re.IGNORECASE,
+)
+
+
+def _has_update_language(text: str) -> bool:
+    """Whether ``text`` carries a temporal/update cue (discipline 2 gate)."""
+    return bool(_UPDATE_LANGUAGE_RE.search(text or ""))
+
 # Enumeration/counting intent (discipline 1).
 _ENUMERATION_RE = re.compile(
     r"\b(how many|how much|count|number of|list (?:all|every|the)|enumerate|"
@@ -106,7 +124,12 @@ _ANSWER_ABSTAINED_NO_EVIDENCE = (
 )
 
 # Evidence rendering caps: keep the context block bounded even at high tier.
+# Fact rows keep a tight budget; passage rows (verbatim ingest chunks,
+# memory_kind="passage") get the full ingest chunk size — the answer often
+# sits deep inside the chunk (audit 27 #16; ingest/chunking.py
+# DEFAULT_MAX_CHARS = 1500).
 _EVIDENCE_CONTENT_CLIP = 500
+_EVIDENCE_PASSAGE_CLIP = 1500
 _EVIDENCE_MAX_ROWS = 120
 
 
@@ -159,30 +182,70 @@ def _make_llm_call(tier: ReasoningTier):
 
 
 def _evidence_rows(evidence: dict, keyword_ids: list[str], enumeration: bool) -> list:
-    """Order evidence for the prompt.
+    """Select and order evidence for the prompt (audit 27 #15).
 
-    Chronological ascending (timestamps drive the recency/contradiction
-    disciplines). For enumeration questions the exact-keyword hits are
-    listed FIRST — the discipline is exact-before-semantic, and list-position
-    is how an LLM weighs evidence.
+    When over the row budget, the keep-set is chosen by priority —
+    keyword-pass hits first, then highest search score, then newest —
+    instead of the old ascending-sort + head-truncation, which silently
+    dropped the NEWEST facts (and let timestamp-less graph rows, whose
+    sort key was "", eat the budget from the front).
+
+    Survivors are then re-sorted chronologically ASCENDING for rendering
+    (timestamps drive the recency/contradiction disciplines); rows with no
+    timestamp sort LAST, not first. For enumeration questions the
+    exact-keyword hits are listed FIRST — the discipline is
+    exact-before-semantic, and list-position is how an LLM weighs evidence.
     """
     def _created(mem) -> str:
         return str(getattr(mem, "created_at", None) or "")
 
-    rows = sorted(evidence.values(), key=_created)
+    rows = list(evidence.values())
+
+    if len(rows) > _EVIDENCE_MAX_ROWS:
+        kw_set = set(keyword_ids)
+        # Three stable sorts, applied lowest-priority first:
+        rows.sort(key=_created, reverse=True)  # newest first ("" sorts last)
+        rows.sort(key=lambda m: (getattr(m, "score", None) is None,
+                                 -(getattr(m, "score", None) or 0.0)))
+        rows.sort(key=lambda m: m.id not in kw_set)  # keyword hits first
+        rows = rows[:_EVIDENCE_MAX_ROWS]
+
+    # Chronological ascending for the prompt; timestamp-less survivors last.
+    rows.sort(key=lambda m: (0, _created(m)) if _created(m) else (1, ""))
     if enumeration and keyword_ids:
         kw = [m for m in rows if m.id in keyword_ids]
         rest = [m for m in rows if m.id not in keyword_ids]
         rows = kw + rest
-    return rows[:_EVIDENCE_MAX_ROWS]
+    return rows
+
+
+def _clip_content(content: str, budget: int) -> str:
+    """Clip ``content`` to ``budget`` chars at a natural boundary.
+
+    Prefers the last sentence boundary (". " or a newline) within budget,
+    falls back to the last whitespace, and only hard-slices when the text
+    is one unbroken token — the old blind ``content[:500]`` slice routinely
+    cut passages mid-fact/mid-word (audit 27 #16).
+    """
+    if len(content) <= budget:
+        return content
+    window = content[:budget]
+    sentence_cut = max(window.rfind(". "), window.rfind("\n"))
+    if sentence_cut > 0:
+        return window[: sentence_cut + 1].rstrip() + " …"
+    ws_cut = window.rfind(" ")
+    if ws_cut > 0:
+        return window[:ws_cut].rstrip() + " …"
+    return window + " …"
 
 
 def _render_evidence(rows: list) -> str:
     lines = []
     for mem in rows:
-        content = (mem.memory or "").strip().replace("\n", " ")
-        if len(content) > _EVIDENCE_CONTENT_CLIP:
-            content = content[:_EVIDENCE_CONTENT_CLIP] + " …"
+        is_passage = getattr(mem, "memory_kind", None) == "passage"
+        budget = _EVIDENCE_PASSAGE_CLIP if is_passage else _EVIDENCE_CONTENT_CLIP
+        # Clip BEFORE flattening newlines so "\n" still marks boundaries.
+        content = _clip_content((mem.memory or "").strip(), budget).replace("\n", " ")
         created = getattr(mem, "created_at", None) or "unknown time"
         category = getattr(mem, "category", None) or "uncategorized"
         lines.append(f"[{mem.id}] ({created}; {category}) {content}")
@@ -215,6 +278,7 @@ def _build_prompt(
     budget: int,
     enumeration: bool,
     keyword_ids: list[str],
+    keyword_scan_capped: bool = False,
 ) -> str:
     """Assemble the answering prompt. Verbosity scales with the tier."""
     parts = [
@@ -223,10 +287,22 @@ def _build_prompt(
         _DISCIPLINES_BRIEF if tier.name == "minimal" else _DISCIPLINES_FULL,
     ]
     if enumeration and tier.name != "minimal":
-        parts.append(
-            "\nThis looks like an enumeration/counting question. Exact-keyword matches are "
-            "listed first in the evidence. Build the dedup table before you count."
-        )
+        if keyword_scan_capped:
+            # Audit 27 #18: the lexical scan hit its point cap — its hits
+            # are a sample, and claiming them exact/exhaustive licenses
+            # confidently wrong counts.
+            parts.append(
+                "\nThis looks like an enumeration/counting question. A keyword scan "
+                "contributed the rows listed first, but it was PARTIAL (it did not cover "
+                "all stored memories) — do not treat those rows as exhaustive or complete. "
+                "Build the dedup table before you count, and qualify the count if the "
+                "evidence may be incomplete."
+            )
+        else:
+            parts.append(
+                "\nThis looks like an enumeration/counting question. Exact-keyword matches are "
+                "listed first in the evidence. Build the dedup table before you count."
+            )
     if tier.name in ("medium", "high"):
         parts.append(
             "\nThink through the evidence step by step BEFORE answering, but output ONLY "
@@ -316,14 +392,43 @@ async def ask_memory(
             f"Must be one of: {list(REASONING_TIERS)}"
         )
 
+    # Cross-source dedup (audit 27 #17): a Graphiti edge and its Qdrant twin
+    # arriving in DIFFERENT passes dodge search's per-pass dedup and would
+    # occupy two evidence rows. Reuse the service layer's content-match rule
+    # so both dedup passes agree on what "the same fact" means.
+    from memory_service import MemoryService
+
     searches: list[str] = []
     evidence: dict[str, object] = {}
+    content_index: dict[str, str] = {}  # normalized content -> evidence id
     keyword_ids: list[str] = []
 
     def _merge(results) -> None:
         for r in results or []:
-            if getattr(r, "id", None) and getattr(r, "memory", None):
-                evidence.setdefault(r.id, r)
+            if not (getattr(r, "id", None) and getattr(r, "memory", None)):
+                continue
+            if r.id in evidence:
+                continue
+            normalized = MemoryService.normalize_memory_content(r.memory)
+            twin_norm = MemoryService.find_duplicate_content(
+                normalized, content_index
+            )
+            if twin_norm is None:
+                evidence[r.id] = r
+                content_index[normalized] = r.id
+                continue
+            # Content twin: prefer the vector row (richer metadata) over
+            # its graph counterpart; otherwise keep the incumbent.
+            twin_id = content_index[twin_norm]
+            incumbent = evidence[twin_id]
+            if (
+                getattr(r, "source", None) == "vector"
+                and getattr(incumbent, "source", None) != "vector"
+            ):
+                del evidence[twin_id]
+                del content_index[twin_norm]
+                evidence[r.id] = r
+                content_index[normalized] = r.id
 
     async def _semantic(query: str) -> None:
         searches.append(query)
@@ -339,12 +444,13 @@ async def ask_memory(
     enumeration = is_enumeration_question(question)
 
     # ── Discipline 1: grep-style exact pass BEFORE semantic ──
+    keyword_scan_capped = False
     if tier.keyword_pass:
         terms = extract_keywords(question)
         if terms:
             searches.append("keyword: " + " ".join(terms))
             try:
-                hits = await asyncio.to_thread(
+                res = await asyncio.to_thread(
                     service.keyword_search,
                     user_id=user_id,
                     terms=terms,
@@ -353,16 +459,33 @@ async def ask_memory(
                 )
             except Exception as e:  # non-fatal: degrade to semantic only
                 logger.warning(f"ask keyword pass failed (non-critical): {e}")
-                hits = []
+                res = []
+            # keyword_search returns (rows, scan_capped); tolerate a bare
+            # list from older forks / test doubles.
+            if isinstance(res, tuple):
+                hits, keyword_scan_capped = res
+            else:
+                hits = res
             keyword_ids = [h.id for h in hits if getattr(h, "id", None)]
             _merge(hits)
 
     # ── Semantic pass (always) ──
     await _semantic(question)
 
-    # ── Discipline 2: forced update-language pass ──
+    # ── Discipline 2: update-language pass, gated on temporal cues ──
+    # (audit 27 #19) Runs only when the question or the first-pass evidence
+    # signals the answer may have changed; otherwise the pass is skipped
+    # (recorded in `skipped_passes`) and its hybrid-search cost saved.
+    skipped_passes: list[str] = []
     if tier.update_pass:
-        await _semantic(f"{question} {_UPDATE_TERMS}")
+        temporal = _has_update_language(question) or any(
+            _has_update_language(getattr(m, "memory", None) or "")
+            for m in evidence.values()
+        )
+        if temporal:
+            await _semantic(f"{question} {_UPDATE_TERMS}")
+        else:
+            skipped_passes.append("update")
 
     # ── Strict abstention short-circuit: nothing retrieved at all ──
     if not evidence:
@@ -374,6 +497,7 @@ async def ask_memory(
             "abstained": True,
             "searches": searches,
             "memories_considered": 0,
+            "skipped_passes": skipped_passes,
             "_evidence_tokens": 0,
         }
 
@@ -384,7 +508,8 @@ async def ask_memory(
     raw = ""
     parsed: dict | None = None
     for _ in range(tier.extra_searches + 1):
-        prompt = _build_prompt(question, evidence, tier, budget, enumeration, keyword_ids)
+        prompt = _build_prompt(question, evidence, tier, budget, enumeration,
+                               keyword_ids, keyword_scan_capped)
         raw = await call(prompt)
         parsed = _parse_llm_json(raw)
         if (
@@ -400,7 +525,8 @@ async def ask_memory(
     # The model spent its last iteration asking for another search — force
     # one final answer-only pass so the caller never gets a non-answer.
     if parsed is not None and parsed.get("action") == "search":
-        prompt = _build_prompt(question, evidence, tier, 0, enumeration, keyword_ids)
+        prompt = _build_prompt(question, evidence, tier, 0, enumeration,
+                               keyword_ids, keyword_scan_capped)
         raw = await call(prompt)
         parsed = _parse_llm_json(raw)
 
@@ -442,5 +568,6 @@ async def ask_memory(
         "abstained": abstained,
         "searches": searches,
         "memories_considered": len(evidence),
+        "skipped_passes": skipped_passes,
         "_evidence_tokens": evidence_tokens,
     }

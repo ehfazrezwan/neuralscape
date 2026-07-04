@@ -19,10 +19,10 @@ tool so their verdict/gating behavior can never drift.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 
 from config import settings
+from memory_service import content_hash
 from schemas import (
     GLOBAL_CATEGORIES,
     CheckpointRequest,
@@ -84,10 +84,9 @@ def dedup_verdicts(service, items: list[dict]) -> list[dict]:
     verdicts: list[dict] = []
     for idx, item in enumerate(items):
         scope, visibility, project_id = effective_storage_key(item)
-        content_hash = hashlib.md5(item["content"].encode()).hexdigest()
         existing = service._find_by_content_hash(
             user_id=item["user_id"],
-            content_hash=content_hash,
+            content_hash=content_hash(item["content"]),
             scope=scope,
             project_id=project_id,
             visibility=visibility,

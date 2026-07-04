@@ -1050,6 +1050,12 @@ class MemoryResponse(BaseModel):
     title: str | None = None
     token_estimate: int | None = None
 
+    # Dedup revival (audit 27 #5): True only on a store response whose
+    # content-hash dedup hit a dream-tombstoned row — re-deriving the fact
+    # resurrected it (tombstone cleared, recallable again). Null on every
+    # other response (searches, plain dedup hits, new inserts).
+    revived: bool | None = None
+
 
 class StoreMemoryResponse(BaseModel):
     status: str = "ok"
@@ -1238,7 +1244,10 @@ class AskMemoryResponse(BaseModel):
     evidence — model-fabricated ids are filtered out. ``abstained`` is True
     when the honest answer is "I don't know" (a first-class outcome, not an
     error). ``searches`` lists every retrieval pass performed (semantic,
-    update-language, and grep-style keyword passes).
+    update-language, and grep-style keyword passes); ``skipped_passes``
+    names mechanical passes the tier enables that were skipped as
+    unwarranted (e.g. "update" when neither the question nor first-pass
+    evidence carried temporal cues — audit 27 #19).
     """
     status: str = "ok"
     reasoning_level: str
@@ -1247,6 +1256,7 @@ class AskMemoryResponse(BaseModel):
     abstained: bool = False
     searches: list[str] = Field(default_factory=list)
     memories_considered: int = 0
+    skipped_passes: list[str] = Field(default_factory=list)
 
 
 class CheckpointVerdict(BaseModel):

@@ -321,6 +321,7 @@ class MemoryGraph:
         edge_type_map=None,
         excluded_entity_types=None,
         custom_extraction_instructions=None,
+        episode_name=None,
     ):
         """Add data to the graph via Graphiti's add_episode.
 
@@ -338,6 +339,12 @@ class MemoryGraph:
                 to drop from the graph.
             custom_extraction_instructions (str | None): Optional extra guidance
                 injected into Graphiti's extraction prompts.
+            episode_name (str | None): NEURALSCAPE PATCH (audit 27 #21) —
+                optional caller-supplied episode name, used as an idempotency
+                carrier: the service derives it deterministically from the
+                content + group so a re-run can find (and skip) an
+                already-ingested episode. None ⇒ the legacy timestamp-based
+                name (every call mints a distinct episode).
 
         Returns:
             dict: {"deleted_entities": [...], "added_entities": [...]}
@@ -363,7 +370,7 @@ class MemoryGraph:
 
         async def _add():
             result = await self.graphiti.add_episode(
-                name=f"mem0_episode_{now.isoformat()}",
+                name=episode_name or f"mem0_episode_{now.isoformat()}",
                 episode_body=data,
                 source_description=source_description,
                 reference_time=now,

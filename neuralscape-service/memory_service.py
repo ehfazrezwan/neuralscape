@@ -23,6 +23,25 @@ from config import settings
 _TRANSIENT_PATTERNS = ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "rate limit", "overloaded", "capacity", "timed out", "timeout")
 
 
+# ── Overlapped graph pass (audit 27 #9) ────────────────────────────────
+# search() used to run its vector pools to completion and only then start
+# the Graphiti pass — wall time was vector + graph even though the two legs
+# are independent once the query embed exists. The graph leg now runs on
+# this small dedicated pool while the calling thread works the vector legs,
+# and is joined right before the weave. Threads here spend their life
+# blocked on the Graphiti bridge future, so a modest pool bounds concurrent
+# graph fan-out without ever serializing a single search.
+from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
+
+_GRAPH_SEARCH_POOL = _ThreadPoolExecutor(
+    max_workers=16, thread_name_prefix="graph-search"
+)
+# The bridge call inside _do_graph_search already enforces its own 30s
+# timeout; this outer join is belt-and-suspenders so a wedged bridge thread
+# can never hang a read indefinitely.
+_GRAPH_SEARCH_JOIN_TIMEOUT_S = 45.0
+
+
 def _is_transient(exc: Exception) -> bool:
     """Check if an exception looks like a transient/retryable API error."""
     msg = str(exc)
@@ -93,7 +112,104 @@ def _parse_expires_at(value) -> datetime | None:
 # to outrank a one-off at comparable cosine similarity without letting
 # repetition drown out relevance. `times_derived - 1` (the count of *extra*
 # derivations) means unreinforced/legacy rows keep their raw score exactly.
+#
+# Audit 27 #4: the live value comes from `settings.reinforcement_boost_k`
+# (env REINFORCEMENT_BOOST_K; 0 disables byte-identically) — this constant
+# is only the historical default / test reference. `times_derived` is
+# clamped at REINFORCEMENT_TIMES_DERIVED_CAP and the boosted score capped
+# at 1.0, so an over-reinforced mediocre hit (e.g. 0.80 cosine, td=30) can
+# no longer outrank a plainly better one (0.90, td=1), and returned scores
+# stay in the cosine range.
 REINFORCEMENT_BOOST_K = 0.05
+REINFORCEMENT_TIMES_DERIVED_CAP = 10
+
+
+# ── Hybrid recall: dense + BM25 lexical rank fusion (audit 27 #1) ──────
+# Commit 7024a81 ("embed once") replaced mem0-v3 hybrid search with a
+# dense-only exactly-k query per pool, silently amputating the BM25 leg —
+# sparse vectors were still WRITTEN on every insert (mem0 fork qdrant.py)
+# but never queried, so proper-noun recall collapsed. The helpers below
+# restore a lexical pass per pool and fuse the two legs by reciprocal rank
+# BEFORE the pool merge, keeping the single query embed.
+
+# Standard RRF constant (Cormack et al.): a hit at 0-based rank r
+# contributes 1 / (RRF_K + r + 1).
+RRF_K = 60
+
+
+def _rrf_fuse(dense_hits: list, lexical_hits: list, limit: int) -> list[dict]:
+    """Rank-fuse one pool's dense and lexical (BM25) hit lists.
+
+    Returns up to ``limit`` entries ``{"hit", "dense", "rrf"}`` ordered by
+    summed reciprocal-rank score; a hit present in both legs accumulates
+    both contributions, so leg agreement ranks it up. ``dense`` marks
+    entries whose ``hit.score`` is a real cosine similarity — lexical-only
+    entries carry a raw BM25 score that is NOT cosine-comparable, so the
+    caller imputes a presentation score for those. With an empty lexical
+    list this is an order-preserving passthrough of the dense ranking
+    (1/(k+r) is strictly decreasing and the sort is stable).
+    """
+    fused: dict[str, dict] = {}
+    for rank, hit in enumerate(dense_hits):
+        hid = str(getattr(hit, "id", ""))
+        fused[hid] = {"hit": hit, "dense": True, "rrf": 1.0 / (RRF_K + rank + 1)}
+    for rank, hit in enumerate(lexical_hits):
+        hid = str(getattr(hit, "id", ""))
+        entry = fused.get(hid)
+        if entry is None:
+            fused[hid] = {"hit": hit, "dense": False, "rrf": 1.0 / (RRF_K + rank + 1)}
+        else:
+            entry["rrf"] += 1.0 / (RRF_K + rank + 1)
+    ordered = sorted(fused.values(), key=lambda e: e["rrf"], reverse=True)
+    return ordered[:limit]
+
+
+def _unit_cosine(a: list, b: list) -> float | None:
+    """Cosine similarity between two vectors, clamped to [0, 1].
+
+    Used to score graph edges with their STORED ``fact_embedding`` against
+    the query vector ``search()`` already computed — pure local arithmetic,
+    no embed/API calls. Both vectors live in the same Gemini embedding
+    space as the Qdrant rows, so the result is directly comparable to the
+    vector leg's cosine scores. Returns ``None`` on any malformed input
+    (empty, length mismatch, zero norm, non-numeric) — an unscorable edge
+    must degrade to the legacy unscored path, never break the read.
+    """
+    try:
+        if not a or not b or len(a) != len(b):
+            return None
+        dot = 0.0
+        norm_a = 0.0
+        norm_b = 0.0
+        for x, y in zip(a, b):
+            dot += x * y
+            norm_a += x * x
+            norm_b += y * y
+        if norm_a <= 0.0 or norm_b <= 0.0:
+            return None
+        return max(0.0, min(1.0, dot / math.sqrt(norm_a * norm_b)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _dense_score_floor(dense_hits: list) -> float | None:
+    """Weakest cosine score in a pool's dense leg (imputed score for
+    lexical-only hits: presence via a strong keyword match is worth at
+    least as much as the pool's weakest dense candidate — never more)."""
+    scores = [
+        s for s in (getattr(h, "score", None) for h in dense_hits) if s is not None
+    ]
+    return min(scores) if scores else None
+
+
+def _mem_is_tombstoned(mem: dict) -> bool:
+    """Whether a mem0 memory dict carries the dreaming consolidation
+    tombstone (``metadata.dream_tombstoned``), handling mem0's potential
+    ``{"metadata": {"metadata": {...}}}`` double-wrap."""
+    meta = mem.get("metadata") or {}
+    if isinstance(meta.get("metadata"), dict):
+        meta = meta["metadata"]
+    return bool(meta.get("dream_tombstoned"))
 
 
 def _times_derived_from_metadata(metadata: dict | None) -> int:
@@ -117,13 +233,29 @@ def _reinforcement_boost(score: float | None, metadata: dict | None) -> float | 
 
     Feature-safe: None scores pass through, and times_derived <= 1 (including
     every legacy row without the field) returns the score unchanged.
+
+    Audit 27 #4 guardrails:
+    - k comes from ``settings.reinforcement_boost_k``; k <= 0 returns the
+      raw score immediately (byte-identical disable path).
+    - effective times_derived clamps at REINFORCEMENT_TIMES_DERIVED_CAP
+      (=10 ⇒ max lift ≈ +12% at the default k), so unbounded reinforcement
+      can never drown out relevance.
+    - the boosted score caps at 1.0 — recall scores stay cosine-shaped.
     """
     if score is None:
         return None
-    times_derived = _times_derived_from_metadata(metadata)
+    try:
+        k = float(settings.reinforcement_boost_k)
+    except (AttributeError, TypeError, ValueError):
+        k = REINFORCEMENT_BOOST_K
+    if k <= 0.0:
+        return score
+    times_derived = min(
+        _times_derived_from_metadata(metadata), REINFORCEMENT_TIMES_DERIVED_CAP
+    )
     if times_derived <= 1:
         return score
-    return score * (1.0 + REINFORCEMENT_BOOST_K * math.log1p(times_derived - 1))
+    return min(1.0, score * (1.0 + k * math.log1p(times_derived - 1)))
 
 
 def _salience_tiebreak(responses: list) -> list:
@@ -165,6 +297,55 @@ def _salience_tiebreak(responses: list) -> list:
     except Exception:
         logger.debug("salience tie-break skipped (non-fatal)", exc_info=True)
     return responses
+
+
+def content_hash(content: str) -> str:
+    """Canonical content hash for write-path dedup (audit 27 #6).
+
+    The service-layer writers of ``payload["hash"]`` — store_raw, the
+    conversation batch path, checkpoints, and the dreaming rewrite (which
+    re-embeds new text in place) — all route through this helper; new
+    writers should too. The exact-dedup cron groups rows by this value and
+    hard-deletes "duplicates", so a stale or divergent hash silently
+    corrupts dedup in both directions.
+    """
+    return hashlib.md5(content.encode()).hexdigest()
+
+
+def _live_edges_filter():
+    """Graphiti ``SearchFilters`` selecting only bi-temporally LIVE edges.
+
+    Excludes any edge with a non-null ``invalid_at`` or ``expired_at`` —
+    i.e. facts the dreaming sweep (or Graphiti's own contradiction
+    handling) has invalidated/superseded (audit 27 #3). Built per call:
+    SearchFilters is a mutable pydantic model and a shared singleton
+    could be mutated by a concurrent caller.
+    """
+    from graphiti_core.search.search_filters import (
+        ComparisonOperator,
+        DateFilter,
+        SearchFilters,
+    )
+
+    return SearchFilters(
+        invalid_at=[[DateFilter(comparison_operator=ComparisonOperator.is_null)]],
+        expired_at=[[DateFilter(comparison_operator=ComparisonOperator.is_null)]],
+    )
+
+
+def _edge_is_invalidated(edge) -> bool:
+    """True when a graph edge carries a bi-temporal invalidation stamp.
+
+    Post-filter companion to ``_live_edges_filter`` for result paths where
+    the Cypher-level filter may not have applied. Only real timestamp
+    values (datetime or non-empty string) count — mock/partial edge
+    objects without the attribute are treated as live.
+    """
+    for attr in ("invalid_at", "expired_at"):
+        value = getattr(edge, attr, None)
+        if isinstance(value, datetime) or (isinstance(value, str) and value.strip()):
+            return True
+    return False
 
 
 def _is_junk_fact(content: str) -> bool:
@@ -686,8 +867,16 @@ class MemoryService:
         project_id: str | None = None,
         agent_id: str | None = None,
         run_id: str | None = None,
-    ) -> list[MemoryResponse]:
+        return_stats: bool = False,
+    ) -> list[MemoryResponse] | tuple[list[MemoryResponse], dict]:
         """Extract facts from conversation via LLM, then store each with category metadata.
+
+        Long conversations are split into overlapping extraction windows
+        (audit 27 #22) — one LLM call per window, facts unioned; a
+        conversation at or under one window (``EXTRACTION_WINDOW_MESSAGES``)
+        is byte-identical to the unwindowed path. One failed window degrades
+        to a partial result (reported via ``return_stats``); only ALL windows
+        failing raises — preserving the post-#118 loud-failure semantics.
 
         Args:
             messages: Conversation messages [{role, content}, ...]
@@ -695,47 +884,78 @@ class MemoryService:
             project_id: Optional project identifier
             agent_id: Optional agent identifier for provenance
             run_id: Optional session identifier
+            return_stats: When True, returns ``(memories, stats)`` where
+                stats is ``{windows_total, windows_failed, window_errors}``
+                so the worker can surface partial extraction in the task
+                result. Default False keeps the legacy list return.
 
         Returns:
-            List of stored memory responses.
+            List of stored memory responses (or ``(list, stats)`` when
+            ``return_stats=True``).
         """
         m = self._get_memory()
 
-        # Step 1: Call Gemini for fact extraction. E4: operator-supplied
-        # extraction instructions (per-project + per-user, composed) ride
-        # along as a clearly-delimited addendum that can steer fact
-        # selection/phrasing but never the JSON output contract.
+        # Step 1: Call Gemini for fact extraction, one call per window.
+        # E4: operator-supplied extraction instructions (per-project +
+        # per-user, composed) ride along as a clearly-delimited addendum on
+        # EVERY window's prompt — they steer fact selection/phrasing but
+        # never the JSON output contract.
         from extraction_settings import resolve_instructions
+        from prompts import split_into_windows
 
         operator_guidance = resolve_instructions(user_id, project_id)
-        extraction_messages = build_extraction_messages(
-            messages, operator_guidance=operator_guidance
+        windows = split_into_windows(
+            messages,
+            settings.extraction_window_messages,
+            settings.extraction_window_overlap,
         )
         client = self._get_genai_client()
 
-        try:
-            from google.genai.types import GenerateContentConfig, HttpOptions
+        from google.genai.types import GenerateContentConfig, HttpOptions
 
-            response = retry_transient(
-                client.models.generate_content,
-                model=settings.gemini_llm_model,
-                contents=extraction_messages[0]["content"],
-                config=GenerateContentConfig(
-                    http_options=HttpOptions(timeout=60_000),  # milliseconds
-                ),
-                operation="LLM extraction",
-                fallback_model=settings.gemini_llm_fallback_model,
+        parsed_facts: list[tuple[str, str]] = []
+        window_errors: list[str] = []
+        last_exc: Exception | None = None
+        for w_idx, window_messages in enumerate(windows):
+            extraction_messages = build_extraction_messages(
+                window_messages, operator_guidance=operator_guidance
             )
-            parsed_facts = parse_extraction_response(response.text)
-        except Exception as e:
-            # Loud failure: propagate so the ARQ job (and task status) reports
-            # failed instead of completing with zero facts. A silent [] here
-            # masked real outages (the caller can't tell "nothing worth
-            # extracting" from "extraction is down").
-            logger.error(
-                f"LLM extraction failed for user {user_id}: {e}", exc_info=True
-            )
-            raise
+            try:
+                response = retry_transient(
+                    client.models.generate_content,
+                    model=settings.gemini_llm_model,
+                    contents=extraction_messages[0]["content"],
+                    config=GenerateContentConfig(
+                        http_options=HttpOptions(timeout=60_000),  # milliseconds
+                    ),
+                    operation="LLM extraction",
+                    fallback_model=settings.gemini_llm_fallback_model,
+                )
+                parsed_facts.extend(parse_extraction_response(response.text))
+            except Exception as e:
+                # One window failing must not zero the whole session — keep
+                # the other windows' facts and report the failure honestly
+                # in the task result (see return_stats).
+                last_exc = e
+                window_errors.append(f"window {w_idx + 1}/{len(windows)}: {e}")
+                logger.error(
+                    f"LLM extraction failed for window {w_idx + 1}/{len(windows)} "
+                    f"(user {user_id}): {e}",
+                    exc_info=True,
+                )
+        if window_errors and len(window_errors) == len(windows):
+            # Loud failure: EVERY window failed → propagate so the ARQ job
+            # (and task status) reports failed instead of completing with
+            # zero facts. A silent [] here masked real outages (the caller
+            # can't tell "nothing worth extracting" from "extraction is
+            # down"). For a single-window conversation this is exactly the
+            # pre-windowing behavior.
+            raise last_exc
+        stats = {
+            "windows_total": len(windows),
+            "windows_failed": len(window_errors),
+            "window_errors": window_errors,
+        }
 
         # Filter out junk facts from extraction
         pre_filter_count = len(parsed_facts)
@@ -750,7 +970,7 @@ class MemoryService:
 
         if not parsed_facts:
             logger.info("No facts extracted from conversation")
-            return []
+            return ([], stats) if return_stats else []
 
         # Step 2: Batch-store all facts (single embed + single Qdrant upsert).
         # A failure here (embedding, Qdrant) must PROPAGATE: the previous
@@ -775,7 +995,9 @@ class MemoryService:
             )
             raise
 
-        # Step 3: Add cleaned conversation text to knowledge graph.
+        # Step 3: Add cleaned conversation text to knowledge graph — ONE
+        # episode for the whole conversation regardless of extraction
+        # windowing (Graphiti handles its own entity windowing internally).
         # Conversation extractions are personal (private) by default — the
         # caller's spoken context isn't team-shared automatically.
         group_id = _build_group_id(
@@ -791,33 +1013,93 @@ class MemoryService:
         graph_write_started_at = datetime.now(timezone.utc)
         try:
             if self._graphiti and self._bridge and raw_text.strip():
-                retry_transient(
-                    self._memory.graph.add,
-                    data=raw_text,
-                    filters={"user_id": user_id, "group_id": group_id},
-                    operation="graph storage (extract_and_store)",
-                )
-                # 1-episode → N-memories shape: a single graph.add produces
-                # entities that could legitimately belong to any of the N
-                # extracted memories. We call attach_memory_id once per
-                # stored memory; the Cypher uses ``coalesce(memory_id,
-                # $memory_id)``, so the first call wins and later calls are
-                # no-ops on the same node. The result is each fresh entity
-                # carries one representative memory_id from the batch — not
-                # a perfect mapping, but enough for the wiki synthesizer
-                # to walk community → source memory.
-                for mem in stored:
-                    self._attach_memory_id_to_graph_nodes(
-                        group_id=group_id,
-                        memory_id=getattr(mem, "id", "") or "",
-                        visibility=MemoryVisibility.PRIVATE.value,
-                        owner_user_id=user_id,
-                        write_started_at=graph_write_started_at,
+                # Idempotency key (audit 27 #21): the episode name is derived
+                # from the cleaned conversation + group, not the wall clock —
+                # an ARQ retry / resubmission of the same conversation re-derives
+                # the same name and is skipped by the existence probe below
+                # instead of minting a duplicate episode (the 4,999
+                # double-episode mechanism).
+                episode_key = hashlib.sha256(
+                    f"{raw_text}\n{group_id}".encode()
+                ).hexdigest()
+                episode_name = f"mem0_episode_{episode_key[:32]}"
+                if self._graph_episode_exists(group_id, episode_name):
+                    logger.info(
+                        f"Skipping graph episode for user {user_id} — episode "
+                        f"{episode_name} already exists in group {group_id} "
+                        f"(re-run of an already-ingested conversation)"
                     )
+                else:
+                    retry_transient(
+                        self._memory.graph.add,
+                        data=raw_text,
+                        filters={"user_id": user_id, "group_id": group_id},
+                        episode_name=episode_name,
+                        operation="graph storage (extract_and_store)",
+                    )
+                    # 1-episode → N-memories shape: a single graph.add produces
+                    # entities that could legitimately belong to any of the N
+                    # extracted memories. We call attach_memory_id once per
+                    # stored memory; the Cypher uses ``coalesce(memory_id,
+                    # $memory_id)``, so the first call wins and later calls are
+                    # no-ops on the same node. The result is each fresh entity
+                    # carries one representative memory_id from the batch — not
+                    # a perfect mapping, but enough for the wiki synthesizer
+                    # to walk community → source memory.
+                    for mem in stored:
+                        self._attach_memory_id_to_graph_nodes(
+                            group_id=group_id,
+                            memory_id=getattr(mem, "id", "") or "",
+                            visibility=MemoryVisibility.PRIVATE.value,
+                            owner_user_id=user_id,
+                            write_started_at=graph_write_started_at,
+                        )
         except Exception as e:
             logger.warning(f"Graph storage failed (non-critical): {e}")
 
-        return stored
+        return (stored, stats) if return_stats else stored
+
+    def _graph_episode_exists(self, group_id: str, episode_name: str) -> bool:
+        """One cheap Cypher lookup: does an Episodic node with this
+        idempotency-keyed name already exist in the group? (audit 27 #21)
+
+        Fail-OPEN: any error (bridge down, Neo4j hiccup, timeout) returns
+        False so a broken probe degrades to today's behavior — a possible
+        duplicate episode — rather than silently dropping the graph write.
+        """
+        if not (self._graphiti and self._bridge):
+            return False
+        # _run_on_bridge submits onto self._bridge._loop; if that isn't a real
+        # event loop (e.g. a mocked bridge in unit tests, or a half-initialized
+        # adapter), run_coroutine_threadsafe would park on future.result() until
+        # the timeout. Bail out fail-open immediately instead.
+        import asyncio as _asyncio
+
+        if not isinstance(getattr(self._bridge, "_loop", None), _asyncio.AbstractEventLoop):
+            return False
+        cypher = (
+            "MATCH (e:Episodic {group_id: $group_id, name: $name}) "
+            "RETURN e.uuid AS uuid LIMIT 1"
+        )
+
+        async def _run():
+            async with self._graphiti.driver.session() as session:
+                result = await session.run(cypher, group_id=group_id, name=episode_name)
+                return await result.data()
+
+        # Built separately so it can be .close()d if _run_on_bridge raises
+        # before awaiting (avoids "coroutine never awaited" warnings — same
+        # convention as _attach_memory_id_to_graph_nodes).
+        coro = _run()
+        try:
+            records = self._run_on_bridge(coro, timeout=10.0) or []
+            return bool(records)
+        except Exception:
+            coro.close()
+            logger.debug(
+                "graph episode idempotency lookup failed (fail-open)", exc_info=True
+            )
+            return False
 
     def extract_facts_only(
         self,
@@ -962,6 +1244,87 @@ class MemoryService:
             Both paths use `source="vector"`; callers that need to distinguish
             should compare the returned `id` against their expected new UUID.
         """
+        # Validation + visibility/scope resolution + content-hash dedup live in
+        # _prepare_raw_store so store_raw_batch shares them without paying a
+        # per-item embed round trip (audit 27 #20 — two-pass batch stores).
+        prepared, existing = self._prepare_raw_store(
+            content=content,
+            user_id=user_id,
+            category=category,
+            scope=scope,
+            project_id=project_id,
+            tags=tags,
+            agent_id=agent_id,
+            run_id=run_id,
+            domain=domain,
+            observation_type=observation_type,
+            concepts=concepts,
+            source_type=source_type,
+            related_memory_ids=related_memory_ids,
+            confidence=confidence,
+            expires_at=expires_at,
+            derived_from=derived_from,
+            epistemic_level=epistemic_level,
+            visibility=visibility,
+            memory_kind=memory_kind,
+            source_ref=source_ref,
+        )
+        if existing is not None:
+            # created=False → caller must NOT re-enqueue graph enrichment.
+            return ([existing], False) if return_created else [existing]
+
+        # ── Direct embed + Qdrant insert (bypass m.add) ──
+        m = self._get_memory()
+        embedding = m.embedding_model.embed(content, memory_action="add")
+        self._finalize_raw_store(
+            prepared,
+            embedding,
+            add_to_graph=add_to_graph,
+            graph_ontology=graph_ontology,
+        )
+
+        responses = [prepared["response"]]
+        # created=True → a new row was written, so the caller should enqueue
+        # graph enrichment (when it deferred it via add_to_graph=False).
+        return (responses, True) if return_created else responses
+
+    def _prepare_raw_store(
+        self,
+        *,
+        content: str,
+        user_id: str,
+        category: str,
+        scope: str = "global",
+        project_id: str | None = None,
+        tags: list[str] | None = None,
+        agent_id: str | None = None,
+        run_id: str | None = None,
+        domain: str | None = None,
+        observation_type: str | None = None,
+        concepts: list[str] | None = None,
+        source_type: str | None = None,
+        related_memory_ids: list[str] | None = None,
+        confidence: float | None = None,
+        expires_at: datetime | None = None,
+        derived_from: list[str] | None = None,
+        epistemic_level: str | None = None,
+        visibility: str | None = None,
+        memory_kind: str | None = None,
+        source_ref: dict | None = None,
+    ) -> tuple[dict | None, MemoryResponse | None]:
+        """Validate + resolve + dedup one raw store; everything except the embed.
+
+        Shared by ``store_raw`` (single, embeds inline) and
+        ``store_raw_batch`` (two-pass: prepares every item first, then ONE
+        ``embed_batch`` call — audit 27 #20). Returns ``(prepared, existing)``
+        where exactly one side is non-None:
+
+        - ``existing``: content-hash dedup hit — ``times_derived`` already
+          bumped (and a dream tombstone revived) on the survivor.
+        - ``prepared``: dict carrying the ready-to-insert payload, the
+          ready-to-return :class:`MemoryResponse`, and the fields
+          ``_finalize_raw_store`` needs for the graph write.
+        """
         if category not in MEMORY_CATEGORIES:
             raise ValueError(f"Invalid category: {category}. Must be one of: {list(MEMORY_CATEGORIES.keys())}")
         if epistemic_level is not None and epistemic_level not in EPISTEMIC_LEVEL_VOCAB:
@@ -1010,29 +1373,32 @@ class MemoryService:
         if scope == "project" and not project_id:
             raise ValueError("project_id is required when scope='project'")
 
-        m = self._get_memory()
         now_iso = datetime.now(timezone.utc).isoformat()
-        content_hash = hashlib.md5(content.encode()).hexdigest()
+        chash = content_hash(content)
 
         # ── Content-hash dedup ──
         # Skip insert if this exact (user_id, scope, hash) already exists.
         existing = self._find_by_content_hash(
-            user_id=user_id, content_hash=content_hash, scope=scope,
+            user_id=user_id, content_hash=chash, scope=scope,
             project_id=project_id, visibility=effective_visibility,
         )
         if existing is not None:
             logger.info(
-                f"Dedup hit for user={user_id} hash={content_hash[:8]}... — returning existing id={existing.id}"
+                f"Dedup hit for user={user_id} hash={chash[:8]}... — returning existing id={existing.id}"
             )
             # Reinforcement-aware dedup: the caller just re-derived this exact
             # fact — count it on the survivor instead of discarding the signal.
             self._bump_times_derived(existing.id, 1)
-            # created=False → caller must NOT re-enqueue graph enrichment.
-            return ([existing], False) if return_created else [existing]
+            # Audit 27 #5: if the survivor was dream-tombstoned, re-derivation
+            # resurrects it — otherwise this dedup short-circuit silently
+            # swallows the write while the fact stays excluded from recall.
+            # Runs AFTER the bump: the bump's read-merge-write could otherwise
+            # re-persist the stale tombstone flag it read moments earlier.
+            if self._revive_if_tombstoned(existing.id):
+                existing.revived = True
+            return (None, existing)
 
-        # ── Direct embed + Qdrant insert (bypass m.add) ──
         mid = str(uuid.uuid4())
-        embedding = m.embedding_model.embed(content, memory_action="add")
 
         # Retrieval economics (C1): distill a ~10-word title + token cost at
         # write time so index-only recall never has to fetch/parse content.
@@ -1084,7 +1450,7 @@ class MemoryService:
 
         payload = {
             "data": content,
-            "hash": content_hash,
+            "hash": chash,
             "created_at": now_iso,
             "user_id": user_id,
             "agent_id": agent_id,
@@ -1092,14 +1458,76 @@ class MemoryService:
             "metadata": metadata,
         }
 
+        response = MemoryResponse(
+            id=mid,
+            memory=content,
+            category=category,
+            scope=scope,
+            project_id=project_id,
+            tags=tags,
+            source="vector",
+            created_at=now_iso,
+            domain=domain,
+            observation_type=observation_type,
+            concepts=concepts,
+            source_type=source_type,
+            related_memory_ids=related_memory_ids,
+            confidence=confidence,
+            expires_at=expires_at.isoformat() if expires_at and hasattr(expires_at, "isoformat") else None,
+            derived_from=derived_from,
+            epistemic_level=epistemic_level,
+            memory_kind=memory_kind,
+            source_ref=source_ref,
+            visibility=effective_visibility,
+            owner_user_id=user_id,
+            title=title,
+            token_estimate=token_estimate,
+        )
+
+        prepared = {
+            "mid": mid,
+            "content": content,
+            "payload": payload,
+            "response": response,
+            "now_iso": now_iso,
+            # (user, hash, scope, project, visibility) — the dedup identity,
+            # exposed so store_raw_batch can collapse in-batch duplicates.
+            "dedup_key": (user_id, chash, scope, project_id, effective_visibility),
+            # Fields _finalize_raw_store needs for the graph write.
+            "user_id": user_id,
+            "project_id": project_id,
+            "effective_visibility": effective_visibility,
+            "source_ref": source_ref,
+        }
+        return (prepared, None)
+
+    def _finalize_raw_store(
+        self,
+        prepared: dict,
+        embedding: list[float],
+        *,
+        add_to_graph: bool = True,
+        graph_ontology: dict | None = None,
+    ) -> None:
+        """Insert + history + (optional) graph write for a prepared raw store.
+
+        The other half of :meth:`_prepare_raw_store` — takes the embedding
+        from the caller so ``store_raw`` can embed one text inline while
+        ``store_raw_batch`` supplies vectors from a single ``embed_batch``
+        call (audit 27 #20).
+        """
+        m = self._get_memory()
+        mid = prepared["mid"]
+        content = prepared["content"]
+
         m.vector_store.insert(
             vectors=[embedding],
             ids=[mid],
-            payloads=[payload],
+            payloads=[prepared["payload"]],
         )
 
         try:
-            m.db.add_history(mid, None, content, "ADD", created_at=now_iso)
+            m.db.add_history(mid, None, content, "ADD", created_at=prepared["now_iso"])
         except Exception as e:
             logger.warning(f"History record failed for {mid}: {e}")
 
@@ -1112,44 +1540,13 @@ class MemoryService:
         if add_to_graph:
             self.enrich_graph(
                 content=content,
-                user_id=user_id,
-                project_id=project_id,
-                visibility=effective_visibility,
+                user_id=prepared["user_id"],
+                project_id=prepared["project_id"],
+                visibility=prepared["effective_visibility"],
                 memory_id=mid,
-                source_ref=source_ref,
+                source_ref=prepared["source_ref"],
                 graph_ontology=graph_ontology,
             )
-
-        responses = [
-            MemoryResponse(
-                id=mid,
-                memory=content,
-                category=category,
-                scope=scope,
-                project_id=project_id,
-                tags=tags,
-                source="vector",
-                created_at=now_iso,
-                domain=domain,
-                observation_type=observation_type,
-                concepts=concepts,
-                source_type=source_type,
-                related_memory_ids=related_memory_ids,
-                confidence=confidence,
-                expires_at=expires_at.isoformat() if expires_at and hasattr(expires_at, "isoformat") else None,
-                derived_from=derived_from,
-                epistemic_level=epistemic_level,
-                memory_kind=memory_kind,
-                source_ref=source_ref,
-                visibility=effective_visibility,
-                owner_user_id=user_id,
-                title=title,
-                token_estimate=token_estimate,
-            )
-        ]
-        # created=True → a new row was written, so the caller should enqueue
-        # graph enrichment (when it deferred it via add_to_graph=False).
-        return (responses, True) if return_created else responses
 
     def enrich_graph(
         self,
@@ -1280,30 +1677,82 @@ class MemoryService:
 
         # qdrant-client v1.13+ removed `.search()` in favor of `.query_points()`;
         # the response wraps hits in a `.points` attribute.
+        qfilter = Filter(must=must, must_not=must_not)
         result = client.query_points(
             collection_name=settings.qdrant_collection,
             query=embedding,
-            query_filter=Filter(must=must, must_not=must_not),
+            query_filter=qfilter,
             limit=limit,
             with_payload=True,
         )
-        hits = getattr(result, "points", result) or []
+        dense_hits = list(getattr(result, "points", result) or [])
+
+        # Hybrid recall (audit 27 #1): BM25 lexical leg under the SAME
+        # filter, rank-fused with the dense leg before the pool merge.
+        lexical_hits = self._lexical_pool_hits(m, query, qfilter, limit)
+        fused = _rrf_fuse(dense_hits, lexical_hits, limit)
+        dense_floor = _dense_score_floor(dense_hits)
 
         out: list[MemoryResponse] = []
-        for hit in hits:
+        for entry in fused:
+            hit = entry["hit"]
             payload = getattr(hit, "payload", None) or {}
             metadata = payload.get("metadata", {})
+            # Lexical-only hits carry a raw BM25 score (not cosine-comparable);
+            # impute the pool's dense floor so the cross-pool score sort stays
+            # meaningful without ever letting a keyword match outrank a
+            # stronger dense hit on score alone.
+            raw_score = getattr(hit, "score", None) if entry["dense"] else dense_floor
             mem_dict = {
                 "id": str(getattr(hit, "id", "")),
                 "memory": payload.get("data", ""),
                 "metadata": metadata,
                 # Reinforcement-aware recall: memories that survived N dedup
                 # collapses rank slightly above one-offs at equal similarity.
-                "score": _reinforcement_boost(getattr(hit, "score", None), metadata),
+                "score": _reinforcement_boost(raw_score, metadata),
                 "created_at": payload.get("created_at"),
             }
             out.append(self._mem_to_response(mem_dict))
         return out
+
+    def _lexical_pool_hits(self, m, query: str, query_filter, limit: int) -> list:
+        """BM25 lexical leg for one pool (audit 27 #1).
+
+        Runs a sparse-vector keyword query against the collection's
+        ``bm25`` named-vector slot using the SAME payload filter as the
+        pool's dense pass, so the lexical leg can never widen
+        visibility/scope. Degrades to an empty list (dense-only search,
+        no error) when:
+
+        - the collection predates the v3 hybrid schema (no ``bm25`` sparse
+          slot — the mem0 fork detects this at startup via
+          ``_has_bm25_slot``),
+        - the configured vector store isn't the NS mem0 Qdrant fork,
+        - the query is empty or sparse encoding fails,
+        - the Qdrant call errors — recall must never break on the lexical
+          extra.
+        """
+        vs = m.vector_store
+        # `is True` (not truthiness): only the fork sets a real bool; any
+        # other store lacks the attribute and must skip the sparse leg.
+        if not query or getattr(vs, "_has_bm25_slot", False) is not True:
+            return []
+        try:
+            sparse = vs._encode_bm25(query)
+            if sparse is None:
+                return []
+            result = vs.client.query_points(
+                collection_name=settings.qdrant_collection,
+                query=sparse,
+                using="bm25",
+                query_filter=query_filter,
+                limit=limit,
+                with_payload=True,
+            )
+            return list(getattr(result, "points", result) or [])
+        except Exception as e:
+            logger.debug(f"BM25 lexical leg failed (non-fatal, dense-only): {e}")
+            return []
 
     def _search_standard_pool(
         self,
@@ -1350,6 +1799,7 @@ class MemoryService:
         observation_type: str | None,
         concepts: list[str] | None,
         limit: int,
+        query: str = "",
     ) -> list[MemoryResponse]:
         """Search Qdrant for the caller's own memories using a precomputed vector.
 
@@ -1360,6 +1810,9 @@ class MemoryService:
         single ``search()`` embeds the query ONCE and reuses ``query_embedding``
         across every pool/scope, instead of re-embedding per ``Memory.search``
         call (the embed round-trip dominates read latency).
+
+        ``query`` (raw text) feeds the BM25 lexical leg only — sparse
+        encoding is lexical, not an embed round-trip. Empty ⇒ dense-only.
         """
         from qdrant_client.models import (
             FieldCondition,
@@ -1388,19 +1841,30 @@ class MemoryService:
         if concepts:
             must.append(FieldCondition(key="metadata.concepts", match=MatchAny(any=concepts)))
 
+        qfilter = Filter(must=must, must_not=must_not)
         result = client.query_points(
             collection_name=settings.qdrant_collection,
             query=query_embedding,
-            query_filter=Filter(must=must, must_not=must_not),
+            query_filter=qfilter,
             limit=limit,
             with_payload=True,
         )
-        hits = getattr(result, "points", result) or []
+        dense_hits = list(getattr(result, "points", result) or [])
+
+        # Hybrid recall (audit 27 #1): BM25 lexical leg under the SAME
+        # filter, rank-fused with the dense leg before the pool merge.
+        lexical_hits = self._lexical_pool_hits(m, query, qfilter, limit)
+        fused = _rrf_fuse(dense_hits, lexical_hits, limit)
+        dense_floor = _dense_score_floor(dense_hits)
 
         out: list[MemoryResponse] = []
-        for hit in hits:
+        for entry in fused:
+            hit = entry["hit"]
             payload = getattr(hit, "payload", None) or {}
             metadata = payload.get("metadata", {})
+            # Lexical-only hits: impute the pool's dense floor (see
+            # _search_shared_pool for the rationale).
+            raw_score = getattr(hit, "score", None) if entry["dense"] else dense_floor
             mem_dict = {
                 "id": str(getattr(hit, "id", "")),
                 "memory": payload.get("data", ""),
@@ -1408,7 +1872,7 @@ class MemoryService:
                 # Same reinforcement boost as the shared/standard pools — the
                 # re-rank must be identical across pools or a reinforced
                 # private memory would lose to its unreinforced shared twin.
-                "score": _reinforcement_boost(getattr(hit, "score", None), metadata),
+                "score": _reinforcement_boost(raw_score, metadata),
                 "created_at": payload.get("created_at"),
             }
             out.append(self._mem_to_response(mem_dict))
@@ -1487,6 +1951,55 @@ class MemoryService:
             logger.warning(f"Content-hash dedup lookup failed (non-fatal): {e}")
             return None
 
+    def _revive_if_tombstoned(self, memory_id: str) -> bool:
+        """Resurrect a dream-tombstoned dedup survivor (audit 27 #5).
+
+        ``_find_by_content_hash`` matches tombstoned rows too — before this
+        existed, re-storing a fact the dreaming sweep had tombstoned was
+        silently swallowed by the dedup short-circuit and the fact stayed
+        excluded from recall forever (search filters
+        ``metadata.dream_tombstoned=true``). Revival semantics:
+        re-derivation is fresh evidence the fact is live, so the tombstone
+        flag is cleared and the row becomes recallable again.
+
+        The clear is an atomic nested-key merge (``set_payload`` with
+        ``key="metadata"``) rather than a read-merge-write of the whole
+        metadata dict, so it can't race a concurrent metadata patch into
+        resurrecting stale fields.
+
+        Returns True if a tombstone was actually cleared. Best-effort:
+        failures log and return False — a lost revival must never block
+        the write path.
+        """
+        try:
+            client = self._memory.vector_store.client
+            collection = settings.qdrant_collection
+            points = client.retrieve(
+                collection_name=collection,
+                ids=[memory_id],
+                with_payload=True,
+                with_vectors=False,
+            )
+            if not points:
+                return False
+            meta = (points[0].payload or {}).get("metadata") or {}
+            if not meta.get("dream_tombstoned"):
+                return False
+            client.set_payload(
+                collection_name=collection,
+                payload={
+                    "dream_tombstoned": False,
+                    "dream_revived_at": datetime.now(timezone.utc).isoformat(),
+                },
+                points=[memory_id],
+                key="metadata",
+            )
+            logger.info(f"Revived dream-tombstoned memory {memory_id} on re-derivation")
+            return True
+        except Exception as e:
+            logger.warning(f"Tombstone revival failed for {memory_id} (non-fatal): {e}")
+            return False
+
     def _bump_times_derived(self, memory_id: str, add: int = 1) -> None:
         """Increment ``metadata.times_derived`` on a surviving memory.
 
@@ -1528,19 +2041,36 @@ class MemoryService:
     ) -> list[MemoryResponse]:
         """Store multiple pre-categorized facts (memory-model v2).
 
-        Each item is a dict matching RawMemoryRequest's shape. Reuses
-        ``store_raw`` per item so dedup, validation, and graph ingestion
-        stay consistent. Single network round-trip from the caller.
+        Each item is a dict matching RawMemoryRequest's shape. Two-pass
+        (audit 27 #20): pass 1 validates + content-hash dedups every item via
+        the same ``_prepare_raw_store`` that ``store_raw`` uses; pass 2 embeds
+        ALL new items in ONE ``embed_batch`` call, then inserts and
+        graph-enriches per item. Previously each item paid its own serial
+        embed round trip — a 25-item checkpoint was 25 embed RTTs on the
+        gateway path.
 
-        Args:
-            items: list of dicts with at least content/user_id/category, plus
-                any v2 optional fields. Each item is independent; one bad item
-                won't block the others (we collect errors but continue).
+        Semantics preserved from the per-item path:
+
+        - duplicates (pre-existing rows OR repeats within the batch) return
+          the surviving row and bump its ``times_derived``;
+        - per-item results in input order (failed items dropped);
+        - one bad item won't block the others.
+
+        The single ``embed_batch`` failure mode is deliberately LOUD (fails
+        the whole batch before any insert) — the content-hash dedup makes the
+        ARQ retry safe, so partial-batch silent loss is the worse trade.
 
         Returns:
-            Flattened list of MemoryResponse objects across all successful items.
+            List of MemoryResponse objects for successful items, input order.
         """
-        results: list[MemoryResponse] = []
+        m = self._get_memory()
+
+        # ── Pass 1: validate + dedup, collect ready-to-insert items ──
+        # Slots: ("new", prepared) | ("dup", response) | ("batchdup", prepared)
+        # | ("skip", None) — batchdup is a repeat WITHIN this batch of a new
+        # item; its bump/response resolve in pass 2, after the survivor exists.
+        entries: list[tuple[str, object]] = []
+        seen_new: dict[tuple, dict] = {}
         for idx, item in enumerate(items):
             try:
                 # Convert ISO string -> datetime if needed (came in via JSON)
@@ -1551,7 +2081,7 @@ class MemoryService:
                         expires_at = _dt.fromisoformat(expires_at.replace("Z", "+00:00"))
                     except ValueError:
                         expires_at = None
-                stored = self.store_raw(
+                prepared, existing = self._prepare_raw_store(
                     content=item["content"],
                     user_id=item["user_id"],
                     category=item["category"],
@@ -1573,10 +2103,71 @@ class MemoryService:
                     memory_kind=item.get("memory_kind"),
                     source_ref=item.get("source_ref"),
                 )
-                results.extend(stored)
+                if existing is not None:
+                    entries.append(("dup", existing))
+                elif prepared["dedup_key"] in seen_new:
+                    # Repeat of an item earlier in THIS batch: the sequential
+                    # path deduped it onto the just-inserted first occurrence.
+                    entries.append(("batchdup", seen_new[prepared["dedup_key"]]))
+                else:
+                    seen_new[prepared["dedup_key"]] = prepared
+                    entries.append(("new", prepared))
             except Exception as e:
                 logger.warning(f"Batch item {idx} failed (continuing): {e}")
-        logger.info(f"store_raw_batch: stored {len(results)} memories from {len(items)} items")
+                entries.append(("skip", None))
+
+        # ── Pass 2: ONE batch embed for all new items, then per-item work ──
+        new_texts = [p["content"] for kind, p in entries if kind == "new"]
+        embeddings = (
+            m.embedding_model.embed_batch(new_texts, memory_action="add")
+            if new_texts
+            else []
+        )
+        # Loud contract check BEFORE any insert (Copilot review, PR #124): a
+        # short/empty/overlong return would otherwise exhaust (or misalign)
+        # the iterator mid-pass — StopIteration swallowed as a per-item
+        # failure, items silently dropped or paired with the wrong vectors.
+        if len(embeddings) != len(new_texts):
+            raise RuntimeError(
+                f"store_raw_batch: embed_batch returned {len(embeddings)} "
+                f"embeddings for {len(new_texts)} new texts — refusing to "
+                f"insert any item of this batch"
+            )
+        emb_iter = iter(embeddings)
+
+        results: list[MemoryResponse] = []
+        finalized_mids: set[str] = set()
+        for idx, (kind, obj) in enumerate(entries):
+            if kind == "skip":
+                continue
+            if kind == "dup":
+                results.append(obj)
+                continue
+            if kind == "batchdup":
+                # Survivor was inserted earlier in this pass — count the
+                # repeat on it, mirroring the old sequential dedup behavior.
+                # If the survivor's store FAILED, this repeat failed too:
+                # never bump a nonexistent row or report a response for a
+                # row that was never stored (Copilot review, PR #124).
+                if obj["mid"] not in finalized_mids:
+                    logger.warning(
+                        f"Batch item {idx} failed (continuing): duplicate of "
+                        f"an item in this batch whose store failed"
+                    )
+                    continue
+                self._bump_times_derived(obj["mid"], 1)
+                results.append(obj["response"])
+                continue
+            try:
+                self._finalize_raw_store(obj, next(emb_iter))
+                finalized_mids.add(obj["mid"])
+                results.append(obj["response"])
+            except Exception as e:
+                logger.warning(f"Batch item {idx} failed (continuing): {e}")
+        logger.info(
+            f"store_raw_batch: stored {len(results)} memories from {len(items)} items "
+            f"(1 embed_batch call for {len(new_texts)} new)"
+        )
         return results
 
     def expire_old_memories(self, batch_size: int = 100) -> dict:
@@ -1660,6 +2251,18 @@ class MemoryService:
         ingestion.  The caller is responsible for a separate graph.add() call
         with the full conversation text.
 
+        Content-hash dedup (audit 27 #21): before inserting, each fact is
+        checked against (user, hash, scope, project) via
+        ``_find_by_content_hash`` — an ARQ retry after a partial upsert (or a
+        client resubmission) no longer duplicates facts under fresh UUIDs.
+        Dedup hits bump ``times_derived`` on the survivor (and revive a
+        dream-tombstoned one) exactly like the raw path, and the survivor is
+        returned in the fact's slot. Duplicates WITHIN the batch (extraction
+        window overlap re-deriving the same fact) collapse to the first
+        occurrence without a bump — one conversation isn't independent
+        re-derivation evidence. The N dedup probes are single indexed Qdrant
+        scrolls (~ms each), noise next to the embed + LLM calls on this path.
+
         Args:
             facts: List of (category, content) tuples.
             user_id: User identifier.
@@ -1669,7 +2272,8 @@ class MemoryService:
             source: Provenance tag for metadata.
 
         Returns:
-            List of MemoryResponse objects for stored facts.
+            List of MemoryResponse objects for stored facts (new rows and
+            dedup survivors, in input order; in-batch duplicates dropped).
         """
         if not facts:
             return []
@@ -1677,11 +2281,15 @@ class MemoryService:
         m = self._get_memory()
         now_iso = datetime.now(timezone.utc).isoformat()
 
-        # ── Build per-fact metadata, IDs, and texts ──
+        # ── Build per-fact metadata, IDs, and texts (dedup-first) ──
         texts: list[str] = []
         memory_ids: list[str] = []
         payloads: list[dict] = []
         fact_meta: list[tuple[str, str, str | None]] = []  # (category, scope, project_id) per fact
+        # Ordered slots: ("new", index-into-texts) | ("dup", existing response)
+        ordered: list[tuple[str, object]] = []
+        seen_in_batch: set[tuple[str, str, str | None]] = set()
+        dedup_hits = 0
 
         for category, content in facts:
             scope = default_scope_for_category(category)
@@ -1705,16 +2313,46 @@ class MemoryService:
                         f"Content snippet: '{content[:80]}'. Storing as global scope."
                     )
 
+            scope_val = scope.value if isinstance(scope, MemoryScope) else scope
+            chash = content_hash(content)
+
+            # In-batch duplicate (extraction-window overlap): keep the first.
+            batch_key = (chash, scope_val, fact_project_id)
+            if batch_key in seen_in_batch:
+                continue
+            seen_in_batch.add(batch_key)
+
+            # Storage-level idempotency (audit 27 #21). visibility=None on
+            # purpose: conversation-path rows don't stamp metadata.visibility,
+            # so a visibility condition would never match them.
+            existing = self._find_by_content_hash(
+                user_id=user_id,
+                content_hash=chash,
+                scope=scope_val,
+                project_id=fact_project_id,
+                visibility=None,
+            )
+            if existing is not None:
+                # Same reinforcement semantics as the raw path: count the
+                # re-derivation on the survivor, resurrect it if a dream
+                # sweep had tombstoned it (audit 27 #5 applies here too).
+                self._bump_times_derived(existing.id, 1)
+                if self._revive_if_tombstoned(existing.id):
+                    existing.revived = True
+                dedup_hits += 1
+                ordered.append(("dup", existing))
+                continue
+
             mid = str(uuid.uuid4())
             payload = {
                 "data": content,
-                "hash": hashlib.md5(content.encode()).hexdigest(),
+                "hash": chash,
                 "created_at": now_iso,
                 "user_id": user_id,
                 "agent_id": agent_id,
                 "run_id": run_id,
                 "metadata": {
-                    "scope": scope.value if isinstance(scope, MemoryScope) else scope,
+                    "scope": scope_val,
                     "category": category,
                     "project_id": fact_project_id,
                     "agent_id": agent_id,
@@ -1736,28 +2374,36 @@ class MemoryService:
             texts.append(content)
             memory_ids.append(mid)
             payloads.append(payload)
-            fact_meta.append((category, scope.value if isinstance(scope, MemoryScope) else scope, fact_project_id))
+            fact_meta.append((category, scope_val, fact_project_id))
+            ordered.append(("new", len(texts) - 1))
 
-        # ── Single batch embed ──
-        embeddings = m.embedding_model.embed_batch(texts, memory_action="add")
+        # ── Single batch embed + single Qdrant upsert (new facts only) ──
+        # Skipped entirely when everything dedup'd — a straight ARQ re-run of
+        # an already-stored conversation inserts ZERO new points.
+        if texts:
+            embeddings = m.embedding_model.embed_batch(texts, memory_action="add")
+            m.vector_store.insert(
+                vectors=embeddings,
+                ids=memory_ids,
+                payloads=payloads,
+            )
 
-        # ── Single Qdrant upsert ──
-        m.vector_store.insert(
-            vectors=embeddings,
-            ids=memory_ids,
-            payloads=payloads,
-        )
+            # ── Record history entries ──
+            for mid, content in zip(memory_ids, texts):
+                try:
+                    m.db.add_history(mid, None, content, "ADD", created_at=now_iso)
+                except Exception as e:
+                    logger.warning(f"History record failed for {mid}: {e}")
 
-        # ── Record history entries ──
-        for mid, content in zip(memory_ids, texts):
-            try:
-                m.db.add_history(mid, None, content, "ADD", created_at=now_iso)
-            except Exception as e:
-                logger.warning(f"History record failed for {mid}: {e}")
-
-        # ── Build responses ──
+        # ── Build responses (input order: new rows + dedup survivors) ──
         responses: list[MemoryResponse] = []
-        for mid, content, (category, scope_val, fact_pid) in zip(memory_ids, texts, fact_meta):
+        for kind, ref in ordered:
+            if kind == "dup":
+                responses.append(ref)  # the existing MemoryResponse
+                continue
+            idx = ref
+            mid, content = memory_ids[idx], texts[idx]
+            category, scope_val, fact_pid = fact_meta[idx]
             responses.append(
                 MemoryResponse(
                     id=mid,
@@ -1777,8 +2423,8 @@ class MemoryService:
             )
 
         logger.info(
-            f"Batch-stored {len(responses)} facts for user={user_id} "
-            f"(1 embed call, 1 Qdrant upsert)"
+            f"Batch-stored {len(texts)} new facts for user={user_id} "
+            f"({dedup_hits} content-hash dedup hits; 1 embed call, 1 Qdrant upsert)"
         )
         return responses
 
@@ -1802,6 +2448,9 @@ class MemoryService:
         # Multi-user pool selection
         visibility: str | None = None,
         include_shared: bool = True,
+        # Internal write-path mode (audit 27 #12): vector pools only — no
+        # graph pass, no graph enrichment, no recall-trace logging.
+        vector_only: bool = False,
     ) -> list[MemoryResponse]:
         """Semantic search across memories with scope/category filters.
 
@@ -1819,10 +2468,19 @@ class MemoryService:
         When project_id is provided, both pools search project+global memories
         for that project (existing dual-scope merge preserved per pool).
 
+        ``vector_only=True`` is the internal write-path mode: the raw-write
+        idempotency check needs a cheap semantic near-dupe probe, not a full
+        hybrid recall — it skips the graph pass, graph enrichment, and the
+        dreaming recall trace (an internal probe must not reinforce
+        salience).
+
         Returns:
             List of matching memory responses sorted by score.
         """
         m = self._get_memory()
+        # Lazily ensure keyword/bool payload indexes for the hot-path filters
+        # (audit 27 #14) — one attempt per service instance, never fatal.
+        self._ensure_filter_indexes()
 
         # Embed the query ONCE and reuse the vector across every pool/scope
         # below. Both pools query Qdrant directly with this precomputed vector
@@ -1830,6 +2488,24 @@ class MemoryService:
         # Memory.search + shared-pool call re-embedded the same query — 4-5
         # embeds per recall — and the embed round-trip dominates read latency.
         query_embedding = m.embedding_model.embed(query, memory_action="search")
+
+        # Audit 27 #9: kick the graph pass off NOW, on its own thread, so it
+        # overlaps the vector pool queries below (the legs are independent —
+        # Graphiti embeds the query itself). Joined right before the weave.
+        graph_future = None
+        if not vector_only:
+            try:
+                graph_future = _GRAPH_SEARCH_POOL.submit(
+                    self._search_graph_for_visibility,
+                    query=query,
+                    user_id=user_id,
+                    project_id=project_id,
+                    limit=limit,
+                    visibility=visibility,
+                    include_shared=include_shared,
+                )
+            except Exception as e:
+                logger.warning(f"Graph search submit failed (non-critical): {e}")
 
         vector_responses: list[MemoryResponse] = []
 
@@ -1849,7 +2525,7 @@ class MemoryService:
                             m=m, user_id=user_id, query_embedding=query_embedding,
                             project_id=project_id, categories=categories, scope=None,
                             domain=domain, observation_type=observation_type,
-                            concepts=concepts, limit=limit,
+                            concepts=concepts, limit=limit, query=query,
                         )
                     )
                     vector_responses.extend(
@@ -1857,7 +2533,7 @@ class MemoryService:
                             m=m, user_id=user_id, query_embedding=query_embedding,
                             project_id=None, categories=categories, scope="global",
                             domain=domain, observation_type=observation_type,
-                            concepts=concepts, limit=limit,
+                            concepts=concepts, limit=limit, query=query,
                         )
                     )
                 else:
@@ -1866,7 +2542,7 @@ class MemoryService:
                             m=m, user_id=user_id, query_embedding=query_embedding,
                             project_id=project_id, categories=categories, scope=scope,
                             domain=domain, observation_type=observation_type,
-                            concepts=concepts, limit=limit,
+                            concepts=concepts, limit=limit, query=query,
                         )
                     )
             except Exception as e:
@@ -1987,37 +2663,61 @@ class MemoryService:
         deduped.sort(key=lambda r: r.score or 0.0, reverse=True)
         vector_responses = deduped[:limit]
 
-        # Also query the knowledge graph and merge edge facts.
-        # Multi-user: when caller restricted the visibility, restrict the
-        # graph search's group_ids to match — otherwise the graph would
-        # walk the full read-set (caller's private + shared) and we'd
+        # Join the knowledge-graph pass started above and merge edge facts.
+        # Multi-user: when caller restricted the visibility, the graph search
+        # already restricted its group_ids to match — otherwise the graph
+        # would walk the full read-set (caller's private + shared) and we'd
         # have to retroactively filter, which is unreliable for graph
         # rows whose enriched visibility ends up as None.
         graph_responses: list[MemoryResponse] = []
-        try:
-            graph_results = self._search_graph_for_visibility(
-                query=query,
-                user_id=user_id,
-                project_id=project_id,
-                limit=limit,
-                visibility=visibility,
-                include_shared=include_shared,
-            )
-            for edge in graph_results.get("edges", []):
-                graph_responses.append(
-                    MemoryResponse(
-                        id=edge.get("uuid", ""),
-                        memory=edge.get("fact", edge.get("name", "")),
-                        source="graph",
-                    )
+        # Stored fact_embeddings, index-aligned with graph_responses — reused
+        # below for the zero-embed twin decoration (query_batch_points with
+        # these vectors instead of re-embedding edge facts).
+        graph_edge_embeddings: list[list | None] = []
+        if graph_future is not None:
+            try:
+                graph_results = graph_future.result(
+                    timeout=_GRAPH_SEARCH_JOIN_TIMEOUT_S
                 )
-        except Exception as e:
-            logger.warning(f"Graph search failed during recall (non-critical): {e}")
+                for edge in graph_results.get("edges", []):
+                    # Graph as a ranked leg: score each edge with its STORED
+                    # fact_embedding (piggybacked on the enrichment Cypher in
+                    # _enrich_graph_results) against the query vector computed
+                    # once above — local cosine in the same Gemini space as
+                    # the vector rows, clamped to [0, 1]. Edges without a
+                    # stored embedding stay unscored (rank last on merit).
+                    emb = edge.get("fact_embedding") or None
+                    graph_responses.append(
+                        MemoryResponse(
+                            id=edge.get("uuid", ""),
+                            memory=edge.get("fact", edge.get("name", "")),
+                            source="graph",
+                            score=(
+                                _unit_cosine(query_embedding, emb)
+                                if emb is not None
+                                else None
+                            ),
+                        )
+                    )
+                    graph_edge_embeddings.append(emb)
+            except Exception as e:
+                logger.warning(f"Graph search failed during recall (non-critical): {e}")
 
-        # Memory-model v2: enrich graph results with v2 metadata from their
-        # nearest source memory, then apply the same v2 filters to graph rows.
-        # Graphiti's edge schema doesn't carry v2 fields natively — we recover
-        # them by semantic match against the Qdrant store.
+        # Enrich graph rows with metadata from their nearest source memory
+        # (title/category/created_at/v2 fields + the twin back-reference).
+        # Graphiti's edge schema doesn't carry those fields natively — we
+        # recover them by semantic match against the Qdrant store.
+        #
+        # Graph-ranked-leg: decoration is ALWAYS-ON again (audit 27 #7 had
+        # gated it behind a v2/passage filter because it cost one embed API
+        # call per edge, then #121 one batch call). With the STORED edge
+        # embeddings from part 1 the twin lookup is a single
+        # query_batch_points round trip and ZERO embed calls, so every
+        # search gets decorated graph rows (feeding ask.py's chronological
+        # evidence and the recall-index budget logic). Edges without a
+        # stored embedding only fall back to a batched embed when a filter
+        # actually needs their metadata (v2 filter / passage filter) —
+        # otherwise they stay undecorated rather than paying API calls.
         v2_filter_active = bool(domain or observation_type or concepts)
         if graph_responses and v2_filter_active:
             graph_responses = self._enrich_and_filter_graph(
@@ -2027,12 +2727,23 @@ class MemoryService:
                 domain=domain,
                 observation_type=observation_type,
                 concepts=concepts,
+                visibility=visibility,
+                include_shared=include_shared,
+                edge_embeddings=graph_edge_embeddings,
             )
         elif graph_responses:
-            # No v2 filter active, but still enrich so callers see v2 fields
-            # surfaced on graph rows when their source memory has them.
             graph_responses = self._enrich_graph_with_v2(
-                graph_responses, user_id=user_id, project_id=project_id
+                graph_responses,
+                user_id=user_id,
+                project_id=project_id,
+                visibility=visibility,
+                include_shared=include_shared,
+                edge_embeddings=graph_edge_embeddings,
+                # The passage filter below reads memory_kind off each row,
+                # which for graph rows only exists via source-memory
+                # enrichment — worth a batched embed for embedding-less
+                # edges. A plain recall is not.
+                allow_embed_fallback=(memory_kind == "passage"),
             )
 
         # Multi-user model: post-filter graph rows by enriched visibility.
@@ -2049,8 +2760,11 @@ class MemoryService:
                 if r.visibility == visibility or r.visibility is None
             ]
 
-        # Deduplicate and enforce caller's limit
-        combined = self._deduplicate_responses(vector_responses, graph_responses)
+        # Deduplicate and enforce caller's limit — ranked vector hits keep
+        # priority; graph rows are appended after, capped within the limit.
+        combined = self._deduplicate_responses(
+            vector_responses, graph_responses, limit=limit
+        )
 
         # memory_kind filter (data-layer connectors). Legacy memories have no
         # memory_kind, so a "fact" filter treats null as fact (back-compat);
@@ -2065,12 +2779,23 @@ class MemoryService:
         # Dreaming: fire-and-forget recall trace (reinforcement signal for
         # the dream sweep's promotion/retention scoring). Runs on a daemon
         # thread inside log_recall — never blocks or fails the read.
-        try:
-            from extensions.dreaming.traces import log_recall
+        #
+        # Audit 27 #13: skipped entirely unless something CONSUMES the traces
+        # — the dream sweep (dreaming enabled) or the bounded salience
+        # tie-breaker (salience_recall_k > 0). With both off, log_recall was
+        # ~5N+4 Redis writes per search feeding a store nothing ever read.
+        # Internal vector_only probes (write-side idempotency checks) never
+        # log — they aren't user recalls and must not reinforce salience.
+        if not vector_only:
+            try:
+                from extensions.dreaming.config import dreaming_settings
 
-            log_recall([r.id for r in results if r.id], query)
-        except Exception:
-            pass
+                if dreaming_settings.enabled or float(dreaming_settings.salience_recall_k) > 0.0:
+                    from extensions.dreaming.traces import log_recall
+
+                    log_recall([r.id for r in results if r.id], query)
+            except Exception:
+                pass
 
         return results
 
@@ -2084,67 +2809,156 @@ class MemoryService:
         graph_responses: list[MemoryResponse],
         user_id: str,
         project_id: str | None,
+        visibility: str | None = None,
+        include_shared: bool = True,
+        edge_embeddings: list | None = None,
+        allow_embed_fallback: bool = True,
     ) -> list[MemoryResponse]:
         """For each graph edge, find its nearest Qdrant source memory and
-        copy that source's v2 metadata onto the graph response — only when
-        the similarity score clears _GRAPH_ENRICH_THRESHOLD.
+        copy that source's metadata onto the graph response — only when
+        the similarity score clears _GRAPH_ENRICH_THRESHOLD. Recovered
+        fields: memory-model v2 (domain/observation_type/concepts/…),
+        presentation fields (title/category/created_at/token_estimate),
+        multi-user fields, and the twin's memory id (as
+        ``related_memory_ids``, the graph row's source back-reference).
 
-        Memory-model v2 augmentation: Graphiti edges don't carry domain /
-        observation_type / concepts natively, but they're derived from
-        source memories that do. We do a top-1 vector search per edge to
-        recover those fields. ~10ms per edge at typical limits.
+        Graph-ranked-leg: ``edge_embeddings`` (index-aligned with
+        ``graph_responses``) carries the STORED Graphiti ``fact_embedding``
+        per row — those rows are looked up with the stored vector and cost
+        ZERO embed API calls. Rows without one either fall back to a single
+        batched ``embed_batch`` call (``allow_embed_fallback=True``, the
+        #121 behavior — used when a v2/passage filter needs their metadata)
+        or stay un-enriched (``allow_embed_fallback=False``, the plain-
+        search hot path).
 
-        Multi-user model: enrichment can use either the caller's private
-        memories OR shared-pool memories (a graph edge for a shared fact
-        should pick up the shared source's metadata). Restricts to the
-        active project_id when supplied so v2 filter parity holds.
+        Audit 27 #7 history: this used to embed + query Qdrant once per
+        edge, sequentially — 10 edges meant 10 Gemini round-trips + 10
+        Qdrant queries (3-12s of the measured hybrid-search latency). At
+        most ONE ``embed_batch`` call and exactly ONE Qdrant
+        ``query_batch_points`` round trip remain. Any failure leaves the
+        rows un-enriched (never breaks the read).
+
+        Multi-user model: the enrichment source filter mirrors the EXACT
+        read-set of the calling search (``visibility``/``include_shared``
+        select the same pools ``_search_graph_for_visibility`` scoped its
+        group_ids to). A private-only or ``include_shared=False`` recall
+        must never pick up a shared row's metadata (visibility /
+        owner_user_id) for its graph rows — the graph edges themselves
+        came from the narrowed group_ids, and enriching them from a wider
+        pool would mislabel rows (or get them dropped by the post-filter).
+        Restricts to the active project_id when supplied so v2 filter
+        parity holds.
         """
-        from qdrant_client.models import FieldCondition, Filter, MatchValue
+        from qdrant_client.models import (
+            FieldCondition,
+            Filter,
+            MatchValue,
+            QueryRequest,
+        )
 
-        m = self._get_memory()
-        client = m.vector_store.client
-        for resp in graph_responses:
-            if not resp.memory:
-                continue
-            try:
-                embedding = m.embedding_model.embed(resp.memory, memory_action="search")
-                # Enrichment source = OR of per-pool sub-filters (Qdrant `should`
-                # accepts nested Filters). Personal + shared are constrained to the
-                # active project; the authoritative STANDARD pool is always global
-                # (no project_id), so it must NOT carry the project constraint —
-                # otherwise standard-origin graph edges never match their source
-                # and lose their v2 metadata / get dropped by v2 filters.
-                proj = (
-                    [FieldCondition(key="metadata.project_id", match=MatchValue(value=project_id))]
-                    if project_id else []
+        enrichable = [(i, r.memory) for i, r in enumerate(graph_responses) if r.memory]
+        if not enrichable:
+            return graph_responses
+
+        # Pool selection — parity with _search_graph_for_visibility:
+        #   private  → caller's own rows only
+        #   shared   → shared pool only
+        #   standard → standard pool only
+        #   include_shared=False (no explicit visibility) → personal + standard
+        #   default  → personal + shared + standard
+        want_personal = visibility in (None, MemoryVisibility.PRIVATE.value)
+        want_shared = visibility == MemoryVisibility.SHARED.value or (
+            visibility is None and include_shared
+        )
+        want_standard = settings.standards_enabled and visibility in (
+            None,
+            MemoryVisibility.STANDARD.value,
+        )
+
+        try:
+            m = self._get_memory()
+            client = m.vector_store.client
+
+            # Per-row lookup vector: prefer the STORED edge embedding (zero
+            # embed API calls); optionally batch-embed the leftovers.
+            provided: dict[int, list] = {}
+            if edge_embeddings:
+                for i, _ in enrichable:
+                    if i < len(edge_embeddings) and edge_embeddings[i]:
+                        provided[i] = edge_embeddings[i]
+            missing = [(i, text) for i, text in enrichable if i not in provided]
+            if missing and not allow_embed_fallback:
+                # Plain-search hot path: rows without a stored embedding
+                # stay un-enriched rather than paying embed API calls.
+                enrichable = [(i, t) for i, t in enrichable if i in provided]
+                missing = []
+            if missing:
+                texts = [text for _, text in missing]
+                embed_batch = getattr(m.embedding_model, "embed_batch", None)
+                if callable(embed_batch):
+                    embeddings = embed_batch(texts, memory_action="search")
+                else:  # embedder without a batch API — degrade to per-text embeds
+                    embeddings = [
+                        m.embedding_model.embed(t, memory_action="search")
+                        for t in texts
+                    ]
+                for (i, _), emb in zip(missing, embeddings):
+                    provided[i] = emb
+            if not enrichable:
+                return graph_responses
+
+            # Enrichment source = OR of per-pool sub-filters (Qdrant `should`
+            # accepts nested Filters). Personal + shared are constrained to the
+            # active project; the authoritative STANDARD pool is always global
+            # (no project_id), so it must NOT carry the project constraint —
+            # otherwise standard-origin graph edges never match their source
+            # and lose their v2 metadata / get dropped by v2 filters. The
+            # filter is identical for every edge, so it is built ONCE.
+            proj = (
+                [FieldCondition(key="metadata.project_id", match=MatchValue(value=project_id))]
+                if project_id else []
+            )
+            should_filters: list = []
+            if want_personal and user_id:
+                should_filters.append(
+                    Filter(must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))] + proj)
                 )
-                should_filters: list = []
-                if user_id:
-                    should_filters.append(
-                        Filter(must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))] + proj)
-                    )
+            if want_shared:
                 should_filters.append(
                     Filter(must=[FieldCondition(
                         key="metadata.visibility",
                         match=MatchValue(value=MemoryVisibility.SHARED.value),
                     )] + proj)
                 )
-                if settings.standards_enabled:
-                    should_filters.append(
-                        Filter(must=[FieldCondition(
-                            key="metadata.visibility",
-                            match=MatchValue(value=MemoryVisibility.STANDARD.value),
-                        )])
-                    )
-                qf = Filter(should=should_filters)
-                # qdrant-client v1.13+ replaced `.search()` with `.query_points()`.
-                result = client.query_points(
-                    collection_name=settings.qdrant_collection,
-                    query=embedding,
-                    query_filter=qf,
-                    limit=1,
-                    with_payload=True,
+            if want_standard:
+                should_filters.append(
+                    Filter(must=[FieldCondition(
+                        key="metadata.visibility",
+                        match=MatchValue(value=MemoryVisibility.STANDARD.value),
+                    )])
                 )
+            if not should_filters:
+                # No readable enrichment pool (e.g. private-only with no
+                # user_id) — leave the rows un-enriched rather than querying
+                # unfiltered.
+                return graph_responses
+            qf = Filter(should=should_filters)
+
+            requests = [
+                QueryRequest(query=provided[i], filter=qf, limit=1, with_payload=True)
+                for i, _ in enrichable
+            ]
+            batch_results = client.query_batch_points(
+                collection_name=settings.qdrant_collection,
+                requests=requests,
+            )
+        except Exception as e:
+            logger.debug(f"Graph enrichment skipped (batch failed): {e}")
+            return graph_responses
+
+        for (idx, _), result in zip(enrichable, batch_results):
+            resp = graph_responses[idx]
+            try:
                 hits = getattr(result, "points", result) or []
                 if not hits:
                     continue
@@ -2162,6 +2976,24 @@ class MemoryService:
                 src_metadata = payload.get("metadata", {}) or {}
                 if isinstance(src_metadata.get("metadata"), dict):
                     src_metadata = src_metadata["metadata"]
+
+                # Presentation decoration (always-on again): timestamps feed
+                # ask.py's chronological evidence; title/token_estimate feed
+                # the recall-index budget logic; the twin's id is the graph
+                # row's source-memory back-reference.
+                if resp.created_at is None:
+                    resp.created_at = payload.get("created_at")
+                if resp.updated_at is None:
+                    resp.updated_at = payload.get("updated_at")
+                if resp.title is None:
+                    resp.title = src_metadata.get("title")
+                if resp.token_estimate is None:
+                    resp.token_estimate = src_metadata.get("token_estimate")
+                hit_id = getattr(hit, "id", None)
+                if hit_id is None and isinstance(hit, dict):
+                    hit_id = hit.get("id")
+                if resp.related_memory_ids is None and hit_id is not None:
+                    resp.related_memory_ids = [str(hit_id)]
 
                 # Copy v2 fields when source has them and graph response doesn't
                 if resp.domain is None:
@@ -2204,13 +3036,25 @@ class MemoryService:
         domain: str | None,
         observation_type: str | None,
         concepts: list[str] | None,
+        visibility: str | None = None,
+        include_shared: bool = True,
+        edge_embeddings: list | None = None,
     ) -> list[MemoryResponse]:
         """Enrich graph rows with v2 metadata, then drop rows that don't match
         the supplied filter. Used when the caller passes domain/observation_type/
-        concepts in SearchMemoryRequest.
+        concepts in SearchMemoryRequest. ``visibility``/``include_shared``
+        scope the enrichment source to the calling search's read-set.
+        ``edge_embeddings`` are the stored per-edge vectors (see
+        ``_enrich_graph_with_v2``); embed fallback stays allowed here —
+        filter correctness beats latency.
         """
         enriched = self._enrich_graph_with_v2(
-            graph_responses, user_id=user_id, project_id=project_id
+            graph_responses,
+            user_id=user_id,
+            project_id=project_id,
+            visibility=visibility,
+            include_shared=include_shared,
+            edge_embeddings=edge_embeddings,
         )
         out: list[MemoryResponse] = []
         for resp in enriched:
@@ -2287,23 +3131,39 @@ class MemoryService:
         from graphiti_core.search.search_config import SearchConfig
         from graphiti_core.search.search_config_recipes import EDGE_HYBRID_SEARCH_RRF
 
+        # Audit 27 #10: EDGE_HYBRID_SEARCH_RRF is a module-level singleton
+        # shared across every thread — mutating its `.limit` in place let a
+        # concurrent delete (limit=5) clamp a live search's graph fan-out.
+        # Always work on a deep copy.
         if search_config:
             try:
                 config = SearchConfig(**search_config)
             except (TypeError, ValueError) as e:
                 logger.warning(f"Invalid search_config, falling back to default: {e}")
-                config = EDGE_HYBRID_SEARCH_RRF
+                config = EDGE_HYBRID_SEARCH_RRF.model_copy(deep=True)
         else:
-            config = EDGE_HYBRID_SEARCH_RRF
+            config = EDGE_HYBRID_SEARCH_RRF.model_copy(deep=True)
         config.limit = limit
 
         try:
             results = self._run_on_bridge(
-                g.search_(query=query, config=config, group_ids=group_ids)
+                g.search_(
+                    query=query,
+                    config=config,
+                    group_ids=group_ids,
+                    # Audit 27 #3: bi-temporal liveness — edges the dreaming
+                    # sweep stamped invalid_at/expired_at (INVALIDATE / PRUNE /
+                    # MERGE, see extensions/dreaming/graph_patcher.py) must not
+                    # surface as live facts and eat top-k slots.
+                    search_filter=_live_edges_filter(),
+                )
             )
             edges = [
                 {"uuid": e.uuid, "name": e.name, "fact": e.fact}
                 for e in results.edges
+                # Belt-and-suspenders: some drivers/recipes skip the Cypher
+                # filter constructor, so drop stamped edges here too.
+                if not _edge_is_invalidated(e)
             ]
             nodes = [
                 {"uuid": n.uuid, "name": n.name, "summary": n.summary}
@@ -2336,14 +3196,23 @@ class MemoryService:
         edges: list[dict],
         communities: list[dict],
     ) -> None:
-        """Annotate graph search results with ``memory_id`` + ``wiki_path``.
+        """Annotate graph search results with ``memory_id`` + ``wiki_path``,
+        and edges additionally with their stored ``fact_embedding``.
 
-        Both fields are added by the wiki synthesizer's Cypher patchers
-        (``attach_memory_id`` and ``patch_wiki_path``) as top-level Neo4j
-        properties, but Graphiti's ORM doesn't rehydrate them. We do one
-        extra Cypher round-trip per result set to fetch the values by
-        UUID, then mutate the dicts in place. Failure logs and leaves
-        the original dicts unchanged.
+        ``memory_id``/``wiki_path`` are added by the wiki synthesizer's
+        Cypher patchers (``attach_memory_id`` and ``patch_wiki_path``) as
+        top-level Neo4j properties, but Graphiti's ORM doesn't rehydrate
+        them. We do one extra Cypher round-trip per result set to fetch the
+        values by UUID, then mutate the dicts in place.
+
+        The same round trip piggybacks ``e.fact_embedding`` for RELATES_TO
+        edges (graph-as-a-ranked-leg): Graphiti's search return path
+        deliberately omits the stored embedding
+        (``get_entity_edge_return_query``), and re-embedding edge facts
+        would cost one Gemini call per search. The UNION arm below matches
+        relationships by uuid (indexed: Graphiti's ``relation_uuid`` range
+        index) — zero additional round trips, no Graphiti subtree change.
+        Failure logs and leaves the original dicts unchanged.
         """
         all_uuids: list[str] = []
         for collection in (nodes, edges, communities):
@@ -2360,7 +3229,15 @@ class MemoryService:
         WHERE n.uuid IN $uuids
         RETURN n.uuid AS uuid,
                n.memory_id AS memory_id,
-               n.wiki_path AS wiki_path
+               n.wiki_path AS wiki_path,
+               null AS fact_embedding
+        UNION ALL
+        MATCH ()-[e:RELATES_TO]->()
+        WHERE e.uuid IN $uuids
+        RETURN e.uuid AS uuid,
+               e.memory_id AS memory_id,
+               e.wiki_path AS wiki_path,
+               e.fact_embedding AS fact_embedding
         """
 
         async def _run():
@@ -2383,6 +3260,8 @@ class MemoryService:
                     item["memory_id"] = rec["memory_id"]
                 if rec.get("wiki_path"):
                     item["wiki_path"] = rec["wiki_path"]
+                if rec.get("fact_embedding"):
+                    item["fact_embedding"] = rec["fact_embedding"]
 
     def search_graph(
         self,
@@ -2416,14 +3295,16 @@ class MemoryService:
         # cross-user `"global"`/`"project--..."` group_ids.
         group_ids = _get_group_ids(user_id, project_id)
 
+        # Audit 27 #10: never mutate the shared module-level recipe singleton
+        # — deep-copy before setting the per-call limit.
         if search_config:
             try:
                 config = SearchConfig(**search_config)
             except (TypeError, ValueError) as e:
                 logger.warning(f"Invalid search_config, falling back to default: {e}")
-                config = EDGE_HYBRID_SEARCH_RRF
+                config = EDGE_HYBRID_SEARCH_RRF.model_copy(deep=True)
         else:
-            config = EDGE_HYBRID_SEARCH_RRF
+            config = EDGE_HYBRID_SEARCH_RRF.model_copy(deep=True)
 
         config.limit = limit
 
@@ -2816,6 +3697,52 @@ class MemoryService:
         # own fallback if the index genuinely isn't there.
         self._created_at_index_ok = True
 
+    # Hot-path payload filters that deserve keyword/bool indexes (audit 27
+    # #14): every pool query carries a dream_tombstoned must_not, the shared/
+    # standard pools filter on visibility, and dual-scope merges filter on
+    # scope — all unindexed meant full payload scans on every search.
+    _FILTER_INDEX_FIELDS = (
+        ("metadata.dream_tombstoned", "bool"),
+        ("metadata.visibility", "keyword"),
+        ("metadata.scope", "keyword"),
+    )
+
+    def _ensure_filter_indexes(self) -> None:
+        """Best-effort: ensure payload indexes on the hot-path filter fields.
+
+        Same pattern as ``_ensure_created_at_index``: idempotent server-side,
+        attempted once per service instance, ``wait=False`` so index builds
+        never block the first read, and any failure degrades to Qdrant's
+        unindexed filtering rather than raising.
+        """
+        if getattr(self, "_filter_indexes_ok", False):
+            return
+        # Mark attempted FIRST — a flaky Qdrant must not re-pay this on
+        # every subsequent search.
+        self._filter_indexes_ok = True
+        try:
+            from qdrant_client.models import PayloadSchemaType
+
+            schema_by_name = {
+                "bool": PayloadSchemaType.BOOL,
+                "keyword": PayloadSchemaType.KEYWORD,
+            }
+            client = self._get_memory().vector_store.client
+            for field_name, schema_name in self._FILTER_INDEX_FIELDS:
+                try:
+                    client.create_payload_index(
+                        collection_name=settings.qdrant_collection,
+                        field_name=field_name,
+                        field_schema=schema_by_name[schema_name],
+                        wait=False,
+                    )
+                except Exception as e:
+                    logger.debug(
+                        f"payload index ensure failed for {field_name} (non-fatal): {e}"
+                    )
+        except Exception as e:
+            logger.debug(f"filter payload index ensure failed (non-fatal): {e}")
+
     def _timeline_filter(
         self,
         user_id: str,
@@ -3063,14 +3990,17 @@ class MemoryService:
         terms: list[str],
         project_id: str | None = None,
         limit: int = 20,
-    ) -> list[MemoryResponse]:
+    ) -> tuple[list[MemoryResponse], bool]:
         """Grep-style exact/keyword scan over caller-visible memories (C3).
 
-        Case-insensitive substring match: a memory matches when its content
-        contains ANY of ``terms``. This is the dialectic discipline for
-        enumeration/counting questions — embeddings under-recall exhaustive
-        "list every X" sets, so the ask path runs this exact pass *before*
-        semantic search and dedups the union.
+        Case-insensitive substring match. A single term must be present;
+        with multiple terms a memory must contain at least TWO of them
+        (i.e. both when only two are given) — ANY-term matching promoted
+        single-common-word noise as "exact" evidence (audit 27 #18). This
+        is the dialectic discipline for enumeration/counting questions —
+        embeddings under-recall exhaustive "list every X" sets, so the ask
+        path runs this exact pass *before* semantic search and dedups the
+        union.
 
         Visibility mirrors search's pool union (caller's own rows at any
         visibility + shared + standard-when-enabled; ``project_id`` adds the
@@ -3079,10 +4009,17 @@ class MemoryService:
         ``_TIMELINE_FALLBACK_PAGE`` up to ``_TIMELINE_FALLBACK_CAP`` points,
         stopping early once ``limit`` matches are found. Results carry no
         score (exact matches aren't ranked).
+
+        Returns ``(matches, scan_capped)`` — ``scan_capped`` is True when
+        the point cap terminated the scan with candidates left unscanned,
+        so callers must NOT present the matches as exhaustive. (Follow-up:
+        a Qdrant full-text index would make this scan complete and cheap.)
         """
-        lowered = [t.lower() for t in terms if t and t.strip()]
+        lowered = [t.strip().lower() for t in terms if t and t.strip()]
         if not lowered:
-            return []
+            return [], False
+        # ≥2 terms must match on multi-term queries (ALL when only 2).
+        required_matches = min(2, len(lowered))
         from qdrant_client.models import FieldCondition, Filter, MatchValue
 
         client = self._get_memory().vector_store.client
@@ -3139,7 +4076,7 @@ class MemoryService:
             )
             for pt in page or []:
                 content = ((getattr(pt, "payload", None) or {}).get("data") or "").lower()
-                if any(t in content for t in lowered):
+                if sum(1 for t in lowered if t in content) >= required_matches:
                     matches.append(self._point_to_response(pt))
                     if len(matches) >= limit:
                         break
@@ -3147,7 +4084,11 @@ class MemoryService:
             # `is None`, not truthiness — integer point-id offsets can be 0.
             if offset is None:
                 break
-        return matches
+        # Partial scan: the point cap fired while Qdrant still had more
+        # candidate points (`offset` non-None) — the matches are a sample,
+        # not the exhaustive lexical truth.
+        scan_capped = offset is not None and scanned >= self._TIMELINE_FALLBACK_CAP
+        return matches, scan_capped
 
     def list_memories(
         self,
@@ -3156,9 +4097,17 @@ class MemoryService:
         category: str | None = None,
         project_id: str | None = None,
         limit: int = 100,
+        include_tombstoned: bool = False,
     ) -> list[MemoryResponse]:
-        """List memories with optional filters."""
+        """List memories with optional filters.
+
+        Audit 27 #14: rows the dreaming sweep consolidated away
+        (``metadata.dream_tombstoned=true``) are excluded from listings by
+        default, matching every recall path. ``include_tombstoned=True`` is
+        the audit escape hatch — it returns the raw set, tombstones included.
+        """
         m = self._get_memory()
+        self._ensure_filter_indexes()
 
         # mem0 v2.0.2 ``get_all`` rejects top-level entity kwargs and
         # renamed ``limit`` -> ``top_k`` on its Qdrant wrapper. Same drift
@@ -3178,6 +4127,12 @@ class MemoryService:
         )
 
         memories = self._extract_memory_list(result)
+        if not include_tombstoned:
+            # mem0's filter dict can't express a must_not, so the tombstone
+            # exclusion happens here. Tombstones are rare (reversible dream
+            # consolidations), so under-filling `limit` slightly beats a
+            # second round trip.
+            memories = [mem for mem in memories if not _mem_is_tombstoned(mem)]
         return [self._mem_to_response(mem) for mem in memories]
 
     def list_projects(self, user_id: str) -> list[str]:
@@ -4419,47 +5374,103 @@ class MemoryService:
         memories = self._extract_memory_list(results)
         return [self._mem_to_response(mem) for mem in memories]
 
+    @staticmethod
+    def normalize_memory_content(text: str) -> str:
+        """Normalize memory content for cross-source duplicate detection."""
+        return (text or "").strip().lower()
+
+    @staticmethod
+    def find_duplicate_content(normalized: str, candidates) -> str | None:
+        """Return the first candidate that content-matches ``normalized``.
+
+        A match is exact equality or a substring in either direction — the
+        same rule ``_deduplicate_responses`` uses to collapse a Graphiti
+        edge against its Qdrant twin. Shared with the ask path (audit 27
+        #17) so both dedup passes agree on what "the same fact" means.
+        """
+        for other in candidates:
+            if normalized == other or normalized in other or other in normalized:
+                return other
+        return None
+
     def _deduplicate_responses(
         self,
         vector_responses: list[MemoryResponse],
         graph_responses: list[MemoryResponse],
+        limit: int | None = None,
     ) -> list[MemoryResponse]:
-        """Deduplicate and interleave vector and graph results.
+        """Fuse the vector and graph legs into one merit-ranked list.
 
-        Removes graph results whose content closely matches a vector result,
-        then interleaves the remaining results (vector-1, graph-1, vector-2, ...).
+        Graph is a FIRST-CLASS RANKED leg: with part-1 cosine scores on the
+        edges (stored ``fact_embedding`` × the query vector), both legs
+        carry scores in the SAME Gemini cosine space, so ranks are computed
+        on the merged score scale — NO quota and NO cap. Strong graph rows
+        take the majority of top-k when they earn it; weak ones sink below
+        every stronger vector hit. (Literal per-leg reciprocal-rank fusion
+        can't do either: a full vector leg mathematically pins graph at a
+        50/50 alternation regardless of magnitude, which both re-creates
+        the audit-27 #2 interleave defect for weak edges and forbids a
+        graph majority for strong ones.)
+
+        This replaces the interim #120 weave (graph appended after vector,
+        capped at ``max(1, limit // 4)``) which itself replaced the 1:1
+        positional interleave that let score=None relation strings evict
+        ranked vector hits. Unscored graph rows (no stored embedding) still
+        rank at the bottom — exactly the old append behavior.
+
+        Content-identity dedup is unchanged: a graph edge whose fact is an
+        exact/substring twin of a vector row is dropped (the vector row is
+        the richer record) — but the twin still credits its vector row with
+        an ``_rrf_fuse``-style reciprocal-rank corroboration bonus
+        ``1/(RRF_K + graph_rank + 1)``: leg agreement ranks up. Each row
+        keeps its NATIVE score; the fused value only orders the list.
+        Ties break deterministically: vector leg first, then id.
         """
-        seen_content: set[str] = set()
-        unique_graph: list[MemoryResponse] = []
+        # Graph leg ranked by its cosine scores (strongest first, unscored
+        # last, stable) — this rank drives both graph-vs-graph twin
+        # preference and the corroboration bonus.
+        graph_leg = sorted(
+            graph_responses,
+            key=lambda r: (r.score is None, -(r.score or 0.0)),
+        )
 
-        # Index vector content for fuzzy matching
+        # entries: {"row", "leg" (0=vector, 1=graph), "fused"}
+        entries: list[dict] = []
+        # normalized content -> entry index (insertion-ordered so substring
+        # twin resolution is deterministic: first matching row wins).
+        norm_to_idx: dict[str, int] = {}
+
         for vr in vector_responses:
-            seen_content.add(vr.memory.strip().lower())
+            norm_to_idx.setdefault(
+                self.normalize_memory_content(vr.memory), len(entries)
+            )
+            entries.append({"row": vr, "leg": 0, "fused": float(vr.score or 0.0)})
 
-        for gr in graph_responses:
-            normalized = gr.memory.strip().lower()
-            # Skip if exact or substring match with any vector result
-            is_duplicate = False
-            for vc in seen_content:
-                if normalized == vc or normalized in vc or vc in normalized:
-                    is_duplicate = True
-                    break
-            if not is_duplicate:
-                unique_graph.append(gr)
-                seen_content.add(normalized)
+        for rank, gr in enumerate(graph_leg):
+            normalized = self.normalize_memory_content(gr.memory)
+            twin_norm = self.find_duplicate_content(normalized, norm_to_idx.keys())
+            if twin_norm is not None:
+                # Content twin: drop the graph row, credit the survivor with
+                # this edge's reciprocal-rank weight (corroboration).
+                entries[norm_to_idx[twin_norm]]["fused"] += 1.0 / (
+                    RRF_K + rank + 1
+                )
+                continue
+            norm_to_idx.setdefault(normalized, len(entries))
+            entries.append({"row": gr, "leg": 1, "fused": float(gr.score or 0.0)})
 
-        # Interleave: vector-1, graph-1, vector-2, graph-2, ...
-        interleaved: list[MemoryResponse] = []
-        vi, gi = 0, 0
-        while vi < len(vector_responses) or gi < len(unique_graph):
-            if vi < len(vector_responses):
-                interleaved.append(vector_responses[vi])
-                vi += 1
-            if gi < len(unique_graph):
-                interleaved.append(unique_graph[gi])
-                gi += 1
-
-        return interleaved
+        # Unscored (score=None) rows sort strictly below scored rows even at
+        # a fused value of 0.0 — the id tie-break must never lift them.
+        entries.sort(
+            key=lambda e: (
+                e["row"].score is None and e["fused"] == 0.0,
+                -e["fused"],
+                e["leg"],
+                str(e["row"].id or ""),
+            )
+        )
+        fused = [e["row"] for e in entries]
+        return fused if limit is None else fused[:limit]
 
     def _expire_graph_edges_for_memory(self, mem: dict) -> None:
         """Soft-delete graph edges related to a memory by setting expired_at."""
@@ -4469,7 +5480,9 @@ class MemoryService:
         try:
             from graphiti_core.search.search_config_recipes import EDGE_HYBRID_SEARCH_RRF
 
-            config = EDGE_HYBRID_SEARCH_RRF
+            # Audit 27 #10: deep-copy — mutating the shared singleton here
+            # clamped every concurrent search's graph fan-out to 5.
+            config = EDGE_HYBRID_SEARCH_RRF.model_copy(deep=True)
             config.limit = 5
 
             metadata = mem.get("metadata", {}) or {}
