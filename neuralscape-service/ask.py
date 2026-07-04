@@ -264,7 +264,17 @@ _DISCIPLINES_FULL = """Disciplines (follow strictly):
 4. ABSTENTION: "I don't know" is a correct answer. If the evidence does not contain the
    answer, abstain — NEVER fabricate facts, dates, or memory ids.
 5. CITATIONS: cite supporting memory ids inline like [<id>]. Only ids from the EVIDENCE
-   list are valid citations."""
+   list are valid citations.
+6. PERSPECTIVE: memories distilled from dialogs may carry generic speaker labels
+   ("Speaker 1", "Speaker 2") or third-person phrasing ("the user", "the assistant")
+   that do not literally match the question's "I/my" or "you/your". These labels are
+   ingestion artifacts, not different people. Resolve perspective from content: when an
+   evidence row plainly answers the substance of the question, answer with it — a label
+   or pronoun mismatch alone is NEVER grounds to abstain or to deny knowing the fact.
+7. SPECIFICITY: when several rows state the same fact at different precision ("as a
+   toddler" vs "at age three"), answer with the MOST SPECIFIC row. Recency (discipline 2)
+   applies to genuine changes of fact — a vaguer restatement never supersedes a more
+   precise one."""
 
 _DISCIPLINES_BRIEF = """Rules: answer ONLY from the evidence; newer memories supersede older ones; if the
 evidence doesn't answer the question say you don't know (never fabricate); cite supporting
