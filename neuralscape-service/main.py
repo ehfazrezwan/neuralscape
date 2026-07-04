@@ -61,6 +61,8 @@ from schemas import (
     StoreMemoryResponse,
     TaskAcceptedResponse,
     TaskStatusResponse,
+    TimelineRequest,
+    TimelineResponse,
     normalize_visibility,
 )
 from task_manager import TaskManager
@@ -1385,6 +1387,45 @@ async def v1_batch_get_memories(req: GetMemoriesRequest, request: Request):
         logger.exception("v1 batch-get failed")
         raise HTTPException(status_code=500, detail="Failed to fetch memories") from e
     return GetMemoriesResponse(results=out["results"], missing=out["missing"])
+
+
+@v1_router.post("/timeline", response_model=TimelineResponse)
+async def v1_timeline(req: TimelineRequest, request: Request):
+    """Chronological window around an anchor memory (C2).
+
+    `anchor` is a memory id (UUID) or a search query (resolved to its best
+    vector hit). Returns ±`depth` caller-visible memories around the anchor
+    in created_at order as compact index rows, the anchor row marked with
+    `anchor: true`. Answers "what was happening around X?" — dream insights
+    and session-context memories interleave naturally. 404 when the anchor
+    can't be resolved (unknown id, unreadable id, or no search hit).
+    """
+    caller = _resolve_user_id(request, req.user_id)
+    try:
+        out = await asyncio.to_thread(
+            _service.timeline,
+            anchor=req.anchor,
+            user_id=caller,
+            depth=req.depth,
+            project_id=req.project_id,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("v1 timeline failed")
+        raise HTTPException(status_code=500, detail="Timeline failed") from e
+    if out is None:
+        raise HTTPException(
+            status_code=404, detail=f"Timeline anchor {req.anchor!r} could not be resolved"
+        )
+    anchor_id = out["anchor_id"]
+    rows = [
+        IndexRow(**index_row(m, anchor=(m.id == anchor_id)))
+        for m in out["memories"]
+    ]
+    return TimelineResponse(anchor_id=anchor_id, results=rows)
 
 
 @v1_router.post("/graph/search")

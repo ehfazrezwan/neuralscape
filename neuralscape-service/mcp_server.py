@@ -1,9 +1,10 @@
-"""MCP server exposing neuralscape memory operations as 17 tools.
+"""MCP server exposing neuralscape memory operations as 19 tools.
 
-Tools: recall_memories, remember, remember_conversation, ingest_document,
-ingest_text, get_project_context, search_knowledge_graph, list_memories,
-list_projects, delete_memories, list_processes, get_process, edit_memory,
-retag_memories, get_reasoning_chain, schedule_dream, get_card.
+Tools: recall_memories, get_memories, timeline, remember,
+remember_conversation, ingest_document, ingest_text, get_project_context,
+search_knowledge_graph, list_memories, list_projects, delete_memories,
+list_processes, get_process, edit_memory, retag_memories,
+get_reasoning_chain, schedule_dream, get_card.
 
 Supports both stdio transport (local Claude Code) and Streamable HTTP
 transport (remote agent access via /mcp/ endpoint on port 8199).
@@ -164,6 +165,44 @@ async def list_tools() -> list[Tool]:
                     },
                 },
                 "required": ["ids"],
+            },
+        ),
+        Tool(
+            name="timeline",
+            description=(
+                "Chronological window around an anchor memory: what was happening before and after it. "
+                "The anchor is a memory id (UUID) or a natural-language query (resolved to the best "
+                "search hit). Returns up to ±depth caller-visible memories around the anchor in "
+                "created_at order as compact index rows ({id, title, category, glyph, age, tokens}), "
+                "the anchor marked with anchor:true. Dream insights and session-context memories "
+                "interleave naturally. Use it for \"what was happening around X?\", standups, and "
+                "weekly digests; follow up with get_memories(ids=[...]) for the rows worth reading "
+                "in full."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "anchor": {
+                        "type": "string",
+                        "description": "Memory ID (UUID) or a search query to anchor the window on",
+                    },
+                    "depth": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "default": 10,
+                        "description": "Memories to include on each side of the anchor (default 10)",
+                    },
+                    "project_id": {
+                        "type": "string",
+                        "description": "Optional project scope (includes that project's + global memories)",
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "Caller user ID (optional under token auth)",
+                    },
+                },
+                "required": ["anchor"],
             },
         ),
         Tool(
@@ -878,6 +917,38 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                     "missing": out["missing"],
                 },
                 default=str))]
+
+        elif name == "timeline":
+            from index_format import index_row
+
+            anchor = arguments.get("anchor")
+            if not anchor or not isinstance(anchor, str):
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": "anchor must be a memory id (UUID) or a search query"}))]
+            try:
+                depth = int(arguments.get("depth", 10))
+            except (TypeError, ValueError):
+                depth = 10
+            try:
+                out = await asyncio.to_thread(
+                    _service.timeline,
+                    anchor=anchor,
+                    user_id=user_id,
+                    depth=depth,
+                    project_id=arguments.get("project_id"),
+                )
+            except ValueError as e:
+                return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+            if out is None:
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": f"Timeline anchor {anchor!r} could not be resolved "
+                              "(unknown id, unreadable id, or no search hit)"}))]
+            anchor_id = out["anchor_id"]
+            rows = [index_row(mem, anchor=(mem.id == anchor_id)) for mem in out["memories"]]
+            return [TextContent(type="text", text=json.dumps(
+                {"anchor_id": anchor_id, "results": rows,
+                 "hint": "Rows are oldest→newest. Call get_memories(ids=[...]) for full payloads."},
+                default=str, ensure_ascii=False))]
 
         elif name == "remember":
             # Determine scope from category

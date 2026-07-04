@@ -315,9 +315,26 @@ from schemas import (
 
 logger = logging.getLogger(__name__)
 
-# Retrieval economics (C1) bound: max ids per batch-get call.
-# Shared by REST + MCP boundaries.
+# Retrieval economics (C1/C2) bounds: max ids per batch-get and max window
+# half-width for the timeline tool. Shared by REST + MCP boundaries.
 GET_MEMORIES_MAX_IDS = 50
+TIMELINE_MAX_DEPTH = 50
+
+
+def _created_at_key(value) -> datetime:
+    """Chronological sort key for a created_at payload value.
+
+    Parses ISO-8601 (any offset — mem0-written rows may carry non-UTC
+    offsets, where lexicographic string comparison missorts). Unparseable /
+    missing values sort first.
+    """
+    if value:
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    return datetime.min.replace(tzinfo=timezone.utc)
 
 # Structured audit trail for authoritative-context serving (standards +
 # processes). Rendered as JSON in prod via logging_config; a plain stdlib
@@ -2624,7 +2641,7 @@ class MemoryService:
         return root
 
     # ──────────────────────────────────────────────
-    # Retrieval economics (C1 batch get)
+    # Retrieval economics (C1 batch get + C2 timeline)
     # ──────────────────────────────────────────────
 
     @staticmethod
@@ -2725,6 +2742,269 @@ class MemoryService:
                 continue
             results.append(self._point_to_response(point))
         return {"results": results, "missing": missing}
+
+    def _ensure_created_at_index(self) -> None:
+        """Best-effort: ensure a DATETIME payload index on ``created_at``.
+
+        Qdrant's ``order_by`` scroll requires a range-capable payload index.
+        Creation is idempotent server-side; attempted once per process. On
+        failure the timeline falls back to a Python-side sort, so this never
+        raises.
+        """
+        if getattr(self, "_created_at_index_ok", False):
+            return
+        try:
+            from qdrant_client.models import PayloadSchemaType
+
+            self._get_memory().vector_store.client.create_payload_index(
+                collection_name=settings.qdrant_collection,
+                field_name="created_at",
+                field_schema=PayloadSchemaType.DATETIME,
+                wait=True,
+            )
+        except Exception as e:
+            logger.debug(f"created_at payload index ensure failed (non-fatal): {e}")
+        # Attempt once per process either way — the order_by scroll has its
+        # own fallback if the index genuinely isn't there.
+        self._created_at_index_ok = True
+
+    def _timeline_filter(
+        self,
+        user_id: str,
+        project_id: str | None,
+        exclude_id: str | None,
+        boundary: datetime,
+        direction: str,
+    ):
+        """Build the Qdrant filter for one side of a timeline window.
+
+        Visibility mirrors search's pool union: caller's own rows (any
+        visibility) + shared + standard (when enabled). Other users' private
+        and legacy no-visibility rows never match. Tombstoned (dream-
+        consolidated) rows are excluded. ``direction`` selects the created_at
+        range: strictly-before (``lt``) or at-or-after (``gte``) the boundary
+        — ties land on the *after* side, and the anchor itself is excluded
+        by id so it never duplicates.
+        """
+        from qdrant_client.models import (
+            DatetimeRange,
+            FieldCondition,
+            Filter,
+            HasIdCondition,
+            MatchValue,
+        )
+
+        visibility_should = [
+            FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+            FieldCondition(
+                key="metadata.visibility",
+                match=MatchValue(value=MemoryVisibility.SHARED.value),
+            ),
+        ]
+        if settings.standards_enabled:
+            visibility_should.append(
+                FieldCondition(
+                    key="metadata.visibility",
+                    match=MatchValue(value=MemoryVisibility.STANDARD.value),
+                )
+            )
+        must: list = [Filter(should=visibility_should)]
+        if project_id:
+            # Dual-scope, like search(): this project's rows + global rows.
+            must.append(
+                Filter(
+                    should=[
+                        FieldCondition(
+                            key="metadata.project_id",
+                            match=MatchValue(value=project_id),
+                        ),
+                        FieldCondition(
+                            key="metadata.scope", match=MatchValue(value="global")
+                        ),
+                    ]
+                )
+            )
+        if direction == "before":
+            must.append(
+                FieldCondition(key="created_at", range=DatetimeRange(lt=boundary))
+            )
+        else:
+            must.append(
+                FieldCondition(key="created_at", range=DatetimeRange(gte=boundary))
+            )
+        must_not: list = [
+            FieldCondition(
+                key="metadata.dream_tombstoned", match=MatchValue(value=True)
+            )
+        ]
+        if exclude_id:
+            must_not.append(HasIdCondition(has_id=[exclude_id]))
+        return Filter(must=must, must_not=must_not)
+
+    def _timeline_window(
+        self,
+        user_id: str,
+        project_id: str | None,
+        exclude_id: str | None,
+        boundary: datetime,
+        direction: str,
+        limit: int,
+    ) -> list[MemoryResponse]:
+        """One side of the timeline: the ``limit`` memories nearest the boundary.
+
+        Prefers a single bounded ``order_by`` scroll (qdrant-client ≥1.13 and
+        a DATETIME index on created_at — ensured lazily). If the server
+        rejects order_by (e.g. index creation raced or is unsupported), falls
+        back to scrolling the filtered set (bounded pages) and sorting in
+        Python. Returned rows are always sorted ascending by created_at.
+        """
+        from qdrant_client.models import Direction, OrderBy
+
+        client = self._get_memory().vector_store.client
+        flt = self._timeline_filter(user_id, project_id, exclude_id, boundary, direction)
+        order = OrderBy(
+            key="created_at",
+            direction=Direction.DESC if direction == "before" else Direction.ASC,
+        )
+
+        points: list = []
+        self._ensure_created_at_index()
+        try:
+            points, _ = client.scroll(
+                collection_name=settings.qdrant_collection,
+                scroll_filter=flt,
+                limit=limit,
+                order_by=order,
+                with_payload=True,
+                with_vectors=False,
+            )
+            points = list(points or [])
+        except Exception as e:
+            logger.warning(
+                f"Timeline order_by scroll failed ({e}) — falling back to Python sort"
+            )
+            points = self._scroll_all_sorted(client, flt, direction, limit)
+
+        responses = [self._point_to_response(p) for p in points]
+        responses.sort(key=lambda r: _created_at_key(r.created_at))
+        return responses
+
+    # Fallback page size / total cap when order_by isn't available. The range
+    # filter already bounds the set to one side of the anchor; the cap only
+    # guards a pathological pool from unbounded scrolling.
+    _TIMELINE_FALLBACK_PAGE = 500
+    _TIMELINE_FALLBACK_CAP = 5000
+
+    def _scroll_all_sorted(self, client, flt, direction: str, limit: int) -> list:
+        """order_by-less fallback: scroll the filtered set and sort in Python."""
+        collected: list = []
+        offset = None
+        while len(collected) < self._TIMELINE_FALLBACK_CAP:
+            page, offset = client.scroll(
+                collection_name=settings.qdrant_collection,
+                scroll_filter=flt,
+                limit=self._TIMELINE_FALLBACK_PAGE,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            collected.extend(page or [])
+            if not offset:
+                break
+
+        def _created(p):
+            return _created_at_key((getattr(p, "payload", None) or {}).get("created_at"))
+
+        # Nearest-to-boundary first: before → newest first; after → oldest first.
+        collected.sort(key=_created, reverse=(direction == "before"))
+        return collected[:limit]
+
+    def timeline(
+        self,
+        anchor: str,
+        user_id: str,
+        depth: int = 10,
+        project_id: str | None = None,
+    ) -> dict | None:
+        """Chronological window of ±``depth`` memories around an anchor (C2).
+
+        ``anchor`` is a memory id (UUID) or a natural-language query:
+
+        - **id**: fetched directly, with the same per-id visibility rule as
+          ``get_memories_by_ids`` — an unreadable or unknown id resolves to
+          None (callers map that to 404; no existence oracle).
+        - **query**: resolved to the best *vector* search hit (graph edges
+          carry no created_at, so they can't anchor a timeline). Search
+          already enforces pool visibility and tombstone exclusion.
+
+        The window unions the caller-visible pools (own + shared + standard
+        when enabled), excludes dream-tombstoned rows, and — when
+        ``project_id`` is given — mirrors search's project+global dual scope.
+        Dream insights and session-context rows interleave naturally: they
+        are just memories with created_at.
+
+        Returns ``{"anchor_id": str, "memories": [MemoryResponse...]}`` in
+        ascending created_at order (anchor included), or None when the
+        anchor can't be resolved.
+        """
+        anchor = (anchor or "").strip()
+        if not anchor:
+            raise ValueError("anchor must be a memory id or a search query")
+        depth = min(max(int(depth), 1), TIMELINE_MAX_DEPTH)
+
+        # ── Resolve the anchor ──
+        anchor_mem: MemoryResponse | None = None
+        looks_like_id = False
+        try:
+            uuid.UUID(anchor)
+            looks_like_id = True
+        except (ValueError, AttributeError, TypeError):
+            pass
+
+        if looks_like_id:
+            got = self.get_memories_by_ids([anchor], user_id)
+            anchor_mem = got["results"][0] if got["results"] else None
+        else:
+            hits = self.search(
+                query=anchor, user_id=user_id, project_id=project_id, limit=5
+            )
+            anchor_mem = next(
+                (
+                    h
+                    for h in hits
+                    if h.source == "vector" and h.id and h.created_at
+                ),
+                None,
+            )
+        if anchor_mem is None:
+            return None
+
+        # ── Parse the anchor timestamp ──
+        boundary: datetime | None = None
+        if anchor_mem.created_at:
+            try:
+                boundary = datetime.fromisoformat(
+                    str(anchor_mem.created_at).replace("Z", "+00:00")
+                )
+                if boundary.tzinfo is None:
+                    boundary = boundary.replace(tzinfo=timezone.utc)
+            except ValueError:
+                boundary = None
+        if boundary is None:
+            # Un-windowable anchor (no/broken created_at) — degrade to the
+            # anchor alone rather than failing the read.
+            return {"anchor_id": anchor_mem.id, "memories": [anchor_mem]}
+
+        before = self._timeline_window(
+            user_id, project_id, anchor_mem.id, boundary, "before", depth
+        )
+        after = self._timeline_window(
+            user_id, project_id, anchor_mem.id, boundary, "after", depth
+        )
+        return {
+            "anchor_id": anchor_mem.id,
+            "memories": [*before, anchor_mem, *after],
+        }
 
     def list_memories(
         self,

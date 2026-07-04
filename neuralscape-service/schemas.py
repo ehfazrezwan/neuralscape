@@ -884,6 +884,20 @@ class GetMemoriesRequest(BaseModel):
     user_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
 
 
+class TimelineRequest(BaseModel):
+    """Chronological window around an anchor memory (retrieval economics C2).
+
+    ``anchor`` is either a memory id (UUID) or a natural-language query — a
+    query resolves to its best vector search hit. The response is ±``depth``
+    memories around the anchor in created_at order, each rendered as a compact
+    index row, with the anchor row marked.
+    """
+    anchor: str = Field(min_length=1, max_length=2000, description="Memory ID (UUID) or search query")
+    depth: int = Field(default=10, ge=1, le=50, description="Memories to include on each side of the anchor")
+    project_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+    user_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
+
+
 class BulkDeleteRequest(BaseModel):
     """Bulk delete memories with filters."""
     user_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
@@ -1000,6 +1014,13 @@ class GetMemoriesResponse(BaseModel):
     status: str = "ok"
     results: list[MemoryResponse] = Field(default_factory=list)
     missing: list[str] = Field(default_factory=list)
+
+
+class TimelineResponse(BaseModel):
+    """Chronological window around an anchor memory (C2), oldest first."""
+    status: str = "ok"
+    anchor_id: str
+    results: list[IndexRow] = Field(default_factory=list)
 
 
 class ContextResponse(BaseModel):
