@@ -208,6 +208,7 @@ async def _dream_pool(
             max_memories=settings.max_memories_per_pool,
             strength_half_life_days=settings.strength_half_life_days,
             prune_strength_threshold=settings.prune_strength_threshold,
+            dynamics_enabled=settings.dynamics_enabled,
         )
         report.staged = len(batch.memories)
 
