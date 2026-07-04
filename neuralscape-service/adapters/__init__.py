@@ -34,6 +34,19 @@ except Exception:  # noqa: BLE001 — adapter registration is best-effort
         "trading_strategy adapter failed to register — continuing without it"
     )
 
+# The code_graph adapter additionally gates on the OPTIONAL graphifyy library
+# (the `code-graph` extra): its register() logs a clear line and returns False
+# when the extra isn't installed, so this degrades to "adapter unavailable"
+# rather than an exception — same 422-on-request behavior as any unknown name.
+try:
+    from adapters import code_graph as _code_graph  # noqa: E402
+
+    _code_graph.register()
+except Exception:  # noqa: BLE001 — adapter registration is best-effort
+    _logging.getLogger(__name__).exception(
+        "code_graph adapter failed to register — continuing without it"
+    )
+
 __all__ = [
     "ADAPTER_REGISTRY",
     "DEFAULT_ADAPTER",
