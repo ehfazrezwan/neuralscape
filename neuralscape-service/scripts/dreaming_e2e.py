@@ -277,16 +277,21 @@ async def main() -> int:
     check("second sweep gated", r2 is not None and r2.status in ("gated", "skipped_unchanged"),
           f"{r2.status}: {r2.reason}" if r2 else "no pool report")
 
-    # cleanup — the essential key MUST go: Home.md's story scans every
-    # dreaming:essential:* key, so a leftover would leak seed lines into
-    # the next real vault regeneration on this Redis.
+    # cleanup — the essential key MUST go even when the Qdrant delete
+    # fails: Home.md's story scans every dreaming:essential:* key, so a
+    # leftover would leak seed lines into the next real vault
+    # regeneration on this Redis.
     try:
-        service._memory.vector_store.client.delete_collection(settings.qdrant_collection)
         for k in r.scan_iter(f"dreaming:essential:{POOL}*"):
             r.delete(k)
-        print(f"\ncleaned up collection {settings.qdrant_collection} + essential keys")
+        print(f"\ncleaned up essential keys for {POOL}")
     except Exception as exc:
-        print(f"\ncleanup warning: {exc}")
+        print(f"\ncleanup warning (essential keys): {exc}")
+    try:
+        service._memory.vector_store.client.delete_collection(settings.qdrant_collection)
+        print(f"cleaned up collection {settings.qdrant_collection}")
+    except Exception as exc:
+        print(f"cleanup warning (collection): {exc}")
 
     failed = [c for c in CHECKS if not c[1]]
     print(f"\n{'='*60}\nE2E: {len(CHECKS) - len(failed)}/{len(CHECKS)} checks passed")

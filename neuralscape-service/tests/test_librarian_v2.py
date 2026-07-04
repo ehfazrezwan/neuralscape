@@ -443,6 +443,44 @@ async def test_update_vault_idempotent_skip_survives_v2(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_update_vault_rerenders_on_content_only_change(tmp_path):
+    """Same id set, rewritten content (e.g. same-sweep MERGE/REWRITE
+    reconciliation) → the fingerprint forces a re-render."""
+    calls = {"merge": 0}
+
+    async def llm(prompt):
+        if "librarian of a personal knowledge vault" in prompt:
+            return json.dumps({"topics": [
+                {"title": "TURN & ICE Connectivity", "summary": "s", "memory_ids": ["a", "b"]},
+            ]})
+        calls["merge"] += 1
+        return _structured_merge()
+
+    kwargs = dict(vault=tmp_path, operator_user_id="e", dry_run=False)
+    await lib.update_vault(_batch([dict(m) for m in MEMS]), llm, **kwargs)
+    assert calls["merge"] == 1
+
+    rewritten = [dict(m) for m in MEMS]
+    rewritten[0]["content"] = "As of 2026-07-04, TURN DNS is fixed via Cloudflare"
+    out = await lib.update_vault(_batch(rewritten), llm, **kwargs)
+    assert out["pages_written"] == 1                    # not skipped
+    assert calls["merge"] == 2
+
+    # and a third pass with identical content skips again
+    out3 = await lib.update_vault(_batch(rewritten), llm, **kwargs)
+    assert out3["pages_skipped"] == 1
+    assert calls["merge"] == 2
+
+
+def test_content_fingerprint_order_independent_and_content_sensitive():
+    a = [{"memory_id": "1", "content": "x"}, {"memory_id": "2", "content": "y"}]
+    b = list(reversed([dict(m) for m in a]))
+    assert lib._content_fingerprint(a) == lib._content_fingerprint(b)
+    b[0]["content"] = "changed"
+    assert lib._content_fingerprint(a) != lib._content_fingerprint(b)
+
+
+@pytest.mark.asyncio
 async def test_update_vault_nonconforming_page_restructured_on_change(tmp_path):
     """A pre-skeleton page gets rebuilt into the skeleton when its ids change."""
     proj = tmp_path / "Projects" / "scope"

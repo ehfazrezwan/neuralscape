@@ -42,6 +42,7 @@ Design rules:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -223,6 +224,23 @@ def _one_line(text: str, limit: int = 180) -> str:
     return t if len(t) <= limit else t[: limit - 1].rstrip() + "…"
 
 
+def _content_fingerprint(memories: list[dict]) -> str:
+    """Order-independent digest of a topic's (id, content) pairs.
+
+    The idempotent skip compares this alongside the id set: a memory
+    rewritten in place (same id, new text — e.g. by this sweep's own
+    REWRITE/MERGE reconciliation) must re-render its page even though the
+    ``source_memory_ids`` set is unchanged.
+    """
+    digest = hashlib.sha256()
+    for mem in sorted(memories, key=lambda m: m.get("memory_id") or ""):
+        digest.update((mem.get("memory_id") or "").encode())
+        digest.update(b"\x00")
+        digest.update((mem.get("content") or "").strip().encode())
+        digest.update(b"\x01")
+    return digest.hexdigest()[:16]
+
+
 def _wikilink(title: str) -> str:
     """[[Page]] when the title already is its page name, else [[Page|Title]]."""
     page = _slug_title(title)
@@ -358,6 +376,7 @@ def render_topic_page(
     sections: dict[str, str] | None = None,
     body: str = "",
     known_pages=(),
+    content_hash: str = "",
     now: datetime | None = None,
 ) -> str:
     """Render one topic page.
@@ -392,6 +411,7 @@ def render_topic_page(
         f"summary: {summary}",
         f"pool: {pool}",
         f"source_memory_ids: [{', '.join(memory_ids)}]",
+        *( [f"content_hash: {content_hash}"] if content_hash else [] ),
         f"last_dreamt: {ts}",
         f"version: {version}",
         "---",
@@ -473,11 +493,17 @@ async def update_vault(
         existing = path.read_text(encoding="utf-8") if path.exists() else ""
         fm, existing_body = split_page(existing)
 
-        if _parse_id_list(fm.get("source_memory_ids", "")) == set(ids):
+        mems = [known[i] for i in ids]
+        fingerprint = _content_fingerprint(mems)
+        # Idempotent skip: same id set AND same contents (pages predating
+        # the fingerprint match on ids alone — they gain the hash on their
+        # next id-set change).
+        if _parse_id_list(fm.get("source_memory_ids", "")) == set(ids) and fm.get(
+            "content_hash", fingerprint
+        ) == fingerprint:
             out["pages_skipped"] += 1
             continue
 
-        mems = [known[i] for i in ids]
         siblings = [s for s in sibling_titles if s != page_name]
         if hub_name:
             siblings.append(hub_name)
@@ -508,6 +534,7 @@ async def update_vault(
             hub_link=hub_name,
             version=int(fm.get("version") or 0) + 1,
             known_pages=siblings,
+            content_hash=fingerprint,
         )
         if not dry_run:
             _atomic_write(path, rendered)
