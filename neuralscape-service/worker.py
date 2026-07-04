@@ -35,10 +35,14 @@ async def _note_session_messages(
     """E3: buffer a conversation write's messages for its session and enqueue
     summary-slot refreshes when the message count crosses a threshold.
 
-    Runs on the fast queue alongside the write that triggered it. The
-    refresh job id is deterministic per (session, slot, threshold bucket)
-    so a burst of writes crossing the same threshold coalesces onto one
-    job. Best-effort — session bookkeeping never fails a store.
+    The trigger runs inline with the write, but the refresh job itself is
+    enqueued onto the GRAPH queue (audit 27 #24): a summary refresh is a
+    multi-second Gemini call with no latency SLO, and running it on the fast
+    queue let bursts of summaries compete with latency-sensitive writes for
+    the 10 fast-worker slots. The refresh job id is deterministic per
+    (session, slot, threshold bucket) so a burst of writes crossing the same
+    threshold coalesces onto one job. Best-effort — session bookkeeping never
+    fails a store.
     """
     if not session_id or not settings.session_summary_enabled:
         return
@@ -56,6 +60,7 @@ async def _note_session_messages(
                 session_id,
                 slot,
                 _job_id=f"sess-{ss._safe(user_id)}-{ss._safe(session_id)}-{slot}-{bucket}",
+                _queue_name=settings.graph_queue_name,
             )
     except Exception:  # noqa: BLE001 — summarization is best-effort
         logger.warning("session summary trigger failed (non-fatal)", exc_info=True)
@@ -64,7 +69,7 @@ async def _note_session_messages(
 async def process_session_summary(
     ctx: dict, user_id: str, session_id: str, slot: str
 ) -> dict:
-    """Background task (fast queue): refresh one session summary slot.
+    """Background task (GRAPH queue — audit 27 #24): refresh one session summary slot.
 
     Recursive compression — prior slot text + only the messages since that
     slot's last refresh. The slot is REPLACED in Redis (TTL'd); it is never
@@ -92,13 +97,17 @@ async def process_memory_store(
     # Offload the synchronous, network-bound work (LLM extraction + embedding +
     # Qdrant insert) to a thread so it doesn't block the ARQ event loop and
     # serialize other concurrent jobs. (process_memory_raw_batch already does this.)
-    memories = await asyncio.to_thread(
+    # return_stats (audit 27 #22): long conversations extract in windows, and a
+    # partially-failed extraction (some windows down, others stored) must be
+    # visible in the task result rather than masquerading as a full success.
+    memories, extraction_stats = await asyncio.to_thread(
         service.extract_and_store,
         messages=messages,
         user_id=user_id,
         project_id=project_id,
         agent_id=agent_id,
         run_id=run_id,
+        return_stats=True,
     )
 
     # Emit memory_stored events so extensions (e.g. conversation-compiler) can write to vault
@@ -122,7 +131,17 @@ async def process_memory_store(
         # Rebuild category index once after all vault writes (not per-fact)
         _rebuild_category_index(registry)
 
-    return {"memories": [m.model_dump(exclude_none=True) for m in memories]}
+    result: dict = {"memories": [m.model_dump(exclude_none=True) for m in memories]}
+    if extraction_stats.get("windows_failed"):
+        # Partial extraction: some windows' LLM calls failed but the rest
+        # were stored. Total failure (ALL windows) raises inside
+        # extract_and_store and fails the job — this branch is honest
+        # partial-success reporting for pollers of the task status.
+        result["partial_extraction"] = True
+        result["windows_total"] = extraction_stats.get("windows_total")
+        result["windows_failed"] = extraction_stats.get("windows_failed")
+        result["window_errors"] = extraction_stats.get("window_errors")
+    return result
 
 
 async def process_memory_raw(
@@ -1261,7 +1280,9 @@ class WorkerSettings:
         process_memory_retag,
         process_conversation_flush,
         process_conversation_compile,
-        process_session_summary,
+        # process_session_summary lives on GraphWorkerSettings (audit 27 #24):
+        # summary refreshes are multi-second Gemini calls with no latency SLO
+        # and must not compete for the 10 fast slots here.
     ]
     cron_jobs = [
         cron(
@@ -1306,6 +1327,9 @@ class GraphWorkerSettings:
     functions = [
         process_graph_enrichment,
         run_dream_sweep,
+        # Session summary refreshes (audit 27 #24): Gemini-bound, no latency
+        # SLO — enqueued by _note_session_messages onto the graph queue.
+        process_session_summary,
     ]
     cron_jobs = [
         cron(
