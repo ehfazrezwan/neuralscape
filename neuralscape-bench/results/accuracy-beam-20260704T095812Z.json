@@ -1,8 +1,8 @@
 {
   "suite": "beam",
   "display": "BEAM",
-  "timestamp": "2026-07-04T09:00:32.830276+00:00",
-  "ns_commit": "124d45f",
+  "timestamp": "2026-07-04T09:58:12.504099+00:00",
+  "ns_commit": "a0c1de7",
   "config": {
     "target": "http://localhost:8398",
     "k": 10,
@@ -112,11 +112,6 @@
       "n": 40,
       "correct": 36,
       "explicit_abstain_flag": 34
-    },
-    "retrieval_recall_at_10": {
-      "n": 400,
-      "hits": 0,
-      "recall": 0.0
     }
   },
   "published_comparison": [
