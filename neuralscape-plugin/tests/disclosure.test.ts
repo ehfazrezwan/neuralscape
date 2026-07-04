@@ -195,9 +195,20 @@ describe("renderIndexTable", () => {
     );
     const r = renderIndexTable(many, { budgetTokens: 200, now: NOW });
     expect(r.included).toBeLessThan(100);
-    expect(r.servedTokens).toBeLessThanOrEqual(200 + 40); // header line slack
+    expect(r.servedTokens).toBeLessThanOrEqual(200 + 40); // omission-line slack
     expect(r.text).toContain("more not shown");
     expect(r.text).toContain("index_only=true");
+  });
+
+  it("counts every rendered line — including the omission line — in servedTokens", () => {
+    const many = Array.from({ length: 100 }, (_, i) =>
+      toIndexEntry(mem({ id: `id-${i}`, created_at: isoAt(0, 9, i % 60) })),
+    );
+    const r = renderIndexTable(many, { budgetTokens: 200, now: NOW });
+    const perLineTokens = r.text
+      .split("\n")
+      .reduce((s, l) => s + Math.max(1, Math.ceil(l.length / 4)), 0);
+    expect(r.servedTokens).toBe(perLineTokens);
   });
 
   it("always includes at least one row even under a tiny budget", () => {

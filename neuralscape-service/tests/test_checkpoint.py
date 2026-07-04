@@ -139,7 +139,7 @@ class TestSessionNote:
         assert SessionNote(learned="x").learned == "x"
 
     def test_investigated_field_renders_in_narrative_order(self):
-        # D2: the plugin's Stop summary sends all five structured fields.
+        # D2: the plugin's SessionEnd summary hook sends all five structured fields.
         note = SessionNote(investigated="Read utils.ts and the hook manifest")
         assert note.investigated
         text = render_session_note({

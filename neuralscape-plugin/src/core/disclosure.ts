@@ -193,9 +193,11 @@ export function renderIndexTable(
 
   const omitted = sorted.length - included;
   if (omitted > 0) {
-    lines.push(
-      `… ${omitted} more not shown — recall_memories(query=…, index_only=true) to browse the rest.`,
-    );
+    const omissionLine = `… ${omitted} more not shown — recall_memories(query=…, index_only=true) to browse the rest.`;
+    lines.push(omissionLine);
+    // The omission line is injected too — count it, or the savings header
+    // would undercount the served cost whenever rows are clipped.
+    served += estimateTokens(omissionLine);
   }
 
   return {
@@ -230,7 +232,7 @@ export function renderEscalationFooter(codeGraphAvailable: boolean): string {
     "",
     "The table above is an index, not the memories themselves. Escalate only when needed:",
     "",
-    `1. **Scan** the rows — title + glyph + age is usually enough to decide relevance.`,
+    `1. **Scan** the rows — title + glyph + recency (day heading + time) is usually enough to decide relevance.`,
     `2. **Search** for more: \`${MCP}recall_memories\` with \`index_only: true\` returns the same compact rows for any query.`,
     `3. **Expand** the few that matter: \`${MCP}get_memories\` with \`ids: [...]\` (the \`#id\` values above; batch up to 50).`,
     `4. **History** around a moment: \`${MCP}timeline\` with \`anchor\` = a memory id or query.`,
