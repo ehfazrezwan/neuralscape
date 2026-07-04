@@ -229,25 +229,32 @@ class TestIndexRow:
 
 
 class TestWriteTimeStamping:
+    # E2: token_estimate is stamped via savings_meter.stamp_tokens — a REAL
+    # tiktoken count when the meter is enabled (default), the len/4 heuristic
+    # when it's off. Field name and stamping site are unchanged.
     def test_store_raw_stamps_title_and_estimate(self, service):
+        from savings_meter import stamp_tokens
+
         content = "User prefers dark mode in every editor they use daily."
         [resp] = service.store_raw(
             content=content, user_id="u1", category="preference", add_to_graph=False
         )
         assert resp.title == distill_title(content)
-        assert resp.token_estimate == estimate_tokens(content)
+        assert resp.token_estimate == stamp_tokens(content)
 
         payload = service._memory.vector_store.insert.call_args.kwargs["payloads"][0]
         assert payload["metadata"]["title"] == distill_title(content)
-        assert payload["metadata"]["token_estimate"] == estimate_tokens(content)
+        assert payload["metadata"]["token_estimate"] == stamp_tokens(content)
 
     def test_batch_store_facts_stamps_title_and_estimate(self, service):
+        from savings_meter import stamp_tokens
+
         service._memory.embedding_model.embed_batch.return_value = [[0.1] * 768]
         [resp] = service._batch_store_facts(
             [("preference", "Terse commit messages are preferred here.")], user_id="u1"
         )
         assert resp.title == "Terse commit messages are preferred here"
-        assert resp.token_estimate == estimate_tokens("Terse commit messages are preferred here.")
+        assert resp.token_estimate == stamp_tokens("Terse commit messages are preferred here.")
         payload = service._memory.vector_store.insert.call_args.kwargs["payloads"][0]
         assert payload["metadata"]["title"] == resp.title
 
