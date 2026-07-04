@@ -164,6 +164,34 @@ def _rrf_fuse(dense_hits: list, lexical_hits: list, limit: int) -> list[dict]:
     return ordered[:limit]
 
 
+def _unit_cosine(a: list, b: list) -> float | None:
+    """Cosine similarity between two vectors, clamped to [0, 1].
+
+    Used to score graph edges with their STORED ``fact_embedding`` against
+    the query vector ``search()`` already computed — pure local arithmetic,
+    no embed/API calls. Both vectors live in the same Gemini embedding
+    space as the Qdrant rows, so the result is directly comparable to the
+    vector leg's cosine scores. Returns ``None`` on any malformed input
+    (empty, length mismatch, zero norm, non-numeric) — an unscorable edge
+    must degrade to the legacy unscored path, never break the read.
+    """
+    try:
+        if not a or not b or len(a) != len(b):
+            return None
+        dot = 0.0
+        norm_a = 0.0
+        norm_b = 0.0
+        for x, y in zip(a, b):
+            dot += x * y
+            norm_a += x * x
+            norm_b += y * y
+        if norm_a <= 0.0 or norm_b <= 0.0:
+            return None
+        return max(0.0, min(1.0, dot / math.sqrt(norm_a * norm_b)))
+    except (TypeError, ValueError):
+        return None
+
+
 def _dense_score_floor(dense_hits: list) -> float | None:
     """Weakest cosine score in a pool's dense leg (imputed score for
     lexical-only hits: presence via a strong keyword match is worth at
@@ -2300,32 +2328,54 @@ class MemoryService:
         # have to retroactively filter, which is unreliable for graph
         # rows whose enriched visibility ends up as None.
         graph_responses: list[MemoryResponse] = []
+        # Stored fact_embeddings, index-aligned with graph_responses — reused
+        # below for the zero-embed twin decoration (query_batch_points with
+        # these vectors instead of re-embedding edge facts).
+        graph_edge_embeddings: list[list | None] = []
         if graph_future is not None:
             try:
                 graph_results = graph_future.result(
                     timeout=_GRAPH_SEARCH_JOIN_TIMEOUT_S
                 )
                 for edge in graph_results.get("edges", []):
+                    # Graph as a ranked leg: score each edge with its STORED
+                    # fact_embedding (piggybacked on the enrichment Cypher in
+                    # _enrich_graph_results) against the query vector computed
+                    # once above — local cosine in the same Gemini space as
+                    # the vector rows, clamped to [0, 1]. Edges without a
+                    # stored embedding stay unscored (rank last on merit).
+                    emb = edge.get("fact_embedding") or None
                     graph_responses.append(
                         MemoryResponse(
                             id=edge.get("uuid", ""),
                             memory=edge.get("fact", edge.get("name", "")),
                             source="graph",
+                            score=(
+                                _unit_cosine(query_embedding, emb)
+                                if emb is not None
+                                else None
+                            ),
                         )
                     )
+                    graph_edge_embeddings.append(emb)
             except Exception as e:
                 logger.warning(f"Graph search failed during recall (non-critical): {e}")
 
-        # Memory-model v2: enrich graph results with v2 metadata from their
-        # nearest source memory, then apply the same v2 filters to graph rows.
-        # Graphiti's edge schema doesn't carry v2 fields natively — we recover
-        # them by semantic match against the Qdrant store.
+        # Enrich graph rows with metadata from their nearest source memory
+        # (title/category/created_at/v2 fields + the twin back-reference).
+        # Graphiti's edge schema doesn't carry those fields natively — we
+        # recover them by semantic match against the Qdrant store.
         #
-        # Audit 27 #7: enrichment only runs when something actually consumes
-        # the recovered fields — an active v2 filter, or a memory_kind=
-        # "passage" filter (passage-ness lives on the source memory). A plain
-        # recall used to pay a per-edge embed + Qdrant query here purely to
-        # decorate graph rows nobody filtered on.
+        # Graph-ranked-leg: decoration is ALWAYS-ON again (audit 27 #7 had
+        # gated it behind a v2/passage filter because it cost one embed API
+        # call per edge, then #121 one batch call). With the STORED edge
+        # embeddings from part 1 the twin lookup is a single
+        # query_batch_points round trip and ZERO embed calls, so every
+        # search gets decorated graph rows (feeding ask.py's chronological
+        # evidence and the recall-index budget logic). Edges without a
+        # stored embedding only fall back to a batched embed when a filter
+        # actually needs their metadata (v2 filter / passage filter) —
+        # otherwise they stay undecorated rather than paying API calls.
         v2_filter_active = bool(domain or observation_type or concepts)
         if graph_responses and v2_filter_active:
             graph_responses = self._enrich_and_filter_graph(
@@ -2337,16 +2387,21 @@ class MemoryService:
                 concepts=concepts,
                 visibility=visibility,
                 include_shared=include_shared,
+                edge_embeddings=graph_edge_embeddings,
             )
-        elif graph_responses and memory_kind == "passage":
-            # The passage filter below reads memory_kind off each row, which
-            # for graph rows only exists via source-memory enrichment.
+        elif graph_responses:
             graph_responses = self._enrich_graph_with_v2(
                 graph_responses,
                 user_id=user_id,
                 project_id=project_id,
                 visibility=visibility,
                 include_shared=include_shared,
+                edge_embeddings=graph_edge_embeddings,
+                # The passage filter below reads memory_kind off each row,
+                # which for graph rows only exists via source-memory
+                # enrichment — worth a batched embed for embedding-less
+                # edges. A plain recall is not.
+                allow_embed_fallback=(memory_kind == "passage"),
             )
 
         # Multi-user model: post-filter graph rows by enriched visibility.
@@ -2414,22 +2469,32 @@ class MemoryService:
         project_id: str | None,
         visibility: str | None = None,
         include_shared: bool = True,
+        edge_embeddings: list | None = None,
+        allow_embed_fallback: bool = True,
     ) -> list[MemoryResponse]:
         """For each graph edge, find its nearest Qdrant source memory and
-        copy that source's v2 metadata onto the graph response — only when
-        the similarity score clears _GRAPH_ENRICH_THRESHOLD.
+        copy that source's metadata onto the graph response — only when
+        the similarity score clears _GRAPH_ENRICH_THRESHOLD. Recovered
+        fields: memory-model v2 (domain/observation_type/concepts/…),
+        presentation fields (title/category/created_at/token_estimate),
+        multi-user fields, and the twin's memory id (as
+        ``related_memory_ids``, the graph row's source back-reference).
 
-        Memory-model v2 augmentation: Graphiti edges don't carry domain /
-        observation_type / concepts natively, but they're derived from
-        source memories that do. We do a top-1 vector match per edge to
-        recover those fields.
+        Graph-ranked-leg: ``edge_embeddings`` (index-aligned with
+        ``graph_responses``) carries the STORED Graphiti ``fact_embedding``
+        per row — those rows are looked up with the stored vector and cost
+        ZERO embed API calls. Rows without one either fall back to a single
+        batched ``embed_batch`` call (``allow_embed_fallback=True``, the
+        #121 behavior — used when a v2/passage filter needs their metadata)
+        or stay un-enriched (``allow_embed_fallback=False``, the plain-
+        search hot path).
 
-        Audit 27 #7: this used to embed + query Qdrant once per edge,
-        sequentially — 10 edges meant 10 Gemini round-trips + 10 Qdrant
-        queries (3-12s of the measured hybrid-search latency). All edge
-        texts now go through ONE ``embed_batch`` call and ONE Qdrant
-        ``query_batch_points`` round trip. Any failure leaves the rows
-        un-enriched (never breaks the read).
+        Audit 27 #7 history: this used to embed + query Qdrant once per
+        edge, sequentially — 10 edges meant 10 Gemini round-trips + 10
+        Qdrant queries (3-12s of the measured hybrid-search latency). At
+        most ONE ``embed_batch`` call and exactly ONE Qdrant
+        ``query_batch_points`` round trip remain. Any failure leaves the
+        rows un-enriched (never breaks the read).
 
         Multi-user model: the enrichment source filter mirrors the EXACT
         read-set of the calling search (``visibility``/``include_shared``
@@ -2472,14 +2537,33 @@ class MemoryService:
             m = self._get_memory()
             client = m.vector_store.client
 
-            texts = [text for _, text in enrichable]
-            embed_batch = getattr(m.embedding_model, "embed_batch", None)
-            if callable(embed_batch):
-                embeddings = embed_batch(texts, memory_action="search")
-            else:  # embedder without a batch API — degrade to per-text embeds
-                embeddings = [
-                    m.embedding_model.embed(t, memory_action="search") for t in texts
-                ]
+            # Per-row lookup vector: prefer the STORED edge embedding (zero
+            # embed API calls); optionally batch-embed the leftovers.
+            provided: dict[int, list] = {}
+            if edge_embeddings:
+                for i, _ in enrichable:
+                    if i < len(edge_embeddings) and edge_embeddings[i]:
+                        provided[i] = edge_embeddings[i]
+            missing = [(i, text) for i, text in enrichable if i not in provided]
+            if missing and not allow_embed_fallback:
+                # Plain-search hot path: rows without a stored embedding
+                # stay un-enriched rather than paying embed API calls.
+                enrichable = [(i, t) for i, t in enrichable if i in provided]
+                missing = []
+            if missing:
+                texts = [text for _, text in missing]
+                embed_batch = getattr(m.embedding_model, "embed_batch", None)
+                if callable(embed_batch):
+                    embeddings = embed_batch(texts, memory_action="search")
+                else:  # embedder without a batch API — degrade to per-text embeds
+                    embeddings = [
+                        m.embedding_model.embed(t, memory_action="search")
+                        for t in texts
+                    ]
+                for (i, _), emb in zip(missing, embeddings):
+                    provided[i] = emb
+            if not enrichable:
+                return graph_responses
 
             # Enrichment source = OR of per-pool sub-filters (Qdrant `should`
             # accepts nested Filters). Personal + shared are constrained to the
@@ -2519,8 +2603,8 @@ class MemoryService:
             qf = Filter(should=should_filters)
 
             requests = [
-                QueryRequest(query=emb, filter=qf, limit=1, with_payload=True)
-                for emb in embeddings
+                QueryRequest(query=provided[i], filter=qf, limit=1, with_payload=True)
+                for i, _ in enrichable
             ]
             batch_results = client.query_batch_points(
                 collection_name=settings.qdrant_collection,
@@ -2550,6 +2634,24 @@ class MemoryService:
                 src_metadata = payload.get("metadata", {}) or {}
                 if isinstance(src_metadata.get("metadata"), dict):
                     src_metadata = src_metadata["metadata"]
+
+                # Presentation decoration (always-on again): timestamps feed
+                # ask.py's chronological evidence; title/token_estimate feed
+                # the recall-index budget logic; the twin's id is the graph
+                # row's source-memory back-reference.
+                if resp.created_at is None:
+                    resp.created_at = payload.get("created_at")
+                if resp.updated_at is None:
+                    resp.updated_at = payload.get("updated_at")
+                if resp.title is None:
+                    resp.title = src_metadata.get("title")
+                if resp.token_estimate is None:
+                    resp.token_estimate = src_metadata.get("token_estimate")
+                hit_id = getattr(hit, "id", None)
+                if hit_id is None and isinstance(hit, dict):
+                    hit_id = hit.get("id")
+                if resp.related_memory_ids is None and hit_id is not None:
+                    resp.related_memory_ids = [str(hit_id)]
 
                 # Copy v2 fields when source has them and graph response doesn't
                 if resp.domain is None:
@@ -2594,11 +2696,15 @@ class MemoryService:
         concepts: list[str] | None,
         visibility: str | None = None,
         include_shared: bool = True,
+        edge_embeddings: list | None = None,
     ) -> list[MemoryResponse]:
         """Enrich graph rows with v2 metadata, then drop rows that don't match
         the supplied filter. Used when the caller passes domain/observation_type/
         concepts in SearchMemoryRequest. ``visibility``/``include_shared``
         scope the enrichment source to the calling search's read-set.
+        ``edge_embeddings`` are the stored per-edge vectors (see
+        ``_enrich_graph_with_v2``); embed fallback stays allowed here —
+        filter correctness beats latency.
         """
         enriched = self._enrich_graph_with_v2(
             graph_responses,
@@ -2606,6 +2712,7 @@ class MemoryService:
             project_id=project_id,
             visibility=visibility,
             include_shared=include_shared,
+            edge_embeddings=edge_embeddings,
         )
         out: list[MemoryResponse] = []
         for resp in enriched:
@@ -2747,14 +2854,23 @@ class MemoryService:
         edges: list[dict],
         communities: list[dict],
     ) -> None:
-        """Annotate graph search results with ``memory_id`` + ``wiki_path``.
+        """Annotate graph search results with ``memory_id`` + ``wiki_path``,
+        and edges additionally with their stored ``fact_embedding``.
 
-        Both fields are added by the wiki synthesizer's Cypher patchers
-        (``attach_memory_id`` and ``patch_wiki_path``) as top-level Neo4j
-        properties, but Graphiti's ORM doesn't rehydrate them. We do one
-        extra Cypher round-trip per result set to fetch the values by
-        UUID, then mutate the dicts in place. Failure logs and leaves
-        the original dicts unchanged.
+        ``memory_id``/``wiki_path`` are added by the wiki synthesizer's
+        Cypher patchers (``attach_memory_id`` and ``patch_wiki_path``) as
+        top-level Neo4j properties, but Graphiti's ORM doesn't rehydrate
+        them. We do one extra Cypher round-trip per result set to fetch the
+        values by UUID, then mutate the dicts in place.
+
+        The same round trip piggybacks ``e.fact_embedding`` for RELATES_TO
+        edges (graph-as-a-ranked-leg): Graphiti's search return path
+        deliberately omits the stored embedding
+        (``get_entity_edge_return_query``), and re-embedding edge facts
+        would cost one Gemini call per search. The UNION arm below matches
+        relationships by uuid (indexed: Graphiti's ``relation_uuid`` range
+        index) — zero additional round trips, no Graphiti subtree change.
+        Failure logs and leaves the original dicts unchanged.
         """
         all_uuids: list[str] = []
         for collection in (nodes, edges, communities):
@@ -2771,7 +2887,15 @@ class MemoryService:
         WHERE n.uuid IN $uuids
         RETURN n.uuid AS uuid,
                n.memory_id AS memory_id,
-               n.wiki_path AS wiki_path
+               n.wiki_path AS wiki_path,
+               null AS fact_embedding
+        UNION ALL
+        MATCH ()-[e:RELATES_TO]->()
+        WHERE e.uuid IN $uuids
+        RETURN e.uuid AS uuid,
+               e.memory_id AS memory_id,
+               e.wiki_path AS wiki_path,
+               e.fact_embedding AS fact_embedding
         """
 
         async def _run():
@@ -2794,6 +2918,8 @@ class MemoryService:
                     item["memory_id"] = rec["memory_id"]
                 if rec.get("wiki_path"):
                     item["wiki_path"] = rec["wiki_path"]
+                if rec.get("fact_embedding"):
+                    item["fact_embedding"] = rec["fact_embedding"]
 
     def search_graph(
         self,
@@ -4931,51 +5057,78 @@ class MemoryService:
         graph_responses: list[MemoryResponse],
         limit: int | None = None,
     ) -> list[MemoryResponse]:
-        """Deduplicate and weave vector and graph results (audit 27 #2).
+        """Fuse the vector and graph legs into one merit-ranked list.
 
-        Removes graph results whose content closely matches a vector result,
-        then appends the surviving graph rows AFTER the vector hits: scored
-        vector hits keep their ranked order and take priority. The old 1:1
-        positional interleave let unranked (score=None) relation strings
-        evict up to half of the ranked vector top-k after the caller's
-        ``[:limit]`` cut.
+        Graph is a FIRST-CLASS RANKED leg: with part-1 cosine scores on the
+        edges (stored ``fact_embedding`` × the query vector), both legs
+        carry scores in the SAME Gemini cosine space, so ranks are computed
+        on the merged score scale — NO quota and NO cap. Strong graph rows
+        take the majority of top-k when they earn it; weak ones sink below
+        every stronger vector hit. (Literal per-leg reciprocal-rank fusion
+        can't do either: a full vector leg mathematically pins graph at a
+        50/50 alternation regardless of magnitude, which both re-creates
+        the audit-27 #2 interleave defect for weak edges and forbids a
+        graph majority for strong ones.)
 
-        When ``limit`` is given, graph rows are capped at
-        ``max(1, limit // 4)`` slots within the limit — except they may
-        additionally fill any shortfall when the vector legs returned fewer
-        than ``limit`` hits. Vector hits are only ever displaced down to
-        ``limit - cap`` slots (e.g. 8 of 10 at the default k=10), never
-        below.
+        This replaces the interim #120 weave (graph appended after vector,
+        capped at ``max(1, limit // 4)``) which itself replaced the 1:1
+        positional interleave that let score=None relation strings evict
+        ranked vector hits. Unscored graph rows (no stored embedding) still
+        rank at the bottom — exactly the old append behavior.
+
+        Content-identity dedup is unchanged: a graph edge whose fact is an
+        exact/substring twin of a vector row is dropped (the vector row is
+        the richer record) — but the twin still credits its vector row with
+        an ``_rrf_fuse``-style reciprocal-rank corroboration bonus
+        ``1/(RRF_K + graph_rank + 1)``: leg agreement ranks up. Each row
+        keeps its NATIVE score; the fused value only orders the list.
+        Ties break deterministically: vector leg first, then id.
         """
-        seen_content: set[str] = set()
-        unique_graph: list[MemoryResponse] = []
+        # Graph leg ranked by its cosine scores (strongest first, unscored
+        # last, stable) — this rank drives both graph-vs-graph twin
+        # preference and the corroboration bonus.
+        graph_leg = sorted(
+            graph_responses,
+            key=lambda r: (r.score is None, -(r.score or 0.0)),
+        )
 
-        # Index vector content for fuzzy matching
+        # entries: {"row", "leg" (0=vector, 1=graph), "fused"}
+        entries: list[dict] = []
+        # normalized content -> entry index (insertion-ordered so substring
+        # twin resolution is deterministic: first matching row wins).
+        norm_to_idx: dict[str, int] = {}
+
         for vr in vector_responses:
-            seen_content.add(self.normalize_memory_content(vr.memory))
+            norm_to_idx.setdefault(
+                self.normalize_memory_content(vr.memory), len(entries)
+            )
+            entries.append({"row": vr, "leg": 0, "fused": float(vr.score or 0.0)})
 
-        for gr in graph_responses:
+        for rank, gr in enumerate(graph_leg):
             normalized = self.normalize_memory_content(gr.memory)
-            # Skip if exact or substring match with any vector result
-            if self.find_duplicate_content(normalized, seen_content) is None:
-                unique_graph.append(gr)
-                seen_content.add(normalized)
+            twin_norm = self.find_duplicate_content(normalized, norm_to_idx.keys())
+            if twin_norm is not None:
+                # Content twin: drop the graph row, credit the survivor with
+                # this edge's reciprocal-rank weight (corroboration).
+                entries[norm_to_idx[twin_norm]]["fused"] += 1.0 / (
+                    RRF_K + rank + 1
+                )
+                continue
+            norm_to_idx.setdefault(normalized, len(entries))
+            entries.append({"row": gr, "leg": 1, "fused": float(gr.score or 0.0)})
 
-        if limit is None:
-            # No budget context (legacy callers): vector first, graph after.
-            return vector_responses + unique_graph
-
-        # Graph reservation: max(1, limit // 4) slots, but never the vector
-        # top hit's slot (at limit=1 the single ranked vector hit wins).
-        graph_cap = max(1, limit // 4)
-        if vector_responses:
-            graph_cap = min(graph_cap, limit - 1)
-        vector_target = min(len(vector_responses), max(limit - graph_cap, 0))
-        # Graph rows fill their reservation plus any vector shortfall;
-        # vector reclaims reserved slots the graph leg can't use.
-        graph_take = min(len(unique_graph), limit - vector_target)
-        vector_kept = vector_responses[: limit - graph_take]
-        return vector_kept + unique_graph[:graph_take]
+        # Unscored (score=None) rows sort strictly below scored rows even at
+        # a fused value of 0.0 — the id tie-break must never lift them.
+        entries.sort(
+            key=lambda e: (
+                e["row"].score is None and e["fused"] == 0.0,
+                -e["fused"],
+                e["leg"],
+                str(e["row"].id or ""),
+            )
+        )
+        fused = [e["row"] for e in entries]
+        return fused if limit is None else fused[:limit]
 
     def _expire_graph_edges_for_memory(self, mem: dict) -> None:
         """Soft-delete graph edges related to a memory by setting expired_at."""
