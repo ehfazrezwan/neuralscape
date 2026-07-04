@@ -1015,6 +1015,56 @@ def _connector_sync_cron_hours() -> list[int]:
     return list(range(0, 24, interval))
 
 
+def _make_after_job_end(queue_name: str):
+    """Build the per-queue ``after_job_end`` hook: queue.empty webhook (C4).
+
+    After ARQ records a job's result (so the queue sorted set no longer
+    contains it), check whether this worker's queue is now empty; if so —
+    and ``WEBHOOK_QUEUE_EMPTY_URL`` is configured — POST a small
+    ``queue.empty`` JSON event so ingest-then-query flows can stop polling
+    per task. The event carries the finishing job's owner (via the
+    ``ns:task-user:`` reverse map task_manager writes at enqueue), so a
+    consumer can match it to their own work. Delivery is SSRF-guarded and
+    fire-and-forget (see webhooks.py); the hook itself swallows every
+    error — observability must never fail a job.
+    """
+    async def after_job_end(ctx: dict) -> None:
+        url = settings.webhook_queue_empty_url
+        if not url:
+            return
+        try:
+            redis = ctx.get("redis")
+            if redis is None:
+                return
+            depth = await redis.zcard(queue_name)
+            if depth:
+                return
+            user_id = None
+            job_id = ctx.get("job_id")
+            if job_id:
+                try:
+                    raw = await redis.get(f"ns:task-user:{job_id}")
+                    if raw:
+                        user_id = raw.decode() if isinstance(raw, bytes) else str(raw)
+                except Exception:  # noqa: BLE001 — attribution is best-effort
+                    pass
+            from datetime import timezone
+
+            from webhooks import fire_queue_empty
+
+            fire_queue_empty(url, {
+                "event": "queue.empty",
+                "queue": queue_name,
+                "job_id": job_id,
+                "user_id": user_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+        except Exception:  # noqa: BLE001
+            logger.debug("queue.empty webhook check failed (non-fatal)", exc_info=True)
+
+    return after_job_end
+
+
 async def startup(ctx: dict) -> None:
     """Worker startup: initialize MemoryService + extension registry."""
     logger.info("ARQ worker starting up...")
@@ -1099,6 +1149,7 @@ class WorkerSettings:
     on_shutdown = shutdown
     redis_settings = parse_redis_settings()
     queue_name = settings.arq_queue_name
+    after_job_end = _make_after_job_end(settings.arq_queue_name)
     max_jobs = 10
     job_timeout = settings.arq_job_timeout
     max_tries = settings.arq_max_retries  # keep light-queue retry behavior unchanged
@@ -1157,6 +1208,7 @@ class GraphWorkerSettings:
     on_shutdown = shutdown
     redis_settings = parse_redis_settings()
     queue_name = settings.graph_queue_name
+    after_job_end = _make_after_job_end(settings.graph_queue_name)
     max_jobs = 4
     job_timeout = 900  # graph.add + entity extraction can run several minutes
     max_tries = settings.arq_max_retries
@@ -1191,6 +1243,7 @@ class IngestWorkerSettings:
     on_shutdown = shutdown
     redis_settings = parse_redis_settings()
     queue_name = settings.ingest_queue_name
+    after_job_end = _make_after_job_end(settings.ingest_queue_name)
     max_jobs = 3
     job_timeout = 900  # a large PDF parse + fact extraction can run minutes
     max_tries = settings.arq_max_retries

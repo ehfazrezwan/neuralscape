@@ -6,6 +6,7 @@ Centralizes task enqueuing and status tracking, replacing the in-memory _tasks d
 import hashlib
 import json
 import logging
+import time
 
 from arq.connections import ArqRedis, create_pool
 from arq.jobs import Job, JobStatus
@@ -13,6 +14,16 @@ from arq.jobs import Job, JobStatus
 from config import parse_redis_settings, settings
 
 logger = logging.getLogger(__name__)
+
+
+def _user_tasks_key(user_id: str) -> str:
+    """Per-user sorted set of recently-enqueued task ids (score = enqueue ts)."""
+    return f"ns:user-tasks:{user_id}"
+
+
+def _task_user_key(task_id: str) -> str:
+    """Reverse map task id → user id (queue.empty webhook attribution)."""
+    return f"ns:task-user:{task_id}"
 
 # Map ARQ JobStatus to our API status strings
 _STATUS_MAP = {
@@ -37,6 +48,28 @@ class TaskManager:
             default_queue_name=settings.arq_queue_name,
         )
         logger.info("TaskManager connected to Redis")
+
+    async def _track_task(self, user_id: str | None, task_id: str) -> None:
+        """Best-effort per-caller task bookkeeping (C4 queue visibility).
+
+        Records the task id in the caller's recent-tasks sorted set (read by
+        ``get_queue_status``) and the reverse task→user map (read by the
+        queue.empty webhook hook). Trivial by design: two keys with a TTL of
+        twice the status window — no per-status bookkeeping, statuses are
+        still read from ARQ itself. Never blocks or fails an enqueue.
+        """
+        if not user_id or self.pool is None:
+            return
+        try:
+            now = time.time()
+            ttl = max(int(settings.queue_status_window_s) * 2, 600)
+            key = _user_tasks_key(user_id)
+            await self.pool.zadd(key, {task_id: now})
+            await self.pool.zremrangebyscore(key, "-inf", now - ttl)
+            await self.pool.expire(key, ttl)
+            await self.pool.set(_task_user_key(task_id), user_id, ex=ttl)
+        except Exception as e:  # noqa: BLE001 — bookkeeping must never break writes
+            logger.debug(f"Task tracking failed (non-fatal): {e}")
 
     async def enqueue_store(
         self,
@@ -66,11 +99,11 @@ class TaskManager:
             run_id,
             _job_id=job_id,
         )
-        if job is None:
-            # Duplicate job ID — ARQ already has this job. Return the ID
-            # so the caller can poll the existing job's status.
-            return job_id
-        return job.job_id
+        # On a duplicate job ID (job is None) ARQ already has this job —
+        # return the ID so the caller can poll the existing job's status.
+        task_id = job_id if job is None else job.job_id
+        await self._track_task(user_id, task_id)
+        return task_id
 
     async def enqueue_raw(
         self,
@@ -146,9 +179,9 @@ class TaskManager:
             v2_extras,
             _job_id=job_id,
         )
-        if job is None:
-            return job_id
-        return job.job_id
+        task_id = job_id if job is None else job.job_id
+        await self._track_task(user_id, task_id)
+        return task_id
 
     async def enqueue_ingest_document(self, doc: dict) -> str:
         """Enqueue a document-ingest task (chunk → passages + facts). Returns job_id.
@@ -176,9 +209,9 @@ class TaskManager:
             _job_id=job_id,
             _queue_name=settings.ingest_queue_name,
         )
-        if job is None:
-            return job_id
-        return job.job_id
+        task_id = job_id if job is None else job.job_id
+        await self._track_task(doc.get("user_id"), task_id)
+        return task_id
 
     async def enqueue_ingest_file(self, payload: dict) -> str:
         """Enqueue a single-file ingest task (parse → passages + facts). Returns job_id.
@@ -211,9 +244,9 @@ class TaskManager:
             _job_id=job_id,
             _queue_name=settings.ingest_queue_name,
         )
-        if job is None:
-            return job_id
-        return job.job_id
+        task_id = job_id if job is None else job.job_id
+        await self._track_task(payload.get("user_id"), task_id)
+        return task_id
 
     async def enqueue_connector_sync(self, connector_id: str) -> str:
         """Enqueue a connector sync task. Returns job_id.
@@ -257,9 +290,11 @@ class TaskManager:
             items,
             _job_id=job_id,
         )
-        if job is None:
-            return job_id
-        return job.job_id
+        task_id = job_id if job is None else job.job_id
+        # Mixed-user batches are legal — track for every distinct writer.
+        for uid in {i.get("user_id") for i in items if i.get("user_id")}:
+            await self._track_task(uid, task_id)
+        return task_id
 
     async def enqueue_retag(self, caller_user_id: str, filters: dict, ops: dict) -> str:
         """Enqueue a bulk retag task on the fast queue. Returns job_id.
@@ -279,9 +314,9 @@ class TaskManager:
             ops,
             _job_id=job_id,
         )
-        if job is None:
-            return job_id
-        return job.job_id
+        task_id = job_id if job is None else job.job_id
+        await self._track_task(caller_user_id, task_id)
+        return task_id
 
     async def enqueue_graph_enrichment(
         self,
@@ -318,9 +353,9 @@ class TaskManager:
             _job_id=job_id,
             _queue_name=settings.graph_queue_name,
         )
-        if job is None:
-            return job_id
-        return job.job_id
+        task_id = job_id if job is None else job.job_id
+        await self._track_task(user_id, task_id)
+        return task_id
 
     def _candidate_queues(self) -> list[str]:
         """Queues a poll-able job could live on (main + ingest), de-duplicated.
@@ -403,6 +438,69 @@ class TaskManager:
                 "result": None,
                 "error": str(e),
             }
+
+    async def get_queue_status(
+        self,
+        user_id: str,
+        window_seconds: int | None = None,
+        cap: int = 200,
+    ) -> dict:
+        """Aggregate task-status view for one caller (C4 queue visibility).
+
+        Reads the caller's recently-enqueued task ids (recorded by
+        ``_track_task``) and aggregates their live ARQ statuses — no new
+        per-status bookkeeping, just what task_manager already tracks in
+        Redis. ``expired`` counts tasks whose result aged out of ARQ's
+        keep_result TTL (indistinguishable from never-existed, reported
+        honestly instead of guessed). ``queues`` reports instance-wide
+        pending depths per queue (ARQ's queue is a sorted set named after
+        the queue). ``caught_up`` is True when the caller has nothing
+        queued or in flight.
+        """
+        window = int(window_seconds or settings.queue_status_window_s)
+        counts = {"queued": 0, "processing": 0, "completed": 0, "failed": 0, "expired": 0}
+        ids: list[str] = []
+        if self.pool is not None:
+            now = time.time()
+            try:
+                raw_ids = await self.pool.zrevrangebyscore(
+                    _user_tasks_key(user_id), max=now, min=now - window,
+                    start=0, num=cap,
+                )
+            except Exception as e:  # noqa: BLE001 — a read must degrade, not 500
+                logger.warning(f"queue_status: tracked-task read failed: {e}")
+                raw_ids = []
+            ids = [i.decode() if isinstance(i, bytes) else str(i) for i in raw_ids or []]
+            for task_id in ids:
+                try:
+                    status = (await self.get_status(task_id))["status"]
+                except Exception:  # noqa: BLE001
+                    status = "not_found"
+                if status == "not_found":
+                    counts["expired"] += 1
+                else:
+                    counts[status] = counts.get(status, 0) + 1
+
+        queues: dict[str, int] = {}
+        queue_names = (
+            ("main", settings.arq_queue_name),
+            ("graph", settings.graph_queue_name),
+            ("ingest", settings.ingest_queue_name),
+        )
+        for label, queue_name in queue_names:
+            try:
+                queues[label] = int(await self.pool.zcard(queue_name))
+            except Exception:  # noqa: BLE001
+                queues[label] = 0
+
+        return {
+            "user_id": user_id,
+            "window_seconds": window,
+            "tracked": len(ids),
+            "counts": counts,
+            "queues": queues,
+            "caught_up": counts["queued"] == 0 and counts["processing"] == 0,
+        }
 
     async def close(self) -> None:
         """Close the Redis connection pool."""
