@@ -61,6 +61,7 @@ from schemas import (
     PatchMemoryRequest,
     RawMemoryRequest,
     RetagRequest,
+    SavingsDetail,
     SearchIndexResponse,
     SearchMemoryRequest,
     SearchMemoryResponse,
@@ -1464,6 +1465,38 @@ async def v1_get_task_status(task_id: str):
 # ── Recall ────────────────────────────────────
 
 
+def _meter_index_recall(op: str, user_id: str, hits, rows) -> tuple[str | None, "SavingsDetail | None"]:
+    """E2: measure + ledger one index-serving recall (sync; call in a thread).
+
+    ``hits`` are the full MemoryResponse objects behind ``rows`` (their stored
+    write-time token counts are the measured baseline); ``rows`` are the
+    IndexRow models actually served — rendered here once and counted as NS
+    overhead. Returns (savings line, detail) or (None, None) when the meter
+    is disabled or the ledger write is skipped.
+    """
+    import savings_meter as sm
+
+    payload = json.dumps(
+        [r.model_dump(exclude_none=True) for r in rows], ensure_ascii=False
+    )
+    event = sm.measure_recall(
+        op, hits, index_payload=payload, include_line_overhead=True
+    )
+    if event is None:
+        return None, None
+    sm.record_event(user_id, event)
+    return sm.format_savings_line(event), SavingsDetail(**event.detail())
+
+
+def _meter_full_recall(op: str, user_id: str, hits) -> None:
+    """E2: ledger a full-payload recall (served == baseline; sync, thread it)."""
+    import savings_meter as sm
+
+    event = sm.measure_recall(op, hits, served_full=True)
+    if event is not None:
+        sm.record_event(user_id, event)
+
+
 # Union response model: Pydantic v2 smart-union validates the returned model
 # instance against its exact member type (a SearchMemoryResponse can never be
 # coerced into SearchIndexResponse or vice versa — IndexRow requires `title`,
@@ -1503,9 +1536,12 @@ async def v1_search_memories(req: SearchMemoryRequest, request: Request):
             include_shared=req.include_shared,
         )
         if req.index_only:
-            return SearchIndexResponse(
-                results=[IndexRow(**index_row(r)) for r in results]
+            rows = [IndexRow(**index_row(r)) for r in results]
+            line, detail = await asyncio.to_thread(
+                _meter_index_recall, "search_index", user_id, results, rows
             )
+            return SearchIndexResponse(results=rows, savings=line, savings_detail=detail)
+        await asyncio.to_thread(_meter_full_recall, "search", user_id, results)
         return SearchMemoryResponse(results=results)
     except HTTPException:
         raise
@@ -1533,6 +1569,7 @@ async def v1_batch_get_memories(req: GetMemoriesRequest, request: Request):
     except Exception as e:
         logger.exception("v1 batch-get failed")
         raise HTTPException(status_code=500, detail="Failed to fetch memories") from e
+    await asyncio.to_thread(_meter_full_recall, "get_memories", caller, out["results"])
     return GetMemoriesResponse(results=out["results"], missing=out["missing"])
 
 
@@ -1572,7 +1609,12 @@ async def v1_timeline(req: TimelineRequest, request: Request):
         IndexRow(**index_row(m, anchor=(m.id == anchor_id)))
         for m in out["memories"]
     ]
-    return TimelineResponse(anchor_id=anchor_id, results=rows)
+    line, detail = await asyncio.to_thread(
+        _meter_index_recall, "timeline", caller, out["memories"], rows
+    )
+    return TimelineResponse(
+        anchor_id=anchor_id, results=rows, savings=line, savings_detail=detail
+    )
 
 
 # ── Ask (C3: reasoning-tiered question answering) ──
@@ -1613,6 +1655,19 @@ async def v1_ask_memory(req: AskMemoryRequest, request: Request):
         logger.exception("v1 ask failed")
         raise HTTPException(status_code=500, detail="Ask failed") from e
 
+    # E2: ledger the ask — baseline = full content of everything retrieved
+    # as evidence (precomputed from stored counts inside ask_memory), served
+    # = the synthesized answer actually returned.
+    def _meter_ask() -> None:
+        import savings_meter as sm
+
+        event = sm.measure_ask(
+            int(out.get("_evidence_tokens", 0) or 0), out.get("answer") or ""
+        )
+        if event is not None:
+            sm.record_event(user_id, event)
+
+    await asyncio.to_thread(_meter_ask)
     out.pop("_evidence_tokens", None)
     return AskMemoryResponse(**out)
 
@@ -1750,6 +1805,24 @@ async def v1_event_stream(request: Request, user_id: str | None = Query(default=
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@v1_router.get("/metrics")
+async def v1_metrics(request: Request, user_id: str | None = Query(default=None)):
+    """Cumulative token-savings totals (E2): per-caller + instance-wide.
+
+    Sums the append-only savings ledger (Redis streams ``ns:savings:{user}``)
+    via O(1) running totals. ``net_tokens_saved`` is measured and SIGNED —
+    it includes every overhead charge (index rows, savings lines, and the
+    per-release tool-schema constant charged once per user per UTC day) and
+    may be negative. ``rederivation_savings_estimate`` is the separate,
+    clearly-labeled heuristic — never blended into the measured net.
+    """
+    import savings_meter as sm
+
+    caller = _resolve_user_id(request, user_id)
+    snapshot = await asyncio.to_thread(sm.metrics_snapshot, caller)
+    return {"status": "ok", "savings_meter": snapshot}
 
 
 @v1_router.get("/queue/status", response_model=QueueStatusResponse)

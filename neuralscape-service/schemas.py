@@ -1077,11 +1077,31 @@ class IndexRow(BaseModel):
     anchor: bool | None = None
 
 
+class SavingsDetail(BaseModel):
+    """Measured token economics for one recall (E2, the honest meter).
+
+    ``net_tokens_saved`` = (baseline − served) − overhead. It is SIGNED and
+    never clamped — a recall whose index rows cost more than the content
+    they map honestly reports negative. ``rederivation_savings_estimate``
+    is a clearly-labeled heuristic ESTIMATE (discovery cost an agent would
+    burn re-deriving the facts) and is never blended into the measured net.
+    """
+    baseline_tokens: int
+    served_tokens: int
+    overhead_tokens: int
+    net_tokens_saved: int
+    rederivation_savings_estimate: int
+
+
 class SearchIndexResponse(BaseModel):
     """Response for index-only search (C1 layer 1)."""
     status: str = "ok"
     index_only: bool = True
     results: list[IndexRow] = Field(default_factory=list)
+    # E2: compact honest savings line ("saved ~N tokens (X%), net of
+    # overhead") + the measured numbers behind it. None when the meter is off.
+    savings: str | None = None
+    savings_detail: SavingsDetail | None = None
 
 
 class GetMemoriesResponse(BaseModel):
@@ -1100,6 +1120,9 @@ class TimelineResponse(BaseModel):
     status: str = "ok"
     anchor_id: str
     results: list[IndexRow] = Field(default_factory=list)
+    # E2: honest savings line + measured numbers (None when the meter is off).
+    savings: str | None = None
+    savings_detail: SavingsDetail | None = None
 
 
 class ContextResponse(BaseModel):

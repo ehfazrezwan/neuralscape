@@ -43,6 +43,35 @@ _service = MemoryService()
 _task_manager = TaskManager()
 
 
+def _meter_mcp_index(op: str, user_id: str, hits, rows: list[dict]):
+    """E2: measure + ledger one index-serving MCP recall (sync; thread it).
+
+    ``hits`` are full MemoryResponse objects (stored write-time token counts
+    = measured baseline); ``rows`` the plain index-row dicts actually served
+    (counted as NS-injected overhead). Returns (savings line, detail dict)
+    or (None, None) when the savings meter is disabled.
+    """
+    import savings_meter as sm
+
+    payload = json.dumps(rows, default=str, ensure_ascii=False)
+    event = sm.measure_recall(
+        op, hits, index_payload=payload, include_line_overhead=True
+    )
+    if event is None:
+        return None, None
+    sm.record_event(user_id, event)
+    return sm.format_savings_line(event), event.detail()
+
+
+def _meter_mcp_full(op: str, user_id: str, hits) -> None:
+    """E2: ledger a full-payload MCP recall (served == baseline)."""
+    import savings_meter as sm
+
+    event = sm.measure_recall(op, hits, served_full=True)
+    if event is not None:
+        sm.record_event(user_id, event)
+
+
 def _standard_write_error(visibility, user_id: str) -> list[TextContent] | None:
     """Return an MCP error payload if a ``standard``-tier write isn't allowed.
 
@@ -1123,10 +1152,20 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 from index_format import index_row
 
                 rows = [index_row(r) for r in results]
+                body = {
+                    "index_only": True, "results": rows,
+                    "hint": "Filter these rows, then call get_memories(ids=[...]) for full payloads.",
+                }
+                # E2: honest savings line + ledger entry for this recall.
+                line, detail = await asyncio.to_thread(
+                    _meter_mcp_index, "search_index", user_id, results, rows
+                )
+                if line is not None:
+                    body["savings"] = line
+                    body["savings_detail"] = detail
                 return [TextContent(type="text", text=json.dumps(
-                    {"index_only": True, "results": rows,
-                     "hint": "Filter these rows, then call get_memories(ids=[...]) for full payloads."},
-                    default=str, ensure_ascii=False))]
+                    body, default=str, ensure_ascii=False))]
+            await asyncio.to_thread(_meter_mcp_full, "search", user_id, results)
             output = [r.model_dump(exclude_none=True) for r in results]
             return [TextContent(type="text", text=json.dumps(output, default=str))]
 
@@ -1139,6 +1178,9 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 out = await asyncio.to_thread(_service.get_memories_by_ids, ids, user_id)
             except ValueError as e:
                 return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+            await asyncio.to_thread(
+                _meter_mcp_full, "get_memories", user_id, out["results"]
+            )
             return [TextContent(type="text", text=json.dumps(
                 {
                     "results": [r.model_dump(exclude_none=True) for r in out["results"]],
@@ -1173,10 +1215,18 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                               "(unknown id, unreadable id, or no search hit)"}))]
             anchor_id = out["anchor_id"]
             rows = [index_row(mem, anchor=(mem.id == anchor_id)) for mem in out["memories"]]
+            body = {
+                "anchor_id": anchor_id, "results": rows,
+                "hint": "Rows are oldest→newest. Call get_memories(ids=[...]) for full payloads.",
+            }
+            line, detail = await asyncio.to_thread(
+                _meter_mcp_index, "timeline", user_id, out["memories"], rows
+            )
+            if line is not None:
+                body["savings"] = line
+                body["savings_detail"] = detail
             return [TextContent(type="text", text=json.dumps(
-                {"anchor_id": anchor_id, "results": rows,
-                 "hint": "Rows are oldest→newest. Call get_memories(ids=[...]) for full payloads."},
-                default=str, ensure_ascii=False))]
+                body, default=str, ensure_ascii=False))]
 
         elif name == "remember":
             # Determine scope from category
@@ -1761,6 +1811,20 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 )
             except AskUnavailable as e:
                 return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+
+            # E2: ledger the ask (baseline = retrieved evidence, served =
+            # answer). `_evidence_tokens` is internal — popped, never served.
+            def _meter_ask() -> None:
+                import savings_meter as sm
+
+                event = sm.measure_ask(
+                    int(out.get("_evidence_tokens", 0) or 0), out.get("answer") or ""
+                )
+                if event is not None:
+                    sm.record_event(user_id, event)
+
+            await asyncio.to_thread(_meter_ask)
+            out.pop("_evidence_tokens", None)
             return [TextContent(type="text", text=json.dumps(out, default=str, ensure_ascii=False))]
 
         elif name == "checkpoint":
