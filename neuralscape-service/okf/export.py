@@ -342,7 +342,9 @@ def build_bundle(
     by_date[export_day].insert(
         0,
         translate.log_entry(
-            "Export", f"Bundle generated from {len(memories)} memories ([index](/index.md))."
+            "Export",
+            f"Bundle generated from {len(memories)} memories "
+            f"([index](/{translate.INDEX_FILENAME})).",
         ),
     )
     dated = sorted(by_date.items(), key=lambda kv: kv[0], reverse=True)
