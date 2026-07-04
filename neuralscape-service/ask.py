@@ -106,7 +106,12 @@ _ANSWER_ABSTAINED_NO_EVIDENCE = (
 )
 
 # Evidence rendering caps: keep the context block bounded even at high tier.
+# Fact rows keep a tight budget; passage rows (verbatim ingest chunks,
+# memory_kind="passage") get the full ingest chunk size — the answer often
+# sits deep inside the chunk (audit 27 #16; ingest/chunking.py
+# DEFAULT_MAX_CHARS = 1500).
 _EVIDENCE_CONTENT_CLIP = 500
+_EVIDENCE_PASSAGE_CLIP = 1500
 _EVIDENCE_MAX_ROWS = 120
 
 
@@ -196,12 +201,33 @@ def _evidence_rows(evidence: dict, keyword_ids: list[str], enumeration: bool) ->
     return rows
 
 
+def _clip_content(content: str, budget: int) -> str:
+    """Clip ``content`` to ``budget`` chars at a natural boundary.
+
+    Prefers the last sentence boundary (". " or a newline) within budget,
+    falls back to the last whitespace, and only hard-slices when the text
+    is one unbroken token — the old blind ``content[:500]`` slice routinely
+    cut passages mid-fact/mid-word (audit 27 #16).
+    """
+    if len(content) <= budget:
+        return content
+    window = content[:budget]
+    sentence_cut = max(window.rfind(". "), window.rfind("\n"))
+    if sentence_cut > 0:
+        return window[: sentence_cut + 1].rstrip() + " …"
+    ws_cut = window.rfind(" ")
+    if ws_cut > 0:
+        return window[:ws_cut].rstrip() + " …"
+    return window + " …"
+
+
 def _render_evidence(rows: list) -> str:
     lines = []
     for mem in rows:
-        content = (mem.memory or "").strip().replace("\n", " ")
-        if len(content) > _EVIDENCE_CONTENT_CLIP:
-            content = content[:_EVIDENCE_CONTENT_CLIP] + " …"
+        is_passage = getattr(mem, "memory_kind", None) == "passage"
+        budget = _EVIDENCE_PASSAGE_CLIP if is_passage else _EVIDENCE_CONTENT_CLIP
+        # Clip BEFORE flattening newlines so "\n" still marks boundaries.
+        content = _clip_content((mem.memory or "").strip(), budget).replace("\n", " ")
         created = getattr(mem, "created_at", None) or "unknown time"
         category = getattr(mem, "category", None) or "uncategorized"
         lines.append(f"[{mem.id}] ({created}; {category}) {content}")

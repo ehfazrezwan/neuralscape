@@ -307,6 +307,62 @@ class TestEvidenceBudget:
 
 
 # ──────────────────────────────────────────────
+# Evidence clipping (audit 27 #16): passage rows get a 1500-char budget,
+# every row clips at a sentence boundary instead of mid-word
+# ──────────────────────────────────────────────
+
+
+def _passage(mid: str, content: str) -> MemoryResponse:
+    return MemoryResponse(
+        id=mid, memory=content, category="domain_knowledge", source="vector",
+        created_at="2026-07-01T00:00:00+00:00", score=0.9, memory_kind="passage",
+    )
+
+
+class TestEvidenceClip:
+    def test_passage_row_keeps_content_beyond_500_chars(self):
+        """Ingest passages default to 1500 chars; a fact-sized 500-char clip
+        hid two-thirds of every passage from the answerer."""
+        filler = "This is a filler sentence to pad out the passage body. "  # 56 chars
+        text = filler * 13 + "The vault access code is 9137. " + filler * 8
+        assert 700 < text.index("9137") < 800  # the answer sits past the old clip
+        rendered = ask_mod._render_evidence([_passage("p1", text)])
+        assert "The vault access code is 9137." in rendered
+
+    def test_fact_row_keeps_500_budget(self):
+        filler = "This is a filler sentence to pad out the fact body zzz. "  # 57 chars
+        text = filler * 13 + "The vault access code is 9137."
+        row = _mem("f1", text)
+        rendered = ask_mod._render_evidence([row])
+        assert "9137" not in rendered  # fact rows keep the tight budget
+        assert "…" in rendered
+
+    def test_fact_clip_lands_on_sentence_boundary(self):
+        # Sentences sized so char 500 falls mid-word: 57-char sentences →
+        # boundary at 456; the old code sliced blindly at 500.
+        filler = "This is a filler sentence to pad out the fact body zzz. "
+        text = (filler * 12).strip()
+        rendered = ask_mod._render_evidence([_mem("f1", text)])
+        assert rendered.rstrip().endswith("zzz. …")
+
+    def test_passage_over_budget_clips_at_sentence_boundary(self):
+        filler = "This is a filler sentence to pad out the passage body. "
+        text = (filler * 32).strip()  # ~1790 chars > 1500
+        rendered = ask_mod._render_evidence([_passage("p1", text)])
+        body = rendered.split(") ", 1)[1]
+        assert len(body) <= ask_mod._EVIDENCE_PASSAGE_CLIP + 2  # "+ …"
+        assert rendered.rstrip().endswith("body. …")
+
+    def test_clip_falls_back_to_whitespace_when_no_sentence_boundary(self):
+        text = "word " * 200  # no ". " anywhere, 1000 chars
+        rendered = ask_mod._render_evidence([_mem("f1", text.strip())])
+        assert "word  …" not in rendered  # no dangling partial token
+        body = rendered.split(") ", 1)[1]
+        clipped = body[: -len(" …")]
+        assert clipped.endswith("word")  # cut on a whole word
+
+
+# ──────────────────────────────────────────────
 # Abstention (dialectic discipline 4)
 # ──────────────────────────────────────────────
 
