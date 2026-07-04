@@ -253,14 +253,26 @@ export function isProjectExcluded(projectId: string | undefined): boolean {
 
 /**
  * Redact `<private>…</private>` spans from text the plugin is about to
- * store or transmit. Fail-closed: an unclosed `<private>` redacts to the
- * end of the string. Case-insensitive. Idempotent.
+ * store or transmit. Case-insensitive. Idempotent.
+ *
+ * Matched OPEN…CLOSE pairs redact exactly their span. An UNMATCHED opener
+ * (e.g. prose *about* the tag: "use <private> to mark secrets") is bounded
+ * (audit 27 #34a): it redacts at most through the next sentence boundary or
+ * end of line — never to end-of-string — and leaves a `[redacted:unclosed]`
+ * warning marker so the truncation is visible instead of silently eating
+ * the rest of the transcript.
  */
 export function redactPrivate(text: string): string {
   if (typeof text !== "string" || !/<private>/i.test(text)) return text;
-  return text
-    .replace(/<private>[\s\S]*?<\/private>/gi, "[redacted]")
-    .replace(/<private>[\s\S]*$/i, "[redacted]");
+  return (
+    text
+      .replace(/<private>[\s\S]*?<\/private>/gi, "[redacted]")
+      // Remaining openers are unmatched: consume within the current line up
+      // to the earliest of (a) a sentence end ([.!?] before whitespace/EOL)
+      // or (b) the end of the line. `[^\n]*?` cannot cross a newline, so a
+      // stray opener can never swallow subsequent lines.
+      .replace(/<private>[^\n]*?(?:[.!?](?=\s|$)|(?=\n)|$)/gi, "[redacted:unclosed]")
+  );
 }
 
 /* v8 ignore start — pre-existing utility, exercised by integration only */
