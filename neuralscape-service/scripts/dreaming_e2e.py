@@ -20,7 +20,11 @@ unique detail), a contradiction pair, a passed future-dated plan, a
 1. dry-run sweep → actions planned, nothing written
 2. real sweep    → merge/invalidate/prune/reframe applied, reflection stored
 3. verification  → recall excludes tombstones, includes the reflection;
-                   secret hard-deleted; diary written; DreamRun in Redis
+                   secret hard-deleted; diary written; DreamRun in Redis;
+                   A1 provenance: merge survivor stamped with derived_from,
+                   insight self-labeled with an epistemic_level, and
+                   get_reasoning_chain resolves the insight back to the
+                   seeded premise memories
 4. second sweep (no force) → gated (volume) — the gate economy holds
 """
 
@@ -34,7 +38,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-USER = "dreamer-e2e"
+# Overridable so parallel E2E runs (e.g. two feature branches sharing the
+# same backing Redis) don't contend on one pool's gate/lock keys.
+USER = os.environ.get("DREAMING_E2E_USER", "dreamer-e2e")
 POOL = f"user--{USER}"
 
 CHECKS: list[tuple[str, bool, str]] = []
@@ -110,8 +116,8 @@ async def main() -> int:
     import redis as redis_lib
 
     r = redis_lib.Redis.from_url(settings.redis_url)
-    for pat in ("dreaming:gate:user--dreamer-e2e*", "dreaming:lock:user--dreamer-e2e*",
-                "dreaming:staged_ids:user--dreamer-e2e*"):
+    for pat in (f"dreaming:gate:{POOL}*", f"dreaming:lock:{POOL}*",
+                f"dreaming:staged_ids:{POOL}*"):
         for k in r.scan_iter(pat):
             r.delete(k)
 
@@ -147,6 +153,13 @@ async def main() -> int:
     check("duplicate merged, unique detail preserved", merged_ok,
           f"tombstoned={tomb}, survivor text keeps FastAPI detail")
 
+    # A1 provenance: the merge survivor's derived_from records the loser id(s)
+    surv_meta = (dup_payloads[live[0]].get("metadata") or {}) if live else {}
+    surv_derived = surv_meta.get("derived_from") or []
+    check("merge survivor stamped with derived_from",
+          bool(tomb) and {ids[n] for n in tomb} <= set(surv_derived),
+          f"derived_from={surv_derived}")
+
     contra_meta = fetch_payload(service, ids["contra_old"]).get("metadata") or {}
     check("contradiction invalidated (old row tombstoned, superseded_by set)",
           bool(contra_meta.get("dream_tombstoned")),
@@ -173,7 +186,34 @@ async def main() -> int:
     check("reflection recallable via normal search", len(dream_hits) > 0,
           dream_hits[0].memory[:80] if dream_hits else "none returned")
 
-    diary = dreaming_settings.dreams_dir / "user-dreamer-e2e.md"
+    # A1 provenance: the insight self-labels its epistemic level and its
+    # reasoning chain resolves back to the seeded premise memories.
+    if dream_hits:
+        # Prefer a vector hit: its id is a real memory id the chain can walk
+        # (a graph edge uuid enriched with source_type="dream" is not).
+        insight = next(
+            (h for h in dream_hits if getattr(h, "source", None) == "vector"),
+            dream_hits[0],
+        )
+        level = getattr(insight, "epistemic_level", None)
+        check("insight carries an epistemic_level",
+              level in ("deductive", "inductive", "reflection"), str(level))
+        chain = service.get_reasoning_chain(insight.id)
+        kids = (chain or {}).get("children") or []
+        seeded_ids = set(ids.values())
+        resolved = [k for k in kids
+                    if k.get("content") and k["memory_id"] in seeded_ids]
+        check("reasoning chain resolves insight → seeded premises",
+              chain is not None and len(resolved) >= 2,
+              f"{len(resolved)} of {len(kids)} premises resolved to seeds")
+    else:
+        check("insight carries an epistemic_level", False, "no dream insight returned")
+        check("reasoning chain resolves insight → seeded premises", False,
+              "no dream insight returned")
+
+    from extensions.dreaming.reflect import diary_page_path
+
+    diary = diary_page_path(dreaming_settings.dreams_dir, POOL)
     check("diary written", diary.exists(), str(diary))
     check("DreamRun in Redis", (get_last_run() or {}).get("run_id") == run.run_id)
 

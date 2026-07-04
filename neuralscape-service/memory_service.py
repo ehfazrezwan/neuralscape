@@ -211,6 +211,7 @@ from prompts import (
     parse_extraction_response,
 )
 from schemas import (
+    EPISTEMIC_LEVEL_VOCAB,
     GLOBAL_CATEGORIES,
     MEMORY_CATEGORIES,
     PROJECT_CATEGORIES,
@@ -744,6 +745,9 @@ class MemoryService:
         related_memory_ids: list[str] | None = None,
         confidence: float | None = None,
         expires_at: datetime | None = None,
+        # Provenance epistemics (A1, optional)
+        derived_from: list[str] | None = None,
+        epistemic_level: str | None = None,
         # Multi-user model (None → category default)
         visibility: str | None = None,
         # Data-layer connectors (None → omitted)
@@ -788,6 +792,10 @@ class MemoryService:
             related_memory_ids: Memory-model v2 — graph linkage
             confidence: Memory-model v2 — extractor's self-rated 0.0-1.0
             expires_at: Memory-model v2 — optional expiry timestamp
+            derived_from: A1 provenance — premise memory IDs this memory was
+                derived from (walked by get_reasoning_chain)
+            epistemic_level: A1 provenance — how this memory is known
+                (explicit | deductive | inductive | reflection)
 
         Returns:
             List of stored memory responses (always exactly one item). When the
@@ -798,6 +806,15 @@ class MemoryService:
         """
         if category not in MEMORY_CATEGORIES:
             raise ValueError(f"Invalid category: {category}. Must be one of: {list(MEMORY_CATEGORIES.keys())}")
+        if epistemic_level is not None and epistemic_level not in EPISTEMIC_LEVEL_VOCAB:
+            raise ValueError(
+                f"Invalid epistemic_level: {epistemic_level}. "
+                f"Must be one of: {sorted(EPISTEMIC_LEVEL_VOCAB)}"
+            )
+        # Normalize empty→None so the response echoes exactly what was
+        # persisted (metadata only stores truthy lists; echoing [] while
+        # storing nothing would make the write and later reads disagree).
+        derived_from = derived_from or None
 
         # Resolve visibility: explicit caller value > per-category default.
         # ``normalize_visibility`` handles MemoryVisibility enum, plain
@@ -882,6 +899,11 @@ class MemoryService:
             metadata["related_memory_ids"] = related_memory_ids
         if confidence is not None:
             metadata["confidence"] = confidence
+        # A1 provenance (only stored when set)
+        if derived_from:
+            metadata["derived_from"] = derived_from
+        if epistemic_level is not None:
+            metadata["epistemic_level"] = epistemic_level
         if expires_at is not None:
             metadata["expires_at"] = expires_at.isoformat() if hasattr(expires_at, "isoformat") else str(expires_at)
         # Data-layer connector provenance
@@ -945,6 +967,8 @@ class MemoryService:
                 related_memory_ids=related_memory_ids,
                 confidence=confidence,
                 expires_at=expires_at.isoformat() if expires_at and hasattr(expires_at, "isoformat") else None,
+                derived_from=derived_from,
+                epistemic_level=epistemic_level,
                 memory_kind=memory_kind,
                 source_ref=source_ref,
                 visibility=effective_visibility,
@@ -1271,6 +1295,8 @@ class MemoryService:
                 related_memory_ids=metadata.get("related_memory_ids"),
                 confidence=metadata.get("confidence"),
                 expires_at=metadata.get("expires_at"),
+                derived_from=metadata.get("derived_from"),
+                epistemic_level=metadata.get("epistemic_level"),
                 memory_kind=metadata.get("memory_kind"),
                 source_ref=metadata.get("source_ref"),
                 visibility=metadata.get("visibility"),
@@ -1325,6 +1351,8 @@ class MemoryService:
                     related_memory_ids=item.get("related_memory_ids"),
                     confidence=item.get("confidence"),
                     expires_at=expires_at,
+                    derived_from=item.get("derived_from"),
+                    epistemic_level=item.get("epistemic_level"),
                     visibility=item.get("visibility"),
                     memory_kind=item.get("memory_kind"),
                     source_ref=item.get("source_ref"),
@@ -1476,6 +1504,10 @@ class MemoryService:
                     "agent_id": agent_id,
                     "run_id": run_id,
                     "source": source,
+                    # Extraction stores directly-stated facts → epistemically
+                    # "explicit" (A1). Derived levels are stamped by their
+                    # authors (dreaming reflection/merge), never here.
+                    "epistemic_level": "explicit",
                     **({"source_type": source_type} if source_type is not None else {}),
                     **({"memory_kind": memory_kind} if memory_kind is not None else {}),
                     **({"source_ref": source_ref} if source_ref else {}),
@@ -1517,6 +1549,7 @@ class MemoryService:
                     source="vector",
                     created_at=now_iso,
                     source_type=source_type,
+                    epistemic_level="explicit",
                     memory_kind=memory_kind,
                     source_ref=source_ref,
                 )
@@ -1916,6 +1949,8 @@ class MemoryService:
                     resp.concepts = src_metadata.get("concepts")
                 if resp.source_type is None:
                     resp.source_type = src_metadata.get("source_type")
+                if resp.epistemic_level is None:
+                    resp.epistemic_level = src_metadata.get("epistemic_level")
                 if resp.confidence is None:
                     resp.confidence = src_metadata.get("confidence")
                 if resp.expires_at is None:
@@ -2358,6 +2393,77 @@ class MemoryService:
         if not result:
             return None
         return self._mem_to_response(result)
+
+    def get_reasoning_chain(
+        self,
+        memory_id: str,
+        max_depth: int = 3,
+        node_cap: int = 50,
+    ) -> dict | None:
+        """Walk a memory's ``derived_from`` provenance into a reasoning tree.
+
+        A derived memory (dream MERGE survivor, REM insight, or any write that
+        supplied ``derived_from``) records its premise memory ids; this
+        resolves each premise via the vector store (mem0 ``get`` by id) and
+        recurses, so an agent can audit *why* the system believes something —
+        Honcho's "a derived memory that can't show its premises is a
+        liability" made walkable.
+
+        Each node is ``{memory_id, content (snippet), epistemic_level,
+        children}``. A node where the walk stops is marked instead of
+        expanded: ``missing`` (premise no longer resolvable — e.g.
+        hard-deleted), ``cycle`` (id already on the current path), or
+        ``truncated`` ("max_depth" | "node_cap" — unexpanded premises
+        remain, re-query with a higher max_depth or start deeper). The
+        node budget bounds the TOTAL emitted node count, so the response
+        size stays bounded even though internal ``derived_from`` lists are
+        uncapped (a wide MERGE fan-in). Tombstoned premises still resolve —
+        a merge survivor's provenance must outlive its losers' recall
+        visibility.
+
+        Returns None when the root memory itself doesn't exist (callers map
+        that to 404).
+        """
+        max_depth = max(1, int(max_depth))
+        budget = {"nodes": 0}
+        _SNIPPET = 200
+
+        def _walk(mid: str, depth: int, path: frozenset[str]) -> dict:
+            budget["nodes"] += 1
+            if mid in path:
+                return {"memory_id": mid, "cycle": True, "children": []}
+            try:
+                mem = self.get_memory(mid)
+            except Exception as e:
+                logger.debug(f"Reasoning-chain lookup failed for {mid}: {e}")
+                mem = None
+            if mem is None:
+                return {"memory_id": mid, "missing": True, "children": []}
+            node: dict = {
+                "memory_id": mid,
+                "content": (mem.memory or "")[:_SNIPPET],
+                "epistemic_level": mem.epistemic_level,
+                "children": [],
+            }
+            premises = mem.derived_from or []
+            if premises and depth >= max_depth:
+                node["truncated"] = "max_depth"
+                return node
+            child_path = path | {mid}
+            for pid in premises:
+                if budget["nodes"] >= node_cap:
+                    # Stop emitting entirely — appending one stub per remaining
+                    # premise would let a wide fan-in inflate the response
+                    # unboundedly despite the budget.
+                    node["truncated"] = "node_cap"
+                    break
+                node["children"].append(_walk(pid, depth + 1, child_path))
+            return node
+
+        root = _walk(memory_id, 0, frozenset())
+        if root.get("missing"):
+            return None
+        return root
 
     def list_memories(
         self,
@@ -3593,6 +3699,8 @@ class MemoryService:
             related_memory_ids=metadata.get("related_memory_ids"),
             confidence=metadata.get("confidence"),
             expires_at=metadata.get("expires_at"),
+            derived_from=metadata.get("derived_from"),
+            epistemic_level=metadata.get("epistemic_level"),
             memory_kind=metadata.get("memory_kind"),
             source_ref=metadata.get("source_ref"),
             visibility=metadata.get("visibility"),

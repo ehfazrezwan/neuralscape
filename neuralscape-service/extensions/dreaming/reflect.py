@@ -5,8 +5,12 @@ NEW higher-order insights (pattern lens + failure lens). Each surviving
 insight becomes a first-class memory:
 
 - ``source_type="dream"``, ``observation_type="reflection"``
-- ``related_memory_ids`` = the cited source memories (DERIVED_FROM
-  provenance at both the vector and graph layers)
+- ``related_memory_ids`` AND ``derived_from`` = the cited source memories
+  (DERIVED_FROM provenance at both the vector and graph layers;
+  ``derived_from`` is the first-class field ``get_reasoning_chain`` walks)
+- ``epistemic_level`` self-labeled by the reflection prompt: ``deductive``
+  (entailed by the cited memories) or ``inductive`` (pattern across >= 2);
+  an invalid/missing label falls back to ``reflection``
 - pool visibility/owner inherited (§4.2 — a private pool's insight is
   private; a shared pool's is shared)
 
@@ -61,6 +65,12 @@ async def reflect(batch: PoolBatch, llm_call, *, max_insights: int) -> list[dict
             ins["category"] = "domain_knowledge"
         if ins.get("lens") not in ("pattern", "failure"):
             ins["lens"] = "pattern"
+        # A1 epistemics: the prompt asks each insight to self-label deductive
+        # (entailed by the cited memories) vs inductive (pattern across >= 2).
+        # Anything else — missing, hallucinated value — falls back to the
+        # honest catch-all "reflection".
+        if ins.get("epistemic_level") not in ("deductive", "inductive"):
+            ins["epistemic_level"] = "reflection"
         try:
             ins["confidence"] = max(0.0, min(1.0, float(ins.get("confidence", 0.0))))
         except (TypeError, ValueError):
@@ -93,6 +103,8 @@ def store_insights(service, batch: PoolBatch, insights: list[dict], *, dry_run: 
                 concepts=["pattern"] if ins["lens"] == "pattern" else ["gotcha"],
                 source_type="dream",
                 related_memory_ids=ins["source_memory_ids"],
+                derived_from=ins["source_memory_ids"],
+                epistemic_level=ins.get("epistemic_level", "reflection"),
                 confidence=ins["confidence"],
                 visibility=batch.visibility if batch.visibility == "shared" else "private",
                 add_to_graph=True,

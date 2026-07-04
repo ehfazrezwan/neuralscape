@@ -158,6 +158,10 @@ def ingest_document(service, doc: IngestDoc) -> dict:
                     agent_id=doc.agent_id,
                     run_id=doc.run_id,
                     source_type="imported",
+                    # Distilled facts restate what the document says directly
+                    # → epistemically "explicit" (A1). Verbatim passages carry
+                    # no level (they're source text, not extracted claims).
+                    epistemic_level="explicit",
                     visibility=doc.visibility,
                     memory_kind="fact",
                     source_ref=base,

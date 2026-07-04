@@ -90,6 +90,9 @@ class TaskManager:
         related_memory_ids: list[str] | None = None,
         confidence: float | None = None,
         expires_at: str | None = None,
+        # Provenance epistemics (A1)
+        derived_from: list[str] | None = None,
+        epistemic_level: str | None = None,
         # Multi-user model
         visibility: str | None = None,
         # Data-layer connectors
@@ -121,6 +124,8 @@ class TaskManager:
             "related_memory_ids": related_memory_ids,
             "confidence": confidence,
             "expires_at": expires_at,
+            "derived_from": derived_from,
+            "epistemic_level": epistemic_level,
             "visibility": visibility,
             "memory_kind": memory_kind,
             "source_ref": source_ref,

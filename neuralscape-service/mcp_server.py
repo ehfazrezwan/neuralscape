@@ -1,8 +1,9 @@
-"""MCP server exposing neuralscape memory operations as 12 tools.
+"""MCP server exposing neuralscape memory operations as 15 tools.
 
 Tools: recall_memories, remember, remember_conversation, ingest_document,
 ingest_text, get_project_context, search_knowledge_graph, list_memories,
-list_projects, delete_memories, list_processes, get_process.
+list_projects, delete_memories, list_processes, get_process, edit_memory,
+retag_memories, get_reasoning_chain.
 
 Supports both stdio transport (local Claude Code) and Streamable HTTP
 transport (remote agent access via /mcp/ endpoint on port 8199).
@@ -199,6 +200,25 @@ async def list_tools() -> list[Tool]:
                         "items": {"type": "string"},
                         "maxItems": 10,
                         "description": "Memory-model v2 — UUIDs of related memories (graph linkage)",
+                    },
+                    "derived_from": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 10,
+                        "description": (
+                            "Provenance: memory IDs this fact was derived from "
+                            "(premises). Walkable later via get_reasoning_chain."
+                        ),
+                    },
+                    "epistemic_level": {
+                        "type": "string",
+                        "description": (
+                            "How this fact is known: 'explicit' (directly stated), "
+                            "'deductive' (entailed by the derived_from premises), "
+                            "'inductive' (pattern across premises), or 'reflection' "
+                            "(higher-order insight). Leave unset when unknown."
+                        ),
+                        "enum": ["explicit", "deductive", "inductive", "reflection"],
                     },
                     "confidence": {
                         "type": "number",
@@ -616,6 +636,39 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="get_reasoning_chain",
+            description=(
+                "Walk the provenance chain of a derived memory: resolve the "
+                "'derived_from' premise memories recursively into a tree of "
+                "{memory_id, content, epistemic_level, children}. Use this to "
+                "audit WHY the system believes a derived fact — e.g. a dream-"
+                "consolidation survivor or a reflection insight — before "
+                "acting on it. epistemic_level tells you how each node is "
+                "known: 'explicit' (directly stated), 'deductive' (entailed "
+                "by its premises), 'inductive' (pattern across premises), "
+                "'reflection' (higher-order insight). Cycle-protected and "
+                "capped (~50 nodes); leaf nodes may carry missing/cycle/"
+                "truncated markers instead of children."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "memory_id": {
+                        "type": "string",
+                        "description": "ID of the memory whose reasoning chain to walk",
+                    },
+                    "max_depth": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 10,
+                        "default": 3,
+                        "description": "How many levels of premises to resolve (default 3)",
+                    },
+                },
+                "required": ["memory_id"],
+            },
+        ),
+        Tool(
             name="retag_memories",
             description=(
                 "Bulk-edit organizational metadata on every memory matching a filter set — "
@@ -700,6 +753,25 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             # category, so a project-category standard (e.g. a global convention)
             # doesn't get a spurious scope="project".
 
+            # Server-side validation of the A1 provenance fields: MCP tool
+            # JSON-schema constraints are client hints, not enforced here, so
+            # mirror RawMemoryRequest's limits before enqueue (a bad value
+            # would otherwise only fail later as a silent background job).
+            from schemas import EPISTEMIC_LEVEL_VOCAB
+            _derived_from = arguments.get("derived_from")
+            if _derived_from is not None and (
+                not isinstance(_derived_from, list)
+                or len(_derived_from) > 10
+                or not all(isinstance(i, str) for i in _derived_from)
+            ):
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": "derived_from must be a list of at most 10 memory-id strings"}))]
+            _epistemic_level = arguments.get("epistemic_level")
+            if _epistemic_level is not None and _epistemic_level not in EPISTEMIC_LEVEL_VOCAB:
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": f"Invalid epistemic_level {_epistemic_level!r}. "
+                              f"Must be one of: {sorted(EPISTEMIC_LEVEL_VOCAB)}"}))]
+
             # Memory-model v2 + multi-user fields (all optional)
             v2_fields = {
                 "domain": arguments.get("domain"),
@@ -709,6 +781,8 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 "related_memory_ids": arguments.get("related_memory_ids"),
                 "confidence": arguments.get("confidence"),
                 "expires_at": arguments.get("expires_at"),
+                "derived_from": arguments.get("derived_from"),
+                "epistemic_level": arguments.get("epistemic_level"),
                 "visibility": arguments.get("visibility"),
             }
 
@@ -1050,6 +1124,21 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 "graph": graph,
                 "graph_task_id": graph_task_id,
             }, default=str))]
+
+        elif name == "get_reasoning_chain":
+            try:
+                max_depth = int(arguments.get("max_depth", 3))
+            except (TypeError, ValueError):
+                max_depth = 3
+            max_depth = min(max(max_depth, 1), 10)
+            chain = await asyncio.to_thread(
+                _service.get_reasoning_chain, arguments["memory_id"], max_depth
+            )
+            if chain is None:
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": f"Memory {arguments['memory_id']!r} not found"}))]
+            return [TextContent(type="text", text=json.dumps(
+                {"status": "ok", "chain": chain}, default=str))]
 
         elif name == "retag_memories":
             # Truthiness, not `is not None`: an empty string / empty list would

@@ -226,6 +226,16 @@ SOURCE_TYPE_VOCAB: set[str] = {
     "dream",
 }
 
+# Epistemic level: HOW a memory came to be known (provenance epistemics).
+# - "explicit":   directly stated by the user/source (extraction default)
+# - "deductive":  strictly entailed by the specific premise memories it cites
+# - "inductive":  a generalization across >= 2 premise memories
+# - "reflection": dream-authored insight without a stricter self-label
+# Legacy memories carry no epistemic_level; readers treat null as unknown.
+# Pairs with `derived_from` (the premise memory-id list) to make every
+# derived memory able to show its premises via get_reasoning_chain.
+EPISTEMIC_LEVEL_VOCAB: set[str] = {"explicit", "deductive", "inductive", "reflection"}
+
 # memory_kind distinguishes a distilled atomic fact from a verbatim passage
 # (chunk) of an ingested document. Legacy memories have no memory_kind set;
 # readers should treat a null value as "fact".
@@ -426,6 +436,16 @@ class RawMemoryRequest(BaseModel):
     confidence: float | None = Field(default=None, ge=0.0, le=1.0, description="Extractor's self-rated confidence")
     expires_at: datetime | None = Field(default=None, description="Optional expiry for short-lived memories")
 
+    # Provenance epistemics (A1, optional, additive)
+    derived_from: list[str] | None = Field(
+        default=None, max_length=10,
+        description="Premise memory IDs this memory was derived from (reasoning-chain provenance)",
+    )
+    epistemic_level: str | None = Field(
+        default=None,
+        description="How this memory is known: explicit | deductive | inductive | reflection",
+    )
+
     # Data-layer connectors (optional, additive)
     memory_kind: str | None = Field(default=None, description="'fact' (distilled) or 'passage' (verbatim chunk). Null → fact.")
     source_ref: SourceDescriptor | None = Field(default=None, description="Provenance + retrieval handle for ingested content")
@@ -473,6 +493,15 @@ class RawMemoryRequest(BaseModel):
         if v is not None and v not in MEMORY_KIND_VOCAB:
             raise ValueError(
                 f"Invalid memory_kind '{v}'. Must be one of: {sorted(MEMORY_KIND_VOCAB)}"
+            )
+        return v
+
+    @field_validator("epistemic_level")
+    @classmethod
+    def _validate_epistemic_level(cls, v: str | None) -> str | None:
+        if v is not None and v not in EPISTEMIC_LEVEL_VOCAB:
+            raise ValueError(
+                f"Invalid epistemic_level '{v}'. Must be one of: {sorted(EPISTEMIC_LEVEL_VOCAB)}"
             )
         return v
 
@@ -883,6 +912,10 @@ class MemoryResponse(BaseModel):
     related_memory_ids: list[str] | None = None
     confidence: float | None = None
     expires_at: str | None = None
+
+    # Provenance epistemics (A1; null for memories that predate it)
+    derived_from: list[str] | None = None
+    epistemic_level: str | None = None
 
     # Data-layer connectors (null for non-ingested memories)
     memory_kind: str | None = None

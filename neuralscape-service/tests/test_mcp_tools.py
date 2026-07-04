@@ -47,9 +47,9 @@ def mock_task_manager():
 
 class TestListTools:
     @pytest.mark.asyncio
-    async def test_returns_14_tools(self):
+    async def test_returns_15_tools(self):
         tools = await mcp_server.list_tools()
-        assert len(tools) == 14
+        assert len(tools) == 15
 
     @pytest.mark.asyncio
     async def test_tool_names(self):
@@ -70,6 +70,7 @@ class TestListTools:
             "delete_memories",
             "edit_memory",
             "retag_memories",
+            "get_reasoning_chain",
         }
         assert names == expected
 
@@ -613,3 +614,81 @@ class TestErrorHandling:
         data = json.loads(result[0].text)
         assert "error" in data
         assert "Database connection failed" in data["error"]
+
+
+class TestGetReasoningChainTool:
+    @pytest.mark.asyncio
+    async def test_returns_chain(self, mock_mcp_service):
+        mock_mcp_service.get_reasoning_chain.return_value = {
+            "memory_id": "m1", "content": "insight",
+            "epistemic_level": "inductive",
+            "children": [
+                {"memory_id": "p1", "content": "premise",
+                 "epistemic_level": "explicit", "children": []},
+            ],
+        }
+        result = await mcp_server.call_tool(
+            "get_reasoning_chain", {"memory_id": "m1", "max_depth": 5}
+        )
+        data = json.loads(result[0].text)
+        assert data["status"] == "ok"
+        assert data["chain"]["epistemic_level"] == "inductive"
+        assert data["chain"]["children"][0]["memory_id"] == "p1"
+        mock_mcp_service.get_reasoning_chain.assert_called_once_with("m1", 5)
+
+    @pytest.mark.asyncio
+    async def test_clamps_max_depth_and_defaults(self, mock_mcp_service):
+        mock_mcp_service.get_reasoning_chain.return_value = {"memory_id": "m1", "children": []}
+        await mcp_server.call_tool("get_reasoning_chain", {"memory_id": "m1"})
+        assert mock_mcp_service.get_reasoning_chain.call_args[0][1] == 3
+        await mcp_server.call_tool(
+            "get_reasoning_chain", {"memory_id": "m1", "max_depth": 99}
+        )
+        assert mock_mcp_service.get_reasoning_chain.call_args[0][1] == 10
+
+    @pytest.mark.asyncio
+    async def test_missing_memory_returns_error(self, mock_mcp_service):
+        mock_mcp_service.get_reasoning_chain.return_value = None
+        result = await mcp_server.call_tool(
+            "get_reasoning_chain", {"memory_id": "ghost"}
+        )
+        data = json.loads(result[0].text)
+        assert "error" in data and "ghost" in data["error"]
+
+
+class TestRememberProvenanceValidation:
+    """A1 fields are validated server-side — MCP JSON-schema hints alone
+    don't bind a client, and a bad value must fail fast, not as a silent
+    background job failure."""
+
+    @pytest.mark.asyncio
+    async def test_oversized_derived_from_rejected(self, mock_task_manager):
+        result = await mcp_server.call_tool("remember", {
+            "content": "x", "user_id": "u", "category": "preference",
+            "derived_from": [f"m{i}" for i in range(11)],
+        })
+        data = json.loads(result[0].text)
+        assert "error" in data and "derived_from" in data["error"]
+        mock_task_manager.enqueue_raw.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_invalid_epistemic_level_rejected(self, mock_task_manager):
+        result = await mcp_server.call_tool("remember", {
+            "content": "x", "user_id": "u", "category": "preference",
+            "epistemic_level": "vibes",
+        })
+        data = json.loads(result[0].text)
+        assert "error" in data and "epistemic_level" in data["error"]
+        mock_task_manager.enqueue_raw.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_valid_provenance_forwarded(self, mock_task_manager):
+        result = await mcp_server.call_tool("remember", {
+            "content": "x", "user_id": "u", "category": "preference",
+            "derived_from": ["m1", "m2"], "epistemic_level": "deductive",
+        })
+        data = json.loads(result[0].text)
+        assert data["status"] == "accepted"
+        kwargs = mock_task_manager.enqueue_raw.call_args[1]
+        assert kwargs["derived_from"] == ["m1", "m2"]
+        assert kwargs["epistemic_level"] == "deductive"

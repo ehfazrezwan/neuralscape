@@ -157,6 +157,8 @@ async def process_memory_raw(
         related_memory_ids=v2_extras.get("related_memory_ids"),
         confidence=v2_extras.get("confidence"),
         expires_at=expires_at,
+        derived_from=v2_extras.get("derived_from"),
+        epistemic_level=v2_extras.get("epistemic_level"),
         visibility=v2_extras.get("visibility"),
         memory_kind=v2_extras.get("memory_kind"),
         source_ref=v2_extras.get("source_ref"),
