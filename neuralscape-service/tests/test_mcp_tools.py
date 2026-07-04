@@ -47,9 +47,9 @@ def mock_task_manager():
 
 class TestListTools:
     @pytest.mark.asyncio
-    async def test_returns_16_tools(self):
+    async def test_returns_17_tools(self):
         tools = await mcp_server.list_tools()
-        assert len(tools) == 16
+        assert len(tools) == 17
 
     @pytest.mark.asyncio
     async def test_tool_names(self):
@@ -72,6 +72,7 @@ class TestListTools:
             "retag_memories",
             "get_reasoning_chain",
             "schedule_dream",
+            "get_card",
         }
         assert names == expected
 

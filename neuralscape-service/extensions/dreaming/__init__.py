@@ -15,7 +15,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from extensions.base import ExtensionManifest
@@ -131,8 +131,59 @@ class DreamingExtension:
                 "auto_apply_confidence": dreaming_settings.auto_apply_confidence,
                 "prune_strength_threshold": dreaming_settings.prune_strength_threshold,
                 "reflection_enabled": dreaming_settings.reflection_enabled,
+                "bridges_enabled": dreaming_settings.bridges_enabled,
+                "identity_card_enabled": dreaming_settings.identity_card_enabled,
                 "dreams_dir": str(dreaming_settings.dreams_dir),
                 "last_run": get_last_run(),
             }
+
+        @router.get("/card")
+        async def get_identity_card(request: Request, pool: str, user_id: str | None = None):
+            """The pinned identity card for one pool (B4).
+
+            ``pool`` is a pool key (``user--<uid>`` or
+            ``shared--project--<pid>``). Returns the grammar-constrained
+            lines for session-start injection; 404 when the sweep hasn't
+            produced a card for that pool yet. Cards are pinned artifacts
+            in Redis — never searchable memories.
+
+            Private ``user--*`` cards are owner-or-dictator only. The
+            caller identity follows the v1 precedence: a verified
+            per-user token wins; legacy shared-key / local callers may
+            claim ``user_id`` (the same trust model as every other
+            legacy read path); otherwise the configured default applies.
+            """
+            import asyncio
+            from functools import partial
+
+            from config import settings as core_settings
+
+            from .card import build_card_view
+            from .sweep import _get_redis
+
+            caller = (
+                getattr(request.state, "user_id", None)
+                or user_id
+                or core_settings.default_user_id
+            )
+            view = await asyncio.to_thread(
+                partial(
+                    build_card_view,
+                    pool,
+                    caller,
+                    is_dictator=core_settings.is_dictator(caller),
+                    redis=_get_redis(),
+                )
+            )
+            if view["status"] == "forbidden":
+                raise HTTPException(
+                    status_code=403,
+                    detail="Another user's private card is not readable",
+                )
+            if view["status"] == "not_found":
+                raise HTTPException(
+                    status_code=404, detail=f"No identity card for pool {pool!r}"
+                )
+            return view
 
         return router
