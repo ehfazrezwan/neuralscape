@@ -789,6 +789,15 @@ class TestKeywordSearch:
         assert [m.id for m in out] == ["m1"]
         assert capped is False
 
+    def test_terms_are_stripped_before_matching(self):
+        """Copilot on PR #122: " apples " passed the blank filter but kept
+        its spaces, so it could never substring-match "apples" in content."""
+        svc = self._service_with_points([
+            self._point("m1", "apples are great"),
+        ])
+        out, _ = svc.keyword_search("u", [" apples "])
+        assert [m.id for m in out] == ["m1"]
+
     def test_two_terms_require_both(self):
         """Audit 27 #18: single-common-term rows are noise, not exact
         matches — with two terms a row must contain BOTH."""

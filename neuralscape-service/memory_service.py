@@ -3547,7 +3547,7 @@ class MemoryService:
         so callers must NOT present the matches as exhaustive. (Follow-up:
         a Qdrant full-text index would make this scan complete and cheap.)
         """
-        lowered = [t.lower() for t in terms if t and t.strip()]
+        lowered = [t.strip().lower() for t in terms if t and t.strip()]
         if not lowered:
             return [], False
         # ≥2 terms must match on multi-term queries (ALL when only 2).
