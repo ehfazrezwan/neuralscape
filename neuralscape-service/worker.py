@@ -494,6 +494,51 @@ async def process_ingest_file(ctx: dict, payload: dict) -> dict:
         data = base64.b64decode(payload["data_b64"])
     options = payload.get("options", {})
 
+    # ── Graphify bundle members (graph.json / GRAPH_REPORT.md) ──
+    # A graphify-out/ upload (zip-expanded or as loose files) is detected by
+    # its canonical filenames. graph.json is distilled into its STABLE
+    # semantic layer only (never mirrored raw — it churns per commit and stays
+    # queryable live via the query_code_graph tools); GRAPH_REPORT.md is
+    # upgraded onto the code_graph adapter's section chunker + report
+    # extractor and then flows through the normal text pipeline below.
+    from adapters.code_graph import code_graph_available
+    from ingest.code_graph import detect_graphify_member, ingest_code_graph_json
+
+    graphify_kind = detect_graphify_member(filename, data)
+    if graphify_kind == "graph":
+        if not code_graph_available():
+            # Graceful degradation (no crash): the optional graphifyy library
+            # isn't installed, and ingesting a graph.json as prose would only
+            # produce megabytes of JSON noise — skip with an honest reason.
+            reason = (
+                "graph.json detected but the code-graph extra is not installed "
+                "(uv sync --extra code-graph); skipping instead of ingesting raw JSON"
+            )
+            logger.warning("Ingest file skipped (%s): %s", filename, reason)
+            return {"filename": filename, "skipped": True, "reason": reason}
+        result = await asyncio.to_thread(ingest_code_graph_json, service, data, payload)
+        graph_jobs = result.pop("graph_jobs", [])
+        result["graph_jobs_enqueued"] = await _enqueue_graph_jobs(
+            ctx, graph_jobs, adapter=result.get("adapter")
+        )
+        registry = ctx.get("extension_registry")
+        if registry and result.get("memory_ids"):
+            await registry.emit_event("memory_stored", {
+                "user_id": payload["user_id"],
+                "memory_id": result["memory_ids"][0],
+                "content": f"[ingest:code_graph] {filename} → {result['facts']} semantic facts",
+                "category": options.get("category", "domain_knowledge"),
+                "scope": options.get("scope", "global"),
+                "project_id": options.get("project_id"),
+                "source": "ingest",
+            })
+        return {"filename": filename, "doc_type": "code_graph", **result}
+    if graphify_kind == "report" and code_graph_available():
+        # Only upgrade from the default adapter — an explicit adapter choice
+        # (e.g. a deliberate re-ingest under another taxonomy) wins.
+        if options.get("adapter", "default") == "default":
+            options = {**options, "adapter": "code_graph"}
+
     # When visual exemplars apply, one Docling conversion yields BOTH the text
     # and the embedded figures — a book PDF takes minutes per parse, so the
     # text and image paths must not each convert separately.
