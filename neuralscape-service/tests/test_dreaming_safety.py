@@ -382,3 +382,90 @@ class TestHonestSweepStatus:
         totals = run.to_dict()["totals"]
         assert totals["pools_failed"] == 1
         assert totals["pools_dreamt"] == 1
+
+
+# ══════════════════════════════════════════════
+# #28 — graph invalidation scoped to the memory's own episode(s)
+# ══════════════════════════════════════════════
+
+
+class _FakeCypherSession:
+    def __init__(self, log: list, records: list[dict]):
+        self._log = log
+        self._records = records
+
+    async def run(self, cypher, **params):
+        self._log.append((cypher, params))
+        cursor = MagicMock()
+
+        async def _data():
+            return self._records
+
+        cursor.data = _data
+        return cursor
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+
+class _FakeDriver:
+    def __init__(self, records: list[dict] | None = None):
+        self.log: list = []
+        self._records = records if records is not None else [{"edges": 0}]
+
+    def session(self):
+        return _FakeCypherSession(self.log, self._records)
+
+
+class TestFactScopedInvalidation:
+    """Pre-fix: ``invalidate_memory_graph`` matched every RELATES_TO edge
+    ADJACENT to the tombstoned memory's entity nodes — including edges
+    asserted by live memories sharing those entities — and stamped them
+    all ``invalid_at``. Graphiti edges carry episode provenance
+    (``r.episodes``); invalidation must be scoped to edges actually
+    derived from the tombstoned memory's own episode(s).
+    """
+
+    @pytest.mark.asyncio
+    async def test_invalidation_is_episode_scoped_not_node_adjacent(self):
+        driver = _FakeDriver()
+        await graph_patcher.invalidate_memory_graph(
+            driver, group_id="user--u1", memory_id="mem-1", superseded_by="mem-2",
+        )
+        assert driver.log, "no cypher was issued"
+        cypher, params = driver.log[0]
+        # Scoping anchor: the memory's own Episodic node(s), then only edges
+        # whose episode provenance is contained in that set.
+        assert "Episodic" in cypher
+        assert "r.episodes" in cypher
+        # An edge co-asserted by ANY other memory's episode must survive —
+        # the subset guard, not a mere intersection check.
+        assert "all(" in cypher
+        # The blanket entity-node adjacency sweep is gone.
+        assert "(n)-[r:RELATES_TO]-()" not in cypher
+        assert params["group_id"] == "user--u1"
+        assert params["memory_id"] == "mem-1"
+
+    @pytest.mark.asyncio
+    async def test_nodes_still_marked_and_edge_count_returned(self):
+        driver = _FakeDriver(records=[{"edges": 3}])
+        edges = await graph_patcher.invalidate_memory_graph(
+            driver, group_id="g", memory_id="m", superseded_by="s",
+        )
+        assert edges == 3
+        cypher, params = driver.log[0]
+        # survivor hop marker is preserved (walkers jump tombstone → survivor)
+        assert "dream_superseded_by" in cypher
+        assert params["superseded_by"] == "s"
+
+    @pytest.mark.asyncio
+    async def test_driver_failure_stays_nonfatal(self):
+        driver = MagicMock()
+        driver.session.side_effect = RuntimeError("neo4j down")
+        edges = await graph_patcher.invalidate_memory_graph(
+            driver, group_id="g", memory_id="m",
+        )
+        assert edges == 0

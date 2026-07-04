@@ -361,23 +361,48 @@ async def invalidate_memory_graph(
 ) -> int:
     """Bi-temporally invalidate a memory's graph facts (never delete).
 
-    Sets ``invalid_at``/``expired_at`` on every RELATES_TO edge touching a
-    node stamped with this ``memory_id`` (see ``attach_memory_id``), and
-    marks the nodes themselves ``dream_superseded_by`` so a graph walk can
-    hop to the survivor. History is preserved — this is Graphiti's own
-    contradiction semantics driven from the dreaming deep phase.
+    Fact-scoped (audit 27 #28): each memory write is one Graphiti episode,
+    and every RELATES_TO edge records the episode uuids that asserted it in
+    ``r.episodes``. Invalidation anchors on the memory's own Episodic
+    node(s) — stamped ``memory_id`` at write time by ``attach_memory_id``
+    — and stamps ``invalid_at``/``expired_at`` only on edges whose ENTIRE
+    episode provenance lies inside that set. Edges co-asserted by any
+    other (live) memory's episode survive untouched — the pre-fix
+    entity-node adjacency sweep invalidated those too, destroying facts
+    asserted by live memories that merely shared an entity.
+
+    Known residual imprecision (NS-layer best effort, no Graphiti change):
+
+    - If the write-time ``memory_id`` stamp missed the Episodic node (a
+      graph write slower than the attach window), zero edges are
+      invalidated — deliberately fail-safe (a stale-but-filtered edge
+      beats destroying live ones).
+    - An edge asserted by episodes of N > 1 memories is only invalidated
+      when ALL those memories' episodes belong to the tombstoned memory —
+      tombstoning each co-asserter in separate sweeps leaves the edge
+      live (each pass sees the others' episodes as external evidence).
+
+    Entity nodes stamped with this ``memory_id`` still get the
+    ``dream_superseded_by`` hop marker (walker convenience, not an
+    invalidation).
 
     Returns the number of edges invalidated (0 on any failure — best-effort
     like every helper in this module).
     """
     ts = (now or datetime.now(timezone.utc)).isoformat()
     cypher = """
-    MATCH (n {group_id: $group_id, memory_id: $memory_id})
-    OPTIONAL MATCH (n)-[r:RELATES_TO]-()
+    OPTIONAL MATCH (ep:Episodic {group_id: $group_id, memory_id: $memory_id})
+    WITH collect(ep.uuid) AS eps
+    OPTIONAL MATCH ()-[r:RELATES_TO {group_id: $group_id}]->()
     WHERE r.invalid_at IS NULL
+      AND size(eps) > 0
+      AND size(coalesce(r.episodes, [])) > 0
+      AND all(x IN coalesce(r.episodes, []) WHERE x IN eps)
     SET r.invalid_at = $ts, r.expired_at = $ts
+    WITH count(r) AS edges
+    OPTIONAL MATCH (n {group_id: $group_id, memory_id: $memory_id})
     SET n.dream_superseded_by = $superseded_by, n.dream_invalidated_at = $ts
-    RETURN count(r) AS edges
+    RETURN edges
     """
     try:
         async with driver.session() as session:
