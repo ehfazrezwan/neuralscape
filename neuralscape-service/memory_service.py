@@ -2166,8 +2166,11 @@ class MemoryService:
                 if r.visibility == visibility or r.visibility is None
             ]
 
-        # Deduplicate and enforce caller's limit
-        combined = self._deduplicate_responses(vector_responses, graph_responses)
+        # Deduplicate and enforce caller's limit — ranked vector hits keep
+        # priority; graph rows are appended after, capped within the limit.
+        combined = self._deduplicate_responses(
+            vector_responses, graph_responses, limit=limit
+        )
 
         # memory_kind filter (data-layer connectors). Legacy memories have no
         # memory_kind, so a "fact" filter treats null as fact (back-compat);
@@ -4540,11 +4543,22 @@ class MemoryService:
         self,
         vector_responses: list[MemoryResponse],
         graph_responses: list[MemoryResponse],
+        limit: int | None = None,
     ) -> list[MemoryResponse]:
-        """Deduplicate and interleave vector and graph results.
+        """Deduplicate and weave vector and graph results (audit 27 #2).
 
         Removes graph results whose content closely matches a vector result,
-        then interleaves the remaining results (vector-1, graph-1, vector-2, ...).
+        then appends the surviving graph rows AFTER the vector hits: scored
+        vector hits keep their ranked order and take priority. The old 1:1
+        positional interleave let unranked (score=None) relation strings
+        evict up to half of the ranked vector top-k after the caller's
+        ``[:limit]`` cut.
+
+        When ``limit`` is given, graph rows are capped at
+        ``max(1, limit // 4)`` slots within the limit — except they may
+        additionally fill any shortfall when the vector legs returned fewer
+        than ``limit`` hits. Vector hits are only ever displaced down to
+        ``limit - cap`` (= ceil(3·limit/4)), never below.
         """
         seen_content: set[str] = set()
         unique_graph: list[MemoryResponse] = []
@@ -4565,18 +4579,21 @@ class MemoryService:
                 unique_graph.append(gr)
                 seen_content.add(normalized)
 
-        # Interleave: vector-1, graph-1, vector-2, graph-2, ...
-        interleaved: list[MemoryResponse] = []
-        vi, gi = 0, 0
-        while vi < len(vector_responses) or gi < len(unique_graph):
-            if vi < len(vector_responses):
-                interleaved.append(vector_responses[vi])
-                vi += 1
-            if gi < len(unique_graph):
-                interleaved.append(unique_graph[gi])
-                gi += 1
+        if limit is None:
+            # No budget context (legacy callers): vector first, graph after.
+            return vector_responses + unique_graph
 
-        return interleaved
+        # Graph reservation: max(1, limit // 4) slots, but never the vector
+        # top hit's slot (at limit=1 the single ranked vector hit wins).
+        graph_cap = max(1, limit // 4)
+        if vector_responses:
+            graph_cap = min(graph_cap, limit - 1)
+        vector_target = min(len(vector_responses), max(limit - graph_cap, 0))
+        # Graph rows fill their reservation plus any vector shortfall;
+        # vector reclaims reserved slots the graph leg can't use.
+        graph_take = min(len(unique_graph), limit - vector_target)
+        vector_kept = vector_responses[: limit - graph_take]
+        return vector_kept + unique_graph[:graph_take]
 
     def _expire_graph_edges_for_memory(self, mem: dict) -> None:
         """Soft-delete graph edges related to a memory by setting expired_at."""

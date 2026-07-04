@@ -182,3 +182,96 @@ class TestBM25LexicalLeg:
         assert [str(e["hit"].id) for e in fused] == ["both", "d1"]
         assert fused[0]["dense"] is True
 
+
+# ══════════════════════════════════════════════
+# Defect 2 — vector/graph weave (ranked hits keep priority)
+# ══════════════════════════════════════════════
+
+
+class TestVectorGraphWeave:
+    """Pre-fix: `_deduplicate_responses` interleaved scored vector hits 1:1
+    with score=None graph edges and the caller cut `combined[:limit]` — at
+    limit=10 with 6 graph rows, vector ranks 6-10 were evicted by unranked
+    relation strings (and the method took no ``limit`` at all, so these
+    tests raised TypeError before the fix).
+    """
+
+    def setup_method(self):
+        self.svc = MemoryService()
+
+    @staticmethod
+    def _vector(n):
+        return [
+            MemoryResponse(
+                id=f"v{i}", memory=f"vector fact {i}", score=0.95 - i * 0.01,
+                source="vector",
+            )
+            for i in range(n)
+        ]
+
+    @staticmethod
+    def _graph(n):
+        return [
+            MemoryResponse(id=f"g{i}", memory=f"graph relation {i}", source="graph")
+            for i in range(n)
+        ]
+
+    def test_vector_ranks_survive_and_graph_capped(self):
+        """10 scored vector hits + 6 graph rows at limit=10: at least
+        ceil(3*limit/4) vector hits survive, in ranked order, and graph
+        rows come after them (pre-fix weave kept only v0-v4)."""
+        limit = 10
+        result = self.svc._deduplicate_responses(
+            self._vector(10), self._graph(6), limit=limit
+        )
+
+        assert len(result) == limit
+        vector_survivors = [r for r in result if r.source == "vector"]
+        assert len(vector_survivors) >= math.ceil(3 * limit / 4)  # >= 8
+        # ranked order preserved, graph strictly after every vector hit
+        assert [r.id for r in vector_survivors] == [f"v{i}" for i in range(8)]
+        first_graph = next(i for i, r in enumerate(result) if r.source == "graph")
+        assert all(r.source == "graph" for r in result[first_graph:])
+        # graph rows capped at max(1, limit // 4)
+        assert sum(1 for r in result if r.source == "graph") <= max(1, limit // 4)
+
+    def test_graph_fills_shortfall_when_vector_underfills(self):
+        result = self.svc._deduplicate_responses(
+            self._vector(3), self._graph(6), limit=10
+        )
+
+        assert [r.id for r in result[:3]] == ["v0", "v1", "v2"]
+        assert sum(1 for r in result if r.source == "graph") == 6
+        assert len(result) == 9
+
+    def test_vector_reclaims_unused_graph_reservation(self):
+        result = self.svc._deduplicate_responses(
+            self._vector(10), self._graph(1), limit=10
+        )
+
+        assert len(result) == 10
+        assert sum(1 for r in result if r.source == "vector") == 9
+        assert result[-1].source == "graph"
+
+    def test_limit_one_prefers_the_top_vector_hit(self):
+        result = self.svc._deduplicate_responses(
+            self._vector(1), self._graph(1), limit=1
+        )
+        assert [r.id for r in result] == ["v0"]
+
+    def test_substring_dedup_still_applies(self):
+        vector = [
+            MemoryResponse(
+                id="v0", memory="User prefers tabs over spaces", score=0.9,
+                source="vector",
+            )
+        ]
+        graph = [MemoryResponse(id="g0", memory="prefers tabs", source="graph")]
+        result = self.svc._deduplicate_responses(vector, graph, limit=10)
+        assert [r.id for r in result] == ["v0"]
+
+    def test_no_limit_appends_graph_after_vector(self):
+        """Back-compat: called without a limit, vector still precedes graph."""
+        result = self.svc._deduplicate_responses(self._vector(2), self._graph(2))
+        assert [r.source for r in result] == ["vector", "vector", "graph", "graph"]
+
