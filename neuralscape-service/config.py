@@ -48,6 +48,13 @@ class Settings(BaseSettings):
     # supports strict structured output. Independent of llm_gateway_enabled, which
     # routes the vector path (and is what stabilizes the API event loop).
     llm_gateway_graphiti_enabled: bool = False
+    # Max inputs per embedder batch call (client-side chunking in mem0's
+    # embedder). 0 → provider default: 100 for the OpenAI-compatible route,
+    # native batching for AI Studio. The gateway's Vertex embedding endpoint
+    # (google-vertex/gemini-embedding-001) accepts only ONE input per request
+    # and rejects mem0's batched input — so when the gateway is enabled this
+    # defaults to 1 (per-item embeds) unless explicitly overridden.
+    embedder_max_batch_size: int = 0
 
     # Neo4j
     neo4j_uri: str = "neo4j://127.0.0.1:7687"
@@ -616,6 +623,9 @@ class Settings(BaseSettings):
                     "api_key": self.llm_gateway_api_key,
                     "openai_base_url": gw,
                     "embedding_dims": 768,
+                    # The gateway's Vertex embedding endpoint accepts only one
+                    # input per request → embed per item unless overridden.
+                    "embedding_batch_size": self.embedder_max_batch_size or 1,
                 },
             }
             # graphiti routes through the gateway only when explicitly enabled;
