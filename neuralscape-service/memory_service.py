@@ -3522,14 +3522,17 @@ class MemoryService:
         terms: list[str],
         project_id: str | None = None,
         limit: int = 20,
-    ) -> list[MemoryResponse]:
+    ) -> tuple[list[MemoryResponse], bool]:
         """Grep-style exact/keyword scan over caller-visible memories (C3).
 
-        Case-insensitive substring match: a memory matches when its content
-        contains ANY of ``terms``. This is the dialectic discipline for
-        enumeration/counting questions — embeddings under-recall exhaustive
-        "list every X" sets, so the ask path runs this exact pass *before*
-        semantic search and dedups the union.
+        Case-insensitive substring match. A single term must be present;
+        with multiple terms a memory must contain at least TWO of them
+        (i.e. both when only two are given) — ANY-term matching promoted
+        single-common-word noise as "exact" evidence (audit 27 #18). This
+        is the dialectic discipline for enumeration/counting questions —
+        embeddings under-recall exhaustive "list every X" sets, so the ask
+        path runs this exact pass *before* semantic search and dedups the
+        union.
 
         Visibility mirrors search's pool union (caller's own rows at any
         visibility + shared + standard-when-enabled; ``project_id`` adds the
@@ -3538,10 +3541,17 @@ class MemoryService:
         ``_TIMELINE_FALLBACK_PAGE`` up to ``_TIMELINE_FALLBACK_CAP`` points,
         stopping early once ``limit`` matches are found. Results carry no
         score (exact matches aren't ranked).
+
+        Returns ``(matches, scan_capped)`` — ``scan_capped`` is True when
+        the point cap terminated the scan with candidates left unscanned,
+        so callers must NOT present the matches as exhaustive. (Follow-up:
+        a Qdrant full-text index would make this scan complete and cheap.)
         """
         lowered = [t.lower() for t in terms if t and t.strip()]
         if not lowered:
-            return []
+            return [], False
+        # ≥2 terms must match on multi-term queries (ALL when only 2).
+        required_matches = min(2, len(lowered))
         from qdrant_client.models import FieldCondition, Filter, MatchValue
 
         client = self._get_memory().vector_store.client
@@ -3598,7 +3608,7 @@ class MemoryService:
             )
             for pt in page or []:
                 content = ((getattr(pt, "payload", None) or {}).get("data") or "").lower()
-                if any(t in content for t in lowered):
+                if sum(1 for t in lowered if t in content) >= required_matches:
                     matches.append(self._point_to_response(pt))
                     if len(matches) >= limit:
                         break
@@ -3606,7 +3616,11 @@ class MemoryService:
             # `is None`, not truthiness — integer point-id offsets can be 0.
             if offset is None:
                 break
-        return matches
+        # Partial scan: the point cap fired while Qdrant still had more
+        # candidate points (`offset` non-None) — the matches are a sample,
+        # not the exhaustive lexical truth.
+        scan_capped = offset is not None and scanned >= self._TIMELINE_FALLBACK_CAP
+        return matches, scan_capped
 
     def list_memories(
         self,

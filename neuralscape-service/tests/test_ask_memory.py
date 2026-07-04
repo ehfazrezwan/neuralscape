@@ -39,10 +39,13 @@ def _graph_mem(mid: str, content: str) -> MemoryResponse:
     )
 
 
-def _service(search_results=None, keyword_results=None) -> MagicMock:
+def _service(search_results=None, keyword_results=None, keyword_capped=False) -> MagicMock:
     svc = MagicMock(name="MemoryService")
     svc.search.return_value = search_results if search_results is not None else []
-    svc.keyword_search.return_value = keyword_results if keyword_results is not None else []
+    svc.keyword_search.return_value = (
+        keyword_results if keyword_results is not None else [],
+        keyword_capped,
+    )
     return svc
 
 
@@ -418,6 +421,48 @@ class TestCrossSourceDedup:
 
 
 # ──────────────────────────────────────────────
+# Keyword-pass prompt honesty (audit 27 #18): a capped (partial) lexical
+# scan must not be endorsed as exact/exhaustive to the answering LLM
+# ──────────────────────────────────────────────
+
+
+class TestKeywordPromptHonesty:
+    @pytest.mark.asyncio
+    async def test_capped_scan_softens_prompt_language(self):
+        svc = _service([_mem("m1", "apple")], [_mem("k1", "banana")],
+                       keyword_capped=True)
+        llm = _answer_llm("2")
+        await ask_memory(svc, question="How many fruits did I mention?",
+                         user_id="u", reasoning_level="high", llm_call=llm)
+        prompt = llm.prompts[0]
+        assert "partial" in prompt.lower()
+        assert "Exact-keyword matches are listed first" not in prompt
+
+    @pytest.mark.asyncio
+    async def test_full_scan_keeps_exact_match_claim(self):
+        svc = _service([_mem("m1", "apple")], [_mem("k1", "banana")],
+                       keyword_capped=False)
+        llm = _answer_llm("2")
+        await ask_memory(svc, question="How many fruits did I mention?",
+                         user_id="u", reasoning_level="high", llm_call=llm)
+        prompt = llm.prompts[0]
+        assert "Exact-keyword matches are listed first" in prompt
+        assert "partial" not in prompt.lower()
+
+    @pytest.mark.asyncio
+    async def test_legacy_list_return_still_accepted(self):
+        """A test double (or older fork) returning a bare list instead of
+        (rows, capped) degrades to capped=False, not a crash."""
+        svc = _service([_mem("m1", "apple")])
+        svc.keyword_search.return_value = [_mem("k1", "banana")]
+        llm = _answer_llm("2")
+        out = await ask_memory(svc, question="How many fruits did I mention?",
+                               user_id="u", reasoning_level="high", llm_call=llm)
+        assert out["memories_considered"] == 2
+        assert "Exact-keyword matches are listed first" in llm.prompts[0]
+
+
+# ──────────────────────────────────────────────
 # Abstention (dialectic discipline 4)
 # ──────────────────────────────────────────────
 
@@ -675,29 +720,72 @@ class TestKeywordSearch:
             self._point("m1", "Deployed the Blue-Green pipeline"),
             self._point("m2", "Wrote docs about testing"),
         ])
-        out = svc.keyword_search("u", ["blue-green"])
+        out, capped = svc.keyword_search("u", ["blue-green"])
         assert [m.id for m in out] == ["m1"]
+        assert capped is False
 
-    def test_any_term_matches(self):
+    def test_two_terms_require_both(self):
+        """Audit 27 #18: single-common-term rows are noise, not exact
+        matches — with two terms a row must contain BOTH."""
         svc = self._service_with_points([
             self._point("m1", "apples are great"),
             self._point("m2", "bananas are fine"),
-            self._point("m3", "carrots though"),
+            self._point("m3", "apples and bananas smoothie"),
         ])
-        out = svc.keyword_search("u", ["apples", "bananas"])
-        assert {m.id for m in out} == {"m1", "m2"}
+        out, _ = svc.keyword_search("u", ["apples", "bananas"])
+        assert {m.id for m in out} == {"m3"}
+
+    def test_three_plus_terms_require_at_least_two(self):
+        svc = self._service_with_points([
+            self._point("m1", "apples alone here"),
+            self._point("m2", "apples and bananas together"),
+            self._point("m3", "bananas with carrots on top"),
+        ])
+        out, _ = svc.keyword_search("u", ["apples", "bananas", "carrots"])
+        assert {m.id for m in out} == {"m2", "m3"}
+
+    def test_single_term_still_matches_alone(self):
+        svc = self._service_with_points([
+            self._point("m1", "apples are great"),
+            self._point("m2", "carrots though"),
+        ])
+        out, _ = svc.keyword_search("u", ["apples"])
+        assert [m.id for m in out] == ["m1"]
+
+    def test_scan_capped_flag_set_when_point_cap_hit(self):
+        """Ten 500-point pages with more remaining → the 5000-point cap
+        terminated the scan; the caller must know it was partial."""
+        from memory_service import MemoryService
+
+        svc = self._service_with_points([])
+        pages = [
+            ([self._point(f"m{p}-{i}", "unrelated note") for i in range(500)], p + 1)
+            for p in range(10)
+        ]
+        svc._memory.vector_store.client.scroll.side_effect = pages
+        out, capped = svc.keyword_search("u", ["apples", "bananas"])
+        assert out == []
+        assert capped is True
+        assert MemoryService._TIMELINE_FALLBACK_CAP == 5000  # test models the real cap
+
+    def test_scan_not_capped_when_collection_exhausted(self):
+        svc = self._service_with_points([
+            self._point("m1", "apples and bananas"),
+        ])  # helper returns (points, None): collection fully scanned
+        _, capped = svc.keyword_search("u", ["apples", "bananas"])
+        assert capped is False
 
     def test_limit_respected(self):
         svc = self._service_with_points([
             self._point(f"m{i}", "deploy note") for i in range(10)
         ])
-        out = svc.keyword_search("u", ["deploy"], limit=3)
+        out, _ = svc.keyword_search("u", ["deploy"], limit=3)
         assert len(out) == 3
 
     def test_empty_terms_short_circuits(self):
         svc = self._service_with_points([])
-        assert svc.keyword_search("u", []) == []
-        assert svc.keyword_search("u", ["", "  "]) == []
+        assert svc.keyword_search("u", []) == ([], False)
+        assert svc.keyword_search("u", ["", "  "]) == ([], False)
         svc._memory.vector_store.client.scroll.assert_not_called()
 
     def test_filter_excludes_tombstones_and_scopes_visibility(self):

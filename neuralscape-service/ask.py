@@ -260,6 +260,7 @@ def _build_prompt(
     budget: int,
     enumeration: bool,
     keyword_ids: list[str],
+    keyword_scan_capped: bool = False,
 ) -> str:
     """Assemble the answering prompt. Verbosity scales with the tier."""
     parts = [
@@ -268,10 +269,22 @@ def _build_prompt(
         _DISCIPLINES_BRIEF if tier.name == "minimal" else _DISCIPLINES_FULL,
     ]
     if enumeration and tier.name != "minimal":
-        parts.append(
-            "\nThis looks like an enumeration/counting question. Exact-keyword matches are "
-            "listed first in the evidence. Build the dedup table before you count."
-        )
+        if keyword_scan_capped:
+            # Audit 27 #18: the lexical scan hit its point cap — its hits
+            # are a sample, and claiming them exact/exhaustive licenses
+            # confidently wrong counts.
+            parts.append(
+                "\nThis looks like an enumeration/counting question. A keyword scan "
+                "contributed the rows listed first, but it was PARTIAL (it did not cover "
+                "all stored memories) — do not treat those rows as exhaustive or complete. "
+                "Build the dedup table before you count, and qualify the count if the "
+                "evidence may be incomplete."
+            )
+        else:
+            parts.append(
+                "\nThis looks like an enumeration/counting question. Exact-keyword matches are "
+                "listed first in the evidence. Build the dedup table before you count."
+            )
     if tier.name in ("medium", "high"):
         parts.append(
             "\nThink through the evidence step by step BEFORE answering, but output ONLY "
@@ -413,12 +426,13 @@ async def ask_memory(
     enumeration = is_enumeration_question(question)
 
     # ── Discipline 1: grep-style exact pass BEFORE semantic ──
+    keyword_scan_capped = False
     if tier.keyword_pass:
         terms = extract_keywords(question)
         if terms:
             searches.append("keyword: " + " ".join(terms))
             try:
-                hits = await asyncio.to_thread(
+                res = await asyncio.to_thread(
                     service.keyword_search,
                     user_id=user_id,
                     terms=terms,
@@ -427,7 +441,13 @@ async def ask_memory(
                 )
             except Exception as e:  # non-fatal: degrade to semantic only
                 logger.warning(f"ask keyword pass failed (non-critical): {e}")
-                hits = []
+                res = []
+            # keyword_search returns (rows, scan_capped); tolerate a bare
+            # list from older forks / test doubles.
+            if isinstance(res, tuple):
+                hits, keyword_scan_capped = res
+            else:
+                hits = res
             keyword_ids = [h.id for h in hits if getattr(h, "id", None)]
             _merge(hits)
 
@@ -458,7 +478,8 @@ async def ask_memory(
     raw = ""
     parsed: dict | None = None
     for _ in range(tier.extra_searches + 1):
-        prompt = _build_prompt(question, evidence, tier, budget, enumeration, keyword_ids)
+        prompt = _build_prompt(question, evidence, tier, budget, enumeration,
+                               keyword_ids, keyword_scan_capped)
         raw = await call(prompt)
         parsed = _parse_llm_json(raw)
         if (
@@ -474,7 +495,8 @@ async def ask_memory(
     # The model spent its last iteration asking for another search — force
     # one final answer-only pass so the caller never gets a non-answer.
     if parsed is not None and parsed.get("action") == "search":
-        prompt = _build_prompt(question, evidence, tier, 0, enumeration, keyword_ids)
+        prompt = _build_prompt(question, evidence, tier, 0, enumeration,
+                               keyword_ids, keyword_scan_capped)
         raw = await call(prompt)
         parsed = _parse_llm_json(raw)
 
