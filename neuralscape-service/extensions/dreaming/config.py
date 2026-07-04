@@ -188,6 +188,35 @@ class DreamingSettings(BaseSettings):
         ),
     )
 
+    bridges_enabled: bool = Field(
+        default=True,
+        description=(
+            "Cross-hub Bridges pass (B3a): after the per-pool librarian "
+            "passes, topic pages whose subject spans multiple hubs gain a "
+            "reciprocal '## Bridges' section. Requires vault_pages_enabled."
+        ),
+    )
+    bridge_graph_limit: int = Field(
+        default=200,
+        ge=10,
+        le=2000,
+        description=(
+            "Row ceiling on the single shared-entity Cypher the bridges "
+            "pass runs per sweep (graph enrichment on top of the "
+            "deterministic slug/source-id signals)."
+        ),
+    )
+
+    identity_card_enabled: bool = Field(
+        default=True,
+        description=(
+            "Identity-card pass (B4): the sweep maintains a pinned, "
+            "grammar-constrained card per user pool and per project pool "
+            "(Redis + Me/Card.md / Projects/<pid>/Card.md), exposed via "
+            "the get_card MCP tool and GET /v1/extensions/dreaming/card."
+        ),
+    )
+
     dry_run_default: bool = Field(
         default=False,
         description="When True, sweeps report planned actions without writing.",

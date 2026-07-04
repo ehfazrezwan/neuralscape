@@ -22,7 +22,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 
-from . import consolidate, gate, librarian, reflect
+from . import bridges, card, consolidate, gate, librarian, reflect
 from .config import DreamingSettings, dreaming_settings
 
 logger = logging.getLogger(__name__)
@@ -42,6 +42,7 @@ class PoolReport:
     insights: int = 0
     pages_written: int = 0
     pages_skipped: int = 0
+    card_status: str = ""             # updated | stable | unchanged | skipped | ""
     errors: list[str] = field(default_factory=list)
     diary_path: str | None = None
 
@@ -53,6 +54,7 @@ class DreamRun:
     finished_at: str | None = None
     dry_run: bool = False
     pools: list[PoolReport] = field(default_factory=list)
+    bridges: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -60,6 +62,7 @@ class DreamRun:
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "dry_run": self.dry_run,
+            "bridges": self.bridges,
             "pools": [asdict(p) for p in self.pools],
             "totals": {
                 "pools_dreamt": sum(1 for p in self.pools if p.status == "dreamt"),
@@ -164,6 +167,27 @@ async def dream_all(
             batch=batch, dry_run=dry_run, force=force,
         )
         run.pools.append(report)
+
+    # Bridges (B3a) run once per sweep, AFTER every pool's librarian pass —
+    # tunnels are cross-pool by nature, so they can't live inside the loop.
+    if (
+        settings.vault_pages_enabled
+        and settings.bridges_enabled
+        and any(p.status == "dreamt" for p in run.pools)
+    ):
+        try:
+            graph_rows = await bridges.fetch_graph_rows(
+                service, limit=settings.bridge_graph_limit
+            )
+            run.bridges = await asyncio.to_thread(
+                bridges.update_bridges,
+                settings.vault_path,
+                graph_rows=graph_rows,
+                dry_run=dry_run,
+            )
+        except Exception:
+            logger.exception("bridges pass failed (non-fatal)")
+            run.bridges = {"error": "bridges"}
 
     run.finished_at = datetime.now(timezone.utc).isoformat()
     _save_run(redis, run)
@@ -270,12 +294,31 @@ async def _dream_pool(
                     operator_user_id=core_settings.default_user_id,
                     dry_run=dry_run,
                     redis=redis,
+                    faded_threshold=settings.prune_strength_threshold,
                 )
                 report.pages_written = lib["pages_written"]
                 report.pages_skipped = lib["pages_skipped"]
             except Exception:
                 logger.exception("librarian pass failed for pool %s (non-fatal)", pool)
                 report.errors.append("librarian")
+
+        # 8b. identity card (B4): pinned Redis artifact + Card.md render.
+        #     Never stored as a searchable memory.
+        if settings.identity_card_enabled:
+            try:
+                from config import settings as core_settings
+
+                card_out = await card.update_card(
+                    batch, llm_call,
+                    redis=redis,
+                    vault=settings.vault_path,
+                    operator_user_id=core_settings.default_user_id,
+                    dry_run=dry_run,
+                )
+                report.card_status = card_out.get("status", "")
+            except Exception:
+                logger.exception("card pass failed for pool %s (non-fatal)", pool)
+                report.errors.append("card")
 
         # 9. diary (review surface; never a promotion source)
         entry = reflect.render_diary_entry(
