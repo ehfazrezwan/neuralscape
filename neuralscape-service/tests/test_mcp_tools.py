@@ -654,3 +654,41 @@ class TestGetReasoningChainTool:
         )
         data = json.loads(result[0].text)
         assert "error" in data and "ghost" in data["error"]
+
+
+class TestRememberProvenanceValidation:
+    """A1 fields are validated server-side — MCP JSON-schema hints alone
+    don't bind a client, and a bad value must fail fast, not as a silent
+    background job failure."""
+
+    @pytest.mark.asyncio
+    async def test_oversized_derived_from_rejected(self, mock_task_manager):
+        result = await mcp_server.call_tool("remember", {
+            "content": "x", "user_id": "u", "category": "preference",
+            "derived_from": [f"m{i}" for i in range(11)],
+        })
+        data = json.loads(result[0].text)
+        assert "error" in data and "derived_from" in data["error"]
+        mock_task_manager.enqueue_raw.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_invalid_epistemic_level_rejected(self, mock_task_manager):
+        result = await mcp_server.call_tool("remember", {
+            "content": "x", "user_id": "u", "category": "preference",
+            "epistemic_level": "vibes",
+        })
+        data = json.loads(result[0].text)
+        assert "error" in data and "epistemic_level" in data["error"]
+        mock_task_manager.enqueue_raw.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_valid_provenance_forwarded(self, mock_task_manager):
+        result = await mcp_server.call_tool("remember", {
+            "content": "x", "user_id": "u", "category": "preference",
+            "derived_from": ["m1", "m2"], "epistemic_level": "deductive",
+        })
+        data = json.loads(result[0].text)
+        assert data["status"] == "accepted"
+        kwargs = mock_task_manager.enqueue_raw.call_args[1]
+        assert kwargs["derived_from"] == ["m1", "m2"]
+        assert kwargs["epistemic_level"] == "deductive"

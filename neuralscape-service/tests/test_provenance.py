@@ -88,6 +88,16 @@ class TestStoreRawProvenance:
         assert "derived_from" not in payload["metadata"]
         assert "epistemic_level" not in payload["metadata"]
 
+    def test_empty_derived_from_normalized_to_none(self, service):
+        # An explicit [] stores nothing, so the response must echo None —
+        # otherwise the write response and later reads would disagree.
+        result = service.store_raw(
+            content="x", user_id="u1", category="preference", derived_from=[],
+        )
+        payload = service._memory.vector_store.insert.call_args[1]["payloads"][0]
+        assert "derived_from" not in payload["metadata"]
+        assert result[0].derived_from is None
+
     def test_rejects_unknown_level(self, service):
         with pytest.raises(ValueError, match="Invalid epistemic_level"):
             service.store_raw(
@@ -340,17 +350,20 @@ class TestReasoningChain:
         svc = _ChainStub(graph)
         chain = svc.get_reasoning_chain("root", max_depth=5, node_cap=8)
 
-        resolved, stubs = [], []
+        all_nodes, truncated = [], []
 
         def _count(node):
-            (stubs if node.get("truncated") == "node_cap" else resolved).append(node)
+            all_nodes.append(node)
+            if node.get("truncated") == "node_cap":
+                truncated.append(node)
             for child in node.get("children", []):
                 _count(child)
 
         _count(chain)
-        assert len(resolved) == 8
-        assert stubs  # the walk stopped by budget, not by exhaustion
-        assert all(s["children"] == [] for s in stubs)
+        # The budget bounds the TOTAL emitted node count (no per-premise
+        # stubs) so a wide fan-in can't inflate the response past the cap.
+        assert len(all_nodes) <= 8
+        assert truncated  # the walk stopped by budget, not by exhaustion
 
     def test_content_snippet_capped(self):
         svc = _ChainStub({"root": ("x" * 500, "explicit", [])})

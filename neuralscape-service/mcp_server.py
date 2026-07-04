@@ -753,6 +753,25 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             # category, so a project-category standard (e.g. a global convention)
             # doesn't get a spurious scope="project".
 
+            # Server-side validation of the A1 provenance fields: MCP tool
+            # JSON-schema constraints are client hints, not enforced here, so
+            # mirror RawMemoryRequest's limits before enqueue (a bad value
+            # would otherwise only fail later as a silent background job).
+            from schemas import EPISTEMIC_LEVEL_VOCAB
+            _derived_from = arguments.get("derived_from")
+            if _derived_from is not None and (
+                not isinstance(_derived_from, list)
+                or len(_derived_from) > 10
+                or not all(isinstance(i, str) for i in _derived_from)
+            ):
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": "derived_from must be a list of at most 10 memory-id strings"}))]
+            _epistemic_level = arguments.get("epistemic_level")
+            if _epistemic_level is not None and _epistemic_level not in EPISTEMIC_LEVEL_VOCAB:
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": f"Invalid epistemic_level {_epistemic_level!r}. "
+                              f"Must be one of: {sorted(EPISTEMIC_LEVEL_VOCAB)}"}))]
+
             # Memory-model v2 + multi-user fields (all optional)
             v2_fields = {
                 "domain": arguments.get("domain"),

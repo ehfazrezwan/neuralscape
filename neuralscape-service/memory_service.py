@@ -811,6 +811,10 @@ class MemoryService:
                 f"Invalid epistemic_level: {epistemic_level}. "
                 f"Must be one of: {sorted(EPISTEMIC_LEVEL_VOCAB)}"
             )
+        # Normalize empty→None so the response echoes exactly what was
+        # persisted (metadata only stores truthy lists; echoing [] while
+        # storing nothing would make the write and later reads disagree).
+        derived_from = derived_from or None
 
         # Resolve visibility: explicit caller value > per-category default.
         # ``normalize_visibility`` handles MemoryVisibility enum, plain
@@ -2406,11 +2410,15 @@ class MemoryService:
         liability" made walkable.
 
         Each node is ``{memory_id, content (snippet), epistemic_level,
-        children}``. Leaf markers instead of children where the walk stops:
-        ``missing`` (premise no longer resolvable — e.g. hard-deleted),
-        ``cycle`` (id already on the current path), ``truncated``
-        ("max_depth" | "node_cap"). Tombstoned premises still resolve — a
-        merge survivor's provenance must outlive its losers' recall
+        children}``. A node where the walk stops is marked instead of
+        expanded: ``missing`` (premise no longer resolvable — e.g.
+        hard-deleted), ``cycle`` (id already on the current path), or
+        ``truncated`` ("max_depth" | "node_cap" — unexpanded premises
+        remain, re-query with a higher max_depth or start deeper). The
+        node budget bounds the TOTAL emitted node count, so the response
+        size stays bounded even though internal ``derived_from`` lists are
+        uncapped (a wide MERGE fan-in). Tombstoned premises still resolve —
+        a merge survivor's provenance must outlive its losers' recall
         visibility.
 
         Returns None when the root memory itself doesn't exist (callers map
@@ -2421,9 +2429,6 @@ class MemoryService:
         _SNIPPET = 200
 
         def _walk(mid: str, depth: int, path: frozenset[str]) -> dict:
-            if budget["nodes"] >= node_cap:
-                # Unresolved stub: counted against nothing, expanded by nothing.
-                return {"memory_id": mid, "truncated": "node_cap", "children": []}
             budget["nodes"] += 1
             if mid in path:
                 return {"memory_id": mid, "cycle": True, "children": []}
@@ -2446,6 +2451,12 @@ class MemoryService:
                 return node
             child_path = path | {mid}
             for pid in premises:
+                if budget["nodes"] >= node_cap:
+                    # Stop emitting entirely — appending one stub per remaining
+                    # premise would let a wide fan-in inflate the response
+                    # unboundedly despite the budget.
+                    node["truncated"] = "node_cap"
+                    break
                 node["children"].append(_walk(pid, depth + 1, child_path))
             return node
 
