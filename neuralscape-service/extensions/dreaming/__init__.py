@@ -15,7 +15,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from extensions.base import ExtensionManifest
@@ -138,7 +138,7 @@ class DreamingExtension:
             }
 
         @router.get("/card")
-        async def get_identity_card(pool: str):
+        async def get_identity_card(request: Request, pool: str, user_id: str | None = None):
             """The pinned identity card for one pool (B4).
 
             ``pool`` is a pool key (``user--<uid>`` or
@@ -146,16 +146,25 @@ class DreamingExtension:
             lines for session-start injection; 404 when the sweep hasn't
             produced a card for that pool yet. Cards are pinned artifacts
             in Redis — never searchable memories.
+
+            Private ``user--*`` cards are owner-or-dictator only. The
+            caller identity follows the v1 precedence: a verified
+            per-user token wins; legacy shared-key / local callers may
+            claim ``user_id`` (the same trust model as every other
+            legacy read path); otherwise the configured default applies.
             """
             import asyncio
 
-            from auth import current_user_id
             from config import settings as core_settings
 
             from .card import card_read_allowed, load_card
             from .sweep import _get_redis
 
-            caller = current_user_id.get()
+            caller = (
+                getattr(request.state, "user_id", None)
+                or user_id
+                or core_settings.default_user_id
+            )
             if not card_read_allowed(
                 pool, caller, is_dictator=core_settings.is_dictator(caller)
             ):

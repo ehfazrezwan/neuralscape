@@ -1230,10 +1230,13 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             if not pool:
                 return [TextContent(type="text", text=json.dumps(
                     {"error": "Cannot resolve a pool — pass project_id or pool"}))]
-            # Token identity (not the argument) gates private-card reads.
-            caller = current_user_id.get()
+            # Private-card reads are gated on the caller's EFFECTIVE
+            # identity (`user_id` above): a verified token identity wins
+            # and cannot be overridden by arguments; legacy shared-key /
+            # stdio callers are scoped to the user they claimed — the
+            # same trust model as every other read tool on this surface.
             if not card_read_allowed(
-                pool, caller, is_dictator=settings.is_dictator(caller)
+                pool, user_id, is_dictator=settings.is_dictator(user_id)
             ):
                 return [TextContent(type="text", text=json.dumps(
                     {"error": "Another user's private card is not readable"}))]

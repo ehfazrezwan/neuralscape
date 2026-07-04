@@ -128,14 +128,20 @@ def card_read_allowed(pool: str, caller_user_id: str | None, *, is_dictator: boo
 
     Project cards are team artifacts — any authenticated caller reads
     them. A ``user--<uid>`` card is that user's private identity
-    distillation: only the user themself or a dictator may read it. A
-    missing caller identity (local/stdio, no auth layer) is trusted like
-    the rest of the local surface.
+    distillation: only the user themself or a dictator may read it.
+
+    ``caller_user_id`` must be the caller's *effective* identity resolved
+    by the surface (verified token identity when present, else the
+    claimed/request user_id, else the configured default — the same
+    precedence every other read path uses). ``None`` denies: this guard
+    never treats a missing identity as trust.
     """
     if not pool.startswith("user--"):
         return True
-    if is_dictator or caller_user_id is None:
+    if is_dictator:
         return True
+    if not caller_user_id:
+        return False
     return pool == f"user--{caller_user_id}" or pool.startswith(f"user--{caller_user_id}--")
 
 
@@ -184,12 +190,17 @@ def _store_card(redis, pool: str, record: dict) -> None:
 
 def _input_hash(memories: list[dict], prior_lines: list[str]) -> str:
     """Fingerprint of everything the card pass would read — unchanged
-    inputs mean an unchanged card, with zero LLM spend."""
+    inputs mean an unchanged card, with zero LLM spend.
+
+    Covers every per-memory field the prompt renders (id, category,
+    created_at, content — see ``render_memories_block``) plus the prior
+    card, so no prompt-visible change can be skipped as "unchanged".
+    """
     digest = hashlib.sha256()
     for mem in sorted(memories, key=lambda m: m.get("memory_id") or ""):
-        digest.update((mem.get("memory_id") or "").encode())
-        digest.update(b"\x00")
-        digest.update((mem.get("content") or "").strip().encode())
+        for key in ("memory_id", "category", "created_at", "content"):
+            digest.update(str(mem.get(key) or "").strip().encode())
+            digest.update(b"\x00")
         digest.update(b"\x01")
     for line in prior_lines:
         digest.update(line.encode())
@@ -255,8 +266,14 @@ async def update_card(
     fingerprint = _input_hash(live, prior_lines)
     if prior_lines and prior.get("input_hash") == fingerprint:
         # Nothing the pass reads has changed → the card cannot change.
-        if not dry_run and file_path is not None and not file_path.exists():
-            _write_card_file(file_path, batch.pool, prior_lines, prior.get("updated_at") or "")
+        # Still re-assert the vault render (missing or hand-edited files
+        # converge back to the pinned artifact — Redis is authoritative).
+        if not dry_run and file_path is not None:
+            _write_card_file(
+                file_path, batch.pool, prior_lines,
+                prior.get("updated_at") or "",
+                only_if_stale=True,
+            )
         return {"status": "unchanged", "lines": len(prior_lines)}
 
     from .prompts import render_memories_block
@@ -291,10 +308,22 @@ async def update_card(
     return {"status": "updated" if changed else "stable", "lines": len(lines)}
 
 
-def _write_card_file(path: Path, pool: str, lines: list[str], updated_at: str) -> None:
+def _write_card_file(
+    path: Path, pool: str, lines: list[str], updated_at: str, *, only_if_stale: bool = False
+) -> None:
+    """Render Card.md. With ``only_if_stale``, write only when the file is
+    missing or drifted from the expected render (byte-idempotent no-op
+    otherwise — the steady state touches nothing)."""
     from extensions.conversation_compiler.obsidian_writer import _atomic_write
 
     try:
-        _atomic_write(path, render_card_md(pool, lines, updated_at))
+        rendered = render_card_md(pool, lines, updated_at)
+        if only_if_stale and path.exists():
+            try:
+                if path.read_text(encoding="utf-8") == rendered:
+                    return
+            except Exception:
+                pass  # unreadable → rewrite
+        _atomic_write(path, rendered)
     except Exception:
         logger.warning("card render failed for %s (non-fatal)", path, exc_info=True)

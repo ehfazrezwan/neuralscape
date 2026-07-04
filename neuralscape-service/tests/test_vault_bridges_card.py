@@ -532,6 +532,44 @@ async def test_card_identical_llm_output_keeps_updated_at(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_card_prompt_visible_field_change_defeats_the_skip(tmp_path):
+    """A category/created_at change alters the LLM prompt, so the input
+    hash must not report 'unchanged' (Copilot review, PR #105)."""
+    redis = FakeRedis()
+    llm, calls = _card_llm(["IDENTITY: Ehfaz is a founding engineer"])
+    kwargs = dict(redis=redis, vault=tmp_path, operator_user_id="op", dry_run=False)
+    await cardmod.update_card(_card_batch(), llm, **kwargs)
+    assert calls["n"] == 1
+
+    recategorized = [dict(m) for m in _card_batch().memories]
+    recategorized[1]["category"] = "workflow"       # same ids + content
+    out = await cardmod.update_card(_card_batch(memories=recategorized), llm, **kwargs)
+    assert out["status"] in ("stable", "updated")   # NOT "unchanged"
+    assert calls["n"] == 2                          # the LLM ran again
+
+
+@pytest.mark.asyncio
+async def test_card_unchanged_sweep_reasserts_drifted_file(tmp_path):
+    """Hand edits to Card.md converge back to the pinned artifact even on
+    an 'unchanged' sweep — Redis is authoritative (Copilot review)."""
+    redis = FakeRedis()
+    llm, _ = _card_llm(["IDENTITY: Ehfaz is a founding engineer"])
+    kwargs = dict(redis=redis, vault=tmp_path, operator_user_id="op", dry_run=False)
+    await cardmod.update_card(_card_batch(), llm, **kwargs)
+    card_md = tmp_path / "Me" / "Card.md"
+    pristine = card_md.read_text()
+
+    card_md.write_text(pristine + "\nHAND EDIT\n", encoding="utf-8")
+    out = await cardmod.update_card(_card_batch(), llm, **kwargs)
+    assert out["status"] == "unchanged"
+    assert card_md.read_text() == pristine          # drift overwritten
+
+    before = card_md.stat().st_mtime_ns
+    await cardmod.update_card(_card_batch(), llm, **kwargs)
+    assert card_md.stat().st_mtime_ns == before     # pristine file untouched
+
+
+@pytest.mark.asyncio
 async def test_card_llm_garbage_keeps_prior_card(tmp_path):
     redis = FakeRedis()
     llm, _ = _card_llm(["IDENTITY: Ehfaz is a founding engineer"])
@@ -598,9 +636,13 @@ def test_resolve_card_pool_precedence():
 def test_card_read_allowed_guards_private_cards():
     assert cardmod.card_read_allowed("shared--project--alpha", "anyone")
     assert cardmod.card_read_allowed("user--bob", "bob")
+    assert cardmod.card_read_allowed("user--bob--project--p", "bob")
     assert not cardmod.card_read_allowed("user--bob", "eve")
     assert cardmod.card_read_allowed("user--bob", "eve", is_dictator=True)
-    assert cardmod.card_read_allowed("user--bob", None)      # local/stdio trust
+    # a missing effective identity is NEVER trust — surfaces must resolve
+    # token identity → claimed user_id → configured default before calling
+    assert not cardmod.card_read_allowed("user--bob", None)
+    assert not cardmod.card_read_allowed("user--bob", "")
     # prefix must not false-match ("user--bo" vs "user--bob")
     assert not cardmod.card_read_allowed("user--bob", "bo")
 
