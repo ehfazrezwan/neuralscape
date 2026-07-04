@@ -271,6 +271,35 @@ code moved on) as INVALIDATE candidates.
 diff), E2E (ingest a small fixture repo's Graphify output → memories + source_refs resolve);
 F2 is mostly plugin/prompt policy — assert extraction skip-rules and hub link rendering.
 
+### Phase G — OKF edge interop (Open Knowledge Format)
+
+**G1. OKF edge interop — spec-conformant bundle export + ingest.**
+Google's Open Knowledge Format (`GoogleCloudPlatform/knowledge-catalog`, Apache-2.0, v0.1
+draft, 6k★ in two months) specifies knowledge as markdown + YAML frontmatter bundles with
+`index.md` progressive disclosure and `log.md` history — i.e., a spec for what our vault
+almost already is. Two boundary features, zero envelope changes. **Export:** make the vault
+render OKF-conformant (required `type:` from category/page-kind, `description`, ISO
+`timestamp`, per-folder `index.md`, root `okf_version: "0.1"`, dream diary doubling as
+`log.md`) and add `GET /v1/export/okf` producing a downloadable bundle; the full envelope
+(confidence, `epistemic_level`, `derived_from`, `valid_at`/`invalid_at`, `source_ref`,
+`times_derived`) rides along as spec-permitted extension keys, and private-visibility
+memories are excluded from shared bundles by construction — this makes NS the first memory
+system with a portable, spec-conformant knowledge export, and every bundle showcases exactly
+the confidence/provenance/typed-relationship metadata the OKF community is still proposing
+(their #148/#151/#140). **Ingest:** an OKF bundle walker in `ingest/` (directory/zip via the
+existing archive guards) that maps `type`→category (heuristic table + LLM fallback),
+registers an `okf_frontmatter` section-aware chunking strategy, converts cross-links into
+graph relationship hints, and stamps `source_ref` with {bundle URI, concept ID} — one-command
+import of Dataplex/Unity Catalog exports and LLM-wiki repos. All OKF name mapping lives in
+one translation module (the spec may still rename `type`→`kind`); explicitly **no** `okf`
+knowledge adapter — OKF defines no taxonomy/ontology, so it's an envelope concern, not a
+domain seam.
+*Tests:* unit (frontmatter conformance per §9 — every exported non-reserved .md has parseable
+frontmatter + non-empty `type`; index/log structure; `type`→category mapping table; private
+memories never in shared bundles), round-trip E2E (export a seeded project → re-ingest the
+bundle into a clean stack → recall parity on distilled facts; ingest the repo's shipped GA4
+sample bundle → concepts queryable with `source_ref` resolving to concept IDs).
+
 ---
 
 ## 5. Build order for the ship loop
@@ -288,11 +317,12 @@ pulls the vault work two slots earlier:
 | 5 | A4 salience dynamics + A3-lite settling guard | `feat/salience-dynamics` |
 | 6 | F1 graphify extractor + code_graph adapter | `feat/code-graph-adapter` |
 | 7 | C1+C2 index recall + timeline | `feat/retrieval-economics` |
-| 8 | C3+C4 tiers + checkpoint | `feat/recall-tiers` |
-| 9 | D1+D2 plugin injection + summaries + F2 deferral policy | `feat/plugin-disclosure` |
-| 10 | D3+D4 read gate + hygiene | `feat/plugin-read-gate` |
-| 11 | A5 + E1+E2 surprisal, stream, economics | `feat/observability` |
-| 12 | E3–E5 context assembler, custom instructions, benchmarks | `feat/platform-proof` |
+| 8 | G1 OKF export + ingest (needs vault v2 landed) | `feat/okf-interop` |
+| 9 | C3+C4 tiers + checkpoint | `feat/recall-tiers` |
+| 10 | D1+D2 plugin injection + summaries + F2 deferral policy | `feat/plugin-disclosure` |
+| 11 | D3+D4 read gate + hygiene | `feat/plugin-read-gate` |
+| 12 | A5 + E1+E2 surprisal, stream, economics | `feat/observability` |
+| 13 | E3–E5 context assembler, custom instructions, benchmarks | `feat/platform-proof` |
 
 Loop per item: worktree off `dev` → build → unit + isolated-compose E2E (one Neuralscape
 deployment at a time) → PR to `dev` → CodeRabbit/Copilot review → address → merge → next.
