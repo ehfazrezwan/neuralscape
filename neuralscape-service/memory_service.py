@@ -133,11 +133,13 @@ def _salience_tiebreak(responses: list) -> list:
     on any failure) this returns immediately, without touching Redis or
     the responses, so the default search path is byte-identical to a
     world without salience dynamics. When enabled the boost is
-    ``score * (1 + k*log1p(strength_signal))``: logarithmic and small so
-    relevance always dominates — a faded-but-relevant memory beats a
-    hot-but-mediocre one at any sane k. Salience never *gates* retrieval:
-    nothing is dropped or filtered here, ordering shifts only within
-    near-ties. (Distinct from the ``times_derived`` boost above: that is
+    ``score * (1 + k*log1p(strength_signal))``: a small, bounded
+    multiplicative lift (the config caps k at 0.1 ⇒ ≤ ~16% at the strength
+    cap) so relevance dominates — a faded-but-relevant memory beats a
+    hot-but-mediocre one at any permitted k. Salience never *gates*
+    retrieval: nothing is dropped or filtered here, the boost only
+    re-orders results whose relevance scores are already close.
+    (Distinct from the ``times_derived`` boost above: that is
     reinforcement-by-dedup stored on the row; this is recall-frequency
     strength from the dreaming traces — the two signals never double-count
     one another.)

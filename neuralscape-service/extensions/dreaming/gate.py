@@ -94,7 +94,9 @@ def check_settling_gate(
             last_write = max(last_write, _parse_ts(mem.get(field)))
     if last_write <= 0:
         return GateDecision(True)
-    minutes_since = (now - last_write) / 60.0
+    # Clamp: a future timestamp (clock skew / bad payload) is still "written
+    # just now" — defer with a sane 0.0m reason rather than a negative delta.
+    minutes_since = max(0.0, (now - last_write) / 60.0)
     if minutes_since < settling_minutes:
         return GateDecision(
             False,

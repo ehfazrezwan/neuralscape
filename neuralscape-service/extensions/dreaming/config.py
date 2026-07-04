@@ -127,12 +127,13 @@ class DreamingSettings(BaseSettings):
     salience_recall_k: float = Field(
         default=0.0,
         ge=0.0,
-        le=1.0,
+        le=0.1,
         description=(
             "Bounded recall tie-breaker: score * (1 + k*log1p(strength "
             "signal)). 0.0 (default) disables it entirely — the search "
-            "path then stays byte-identical and Redis-free. Keep it "
-            "conservative (≤ 0.05): relevance must always dominate; "
+            "path then stays byte-identical and Redis-free. Hard-bounded "
+            "at 0.1 (≤ ~16% boost at the strength cap) and 0.05 is the "
+            "recommended ceiling: relevance must always dominate; "
             "salience shapes consolidation and vault presentation, never "
             "gates retrieval."
         ),

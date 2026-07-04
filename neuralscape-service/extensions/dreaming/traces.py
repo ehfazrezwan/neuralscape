@@ -108,11 +108,20 @@ def _write_dynamics(r, memory_ids: list[str], trace_results: list, now: float, t
             return
         from . import dynamics
 
+        # The trace pipeline queues exactly 4 ops per memory (hincrby, hset,
+        # pfadd, expire) plus 2 trailing expires; PFADD replies sit at stride
+        # 4, offset 2. Guard the shape so a future pipeline change degrades
+        # to novel=True (no damping) instead of silently mis-damping.
+        expected_len = len(memory_ids) * 4 + 2
+        if isinstance(trace_results, (list, tuple)) and len(trace_results) == expected_len:
+            pfadd_replies = trace_results[2 : len(memory_ids) * 4 : 4]
+        else:
+            pfadd_replies = [None] * len(memory_ids)
         novel: list[bool] = []
-        for i in range(len(memory_ids)):
+        for reply in pfadd_replies:
             try:
-                novel.append(bool(int(trace_results[i * 4 + 2])))
-            except (IndexError, TypeError, ValueError):
+                novel.append(bool(int(reply)))
+            except (TypeError, ValueError):
                 novel.append(True)  # unknown → don't damp
         co_recalled = len(memory_ids) >= 2
         raw_states = r.hmget(_DYN_KEY, memory_ids)

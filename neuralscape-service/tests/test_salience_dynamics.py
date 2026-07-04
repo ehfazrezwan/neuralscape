@@ -143,10 +143,10 @@ def test_recall_boost_k_zero_is_identity():
     assert dynamics.recall_boost(None, 4.0, 0.05) is None
 
 
-@pytest.mark.parametrize("k", [0.0, 0.01, 0.05])
+@pytest.mark.parametrize("k", [0.0, 0.01, 0.05, 0.1])
 def test_faded_but_relevant_beats_hot_but_mediocre(k):
-    """Guardrail 1: relevance always dominates at any k ≤ the conservative
-    recommended default (0.05)."""
+    """Guardrail 1: relevance always dominates at any k the config permits
+    (hard-bounded at 0.1; 0.05 is the recommended ceiling)."""
     faded_relevant = dynamics.recall_boost(0.9, 0.0, k)      # faded: zero signal
     max_signal = dynamics.STRENGTH_CAP - dynamics.INITIAL_STRENGTH  # hottest possible
     hot_mediocre = dynamics.recall_boost(0.5, max_signal, k)
@@ -358,6 +358,26 @@ def test_write_trace_single_result_gets_no_co_bonus(stub_trace_redis):
     assert state.co_recall_count == 0
 
 
+def test_write_dynamics_bad_pipeline_shape_falls_back_to_novel(stub_trace_redis):
+    """A mis-shaped trace-pipeline reply must degrade to novel=True (no
+    damping), never to incorrect damping."""
+    from extensions.dreaming import traces as tr
+
+    tr._write_dynamics(stub_trace_redis, ["a"], ["garbage"], NOW, 86400)
+    state = tr.read_dynamics(stub_trace_redis, ["a"])["a"]
+    assert state.strength == pytest.approx(1.05)  # full δ — treated as novel
+
+
+def test_recall_k_config_hard_bound():
+    import pydantic
+
+    from extensions.dreaming.config import DreamingSettings
+
+    assert DreamingSettings(_env_file=None, salience_recall_k=0.1).salience_recall_k == 0.1
+    with pytest.raises(pydantic.ValidationError):
+        DreamingSettings(_env_file=None, salience_recall_k=0.5)
+
+
 def test_write_trace_respects_dynamics_disabled(stub_trace_redis, monkeypatch):
     from extensions.dreaming import traces as tr
     from extensions.dreaming.config import dreaming_settings
@@ -397,6 +417,10 @@ def test_settling_gate_fake_clock():
     assert gate.check_settling_gate(fresh, settling_minutes=0, now=now).proceed
     assert gate.check_settling_gate([], settling_minutes=30, now=now).proceed
     assert gate.check_settling_gate([{"memory_id": "x"}], settling_minutes=30, now=now).proceed
+    # clock skew: a future-dated write still reads "just now", never negative
+    future = [_mem_at(iso(-10 * 60))]  # 10 minutes in the future
+    decision = gate.check_settling_gate(future, settling_minutes=30, now=now)
+    assert not decision.proceed and "-" not in decision.reason.split("settling:")[1]
 
 
 @pytest.mark.asyncio
