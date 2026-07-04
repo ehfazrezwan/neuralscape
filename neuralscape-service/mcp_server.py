@@ -919,7 +919,8 @@ async def list_tools() -> list[Tool]:
                 "BEFORE enqueue and the verdicts come back immediately (verdict: 'new' | "
                 "'duplicate' with the existing_id), then the non-duplicates are stored as one "
                 "async batch job (poll the task_id, or just continue — writes never block on "
-                "extraction). session_note is {request, learned, completed, next_steps} and is "
+                "extraction). session_note is {request, investigated, learned, completed, "
+                "next_steps} and is "
                 "stored as a single task_context memory (observation_type=meeting_outcome) so the "
                 "next session picks it up."
             ),
@@ -955,6 +956,7 @@ async def list_tools() -> list[Tool]:
                         "type": "object",
                         "properties": {
                             "request": {"type": "string", "description": "What the user asked for this session"},
+                            "investigated": {"type": "string", "description": "What was explored/read/probed along the way"},
                             "learned": {"type": "string", "description": "What was learned/discovered"},
                             "completed": {"type": "string", "description": "What got done"},
                             "next_steps": {"type": "string", "description": "What should happen next"},

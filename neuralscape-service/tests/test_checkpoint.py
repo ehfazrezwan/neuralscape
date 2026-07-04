@@ -138,6 +138,23 @@ class TestSessionNote:
             SessionNote(request="   ")
         assert SessionNote(learned="x").learned == "x"
 
+    def test_investigated_field_renders_in_narrative_order(self):
+        # D2: the plugin's SessionEnd summary hook sends all five structured fields.
+        note = SessionNote(investigated="Read utils.ts and the hook manifest")
+        assert note.investigated
+        text = render_session_note({
+            "request": "Fix the offset bug",
+            "investigated": "Read utils.ts and the hook manifest",
+            "next_steps": "Ship it",
+        })
+        assert "Investigated: Read utils.ts and the hook manifest" in text
+        # Narrative order: Request before Investigated before Next steps.
+        assert (
+            text.index("Request:")
+            < text.index("Investigated:")
+            < text.index("Next steps:")
+        )
+
 
 # ──────────────────────────────────────────────
 # prepare_checkpoint (shared REST/MCP core)

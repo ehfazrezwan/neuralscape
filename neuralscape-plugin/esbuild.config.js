@@ -4,6 +4,7 @@ const entryPoints = [
   "src/hooks/session-start.ts",
   "src/hooks/conversation-turn.ts",
   "src/hooks/session-end.ts",
+  "src/hooks/session-summary.ts",
   "src/hooks/post-tool-use.ts",
   "src/hooks/user-prompt-submit.ts",
 ];

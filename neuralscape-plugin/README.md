@@ -2,7 +2,7 @@
 
 Persistent agentic memory for **Claude Code** and **Claude Cowork**, backed by your own Neuralscape service (FastAPI + mem0 + Graphiti). In Claude Code, plugin hooks auto-capture your conversations and recall relevant context on every session start; in Claude Cowork (which doesn't run plugin hooks), the cross-platform skills drive the same recall/capture loop on demand through the MCP connector. Exposes the 8 Neuralscape MCP tools.
 
-- **What you get:** memory injection on `SessionStart`, conversation flush + compile on `Stop`, **incremental tool-observation capture on `PostToolUse` + threshold-driven compile on `UserPromptSubmit`** (no extra API cost — runs on your subscription), cross-platform MCP-driven skills (`recall`, `remember`, `save-session`, `project`, `search`, `ns-status`, `ns-config`) plus Claude-Code capture skills (`sync`, `capture`), and the Neuralscape MCP toolkit auto-wired via `.mcp.json`.
+- **What you get:** **progressive-disclosure memory injection** on `SessionStart` (a budget-bounded, day-grouped index of your memories — the map, not the payloads — plus your identity card and a "Previously…" block from the last session), conversation flush + compile on `Stop`, a **structured session summary** stored via one `checkpoint` call on `SessionEnd`, **incremental tool-observation capture on `PostToolUse` + threshold-driven compile on `UserPromptSubmit`** (no extra API cost — runs on your subscription), cross-platform MCP-driven skills (`recall`, `remember`, `save-session`, `project`, `search`, `ns-status`, `ns-config`) plus Claude-Code capture skills (`sync`, `capture`), and the Neuralscape MCP toolkit auto-wired via `.mcp.json`.
 - **Where it stores:** in your own Neuralscape deployment. The plugin never sends data anywhere else.
 - **Cost:** zero additional. The plugin is a thin client over your service.
 
@@ -100,7 +100,7 @@ dynamic client registration and PKCE are automatic.
 .claude/plugins/cache/neuralscape-plugins/neuralscape/2.4.0/
 ├── .claude-plugin/plugin.json    manifest with userConfig (hooks) prompts
 ├── .mcp.json                      bundled OAuth MCP connector at the baked <URL>/mcp/
-├── hooks/hooks.json               SessionStart, PostToolUse, UserPromptSubmit, Stop
+├── hooks/hooks.json               SessionStart, PostToolUse, UserPromptSubmit, Stop, SessionEnd
 ├── skills/{recall,remember,save-session,project,search,ns-status,ns-config,sync,capture,compile-observations}/SKILL.md
 ├── scripts/                       built hook bundles
 └── LICENSE / CHANGELOG.md
@@ -110,13 +110,14 @@ The plugin reaches your service via these calls:
 
 | Trigger | Endpoint | Purpose |
 |---|---|---|
-| SessionStart | `GET /v1/context/{project_id}` or `/v1/context/global` | Fetch stored memories, format by category, inject as `additionalContext`. Also flags any pending observation buffers from prior sessions. |
+| SessionStart | `GET /v1/context/{project_id}` or `/v1/context/global` (+ `GET /v1/extensions/dreaming/card`, `GET /v1/code-graph/query` probe) | **Index mode (default):** inject a day-grouped, budget-bounded memory *index* (`#id \| time \| type \| title \| ~tokens`) with a savings header, the identity card(s) when the dreaming sweep has built them, a "Previously…" block from the last session note, and an escalation footer teaching `recall_memories(index_only=true)` → `get_memories(ids=[...])` → `timeline`. `CONTEXT_MODE=full` restores legacy full-content injection. Also flags any pending observation buffers from prior sessions. |
 | PostToolUse | (none — local file write) | Append `{tool, input, output, ts, project_id}` to per-session JSONL buffer. Filters read-only tools and trivial Bash commands; truncates large outputs. |
 | UserPromptSubmit | (none — local check) | When the buffer crosses the threshold (default 25 obs or 30 min old), prepends an `additionalContext` instruction asking Claude to compile the buffer using the `compile-observations` skill before responding. |
 | compile-observations skill | `POST /v1/memories/raw` (via `mcp__plugin_neuralscape_neuralscape__remember`) | Claude reads the buffer, applies the quality rubric, and submits one wiki-quality memory per significant work unit. Backend embeds and stores — **no Gemini call**. |
 | Stop (per turn) | `POST /v1/extensions/conversation-compiler/flush` | Stream each user/assistant pair to Gemini extraction (legacy conversation-driven memory). |
 | Stop (after flush) | `POST /v1/extensions/conversation-compiler/compile` | Synthesize the day's facts into Sessions/Decisions/Research articles. |
 | Stop (after compile) | (none — local marker) | Drop a `.stale` marker next to any non-empty observation buffer so the next SessionStart compiles it even if no further user prompts were sent. |
+| SessionEnd | `POST /v1/checkpoint` | Distill the whole session (transcript + observation buffer, deterministic — no LLM) into a structured `{request, investigated, learned, completed, next_steps}` note and store it as ONE checkpoint `session_note`. The next SessionStart renders it as the "Previously…" block, next steps first. Fires once per session (clear/logout/exit), not per turn. |
 
 ### Where extraction happens
 
@@ -182,6 +183,9 @@ The plugin reads from `userConfig` prompts (modern) or env vars (legacy fallback
 |  | *Default when unset:* the hooks fall back to the **OS username** (`$USER` / `$USERNAME`) so zero-config local installs keep a stable identity. Set it explicitly on shared machines or if your OS username isn't the id you want memories filed under. Servers with token auth derive identity from the Bearer token and ignore client-claimed ids. | |
 | Compile threshold (obs) | `CLAUDE_PLUGIN_OPTION_COMPILE_THRESHOLD` (default `25`) | `NEURALSCAPE_COMPILE_THRESHOLD` |
 | Compile age (minutes) | `CLAUDE_PLUGIN_OPTION_COMPILE_AGE_MIN` (default `30`) | `NEURALSCAPE_COMPILE_AGE_MIN` |
+| SessionStart context mode | `CLAUDE_PLUGIN_OPTION_CONTEXT_MODE` (`index` default \| `full` legacy) | `NEURALSCAPE_CONTEXT_MODE` |
+| Index budget (tokens) | `CLAUDE_PLUGIN_OPTION_INDEX_BUDGET_TOKENS` (default `1500`) | `NEURALSCAPE_INDEX_BUDGET_TOKENS` |
+| Code-graph deferral | `CLAUDE_PLUGIN_OPTION_CODE_GRAPH` (`auto` default \| `on` \| `off`) | `NEURALSCAPE_CODE_GRAPH` |
 
 To change settings after install:
 
@@ -211,6 +215,28 @@ basenames and memories fragment). Resolution precedence:
 3. **The git repo root basename** (walk up for `.git`).
 4. **The working-directory basename** (legacy fallback).
 
+## Privacy: `<private>` tags
+
+Wrap anything in `<private>…</private>` and the plugin will never store or
+transmit it: the spans are replaced with `[redacted]` **before** observation
+rows hit disk, before conversation turns are flushed to the compiler, and
+before session-note fields go into a checkpoint. Redaction is case-insensitive
+and fail-closed — an unclosed `<private>` redacts to the end of the text. The
+compile-observations skill additionally skips any work unit containing
+`<private>` content entirely.
+
+## Hook failure taxonomy (never-block contract)
+
+The hooks distinguish *whose* fault a failure is, and encode it in the exit
+code:
+
+| Failure | Behavior | Exit code |
+|---|---|---|
+| Neuralscape unreachable / transport error | Continue without memory. SessionStart injects a one-line `[neuralscape] memory service unreachable` notice; other hooks log to stderr. The session is NEVER blocked. | `0` |
+| Malformed hook stdin (not valid JSON — a client bug) | Fail loud so the bug is visible instead of silently swallowed. | `2` on hooks where exit 2 cannot block (`SessionStart`, `SessionEnd`, `PostToolUse`) |
+| Malformed stdin on `Stop` / `UserPromptSubmit` | Exit 2 has *blocking* semantics on these events (it would force Claude to continue, or erase the user's prompt), so the never-block principle wins: log to stderr, exit `0`. | `0` |
+| Hook-internal error (our bug) | Logged to stderr, session continues. | `0` |
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
@@ -234,7 +260,9 @@ npm run watch      # rebuild on save
 npm run package    # build a clean installable zip under dist/
 ```
 
-The TypeScript source lives in `src/`. esbuild bundles five entry points (`session-start.ts`, `conversation-turn.ts`, `session-end.ts`, `post-tool-use.ts`, `user-prompt-submit.ts`) into `scripts/*.js` (ESM, Node 18+, minified). Built scripts are gitignored — `npm install` regenerates them.
+The TypeScript source lives in `src/`. esbuild bundles six entry points (`session-start.ts`, `conversation-turn.ts`, `session-end.ts`, `session-summary.ts`, `post-tool-use.ts`, `user-prompt-submit.ts`) into `scripts/*.js` (ESM, Node 18+, minified). Built scripts are **committed** (marketplace installs pull raw from git) — rebuild with `npm run build` whenever `src/` changes.
+
+Unit tests run with vitest: `npm test` (builds first, then runs the pure-logic suites plus subprocess tests that assert the exit-code taxonomy against the built bundles). Coverage: `npm run test:coverage`.
 
 ### Packaging for local install (Cowork / manual)
 

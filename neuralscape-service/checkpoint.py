@@ -39,6 +39,7 @@ CHECKPOINT_MAX_ITEMS = 25
 # Session-note field → rendered label, in narrative order.
 _NOTE_FIELDS = (
     ("request", "Request"),
+    ("investigated", "Investigated"),
     ("learned", "Learned"),
     ("completed", "Completed"),
     ("next_steps", "Next steps"),

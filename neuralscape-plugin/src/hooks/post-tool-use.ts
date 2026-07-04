@@ -9,6 +9,7 @@
 
 import {
   type HookInput,
+  MalformedHookInputError,
   appendObservation,
   getObservationDir,
   getProjectId,
@@ -16,8 +17,9 @@ import {
   hasUserId,
   logError,
   outputContinue,
-  parseStdin,
+  parseStdinStrict,
   pickRelevantInput,
+  redactPrivate,
   truncateOutput,
 } from "../utils.js";
 
@@ -97,8 +99,13 @@ export function shouldCapture(input: HookInput): boolean {
   return true;
 }
 
-/** Build the observation row that gets appended to the per-session buffer. */
+/** Build the observation row that gets appended to the per-session buffer.
+ *  `<private>…</private>` spans are redacted BEFORE anything hits disk (D4). */
 export function buildObservationRow(input: HookInput): Record<string, unknown> {
+  const picked = pickRelevantInput(input.tool_name!, input.tool_input);
+  for (const [k, v] of Object.entries(picked)) {
+    if (typeof v === "string") picked[k] = redactPrivate(v);
+  }
   return {
     ts: new Date().toISOString(),
     session_id: input.session_id || "unknown",
@@ -106,8 +113,8 @@ export function buildObservationRow(input: HookInput): Record<string, unknown> {
     project_id: getProjectId(input.cwd),
     user_id: getUserId(),
     tool: input.tool_name,
-    input: pickRelevantInput(input.tool_name!, input.tool_input),
-    output: truncateOutput(asString(input.tool_output)),
+    input: picked,
+    output: redactPrivate(truncateOutput(asString(input.tool_output))),
   };
 }
 
@@ -116,13 +123,24 @@ async function main(): Promise<void> {
   // Always emit continue first so even a thrown error below cannot block.
   outputContinue();
 
+  let input: HookInput;
+  try {
+    input = await parseStdinStrict();
+  } catch (error) {
+    if (error instanceof MalformedHookInputError) {
+      logError(error.message);
+      process.exit(2); // client bug — fail loud (PostToolUse already ran; cannot block)
+    }
+    logError("post-tool-use stdin read failed", error);
+    return;
+  }
+
   try {
     if (!hasUserId()) {
       // Quietly skip when not configured — no logging noise per tool.
       return;
     }
 
-    const input = await parseStdin();
     if (!shouldCapture(input)) return;
 
     await appendObservation(buildObservationRow(input));

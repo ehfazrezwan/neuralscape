@@ -1,5 +1,5 @@
 {
-  "description": "Neuralscape memory hooks — automatic context injection, conversation capture, and PostToolUse observation buffering",
+  "description": "Neuralscape memory hooks — progressive-disclosure context injection, conversation capture, PostToolUse observation buffering, and SessionEnd structured summaries",
   "hooks": {
     "SessionStart": [
       {
@@ -46,6 +46,18 @@
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/session-end.js\"",
             "timeout": 60,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/session-summary.js\"",
+            "timeout": 30,
             "async": true
           }
         ]
