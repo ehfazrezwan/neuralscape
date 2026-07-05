@@ -464,13 +464,18 @@ def _ask_mem(mid, content, created_at="2026-07-01T00:00:00+00:00",
 
 
 class TestAskEvidenceOccurredAt:
-    def test_render_shows_event_time_when_present(self):
+    def test_render_shows_event_time_when_informative(self):
+        """Annotation renders when the evidence timeline has real spread —
+        a historical row alongside recent ones (see TestEventRenderGate for
+        the suppression side)."""
         import ask as ask_mod
 
         row = _ask_mem("m1", "Moved to Berlin",
                        created_at="2026-07-01T00:00:00+00:00",
                        occurred_at="2019-03-15T00:00:00+00:00")
-        rendered = ask_mod._render_evidence([row])
+        recent = _ask_mem("m2", "Lives in Berlin",
+                          created_at="2026-07-01T00:00:00+00:00")
+        rendered = ask_mod._render_evidence([row, recent])
         assert "event: 2019-03-15T00:00:00+00:00" in rendered
         assert "stored: 2026-07-01T00:00:00+00:00" in rendered
 
@@ -568,3 +573,63 @@ class TestMcpRememberOccurredAt:
         body = _json.loads(out[0].text)
         assert "occurred_at" in body.get("error", "")
         mock_mcp_task_manager.enqueue_raw.assert_not_called()
+
+
+# ──────────────────────────────────────────────
+# Render gate: event-time annotations only when informative
+# ──────────────────────────────────────────────
+
+
+class TestEventRenderGate:
+    """Event-time annotations render ONLY when the evidence timeline has real
+    spread. Measured on hours-apart conversational data (DMR mini A/B,
+    2026-07-05): annotating every row with near-identical event times baited
+    the RECENCY discipline into false supersession (facts discarded as
+    outdated) and perspective drift, costing accuracy — while for genuinely
+    historical imports (spreads of months) the annotation is the point."""
+
+    @staticmethod
+    def _row(mid, occurred_at=None, created_at="2026-07-05T10:00:00+00:00"):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            id=mid, memory=f"fact {mid}", created_at=created_at,
+            occurred_at=occurred_at, category="personal_fact", memory_kind=None,
+        )
+
+    def test_small_spread_suppresses_event_annotations(self):
+        from ask import _render_evidence
+
+        rows = [
+            self._row("m1", occurred_at="2026-01-01T12:00:00+00:00"),
+            self._row("m2", occurred_at="2026-01-03T12:00:00+00:00"),
+            self._row("m3", occurred_at="2026-01-05T12:00:00+00:00"),
+        ]
+        out = _render_evidence(rows)
+        assert "(event:" not in out
+        assert "[m1]" in out and "[m3]" in out
+
+    def test_large_spread_renders_event_annotations(self):
+        from ask import _render_evidence
+
+        rows = [
+            self._row("old", occurred_at="2019-03-15T00:00:00+00:00"),
+            self._row("new1"),
+            self._row("new2"),
+        ]
+        out = _render_evidence(rows)
+        assert "(event: 2019-03-15T00:00:00+00:00" in out
+        # Rows without an event time keep the plain format.
+        assert "[new1] (2026-07-05T10:00:00+00:00" in out
+
+    def test_no_event_times_renders_plain(self):
+        from ask import _render_evidence
+
+        out = _render_evidence([self._row("a"), self._row("b")])
+        assert "(event:" not in out
+
+    def test_single_row_never_annotates(self):
+        from ask import _render_evidence
+
+        out = _render_evidence([self._row("solo", occurred_at="2019-01-01T00:00:00+00:00")])
+        assert "(event:" not in out

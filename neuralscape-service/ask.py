@@ -40,7 +40,7 @@ import logging
 import re
 from types import SimpleNamespace
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from config import settings
 
@@ -196,16 +196,27 @@ def _event_time(mem) -> str:
     validation, but created_at comes from the vector store and is not
     guaranteed one spelling). Unparseable values fall back to the raw
     string rather than dropping the row."""
+    dt = _event_dt(mem)
+    if dt is not None:
+        return dt.isoformat()
+    return str(getattr(mem, "occurred_at", None) or getattr(mem, "created_at", None) or "")
+
+
+def _event_dt(mem) -> datetime | None:
+    """Parsed aware-UTC event/storage time, or None when absent/unparseable.
+
+    Single parse point shared by the sort key (:func:`_event_time`) and the
+    render gate (:func:`_events_informative`)."""
     raw = getattr(mem, "occurred_at", None) or getattr(mem, "created_at", None) or ""
     if not raw:
-        return ""
+        return None
     try:
         dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
     except ValueError:
-        return str(raw)
+        return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat()
+    return dt.astimezone(timezone.utc)
 
 
 def _evidence_rows(evidence: dict, keyword_ids: list[str], enumeration: bool) -> list:
@@ -225,7 +236,14 @@ def _evidence_rows(evidence: dict, keyword_ids: list[str], enumeration: bool) ->
     are listed FIRST — the discipline is exact-before-semantic, and
     list-position is how an LLM weighs evidence.
     """
-    _created = _event_time
+    def _created(m) -> tuple:
+        # Event time first, storage time as tie-break: historical ingestion
+        # stamps ONE occurred_at per session, so every fact from that session
+        # ties on event time — without the created_at tie-break the sort
+        # coarsens to session granularity and loses the per-row write order
+        # the disciplines previously reasoned over (occurred_at read-side
+        # refinement, with PR #134).
+        return (_event_time(m), str(getattr(m, "created_at", None) or ""))
 
     rows = list(evidence.values())
 
@@ -239,7 +257,7 @@ def _evidence_rows(evidence: dict, keyword_ids: list[str], enumeration: bool) ->
         rows = rows[:_EVIDENCE_MAX_ROWS]
 
     # Chronological ascending for the prompt; timestamp-less survivors last.
-    rows.sort(key=lambda m: (0, _created(m)) if _created(m) else (1, ""))
+    rows.sort(key=lambda m: (0, _created(m)) if _created(m)[0] else (1, ("", "")))
     if enumeration and keyword_ids:
         kw = [m for m in rows if m.id in keyword_ids]
         rest = [m for m in rows if m.id not in keyword_ids]
@@ -267,7 +285,26 @@ def _clip_content(content: str, budget: int) -> str:
     return window + " …"
 
 
+# Event-time annotations render only when the evidence timeline spans more
+# than this. Measured on hours-apart conversational data (DMR mini A/B,
+# 2026-07-05): annotating rows whose event times are near-identical baited
+# the RECENCY discipline into false supersession ("earlier memory said three
+# dogs" → answers two) and perspective drift, while for genuinely historical
+# imports (months/years of spread) the annotation is the entire point.
+_EVENT_RENDER_MIN_SPREAD = timedelta(days=30)
+
+
+def _events_informative(rows: list) -> bool:
+    """True when the event/storage timeline across ``rows`` spans enough to
+    make per-row event-time annotations informative rather than noise."""
+    times = [dt for dt in (_event_dt(mem) for mem in rows) if dt is not None]
+    if len(times) < 2:
+        return False
+    return max(times) - min(times) > _EVENT_RENDER_MIN_SPREAD
+
+
 def _render_evidence(rows: list) -> str:
+    render_events = _events_informative(rows)
     lines = []
     for mem in rows:
         is_passage = getattr(mem, "memory_kind", None) == "passage"
@@ -276,11 +313,12 @@ def _render_evidence(rows: list) -> str:
         content = _clip_content((mem.memory or "").strip(), budget).replace("\n", " ")
         created = getattr(mem, "created_at", None) or "unknown time"
         category = getattr(mem, "category", None) or "uncategorized"
-        occurred = getattr(mem, "occurred_at", None)
+        occurred = getattr(mem, "occurred_at", None) if render_events else None
         if occurred:
-            # Event time known (historical ingestion): show both so the
-            # recency discipline reasons over when it HAPPENED, with the
-            # storage time still visible for provenance.
+            # Event time known (historical ingestion) AND the timeline spread
+            # makes it informative: show both so the recency discipline
+            # reasons over when it HAPPENED, with the storage time still
+            # visible for provenance.
             lines.append(
                 f"[{mem.id}] (event: {occurred}; stored: {created}; {category}) {content}"
             )
