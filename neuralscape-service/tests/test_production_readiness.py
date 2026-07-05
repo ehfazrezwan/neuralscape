@@ -811,18 +811,30 @@ class TestLivenessEndpoint:
         original_tm = main._task_manager
         main._task_manager = mock_tm
 
-        # A service whose backend accessors all explode
-        mock_svc = MagicMock()
-        type(mock_svc)._memory = property(lambda self: (_ for _ in ()).throw(RuntimeError("down")))
-        type(mock_svc)._graphiti = property(lambda self: (_ for _ in ()).throw(RuntimeError("down")))
+        # A service whose backend accessors all explode. A dedicated class —
+        # NOT properties patched onto type(MagicMock()), which is the global
+        # MagicMock class and would leak into every other test (Copilot,
+        # PR #132).
+        class ExplodingService:
+            @property
+            def _memory(self):
+                raise RuntimeError("down")
+
+            @property
+            def _graphiti(self):
+                raise RuntimeError("down")
+
         original_svc = main._service
-        main._service = mock_svc
+        main._service = ExplodingService()
 
         try:
             resp = client.get("/health/live")
             assert resp.status_code == 200
             assert resp.json() == {"status": "alive"}
-            # No dependency probes at all — this is pure process liveness
+            # No dependency probes at all — this is pure process liveness.
+            # not_called (not just not_awaited): a created-but-never-awaited
+            # coroutine would still mean the backend was touched.
+            mock_tm.pool.ping.assert_not_called()
             mock_tm.pool.ping.assert_not_awaited()
         finally:
             main._task_manager = original_tm
