@@ -25,8 +25,10 @@ tears the pub/sub connection down in a ``finally``).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -77,6 +79,77 @@ def _get_redis():
             settings.redis_url, socket_timeout=2, socket_connect_timeout=2
         )
     return _redis
+
+
+# ── In-process fan-out (solo engine, unit 5) ────────────────────────
+#
+# One daemon process → pub/sub is plain queue fan-out. The publish side
+# routes through channel_for exactly as with Redis; InProcPubSub satisfies
+# the one-method get_message contract sse_event_stream documents. Kept
+# alive (rather than disabled) deliberately: this stream is also Layer 2's
+# future edge-sync invalidation feed (28-solo-engine.md §5.5).
+#
+# Publishes arrive from the telemetry executor THREAD while subscriber
+# queues live on the daemon's event loop — delivery hops through
+# call_soon_threadsafe on the loop captured at subscribe time.
+
+_INPROC_QUEUE_MAX = 256
+_inproc_lock = threading.Lock()
+_inproc_subscribers: dict[str, set["InProcPubSub"]] = {}
+
+
+def _inproc_publish(channel: str, data: str) -> None:
+    with _inproc_lock:
+        subs = list(_inproc_subscribers.get(channel, ()))
+    message = {"type": "message", "channel": channel, "data": data}
+    for sub in subs:
+        sub._deliver(message)
+
+
+class InProcPubSub:
+    """In-process stand-in for redis.asyncio's PubSub (solo engine).
+
+    Implements exactly the surface the SSE endpoint + sse_event_stream use:
+    ``get_message(ignore_subscribe_messages, timeout)``, ``unsubscribe()``,
+    ``aclose()``. Construct on the event loop that will consume it.
+    """
+
+    def __init__(self, channels: list[str]):
+        self._queue: asyncio.Queue = asyncio.Queue(maxsize=_INPROC_QUEUE_MAX)
+        self._loop = asyncio.get_running_loop()
+        self._channels = list(channels)
+        with _inproc_lock:
+            for channel in self._channels:
+                _inproc_subscribers.setdefault(channel, set()).add(self)
+
+    def _deliver(self, message: dict) -> None:
+        def _put() -> None:
+            try:
+                self._queue.put_nowait(message)
+            except asyncio.QueueFull:
+                # Observability surface: drop-on-overflow, never block writes.
+                logger.debug("in-proc event queue full; event dropped")
+
+        try:
+            self._loop.call_soon_threadsafe(_put)
+        except RuntimeError:
+            pass  # consumer loop already closed — subscriber is dead
+
+    async def get_message(
+        self, ignore_subscribe_messages: bool = True, timeout: float = 1.0
+    ):
+        try:
+            return await asyncio.wait_for(self._queue.get(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+
+    async def unsubscribe(self) -> None:
+        with _inproc_lock:
+            for channel in self._channels:
+                _inproc_subscribers.get(channel, set()).discard(self)
+
+    async def aclose(self) -> None:
+        await self.unsubscribe()
 
 
 # ── Visibility routing/filtering ────────────────────────────────────
@@ -164,6 +237,10 @@ def publish_event(event_type: str, payload: dict) -> bool:
         channel = channel_for(event)
         if channel is None:
             return False
+        if settings.ns_mode == "solo":
+            # Single process — fan out in-memory, no Redis (unit 5).
+            _inproc_publish(channel, json.dumps(event, default=str))
+            return True
         _get_redis().publish(channel, json.dumps(event, default=str))
         return True
     except Exception:

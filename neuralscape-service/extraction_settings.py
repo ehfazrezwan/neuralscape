@@ -48,14 +48,78 @@ _redis = None
 _redis_lock = threading.Lock()
 
 
+class _LocalJsonStore:
+    """redis-shaped (get/set/delete) whole-value store over one JSON file.
+
+    Solo engine (unit 5): extraction instructions are two tiny JSON records
+    keyed by the same strings as the Redis keys — a local file is a direct
+    port. Writes are atomic (tmp + replace) under a process-wide lock; solo
+    is a single daemon, so no cross-process coordination is needed.
+    """
+
+    def __init__(self, path):
+        from pathlib import Path
+
+        self._path = Path(path).expanduser()
+        self._lock = threading.Lock()
+
+    def _load(self) -> dict:
+        try:
+            return json.loads(self._path.read_text())
+        except FileNotFoundError:
+            return {}
+        except Exception:  # noqa: BLE001 — a corrupt file reads as empty
+            logger.warning("extraction-settings file unreadable; treating as empty")
+            return {}
+
+    def _write(self, data: dict) -> None:
+        import os
+
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+        os.replace(tmp, self._path)
+
+    def get(self, key: str):
+        with self._lock:
+            return self._load().get(key)
+
+    def set(self, key: str, value: str) -> None:
+        with self._lock:
+            data = self._load()
+            data[key] = value
+            self._write(data)
+
+    def delete(self, key: str) -> None:
+        with self._lock:
+            data = self._load()
+            if key in data:
+                del data[key]
+                self._write(data)
+
+
+_local_store: _LocalJsonStore | None = None
+
+
 def _get_redis():
-    global _redis
+    """The settings store: Redis in team mode, a local JSON file in solo.
+
+    Kept under the historical name because the three public functions take
+    an injectable ``redis=`` handle whose only contract is get/set/delete.
+    """
+    global _redis, _local_store
+    from config import settings
+
+    if settings.ns_mode == "solo":
+        if _local_store is None:
+            with _redis_lock:
+                if _local_store is None:
+                    _local_store = _LocalJsonStore(settings.extraction_settings_path)
+        return _local_store
     if _redis is None:
         with _redis_lock:
             if _redis is None:
                 import redis as redis_lib
-
-                from config import settings
 
                 _redis = redis_lib.Redis.from_url(
                     settings.redis_url, socket_timeout=3, socket_connect_timeout=3
