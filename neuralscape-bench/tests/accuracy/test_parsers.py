@@ -118,6 +118,26 @@ def test_convomem_parse_file():
     assert qa.qtype == "user_evidence"
 
 
+def test_convomem_ids_namespaced_by_category():
+    """Same file stem in two categories must NOT collide — conv_id doubles as
+    the NS user id, so a collision merges two unrelated conversations into one
+    user's memory space (and breaks qa_id-keyed resume/judge joins)."""
+    a = convomem.parse_file(fixtures.CONVOMEM_FILE, category="user_evidence",
+                            file_stem="fixture")
+    b = convomem.parse_file(fixtures.CONVOMEM_FILE, category="preference_evidence",
+                            file_stem="fixture")
+    assert a.qa_items[0].qa_id != b.qa_items[0].qa_id
+    assert a.conversations[0].conv_id != b.conversations[0].conv_id
+    # and the derived NS user id stays within the service's 100-char cap even
+    # for the longest category name
+    from neuralscape_bench.accuracy.schema import bench_user_id
+    c = convomem.parse_file(fixtures.CONVOMEM_FILE,
+                            category="implicit_connection_evidence",
+                            file_stem="x" * 40)
+    uid = bench_user_id("convomem", c.conversations[0].conv_id)
+    assert len(uid) <= 100
+
+
 # ── MemBench ──
 
 
