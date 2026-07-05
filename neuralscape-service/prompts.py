@@ -97,11 +97,14 @@ Capture each detail WITH its concrete specifics, as a standalone sentence that m
 sense without the conversation.
 
 Rules for details:
-1. Extract "facts" exactly as instructed above — never move a fact into "details",
-   never omit a fact because a detail overlaps it.
-2. Each detail must preserve the concrete specific (the color, the name, the reason),
+1. THE FACTS ARRAY COMES FIRST AND IS SACRED: it must contain exactly the facts you
+   would have extracted if this details channel did not exist. Decide the complete
+   "facts" array before you even think about details.
+2. Overlap is expected and fine: when something qualifies as both, put it in BOTH
+   arrays — never resolve an overlap by demoting a fact to a detail.
+3. Each detail must preserve the concrete specific (the color, the name, the reason),
    not a generalization of it.
-3. Skip anything already captured verbatim in "facts".
+4. At most 5 details per conversation — pick the most concrete, answerable ones.
 
 Respond with the same JSON object, plus the optional array:
 {
