@@ -170,12 +170,6 @@ async def lifespan(app: FastAPI):
     await _extension_registry.startup_all()
     _extension_registry.mount_routes(app)
 
-    # Solo engine: arm the inline task backend with the SHARED service and
-    # registry — the runner must reuse this process's MemoryService because
-    # the embedded stores (Kuzu, local Qdrant) are single-process.
-    if hasattr(_task_manager, "bind"):
-        _task_manager.bind(_service, _extension_registry)
-
     # Initialize the connector vault when enabled.
     if settings.connectors_enabled:
         global _vault
@@ -186,6 +180,13 @@ async def lifespan(app: FastAPI):
             logger.info("Connector vault initialized")
         except Exception as e:
             logger.warning(f"Connector vault init failed (connector API disabled): {e}")
+
+    # Solo engine: arm the inline task backend with the SHARED service,
+    # registry, and (post-init, per Copilot on PR #142) the vault — the
+    # runner must reuse this process's MemoryService because the embedded
+    # stores (Kuzu, local Qdrant) are single-process.
+    if hasattr(_task_manager, "bind"):
+        _task_manager.bind(_service, _extension_registry, vault=_vault)
 
     # Start MCP HTTP session manager if enabled and connect its task manager
     if _mcp_session_manager is not None:

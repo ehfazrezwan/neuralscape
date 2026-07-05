@@ -30,7 +30,7 @@ import adapters  # noqa: F401 — registers knowledge-adapter taxonomies at impo
 from config import settings
 from memory_service import get_shared_service
 from schemas import CORE_MEMORY_CATEGORIES
-from task_manager import TaskManager, create_task_manager
+from task_manager import create_task_manager
 
 logger = logging.getLogger(__name__)
 

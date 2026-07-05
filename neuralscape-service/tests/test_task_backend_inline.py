@@ -278,3 +278,27 @@ class TestInlineTaskManagerE2E:
 
         with pytest.raises(ConnectionError):
             asyncio.run(scenario())
+
+    def test_resubmitted_job_id_moves_to_newest_position(self):
+        """Copilot (PR #142): re-running a finished deterministic job_id must
+        re-order the entry to the new end, or _evict() (oldest-first) could
+        drop the fresh run early."""
+        import inline_tasks
+
+        async def scenario():
+            runner = inline_tasks.InlineTaskRunner(service=object())
+
+            async def ok(ctx):
+                return {}
+
+            _stub_worker(runner, process_memory_raw=ok, process_memory_retag=ok)
+            runner.submit("process_memory_raw", (), {}, "reused")
+            await runner.wait("reused", timeout=5)
+            for i in range(3):
+                runner.submit("process_memory_retag", (), {}, f"pad{i}")
+                await runner.wait(f"pad{i}", timeout=5)
+            runner.submit("process_memory_raw", (), {}, "reused")  # re-run
+            await runner.wait("reused", timeout=5)
+            return list(runner._tasks)[-1]
+
+        assert asyncio.run(scenario()) == "reused"

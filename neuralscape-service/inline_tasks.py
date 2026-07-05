@@ -55,6 +55,7 @@ _LANES: dict[str, str] = {
     "process_conversation_flush": "fast",
     "process_conversation_compile": "fast",
     "process_graph_enrichment": "slow",
+    "process_session_summary": "slow",
     "process_ingest_document": "slow",
     "process_ingest_file": "slow",
     "process_ingest_okf_bundle": "slow",
@@ -106,13 +107,14 @@ class _InlinePool:
 class InlineTaskRunner:
     """Two-lane asyncio executor over the worker.py task coroutines."""
 
-    def __init__(self, service: Any, extension_registry: Any = None):
+    def __init__(self, service: Any, extension_registry: Any = None, vault: Any = None):
         import worker as _worker  # heavy import deferred to bind time
 
         self._worker = _worker
         self.ctx: dict[str, Any] = {
             "service": service,
             "extension_registry": extension_registry,
+            "vault": vault,
             "redis": _InlinePool(self),
         }
         self._sems = {
@@ -129,8 +131,13 @@ class InlineTaskRunner:
         """Schedule a task; False when an identical live job id exists
         (mirrors ARQ's _job_id dedup, which the enqueue methods rely on)."""
         existing = self._tasks.get(job_id)
-        if existing and existing["status"] in ("queued", "processing"):
-            return False
+        if existing:
+            if existing["status"] in ("queued", "processing"):
+                return False
+            # Finished entry being re-run: drop it so the re-insert lands at
+            # the NEW end of the OrderedDict — otherwise _evict() (which
+            # trims from the oldest end) could evict the fresh run early.
+            del self._tasks[job_id]
         fn = getattr(self._worker, function, None)
         lane = _LANES.get(function)
         if fn is None or lane is None:
@@ -247,15 +254,18 @@ class InlineTaskManager(TaskManager):
     overridden to consult the in-memory task table.
     """
 
-    def bind(self, service: Any, extension_registry: Any = None) -> None:
-        """Attach the shared MemoryService (+ registry) and arm the runner.
+    def bind(
+        self, service: Any, extension_registry: Any = None, vault: Any = None
+    ) -> None:
+        """Attach the shared MemoryService (+ registry, + connector vault)
+        and arm the runner.
 
         Must be called from the daemon lifespan AFTER the shared service
-        exists — the runner reuses it rather than constructing a second
-        MemoryService, because the embedded stores are single-process and a
-        second instance would fight over their locks.
+        (and, when connectors are enabled, the vault) exist — the runner
+        reuses them rather than constructing seconds, because the embedded
+        stores are single-process and would fight over their locks.
         """
-        runner = InlineTaskRunner(service, extension_registry)
+        runner = InlineTaskRunner(service, extension_registry, vault=vault)
         self._runner = runner
         self.pool = runner.ctx["redis"]
         logger.info(
