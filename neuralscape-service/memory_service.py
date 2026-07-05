@@ -1665,6 +1665,7 @@ class MemoryService:
         limit: int,
         query_embedding: list[float] | None = None,
         visibility_value: str = MemoryVisibility.SHARED.value,
+        memory_kind: str | None = None,
     ) -> list[MemoryResponse]:
         """Search Qdrant for cross-writer memories of a given visibility.
 
@@ -1705,6 +1706,19 @@ class MemoryService:
         must_not = [
             FieldCondition(key="metadata.dream_tombstoned", match=MatchValue(value=True))
         ]
+        # Detail channel: micro-detail rows are recallable ONLY through an
+        # explicit memory_kind="detail" search (ask's capped detail leg). The
+        # main pass excludes them AT THE INDEX — same mechanism as
+        # dream_tombstoned — so they can never dilute core top-k (naive
+        # densification was measured net-negative on DMR).
+        if memory_kind == "detail":
+            must.append(
+                FieldCondition(key="metadata.memory_kind", match=MatchValue(value="detail"))
+            )
+        else:
+            must_not.append(
+                FieldCondition(key="metadata.memory_kind", match=MatchValue(value="detail"))
+            )
         if categories:
             must.append(FieldCondition(key="metadata.category", match=MatchAny(any=categories)))
         if scope:
@@ -1809,6 +1823,7 @@ class MemoryService:
         concepts: list[str] | None,
         limit: int,
         query_embedding: list[float] | None = None,
+        memory_kind: str | None = None,
     ) -> list[MemoryResponse]:
         """Search the authoritative ``standard``-tier pool (dictator-written).
 
@@ -1828,6 +1843,7 @@ class MemoryService:
             limit=limit,
             query_embedding=query_embedding,
             visibility_value=MemoryVisibility.STANDARD.value,
+            memory_kind=memory_kind,
         )
 
     def _search_personal_pool(
@@ -1843,6 +1859,7 @@ class MemoryService:
         concepts: list[str] | None,
         limit: int,
         query: str = "",
+        memory_kind: str | None = None,
     ) -> list[MemoryResponse]:
         """Search Qdrant for the caller's own memories using a precomputed vector.
 
@@ -1871,6 +1888,17 @@ class MemoryService:
         must_not = [
             FieldCondition(key="metadata.dream_tombstoned", match=MatchValue(value=True))
         ]
+        # Detail channel: index-time exclusion of memory_kind="detail" rows
+        # unless the caller explicitly asked for them (see _search_shared_pool
+        # for the rationale — this is the load-bearing top-k invariant).
+        if memory_kind == "detail":
+            must.append(
+                FieldCondition(key="metadata.memory_kind", match=MatchValue(value="detail"))
+            )
+        else:
+            must_not.append(
+                FieldCondition(key="metadata.memory_kind", match=MatchValue(value="detail"))
+            )
         if categories:
             must.append(FieldCondition(key="metadata.category", match=MatchAny(any=categories)))
         if scope:
@@ -2541,8 +2569,11 @@ class MemoryService:
         # Audit 27 #9: kick the graph pass off NOW, on its own thread, so it
         # overlaps the vector pool queries below (the legs are independent —
         # Graphiti embeds the query itself). Joined right before the weave.
+        # Detail-channel searches skip it: graph edges carry no memory_kind,
+        # so they could never survive the detail filter — the leg would be
+        # pure latency.
         graph_future = None
-        if not vector_only:
+        if not vector_only and memory_kind != "detail":
             try:
                 graph_future = _GRAPH_SEARCH_POOL.submit(
                     self._search_graph_for_visibility,
@@ -2575,6 +2606,7 @@ class MemoryService:
                             project_id=project_id, categories=categories, scope=None,
                             domain=domain, observation_type=observation_type,
                             concepts=concepts, limit=limit, query=query,
+                            memory_kind=memory_kind,
                         )
                     )
                     vector_responses.extend(
@@ -2583,6 +2615,7 @@ class MemoryService:
                             project_id=None, categories=categories, scope="global",
                             domain=domain, observation_type=observation_type,
                             concepts=concepts, limit=limit, query=query,
+                            memory_kind=memory_kind,
                         )
                     )
                 else:
@@ -2592,6 +2625,7 @@ class MemoryService:
                             project_id=project_id, categories=categories, scope=scope,
                             domain=domain, observation_type=observation_type,
                             concepts=concepts, limit=limit, query=query,
+                            memory_kind=memory_kind,
                         )
                     )
             except Exception as e:
@@ -2632,6 +2666,7 @@ class MemoryService:
                             concepts=concepts,
                             limit=limit,
                             query_embedding=query_embedding,
+                            memory_kind=memory_kind,
                         )
                     )
                     vector_responses.extend(
@@ -2646,6 +2681,7 @@ class MemoryService:
                             concepts=concepts,
                             limit=limit,
                             query_embedding=query_embedding,
+                            memory_kind=memory_kind,
                         )
                     )
                 else:
@@ -2661,6 +2697,7 @@ class MemoryService:
                             concepts=concepts,
                             limit=limit,
                             query_embedding=query_embedding,
+                            memory_kind=memory_kind,
                         )
                     )
             except Exception as e:
@@ -2695,6 +2732,7 @@ class MemoryService:
                         concepts=concepts,
                         limit=limit,
                         query_embedding=query_embedding,
+                        memory_kind=memory_kind,
                     )
                 )
             except Exception as e:
@@ -2817,11 +2855,16 @@ class MemoryService:
 
         # memory_kind filter (data-layer connectors). Legacy memories have no
         # memory_kind, so a "fact" filter treats null as fact (back-compat);
-        # "passage" matches only explicitly-tagged passages.
+        # "passage"/"detail" match only explicitly-tagged rows (for "detail"
+        # this is a belt-and-braces backstop — the index filter above already
+        # restricted the vector pools to detail rows, and the graph pass was
+        # skipped).
         if memory_kind == "fact":
             combined = [r for r in combined if (r.memory_kind or "fact") == "fact"]
         elif memory_kind == "passage":
             combined = [r for r in combined if r.memory_kind == "passage"]
+        elif memory_kind == "detail":
+            combined = [r for r in combined if r.memory_kind == "detail"]
 
         results = combined[:limit]
 
@@ -4107,7 +4150,14 @@ class MemoryService:
             must_not=[
                 FieldCondition(
                     key="metadata.dream_tombstoned", match=MatchValue(value=True)
-                )
+                ),
+                # Detail channel: the grep pass feeds ask's evidence with a
+                # ~20-row limit — detail rows entering here would bypass the
+                # capped detail leg, so they're excluded like every main-recall
+                # path (the leg is the ONLY door into the channel).
+                FieldCondition(
+                    key="metadata.memory_kind", match=MatchValue(value="detail")
+                ),
             ],
         )
 
