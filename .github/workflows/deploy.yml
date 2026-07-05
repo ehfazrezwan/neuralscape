@@ -1,0 +1,90 @@
+name: deploy
+
+# CD: every push to main builds the runtime image, records it in GHCR, and
+# rolls it onto the production VPS over SSH. The image is transported with
+# `docker save | ssh docker load`, so the VPS needs no registry credentials.
+# Rollback = revert the commit on main (or re-run this workflow from an older
+# main SHA via workflow_dispatch).
+#
+# Required repo secrets: VPS_HOST (IP/hostname), VPS_SSH_KEY (dedicated
+# ed25519 private key whose public half is in the VPS authorized_keys).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@v3
+
+      - id: meta
+        run: echo "tag=sha-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Build runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: neuralscape-service/Dockerfile
+          target: runtime
+          load: true
+          tags: ghcr.io/${{ github.repository_owner }}/neuralscape:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha
+
+      - name: Push to GHCR (artifact trail + rollback registry)
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          IMG="ghcr.io/${{ github.repository_owner }}/neuralscape"
+          docker tag "$IMG:${{ steps.meta.outputs.tag }}" "$IMG:latest"
+          docker push "$IMG:${{ steps.meta.outputs.tag }}"
+          docker push "$IMG:latest"
+
+      - name: Ship image to VPS and roll the stack
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          SHA: ${{ github.sha }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          SSH="ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 root@${VPS_HOST}"
+
+          IMG="ghcr.io/${{ github.repository_owner }}/neuralscape:${TAG}"
+          docker save "$IMG" | gzip -1 | $SSH 'gunzip | docker load'
+
+          $SSH "set -euo pipefail
+            cd /opt/neuralscape
+            git fetch -q origin main
+            git checkout -q main 2>/dev/null || git checkout -qb main origin/main
+            git reset -q --hard ${SHA}
+            NS_IMAGE=${IMG} docker compose \
+              -f docker-compose.yml -f docker-compose.vps.yml -f docker-compose.deploy.yml \
+              --profile tunnel up -d
+            for i in \$(seq 1 30); do
+              curl -fsS -m 5 http://127.0.0.1:8199/health/live >/dev/null && break
+              [ \$i -eq 30 ] && { echo 'liveness never came up'; exit 1; }
+              sleep 5
+            done
+            for i in \$(seq 1 12); do
+              curl -fsS -m 15 http://127.0.0.1:8199/health && break
+              [ \$i -eq 12 ] && { echo 'deep health never went green'; exit 1; }
+              sleep 10
+            done
+            echo
+            echo \"DEPLOYED ${TAG} (\$(git rev-parse --short HEAD))\""
