@@ -481,6 +481,7 @@ from index_format import distill_title, estimate_tokens  # noqa: F401 — estima
 # The stored field keeps its `token_estimate` name either way.
 from savings_meter import stamp_tokens
 from prompts import (
+    build_details_only_messages,
     build_extraction_messages,
     parse_extraction_response,
     parse_extraction_response_with_details,
@@ -925,10 +926,14 @@ class MemoryService:
         window_errors: list[str] = []
         last_exc: Exception | None = None
         for w_idx, window_messages in enumerate(windows):
+            # E11c: facts ALWAYS come from the base prompt (byte-identical to
+            # the pre-channel path); details come from a SEPARATE second call.
+            # Single-call variants cannibalized core facts into details
+            # regardless of instruction strength (measured twice on DMR).
             extraction_messages = build_extraction_messages(
                 window_messages,
                 operator_guidance=operator_guidance,
-                include_details=extract_details,
+                include_details=False,
             )
             try:
                 response = retry_transient(
@@ -941,14 +946,27 @@ class MemoryService:
                     operation="LLM extraction",
                     fallback_model=settings.gemini_llm_fallback_model,
                 )
+                parsed_facts.extend(parse_extraction_response(response.text))
                 if extract_details:
-                    facts_w, details_w = parse_extraction_response_with_details(
-                        response.text
-                    )
-                    parsed_facts.extend(facts_w)
-                    parsed_details.extend(details_w)
-                else:
-                    parsed_facts.extend(parse_extraction_response(response.text))
+                    detail_messages = build_details_only_messages(window_messages)
+                    try:
+                        d_response = retry_transient(
+                            client.models.generate_content,
+                            model=settings.gemini_llm_model,
+                            contents=detail_messages[0]["content"],
+                            config=GenerateContentConfig(
+                                http_options=HttpOptions(timeout=60_000),
+                            ),
+                            operation="LLM detail extraction",
+                            fallback_model=settings.gemini_llm_fallback_model,
+                        )
+                        _, details_w = parse_extraction_response_with_details(
+                            d_response.text
+                        )
+                        parsed_details.extend(details_w)
+                    except Exception as de:  # details are additive — never
+                        # fail the window over them
+                        logger.warning(f"detail extraction failed (non-critical): {de}")
             except Exception as e:
                 # One window failing must not zero the whole session — keep
                 # the other windows' facts and report the failure honestly

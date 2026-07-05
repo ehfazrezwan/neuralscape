@@ -327,6 +327,14 @@ def _wire_episode_tracking(service):
 
 
 class TestGraphEpisodeIdempotency:
+    @pytest.fixture(autouse=True)
+    def _details_off(self, monkeypatch):
+        # These tests assert extraction-call sequences; the E11c detail
+        # channel adds a second call per window — out of scope here.
+        from config import settings as _s
+
+        monkeypatch.setattr(_s, "extract_detail_memories", False)
+
     def test_second_run_skips_graph_add(self, service):
         _mock_extraction(service, [["[preference] Prefers dark mode"]] * 2)
         added = _wire_episode_tracking(service)
@@ -408,6 +416,15 @@ def _no_operator_guidance(monkeypatch):
 
 
 class TestWindowedExtraction:
+    @pytest.fixture(autouse=True)
+    def _details_off(self, monkeypatch):
+        # Windowing-contract tests: call counts are per-window facts calls;
+        # the E11c detail channel's second call is covered in
+        # test_detail_channel.py.
+        from config import settings as _s
+
+        monkeypatch.setattr(_s, "extract_detail_memories", False)
+
     def test_window_constants(self):
         assert settings.extraction_window_messages == 30
         assert settings.extraction_window_overlap == 2

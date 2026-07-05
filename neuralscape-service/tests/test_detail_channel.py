@@ -81,9 +81,10 @@ class TestExtractionPrompt:
 
     def test_addendum_is_additive_not_reductive(self):
         assert "facts" in DETAIL_EXTRACTION_ADDENDUM
-        # The addendum must explicitly instruct that facts extraction is
-        # unchanged — never move facts into details.
-        assert "exactly as instructed above" in DETAIL_EXTRACTION_ADDENDUM
+        # E11b hardening: the addendum anchors the facts array explicitly
+        # (facts-first, overlap goes to both, per-conversation cap).
+        assert "SACRED" in DETAIL_EXTRACTION_ADDENDUM
+        assert "BOTH" in DETAIL_EXTRACTION_ADDENDUM
 
     def test_base_prompt_constant_unchanged(self):
         """No detail contract leaks into the facts-only prompt constant."""
@@ -274,11 +275,21 @@ class TestDetailStorage:
         assert [m.memory for m in stored] == ["Prefers handwritten thank-you notes"]
         assert all(m.memory_kind is None for m in stored)
 
-    def test_flag_on_prompt_carries_detail_contract(self, service):
+    def test_flag_on_makes_two_calls_base_prompt_untouched(self, service):
+        """E11c: facts come from the base prompt (byte-identical to the
+        pre-channel path); details from a SEPARATE second call — the
+        by-construction fix for cannibalization (single-call variants
+        demoted core facts into details regardless of instruction)."""
+        from prompts import DETAILS_ONLY_EXTRACTION_PROMPT
+
         client = _mock_extraction(service, {"facts": [], "details": []})
         service.extract_and_store(messages=CONVO, user_id="ehfaz")
-        sent = client.models.generate_content.call_args.kwargs["contents"]
-        assert DETAIL_EXTRACTION_ADDENDUM in sent
+        calls = client.models.generate_content.call_args_list
+        assert len(calls) == 2
+        first, second = (c.kwargs["contents"] for c in calls)
+        assert DETAIL_EXTRACTION_ADDENDUM not in first
+        assert first.startswith("You are a memory extraction engine for an AI assistant")
+        assert second.startswith(DETAILS_ONLY_EXTRACTION_PROMPT[:60])
 
     def test_details_only_conversation_still_stores(self, service):
         """No core facts extracted but details present — the channel write

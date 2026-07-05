@@ -279,6 +279,32 @@ def split_into_windows(
     return windows
 
 
+DETAILS_ONLY_EXTRACTION_PROMPT = """You are a memory extraction engine. Extract ONLY one-off concrete micro-details from the conversation below: colors, names, breeds, gifts given or received, stated reasons for a choice, fears, family/pet/student specifics, attributes of possessions. Each detail must be a standalone sentence that preserves the concrete specific ("The user's construction hat is yellow"), attributed to the right person. Skip generic facts, preferences, summaries, and anything vague — micro-specifics only. At most 8 details.
+
+Respond with ONLY this JSON object (no prose, no code fences):
+{"details": ["One-off concrete micro-detail sentence", "..."]}
+
+If there are none, return: {"details": []}
+
+CONVERSATION:
+"""
+
+
+def build_details_only_messages(conversation_messages: list[dict]) -> list[dict]:
+    """Messages for the SEPARATE details-only extraction call (E11c).
+
+    A second independent call is the by-construction fix for detail-channel
+    cannibalization: single-call variants demoted core facts into details
+    regardless of instruction strength (measured twice on DMR minis).
+    """
+    conversation_text = ""
+    for msg in conversation_messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        conversation_text += f"{role}: {content}\n"
+    return [{"role": "user", "content": DETAILS_ONLY_EXTRACTION_PROMPT + conversation_text}]
+
+
 def build_extraction_messages(
     conversation_messages: list[dict],
     operator_guidance: str | None = None,
