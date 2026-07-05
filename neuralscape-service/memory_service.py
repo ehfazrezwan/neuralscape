@@ -5852,3 +5852,32 @@ class MemoryService:
         # Sort by score (descending) if available
         merged.sort(key=lambda x: x.get("score", 0) or 0, reverse=True)
         return merged
+
+
+# ──────────────────────────────────────────────
+# Shared process-wide instance (audit 27 #35)
+# ──────────────────────────────────────────────
+#
+# main.py (REST) and mcp_server.py (mounted MCP transport) run in the SAME
+# process; each holding its own MemoryService used to double every lazy-init
+# (two mem0/Graphiti stacks, two embedder clients) and split warm caches.
+# Both now resolve the one instance below. Workers still construct their own
+# service explicitly (separate processes, different lifecycle).
+
+_shared_service: "MemoryService | None" = None
+_shared_service_lock = threading.Lock()
+
+
+def get_shared_service() -> "MemoryService":
+    """Return the process-wide MemoryService, creating it on first use.
+
+    Thread-safe double-checked locking; construction itself is cheap (all
+    heavy clients inside MemoryService are lazy), so this only guarantees
+    identity — REST and MCP share one instance and one set of warm caches.
+    """
+    global _shared_service
+    if _shared_service is None:
+        with _shared_service_lock:
+            if _shared_service is None:
+                _shared_service = MemoryService()
+    return _shared_service

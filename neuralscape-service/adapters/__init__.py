@@ -14,9 +14,11 @@ from adapters.base import (
     DEFAULT_ADAPTER,
     DEFAULT_ADAPTER_NAME,
     KnowledgeAdapter,
+    UnknownAdapterError,
     get_adapter,
     list_adapters,
     register_adapter,
+    require_adapter,
 )
 
 # ── Register built-in adapters (import side effects) ──
@@ -52,7 +54,9 @@ __all__ = [
     "DEFAULT_ADAPTER",
     "DEFAULT_ADAPTER_NAME",
     "KnowledgeAdapter",
+    "UnknownAdapterError",
     "get_adapter",
     "list_adapters",
     "register_adapter",
+    "require_adapter",
 ]

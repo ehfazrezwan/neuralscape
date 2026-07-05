@@ -112,7 +112,11 @@ class MemoryCategory(str, Enum):
 # Category taxonomy (descriptions are domain-neutral as of memory-model v2)
 # ──────────────────────────────────────────────
 
-MEMORY_CATEGORIES: dict[str, str] = {
+# The immutable core taxonomy. Tool-facing enums (MCP inputSchema, docs)
+# advertise THIS set only — knowledge adapters extend MEMORY_CATEGORIES below
+# for validation/parsing, but never swell the advertised enums (audit 27 #36:
+# parser acceptance ≠ enum advertisement).
+CORE_MEMORY_CATEGORIES: dict[str, str] = {
     "preference": "Personal preferences: how the user likes to work, communicate, and consume information",
     "personal_fact": "Personal details about the user: name, timezone, role, team, working hours",
     "technical_skill": "Skills and proficiencies the user has, technical or otherwise",
@@ -127,6 +131,11 @@ MEMORY_CATEGORIES: dict[str, str] = {
     "procedure": "Step-by-step how-tos for repeatable tasks",
     "task_context": "Active work-in-progress: current goals, recent state, blockers — short-lived",
 }
+
+# The mutable shared taxonomy: core 13 + whatever knowledge adapters register.
+# This is what store_raw's membership check, the ingest validators, and the
+# fact parser consult (i.e. validation ACCEPTS adapter categories).
+MEMORY_CATEGORIES: dict[str, str] = dict(CORE_MEMORY_CATEGORIES)
 
 # Categories that default to global scope
 GLOBAL_CATEGORIES = {"preference", "personal_fact", "technical_skill", "domain_knowledge"}
@@ -315,10 +324,11 @@ def validate_adapter_name(v: str) -> str:
 
     A typo'd ``adapter`` must fail loudly here (422) — silently degrading to the
     default adapter would ingest a document *without* the taxonomy/ontology the
-    caller asked for, which is far worse than an error. (The worker-side
-    ``get_adapter`` still degrades gracefully, but only for jobs already queued
-    when an adapter was removed.) Imported lazily: ``adapters`` imports this
-    module at import time, so a top-level import here would be circular.
+    caller asked for, which is far worse than an error. (The worker-side queued
+    paths are strict too: ``require_adapter`` fails a queued job whose adapter
+    isn't registered in that process — audit 27 #36.) Imported lazily:
+    ``adapters`` imports this module at import time, so a top-level import here
+    would be circular.
     """
     from adapters import list_adapters
 

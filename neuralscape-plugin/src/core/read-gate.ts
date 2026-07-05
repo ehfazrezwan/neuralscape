@@ -1,29 +1,34 @@
 /**
- * File Read Gate — ranking + rendering (roadmap D3).
+ * File Read Gate — ranking + rendering (roadmap D3, reworked per audit 27
+ * #31/#32).
  *
  * Pure functions only (no HTTP, no filesystem) so the whole decision
  * surface is unit-testable from fixtures. The PreToolUse hook stats the
- * file, fetches candidate memories, and delegates everything else here.
+ * file, loads/fetches candidate memories, and delegates everything else
+ * here.
  *
- * ## The file-reference signal (documented per D3)
+ * ## Steer, never block (audit 27 #32)
+ *
+ * The gate used to DENY the Read and substitute a memory index for the file
+ * contents. Titles are lossy and matching is heuristic, so denials both
+ * blocked legitimate reads and served stale memory in place of real code.
+ * The gate now emits `additionalContext` ("NS has N memories about this
+ * file: …") while the Read ALWAYS proceeds.
+ *
+ * ## The file-reference signal
  *
  * NS memories carry NO structured `files_read` / `files_modified` metadata —
- * the plugin's PostToolUse observations record `file_path` per row, but
- * compile-observations distills them into prose memories where the paths
- * survive only in `memory` content (and sometimes `title`/`tags`). The
- * strongest available signal is therefore:
+ * paths survive in prose (`memory` content, sometimes `title`/`tags`). The
+ * verification filter matches on PATH TAILS: at least `dir/basename` when
+ * the target path has directories (a bare basename like `utils.ts` is too
+ * ambiguous across a repo — the pre-audit basename matcher was the false-
+ * positive source), falling back to the basename only for single-segment
+ * paths. Deeper tails (3+ segments) rank higher.
  *
- *   1. fetch the recency-bounded memory list (`GET /v1/memories`, newest
- *      READ_GATE_FETCH_LIMIT project-scoped memories — a fast list, ~100ms;
- *      the hybrid `POST /v1/search` also runs a Graphiti pass whose latency
- *      routinely exceeds the PreToolUse hook budget), then
- *   2. a hard verification filter: keep only memories whose content/title/
- *      tags literally contain the file's basename (case-insensitive).
- *
- * "Modified vs merely read" is likewise heuristic: `observation_type` in
- * {bugfix, feature, refactor} is the strongest modify signal (stamped by the
- * compile-observations rubric), with modification verbs in the content as a
- * weaker fallback. Specificity = fewer distinct file mentions in the memory.
+ * "Modified vs merely read" stays heuristic: `observation_type` in
+ * {bugfix, feature, refactor} is the strongest modify signal, with
+ * modification verbs in the content as a weaker fallback. Specificity =
+ * fewer distinct file mentions in the memory.
  */
 
 import type { NeuralscapeMemory } from "../utils.js";
@@ -40,12 +45,17 @@ import {
 /** Files at or below this size are never gated (config: READ_GATE_MIN_BYTES). */
 export const DEFAULT_READ_GATE_MIN_BYTES = 1500;
 
-/** Max rows in the deny block. */
+/** Max rows in the steering block. */
 export const READ_GATE_MAX_ROWS = 10;
 
-/** How many recent memories to fetch before the verification filter
- *  (the `GET /v1/memories` endpoint caps `limit` at 500). */
-export const READ_GATE_FETCH_LIMIT = 500;
+/** How many recent index rows to fetch before the verification filter
+ *  (audit 27 #31: was 500 FULL payloads; now a capped index-level fetch —
+ *  `GET /v1/memories?fields=index` — once per session). */
+export const READ_GATE_FETCH_LIMIT = 150;
+
+/** Hard time budget for the one NS fetch (config: READ_GATE_TIME_BUDGET_MS).
+ *  On timeout the hook allows the Read with no output — never block. */
+export const DEFAULT_READ_GATE_TIME_BUDGET_MS = 2000;
 
 // ── Binary / media bypass ────────────────────────────────────────
 
@@ -68,15 +78,22 @@ export const GATE_BYPASS_EXTENSIONS = new Set<string>([
   "sqlite", "sqlite3", "db", "parquet", "pkl", "pt", "onnx", "gguf",
 ]);
 
+/** Path segments, tolerant of both separators. */
+function pathSegments(filePath: string): string[] {
+  return filePath.replace(/\\/g, "/").split("/").filter(Boolean);
+}
+
 /** Basename of a path, tolerant of both separators. */
 export function fileNameOf(filePath: string): string {
-  return filePath.replace(/\\/g, "/").split("/").filter(Boolean).pop() ?? "";
+  return pathSegments(filePath).pop() ?? "";
 }
 
 /** Last `n` path segments joined with "/" — a higher-confidence needle
- *  than the bare basename (e.g. `src/utils.ts` vs `utils.ts`). */
+ *  than the bare basename (e.g. `src/utils.ts` vs `utils.ts`). Returns ""
+ *  when the path has fewer than `n` segments. */
 export function pathTail(filePath: string, n = 2): string {
-  const segments = filePath.replace(/\\/g, "/").split("/").filter(Boolean);
+  const segments = pathSegments(filePath);
+  if (segments.length < n) return "";
   return segments.slice(-n).join("/");
 }
 
@@ -111,21 +128,38 @@ export function basenameMatchRe(basename: string): RegExp {
   return new RegExp(`(?<![\\w.-])${escapeRegExp(basename)}(?![\\w-])`, "i");
 }
 
+/**
+ * Token-boundary matcher for a multi-segment path tail like
+ * `gate/target-module.ts`: segments may be joined by either separator in
+ * the haystack, a longer path prefix before the tail is fine (`src/gate/…`
+ * still contains `gate/…`), but partial-segment prefixes (`irrigate/…`) and
+ * extension extensions (`….tsx`) are not matches. Case-insensitive.
+ */
+export function tailMatchRe(tail: string): RegExp {
+  const joined = tail.split("/").map(escapeRegExp).join("[/\\\\]");
+  return new RegExp(`(?<![\\w.-])${joined}(?![\\w-])`, "i");
+}
+
 /** Everything a memory can reference a file through: content, title, tags. */
 export function memoryHaystack(mem: NeuralscapeMemory): string {
   return `${mem.memory ?? ""}\n${mem.title ?? ""}\n${(mem.tags ?? []).join("\n")}`;
 }
 
 /**
- * Verification filter: does this memory actually reference the file?
- * Content, title, and tags are checked for the basename as a whole token
- * (case-insensitive) — substring hits like `a.ts` inside `data.ts` don't
- * count.
+ * Verification filter (audit 27 #32): does this memory reference the file
+ * via a PATH TAIL? Requires at least `dir/basename` when the target path
+ * has directories — a bare basename mention is deliberately NOT enough
+ * (same-named files exist all over a repo). Single-segment targets fall
+ * back to the token-bounded basename. Checks content, title, and tags,
+ * case-insensitively.
  */
 export function referencesFile(mem: NeuralscapeMemory, filePath: string): boolean {
+  const hay = memoryHaystack(mem);
+  const tail = pathTail(filePath, 2);
+  if (tail) return tailMatchRe(tail).test(hay);
   const base = fileNameOf(filePath);
   if (!base) return false;
-  return basenameMatchRe(base).test(memoryHaystack(mem));
+  return basenameMatchRe(base).test(hay);
 }
 
 /** 2 = modify-typed observation, 1 = modify verbs in content, 0 = read-only. */
@@ -150,16 +184,17 @@ export function distinctFileMentions(content: string | null | undefined): number
 }
 
 /**
- * Filter search hits down to verified references and rank them:
- * modified-the-file first, then specificity (fewer distinct files),
- * then tail-match confidence, then recency. Capped at `cap` rows.
+ * Filter candidates down to verified path-tail references and rank them:
+ * modified-the-file first, then specificity (fewer distinct files), then
+ * deeper-tail confidence (3+ segments), then recency. Capped at `cap` rows.
  */
 export function rankFileMemories(
   memories: NeuralscapeMemory[],
   filePath: string,
   cap = READ_GATE_MAX_ROWS,
 ): NeuralscapeMemory[] {
-  const tail = pathTail(filePath).toLowerCase();
+  const deepTail = pathTail(filePath, 3);
+  const deepRe = deepTail ? tailMatchRe(deepTail) : null;
   const scored = memories
     .filter((m) => referencesFile(m, filePath))
     .map((m) => {
@@ -172,7 +207,7 @@ export function rankFileMemories(
         m,
         mod: modifiedScore(m),
         files: distinctFileMentions(hay) || Number.MAX_SAFE_INTEGER,
-        tailHit: tail && hay.toLowerCase().includes(tail) ? 1 : 0,
+        tailHit: deepRe && deepRe.test(hay) ? 1 : 0,
         ts: Number.isNaN(ts) ? Number.NEGATIVE_INFINITY : ts,
       };
     });
@@ -182,7 +217,7 @@ export function rankFileMemories(
   return scored.slice(0, cap).map((s) => s.m);
 }
 
-// ── Deny-block rendering ─────────────────────────────────────────
+// ── Steering-context rendering (audit 27 #32: steer, never block) ─
 
 const MCP = "mcp__plugin_neuralscape_neuralscape__";
 
@@ -194,21 +229,19 @@ export function renderGateRow(mem: NeuralscapeMemory, now: Date = new Date()): s
 }
 
 /**
- * The full deny reason: what happened, the ranked per-file timeline, the
- * escalation menu, and the exact override instruction. Short on purpose —
- * this whole block lands in Claude's context in place of the file.
+ * The steering context injected ALONGSIDE the Read (never in place of it):
+ * how many memories reference this file, their ranked index rows, and the
+ * escalation menu. Short on purpose — it rides into Claude's context in
+ * addition to the file contents.
  */
-export function renderReadGateReason(
+export function renderReadGateContext(
   filePath: string,
-  sizeBytes: number,
   ranked: NeuralscapeMemory[],
   now: Date = new Date(),
 ): string {
-  const kb = (sizeBytes / 1024).toFixed(1);
   const lines: string[] = [
-    `[Neuralscape Read Gate] Skipped reading \`${filePath}\` (${kb} KB) — ` +
-      `${ranked.length} stored ${ranked.length === 1 ? "memory references" : "memories reference"} this file. ` +
-      `Check whether they already answer your question:`,
+    `[Neuralscape] ${ranked.length} stored ${ranked.length === 1 ? "memory references" : "memories reference"} ` +
+      `\`${filePath}\` — prior context that may complement the file you are reading:`,
     "",
     "`#id | when | title | ~tokens`",
     ...ranked.map((m) => renderGateRow(m, now)),
@@ -216,21 +249,22 @@ export function renderReadGateReason(
     `Details: \`${MCP}get_memories\` with \`ids: [...]\` (the #ids above) for full payloads; ` +
       `\`${MCP}timeline\` with \`anchor\` = an #id for surrounding history; ` +
       `\`${MCP}recall_memories\` with \`index_only: true\` to browse further.`,
-    `Override: if you still need the raw contents, just Read the same path again — ` +
-      `the retry is always allowed and this gate stays quiet for this file for the rest of the session.`,
   ];
   // Server-sourced titles/content could carry <private> spans (e.g. from
   // ingested docs) — never re-emit them into the transcript.
   return redactPrivate(lines.join("\n"));
 }
 
-/** The PreToolUse deny decision in the shape the hooks API expects. */
-export function buildDenyOutput(reason: string): Record<string, unknown> {
+/**
+ * The PreToolUse steering output: additionalContext only — NO permission
+ * decision, so the Read proceeds through the normal permission flow
+ * untouched (audit 27 #32: the gate must never deny-and-substitute).
+ */
+export function buildSteerOutput(context: string): Record<string, unknown> {
   return {
     hookSpecificOutput: {
       hookEventName: "PreToolUse",
-      permissionDecision: "deny",
-      permissionDecisionReason: reason,
+      additionalContext: context,
     },
   };
 }
