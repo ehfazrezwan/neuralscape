@@ -56,6 +56,27 @@ class Settings(BaseSettings):
     # defaults to 1 (per-item embeds) unless explicitly overridden.
     embedder_max_batch_size: int = 0
 
+    # ── Deployment mode (solo engine — docs/neuralscape/28-solo-engine.md) ──
+    # team (default): today's multi-service deployment — Redis/ARQ queues,
+    # separate worker processes, Neo4j graph server. Bit-identical to the
+    # behavior before this setting existed.
+    # solo: one local daemon owning embedded single-process stores — no Redis,
+    # no Neo4j server, no workers. Flips the defaults of the three backend
+    # selectors below (each still individually overridable) and disables
+    # Docling unless explicitly enabled.
+    ns_mode: str = "team"
+    # Graph backend. "" resolves by mode: team → neo4j, solo → kuzu. kuzu is
+    # embedded/single-process and therefore solo-only; neo4j stays available
+    # in solo as the parity fallback (one `docker run neo4j`).
+    graph_provider: str = ""
+    kuzu_path: str = "~/.neuralscape/graph.kuzu"  # used when graph_provider=kuzu
+    # Async-write backend. "" resolves by mode: team → redis (ARQ queues),
+    # solo → inline (in-process two-lane executor; solo-engine unit 4).
+    task_backend: str = ""
+    # Maintenance scheduler. "" resolves by mode: team → off (ARQ crons own
+    # maintenance), solo → inproc (solo-engine unit 5).
+    scheduler_mode: str = ""
+
     # Neo4j
     neo4j_uri: str = "neo4j://127.0.0.1:7687"
     neo4j_user: str = "neo4j"
@@ -553,6 +574,70 @@ class Settings(BaseSettings):
         """True iff `user_id` is an authorized dictator (may write standards)."""
         return bool(user_id) and user_id in self.dictator_user_ids_set()
 
+    @model_validator(mode="after")
+    def _resolve_mode_profile(self):
+        """Materialize NS_MODE-dependent defaults and reject hybrid topologies.
+
+        Solo is one daemon owning embedded single-process stores; pointing it
+        at team services (a Qdrant server, Redis) is a config error rather
+        than a silent half-hybrid — the two-layer edge-sync topology is a
+        designed future feature, not an accident of leftover env vars.
+        """
+        if self.ns_mode not in ("team", "solo"):
+            raise ValueError(f"NS_MODE must be 'team' or 'solo', got {self.ns_mode!r}")
+        if self.graph_provider not in ("", "neo4j", "kuzu"):
+            raise ValueError(
+                f"GRAPH_PROVIDER must be 'neo4j' or 'kuzu', got {self.graph_provider!r}"
+            )
+        if self.task_backend not in ("", "redis", "inline"):
+            raise ValueError(
+                f"TASK_BACKEND must be 'redis' or 'inline', got {self.task_backend!r}"
+            )
+        if self.scheduler_mode not in ("", "off", "inproc"):
+            raise ValueError(
+                f"SCHEDULER_MODE must be 'off' or 'inproc', got {self.scheduler_mode!r}"
+            )
+        solo = self.ns_mode == "solo"
+        if not self.graph_provider:
+            self.graph_provider = "kuzu" if solo else "neo4j"
+        if not self.task_backend:
+            self.task_backend = "inline" if solo else "redis"
+        if not self.scheduler_mode:
+            self.scheduler_mode = "inproc" if solo else "off"
+        if solo:
+            if self.qdrant_url:
+                raise ValueError(
+                    "NS_MODE=solo uses embedded Qdrant only — unset QDRANT_URL "
+                    "(a solo daemon must own its stores; see 28-solo-engine.md)"
+                )
+            if "redis_url" in self.model_fields_set and self.redis_url:
+                raise ValueError("NS_MODE=solo runs without Redis — unset REDIS_URL")
+            if self.task_backend == "redis":
+                raise ValueError(
+                    "NS_MODE=solo requires TASK_BACKEND=inline — with no worker "
+                    "processes, redis-queued jobs would never be consumed"
+                )
+            if "docling_enabled" not in self.model_fields_set:
+                self.docling_enabled = False
+        else:
+            if self.graph_provider == "kuzu":
+                raise ValueError(
+                    "GRAPH_PROVIDER=kuzu is solo-only: Kuzu is an embedded "
+                    "single-process store and cannot be shared by the API and "
+                    "worker processes of a team deployment"
+                )
+            if self.task_backend == "inline":
+                raise ValueError(
+                    "TASK_BACKEND=inline is solo-only — team deployments route "
+                    "writes through the ARQ workers"
+                )
+            if self.scheduler_mode == "inproc":
+                raise ValueError(
+                    "SCHEDULER_MODE=inproc is solo-only — team maintenance runs "
+                    "as ARQ crons on the workers"
+                )
+        return self
+
     def validate_required(self) -> None:
         """Validate that all required configuration fields are set.
 
@@ -565,11 +650,15 @@ class Settings(BaseSettings):
         # defaults to AI Studio entirely unless LLM_GATEWAY_GRAPHITI_ENABLED.
         if not self.google_api_key:
             errors.append("GOOGLE_API_KEY is required but not set")
-        if not self.neo4j_password:
-            errors.append("NEO4J_PASSWORD is required but not set")
-        if not self.neo4j_uri:
-            errors.append("NEO4J_URI is required but not set")
-        if not self.redis_url:
+        # Server gates follow the RESOLVED backends, not ns_mode: a solo
+        # deployment that explicitly opts into the neo4j fallback still needs
+        # the neo4j credentials; a kuzu solo needs neither server.
+        if self.graph_provider == "neo4j":
+            if not self.neo4j_password:
+                errors.append("NEO4J_PASSWORD is required but not set")
+            if not self.neo4j_uri:
+                errors.append("NEO4J_URI is required but not set")
+        if self.task_backend == "redis" and not self.redis_url:
             errors.append("REDIS_URL is required but not set")
         if self.llm_gateway_enabled:
             if not self.llm_gateway_base_url:
@@ -660,6 +749,14 @@ class Settings(BaseSettings):
         is a single env flag; everything else (model tags, keys, providers) is
         derived from it.
         """
+        if self.graph_provider == "kuzu":
+            # The kuzu driver seam lands in solo-engine unit 2. Until then,
+            # failing loud beats silently building a Neo4jDriver pointed at
+            # a server that solo mode doesn't have.
+            raise NotImplementedError(
+                "graph_provider=kuzu is not wired yet (solo-engine unit 2); "
+                "set GRAPH_PROVIDER=neo4j in the meantime"
+            )
         # Qdrant: server mode (url) or local on-disk mode (path)
         qdrant_config: dict = {
             "collection_name": self.qdrant_collection,
@@ -741,6 +838,8 @@ class Settings(BaseSettings):
             "graph_store": {
                 "provider": "graphiti",
                 "config": {
+                    "graph_provider": self.graph_provider,
+                    "kuzu_path": str(Path(self.kuzu_path).expanduser()),
                     "url": self.neo4j_uri,
                     "username": self.neo4j_user,
                     "password": self.neo4j_password,
