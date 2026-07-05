@@ -236,7 +236,14 @@ def _evidence_rows(evidence: dict, keyword_ids: list[str], enumeration: bool) ->
     are listed FIRST — the discipline is exact-before-semantic, and
     list-position is how an LLM weighs evidence.
     """
-    _created = _event_time
+    def _created(m) -> tuple:
+        # Event time first, storage time as tie-break: historical ingestion
+        # stamps ONE occurred_at per session, so every fact from that session
+        # ties on event time — without the created_at tie-break the sort
+        # coarsens to session granularity and loses the per-row write order
+        # the disciplines previously reasoned over (occurred_at read-side
+        # refinement, with PR #134).
+        return (_event_time(m), str(getattr(m, "created_at", None) or ""))
 
     rows = list(evidence.values())
 
@@ -250,7 +257,7 @@ def _evidence_rows(evidence: dict, keyword_ids: list[str], enumeration: bool) ->
         rows = rows[:_EVIDENCE_MAX_ROWS]
 
     # Chronological ascending for the prompt; timestamp-less survivors last.
-    rows.sort(key=lambda m: (0, _created(m)) if _created(m) else (1, ""))
+    rows.sort(key=lambda m: (0, _created(m)) if _created(m)[0] else (1, ("", "")))
     if enumeration and keyword_ids:
         kw = [m for m in rows if m.id in keyword_ids]
         rest = [m for m in rows if m.id not in keyword_ids]
