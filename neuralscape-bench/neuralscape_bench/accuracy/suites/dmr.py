@@ -17,6 +17,7 @@ annotations exist → retrieval R@k is skipped for this suite.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from neuralscape_bench.accuracy.download import fetch_file, hf_resolve_url, read_jsonl
@@ -80,6 +81,21 @@ def parse(records: list[dict]) -> SuiteData:
         gold = (si_pair.get("A") or "").strip()
         if not question:
             continue
+        # E3 (flagged): MSC-self-instruct questions are posed BY the Speaker-2
+        # persona TO the Speaker-1 persona (verified against gold: "how much I
+        # make" → Speaker 2's salary; "how old were you...guitar" → Speaker 1's
+        # fact answered in first person). The perspective is dataset semantics
+        # the answering system otherwise cannot know — competitors supply it
+        # via their session framing. Contains no answer content.
+        if os.environ.get("DMR_PERSPECTIVE_CONTEXT") == "1":
+            question = (
+                "[Perspective: this question comes from your long-term conversation "
+                "partner — memories phrase their facts as 'the assistant'. In the "
+                "question, 'I'/'my'/'me' refer to that partner; 'you'/'your' refer "
+                "to the one answering (memories phrase those facts as 'the user'). "
+                "Answer from the user-side perspective, addressing the partner as "
+                "'you'.] " + question
+            )
         out.conversations.append(Conversation(conv_id=conv_id, sessions=tuple(sessions)))
         out.qa_items.append(QAItem(
             qa_id=conv_id,
