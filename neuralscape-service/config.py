@@ -198,6 +198,26 @@ class Settings(BaseSettings):
     extraction_window_messages: int = 30
     extraction_window_overlap: int = 2
 
+    # ── Detail memory channel (DMR experiment ledger, 2026-07) ────────
+    # Distillation drops one-off micro-details (possession attributes,
+    # stated reasons, gifts, fears, family/pet specifics); ~half of the
+    # residual DMR abstentions had the gold fact ABSENT from the store.
+    # Naively densifying the fact extractor was measured NET-NEGATIVE
+    # twice (66% vs 72%, 66% vs 70% on matched samples) — extra facts
+    # dilute top-k retrieval. The winning pattern is a separate ADDITIVE
+    # CAPPED channel (a 3-excerpt episode leg added +3.8pp full-scale):
+    # micro-details are extracted into their own `memory_kind="detail"`
+    # rows, EXCLUDED from the main search at the index, and surfaced only
+    # through ask's capped detail evidence leg.
+    #
+    # `extract_detail_memories` gates the additive "details" array in the
+    # conversation-extraction contract — when False, the prompt and parser
+    # are byte-identical to the pre-channel path. `ask_detail_evidence`
+    # gates the capped (limit-3) detail leg in ask_memory (non-minimal
+    # tiers only; non-fatal on failure).
+    extract_detail_memories: bool = True   # env EXTRACT_DETAIL_MEMORIES
+    ask_detail_evidence: bool = True       # env ASK_DETAIL_EVIDENCE
+
     # ── Custom extraction instructions (roadmap E4) ───────────────────
     # Operator-supplied guidance appended to the extraction prompt as a
     # clearly-delimited addendum ("OPERATOR GUIDANCE"). Per-user (self-set)
