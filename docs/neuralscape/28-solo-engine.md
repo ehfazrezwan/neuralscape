@@ -184,6 +184,30 @@ The wizard asks one question — **Solo or Team?**
 
 Upgrade story: `uvx neuralscape upgrade` = package bump + daemon restart. Embedded-store schema migrations ship with the package and run at daemon startup (Kuzu schema is versioned by the graphiti driver's `setup_schema`).
 
+### 6.1 Who installs what — the onboarding matrix
+
+**You install an engine only if you host one; you configure a connection if you use one.** `neuralscape init` is for engine *hosts*. Memory *consumers* — team members — never run it.
+
+| Onboarding path | Local install | Configuration |
+|---|---|---|
+| **Solo self-hosted** | `uvx neuralscape init` → local daemon | none — the plugin already defaults to `http://localhost:8199`; onboarding guides the user through Claude Code / Cowork setup |
+| **Team member** | **none** | plugin/connector config: team base URL + auth (token, or the team's OAuth provider) — exactly today's flow |
+| **Team admin** (hosts the team engine) | compose / Helm | today's team deployment, unchanged |
+| **Solo user joining a team** | nothing new | adoption flow (§8) migrates the local store into the team engine; the user then flips their plugin URL to the team server — or (Layer 2) keeps the daemon as an edge cache |
+| **Team member + edge cache** (Layer 2, later) | same binary, `edge` mode | the daemon gets the team URL + auth and syncs the user's slice; the plugin points back at `localhost:8199` |
+
+Two properties are hard requirements, not conveniences:
+
+1. **The team-member path stays zero-install.** A team member's entire onboarding is "paste URL, authenticate." The solo daemon must never become a prerequisite for team use.
+2. **The edge cache is an opt-in upgrade of the team-member path, not a fourth product.** It is the same binary as the solo engine running in a different mode: a team member who wants offline recall or local-disk read latency runs `neuralscape init` and picks *edge* instead of *solo*. Everyone else keeps the thin client. (This also means a solo user who joins a team loses nothing — their daemon flips to edge mode instead of being uninstalled.)
+
+### 6.2 Multiple backends on one machine
+
+"Can a user belong to multiple teams?" decomposes into routing vs. federation:
+
+- **Routing (in scope, cheap):** the plugin already resolves a per-project `PROJECT_ID`; adding a per-project *URL + auth* override maps cleanly to "work project → team A engine, side project → team B engine, everything else → my solo daemon." Exactly one backend answers any given recall, so correctness is trivial.
+- **Federation (out of scope):** a single recall fanned out across several engines with merged ranking, cross-engine dedup, and unified provenance is a genuinely hard distributed-retrieval problem. Not planned; the edge daemon's slice-sync (Layer 2) is as far as we go.
+
 ## 7. Retrieval parity plan (the merge gate)
 
 Parity is defined and enforced, not assumed.
@@ -270,3 +294,4 @@ Estimated effort: units 1–2 are days; unit 3 is the long pole (~2–3 weeks, w
 2. **Local embeddings for solo** — self-hosted embeddings (per the scaling roadmap) would make solo recall fully offline-capable and quota-free; out of scope here but the config seam should not assume the embedder is remote.
 3. **Session summarizer in solo v1** — in-process port vs. ship-disabled; decide by effort during unit 5.
 4. **LadybugDB adoption criteria** — revisit once its Graphiti driver merges upstream and it shows a second year of releases.
+5. **Per-project backend routing in the plugin** (§6.2) — spec the override precedence (env → project marker → global config) when unit 6 lands.
