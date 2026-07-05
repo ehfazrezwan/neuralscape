@@ -92,6 +92,7 @@ SCHEMA_QUERIES = """
         expired_at TIMESTAMP,
         valid_at TIMESTAMP,
         invalid_at TIMESTAMP,
+        reference_time TIMESTAMP,
         attributes STRING
     );
     CREATE REL TABLE IF NOT EXISTS RELATES_TO(
@@ -115,7 +116,11 @@ SCHEMA_QUERIES = """
         uuid STRING PRIMARY KEY,
         name STRING,
         group_id STRING,
-        created_at TIMESTAMP
+        created_at TIMESTAMP,
+        summary STRING,
+        first_episode_uuid STRING,
+        last_episode_uuid STRING,
+        last_summarized_at TIMESTAMP
     );
     CREATE REL TABLE IF NOT EXISTS HAS_EPISODE(
         FROM Saga TO Episodic,
@@ -142,6 +147,12 @@ class KuzuDriver(GraphDriver):
         max_concurrent_queries: int = 1,
     ):
         super().__init__()
+        # NEURALSCAPE PATCH: add_episode compares `driver._database` against the
+        # group_id before its (no-op, base-class) clone() call — Neo4jDriver
+        # sets this in __init__ but Kuzu never did, so every add_episode with a
+        # group_id crashed with AttributeError. Kuzu has one database per file;
+        # the path stands in as its name and never equals a group_id.
+        self._database = db
         self.db = kuzu.Database(db)
 
         self.setup_schema()

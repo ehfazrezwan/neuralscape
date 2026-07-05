@@ -61,3 +61,13 @@ The existing graph tests are MagicMock-seam tests (`svc._graphiti = MagicMock()`
 ### Exception handling
 
 Only NS product-code `neo4j.exceptions` import: `extensions/dreaming/graph_patcher.py:164` (`TransientError` deadlock retry in `attach_source_ref`). Kuzu is single-writer embedded — no transient deadlocks; gate the import + retry to the neo4j provider branch.
+
+## E2E findings (solo/e2e-verify — real daemon, embedded stores, live Gemini)
+
+The first true end-to-end boot (NS_MODE=solo, zero containers) surfaced three defects no unit test had caught:
+
+1. **Startup crash without Redis** — `TaskManager.connect()` was unguarded, and a `None` pool raised `AttributeError` from enqueues, which the write paths' sync fallbacks (`except (ConnectionError, OSError)`) do NOT catch. Fixed: `connect()` skips Redis when `task_backend != "redis"`, and the pool rests as a falsy `_DisabledPool` sentinel whose any-use raises `ConnectionError` — routing every write into the sync fallbacks. (Interim until unit 4's real inline backend.)
+2. **`KuzuDriver` missing `_database`** — `graphiti.add_episode` compares `driver._database` to the group_id before its no-op base-class `clone()`; Neo4j sets the attribute, Kuzu didn't → every group-scoped episode write crashed. Subtree-patched in the driver `__init__`.
+3. **Kuzu DDL drift** — the edge model's `reference_time` and four Saga columns (`summary`, `first/last_episode_uuid`, `last_summarized_at`) are SET by the Kuzu save queries but were never declared in `SCHEMA_QUERIES` (static schema → binder errors). Fixed in the DDL for fresh stores + `_GRAPHITI_DRIFT_ALTERS` in the NS bootstrap for existing ones, and guarded forever by `TestKuzuSchemaDrift` — a static cross-check of every Kuzu save query's SET columns against the DDL.
+
+Lesson recorded: the MagicMock seam tests and even the real-driver query tests couldn't find these — only booting the actual daemon and pushing a conversation through Gemini → Graphiti → Kuzu did. The parity bench (unit 7) must run against the daemon, not the library.
