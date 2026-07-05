@@ -936,3 +936,64 @@ class TestHelpers:
     def test_parse_llm_json_garbage_is_none(self):
         assert ask_mod._parse_llm_json("no json here") is None
         assert ask_mod._parse_llm_json("") is None
+
+
+# ──────────────────────────────────────────────
+# Verbatim episode evidence leg: distillation drops one-off micro-details;
+# up to 3 fulltext-ranked session excerpts join the evidence (non-minimal
+# tiers, kill switch ASK_EPISODE_EVIDENCE)
+# ──────────────────────────────────────────────
+
+
+class TestEpisodeEvidenceLeg:
+    @pytest.mark.asyncio
+    async def test_episode_rows_join_evidence(self):
+        svc = _service([_mem("m1", "the user owns a construction hat")])
+        svc.search_episodes_fulltext.return_value = [
+            {"uuid": "abcdef123456xyz", "content": "my hat is yellow!", "created_at": "2026-01-01"},
+        ]
+        llm = _answer_llm("yellow")
+        out = await ask_memory(svc, question="What color is my construction hat?",
+                               user_id="u", reasoning_level="high", llm_call=llm)
+        prompt = llm.prompts[0]
+        assert "[verbatim session excerpt] my hat is yellow!" in prompt
+        assert any(s.startswith("episodes:") for s in out["searches"])
+        # keyword-filtered query, not the raw question
+        args = svc.search_episodes_fulltext.call_args[0]
+        assert "what" not in args[0].lower()
+
+    @pytest.mark.asyncio
+    async def test_minimal_tier_skips_episode_pass(self):
+        svc = _service([_mem("m1", "apple")])
+        llm = _answer_llm("apple")
+        await ask_memory(svc, question="What fruit do I like?",
+                         user_id="u", reasoning_level="minimal", llm_call=llm)
+        svc.search_episodes_fulltext.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_kill_switch_disables_pass(self, monkeypatch):
+        from config import settings
+        monkeypatch.setattr(settings, "ask_episode_evidence", False)
+        svc = _service([_mem("m1", "apple")])
+        llm = _answer_llm("apple")
+        await ask_memory(svc, question="What fruit do I like?",
+                         user_id="u", reasoning_level="high", llm_call=llm)
+        svc.search_episodes_fulltext.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_episode_failure_is_non_fatal(self):
+        svc = _service([_mem("m1", "apple")])
+        svc.search_episodes_fulltext.side_effect = RuntimeError("neo4j down")
+        llm = _answer_llm("apple")
+        out = await ask_memory(svc, question="What fruit do I like?",
+                               user_id="u", reasoning_level="high", llm_call=llm)
+        assert out["answer"]
+
+    @pytest.mark.asyncio
+    async def test_non_list_return_tolerated(self):
+        svc = _service([_mem("m1", "apple")])
+        svc.search_episodes_fulltext.return_value = MagicMock()  # older fork / double
+        llm = _answer_llm("apple")
+        out = await ask_memory(svc, question="What fruit do I like?",
+                               user_id="u", reasoning_level="high", llm_call=llm)
+        assert out["answer"]

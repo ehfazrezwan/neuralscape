@@ -38,6 +38,7 @@ import asyncio
 import json
 import logging
 import re
+from types import SimpleNamespace
 from dataclasses import dataclass
 
 from config import settings
@@ -481,6 +482,37 @@ async def ask_memory(
 
     # ── Semantic pass (always) ──
     await _semantic(question)
+
+    # ── Verbatim episode leg: distillation drops one-off micro-details
+    # (colors, gifts, stated reasons); the raw session text still has them.
+    # Measured +5pp on a DMR 100-question stratified sample; 3 excerpts is
+    # the sweet spot (5 diluted the evidence and regressed).
+    if tier.name != "minimal" and settings.ask_episode_evidence:
+        ep_query = " ".join(extract_keywords(question, max_terms=12)) or question
+        try:
+            eps = await asyncio.to_thread(
+                service.search_episodes_fulltext,
+                ep_query, user_id, project_id, 3,
+            )
+        except Exception as e:  # non-fatal: facts-only evidence still works
+            logger.warning(f"ask episode pass failed (non-critical): {e}")
+            eps = []
+        if not isinstance(eps, list):  # tolerate test doubles / older forks
+            eps = []
+        if eps:
+            searches.append("episodes: fulltext")
+            _merge([
+                SimpleNamespace(
+                    id=f"ep-{str(e_.get('uuid') or '')[:12]}",
+                    memory="[verbatim session excerpt] "
+                           + _clip_content(str(e_.get("content") or ""),
+                                           _EVIDENCE_PASSAGE_CLIP),
+                    score=None,
+                    source="episode",
+                    created_at=e_.get("created_at") or None,
+                )
+                for e_ in eps
+            ])
 
     # ── Discipline 2: update-language pass, gated on temporal cues ──
     # (audit 27 #19) Runs only when the question or the first-pass evidence
