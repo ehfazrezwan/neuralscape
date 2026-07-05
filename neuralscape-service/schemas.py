@@ -237,9 +237,12 @@ SOURCE_TYPE_VOCAB: set[str] = {
 EPISTEMIC_LEVEL_VOCAB: set[str] = {"explicit", "deductive", "inductive", "reflection"}
 
 # memory_kind distinguishes a distilled atomic fact from a verbatim passage
-# (chunk) of an ingested document. Legacy memories have no memory_kind set;
-# readers should treat a null value as "fact".
-MEMORY_KIND_VOCAB: set[str] = {"fact", "passage"}
+# (chunk) of an ingested document, and from a one-off micro-detail captured by
+# the detail channel. Legacy memories have no memory_kind set; readers should
+# treat a null value as "fact". "detail" rows are EXCLUDED from the main
+# search at the index (they surface only via an explicit memory_kind="detail"
+# search — see ask.py's capped detail evidence leg).
+MEMORY_KIND_VOCAB: set[str] = {"fact", "passage", "detail"}
 
 # Connector adapter types recognised by the ingest/connector subsystem.
 # `manual` = content a user provided directly (pasted context); `file_upload` =
@@ -454,7 +457,7 @@ class RawMemoryRequest(BaseModel):
     )
 
     # Data-layer connectors (optional, additive)
-    memory_kind: str | None = Field(default=None, description="'fact' (distilled) or 'passage' (verbatim chunk). Null → fact.")
+    memory_kind: str | None = Field(default=None, description="'fact' (distilled), 'passage' (verbatim chunk), or 'detail' (one-off micro-detail; excluded from main search). Null → fact.")
     source_ref: SourceDescriptor | None = Field(default=None, description="Provenance + retrieval handle for ingested content")
 
     @field_validator("domain")
@@ -669,7 +672,7 @@ class SearchMemoryRequest(BaseModel):
     domain: str | None = Field(default=None, description="Filter by domain")
     observation_type: str | None = Field(default=None, description="Filter by observation_type")
     concepts: list[str] | None = Field(default=None, max_length=5, description="Filter by concept tags (any-match)")
-    memory_kind: str | None = Field(default=None, description="Filter by 'fact' or 'passage'")
+    memory_kind: str | None = Field(default=None, description="Filter by 'fact', 'passage', or 'detail' (detail rows only surface via this filter)")
 
     # Multi-user pool selection
     visibility: MemoryVisibility | None = Field(

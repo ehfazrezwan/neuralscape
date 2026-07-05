@@ -483,6 +483,7 @@ from savings_meter import stamp_tokens
 from prompts import (
     build_extraction_messages,
     parse_extraction_response,
+    parse_extraction_response_with_details,
 )
 from schemas import (
     EPISTEMIC_LEVEL_VOCAB,
@@ -913,12 +914,21 @@ class MemoryService:
 
         from google.genai.types import GenerateContentConfig, HttpOptions
 
+        # Detail channel (DMR ledger, 2026-07): when on, the prompt gains the
+        # additive "details" contract and the response is parsed by the
+        # details-aware sibling. When off, prompt AND parser are byte-identical
+        # to the pre-channel path (see tests/test_detail_channel.py).
+        extract_details = settings.extract_detail_memories
+
         parsed_facts: list[tuple[str, str]] = []
+        parsed_details: list[tuple[str, str]] = []
         window_errors: list[str] = []
         last_exc: Exception | None = None
         for w_idx, window_messages in enumerate(windows):
             extraction_messages = build_extraction_messages(
-                window_messages, operator_guidance=operator_guidance
+                window_messages,
+                operator_guidance=operator_guidance,
+                include_details=extract_details,
             )
             try:
                 response = retry_transient(
@@ -931,7 +941,14 @@ class MemoryService:
                     operation="LLM extraction",
                     fallback_model=settings.gemini_llm_fallback_model,
                 )
-                parsed_facts.extend(parse_extraction_response(response.text))
+                if extract_details:
+                    facts_w, details_w = parse_extraction_response_with_details(
+                        response.text
+                    )
+                    parsed_facts.extend(facts_w)
+                    parsed_details.extend(details_w)
+                else:
+                    parsed_facts.extend(parse_extraction_response(response.text))
             except Exception as e:
                 # One window failing must not zero the whole session — keep
                 # the other windows' facts and report the failure honestly
@@ -957,18 +974,24 @@ class MemoryService:
             "window_errors": window_errors,
         }
 
-        # Filter out junk facts from extraction
-        pre_filter_count = len(parsed_facts)
+        # Filter out junk facts from extraction (details get the same filter —
+        # a shell command is junk whichever channel it arrived on).
+        pre_filter_count = len(parsed_facts) + len(parsed_details)
         parsed_facts = [
             (cat, content) for cat, content in parsed_facts
             if not _is_junk_fact(content)
         ]
-        if pre_filter_count != len(parsed_facts):
+        parsed_details = [
+            (cat, content) for cat, content in parsed_details
+            if not _is_junk_fact(content)
+        ]
+        post_filter_count = len(parsed_facts) + len(parsed_details)
+        if pre_filter_count != post_filter_count:
             logger.info(
-                f"Filtered {pre_filter_count - len(parsed_facts)} junk facts from extraction"
+                f"Filtered {pre_filter_count - post_filter_count} junk facts from extraction"
             )
 
-        if not parsed_facts:
+        if not parsed_facts and not parsed_details:
             logger.info("No facts extracted from conversation")
             return ([], stats) if return_stats else []
 
@@ -978,19 +1001,39 @@ class MemoryService:
         # reported success — exactly what hid the gateway's single-input
         # embed rejection in production. Raising fails the ARQ job, so
         # /v1/memories/status/{task_id} reports status=failed with the error.
+        #
+        # Details ride the SAME batch write path (content-hash dedup,
+        # times_derived bump, tombstone revival, two-pass embed) in a second
+        # call stamped memory_kind="detail" — the stamp is what the main
+        # search's index-time exclusion keys off. Failures propagate for the
+        # same reason as facts; the dedup makes the ARQ retry safe.
         try:
-            stored = self._batch_store_facts(
-                facts=parsed_facts,
-                user_id=user_id,
-                project_id=project_id,
-                agent_id=agent_id,
-                run_id=run_id,
-                source="conversation",
+            stored = (
+                self._batch_store_facts(
+                    facts=parsed_facts,
+                    user_id=user_id,
+                    project_id=project_id,
+                    agent_id=agent_id,
+                    run_id=run_id,
+                    source="conversation",
+                )
+                if parsed_facts
+                else []
             )
+            if parsed_details:
+                stored += self._batch_store_facts(
+                    facts=parsed_details,
+                    user_id=user_id,
+                    project_id=project_id,
+                    agent_id=agent_id,
+                    run_id=run_id,
+                    source="conversation",
+                    memory_kind="detail",
+                )
         except Exception as e:
             logger.error(
                 f"Batch store failed for user {user_id}: {e} — "
-                f"{len(parsed_facts)} extracted facts were NOT stored",
+                f"{len(parsed_facts) + len(parsed_details)} extracted facts were NOT stored",
                 exc_info=True,
             )
             raise
