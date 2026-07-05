@@ -749,7 +749,10 @@ class MemoryService:
             timeout: Maximum seconds to wait for the result (default 30s).
 
         Raises:
-            RuntimeError: If the bridge is not initialized.
+            RuntimeError: If the bridge is not initialized, or its loop is
+                not a real event loop (half-initialized adapter / mocked
+                bridge) — failing fast instead of parking on
+                ``future.result()`` for the full timeout.
             TimeoutError: If the operation exceeds the timeout.
         """
         if self._bridge is None:
@@ -757,7 +760,19 @@ class MemoryService:
         import asyncio as _asyncio
         import concurrent.futures
 
-        future = _asyncio.run_coroutine_threadsafe(coro, self._bridge._loop)
+        # If the bridge's loop isn't a real event loop (e.g. a mocked bridge
+        # in unit tests, or a half-initialized adapter), run_coroutine_threadsafe
+        # would return a future that never completes and we'd park on
+        # future.result() until the timeout. Fail fast instead — callers
+        # already treat bridge failures as non-critical/fail-open. (Same
+        # guard as the episode-idempotency probe, hoisted to the choke point.)
+        loop = getattr(self._bridge, "_loop", None)
+        if not isinstance(loop, _asyncio.AbstractEventLoop):
+            raise RuntimeError(
+                "Graphiti bridge loop is not an asyncio event loop "
+                f"(got {type(loop).__name__}) — bridge mocked or half-initialized"
+            )
+        future = _asyncio.run_coroutine_threadsafe(coro, loop)
         try:
             return future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:

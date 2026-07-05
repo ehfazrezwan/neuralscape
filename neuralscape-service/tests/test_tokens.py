@@ -48,9 +48,15 @@ class TestVerifyUserToken:
 
     def test_tampered_signature_returns_none(self):
         token = issue_user_token("alice", "topsecret", 3600)
-        # Flip the last character of the signature segment
-        flipped = token[:-1] + ("a" if token[-1] != "a" else "b")
-        assert verify_user_token(flipped, "topsecret") is None
+        # Flip the FIRST character of the signature segment. The last char
+        # of an unpadded base64 signature carries 2 ignored trailing bits,
+        # so flipping it (the old approach) decoded to the *same* bytes
+        # ~5% of the time and the test flaked. The first char is fully
+        # significant, so this tamper always changes the decoded signature.
+        payload_seg, sig_seg = token.split(".", 1)
+        flipped_first = "a" if sig_seg[0] != "a" else "b"
+        tampered = f"{payload_seg}.{flipped_first}{sig_seg[1:]}"
+        assert verify_user_token(tampered, "topsecret") is None
 
     def test_tampered_payload_returns_none(self):
         """Modifying the payload without re-signing must fail verification."""

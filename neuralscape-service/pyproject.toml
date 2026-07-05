@@ -81,6 +81,7 @@ dev = [
     # Dev installs get the code-graph extra so the adapter/tool tests exercise
     # the real graphifyy library (production keeps it opt-in via the extra).
     "graphifyy>=0.9.5",
+    "pytest-xdist>=3.8.0",
 ]
 
 [tool.pytest.ini_options]

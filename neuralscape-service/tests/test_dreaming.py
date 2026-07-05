@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -579,8 +580,7 @@ def test_stage_pool_guards_and_gates(monkeypatch):
     now = time.time()
     # "recent" must stay inside the settling window relative to the single
     # captured time source — a hardcoded date here became a time bomb
-    # (started failing 2026-07-05).
-    from datetime import datetime, timezone
+    # (started failing 2026-07-05). datetime/timezone imported at module level.
     recent = datetime.fromtimestamp(now - 3600, tz=timezone.utc).isoformat()
     ancient = "2024-01-01T00:00:00+00:00"
     batch = _batch([
