@@ -52,9 +52,10 @@ class TestServiceUnitRendering:
         assert f"{tmp_path}/logs/daemon.log" in plist
 
     def test_systemd_unit_uses_environment_file(self, tmp_path):
-        unit = cli.render_systemd_unit(tmp_path, ["/usr/bin/neuralscape", "serve"])
+        unit = cli.render_systemd_unit(tmp_path, ["/opt/venv path/neuralscape", "serve"])
         assert f"EnvironmentFile={tmp_path}/env" in unit
-        assert "ExecStart=/usr/bin/neuralscape serve" in unit
+        # args are individually quoted so venv paths with spaces survive
+        assert 'ExecStart="/opt/venv path/neuralscape" "serve"' in unit
         assert "Restart=on-failure" in unit
 
 
@@ -91,7 +92,7 @@ class TestBundleRoundTrip:
         assert "--force" in capsys.readouterr().out
         assert cli.main(["--home", str(home), "import", str(bundle), "--force"]) == 0
 
-    def test_import_rejects_tar_slip(self, tmp_path, capsys):
+    def test_import_rejects_tar_slip_with_clean_exit(self, tmp_path, capsys):
         bundle = tmp_path / "evil.tar.gz"
         with tarfile.open(bundle, "w:gz") as tar:
             import io
@@ -105,9 +106,32 @@ class TestBundleRoundTrip:
             evil = tarfile.TarInfo("../escape.txt")
             evil.size = 4
             tar.addfile(evil, io.BytesIO(b"pwnd"))
-        with pytest.raises(ValueError, match="unsafe path"):
-            cli.main(["--home", str(tmp_path / "h"), "import", str(bundle)])
+        rc = cli.main(["--home", str(tmp_path / "h"), "import", str(bundle)])
+        assert rc == 1
+        assert "unsafe path" in capsys.readouterr().out
         assert not (tmp_path.parent / "escape.txt").exists()
+
+    def test_import_rejects_manifest_path_escape(self, tmp_path, capsys):
+        """A malicious manifest must not aim --force deletion outside home
+        (Copilot, PR #145)."""
+        victim = tmp_path / "victim.txt"
+        victim.write_text("precious")
+        home = tmp_path / "h"
+        home.mkdir()
+        bundle = tmp_path / "evil2.tar.gz"
+        with tarfile.open(bundle, "w:gz") as tar:
+            import io
+
+            manifest = json.dumps(
+                {"bundle_version": cli.BUNDLE_VERSION, "contents": ["../victim.txt"]}
+            ).encode()
+            info = tarfile.TarInfo("manifest.json")
+            info.size = len(manifest)
+            tar.addfile(info, io.BytesIO(manifest))
+        rc = cli.main(["--home", str(home), "import", str(bundle), "--force"])
+        assert rc == 1
+        assert "unsafe manifest entry" in capsys.readouterr().out
+        assert victim.read_text() == "precious"
 
     def test_import_rejects_wrong_version(self, tmp_path, capsys):
         bundle = tmp_path / "old.tar.gz"
@@ -153,6 +177,40 @@ class TestDoctor:
         out = capsys.readouterr().out
         assert rc == 1
         assert "daemon reachable" in out and "FAIL" in out
+
+    def test_deep_doctor_polls_task_before_searching(self, tmp_path, monkeypatch, capsys):
+        """The write is 202-and-poll: the round-trip must wait for the task
+        to complete BEFORE searching (Copilot, PR #145 — and the exact bug
+        the first live run of --deep exposed)."""
+        home = tmp_path / "home"
+        cli.write_env_file(home, "key", 18199)
+        calls: list[str] = []
+        polls = {"n": 0}
+        seen = {"probe": ""}
+
+        def fake_http(url, payload=None, timeout=30.0):
+            calls.append(url)
+            if url.endswith("/health"):
+                return {
+                    "checks": {"redis": "inline", "vector_store": "ok", "graph_store": "ok"}
+                }
+            if url.endswith("/v1/memories/raw"):
+                seen["probe"] = payload["content"]
+                return {"status": "accepted", "task_id": "t-1"}
+            if "/v1/memories/status/" in url:
+                polls["n"] += 1
+                return {"status": "queued" if polls["n"] < 2 else "completed"}
+            if url.endswith("/v1/search"):
+                assert polls["n"] >= 2, "searched before the write completed"
+                return {"results": [{"memory": seen["probe"]}]}
+            raise AssertionError(url)
+
+        monkeypatch.setattr(cli, "_http_json", fake_http)
+        monkeypatch.setattr("time.sleep", lambda s: None)
+        rc = cli.main(["--home", str(home), "doctor", "--deep"])
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "task completed" in out and "all checks passed" in out
 
     def test_doctor_flags_blank_api_key(self, tmp_path, monkeypatch, capsys):
         home = tmp_path / "home"
