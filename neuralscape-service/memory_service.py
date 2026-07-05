@@ -767,7 +767,10 @@ class MemoryService:
         # guard as the episode-idempotency probe, hoisted to the choke point.)
         loop = getattr(self._bridge, "_loop", None)
         if not isinstance(loop, _asyncio.AbstractEventLoop):
-            raise RuntimeError("Graphiti bridge loop is not a running event loop")
+            raise RuntimeError(
+                "Graphiti bridge loop is not an asyncio event loop "
+                f"(got {type(loop).__name__}) — bridge mocked or half-initialized"
+            )
         future = _asyncio.run_coroutine_threadsafe(coro, loop)
         try:
             return future.result(timeout=timeout)
