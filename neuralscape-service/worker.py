@@ -792,7 +792,10 @@ async def process_graph_enrichment(
     ``DERIVED_FROM`` back-reference is attached even on the deferred path.
     ``adapter`` is a knowledge-adapter *name* — the ontology itself isn't
     queue-serializable (Pydantic classes, tuple-keyed maps), so the worker
-    re-resolves it here; an unknown/stale name degrades to no custom types.
+    re-resolves it here via ``require_adapter``; an unregistered name FAILS the
+    job with a clear error (audit 27 #36) rather than silently enriching
+    without the adapter's ontology, so the worker image must register the same
+    adapter set as the API/ingest processes that enqueue these jobs.
     """
     service: MemoryService = ctx["service"]
     # Guard against a delete/expiry that happened while this job sat in the
