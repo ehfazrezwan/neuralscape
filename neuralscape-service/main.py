@@ -722,6 +722,7 @@ async def v1_store_memories(req: StoreMemoryRequest, request: Request):
             project_id=req.project_id,
             agent_id=req.agent_id,
             run_id=req.run_id,
+            occurred_at=req.occurred_at,
         )
     except (ConnectionError, OSError) as e:
         logger.warning(f"Redis unavailable, falling back to sync store: {e}")
@@ -732,6 +733,7 @@ async def v1_store_memories(req: StoreMemoryRequest, request: Request):
             project_id=req.project_id,
             agent_id=req.agent_id,
             run_id=req.run_id,
+            occurred_at=req.occurred_at,
         )
         return JSONResponse(
             status_code=200,

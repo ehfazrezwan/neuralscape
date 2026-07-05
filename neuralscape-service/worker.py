@@ -88,8 +88,15 @@ async def process_memory_store(
     project_id: str | None = None,
     agent_id: str | None = None,
     run_id: str | None = None,
+    occurred_at: str | None = None,
 ) -> dict:
-    """Background task: LLM extraction + store each fact."""
+    """Background task: LLM extraction + store each fact.
+
+    ``occurred_at`` (event time, ISO 8601) rides along for historical
+    ingestion — when the conversation actually happened, stamped on every
+    extracted fact. None (the default, and every pre-existing queued job)
+    means event time unknown.
+    """
     service: MemoryService = ctx["service"]
     # E3: conversation writes feed the per-session summary slots (run_id is
     # the session identifier on this path).
@@ -107,6 +114,7 @@ async def process_memory_store(
         project_id=project_id,
         agent_id=agent_id,
         run_id=run_id,
+        occurred_at=occurred_at,
         return_stats=True,
     )
 
@@ -230,6 +238,7 @@ async def process_memory_raw(
         related_memory_ids=v2_extras.get("related_memory_ids"),
         confidence=v2_extras.get("confidence"),
         expires_at=expires_at,
+        occurred_at=v2_extras.get("occurred_at"),
         derived_from=v2_extras.get("derived_from"),
         epistemic_level=v2_extras.get("epistemic_level"),
         visibility=v2_extras.get("visibility"),

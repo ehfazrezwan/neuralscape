@@ -78,17 +78,25 @@ class TaskManager:
         project_id: str | None = None,
         agent_id: str | None = None,
         run_id: str | None = None,
+        occurred_at: str | None = None,
     ) -> str:
         """Enqueue memory extraction task. Returns task_id (job_id).
 
         Uses a deterministic job ID based on content hash to prevent
-        duplicate enqueues of the same conversation.
+        duplicate enqueues of the same conversation. ``occurred_at`` (event
+        time, for historical ingestion of old chat exports) is part of the
+        key when present — the same transcript imported with a different
+        event time is a distinct job, not a duplicate; the plain path's job
+        ids are unchanged.
         """
         # Generate deterministic job ID from message content
         content_str = "|".join(
             m.get("content", "") for m in messages
         )
-        job_id = _generate_job_id(f"store:{content_str}", user_id)
+        key = f"store:{content_str}"
+        if occurred_at:
+            key = f"store:{occurred_at}:{content_str}"
+        job_id = _generate_job_id(key, user_id)
 
         job = await self.pool.enqueue_job(
             "process_memory_store",
@@ -97,6 +105,7 @@ class TaskManager:
             project_id,
             agent_id,
             run_id,
+            occurred_at,
             _job_id=job_id,
         )
         # On a duplicate job ID (job is None) ARQ already has this job —
@@ -123,6 +132,8 @@ class TaskManager:
         related_memory_ids: list[str] | None = None,
         confidence: float | None = None,
         expires_at: str | None = None,
+        # Event time (ISO 8601, for historical ingestion)
+        occurred_at: str | None = None,
         # Provenance epistemics (A1)
         derived_from: list[str] | None = None,
         epistemic_level: str | None = None,
@@ -157,6 +168,7 @@ class TaskManager:
             "related_memory_ids": related_memory_ids,
             "confidence": confidence,
             "expires_at": expires_at,
+            "occurred_at": occurred_at,
             "derived_from": derived_from,
             "epistemic_level": epistemic_level,
             "visibility": visibility,

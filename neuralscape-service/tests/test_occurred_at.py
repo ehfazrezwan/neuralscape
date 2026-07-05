@@ -122,3 +122,302 @@ class TestRequestModels:
     def test_memory_response_has_field_defaulting_none(self):
         resp = MemoryResponse(id="m1", memory="x")
         assert resp.occurred_at is None
+
+
+# ──────────────────────────────────────────────
+# Piece 2: write-path payload stamping
+# ──────────────────────────────────────────────
+
+
+@pytest.fixture
+def service():
+    """MemoryService with mocked internals (mirrors test_provenance.py)."""
+    svc = MemoryService()
+    svc._memory = MagicMock(name="Memory")
+    svc._graphiti = MagicMock(name="Graphiti")
+    svc._bridge = MagicMock(name="AsyncBridge")
+    svc._memory.graph = MagicMock()
+    svc._memory.embedding_model.embed.return_value = [0.1] * 768
+    svc._memory.vector_store.client.scroll.return_value = ([], None)
+    return svc
+
+
+class TestStoreRawOccurredAt:
+    def test_stamps_metadata_and_response(self, service):
+        result = service.store_raw(
+            content="Moved to Berlin",
+            user_id="u1",
+            category="personal_fact",
+            occurred_at="2019-03-15T00:00:00+00:00",
+        )
+        payload = service._memory.vector_store.insert.call_args[1]["payloads"][0]
+        assert payload["metadata"]["occurred_at"] == "2019-03-15T00:00:00+00:00"
+        assert result[0].occurred_at == "2019-03-15T00:00:00+00:00"
+        # created_at is still the storage time, distinct from the event time.
+        assert result[0].created_at != result[0].occurred_at
+
+    def test_normalizes_naive_input(self, service):
+        result = service.store_raw(
+            content="Old journal entry",
+            user_id="u1",
+            category="personal_fact",
+            occurred_at="2019-03-15T08:30:00",
+        )
+        payload = service._memory.vector_store.insert.call_args[1]["payloads"][0]
+        assert payload["metadata"]["occurred_at"] == "2019-03-15T08:30:00+00:00"
+        assert result[0].occurred_at == "2019-03-15T08:30:00+00:00"
+
+    def test_absent_means_absent(self, service):
+        """No occurred_at → key omitted from metadata, response None.
+
+        Absence means "event time unknown, fall back to created_at" —
+        it must NOT be defaulted to the storage time.
+        """
+        result = service.store_raw(
+            content="A fact with unknown event time",
+            user_id="u1",
+            category="preference",
+        )
+        payload = service._memory.vector_store.insert.call_args[1]["payloads"][0]
+        assert "occurred_at" not in payload["metadata"]
+        assert result[0].occurred_at is None
+        assert result[0].created_at is not None
+
+    def test_invalid_occurred_at_raises(self, service):
+        with pytest.raises(ValueError, match="occurred_at"):
+            service.store_raw(
+                content="x", user_id="u1", category="preference",
+                occurred_at="not-a-time",
+            )
+        service._memory.vector_store.insert.assert_not_called()
+
+    def test_batch_item_passthrough(self, service):
+        n = 768
+        service._memory.embedding_model.embed_batch.return_value = [[0.1] * n]
+        result = service.store_raw_batch([
+            {
+                "content": "Historic fact",
+                "user_id": "u1",
+                "category": "personal_fact",
+                "occurred_at": "2020-06-01T00:00:00+00:00",
+            }
+        ])
+        payload = service._memory.vector_store.insert.call_args[1]["payloads"][0]
+        assert payload["metadata"]["occurred_at"] == "2020-06-01T00:00:00+00:00"
+        assert result[0].occurred_at == "2020-06-01T00:00:00+00:00"
+
+
+class TestConversationPathOccurredAt:
+    def test_batch_store_facts_stamps_all(self, service):
+        service._memory.embedding_model.embed_batch.return_value = [[0.1] * 768] * 2
+        result = service._batch_store_facts(
+            facts=[("preference", "Likes tea"), ("personal_fact", "Lived in Oslo")],
+            user_id="u1",
+            occurred_at="2021-02-03T00:00:00+00:00",
+        )
+        payloads = service._memory.vector_store.insert.call_args[1]["payloads"]
+        assert all(
+            p["metadata"]["occurred_at"] == "2021-02-03T00:00:00+00:00"
+            for p in payloads
+        )
+        assert all(r.occurred_at == "2021-02-03T00:00:00+00:00" for r in result)
+
+    def test_batch_store_facts_absent_means_absent(self, service):
+        service._memory.embedding_model.embed_batch.return_value = [[0.1] * 768]
+        result = service._batch_store_facts(
+            facts=[("preference", "Likes coffee")],
+            user_id="u1",
+        )
+        payloads = service._memory.vector_store.insert.call_args[1]["payloads"]
+        assert "occurred_at" not in payloads[0]["metadata"]
+        assert result[0].occurred_at is None
+
+    def test_batch_store_facts_rejects_invalid(self, service):
+        with pytest.raises(ValueError, match="occurred_at"):
+            service._batch_store_facts(
+                facts=[("preference", "x")], user_id="u1", occurred_at="garbage",
+            )
+
+
+class TestResponseSurfacing:
+    def test_mem_to_response_maps_occurred_at(self):
+        svc = MemoryService()
+        resp = svc._mem_to_response({
+            "id": "m1",
+            "memory": "x",
+            "created_at": "2026-07-01T00:00:00+00:00",
+            "metadata": {
+                "category": "personal_fact",
+                "occurred_at": "2018-01-01T00:00:00+00:00",
+            },
+        })
+        assert resp.occurred_at == "2018-01-01T00:00:00+00:00"
+        assert resp.created_at == "2026-07-01T00:00:00+00:00"
+
+    def test_mem_to_response_legacy_null(self):
+        svc = MemoryService()
+        resp = svc._mem_to_response({"id": "m1", "memory": "x", "metadata": {}})
+        assert resp.occurred_at is None
+
+    def test_dedup_hit_response_carries_occurred_at(self, service):
+        """_find_by_content_hash's response builder surfaces occurred_at."""
+        point = MagicMock()
+        point.id = "existing-id"
+        point.payload = {
+            "data": "x",
+            "created_at": "2026-07-01T00:00:00+00:00",
+            "metadata": {
+                "category": "personal_fact",
+                "scope": "global",
+                "occurred_at": "2017-05-05T00:00:00+00:00",
+            },
+        }
+        service._memory.vector_store.client.scroll.return_value = ([point], None)
+        existing = service._find_by_content_hash(
+            user_id="u1", content_hash="h", scope="global",
+            project_id=None, visibility=None,
+        )
+        assert existing.occurred_at == "2017-05-05T00:00:00+00:00"
+
+
+# ──────────────────────────────────────────────
+# Piece 2b: enqueue plumbing (API → worker)
+# ──────────────────────────────────────────────
+
+
+@pytest.fixture
+def tm():
+    """A TaskManager with a mocked ARQ pool (mirrors test_task_manager.py)."""
+    from unittest.mock import AsyncMock
+
+    from task_manager import TaskManager
+
+    manager = TaskManager()
+    pool = MagicMock()
+    pool.enqueue_job = AsyncMock()
+    pool.aclose = AsyncMock()
+    manager.pool = pool
+    return manager
+
+
+class TestEnqueuePlumbing:
+    @pytest.mark.asyncio
+    async def test_enqueue_raw_forwards_occurred_at_in_v2_extras(self, tm):
+        job = MagicMock()
+        job.job_id = "job-1"
+        tm.pool.enqueue_job.return_value = job
+        await tm.enqueue_raw(
+            content="x", user_id="u1", category="personal_fact",
+            occurred_at="2020-01-01T00:00:00+00:00",
+        )
+        positional = tm.pool.enqueue_job.call_args[0]
+        v2_extras = positional[9]
+        assert v2_extras["occurred_at"] == "2020-01-01T00:00:00+00:00"
+
+    @pytest.mark.asyncio
+    async def test_enqueue_raw_omits_when_absent(self, tm):
+        job = MagicMock()
+        job.job_id = "job-2"
+        tm.pool.enqueue_job.return_value = job
+        await tm.enqueue_raw(content="x", user_id="u1", category="personal_fact")
+        v2_extras = tm.pool.enqueue_job.call_args[0][9]
+        assert "occurred_at" not in v2_extras
+
+    @pytest.mark.asyncio
+    async def test_enqueue_store_forwards_occurred_at(self, tm):
+        job = MagicMock()
+        job.job_id = "job-3"
+        tm.pool.enqueue_job.return_value = job
+        await tm.enqueue_store(
+            messages=[{"role": "user", "content": "hi"}],
+            user_id="u1",
+            occurred_at="2019-09-09T00:00:00+00:00",
+        )
+        positional = tm.pool.enqueue_job.call_args[0]
+        # args: task_name, messages, user_id, project_id, agent_id, run_id, occurred_at
+        assert positional[6] == "2019-09-09T00:00:00+00:00"
+
+    @pytest.mark.asyncio
+    async def test_worker_raw_task_passes_occurred_at_to_store(self, service):
+        """process_memory_raw forwards v2_extras['occurred_at'] to store_raw."""
+        from unittest.mock import AsyncMock
+
+        import worker as worker_mod
+
+        svc = MagicMock(name="MemoryService")
+        svc.search.return_value = []
+        stored_mem = MemoryResponse(
+            id="m1", memory="x", occurred_at="2020-01-01T00:00:00+00:00",
+        )
+        svc.store_raw.return_value = ([stored_mem], True)
+        ctx = {"service": svc, "redis": MagicMock(enqueue_job=AsyncMock())}
+        await worker_mod.process_memory_raw(
+            ctx, "x", "u1", "personal_fact",
+            v2_extras={"occurred_at": "2020-01-01T00:00:00+00:00"},
+        )
+        assert (
+            svc.store_raw.call_args[1]["occurred_at"]
+            == "2020-01-01T00:00:00+00:00"
+        )
+
+
+# ──────────────────────────────────────────────
+# Piece 3: ingest-text pipeline threading
+# ──────────────────────────────────────────────
+
+
+class _FakeIngestService:
+    """Records store_raw calls (mirrors test_ingest_pipeline.FakeService)."""
+
+    def __init__(self, facts=None):
+        self.store_calls = []
+        self._facts = facts or []
+
+    def store_raw(self, **kwargs):
+        self.store_calls.append(kwargs)
+        responses = [MemoryResponse(id=f"id-{len(self.store_calls)}",
+                                    memory=kwargs["content"])]
+        if kwargs.get("return_created"):
+            return responses, True
+        return responses
+
+    def extract_facts_only(self, text, extractor=None, user_id=None, project_id=None):
+        return list(self._facts)
+
+
+class TestIngestPipelineOccurredAt:
+    _SOURCE = {"connector_id": "manual", "connector_type": "manual",
+               "external_id": "hash-1"}
+
+    def test_passages_and_facts_carry_occurred_at(self):
+        from ingest.pipeline import IngestDoc, ingest_document
+
+        svc = _FakeIngestService(facts=[("domain_knowledge", "A distilled fact.")])
+        doc = IngestDoc(
+            content="word " * 300,
+            source=dict(self._SOURCE),
+            user_id="u1",
+            max_chars=200,
+            overlap=20,
+            occurred_at="2015-08-01T00:00:00+00:00",
+        )
+        ingest_document(svc, doc)
+        assert svc.store_calls  # passages + fact
+        assert all(
+            c["occurred_at"] == "2015-08-01T00:00:00+00:00"
+            for c in svc.store_calls
+        )
+
+    def test_absent_stays_absent(self):
+        from ingest.pipeline import IngestDoc, ingest_document
+
+        svc = _FakeIngestService(facts=[("domain_knowledge", "A distilled fact.")])
+        doc = IngestDoc(
+            content="word " * 300,
+            source=dict(self._SOURCE),
+            user_id="u1",
+            max_chars=200,
+            overlap=20,
+        )
+        ingest_document(svc, doc)
+        assert all(c.get("occurred_at") is None for c in svc.store_calls)
