@@ -421,3 +421,58 @@ class TestIngestPipelineOccurredAt:
         )
         ingest_document(svc, doc)
         assert all(c.get("occurred_at") is None for c in svc.store_calls)
+
+
+# ──────────────────────────────────────────────
+# Piece 4: ask evidence rendering + recency discipline
+# ──────────────────────────────────────────────
+
+
+def _ask_mem(mid, content, created_at="2026-07-01T00:00:00+00:00",
+             occurred_at=None, score=0.9):
+    return MemoryResponse(
+        id=mid, memory=content, category="personal_fact", source="vector",
+        created_at=created_at, occurred_at=occurred_at, score=score,
+    )
+
+
+class TestAskEvidenceOccurredAt:
+    def test_render_shows_event_time_when_present(self):
+        import ask as ask_mod
+
+        row = _ask_mem("m1", "Moved to Berlin",
+                       created_at="2026-07-01T00:00:00+00:00",
+                       occurred_at="2019-03-15T00:00:00+00:00")
+        rendered = ask_mod._render_evidence([row])
+        assert "event: 2019-03-15T00:00:00+00:00" in rendered
+        assert "stored: 2026-07-01T00:00:00+00:00" in rendered
+
+    def test_render_falls_back_to_created_at_verbatim(self):
+        """Rows without occurred_at keep the exact pre-existing format."""
+        import ask as ask_mod
+
+        row = _ask_mem("m1", "Likes tea")
+        rendered = ask_mod._render_evidence([row])
+        assert rendered == "[m1] (2026-07-01T00:00:00+00:00; personal_fact) Likes tea"
+
+    def test_rows_sorted_by_event_time_when_present(self):
+        """A row stored today about an old event sorts by its EVENT time."""
+        import ask as ask_mod
+
+        old_event_stored_today = _ask_mem(
+            "old-event", "Lived in Oslo",
+            created_at="2026-07-01T00:00:00+00:00",
+            occurred_at="2015-01-01T00:00:00+00:00",
+        )
+        newer = _ask_mem("newer", "Moved to Berlin",
+                         created_at="2020-01-01T00:00:00+00:00")
+        evidence = {m.id: m for m in [old_event_stored_today, newer]}
+        out = ask_mod._evidence_rows(evidence, [], False)
+        # Chronological ascending by event time: 2015 event first, then 2020.
+        assert [m.id for m in out] == ["old-event", "newer"]
+
+    def test_recency_discipline_mentions_event_time(self):
+        import ask as ask_mod
+
+        assert "event time" in ask_mod._DISCIPLINES_FULL
+        assert "event time" in ask_mod._DISCIPLINES_BRIEF

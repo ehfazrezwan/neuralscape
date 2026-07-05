@@ -181,6 +181,17 @@ def _make_llm_call(tier: ReasoningTier):
     return call
 
 
+def _event_time(mem) -> str:
+    """The timestamp the recency disciplines reason over: the EVENT time
+    (``occurred_at``, when the fact actually happened) when present, else
+    the storage time (``created_at``). Historical ingestion stamps
+    occurred_at precisely so "newer" means newer *events*, not newer
+    writes."""
+    return str(
+        getattr(mem, "occurred_at", None) or getattr(mem, "created_at", None) or ""
+    )
+
+
 def _evidence_rows(evidence: dict, keyword_ids: list[str], enumeration: bool) -> list:
     """Select and order evidence for the prompt (audit 27 #15).
 
@@ -192,12 +203,13 @@ def _evidence_rows(evidence: dict, keyword_ids: list[str], enumeration: bool) ->
 
     Survivors are then re-sorted chronologically ASCENDING for rendering
     (timestamps drive the recency/contradiction disciplines); rows with no
-    timestamp sort LAST, not first. For enumeration questions the
-    exact-keyword hits are listed FIRST — the discipline is
-    exact-before-semantic, and list-position is how an LLM weighs evidence.
+    timestamp sort LAST, not first. "Newest" means the event time
+    (``occurred_at``) when present, else the storage time — see
+    :func:`_event_time`. For enumeration questions the exact-keyword hits
+    are listed FIRST — the discipline is exact-before-semantic, and
+    list-position is how an LLM weighs evidence.
     """
-    def _created(mem) -> str:
-        return str(getattr(mem, "created_at", None) or "")
+    _created = _event_time
 
     rows = list(evidence.values())
 
@@ -248,7 +260,16 @@ def _render_evidence(rows: list) -> str:
         content = _clip_content((mem.memory or "").strip(), budget).replace("\n", " ")
         created = getattr(mem, "created_at", None) or "unknown time"
         category = getattr(mem, "category", None) or "uncategorized"
-        lines.append(f"[{mem.id}] ({created}; {category}) {content}")
+        occurred = getattr(mem, "occurred_at", None)
+        if occurred:
+            # Event time known (historical ingestion): show both so the
+            # recency discipline reasons over when it HAPPENED, with the
+            # storage time still visible for provenance.
+            lines.append(
+                f"[{mem.id}] (event: {occurred}; stored: {created}; {category}) {content}"
+            )
+        else:
+            lines.append(f"[{mem.id}] ({created}; {category}) {content}")
     return "\n".join(lines)
 
 
@@ -256,7 +277,8 @@ _DISCIPLINES_FULL = """Disciplines (follow strictly):
 1. ENUMERATION/COUNTING: if the question asks how many / to list items, first build a
    deduplication table — group evidence rows that describe the SAME real-world item worded
    differently — then count or list the deduplicated groups. Never count raw rows.
-2. RECENCY: newer memories supersede older ones. When rows describe a change ("changed",
+2. RECENCY: newer memories supersede older ones. "Newer" means the event time (shown as
+   "event: …") when present, else the storage time. When rows describe a change ("changed",
    "rescheduled", "now", "moved to"), the newest row is the current truth.
 3. CONTRADICTIONS: when two memories genuinely contradict, surface BOTH with their
    timestamps, prefer the newer/valid one, and say explicitly that you are preferring it
@@ -266,9 +288,9 @@ _DISCIPLINES_FULL = """Disciplines (follow strictly):
 5. CITATIONS: cite supporting memory ids inline like [<id>]. Only ids from the EVIDENCE
    list are valid citations."""
 
-_DISCIPLINES_BRIEF = """Rules: answer ONLY from the evidence; newer memories supersede older ones; if the
-evidence doesn't answer the question say you don't know (never fabricate); cite supporting
-memory ids inline like [<id>]."""
+_DISCIPLINES_BRIEF = """Rules: answer ONLY from the evidence; newer memories supersede older ones (by event time
+when shown, else storage time); if the evidence doesn't answer the question say you don't
+know (never fabricate); cite supporting memory ids inline like [<id>]."""
 
 
 def _build_prompt(
