@@ -33,19 +33,19 @@ Status legend: ☐ pending · ◐ in progress · ☑ ported+tested (both provide
 | Status | # | Site | Purpose | Kuzu divergence |
 |---|---|---|---|---|
 | ☑ | 3 | `memory/graph_admin.py` fulltext episodes | episode excerpt search | ported: provider branch reusing `get_nodes_query`, unified `execute_query` read; group-scope verified on real Kuzu. **Nuance for parity bench:** Kuzu applies `TOP := $limit` *before* the group filter (same as graphiti's own episode search) — multi-group stores can under-fill vs Neo4j; fix with over-fetch only if DMR shows it |
-| ☐ | 6 | `extensions/dreaming/graph_patcher.py:78-86` `attach_memory_id` | stamp memory_id/visibility/owner | label-less `MATCH (n)` → per-label loop; `datetime($s)` → native datetime param; `coalesce()` → verify or `CASE WHEN`; needs Tier 0 |
-| ☐ | 7 | `graph_patcher.py:147-163` `attach_source_ref` | Source node + DERIVED_FROM link | same as #6 + `Source`/`DERIVED_FROM` tables (Tier 0); `TransientError` retry gated to neo4j branch |
-| ☐ | 8/9 | `graph_patcher.py:228-248, 300-320` `patch_wiki_path*` | wiki back-refs | label-less → per-label loop; needs Tier 0 |
-| ☐ | 12 | `graph_patcher.py:453-457` `patch_dream_path_by_memory_ids` | dream-diary back-ref | same shape as #8/9 |
-| ☐ | 10 | `graph_patcher.py:397-401` invalidate (node arm) | tombstone marking | label-less w/ property map → per-label loop |
-| ☐ | 14 | `extensions/strategy_synthesizer/graph_patcher.py:39-45` | playbook back-ref | same shape as #8/9 |
+| ☑ | 6 | `extensions/dreaming/graph_patcher.py:78-86` `attach_memory_id` | stamp memory_id/visibility/owner | label-less `MATCH (n)` → per-label loop; `datetime($s)` → native datetime param; `coalesce()` → verify or `CASE WHEN`; needs Tier 0 |
+| ☑ | 7 | `graph_patcher.py:147-163` `attach_source_ref` | Source node + DERIVED_FROM link | same as #6 + `Source`/`DERIVED_FROM` tables (Tier 0); `TransientError` retry gated to neo4j branch |
+| ☑ | 8/9 | `graph_patcher.py:228-248, 300-320` `patch_wiki_path*` | wiki back-refs | label-less → per-label loop; needs Tier 0 |
+| ☑ | 12 | `graph_patcher.py:453-457` `patch_dream_path_by_memory_ids` | dream-diary back-ref | same shape as #8/9 |
+| ☑ | 10 | `graph_patcher.py:397-401` invalidate (node arm) | tombstone marking | label-less w/ property map → per-label loop |
+| ☑ | 14 | `extensions/strategy_synthesizer/graph_patcher.py:39-45` | playbook back-ref | same shape as #8/9 |
 
 ### Tier 3 — redesign (reified edges / label-less scans / Cypher UNION)
 
 | Status | # | Site | Purpose | Redesign |
 |---|---|---|---|---|
 | ☐ | 2 | `memory/search.py:1104-1123` graph-result enricher | fetch NS props + edge embedding by uuid | edge arm must read `RelatesToNode_` on Kuzu; `UNION ALL` → app-side union |
-| ☐ | 11 | `graph_patcher.py:402-411` invalidate (edge arm) | bi-temporal edge invalidation | `SET r.invalid_at` on reified node; highest logic risk — parity test against Neo4j behavior required |
+| ☑ | 11 | `graph_patcher.py` invalidate (edge arm) | bi-temporal edge invalidation | ported: RelatesToNode_ + Python-side exclusively-derived filter (no unverified list predicates); semantics matrix green on real Kuzu (exclusive dies, co-asserted/empty survive, fail-safe, unconditional node marking) |
 | ☐ | 1 | `memory/reads.py:638-657` `list_projects` | distinct project group_ids | per-label queries + app-side union; verify `STARTS WITH` |
 | ☐ | 13 | `extensions/dreaming/bridges.py:59-70` `SHARED_ENTITY_CYPHER` | hub entities across pools | per-label rewrite; verify `toLower/trim/head/collect(DISTINCT)/size` |
 | ☐ | 15-18 | `scripts/identity.py`, `scripts/migrate_graph_groups.py` | offline admin | direct bolt driver + untyped rel patterns + `EntityEdge` label — keep Neo4j-only, document skip on Kuzu (solo has one identity and no legacy groups) |

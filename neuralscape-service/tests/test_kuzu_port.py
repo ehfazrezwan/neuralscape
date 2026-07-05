@@ -8,6 +8,7 @@ by design — this file is where dialect breaks surface.
 """
 
 import asyncio
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from mem0.memory.graphiti_memory import _build_graph_driver
@@ -18,6 +19,17 @@ def _driver(tmp_path):
     return _build_graph_driver(
         SimpleNamespace(graph_provider="kuzu", kuzu_path=str(tmp_path / "g.kuzu"))
     )
+
+
+class _PassthroughService(SimpleNamespace):
+    """Stand-in for MemoryService: awaits bridge coroutines inline."""
+
+    async def _run_on_bridge_async(self, coro, timeout: float = 30.0):
+        return await coro
+
+
+def _now():
+    return datetime.now(timezone.utc)
 
 
 class TestNsKuzuSchema:
@@ -207,3 +219,216 @@ class TestTier1Ports:
             return rows
 
         assert asyncio.run(run()) == []
+
+
+class TestGraphPatcherKuzu:
+    """Tier-2/3 dreaming patcher ports against the real embedded driver."""
+
+    def _bootstrapped(self, tmp_path):
+        d = _driver(tmp_path)
+        asyncio.run(apply_ns_kuzu_schema(d))
+        return d
+
+    def test_attach_memory_id_stamps_window_and_respects_coalesce(self, tmp_path):
+        from extensions.dreaming.graph_patcher import attach_memory_id
+
+        d = self._bootstrapped(tmp_path)
+        now = _now()
+
+        async def run():
+            await d.execute_query(
+                "CREATE (n:Entity {uuid: $u, group_id: $g, created_at: $ts})",
+                u="e1", g="user--local", ts=now,
+            )
+            await d.execute_query(
+                "CREATE (e:Episodic {uuid: $u, group_id: $g, created_at: $ts})",
+                u="ep1", g="user--local", ts=now,
+            )
+            await d.execute_query(
+                "CREATE (n:Entity {uuid: $u, group_id: $g, created_at: $ts})",
+                u="other", g="user--other", ts=now,
+            )
+            first = await attach_memory_id(
+                d, group_id="user--local", memory_id="m-1",
+                visibility="private", owner_user_id="local",
+                write_started_at=now,
+            )
+            second = await attach_memory_id(
+                d, group_id="user--local", memory_id="m-2",
+                visibility=None, owner_user_id=None,
+                write_started_at=now,
+            )
+            rows, _, _ = await d.execute_query(
+                "MATCH (n:Entity {uuid: $u}) RETURN n.memory_id AS m, "
+                "n.ns_visibility AS v, n.ns_owner AS o", u="e1",
+            )
+            return first, second, rows
+
+        first, second, rows = asyncio.run(run())
+        assert first == 2  # Entity + Episodic in group; other group untouched
+        assert second == 2  # matched again, but coalesce kept the first stamp
+        assert rows == [{"m": "m-1", "v": "private", "o": "local"}]
+
+    def test_attach_source_ref_merges_source_and_links(self, tmp_path):
+        from extensions.dreaming.graph_patcher import attach_source_ref
+
+        d = self._bootstrapped(tmp_path)
+        now = _now()
+        ref = {
+            "connector_id": "gdrive",
+            "external_id": "doc-9",
+            "connector_type": "file",
+            "url": "https://example.com/doc-9",
+            "title": None,  # optional prop omitted — must not bind-error
+        }
+
+        async def run():
+            await d.execute_query(
+                "CREATE (e:Episodic {uuid: $u, group_id: $g, created_at: $ts})",
+                u="ep-s", g="user--local", ts=now,
+            )
+            n1 = await attach_source_ref(
+                d, group_id="user--local", memory_id="m-s",
+                source_ref=ref, write_started_at=now,
+            )
+            n2 = await attach_source_ref(  # re-run: same Source row, no dupes
+                d, group_id="user--local", memory_id="m-s",
+                source_ref=ref, write_started_at=now,
+            )
+            srcs, _, _ = await d.execute_query(
+                "MATCH (s:Source) RETURN s.key AS key, s.connector_id AS cid"
+            )
+            links, _, _ = await d.execute_query(
+                "MATCH (n:Episodic)-[:DERIVED_FROM]->(s:Source) "
+                "RETURN n.uuid AS uuid, n.ns_connector_id AS cid"
+            )
+            return n1, n2, srcs, links
+
+        n1, n2, srcs, links = asyncio.run(run())
+        assert n1 == 1 and n2 == 1
+        assert srcs == [{"key": "gdrive::doc-9", "cid": "gdrive"}]
+        assert links == [{"uuid": "ep-s", "cid": "gdrive"}]
+
+    def test_patch_wiki_path_by_memory_ids(self, tmp_path):
+        from extensions.dreaming.graph_patcher import patch_wiki_path_by_memory_ids
+
+        d = self._bootstrapped(tmp_path)
+        svc = _PassthroughService(_graphiti=SimpleNamespace(driver=d))
+
+        async def run():
+            await d.execute_query(
+                "CREATE (n:Entity {uuid: 'w1', group_id: 'user--local', memory_id: 'm-w'})"
+            )
+            count = await patch_wiki_path_by_memory_ids(
+                svc, memory_ids=["m-w"], wiki_path="wiki/topic.md",
+                group_id="user--local",
+            )
+            rows, _, _ = await d.execute_query(
+                "MATCH (n:Entity {uuid: 'w1'}) RETURN n.wiki_path AS w"
+            )
+            return count, rows
+
+        count, rows = asyncio.run(run())
+        assert count == 1 and rows == [{"w": "wiki/topic.md"}]
+
+    def test_patch_playbook_path_by_memory_ids(self, tmp_path):
+        from extensions.strategy_synthesizer.graph_patcher import (
+            patch_playbook_path_by_memory_ids,
+        )
+
+        d = self._bootstrapped(tmp_path)
+        svc = _PassthroughService(_graphiti=SimpleNamespace(driver=d))
+
+        async def run():
+            await d.execute_query(
+                "CREATE (n:Entity {uuid: 'p1', memory_id: 'm-p'})"
+            )
+            count = await patch_playbook_path_by_memory_ids(
+                svc, memory_ids=["m-p"], playbook_path="playbooks/breakout.md"
+            )
+            rows, _, _ = await d.execute_query(
+                "MATCH (n:Entity {uuid: 'p1'}) RETURN n.strategy_playbook_path AS p"
+            )
+            return count, rows
+
+        count, rows = asyncio.run(run())
+        assert count == 1 and rows == [{"p": "playbooks/breakout.md"}]
+
+    def test_patch_dream_path_by_memory_ids(self, tmp_path):
+        from extensions.dreaming.graph_patcher import patch_dream_path_by_memory_ids
+
+        d = self._bootstrapped(tmp_path)
+
+        async def run():
+            await d.execute_query(
+                "CREATE (n:Entity {uuid: 'd1', group_id: 'user--local', memory_id: 'm-d'})"
+            )
+            count = await patch_dream_path_by_memory_ids(
+                d, memory_ids=["m-d"], dream_path="dreams/2026-07-05.md",
+                group_id="user--local",
+            )
+            rows, _, _ = await d.execute_query(
+                "MATCH (n:Entity {uuid: 'd1'}) RETURN n.dream_path AS p"
+            )
+            return count, rows
+
+        count, rows = asyncio.run(run())
+        assert count == 1 and rows == [{"p": "dreams/2026-07-05.md"}]
+
+    def test_invalidate_memory_graph_semantics_matrix(self, tmp_path):
+        """The crown-jewel parity test: exclusive edges die, co-asserted and
+        empty-provenance edges survive, already-invalid rows are untouched,
+        node marking is unconditional."""
+        from extensions.dreaming.graph_patcher import invalidate_memory_graph
+
+        d = self._bootstrapped(tmp_path)
+        g = "user--local"
+
+        async def run():
+            await d.execute_query(
+                "CREATE (ep:Episodic {uuid: 'E1', group_id: $g, memory_id: 'm-x'})", g=g
+            )
+            await d.execute_query(
+                "CREATE (n:Entity {uuid: 'N1', group_id: $g, memory_id: 'm-x'})", g=g
+            )
+            # r-solo: exclusively derived from E1 → must be invalidated
+            await d.execute_query(
+                "CREATE (r:RelatesToNode_ {uuid: 'r-solo', group_id: $g, episodes: $e})",
+                g=g, e=["E1"],
+            )
+            # r-co: co-asserted by an external episode → must survive
+            await d.execute_query(
+                "CREATE (r:RelatesToNode_ {uuid: 'r-co', group_id: $g, episodes: $e})",
+                g=g, e=["E1", "E-external"],
+            )
+            # r-empty: no recorded provenance → must survive
+            await d.execute_query(
+                "CREATE (r:RelatesToNode_ {uuid: 'r-empty', group_id: $g, episodes: $e})",
+                g=g, e=[],
+            )
+            edges = await invalidate_memory_graph(
+                d, group_id=g, memory_id="m-x", superseded_by="m-y"
+            )
+            state, _, _ = await d.execute_query(
+                "MATCH (r:RelatesToNode_) WHERE r.group_id = $g "
+                "RETURN r.uuid AS uuid, r.invalid_at IS NULL AS live ORDER BY r.uuid",
+                g=g,
+            )
+            nodes, _, _ = await d.execute_query(
+                "MATCH (n:Entity {uuid: 'N1'}) RETURN n.dream_superseded_by AS s"
+            )
+            # fail-safe: a memory with no stamped episodes invalidates nothing
+            failsafe = await invalidate_memory_graph(
+                d, group_id=g, memory_id="m-unstamped", superseded_by=""
+            )
+            return edges, state, nodes, failsafe
+
+        edges, state, nodes, failsafe = asyncio.run(run())
+        assert edges == 1
+        assert state == [
+            {"uuid": "r-co", "live": True},
+            {"uuid": "r-empty", "live": True},
+            {"uuid": "r-solo", "live": False},
+        ]
+        assert nodes == [{"s": "m-y"}]  # node marking landed
+        assert failsafe == 0
