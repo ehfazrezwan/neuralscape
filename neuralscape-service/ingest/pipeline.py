@@ -65,6 +65,11 @@ class IngestDoc:
     # e.g. the OKF bundle walker's frontmatter-aware strategy. None defers to
     # the adapter's strategy (today's behavior).
     chunking_strategy: str | None = None
+    # Event time (ISO 8601): when the ingested content actually happened /
+    # was written, for historical ingestion (imported journals, old notes).
+    # Stamped on every produced passage + fact. None ⇒ omitted (event time
+    # unknown; readers fall back to created_at).
+    occurred_at: str | None = None
 
 
 def _fact_scope(category: str, project_id: str | None) -> tuple[str, str | None]:
@@ -136,6 +141,7 @@ def ingest_document(service, doc: IngestDoc) -> dict:
                     visibility=doc.visibility,
                     memory_kind="passage",
                     source_ref=chunk_source,
+                    occurred_at=doc.occurred_at,
                     add_to_graph=False,
                 )
                 memory_ids.extend(m.id for m in stored)
@@ -181,6 +187,7 @@ def ingest_document(service, doc: IngestDoc) -> dict:
                     visibility=doc.visibility,
                     memory_kind="fact",
                     source_ref=base,
+                    occurred_at=doc.occurred_at,
                     add_to_graph=False,
                     return_created=True,
                 )

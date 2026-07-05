@@ -47,6 +47,7 @@ import {
   renderEscalationFooter,
   renderIndexTable,
   renderPreviously,
+  renderResumeAfterCompact,
   renderSavingsHeader,
   toIndexEntry,
 } from "../core/disclosure.js";
@@ -157,6 +158,12 @@ export interface IndexModeInputs {
   codeGraphAvailable: boolean;
   budgetTokens: number;
   now?: Date;
+  /**
+   * SessionStart `source` from Claude Code: "startup" | "resume" | "clear"
+   * | "compact". On "compact"/"resume" the recent compact snapshots render
+   * full-content under "## Resuming after compaction".
+   */
+  source?: string;
 }
 
 /**
@@ -176,6 +183,18 @@ export function buildIndexContext(inputs: IndexModeInputs): string {
 
   const cardBlock = renderCardBlock(cards);
   if (cardBlock) sections.push(cardBlock);
+
+  // Compact-resilience: after a compaction (or --resume), re-anchor the
+  // session with the pre-compact snapshots the PreCompact hook stored.
+  // Rendered full-content here, excluded from the index table below.
+  const resumeIds = new Set<string>();
+  if (inputs.source === "compact" || inputs.source === "resume") {
+    const resume = renderResumeAfterCompact(categories, { now });
+    if (resume.block) {
+      sections.push(resume.block);
+      for (const id of resume.ids) resumeIds.add(id);
+    }
+  }
 
   // D2: "Previously…" from the newest checkpoint session note.
   const noteMemory = findLatestSessionNote(categories);
@@ -199,6 +218,7 @@ export function buildIndexContext(inputs: IndexModeInputs): string {
   for (const cat of Object.keys(categories)) {
     for (const mem of categories[cat] ?? []) {
       if (mem.id === previouslyId) continue;
+      if (resumeIds.has(mem.id)) continue;
       memories.push(mem);
     }
   }
@@ -219,6 +239,9 @@ export function buildIndexContext(inputs: IndexModeInputs): string {
     );
     sections.push(renderEscalationFooter(codeGraphAvailable));
   } else if (cardBlock || previouslyId) {
+    // NOTE: resume-after-compact sections alone do NOT pull the footer in —
+    // its copy explains "the table above", and a snapshot-only injection
+    // renders no index table (Copilot, PR #131).
     sections.push(renderEscalationFooter(codeGraphAvailable));
   }
 
@@ -387,6 +410,7 @@ async function main(): Promise<void> {
         cards,
         codeGraphAvailable,
         budgetTokens: getIndexBudgetTokens(),
+        source: input.source,
       });
     }
 

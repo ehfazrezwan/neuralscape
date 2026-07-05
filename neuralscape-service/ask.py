@@ -38,7 +38,9 @@ import asyncio
 import json
 import logging
 import re
+from types import SimpleNamespace
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from config import settings
 
@@ -181,6 +183,31 @@ def _make_llm_call(tier: ReasoningTier):
     return call
 
 
+def _event_time(mem) -> str:
+    """The timestamp the recency disciplines reason over: the EVENT time
+    (``occurred_at``, when the fact actually happened) when present, else
+    the storage time (``created_at``). Historical ingestion stamps
+    occurred_at precisely so "newer" means newer *events*, not newer
+    writes.
+
+    Returned as a canonical-UTC ISO string so the lexicographic sort in
+    ``_evidence_rows`` is a true chronological sort even when a stored
+    timestamp carries a non-UTC offset (occurred_at is canonicalized at
+    validation, but created_at comes from the vector store and is not
+    guaranteed one spelling). Unparseable values fall back to the raw
+    string rather than dropping the row."""
+    raw = getattr(mem, "occurred_at", None) or getattr(mem, "created_at", None) or ""
+    if not raw:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return str(raw)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
 def _evidence_rows(evidence: dict, keyword_ids: list[str], enumeration: bool) -> list:
     """Select and order evidence for the prompt (audit 27 #15).
 
@@ -192,12 +219,13 @@ def _evidence_rows(evidence: dict, keyword_ids: list[str], enumeration: bool) ->
 
     Survivors are then re-sorted chronologically ASCENDING for rendering
     (timestamps drive the recency/contradiction disciplines); rows with no
-    timestamp sort LAST, not first. For enumeration questions the
-    exact-keyword hits are listed FIRST — the discipline is
-    exact-before-semantic, and list-position is how an LLM weighs evidence.
+    timestamp sort LAST, not first. "Newest" means the event time
+    (``occurred_at``) when present, else the storage time — see
+    :func:`_event_time`. For enumeration questions the exact-keyword hits
+    are listed FIRST — the discipline is exact-before-semantic, and
+    list-position is how an LLM weighs evidence.
     """
-    def _created(mem) -> str:
-        return str(getattr(mem, "created_at", None) or "")
+    _created = _event_time
 
     rows = list(evidence.values())
 
@@ -248,7 +276,16 @@ def _render_evidence(rows: list) -> str:
         content = _clip_content((mem.memory or "").strip(), budget).replace("\n", " ")
         created = getattr(mem, "created_at", None) or "unknown time"
         category = getattr(mem, "category", None) or "uncategorized"
-        lines.append(f"[{mem.id}] ({created}; {category}) {content}")
+        occurred = getattr(mem, "occurred_at", None)
+        if occurred:
+            # Event time known (historical ingestion): show both so the
+            # recency discipline reasons over when it HAPPENED, with the
+            # storage time still visible for provenance.
+            lines.append(
+                f"[{mem.id}] (event: {occurred}; stored: {created}; {category}) {content}"
+            )
+        else:
+            lines.append(f"[{mem.id}] ({created}; {category}) {content}")
     return "\n".join(lines)
 
 
@@ -256,7 +293,8 @@ _DISCIPLINES_FULL = """Disciplines (follow strictly):
 1. ENUMERATION/COUNTING: if the question asks how many / to list items, first build a
    deduplication table — group evidence rows that describe the SAME real-world item worded
    differently — then count or list the deduplicated groups. Never count raw rows.
-2. RECENCY: newer memories supersede older ones. When rows describe a change ("changed",
+2. RECENCY: newer memories supersede older ones. "Newer" means the event time (shown as
+   "event: …") when present, else the storage time. When rows describe a change ("changed",
    "rescheduled", "now", "moved to"), the newest row is the current truth.
 3. CONTRADICTIONS: when two memories genuinely contradict, surface BOTH with their
    timestamps, prefer the newer/valid one, and say explicitly that you are preferring it
@@ -264,11 +302,21 @@ _DISCIPLINES_FULL = """Disciplines (follow strictly):
 4. ABSTENTION: "I don't know" is a correct answer. If the evidence does not contain the
    answer, abstain — NEVER fabricate facts, dates, or memory ids.
 5. CITATIONS: cite supporting memory ids inline like [<id>]. Only ids from the EVIDENCE
-   list are valid citations."""
+   list are valid citations.
+6. PERSPECTIVE: memories distilled from dialogs may carry generic speaker labels
+   ("Speaker 1", "Speaker 2") or third-person phrasing ("the user", "the assistant")
+   that do not literally match the question's "I/my" or "you/your". These labels are
+   ingestion artifacts, not different people. Resolve perspective from content: when an
+   evidence row plainly answers the substance of the question, answer with it — a label
+   or pronoun mismatch alone is NEVER grounds to abstain or to deny knowing the fact.
+7. SPECIFICITY: when several rows state the same fact at different precision ("as a
+   toddler" vs "at age three"), answer with the MOST SPECIFIC row. Recency (discipline 2)
+   applies to genuine changes of fact — a vaguer restatement never supersedes a more
+   precise one."""
 
-_DISCIPLINES_BRIEF = """Rules: answer ONLY from the evidence; newer memories supersede older ones; if the
-evidence doesn't answer the question say you don't know (never fabricate); cite supporting
-memory ids inline like [<id>]."""
+_DISCIPLINES_BRIEF = """Rules: answer ONLY from the evidence; newer memories supersede older ones (by event time
+when shown, else storage time); if the evidence doesn't answer the question say you don't
+know (never fabricate); cite supporting memory ids inline like [<id>]."""
 
 
 def _build_prompt(
@@ -471,6 +519,37 @@ async def ask_memory(
 
     # ── Semantic pass (always) ──
     await _semantic(question)
+
+    # ── Verbatim episode leg: distillation drops one-off micro-details
+    # (colors, gifts, stated reasons); the raw session text still has them.
+    # Measured +5pp on a DMR 100-question stratified sample; 3 excerpts is
+    # the sweet spot (5 diluted the evidence and regressed).
+    if tier.name != "minimal" and settings.ask_episode_evidence:
+        ep_query = " ".join(extract_keywords(question, max_terms=12)) or question
+        try:
+            eps = await asyncio.to_thread(
+                service.search_episodes_fulltext,
+                ep_query, user_id, project_id, 3,
+            )
+        except Exception as e:  # non-fatal: facts-only evidence still works
+            logger.warning(f"ask episode pass failed (non-critical): {e}")
+            eps = []
+        if not isinstance(eps, list):  # tolerate test doubles / older forks
+            eps = []
+        if eps:
+            searches.append("episodes: fulltext")
+            _merge([
+                SimpleNamespace(
+                    id=f"ep-{str(e_.get('uuid') or '')[:12]}",
+                    memory="[verbatim session excerpt] "
+                           + _clip_content(str(e_.get("content") or ""),
+                                           _EVIDENCE_PASSAGE_CLIP),
+                    score=None,
+                    source="episode",
+                    created_at=e_.get("created_at") or None,
+                )
+                for e_ in eps
+            ])
 
     # ── Discipline 2: update-language pass, gated on temporal cues ──
     # (audit 27 #19) Runs only when the question or the first-pass evidence
