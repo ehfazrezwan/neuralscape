@@ -277,14 +277,14 @@ Branch discipline: **`solo-engine`** is the integration branch (off `dev @ 4c65d
 
 | # | Work unit (worktree) | Contents | Exit criteria |
 |---|---|---|---|
-| 0 | `solo/design-doc` | this document | folded into `solo-engine` |
-| 1 | `solo/config-profile` | `NS_MODE`, mode-aware `validate_required`, defaults matrix, guardrails | team mode bit-identical; unit tests for both profiles |
-| 2 | `solo/graph-provider-seam` | `graph_provider` threading (config → mem0 fork → driver construction), kuzu extra in service deps | neo4j default untouched; kuzu constructs and round-trips a smoke write/read |
-| 3 | `solo/kuzu-test-matrix` | parameterize graph unit suites across providers; port/branch the 11 raw Cypher sites; provider-neutral retry wrapper | both providers green on the graph suites |
-| 4 | `solo/inline-task-backend` | `TaskBackend` interface, inline impl (two lanes), task-status table, wire MCP/REST enqueue seam | full write path incl. graph enrichment works Redis-less; team path untouched |
-| 5 | `solo/inproc-scheduler` + Redis-adjacent swaps | scheduler, in-process SSE/savings/settings equivalents | solo daemon runs maintenance without workers |
-| 6 | `solo/installer` | `neuralscape init/doctor/export/import`, service units, docs | clean-machine install → plugin round-trip in <5 min |
-| 7 | `solo/parity-bench` | bench harness against solo stack; DMR + latency runs | §7.3 gate green → open the `solo-engine → dev` PR |
+| 0 ✅ | `solo/design-doc` | this document | folded into `solo-engine` |
+| 1 ✅ | `solo/config-profile` | `NS_MODE`, mode-aware `validate_required`, defaults matrix, guardrails | team mode bit-identical; unit tests for both profiles |
+| 2 ✅ | `solo/graph-provider-seam` | `graph_provider` threading (config → mem0 fork → driver construction), kuzu extra in service deps | neo4j default untouched; kuzu constructs and round-trips a smoke write/read |
+| 3 ✅ | `solo/kuzu-test-matrix` | parameterize graph unit suites across providers; port/branch the 11 raw Cypher sites; provider-neutral retry wrapper | both providers green on the graph suites |
+| 4 ✅ | `solo/inline-task-backend` | `TaskBackend` interface, inline impl (two lanes), task-status table, wire MCP/REST enqueue seam | full write path incl. graph enrichment works Redis-less; team path untouched |
+| 5 ✅ | `solo/inproc-scheduler` + Redis-adjacent swaps | scheduler, in-process SSE/savings/settings equivalents | solo daemon runs maintenance without workers |
+| 6 ✅ | `solo/installer` | `neuralscape init/doctor/export/import`, service units, docs | clean-machine install → plugin round-trip in <5 min |
+| 7 | `solo/parity-bench` | bench harness against solo stack; DMR + latency runs | **NEXT / deferred** — §7.3 gate green → open the `solo-engine → dev` PR |
 
 Estimated effort: units 1–2 are days; unit 3 is the long pole (~2–3 weeks, where Kuzu surprises will surface); units 4–6 ~1–2 weeks combined; unit 7 is run-and-measure.
 
