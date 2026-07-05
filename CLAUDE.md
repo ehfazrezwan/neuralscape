@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+> **⚠️ CONTAINER BUILD GATE — READ FIRST:** No PR merges into `dev` without a
+> Docker build + in-container test of the same tree. Host-side `pytest` alone
+> is NOT sufficient. See [Container Build Gate](#container-build-gate-hard-rule).
+
 ## What This Is
 
 Neuralscape is a production-grade agentic memory layer combining mem0 (vector store) + Graphiti (temporal knowledge graph). It exposes both a REST API (FastAPI) and MCP server for AI agents to store and retrieve structured memories. Writes are async (enqueued to Redis/ARQ, return 202), reads are sync (return 200).
@@ -115,6 +119,32 @@ placeholder defaults (`project_id`, `neuralscape.example.com`, empty
 inside the **private** org Git via `terraform.tfvars`, `backend.hcl`, and a
 private Helm values / kustomize overlay. Grep before pushing:
 `git grep -iE "optimizely|iiis-492427|windmill-gke|svc-utility-belt|lightpath"`.
+
+## Container Build Gate (HARD RULE)
+
+**No PR merges into `dev` (or `main`) without a successful Docker build AND an
+in-container test run of the exact tree being merged.** Host-side
+`uv run pytest` is NOT sufficient: the Dockerfile **enumerates** its COPY
+paths per directory, so a new top-level package under `neuralscape-service/`
+passes every host test and then crash-loops in production because it was
+never copied into the image. This happened on 2026-07-05 — the `memory/`
+package split passed 1,826 host tests, merged clean, and took the live API
+down for ~5 minutes until the COPY lines were hotfixed.
+
+Minimum gate before any merge (run from repo root):
+
+```bash
+# 1. Suite runs INSIDE the packaged image (test stage is the default target)
+docker build -f neuralscape-service/Dockerfile -t ns-gate . && docker run --rm ns-gate
+
+# 2. Runtime image builds
+docker build --target runtime -f neuralscape-service/Dockerfile -t ns-gate-rt .
+```
+
+When adding ANY new top-level file or directory under `neuralscape-service/`,
+update the COPY lists in **all three** Dockerfile stages (builder, runtime,
+test). The upcoming CI pipeline makes this gate a required PR check; until
+then it is a manual, non-negotiable step.
 
 ## Git Workflow
 

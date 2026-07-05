@@ -15,6 +15,7 @@ COPY neuralscape-service/pyproject.toml neuralscape-service/uv.lock neuralscape-
 COPY graphiti/graphiti_core/ graphiti/graphiti_core/
 COPY mem0/mem0/ mem0/mem0/
 COPY neuralscape-service/*.py neuralscape-service/
+COPY neuralscape-service/memory/ neuralscape-service/memory/
 COPY neuralscape-service/extensions/ neuralscape-service/extensions/
 COPY neuralscape-service/adapters/ neuralscape-service/adapters/
 COPY neuralscape-service/ingest/ neuralscape-service/ingest/
@@ -57,6 +58,7 @@ COPY graphiti/pyproject.toml graphiti/
 COPY mem0/mem0/ mem0/mem0/
 COPY mem0/pyproject.toml mem0/
 COPY neuralscape-service/*.py neuralscape-service/
+COPY neuralscape-service/memory/ neuralscape-service/memory/
 COPY neuralscape-service/extensions/ neuralscape-service/extensions/
 COPY neuralscape-service/adapters/ neuralscape-service/adapters/
 COPY neuralscape-service/ingest/ neuralscape-service/ingest/
@@ -105,6 +107,7 @@ COPY neuralscape-service/pyproject.toml neuralscape-service/uv.lock neuralscape-
 COPY graphiti/graphiti_core/ graphiti/graphiti_core/
 COPY mem0/mem0/ mem0/mem0/
 COPY neuralscape-service/*.py neuralscape-service/
+COPY neuralscape-service/memory/ neuralscape-service/memory/
 COPY neuralscape-service/extensions/ neuralscape-service/extensions/
 COPY neuralscape-service/adapters/ neuralscape-service/adapters/
 COPY neuralscape-service/ingest/ neuralscape-service/ingest/
