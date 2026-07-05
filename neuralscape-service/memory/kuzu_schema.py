@@ -38,8 +38,10 @@ _NS_NODE_COLUMNS: list[tuple[str, str]] = [
 ]
 
 # RelatesToNode_ is included because Kuzu reifies RELATES_TO edges through it —
-# edge-level NS props (memory_id, wiki_path) land on that node table.
-_NS_TABLES = ("Entity", "Episodic", "Community", "RelatesToNode_")
+# edge-level NS props (memory_id, wiki_path) land on that node table. Saga is
+# included because Neo4j's label-less `MATCH (n)` stamps Saga nodes too, and
+# the per-table Kuzu stamp loops must be able to mirror that.
+_NS_TABLES = ("Entity", "Episodic", "Community", "RelatesToNode_", "Saga")
 
 # Provenance surface used by extensions/dreaming/graph_patcher.attach_source_ref.
 # Kuzu node tables need a single-column primary key; the Kuzu branch of
@@ -59,7 +61,8 @@ _NS_TABLE_DDL = [
     """CREATE REL TABLE IF NOT EXISTS DERIVED_FROM(
         FROM Entity TO Source,
         FROM Episodic TO Source,
-        FROM Community TO Source
+        FROM Community TO Source,
+        FROM Saga TO Source
     )""",
 ]
 

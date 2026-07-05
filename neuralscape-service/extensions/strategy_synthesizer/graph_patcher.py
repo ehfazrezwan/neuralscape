@@ -36,6 +36,34 @@ async def patch_playbook_path_by_memory_ids(
     if driver is None:
         return 0
     ts = (synthesized_at or datetime.now(timezone.utc)).isoformat()
+    from extensions.dreaming.graph_patcher import _is_kuzu, _kuzu_stamp
+
+    if _is_kuzu(driver):
+        try:
+            return await service._run_on_bridge_async(
+                _kuzu_stamp(
+                    driver,
+                    where="n.memory_id IN $mids",
+                    set_clause=(
+                        "SET n.strategy_playbook_path = $playbook_path, "
+                        "n.strategy_synthesized_at = $synthesized_at"
+                    ),
+                    params={
+                        "mids": mids,
+                        "playbook_path": playbook_path,
+                        "synthesized_at": ts,
+                    },
+                ),
+                timeout=30.0,
+            )
+        except Exception:
+            logger.warning(
+                "patch_playbook_path_by_memory_ids failed for %d memory_ids → %s (non-fatal)",
+                len(mids),
+                playbook_path,
+                exc_info=True,
+            )
+            return 0
     cypher = """
     MATCH (n)
     WHERE n.memory_id IN $mids
