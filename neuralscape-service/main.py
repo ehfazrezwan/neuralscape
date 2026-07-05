@@ -277,6 +277,20 @@ class LegacyGraphSearchRequest(BaseModel):
     )
 
 
+@app.get("/health/live")
+async def health_live():
+    """Pure process liveness — answers "should this process be killed?".
+
+    Deliberately performs NO dependency checks (no Redis/Qdrant/Neo4j calls):
+    under heavy write/enrichment load the readiness probes in /health can
+    exceed the container healthcheck timeout, which marked a merely-busy API
+    unhealthy and let the autoheal sidecar restart it mid-flight. The
+    container healthcheck (and autoheal) must watch this endpoint; external
+    monitors that care about backend reachability should keep using /health.
+    """
+    return {"status": "alive"}
+
+
 @app.get("/health")
 async def health():
     """Health check that verifies backend connectivity.

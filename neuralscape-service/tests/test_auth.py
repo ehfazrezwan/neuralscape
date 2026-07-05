@@ -107,6 +107,12 @@ class TestAuthEnabled:
         resp = client.get("/health")
         assert resp.status_code == 200
 
+    def test_health_live_always_public(self):
+        """The container healthcheck has no credentials — /health/live must be public."""
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.get("/health/live")
+        assert resp.status_code == 200
+
     def test_no_auth_header_returns_401(self):
         client = TestClient(app, raise_server_exceptions=False)
         resp = client.get("/v1/memories", params={"user_id": "test"})

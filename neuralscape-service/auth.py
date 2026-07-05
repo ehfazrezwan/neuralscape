@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 current_user_id: ContextVar[str | None] = ContextVar("current_user_id", default=None)
 
 # Paths that never require authentication
-PUBLIC_PATHS = {"/health", "/api/v1/health"}
+PUBLIC_PATHS = {"/health", "/health/live", "/api/v1/health"}
 # Path prefixes that never require auth: OAuth discovery metadata and the
 # Authorization Server endpoints themselves (the consent page, DCR, token
 # exchange). These are the public front door of the OAuth flow.
