@@ -7,10 +7,9 @@ description: Ingest files, folders, or a block of pasted context into Neuralscap
 
 Bring larger content into memory: uploaded **files** (a folder or a `.zip`, or individual Markdown/HTML/PDF/Office files) or a **manually-pasted block of context**. Ingested content is chunked into verbatim passages **and** distilled into graph facts. When the server has artifact storage enabled, every produced memory references a stored source artifact you can fetch back; if storage is disabled, memories instead carry a lightweight content-hash provenance ref (no re-fetchable file).
 
-Two mechanisms, chosen by what's actually available (probe the artifact, not the platform):
+**MCP first.** Text content — pasted, dictated, or read from a file you can open — always goes through the MCP `ingest_text` tool (or `ingest_document` when the content came from an external system and you can supply a connector `source` descriptor for provenance). Never curl text to the API.
 
-- **Files/folder + Claude Code** (a service URL and `curl` are present) → upload to the `POST /v1/ingest/files` endpoint. The server parses rich formats (PDF/Office/HTML via Docling), so binaries work — you don't parse them yourself.
-- **Pasted context, or Claude Cowork (no local filesystem)** → the MCP `ingest_text` tool. Works in both platforms.
+The **one sanctioned REST exception** is binary file upload: MCP cannot carry file bytes, so PDFs/Office docs/zips go to `POST /v1/ingest/files` (Claude Code only, when a service URL and `curl` are present). The server parses rich formats via Docling — you don't parse binaries yourself. That endpoint exists *because* there is no MCP equivalent; it is not a general fallback.
 
 For a single short fact, use `/neuralscape:remember` instead — this skill is for documents and longer passages.
 
@@ -21,9 +20,10 @@ For a single short fact, use `/neuralscape:remember` instead — this skill is f
    - The user named a file or folder path → **file-upload path** (step 4).
 2. **Resolve `user_id`** (Identity block below) and **`project_id`** — an active project selected this session → else (Claude Code) the plugin's project-id resolution, in order (`PROJECT_ID` override → nearest `.neuralscape-project` marker walking up from cwd → git-repo-root basename → cwd basename) → else omit (global). Pick a **`category`** for the produced memories (default `domain_knowledge`; use `tech_stack`/`convention`/`architecture`/etc. when the docs are project-specific — this is also how artifacts are filed into subfolders on the server).
 
-3. **Manual context path — MCP `ingest_text`:**
+3. **Manual context path — MCP `ingest_text` / `ingest_document`:**
    - Call `ingest_text(content=<the text>, title=<short label>, user_id=<resolved>, category=<cat>, project_id=<id or omit>)`.
-   - The server persists the text as a Markdown artifact (filed under user/project/category) and the memories reference it. Async by default; report that ingestion was **queued** (passages + facts land shortly).
+   - When the content was fetched from an external system (a Notion page, a Drive file, an API response), prefer `ingest_document(content=..., source={connector_id, connector_type, title?, url?, retrieval?})` so every produced memory carries a `source_ref` that can re-fetch the original.
+   - The server persists the text as a Markdown artifact (filed under user/project/category) and the memories reference it. Async by default; report that ingestion was **queued** (passages + facts land shortly). `queue_status()` shows when the ingest queue has drained.
 
 4. **File-upload path — `POST /v1/ingest/files` (Claude Code only):**
    - Requires a service URL (`CLAUDE_PLUGIN_OPTION_URL` / `NEURALSCAPE_URL`) and `curl`. If neither is present (e.g. Claude Cowork), you **cannot** upload binaries — tell the user file upload needs the Claude Code CLI with a configured URL, and offer to ingest pasted text via the manual path instead. Never error.
@@ -38,7 +38,7 @@ For a single short fact, use `/neuralscape:remember` instead — this skill is f
        -F "project_id=<id>"                     # omit for global scope
      ```
    - The response is `{"files": [{"filename", "task_id", "file_id"}], "count": N}` (HTTP 202). Each file is parsed + chunked on a dedicated ingest worker, so this won't interrupt the active session.
-   - Optionally poll `GET <URL>/v1/memories/status/{task_id}` for per-file `{passages, facts}` counts. The original file is retrievable at `<URL>/v1/ingest/artifacts/{file_id}`.
+   - To check progress, prefer the MCP `queue_status()` tool (aggregate per-queue depths + `caught_up`). The original file is retrievable at `<URL>/v1/ingest/artifacts/{file_id}`.
 
 5. **Confirm** to the user: how many files/how much context was accepted, the category/scope, and that parsing is running in the background (queued). List any files the server skipped.
 

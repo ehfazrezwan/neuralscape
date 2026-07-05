@@ -26,7 +26,9 @@ The trigger always supplies the path(s) to one or more JSONL files to process.
    ```
 2. **Group consecutive rows that work on the same target** (same file, same topic, same command intent). One *work unit* per group.
 3. **For each work unit, decide: is this *significant*?** Apply the quality rubric below. If not, skip.
-4. **For each significant work unit, write ONE memory** and submit it via `mcp__plugin_neuralscape_neuralscape__remember` with the v2 fields filled in.
+4. **For each significant work unit, write ONE memory.** Submit via the MCP tools only (never curl):
+   - **3 or more memories** from this compile → ONE `mcp__plugin_neuralscape_neuralscape__checkpoint` call with all of them in the `memories` array (each item carries the same v2 fields listed below). One tool call, instant per-item dedup verdicts, one background batch.
+   - **1–2 memories** → individual `mcp__plugin_neuralscape_neuralscape__remember` calls.
 5. **After all calls succeed, truncate every buffer file that was processed** by using the `Write` tool with the buffer's absolute path and content `""`. (This preserves the file for next session writes; the `Write` tool accepts only `file_path` and `content`.)
 
 ## Quality rubric — keep these

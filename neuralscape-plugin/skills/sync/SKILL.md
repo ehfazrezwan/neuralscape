@@ -9,11 +9,13 @@ Trigger an immediate flush + compile of the current session, mid-conversation ra
 
 ## Which path to take
 
-This skill has a deterministic HTTP conversation-compiler path (Claude Code) and an MCP path (everywhere else). Pick the path **before** doing anything:
+This skill has a deterministic HTTP conversation-compiler path (Claude Code) and an MCP path (everywhere else). The compiler `flush`/`compile` endpoints are the **only sanctioned REST calls in this skill** — they have no MCP equivalent (they feed the hook-parity compiler pipeline, not the memory store). Every other memory operation, here and everywhere, goes through the MCP tools; never substitute curl for a memory read or write.
+
+Pick the path **before** doing anything:
 
 0. **Is a service URL (`CLAUDE_PLUGIN_OPTION_URL` / `NEURALSCAPE_URL`) set AND is `curl` available?**
    - **Yes** → this is the Claude Code fast path. Use the HTTP conversation-compiler flow in steps 1–5 below.
-   - **No** (no local URL/env — almost certainly **Claude Cowork**) → **do not** attempt curl and **do not** error. Invoke `/neuralscape:save-session` instead — it does the same job (extract + store the conversation) via the MCP `remember_conversation` tool, which works without any local config. Tell the user you're using the MCP path because no local service URL is configured, then stop.
+   - **No** (no local URL/env — almost certainly **Claude Cowork**) → **do not** attempt curl and **do not** error. Invoke `/neuralscape:save-session` instead — it does the same job via MCP (`checkpoint` or `remember_conversation`), which works without any local config. Tell the user you're using the MCP path because no local service URL is configured, then stop.
 
 ## What to do (HTTP path — Claude Code)
 

@@ -10,14 +10,16 @@ Confirm Neuralscape is reachable and show what the plugin is currently using. Th
 ## What to do
 
 1. **MCP reachability (primary, both platforms)** — call `list_memories(limit: 1)` via the MCP tool. If it returns without error, the connector is reachable; report `MCP connector: reachable`. If it errors, report the error verbatim and that the connector is unreachable.
-2. **Read config (Claude Code)** — `URL` from `process.env.CLAUDE_PLUGIN_OPTION_URL` (fallback `NEURALSCAPE_URL`); `user_id` from `CLAUDE_PLUGIN_OPTION_USER_ID` (fallback `NEURALSCAPE_USER_ID`); API-key **state only** from `CLAUDE_PLUGIN_OPTION_API_KEY` (fallback `NEURALSCAPE_API_KEY`) — never echo the value.
-3. **Local `/health` probe (Claude Code only, when URL + curl present)** — `GET <URL>/health` with a 5-second timeout, `Authorization: Bearer <key>` if set. Report the per-backend checks.
+2. **Background queues (MCP, both platforms)** — call `queue_status()`. Report the per-queue pending depths (`main`/`graph`/`ingest`) and the `caught_up` flag — this answers "are my writes done?" without any REST polling.
+3. **Read config (Claude Code)** — `URL` from `process.env.CLAUDE_PLUGIN_OPTION_URL` (fallback `NEURALSCAPE_URL`); `user_id` from `CLAUDE_PLUGIN_OPTION_USER_ID` (fallback `NEURALSCAPE_USER_ID`); API-key **state only** from `CLAUDE_PLUGIN_OPTION_API_KEY` (fallback `NEURALSCAPE_API_KEY`) — never echo the value.
+4. **Local `/health` probe (Claude Code only, when URL + curl present)** — `GET <URL>/health` with a 5-second timeout, `Authorization: Bearer <key>` if set. Report the per-backend checks. This is the **one sanctioned REST call in this skill** — an ops probe of the backing stores that has no MCP equivalent. (`/health/live` is the dependency-free liveness endpoint; `/health` is the deep readiness check that probes Redis/Qdrant/Neo4j.) Never use REST for any *memory* operation.
 4. **Render a compact status block.** Two shapes depending on what's available:
 
    **Claude Code (env + URL present):**
    ```
    Neuralscape — status
      MCP connector: reachable
+     queues: main 0 · graph 1 · ingest 0 (caught up: no)
      URL:     https://neuralscape.example.com
      user_id: aydin
      API key: set

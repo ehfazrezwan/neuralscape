@@ -4,6 +4,35 @@ All notable changes to the `neuralscape` Claude plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.9.1] - 2026-07-05
+
+### Changed
+
+- **Skills refreshed to the 22-tool MCP census** (dev @ `64baf3d`). Every
+  skill now carries an explicit **MCP-only rule**: memory operations go
+  through the `mcp__plugin_neuralscape_neuralscape__*` tools, never
+  `curl`/REST. The only sanctioned REST calls left are the three with no MCP
+  equivalent, each labeled in place: binary file upload
+  (`/v1/ingest/files`, `ingest` skill), the conversation-compiler
+  `flush`/`compile` pair (`sync` skill), and the `/health` ops probe
+  (`ns-status` skill). The `search` skill's raw-HTTP fallback path is
+  **removed**.
+- **Tool-economics routing baked into the skills** (measured tiers:
+  instant ≈ 0.1–0.2 s metadata ops · ~1.6 s embed-backed ops · 3–7 s
+  LLM-backed ops). Skills now steer to the cheapest tool that answers —
+  in particular, `ask_memory` is reserved for "the user asked a question
+  and wants a synthesized, cited answer", never plain lookups or context
+  loading.
+- **New tools woven into existing skills** (no new skills): index-first
+  retrieval (`recall_memories(index_only=true)` → `get_memories`) in
+  `search`/`recall`; `timeline` and `get_card` in `recall`; `occurred_at`
+  guidance (absent-means-unknown, never fabricated) and
+  `edit_memory`-vs-re-`remember` correction routing in `remember`;
+  `checkpoint` as the preferred batch path in `save-session` and
+  `compile-observations` (≥3 memories → one call); `queue_status` for
+  "did my writes land?" in `ns-status`/`ingest`/`remember`;
+  `ingest_document` with connector `source` provenance in `ingest`.
+
 ## [2.9.0] - 2026-07-04
 
 ### Added

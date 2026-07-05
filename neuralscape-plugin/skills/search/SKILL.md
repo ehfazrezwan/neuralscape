@@ -7,16 +7,21 @@ description: Search the user's Neuralscape memory store for relevant facts. Use 
 
 Run this skill when the user wants to recall stored memories on a topic.
 
-This skill prefers the **MCP `recall_memories` tool**, so it works identically in Claude Code and Claude Cowork. A raw-HTTP path to `POST /v1/search` is kept only as a Claude Code fast path for when MCP is unavailable.
+**MCP only — never curl.** All searches go through the MCP `recall_memories` tool; that surface is the whole point of the plugin, and it works identically in Claude Code and Claude Cowork. Do **not** fall back to `curl`/REST (`/v1/search` etc.) even if a service URL is configured — if the MCP tool is unavailable, say the memory connector isn't reachable and stop.
+
+**Pick the cheapest tool that answers** (measured tiers on the production stack):
+
+- The user wants **matching memories** (this skill's job) → `recall_memories` (~1.6 s, one embedding round-trip). For a broad scan, pass `index_only: true` to get ~50-token index rows, then `get_memories(ids=[...])` (~0.1 s) for only the rows worth reading in full — ~10× cheaper in context tokens at the same speed.
+- The user wants **a specific memory they can already identify** → `get_memories` / `list_memories` (instant, no embedding).
+- The user asked a **question and wants an answer, not a list** → consider `ask_memory` instead, but know its cost: it runs an LLM synthesis pass (~3 s at `reasoning_level: "minimal"`, ~5 s at `"low"`, more at higher tiers). Never use it for a lookup this skill's list format already answers.
 
 ## What to do
 
 1. **Resolve the query** — use the user's exact phrasing as the search query. Do not rewrite or summarize unless the query is empty (then ask what they want to look up).
 2. **Resolve `user_id`** — see the Identity block below.
 3. **Detect project scope** — an active project selected this session → else (Claude Code) the plugin's project-id resolution, in order (`PROJECT_ID` override → nearest `.neuralscape-project` marker walking up from cwd → git-repo-root basename → cwd basename) → else omit. If the user says "across all projects" or "globally", omit `project_id`.
-4. **Primary path — MCP (both platforms):** call `recall_memories(query=<user's question>, user_id=<resolved>, project_id=<id or omit>, limit=10)`. This is the default and the only path that works in Cowork.
-5. **Optional Claude Code fast path:** only if the `recall_memories` MCP tool is unavailable AND a service URL (`CLAUDE_PLUGIN_OPTION_URL` / `NEURALSCAPE_URL`) plus `curl` are present, fall back to `POST <URL>/v1/search` with body `{"query", "user_id", "project_id", "limit": 10}` and `Authorization: Bearer <API_KEY>` if set (8s timeout). Never require env; never error in Cowork — if neither path is available, say the memory store isn't reachable and stop.
-6. **Render results** as a compact markdown list, ordered by score:
+4. **Call `recall_memories`** — `recall_memories(query=<user's question>, user_id=<resolved>, project_id=<id or omit>, limit=10)`. This is the only path, on both platforms. For broad scans, use the two-step index-first flow instead: `recall_memories(..., index_only=true, limit=20)` → filter the index rows → `get_memories(ids=[...])` for the few full payloads you need. If the MCP tool errors or is missing, report that the memory connector isn't reachable and stop — do not curl.
+5. **Render results** as a compact markdown list, ordered by score:
 
    ```
    ## Memories matching "<query>"
@@ -28,7 +33,7 @@ This skill prefers the **MCP `recall_memories` tool**, so it works identically i
 
    Show `category` in brackets, then the memory text, then `(score, source)`. Include `project: <id>` when scope is project. When results carry a `source` field, prefer `graph`-sourced results as authoritative when they conflict with `vector` results. If no results, say "No matches found" and suggest broadening the query.
 
-7. **Brief synthesis** (optional, 1-2 sentences) after the list if the results have a clear collective answer.
+6. **Brief synthesis** (optional, 1-2 sentences) after the list if the results have a clear collective answer. If the user's request was really a question needing cross-memory reasoning ("so what did we end up deciding?"), offer `ask_memory` as the follow-up rather than stretching this skill.
 
 ## Identity block (how to resolve `user_id`)
 
@@ -41,5 +46,5 @@ The MCP `recall_memories` schema marks `user_id` required, but under token auth 
 ## Notes
 
 - Read-only. Never store or modify memories from this skill.
-- The Neuralscape `/v1/search` endpoint is documented at `docs/neuralscape/04-memory-service-core.md#hybrid-search` in the Neuralscape repo.
+- Related tools for adjacent jobs: `timeline(anchor=...)` for "what was happening around X?" (chronological, instant), `search_knowledge_graph` for entity/relationship queries, `ask_memory` for synthesized answers with citations.
 - Categories and scopes (13 total) are documented at `docs/neuralscape/03-memory-model.md` in the Neuralscape repo.
