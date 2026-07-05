@@ -462,6 +462,7 @@ async def process_ingest_document(ctx: dict, doc: dict) -> dict:
         max_chars=doc.get("max_chars"),
         overlap=doc.get("overlap"),
         adapter=doc.get("adapter", "default"),
+        occurred_at=doc.get("occurred_at"),
     )
     result = await asyncio.to_thread(ingest_document, service, ingest_doc)
 

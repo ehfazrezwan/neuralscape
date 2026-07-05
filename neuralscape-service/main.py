@@ -929,6 +929,7 @@ async def v1_ingest_text(req: IngestTextRequest, request: Request):
         "extract_facts": req.extract_facts,
         "index_passages": req.index_passages,
         "adapter": req.adapter,
+        "occurred_at": req.occurred_at,
     }
     doc = {k: v for k, v in doc.items() if v is not None}
 
