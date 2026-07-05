@@ -254,10 +254,12 @@ Behavior details:
   produce false references.
 - **Hot-path cost:** the index fetch (`GET /v1/memories?fields=index`,
   newest 150 project-scoped index rows — no content payloads) happens **at
-  most once per session** and is cached; later Reads match in-process. The
-  one fetch runs under a hard time budget (`READ_GATE_TIME_BUDGET_MS`,
-  default 2000 ms) — on timeout or error the hook exits 0 and stays quiet
-  for the rest of the session.
+  most once per session per project** and is cached (switching your cwd to a
+  different repo mid-session triggers one fresh fetch for that project);
+  later Reads match in-process. The one fetch runs under a hard time budget
+  (`READ_GATE_TIME_BUDGET_MS`, default 2000 ms) — on timeout or error the
+  hook exits 0 and the gate stays quiet for that project for the rest of the
+  session.
 - **Never in your way:** steering fires at most **once per file per
   session**. Small files, binary/media extensions, excluded projects, and an
   unreachable service all bypass the gate entirely (allow, exit 0).

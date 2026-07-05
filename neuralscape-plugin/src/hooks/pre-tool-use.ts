@@ -10,9 +10,11 @@
  * substitutes memory titles for real file contents.
  *
  * Cost control (audit 27 #31 — this spawns synchronously on every Read):
- *   - the NS fetch happens AT MOST ONCE per session: index-level rows
- *     (`GET /v1/memories?fields=index`, capped at READ_GATE_FETCH_LIMIT)
- *     are cached in a session-scoped file; later Reads match in-process;
+ *   - the NS fetch happens AT MOST ONCE per session per resolved project:
+ *     index-level rows (`GET /v1/memories?fields=index`, capped at
+ *     READ_GATE_FETCH_LIMIT) are cached in a session+project-keyed file;
+ *     later Reads match in-process, and a cwd switch to a different repo
+ *     triggers one fresh fetch for that project (Copilot, PR #126);
  *   - a hard time budget (READ_GATE_TIME_BUDGET_MS, default 2s) bounds the
  *     one fetch — on timeout/error the hook exits 0 with a plain allow and
  *     caches the failure so the gate stays quiet for the session;
@@ -185,10 +187,13 @@ async function main(): Promise<void> {
       return;
     }
 
-    // Session-scoped index cache (audit 27 #31): the NS fetch happens at
-    // most once per session; a cached failure keeps the gate quiet.
+    // Session+project-scoped index cache (audit 27 #31; project-keyed per
+    // Copilot on PR #126): the NS fetch happens at most once per session
+    // per resolved project — a cwd switch to another repo triggers one
+    // fresh project-scoped fetch instead of reusing the wrong project's
+    // rows. A cached failure keeps the gate quiet for that project.
     let rows: NeuralscapeMemory[];
-    const cached = await loadReadGateIndexCache(sessionId);
+    const cached = await loadReadGateIndexCache(sessionId, projectId);
     if (cached) {
       if (!cached.ok) {
         outputContinue();
@@ -203,14 +208,14 @@ async function main(): Promise<void> {
         // Transport failure → allow, exit 0 (never-block) + count toward the
         // fail-loud threshold surfaced at next SessionStart.
         await recordTransportFailure();
-        await saveReadGateIndexCache(sessionId, false, []);
+        await saveReadGateIndexCache(sessionId, projectId, false, []);
         logError("read-gate memory fetch failed (service unreachable?) — allowing read", error);
         outputContinue();
         return;
       }
       if (fetched === FETCH_TIMEOUT) {
         await recordTransportFailure();
-        await saveReadGateIndexCache(sessionId, false, []);
+        await saveReadGateIndexCache(sessionId, projectId, false, []);
         logError(
           `read-gate memory fetch exceeded the ${getReadGateTimeBudgetMs()}ms budget — allowing read`,
         );
@@ -219,7 +224,7 @@ async function main(): Promise<void> {
       }
       await resetTransportFailures();
       rows = fetched;
-      await saveReadGateIndexCache(sessionId, true, rows);
+      await saveReadGateIndexCache(sessionId, projectId, true, rows);
     }
 
     const ranked = rankFileMemories(rows, filePath);

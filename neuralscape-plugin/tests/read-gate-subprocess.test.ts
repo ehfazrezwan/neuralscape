@@ -259,6 +259,38 @@ describe("read gate subprocess matrix (steer, never block)", () => {
     expect(fetchCalls).toBe(callsAfterFirst);
   }, 30000);
 
+  it("a project switch within one session triggers a fresh project-scoped fetch (Copilot, PR #126)", async () => {
+    const { dataDir } = await makeEnv(); // observation/cache dir only
+    const projA = await mkdtemp(join(tmpdir(), "ns-proj-a-"));
+    const projB = await mkdtemp(join(tmpdir(), "ns-proj-b-"));
+    await mkdir(join(projA, "src"), { recursive: true });
+    await mkdir(join(projB, "src"), { recursive: true });
+    const fileA = join(projA, "src", "gate-fixture-module.ts");
+    const fileA2 = join(projA, "src", "other-fixture-module.ts");
+    const fileB = join(projB, "src", "gate-fixture-module.ts");
+    for (const f of [fileA, fileA2, fileB]) {
+      await writeFile(f, `// fixture\n${"x".repeat(2500)}\n`, "utf-8");
+    }
+    const projectA = projA.split("/").filter(Boolean).pop()!;
+    const projectB = projB.split("/").filter(Boolean).pop()!;
+    const env = { NEURALSCAPE_URL: serverUrl, CLAUDE_PLUGIN_DATA: dataDir };
+
+    await runGate(readEvent(fileA, "s-projswitch", projA), env);
+    const callsAfterA = fetchCalls;
+    expect(new URL(fetchUrls[fetchUrls.length - 1], serverUrl).searchParams.get("project_id")).toBe(projectA);
+
+    // Same session, cwd now resolves a DIFFERENT project: the cached rows
+    // belong to project A and must NOT be served — a fresh project-B-scoped
+    // fetch happens instead.
+    await runGate(readEvent(fileB, "s-projswitch", projB), env);
+    expect(fetchCalls).toBe(callsAfterA + 1);
+    expect(new URL(fetchUrls[fetchUrls.length - 1], serverUrl).searchParams.get("project_id")).toBe(projectB);
+
+    // Back in project A: its cache is still valid — no third fetch.
+    await runGate(readEvent(fileA2, "s-projswitch", projA), env);
+    expect(fetchCalls).toBe(callsAfterA + 1);
+  }, 30000);
+
   it("still steers the same file in a DIFFERENT session (fresh fetch)", async () => {
     const { dataDir, largeFile } = await makeEnv();
     const env = { NEURALSCAPE_URL: serverUrl, CLAUDE_PLUGIN_DATA: dataDir };

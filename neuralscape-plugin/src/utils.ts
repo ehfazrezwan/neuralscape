@@ -716,12 +716,16 @@ export async function recordGatedFile(sessionId: string, filePath: string): Prom
 
 // ── Read-gate session index cache (audit 27 #31) ─────────────────
 //
-// The candidate-memory fetch happens AT MOST ONCE per session: the first
-// gateable Read fetches the index-level rows and caches them here; every
-// later Read (any file) matches against the cache with zero network I/O.
-// A failed/timed-out fetch caches a failure sentinel — the gate then stays
-// quiet for the rest of the session instead of re-paying the round trip on
-// every large-file Read while the service is down.
+// The candidate-memory fetch happens AT MOST ONCE per session AND project:
+// the first gateable Read fetches the index-level rows and caches them
+// here; every later Read (any file) in the same project matches against
+// the cache with zero network I/O. The key includes the resolved project
+// id (Copilot, PR #126): a session whose cwd moves to a different repo
+// must NOT be steered by the previous project's rows — the switch triggers
+// exactly one fresh project-scoped fetch. A failed/timed-out fetch caches
+// a failure sentinel — the gate then stays quiet for that project for the
+// rest of the session instead of re-paying the round trip on every
+// large-file Read while the service is down.
 
 export interface ReadGateIndexCache {
   /** False when the one fetch failed/timed out (gate stays quiet). */
@@ -730,15 +734,20 @@ export interface ReadGateIndexCache {
   rows: NeuralscapeMemory[];
 }
 
-export function getReadGateCachePath(sessionId: string): string {
-  return pathJoin(getObservationDir(), `${safeSessionName(sessionId)}.readgate-index.json`);
+export function getReadGateCachePath(sessionId: string, projectId?: string): string {
+  const project = safeSessionName(projectId || "global");
+  return pathJoin(
+    getObservationDir(),
+    `${safeSessionName(sessionId)}.${project}.readgate-index.json`,
+  );
 }
 
 export async function loadReadGateIndexCache(
   sessionId: string,
+  projectId?: string,
 ): Promise<ReadGateIndexCache | null> {
   try {
-    const raw = await readFile(getReadGateCachePath(sessionId), "utf-8");
+    const raw = await readFile(getReadGateCachePath(sessionId, projectId), "utf-8");
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed === "object" && typeof parsed.ok === "boolean") {
       return {
@@ -755,13 +764,14 @@ export async function loadReadGateIndexCache(
 
 export async function saveReadGateIndexCache(
   sessionId: string,
+  projectId: string | undefined,
   ok: boolean,
   rows: NeuralscapeMemory[],
 ): Promise<void> {
   try {
     await mkdir(getObservationDir(), { recursive: true });
     const payload: ReadGateIndexCache = { ok, fetchedAt: new Date().toISOString(), rows };
-    await writeFile(getReadGateCachePath(sessionId), JSON.stringify(payload), "utf-8");
+    await writeFile(getReadGateCachePath(sessionId, projectId), JSON.stringify(payload), "utf-8");
   } catch (error) {
     logError("saveReadGateIndexCache failed", error);
   }

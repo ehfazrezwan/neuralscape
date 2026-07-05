@@ -55,9 +55,11 @@ const {
   globToRegExp,
   isProjectExcluded,
   loadGatedFiles,
+  loadReadGateIndexCache,
   recordGatedFile,
   recordTransportFailure,
   resetTransportFailures,
+  saveReadGateIndexCache,
 } = utils;
 
 import type { NeuralscapeMemory } from "../src/utils.js";
@@ -592,5 +594,23 @@ describe("read-gate session state", () => {
     await recordGatedFile("../../evil", "/repo/a.ts");
     const gated = await loadGatedFiles("../../evil");
     expect(gated.has("/repo/a.ts")).toBe(true);
+  });
+
+  it("index cache is keyed by session AND project (Copilot, PR #126)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ns-gatecache-"));
+    process.env.CLAUDE_PLUGIN_DATA = dir;
+    const rows = [mem({ id: "m-proj-a", memory: "gate/target-module.ts note" })];
+    await saveReadGateIndexCache("sess-p", "proj-a", true, rows);
+    // A different project in the SAME session must not see proj-a's rows —
+    // it triggers its own fresh fetch instead of reusing wrong-project cache.
+    expect(await loadReadGateIndexCache("sess-p", "proj-b")).toBeNull();
+    expect(await loadReadGateIndexCache("sess-p", undefined)).toBeNull();
+    const hit = await loadReadGateIndexCache("sess-p", "proj-a");
+    expect(hit?.ok).toBe(true);
+    expect(hit?.rows[0]?.id).toBe("m-proj-a");
+    // The failure sentinel is project-keyed too.
+    await saveReadGateIndexCache("sess-p", "proj-b", false, []);
+    expect((await loadReadGateIndexCache("sess-p", "proj-b"))?.ok).toBe(false);
+    expect((await loadReadGateIndexCache("sess-p", "proj-a"))?.ok).toBe(true);
   });
 });
