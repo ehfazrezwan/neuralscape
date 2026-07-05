@@ -16,12 +16,15 @@ Skip these automatically when the server isn't reachable by using the
 """
 
 import asyncio
+import os
 import time
 
 import httpx
 import pytest
 
-BASE_URL = "http://localhost:8199"
+# Overridable so the suite can target an isolated test deployment instead of
+# whatever stack owns the default port (e.g. a developer's live stack).
+BASE_URL = os.environ.get("NS_TEST_BASE_URL", "http://localhost:8199")
 POLL_INTERVAL = 5  # seconds between status polls
 POLL_TIMEOUT = 300  # max seconds to wait for task completion (LLM + Neo4j writes are slow)
 

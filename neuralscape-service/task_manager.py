@@ -35,14 +35,46 @@ _STATUS_MAP = {
 }
 
 
+class _DisabledPool:
+    """Stands in when no task queue is connected (task_backend=inline, or
+    before/without connect()). Falsy so truthiness checks skip it; any actual
+    use raises ConnectionError so every write path's sync fallback
+    (``except (ConnectionError, OSError)``) engages instead of a 500 from an
+    AttributeError on None. Solo-engine interim until the full inline
+    TaskBackend lands (28-solo-engine.md unit 4)."""
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __getattr__(self, name: str):
+        raise ConnectionError(
+            "task queue unavailable (task_backend=inline or Redis not connected)"
+        )
+
+
+_DISABLED_POOL = _DisabledPool()
+
+
 class TaskManager:
     """Redis-backed task status tracking + ARQ job enqueuing."""
 
     def __init__(self):
-        self.pool: ArqRedis | None = None
+        self.pool: ArqRedis | _DisabledPool = _DISABLED_POOL
 
     async def connect(self) -> None:
-        """Initialize the ARQ Redis connection pool."""
+        """Initialize the ARQ Redis connection pool.
+
+        In inline mode (NS_MODE=solo) there is no queue by design: the pool
+        stays disabled, enqueues raise ConnectionError, and the API/MCP write
+        paths take their synchronous in-process fallbacks.
+        """
+        if settings.task_backend != "redis":
+            logger.info(
+                "task_backend=%s: skipping Redis task-queue connection "
+                "(writes run in-process via the sync fallbacks)",
+                settings.task_backend,
+            )
+            return
         self.pool = await create_pool(
             parse_redis_settings(),
             default_queue_name=settings.arq_queue_name,
@@ -58,7 +90,7 @@ class TaskManager:
         twice the status window — no per-status bookkeeping, statuses are
         still read from ARQ itself. Never blocks or fails an enqueue.
         """
-        if not user_id or self.pool is None:
+        if not user_id or not self.pool:
             return
         try:
             now = time.time()
@@ -502,7 +534,7 @@ class TaskManager:
         window = int(window_seconds or settings.queue_status_window_s)
         counts = {"queued": 0, "processing": 0, "completed": 0, "failed": 0, "expired": 0}
         ids: list[str] = []
-        if self.pool is not None:
+        if self.pool:
             now = time.time()
             try:
                 raw_ids = await self.pool.zrevrangebyscore(

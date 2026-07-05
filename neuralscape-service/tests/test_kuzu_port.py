@@ -526,3 +526,65 @@ class TestTier3Ports:
         assert len(rows) == 1
         assert rows[0]["name"].strip().lower() == "tokyo"
         assert sorted(rows[0]["memory_ids"]) == ["m-1", "m-2"]
+
+
+class TestAddEpisodeDriverContract:
+    """Regression for the solo e2e boot failure: graphiti.add_episode reads
+    driver._database before its no-op clone(); KuzuDriver didn't set it, so
+    every group_id-bearing episode write crashed with AttributeError."""
+
+    def test_kuzu_driver_has_database_attribute(self, tmp_path):
+        d = _driver(tmp_path)
+        assert isinstance(d._database, str) and d._database
+        # base-class clone is a no-op returning self — the add_episode branch
+        # must be harmless for any group_id
+        assert d.clone(database="user--someone") is d
+
+
+class TestKuzuSchemaDrift:
+    """Static cross-check: every column a Kuzu save query SETs must exist in
+    the driver DDL (plus NS bootstrap ALTERs). Catches model/schema drift in
+    CI instead of as runtime binder errors — the e2e boot found the edge
+    model's reference_time missing from RelatesToNode_ exactly this way."""
+
+    def test_save_query_columns_exist_in_schema(self):
+        import re
+
+        from graphiti_core.driver.driver import GraphProvider
+        from graphiti_core.driver.kuzu_driver import SCHEMA_QUERIES
+        from graphiti_core.models.edges import edge_db_queries as eq
+        from graphiti_core.models.nodes import node_db_queries as nq
+        from memory.kuzu_schema import ns_kuzu_schema_statements
+
+        # Parse DDL: table name → declared columns.
+        ddl_cols: dict[str, set[str]] = {}
+        for tbl_m in re.finditer(
+            r"CREATE NODE TABLE IF NOT EXISTS (\w+)\s*\((.*?)\);",
+            SCHEMA_QUERIES,
+            re.S,
+        ):
+            table, body = tbl_m.group(1), tbl_m.group(2)
+            ddl_cols[table] = {
+                m.group(1) for m in re.finditer(r"^\s*(\w+)\s+\w", body, re.M)
+            }
+        # NS bootstrap ALTERs extend the DDL.
+        for stmt in ns_kuzu_schema_statements():
+            m = re.match(r"ALTER TABLE (\w+) ADD (\w+)", stmt)
+            if m and m.group(1) in ddl_cols:
+                ddl_cols[m.group(1)].add(m.group(2))
+
+        kuzu = GraphProvider.KUZU
+        cases = [
+            (nq.get_entity_node_save_query(kuzu, labels=""), "Entity"),
+            (nq.get_episode_node_save_query(kuzu), "Episodic"),
+            (nq.get_community_node_save_query(kuzu), "Community"),
+            (nq.get_saga_node_save_query(kuzu), "Saga"),
+            (eq.get_entity_edge_save_query(kuzu), "RelatesToNode_"),
+        ]
+        problems = []
+        for query, table in cases:
+            set_cols = set(re.findall(r"\b\w+\.(\w+)\s*=\s*\$", query))
+            missing = set_cols - ddl_cols.get(table, set())
+            if missing:
+                problems.append(f"{table}: {sorted(missing)}")
+        assert not problems, f"save queries SET undeclared columns: {problems}"

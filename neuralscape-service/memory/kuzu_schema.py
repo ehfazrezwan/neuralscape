@@ -83,6 +83,18 @@ def _graphiti_fts_statements() -> list[str]:
     return get_fulltext_indices(GraphProvider.KUZU)
 
 
+# Graphiti-owned columns the subtree's Kuzu DDL drifted on (the edge model
+# gained reference_time but RelatesToNode_ didn't) — the DDL is patched for
+# fresh stores; these ALTERs heal stores created before the patch.
+_GRAPHITI_DRIFT_ALTERS = [
+    "ALTER TABLE RelatesToNode_ ADD reference_time TIMESTAMP",
+    "ALTER TABLE Saga ADD summary STRING",
+    "ALTER TABLE Saga ADD first_episode_uuid STRING",
+    "ALTER TABLE Saga ADD last_episode_uuid STRING",
+    "ALTER TABLE Saga ADD last_summarized_at TIMESTAMP",
+]
+
+
 def ns_kuzu_schema_statements() -> list[str]:
     """All bootstrap statements, ordered: FTS extension → tables/columns →
     FTS indices (which index columns that must exist first)."""
@@ -91,6 +103,7 @@ def ns_kuzu_schema_statements() -> list[str]:
     for table in _NS_TABLES:
         for column, ctype in _NS_NODE_COLUMNS:
             stmts.append(f"ALTER TABLE {table} ADD {column} {ctype}")
+    stmts.extend(_GRAPHITI_DRIFT_ALTERS)
     stmts.extend(_graphiti_fts_statements())
     return stmts
 
