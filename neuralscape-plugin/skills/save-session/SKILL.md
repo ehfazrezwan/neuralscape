@@ -5,7 +5,7 @@ description: Extract and save the durable facts from the current conversation to
 
 # Neuralscape — Save Session
 
-Save the session's durable knowledge — **MCP only, never curl/REST**. Works identically in Claude Code and Claude Cowork.
+Save the session's durable knowledge — **MCP first: never curl/REST while the MCP tools are available**. Works identically in Claude Code and Claude Cowork.
 
 Two MCP paths; pick by who does the distilling:
 

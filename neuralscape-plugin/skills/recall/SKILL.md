@@ -7,9 +7,9 @@ description: Load the user's relevant Neuralscape memories before planning or ac
 
 Load stored context so you act on what the user already knows and decided, instead of starting cold. In Claude Code the SessionStart hook does this automatically; this skill is the manual/on-demand equivalent, and it's the **primary** way context gets loaded in Claude Cowork (which runs no hooks).
 
-**MCP only — never curl.** This skill uses the MCP tools (`recall_memories`, `get_project_context`, and friends) exclusively; they work identically on both platforms. Never substitute `curl`/REST calls for any memory operation — if an MCP tool is unavailable, say the connector isn't reachable and stop.
+**MCP first.** This skill uses the MCP tools (`recall_memories`, `get_project_context`, and friends); they work identically on both platforms and are the primary surface — never substitute `curl`/REST while the MCP tools are present. (The REST API mirrors the MCP surface; the `search` skill documents the one sanctioned fallback for when MCP is truly unavailable.)
 
-**Tool economics** (measured on the production stack): `get_project_context`, `get_memories`, `list_memories`, `timeline`, and `get_card` are instant (~0.1–0.2 s, no model call). `recall_memories` costs one embedding round-trip (~1.6 s). `ask_memory` runs an LLM synthesis pass (~3–5 s+) — reach for it **only** when the user asked a question and wants a reasoned answer with citations, never for plain context loading. Default to the cheapest tool that does the job.
+**Route by job, not by cost.** For *relevance* — "what does the store know that bears on this?" — `recall_memories` (or `get_project_context` for a whole project) IS the tool; the instant tools are not cheaper substitutes for it. They serve different jobs: `get_memories` fetches known IDs (~0.1 s), `timeline` gives chronology, `list_memories` gives inventory, `get_card` gives standing identity grounding. `ask_memory` runs an LLM synthesis pass (~3–5 s+) — reach for it when the user asked a question and wants a reasoned, cited answer; its `reasoning_level` (minimal→high) is the knob you scale to question complexity. Escalate a tier when results come back thin; never pre-emptively downgrade a relevance search to save tokens.
 
 ## What to do
 

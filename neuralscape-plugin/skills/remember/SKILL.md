@@ -5,7 +5,7 @@ description: Save one durable fact to Neuralscape memory now — a preference, d
 
 # Neuralscape — Remember
 
-Store a single, durable fact via the MCP `remember` tool — **MCP only, never curl/REST**. Works identically in Claude Code and Claude Cowork.
+Store a single, durable fact via the MCP `remember` tool — **MCP first: never curl/REST while the MCP tools are available**. Works identically in Claude Code and Claude Cowork.
 
 Route by volume: **one fact** → this skill (`remember`). **Three or more facts at once** → one `checkpoint` call (batch of up to 25 with instant dedup verdicts) instead of N `remember` calls. **A whole conversation to extract from** → `/neuralscape:save-session`. **Correcting an existing memory** → `edit_memory(memory_id, ...)` when it's a refinement of the *same* fact (typo, added detail — keeps the ID and history); a fresh `remember` when the fact genuinely *changed* (the knowledge graph detects the contradiction and expires the old one).
 

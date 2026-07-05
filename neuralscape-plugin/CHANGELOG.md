@@ -9,20 +9,24 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 ### Changed
 
 - **Skills refreshed to the 22-tool MCP census** (dev @ `64baf3d`). Every
-  skill now carries an explicit **MCP-only rule**: memory operations go
-  through the `mcp__plugin_neuralscape_neuralscape__*` tools, never
-  `curl`/REST. The only sanctioned REST calls left are the three with no MCP
-  equivalent, each labeled in place: binary file upload
-  (`/v1/ingest/files`, `ingest` skill), the conversation-compiler
-  `flush`/`compile` pair (`sync` skill), and the `/health` ops probe
-  (`ns-status` skill). The `search` skill's raw-HTTP fallback path is
-  **removed**.
-- **Tool-economics routing baked into the skills** (measured tiers:
+  skill now carries an explicit **MCP-first rule**: the MCP tools are the
+  primary surface, and an agent must never switch to `curl`/REST while an
+  MCP tool is available. The REST API deliberately mirrors the MCP
+  surface, so REST remains documented where it belongs: the `search`
+  skill keeps its `/v1/search` fallback (gated on the MCP tool being
+  truly absent), and the three calls with no MCP equivalent are labeled
+  sanctioned exceptions in place — binary file upload (`/v1/ingest/files`,
+  `ingest` skill), the conversation-compiler `flush`/`compile` pair
+  (`sync` skill), and the `/health` ops probe (`ns-status` skill).
+- **Route-by-job guidance baked into the skills** (measured tiers:
   instant ≈ 0.1–0.2 s metadata ops · ~1.6 s embed-backed ops · 3–7 s
-  LLM-backed ops). Skills now steer to the cheapest tool that answers —
-  in particular, `ask_memory` is reserved for "the user asked a question
-  and wants a synthesized, cited answer", never plain lookups or context
-  loading.
+  LLM-backed ops). `recall_memories` stays the non-negotiable default
+  for relevance retrieval — the instant tools serve *different jobs*
+  (known-ID fetch, chronology, inventory), never cheaper substitutes —
+  and skills teach an escalation ladder (broaden → re-run → `ask_memory`)
+  instead of pre-emptive downgrading. `ask_memory` is reserved for
+  question-shaped requests that want a synthesized, cited answer, with
+  `reasoning_level` as the agent-chosen effort knob.
 - **New tools woven into existing skills** (no new skills): index-first
   retrieval (`recall_memories(index_only=true)` → `get_memories`) in
   `search`/`recall`; `timeline` and `get_card` in `recall`; `occurred_at`
