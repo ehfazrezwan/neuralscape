@@ -1,0 +1,95 @@
+name: service-ci
+
+# Enforces the CLAUDE.md Container Build Gate (HARD RULE): no merge into dev
+# or main without a Docker build AND an in-container test run of the exact
+# tree. Host pytest alone cannot catch missing Dockerfile COPY paths — the
+# 2026-07-05 memory/ package incident (PR #136 → #138) is the origin story.
+#
+# Trigger shape: runs on EVERY PR so the jobs can be marked as required
+# checks; the `changes` job path-filters internally and non-service PRs get
+# "skipped" jobs, which GitHub treats as passing for required checks.
+
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev, main]
+    paths:
+      - "neuralscape-service/**"
+      - "mem0/**"
+      - "graphiti/**"
+      - "docker-compose*.yml"
+      - ".github/workflows/service-ci.yml"
+
+concurrency:
+  group: service-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      service: ${{ steps.filter.outputs.service }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            service:
+              - "neuralscape-service/**"
+              - "mem0/**"
+              - "graphiti/**"
+              - "docker-compose*.yml"
+              - ".github/workflows/service-ci.yml"
+
+  host-tests:
+    needs: changes
+    if: needs.changes.outputs.service == 'true' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: neuralscape-service
+    env:
+      # Unit tests mock all external services; these only satisfy Settings.
+      GOOGLE_API_KEY: ci-dummy
+      NEO4J_PASSWORD: ci-dummy
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "neuralscape-service/uv.lock"
+      - name: Install dependencies
+        run: uv sync --frozen
+      - name: Run fast suite
+        run: uv run pytest tests/ --ignore=tests/test_async_pipeline.py -q
+
+  container-gate:
+    needs: changes
+    if: needs.changes.outputs.service == 'true' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build test-stage image (suite runs in-container)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: neuralscape-service/Dockerfile
+          target: test
+          load: true
+          tags: ns-gate:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Run suite inside the packaged image
+        run: docker run --rm ns-gate:ci
+      - name: Build runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: neuralscape-service/Dockerfile
+          target: runtime
+          load: true
+          tags: ns-gate-rt:ci
+          cache-from: type=gha
