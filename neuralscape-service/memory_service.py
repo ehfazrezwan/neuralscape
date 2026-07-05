@@ -483,6 +483,7 @@ from savings_meter import stamp_tokens
 from prompts import (
     build_extraction_messages,
     parse_extraction_response,
+    parse_extraction_response_with_details,
 )
 from schemas import (
     EPISTEMIC_LEVEL_VOCAB,
@@ -913,12 +914,21 @@ class MemoryService:
 
         from google.genai.types import GenerateContentConfig, HttpOptions
 
+        # Detail channel (DMR ledger, 2026-07): when on, the prompt gains the
+        # additive "details" contract and the response is parsed by the
+        # details-aware sibling. When off, prompt AND parser are byte-identical
+        # to the pre-channel path (see tests/test_detail_channel.py).
+        extract_details = settings.extract_detail_memories
+
         parsed_facts: list[tuple[str, str]] = []
+        parsed_details: list[tuple[str, str]] = []
         window_errors: list[str] = []
         last_exc: Exception | None = None
         for w_idx, window_messages in enumerate(windows):
             extraction_messages = build_extraction_messages(
-                window_messages, operator_guidance=operator_guidance
+                window_messages,
+                operator_guidance=operator_guidance,
+                include_details=extract_details,
             )
             try:
                 response = retry_transient(
@@ -931,7 +941,14 @@ class MemoryService:
                     operation="LLM extraction",
                     fallback_model=settings.gemini_llm_fallback_model,
                 )
-                parsed_facts.extend(parse_extraction_response(response.text))
+                if extract_details:
+                    facts_w, details_w = parse_extraction_response_with_details(
+                        response.text
+                    )
+                    parsed_facts.extend(facts_w)
+                    parsed_details.extend(details_w)
+                else:
+                    parsed_facts.extend(parse_extraction_response(response.text))
             except Exception as e:
                 # One window failing must not zero the whole session — keep
                 # the other windows' facts and report the failure honestly
@@ -957,18 +974,24 @@ class MemoryService:
             "window_errors": window_errors,
         }
 
-        # Filter out junk facts from extraction
-        pre_filter_count = len(parsed_facts)
+        # Filter out junk facts from extraction (details get the same filter —
+        # a shell command is junk whichever channel it arrived on).
+        pre_filter_count = len(parsed_facts) + len(parsed_details)
         parsed_facts = [
             (cat, content) for cat, content in parsed_facts
             if not _is_junk_fact(content)
         ]
-        if pre_filter_count != len(parsed_facts):
+        parsed_details = [
+            (cat, content) for cat, content in parsed_details
+            if not _is_junk_fact(content)
+        ]
+        post_filter_count = len(parsed_facts) + len(parsed_details)
+        if pre_filter_count != post_filter_count:
             logger.info(
-                f"Filtered {pre_filter_count - len(parsed_facts)} junk facts from extraction"
+                f"Filtered {pre_filter_count - post_filter_count} junk facts from extraction"
             )
 
-        if not parsed_facts:
+        if not parsed_facts and not parsed_details:
             logger.info("No facts extracted from conversation")
             return ([], stats) if return_stats else []
 
@@ -978,19 +1001,39 @@ class MemoryService:
         # reported success — exactly what hid the gateway's single-input
         # embed rejection in production. Raising fails the ARQ job, so
         # /v1/memories/status/{task_id} reports status=failed with the error.
+        #
+        # Details ride the SAME batch write path (content-hash dedup,
+        # times_derived bump, tombstone revival, two-pass embed) in a second
+        # call stamped memory_kind="detail" — the stamp is what the main
+        # search's index-time exclusion keys off. Failures propagate for the
+        # same reason as facts; the dedup makes the ARQ retry safe.
         try:
-            stored = self._batch_store_facts(
-                facts=parsed_facts,
-                user_id=user_id,
-                project_id=project_id,
-                agent_id=agent_id,
-                run_id=run_id,
-                source="conversation",
+            stored = (
+                self._batch_store_facts(
+                    facts=parsed_facts,
+                    user_id=user_id,
+                    project_id=project_id,
+                    agent_id=agent_id,
+                    run_id=run_id,
+                    source="conversation",
+                )
+                if parsed_facts
+                else []
             )
+            if parsed_details:
+                stored += self._batch_store_facts(
+                    facts=parsed_details,
+                    user_id=user_id,
+                    project_id=project_id,
+                    agent_id=agent_id,
+                    run_id=run_id,
+                    source="conversation",
+                    memory_kind="detail",
+                )
         except Exception as e:
             logger.error(
                 f"Batch store failed for user {user_id}: {e} — "
-                f"{len(parsed_facts)} extracted facts were NOT stored",
+                f"{len(parsed_facts) + len(parsed_details)} extracted facts were NOT stored",
                 exc_info=True,
             )
             raise
@@ -1622,6 +1665,7 @@ class MemoryService:
         limit: int,
         query_embedding: list[float] | None = None,
         visibility_value: str = MemoryVisibility.SHARED.value,
+        memory_kind: str | None = None,
     ) -> list[MemoryResponse]:
         """Search Qdrant for cross-writer memories of a given visibility.
 
@@ -1662,6 +1706,19 @@ class MemoryService:
         must_not = [
             FieldCondition(key="metadata.dream_tombstoned", match=MatchValue(value=True))
         ]
+        # Detail channel: micro-detail rows are recallable ONLY through an
+        # explicit memory_kind="detail" search (ask's capped detail leg). The
+        # main pass excludes them AT THE INDEX — same mechanism as
+        # dream_tombstoned — so they can never dilute core top-k (naive
+        # densification was measured net-negative on DMR).
+        if memory_kind == "detail":
+            must.append(
+                FieldCondition(key="metadata.memory_kind", match=MatchValue(value="detail"))
+            )
+        else:
+            must_not.append(
+                FieldCondition(key="metadata.memory_kind", match=MatchValue(value="detail"))
+            )
         if categories:
             must.append(FieldCondition(key="metadata.category", match=MatchAny(any=categories)))
         if scope:
@@ -1766,6 +1823,7 @@ class MemoryService:
         concepts: list[str] | None,
         limit: int,
         query_embedding: list[float] | None = None,
+        memory_kind: str | None = None,
     ) -> list[MemoryResponse]:
         """Search the authoritative ``standard``-tier pool (dictator-written).
 
@@ -1785,6 +1843,7 @@ class MemoryService:
             limit=limit,
             query_embedding=query_embedding,
             visibility_value=MemoryVisibility.STANDARD.value,
+            memory_kind=memory_kind,
         )
 
     def _search_personal_pool(
@@ -1800,6 +1859,7 @@ class MemoryService:
         concepts: list[str] | None,
         limit: int,
         query: str = "",
+        memory_kind: str | None = None,
     ) -> list[MemoryResponse]:
         """Search Qdrant for the caller's own memories using a precomputed vector.
 
@@ -1828,6 +1888,17 @@ class MemoryService:
         must_not = [
             FieldCondition(key="metadata.dream_tombstoned", match=MatchValue(value=True))
         ]
+        # Detail channel: index-time exclusion of memory_kind="detail" rows
+        # unless the caller explicitly asked for them (see _search_shared_pool
+        # for the rationale — this is the load-bearing top-k invariant).
+        if memory_kind == "detail":
+            must.append(
+                FieldCondition(key="metadata.memory_kind", match=MatchValue(value="detail"))
+            )
+        else:
+            must_not.append(
+                FieldCondition(key="metadata.memory_kind", match=MatchValue(value="detail"))
+            )
         if categories:
             must.append(FieldCondition(key="metadata.category", match=MatchAny(any=categories)))
         if scope:
@@ -2005,9 +2076,15 @@ class MemoryService:
 
         Called when a duplicate of ``memory_id`` was detected and dropped —
         the reinforcement is counted on the survivor instead of discarded.
-        Read-merge-write of the nested metadata dict (Qdrant's ``set_payload``
-        replaces top-level keys wholesale, so the merge is mandatory —
-        mirrors ``extensions/dreaming/consolidate._merged_metadata``).
+
+        Audit 27 #30: the write is an atomic nested-key merge
+        (``set_payload`` with ``key="metadata"`` carrying ONLY
+        ``times_derived``) — a concurrent patcher's keys (e.g. a dream
+        tombstone landing between our read and write) can never be
+        clobbered by a whole replaced metadata dict. The counter value
+        itself still needs a read (Qdrant has no atomic increment), so two
+        simultaneous bumps can lose a tick — bounded, and strictly better
+        than losing arbitrary foreign keys.
 
         Best-effort: losing a reinforcement tick must never block a write or
         a dedup pass, so every failure is swallowed with a warning.
@@ -2025,12 +2102,12 @@ class MemoryService:
             )
             if not points:
                 return
-            meta = dict((points[0].payload or {}).get("metadata") or {})
-            meta["times_derived"] = _times_derived_from_metadata(meta) + add
+            meta = (points[0].payload or {}).get("metadata") or {}
             client.set_payload(
                 collection_name=collection,
-                payload={"metadata": meta},
+                payload={"times_derived": _times_derived_from_metadata(meta) + add},
                 points=[memory_id],
+                key="metadata",
             )
         except Exception as e:
             logger.warning(f"times_derived bump failed for {memory_id} (non-fatal): {e}")
@@ -2492,8 +2569,11 @@ class MemoryService:
         # Audit 27 #9: kick the graph pass off NOW, on its own thread, so it
         # overlaps the vector pool queries below (the legs are independent —
         # Graphiti embeds the query itself). Joined right before the weave.
+        # Detail-channel searches skip it: graph edges carry no memory_kind,
+        # so they could never survive the detail filter — the leg would be
+        # pure latency.
         graph_future = None
-        if not vector_only:
+        if not vector_only and memory_kind != "detail":
             try:
                 graph_future = _GRAPH_SEARCH_POOL.submit(
                     self._search_graph_for_visibility,
@@ -2526,6 +2606,7 @@ class MemoryService:
                             project_id=project_id, categories=categories, scope=None,
                             domain=domain, observation_type=observation_type,
                             concepts=concepts, limit=limit, query=query,
+                            memory_kind=memory_kind,
                         )
                     )
                     vector_responses.extend(
@@ -2534,6 +2615,7 @@ class MemoryService:
                             project_id=None, categories=categories, scope="global",
                             domain=domain, observation_type=observation_type,
                             concepts=concepts, limit=limit, query=query,
+                            memory_kind=memory_kind,
                         )
                     )
                 else:
@@ -2543,6 +2625,7 @@ class MemoryService:
                             project_id=project_id, categories=categories, scope=scope,
                             domain=domain, observation_type=observation_type,
                             concepts=concepts, limit=limit, query=query,
+                            memory_kind=memory_kind,
                         )
                     )
             except Exception as e:
@@ -2583,6 +2666,7 @@ class MemoryService:
                             concepts=concepts,
                             limit=limit,
                             query_embedding=query_embedding,
+                            memory_kind=memory_kind,
                         )
                     )
                     vector_responses.extend(
@@ -2597,6 +2681,7 @@ class MemoryService:
                             concepts=concepts,
                             limit=limit,
                             query_embedding=query_embedding,
+                            memory_kind=memory_kind,
                         )
                     )
                 else:
@@ -2612,6 +2697,7 @@ class MemoryService:
                             concepts=concepts,
                             limit=limit,
                             query_embedding=query_embedding,
+                            memory_kind=memory_kind,
                         )
                     )
             except Exception as e:
@@ -2646,6 +2732,7 @@ class MemoryService:
                         concepts=concepts,
                         limit=limit,
                         query_embedding=query_embedding,
+                        memory_kind=memory_kind,
                     )
                 )
             except Exception as e:
@@ -2768,11 +2855,16 @@ class MemoryService:
 
         # memory_kind filter (data-layer connectors). Legacy memories have no
         # memory_kind, so a "fact" filter treats null as fact (back-compat);
-        # "passage" matches only explicitly-tagged passages.
+        # "passage"/"detail" match only explicitly-tagged rows (for "detail"
+        # this is a belt-and-braces backstop — the index filter above already
+        # restricted the vector pools to detail rows, and the graph pass was
+        # skipped).
         if memory_kind == "fact":
             combined = [r for r in combined if (r.memory_kind or "fact") == "fact"]
         elif memory_kind == "passage":
             combined = [r for r in combined if r.memory_kind == "passage"]
+        elif memory_kind == "detail":
+            combined = [r for r in combined if r.memory_kind == "detail"]
 
         results = combined[:limit]
 
@@ -4058,7 +4150,14 @@ class MemoryService:
             must_not=[
                 FieldCondition(
                     key="metadata.dream_tombstoned", match=MatchValue(value=True)
-                )
+                ),
+                # Detail channel: the grep pass feeds ask's evidence with a
+                # ~20-row limit — detail rows entering here would bypass the
+                # capped detail leg, so they're excluded like every main-recall
+                # path (the leg is the ONLY door into the channel).
+                FieldCondition(
+                    key="metadata.memory_kind", match=MatchValue(value="detail")
+                ),
             ],
         )
 

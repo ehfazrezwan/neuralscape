@@ -18,7 +18,14 @@ logger = logging.getLogger(__name__)
 # Extraction prompt
 # ──────────────────────────────────────────────
 
-CODING_ASSISTANT_EXTRACTION_PROMPT = """You are a memory extraction engine for an AI assistant. The user may be coding, doing research, running meetings, writing, or any other knowledge work — extract memories that fit the broad context, not just code.
+# Split into BODY + TAIL so the detail-channel addendum can be spliced between
+# the facts contract and the conversation without touching a byte of either
+# (the public constant below remains the exact composed prompt). The facts
+# instructions must stay byte-identical whether or not the detail channel is
+# on — a "capture micro-details too" rule folded INTO the facts contract was
+# measured NET-NEGATIVE on DMR (extra facts dilute top-k retrieval).
+
+_EXTRACTION_PROMPT_BODY = """You are a memory extraction engine for an AI assistant. The user may be coding, doing research, running meetings, writing, or any other knowledge work — extract memories that fit the broad context, not just code.
 
 Analyze the conversation below and extract distinct, factual memories about the user, their preferences, projects, and environment.
 
@@ -56,10 +63,53 @@ Respond with a JSON object:
     ]
 }
 
-If no memorable facts can be extracted, return: {"facts": []}
+If no memorable facts can be extracted, return: {"facts": []}"""
+
+_EXTRACTION_PROMPT_TAIL = """
 
 CONVERSATION:
 """
+
+CODING_ASSISTANT_EXTRACTION_PROMPT = _EXTRACTION_PROMPT_BODY + _EXTRACTION_PROMPT_TAIL
+
+
+# ──────────────────────────────────────────────
+# Detail channel addendum (DMR experiment ledger, 2026-07)
+# ──────────────────────────────────────────────
+#
+# Distillation drops one-off micro-details (possession attributes, stated
+# reasons, gifts, fears, family/pet specifics) — ~half of residual benchmark
+# abstentions had the gold fact ABSENT from the store. The fix is a separate
+# ADDITIVE channel, never a denser facts contract: details land in their own
+# capped retrieval leg (see ask.py) so they cannot compete with core facts
+# for top-k rank. This addendum is spliced between the facts contract and the
+# conversation ONLY when EXTRACT_DETAIL_MEMORIES is on; it explicitly forbids
+# changing how "facts" are extracted.
+
+DETAIL_EXTRACTION_ADDENDUM = """
+
+DETAIL CHANNEL (additive — changes NOTHING about the "facts" rules above):
+In addition to "facts", return an OPTIONAL "details" array. A detail is a one-off
+concrete micro-specific stated in a single utterance that is too minor to be a core
+reusable fact on its own: colors, names, breeds, gifts given or received, stated
+reasons for a choice, fears, family/pet/student specifics, attributes of possessions.
+Capture each detail WITH its concrete specifics, as a standalone sentence that makes
+sense without the conversation.
+
+Rules for details:
+1. Extract "facts" exactly as instructed above — never move a fact into "details",
+   never omit a fact because a detail overlaps it.
+2. Each detail must preserve the concrete specific (the color, the name, the reason),
+   not a generalization of it.
+3. Skip anything already captured verbatim in "facts".
+
+Respond with the same JSON object, plus the optional array:
+{
+    "facts": ["[category] Fact description here"],
+    "details": ["One-off concrete micro-detail sentence here"]
+}
+
+If there are no such micro-details, return "details": []"""
 
 
 # ──────────────────────────────────────────────
@@ -159,6 +209,44 @@ def parse_extraction_response(response_text: str) -> list[tuple[str, str]]:
     return [parse_category_from_fact(f) for f in facts if f and isinstance(f, str)]
 
 
+def parse_extraction_response_with_details(
+    response_text: str,
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Parse the detail-channel extraction response: facts AND details.
+
+    Sibling of :func:`parse_extraction_response` — the facts leg delegates to
+    it verbatim (identical parse, identical fallbacks), and the optional
+    ``"details"`` array is read separately with the same fence tolerance.
+    A missing/malformed ``"details"`` value (non-list, non-string entries,
+    unparseable JSON) degrades to ``[]`` and can never break fact parsing.
+
+    Detail entries are run through :func:`parse_category_from_fact`, so an
+    optional ``[category]`` tag is honored and untagged details default to
+    ``personal_fact``.
+
+    Returns:
+        ``(facts, details)`` — both lists of (category, content) tuples.
+    """
+    facts = parse_extraction_response(response_text)
+    details: list[tuple[str, str]] = []
+    try:
+        text = response_text.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+        data = json.loads(text)
+        raw_details = data.get("details", [])
+        if isinstance(raw_details, list):
+            details = [
+                parse_category_from_fact(d)
+                for d in raw_details
+                if isinstance(d, str) and d.strip()
+            ]
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        details = []
+    return facts, details
+
+
 def split_into_windows(
     messages: list[dict],
     window_size: int,
@@ -191,6 +279,7 @@ def split_into_windows(
 def build_extraction_messages(
     conversation_messages: list[dict],
     operator_guidance: str | None = None,
+    include_details: bool = False,
 ) -> list[dict]:
     """Build the messages to send to the LLM for fact extraction.
 
@@ -199,6 +288,12 @@ def build_extraction_messages(
         operator_guidance: Optional E4 custom extraction instructions,
             appended as the clearly-delimited OPERATOR GUIDANCE addendum
             (never able to override the JSON output contract).
+        include_details: When True, splice the additive detail-channel
+            addendum between the facts contract and the conversation (the
+            conversation path passes ``settings.extract_detail_memories``
+            here). Default False keeps EVERY existing caller — ingest
+            extractors, ``extract_facts_only`` — byte-identical to the
+            facts-only prompt.
 
     Returns:
         Messages list formatted for the LLM API call.
@@ -210,6 +305,10 @@ def build_extraction_messages(
         content = msg.get("content", "")
         conversation_text += f"{role}: {content}\n"
 
-    content = CODING_ASSISTANT_EXTRACTION_PROMPT + conversation_text
+    if include_details:
+        prompt = _EXTRACTION_PROMPT_BODY + DETAIL_EXTRACTION_ADDENDUM + _EXTRACTION_PROMPT_TAIL
+    else:
+        prompt = CODING_ASSISTANT_EXTRACTION_PROMPT
+    content = prompt + conversation_text
     content = append_operator_guidance(content, operator_guidance)
     return [{"role": "user", "content": content}]

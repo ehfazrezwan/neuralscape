@@ -440,12 +440,14 @@ class TestTombstoneRevival:
         assert created is False
         assert responses[0].revived is True
         # tombstone cleared via an atomic nested-key merge (key="metadata"),
-        # NOT a whole-metadata replacement.
+        # NOT a whole-metadata replacement. Since audit 27 #30 the bump is a
+        # nested-key merge too, so the calls are told apart by payload keys.
         set_payload_calls = (
             service._memory.vector_store.client.set_payload.call_args_list
         )
+        assert all(c.kwargs.get("key") == "metadata" for c in set_payload_calls)
         revive_calls = [
-            c for c in set_payload_calls if c.kwargs.get("key") == "metadata"
+            c for c in set_payload_calls if "dream_tombstoned" in c.kwargs["payload"]
         ]
         assert len(revive_calls) == 1
         assert revive_calls[0].kwargs["payload"]["dream_tombstoned"] is False
@@ -454,11 +456,9 @@ class TestTombstoneRevival:
         service._memory.vector_store.insert.assert_not_called()
         # re-derivation still reinforces the survivor
         bump_calls = [
-            c for c in set_payload_calls if c.kwargs.get("key") != "metadata"
+            c for c in set_payload_calls if "times_derived" in c.kwargs["payload"]
         ]
-        assert bump_calls and bump_calls[0].kwargs["payload"]["metadata"][
-            "times_derived"
-        ] == 2
+        assert bump_calls and bump_calls[0].kwargs["payload"]["times_derived"] == 2
 
     def test_live_dedup_hit_is_not_marked_revived(self, service):
         existing = MemoryResponse(
@@ -478,7 +478,7 @@ class TestTombstoneRevival:
         revive_calls = [
             c
             for c in service._memory.vector_store.client.set_payload.call_args_list
-            if c.kwargs.get("key") == "metadata"
+            if "dream_tombstoned" in c.kwargs["payload"]
         ]
         assert revive_calls == []
 

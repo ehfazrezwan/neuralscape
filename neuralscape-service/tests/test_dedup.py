@@ -445,9 +445,10 @@ class TestExactDedupReinforcement:
         service._memory.vector_store.client.set_payload.assert_called_once()
         kwargs = service._memory.vector_store.client.set_payload.call_args.kwargs
         assert kwargs["points"] == ["p3"]
-        # survivor(1) + p1(1) + p2(1) = 3; merge preserved existing metadata
-        assert kwargs["payload"]["metadata"]["times_derived"] == 3
-        assert kwargs["payload"]["metadata"]["scope"] == "global"
+        # survivor(1) + p1(1) + p2(1) = 3; nested-key merge (audit 27 #30)
+        # touches ONLY the counter — existing metadata survives server-side
+        assert kwargs["key"] == "metadata"
+        assert kwargs["payload"] == {"times_derived": 3}
 
     def test_dropped_duplicate_counters_sum_not_count(self, service):
         """A dropped dup that already accumulated reinforcements transfers
@@ -467,7 +468,8 @@ class TestExactDedupReinforcement:
 
         kwargs = service._memory.vector_store.client.set_payload.call_args.kwargs
         assert kwargs["points"] == ["p2"]
-        assert kwargs["payload"]["metadata"]["times_derived"] == 6  # 2 + 4
+        assert kwargs["key"] == "metadata"  # nested-key merge (audit 27 #30)
+        assert kwargs["payload"] == {"times_derived": 6}  # 2 + 4
 
     def test_no_duplicates_no_bump(self, service):
         memories = [
@@ -517,7 +519,8 @@ class TestSemanticDedupReinforcement:
         assert result["semantic_duplicates_removed"] == 1
         kwargs = service._memory.vector_store.client.set_payload.call_args.kwargs
         assert kwargs["points"] == ["p2"]
-        assert kwargs["payload"]["metadata"]["times_derived"] == 4  # 1 + 3
+        assert kwargs["key"] == "metadata"  # nested-key merge (audit 27 #30)
+        assert kwargs["payload"] == {"times_derived": 4}  # 1 + 3
 
 
 class TestWritePathReinforcement:
@@ -538,7 +541,8 @@ class TestWritePathReinforcement:
         assert responses[0].id == "exist1"
         kwargs = service._memory.vector_store.client.set_payload.call_args.kwargs
         assert kwargs["points"] == ["exist1"]
-        assert kwargs["payload"]["metadata"]["times_derived"] == 2
+        assert kwargs["key"] == "metadata"  # nested-key merge (audit 27 #30)
+        assert kwargs["payload"] == {"times_derived": 2}
         # dedup hit must not insert a new row
         service._memory.vector_store.insert.assert_not_called()
 

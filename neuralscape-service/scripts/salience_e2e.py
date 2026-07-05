@@ -166,6 +166,8 @@ async def main() -> int:
     if batch is None:
         check("pool enumerated", False, f"{POOL} missing from {sorted(pools)}")
     else:
+        # enumeration is light post-audit-#29 — hydrate full rows before staging
+        batch = await asyncio.to_thread(consolidate.hydrate_pool, service, batch)
         staged = await asyncio.to_thread(
             consolidate.stage_pool, batch, r,
             last_dreamt_at=time.time() - 86400,   # everything back-dated is "old"

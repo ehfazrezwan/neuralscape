@@ -468,9 +468,9 @@ async def test_apply_actions_merge_sums_times_derived():
     assert upserted.id == "a"
     assert upserted.payload["data"] == "merged fact"
     assert upserted.payload["metadata"]["times_derived"] == 6
-    # losers tombstoned, not counted twice
+    # losers tombstoned, not counted twice (nested-key patch, audit 27 #30)
     tombstoned = {
-        call.kwargs["points"][0]: call.kwargs["payload"]["metadata"]
+        call.kwargs["points"][0]: call.kwargs["payload"]
         for call in client.set_payload.call_args_list
     }
     assert set(tombstoned) == {"b", "c"}
@@ -577,7 +577,11 @@ def test_stage_pool_guards_and_gates(monkeypatch):
                                 "last_recalled_at": 0.0} for i in ids},
     )
     now = time.time()
-    recent = "2026-07-04T00:00:00+00:00"
+    from datetime import datetime, timezone
+
+    # Derived from the captured `now`, not a hardcoded date — the literal
+    # "2026-07-04" became stale (older than the staging window) on 07-05.
+    recent = datetime.fromtimestamp(now - 3600, tz=timezone.utc).isoformat()
     ancient = "2024-01-01T00:00:00+00:00"
     batch = _batch([
         {"memory_id": "new1", "content": "n", "created_at": recent,
