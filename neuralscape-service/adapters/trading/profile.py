@@ -18,7 +18,6 @@ from __future__ import annotations
 from adapters.base import KnowledgeAdapter, register_adapter
 from ingest.chunking_strategies import register_chunking_strategy
 from ingest.extractors import register_extractor
-from schemas import register_categories
 
 from adapters.trading.chunking import SectionAwareStrategy
 from adapters.trading.extractor import TradingStrategyExtractor
@@ -49,11 +48,12 @@ TRADING_CATEGORIES: dict[str, str] = {
 
 
 def _register() -> KnowledgeAdapter:
-    # Trading categories are reference knowledge — keep them flexible (scope
-    # follows the caller's project_id, like domain_knowledge) rather than forcing
-    # global/project. Not added to CATEGORY_VAULT_PATHS (see module docstring).
-    register_categories(TRADING_CATEGORIES)
-
+    # Trading categories are reference knowledge — the profile deliberately
+    # declares NO global/project scope sets, keeping them flexible (scope
+    # follows the caller's project_id, like domain_knowledge). Taxonomy
+    # registration happens inside register_adapter — the profile is the source
+    # of truth (audit 27 #36). Not added to CATEGORY_VAULT_PATHS (see module
+    # docstring).
     register_chunking_strategy(SectionAwareStrategy.name, SectionAwareStrategy())
     register_extractor(TradingStrategyExtractor.name, TradingStrategyExtractor())
 

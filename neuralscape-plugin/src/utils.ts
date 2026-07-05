@@ -110,7 +110,8 @@ export interface HookOutput {
 
 export interface NeuralscapeMemory {
   id: string;
-  memory: string;
+  /** Full content. Absent/empty on index-level rows (`fields=index`). */
+  memory?: string;
   category?: string;
   scope?: string;
   project_id?: string;
@@ -253,14 +254,26 @@ export function isProjectExcluded(projectId: string | undefined): boolean {
 
 /**
  * Redact `<private>…</private>` spans from text the plugin is about to
- * store or transmit. Fail-closed: an unclosed `<private>` redacts to the
- * end of the string. Case-insensitive. Idempotent.
+ * store or transmit. Case-insensitive. Idempotent.
+ *
+ * Matched OPEN…CLOSE pairs redact exactly their span. An UNMATCHED opener
+ * (e.g. prose *about* the tag: "use <private> to mark secrets") is bounded
+ * (audit 27 #34a): it redacts at most through the next sentence boundary or
+ * end of line — never to end-of-string — and leaves a `[redacted:unclosed]`
+ * warning marker so the truncation is visible instead of silently eating
+ * the rest of the transcript.
  */
 export function redactPrivate(text: string): string {
   if (typeof text !== "string" || !/<private>/i.test(text)) return text;
-  return text
-    .replace(/<private>[\s\S]*?<\/private>/gi, "[redacted]")
-    .replace(/<private>[\s\S]*$/i, "[redacted]");
+  return (
+    text
+      .replace(/<private>[\s\S]*?<\/private>/gi, "[redacted]")
+      // Remaining openers are unmatched: consume within the current line up
+      // to the earliest of (a) a sentence end ([.!?] before whitespace/EOL)
+      // or (b) the end of the line. `[^\n]*?` cannot cross a newline, so a
+      // stray opener can never swallow subsequent lines.
+      .replace(/<private>[^\n]*?(?:[.!?](?=\s|$)|(?=\n)|$)/gi, "[redacted:unclosed]")
+  );
 }
 
 /* v8 ignore start — pre-existing utility, exercised by integration only */
@@ -698,6 +711,69 @@ export async function recordGatedFile(sessionId: string, filePath: string): Prom
     await writeFile(getReadGateStatePath(sessionId), JSON.stringify([...gated]), "utf-8");
   } catch (error) {
     logError("recordGatedFile failed", error);
+  }
+}
+
+// ── Read-gate session index cache (audit 27 #31) ─────────────────
+//
+// The candidate-memory fetch happens AT MOST ONCE per session AND project:
+// the first gateable Read fetches the index-level rows and caches them
+// here; every later Read (any file) in the same project matches against
+// the cache with zero network I/O. The key includes the resolved project
+// id (Copilot, PR #126): a session whose cwd moves to a different repo
+// must NOT be steered by the previous project's rows — the switch triggers
+// exactly one fresh project-scoped fetch. A failed/timed-out fetch caches
+// a failure sentinel — the gate then stays quiet for that project for the
+// rest of the session instead of re-paying the round trip on every
+// large-file Read while the service is down.
+
+export interface ReadGateIndexCache {
+  /** False when the one fetch failed/timed out (gate stays quiet). */
+  ok: boolean;
+  fetchedAt: string;
+  rows: NeuralscapeMemory[];
+}
+
+export function getReadGateCachePath(sessionId: string, projectId?: string): string {
+  const project = safeSessionName(projectId || "global");
+  return pathJoin(
+    getObservationDir(),
+    `${safeSessionName(sessionId)}.${project}.readgate-index.json`,
+  );
+}
+
+export async function loadReadGateIndexCache(
+  sessionId: string,
+  projectId?: string,
+): Promise<ReadGateIndexCache | null> {
+  try {
+    const raw = await readFile(getReadGateCachePath(sessionId, projectId), "utf-8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && typeof parsed.ok === "boolean") {
+      return {
+        ok: parsed.ok,
+        fetchedAt: typeof parsed.fetchedAt === "string" ? parsed.fetchedAt : "",
+        rows: Array.isArray(parsed.rows) ? (parsed.rows as NeuralscapeMemory[]) : [],
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveReadGateIndexCache(
+  sessionId: string,
+  projectId: string | undefined,
+  ok: boolean,
+  rows: NeuralscapeMemory[],
+): Promise<void> {
+  try {
+    await mkdir(getObservationDir(), { recursive: true });
+    const payload: ReadGateIndexCache = { ok, fetchedAt: new Date().toISOString(), rows };
+    await writeFile(getReadGateCachePath(sessionId, projectId), JSON.stringify(payload), "utf-8");
+  } catch (error) {
+    logError("saveReadGateIndexCache failed", error);
   }
 }
 

@@ -33,9 +33,19 @@ from dataclasses import dataclass, field
 
 from pydantic import BaseModel
 
-from schemas import MEMORY_CATEGORIES
+from schemas import MEMORY_CATEGORIES, register_categories
 
 DEFAULT_ADAPTER_NAME = "default"
+
+
+class UnknownAdapterError(LookupError):
+    """A non-default adapter name that isn't registered in this process.
+
+    Raised by :func:`require_adapter` on the queued-job paths (ingest pipeline,
+    graph enrichment): silently degrading to the default taxonomy would ingest
+    a document *without* the taxonomy/ontology the caller asked for — far worse
+    than failing the task loudly (audit 27 #36).
+    """
 
 
 @dataclass(frozen=True)
@@ -57,6 +67,16 @@ class KnowledgeAdapter:
     # membership check and the fact parser both accept them; this field is the
     # adapter-local view used for prompts/docs.
     categories: dict[str, str] = field(default_factory=dict)
+
+    # Scope declaration for the adapter's categories (audit 27 #36): which of
+    # ``categories`` default to global / project scope. Categories in neither
+    # set are *flexible* (scope follows the caller's ``project_id``, like
+    # ``domain_knowledge``) — an explicit profile choice, not an accident of
+    # registration. ``register_adapter`` threads these into
+    # ``schemas.register_categories`` so ``default_scope_for_category`` answers
+    # from the adapter profile instead of defaulting adapter categories global.
+    global_categories: frozenset[str] = frozenset()
+    project_categories: frozenset[str] = frozenset()
 
     # ── (2) Chunking ── resolved from ingest.chunking_strategies
     chunking_strategy: str = "paragraph_aware"
@@ -142,20 +162,55 @@ def register_adapter(adapter: KnowledgeAdapter) -> None:
 
     Idempotent — re-registering the same name overwrites, so a module that
     defines an adapter can be imported more than once without error.
+
+    Also registers the adapter's taxonomy (categories + their declared scopes)
+    into the shared registries in :mod:`schemas`, making the adapter profile
+    the single source of truth for category scope (audit 27 #36).
     """
     ADAPTER_REGISTRY[adapter.name] = adapter
+    if adapter.categories:
+        register_categories(
+            adapter.categories,
+            global_categories=set(adapter.global_categories) or None,
+            project_categories=set(adapter.project_categories) or None,
+        )
 
 
 def get_adapter(name: str | None = DEFAULT_ADAPTER_NAME) -> KnowledgeAdapter:
     """Resolve an adapter by name, falling back to the default.
 
-    A ``None`` or unknown name resolves to :data:`DEFAULT_ADAPTER` so a stale
-    or typo'd ``adapter=`` value degrades to current behavior instead of failing
-    an ingest.
+    A ``None`` or unknown name resolves to :data:`DEFAULT_ADAPTER`. Use this
+    only where degrading to the default taxonomy is genuinely acceptable —
+    queued jobs must use :func:`require_adapter` instead so a job whose adapter
+    failed to register fails loudly rather than silently ingesting under the
+    wrong taxonomy (audit 27 #36).
     """
     if not name:
         return DEFAULT_ADAPTER
     return ADAPTER_REGISTRY.get(name, DEFAULT_ADAPTER)
+
+
+def require_adapter(name: str | None = DEFAULT_ADAPTER_NAME) -> KnowledgeAdapter:
+    """Resolve an adapter by name, raising on unknown non-default names.
+
+    The strict twin of :func:`get_adapter` for the queued-job paths (document
+    ingest, deferred graph enrichment): ``None``/``"default"`` resolve to the
+    default adapter, but a named adapter that isn't registered in this process
+    (failed import, missing optional extra, removed adapter) raises
+    :class:`UnknownAdapterError` so the task FAILS with a clear error instead
+    of silently falling back to the default taxonomy.
+    """
+    if not name or name == DEFAULT_ADAPTER_NAME:
+        return DEFAULT_ADAPTER
+    try:
+        return ADAPTER_REGISTRY[name]
+    except KeyError:
+        raise UnknownAdapterError(
+            f"Knowledge adapter {name!r} is not registered in this process "
+            f"(available: {list_adapters()}). The adapter may have failed to "
+            "import or its optional dependency is not installed — refusing to "
+            "fall back to the default taxonomy for a queued job."
+        ) from None
 
 
 def list_adapters() -> list[str]:

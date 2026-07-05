@@ -31,7 +31,7 @@ from config import settings
 from extensions import ExtensionRegistry
 from extensions.events import EventType, EVENT_PAYLOAD_MODELS
 from logging_config import configure_logging
-from memory_service import MemoryService
+from memory_service import get_shared_service
 
 # Configure structured logging before anything else
 configure_logging()
@@ -81,8 +81,9 @@ from task_manager import TaskManager
 
 logger = logging.getLogger(__name__)
 
-# Shared service instance
-_service = MemoryService()
+# Shared service instance — the SAME object the mounted MCP server uses
+# (audit 27 #35: one MemoryService per process, not one per surface).
+_service = get_shared_service()
 
 # Redis-backed task manager (initialized in lifespan)
 _task_manager = TaskManager()
@@ -2282,11 +2283,22 @@ async def v1_list_memories(
             "(hidden from listings and recall by default)."
         ),
     ),
+    fields: str = Query(
+        default="full",
+        pattern="^(full|index)$",
+        description=(
+            "'full' (default) returns complete rows; 'index' strips content "
+            "payloads down to index-level fields (id, title, category, tags, "
+            "timestamps, observation_type, token_estimate) — a fraction of "
+            "the bytes for clients that only need to scan/match, e.g. the "
+            "plugin file read gate (audit 27 #31)."
+        ),
+    ),
 ):
     """List memories with filters (scope, category, project_id)."""
     resolved_user_id = _resolve_user_id(request, user_id)
     try:
-        return await asyncio.to_thread(
+        rows = await asyncio.to_thread(
             _service.list_memories,
             user_id=resolved_user_id,
             scope=scope,
@@ -2295,6 +2307,21 @@ async def v1_list_memories(
             limit=limit,
             include_tombstoned=include_tombstoned,
         )
+        if fields == "index":
+            from index_format import distill_title
+
+            rows = [
+                row.model_copy(
+                    update={
+                        "memory": "",
+                        # Legacy rows without a write-time title still need a
+                        # scannable label — distill one server-side.
+                        "title": row.title or distill_title(row.memory),
+                    }
+                )
+                for row in rows
+            ]
+        return rows
     except HTTPException:
         raise
     except Exception as e:
