@@ -266,12 +266,43 @@ describe("redactPrivate", () => {
     expect(out).toBe("one [redacted] two [redacted] three");
   });
 
-  it("fails closed on an unclosed tag", () => {
-    expect(redactPrivate("head <private>tail without close")).toBe("head [redacted]");
+  it("bounds an unclosed tag to the current line/sentence, never to EOF (audit 27 #34)", () => {
+    // A stray literal <private> must not swallow the rest of the transcript.
+    const out = redactPrivate(
+      "The doc says use <private> to mark secrets.\nSecond line survives.\nThird line survives too.",
+    );
+    expect(out).toContain("Second line survives.");
+    expect(out).toContain("Third line survives too.");
+    expect(out).not.toContain("<private>");
+  });
+
+  it("unmatched opener redacts through the next sentence boundary with a warning marker", () => {
+    const out = redactPrivate("a <private>oops secret here. But this sentence stays.");
+    expect(out).toContain("[redacted:unclosed]");
+    expect(out).toContain("But this sentence stays.");
+    expect(out).not.toContain("oops secret here");
+  });
+
+  it("unmatched opener with no boundary redacts to end of that line only", () => {
+    expect(redactPrivate("head <private>tail without close")).toBe("head [redacted:unclosed]");
+    const multi = redactPrivate("head <private>tail without close\nnext line stays");
+    expect(multi).toBe("head [redacted:unclosed]\nnext line stays");
+  });
+
+  it("still redacts matched pairs fully even when an unmatched opener follows", () => {
+    const out = redactPrivate("a <private>s1</private> b <private>trailing");
+    expect(out).toBe("a [redacted] b [redacted:unclosed]");
+  });
+
+  it("is idempotent", () => {
+    const once = redactPrivate("a <private>s</private> b <private>c. d");
+    expect(redactPrivate(once)).toBe(once);
   });
 
   it("leaves clean text untouched", () => {
     expect(redactPrivate("nothing to hide")).toBe("nothing to hide");
     expect(redactPrivate("")).toBe("");
+    // A stray closer without an opener is inert (nothing to redact).
+    expect(redactPrivate("just a </private> closer")).toBe("just a </private> closer");
   });
 });

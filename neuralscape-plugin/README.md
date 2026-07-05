@@ -2,7 +2,7 @@
 
 Persistent agentic memory for **Claude Code** and **Claude Cowork**, backed by your own Neuralscape service (FastAPI + mem0 + Graphiti). In Claude Code, plugin hooks auto-capture your conversations and recall relevant context on every session start; in Claude Cowork (which doesn't run plugin hooks), the cross-platform skills drive the same recall/capture loop on demand through the MCP connector. Exposes the 8 Neuralscape MCP tools.
 
-- **What you get:** **progressive-disclosure memory injection** on `SessionStart` (a budget-bounded, day-grouped index of your memories — the map, not the payloads — plus your identity card and a "Previously…" block from the last session), a **File Read Gate** on `PreToolUse(Read)` (large files that already have memories get a ranked per-file memory timeline instead of a raw re-read — re-Read to override), conversation flush + compile on `Stop`, a **structured session summary** stored via one `checkpoint` call on `SessionEnd`, **incremental tool-observation capture on `PostToolUse` + threshold-driven compile on `UserPromptSubmit`** (no extra API cost — runs on your subscription), cross-platform MCP-driven skills (`recall`, `remember`, `save-session`, `project`, `search`, `ns-status`, `ns-config`) plus Claude-Code capture skills (`sync`, `capture`), and the Neuralscape MCP toolkit auto-wired via `.mcp.json`.
+- **What you get:** **progressive-disclosure memory injection** on `SessionStart` (a budget-bounded, day-grouped index of your memories — the map, not the payloads — plus your identity card and a "Previously…" block from the last session), a **File Read Gate** on `PreToolUse(Read)` (large files that already have memories get a ranked per-file memory timeline injected *alongside* the read — the read always proceeds), conversation flush + compile on `Stop`, a **structured session summary** stored via one `checkpoint` call on `SessionEnd`, **incremental tool-observation capture on `PostToolUse` + threshold-driven compile on `UserPromptSubmit`** (no extra API cost — runs on your subscription), cross-platform MCP-driven skills (`recall`, `remember`, `save-session`, `project`, `search`, `ns-status`, `ns-config`) plus Claude-Code capture skills (`sync`, `capture`), and the Neuralscape MCP toolkit auto-wired via `.mcp.json`.
 - **Where it stores:** in your own Neuralscape deployment. The plugin never sends data anywhere else.
 - **Cost:** zero additional. The plugin is a thin client over your service.
 
@@ -111,7 +111,7 @@ The plugin reaches your service via these calls:
 | Trigger | Endpoint | Purpose |
 |---|---|---|
 | SessionStart | `GET /v1/context/{project_id}` or `/v1/context/global` (+ `GET /v1/extensions/dreaming/card`, `GET /v1/code-graph/query` probe) | **Index mode (default):** inject a day-grouped, budget-bounded memory *index* (`#id \| time \| type \| title \| ~tokens`) with a savings header, the identity card(s) when the dreaming sweep has built them, a "Previously…" block from the last session note, and an escalation footer teaching `recall_memories(index_only=true)` → `get_memories(ids=[...])` → `timeline`. `CONTEXT_MODE=full` restores legacy full-content injection. Also flags any pending observation buffers from prior sessions. |
-| PreToolUse (Read) | `GET /v1/memories` (newest-first, project-scoped) | **File Read Gate:** when the target file is larger than `READ_GATE_MIN_BYTES` and stored memories reference it, the read is denied and replaced with a ranked per-file memory timeline (`#id \| when \| title \| ~tokens`) plus an escalation menu (`get_memories` → `timeline` → full re-Read). Fires at most once per file per session; the second Read of the same path always passes. |
+| PreToolUse (Read) | `GET /v1/memories?fields=index` (newest-first, project-scoped, once per session) | **File Read Gate (steering):** when the target file is larger than `READ_GATE_MIN_BYTES` and stored memories reference it (path-tail match, at least `dir/basename`), the hook injects `additionalContext` with a ranked per-file memory timeline (`#id \| when \| title \| ~tokens`) plus an escalation menu (`get_memories` → `timeline`) — **the Read always proceeds**. The index fetch happens at most once per session (cached), under a hard time budget; steering fires at most once per file per session. |
 | PostToolUse | (none — local file write) | Append `{tool, input, output, ts, project_id}` to per-session JSONL buffer. Filters read-only tools, harness plumbing (`SKIP_TOOLS`), and trivial Bash commands; truncates large outputs. |
 | UserPromptSubmit | (none — local check) | When the buffer crosses the threshold (default 25 obs or 30 min old), prepends an `additionalContext` instruction asking Claude to compile the buffer using the `compile-observations` skill before responding. |
 | compile-observations skill | `POST /v1/memories/raw` (via `mcp__plugin_neuralscape_neuralscape__remember`) | Claude reads the buffer, applies the quality rubric, and submits one wiki-quality memory per significant work unit. Backend embeds and stores — **no Gemini call**. |
@@ -189,6 +189,7 @@ The plugin reads from `userConfig` prompts (modern) or env vars (legacy fallback
 | Code-graph deferral | `CLAUDE_PLUGIN_OPTION_CODE_GRAPH` (`auto` default \| `on` \| `off`) | `NEURALSCAPE_CODE_GRAPH` |
 | File read gate | `CLAUDE_PLUGIN_OPTION_READ_GATE_ENABLED` (default `true`) | `NEURALSCAPE_READ_GATE_ENABLED` |
 | Read gate min size (bytes) | `CLAUDE_PLUGIN_OPTION_READ_GATE_MIN_BYTES` (default `1500`) | `NEURALSCAPE_READ_GATE_MIN_BYTES` |
+| Read gate fetch budget (ms) | `CLAUDE_PLUGIN_OPTION_READ_GATE_TIME_BUDGET_MS` (default `2000`) | `NEURALSCAPE_READ_GATE_TIME_BUDGET_MS` |
 | Excluded projects (globs) | `CLAUDE_PLUGIN_OPTION_EXCLUDED_PROJECTS` (comma-separated, `*`/`?` wildcards) | `NEURALSCAPE_EXCLUDED_PROJECTS` (or `NS_EXCLUDED_PROJECTS`) |
 | Extra skip-tools (capture) | `CLAUDE_PLUGIN_OPTION_SKIP_TOOLS` (comma-separated, additive) | `NEURALSCAPE_SKIP_TOOLS` |
 | Fail-loud threshold | `CLAUDE_PLUGIN_OPTION_FAIL_LOUD_THRESHOLD` (default `3`) | `NEURALSCAPE_FAIL_LOUD_THRESHOLD` |
@@ -225,18 +226,18 @@ basenames and memories fragment). Resolution precedence:
 
 When Claude is about to `Read` a file **larger than `READ_GATE_MIN_BYTES`
 (default 1500)** that Neuralscape already holds memories about, the gate
-denies the read and substitutes a ranked per-file memory timeline — the
-memories usually answer the question for a fraction of the tokens:
+**steers**: it injects `additionalContext` with a ranked per-file memory
+timeline alongside the read — **the Read itself always proceeds** (it is
+never denied, and memories are never substituted for real file contents):
 
 ```text
-[Neuralscape Read Gate] Skipped reading `src/worker.ts` (14.2 KB) — 3 stored memories reference this file. …
+[Neuralscape] 3 stored memories reference `src/worker.ts` — prior context that may complement the file you are reading:
 
 `#id | when | title | ~tokens`
 #a1b2… | 2d | 🐛 Fixed queue-starvation race in worker.ts | ~120
 #c3d4… | 5d | 🔍 worker.ts drains the retry queue before shutdown | ~90
 
 Details: get_memories with ids for full payloads; timeline for surrounding history; …
-Override: just Read the same path again — the retry is always allowed …
 ```
 
 Behavior details:
@@ -244,21 +245,26 @@ Behavior details:
 - **Ranking:** memories that *modified* the file (`observation_type` in
   bugfix/feature/refactor, or modification verbs in the content) outrank ones
   that merely read it; memories mentioning fewer files rank higher
-  (specificity); capped at 10 rows.
+  (specificity), deeper path-tail matches higher still; capped at 10 rows.
 - **File-reference signal:** NS memories carry no structured
   `files_read`/`files_modified` metadata — paths survive only in memory
-  content/title/tags. The gate fetches the newest 500 project-scoped
-  memories (the fast `GET /v1/memories` list, ~100ms; the hybrid
-  `POST /v1/search` also runs a Graphiti pass whose latency routinely
-  exceeds the PreToolUse budget) and keeps only ones that literally contain
-  the file's basename. That is the strongest signal the current memory
-  schema provides.
-- **Never in your way:** fires at most **once per file per session**; the
-  **second Read of the same path always passes** (that *is* the override —
-  just read again). Small files, binary/media extensions, excluded projects,
-  and an unreachable service all bypass the gate entirely (allow, exit 0).
+  content/title/tags. The gate matches **path tails** (at least
+  `dir/basename`, e.g. `src/worker.ts`; a bare basename is only used for
+  single-segment paths) so same-named files elsewhere in the repo don't
+  produce false references.
+- **Hot-path cost:** the index fetch (`GET /v1/memories?fields=index`,
+  newest 150 project-scoped index rows — no content payloads) happens **at
+  most once per session per project** and is cached (switching your cwd to a
+  different repo mid-session triggers one fresh fetch for that project);
+  later Reads match in-process. The one fetch runs under a hard time budget
+  (`READ_GATE_TIME_BUDGET_MS`, default 2000 ms) — on timeout or error the
+  hook exits 0 and the gate stays quiet for that project for the rest of the
+  session.
+- **Never in your way:** steering fires at most **once per file per
+  session**. Small files, binary/media extensions, excluded projects, and an
+  unreachable service all bypass the gate entirely (allow, exit 0).
 - Disable with `READ_GATE_ENABLED=false`; tune the size floor with
-  `READ_GATE_MIN_BYTES`.
+  `READ_GATE_MIN_BYTES` and the fetch budget with `READ_GATE_TIME_BUDGET_MS`.
 
 ## Excluded projects
 

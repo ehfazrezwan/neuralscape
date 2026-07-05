@@ -26,21 +26,43 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
-import adapters  # noqa: F401 — registers knowledge-adapter taxonomies at import (deterministic MEMORY_CATEGORIES + tool enums)
+import adapters  # noqa: F401 — registers knowledge-adapter taxonomies at import (deterministic MEMORY_CATEGORIES for validation; tool enums stay core-13)
 from config import settings
-from memory_service import MemoryService
-from schemas import MEMORY_CATEGORIES
+from memory_service import get_shared_service
+from schemas import CORE_MEMORY_CATEGORIES
 from task_manager import TaskManager
 
 logger = logging.getLogger(__name__)
 
 server = Server("neuralscape-memory")
 
-# Shared service instance
-_service = MemoryService()
+# Shared service instance — the SAME object main.py's REST routes use when
+# this server is mounted at /mcp/ (audit 27 #35: one MemoryService per
+# process; previously the MCP surface cold-initialized a second full
+# mem0/Graphiti stack on its first tool call).
+_service = get_shared_service()
 
 # Task manager for async memory operations (initialized at startup)
 _task_manager = TaskManager()
+
+# Process-lifetime ARQ pool for schedule_dream enqueues (audit 27 #35:
+# previously a fresh Redis connection was created and torn down per call).
+_arq_pool = None
+_arq_pool_lock = asyncio.Lock()
+
+
+async def _get_arq_pool():
+    """Lazily create (once) and reuse the ARQ Redis pool for job enqueues."""
+    global _arq_pool
+    if _arq_pool is None:
+        async with _arq_pool_lock:
+            if _arq_pool is None:
+                import arq
+
+                from config import parse_redis_settings
+
+                _arq_pool = await arq.create_pool(parse_redis_settings())
+    return _arq_pool
 
 
 def _meter_mcp_index_bg(op: str, user_id: str, hits, body: dict) -> None:
@@ -125,11 +147,14 @@ async def list_tools() -> list[Tool]:
                 "Search across the user's global and project-specific memories using semantic search. "
                 "ALWAYS call this tool before starting work on a task to load relevant context about "
                 "user preferences, project conventions, tech stack, and past decisions. "
-                "PREFER the token-efficient 3-layer workflow: (1) search with index_only=true to get a "
-                "compact index — {id, title, category, glyph, age, tokens, score} per hit, ~50-100 tokens "
-                "each instead of full payloads; (2) filter the index by title/category/age/token cost; "
-                "(3) call get_memories(ids=[...]) for full payloads of ONLY the hits you actually need. "
-                "NEVER fetch full details without filtering first when you expect many hits. "
+                "For broad scans, PREFER the token-efficient 3-layer workflow: (1) search with "
+                "index_only=true to get a compact index — {id, title, category, glyph, age, tokens, "
+                "score} per hit, ~50-100 tokens each instead of full payloads; (2) filter the index by "
+                "title/category/age/token cost; (3) call get_memories(ids=[...]) for full payloads of "
+                "the hits you need. This is guidance, not a gate: titles are lossy ~10-word summaries, "
+                "so when a title looks even plausibly relevant, fetch its full content rather than "
+                "ruling it out from the title alone — a full payload costs ~5-20x an index row, cheap "
+                "next to missing the memory you needed. "
                 "When project_id is provided, searches both global user memories and project-specific memories, "
                 "returning the most relevant results sorted by relevance score. "
                 "Full (non-index) results include a 'source' field: 'graph' results come from the knowledge "
@@ -204,8 +229,10 @@ async def list_tools() -> list[Tool]:
                 "Returns every stored field — content, category, tags, memory-model v2 fields, provenance "
                 "(derived_from, epistemic_level, source_ref), visibility, owner. Max 50 ids per call. "
                 "Ids that don't exist or that you may not read (another user's private memory) are "
-                "returned in 'missing'. NEVER fetch full details without filtering the index first — "
-                "each full payload costs 5-20x an index row."
+                "returned in 'missing'. Prefer filtering the index first on broad scans (each full "
+                "payload costs ~5-20x an index row in tokens), but don't hesitate to expand any id "
+                "whose title looks relevant — titles are lossy ~10-word summaries and the index "
+                "can't show what a memory actually says."
             ),
             inputSchema={
                 "type": "object",
@@ -290,9 +317,12 @@ async def list_tools() -> list[Tool]:
                         "description": (
                             "Memory category. One of: preference, personal_fact, technical_skill, "
                             "domain_knowledge, tech_stack, convention, architecture, dependency, "
-                            "decision, interaction, workflow, procedure, task_context"
+                            "decision, interaction, workflow, procedure, task_context. Categories "
+                            "registered by an installed knowledge adapter (e.g. the trading "
+                            "taxonomy) are also accepted server-side even though only the core 13 "
+                            "are advertised here."
                         ),
-                        "enum": list(MEMORY_CATEGORIES.keys()),
+                        "enum": list(CORE_MEMORY_CATEGORIES),
                     },
                     "project_id": {
                         "type": "string",
@@ -483,7 +513,7 @@ async def list_tools() -> list[Tool]:
                     "category": {
                         "type": "string",
                         "description": "Category for produced memories (default: domain_knowledge)",
-                        "enum": list(MEMORY_CATEGORIES.keys()),
+                        "enum": list(CORE_MEMORY_CATEGORIES),
                     },
                     "project_id": {"type": "string", "description": "Project id (sets project scope)"},
                     "scope": {"type": "string", "enum": ["global", "project"]},
@@ -520,7 +550,7 @@ async def list_tools() -> list[Tool]:
                     "category": {
                         "type": "string",
                         "description": "Category for produced memories (default: domain_knowledge)",
-                        "enum": list(MEMORY_CATEGORIES.keys()),
+                        "enum": list(CORE_MEMORY_CATEGORIES),
                     },
                     "project_id": {"type": "string", "description": "Project id (sets project scope)"},
                     "scope": {"type": "string", "enum": ["global", "project"]},
@@ -622,7 +652,7 @@ async def list_tools() -> list[Tool]:
                     "category": {
                         "type": "string",
                         "description": "Filter by category",
-                        "enum": list(MEMORY_CATEGORIES.keys()),
+                        "enum": list(CORE_MEMORY_CATEGORIES),
                     },
                     "project_id": {
                         "type": "string",
@@ -1005,7 +1035,7 @@ async def list_tools() -> list[Tool]:
                                 "content": {"type": "string", "description": "The fact to remember"},
                                 "category": {
                                     "type": "string",
-                                    "enum": list(MEMORY_CATEGORIES.keys()),
+                                    "enum": list(CORE_MEMORY_CATEGORIES),
                                 },
                                 "project_id": {"type": "string"},
                                 "tags": {"type": "array", "items": {"type": "string"}},
@@ -1773,21 +1803,16 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 return [TextContent(type="text", text=json.dumps({
                     "error": "DREAMING_ENABLED=false — set the env var (or force=true) to run"
                 }))]
-            from arq import create_pool
-
-            from config import parse_redis_settings
-
-            arq_pool = await create_pool(parse_redis_settings())
-            try:
-                job = await arq_pool.enqueue_job(
-                    "run_dream_sweep",
-                    arguments.get("pool"),
-                    bool(arguments.get("dry_run", False)),
-                    force,
-                    _queue_name=settings.graph_queue_name,
-                )
-            finally:
-                await arq_pool.close()
+            # Reuse the process-lifetime pool (audit 27 #35) — no per-call
+            # connect/teardown on this path.
+            arq_pool = await _get_arq_pool()
+            job = await arq_pool.enqueue_job(
+                "run_dream_sweep",
+                arguments.get("pool"),
+                bool(arguments.get("dry_run", False)),
+                force,
+                _queue_name=settings.graph_queue_name,
+            )
             return [TextContent(type="text", text=json.dumps({
                 "status": "enqueued",
                 "job_id": job.job_id if job else None,

@@ -8,6 +8,7 @@
  * Runs async (fire-and-forget) so it never blocks the caller.
  */
 
+import { commitClaudeCodeFlush } from "../adapters/claude-code.js";
 import { detectClient, getTurnExtractor } from "../adapters/detect.js";
 import { flushTurns } from "../core/flush.js";
 import {
@@ -38,7 +39,13 @@ async function main(): Promise<void> {
     const client = detectClient(raw);
     const extractor = getTurnExtractor(client);
     const turns = await extractor(raw);
-    await flushTurns(turns);
+    const result = await flushTurns(turns);
+    // Persist the transcript cursor only past delivered turns (audit 27
+    // #34b) — without this commit the offset file is never written and
+    // every flush re-reads the transcript from zero.
+    if (client === "claude-code") {
+      await commitClaudeCodeFlush(raw, result);
+    }
   } catch (error) {
     logError("conversation-turn hook failed", error);
   }

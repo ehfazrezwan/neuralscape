@@ -62,8 +62,6 @@ _JUNK_PATTERNS = [
 ]
 _JUNK_RE = re.compile("|".join(_JUNK_PATTERNS), re.IGNORECASE | re.MULTILINE)
 
-# All known project group IDs for multi-group episode cleanup
-ALL_KNOWN_PROJECTS = ["svc-utility-belt", "lightpath", "neuralscape", "openclaw"]
 
 # Tags that mark a `standard` as ALWAYS-INJECT (surfaced in the session-start
 # context regardless of relevance). Every other standard stays out of the
@@ -396,19 +394,13 @@ def _clean_conversation_for_graph(messages: list[dict]) -> list[dict]:
     return cleaned
 
 
-# Known project slugs for project_id inference
-_KNOWN_PROJECT_SLUGS = [
-    "svc-utility-belt",
-    "lightpath",
-    "neuralscape",
-    "openclaw",
-]
-
-
 def _infer_project_id(content: str) -> str | None:
-    """Try to infer a project_id from memory content by matching known project slugs."""
+    """Try to infer a project_id from memory content by matching known project slugs.
+
+    Slugs are deployment-specific and come from KNOWN_PROJECT_SLUGS.
+    """
     content_lower = content.lower()
-    for slug in _KNOWN_PROJECT_SLUGS:
+    for slug in settings.known_projects:
         if slug in content_lower:
             return slug
     return None
@@ -5299,7 +5291,8 @@ class MemoryService:
             project_ids_to_scan = [project_id]
         else:
             # None = global group, then all known projects
-            project_ids_to_scan = [None] + ALL_KNOWN_PROJECTS
+            # (deployment-specific, supplied via KNOWN_PROJECT_SLUGS)
+            project_ids_to_scan = [None] + settings.known_projects
 
         breakdown = {}
         total_junk = 0
@@ -5898,3 +5891,32 @@ class MemoryService:
         # Sort by score (descending) if available
         merged.sort(key=lambda x: x.get("score", 0) or 0, reverse=True)
         return merged
+
+
+# ──────────────────────────────────────────────
+# Shared process-wide instance (audit 27 #35)
+# ──────────────────────────────────────────────
+#
+# main.py (REST) and mcp_server.py (mounted MCP transport) run in the SAME
+# process; each holding its own MemoryService used to double every lazy-init
+# (two mem0/Graphiti stacks, two embedder clients) and split warm caches.
+# Both now resolve the one instance below. Workers still construct their own
+# service explicitly (separate processes, different lifecycle).
+
+_shared_service: "MemoryService | None" = None
+_shared_service_lock = threading.Lock()
+
+
+def get_shared_service() -> "MemoryService":
+    """Return the process-wide MemoryService, creating it on first use.
+
+    Thread-safe double-checked locking; construction itself is cheap (all
+    heavy clients inside MemoryService are lazy), so this only guarantees
+    identity — REST and MCP share one instance and one set of warm caches.
+    """
+    global _shared_service
+    if _shared_service is None:
+        with _shared_service_lock:
+            if _shared_service is None:
+                _shared_service = MemoryService()
+    return _shared_service

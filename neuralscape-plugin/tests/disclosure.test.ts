@@ -268,6 +268,12 @@ describe("renderEscalationFooter", () => {
     expect(footer).not.toContain("query_code_graph");
   });
 
+  it("steers with guidance, not absolutes (audit 27 #33)", () => {
+    const footer = renderEscalationFooter(false);
+    expect(footer).not.toMatch(/never expand/i);
+    expect(footer).toContain("titles are lossy");
+  });
+
   it("adds the F2 code-graph deferral policy when a graph is available", () => {
     const footer = renderEscalationFooter(true);
     expect(footer).toContain("query_code_graph");

@@ -366,10 +366,10 @@ class TestListMemoriesTool:
 class TestListProjectsTool:
     @pytest.mark.asyncio
     async def test_lists_projects(self, mock_mcp_service):
-        mock_mcp_service.list_projects.return_value = ["lightpath", "neuralscape"]
+        mock_mcp_service.list_projects.return_value = ["demo-alpha", "neuralscape"]
         result = await mcp_server.call_tool("list_projects", {"user_id": "ehfaz"})
         data = json.loads(result[0].text)
-        assert data["projects"] == ["lightpath", "neuralscape"]
+        assert data["projects"] == ["demo-alpha", "neuralscape"]
         mock_mcp_service.list_projects.assert_called_once_with(user_id="ehfaz")
 
     @pytest.mark.asyncio
@@ -730,7 +730,9 @@ class TestScheduleDreamTool:
     @pytest.mark.asyncio
     async def test_enqueues_onto_graph_queue(self, monkeypatch):
         """The tool goes through the same arq path as the /run route:
-        run_dream_sweep(pool, dry_run, force) on the graph worker queue."""
+        run_dream_sweep(pool, dry_run, force) on the graph worker queue.
+        The pool is process-lifetime (audit 27 #35): created once, reused,
+        never closed per call."""
         from extensions.dreaming.config import dreaming_settings
 
         monkeypatch.setattr(dreaming_settings, "enabled", True)
@@ -739,7 +741,9 @@ class TestScheduleDreamTool:
         arq_pool.close = AsyncMock()
         import arq
 
-        monkeypatch.setattr(arq, "create_pool", AsyncMock(return_value=arq_pool))
+        create_pool = AsyncMock(return_value=arq_pool)
+        monkeypatch.setattr(arq, "create_pool", create_pool)
+        monkeypatch.setattr(mcp_server, "_arq_pool", None)
 
         result = await mcp_server.call_tool(
             "schedule_dream", {"pool": "user--alice", "dry_run": True}
@@ -753,7 +757,10 @@ class TestScheduleDreamTool:
         args, kwargs = arq_pool.enqueue_job.call_args
         assert args == ("run_dream_sweep", "user--alice", True, False)
         assert kwargs["_queue_name"] == settings.graph_queue_name
-        arq_pool.close.assert_awaited_once()
+        # Cached client: never torn down per call, and a second call reuses it.
+        arq_pool.close.assert_not_awaited()
+        await mcp_server.call_tool("schedule_dream", {"pool": "user--alice"})
+        create_pool.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_force_bypasses_disabled_and_forwards(self, monkeypatch):
@@ -766,6 +773,7 @@ class TestScheduleDreamTool:
         import arq
 
         monkeypatch.setattr(arq, "create_pool", AsyncMock(return_value=arq_pool))
+        monkeypatch.setattr(mcp_server, "_arq_pool", None)
 
         result = await mcp_server.call_tool("schedule_dream", {"force": True})
         data = json.loads(result[0].text)

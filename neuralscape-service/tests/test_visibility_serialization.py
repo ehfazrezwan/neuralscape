@@ -181,7 +181,7 @@ class TestConversationCompilerVisibilityParsing:
             "content": "Test content for backfill",
             "category": "decision",
             "scope": "project",
-            "project_id": "lightpath",
+            "project_id": "demo-alpha",
             "visibility": "MemoryVisibility.SHARED",  # ← the broken format
             "owner_user_id": "ehfazrezwan",
             "created_at": "2026-05-26T13:46:43.930000+00:00",
@@ -220,7 +220,7 @@ class TestConversationCompilerVisibilityParsing:
             "content": "Canonical shared memory",
             "category": "architecture",
             "scope": "project",
-            "project_id": "lightpath",
+            "project_id": "demo-alpha",
             "visibility": "shared",  # ← canonical lowercase value
             "owner_user_id": "ehfazrezwan",
             "created_at": "2026-05-26T13:46:43.930000+00:00",
@@ -240,7 +240,7 @@ class TestConversationCompilerVisibilityParsing:
             "content": "Enum-typed visibility",
             "category": "convention",
             "scope": "project",
-            "project_id": "lightpath",
+            "project_id": "demo-alpha",
             "visibility": MemoryVisibility.SHARED,
             "owner_user_id": "ehfazrezwan",
             "created_at": "2026-05-26T13:46:43.930000+00:00",
@@ -277,7 +277,7 @@ class TestConversationCompilerVisibilityParsing:
             "content": "No visibility set",
             "category": "architecture",  # defaults to SHARED
             "scope": "project",
-            "project_id": "lightpath",
+            "project_id": "demo-alpha",
             "owner_user_id": "ehfazrezwan",
             "created_at": "2026-05-26T13:46:43.930000+00:00",
             "source": "backfill",
