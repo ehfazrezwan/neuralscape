@@ -1384,6 +1384,19 @@ class TestInferProjectId:
 
 
 class TestDeleteEpisode:
+    @pytest.fixture(autouse=True)
+    def _real_bridge_loop(self, service):
+        """_run_on_bridge fails fast unless bridge._loop is a real event
+        loop. These tests patch asyncio.run_coroutine_threadsafe, so the
+        loop is never actually run — it just has to pass the isinstance
+        guard."""
+        import asyncio
+
+        loop = asyncio.new_event_loop()
+        service._bridge._loop = loop
+        yield
+        loop.close()
+
     def test_delete_episode_calls_cypher(self, service):
         service._bridge.run = MagicMock(return_value=None)
         # Mock run_coroutine_threadsafe + future
