@@ -44,9 +44,13 @@ def _turns_from(dialog: list[dict]) -> list[Turn]:
         if not text:
             continue
         speaker = t.get("id") or ("Speaker 1" if i % 2 == 0 else "Speaker 2")
+        # Identity travels on the role field only. Prefixing the text with
+        # "Speaker N:" too gave the extractor a second, literal channel it
+        # sometimes latched onto, distilling unresolvable "Speaker 2 ..."
+        # memories (run-3 failure analysis, 2026-07-05).
         turns.append(Turn(
             role="user" if speaker == "Speaker 1" else "assistant",
-            content=f"{speaker}: {text}",
+            content=text,
             speaker=speaker,
         ))
     return turns
