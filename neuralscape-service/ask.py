@@ -486,10 +486,11 @@ async def ask_memory(
     # ── Verbatim episode leg: distillation drops one-off micro-details
     # (colors, gifts, stated reasons); the raw session text still has them.
     if tier.name != "minimal":
+        ep_query = " ".join(extract_keywords(question, max_terms=12)) or question
         try:
             eps = await asyncio.to_thread(
                 service.search_episodes_fulltext,
-                question, user_id, project_id, 3,
+                ep_query, user_id, project_id, 3,
             )
         except Exception as e:  # non-fatal: facts-only evidence still works
             logger.warning(f"ask episode pass failed (non-critical): {e}")
