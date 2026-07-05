@@ -874,7 +874,7 @@ class TestGenaiClientThreadSafety:
         """_get_genai_client should use the init lock for thread safety."""
         svc = MemoryService()
 
-        with patch("memory_service.genai") as mock_genai:
+        with patch("memory.core.genai") as mock_genai:
             mock_genai.Client.return_value = MagicMock()
 
             # Call from multiple threads
@@ -987,7 +987,7 @@ class TestThreadSafeInit:
             import sys
             sys.modules["mem0"].Memory.from_config.side_effect = track_init
 
-            with patch("memory_service.settings") as mock_settings:
+            with patch("memory.core.settings") as mock_settings:
                 mock_settings.get_mem0_config.return_value = {}
 
                 threads = []
@@ -1066,7 +1066,7 @@ class TestRetryTransient:
         retry_transient(fn, "a", "b", key="val", max_retries=1, base_delay=0, operation="test")
         fn.assert_called_once_with("a", "b", key="val")
 
-    @patch("memory_service.settings")
+    @patch("memory.retry.settings")
     def test_uses_config_defaults(self, mock_settings):
         mock_settings.llm_max_retries = 1
         mock_settings.llm_retry_base_delay = 0
