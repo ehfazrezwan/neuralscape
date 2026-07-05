@@ -1,0 +1,130 @@
+{
+  "suite": "beam",
+  "display": "BEAM",
+  "timestamp": "2026-07-04T09:58:12.504099+00:00",
+  "ns_commit": "a0c1de7",
+  "config": {
+    "target": "http://localhost:8398",
+    "k": 10,
+    "reasoning_level": "high",
+    "judge_model": "gemini-2.5-flash",
+    "sample": null,
+    "seed": 42,
+    "suite_options": {
+      "tier": "100k"
+    }
+  },
+  "dataset": {
+    "conversations": 20,
+    "sessions": 170,
+    "turns": 5732,
+    "conversation_chars": 12231686,
+    "qa_items": 400,
+    "qa_by_type": {
+      "abstention": 40,
+      "contradiction_resolution": 40,
+      "event_ordering": 40,
+      "information_extraction": 40,
+      "instruction_following": 40,
+      "knowledge_update": 40,
+      "multi_session_reasoning": 40,
+      "preference_following": 40,
+      "summarization": 40,
+      "temporal_reasoning": 40
+    }
+  },
+  "run": {
+    "conversations": 20,
+    "sessions": 169,
+    "ingest_wall_s": 6120.3,
+    "est_tokens": 3034938
+  },
+  "metrics": {
+    "overall": {
+      "n": 400,
+      "judged": 400,
+      "correct": 111,
+      "accuracy": 0.2775
+    },
+    "by_type": {
+      "abstention": {
+        "n": 40,
+        "judged": 40,
+        "correct": 36,
+        "accuracy": 0.9
+      },
+      "contradiction_resolution": {
+        "n": 40,
+        "judged": 40,
+        "correct": 0,
+        "accuracy": 0.0
+      },
+      "event_ordering": {
+        "n": 40,
+        "judged": 40,
+        "correct": 0,
+        "accuracy": 0.0
+      },
+      "information_extraction": {
+        "n": 40,
+        "judged": 40,
+        "correct": 8,
+        "accuracy": 0.2
+      },
+      "instruction_following": {
+        "n": 40,
+        "judged": 40,
+        "correct": 18,
+        "accuracy": 0.45
+      },
+      "knowledge_update": {
+        "n": 40,
+        "judged": 40,
+        "correct": 15,
+        "accuracy": 0.375
+      },
+      "multi_session_reasoning": {
+        "n": 40,
+        "judged": 40,
+        "correct": 3,
+        "accuracy": 0.075
+      },
+      "preference_following": {
+        "n": 40,
+        "judged": 40,
+        "correct": 25,
+        "accuracy": 0.625
+      },
+      "summarization": {
+        "n": 40,
+        "judged": 40,
+        "correct": 1,
+        "accuracy": 0.025
+      },
+      "temporal_reasoning": {
+        "n": 40,
+        "judged": 40,
+        "correct": 5,
+        "accuracy": 0.125
+      }
+    },
+    "abstention": {
+      "n": 40,
+      "correct": 36,
+      "explicit_abstain_flag": 34
+    }
+  },
+  "published_comparison": [
+    {
+      "system": "Honcho",
+      "metric": "per-tier scores",
+      "score": "see honcho.dev/evals",
+      "source": "honcho.dev/evals (self-reported)"
+    }
+  ],
+  "caveats": [
+    "Competitor figures are self-reported on their own configurations (different answer models, retrieval settings, and judge models).",
+    "Retrieval R@k uses lexical session attribution over distilled memories (see metrics.py) \u2014 not a turn-id echo from the store.",
+    "Dreaming/consolidation disabled for the baseline run; a post-dream re-run is future work (NS's differentiator experiment)."
+  ]
+}

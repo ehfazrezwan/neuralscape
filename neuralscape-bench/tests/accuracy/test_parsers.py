@@ -97,7 +97,9 @@ def test_beam_parse_haystack_per_user():
     assert conv.conv_id == "1"
     assert [s.session_id for s in conv.sessions] == ["doc-1", "doc-2"]
     q_ku, q_abs = data.qa_items
-    assert q_ku.evidence_session_ids == ("doc-2",)
+    # 100k-tier gold_ids are user-level, not document ids — the parser
+    # deliberately drops them so R@k is skipped instead of flat-zero.
+    assert q_ku.evidence_session_ids == ()
     assert q_ku.rubric == ("Mentions Lisbon as the final destination",)
     assert q_abs.is_abstention
 
