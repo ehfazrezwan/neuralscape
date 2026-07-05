@@ -196,16 +196,27 @@ def _event_time(mem) -> str:
     validation, but created_at comes from the vector store and is not
     guaranteed one spelling). Unparseable values fall back to the raw
     string rather than dropping the row."""
+    dt = _event_dt(mem)
+    if dt is not None:
+        return dt.isoformat()
+    return str(getattr(mem, "occurred_at", None) or getattr(mem, "created_at", None) or "")
+
+
+def _event_dt(mem) -> datetime | None:
+    """Parsed aware-UTC event/storage time, or None when absent/unparseable.
+
+    Single parse point shared by the sort key (:func:`_event_time`) and the
+    render gate (:func:`_events_informative`)."""
     raw = getattr(mem, "occurred_at", None) or getattr(mem, "created_at", None) or ""
     if not raw:
-        return ""
+        return None
     try:
         dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
     except ValueError:
-        return str(raw)
+        return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat()
+    return dt.astimezone(timezone.utc)
 
 
 def _evidence_rows(evidence: dict, keyword_ids: list[str], enumeration: bool) -> list:
@@ -279,18 +290,7 @@ _EVENT_RENDER_MIN_SPREAD = timedelta(days=30)
 def _events_informative(rows: list) -> bool:
     """True when the event/storage timeline across ``rows`` spans enough to
     make per-row event-time annotations informative rather than noise."""
-    times = []
-    for mem in rows:
-        key = _event_time(mem)
-        if not key:
-            continue
-        try:
-            dt = datetime.fromisoformat(key)
-        except ValueError:
-            continue
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        times.append(dt)
+    times = [dt for dt in (_event_dt(mem) for mem in rows) if dt is not None]
     if len(times) < 2:
         return False
     return max(times) - min(times) > _EVENT_RENDER_MIN_SPREAD
