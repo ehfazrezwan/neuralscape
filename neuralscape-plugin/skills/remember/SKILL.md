@@ -5,9 +5,9 @@ description: Save one durable fact to Neuralscape memory now — a preference, d
 
 # Neuralscape — Remember
 
-Store a single, durable fact via the MCP `remember` tool. Works identically in Claude Code and Claude Cowork (no local service URL or `curl` required).
+Store a single, durable fact via the MCP `remember` tool — **MCP first: never curl/REST while the MCP tools are available**. Works identically in Claude Code and Claude Cowork.
 
-Use this for one clear fact at a time. To capture many facts from a whole working session, use `/neuralscape:save-session` instead.
+Route by volume: **one fact** → this skill (`remember`). **Three or more facts at once** → one `checkpoint` call (batch of up to 25 with instant dedup verdicts) instead of N `remember` calls. **A whole conversation to extract from** → `/neuralscape:save-session`. **Correcting an existing memory** → `edit_memory(memory_id, ...)` when it's a refinement of the *same* fact (typo, added detail — keeps the ID and history); a fresh `remember` when the fact genuinely *changed* (the knowledge graph detects the contradiction and expires the old one).
 
 ## What to do
 
@@ -25,8 +25,9 @@ Use this for one clear fact at a time. To capture many facts from a whole workin
    **Near-duplicate guard.** Only when the `project_id` is a name the *user just supplied* (not the active session selection and not the repo's deterministic pinned id — those are already canonical and need no check), apply the fuzzy check from the `project` skill before writing: call `list_projects`, normalize (lowercase, strip non-alphanumerics), and if it matches an existing project with a different spelling, use the existing canonical name (or confirm with the user) rather than silently creating a variant like `Neuralscape` next to `neuralscape`.
 4. **Resolve `user_id`** — see the Identity block below.
 5. **Visibility**: **omit** the `visibility` field to take the per-category default (semantic/personal categories default `private`; team categories like `tech_stack`/`convention`/`architecture`/`dependency`/`decision`/`interaction`/`workflow`/`procedure` default `shared`). Only set `visibility="private"` explicitly when a normally-shared fact is sensitive (internal politics, a personal note, a draft).
-6. **Call `remember`** with `content`, `category`, `user_id`, `project_id?`, `visibility?`. The write is fire-and-forget (async) by default; set `wait: true` only when the user needs confirmation that it actually persisted.
-7. **Confirm** to the user, matching the call's mode: say the fact was **queued** (not "stored"/"saved") when `wait` was unset/false, and only say **stored/persisted** when `wait: true` was used. Include the category and visibility (private vs shared) either way.
+6. **Event time (`occurred_at`), when known.** If the fact describes something that *happened at a specific time other than now* (a past meeting, a decision made last week, an imported note), pass `occurred_at` as ISO 8601. **Omit it entirely when unknown — never guess or default it**; absent means "unknown", and a fabricated event time poisons recency reasoning. Storage time is recorded automatically either way.
+7. **Call `remember`** with `content`, `category`, `user_id`, `project_id?`, `visibility?`, `occurred_at?`. The write is fire-and-forget (async) by default; set `wait: true` only when the user needs confirmation that it actually persisted. (`queue_status` answers "did my writes land?" without polling individual tasks.)
+8. **Confirm** to the user, matching the call's mode: say the fact was **queued** (not "stored"/"saved") when `wait` was unset/false, and only say **stored/persisted** when `wait: true` was used. Include the category and visibility (private vs shared) either way.
 
 ## Identity block (how to resolve `user_id`)
 

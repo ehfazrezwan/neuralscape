@@ -5,18 +5,26 @@ description: Extract and save the durable facts from the current conversation to
 
 # Neuralscape — Save Session
 
-Hand the conversation to Neuralscape's extractor so it identifies, categorizes, and stores all the important facts at once via the MCP `remember_conversation` tool. Works identically in Claude Code and Claude Cowork.
+Save the session's durable knowledge — **MCP first: never curl/REST while the MCP tools are available**. Works identically in Claude Code and Claude Cowork.
 
-This is the conversation-level counterpart to `/neuralscape:remember` (one fact). In Claude Code the `Stop` hook does this automatically at session end; in Claude Cowork (no hooks) this skill is how end-of-session capture happens. The `/neuralscape:sync` skill delegates here when no local service URL is configured.
+Two MCP paths; pick by who does the distilling:
+
+- **You already know what the durable facts are** (you worked the session and can write them) → **`checkpoint`**: up to 25 distilled memories PLUS a structured `session_note` (`request` / `investigated` / `learned` / `completed` / `next_steps` — **each field a plain string, not a list**) in ONE call. Dedup verdicts come back instantly; storage runs async. This is the preferred path: cheaper, structured, and the next session picks the note up.
+- **You want the server to extract facts from raw turns** (long session, or you're summarizing someone else's transcript) → **`remember_conversation`** with the filtered messages; server-side LLM extraction identifies and categorizes facts (slower — an LLM pass, ~7 s+).
+
+In Claude Code the `Stop` hook does this automatically at session end; in Claude Cowork (no hooks) this skill is how end-of-session capture happens. The `/neuralscape:sync` skill delegates here when no local service URL is configured.
 
 ## What to do
 
-1. **Gather the relevant recent messages** as a list of `{role, content}` objects from the conversation. Include the substantive user/assistant exchanges; the server's LLM does the extraction, so you don't pre-summarize.
-2. **Apply a semantic noise filter** — drop turns that carry no signal: explicit non-content markers (`NO_REPLY` / `[heartbeat]` / `[system]`) and pure acknowledgements/filler ("ok", "thanks", "got it", "sounds good"). Judge by content, not length — keep a short turn if it states a real fact or decision, and drop a long turn that's just filler.
-3. **Resolve `project_id`**: an active project selected this session → else (Claude Code) the plugin's project-id resolution, in order — `PROJECT_ID` override → nearest `.neuralscape-project` marker (walking up from cwd) → git-repo-root basename → cwd basename → else omit (global).
-4. **Resolve `user_id`** — see the Identity block below.
-5. **Call `remember_conversation(messages=<filtered list>, user_id=<resolved>, project_id=<id or omit>)`.** Extraction is async by default — pass `wait: true` only if the user wants to block until storage completes.
-6. **Report** that extraction was queued, and roughly how many messages you sent. The extracted facts become retrievable via `/neuralscape:recall` shortly after.
+1. **Pick the path first** (see above): `checkpoint` when you can distill the facts yourself; `remember_conversation` when the server should extract from raw turns. Steps 2–3 apply **only** to the `remember_conversation` path — on the `checkpoint` path there is no transcript to gather: write the distilled memories and the session note directly, then jump to step 4.
+2. *(remember_conversation only)* **Gather the relevant recent messages** as a list of `{role, content}` objects from the conversation. Include the substantive user/assistant exchanges; the server's LLM does the extraction, so you don't pre-summarize.
+3. *(remember_conversation only)* **Apply a semantic noise filter** — drop turns that carry no signal: explicit non-content markers (`NO_REPLY` / `[heartbeat]` / `[system]`) and pure acknowledgements/filler ("ok", "thanks", "got it", "sounds good"). Judge by content, not length — keep a short turn if it states a real fact or decision, and drop a long turn that's just filler.
+4. **Resolve `project_id`**: an active project selected this session → else (Claude Code) the plugin's project-id resolution, in order — `PROJECT_ID` override → nearest `.neuralscape-project` marker (walking up from cwd) → git-repo-root basename → cwd basename → else omit (global).
+5. **Resolve `user_id`** — see the Identity block below.
+6. **Call the chosen path:**
+   - `checkpoint(memories=[...], session_note={...}, user_id=<resolved>, project_id=<id or omit>)` — each memory item carries the same v2 fields as `remember` (`content`, `category`, plus `domain`/`observation_type`/`concepts`/`confidence`/`tags` when you can fill them honestly).
+   - or `remember_conversation(messages=<filtered list>, user_id=<resolved>, project_id=<id or omit>)`. Extraction is async by default — pass `wait: true` only if the user wants to block until storage completes.
+7. **Report** what was queued (memory count and whether a session note was included, or roughly how many messages went to extraction). The facts become retrievable via `/neuralscape:recall` shortly after; `queue_status` confirms when everything has settled.
 
 ## Identity block (how to resolve `user_id`)
 

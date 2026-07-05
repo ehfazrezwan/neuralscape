@@ -4,6 +4,39 @@ All notable changes to the `neuralscape` Claude plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.9.1] - 2026-07-05
+
+### Changed
+
+- **Skills refreshed to the 22-tool MCP census** (dev @ `64baf3d`). Every
+  skill now carries an explicit **MCP-first rule**: the MCP tools are the
+  primary surface, and an agent must never switch to `curl`/REST while an
+  MCP tool is available. The REST API deliberately mirrors the MCP
+  surface, so REST remains documented where it belongs: the `search`
+  skill keeps its `/v1/search` fallback (gated on the MCP tool being
+  truly absent), and the three calls with no MCP equivalent are labeled
+  sanctioned exceptions in place — binary file upload (`/v1/ingest/files`,
+  `ingest` skill), the conversation-compiler `flush`/`compile` pair
+  (`sync` skill), and the `/health` ops probe (`ns-status` skill).
+- **Route-by-job guidance baked into the skills** (measured tiers:
+  instant ≈ 0.1–0.2 s metadata ops · ~1.6 s embed-backed ops · 3–7 s
+  LLM-backed ops). `recall_memories` stays the non-negotiable default
+  for relevance retrieval — the instant tools serve *different jobs*
+  (known-ID fetch, chronology, inventory), never cheaper substitutes —
+  and skills teach an escalation ladder (broaden → re-run → `ask_memory`)
+  instead of pre-emptive downgrading. `ask_memory` is reserved for
+  question-shaped requests that want a synthesized, cited answer, with
+  `reasoning_level` as the agent-chosen effort knob.
+- **New tools woven into existing skills** (no new skills): index-first
+  retrieval (`recall_memories(index_only=true)` → `get_memories`) in
+  `search`/`recall`; `timeline` and `get_card` in `recall`; `occurred_at`
+  guidance (absent-means-unknown, never fabricated) and
+  `edit_memory`-vs-re-`remember` correction routing in `remember`;
+  `checkpoint` as the preferred batch path in `save-session` and
+  `compile-observations` (≥3 memories → one call); `queue_status` for
+  "did my writes land?" in `ns-status`/`ingest`/`remember`;
+  `ingest_document` with connector `source` provenance in `ingest`.
+
 ## [2.9.0] - 2026-07-04
 
 ### Added
