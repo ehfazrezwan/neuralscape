@@ -467,6 +467,37 @@ class TestKeywordPromptHonesty:
 
 
 # ──────────────────────────────────────────────
+# Perspective + specificity disciplines (DMR run-3 failure analysis):
+# label/pronoun mismatch must not force abstention; a vaguer restatement
+# must not supersede a more precise row via the recency rule
+# ──────────────────────────────────────────────
+
+
+class TestPerspectiveAndSpecificityDisciplines:
+    @pytest.mark.asyncio
+    async def test_full_disciplines_include_perspective_and_specificity(self):
+        svc = _service([_mem("m1", "Speaker 2 earns an average salary of 15k")])
+        llm = _answer_llm("15k")
+        await ask_memory(svc, question="How much do I make annually?",
+                         user_id="u", reasoning_level="high", llm_call=llm)
+        prompt = llm.prompts[0]
+        assert "PERSPECTIVE:" in prompt
+        assert "NEVER grounds to abstain" in prompt
+        assert "SPECIFICITY:" in prompt
+        assert "vaguer restatement never supersedes" in prompt
+
+    @pytest.mark.asyncio
+    async def test_minimal_tier_keeps_brief_rules(self):
+        svc = _service([_mem("m1", "apple")])
+        llm = _answer_llm("apple")
+        await ask_memory(svc, question="What fruit do I like?",
+                         user_id="u", reasoning_level="minimal", llm_call=llm)
+        prompt = llm.prompts[0]
+        assert "PERSPECTIVE:" not in prompt
+        assert "answer ONLY from the evidence" in prompt
+
+
+# ──────────────────────────────────────────────
 # Update-pass gating (audit 27 #19): the forced update-language search
 # only runs when temporal cues appear in the question or first-pass evidence
 # ──────────────────────────────────────────────
