@@ -656,7 +656,29 @@ class ReadsMixin:
                 )
                 return await result.data()
 
-        coro = _run()
+        from memory.kuzu_schema import is_kuzu_driver
+
+        if is_kuzu_driver(g.driver):
+            # Kuzu: per-table typed queries with the UNION done app-side
+            # (graphiti's own Kuzu ops avoid Cypher UNION); dedup happens in
+            # the shared `projects` set below either way.
+            async def _run_kuzu():
+                out: list[dict] = []
+                for label in ("Entity", "Episodic", "Community"):
+                    rows, _, _ = await g.driver.execute_query(
+                        f"MATCH (n:{label}) "
+                        f"WHERE n.group_id STARTS WITH $user_prefix "
+                        f"OR n.group_id STARTS WITH $shared_prefix "
+                        f"RETURN DISTINCT n.group_id AS group_id",
+                        user_prefix=user_prefix,
+                        shared_prefix=shared_prefix,
+                    )
+                    out.extend(rows)
+                return out
+
+            coro = _run_kuzu()
+        else:
+            coro = _run()
         try:
             records = self._run_on_bridge(coro, timeout=10.0) or []
         except Exception as e:

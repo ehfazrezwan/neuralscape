@@ -95,6 +95,16 @@ def ns_kuzu_schema_statements() -> list[str]:
     return stmts
 
 
+def is_kuzu_driver(driver) -> bool:
+    """Provider check usable anywhere in the memory package (mock-safe)."""
+    try:
+        from graphiti_core.driver.driver import GraphProvider
+
+        return getattr(driver, "provider", None) == GraphProvider.KUZU
+    except ImportError:
+        return False
+
+
 async def apply_ns_kuzu_schema(driver) -> None:
     """Apply the NS schema extensions; idempotent.
 

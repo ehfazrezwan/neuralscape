@@ -44,11 +44,11 @@ Status legend: ☐ pending · ◐ in progress · ☑ ported+tested (both provide
 
 | Status | # | Site | Purpose | Redesign |
 |---|---|---|---|---|
-| ☐ | 2 | `memory/search.py:1104-1123` graph-result enricher | fetch NS props + edge embedding by uuid | edge arm must read `RelatesToNode_` on Kuzu; `UNION ALL` → app-side union |
+| ☑ | 2 | `memory/search.py` graph-result enricher | fetch NS props + edge embedding by uuid | ported: explicit per-label node arm (bare MATCH would double-report reified edges) + RelatesToNode_ edge arm, app-side union; embedding round-trip verified |
 | ☑ | 11 | `graph_patcher.py` invalidate (edge arm) | bi-temporal edge invalidation | ported: RelatesToNode_ + Python-side exclusively-derived filter (no unverified list predicates); semantics matrix green on real Kuzu (exclusive dies, co-asserted/empty survive, fail-safe, unconditional node marking) |
-| ☐ | 1 | `memory/reads.py:638-657` `list_projects` | distinct project group_ids | per-label queries + app-side union; verify `STARTS WITH` |
-| ☐ | 13 | `extensions/dreaming/bridges.py:59-70` `SHARED_ENTITY_CYPHER` | hub entities across pools | per-label rewrite; verify `toLower/trim/head/collect(DISTINCT)/size` |
-| ☐ | 15-18 | `scripts/identity.py`, `scripts/migrate_graph_groups.py` | offline admin | direct bolt driver + untyped rel patterns + `EntityEdge` label — keep Neo4j-only, document skip on Kuzu (solo has one identity and no legacy groups) |
+| ☑ | 1 | `memory/reads.py` `list_projects` | distinct project group_ids | ported: per-label queries + app-side union; `STARTS WITH` verified working on Kuzu |
+| ☑ | 13 | `extensions/dreaming/bridges.py` `SHARED_ENTITY_CYPHER` | hub entities across pools | ported: raw per-label fetch + full aggregation pipeline in Python (key/casefold, head-of-collect, DISTINCT, >=2/>=2 filter, ordering, limit) |
+| ☑ | 15-18 | `scripts/identity.py`, `scripts/migrate_graph_groups.py` | offline admin | direct bolt driver + untyped rel patterns + `EntityEdge` label — RESOLVED as documented-Neo4j-only: solo has one identity and no legacy groups; scripts print a clear error under kuzu (no code change needed — they require NEO4J_URI explicitly) |
 
 ### Dialect verification checklist (no in-subtree Kuzu precedent — test each)
 
