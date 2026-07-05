@@ -40,7 +40,7 @@ import logging
 import re
 from types import SimpleNamespace
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from config import settings
 
@@ -267,7 +267,37 @@ def _clip_content(content: str, budget: int) -> str:
     return window + " …"
 
 
+# Event-time annotations render only when the evidence timeline spans more
+# than this. Measured on hours-apart conversational data (DMR mini A/B,
+# 2026-07-05): annotating rows whose event times are near-identical baited
+# the RECENCY discipline into false supersession ("earlier memory said three
+# dogs" → answers two) and perspective drift, while for genuinely historical
+# imports (months/years of spread) the annotation is the entire point.
+_EVENT_RENDER_MIN_SPREAD = timedelta(days=30)
+
+
+def _events_informative(rows: list) -> bool:
+    """True when the event/storage timeline across ``rows`` spans enough to
+    make per-row event-time annotations informative rather than noise."""
+    times = []
+    for mem in rows:
+        key = _event_time(mem)
+        if not key:
+            continue
+        try:
+            dt = datetime.fromisoformat(key)
+        except ValueError:
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        times.append(dt)
+    if len(times) < 2:
+        return False
+    return max(times) - min(times) > _EVENT_RENDER_MIN_SPREAD
+
+
 def _render_evidence(rows: list) -> str:
+    render_events = _events_informative(rows)
     lines = []
     for mem in rows:
         is_passage = getattr(mem, "memory_kind", None) == "passage"
@@ -276,11 +306,12 @@ def _render_evidence(rows: list) -> str:
         content = _clip_content((mem.memory or "").strip(), budget).replace("\n", " ")
         created = getattr(mem, "created_at", None) or "unknown time"
         category = getattr(mem, "category", None) or "uncategorized"
-        occurred = getattr(mem, "occurred_at", None)
+        occurred = getattr(mem, "occurred_at", None) if render_events else None
         if occurred:
-            # Event time known (historical ingestion): show both so the
-            # recency discipline reasons over when it HAPPENED, with the
-            # storage time still visible for provenance.
+            # Event time known (historical ingestion) AND the timeline spread
+            # makes it informative: show both so the recency discipline
+            # reasons over when it HAPPENED, with the storage time still
+            # visible for provenance.
             lines.append(
                 f"[{mem.id}] (event: {occurred}; stored: {created}; {category}) {content}"
             )
