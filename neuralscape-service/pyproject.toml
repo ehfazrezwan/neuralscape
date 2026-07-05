@@ -18,6 +18,37 @@ dependencies = [
     "arq>=0.26.0",
     "redis[hiredis]>=5.0.0",
     "structlog>=24.0.0",
+    # Encrypts connector credentials at rest in the vault (Fernet).
+    "cryptography>=42.0",
+    # HTTP client for native data-layer connectors (Notion, Google Drive, REST).
+    # Also pulled transitively, but the connector adapters depend on it directly.
+    "httpx>=0.27.0",
+    # ── Search-quality dependencies that mem0 picks up at import time ──
+    # Without these, the worker logs at startup:
+    #   "Failed to load spaCy lemma model: spaCy is not installed."
+    #   "fastembed not installed — BM25 keyword search disabled."
+    # spaCy enables lemmatization for keyword extraction; fastembed
+    # provides BM25 keyword search as a complement to vector similarity.
+    # The Dockerfile also runs `python -m spacy download en_core_web_sm`
+    # so the small English model is bundled (~12MB).
+    "spacy>=3.7",
+    "fastembed>=0.3",
+    # Federated login (AUTH_PROVIDER=google|supabase): JWT verification for
+    # Google OIDC id_tokens + Supabase session JWTs. [crypto] pulls in
+    # `cryptography` for RS256/ES256 and enables PyJWKClient JWKS fetching.
+    # httpx (already present transitively via google-genai) is the HTTP client
+    # for Google's token exchange — pinned explicitly since we import it.
+    "pyjwt[crypto]>=2.9",
+    "httpx>=0.27.0",
+    # ── Document/file ingestion ──
+    # Parses multipart file uploads on the /v1/ingest/files endpoint.
+    "python-multipart>=0.0.9",
+    # In-process fallback parser for rich formats (PDF + MS Office docx/xlsx/pptx)
+    # when the preferred docling-serve container is disabled or unreachable. HTML
+    # is handled by markitdown too. The heavy/optional extras (audio, youtube) are
+    # intentionally excluded to keep the image lean.
+    "markitdown[docx,pptx,xlsx,xls,pdf]>=0.0.1a3",
+    "tiktoken>=0.13.0",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -29,6 +60,14 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
 ]
+# Code-graph knowledge adapter (Phase F1): uses Graphify (PyPI: graphifyy) as a
+# library to read/query `graph.json` code graphs and distill their stable
+# semantic layer into memories. OPTIONAL — everything degrades gracefully (the
+# code_graph adapter, ingest extractor, and MCP/REST code-graph tools simply
+# don't register) when this extra isn't installed.
+code-graph = [
+    "graphifyy>=0.9.5",
+]
 
 [tool.uv.sources]
 graphiti-core = { path = "../graphiti", editable = true }
@@ -39,6 +78,10 @@ dev = [
     "httpx>=0.28.1",
     "pytest>=9.0.2",
     "pytest-asyncio>=1.3.0",
+    # Dev installs get the code-graph extra so the adapter/tool tests exercise
+    # the real graphifyy library (production keeps it opt-in via the extra).
+    "graphifyy>=0.9.5",
+    "pytest-xdist>=3.8.0",
 ]
 
 [tool.pytest.ini_options]

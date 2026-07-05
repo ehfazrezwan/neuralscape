@@ -16,10 +16,13 @@ import {
   getBufferPath,
   getBufferStats,
   getObservationDir,
+  getProjectId,
   getStaleMarkerPath,
   listPendingBuffers,
   markBufferStale,
   pickRelevantInput,
+  readBakedUrl,
+  readConfig,
   truncateBuffer,
   truncateOutput,
 } from "../src/utils.js";
@@ -412,5 +415,184 @@ describe("pickRelevantInput", () => {
     expect(result.description).toBe("investigate");
     expect(result.subagent_type).toBe("Explore");
     expect(result.prompt).toBe("find the bug");
+  });
+});
+
+
+describe("getProjectId", () => {
+  // getProjectId reads PROJECT_ID config per-call; isolate those env vars.
+  let prevModern: string | undefined;
+  let prevLegacy: string | undefined;
+
+  beforeEach(() => {
+    prevModern = process.env.CLAUDE_PLUGIN_OPTION_PROJECT_ID;
+    prevLegacy = process.env.NEURALSCAPE_PROJECT_ID;
+    delete process.env.CLAUDE_PLUGIN_OPTION_PROJECT_ID;
+    delete process.env.NEURALSCAPE_PROJECT_ID;
+  });
+
+  afterEach(() => {
+    if (prevModern === undefined) delete process.env.CLAUDE_PLUGIN_OPTION_PROJECT_ID;
+    else process.env.CLAUDE_PLUGIN_OPTION_PROJECT_ID = prevModern;
+    if (prevLegacy === undefined) delete process.env.NEURALSCAPE_PROJECT_ID;
+    else process.env.NEURALSCAPE_PROJECT_ID = prevLegacy;
+  });
+
+  it("prefers the PROJECT_ID config override over everything", () => {
+    process.env.CLAUDE_PLUGIN_OPTION_PROJECT_ID = "pinned-id";
+    // Even with a marker present, the override wins.
+    writeFileSync(join(scratch, ".neuralscape-project"), "from-marker\n");
+    expect(getProjectId(scratch)).toBe("pinned-id");
+  });
+
+  it("honors the legacy NEURALSCAPE_PROJECT_ID override", () => {
+    process.env.NEURALSCAPE_PROJECT_ID = "legacy-id";
+    expect(getProjectId(scratch)).toBe("legacy-id");
+  });
+
+  it("reads the id from a .neuralscape-project marker's first line", () => {
+    writeFileSync(join(scratch, ".neuralscape-project"), "neuralscape\nignored second line\n");
+    expect(getProjectId(scratch)).toBe("neuralscape");
+  });
+
+  it("walks up to find the marker from a nested subdirectory", () => {
+    writeFileSync(join(scratch, ".neuralscape-project"), "monorepo-id\n");
+    const sub = join(scratch, "packages", "service");
+    mkdirSync(sub, { recursive: true });
+    expect(getProjectId(sub)).toBe("monorepo-id");
+  });
+
+  it("falls back to the marker directory basename when the marker is empty", () => {
+    const repo = join(scratch, "my-repo");
+    mkdirSync(repo, { recursive: true });
+    writeFileSync(join(repo, ".neuralscape-project"), "   \n");
+    expect(getProjectId(repo)).toBe("my-repo");
+  });
+
+  it("falls back to the git repo root basename when no marker exists", () => {
+    const repo = join(scratch, "gitrepo");
+    const sub = join(repo, "nested", "deep");
+    mkdirSync(sub, { recursive: true });
+    mkdirSync(join(repo, ".git"), { recursive: true });
+    expect(getProjectId(sub)).toBe("gitrepo");
+  });
+
+  it("falls back to the cwd basename when no marker and no git exist", () => {
+    // scratch lives under the OS tmpdir, which has no .git or marker ancestor,
+    // so resolution reaches precedence 4 (the cwd basename).
+    const repo = join(scratch, "plain-dir");
+    mkdirSync(repo, { recursive: true });
+    expect(getProjectId(repo)).toBe("plain-dir");
+  });
+});
+
+// ── Baked URL resolution ─────────────────────────────────────────
+//
+// The connector base URL is baked into `.mcp.json` per distribution channel;
+// hooks derive their API base from that same file via readBakedUrl(). These
+// cover the parsing, /mcp/ stripping, template-skipping, and error paths.
+describe("readBakedUrl", () => {
+  let root: string;
+  let prevRoot: string | undefined;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "neuralscape-root-"));
+    prevRoot = process.env.CLAUDE_PLUGIN_ROOT;
+    process.env.CLAUDE_PLUGIN_ROOT = root;
+  });
+
+  afterEach(() => {
+    if (prevRoot === undefined) delete process.env.CLAUDE_PLUGIN_ROOT;
+    else process.env.CLAUDE_PLUGIN_ROOT = prevRoot;
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const writeMcp = (url: unknown) =>
+    writeFileSync(
+      join(root, ".mcp.json"),
+      JSON.stringify({ mcpServers: { neuralscape: { type: "http", url } } }),
+    );
+
+  it("strips a trailing /mcp/ connector suffix to the API base", () => {
+    writeMcp("https://neuralscape.siliconinja.dev/mcp/");
+    expect(readBakedUrl()).toBe("https://neuralscape.siliconinja.dev");
+  });
+
+  it("strips /mcp without a trailing slash", () => {
+    writeMcp("https://example.com/mcp");
+    expect(readBakedUrl()).toBe("https://example.com");
+  });
+
+  it("preserves a path prefix before /mcp/ and keeps the port", () => {
+    writeMcp("http://localhost:8199/api/mcp/");
+    expect(readBakedUrl()).toBe("http://localhost:8199/api");
+  });
+
+  it("drops query strings and hash fragments before stripping", () => {
+    writeMcp("https://example.com/mcp/?token=abc#frag");
+    expect(readBakedUrl()).toBe("https://example.com");
+  });
+
+  it("ignores an un-baked ${...} template", () => {
+    writeMcp("${user_config.URL}/mcp/");
+    expect(readBakedUrl()).toBe("");
+  });
+
+  it("rejects a non-http(s) scheme", () => {
+    writeMcp("ftp://example.com/mcp/");
+    expect(readBakedUrl()).toBe("");
+  });
+
+  it("returns '' when CLAUDE_PLUGIN_ROOT is unset", () => {
+    delete process.env.CLAUDE_PLUGIN_ROOT;
+    expect(readBakedUrl()).toBe("");
+  });
+
+  it("returns '' when .mcp.json is missing", () => {
+    expect(readBakedUrl()).toBe("");
+  });
+
+  it("returns '' on malformed JSON", () => {
+    writeFileSync(join(root, ".mcp.json"), "{ not json");
+    expect(readBakedUrl()).toBe("");
+  });
+
+  it("returns '' when the url field is absent or non-string", () => {
+    writeMcp(undefined);
+    expect(readBakedUrl()).toBe("");
+    writeMcp(42);
+    expect(readBakedUrl()).toBe("");
+  });
+});
+
+describe("readConfig URL precedence", () => {
+  const KEYS = ["CLAUDE_PLUGIN_OPTION_URL", "NEURALSCAPE_URL"] as const;
+  let prev: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    prev = Object.fromEntries(KEYS.map((k) => [k, process.env[k]]));
+    for (const k of KEYS) delete process.env[k];
+  });
+
+  afterEach(() => {
+    for (const k of KEYS) {
+      if (prev[k] === undefined) delete process.env[k];
+      else process.env[k] = prev[k];
+    }
+  });
+
+  it("prefers CLAUDE_PLUGIN_OPTION_URL over the legacy var", () => {
+    process.env.CLAUDE_PLUGIN_OPTION_URL = "https://modern.example";
+    process.env.NEURALSCAPE_URL = "https://legacy.example";
+    expect(readConfig("URL")).toBe("https://modern.example");
+  });
+
+  it("falls back to the legacy NEURALSCAPE_URL var", () => {
+    process.env.NEURALSCAPE_URL = "https://legacy.example";
+    expect(readConfig("URL")).toBe("https://legacy.example");
+  });
+
+  it("returns the fallback when neither is set", () => {
+    expect(readConfig("URL", "fallback")).toBe("fallback");
   });
 });

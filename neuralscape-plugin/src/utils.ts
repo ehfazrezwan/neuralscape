@@ -3,8 +3,9 @@
  */
 
 import { appendFile, mkdir, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join as pathJoin, parse as parsePath } from "node:path";
+import { dirname, join as pathJoin, parse as parsePath } from "node:path";
 
 // ── Configuration ────────────────────────────────────────────────
 //
@@ -20,10 +21,46 @@ export function readConfig(key: string, fallback = ""): string {
   return fallback;
 }
 
-const NEURALSCAPE_URL = readConfig("URL", "http://localhost:8199").replace(/\/$/, "");
+// Single source of truth for the service URL: the base URL is baked into the
+// plugin's `.mcp.json` (the connector endpoint) per distribution channel. The
+// hooks derive the same base from that file so there is exactly one place to
+// change it. Strips the trailing `/mcp/` connector suffix to get the API base.
+// Ignores an un-baked `${...}` template (transitional) and any read/parse error.
+// Parses with the URL constructor (not a raw regex) so query/hash/port variants
+// normalize correctly before the `/mcp/` segment is removed.
+export function readBakedUrl(): string {
+  const root = process.env.CLAUDE_PLUGIN_ROOT?.trim();
+  if (!root) return "";
+  try {
+    const cfg = JSON.parse(readFileSync(pathJoin(root, ".mcp.json"), "utf8"));
+    const raw = cfg?.mcpServers?.neuralscape?.url;
+    if (typeof raw !== "string" || raw.includes("${")) return "";
+    const parsed = new URL(raw);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "";
+    // `parsed.origin` already excludes query/hash; `parsed.pathname` is the path
+    // alone. Build the base directly — never assign back to `parsed.pathname`,
+    // which the URL object re-normalizes "" to "/".
+    const base = parsed.pathname.replace(/\/mcp\/?$/, "").replace(/\/$/, "");
+    return `${parsed.origin}${base}`;
+  } catch {
+    return "";
+  }
+}
+
+// Precedence: explicit config override → baked `.mcp.json` URL → local dev.
+const NEURALSCAPE_URL = (
+  readConfig("URL", "") ||
+  readBakedUrl() ||
+  "http://localhost:8199"
+).replace(/\/$/, "");
 
 const NEURALSCAPE_API_KEY = readConfig("API_KEY", "");
 
+// Deliberate zero-config fallback: an unconfigured install identifies as the
+// OS username so hook captures stay continuous on single-user/local servers.
+// Removing it would orphan memories existing installs stored under that id.
+// Token-authenticated servers ignore client-claimed ids (identity comes from
+// the Bearer token), so this can't spoof identity on multi-user deployments.
 const NEURALSCAPE_USER_ID =
   readConfig("USER_ID", "") ||
   process.env.USER?.trim() ||
@@ -57,6 +94,12 @@ export interface HookInput {
   prompt?: string;
   stop_hook_active?: boolean;
   last_assistant_message?: string;
+  /** SessionStart: "startup" | "resume" | "clear" | "compact". */
+  source?: string;
+  /** PreCompact: "manual" (/compact) or "auto". */
+  trigger?: string;
+  /** PreCompact: instructions passed to /compact, if any. */
+  custom_instructions?: string;
 }
 
 export interface HookOutput {
@@ -73,13 +116,18 @@ export interface HookOutput {
 
 export interface NeuralscapeMemory {
   id: string;
-  memory: string;
+  /** Full content. Absent/empty on index-level rows (`fields=index`). */
+  memory?: string;
   category?: string;
   scope?: string;
   project_id?: string;
   tags?: string[];
   created_at?: string;
   source?: string;
+  // Memory-model v2 / retrieval economics (C1) — null on legacy memories.
+  observation_type?: string | null;
+  title?: string | null;
+  token_estimate?: number | null;
 }
 
 export interface ContextResponse {
@@ -87,6 +135,10 @@ export interface ContextResponse {
   user_id: string;
   project_id?: string;
   categories: Record<string, NeuralscapeMemory[]>;
+  // Authoritative org standards (visibility=standard). Rendered as a binding
+  // block that overrides personal preferences on conflict. Empty unless the
+  // server has STANDARDS_ENABLED.
+  standards?: NeuralscapeMemory[];
 }
 
 // ── Stdin Parsing ────────────────────────────────────────────────
@@ -117,6 +169,120 @@ export async function parseStdin(): Promise<HookInput> {
   });
 }
 
+/**
+ * Thrown by parseStdinStrict when the hook payload isn't valid JSON.
+ * Per the hook exit-code taxonomy (see README), this is a CLIENT BUG:
+ * hooks that can safely fail loud exit 2 so the malformed input is
+ * surfaced instead of silently swallowed.
+ */
+export class MalformedHookInputError extends Error {
+  constructor(detail: string) {
+    super(`malformed hook input (client bug): ${detail}`);
+    this.name = "MalformedHookInputError";
+  }
+}
+
+/**
+ * Strict variant of parseStdin: rejects with MalformedHookInputError on
+ * empty or non-JSON stdin instead of resolving `{}`. New hooks use this
+ * to implement the exit-code taxonomy; parseStdin stays lenient for the
+ * legacy paths that must never change behavior mid-release.
+ */
+export async function parseStdinStrict(): Promise<HookInput> {
+  const data: string = await new Promise((resolve) => {
+    let buf = "";
+    process.stdin.setEncoding("utf-8");
+    process.stdin.on("data", (chunk: string) => {
+      buf += chunk;
+    });
+    process.stdin.on("end", () => resolve(buf));
+    if (process.stdin.readableEnded) resolve(buf);
+  });
+  if (!data.trim()) {
+    throw new MalformedHookInputError("empty stdin");
+  }
+  try {
+    return JSON.parse(data) as HookInput;
+  } catch {
+    throw new MalformedHookInputError("stdin is not valid JSON");
+  }
+}
+/* v8 ignore stop */
+
+// ── Excluded projects (roadmap D4) ───────────────────────────────
+//
+// Comma-separated globs of project ids the plugin must never capture from
+// or inject into. Config: EXCLUDED_PROJECTS (CLAUDE_PLUGIN_OPTION_ /
+// NEURALSCAPE_ prefixes), plus the roadmap-spelled `NS_EXCLUDED_PROJECTS`
+// raw env var as an alias. Matching is case-insensitive; `*` and `?` are
+// the only wildcards.
+
+/** Compile one project glob to an anchored, case-insensitive RegExp. */
+export function globToRegExp(glob: string): RegExp {
+  const escaped = glob
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*/g, ".*")
+    .replace(/\?/g, ".");
+  return new RegExp(`^${escaped}$`, "i");
+}
+
+export function getExcludedProjectGlobs(): string[] {
+  const raw = readConfig("EXCLUDED_PROJECTS", "") || process.env.NS_EXCLUDED_PROJECTS?.trim() || "";
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+// isProjectExcluded runs in hook hot paths (once per PostToolUse event) —
+// cache the compiled regexes keyed by the raw glob list so config parsing
+// and RegExp construction happen once per process, not once per tool call.
+let excludedGlobCacheKey: string | null = null;
+let excludedGlobCache: RegExp[] = [];
+
+function getExcludedProjectRegexps(): RegExp[] {
+  const globs = getExcludedProjectGlobs();
+  const key = globs.join(",");
+  if (key !== excludedGlobCacheKey) {
+    excludedGlobCacheKey = key;
+    excludedGlobCache = globs.map(globToRegExp);
+  }
+  return excludedGlobCache;
+}
+
+/** True when the resolved project id matches any excluded-projects glob. */
+export function isProjectExcluded(projectId: string | undefined): boolean {
+  if (!projectId) return false;
+  return getExcludedProjectRegexps().some((re) => re.test(projectId));
+}
+
+// ── Privacy: <private> tag redaction (roadmap D4) ────────────────
+
+/**
+ * Redact `<private>…</private>` spans from text the plugin is about to
+ * store or transmit. Case-insensitive. Idempotent.
+ *
+ * Matched OPEN…CLOSE pairs redact exactly their span. An UNMATCHED opener
+ * (e.g. prose *about* the tag: "use <private> to mark secrets") is bounded
+ * (audit 27 #34a): it redacts at most through the next sentence boundary or
+ * end of line — never to end-of-string — and leaves a `[redacted:unclosed]`
+ * warning marker so the truncation is visible instead of silently eating
+ * the rest of the transcript.
+ */
+export function redactPrivate(text: string): string {
+  if (typeof text !== "string" || !/<private>/i.test(text)) return text;
+  return (
+    text
+      .replace(/<private>[\s\S]*?<\/private>/gi, "[redacted]")
+      // Remaining openers are unmatched: consume within the current line up
+      // to the earliest of (a) a sentence end ([.!?] before whitespace/EOL)
+      // or (b) the end of the line. `[^\n]*?` cannot cross a newline, so a
+      // stray opener can never swallow subsequent lines.
+      .replace(/<private>[^\n]*?(?:[.!?](?=\s|$)|(?=\n)|$)/gi, "[redacted:unclosed]")
+  );
+}
+
+/* v8 ignore start — pre-existing utility, exercised by integration only */
 // ── Identity ─────────────────────────────────────────────────────
 
 export function getUserId(): string {
@@ -135,15 +301,63 @@ export function hasApiKey(): boolean {
   return NEURALSCAPE_API_KEY.length > 0;
 }
 
+/** File name the plugin walks up the tree to find, to pin one project id
+ *  across every subdirectory of a repo (e.g. a monorepo whose service and
+ *  plugin live in sibling folders). Its trimmed first line, if any, IS the
+ *  project id; an empty marker falls back to the marker directory's basename. */
+const PROJECT_MARKER = ".neuralscape-project";
+
 /**
- * Project ID is the basename of the working directory.
- * Uses path.parse so it handles both POSIX (/home/foo/bar) and
- * Windows (C:\Users\foo\bar) path separators.
+ * Walk up from `start` (inclusive) to the filesystem root looking for an
+ * entry named `name`. Returns the absolute path of the containing directory,
+ * or undefined. Synchronous on purpose — `getProjectId` is sync and called
+ * from hook hot paths.
+ */
+function findUp(start: string, name: string): string | undefined {
+  let dir = start;
+  // Bounded by the root check below (dirname(root) === root), so this can't loop forever.
+  for (;;) {
+    if (existsSync(pathJoin(dir, name))) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) return undefined;
+    dir = parent;
+  }
+}
+
+/**
+ * Resolve the project id with a deterministic precedence so the SAME repo
+ * always reports the SAME id regardless of which subdirectory a hook runs in:
+ *
+ *   1. Explicit config override — `PROJECT_ID` (CLAUDE_PLUGIN_OPTION_PROJECT_ID
+ *      / NEURALSCAPE_PROJECT_ID). Pins one id everywhere.
+ *   2. A `.neuralscape-project` marker file found by walking up from `cwd`.
+ *      Its trimmed first line is the id; an empty marker → its dir basename.
+ *   3. The git repo root basename (walk up for `.git`).
+ *   4. Legacy fallback: the basename of `cwd`.
+ *
+ * Uses path.parse so it handles both POSIX and Windows separators.
  */
 export function getProjectId(cwd?: string): string | undefined {
+  const override = readConfig("PROJECT_ID", "").trim();
+  if (override) return override;
+
   const dir = cwd || process.cwd();
-  const name = parsePath(dir).name;
-  return name || undefined;
+
+  const markerDir = findUp(dir, PROJECT_MARKER);
+  if (markerDir) {
+    try {
+      const id = readFileSync(pathJoin(markerDir, PROJECT_MARKER), "utf8").trim().split(/\r?\n/)[0]?.trim();
+      if (id) return id;
+    } catch {
+      /* unreadable marker — fall through to its directory basename */
+    }
+    return parsePath(markerDir).name || undefined;
+  }
+
+  const gitDir = findUp(dir, ".git");
+  if (gitDir) return parsePath(gitDir).name || undefined;
+
+  return parsePath(dir).name || undefined;
 }
 
 // ── HTTP Client ──────────────────────────────────────────────────
@@ -411,6 +625,161 @@ export async function markBufferStale(sessionId: string): Promise<void> {
     await writeFile(getStaleMarkerPath(sessionId), new Date().toISOString(), "utf-8");
   } catch (error) {
     logError("markBufferStale failed", error);
+  }
+}
+
+// ── Fail-loud transport-failure counter (roadmap D4) ─────────────
+//
+// A tiny state file counting CONSECUTIVE Neuralscape-unreachable events
+// across hooks. Any hook that hits a transport failure increments it; any
+// successful call resets it. When the count reaches the threshold, the
+// SessionStart notice upgrades from the generic one-liner to a fail-loud
+// "unreachable for N events — check `docker compose ps`" message. All
+// still exit 0 — the counter changes the message, never the contract.
+
+export const DEFAULT_FAIL_LOUD_THRESHOLD = 3;
+
+export function getFailLoudThreshold(): number {
+  const parsed = parseInt(readConfig("FAIL_LOUD_THRESHOLD", ""), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_FAIL_LOUD_THRESHOLD;
+}
+
+/** Counter lives next to the observation buffers (same data dir). */
+export function getFailureCounterPath(): string {
+  return pathJoin(getObservationDir(), "unreachable.count");
+}
+
+export async function getTransportFailureCount(): Promise<number> {
+  try {
+    const raw = await readFile(getFailureCounterPath(), "utf-8");
+    const parsed = parseInt(raw.trim(), 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** Increment the consecutive-failure counter; returns the new count. */
+export async function recordTransportFailure(): Promise<number> {
+  try {
+    const next = (await getTransportFailureCount()) + 1;
+    await mkdir(getObservationDir(), { recursive: true });
+    await writeFile(getFailureCounterPath(), String(next), "utf-8");
+    return next;
+  } catch (error) {
+    logError("recordTransportFailure failed", error);
+    return 1;
+  }
+}
+
+/** Any successful NS call resets the streak. */
+export async function resetTransportFailures(): Promise<void> {
+  try {
+    await unlink(getFailureCounterPath());
+  } catch {
+    // no counter — already clean
+  }
+}
+
+// ── Read-gate session state (roadmap D3) ─────────────────────────
+//
+// Session-scoped dedup: the gate fires at most once per file per session.
+// The state file records every path already checked (denied or not), so a
+// second Read of the same path — the user/agent override — always passes,
+// and repeated large-file reads don't pay the search round-trip again.
+
+function safeSessionName(sessionId: string): string {
+  return sessionId.replace(/[^A-Za-z0-9._-]/g, "_") || "unknown";
+}
+
+export function getReadGateStatePath(sessionId: string): string {
+  return pathJoin(getObservationDir(), `${safeSessionName(sessionId)}.readgate.json`);
+}
+
+export async function loadGatedFiles(sessionId: string): Promise<Set<string>> {
+  try {
+    const raw = await readFile(getReadGateStatePath(sessionId), "utf-8");
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      return new Set(parsed.filter((p): p is string => typeof p === "string"));
+    }
+    return new Set();
+  } catch {
+    return new Set();
+  }
+}
+
+export async function recordGatedFile(sessionId: string, filePath: string): Promise<void> {
+  try {
+    const gated = await loadGatedFiles(sessionId);
+    gated.add(filePath);
+    await mkdir(getObservationDir(), { recursive: true });
+    await writeFile(getReadGateStatePath(sessionId), JSON.stringify([...gated]), "utf-8");
+  } catch (error) {
+    logError("recordGatedFile failed", error);
+  }
+}
+
+// ── Read-gate session index cache (audit 27 #31) ─────────────────
+//
+// The candidate-memory fetch happens AT MOST ONCE per session AND project:
+// the first gateable Read fetches the index-level rows and caches them
+// here; every later Read (any file) in the same project matches against
+// the cache with zero network I/O. The key includes the resolved project
+// id (Copilot, PR #126): a session whose cwd moves to a different repo
+// must NOT be steered by the previous project's rows — the switch triggers
+// exactly one fresh project-scoped fetch. A failed/timed-out fetch caches
+// a failure sentinel — the gate then stays quiet for that project for the
+// rest of the session instead of re-paying the round trip on every
+// large-file Read while the service is down.
+
+export interface ReadGateIndexCache {
+  /** False when the one fetch failed/timed out (gate stays quiet). */
+  ok: boolean;
+  fetchedAt: string;
+  rows: NeuralscapeMemory[];
+}
+
+export function getReadGateCachePath(sessionId: string, projectId?: string): string {
+  const project = safeSessionName(projectId || "global");
+  return pathJoin(
+    getObservationDir(),
+    `${safeSessionName(sessionId)}.${project}.readgate-index.json`,
+  );
+}
+
+export async function loadReadGateIndexCache(
+  sessionId: string,
+  projectId?: string,
+): Promise<ReadGateIndexCache | null> {
+  try {
+    const raw = await readFile(getReadGateCachePath(sessionId, projectId), "utf-8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && typeof parsed.ok === "boolean") {
+      return {
+        ok: parsed.ok,
+        fetchedAt: typeof parsed.fetchedAt === "string" ? parsed.fetchedAt : "",
+        rows: Array.isArray(parsed.rows) ? (parsed.rows as NeuralscapeMemory[]) : [],
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveReadGateIndexCache(
+  sessionId: string,
+  projectId: string | undefined,
+  ok: boolean,
+  rows: NeuralscapeMemory[],
+): Promise<void> {
+  try {
+    await mkdir(getObservationDir(), { recursive: true });
+    const payload: ReadGateIndexCache = { ok, fetchedAt: new Date().toISOString(), rows };
+    await writeFile(getReadGateCachePath(sessionId, projectId), JSON.stringify(payload), "utf-8");
+  } catch (error) {
+    logError("saveReadGateIndexCache failed", error);
   }
 }
 

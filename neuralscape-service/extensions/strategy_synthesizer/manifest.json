@@ -1,0 +1,7 @@
+{
+  "name": "strategy-synthesizer",
+  "version": "0.1.0",
+  "description": "Cron-driven synthesizer that merges a trading strategy's ingested rule memories into one canonical, versioned playbook page per strategy. Non-destructive: source memories are immutable, playbook pages are append-only (version_number++), contradictions resolve via Graphiti bi-temporal invalidation. Groups by strategy name; patches Graphiti nodes with a strategy_playbook_path back-reference.",
+  "author": "ehfaz",
+  "hooks": []
+}

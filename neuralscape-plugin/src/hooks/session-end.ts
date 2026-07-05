@@ -19,7 +19,9 @@ import { flushTurns } from "../core/flush.js";
 import {
   getBufferPath,
   getBufferStats,
+  getProjectId,
   hasUserId,
+  isProjectExcluded,
   logError,
   markBufferStale,
   outputContinue,
@@ -38,16 +40,22 @@ async function main(): Promise<void> {
 
   try {
     const raw = (await parseStdin()) as Record<string, unknown>;
+
+    // Excluded projects (D4): no conversation capture leaves an excluded project.
+    if (isProjectExcluded(getProjectId(raw.cwd as string | undefined))) return;
+
     const client = detectClient(raw);
 
     // Claude Code: flush all turns from transcript before compiling.
-    // Commit the transcript offset only after flushTurns returns so a
-    // crash mid-flush leaves the cursor at its prior position.
+    // The offset commit is bounded by the flush RESULT (audit 27 #34b):
+    // full success commits the whole window, a partial failure commits only
+    // past the delivered prefix, and an all-failed flush leaves the cursor
+    // untouched so the next session re-flushes everything.
     if (client === "claude-code") {
       const turnExtractor = getTurnExtractor(client);
       const turns = await turnExtractor(raw);
-      await flushTurns(turns);
-      await commitClaudeCodeFlush(raw);
+      const result = await flushTurns(turns);
+      await commitClaudeCodeFlush(raw, result);
     }
 
     // All clients: trigger compilation of conversation-compiler

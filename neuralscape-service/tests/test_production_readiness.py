@@ -143,7 +143,10 @@ class TestDeduplicateResponses:
         assert "vector" in sources
         assert "graph" in sources
 
-    def test_interleaves_results(self):
+    def test_vector_hits_precede_graph_rows(self):
+        """Audit 27 #2: ranked vector hits keep priority — graph rows are
+        appended after them, never positionally interleaved (the old 1:1
+        weave let unranked relation strings evict ranked vector hits)."""
         vector = [
             MemoryResponse(id="v1", memory="Fact A", source="vector"),
             MemoryResponse(id="v2", memory="Fact B", source="vector"),
@@ -154,11 +157,8 @@ class TestDeduplicateResponses:
         ]
         result = self.svc._deduplicate_responses(vector, graph)
         assert len(result) == 4
-        # Should be: v1, g1, v2, g2
-        assert result[0].id == "v1"
-        assert result[1].id == "g1"
-        assert result[2].id == "v2"
-        assert result[3].id == "g2"
+        # Should be: v1, v2, g1, g2 — vector first, graph after
+        assert [r.id for r in result] == ["v1", "v2", "g1", "g2"]
 
     def test_case_insensitive_dedup(self):
         vector = [MemoryResponse(id="v1", memory="PREFERS TABS", source="vector")]
@@ -785,6 +785,86 @@ class TestHealthEndpointChecks:
 
 
 # ══════════════════════════════════════════════
+# Liveness endpoint: /health/live must never touch backends
+# ══════════════════════════════════════════════
+
+
+class TestLivenessEndpoint:
+    """The container healthcheck (and autoheal) watch /health/live, so it must
+    answer instantly and never depend on Redis/Qdrant/Neo4j reachability."""
+
+    @pytest.fixture
+    def client(self):
+        return TestClient(main.app, raise_server_exceptions=False)
+
+    def test_health_live_returns_alive(self, client):
+        resp = client.get("/health/live")
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "alive"}
+
+    def test_health_live_makes_no_dependency_calls(self, client):
+        """/health/live must return 200 without touching any backing store,
+        even when every backend client would raise."""
+        mock_tm = MagicMock(name="TaskManager")
+        mock_tm.pool = MagicMock()
+        mock_tm.pool.ping = AsyncMock(side_effect=ConnectionError("refused"))
+        original_tm = main._task_manager
+        main._task_manager = mock_tm
+
+        # A service whose backend accessors all explode. A dedicated class —
+        # NOT properties patched onto type(MagicMock()), which is the global
+        # MagicMock class and would leak into every other test (Copilot,
+        # PR #132).
+        class ExplodingService:
+            @property
+            def _memory(self):
+                raise RuntimeError("down")
+
+            @property
+            def _graphiti(self):
+                raise RuntimeError("down")
+
+        original_svc = main._service
+        main._service = ExplodingService()
+
+        try:
+            resp = client.get("/health/live")
+            assert resp.status_code == 200
+            assert resp.json() == {"status": "alive"}
+            # No dependency probes at all — this is pure process liveness.
+            # not_called (not just not_awaited): a created-but-never-awaited
+            # coroutine would still mean the backend was touched.
+            mock_tm.pool.ping.assert_not_called()
+            mock_tm.pool.ping.assert_not_awaited()
+        finally:
+            main._task_manager = original_tm
+            main._service = original_svc
+
+    def test_health_readiness_still_probes_dependencies(self, client):
+        """/health (readiness) must keep performing dependency checks."""
+        mock_tm = MagicMock(name="TaskManager")
+        mock_tm.pool = MagicMock()
+        mock_tm.pool.ping = AsyncMock(return_value=True)
+        original_tm = main._task_manager
+        main._task_manager = mock_tm
+
+        mock_svc = MagicMock()
+        mock_svc._memory = MagicMock()
+        mock_svc._graphiti = MagicMock()
+        original_svc = main._service
+        main._service = mock_svc
+
+        try:
+            resp = client.get("/health")
+            assert resp.status_code == 200
+            assert "checks" in resp.json()
+            mock_tm.pool.ping.assert_awaited()
+        finally:
+            main._task_manager = original_tm
+            main._service = original_svc
+
+
+# ══════════════════════════════════════════════
 # Audit P1-4: _get_genai_client() thread safety
 # ══════════════════════════════════════════════
 
@@ -794,7 +874,7 @@ class TestGenaiClientThreadSafety:
         """_get_genai_client should use the init lock for thread safety."""
         svc = MemoryService()
 
-        with patch("memory_service.genai") as mock_genai:
+        with patch("memory.core.genai") as mock_genai:
             mock_genai.Client.return_value = MagicMock()
 
             # Call from multiple threads
@@ -907,7 +987,7 @@ class TestThreadSafeInit:
             import sys
             sys.modules["mem0"].Memory.from_config.side_effect = track_init
 
-            with patch("memory_service.settings") as mock_settings:
+            with patch("memory.core.settings") as mock_settings:
                 mock_settings.get_mem0_config.return_value = {}
 
                 threads = []
@@ -986,7 +1066,7 @@ class TestRetryTransient:
         retry_transient(fn, "a", "b", key="val", max_retries=1, base_delay=0, operation="test")
         fn.assert_called_once_with("a", "b", key="val")
 
-    @patch("memory_service.settings")
+    @patch("memory.retry.settings")
     def test_uses_config_defaults(self, mock_settings):
         mock_settings.llm_max_retries = 1
         mock_settings.llm_retry_base_delay = 0

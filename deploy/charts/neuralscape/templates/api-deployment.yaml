@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: neuralscape-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: neuralscape-api
+    app.kubernetes.io/component: api
+    {{- include "neuralscape.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.api.autoscaling.enabled }}
+  replicas: {{ .Values.api.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: neuralscape-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: neuralscape-api
+        app.kubernetes.io/component: api
+        {{- include "neuralscape.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: api
+          image: {{ include "neuralscape.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Default image entrypoint is `uvicorn main:app --host 0.0.0.0 --port 8199`.
+          ports:
+            - name: http
+              containerPort: {{ .Values.api.containerPort }}
+          {{- include "neuralscape.env" . | nindent 10 }}
+          volumeMounts:
+            - name: vault
+              mountPath: /data/vault
+            {{- include "neuralscape.ingestVolumeMount" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}
+          # Readiness = "can it serve traffic?" — keeps the dependency-checking
+          # /health so a pod with unreachable backends is pulled from endpoints.
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          # Liveness = "should the process be killed?" — /health/live does no
+          # dependency checks, so a busy-but-healthy API (slow /health under
+          # heavy write/enrichment load) never gets restarted by the kubelet.
+          livenessProbe:
+            httpGet: { path: /health/live, port: http }
+            # Generous start: spaCy/fastembed load + backend connects (matches the
+            # compose healthcheck start_period of 90s).
+            initialDelaySeconds: 90
+            periodSeconds: 30
+            timeoutSeconds: 15
+            failureThreshold: 5
+      volumes:
+        # Conversation-compiler / wiki-synth scratch space. emptyDir is fine while
+        # WIKI_SYNTHESIZER_ENABLED=false; switch to a Filestore (RWX) PVC if you
+        # enable the synthesizer and want the vault shared + persistent.
+        - name: vault
+          emptyDir: {}
+        {{- include "neuralscape.ingestVolume" . | nindent 8 }}

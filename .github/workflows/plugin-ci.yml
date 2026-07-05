@@ -1,0 +1,57 @@
+name: plugin-ci
+
+# The plugin's hooks execute the esbuild bundles in neuralscape-plugin/scripts/,
+# and those bundles are committed artifacts (marketplace installs are plain git
+# clones — there is no install-time build). This workflow is the guard for the
+# 2.7.1 packaging bug class: it fails when the committed bundles are missing or
+# stale relative to src/.
+
+on:
+  pull_request:
+    paths:
+      - "neuralscape-plugin/**"
+      - ".github/workflows/plugin-ci.yml"
+  push:
+    branches: [dev, main]
+    paths:
+      - "neuralscape-plugin/**"
+      - ".github/workflows/plugin-ci.yml"
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: neuralscape-plugin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: neuralscape-plugin/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Rebuild hook bundles
+        run: npm run build
+
+      - name: Committed bundles must match a fresh build
+        run: |
+          if ! git diff --exit-code -- scripts/; then
+            echo "::error::neuralscape-plugin/scripts/ is stale — run 'npm run build' and commit the bundles."
+            exit 1
+          fi
+          # A deleted/never-committed bundle wouldn't show in git diff; make
+          # sure every bundle the hooks reference is actually tracked.
+          for f in session-start user-prompt-submit post-tool-use session-end conversation-turn; do
+            git ls-files --error-unmatch "scripts/$f.js" >/dev/null || {
+              echo "::error::scripts/$f.js is not committed — hooks would 404 on marketplace installs."
+              exit 1
+            }
+          done
+
+      - name: Run plugin tests
+        run: npm test

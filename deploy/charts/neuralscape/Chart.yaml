@@ -1,0 +1,7 @@
+apiVersion: v2
+name: neuralscape
+description: Neuralscape application tier (FastAPI API + ARQ fast worker + graph worker)
+type: application
+version: 0.1.0
+# appVersion tracks the container image tag deployed by default (overridable).
+appVersion: "latest"

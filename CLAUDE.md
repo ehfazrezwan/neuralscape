@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+> **⚠️ CONTAINER BUILD GATE — READ FIRST:** No PR merges into `dev` without a
+> Docker build + in-container test of the same tree. Host-side `pytest` alone
+> is NOT sufficient. See [Container Build Gate](#container-build-gate-hard-rule).
+
 ## What This Is
 
 Neuralscape is a production-grade agentic memory layer combining mem0 (vector store) + Graphiti (temporal knowledge graph). It exposes both a REST API (FastAPI) and MCP server for AI agents to store and retrieve structured memories. Writes are async (enqueued to Redis/ARQ, return 202), reads are sync (return 200).
@@ -20,8 +24,10 @@ docker compose up neo4j redis qdrant -d
 # Run the API server
 uv run python main.py
 
-# Run the ARQ background worker (separate terminal)
-uv run arq worker.WorkerSettings
+# Run the ARQ background workers (separate terminals)
+uv run arq worker.WorkerSettings         # fast: vector writes/reads, conversation tasks
+uv run arq worker.GraphWorkerSettings    # slow: Graphiti graph enrichment + heavy crons
+uv run arq worker.IngestWorkerSettings   # bulk document/file ingest + connector sync
 
 # Run MCP server in stdio mode
 uv run python mcp_server.py
@@ -47,11 +53,13 @@ uv run pytest tests/test_async_pipeline.py -v -s
 ### Service Layer (`neuralscape-service/`)
 
 - **`main.py`** — FastAPI app. Legacy endpoints at root, v1 endpoints at `/v1/*`. Also mounts MCP HTTP transport at `/mcp/`. Health checks at `/health` and `/api/v1/health`.
-- **`memory_service.py`** — Core business logic. Handles extraction (via Gemini LLM), storage (Qdrant + Neo4j), search, dedup, and graph re-ingestion. This is the largest file (~1200 LOC).
-- **`mcp_server.py`** — MCP server with 7 tools. Supports both stdio and Streamable HTTP transports.
-- **`worker.py`** — ARQ background worker. Processes `process_memory_store` and `process_memory_raw` tasks. Runs periodic dedup cron job (every 6 hours).
+- **`memory_service.py` + `memory/`** — Core business logic. `memory_service.py` is a thin facade (public + test import surface, `get_shared_service` singleton) over the `memory/` package, where the implementation lives as mixins: `core.py` (lazy mem0/Graphiti init + bridge dispatch), `write.py` (extraction, store, dedup, graph enrich), `search.py` (pool searches, graph legs, fusion/rerank), `reads.py` (context, batch get, timeline), `standards.py`, `edit.py`, `delete.py`, `graph_admin.py`, `convert.py`, plus leaf utils (`retry.py`, `hashing.py`, `junk.py`, `ranking.py`, `groups.py`). Handles extraction (via Gemini LLM), storage (Qdrant + Neo4j), search, dedup, and graph re-ingestion.
+- **`mcp_server.py`** — MCP server with 22 tools (19 core + 3 code-graph delegation tools registered when the optional `code-graph` extra is installed). Supports both stdio and Streamable HTTP transports.
+- **`worker.py`** — ARQ background workers on three isolated queues: `WorkerSettings` (fast vector writes/reads + conversation tasks), `GraphWorkerSettings` (slow Graphiti enrichment + dedup / dreaming-sweep / strategy-playbook-synth crons), and `IngestWorkerSettings` (bulk document/file ingest + connector sync). Isolation keeps a folder ingest or heavy graph write from starving latency-sensitive reads/writes.
+- **`ingest/`** — document/file ingestion: `chunking.py` (paragraph-aware chunker), `chunking_strategies.py` + `extractors.py` (pluggable strategy/extractor registries — adapter seam), `extract.py` (rich formats → Markdown via a Docling container, MarkItDown in-process fallback; `extract_images` for figure extraction), `archive.py` (zip expansion + bomb guards), `storage.py` (persist uploads as artifacts on a volume, organized by user/project/category, referenced back via source_ref), `pipeline.py` (resolves the knowledge adapter → chunk → passages + distilled facts).
+- **`adapters/`** — pluggable **knowledge adapters** (`base.py`: `KnowledgeAdapter` + `ADAPTER_REGISTRY` + `get_adapter`). An adapter swaps the taxonomy, chunking strategy, fact extractor, and Graphiti ontology while keeping the fixed envelope identical. `adapters/trading/` is the `trading_strategy` adapter (taxonomy, ontology, section-aware chunker, rule extractor, visual exemplars). See `docs/neuralscape/22-knowledge-adapters.md`.
 - **`config.py`** — Pydantic Settings. All configuration via env vars. Builds the mem0 config dict.
-- **`schemas.py`** — 13 memory categories organized by type (semantic, project, episodic, procedural, working). Pydantic request/response models.
+- **`schemas.py`** — 13 core memory categories (semantic, project, episodic, procedural, working) plus any registered by a knowledge adapter (`register_categories`). Pydantic request/response models.
 - **`prompts.py`** — LLM extraction prompts and category parsers.
 - **`task_manager.py`** — Redis-backed task enqueuing and status polling for async writes.
 - **`logging_config.py`** — Structlog setup (JSON in prod, console in dev).
@@ -60,6 +68,7 @@ uv run pytest tests/test_async_pipeline.py -v -s
 
 - **Write path**: Client → API/MCP → Redis queue → 202 → ARQ Worker → Gemini extraction → Qdrant + Neo4j → Redis status → poll for result
 - **Read path**: Client → API/MCP → MemoryService → Qdrant + Neo4j → 200 OK (synchronous)
+- **Ingest path**: Client → `POST /v1/ingest/{text,files}` (or MCP `ingest_text`) → file persisted as an artifact on the storage volume → 202 → **ingest** queue → Ingest Worker (Docling/MarkItDown parse → chunk → passages + distilled facts, each stamped with a source_ref pointing back to the artifact). A dedicated queue so bulk ingest never blocks the fast paths.
 
 ### Memory Model
 
@@ -67,7 +76,9 @@ Two scopes: `global` (user-wide) and `project` (project-specific, requires `proj
 
 ### Subtree Dependencies
 
-`graphiti/` and `mem0/` are git subtrees from upstream repos, installed as editable packages via `uv` (see `[tool.uv.sources]` in pyproject.toml). After syncing upstream, check for merge conflicts in mem0's `configs.py` / `factory.py`.
+`graphiti/` and `mem0/` are git subtrees from upstream repos, installed as editable packages via `uv` (see `[tool.uv.sources]` in pyproject.toml). Both subtrees are **pruned to library core** (`graphiti/graphiti_core`, `mem0/mem0`, plus packaging files) — upstream's apps, docs, examples, and tests are deliberately not tracked. `scripts/sync-upstream.sh` pulls from a locally built **filtered mirror** (requires `git-filter-repo`), so syncs only ever bring the core paths in. After syncing upstream, check for merge conflicts in mem0's `configs.py` / `factory.py`.
+
+**The mem0 graph layer is an NS fork, not an upstream patch.** mem0 deleted its entire self-hostable OSS graph layer in PR #4805 (`a488e190`, 2026-04-14, the v3 pipeline) — `mem0/graphs/` and `graph_memory.py` / `memgraph_memory.py` no longer exist upstream, and graph memory is now a hosted-Platform-only feature. NS restores and maintains that layer plus a `GraphStoreFactory`, and `graphiti_memory.py` is **net-new NS code that never existed upstream** (the adapter presenting Graphiti as a mem0 graph provider). Because mem0 2.x's `Memory` class has no `.graph` concept, the re-attach shim in `memory/core.py` (`_get_memory`) fabricates one. Every sync re-grafts this layer onto a core that deliberately removed it — this is the dominant sync risk, documented in `docs/neuralscape/14-upstream-delta-report.md`.
 
 ### Required Services
 
@@ -86,6 +97,54 @@ NEO4J_PASSWORD     # Neo4j password (default user: neo4j)
 REDIS_URL          # Redis connection string
 QDRANT_URL         # Qdrant server URL (omit for local on-disk mode)
 ```
+
+## Public Repo — Deployment Secrecy (HARD RULE)
+
+**This is a public GitHub repo. NEVER commit organization- or deployment-specific
+details to it.** This applies to every deployment target, including the
+Optimizely and Digital Ambiance (DA) deployments.
+
+Forbidden in tracked files:
+- Company/org names tied to a deployment (e.g. `optimizely`, `optimizely.com`).
+- GCP project IDs, cluster names, state-bucket names, or other infra identifiers
+  (e.g. `iiis-492427`, `windmill-gke`, `svc-utility-belt`).
+- Internal project slugs / codenames (e.g. `lightpath`, `openclaw`).
+- Which external LLM gateway/endpoint or org we route inference through. (The
+  generic `LLM_GATEWAY_*` *feature flags* in `config.py` are fine — the
+  gateway's identity/URL is not.)
+
+Keep `deploy/` (Terraform + Helm + k8s) **generic and parameterized** with
+placeholder defaults (`project_id`, `neuralscape.example.com`, empty
+`nodeSelector`, partial TF backend). Real values are supplied only at deploy time
+inside the **private** org Git via `terraform.tfvars`, `backend.hcl`, and a
+private Helm values / kustomize overlay. Grep before pushing:
+`git grep -iE "optimizely|iiis-492427|windmill-gke|svc-utility-belt|lightpath"`.
+
+## Container Build Gate (HARD RULE)
+
+**No PR merges into `dev` (or `main`) without a successful Docker build AND an
+in-container test run of the exact tree being merged.** Host-side
+`uv run pytest` is NOT sufficient: the Dockerfile **enumerates** its COPY
+paths per directory, so a new top-level package under `neuralscape-service/`
+passes every host test and then crash-loops in production because it was
+never copied into the image. This happened on 2026-07-05 — the `memory/`
+package split passed 1,826 host tests, merged clean, and took the live API
+down for ~5 minutes until the COPY lines were hotfixed.
+
+Minimum gate before any merge (run from repo root):
+
+```bash
+# 1. Suite runs INSIDE the packaged image (test stage is the default target)
+docker build -f neuralscape-service/Dockerfile -t ns-gate . && docker run --rm ns-gate
+
+# 2. Runtime image builds
+docker build --target runtime -f neuralscape-service/Dockerfile -t ns-gate-rt .
+```
+
+When adding ANY new top-level file or directory under `neuralscape-service/`,
+update the COPY lists in **all three** Dockerfile stages (builder, runtime,
+test). The upcoming CI pipeline makes this gate a required PR check; until
+then it is a manual, non-negotiable step.
 
 ## Git Workflow
 
@@ -109,4 +168,4 @@ Tests are in `neuralscape-service/tests/`. Unit tests mock all external services
 
 ## Docker
 
-`docker compose up` starts the full stack (neo4j, redis, qdrant, neuralscape API, neuralscape-worker). The API runs on port 8199.
+`docker compose up` starts the full stack (neo4j, redis, qdrant, docling, neuralscape API, neuralscape-worker, neuralscape-graph-worker, neuralscape-ingest-worker). The API runs on port 8199; Docling on 5001. The API and ingest worker share the `ingest_data` volume for uploaded artifacts.

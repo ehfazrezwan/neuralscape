@@ -8,16 +8,25 @@
 
 import { readFile } from "node:fs/promises";
 import { getProjectId, getUserId, logError } from "../utils.js";
+import type { FlushResult } from "../core/flush.js";
 import type { ConversationTurn, SessionEndInput } from "../core/types.js";
 
 const OFFSET_SUFFIX = ".neuralscape-offset";
 
 /**
- * Offsets staged by extractClaudeCodeTurns are written to disk only after
- * the caller confirms a successful flush, so a failed flush leaves the
- * cursor at its prior position and we re-flush next session.
+ * Offsets staged by extractClaudeCodeTurns, committed only after the caller
+ * reports delivery (audit 27 #34b): `turnEndOffsets[i]` is the transcript
+ * cursor value just past turn i's messages, so a partial flush can advance
+ * exactly to the end of the delivered prefix; `finalOffset` covers the whole
+ * parsed window (including trailing unpaired messages) and is committed only
+ * on full success.
  */
-const pendingOffsets = new Map<string, number>();
+interface StagedFlush {
+  turnEndOffsets: number[];
+  finalOffset: number;
+}
+
+const pendingOffsets = new Map<string, StagedFlush>();
 
 interface TranscriptMessage {
   type: string; // "user" | "assistant" | "tool_use" | "tool_result" | ...
@@ -69,7 +78,10 @@ function extractText(msg: TranscriptMessage): string {
 function parseTranscript(
   content: string,
   startOffset: number
-): { turns: Array<{ user: string; assistant: string }>; newOffset: number } {
+): {
+  turns: Array<{ user: string; assistant: string; endOffset: number }>;
+  newOffset: number;
+} {
   let messages: TranscriptMessage[];
   try {
     // Try JSON array first
@@ -101,8 +113,10 @@ function parseTranscript(
   // Skip already-processed messages
   const newMessages = relevant.slice(startOffset);
 
-  // Pair consecutive user/assistant messages
-  const turns: Array<{ user: string; assistant: string }> = [];
+  // Pair consecutive user/assistant messages. Each turn records the cursor
+  // value just past its own messages so a partially-delivered flush can
+  // commit exactly the delivered prefix (audit 27 #34b).
+  const turns: Array<{ user: string; assistant: string; endOffset: number }> = [];
   for (let i = 0; i < newMessages.length - 1; i++) {
     const msg = newMessages[i];
     const next = newMessages[i + 1];
@@ -113,6 +127,7 @@ function parseTranscript(
       turns.push({
         user: extractText(msg),
         assistant: extractText(next),
+        endOffset: startOffset + i + 2,
       });
       i++; // skip the assistant message on next iteration
     }
@@ -145,9 +160,12 @@ export async function extractClaudeCodeTurns(
       const { turns, newOffset } = parseTranscript(content, offset);
 
       if (turns.length > 0) {
-        // Stage the new offset; commitClaudeCodeFlush() persists it
-        // only after the caller confirms a successful flush.
-        pendingOffsets.set(transcriptPath, newOffset);
+        // Stage per-turn offsets; commitClaudeCodeFlush() persists a cursor
+        // only as far as the caller reports turns actually delivered.
+        pendingOffsets.set(transcriptPath, {
+          turnEndOffsets: turns.map((t) => t.endOffset),
+          finalOffset: newOffset,
+        });
 
         return turns.map((t) => ({
           userMessage: t.user,
@@ -186,6 +204,27 @@ export async function extractClaudeCodeTurns(
 }
 
 /**
+ * Read ALL user/assistant turn pairs of a session transcript from the
+ * beginning, ignoring (and never touching) the flush offset. Used by the
+ * SessionEnd summary hook (roadmap D2), which needs the whole session to
+ * build its structured note — unlike the flush path, it is not
+ * incremental. Returns [] when the transcript is missing/unreadable.
+ */
+export async function extractAllTurnPairs(
+  raw: Record<string, unknown>
+): Promise<Array<{ user: string; assistant: string }>> {
+  const transcriptPath = raw.transcript_path as string | undefined;
+  if (!transcriptPath) return [];
+  try {
+    const content = await readFile(transcriptPath, "utf-8");
+    return parseTranscript(content, 0).turns;
+  } catch (error) {
+    logError("Failed to read transcript for session summary", error);
+    return [];
+  }
+}
+
+/**
  * Extract session-end metadata from a Claude Code Stop event.
  */
 export function extractClaudeCodeSessionEnd(
@@ -199,27 +238,42 @@ export function extractClaudeCodeSessionEnd(
 }
 
 /**
- * Persist the offset staged by extractClaudeCodeTurns().
+ * Persist the offset staged by extractClaudeCodeTurns(), bounded by what the
+ * flush actually DELIVERED (audit 27 #34b):
  *
- * Call this AFTER a successful flush so the cursor advances only when
- * the turns have actually been delivered. If the hook crashes between
- * extract and commit, the on-disk offset stays at its prior value and
- * the next session re-flushes (the backend is expected to dedup).
+ * - full success → commit the full parsed-window offset;
+ * - partial failure → commit only past the successfully-POSTed prefix, so
+ *   the next session re-flushes exactly the undelivered turns;
+ * - nothing delivered (first turn failed) → leave the cursor untouched.
+ *
+ * If the hook crashes between extract and commit, the on-disk offset stays
+ * at its prior value and the next session re-flushes (the backend dedups).
  */
 export async function commitClaudeCodeFlush(
-  raw: Record<string, unknown>
+  raw: Record<string, unknown>,
+  result: FlushResult
 ): Promise<void> {
   const transcriptPath = raw.transcript_path as string | undefined;
   if (!transcriptPath) return;
 
-  const newOffset = pendingOffsets.get(transcriptPath);
-  if (newOffset === undefined) return;
+  const staged = pendingOffsets.get(transcriptPath);
+  if (staged === undefined) return;
+  pendingOffsets.delete(transcriptPath);
+
+  let newOffset: number;
+  if (result.firstFailedIndex === null) {
+    newOffset = staged.finalOffset;
+  } else if (result.firstFailedIndex <= 0) {
+    return; // nothing confirmed delivered — cursor stays where it was
+  } else {
+    const committed = staged.turnEndOffsets[result.firstFailedIndex - 1];
+    if (committed === undefined) return;
+    newOffset = committed;
+  }
 
   try {
     await writeFlushOffset(transcriptPath, newOffset);
   } catch (error) {
     logError("Failed to commit transcript flush offset", error);
-  } finally {
-    pendingOffsets.delete(transcriptPath);
   }
 }

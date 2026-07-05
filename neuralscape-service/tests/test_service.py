@@ -56,6 +56,8 @@ def mock_task_manager():
     mock_tm.close = AsyncMock()
     mock_tm.enqueue_store = AsyncMock(return_value="test-task-id-store")
     mock_tm.enqueue_raw = AsyncMock(return_value="test-task-id-raw")
+    mock_tm.enqueue_retag = AsyncMock(return_value="test-task-id-retag")
+    mock_tm.enqueue_graph_enrichment = AsyncMock(return_value="test-task-id-graph")
     mock_tm.get_status = AsyncMock(return_value={
         "task_id": "test-task-id",
         "status": "completed",
@@ -421,17 +423,172 @@ class TestV1ManageMemories:
         resp = client.get("/v1/memories/nonexistent")
         assert resp.status_code == 404
 
-    def test_update_memory(self, client, mock_service):
-        mock_service.update_memory.return_value = {"message": "Memory updated successfully"}
-        resp = client.put("/v1/memories/m1", json={
-            "content": "Prefers 4-space indentation",
-        })
-        assert resp.status_code == 200
-
     def test_delete_single_memory(self, client, mock_service):
         mock_service.delete_memory.return_value = {"message": "Memory deleted successfully!"}
         resp = client.delete("/v1/memories/m1")
         assert resp.status_code == 200
+
+
+def _patch_result(graph="unchanged", graph_job=None):
+    from schemas import MemoryResponse
+
+    return {
+        "memory": MemoryResponse(id="m1", memory="x", category="preference"),
+        "graph_job": graph_job,
+        "graph": graph,
+    }
+
+
+class TestV1PatchMemory:
+    def test_patch_metadata_only(self, client, mock_service, mock_task_manager):
+        mock_service.patch_memory.return_value = _patch_result()
+        resp = client.patch("/v1/memories/m1", json={"tags": ["project:bon002"]})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "ok"
+        assert data["graph"] == "unchanged" and data["graph_task_id"] is None
+        # PATCH semantics: only the sent field reaches the service
+        args = mock_service.patch_memory.call_args.args
+        assert args[0] == "m1"
+        assert args[2] == {"tags": ["project:bon002"]}
+        mock_task_manager.enqueue_graph_enrichment.assert_not_awaited()
+
+    def test_patch_explicit_null_clears(self, client, mock_service):
+        mock_service.patch_memory.return_value = _patch_result()
+        resp = client.patch("/v1/memories/m1", json={"project_id": None})
+        assert resp.status_code == 200
+        assert mock_service.patch_memory.call_args.args[2] == {"project_id": None}
+
+    def test_patch_empty_body_400(self, client, mock_service):
+        resp = client.patch("/v1/memories/m1", json={})
+        assert resp.status_code == 400
+        mock_service.patch_memory.assert_not_called()
+
+    def test_patch_permission_maps_403(self, client, mock_service):
+        mock_service.patch_memory.side_effect = PermissionError("Only the memory's owner")
+        resp = client.patch("/v1/memories/m1", json={"content": "rewrite"})
+        assert resp.status_code == 403
+
+    def test_patch_not_found_maps_404(self, client, mock_service):
+        mock_service.patch_memory.side_effect = LookupError("Memory m1 not found")
+        resp = client.patch("/v1/memories/m1", json={"tags": ["x"]})
+        assert resp.status_code == 404
+
+    def test_patch_invalid_maps_400(self, client, mock_service):
+        mock_service.patch_memory.side_effect = ValueError("Invalid category: bogus")
+        resp = client.patch("/v1/memories/m1", json={"category": "bogus"})
+        assert resp.status_code == 400
+
+    def test_put_alias_still_works(self, client, mock_service):
+        mock_service.patch_memory.return_value = _patch_result()
+        resp = client.put("/v1/memories/m1", json={"content": "Prefers 4-space indentation"})
+        assert resp.status_code == 200
+
+    def test_patch_enqueues_graph_job(self, client, mock_service, mock_task_manager):
+        job = {
+            "memory_id": "m1", "content": "new", "user_id": "ehfaz",
+            "project_id": "p1", "visibility": "shared", "source_ref": None,
+        }
+        mock_service.patch_memory.return_value = _patch_result("reingest_pending", job)
+        resp = client.patch("/v1/memories/m1", json={"content": "new"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["graph"] == "reingest_queued"
+        assert data["graph_task_id"] == "test-task-id-graph"
+        mock_task_manager.enqueue_graph_enrichment.assert_awaited_once_with(**job)
+
+    def test_patch_reports_enqueue_failure_honestly(self, client, mock_service, mock_task_manager):
+        job = {"memory_id": "m1", "content": "new", "user_id": "e",
+               "project_id": None, "visibility": "private", "source_ref": None}
+        mock_service.patch_memory.return_value = _patch_result("migration_pending", job)
+        mock_task_manager.enqueue_graph_enrichment.side_effect = ConnectionError("redis down")
+        resp = client.patch("/v1/memories/m1", json={"project_id": None})
+        assert resp.status_code == 200
+        assert resp.json()["graph"] == "enqueue_failed"
+
+
+class TestV1Retag:
+    def test_retag_returns_202(self, client, mock_service, mock_task_manager):
+        resp = client.post("/v1/memories/retag", json={
+            "filters": {"project_id": "neuralscape"},
+            "ops": {"add_tags": ["project:bon002"]},
+        })
+        assert resp.status_code == 202
+        assert resp.json()["task_id"] == "test-task-id-retag"
+        _caller, filters, ops = mock_task_manager.enqueue_retag.await_args.args
+        assert filters == {"project_id": "neuralscape"}
+        assert ops == {"add_tags": ["project:bon002"]}
+        mock_service.retag_memories.assert_not_called()
+
+    def test_retag_preserves_explicit_null_project(self, client, mock_task_manager):
+        resp = client.post("/v1/memories/retag", json={
+            "filters": {"category": "decision"},
+            "ops": {"set_project_id": None},
+        })
+        assert resp.status_code == 202
+        _, _, ops = mock_task_manager.enqueue_retag.await_args.args
+        assert ops == {"set_project_id": None}
+
+    def test_retag_dry_run_synchronous(self, client, mock_service, mock_task_manager):
+        mock_service.retag_memories.return_value = {
+            "matched": 5, "updated": 4, "skipped_forbidden": 1,
+            "skipped_invalid": 0, "graph_jobs": [], "dry_run": True,
+        }
+        resp = client.post("/v1/memories/retag", json={
+            "filters": {"category": "decision"},
+            "ops": {"add_tags": ["t"]},
+            "dry_run": True,
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["matched"] == 5 and "graph_jobs" not in data
+        mock_task_manager.enqueue_retag.assert_not_awaited()
+
+    def test_retag_requires_a_filter(self, client):
+        resp = client.post("/v1/memories/retag", json={
+            "filters": {}, "ops": {"add_tags": ["t"]},
+        })
+        assert resp.status_code == 422
+
+    def test_retag_empty_filter_values_rejected(self, client, mock_task_manager):
+        """REGRESSION: `tags_contains: []` / `category: ""` produce no Qdrant
+        condition downstream — counting them as 'a filter is present' would
+        turn a supposedly filtered retag into an unfiltered sweep."""
+        for filters in ({"tags_contains": []}, {"category": ""}):
+            resp = client.post("/v1/memories/retag", json={
+                "filters": filters, "ops": {"add_tags": ["t"]},
+            })
+            assert resp.status_code == 422, filters
+        mock_task_manager.enqueue_retag.assert_not_awaited()
+
+    def test_retag_requires_an_op(self, client):
+        resp = client.post("/v1/memories/retag", json={
+            "filters": {"category": "decision"}, "ops": {},
+        })
+        assert resp.status_code == 422
+
+    def test_retag_redis_down_503_with_project_change(self, client, mock_task_manager):
+        mock_task_manager.enqueue_retag.side_effect = ConnectionError("redis down")
+        resp = client.post("/v1/memories/retag", json={
+            "filters": {"category": "decision"},
+            "ops": {"set_project_id": "bon002"},
+        })
+        assert resp.status_code == 503
+
+    def test_retag_redis_down_sync_fallback_without_project_change(
+        self, client, mock_service, mock_task_manager
+    ):
+        mock_task_manager.enqueue_retag.side_effect = ConnectionError("redis down")
+        mock_service.retag_memories.return_value = {
+            "matched": 2, "updated": 2, "skipped_forbidden": 0,
+            "skipped_invalid": 0, "graph_jobs": [], "dry_run": False,
+        }
+        resp = client.post("/v1/memories/retag", json={
+            "filters": {"category": "decision"},
+            "ops": {"add_tags": ["t"]},
+        })
+        assert resp.status_code == 200
+        assert resp.json()["updated"] == 2
 
 
 class TestV1Categories:
@@ -442,7 +599,15 @@ class TestV1Categories:
         assert data["status"] == "ok"
         assert "preference" in data["categories"]
         assert "tech_stack" in data["categories"]
-        assert len(data["categories"]) == 13
+        # The core 13 are always present. Knowledge adapters (e.g. the trading
+        # adapter) additively register more categories, so assert the core set
+        # is a subset rather than an exact count.
+        core = {
+            "preference", "personal_fact", "technical_skill", "domain_knowledge",
+            "tech_stack", "convention", "architecture", "dependency",
+            "decision", "interaction", "workflow", "procedure", "task_context",
+        }
+        assert core <= set(data["categories"])
 
 
 class TestV1AsyncMemoryStatus:

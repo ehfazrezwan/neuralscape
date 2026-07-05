@@ -180,17 +180,34 @@ class ConversationCompilerExtension:
         if not content or not category:
             return None
 
-        from schemas import MemoryVisibility, default_visibility_for_category
+        from schemas import (
+            MemoryVisibility,
+            default_visibility_for_category,
+            normalize_visibility,
+        )
 
         visibility_raw = payload.get("visibility")
         if visibility_raw is None:
             resolved_visibility = default_visibility_for_category(category)
         else:
-            resolved_visibility = (
-                visibility_raw
-                if isinstance(visibility_raw, MemoryVisibility)
-                else MemoryVisibility(visibility_raw)
-            )
+            # ``normalize_visibility`` tolerates the legacy
+            # "MemoryVisibility.SHARED" stringified-enum format from the
+            # pre-fix str(Enum) bug — older memories stored in Qdrant
+            # before the __str__ override still parse cleanly here, so
+            # the backfill script can replay events for every stored
+            # memory without crashing on broken visibility values.
+            try:
+                normalized = normalize_visibility(visibility_raw)
+                resolved_visibility = (
+                    MemoryVisibility(normalized) if normalized
+                    else default_visibility_for_category(category)
+                )
+            except (ValueError, TypeError):
+                logger.warning(
+                    "Unknown visibility %r — defaulting per category",
+                    visibility_raw,
+                )
+                resolved_visibility = default_visibility_for_category(category)
         if resolved_visibility != MemoryVisibility.SHARED:
             return None
 

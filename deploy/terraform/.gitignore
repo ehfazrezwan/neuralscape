@@ -1,0 +1,11 @@
+# Terraform working dirs / state / secrets — never commit.
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+terraform.tfvars
+*.auto.tfvars
+backend.hcl
+override.tf
+override.tf.json
+# Keep .terraform.lock.hcl tracked (provider version pinning).

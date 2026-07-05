@@ -1,0 +1,16 @@
+# Foundation + stateful backends for Neuralscape on GKE.
+# Apply with:  kubectl apply -k deploy/k8s/
+#
+# Order within a single `kubectl apply -k` is handled by kubectl (namespace
+# first, then namespaced resources). The ExternalSecret requires the
+# external-secrets CRDs + the ClusterSecretStore (default name
+# `gcp-secret-manager`) to already exist on the cluster.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: neuralscape
+resources:
+  - namespace.yaml
+  - externalsecret.yaml
+  - neo4j.yaml
+  - qdrant.yaml
+  - redis.yaml

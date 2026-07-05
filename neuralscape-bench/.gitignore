@@ -1,0 +1,22 @@
+# Benchmark outputs (keep the sample + committed accuracy aggregates, ignore the rest)
+results/*.json
+!results/sample-run.json
+!results/sample-compare.json
+!results/sample-stress.json
+!results/accuracy-*.json
+!results/cost-estimates.json
+
+# Accuracy battery: datasets are downloaded at run time and NEVER committed;
+# raw per-question outputs contain conversation text — gitignored too.
+datasets/
+state/
+results/raw/
+
+# Orchestrator-managed stack worktrees
+.stacks/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/

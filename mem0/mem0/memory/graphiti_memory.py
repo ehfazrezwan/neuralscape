@@ -27,17 +27,39 @@ def _create_llm_client(
     model: str | None,
     api_key: str | None,
     fallback_model: str | None = None,
+    small_model: str | None = None,
 ):
     """Create a Graphiti LLM client based on provider name."""
     if provider == "gemini":
         from graphiti_core.llm_client.gemini_client import GeminiClient
 
-        config = LLMConfig(api_key=api_key, model=model, fallback_model=fallback_model)
+        # NEURALSCAPE PATCH: default small_model to the main model. Graphiti's
+        # GeminiClient uses small_model for cheaper sub-tasks (e.g.
+        # dedupe_edges.resolve_edge); if left unset it uses its own hardcoded
+        # DEFAULT_SMALL_MODEL. Threading the configured main model here keeps the
+        # ENTIRE enrichment path (extraction + dedup) on one reliable model
+        # instead of silently splitting onto a different default.
+        config = LLMConfig(
+            api_key=api_key,
+            model=model,
+            fallback_model=fallback_model,
+            small_model=small_model or model,
+        )
         return GeminiClient(config=config)
     elif provider == "openai":
         from graphiti_core.llm_client.openai_client import OpenAIClient
 
-        config = LLMConfig(api_key=api_key, model=model, fallback_model=fallback_model)
+        # NEURALSCAPE PATCH: default small_model to the main model. Graphiti's
+        # OpenAIBaseClient uses small_model for cheaper sub-tasks and otherwise
+        # falls back to DEFAULT_SMALL_MODEL ("gpt-4.1-nano") — an OpenAI model an
+        # OpenAI-compatible gateway that only fronts Google/Anthropic-on-Vertex
+        # doesn't provision. base_url is left to OPENAI_BASE_URL.
+        config = LLMConfig(
+            api_key=api_key,
+            model=model,
+            fallback_model=fallback_model,
+            small_model=small_model or model,
+        )
         return OpenAIClient(config=config)
     elif provider == "anthropic":
         from graphiti_core.llm_client.anthropic_client import AnthropicClient
@@ -80,12 +102,17 @@ def _create_embedder(provider: str, model: str | None, api_key: str | None):
         raise ValueError(f"Unsupported Graphiti embedder provider: {provider}")
 
 
-def _create_cross_encoder(provider: str | None, api_key: str | None):
+def _create_cross_encoder(provider: str | None, api_key: str | None, model: str | None = None):
     """Create a Graphiti cross-encoder/reranker client."""
     if provider is None or provider == "openai":
         from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
 
-        return OpenAIRerankerClient(api_key=api_key)
+        # NEURALSCAPE PATCH: OpenAIRerankerClient takes a `config` (LLMConfig),
+        # not `api_key=` — passing api_key raises TypeError and fails graphiti
+        # init. Build a config (model + key; base_url via OPENAI_BASE_URL) so the
+        # reranker can route through an OpenAI-compatible gateway.
+        config = LLMConfig(api_key=api_key, model=model)
+        return OpenAIRerankerClient(config=config)
     elif provider == "gemini":
         from graphiti_core.cross_encoder.gemini_reranker_client import GeminiRerankerClient
 
@@ -148,6 +175,7 @@ class MemoryGraph:
             model=graph_config.graphiti_llm_model,
             api_key=graph_config.graphiti_llm_api_key,
             fallback_model=getattr(graph_config, "graphiti_llm_fallback_model", None),
+            small_model=getattr(graph_config, "graphiti_llm_small_model", None),
         )
 
         embedder = _create_embedder(
@@ -159,6 +187,7 @@ class MemoryGraph:
         cross_encoder = _create_cross_encoder(
             provider=graph_config.graphiti_reranker_provider,
             api_key=graph_config.graphiti_llm_api_key,
+            model=graph_config.graphiti_llm_model,
         )
 
         # Create Neo4j driver and Graphiti instance ON the bridge loop
@@ -283,12 +312,39 @@ class MemoryGraph:
             })
         return results
 
-    def add(self, data, filters):
+    def add(
+        self,
+        data,
+        filters,
+        entity_types=None,
+        edge_types=None,
+        edge_type_map=None,
+        excluded_entity_types=None,
+        custom_extraction_instructions=None,
+        episode_name=None,
+    ):
         """Add data to the graph via Graphiti's add_episode.
 
         Args:
             data (str): The data to add to the graph.
             filters (dict): Filters with user_id, agent_id, run_id.
+            entity_types (dict[str, type[BaseModel]] | None): Optional custom
+                Graphiti entity types (a knowledge adapter's ontology). None ⇒
+                Graphiti's built-in generic extraction (current behavior).
+            edge_types (dict[str, type[BaseModel]] | None): Optional custom edge
+                types.
+            edge_type_map (dict[tuple[str, str], list[str]] | None): Optional
+                map of (source_type, target_type) → allowed edge type names.
+            excluded_entity_types (list[str] | None): Optional entity type names
+                to drop from the graph.
+            custom_extraction_instructions (str | None): Optional extra guidance
+                injected into Graphiti's extraction prompts.
+            episode_name (str | None): NEURALSCAPE PATCH (audit 27 #21) —
+                optional caller-supplied episode name, used as an idempotency
+                carrier: the service derives it deterministically from the
+                content + group so a re-run can find (and skip) an
+                already-ingested episode. None ⇒ the legacy timestamp-based
+                name (every call mints a distinct episode).
 
         Returns:
             dict: {"deleted_entities": [...], "added_entities": [...]}
@@ -298,15 +354,30 @@ class MemoryGraph:
         source_description = self._build_source_description(filters)
         now = datetime.now(timezone.utc)
 
+        # Only forward custom-ontology kwargs when supplied so the default path
+        # is byte-for-byte the pre-adapter add_episode call.
+        episode_kwargs = {}
+        if entity_types is not None:
+            episode_kwargs["entity_types"] = entity_types
+        if edge_types is not None:
+            episode_kwargs["edge_types"] = edge_types
+        if edge_type_map is not None:
+            episode_kwargs["edge_type_map"] = edge_type_map
+        if excluded_entity_types is not None:
+            episode_kwargs["excluded_entity_types"] = excluded_entity_types
+        if custom_extraction_instructions is not None:
+            episode_kwargs["custom_extraction_instructions"] = custom_extraction_instructions
+
         async def _add():
             result = await self.graphiti.add_episode(
-                name=f"mem0_episode_{now.isoformat()}",
+                name=episode_name or f"mem0_episode_{now.isoformat()}",
                 episode_body=data,
                 source_description=source_description,
                 reference_time=now,
                 source=EpisodeType.text,
                 group_id=group_id,
                 update_communities=self._update_communities,
+                **episode_kwargs,
             )
 
             added = []

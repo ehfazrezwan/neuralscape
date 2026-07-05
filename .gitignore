@@ -176,3 +176,12 @@ docker-compose.override.yml
 # Local vault directory (created by Docker volume mount)
 vault/
 settings.local.json
+# Vendored wheels (host-downloaded, e.g. spaCy model when TLS is MITMed)
+neuralscape-service/vendor/*.whl
+
+# Filtered upstream mirrors built by scripts/sync-upstream.sh (scratch)
+.sync-mirrors/
+
+# One-off local report/visualization exports at repo root
+/ns-perf-report-*.html
+/naked-forex-graph.html

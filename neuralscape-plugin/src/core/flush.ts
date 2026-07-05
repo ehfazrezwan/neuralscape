@@ -12,6 +12,7 @@ import {
   isSystemMessage,
   logError,
   neuralscapePost,
+  redactPrivate,
 } from "../utils.js";
 import type { ConversationTurn } from "./types.js";
 
@@ -33,21 +34,44 @@ export function shouldSkipTurn(turn: ConversationTurn): boolean {
 }
 
 /**
+ * Delivery accounting for a flush (audit 27 #34b): callers that maintain a
+ * transcript cursor must advance it only past the successfully-delivered
+ * prefix, so the result reports where delivery stopped.
+ */
+export interface FlushResult {
+  /** Turns handed in. */
+  attempted: number;
+  /** POSTs that succeeded (noise-skipped turns are not counted here). */
+  flushed: number;
+  /**
+   * Index (into the input array) of the first turn whose POST failed, or
+   * null when every non-skipped turn was delivered. Turns after this index
+   * were NOT attempted — they stay re-flushable next session.
+   */
+  firstFailedIndex: number | null;
+}
+
+/**
  * Flush conversation turns to the conversation-compiler extension.
  *
- * Filters noise, then POSTs each turn sequentially. Errors are logged
- * but do not throw — this is fire-and-forget.
+ * Filters noise, then POSTs each turn sequentially, stopping at the first
+ * failure (if the service is down, later POSTs would fail too, and stopping
+ * keeps the undelivered turns a contiguous re-flushable suffix). Never
+ * throws — failures are logged and reported via the result.
  */
-export async function flushTurns(turns: ConversationTurn[]): Promise<number> {
+export async function flushTurns(turns: ConversationTurn[]): Promise<FlushResult> {
   let flushed = 0;
 
-  for (const turn of turns) {
+  for (let i = 0; i < turns.length; i++) {
+    const turn = turns[i];
+    // Noise counts as delivered: there is nothing to re-flush later.
     if (shouldSkipTurn(turn)) continue;
 
     try {
+      // <private>…</private> spans never leave the machine (D4).
       await neuralscapePost("/v1/extensions/conversation-compiler/flush", {
-        user_message: turn.userMessage,
-        assistant_response: turn.assistantResponse,
+        user_message: redactPrivate(turn.userMessage),
+        assistant_response: redactPrivate(turn.assistantResponse),
         session_id: turn.sessionId,
         channel: turn.channel,
         timestamp: turn.timestamp,
@@ -56,9 +80,10 @@ export async function flushTurns(turns: ConversationTurn[]): Promise<number> {
       });
       flushed++;
     } catch (error) {
-      logError("Failed to flush conversation turn", error);
+      logError(`Failed to flush conversation turn ${i + 1}/${turns.length}; leaving the rest for the next flush`, error);
+      return { attempted: turns.length, flushed, firstFailedIndex: i };
     }
   }
 
-  return flushed;
+  return { attempted: turns.length, flushed, firstFailedIndex: null };
 }

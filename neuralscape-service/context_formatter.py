@@ -43,16 +43,56 @@ CATEGORY_LABELS = {
 # Default max characters (~2000 tokens at ~4 chars/token)
 DEFAULT_MAX_CHARS = 8000
 
+# Guaranteed budget for authoritative standards, on top of DEFAULT_MAX_CHARS.
+# Standards are binding org rules and must never be truncated away by a large
+# recalled-context payload, so they get their own reserved allowance.
+STANDARDS_MAX_CHARS = 3000
+
+
+def format_standards_block(
+    standards: list[MemoryResponse],
+    max_chars: int = STANDARDS_MAX_CHARS,
+) -> str:
+    """Format authoritative standards as a binding-directive markdown block.
+
+    Rendered ABOVE the ordinary memory context and framed as binding: on
+    conflict these override personal preferences and project conventions.
+    Empty string when there are no standards.
+    """
+    if not standards:
+        return ""
+    header = (
+        "# ⚖️ Neuralscape AUTHORITATIVE Standards (binding)\n\n"
+        "These are organization standards set by a Neuralscape dictator. They "
+        "are BINDING directives, not preferences. On any conflict they OVERRIDE "
+        "personal preferences and project conventions. Follow them unless the "
+        "user explicitly overrides them in this session."
+    )
+    # The caller passes the always-inject (critical) subset of standards — see
+    # MemoryService._get_standards(critical_only=True). Those are BINDING and
+    # exempt from the ordinary context char budget, so we emit them ALL, never
+    # truncating: dropping an authoritative directive (or emitting a header with
+    # no rules when the first is large) would silently weaken the contract. The
+    # non-critical standards are not dumped here — they surface, relevance-ranked,
+    # via recall.
+    lines: list[str] = [header, ""]
+    for mem in standards:
+        lines.append(f"- {mem.memory}")
+    return "\n".join(lines)
+
 
 def format_context_for_injection(
     categories: dict[str, list[MemoryResponse]],
     max_chars: int = DEFAULT_MAX_CHARS,
+    standards: list[MemoryResponse] | None = None,
 ) -> str:
     """Format memories as concise markdown for hook injection.
 
     Args:
         categories: Memory responses organized by category name.
-        max_chars: Maximum character budget for the output.
+        max_chars: Maximum character budget for the category context.
+        standards: Authoritative standards, prepended as a binding block that
+            is exempt from ``max_chars`` (its own reserved budget).
 
     Returns:
         Formatted markdown string, or empty string if no memories.
@@ -81,7 +121,11 @@ def format_context_for_injection(
         if total_chars >= max_chars:
             break
 
-    if not sections:
-        return ""
+    standards_block = format_standards_block(standards or [])
 
-    return f"# Neuralscape Memory Context\n\n" + "\n\n".join(sections)
+    if not sections:
+        # Standards alone are still worth injecting even with no other context.
+        return standards_block
+
+    body = "# Neuralscape Memory Context\n\n" + "\n\n".join(sections)
+    return f"{standards_block}\n\n---\n\n{body}" if standards_block else body

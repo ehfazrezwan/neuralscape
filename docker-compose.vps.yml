@@ -1,0 +1,17 @@
+# VPS override: zero published ports except loopback API. Docker bypasses ufw,
+# so NOT publishing is the actual security boundary — access is tunnel-only.
+#
+# NOTE: on the production VPS this file is managed by CD (`git reset --hard`
+# on every deploy) — machine-specific tweaks go in .env, never here.
+services:
+  neo4j:
+    ports: !override []
+  redis:
+    ports: !override []
+  qdrant:
+    ports: !override []
+  docling:
+    profiles: ["ingest-heavy"]   # off by default on the VPS (4G container)
+  neuralscape:
+    ports: !override
+      - "127.0.0.1:8199:8199"

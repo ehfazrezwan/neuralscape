@@ -87,6 +87,61 @@ class TestEnqueueRawV2:
         assert v2_extras["expires_at"] == "2026-12-01T00:00:00+00:00"
 
     @pytest.mark.asyncio
+    async def test_memory_kind_and_source_ref_forwarded(self, tm):
+        """Connector provenance fields reach the worker via v2_extras (C1)."""
+        tm.pool.enqueue_job.return_value = None  # simulate dup → returns job_id
+        src = {"connector_id": "notion-x", "connector_type": "notion"}
+        await tm.enqueue_raw(
+            content="x",
+            user_id="ehfaz",
+            category="domain_knowledge",
+            memory_kind="passage",
+            source_ref=src,
+        )
+        v2_extras = tm.pool.enqueue_job.call_args[0][9]
+        assert v2_extras["memory_kind"] == "passage"
+        assert v2_extras["source_ref"] == src
+
+    @pytest.mark.asyncio
+    async def test_job_id_differs_by_visibility(self, tm):
+        """Same text at different visibility tiers must get DISTINCT job ids, or
+        ARQ coalesces a standard-promotion onto the earlier private/shared job and
+        silently drops it before it reaches store_raw."""
+        tm.pool.enqueue_job.return_value = None
+        ids = {}
+        for vis in ("private", "standard"):
+            await tm.enqueue_raw(content="same text", user_id="d", category="convention", visibility=vis)
+            ids[vis] = tm.pool.enqueue_job.call_args[1]["_job_id"]
+        assert ids["private"] != ids["standard"]
+
+    @pytest.mark.asyncio
+    async def test_ingest_file_job_id_differs_by_page_offset(self, tm):
+        """Same file re-uploaded with a corrected page_offset must be a NEW job —
+        page_offset changes exemplar provenance content, so coalescing onto the
+        earlier job's cached result would silently drop the correction."""
+        tm.pool.enqueue_job.return_value = None
+        ids = {}
+        for offset in (0, 60):
+            payload = {
+                "filename": "slice.pdf",
+                "user_id": "d",
+                "source_ref": {"external_id": "samehash"},
+                "options": {"visibility": "shared", "adapter": "trading_strategy",
+                            **({"page_offset": offset} if offset else {})},
+            }
+            await tm.enqueue_ingest_file(payload)
+            ids[offset] = tm.pool.enqueue_job.call_args.kwargs["_job_id"]
+        assert ids[0] != ids[60]
+
+    @pytest.mark.asyncio
+    async def test_connector_sync_job_id_matches_cron_scheme(self, tm):
+        """enqueue_connector_sync uses the same sync-<id> job id as the cron (C2)."""
+        tm.pool.enqueue_job.return_value = None
+        job_id = await tm.enqueue_connector_sync("notion-personal")
+        assert job_id == "sync-notion-personal"
+        assert tm.pool.enqueue_job.call_args.kwargs["_job_id"] == "sync-notion-personal"
+
+    @pytest.mark.asyncio
     async def test_no_v2_fields_packs_empty_extras(self, tm):
         """Without v2 fields, extras dict is empty (None values dropped)."""
         mock_job = MagicMock()
@@ -211,6 +266,66 @@ class TestEnqueueRawBatch:
 # ──────────────────────────────────────────────
 
 
+class TestEnqueueRetag:
+    _FILTERS = {"project_id": "neuralscape", "category": "decision"}
+    _OPS = {"add_tags": ["project:bon002"]}
+
+    @pytest.mark.asyncio
+    async def test_dispatches_on_fast_queue(self, tm):
+        tm.pool.enqueue_job.return_value = None
+        await tm.enqueue_retag("robb", dict(self._FILTERS), dict(self._OPS))
+        positional = tm.pool.enqueue_job.call_args[0]
+        assert positional[0] == "process_memory_retag"
+        assert positional[1] == "robb"
+        assert positional[2] == self._FILTERS
+        assert positional[3] == self._OPS
+        # Fast queue: no _queue_name override
+        assert "_queue_name" not in tm.pool.enqueue_job.call_args[1]
+
+    @pytest.mark.asyncio
+    async def test_job_id_deterministic_and_key_order_insensitive(self, tm):
+        tm.pool.enqueue_job.return_value = None
+        a = await tm.enqueue_retag("robb", {"category": "decision", "project_id": "p"}, dict(self._OPS))
+        b = await tm.enqueue_retag("robb", {"project_id": "p", "category": "decision"}, dict(self._OPS))
+        assert a == b  # canonical JSON: dict key order can't fork the id
+
+    @pytest.mark.asyncio
+    async def test_distinct_retags_get_distinct_ids(self, tm):
+        tm.pool.enqueue_job.return_value = None
+        a = await tm.enqueue_retag("robb", dict(self._FILTERS), {"add_tags": ["x"]})
+        b = await tm.enqueue_retag("robb", dict(self._FILTERS), {"add_tags": ["y"]})
+        c = await tm.enqueue_retag("javi", dict(self._FILTERS), {"add_tags": ["x"]})
+        assert len({a, b, c}) == 3
+
+
+class TestEnqueueGraphEnrichmentForEdit:
+    @pytest.mark.asyncio
+    async def test_dispatches_on_graph_queue(self, tm):
+        from config import settings
+
+        tm.pool.enqueue_job.return_value = None
+        await tm.enqueue_graph_enrichment(
+            "m1", "new content", "ehfaz", "p1", "shared", None
+        )
+        positional = tm.pool.enqueue_job.call_args[0]
+        kwargs = tm.pool.enqueue_job.call_args[1]
+        assert positional[0] == "process_graph_enrichment"
+        assert positional[1:8] == ("m1", "new content", "ehfaz", "p1", "shared", None, None)
+        assert kwargs["_queue_name"] == settings.graph_queue_name
+
+    @pytest.mark.asyncio
+    async def test_job_id_keys_on_target_state(self, tm):
+        """Editing the same memory to a DIFFERENT state must be a new job;
+        replaying the same edit coalesces."""
+        tm.pool.enqueue_job.return_value = None
+        a = await tm.enqueue_graph_enrichment("m1", "c", "e", "p1", "shared")
+        replay = await tm.enqueue_graph_enrichment("m1", "c", "e", "p1", "shared")
+        diff_project = await tm.enqueue_graph_enrichment("m1", "c", "e", "p2", "shared")
+        diff_content = await tm.enqueue_graph_enrichment("m1", "c2", "e", "p1", "shared")
+        assert a == replay
+        assert len({a, diff_project, diff_content}) == 3
+
+
 class TestEnqueueStore:
     @pytest.mark.asyncio
     async def test_dispatches_with_messages(self, tm):
@@ -305,8 +420,11 @@ class TestGetStatus:
 class TestWaitForResult:
     @pytest.mark.asyncio
     async def test_returns_result_on_success(self, tm):
+        from arq.jobs import JobStatus
         with patch("task_manager.Job") as MockJob:
             instance = MockJob.return_value
+            # _find_job probes status across candidate queues before awaiting result.
+            instance.status = AsyncMock(return_value=JobStatus.complete)
             instance.result = AsyncMock(return_value={"memories": []})
             result = await tm.wait_for_result("task-x", timeout=5)
         assert result["status"] == "completed"
@@ -314,8 +432,10 @@ class TestWaitForResult:
 
     @pytest.mark.asyncio
     async def test_returns_failed_on_exception(self, tm):
+        from arq.jobs import JobStatus
         with patch("task_manager.Job") as MockJob:
             instance = MockJob.return_value
+            instance.status = AsyncMock(return_value=JobStatus.complete)
             instance.result = AsyncMock(side_effect=Exception("Worker crashed"))
             result = await tm.wait_for_result("task-y", timeout=5)
         assert result["status"] == "failed"

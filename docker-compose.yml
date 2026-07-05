@@ -26,7 +26,7 @@ services:
       retries: 10
 
   redis:
-    image: redis:7-alpine
+    image: redis:7.4-alpine  # pinned to the 7.4 minor series for license clarity (the :7 tag floats across the RSALv2/SSPLv1 boundary at 7.4), not for byte-reproducibility — see THIRD_PARTY_NOTICES.md; Valkey is the BSD fallback
     ports:
       - "6379:6379"
     volumes:
@@ -70,6 +70,32 @@ services:
       timeout: 3s
       retries: 5
 
+  # ── Docling document converter ──────────────────────────────────
+  # Converts rich formats (PDF, MS Office docx/xlsx/pptx, HTML, …) to Markdown
+  # for the ingest worker. The preferred, AI-grade extractor; when it's down or
+  # DOCLING_ENABLED=false the worker falls back to the in-process MarkItDown
+  # parser, so ingestion degrades rather than failing. CPU/RAM-heavy (ML models).
+  docling:
+    image: ghcr.io/docling-project/docling-serve:latest
+    ports:
+      - "5001:5001"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:5001/health')\""]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
   neuralscape:
     build:
       context: .
@@ -91,13 +117,34 @@ services:
       NEO4J_DATABASE: ${NEO4J_DATABASE:-memory}
       QDRANT_URL: http://qdrant:6333
       REDIS_URL: redis://redis:6379
-      GEMINI_LLM_MODEL: ${SMALL_MODEL_NAME:-gemini-3-flash-preview}
+      GEMINI_LLM_MODEL: ${GEMINI_LLM_MODEL:-gemini-3.1-flash-lite}
       GEMINI_EMBEDDER_MODEL: ${EMBEDDING_MODEL_NAME:-gemini-embedding-001}
       MCP_TRANSPORT: http
       OBSIDIAN_VAULT_PATH: /data/vault
+      # Dreaming admin surface (/v1/extensions/dreaming/*) enqueues sweeps
+      # onto the graph worker rather than running them in-process (an
+      # in-process sweep starves /health until autoheal kills the API).
+      # The API still needs these to validate /run and report /status.
+      DREAMING_ENABLED: ${DREAMING_ENABLED:-false}
+      DREAMING_OBSIDIAN_VAULT_PATH: /data/vault
+      # Ingest artifact storage — shared with neuralscape-ingest-worker so the
+      # API writes uploaded files and the worker reads them back to parse.
+      INGEST_STORAGE_DIR: /data/ingest
+      # Exemplar store — shared with the ingest worker (which writes images) so
+      # GET /v1/ingest/exemplars/{id} can serve them. Dark by default.
+      EXEMPLAR_STORE_ENABLED: ${EXEMPLAR_STORE_ENABLED:-false}
+      EXEMPLAR_STORE_DIR: /data/exemplars
     volumes:
       - ${OBSIDIAN_VAULT_PATH:-./vault}:/data/vault
+      - ingest_data:/data/ingest
+      - exemplar_data:/data/exemplars
     restart: unless-stopped
+    # Docker's restart policy only fires on container EXIT, not on a failing
+    # healthcheck — a wedged-but-running API (e.g. after the host sleeps) would
+    # otherwise stay wedged/unresponsive. The `autoheal` sidecar restarts it on
+    # unhealthy. Reverse-DNS label so it can't collide with another stack's.
+    labels:
+      com.neuralscape.autoheal: "true"
     deploy:
       resources:
         limits:
@@ -108,10 +155,20 @@ services:
         max-size: "10m"
         max-file: "3"
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8199/health')\""]
+      # Liveness, not readiness: probe /health/live (pure process liveness, no
+      # dependency checks). /health probes Redis/backends and can exceed the
+      # timeout when the API is merely busy under heavy write/enrichment load —
+      # which made autoheal restart a working container. Generous timeout and
+      # retries for the same reason: only a truly wedged process should fail.
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8199/health/live')\""]
       interval: 10s
-      timeout: 5s
-      retries: 3
+      timeout: 15s
+      retries: 5
+      # Slow first boot (spaCy/fastembed load, backend connections) must not
+      # count failed checks toward `retries` — otherwise autoheal would restart
+      # the API mid-initialization. This is the per-container startup grace;
+      # AUTOHEAL_START_PERIOD on the sidecar is unrelated (its own boot delay).
+      start_period: 90s
 
   neuralscape-worker:
     build:
@@ -133,7 +190,7 @@ services:
       NEO4J_DATABASE: ${NEO4J_DATABASE:-memory}
       QDRANT_URL: http://qdrant:6333
       REDIS_URL: redis://redis:6379
-      GEMINI_LLM_MODEL: ${SMALL_MODEL_NAME:-gemini-3-flash-preview}
+      GEMINI_LLM_MODEL: ${GEMINI_LLM_MODEL:-gemini-3.1-flash-lite}
       GEMINI_EMBEDDER_MODEL: ${EMBEDDING_MODEL_NAME:-gemini-embedding-001}
       OBSIDIAN_VAULT_PATH: /data/vault
     volumes:
@@ -153,6 +210,162 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+
+  # ── Dedicated graph / heavy-work worker ─────────────────────────
+  # Consumes the graph queue (GRAPH_QUEUE_NAME): slow Graphiti graph
+  # enrichment per write + the expensive dedup / wiki-synth crons.
+  # Isolated from neuralscape-worker so a 12-minute wiki-synth run or a
+  # burst of graph writes can't starve fast vector writes/reads.
+  neuralscape-graph-worker:
+    build:
+      context: .
+      dockerfile: neuralscape-service/Dockerfile
+      target: runtime
+    command: ["arq", "worker.GraphWorkerSettings"]
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      NEO4J_URI: neo4j://neo4j:7687
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-neuralscape}
+      NEO4J_DATABASE: ${NEO4J_DATABASE:-memory}
+      QDRANT_URL: http://qdrant:6333
+      REDIS_URL: redis://redis:6379
+      GEMINI_LLM_MODEL: ${GEMINI_LLM_MODEL:-gemini-3.1-flash-lite}
+      GEMINI_EMBEDDER_MODEL: ${EMBEDDING_MODEL_NAME:-gemini-embedding-001}
+      OBSIDIAN_VAULT_PATH: /data/vault
+      # Background synthesis (dark by default; enable via .env).
+      # Dreaming replaces the retired wiki synthesizer — the sweep runs on
+      # this worker (nightly), so its settings must land here. The vault
+      # path rides the OBSIDIAN_VAULT_PATH mount above.
+      DREAMING_ENABLED: ${DREAMING_ENABLED:-false}
+      DREAMING_OBSIDIAN_VAULT_PATH: /data/vault
+      # Containers run on UTC — set the anchor so the nightly sweep lands
+      # at a quiet local hour (e.g. 21 ⇒ 03:35 at UTC+6). Default 03:35 UTC.
+      DREAMING_CRON_ANCHOR_HOUR: ${DREAMING_CRON_ANCHOR_HOUR:-3}
+      STRATEGY_SYNTHESIZER_ENABLED: ${STRATEGY_SYNTHESIZER_ENABLED:-false}
+    volumes:
+      - ${OBSIDIAN_VAULT_PATH:-./vault}:/data/vault
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import sys; sys.exit(0)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── Dedicated ingest worker ─────────────────────────────────────
+  # Consumes the ingest queue (INGEST_QUEUE_NAME): bulk document/file ingestion
+  # (chunk + Docling parse + LLM fact extraction) and connector sync. Isolated
+  # from neuralscape-worker so a folder/zip upload can't starve fast vector
+  # writes/reads. Shares the ingest artifact volume with the API.
+  neuralscape-ingest-worker:
+    build:
+      context: .
+      dockerfile: neuralscape-service/Dockerfile
+      target: runtime
+    command: ["arq", "worker.IngestWorkerSettings"]
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      NEO4J_URI: neo4j://neo4j:7687
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-neuralscape}
+      NEO4J_DATABASE: ${NEO4J_DATABASE:-memory}
+      QDRANT_URL: http://qdrant:6333
+      REDIS_URL: redis://redis:6379
+      GEMINI_LLM_MODEL: ${GEMINI_LLM_MODEL:-gemini-3.1-flash-lite}
+      GEMINI_EMBEDDER_MODEL: ${EMBEDDING_MODEL_NAME:-gemini-embedding-001}
+      OBSIDIAN_VAULT_PATH: /data/vault
+      # Ingest artifact storage (shared with the API) + Docling converter.
+      INGEST_STORAGE_DIR: /data/ingest
+      DOCLING_ENABLED: ${DOCLING_ENABLED:-true}
+      DOCLING_URL: ${DOCLING_URL:-http://docling:5001}
+      # Visual setup exemplars (trading adapter; dark by default). When enabled,
+      # PDF chart images are extracted, vision-described, and stored here.
+      EXEMPLAR_STORE_ENABLED: ${EXEMPLAR_STORE_ENABLED:-false}
+      EXEMPLAR_STORE_DIR: /data/exemplars
+      DOCLING_EXTRACT_IMAGES: ${DOCLING_EXTRACT_IMAGES:-false}
+    volumes:
+      - ${OBSIDIAN_VAULT_PATH:-./vault}:/data/vault
+      - ingest_data:/data/ingest
+      - exemplar_data:/data/exemplars
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import sys; sys.exit(0)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── Cloudflare tunnel ───────────────────────────────────────────
+  # Exposes the API to the public internet via a Cloudflare Tunnel
+  # without opening any inbound ports on the host. Gated behind the
+  # `tunnel` compose profile so it never starts with a bare
+  # `docker compose up` — only deployments that have provisioned a
+  # tunnel in the Cloudflare dashboard need it. Use:
+  #
+  #   docker compose --profile tunnel up -d cloudflared
+  #
+  # In the Cloudflare dashboard (Zero Trust → Networks → Tunnels)
+  # create a tunnel, copy the token, and put it in .env as
+  # CLOUDFLARE_TUNNEL_TOKEN. Configure the public hostname to route
+  # to ``neuralscape:8199`` — cloudflared joins the same default
+  # compose network so the service-name DNS works.
+  #
+  # TLS, DDoS protection, and (optionally) Cloudflare Access auth all
+  # terminate at Cloudflare's edge. The Windows host never needs an
+  # open port 80/443.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    profiles: ["tunnel"]
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN}
+      # Corporate/Umbrella networks throttle the default QUIC transport
+      # (UDP 7844), causing the edge connections to stall intermittently and
+      # surface as "couldn't reach the MCP server" in Cowork. http2 runs the
+      # edge connection over TCP, which the firewall handles far more reliably.
+      TUNNEL_TRANSPORT_PROTOCOL: http2
+    depends_on:
+      neuralscape:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # ── Test runner ─────────────────────────────────────────────────
   # Reproducible test runner. Gated behind the `test` compose profile
@@ -185,7 +398,7 @@ services:
       NEO4J_DATABASE: ${NEO4J_DATABASE:-memory}
       QDRANT_URL: http://qdrant:6333
       REDIS_URL: redis://redis:6379
-      GEMINI_LLM_MODEL: ${SMALL_MODEL_NAME:-gemini-3-flash-preview}
+      GEMINI_LLM_MODEL: ${GEMINI_LLM_MODEL:-gemini-3.1-flash-lite}
       GEMINI_EMBEDDER_MODEL: ${EMBEDDING_MODEL_NAME:-gemini-embedding-001}
       OBSIDIAN_VAULT_PATH: /data/vault
       PYTHONDONTWRITEBYTECODE: "1"
@@ -198,8 +411,48 @@ services:
       - ./neuralscape-service:/app/neuralscape-service
       - test_venv:/app/neuralscape-service/.venv
 
+  # ── Autoheal ────────────────────────────────────────────────────
+  # Restarts any container labelled `com.neuralscape.autoheal=true` whose Docker
+  # healthcheck reports `unhealthy`. Docker's own `restart: unless-stopped` only
+  # fires on process EXIT, so a wedged-but-running API (e.g. after the host
+  # sleeps and its event loop / backend connections go stale) would otherwise
+  # stay wedged/unresponsive until a manual restart. Scoped by a reverse-DNS
+  # label (NOT "all") so it never touches unrelated containers on the host.
+  autoheal:
+    # Pinned by digest: this container has the Docker socket (root-equivalent on
+    # the host), so a mutable :latest tag is a supply-chain risk. Digest is
+    # willfarrell/autoheal:latest as of 2026-06-29; bump deliberately.
+    image: willfarrell/autoheal@sha256:3fd4d591075224304e95d92af8619adda1fe6e1469587e8b5230d946b0926f00
+    restart: unless-stopped
+    # Only needs the Docker Unix socket; no webhook/notifications are
+    # configured, so deny it network access entirely.
+    network_mode: "none"
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: com.neuralscape.autoheal  # only this stack's containers
+      AUTOHEAL_INTERVAL: "15"                  # seconds between health polls
+      AUTOHEAL_START_PERIOD: "90"              # sidecar's own boot delay before it polls
+      # An already-unhealthy/wedged API has nothing worth draining — SIGKILL it
+      # fast rather than waiting out a graceful shutdown that may never finish.
+      AUTOHEAL_DEFAULT_STOP_TIMEOUT: "10"      # SIGTERM grace before SIGKILL
+      # MUST exceed STOP_TIMEOUT + container start time. autoheal restarts via a
+      # single blocking `curl` to Docker's /restart endpoint (stop, then start);
+      # if CURL_TIMEOUT <= STOP_TIMEOUT the curl aborts the moment the stop
+      # window closes — BEFORE start completes — and every restart of a
+      # slow-stopping container is logged "failed" and retried in a churn loop
+      # (the bug that left the wedged API unrestarted). 60s gives ample headroom.
+      CURL_TIMEOUT: "60"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 volumes:
   neo4j_data:
   qdrant_data:
   redis_data:
+  ingest_data:
+  exemplar_data:
   test_venv:

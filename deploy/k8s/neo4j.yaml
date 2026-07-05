@@ -1,0 +1,122 @@
+# Neo4j 5 Community — temporal knowledge graph (Graphiti) backend.
+# Single replica, Recreate strategy (RWO disk can only attach to one pod),
+# SSD persistent disk (premium-rwo) since the graph is latency-sensitive.
+# Internal-only ClusterIP; never exposed via ingress.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: neo4j-data
+  namespace: neuralscape
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: premium-rwo
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: neo4j
+  namespace: neuralscape
+  labels:
+    app.kubernetes.io/name: neo4j
+    app.kubernetes.io/part-of: neuralscape
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: neo4j
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: neo4j
+        app.kubernetes.io/part-of: neuralscape
+    spec:
+      # Neo4j treats every NEO4J_* env var as a config setting. Kubernetes'
+      # service-link injection creates NEO4J_PORT_7687_TCP_PORT etc. (the Service
+      # is named "neo4j"), which Neo4j rejects under strict validation. Disable
+      # service links so those are never injected.
+      enableServiceLinks: false
+      securityContext:
+        fsGroup: 7474
+      containers:
+        - name: neo4j
+          image: neo4j:5-community
+          ports:
+            - { name: http, containerPort: 7474 }
+            - { name: bolt, containerPort: 7687 }
+          env:
+            # Password from the ESO-synced Secret; NEO4J_AUTH is composed from it
+            # via K8s dependent-env expansion ($(VAR) references an earlier env).
+            # The intermediate var must NOT start with NEO4J_ — Neo4j would parse
+            # NEO4J_DB_PASSWORD as a config setting and fail strict validation.
+            - name: NS_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: neuralscape-secrets
+                  key: neo4j-password
+            - name: NEO4J_AUTH
+              value: "neo4j/$(NS_DB_PASSWORD)"
+            - name: NEO4J_initial_dbms_default__database
+              value: "memory"
+            # Heap + page cache tuned to fit the 2Gi limit (leave headroom for JVM
+            # off-heap + OS). Bump alongside the memory limit if the graph grows.
+            - name: NEO4J_server_memory_heap_initial__size
+              value: "1G"
+            - name: NEO4J_server_memory_heap_max__size
+              value: "1G"
+            - name: NEO4J_server_memory_pagecache_size
+              value: "512m"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "1000m"
+          readinessProbe:
+            # Wrapped in `sh -c` so $NS_DB_PASSWORD is expanded by the shell —
+            # Kubernetes only expands $(VAR) in a container's command/args, NOT in
+            # probe exec commands, so a bare $(NS_DB_PASSWORD) here would be passed
+            # literally and fail auth (locking the account via rate limiting).
+            exec:
+              command:
+                ["sh", "-c", "cypher-shell -u neo4j -p \"$NS_DB_PASSWORD\" 'RETURN 1'"]
+            # cypher-shell spins up a JVM inside the memory-tight container, which
+            # regularly takes >5s — a short timeout makes the probe flap and the
+            # pod never goes Ready even though Neo4j is up. Give it real headroom.
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 20
+            failureThreshold: 8
+          livenessProbe:
+            tcpSocket:
+              port: 7687
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: neo4j-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: neo4j
+  namespace: neuralscape
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: neo4j
+  ports:
+    - { name: http, port: 7474, targetPort: 7474 }
+    - { name: bolt, port: 7687, targetPort: 7687 }

@@ -27,7 +27,8 @@ The 20 public methods cluster into six functional groups. Most callers (REST han
 | Read | `get_global_context` | `memory_service.py:803-833` | Global only, bucketed by category |
 | CRUD | `get_memory` | `memory_service.py:839-845` | Single memory by ID |
 | CRUD | `list_memories` | `memory_service.py:847-873` | Filter by scope/category/project |
-| CRUD | `update_memory` | `memory_service.py:875-912` | Updates; triggers graph re-ingest |
+| CRUD | `patch_memory` | `memory_service.py` | Presence-keyed partial update; permission-gated; returns a deferred graph job |
+| CRUD | `retag_memories` | `memory_service.py` | Bulk metadata ops over a filter set; per-row permission/validity skip counters |
 | CRUD | `delete_memory` | `memory_service.py:914-929` | Vector delete + soft-delete edges |
 | CRUD | `delete_memories` | `memory_service.py:931-992` | Bulk delete with filters |
 | Graph | `get_graph_nodes` | `memory_service.py:1055-1084` | Entity nodes by group_id |
@@ -245,7 +246,7 @@ When a fact comes through extraction without an explicit scope, `_batch_store_fa
 
 1. `default_scope_for_category(category)` (`schemas.py:73-79`) provides the default — semantic categories (preference, personal_fact) → global; project categories (tech_stack, convention) → project.
 2. If `project_id` is present and the category isn't in `GLOBAL_CATEGORIES`, force scope to `PROJECT`.
-3. If category is in `PROJECT_CATEGORIES` but no `project_id` given, call `_infer_project_id(content)` (`memory_service.py:88-94`), which pattern-matches against known project slugs (`svc-utility-belt`, `lightpath`, `neuralscape`, `openclaw`).
+3. If category is in `PROJECT_CATEGORIES` but no `project_id` given, call `_infer_project_id(content)` (`memory_service.py:88-94`), which pattern-matches against known project slugs (deployment-specific, from `KNOWN_PROJECT_SLUGS`).
 4. If inference fails, fall back to global with a warning rather than rejecting the fact.
 
 ## Two-phase deduplication
@@ -386,7 +387,7 @@ else:
 ```
 (`memory_service.py:1239-1243`)
 
-`ALL_KNOWN_PROJECTS` lives at `memory_service.py:46`: `["svc-utility-belt", "lightpath", "neuralscape", "openclaw"]`. The same list backs `_infer_project_id`'s slug matcher.
+The known-project list comes from the `KNOWN_PROJECT_SLUGS` env setting (`settings.known_projects`); the same list backs `_infer_project_id`'s slug matcher.
 
 Two modes: `dry_run=True` returns a per-group breakdown of junk counts plus 5 sample contents per group without deleting; the production mode hard-deletes each junk episode via `delete_episode` (`memory_service.py:1187-1203`), which runs `MATCH (e:Episodic {uuid: $uuid}) DETACH DELETE e` against the Neo4j driver. Returns include both per-group breakdown and total count.
 

@@ -86,7 +86,9 @@ uv run pytest tests/test_async_pipeline.py -v -s
 
 ## Claude Code / Cowork Plugin
 
-The **neuralscape plugin** gives Claude Code (and Claude Cowork — same plugin, same marketplace) automatic, persistent memory. Two lifecycle hooks plus four discoverable slash commands plus the seven Neuralscape MCP tools auto-wired on install.
+The **neuralscape plugin** gives Claude Code automatic, persistent memory: lifecycle hooks plus ten user-facing slash commands (including `/neuralscape:ingest` for files/folders/pasted context; plus an internal `compile-observations` helper the hooks/`capture` invoke) plus the ten Neuralscape MCP tools auto-wired on install.
+
+> **Claude Cowork:** Cowork does **not** run plugin hooks ([#27398](https://github.com/anthropics/claude-code/issues/27398)), so the automatic inject/capture loop below does not fire there. Cowork is supported via a remote **MCP OAuth connector** plus a standing-context "memory protocol" that drives recall/capture through the MCP tools. See **[COWORK.md](./COWORK.md)** — that is the supported Cowork path, not this hook-based one.
 
 ### How It Works
 
@@ -104,14 +106,21 @@ The **neuralscape plugin** gives Claude Code (and Claude Cowork — same plugin,
 | **SessionStart** | Session start / resume / clear | Calls `/v1/context/{projectId}` (or `/v1/context/global`), formats the response by category, injects as `additionalContext` | Yes (sync, ~1s, 30s timeout) |
 | **Stop** | Session ends | Reads transcript since last offset, POSTs each new turn to `/flush`, commits offset only after success, then triggers `/compile` | No (async, 60s timeout) |
 
-Slash commands (auto-discovered from `skills/`):
+Slash commands (auto-discovered from `skills/`). The MCP-driven ones work in
+both Claude Code and Claude Cowork:
 
-| Command | Use |
-|---|---|
-| `/neuralscape:status` | Health check + config display |
-| `/neuralscape:search` | Inline memory recall via `/v1/search` |
-| `/neuralscape:sync` | Manually flush the current conversation |
-| `/neuralscape:config` | Show URL / user_id / API-key state without leaking secrets |
+| Command | Use | Platform |
+|---|---|---|
+| `/neuralscape:recall` | Load relevant memories before planning/acting | Both (MCP) |
+| `/neuralscape:remember` | Save one durable fact now | Both (MCP) |
+| `/neuralscape:save-session` | Extract + store facts from the conversation | Both (MCP) |
+| `/neuralscape:project` | List / pick / create the project to scope memory to | Both (MCP) |
+| `/neuralscape:search` | Inline memory recall (`recall_memories`; `/v1/search` as CLI fast path) | Both (MCP) |
+| `/neuralscape:ingest` | Ingest files/folders/zips or pasted context (Markdown/HTML/PDF/MS-Office) | Both (MCP) |
+| `/neuralscape:ns-status` | Reachability check + config display | Both (degrades) |
+| `/neuralscape:ns-config` | Show URL / user_id / API-key state (or connector mode) without leaking secrets | Both (degrades) |
+| `/neuralscape:sync` | Manually flush the current conversation (delegates to `save-session` in Cowork) | Both |
+| `/neuralscape:capture` | Compile the PostToolUse observation buffer now | Claude Code |
 
 ### Installation (60 seconds)
 
@@ -120,7 +129,7 @@ Slash commands (auto-discovered from `skills/`):
 /plugin install neuralscape@neuralscape-plugins
 ```
 
-Claude Code / Cowork prompts you for three values from the manifest's `userConfig`:
+Claude Code prompts you for three values from the manifest's `userConfig`:
 
 | Prompt | Notes |
 |---|---|
@@ -130,7 +139,7 @@ Claude Code / Cowork prompts you for three values from the manifest's `userConfi
 
 That's it. The plugin builds itself via `postinstall`, registers hooks, and the next session you open fires `SessionStart` and injects context.
 
-**Cowork users:** Customize → Browse plugins → Install — same prompts, same outcome.
+**Cowork users:** the marketplace plugin loads the **skills**, but hooks won't fire and the `userConfig` token prompt is unreliable in Cowork ([#39455](https://github.com/anthropics/claude-code/issues/39455)). Use the **OAuth connector + standing context** instead — full runbook in **[COWORK.md](./COWORK.md)**.
 
 **OpenClaw users:** see `neuralscape-plugin/README.md` for the manual `~/.openclaw/hooks/` install path (no marketplace there).
 
@@ -155,19 +164,37 @@ The plugin and MCP server complement each other:
 
 Both can run simultaneously. The plugin captures breadcrumbs in the background; MCP tools let you or the agent interact with memory directly.
 
+## Authentication
+
+The service authenticates requests via `Authorization: Bearer` tokens and, for
+Claude Cowork / claude.ai, a built-in OAuth 2.1 connector. The human-login step
+is pluggable per deployment via `AUTH_PROVIDER` (`token` | `google` | `supabase`)
+— admin-issued HMAC tokens, "Sign in with Google" (OIDC + env allowlist), or
+Supabase (Google + a managed allowlist hook). Full runbook, setup steps, and
+troubleshooting: **[AUTH.md](./AUTH.md)**.
+
 ## MCP Server
 
-7 tools exposed via MCP for direct use by AI agents:
+10 tools exposed via MCP for direct use by AI agents:
 
 | Tool | Mode | Purpose |
 |---|---|---|
 | `recall_memories` | sync | Semantic search across global + project memories. Agents should call this before starting work. |
 | `remember` | async | Store a single categorized fact. Set `wait: true` to block until stored. |
 | `remember_conversation` | async | Bulk extract from conversation messages via LLM. Set `wait: true` to block. |
+| `ingest_document` | async | Ingest a fetched document (with a connector source_ref) → passages + facts. |
+| `ingest_text` | async | Manually provide a block of context → persisted as an artifact + passages + facts. |
 | `get_project_context` | sync | Bootstrap: load all user prefs + project context organized by category. |
 | `search_knowledge_graph` | sync | Graph-based entity/relationship search. |
 | `list_memories` | sync | List/inspect stored memories with filters. |
+| `list_projects` | sync | List the caller's distinct project ids. |
 | `delete_memories` | sync | Delete by ID or by filters. |
+
+**Document & file ingestion** (REST): `POST /v1/ingest/text` (manual context),
+`POST /v1/ingest/files` (multipart — files, folders, or a `.zip`; parses
+Markdown/HTML/PDF/MS-Office server-side via Docling), and `GET
+/v1/ingest/artifacts/{file_id}` to fetch a stored source back. Ingestion runs on
+a dedicated worker (`uv run arq worker.IngestWorkerSettings`).
 
 ### Claude Code (stdio)
 
@@ -269,7 +296,7 @@ There are two approaches to giving Claude Code persistent memory. Use either or 
 
 The neuralscape plugin handles context injection and conversation capture automatically via lifecycle hooks. See the [Claude Code / Cowork Plugin](#claude-code--cowork-plugin) section above for installation.
 
-Once installed, the plugin loads on every session across all projects. The plugin's `.mcp.json` also auto-wires the seven Neuralscape MCP tools, so the manual MCP setup below is redundant if you've installed the plugin. The MCP-only path remains documented for setups that can't run a plugin.
+Once installed, the plugin loads on every session across all projects. The plugin's `.mcp.json` also auto-wires the ten Neuralscape MCP tools, so the manual MCP setup below is redundant if you've installed the plugin. The MCP-only path remains documented for setups that can't run a plugin.
 
 ### Approach 2: MCP server + CLAUDE.md instructions
 
@@ -420,7 +447,7 @@ curl "http://localhost:8199/v1/graph/communities?user_id=ehfaz"
        │  ┌──────────────────────────────────────────────┐
        │  │           neuralscape-service                │
        │  │                                              │
-       ├─►│  MCP Server (7 tools)   REST API (/v1)      │
+       ├─►│  MCP Server (8 tools)   REST API (/v1)      │
        │  │       stdio / HTTP         FastAPI           │
        │  │              │                │              │
        │  │              └──────┬─────────┘              │
@@ -628,7 +655,7 @@ neuralscape/
 │   ├── main.py                   # FastAPI app: legacy + v1 endpoints
 │   ├── memory_service.py         # Business logic layer (MemoryService class)
 │   ├── context_formatter.py      # Format memories as markdown for hook injection
-│   ├── mcp_server.py             # MCP server: 7 tools, stdio + HTTP
+│   ├── mcp_server.py             # MCP server: 8 tools, stdio + HTTP
 │   ├── worker.py                 # ARQ worker: background task processing + dedup cron
 │   ├── task_manager.py           # Redis-backed task enqueuing + status
 │   ├── schemas.py                # Enums, category taxonomy, Pydantic models
@@ -647,7 +674,7 @@ neuralscape/
 │   └── sync-upstream.sh          # Pull upstream changes for git subtree deps
 ├── mem0/                         # mem0 (git subtree from upstream)
 │   └── mem0/memory/
-│       └── graphiti_memory.py    # Graphiti adapter (local patches applied)
+│       └── graphiti_memory.py    # Graphiti adapter (NS-authored; never existed upstream)
 └── graphiti/                     # graphiti-core (git subtree from upstream)
 ```
 
@@ -669,4 +696,17 @@ neuralscape/
 
 **Why a periodic dedup cron instead of dedup-on-write?** `mem0.add(infer=False)` bypasses mem0's built-in LLM dedup because we do our own extraction. Checking for duplicates on every write would add latency to the async write path and require embedding + search per write. A periodic batch job is simpler, runs during low-traffic hours, and can use higher thresholds without blocking user-facing operations.
 
-**Why git subtrees for mem0 and graphiti?** Both dependencies have local patches (Graphiti adapter scoping, Neo4j driver fixes). Git subtrees keep the full upstream history, allow pulling upstream changes with `scripts/sync-upstream.sh`, and let local patches live as normal commits — no submodule headaches or fork maintenance.
+**Why git subtrees for mem0 and graphiti?** Both dependencies carry NS-local changes. Git subtrees keep the full upstream history, allow pulling upstream changes with `scripts/sync-upstream.sh`, and let local changes live as normal commits — no submodule headaches or fork maintenance. Two of these changes are not "patches" in the usual sense but a maintained fork of code that no longer exists upstream:
+
+- **`mem0/memory/graphiti_memory.py` is net-new NS code** — it has never existed in mem0's upstream history. It is the adapter we wrote to present Graphiti as a mem0 graph provider, not a patched upstream file.
+- **mem0 deleted its entire self-hostable OSS graph layer upstream** (PR #4805 / `a488e190`, 2026-04-14, the "v3 pipeline"): `mem0/graphs/` plus `graph_memory.py` / `memgraph_memory.py` etc. were removed and graph memory became a hosted-Platform-only feature. We restore and maintain that layer (Neo4j/Memgraph/Neptune/Kuzu providers + a `GraphStoreFactory`) ourselves, and our `Memory` re-attach shim in `memory_service.py` bolts it onto a mem0 core that no longer has a `.graph` concept. Every upstream sync re-grafts this layer — see `docs/neuralscape/14-upstream-delta-report.md` for the full risk surface.
+
+## License
+
+Neuralscape is licensed under the [Elastic License 2.0](./LICENSE) — free to
+use, modify, and self-host. The headline limitation is that you may not offer
+Neuralscape itself to third parties as a hosted or managed service; ELv2 also
+requires preserving license/copyright notices and forbids circumventing any
+license-key functionality — see [LICENSE](./LICENSE) for the full terms. The
+vendored `mem0/` and `graphiti/` subtrees remain Apache-2.0 (see
+[THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md)).

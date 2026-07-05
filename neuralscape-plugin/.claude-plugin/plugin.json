@@ -1,8 +1,8 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "neuralscape",
-  "version": "2.2.0",
-  "description": "Persistent agentic memory for Claude. Multi-user support: each user has personal memory (only they can read it) plus access to a shared team knowledge pool. Auto-captures conversations + per-tool observations, recalls relevant context on every session start, and exposes 7 MCP tools (recall, remember, search, project context, graph search, list, delete).",
+  "version": "2.9.1",
+  "description": "Persistent agentic memory for Claude Code and Claude Cowork. Multi-user support: each user has personal memory (only they can read it) plus access to a shared team knowledge pool and an optional authoritative 'standard' tier of org rules and selectable team processes set by a designated dictator. In Claude Code, plugin hooks auto-capture conversations + per-tool observations and recall context on session start; in Claude Cowork (which does not run plugin hooks), the cross-platform recall/remember/save-session/project/ingest/process skills drive the same loop through the MCP connector. The ingest skill loads files, folders, or pasted context (Markdown/HTML/PDF/MS-Office) into memory; the process skill runs a defined team process and pulls its standards. Exposes 14 MCP tools (recall_memories, remember, remember_conversation, ingest_document, ingest_text, get_project_context, search_knowledge_graph, list_memories, list_projects, list_processes, get_process, delete_memories, edit_memory, retag_memories).",
   "author": {
     "name": "Ehfaz Rezwan",
     "email": "ehfaz.rezwan@gmail.com"
@@ -55,6 +55,54 @@
       "title": "Compile age (minutes)",
       "description": "Buffer age (oldest entry) that triggers in-session compilation. Default: 30.",
       "default": "30"
+    },
+    "CONTEXT_MODE": {
+      "type": "string",
+      "title": "SessionStart context mode",
+      "description": "'index' (default) injects a budget-bounded, day-grouped memory index with an escalation footer (progressive disclosure); 'full' restores the legacy full-content injection.",
+      "default": "index"
+    },
+    "INDEX_BUDGET_TOKENS": {
+      "type": "string",
+      "title": "Index budget (tokens)",
+      "description": "Approximate token budget for the SessionStart memory index table. Default: 1500.",
+      "default": "1500"
+    },
+    "CODE_GRAPH": {
+      "type": "string",
+      "title": "Code-graph deferral",
+      "description": "'auto' (default) probes the service for a resolvable Graphify code graph at session start and, when found, teaches code-structure questions to defer to the NS code-graph tools; 'on' skips the probe and always teaches it; 'off' disables it.",
+      "default": "auto"
+    },
+    "READ_GATE_ENABLED": {
+      "type": "string",
+      "title": "File read gate",
+      "description": "'true' (default) enables the PreToolUse gate on Read: large files that already have Neuralscape memories get a ranked per-file memory timeline instead of a raw read (re-Read the same path to override). 'false' disables it.",
+      "default": "true"
+    },
+    "READ_GATE_MIN_BYTES": {
+      "type": "string",
+      "title": "Read gate minimum file size (bytes)",
+      "description": "Files at or below this size are never gated. Default: 1500.",
+      "default": "1500"
+    },
+    "EXCLUDED_PROJECTS": {
+      "type": "string",
+      "title": "Excluded projects (globs)",
+      "description": "Comma-separated project-id globs (e.g. 'scratch-*,secret?') the plugin must never capture from or inject into. Honored by every capturing hook. NS_EXCLUDED_PROJECTS env var works as an alias.",
+      "default": ""
+    },
+    "SKIP_TOOLS": {
+      "type": "string",
+      "title": "Extra tools to skip in observation capture",
+      "description": "Comma-separated tool names added to the built-in PostToolUse skip list (Read/Glob/Grep/TodoWrite/Skill/ToolSearch/AskUserQuestion/etc.).",
+      "default": ""
+    },
+    "FAIL_LOUD_THRESHOLD": {
+      "type": "string",
+      "title": "Fail-loud threshold (consecutive failures)",
+      "description": "After this many consecutive Neuralscape-unreachable events, SessionStart shows an explicit 'unreachable for N events — check docker compose ps' notice instead of the generic degrade line. Default: 3.",
+      "default": "3"
     }
   }
 }

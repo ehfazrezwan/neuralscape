@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: neuralscape-worker
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: neuralscape-worker
+    app.kubernetes.io/component: worker
+    {{- include "neuralscape.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.worker.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: neuralscape-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: neuralscape-worker
+        app.kubernetes.io/component: worker
+        {{- include "neuralscape.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: worker
+          image: {{ include "neuralscape.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Fast queue: vector writes + light tasks.
+          command: ["arq", "worker.WorkerSettings"]
+          {{- include "neuralscape.env" . | nindent 10 }}
+          volumeMounts:
+            - name: vault
+              mountPath: /data/vault
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+          livenessProbe:
+            exec:
+              command: ["python", "-c", "import sys; sys.exit(0)"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: vault
+          emptyDir: {}

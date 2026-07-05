@@ -1,6 +1,6 @@
 {
   "name": "neuralscape-plugin",
-  "version": "2.2.0",
+  "version": "2.9.1",
   "description": "Persistent agentic memory plugin for Claude Code and Claude Cowork",
   "private": true,
   "type": "module",
@@ -19,14 +19,18 @@
     "build": "node esbuild.config.js",
     "watch": "node esbuild.config.js --watch",
     "postinstall": "node esbuild.config.js",
+    "package": "node tools/package.mjs",
+    "dist": "node tools/package.mjs",
+    "bake": "node tools/bake.mjs",
+    "pretest": "node esbuild.config.js",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage"
   },
   "devDependencies": {
-    "@vitest/coverage-v8": "^4.1.6",
-    "esbuild": "^0.28.0",
+    "@vitest/coverage-v8": "^4.1.9",
+    "esbuild": "^0.28.1",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.6"
+    "vitest": "^4.1.9"
   }
 }
