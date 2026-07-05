@@ -677,12 +677,12 @@ class TestCategoryIndex:
         )
         writer.append_category_entry(
             category="tech_stack", content="Uses grammY",
-            project_id="openclaw", session_id="s2", timestamp="2026-04-29T11:00:00",
+            project_id="demo-gamma", session_id="s2", timestamp="2026-04-29T11:00:00",
         )
         writer.update_category_index()
         content = (tmp_vault / "_raw" / "category-index.md").read_text()
         assert "neuralscape.md" in content
-        assert "openclaw.md" in content
+        assert "demo-gamma.md" in content
 
 
 # ──────────────────────────────────────────────
