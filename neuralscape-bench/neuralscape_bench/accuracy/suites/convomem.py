@@ -82,7 +82,11 @@ def parse_file(payload: dict, *, category: str, file_stem: str) -> SuiteData:
     """Pure parser over one ConvoMem evidence file (fixture-tested)."""
     out = SuiteData(suite="convomem")
     for i, item in enumerate(payload.get("evidence_items", [])):
-        conv_id = f"{file_stem}-{i}"
+        # Category-namespaced: file stems repeat across categories (the known
+        # cross-category collision), and conv_id doubles as the NS user id —
+        # a collision ingests two unrelated conversations into one user's
+        # memory space and breaks qa_id joins/resume.
+        conv_id = f"{category}-{file_stem}-{i}"
         sessions: list[Session] = []
         evidence_sessions: list[str] = []
         for conv in item.get("conversations", []):
