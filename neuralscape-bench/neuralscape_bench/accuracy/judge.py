@@ -102,7 +102,11 @@ class GeminiJudge:
         prompt = render_judge_prompt(qa, model_answer)
         body = {
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.0, "maxOutputTokens": 256},
+            # thinkingBudget 0: on thinking-enabled Gemini models (2.5-flash+)
+            # thoughts otherwise consume the output cap and truncate the JSON
+            # verdict mid-object (observed: ~20% unparseable on DMR).
+            "generationConfig": {"temperature": 0.0, "maxOutputTokens": 1024,
+                                 "thinkingConfig": {"thinkingBudget": 0}},
         }
         url = _GEMINI_URL.format(model=self.model)
         delay = 2.0
@@ -137,13 +141,18 @@ async def judge_suite(judge: GeminiJudge, data, answers_path, judged_path, *,
                       concurrency: int = 4, log=print) -> dict:
     """Judge every answered-but-unjudged record (resumable via judged JSONL)."""
     from neuralscape_bench.accuracy.manifest import (  # noqa: PLC0415 — avoid cycle
-        append_jsonl, load_done_qa_ids, read_jsonl_records,
+        append_jsonl, read_jsonl_records,
     )
 
     qa_by_id: dict[str, QAItem] = {qa.qa_id: qa for qa in data.qa_items}
     answered = read_jsonl_records(answers_path)
-    done = load_done_qa_ids(judged_path)
-    todo = [r for r in answered if r.get("qa_id") in qa_by_id and r["qa_id"] not in done]
+    # Resume keys on (qa_id, qtype): plain qa_id is not unique in suites with
+    # the known cross-category stem collision (ConvoMem), and keying on it
+    # would silently skip unjudged records after an interrupted judge pass.
+    done = {(r.get("qa_id"), r.get("qtype"))
+            for r in read_jsonl_records(judged_path) if r.get("qa_id")}
+    todo = [r for r in answered
+            if r.get("qa_id") in qa_by_id and (r["qa_id"], r.get("qtype")) not in done]
     log(f"[judge] {data.suite}: {len(todo)} to judge ({len(done)} already judged)")
 
     sem = asyncio.Semaphore(max(1, concurrency))
