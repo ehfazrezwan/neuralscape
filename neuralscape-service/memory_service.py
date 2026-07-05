@@ -5170,6 +5170,66 @@ class MemoryService:
             logger.warning("get_graph_edges failed: %s", e)
             return []
 
+    def search_episodes_fulltext(
+        self, query: str, user_id: str, project_id: str | None = None, limit: int = 3
+    ) -> list[dict]:
+        """Relevance-ranked verbatim episode excerpts (group-scoped).
+
+        Read-side evidence leg for ask: distillation drops one-off
+        micro-details (colors, gifts, stated reasons); the raw session text
+        still has them. Uses Graphiti's `episode_content` fulltext index —
+        one Cypher call, no embeddings.
+        """
+        g = self._get_graphiti()
+        if g is None:
+            return []
+        # Lowercase + drop Lucene boolean operators so caller tokens can't
+        # change query semantics or trip the fulltext parser.
+        terms = [
+            t.lower()
+            for t in re.findall(r"[A-Za-z0-9']+", query)
+            if len(t) >= 3 and t.upper() not in ("AND", "OR", "NOT")
+        ]
+        if not terms:
+            return []
+        lucene = " OR ".join(terms[:12])
+        group_ids = _get_group_ids(user_id, project_id)
+        cypher = """
+        CALL db.index.fulltext.queryNodes('episode_content', $q) YIELD node, score
+        WHERE node.group_id IN $group_ids
+        RETURN node.uuid AS uuid, node.content AS content,
+               node.created_at AS created_at, score
+        ORDER BY score DESC LIMIT $limit
+        """
+
+        async def _run():
+            async with g.driver.session() as session:
+                result = await session.run(
+                    cypher, q=lucene, group_ids=group_ids, limit=limit
+                )
+                return await result.data()
+
+        coro = _run()
+        try:
+            records = self._run_on_bridge(coro, timeout=10.0) or []
+        except Exception as e:
+            logger.warning(f"episode fulltext search failed: {e}")
+            return []
+        finally:
+            # No-op for an awaited coroutine; prevents "never awaited"
+            # leaks when the bridge is mocked or fails before scheduling.
+            coro.close()
+        return [
+            {
+                "uuid": rec.get("uuid"),
+                "content": rec.get("content") or "",
+                "created_at": str(rec.get("created_at") or ""),
+                "score": rec.get("score"),
+            }
+            for rec in records
+            if rec.get("content")
+        ]
+
     def get_graph_episodes(
         self, user_id: str, project_id: str | None = None, limit: int = 20
     ) -> list[dict]:

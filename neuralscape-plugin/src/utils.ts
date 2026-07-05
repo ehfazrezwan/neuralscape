@@ -94,6 +94,12 @@ export interface HookInput {
   prompt?: string;
   stop_hook_active?: boolean;
   last_assistant_message?: string;
+  /** SessionStart: "startup" | "resume" | "clear" | "compact". */
+  source?: string;
+  /** PreCompact: "manual" (/compact) or "auto". */
+  trigger?: string;
+  /** PreCompact: instructions passed to /compact, if any. */
+  custom_instructions?: string;
 }
 
 export interface HookOutput {

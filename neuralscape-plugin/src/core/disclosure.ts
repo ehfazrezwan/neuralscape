@@ -12,6 +12,7 @@
  */
 
 import type { NeuralscapeMemory } from "../utils.js";
+import { COMPACT_SNAPSHOT_MARKER, COMPACT_SNAPSHOT_TAG } from "./compact.js";
 
 // ── Budget ───────────────────────────────────────────────────────
 
@@ -334,6 +335,60 @@ export function findLatestSessionNote(
     }
   }
   return latest;
+}
+
+// ── Resuming after compaction (compact-resilience loop) ─────────
+
+/** Is this memory a PreCompact compact snapshot? */
+export function isCompactSnapshot(mem: NeuralscapeMemory): boolean {
+  return (
+    (mem.tags ?? []).includes(COMPACT_SNAPSHOT_TAG) ||
+    (mem.memory ?? "").trimStart().startsWith(COMPACT_SNAPSHOT_MARKER)
+  );
+}
+
+/**
+ * Render the newest compact snapshots — FULL content, they're small by
+ * construction — under a "## Resuming after compaction" heading. Scans all
+ * categories (snapshots live in task_context, but scan everything for
+ * safety, mirroring findLatestSessionNote). Returns the rendered block
+ * ("" when no snapshots) plus the ids rendered, so the caller can keep
+ * them out of the index table (no double render).
+ */
+export function renderResumeAfterCompact(
+  categories: Record<string, NeuralscapeMemory[]>,
+  opts: { now?: Date; limit?: number } = {},
+): { block: string; ids: string[] } {
+  const now = opts.now ?? new Date();
+  const limit = opts.limit ?? 3;
+
+  const snapshots: NeuralscapeMemory[] = [];
+  for (const memories of Object.values(categories)) {
+    for (const mem of memories ?? []) {
+      if (isCompactSnapshot(mem)) snapshots.push(mem);
+    }
+  }
+  if (snapshots.length === 0) return { block: "", ids: [] };
+
+  snapshots.sort((a, b) => {
+    const ta = a.created_at ? new Date(a.created_at).getTime() : Number.NEGATIVE_INFINITY;
+    const tb = b.created_at ? new Date(b.created_at).getTime() : Number.NEGATIVE_INFINITY;
+    return (Number.isNaN(tb) ? Number.NEGATIVE_INFINITY : tb) - (Number.isNaN(ta) ? Number.NEGATIVE_INFINITY : ta);
+  });
+
+  const kept = snapshots.slice(0, limit);
+  const lines: string[] = [
+    "## Resuming after compaction",
+    "",
+    "The context was just compacted (lossy summary). These pre-compact " +
+      "snapshots carry what the summary may have dropped — trust them for " +
+      "what was underway:",
+  ];
+  for (const mem of kept) {
+    lines.push("", `**Snapshot (${humanizeAge(mem.created_at ?? null, now)} ago):**`);
+    lines.push((mem.memory ?? "").trim());
+  }
+  return { block: lines.join("\n"), ids: kept.map((m) => m.id) };
 }
 
 /** Compact "Previously…" block — next_steps first, then narrative order. */
