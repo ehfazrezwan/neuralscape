@@ -485,12 +485,12 @@ async def ask_memory(
 
     # ── Verbatim episode leg: distillation drops one-off micro-details
     # (colors, gifts, stated reasons); the raw session text still has them.
-    if tier.name != "minimal":
-        ep_query = " ".join(extract_keywords(question, max_terms=12)) or question
+    async def _episodes(query: str, n: int) -> None:
+        ep_query = " ".join(extract_keywords(query, max_terms=12)) or query
         try:
             eps = await asyncio.to_thread(
                 service.search_episodes_fulltext,
-                ep_query, user_id, project_id, 3,
+                ep_query, user_id, project_id, n,
             )
         except Exception as e:  # non-fatal: facts-only evidence still works
             logger.warning(f"ask episode pass failed (non-critical): {e}")
@@ -511,6 +511,9 @@ async def ask_memory(
                 )
                 for e_ in eps
             ])
+
+    if tier.name != "minimal":
+        await _episodes(question, 3)
 
     # ── Discipline 2: update-language pass, gated on temporal cues ──
     # (audit 27 #19) Runs only when the question or the first-pass evidence
@@ -559,7 +562,12 @@ async def ask_memory(
             and str(parsed.get("query") or "").strip()
         ):
             budget -= 1
-            await _semantic(str(parsed["query"]).strip())
+            follow_up = str(parsed["query"]).strip()
+            await _semantic(follow_up)
+            # E9: the refined query also probes the verbatim episodes — the
+            # first-pass fulltext may have missed what the model now names.
+            if tier.name != "minimal":
+                await _episodes(follow_up, 2)
             continue
         break
     # The model spent its last iteration asking for another search — force
