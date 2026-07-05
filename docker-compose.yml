@@ -155,10 +155,15 @@ services:
         max-size: "10m"
         max-file: "3"
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8199/health')\""]
+      # Liveness, not readiness: probe /health/live (pure process liveness, no
+      # dependency checks). /health probes Redis/backends and can exceed the
+      # timeout when the API is merely busy under heavy write/enrichment load —
+      # which made autoheal restart a working container. Generous timeout and
+      # retries for the same reason: only a truly wedged process should fail.
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8199/health/live')\""]
       interval: 10s
-      timeout: 5s
-      retries: 3
+      timeout: 15s
+      retries: 5
       # Slow first boot (spaCy/fastembed load, backend connections) must not
       # count failed checks toward `retries` — otherwise autoheal would restart
       # the API mid-initialization. This is the per-container startup grace;

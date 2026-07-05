@@ -785,6 +785,86 @@ class TestHealthEndpointChecks:
 
 
 # ══════════════════════════════════════════════
+# Liveness endpoint: /health/live must never touch backends
+# ══════════════════════════════════════════════
+
+
+class TestLivenessEndpoint:
+    """The container healthcheck (and autoheal) watch /health/live, so it must
+    answer instantly and never depend on Redis/Qdrant/Neo4j reachability."""
+
+    @pytest.fixture
+    def client(self):
+        return TestClient(main.app, raise_server_exceptions=False)
+
+    def test_health_live_returns_alive(self, client):
+        resp = client.get("/health/live")
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "alive"}
+
+    def test_health_live_makes_no_dependency_calls(self, client):
+        """/health/live must return 200 without touching any backing store,
+        even when every backend client would raise."""
+        mock_tm = MagicMock(name="TaskManager")
+        mock_tm.pool = MagicMock()
+        mock_tm.pool.ping = AsyncMock(side_effect=ConnectionError("refused"))
+        original_tm = main._task_manager
+        main._task_manager = mock_tm
+
+        # A service whose backend accessors all explode. A dedicated class —
+        # NOT properties patched onto type(MagicMock()), which is the global
+        # MagicMock class and would leak into every other test (Copilot,
+        # PR #132).
+        class ExplodingService:
+            @property
+            def _memory(self):
+                raise RuntimeError("down")
+
+            @property
+            def _graphiti(self):
+                raise RuntimeError("down")
+
+        original_svc = main._service
+        main._service = ExplodingService()
+
+        try:
+            resp = client.get("/health/live")
+            assert resp.status_code == 200
+            assert resp.json() == {"status": "alive"}
+            # No dependency probes at all — this is pure process liveness.
+            # not_called (not just not_awaited): a created-but-never-awaited
+            # coroutine would still mean the backend was touched.
+            mock_tm.pool.ping.assert_not_called()
+            mock_tm.pool.ping.assert_not_awaited()
+        finally:
+            main._task_manager = original_tm
+            main._service = original_svc
+
+    def test_health_readiness_still_probes_dependencies(self, client):
+        """/health (readiness) must keep performing dependency checks."""
+        mock_tm = MagicMock(name="TaskManager")
+        mock_tm.pool = MagicMock()
+        mock_tm.pool.ping = AsyncMock(return_value=True)
+        original_tm = main._task_manager
+        main._task_manager = mock_tm
+
+        mock_svc = MagicMock()
+        mock_svc._memory = MagicMock()
+        mock_svc._graphiti = MagicMock()
+        original_svc = main._service
+        main._service = mock_svc
+
+        try:
+            resp = client.get("/health")
+            assert resp.status_code == 200
+            assert "checks" in resp.json()
+            mock_tm.pool.ping.assert_awaited()
+        finally:
+            main._task_manager = original_tm
+            main._service = original_svc
+
+
+# ══════════════════════════════════════════════
 # Audit P1-4: _get_genai_client() thread safety
 # ══════════════════════════════════════════════
 

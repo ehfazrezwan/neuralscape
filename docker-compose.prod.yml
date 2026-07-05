@@ -107,10 +107,16 @@ services:
         max-size: "10m"
         max-file: "3"
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8199/health')\""]
+      # Liveness, not readiness: /health/live has no dependency checks, so a
+      # busy-but-healthy API (slow /health under heavy load) is never marked
+      # unhealthy. Generous timeout/retries for the same reason.
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8199/health/live')\""]
       interval: 10s
-      timeout: 5s
-      retries: 3
+      timeout: 15s
+      retries: 5
+      # Slow first boot (spaCy/fastembed load, backend connections) must not
+      # count failed checks toward `retries` (matches the dev compose).
+      start_period: 90s
 
   neuralscape-worker:
     build:
