@@ -310,8 +310,55 @@ async def fetch_graph_rows(service, *, limit: int = 200) -> list[dict]:
             cursor = await session.run(SHARED_ENTITY_CYPHER, limit=int(limit))
             return await cursor.data()
 
+    from extensions.dreaming.graph_patcher import _is_kuzu
+
+    if _is_kuzu(driver):
+        # Kuzu arm: fetch raw (name, memory_id, group_id) rows per node table
+        # and run the aggregation pipeline (toLower/trim key, head-of-collect
+        # name, DISTINCT collects, >=2/>=2 hub filter, ordering, limit) in
+        # Python — Kuzu support for those Cypher aggregation forms is
+        # unverified, and solo graphs are small enough to aggregate app-side.
+        async def _inner_kuzu() -> list[dict]:
+            raw: list[dict] = []
+            for label in ("Entity", "Episodic", "Community", "Saga"):
+                out, _, _ = await driver.execute_query(
+                    f"MATCH (n:{label}) WHERE n.memory_id IS NOT NULL "
+                    f"AND n.name IS NOT NULL AND n.group_id IS NOT NULL "
+                    f"RETURN n.name AS name, n.memory_id AS memory_id, "
+                    f"n.group_id AS group_id"
+                )
+                raw.extend(out)
+            agg: dict[str, dict] = {}
+            for r in raw:
+                name = str(r.get("name") or "")
+                key = name.strip().lower()
+                if not key:
+                    continue
+                a = agg.setdefault(
+                    key,
+                    {"name": name, "memory_ids": [], "_mids": set(), "groups": set()},
+                )
+                mid = r.get("memory_id")
+                if mid and mid not in a["_mids"]:
+                    a["_mids"].add(mid)
+                    a["memory_ids"].append(mid)
+                a["groups"].add(r.get("group_id"))
+            hubs = [
+                a for a in agg.values()
+                if len(a["memory_ids"]) >= 2 and len(a["groups"]) >= 2
+            ]
+            hubs.sort(key=lambda a: (-len(a["groups"]), -len(a["memory_ids"])))
+            return [
+                {"name": a["name"], "memory_ids": a["memory_ids"]}
+                for a in hubs[: int(limit)]
+            ]
+
+        fetch = _inner_kuzu()
+    else:
+        fetch = _inner()
+
     try:
-        rows = await service._run_on_bridge_async(_inner(), timeout=30.0)
+        rows = await service._run_on_bridge_async(fetch, timeout=30.0)
         return [
             {
                 "name": str(r.get("name") or ""),

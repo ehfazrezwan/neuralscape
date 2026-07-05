@@ -432,3 +432,97 @@ class TestGraphPatcherKuzu:
         ]
         assert nodes == [{"s": "m-y"}]  # node marking landed
         assert failsafe == 0
+
+
+class TestTier3Ports:
+    """list_projects (#1), search enricher (#2), bridges hub scan (#13)."""
+
+    def _bootstrapped(self, tmp_path):
+        d = _driver(tmp_path)
+        asyncio.run(apply_ns_kuzu_schema(d))
+        return d
+
+    def test_list_projects_on_kuzu(self, tmp_path):
+        from memory.reads import ReadsMixin
+
+        d = self._bootstrapped(tmp_path)
+
+        async def seed():
+            await d.execute_query(
+                "CREATE (n:Entity {uuid: 'a', group_id: 'user--u1--project--alpha'})"
+            )
+            await d.execute_query(
+                "CREATE (e:Episodic {uuid: 'b', group_id: 'shared--project--beta'})"
+            )
+            await d.execute_query(
+                "CREATE (n:Entity {uuid: 'c', group_id: 'user--u1'})"  # global — skipped
+            )
+            await d.execute_query(
+                "CREATE (n:Entity {uuid: 'd', group_id: 'user--other--project--gamma'})"
+            )
+
+        asyncio.run(seed())
+        fake = SimpleNamespace(
+            _get_graphiti=lambda: SimpleNamespace(driver=d),
+            _run_on_bridge=lambda coro, timeout=10.0: asyncio.run(coro),
+        )
+        assert ReadsMixin.list_projects(fake, "u1") == ["alpha", "beta"]
+
+    def test_enrich_graph_results_on_kuzu(self, tmp_path):
+        from memory.search import SearchMixin
+
+        d = self._bootstrapped(tmp_path)
+
+        async def seed():
+            await d.execute_query(
+                "CREATE (n:Entity {uuid: 'n1', memory_id: 'm-n', wiki_path: 'wiki/n.md'})"
+            )
+            await d.execute_query(
+                "CREATE (r:RelatesToNode_ {uuid: 'r1', memory_id: 'm-r', "
+                "fact_embedding: $emb})",
+                emb=[0.25, 0.5, 0.25],
+            )
+
+        asyncio.run(seed())
+        fake = SimpleNamespace(
+            _graphiti=SimpleNamespace(driver=d),
+            _bridge=object(),
+            _run_on_bridge=lambda coro, timeout=10.0: asyncio.run(coro),
+        )
+        nodes = [{"uuid": "n1"}]
+        edges = [{"uuid": "r1"}]
+        SearchMixin._enrich_graph_results(fake, nodes, edges, [])
+        assert nodes[0]["memory_id"] == "m-n"
+        assert nodes[0]["wiki_path"] == "wiki/n.md"
+        assert edges[0]["memory_id"] == "m-r"
+        assert [round(x, 2) for x in edges[0]["fact_embedding"]] == [0.25, 0.5, 0.25]
+
+    def test_bridges_hub_scan_on_kuzu(self, tmp_path):
+        from extensions.dreaming.bridges import fetch_graph_rows
+
+        d = self._bootstrapped(tmp_path)
+
+        async def run():
+            # "Tokyo" spans two pools with two memories → hub.
+            await d.execute_query(
+                "CREATE (n:Entity {uuid: 'h1', name: 'Tokyo', memory_id: 'm-1', "
+                "group_id: 'user--u1'})"
+            )
+            await d.execute_query(
+                "CREATE (n:Entity {uuid: 'h2', name: ' tokyo ', memory_id: 'm-2', "
+                "group_id: 'shared'})"
+            )
+            # Single-pool entity → filtered out.
+            await d.execute_query(
+                "CREATE (n:Entity {uuid: 's1', name: 'Osaka', memory_id: 'm-3', "
+                "group_id: 'user--u1'})"
+            )
+            svc = _PassthroughService(
+                _graphiti=SimpleNamespace(driver=d), _bridge=object()
+            )
+            return await fetch_graph_rows(svc, limit=10)
+
+        rows = asyncio.run(run())
+        assert len(rows) == 1
+        assert rows[0]["name"].strip().lower() == "tokyo"
+        assert sorted(rows[0]["memory_ids"]) == ["m-1", "m-2"]

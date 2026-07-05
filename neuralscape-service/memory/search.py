@@ -1122,8 +1122,41 @@ class SearchMixin:
                 result = await session.run(cypher, uuids=all_uuids)
                 return await result.data()
 
+        from memory.kuzu_schema import is_kuzu_driver
+
+        if is_kuzu_driver(self._graphiti.driver):
+            # Kuzu: explicit labels + app-side union. A bare MATCH (n) would
+            # ALSO match RelatesToNode_ rows (edges are reified as nodes),
+            # double-reporting edge uuids with a null embedding — so nodes and
+            # edges are fetched separately, mirroring Neo4j's two UNION arms.
+            # The node arm omits fact_embedding entirely (rec.get → None).
+            driver = self._graphiti.driver
+
+            async def _run_kuzu():
+                out: list[dict] = []
+                for label in ("Entity", "Episodic", "Community", "Saga"):
+                    rows, _, _ = await driver.execute_query(
+                        f"MATCH (n:{label}) WHERE n.uuid IN $uuids "
+                        f"RETURN n.uuid AS uuid, n.memory_id AS memory_id, "
+                        f"n.wiki_path AS wiki_path",
+                        uuids=all_uuids,
+                    )
+                    out.extend(rows)
+                rows, _, _ = await driver.execute_query(
+                    "MATCH (r:RelatesToNode_) WHERE r.uuid IN $uuids "
+                    "RETURN r.uuid AS uuid, r.memory_id AS memory_id, "
+                    "r.wiki_path AS wiki_path, r.fact_embedding AS fact_embedding",
+                    uuids=all_uuids,
+                )
+                out.extend(rows)
+                return out
+
+            fetch = _run_kuzu()
+        else:
+            fetch = _run()
+
         try:
-            records = self._run_on_bridge(_run(), timeout=10.0) or []
+            records = self._run_on_bridge(fetch, timeout=10.0) or []
         except Exception:
             logger.warning("graph result enrichment failed (non-critical)", exc_info=True)
             return
