@@ -147,14 +147,8 @@ def _infer_project(content: str) -> Optional[str]:
     Looks for known project patterns and explicit project mentions.
     """
     content_lower = content.lower()
-    # Check for common project indicators
-    known_slugs = [
-        "neuralscape",
-        "openclaw",
-        "lightpath",
-        "svc-utility-belt",
-    ]
-    for slug in known_slugs:
+    # Deployment-specific slugs come from KNOWN_PROJECT_SLUGS
+    for slug in core_settings.known_projects:
         if slug in content_lower:
             return slug
     return None

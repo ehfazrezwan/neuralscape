@@ -366,10 +366,10 @@ class TestListMemoriesTool:
 class TestListProjectsTool:
     @pytest.mark.asyncio
     async def test_lists_projects(self, mock_mcp_service):
-        mock_mcp_service.list_projects.return_value = ["lightpath", "neuralscape"]
+        mock_mcp_service.list_projects.return_value = ["demo-alpha", "neuralscape"]
         result = await mcp_server.call_tool("list_projects", {"user_id": "ehfaz"})
         data = json.loads(result[0].text)
-        assert data["projects"] == ["lightpath", "neuralscape"]
+        assert data["projects"] == ["demo-alpha", "neuralscape"]
         mock_mcp_service.list_projects.assert_called_once_with(user_id="ehfaz")
 
     @pytest.mark.asyncio

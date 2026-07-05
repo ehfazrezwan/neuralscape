@@ -615,14 +615,14 @@ class TestCRUD:
         service._run_on_bridge = self._bridge_returning(
             [
                 {"group_id": "user--ehfaz--project--neuralscape"},
-                {"group_id": "shared--project--lightpath"},  # team-shared
+                {"group_id": "shared--project--demo-alpha"},  # team-shared
                 {"group_id": "user--ehfaz--project--neuralscape"},  # duplicate
                 {"group_id": "user--ehfaz"},  # global private — no project
                 {"group_id": "shared"},  # global shared — no project
             ]
         )
         projects = service.list_projects(user_id="ehfaz")
-        assert projects == ["lightpath", "neuralscape"]
+        assert projects == ["demo-alpha", "neuralscape"]
 
     def test_list_projects_empty(self, service):
         service._run_on_bridge = self._bridge_returning([])
@@ -1347,11 +1347,19 @@ class TestBulkDeleteNullCategory:
 
 
 class TestInferProjectId:
+    @pytest.fixture(autouse=True)
+    def _known_slugs(self, monkeypatch):
+        from config import settings
+
+        monkeypatch.setattr(
+            settings, "known_project_slugs", "neuralscape,demo-alpha,demo-gamma,demo-beta"
+        )
+
     def test_infers_known_slug(self):
         assert _infer_project_id("The neuralscape project uses FastAPI") == "neuralscape"
-        assert _infer_project_id("Lightpath uses Three.js") == "lightpath"
-        assert _infer_project_id("OpenClaw agent framework") == "openclaw"
-        assert _infer_project_id("svc-utility-belt deploys on GKE") == "svc-utility-belt"
+        assert _infer_project_id("Demo-Alpha uses Three.js") == "demo-alpha"
+        assert _infer_project_id("Demo-Gamma agent framework") == "demo-gamma"
+        assert _infer_project_id("demo-beta deploys on GKE") == "demo-beta"
 
     def test_returns_none_for_unknown(self):
         assert _infer_project_id("User prefers dark mode") is None
@@ -1421,6 +1429,14 @@ class TestDeleteEpisode:
 
 
 class TestDeleteJunkEpisodes:
+    @pytest.fixture(autouse=True)
+    def _known_slugs(self, monkeypatch):
+        from config import settings
+
+        monkeypatch.setattr(
+            settings, "known_project_slugs", "neuralscape,demo-alpha,demo-gamma,demo-beta"
+        )
+
     def _mock_episodes_by_project(self, user_id=None, project_id=None, limit=500):
         """Return test episodes keyed by project_id (None = global)."""
         data = {
@@ -1429,17 +1445,17 @@ class TestDeleteJunkEpisodes:
                 {"uuid": "g-2", "content": "assistant: Got it, I'll fix that bug now.", "group_id": "global"},
                 {"uuid": "g-3", "content": "Ran command: git status", "group_id": "global"},
             ],
-            "svc-utility-belt": [
-                {"uuid": "su-1", "content": "assistant: Sure, deploying now.", "group_id": "project--svc-utility-belt"},
-                {"uuid": "su-2", "content": "Uses FastAPI for microservices", "group_id": "project--svc-utility-belt"},
+            "demo-beta": [
+                {"uuid": "su-1", "content": "assistant: Sure, deploying now.", "group_id": "project--demo-beta"},
+                {"uuid": "su-2", "content": "Uses FastAPI for microservices", "group_id": "project--demo-beta"},
             ],
-            "lightpath": [],
+            "demo-alpha": [],
             "neuralscape": [
                 {"uuid": "ns-1", "content": "Wrote file: main.py", "group_id": "project--neuralscape"},
                 {"uuid": "ns-2", "content": "Neo4j is the graph backend", "group_id": "project--neuralscape"},
             ],
-            "openclaw": [
-                {"uuid": "oc-1", "content": "Tool result: success", "group_id": "project--openclaw"},
+            "demo-gamma": [
+                {"uuid": "oc-1", "content": "Tool result: success", "group_id": "project--demo-gamma"},
             ],
         }
         return data.get(project_id, [])
@@ -1469,14 +1485,14 @@ class TestDeleteJunkEpisodes:
         result = service.delete_junk_episodes(user_id="ehfaz", dry_run=True)
 
         assert result["dry_run"] is True
-        # g-2, g-3 (global) + su-1 (svc-utility-belt) + ns-1 (neuralscape) + oc-1 (openclaw) = 5
+        # g-2, g-3 (global) + su-1 (demo-beta) + ns-1 (neuralscape) + oc-1 (demo-gamma) = 5
         assert result["junk_count"] == 5
         assert "breakdown" in result
         assert result["breakdown"]["global"]["junk_count"] == 2
-        assert result["breakdown"]["svc-utility-belt"]["junk_count"] == 1
-        assert result["breakdown"]["lightpath"]["junk_count"] == 0
+        assert result["breakdown"]["demo-beta"]["junk_count"] == 1
+        assert result["breakdown"]["demo-alpha"]["junk_count"] == 0
         assert result["breakdown"]["neuralscape"]["junk_count"] == 1
-        assert result["breakdown"]["openclaw"]["junk_count"] == 1
+        assert result["breakdown"]["demo-gamma"]["junk_count"] == 1
         # Should have called get_graph_episodes 5 times (global + 4 projects)
         assert service.get_graph_episodes.call_count == 5
 
@@ -1491,9 +1507,9 @@ class TestDeleteJunkEpisodes:
         assert result["deleted_count"] == 5
         assert "breakdown" in result
         assert result["breakdown"]["global"]["deleted_count"] == 2
-        assert result["breakdown"]["svc-utility-belt"]["deleted_count"] == 1
+        assert result["breakdown"]["demo-beta"]["deleted_count"] == 1
         assert result["breakdown"]["neuralscape"]["deleted_count"] == 1
-        assert result["breakdown"]["openclaw"]["deleted_count"] == 1
+        assert result["breakdown"]["demo-gamma"]["deleted_count"] == 1
         # Verify delete_episode was called for each junk episode
         deleted_uuids = [call.args[0] for call in service.delete_episode.call_args_list]
         assert "g-2" in deleted_uuids

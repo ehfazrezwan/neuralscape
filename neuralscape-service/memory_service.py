@@ -62,8 +62,6 @@ _JUNK_PATTERNS = [
 ]
 _JUNK_RE = re.compile("|".join(_JUNK_PATTERNS), re.IGNORECASE | re.MULTILINE)
 
-# All known project group IDs for multi-group episode cleanup
-ALL_KNOWN_PROJECTS = ["svc-utility-belt", "lightpath", "neuralscape", "openclaw"]
 
 # Tags that mark a `standard` as ALWAYS-INJECT (surfaced in the session-start
 # context regardless of relevance). Every other standard stays out of the
@@ -396,19 +394,13 @@ def _clean_conversation_for_graph(messages: list[dict]) -> list[dict]:
     return cleaned
 
 
-# Known project slugs for project_id inference
-_KNOWN_PROJECT_SLUGS = [
-    "svc-utility-belt",
-    "lightpath",
-    "neuralscape",
-    "openclaw",
-]
-
-
 def _infer_project_id(content: str) -> str | None:
-    """Try to infer a project_id from memory content by matching known project slugs."""
+    """Try to infer a project_id from memory content by matching known project slugs.
+
+    Slugs are deployment-specific and come from KNOWN_PROJECT_SLUGS.
+    """
     content_lower = content.lower()
-    for slug in _KNOWN_PROJECT_SLUGS:
+    for slug in settings.known_projects:
         if slug in content_lower:
             return slug
     return None
@@ -5254,7 +5246,8 @@ class MemoryService:
             project_ids_to_scan = [project_id]
         else:
             # None = global group, then all known projects
-            project_ids_to_scan = [None] + ALL_KNOWN_PROJECTS
+            # (deployment-specific, supplied via KNOWN_PROJECT_SLUGS)
+            project_ids_to_scan = [None] + settings.known_projects
 
         breakdown = {}
         total_junk = 0
