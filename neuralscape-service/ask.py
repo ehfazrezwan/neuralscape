@@ -39,6 +39,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from config import settings
 
@@ -186,10 +187,24 @@ def _event_time(mem) -> str:
     (``occurred_at``, when the fact actually happened) when present, else
     the storage time (``created_at``). Historical ingestion stamps
     occurred_at precisely so "newer" means newer *events*, not newer
-    writes."""
-    return str(
-        getattr(mem, "occurred_at", None) or getattr(mem, "created_at", None) or ""
-    )
+    writes.
+
+    Returned as a canonical-UTC ISO string so the lexicographic sort in
+    ``_evidence_rows`` is a true chronological sort even when a stored
+    timestamp carries a non-UTC offset (occurred_at is canonicalized at
+    validation, but created_at comes from the vector store and is not
+    guaranteed one spelling). Unparseable values fall back to the raw
+    string rather than dropping the row."""
+    raw = getattr(mem, "occurred_at", None) or getattr(mem, "created_at", None) or ""
+    if not raw:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return str(raw)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
 
 
 def _evidence_rows(evidence: dict, keyword_ids: list[str], enumeration: bool) -> list:

@@ -39,9 +39,36 @@ class TestValidateOccurredAt:
     def test_none_passes_through(self):
         assert validate_occurred_at(None) is None
 
-    def test_aware_iso_accepted(self):
+    def test_aware_iso_canonicalized_to_utc(self):
+        # Non-UTC offsets are converted, not preserved: one spelling per
+        # instant keeps lexicographic recency sorting and the deterministic
+        # enqueue job key stable across ISO spellings (Copilot, PR #130).
         out = validate_occurred_at("2023-05-01T10:00:00+02:00")
-        assert out == "2023-05-01T10:00:00+02:00"
+        assert out == "2023-05-01T08:00:00+00:00"
+
+    def test_equivalent_spellings_normalize_identically(self):
+        spellings = [
+            "2023-05-01T08:00:00+00:00",
+            "2023-05-01T08:00:00Z",
+            "2023-05-01T10:00:00+02:00",
+            "2023-05-01T08:00:00",
+        ]
+        assert len({validate_occurred_at(v) for v in spellings}) == 1
+
+    def test_event_time_sort_key_is_offset_proof(self):
+        from types import SimpleNamespace
+
+        from ask import _event_time
+
+        # 11:00+02:00 is 09:00 UTC; it must compare AFTER 08:30 UTC under the
+        # sort key even though raw-string comparison across mixed offsets
+        # would be meaningless.
+        older = SimpleNamespace(occurred_at=None, created_at="2023-05-01T08:30:00+00:00")
+        newer = SimpleNamespace(occurred_at="2023-05-01T11:00:00+02:00", created_at=None)
+        assert _event_time(newer) > _event_time(older)
+        # Unparseable values degrade to the raw string instead of raising.
+        junk = SimpleNamespace(occurred_at="not-a-date", created_at=None)
+        assert _event_time(junk) == "not-a-date"
 
     def test_z_suffix_accepted(self):
         out = validate_occurred_at("2023-05-01T10:00:00Z")

@@ -360,7 +360,12 @@ def validate_occurred_at(v) -> str | None:
     - naive datetimes are assumed UTC;
     - future dates beyond ``OCCURRED_AT_MAX_FUTURE_SKEW`` (~1 day of clock
       skew) are rejected;
-    - returns the normalized (timezone-aware) ISO string, or None for None.
+    - returns the CANONICAL UTC ISO string (``+00:00``), or None for None.
+      Canonicalizing here (not just validating) means every downstream
+      consumer - lexicographic recency sorting in ask.py, the deterministic
+      enqueue job key in task_manager.py - sees one spelling per instant,
+      so Z / +02:00 / naive inputs of the same moment cannot sort or
+      dedup differently (Copilot, PR #130).
     """
     if v is None:
         return None
@@ -380,7 +385,7 @@ def validate_occurred_at(v) -> str | None:
             f"occurred_at is in the future ({dt.isoformat()}) — event times "
             "must not be later than now (plus a small clock-skew allowance)"
         )
-    return dt.isoformat()
+    return dt.astimezone(timezone.utc).isoformat()
 
 
 # ──────────────────────────────────────────────
