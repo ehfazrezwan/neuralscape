@@ -205,6 +205,14 @@ class Settings(BaseSettings):
     # deploy time; never hardcode real project names in this public repo.
     known_project_slugs: str = "neuralscape"
 
+    # ── Ask: verbatim episode evidence leg ─────────────────────────────
+    # Distillation drops one-off micro-details (colors, gifts, stated
+    # reasons); the raw Episodic content still holds them. When enabled,
+    # non-minimal asks add up to 3 relevance-ranked verbatim excerpts via
+    # Graphiti's episode_content fulltext index (one Cypher call, no
+    # embeddings). Measured +5pp on a DMR 100-question stratified sample.
+    ask_episode_evidence: bool = True
+
     # ── Custom extraction instructions (roadmap E4) ───────────────────
     # Operator-supplied guidance appended to the extraction prompt as a
     # clearly-delimited addendum ("OPERATOR GUIDANCE"). Per-user (self-set)

@@ -3252,3 +3252,43 @@ class TestDeletedMsg:
     def test_none_preserved(self):
         from memory_service import _deleted_msg
         assert _deleted_msg("null-category memories", 5, 0, 0) == "Deleted 5 null-category memories"
+
+
+class TestSearchEpisodesFulltext:
+    """Verbatim episode evidence leg (ask): group-scoped fulltext over
+    Graphiti's episode_content index."""
+
+    @staticmethod
+    def _bridge_returning(records):
+        def _bridge(coro, timeout=None):
+            coro.close()
+            return records
+
+        return MagicMock(side_effect=_bridge)
+
+    def test_returns_ranked_excerpts(self, service):
+        service._run_on_bridge = self._bridge_returning([
+            {"uuid": "ep-1", "content": "the hat was yellow", "created_at": "2026-01-01", "score": 2.0},
+            {"uuid": "ep-2", "content": "", "created_at": "2026-01-02", "score": 1.0},
+        ])
+        out = service.search_episodes_fulltext("yellow hat", user_id="u1")
+        assert len(out) == 1  # empty-content rows dropped
+        assert out[0]["uuid"] == "ep-1"
+        assert out[0]["content"] == "the hat was yellow"
+
+    def test_no_graphiti_returns_empty(self, service):
+        service._get_graphiti = MagicMock(return_value=None)
+        assert service.search_episodes_fulltext("anything", user_id="u1") == []
+
+    def test_no_usable_terms_returns_empty(self, service):
+        service._run_on_bridge = MagicMock()
+        assert service.search_episodes_fulltext("a b", user_id="u1") == []
+        service._run_on_bridge.assert_not_called()
+
+    def test_bridge_failure_returns_empty(self, service):
+        def _boom(coro, timeout=None):
+            coro.close()
+            raise RuntimeError("neo4j down")
+
+        service._run_on_bridge = MagicMock(side_effect=_boom)
+        assert service.search_episodes_fulltext("yellow hat", user_id="u1") == []

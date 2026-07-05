@@ -38,6 +38,7 @@ import asyncio
 import json
 import logging
 import re
+from types import SimpleNamespace
 from dataclasses import dataclass
 
 from config import settings
@@ -264,7 +265,17 @@ _DISCIPLINES_FULL = """Disciplines (follow strictly):
 4. ABSTENTION: "I don't know" is a correct answer. If the evidence does not contain the
    answer, abstain — NEVER fabricate facts, dates, or memory ids.
 5. CITATIONS: cite supporting memory ids inline like [<id>]. Only ids from the EVIDENCE
-   list are valid citations."""
+   list are valid citations.
+6. PERSPECTIVE: memories distilled from dialogs may carry generic speaker labels
+   ("Speaker 1", "Speaker 2") or third-person phrasing ("the user", "the assistant")
+   that do not literally match the question's "I/my" or "you/your". These labels are
+   ingestion artifacts, not different people. Resolve perspective from content: when an
+   evidence row plainly answers the substance of the question, answer with it — a label
+   or pronoun mismatch alone is NEVER grounds to abstain or to deny knowing the fact.
+7. SPECIFICITY: when several rows state the same fact at different precision ("as a
+   toddler" vs "at age three"), answer with the MOST SPECIFIC row. Recency (discipline 2)
+   applies to genuine changes of fact — a vaguer restatement never supersedes a more
+   precise one."""
 
 _DISCIPLINES_BRIEF = """Rules: answer ONLY from the evidence; newer memories supersede older ones; if the
 evidence doesn't answer the question say you don't know (never fabricate); cite supporting
@@ -471,6 +482,37 @@ async def ask_memory(
 
     # ── Semantic pass (always) ──
     await _semantic(question)
+
+    # ── Verbatim episode leg: distillation drops one-off micro-details
+    # (colors, gifts, stated reasons); the raw session text still has them.
+    # Measured +5pp on a DMR 100-question stratified sample; 3 excerpts is
+    # the sweet spot (5 diluted the evidence and regressed).
+    if tier.name != "minimal" and settings.ask_episode_evidence:
+        ep_query = " ".join(extract_keywords(question, max_terms=12)) or question
+        try:
+            eps = await asyncio.to_thread(
+                service.search_episodes_fulltext,
+                ep_query, user_id, project_id, 3,
+            )
+        except Exception as e:  # non-fatal: facts-only evidence still works
+            logger.warning(f"ask episode pass failed (non-critical): {e}")
+            eps = []
+        if not isinstance(eps, list):  # tolerate test doubles / older forks
+            eps = []
+        if eps:
+            searches.append("episodes: fulltext")
+            _merge([
+                SimpleNamespace(
+                    id=f"ep-{str(e_.get('uuid') or '')[:12]}",
+                    memory="[verbatim session excerpt] "
+                           + _clip_content(str(e_.get("content") or ""),
+                                           _EVIDENCE_PASSAGE_CLIP),
+                    score=None,
+                    source="episode",
+                    created_at=e_.get("created_at") or None,
+                )
+                for e_ in eps
+            ])
 
     # ── Discipline 2: update-language pass, gated on temporal cues ──
     # (audit 27 #19) Runs only when the question or the first-pass evidence
