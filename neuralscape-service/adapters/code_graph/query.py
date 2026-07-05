@@ -1,11 +1,17 @@
-"""NS-surface code-structure queries — thin delegations to the graphifyy library.
+"""NS-surface code-structure queries — route through the CodeIntelEngine protocol.
+
+E1 refactor: the three public tools (query_code_graph, get_code_neighbors,
+code_path) now route through the CodeIntelEngine protocol via get_engine(),
+which selects GraphifyJsonEngine for .json artifact graph_ids (the only kind
+that exists today). Zero behavior change: GraphifyJsonEngine wraps the exact
+same graphify library calls that the old direct-call code path used.
 
 **The interaction interface is ALWAYS Neuralscape** (roadmap F2 constraint):
 agents call NS's own ``query_code_graph`` / ``get_code_neighbors`` /
 ``code_path`` MCP tools (or the matching ``/v1/code-graph/*`` REST routes),
-and NS resolves them against a ``graph.json`` via graphifyy's query layer.
-Clients are never pointed at Graphify's own MCP server; the ``source_ref``
-retrieval handles stamped on code-graph memories point back HERE.
+and NS resolves them against a ``graph.json`` via the engine. Clients are
+never pointed at Graphify's own MCP server; the ``source_ref`` retrieval
+handles stamped on code-graph memories point back HERE.
 
 Graph resolution (no arbitrary path reads — the API must not become a file
 oracle):
@@ -14,14 +20,6 @@ oracle):
   owner-scoped via :func:`ingest.storage.find_artifact` (one user cannot read
   another's graph by guessing an id);
 - otherwise the deployment-configured ``settings.code_graph_json_path``.
-
-Query semantics reuse graphify's own scoring/traversal/rendering
-(``_query_graph_text`` / ``_find_node`` / ``_score_nodes``). The neighbor and
-shortest-path renderers are small re-implementations of graphify's MCP tool
-bodies — those live as closures inside ``serve._build_server`` and aren't
-importable, but every non-trivial step (node search, edge access, label
-sanitisation, path-finding) still calls the library. Kept behaviorally aligned
-with graphify's ``get_neighbors`` / ``shortest_path`` tools.
 
 This module imports ``graphify`` at module level — import it only behind
 :func:`adapters.code_graph.code_graph_available`.
@@ -35,10 +33,9 @@ import threading
 from pathlib import Path
 
 import networkx as nx
-from graphify.build import edge_data
-from graphify.security import sanitize_label
-from graphify.serve import _find_node, _query_graph_text, _score_nodes
 
+from adapters.code_graph.engine import CodeIntelEngine
+from adapters.code_graph.graphify_engine import GraphifyJsonEngine
 from adapters.code_graph.semantic import CodeGraphError, load_code_graph
 
 logger = logging.getLogger(__name__)
@@ -48,10 +45,11 @@ class CodeGraphNotConfigured(CodeGraphError):
     """No graph.json to query: no graph_id given and no default path configured."""
 
 
-# ── Graph resolution + cache ────────────────────────────────────────
+# ── Graph resolution + engine cache ────────────────────────────────
 
-# path -> {"key": (mtime_ns, size), "G": nx.Graph} — mtime+size hot-reload,
-# mirroring graphify's own serve-layer cache.
+# E1: path -> {"key": (mtime_ns, size), "engine": CodeIntelEngine} — mtime+size
+# hot-reload, mirroring graphify's own serve-layer cache. E2+ will extend this
+# to cache NativeEngine instances keyed by repo:<name> refs.
 _ctx_lock = threading.Lock()
 _ctx_cache: dict[str, dict] = {}
 
@@ -87,8 +85,28 @@ def resolve_graph_path(graph_id: str | None, user_id: str, settings) -> str:
     return str(Path(os.path.expanduser(default)))
 
 
-def load_graph_cached(path: str) -> nx.Graph:
-    """Load graph.json via the library, cached per path until (mtime, size) changes."""
+def get_engine(graph_id: str | None, user_id: str, settings) -> CodeIntelEngine:
+    """Engine-selection factory: returns the right CodeIntelEngine for the graph ref.
+
+    E1: always returns GraphifyJsonEngine for .json artifact paths (the only kind
+    that exists today). E2+ will detect repo:<name> refs and return NativeEngine.
+
+    The engine is cached per resolved path until (mtime, size) changes — same
+    hot-reload discipline as the old load_graph_cached.
+
+    Args:
+        graph_id: Artifact id or None (uses default path).
+        user_id: Owner-scoped resolution.
+        settings: Config for default path.
+
+    Returns:
+        A CodeIntelEngine (today: GraphifyJsonEngine).
+
+    Raises:
+        CodeGraphNotConfigured: No graph_id and no default configured.
+        CodeGraphError: graph_id doesn't resolve or isn't a .json artifact.
+    """
+    path = resolve_graph_path(graph_id, user_id, settings)
     try:
         s = Path(path).stat()
     except FileNotFoundError:
@@ -96,21 +114,19 @@ def load_graph_cached(path: str) -> nx.Graph:
     key = (s.st_mtime_ns, s.st_size)
     ent = _ctx_cache.get(path)
     if ent is not None and ent["key"] == key:
-        return ent["G"]
+        return ent["engine"]
     with _ctx_lock:
         ent = _ctx_cache.get(path)
         if ent is not None and ent["key"] == key:
-            return ent["G"]  # another thread built it
+            return ent["engine"]  # another thread built it
+        # Load the graph and wrap it in GraphifyJsonEngine.
         G = load_code_graph(path)
-        _ctx_cache[path] = {"key": key, "G": G}
-        return G
+        engine = GraphifyJsonEngine(G, path)
+        _ctx_cache[path] = {"key": key, "engine": engine}
+        return engine
 
 
-def _resolve_and_load(graph_id: str | None, user_id: str, settings) -> nx.Graph:
-    return load_graph_cached(resolve_graph_path(graph_id, user_id, settings))
-
-
-# ── The three delegation queries ────────────────────────────────────
+# ── The three delegation queries (now route through the protocol) ──
 
 
 def query_code_graph(
@@ -123,12 +139,9 @@ def query_code_graph(
     depth: int = 3,
     token_budget: int = 2000,
 ) -> str:
-    """Search the code graph (BFS/DFS from scored seed nodes) — graphify's query_graph."""
-    G = _resolve_and_load(graph_id, user_id, settings)
-    mode = mode if mode in ("bfs", "dfs") else "bfs"
-    depth = max(1, min(int(depth), 6))
-    token_budget = max(100, min(int(token_budget), 20_000))
-    return _query_graph_text(G, question, mode=mode, depth=depth, token_budget=token_budget)
+    """Search the code graph (BFS/DFS from scored seed nodes) — routes through engine."""
+    engine = get_engine(graph_id, user_id, settings)
+    return engine.query(question, mode=mode, depth=depth, token_budget=token_budget)
 
 
 def get_code_neighbors(
@@ -139,35 +152,9 @@ def get_code_neighbors(
     graph_id: str | None = None,
     relation_filter: str = "",
 ) -> str:
-    """Direct in/out neighbors of a node — graphify's get_neighbors behavior."""
-    G = _resolve_and_load(graph_id, user_id, settings)
-    matches = _find_node(G, label)
-    if not matches:
-        return f"No node matching '{sanitize_label(label)}' found."
-    nid = matches[0]
-    rel_filter = (relation_filter or "").lower()
-    lines = [f"Neighbors of {sanitize_label(G.nodes[nid].get('label', nid))}:"]
-    for nb in G.successors(nid):
-        d = edge_data(G, nid, nb)
-        rel = d.get("relation", "")
-        if rel_filter and rel_filter not in rel.lower():
-            continue
-        lines.append(
-            f"  --> {sanitize_label(G.nodes[nb].get('label', nb))} "
-            f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]"
-        )
-    for nb in G.predecessors(nid):
-        d = edge_data(G, nb, nid)
-        rel = d.get("relation", "")
-        if rel_filter and rel_filter not in rel.lower():
-            continue
-        lines.append(
-            f"  <-- {sanitize_label(G.nodes[nb].get('label', nb))} "
-            f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]"
-        )
-    if len(lines) == 1:
-        lines.append("  (no neighbors matching the filter)")
-    return "\n".join(lines)
+    """Direct in/out neighbors of a node — routes through engine."""
+    engine = get_engine(graph_id, user_id, settings)
+    return engine.neighbors(label, relation_filter=relation_filter)
 
 
 def code_path(
@@ -179,46 +166,6 @@ def code_path(
     graph_id: str | None = None,
     max_hops: int = 8,
 ) -> str:
-    """Shortest path between two symbols — graphify's shortest_path behavior."""
-    G = _resolve_and_load(graph_id, user_id, settings)
-    src_scored = _score_nodes(G, [t.lower() for t in source.split()])
-    tgt_scored = _score_nodes(G, [t.lower() for t in target.split()])
-    if not src_scored:
-        return f"No node matching source '{sanitize_label(source)}' found."
-    if not tgt_scored:
-        return f"No node matching target '{sanitize_label(target)}' found."
-    src_nid, tgt_nid = src_scored[0][1], tgt_scored[0][1]
-    if src_nid == tgt_nid:
-        return (
-            f"'{sanitize_label(source)}' and '{sanitize_label(target)}' both resolved "
-            f"to the same node '{sanitize_label(src_nid)}'. Use a more specific label."
-        )
-    try:
-        path_nodes = nx.shortest_path(G.to_undirected(as_view=True), src_nid, tgt_nid)
-    except (nx.NetworkXNoPath, nx.NodeNotFound):
-        return (
-            f"No path found between "
-            f"'{sanitize_label(G.nodes[src_nid].get('label', src_nid))}' and "
-            f"'{sanitize_label(G.nodes[tgt_nid].get('label', tgt_nid))}'."
-        )
-    hops = len(path_nodes) - 1
-    max_hops = max(1, min(int(max_hops), 32))
-    if hops > max_hops:
-        return f"Path exceeds max_hops={max_hops} ({hops} hops found)."
-    segments: list[str] = []
-    for i in range(hops):
-        u, v = path_nodes[i], path_nodes[i + 1]
-        if G.has_edge(u, v):
-            edata, forward = edge_data(G, u, v), True
-        else:
-            edata, forward = edge_data(G, v, u), False
-        rel = sanitize_label(str(edata.get("relation", "")))
-        conf = edata.get("confidence", "")
-        conf_str = f" [{sanitize_label(str(conf))}]" if conf else ""
-        if i == 0:
-            segments.append(sanitize_label(G.nodes[u].get("label", u)))
-        if forward:
-            segments.append(f"--{rel}{conf_str}--> {sanitize_label(G.nodes[v].get('label', v))}")
-        else:
-            segments.append(f"<--{rel}{conf_str}-- {sanitize_label(G.nodes[v].get('label', v))}")
-    return f"Shortest path ({hops} hops):\n  " + " ".join(segments)
+    """Shortest path between two symbols — routes through engine."""
+    engine = get_engine(graph_id, user_id, settings)
+    return engine.path(source, target, max_hops=max_hops)
