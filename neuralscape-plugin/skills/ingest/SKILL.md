@@ -22,7 +22,7 @@ For a single short fact, use `/neuralscape:remember` instead — this skill is f
 
 3. **Manual context path — MCP `ingest_text` / `ingest_document`:**
    - Call `ingest_text(content=<the text>, title=<short label>, user_id=<resolved>, category=<cat>, project_id=<id or omit>)`.
-   - When the content was fetched from an external system (a Notion page, a Drive file, an API response), prefer `ingest_document(content=..., source={connector_id, connector_type, title?, url?, retrieval?})` so every produced memory carries a `source_ref` that can re-fetch the original.
+   - When the content was fetched from an external system (a Notion page, a Drive file, an API response), use `ingest_document(content=..., source={connector_id, connector_type, title?, url?, retrieval?})` whenever you can supply connector provenance, so every produced memory carries a `source_ref` that can re-fetch the original.
    - The server persists the text as a Markdown artifact (filed under user/project/category) and the memories reference it. Async by default; report that ingestion was **queued** (passages + facts land shortly). `queue_status()` shows when the ingest queue has drained.
 
 4. **File-upload path — `POST /v1/ingest/files` (Claude Code only):**
@@ -38,7 +38,7 @@ For a single short fact, use `/neuralscape:remember` instead — this skill is f
        -F "project_id=<id>"                     # omit for global scope
      ```
    - The response is `{"files": [{"filename", "task_id", "file_id"}], "count": N}` (HTTP 202). Each file is parsed + chunked on a dedicated ingest worker, so this won't interrupt the active session.
-   - To check progress, prefer the MCP `queue_status()` tool (aggregate per-queue depths + `caught_up`). The original file is retrievable at `<URL>/v1/ingest/artifacts/{file_id}`.
+   - To check progress, prefer the MCP `queue_status()` tool (aggregate per-queue depths + `caught_up`). When artifact storage is enabled, the original file is retrievable at `<URL>/v1/ingest/artifacts/{file_id}`.
 
 5. **Confirm** to the user: how many files/how much context was accepted, the category/scope, and that parsing is running in the background (queued). List any files the server skipped.
 

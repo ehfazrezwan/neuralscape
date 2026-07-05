@@ -51,5 +51,5 @@ The MCP `recall_memories` schema marks `user_id` required, but under token auth 
 ## Notes
 
 - Read-only. Never store or modify memories from this skill.
-- Related tools for adjacent jobs: `timeline(anchor=...)` for "what was happening around X?" (chronological, instant), `search_knowledge_graph` for entity/relationship queries, `ask_memory` for synthesized answers with citations.
+- Related tools for adjacent jobs: `timeline(anchor=...)` for "what was happening around X?" (chronological; instant with a memory-ID anchor, while a natural-language anchor pays one embedding-backed search to resolve), `search_knowledge_graph` for entity/relationship queries, `ask_memory` for synthesized answers with citations.
 - Categories and scopes (13 total) are documented at `docs/neuralscape/03-memory-model.md` in the Neuralscape repo.
