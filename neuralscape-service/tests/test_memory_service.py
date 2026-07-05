@@ -466,7 +466,8 @@ class TestStandardDeleteGate:
 
     def test_non_standard_delete_unaffected(self, service):
         service._memory.get.return_value = {
-            "id": "p1", "memory": "note", "metadata": {"visibility": "private"}
+            "id": "p1", "memory": "note", "user_id": "anyone",
+            "metadata": {"visibility": "private", "owner_user_id": "anyone"}
         }
         service._memory.delete.return_value = {"message": "deleted"}
         service.delete_memory("p1", caller_user_id="anyone")
@@ -1548,7 +1549,7 @@ class TestDeleteJunkEpisodes:
         assert result["deleted_count"] == 1
         assert len(result["breakdown"]) == 1
         assert result["breakdown"]["neuralscape"]["deleted_count"] == 1
-        service.delete_episode.assert_called_once_with("ns-1")
+        service.delete_episode.assert_called_once_with("ns-1", user_id="ehfaz", project_id="neuralscape")
 
     def test_delete_handles_partial_failures(self, service):
         """If some deletes fail, only successful ones are counted."""

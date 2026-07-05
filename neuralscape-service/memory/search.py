@@ -635,15 +635,17 @@ class SearchMixin:
                 if r.visibility == visibility or r.visibility is None
             ]
 
-        # Deduplicate and enforce caller's limit — ranked vector hits keep
-        # priority; graph rows are appended after, capped within the limit.
+        # Deduplicate without applying limit yet — the memory_kind filter
+        # below may exclude rows, so we apply limit AFTER filtering to avoid
+        # the cap being consumed by filtered-out rows (audit 27 hardening #8).
         combined = self._deduplicate_responses(
-            vector_responses, graph_responses, limit=limit
+            vector_responses, graph_responses, limit=None
         )
 
         # memory_kind filter (data-layer connectors). Legacy memories have no
         # memory_kind, so a "fact" filter treats null as fact (back-compat);
-        # "passage" matches only explicitly-tagged passages.
+        # "passage" matches only explicitly-tagged passages. Applied BEFORE
+        # the top-k truncation so the cap isn't consumed by filtered-out rows.
         if memory_kind == "fact":
             combined = [r for r in combined if (r.memory_kind or "fact") == "fact"]
         elif memory_kind == "passage":
@@ -789,22 +791,49 @@ class SearchMixin:
             # otherwise standard-origin graph edges never match their source
             # and lose their v2 metadata / get dropped by v2 filters. The
             # filter is identical for every edge, so it is built ONCE.
+            # Audit 27 hardening #9: when project_id is set, include BOTH the
+            # project-scoped AND global-scoped pools as fallback — so a graph
+            # edge in a project can enrich from global memories when no project
+            # memories exist. Qdrant's nearest-neighbor returns the closest
+            # match across all should clauses, so project takes precedence when
+            # present (same semantic distance → project wins on id tie-break).
             proj = (
                 [FieldCondition(key="metadata.project_id", match=MatchValue(value=project_id))]
                 if project_id else []
             )
             should_filters: list = []
             if want_personal and user_id:
+                # Project-scoped personal pool
                 should_filters.append(
                     Filter(must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))] + proj)
                 )
+                # Global-scoped personal pool as fallback (when project_id is set)
+                if project_id:
+                    should_filters.append(
+                        Filter(must=[
+                            FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                            FieldCondition(key="metadata.scope", match=MatchValue(value="global")),
+                        ])
+                    )
             if want_shared:
+                # Project-scoped shared pool
                 should_filters.append(
                     Filter(must=[FieldCondition(
                         key="metadata.visibility",
                         match=MatchValue(value=MemoryVisibility.SHARED.value),
                     )] + proj)
                 )
+                # Global-scoped shared pool as fallback (when project_id is set)
+                if project_id:
+                    should_filters.append(
+                        Filter(must=[
+                            FieldCondition(
+                                key="metadata.visibility",
+                                match=MatchValue(value=MemoryVisibility.SHARED.value),
+                            ),
+                            FieldCondition(key="metadata.scope", match=MatchValue(value="global")),
+                        ])
+                    )
             if want_standard:
                 should_filters.append(
                     Filter(must=[FieldCondition(
@@ -1186,11 +1215,14 @@ class SearchMixin:
         config.limit = limit
 
         try:
+            # Audit 27 (hardening): filter out invalidated/expired edges from
+            # graph search results — same live-edge discipline as other paths.
             results = self._run_on_bridge(
                 g.search_(
                     query=query,
                     config=config,
                     group_ids=group_ids,
+                    search_filter=_live_edges_filter(),
                 )
             )
 

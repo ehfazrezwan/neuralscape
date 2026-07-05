@@ -336,6 +336,14 @@ class EditMixin:
                     continue
                 new_meta["project_id"] = new_meta.get("project_id")
 
+                # Standard-tier invariant: only a dictator may touch standard
+                # memories or create new ones (changing the category of an
+                # existing standard is a standard-affecting edit).
+                current_vis = meta.get("visibility") or MemoryVisibility.PRIVATE.value
+                if current_vis == MemoryVisibility.STANDARD.value and not settings.is_dictator(caller_user_id):
+                    skipped_forbidden += 1
+                    continue
+
                 updated += 1
                 if dry_run:
                     continue

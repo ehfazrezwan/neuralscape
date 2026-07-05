@@ -1323,7 +1323,7 @@ class WriteMixin:
                     scope = MemoryScope.GLOBAL
                     logger.warning(
                         f"Category '{category}' requires project_id but none provided and could not be inferred. "
-                        f"Content snippet: '{content[:80]}'. Storing as global scope."
+                        f"Storing as global scope."
                     )
 
             scope_val = scope.value if isinstance(scope, MemoryScope) else scope
@@ -1397,6 +1397,13 @@ class WriteMixin:
         # an already-stored conversation inserts ZERO new points.
         if texts:
             embeddings = m.embedding_model.embed_batch(texts, memory_action="add")
+            # Validate embed count matches text count before zipping — a
+            # misaligned embed/fact zip silently writes garbage vectors.
+            if len(embeddings) != len(texts):
+                raise ValueError(
+                    f"embed_batch returned {len(embeddings)} embeddings for "
+                    f"{len(texts)} texts — cannot safely align vectors to facts"
+                )
             m.vector_store.insert(
                 vectors=embeddings,
                 ids=memory_ids,

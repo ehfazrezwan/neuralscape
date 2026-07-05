@@ -2599,16 +2599,30 @@ async def v1_delete_junk_episodes(
 
 
 @v1_router.delete("/graph/episodes/{episode_uuid}")
-async def v1_delete_episode(episode_uuid: str):
-    """Delete a single episodic node by UUID."""
+async def v1_delete_episode(
+    request: Request,
+    episode_uuid: str,
+    user_id: str | None = Query(default=None),
+    project_id: str | None = Query(default=None),
+):
+    """Delete a single episodic node by UUID.
+
+    Authorization: the episode must belong to one of the caller's readable
+    group_ids (private + shared + standard-when-enabled).
+    """
+    resolved_user_id = _resolve_user_id(request, user_id)
     try:
         result = await asyncio.to_thread(
             _service.delete_episode,
             episode_uuid=episode_uuid,
+            user_id=resolved_user_id,
+            project_id=project_id,
         )
         if "error" in result:
             raise HTTPException(status_code=500, detail=result["error"])
         return {"status": "ok", **result}
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except HTTPException:
         raise
     except Exception as e:
