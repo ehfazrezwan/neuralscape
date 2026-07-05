@@ -1,0 +1,17 @@
+# CD override: run the four service containers from the prebuilt image
+# shipped by .github/workflows/deploy.yml instead of building on the host.
+# NS_IMAGE is set by the deploy workflow to the exact sha-tagged image.
+#
+# NOTE: on the production VPS this file is managed by CD (`git reset --hard`
+# on every deploy) — put machine-specific tweaks in .env or a non-tracked
+# local override, never here.
+
+services:
+  neuralscape:
+    image: ${NS_IMAGE:-ghcr.io/ehfazrezwan/neuralscape:latest}
+  neuralscape-worker:
+    image: ${NS_IMAGE:-ghcr.io/ehfazrezwan/neuralscape:latest}
+  neuralscape-graph-worker:
+    image: ${NS_IMAGE:-ghcr.io/ehfazrezwan/neuralscape:latest}
+  neuralscape-ingest-worker:
+    image: ${NS_IMAGE:-ghcr.io/ehfazrezwan/neuralscape:latest}
