@@ -2,6 +2,7 @@ import asyncio
 import logging
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +150,41 @@ class _AsyncBridge:
         return future.result()
 
 
+def _build_graph_driver(graph_config):
+    """Construct the Graphiti graph driver selected by ``graph_provider``.
+
+    NEURALSCAPE PATCH (solo engine): ``graph_provider`` selects between the
+    Neo4j server driver (team deployments, the default) and the embedded
+    single-process Kuzu driver (solo mode). Kuzu is imported lazily so team
+    installs don't need the ``kuzu`` package.
+    """
+    provider = getattr(graph_config, "graph_provider", "") or "neo4j"
+    if provider == "kuzu":
+        kuzu_path = getattr(graph_config, "kuzu_path", None)
+        if not kuzu_path:
+            # ':memory:' would silently discard the graph on restart — an
+            # unset path must be a loud config error, not a data-loss default.
+            raise ValueError("graph_provider=kuzu requires kuzu_path to be set")
+        try:
+            from graphiti_core.driver.kuzu_driver import KuzuDriver
+        except ImportError as e:
+            raise ImportError(
+                "graph_provider=kuzu requires the 'kuzu' package. "
+                "Install the solo extra: pip install 'neuralscape-service[solo]'"
+            ) from e
+        if kuzu_path != ":memory:":
+            Path(kuzu_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+        return KuzuDriver(db=str(Path(kuzu_path).expanduser()))
+    if provider == "neo4j":
+        return Neo4jDriver(
+            uri=graph_config.url,
+            user=graph_config.username,
+            password=graph_config.password,
+            database=graph_config.database,
+        )
+    raise ValueError(f"Unknown graph_provider {provider!r} (expected 'neo4j' or 'kuzu')")
+
+
 class MemoryGraph:
     """Graphiti-backed MemoryGraph adapter for mem0.
 
@@ -190,15 +226,10 @@ class MemoryGraph:
             model=graph_config.graphiti_llm_model,
         )
 
-        # Create Neo4j driver and Graphiti instance ON the bridge loop
-        # so the async neo4j driver is bound to the correct event loop
+        # Create the graph driver and Graphiti instance ON the bridge loop
+        # so the async driver is bound to the correct event loop
         def _init_graphiti():
-            driver = Neo4jDriver(
-                uri=graph_config.url,
-                user=graph_config.username,
-                password=graph_config.password,
-                database=graph_config.database,
-            )
+            driver = _build_graph_driver(graph_config)
 
             return Graphiti(
                 llm_client=llm_client,
