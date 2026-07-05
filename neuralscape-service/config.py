@@ -76,6 +76,9 @@ class Settings(BaseSettings):
     # Maintenance scheduler. "" resolves by mode: team → off (ARQ crons own
     # maintenance), solo → inproc (solo-engine unit 5).
     scheduler_mode: str = ""
+    # Solo: extraction instructions live in a local JSON file instead of
+    # Redis keys (same records, same keys — see extraction_settings.py).
+    extraction_settings_path: str = "~/.neuralscape/extraction_settings.json"
 
     # Neo4j
     neo4j_uri: str = "neo4j://127.0.0.1:7687"

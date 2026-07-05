@@ -188,6 +188,14 @@ async def lifespan(app: FastAPI):
     if hasattr(_task_manager, "bind"):
         _task_manager.bind(_service, _extension_registry, vault=_vault)
 
+    # Solo engine: in-process maintenance scheduler (unit 5) — runs the
+    # worker cron subset on the inline runner's slow lane.
+    _scheduler_task = None
+    if settings.scheduler_mode == "inproc" and getattr(_task_manager, "_runner", None):
+        from scheduler import start_scheduler
+
+        _scheduler_task = start_scheduler(_task_manager._runner)
+
     # Start MCP HTTP session manager if enabled and connect its task manager
     if _mcp_session_manager is not None:
         from mcp_server import _task_manager as mcp_task_manager
@@ -203,6 +211,14 @@ async def lifespan(app: FastAPI):
         await mcp_task_manager.close()
     else:
         yield
+
+    # Stop the in-process maintenance scheduler before extensions go away.
+    if _scheduler_task is not None:
+        _scheduler_task.cancel()
+        try:
+            await _scheduler_task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
 
     # Shutdown extensions with timeout to prevent hanging on misbehaving extensions
     try:
@@ -1830,24 +1846,30 @@ async def v1_event_stream(request: Request, user_id: str | None = Query(default=
     goes out roughly every 20s; client disconnect tears the subscription
     down within ~1s.
     """
-    import redis.asyncio as aioredis
-
     import event_stream as es
 
     caller = _resolve_user_id(request, user_id)
     if not settings.event_stream_enabled:
         raise HTTPException(status_code=503, detail="Event stream is disabled")
 
-    client = aioredis.from_url(settings.redis_url)
-    pubsub = client.pubsub()
-    try:
-        await pubsub.subscribe(es.SHARED_CHANNEL, f"{es.CHANNEL_PREFIX}{caller}")
-    except Exception as e:
+    channels = [es.SHARED_CHANNEL, f"{es.CHANNEL_PREFIX}{caller}"]
+    if settings.ns_mode == "solo":
+        # Single process: in-memory fan-out, no Redis (solo engine, unit 5).
+        client = None
+        pubsub = es.InProcPubSub(channels)
+    else:
+        import redis.asyncio as aioredis
+
+        client = aioredis.from_url(settings.redis_url)
+        pubsub = client.pubsub()
         try:
-            await client.aclose()
-        except Exception:
-            pass
-        raise HTTPException(status_code=503, detail="Event stream unavailable") from e
+            await pubsub.subscribe(*channels)
+        except Exception as e:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+            raise HTTPException(status_code=503, detail="Event stream unavailable") from e
 
     async def _gen():
         try:
@@ -1861,10 +1883,11 @@ async def v1_event_stream(request: Request, user_id: str | None = Query(default=
                 await pubsub.aclose()
             except Exception:
                 pass
-            try:
-                await client.aclose()
-            except Exception:
-                pass
+            if client is not None:
+                try:
+                    await client.aclose()
+                except Exception:
+                    pass
 
     return StreamingResponse(
         _gen(),
