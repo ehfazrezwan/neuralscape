@@ -21,10 +21,14 @@ def _driver(tmp_path):
 
 
 class TestNsKuzuSchema:
-    def test_statements_declare_tables_before_columns(self):
+    def test_statement_ordering(self):
+        """FTS extension first, then tables/columns, FTS indices last."""
         stmts = ns_kuzu_schema_statements()
-        assert "Source" in stmts[0] and "DERIVED_FROM" in stmts[1]
-        assert all(s.startswith("ALTER TABLE") for s in stmts[2:])
+        assert stmts[0] == "INSTALL FTS" and stmts[1] == "LOAD EXTENSION FTS"
+        assert "Source" in stmts[2] and "DERIVED_FROM" in stmts[3]
+        assert all(s.startswith("CALL CREATE_FTS_INDEX") for s in stmts[-4:])
+        alters = stmts[4:-4]
+        assert alters and all(s.startswith("ALTER TABLE") for s in alters)
 
     def test_apply_declares_ns_columns(self, tmp_path):
         d = _driver(tmp_path)
@@ -99,6 +103,67 @@ class TestNsKuzuSchema:
             return rows
 
         assert asyncio.run(run()) == [{"uuid": "ep1", "key": "conn::doc1"}]
+
+
+class TestFtsBootstrap:
+    def test_fts_index_live_after_bootstrap_and_maintained_on_insert(self, tmp_path):
+        """Bootstrap creates graphiti's FTS indices; rows inserted AFTER index
+        creation are searchable (Kuzu FTS is maintained, not a snapshot)."""
+        d = _driver(tmp_path)
+
+        async def run():
+            await apply_ns_kuzu_schema(d)
+            await d.execute_query(
+                "CREATE (e:Episodic {uuid: $u, group_id: $g, content: $c})",
+                u="ep-f1", g="user--local", c="the quick brown fox",
+            )
+            rows, _, _ = await d.execute_query(
+                "CALL QUERY_FTS_INDEX('Episodic', 'episode_content', $q, TOP := $limit) "
+                "WITH node, score WHERE node.group_id IN $group_ids "
+                "RETURN node.uuid AS uuid, node.content AS content, score "
+                "ORDER BY score DESC LIMIT $limit",
+                q="fox", limit=3, group_ids=["user--local"],
+            )
+            return rows
+
+        rows = asyncio.run(run())
+        assert [r["uuid"] for r in rows] == ["ep-f1"]
+
+    def test_group_filter_excludes_other_pools(self, tmp_path):
+        """The exact composed query from search_episodes_fulltext (#3):
+        group scoping must hold on Kuzu exactly as on Neo4j."""
+        from graphiti_core.driver.driver import GraphProvider
+        from graphiti_core.graph_queries import get_nodes_query
+
+        d = _driver(tmp_path)
+        cypher = (
+            get_nodes_query("episode_content", "$q", limit=3, provider=GraphProvider.KUZU)
+            + """
+        WITH node, score
+        WHERE node.group_id IN $group_ids
+        RETURN node.uuid AS uuid, node.content AS content,
+               node.created_at AS created_at, score
+        ORDER BY score DESC LIMIT $limit
+        """
+        )
+
+        async def run():
+            await apply_ns_kuzu_schema(d)
+            await d.execute_query(
+                "CREATE (e:Episodic {uuid: $u, group_id: $g, content: $c})",
+                u="mine", g="user--local", c="tokyo trip planning",
+            )
+            await d.execute_query(
+                "CREATE (e:Episodic {uuid: $u, group_id: $g, content: $c})",
+                u="theirs", g="user--other", c="tokyo restaurant list",
+            )
+            rows, _, _ = await d.execute_query(
+                cypher, q="tokyo", group_ids=["user--local"], limit=3
+            )
+            return rows
+
+        rows = asyncio.run(run())
+        assert [r["uuid"] for r in rows] == ["mine"]
 
 
 class TestTier1Ports:

@@ -112,7 +112,35 @@ class GraphAdminMixin:
             return []
         lucene = " OR ".join(terms[:12])
         group_ids = _get_group_ids(user_id, project_id)
-        cypher = """
+
+        from graphiti_core.driver.driver import GraphProvider
+
+        provider = getattr(g.driver, "provider", GraphProvider.NEO4J)
+        if provider == GraphProvider.KUZU:
+            # Kuzu FTS is not Lucene: plain space-joined terms, and the group
+            # filter runs after the CALL (mirrors graphiti's own
+            # episode_fulltext_search). The index is created by the
+            # memory/kuzu_schema bootstrap. Nuance flagged in
+            # 29-kuzu-port-inventory.md: TOP := $limit applies before the
+            # group filter, so multi-group stores can under-fill.
+            from graphiti_core.graph_queries import get_nodes_query
+
+            q_text = " ".join(terms[:12])
+            cypher = (
+                get_nodes_query(
+                    "episode_content", "$q", limit=limit, provider=provider
+                )
+                + """
+        WITH node, score
+        WHERE node.group_id IN $group_ids
+        RETURN node.uuid AS uuid, node.content AS content,
+               node.created_at AS created_at, score
+        ORDER BY score DESC LIMIT $limit
+        """
+            )
+        else:
+            q_text = lucene
+            cypher = """
         CALL db.index.fulltext.queryNodes('episode_content', $q) YIELD node, score
         WHERE node.group_id IN $group_ids
         RETURN node.uuid AS uuid, node.content AS content,
@@ -121,11 +149,13 @@ class GraphAdminMixin:
         """
 
         async def _run():
-            async with g.driver.session() as session:
-                result = await session.run(
-                    cypher, q=lucene, group_ids=group_ids, limit=limit
-                )
-                return await result.data()
+            # execute_query is the provider-portable read path (Kuzu's
+            # session.run returns None); the dict-shaping below is .get()-
+            # based, which neo4j Records and Kuzu dict rows both support.
+            records, _, _ = await g.driver.execute_query(
+                cypher, q=q_text, group_ids=group_ids, limit=limit
+            )
+            return records
 
         coro = _run()
         try:
