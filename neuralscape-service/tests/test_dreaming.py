@@ -577,10 +577,11 @@ def test_stage_pool_guards_and_gates(monkeypatch):
                                 "last_recalled_at": 0.0} for i in ids},
     )
     now = time.time()
-    # "recent" must stay inside the settling window relative to wall clock —
-    # a hardcoded date here became a time bomb (started failing 2026-07-05).
-    from datetime import datetime, timedelta, timezone
-    recent = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    # "recent" must stay inside the settling window relative to the single
+    # captured time source — a hardcoded date here became a time bomb
+    # (started failing 2026-07-05).
+    from datetime import datetime, timezone
+    recent = datetime.fromtimestamp(now - 3600, tz=timezone.utc).isoformat()
     ancient = "2024-01-01T00:00:00+00:00"
     batch = _batch([
         {"memory_id": "new1", "content": "n", "created_at": recent,

@@ -5146,7 +5146,13 @@ class MemoryService:
         g = self._get_graphiti()
         if g is None:
             return []
-        terms = [t for t in re.findall(r"[A-Za-z0-9']+", query) if len(t) >= 3]
+        # Lowercase + drop Lucene boolean operators so caller tokens can't
+        # change query semantics or trip the fulltext parser.
+        terms = [
+            t.lower()
+            for t in re.findall(r"[A-Za-z0-9']+", query)
+            if len(t) >= 3 and t.upper() not in ("AND", "OR", "NOT")
+        ]
         if not terms:
             return []
         lucene = " OR ".join(terms[:12])
@@ -5170,9 +5176,12 @@ class MemoryService:
         try:
             records = self._run_on_bridge(coro, timeout=10.0) or []
         except Exception as e:
-            coro.close()
             logger.warning(f"episode fulltext search failed: {e}")
             return []
+        finally:
+            # No-op for an awaited coroutine; prevents "never awaited"
+            # leaks when the bridge is mocked or fails before scheduling.
+            coro.close()
         return [
             {
                 "uuid": rec.get("uuid"),
