@@ -10,11 +10,13 @@
  * untouched.
  */
 
-import { beforeAll, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 
-beforeAll(() => {
-  process.env.NEURALSCAPE_TEST = "1";
-});
+// MUST be set at module top level BEFORE the awaited imports below: the
+// imported hook modules auto-run main() at evaluation time unless this is
+// set, and beforeAll callbacks only fire after module evaluation — setting
+// it there would be order-dependent across files/workers (Copilot, PR #131).
+process.env.NEURALSCAPE_TEST = "1";
 
 const disclosure = await import("../src/core/disclosure.js");
 const { isCompactSnapshot, renderResumeAfterCompact } = disclosure;

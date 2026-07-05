@@ -238,7 +238,10 @@ export function buildIndexContext(inputs: IndexModeInputs): string {
       ].join("\n"),
     );
     sections.push(renderEscalationFooter(codeGraphAvailable));
-  } else if (cardBlock || previouslyId || resumeIds.size > 0) {
+  } else if (cardBlock || previouslyId) {
+    // NOTE: resume-after-compact sections alone do NOT pull the footer in —
+    // its copy explains "the table above", and a snapshot-only injection
+    // renders no index table (Copilot, PR #131).
     sections.push(renderEscalationFooter(codeGraphAvailable));
   }
 
