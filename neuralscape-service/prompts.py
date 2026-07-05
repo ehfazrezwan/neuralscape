@@ -47,12 +47,6 @@ Rules:
 6. For project-specific facts (tech_stack, convention, architecture, dependency), mention the project name if known.
 7. NEVER extract raw tool operations, shell commands run, files edited/read/written, git operations, terminal output, or build/test execution logs — these are ephemeral actions, not reusable knowledge.
 8. NEVER extract information only meaningful in the current session context (e.g., "currently running tests", "just fixed a bug in X file").
-9. Concrete one-off personal details ARE reusable facts, not transient dialogue: possessions
-   and their attributes (colors, names, breeds, brands), stated reasons and motivations
-   ("plays soccer because ..."), gifts given or received, fears, childhood details, and
-   specific facts about the speaker's family, friends, students, or pets. When a speaker
-   states a specific detail, capture it WITH its specifics ("the user's construction hat is
-   yellow"), and prefer several precise micro-facts over one broad summary sentence.
 
 Respond with a JSON object:
 {
