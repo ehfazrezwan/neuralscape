@@ -64,12 +64,31 @@ _NS_TABLE_DDL = [
 ]
 
 
+# Kuzu ships FTS as a bundled extension (0.11.3 bundled all extensions in the
+# farewell release) — it must be installed+loaded per Database before the FTS
+# indices graphiti's BM25 search leg expects can exist. Nothing in the subtree
+# driver creates them (build_indices_and_constraints is a Kuzu no-op), so this
+# bootstrap also runs graphiti's own get_fulltext_indices(KUZU) statements —
+# fixing graphiti's hybrid search on Kuzu, not just NS's queries.
+_FTS_BOOTSTRAP = ["INSTALL FTS", "LOAD EXTENSION FTS"]
+
+
+def _graphiti_fts_statements() -> list[str]:
+    from graphiti_core.driver.driver import GraphProvider
+    from graphiti_core.graph_queries import get_fulltext_indices
+
+    return get_fulltext_indices(GraphProvider.KUZU)
+
+
 def ns_kuzu_schema_statements() -> list[str]:
-    """All DDL statements, tables first so DERIVED_FROM can reference Source."""
-    stmts = list(_NS_TABLE_DDL)
+    """All bootstrap statements, ordered: FTS extension → tables/columns →
+    FTS indices (which index columns that must exist first)."""
+    stmts = list(_FTS_BOOTSTRAP)
+    stmts.extend(_NS_TABLE_DDL)
     for table in _NS_TABLES:
         for column, ctype in _NS_NODE_COLUMNS:
             stmts.append(f"ALTER TABLE {table} ADD {column} {ctype}")
+    stmts.extend(_graphiti_fts_statements())
     return stmts
 
 

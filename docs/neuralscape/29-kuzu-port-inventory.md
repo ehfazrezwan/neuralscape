@@ -18,20 +18,21 @@ Status legend: ☐ pending · ◐ in progress · ☑ ported+tested (both provide
 
 | Status | Work | Notes |
 |---|---|---|
-| ☐ | NS Kuzu schema extension hook | `ALTER TABLE … ADD` the NS columns on `Entity`/`Episodic`/`Community`/`RelatesToNode_`; `CREATE NODE TABLE Source` + `CREATE REL TABLE DERIVED_FROM`; tolerant of already-exists; runs post-`setup_schema()` for `graph_provider=kuzu` only |
+| ☑ | NS Kuzu schema extension hook | `memory/kuzu_schema.py`, applied post-attach in `memory/core.py` (kuzu only). `Source` keyed on synthetic `key` = `<connector_id>::<source_key>` (Kuzu PKs are single-column) — the Kuzu branch of `attach_source_ref` must MERGE on that |
+| ☑ | FTS bootstrap | Discovered during port: `build_indices_and_constraints` is a Kuzu **no-op** and `setup_schema` only makes tables — graphiti's own BM25 leg had no indices on Kuzu. Bootstrap now runs `INSTALL FTS; LOAD EXTENSION FTS` + graphiti's `get_fulltext_indices(KUZU)`. Empirically verified (probe + tests): indices are **maintained on insert**, not snapshots |
 
 ### Tier 1 — trivial (typed labels already; read-seam swap only)
 
 | Status | # | Site | Purpose | Port |
 |---|---|---|---|---|
-| ☐ | 4 | `memory/graph_admin.py:223-227` `delete_episode` | `MATCH (e:Episodic {uuid}) DETACH DELETE` | already `execute_query` + typed + `DETACH DELETE` supported → verify test only |
-| ☐ | 5 | `memory/write.py:327-335` `_graph_episode_exists` | episode idempotency probe | `session.run` → `execute_query` |
+| ☑ | 4 | `memory/graph_admin.py` `delete_episode` | `MATCH (e:Episodic {uuid}) DETACH DELETE` | verified as-is on real Kuzu (`test_kuzu_port.py`) |
+| ☑ | 5 | `memory/write.py` `_graph_episode_exists` | episode idempotency probe | ported to `execute_query`; probe query verified on real Kuzu |
 
 ### Tier 2 — mechanical provider branches
 
 | Status | # | Site | Purpose | Kuzu divergence |
 |---|---|---|---|---|
-| ☐ | 3 | `memory/graph_admin.py:115-128` fulltext episodes | episode excerpt search | `CALL db.index.fulltext.queryNodes` → `CALL QUERY_FTS_INDEX('Episodic','episode_content',$q,TOP:=$limit)`; reuse `graph_queries.get_nodes_query` |
+| ☑ | 3 | `memory/graph_admin.py` fulltext episodes | episode excerpt search | ported: provider branch reusing `get_nodes_query`, unified `execute_query` read; group-scope verified on real Kuzu. **Nuance for parity bench:** Kuzu applies `TOP := $limit` *before* the group filter (same as graphiti's own episode search) — multi-group stores can under-fill vs Neo4j; fix with over-fetch only if DMR shows it |
 | ☐ | 6 | `extensions/dreaming/graph_patcher.py:78-86` `attach_memory_id` | stamp memory_id/visibility/owner | label-less `MATCH (n)` → per-label loop; `datetime($s)` → native datetime param; `coalesce()` → verify or `CASE WHEN`; needs Tier 0 |
 | ☐ | 7 | `graph_patcher.py:147-163` `attach_source_ref` | Source node + DERIVED_FROM link | same as #6 + `Source`/`DERIVED_FROM` tables (Tier 0); `TransientError` retry gated to neo4j branch |
 | ☐ | 8/9 | `graph_patcher.py:228-248, 300-320` `patch_wiki_path*` | wiki back-refs | label-less → per-label loop; needs Tier 0 |
