@@ -81,6 +81,10 @@ jobs:
               [ \$i -eq 30 ] && { echo 'liveness never came up'; exit 1; }
               sleep 5
             done
-            curl -fsS -m 15 http://127.0.0.1:8199/health
+            for i in \$(seq 1 12); do
+              curl -fsS -m 15 http://127.0.0.1:8199/health && break
+              [ \$i -eq 12 ] && { echo 'deep health never went green'; exit 1; }
+              sleep 10
+            done
             echo
             echo \"DEPLOYED ${TAG} (\$(git rev-parse --short HEAD))\""
