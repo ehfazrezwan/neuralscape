@@ -68,6 +68,13 @@ dev = [
 code-graph = [
     "graphifyy>=0.9.5",
 ]
+# Solo engine (NS_MODE=solo): embedded Kuzu graph store for the one-daemon
+# deployment — no Neo4j/Redis/Qdrant servers. Kuzu is pinned to the final
+# upstream line (the project was archived at 0.11.3, MIT; extensions bundled).
+# See docs/neuralscape/28-solo-engine.md.
+solo = [
+    "kuzu>=0.11.3,<0.12.0",
+]
 
 [tool.uv.sources]
 graphiti-core = { path = "../graphiti", editable = true }
@@ -82,6 +89,10 @@ dev = [
     # the real graphifyy library (production keeps it opt-in via the extra).
     "graphifyy>=0.9.5",
     "pytest-xdist>=3.8.0",
+    # Dev installs get the solo extra's kuzu so the graph-provider seam and
+    # (unit 3) the provider-parameterized graph suites exercise the real
+    # embedded driver (production keeps it opt-in via the solo extra).
+    "kuzu>=0.11.3,<0.12.0",
 ]
 
 [tool.pytest.ini_options]

@@ -749,14 +749,6 @@ class Settings(BaseSettings):
         is a single env flag; everything else (model tags, keys, providers) is
         derived from it.
         """
-        if self.graph_provider == "kuzu":
-            # The kuzu driver seam lands in solo-engine unit 2. Until then,
-            # failing loud beats silently building a Neo4jDriver pointed at
-            # a server that solo mode doesn't have.
-            raise NotImplementedError(
-                "graph_provider=kuzu is not wired yet (solo-engine unit 2); "
-                "set GRAPH_PROVIDER=neo4j in the meantime"
-            )
         # Qdrant: server mode (url) or local on-disk mode (path)
         qdrant_config: dict = {
             "collection_name": self.qdrant_collection,

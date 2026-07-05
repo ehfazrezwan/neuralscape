@@ -127,11 +127,13 @@ class TestHybridGuardrails:
             _settings(ns_mode="solo", task_backend="redis")
 
 
-class TestKuzuNotWiredYet:
-    def test_get_mem0_config_fails_loud_for_kuzu(self):
-        s = _settings(ns_mode="solo", google_api_key="k")
-        with pytest.raises(NotImplementedError, match="unit 2"):
-            s.get_mem0_config()
+class TestMem0ConfigProviderFields:
+    def test_solo_kuzu_config_builds_and_carries_provider_fields(self):
+        cfg = _settings(ns_mode="solo", google_api_key="k").get_mem0_config()
+        gs = cfg["graph_store"]["config"]
+        assert gs["graph_provider"] == "kuzu"
+        assert gs["kuzu_path"].endswith("graph.kuzu")
+        assert "~" not in gs["kuzu_path"]  # expanded
 
     def test_solo_neo4j_fallback_builds_config_with_embedded_qdrant(self):
         cfg = _settings(
