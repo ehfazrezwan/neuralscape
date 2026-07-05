@@ -81,21 +81,32 @@ async def _fire(runner: Any, name: str) -> None:
 async def _loop(runner: Any) -> None:
     specs = _cron_specs()
     fired: set[tuple[str, str, int]] = set()
+    inflight: set[asyncio.Task] = set()
     logger.info(
         "In-process scheduler started (%s)",
         ", ".join(f"{n}@{m:02d}" for n, _, m in specs),
     )
-    while True:
-        now = datetime.now(timezone.utc)
-        # Keep the dedup set bounded: entries from previous days are inert.
-        if len(fired) > 200:
-            today = now.date().isoformat()
-            fired = {k for k in fired if k[1] == today}
-        for name in _due(now, specs, fired):
-            asyncio.get_running_loop().create_task(
-                _fire(runner, name), name=f"cron:{name}"
-            )
-        await asyncio.sleep(_POLL_SECONDS)
+    try:
+        while True:
+            now = datetime.now(timezone.utc)
+            # Keep the dedup set bounded: entries from previous days are inert.
+            if len(fired) > 200:
+                today = now.date().isoformat()
+                fired = {k for k in fired if k[1] == today}
+            for name in _due(now, specs, fired):
+                task = asyncio.get_running_loop().create_task(
+                    _fire(runner, name), name=f"cron:{name}"
+                )
+                inflight.add(task)
+                task.add_done_callback(inflight.discard)
+            await asyncio.sleep(_POLL_SECONDS)
+    finally:
+        # Scheduler cancellation also stops in-flight crons (Copilot, PR
+        # #143) — they must not keep running while backends shut down.
+        # (CancelledError passes through _fire's `except Exception`: it is
+        # a BaseException on this Python.)
+        for task in list(inflight):
+            task.cancel()
 
 
 def start_scheduler(runner: Any) -> asyncio.Task:

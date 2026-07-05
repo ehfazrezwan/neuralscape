@@ -65,12 +65,20 @@ class _LocalJsonStore:
 
     def _load(self) -> dict:
         try:
-            return json.loads(self._path.read_text())
+            data = json.loads(self._path.read_text())
         except FileNotFoundError:
             return {}
         except Exception:  # noqa: BLE001 — a corrupt file reads as empty
-            logger.warning("extraction-settings file unreadable; treating as empty")
+            logger.warning(
+                "extraction-settings file unreadable; treating as empty", exc_info=True
+            )
             return {}
+        if not isinstance(data, dict):
+            # Valid JSON but not an object (list/string/number) — callers
+            # assume a dict; normalize rather than raise (Copilot, PR #143).
+            logger.warning("extraction-settings file is not a JSON object; treating as empty")
+            return {}
+        return data
 
     def _write(self, data: dict) -> None:
         import os

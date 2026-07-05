@@ -244,3 +244,57 @@ class TestExtractionSettingsLocalStore:
         xs.set_instructions(user_id="solo", instructions="User rule.", updated_by="solo")
         resolved = xs.resolve_instructions("solo", "proj")
         assert resolved.index("Project rule.") < resolved.index("User rule.")
+
+
+class TestReviewRegressions:
+    """PR #143 Copilot findings."""
+
+    def test_non_dict_json_file_reads_as_empty(self, monkeypatch, tmp_path):
+        import extraction_settings as xs
+        from config import settings
+
+        monkeypatch.setattr(settings, "ns_mode", "solo")
+        path = tmp_path / "xs.json"
+        path.write_text('["not", "an", "object"]')
+        monkeypatch.setattr(settings, "extraction_settings_path", str(path))
+        monkeypatch.setattr(xs, "_local_store", None)
+        assert xs.get_instructions(user_id="solo") is None
+        # and a write recovers the file to an object
+        xs.set_instructions(user_id="solo", instructions="Recovered.", updated_by="s")
+        assert xs.get_instructions(user_id="solo")["instructions"] == "Recovered."
+
+    def test_scheduler_shutdown_cancels_inflight_crons(self, monkeypatch):
+        import scheduler as sched
+
+        async def scenario():
+            started = asyncio.Event()
+            cancelled = {"flag": False}
+
+            async def stuck_cron(ctx):
+                started.set()
+                try:
+                    await asyncio.sleep(60)
+                except asyncio.CancelledError:
+                    cancelled["flag"] = True
+                    raise
+
+            runner = SimpleNamespace(
+                _worker=SimpleNamespace(stuck=stuck_cron),
+                _sems={"slow": asyncio.Semaphore(1)},
+                ctx={},
+            )
+            monkeypatch.setattr(
+                sched, "_cron_specs", lambda: [("stuck", lambda: set(range(24)), 0)]
+            )
+            monkeypatch.setattr(sched, "_MINUTE_GRACE", 60)  # always due
+            loop_task = sched.start_scheduler(runner)
+            await asyncio.wait_for(started.wait(), timeout=5)
+            loop_task.cancel()
+            try:
+                await loop_task
+            except asyncio.CancelledError:
+                pass
+            await asyncio.sleep(0.05)  # let the cron task observe cancellation
+            return cancelled["flag"]
+
+        assert asyncio.run(scenario()) is True
