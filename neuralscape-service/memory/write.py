@@ -330,9 +330,13 @@ class WriteMixin:
         )
 
         async def _run():
-            async with self._graphiti.driver.session() as session:
-                result = await session.run(cypher, group_id=group_id, name=episode_name)
-                return await result.data()
+            # execute_query is the provider-portable read path: Kuzu's
+            # session.run() returns None (see 29-kuzu-port-inventory.md), and
+            # both drivers return subscriptable rows from execute_query.
+            records, _, _ = await self._graphiti.driver.execute_query(
+                cypher, group_id=group_id, name=episode_name
+            )
+            return records
 
         # Built separately so it can be .close()d if _run_on_bridge raises
         # before awaiting (avoids "coroutine never awaited" warnings — same

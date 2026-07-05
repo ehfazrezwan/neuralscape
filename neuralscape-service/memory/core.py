@@ -81,6 +81,19 @@ class CoreMixin:
                                 "auto-creates Memory.graph",
                                 provider,
                             )
+                            if inner.get("graph_provider") == "kuzu":
+                                # Kuzu's schema is static: NS back-reference
+                                # columns (memory_id, wiki_path, dream_*, ns_*)
+                                # and the Source/DERIVED_FROM provenance tables
+                                # must be declared before any patcher SETs
+                                # them. Idempotent; neo4j is schema-free and
+                                # never takes this branch.
+                                from .kuzu_schema import apply_ns_kuzu_schema
+
+                                g = self._memory.graph
+                                g._bridge.run(
+                                    apply_ns_kuzu_schema(g.graphiti.driver)
+                                )
                         except Exception as e:
                             logger.warning(
                                 f"Graphiti adapter init failed (non-critical): {e}"
