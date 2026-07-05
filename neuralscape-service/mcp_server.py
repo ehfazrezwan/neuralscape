@@ -370,6 +370,16 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Memory-model v2 — ISO 8601 timestamp; memory is purged after this",
                     },
+                    "occurred_at": {
+                        "type": "string",
+                        "description": (
+                            "Event time (ISO 8601): when the remembered fact/event "
+                            "actually happened, for historical ingestion (imported "
+                            "journals, old chat exports). Omit when unknown — readers "
+                            "fall back to created_at (storage time). Future dates are "
+                            "rejected beyond a small clock-skew allowance."
+                        ),
+                    },
                     "visibility": {
                         "type": "string",
                         "description": (
@@ -1282,6 +1292,16 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 return [TextContent(type="text", text=json.dumps(
                     {"error": f"Invalid epistemic_level {_epistemic_level!r}. "
                               f"Must be one of: {sorted(EPISTEMIC_LEVEL_VOCAB)}"}))]
+            # Event time: validate + normalize at the tool boundary (same
+            # rationale as above — a bad value must fail HERE, actionably,
+            # not later as a silent background-job failure).
+            _occurred_at = arguments.get("occurred_at")
+            if _occurred_at is not None:
+                from schemas import validate_occurred_at
+                try:
+                    _occurred_at = validate_occurred_at(_occurred_at)
+                except ValueError as ve:
+                    return [TextContent(type="text", text=json.dumps({"error": str(ve)}))]
 
             # Memory-model v2 + multi-user fields (all optional)
             v2_fields = {
@@ -1292,6 +1312,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 "related_memory_ids": arguments.get("related_memory_ids"),
                 "confidence": arguments.get("confidence"),
                 "expires_at": arguments.get("expires_at"),
+                "occurred_at": _occurred_at,
                 "derived_from": arguments.get("derived_from"),
                 "epistemic_level": arguments.get("epistemic_level"),
                 "visibility": arguments.get("visibility"),

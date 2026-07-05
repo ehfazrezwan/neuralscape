@@ -476,3 +476,68 @@ class TestAskEvidenceOccurredAt:
 
         assert "event time" in ask_mod._DISCIPLINES_FULL
         assert "event time" in ask_mod._DISCIPLINES_BRIEF
+
+
+# ──────────────────────────────────────────────
+# Piece 5: MCP tool-schema exposure
+# ──────────────────────────────────────────────
+
+
+@pytest.fixture
+def mock_mcp_task_manager():
+    """Patch the TaskManager in the MCP server module (mirrors test_mcp_tools)."""
+    from unittest.mock import AsyncMock
+
+    import mcp_server
+
+    mock_tm = MagicMock(name="TaskManager")
+    mock_tm.enqueue_raw = AsyncMock(return_value="task-oa")
+    original = mcp_server._task_manager
+    mcp_server._task_manager = mock_tm
+    yield mock_tm
+    mcp_server._task_manager = original
+
+
+class TestMcpRememberOccurredAt:
+    @pytest.mark.asyncio
+    async def test_remember_schema_exposes_occurred_at(self):
+        import mcp_server
+
+        tools = {t.name: t for t in await mcp_server.list_tools()}
+        props = tools["remember"].inputSchema["properties"]
+        assert "occurred_at" in props
+        assert props["occurred_at"]["type"] == "string"
+        # Documented as the historical-ingestion event time.
+        assert "happened" in props["occurred_at"]["description"]
+
+    @pytest.mark.asyncio
+    async def test_remember_forwards_occurred_at(self, mock_mcp_task_manager):
+        import mcp_server
+
+        await mcp_server.call_tool("remember", {
+            "content": "Moved to Berlin",
+            "category": "personal_fact",
+            "user_id": "u1",
+            "occurred_at": "2019-03-15T00:00:00Z",
+        })
+        kwargs = mock_mcp_task_manager.enqueue_raw.call_args[1]
+        # Normalized at the tool boundary (Z → +00:00).
+        assert kwargs["occurred_at"] == "2019-03-15T00:00:00+00:00"
+
+    @pytest.mark.asyncio
+    async def test_remember_rejects_invalid_occurred_at_before_enqueue(
+        self, mock_mcp_task_manager
+    ):
+        import json as _json
+
+        import mcp_server
+
+        out = await mcp_server.call_tool("remember", {
+            "content": "x",
+            "category": "personal_fact",
+            "user_id": "u1",
+            "occurred_at": "not-a-date",
+        })
+        body = _json.loads(out[0].text)
+        assert "occurred_at" in body.get("error", "")
+        mock_mcp_task_manager.enqueue_raw.assert_not_called()
