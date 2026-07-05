@@ -86,7 +86,8 @@ async def ingest_conversation(client: NeuralscapeClient, conv: Conversation, *,
         for batch in _batches(messages):
             resp = await _with_backoff(
                 lambda b=batch: client.extract_write(
-                    b, user_id=user_id, run_id=session.session_id)
+                    b, user_id=user_id, run_id=session.session_id,
+                    occurred_at=session.occurred_at)
             )
             task_id = resp.get("task_id")
             if task_id:

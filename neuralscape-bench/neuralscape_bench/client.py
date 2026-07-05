@@ -73,12 +73,16 @@ class NeuralscapeClient:
         return r.json()
 
     async def extract_write(self, messages: list[dict], *, user_id: str, project_id: str | None = None,
-                            run_id: str | None = None) -> dict:
+                            run_id: str | None = None, occurred_at: str | None = None) -> dict:
         body: dict = {"messages": messages, "user_id": user_id}
         if project_id:
             body["project_id"] = project_id
         if run_id:
             body["run_id"] = run_id
+        if occurred_at:
+            # Event time for historical ingestion (service ≥ PR #130); older
+            # services ignore the extra field, so this is version-agnostic.
+            body["occurred_at"] = occurred_at
         r = await self._http.post("/v1/memories", json=body)
         r.raise_for_status()
         return r.json()

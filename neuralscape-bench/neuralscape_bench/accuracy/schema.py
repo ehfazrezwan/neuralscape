@@ -43,6 +43,10 @@ class Session:
     session_id: str
     turns: tuple[Turn, ...]
     date: str | None = None         # dataset-native timestamp string
+    # Deterministic event time (ISO 8601, UTC) for the service's occurred_at
+    # envelope field — when the session "happened" per dataset semantics.
+    # None ⇒ not sent (service falls back to storage time).
+    occurred_at: str | None = None
 
     def text(self) -> str:
         """Plain-text render used for lexical session attribution."""
