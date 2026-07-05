@@ -72,7 +72,7 @@ Two scopes: `global` (user-wide) and `project` (project-specific, requires `proj
 
 ### Subtree Dependencies
 
-`graphiti/` and `mem0/` are git subtrees from upstream repos, installed as editable packages via `uv` (see `[tool.uv.sources]` in pyproject.toml). After syncing upstream, check for merge conflicts in mem0's `configs.py` / `factory.py`.
+`graphiti/` and `mem0/` are git subtrees from upstream repos, installed as editable packages via `uv` (see `[tool.uv.sources]` in pyproject.toml). Both subtrees are **pruned to library core** (`graphiti/graphiti_core`, `mem0/mem0`, plus packaging files) — upstream's apps, docs, examples, and tests are deliberately not tracked. `scripts/sync-upstream.sh` pulls from a locally built **filtered mirror** (requires `git-filter-repo`), so syncs only ever bring the core paths in. After syncing upstream, check for merge conflicts in mem0's `configs.py` / `factory.py`.
 
 **The mem0 graph layer is an NS fork, not an upstream patch.** mem0 deleted its entire self-hostable OSS graph layer in PR #4805 (`a488e190`, 2026-04-14, the v3 pipeline) — `mem0/graphs/` and `graph_memory.py` / `memgraph_memory.py` no longer exist upstream, and graph memory is now a hosted-Platform-only feature. NS restores and maintains that layer plus a `GraphStoreFactory`, and `graphiti_memory.py` is **net-new NS code that never existed upstream** (the adapter presenting Graphiti as a mem0 graph provider). Because mem0 2.x's `Memory` class has no `.graph` concept, the re-attach shim in `memory/core.py` (`_get_memory`) fabricates one. Every sync re-grafts this layer onto a core that deliberately removed it — this is the dominant sync risk, documented in `docs/neuralscape/14-upstream-delta-report.md`.
 
