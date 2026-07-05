@@ -30,7 +30,7 @@ import adapters  # noqa: F401 — registers knowledge-adapter taxonomies at impo
 from config import settings
 from memory_service import get_shared_service
 from schemas import CORE_MEMORY_CATEGORIES
-from task_manager import TaskManager
+from task_manager import TaskManager, create_task_manager
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +42,10 @@ server = Server("neuralscape-memory")
 # mem0/Graphiti stack on its first tool call).
 _service = get_shared_service()
 
-# Task manager for async memory operations (initialized at startup)
-_task_manager = TaskManager()
+# Task manager for async memory operations (initialized at startup).
+# Backend-selected: redis (team) or inline (solo, armed in run_stdio /
+# main.py's lifespan when this server is mounted at /mcp/).
+_task_manager = create_task_manager()
 
 # Process-lifetime ARQ pool for schedule_dream enqueues (audit 27 #35:
 # previously a fresh Redis connection was created and torn down per call).
@@ -2090,6 +2092,10 @@ async def run_stdio():
     """Run MCP server over stdio transport."""
     # Initialize task manager for stdio mode
     await _task_manager.connect()
+    if hasattr(_task_manager, "bind"):
+        # Solo engine: arm the inline runner with this process's shared
+        # service (embedded stores are single-process — never a second one).
+        _task_manager.bind(_service, None)
     try:
         async with stdio_server() as (read_stream, write_stream):
             await server.run(read_stream, write_stream, server.create_initialization_options())

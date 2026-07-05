@@ -587,3 +587,18 @@ def _generate_job_id(content: str, user_id: str) -> str:
     """Generate a deterministic job ID from content + user_id."""
     h = hashlib.sha256(f"{user_id}:{content}".encode()).hexdigest()[:16]
     return f"ns-{h}"
+
+
+def create_task_manager() -> TaskManager:
+    """Construct the TaskManager for the configured backend.
+
+    ``redis`` (team, the default) → the classic ARQ-backed TaskManager.
+    ``inline`` (solo) → InlineTaskManager, which runs the same worker
+    coroutines in-process on two lanes (see inline_tasks.py). Imported
+    lazily to keep the module import graph acyclic.
+    """
+    if settings.task_backend == "inline":
+        from inline_tasks import InlineTaskManager
+
+        return InlineTaskManager()
+    return TaskManager()

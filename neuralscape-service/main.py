@@ -77,7 +77,7 @@ from schemas import (
     TimelineResponse,
     normalize_visibility,
 )
-from task_manager import TaskManager
+from task_manager import create_task_manager
 
 logger = logging.getLogger(__name__)
 
@@ -85,8 +85,9 @@ logger = logging.getLogger(__name__)
 # (audit 27 #35: one MemoryService per process, not one per surface).
 _service = get_shared_service()
 
-# Redis-backed task manager (initialized in lifespan)
-_task_manager = TaskManager()
+# Task manager for the configured backend: redis (team) or inline (solo).
+# Initialized in lifespan; the inline variant is armed there via bind().
+_task_manager = create_task_manager()
 
 # Extension registry (discovered + started in lifespan)
 _extension_registry = ExtensionRegistry()
@@ -160,13 +161,20 @@ async def lifespan(app: FastAPI):
 
     # Initialize the service (this also initializes mem0 + Graphiti)
     _service._get_memory()
-    # Connect task manager to Redis
+    # Connect task manager (redis backend) — inline is armed after the
+    # extension registry exists, below.
     await _task_manager.connect()
 
     # Discover and start extensions
     await _extension_registry.discover()
     await _extension_registry.startup_all()
     _extension_registry.mount_routes(app)
+
+    # Solo engine: arm the inline task backend with the SHARED service and
+    # registry — the runner must reuse this process's MemoryService because
+    # the embedded stores (Kuzu, local Qdrant) are single-process.
+    if hasattr(_task_manager, "bind"):
+        _task_manager.bind(_service, _extension_registry)
 
     # Initialize the connector vault when enabled.
     if settings.connectors_enabled:
@@ -183,6 +191,12 @@ async def lifespan(app: FastAPI):
     if _mcp_session_manager is not None:
         from mcp_server import _task_manager as mcp_task_manager
         await mcp_task_manager.connect()
+        if hasattr(mcp_task_manager, "bind") and getattr(_task_manager, "_runner", None):
+            # Inline backend: REST and MCP must share ONE runner — separate
+            # task tables would break cross-surface polling and double the
+            # lane concurrency caps.
+            mcp_task_manager._runner = _task_manager._runner
+            mcp_task_manager.pool = _task_manager.pool
         async with _mcp_session_manager.run():
             yield
         await mcp_task_manager.close()
@@ -300,9 +314,13 @@ async def health():
     """
     checks: dict[str, str] = {}
 
-    # Check Redis (task queue)
+    # Check the task queue (Redis in team mode; in-process lanes in solo)
     try:
-        if _task_manager.pool:
+        if settings.task_backend == "inline":
+            checks["redis"] = (
+                "inline" if getattr(_task_manager, "_runner", None) else "not_connected"
+            )
+        elif _task_manager.pool:
             await _task_manager.pool.ping()
             checks["redis"] = "ok"
         else:
