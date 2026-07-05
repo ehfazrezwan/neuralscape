@@ -490,7 +490,7 @@ async def ask_memory(
         try:
             eps = await asyncio.to_thread(
                 service.search_episodes_fulltext,
-                ep_query, user_id, project_id, 3,
+                ep_query, user_id, project_id, 5,
             )
         except Exception as e:  # non-fatal: facts-only evidence still works
             logger.warning(f"ask episode pass failed (non-critical): {e}")
