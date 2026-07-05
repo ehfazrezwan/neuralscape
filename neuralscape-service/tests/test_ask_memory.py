@@ -128,16 +128,17 @@ class TestRetrievalPasses:
     @pytest.mark.asyncio
     async def test_low_adds_update_language_pass(self):
         """Temporal question at low tier → the update-language recency pass
-        runs (atemporal questions skip it — see TestUpdatePassGating)."""
+        runs (atemporal questions skip it — see TestUpdatePassGating).
+        Non-minimal tiers add the capped detail leg as a third search."""
         svc = _service([_mem("m1", "fact")])
         llm = _answer_llm("ans", ["m1"])
         out = await ask_memory(svc, question="Was the sync rescheduled?", user_id="u",
                                reasoning_level="low", llm_call=llm)
-        assert svc.search.call_count == 2
+        assert svc.search.call_count == 3  # semantic + update + detail leg
         update_query = svc.search.call_args_list[1].kwargs["query"]
         for term in ("changed", "rescheduled", "now"):
             assert term in update_query
-        assert len(out["searches"]) == 2
+        assert len(out["searches"]) == 3
 
     @pytest.mark.asyncio
     async def test_high_runs_keyword_pass_before_semantic(self):
@@ -156,7 +157,9 @@ class TestRetrievalPasses:
         svc = _service([_mem("m1", "x")])
         await ask_memory(svc, question="q?", user_id="u",
                          reasoning_level="high", llm_call=_answer_llm("a"))
-        assert svc.search.call_args.kwargs["limit"] == REASONING_TIERS["high"].search_limit
+        # First search is the main semantic pass (later calls include the
+        # capped detail leg, whose limit is fixed at 3 by design).
+        assert svc.search.call_args_list[0].kwargs["limit"] == REASONING_TIERS["high"].search_limit
 
     @pytest.mark.asyncio
     async def test_project_id_forwarded(self):
@@ -187,8 +190,9 @@ class TestSearchLoop:
         out = await ask_memory(svc, question="What is the latest plan?", user_id="u",
                                reasoning_level="high", llm_call=greedy_llm)
         tier = REASONING_TIERS["high"]
-        # Semantic passes: initial + update + at most `extra_searches` follow-ups.
-        assert svc.search.call_count == 2 + tier.extra_searches
+        # Search passes: initial + update + detail leg + at most
+        # `extra_searches` follow-ups.
+        assert svc.search.call_count == 3 + tier.extra_searches
         # LLM calls: one per follow-up + the final forced-answer pass.
         assert calls["n"] <= tier.extra_searches + 2
         # Greedy model never answered — fallback shape, but never a crash.
@@ -220,11 +224,12 @@ class TestSearchLoop:
     @pytest.mark.asyncio
     async def test_followup_search_results_merge_into_evidence(self):
         """A follow-up hit becomes citable evidence (low: initial + update
-        + 1 LLM-directed follow-up)."""
+        + detail leg + 1 LLM-directed follow-up)."""
         svc = _service()
         svc.search.side_effect = [
             [_mem("m1", "first")],                     # initial semantic
             [_mem("m1", "first")],                     # forced update pass
+            [],                                        # detail leg (capped)
             [_mem("m1", "first"), _mem("m2", "second")],  # LLM follow-up
         ]
         responses = iter([
@@ -239,8 +244,8 @@ class TestSearchLoop:
         # Temporal question so the (gated) update pass still runs.
         out = await ask_memory(svc, question="Where do we meet now?", user_id="u",
                                reasoning_level="low", llm_call=llm)
-        assert svc.search.call_count == 3
-        assert svc.search.call_args_list[2].kwargs["query"] == "narrower"
+        assert svc.search.call_count == 4
+        assert svc.search.call_args_list[3].kwargs["query"] == "narrower"
         assert out["memories_considered"] == 2
         assert set(out["citations"]) == {"m1", "m2"}  # follow-up hit is citable
 
@@ -479,8 +484,9 @@ class TestUpdatePassGating:
         llm = _answer_llm("teal [m1]", ["m1"])
         out = await ask_memory(svc, question="What is Alice's favorite color?",
                                user_id="u", reasoning_level="low", llm_call=llm)
-        assert svc.search.call_count == 1  # no update pass issued
-        assert out["searches"] == ["What is Alice's favorite color?"]
+        assert svc.search.call_count == 2  # semantic + detail leg, NO update pass
+        assert out["searches"][0] == "What is Alice's favorite color?"
+        assert [s for s in out["searches"][1:] if not s.startswith("detail:")] == []
         assert out["skipped_passes"] == ["update"]
 
     @pytest.mark.asyncio
@@ -489,7 +495,7 @@ class TestUpdatePassGating:
         llm = _answer_llm("Berlin [m1]", ["m1"])
         out = await ask_memory(svc, question="Where does Alice live now?",
                                user_id="u", reasoning_level="low", llm_call=llm)
-        assert svc.search.call_count == 2
+        assert svc.search.call_count == 3  # semantic + update + detail leg
         assert out["skipped_passes"] == []
 
     @pytest.mark.asyncio
@@ -500,7 +506,7 @@ class TestUpdatePassGating:
         llm = _answer_llm("Thursday [m1]", ["m1"])
         out = await ask_memory(svc, question="What day is the sync?",
                                user_id="u", reasoning_level="low", llm_call=llm)
-        assert svc.search.call_count == 2
+        assert svc.search.call_count == 3  # semantic + update + detail leg
         assert out["skipped_passes"] == []
 
     def test_update_language_heuristic(self):

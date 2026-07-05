@@ -437,7 +437,11 @@ class TestWindowedExtraction:
 
         assert client.models.generate_content.call_count == 1
         sent = client.models.generate_content.call_args.kwargs["contents"]
-        assert sent == build_extraction_messages(msgs)[0]["content"]
+        # include_details mirrors the conversation path's flag (the detail
+        # channel rides the same single-window prompt when enabled).
+        assert sent == build_extraction_messages(
+            msgs, include_details=settings.extract_detail_memories
+        )[0]["content"]
 
     def test_long_conversation_fans_out_and_unions_facts(self, service):
         msgs = _msgs(100)

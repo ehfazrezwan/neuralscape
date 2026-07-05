@@ -9,8 +9,11 @@ knob — ``minimal | low | medium | high`` — jointly selects:
   answering LLM may request follow-up searches;
 - **mechanical passes**: an update-language search, gated on temporal cues
   in the question or first-pass evidence (so newer facts supersede older
-  ones without diluting atemporal asks), and a grep-style exact-keyword
-  pass (embeddings under-recall exhaustive enumeration sets);
+  ones without diluting atemporal asks), a grep-style exact-keyword
+  pass (embeddings under-recall exhaustive enumeration sets), and a capped
+  detail-channel pass (non-minimal tiers; at most ``_DETAIL_EVIDENCE_LIMIT``
+  ``memory_kind="detail"`` rows join the evidence — the additive-capped
+  pattern that won on DMR, never competing with core facts for rank);
 - **thinking depth**: prompt verbosity;
 - **output cap**: maximum answer length.
 
@@ -131,6 +134,14 @@ _ANSWER_ABSTAINED_NO_EVIDENCE = (
 _EVIDENCE_CONTENT_CLIP = 500
 _EVIDENCE_PASSAGE_CLIP = 1500
 _EVIDENCE_MAX_ROWS = 120
+
+# Detail evidence leg cap (DMR ledger, 2026-07). Micro-details live in a
+# separate memory_kind="detail" channel that the main search excludes at the
+# index; non-minimal tiers add ONE capped pass over that channel. The cap is
+# the point: the winning pattern on DMR was ADDITIVE CAPPED channels (a
+# 3-excerpt episode leg added +3.8pp full-scale) — a handful of detail rows
+# join the evidence without ever competing with core facts for top-k rank.
+_DETAIL_EVIDENCE_LIMIT = 3
 
 
 def is_enumeration_question(question: str) -> bool:
@@ -486,6 +497,40 @@ async def ask_memory(
             await _semantic(f"{question} {_UPDATE_TERMS}")
         else:
             skipped_passes.append("update")
+
+    # ── Detail evidence leg: one capped pass over the micro-detail channel ──
+    # memory_kind="detail" rows are excluded from every main-recall path (the
+    # index-time must_not in the vector pools + keyword_search), so this
+    # filtered pass is their ONLY door into evidence — at most
+    # _DETAIL_EVIDENCE_LIMIT rows, tagged source="detail". Query is the
+    # stopword-filtered question keywords (micro-details are keyword-shaped:
+    # names, colors, gifts). Mirrors the keyword pass's guards: minimal tier
+    # skips, ASK_DETAIL_EVIDENCE kills, failure and non-list results are
+    # non-fatal (degrade to main evidence only).
+    if tier.name != "minimal" and settings.ask_detail_evidence:
+        terms = extract_keywords(question)
+        detail_query = " ".join(terms) if terms else question
+        searches.append("detail: " + detail_query)
+        try:
+            detail_rows = await asyncio.to_thread(
+                service.search,
+                query=detail_query,
+                user_id=user_id,
+                project_id=project_id,
+                limit=_DETAIL_EVIDENCE_LIMIT,
+                memory_kind="detail",
+            )
+        except Exception as e:  # non-fatal: the main evidence stands alone
+            logger.warning(f"ask detail pass failed (non-critical): {e}")
+            detail_rows = []
+        if not isinstance(detail_rows, list):
+            detail_rows = []
+        for row in detail_rows:
+            try:
+                row.source = "detail"
+            except Exception:
+                pass  # foreign row shape — keep it, just untagged
+        _merge(detail_rows)
 
     # ── Strict abstention short-circuit: nothing retrieved at all ──
     if not evidence:
