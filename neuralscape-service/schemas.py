@@ -1,6 +1,6 @@
 """Schemas for neuralscape-service: enums, category taxonomy, request/response models."""
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -338,6 +338,56 @@ def validate_adapter_name(v: str) -> str:
     return v
 
 
+# Event time (occurred_at): allow modest client clock skew when rejecting
+# "future" event times — an importer whose clock runs slightly ahead must not
+# be rejected, but a genuinely future date is a caller bug (events haven't
+# happened yet).
+OCCURRED_AT_MAX_FUTURE_SKEW = timedelta(days=1)
+
+
+def validate_occurred_at(v) -> str | None:
+    """Validate + normalize an ``occurred_at`` event-time value.
+
+    ``occurred_at`` is the OPTIONAL event-time envelope field: when the
+    remembered fact/event actually happened, as opposed to ``created_at``
+    (when NS stored it). Meant for historical ingestion — imported journals,
+    old chat exports — where stamping "today" breaks recency reasoning and
+    temporal ordering. Absence means "event time unknown"; readers fall back
+    to ``created_at``. It is never defaulted.
+
+    Rules:
+    - must parse as ISO 8601 (``Z`` suffix tolerated);
+    - naive datetimes are assumed UTC;
+    - future dates beyond ``OCCURRED_AT_MAX_FUTURE_SKEW`` (~1 day of clock
+      skew) are rejected;
+    - returns the CANONICAL UTC ISO string (``+00:00``), or None for None.
+      Canonicalizing here (not just validating) means every downstream
+      consumer - lexicographic recency sorting in ask.py, the deterministic
+      enqueue job key in task_manager.py - sees one spelling per instant,
+      so Z / +02:00 / naive inputs of the same moment cannot sort or
+      dedup differently (Copilot, PR #130).
+    """
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        dt = v
+    else:
+        try:
+            dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        except (ValueError, TypeError) as e:
+            raise ValueError(
+                f"occurred_at must be a valid ISO 8601 timestamp (got {v!r})"
+            ) from e
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    if dt > datetime.now(timezone.utc) + OCCURRED_AT_MAX_FUTURE_SKEW:
+        raise ValueError(
+            f"occurred_at is in the future ({dt.isoformat()}) — event times "
+            "must not be later than now (plus a small clock-skew allowance)"
+        )
+    return dt.astimezone(timezone.utc).isoformat()
+
+
 # ──────────────────────────────────────────────
 # Source provenance (data-layer connectors)
 # ──────────────────────────────────────────────
@@ -406,6 +456,14 @@ class StoreMemoryRequest(BaseModel):
         default=None,
         description="Multi-user model: who can read this memory. Defaults per-category. 'standard' is a dictator-only authoritative tier (requires STANDARDS_ENABLED).",
     )
+    occurred_at: str | None = Field(
+        default=None,
+        description=(
+            "Event time (ISO 8601): when this conversation actually happened, "
+            "for historical ingestion (old chat exports). Omit for live "
+            "conversations — absence means event time unknown."
+        ),
+    )
 
     @field_validator("domain")
     @classmethod
@@ -413,6 +471,11 @@ class StoreMemoryRequest(BaseModel):
         if v is not None and v not in DOMAIN_VOCAB:
             raise ValueError(f"Invalid domain '{v}'. Must be one of: {sorted(DOMAIN_VOCAB)}")
         return v
+
+    @field_validator("occurred_at")
+    @classmethod
+    def _validate_occurred_at(cls, v: str | None) -> str | None:
+        return validate_occurred_at(v)
 
 
 class RawMemoryRequest(BaseModel):
@@ -452,6 +515,14 @@ class RawMemoryRequest(BaseModel):
     related_memory_ids: list[str] | None = Field(default=None, max_length=10, description="UUIDs of related memories")
     confidence: float | None = Field(default=None, ge=0.0, le=1.0, description="Extractor's self-rated confidence")
     expires_at: datetime | None = Field(default=None, description="Optional expiry for short-lived memories")
+    occurred_at: str | None = Field(
+        default=None,
+        description=(
+            "Event time (ISO 8601): when the remembered fact/event actually "
+            "happened, for historical ingestion. Omit when unknown — readers "
+            "fall back to created_at (storage time)."
+        ),
+    )
 
     # Provenance epistemics (A1, optional, additive)
     derived_from: list[str] | None = Field(
@@ -521,6 +592,11 @@ class RawMemoryRequest(BaseModel):
                 f"Invalid epistemic_level '{v}'. Must be one of: {sorted(EPISTEMIC_LEVEL_VOCAB)}"
             )
         return v
+
+    @field_validator("occurred_at")
+    @classmethod
+    def _validate_occurred_at(cls, v: str | None) -> str | None:
+        return validate_occurred_at(v)
 
 
 class RawMemoryBatchRequest(BaseModel):
@@ -600,6 +676,15 @@ class IngestTextRequest(BaseModel):
         max_length=100,
         description="Knowledge adapter selecting taxonomy/chunker/extractor/graph-ontology (e.g. 'default', 'trading_strategy').",
     )
+    occurred_at: str | None = Field(
+        default=None,
+        description=(
+            "Event time (ISO 8601): when the ingested content actually "
+            "happened/was written, for historical ingestion (imported "
+            "journals, old notes). Stamped on every produced memory. Omit "
+            "when unknown — readers fall back to created_at."
+        ),
+    )
 
     @field_validator("category")
     @classmethod
@@ -619,6 +704,11 @@ class IngestTextRequest(BaseModel):
     @classmethod
     def _validate_adapter(cls, v: str) -> str:
         return validate_adapter_name(v)
+
+    @field_validator("occurred_at")
+    @classmethod
+    def _validate_occurred_at(cls, v: str | None) -> str | None:
+        return validate_occurred_at(v)
 
 
 class ConnectorConfigRequest(BaseModel):
@@ -1033,6 +1123,10 @@ class MemoryResponse(BaseModel):
     created_at: str | None = None
     updated_at: str | None = None
     source: str | None = None
+    # Event time (when the fact/event actually happened; ISO 8601). Null means
+    # "event time unknown" — readers fall back to created_at. Never defaulted
+    # to the storage time.
+    occurred_at: str | None = None
 
     # Memory-model v2 (all optional, render as null for legacy memories)
     domain: str | None = None

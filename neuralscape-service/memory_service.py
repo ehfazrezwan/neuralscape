@@ -488,6 +488,7 @@ from schemas import (
     default_scope_for_category,
     default_visibility_for_category,
     normalize_visibility,
+    validate_occurred_at,
 )
 
 logger = logging.getLogger(__name__)
@@ -859,6 +860,7 @@ class MemoryService:
         project_id: str | None = None,
         agent_id: str | None = None,
         run_id: str | None = None,
+        occurred_at: str | None = None,
         return_stats: bool = False,
     ) -> list[MemoryResponse] | tuple[list[MemoryResponse], dict]:
         """Extract facts from conversation via LLM, then store each with category metadata.
@@ -876,6 +878,9 @@ class MemoryService:
             project_id: Optional project identifier
             agent_id: Optional agent identifier for provenance
             run_id: Optional session identifier
+            occurred_at: Event time (ISO 8601) — when this conversation
+                actually happened, for historical ingestion of old chat
+                exports. Stamped on every extracted fact; None ⇒ omitted.
             return_stats: When True, returns ``(memories, stats)`` where
                 stats is ``{windows_total, windows_failed, window_errors}``
                 so the worker can surface partial extraction in the task
@@ -978,6 +983,7 @@ class MemoryService:
                 agent_id=agent_id,
                 run_id=run_id,
                 source="conversation",
+                occurred_at=occurred_at,
             )
         except Exception as e:
             logger.error(
@@ -990,6 +996,11 @@ class MemoryService:
         # Step 3: Add cleaned conversation text to knowledge graph — ONE
         # episode for the whole conversation regardless of extraction
         # windowing (Graphiti handles its own entity windowing internally).
+        # KNOWN RESIDUAL (occurred_at): the episode's Graphiti reference_time
+        # is stamped "now" inside the mem0 subtree's MemoryGraph.add, which
+        # exposes no event-time parameter — threading occurred_at through to
+        # add_episode(reference_time=...) needs a subtree change, deliberately
+        # out of scope here. Event time lives in the Qdrant payload only.
         # Conversation extractions are personal (private) by default — the
         # caller's spoken context isn't team-shared automatically.
         group_id = _build_group_id(
@@ -1177,6 +1188,10 @@ class MemoryService:
         related_memory_ids: list[str] | None = None,
         confidence: float | None = None,
         expires_at: datetime | None = None,
+        # Event time (ISO 8601): when the fact/event actually happened, for
+        # historical ingestion. None → omitted from the payload entirely
+        # ("event time unknown, fall back to created_at") — never defaulted.
+        occurred_at: str | None = None,
         # Provenance epistemics (A1, optional)
         derived_from: list[str] | None = None,
         epistemic_level: str | None = None,
@@ -1224,6 +1239,9 @@ class MemoryService:
             related_memory_ids: Memory-model v2 — graph linkage
             confidence: Memory-model v2 — extractor's self-rated 0.0-1.0
             expires_at: Memory-model v2 — optional expiry timestamp
+            occurred_at: Event time (ISO 8601) — when the fact/event actually
+                happened (historical ingestion). Validated + normalized via
+                ``validate_occurred_at``; absent ⇒ omitted from the payload
             derived_from: A1 provenance — premise memory IDs this memory was
                 derived from (walked by get_reasoning_chain)
             epistemic_level: A1 provenance — how this memory is known
@@ -1255,6 +1273,7 @@ class MemoryService:
             related_memory_ids=related_memory_ids,
             confidence=confidence,
             expires_at=expires_at,
+            occurred_at=occurred_at,
             derived_from=derived_from,
             epistemic_level=epistemic_level,
             visibility=visibility,
@@ -1298,6 +1317,7 @@ class MemoryService:
         related_memory_ids: list[str] | None = None,
         confidence: float | None = None,
         expires_at: datetime | None = None,
+        occurred_at: str | None = None,
         derived_from: list[str] | None = None,
         epistemic_level: str | None = None,
         visibility: str | None = None,
@@ -1324,6 +1344,10 @@ class MemoryService:
                 f"Invalid epistemic_level: {epistemic_level}. "
                 f"Must be one of: {sorted(EPISTEMIC_LEVEL_VOCAB)}"
             )
+        # Event time: validate + normalize here (not only at the API boundary)
+        # so worker / batch / ingest callers share one contract. Raises
+        # ValueError on garbage or far-future values, like the checks above.
+        occurred_at = validate_occurred_at(occurred_at)
         # Normalize empty→None so the response echoes exactly what was
         # persisted (metadata only stores truthy lists; echoing [] while
         # storing nothing would make the write and later reads disagree).
@@ -1434,6 +1458,10 @@ class MemoryService:
             metadata["epistemic_level"] = epistemic_level
         if expires_at is not None:
             metadata["expires_at"] = expires_at.isoformat() if hasattr(expires_at, "isoformat") else str(expires_at)
+        # Event time — only stored when known (absence means "fall back to
+        # created_at"; a created_at default here would fabricate event times).
+        if occurred_at is not None:
+            metadata["occurred_at"] = occurred_at
         # Data-layer connector provenance
         if memory_kind is not None:
             metadata["memory_kind"] = memory_kind
@@ -1466,6 +1494,7 @@ class MemoryService:
             related_memory_ids=related_memory_ids,
             confidence=confidence,
             expires_at=expires_at.isoformat() if expires_at and hasattr(expires_at, "isoformat") else None,
+            occurred_at=occurred_at,
             derived_from=derived_from,
             epistemic_level=epistemic_level,
             memory_kind=memory_kind,
@@ -1923,6 +1952,7 @@ class MemoryService:
                 tags=metadata.get("tags"),
                 source="vector",
                 created_at=payload.get("created_at"),
+                occurred_at=metadata.get("occurred_at"),
                 domain=metadata.get("domain"),
                 observation_type=metadata.get("observation_type"),
                 concepts=metadata.get("concepts"),
@@ -2095,6 +2125,7 @@ class MemoryService:
                     related_memory_ids=item.get("related_memory_ids"),
                     confidence=item.get("confidence"),
                     expires_at=expires_at,
+                    occurred_at=item.get("occurred_at"),
                     derived_from=item.get("derived_from"),
                     epistemic_level=item.get("epistemic_level"),
                     visibility=item.get("visibility"),
@@ -2242,6 +2273,7 @@ class MemoryService:
         source_type: str | None = None,
         memory_kind: str | None = None,
         source_ref: dict | None = None,
+        occurred_at: str | None = None,
     ) -> list[MemoryResponse]:
         """Store multiple categorized facts via a single batch embed + single Qdrant upsert.
 
@@ -2268,6 +2300,10 @@ class MemoryService:
             agent_id: Optional agent identifier.
             run_id: Optional run/session identifier.
             source: Provenance tag for metadata.
+            occurred_at: Event time (ISO 8601) applied to EVERY fact in the
+                batch — when the conversation actually happened, for
+                historical ingestion of old chat exports. None ⇒ omitted
+                (event time unknown; readers fall back to created_at).
 
         Returns:
             List of MemoryResponse objects for stored facts (new rows and
@@ -2275,6 +2311,10 @@ class MemoryService:
         """
         if not facts:
             return []
+
+        # Validate once for the whole batch (every fact shares the
+        # conversation's event time). Raises ValueError on garbage.
+        occurred_at = validate_occurred_at(occurred_at)
 
         m = self._get_memory()
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -2366,6 +2406,8 @@ class MemoryService:
                     **({"source_type": source_type} if source_type is not None else {}),
                     **({"memory_kind": memory_kind} if memory_kind is not None else {}),
                     **({"source_ref": source_ref} if source_ref else {}),
+                    # Event time: only stored when known (never defaulted).
+                    **({"occurred_at": occurred_at} if occurred_at is not None else {}),
                 },
             }
 
@@ -2411,6 +2453,7 @@ class MemoryService:
                     project_id=fact_pid,
                     source="vector",
                     created_at=now_iso,
+                    occurred_at=occurred_at,
                     source_type=source_type,
                     epistemic_level="explicit",
                     memory_kind=memory_kind,
@@ -2983,6 +3026,8 @@ class MemoryService:
                     resp.created_at = payload.get("created_at")
                 if resp.updated_at is None:
                     resp.updated_at = payload.get("updated_at")
+                if resp.occurred_at is None:
+                    resp.occurred_at = src_metadata.get("occurred_at")
                 if resp.title is None:
                     resp.title = src_metadata.get("title")
                 if resp.token_estimate is None:
@@ -5395,6 +5440,7 @@ class MemoryService:
             score=mem.get("score"),
             created_at=mem.get("created_at"),
             updated_at=mem.get("updated_at"),
+            occurred_at=metadata.get("occurred_at"),
             source="vector",
             domain=metadata.get("domain"),
             observation_type=metadata.get("observation_type"),
