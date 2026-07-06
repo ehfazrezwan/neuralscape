@@ -228,7 +228,12 @@ def _event_dt(mem) -> datetime | None:
     return dt.astimezone(timezone.utc)
 
 
-def _evidence_rows(evidence: dict, keyword_ids: list[str], enumeration: bool) -> list:
+def _evidence_rows(
+    evidence: dict,
+    keyword_ids: list[str],
+    enumeration: bool,
+    prioritize_ids: list[str] | None = None,
+) -> list:
     """Select and order evidence for the prompt (audit 27 #15).
 
     When over the row budget, the keep-set is chosen by priority —
@@ -256,8 +261,9 @@ def _evidence_rows(evidence: dict, keyword_ids: list[str], enumeration: bool) ->
 
     rows = list(evidence.values())
 
+    prioritized = set(prioritize_ids or [])
     if len(rows) > _EVIDENCE_MAX_ROWS:
-        kw_set = set(keyword_ids)
+        kw_set = set(keyword_ids) | prioritized
         # Three stable sorts, applied lowest-priority first:
         rows.sort(key=_created, reverse=True)  # newest first ("" sorts last)
         rows.sort(key=lambda m: (getattr(m, "score", None) is None,
@@ -267,7 +273,11 @@ def _evidence_rows(evidence: dict, keyword_ids: list[str], enumeration: bool) ->
 
     # Chronological ascending for the prompt; timestamp-less survivors last.
     rows.sort(key=lambda m: (0, _created(m)) if _created(m)[0] else (1, ("", "")))
-    if enumeration and keyword_ids:
+    if prioritized:
+        promoted = [m for m in rows if m.id in prioritized]
+        rest = [m for m in rows if m.id not in prioritized]
+        rows = promoted + rest
+    elif enumeration and keyword_ids:
         kw = [m for m in rows if m.id in keyword_ids]
         rest = [m for m in rows if m.id not in keyword_ids]
         rows = kw + rest
@@ -377,6 +387,7 @@ def _build_prompt(
     enumeration: bool,
     keyword_ids: list[str],
     keyword_scan_capped: bool = False,
+    prioritize_ids: list[str] | None = None,
 ) -> str:
     """Assemble the answering prompt. Verbosity scales with the tier."""
     parts = [
@@ -406,8 +417,19 @@ def _build_prompt(
             "\nThink through the evidence step by step BEFORE answering, but output ONLY "
             "the JSON object described below — no reasoning text outside it."
         )
+    if prioritize_ids:
+        parts.append(
+            "\nThe evidence rows listed first are the MOST RELEVANT to the question "
+            "(direct keyword/entity overlap). Start with them."
+        )
     parts.append("\nEVIDENCE:")
-    parts.append(_render_evidence(_evidence_rows(evidence, keyword_ids, enumeration)))
+    parts.append(
+        _render_evidence(
+            _evidence_rows(
+                evidence, keyword_ids, enumeration, prioritize_ids=prioritize_ids
+            )
+        )
+    )
     parts.append(f"\nQUESTION: {question}")
 
     if budget > 0:
@@ -688,8 +710,9 @@ async def ask_memory(
             # Re-ask with keyword-overlapping rows promoted to top of evidence.
             prompt = _build_prompt(
                 question, evidence, tier, 0, enumeration,
-                relevant_ids,  # promoted keyword_ids param
+                keyword_ids,
                 keyword_scan_capped,
+                prioritize_ids=relevant_ids,
             )
             raw2 = await call(prompt)
             parsed2 = _parse_llm_json(raw2)

@@ -635,8 +635,10 @@ class TestSecondChancePass:
         """When first pass abstains AND evidence shares ≥2 keywords, re-ask
         with those rows promoted; if the second pass answers, use it."""
         svc = _service([
-            _mem("m1", "Alice joined the project in Berlin for backend work"),
-            _mem("m2", "irrelevant note about meetings"),
+            _mem("m1", "Alice joined the project in Berlin for backend work",
+                 "2026-07-02T00:00:00+00:00"),
+            _mem("m2", "irrelevant note about meetings",
+                 "2026-07-01T00:00:00+00:00"),
         ])
         prompts: list[str] = []
         responses = iter([
@@ -656,6 +658,9 @@ class TestSecondChancePass:
         assert out["abstained"] is False
         assert out["answer"] == "Berlin [m1]"
         assert out["citations"] == ["m1"]
+        assert prompts[0].index("[m2]") < prompts[0].index("[m1]")
+        assert "MOST RELEVANT to the question" in prompts[1]
+        assert prompts[1].index("[m1]") < prompts[1].index("[m2]")
         # Audit trail: second-chance recorded in searches.
         assert any("second-chance" in s for s in out["searches"])
 
