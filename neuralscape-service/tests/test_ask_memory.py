@@ -597,8 +597,11 @@ class TestPerspectiveResolution:
         assert "speaker/pronoun/label mismatch" in discipline_section
         assert "Do not hedge by denying you know a" in discipline_section
         assert "fact solely because of a speaker/pronoun/label mismatch" in discipline_section
-        # The blanket "commit to the fact itself" is gone (over-commit fix)
+        # The blanket over-commit phrasing is gone (over-commit fix): assert BOTH
+        # the trigger clause and the "commit to the fact itself" imperative are absent,
+        # so the discipline can't push commitment on non-perspective (synthesis) cases.
         assert "when the evidence directly answers the substance" not in discipline_section
+        assert "commit to the fact itself" not in discipline_section
 
     @pytest.mark.asyncio
     async def test_perspective_directs_first_person_answering(self):
