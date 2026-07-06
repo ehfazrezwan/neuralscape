@@ -1319,6 +1319,39 @@ async def v1_code_graph_path(
     return {"result": text, "graph_id": graph_id}
 
 
+@v1_router.get("/code-graph/locate")
+async def v1_code_graph_locate(
+    request: Request,
+    query: str = Query(..., min_length=1, max_length=500),
+    k: int = Query(10, ge=1, le=50),
+    graph_id: str | None = Query(None),
+    user_id: str | None = Query(None),
+):
+    """Hybrid code retrieval: find symbols by description or name pattern (E3).
+
+    Uses dense embeddings + BM25 + degree signal. Returns file:line locations with
+    signatures and docstrings. E3: requires NativeEngine (repo:<name> refs); raises
+    501 on GraphifyJsonEngine (.json artifacts).
+    """
+    cg = _code_graph_or_501()
+    caller = _resolve_user_id(request, user_id)
+    try:
+        hits = await asyncio.to_thread(
+            cg.locate_symbols,
+            query,
+            user_id=caller,
+            settings=settings,
+            graph_id=graph_id,
+            k=k,
+        )
+        # Convert LocateHit dataclasses to dicts
+        from dataclasses import asdict
+        results = [asdict(hit) for hit in hits]
+    except cg.CodeGraphError as e:
+        raise _map_code_graph_error(e) from e
+    return {"results": results, "graph_id": graph_id, "k": k}
+
+
 # ── Connectors (data-layer sources) ──────────────
 
 

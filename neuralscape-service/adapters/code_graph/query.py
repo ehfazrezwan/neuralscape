@@ -234,3 +234,34 @@ def code_path(
     """Shortest path between two symbols — routes through engine."""
     engine = get_engine(graph_id, user_id, settings)
     return engine.path(source, target, max_hops=max_hops)
+
+
+def locate_symbols(
+    query: str,
+    *,
+    user_id: str,
+    settings,
+    graph_id: str | None = None,
+    k: int = 10,
+):
+    """Hybrid code retrieval — routes through engine (E3: NativeEngine only).
+
+    Args:
+        query: Natural-language description or symbol name pattern.
+        user_id: Owner-scoped resolution.
+        settings: Config for default path / repo resolution.
+        graph_id: Artifact id, repo:<name> ref, or None (uses default).
+        k: Max hits to return.
+
+    Returns:
+        List of LocateHit dataclasses.
+
+    Raises:
+        EngineCapabilityError: When the engine lacks locate (GraphifyJsonEngine).
+        CodeGraphError: graph_id doesn't resolve or repo not configured.
+    """
+    from adapters.code_graph.engine import EngineCapabilityError
+
+    k = max(1, min(int(k), 50))  # clamp to [1, 50]
+    engine = get_engine(graph_id, user_id, settings)
+    return engine.locate(query, k=k)

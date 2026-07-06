@@ -80,16 +80,49 @@ def test_native_engine_init(mock_bridge, mock_settings):
     assert str(engine.repo_path) == "/tmp/test"
 
 
-def test_native_engine_locate_not_implemented(mock_bridge, mock_settings):
-    """Test that locate() raises EngineCapabilityError (E3+)."""
+def test_native_engine_locate_implemented(mock_bridge, mock_settings):
+    """Test that locate() now works in E3 (requires mocked embedding)."""
+    from unittest.mock import patch, Mock
+    import uuid
+
+    # Mock the memory service
+    mock_service = Mock()
+    mock_memory = Mock()
+
+    # Mock embedding model
+    embedding_model = Mock()
+    embedding_model.embed = Mock(return_value=[0.1] * 768)
+    mock_memory.embedding_model = embedding_model
+
+    # Mock vector store with Qdrant client
+    vector_store = Mock()
+    qdrant_client = Mock()
+
+    # Mock empty hits
+    qdrant_client.query_points = Mock(return_value=Mock(points=[]))
+    qdrant_client.get_collection = Mock(side_effect=Exception("Not found"))
+    qdrant_client.create_collection = Mock()
+
+    vector_store.client = qdrant_client
+    vector_store._has_bm25_slot = False
+    mock_memory.vector_store = vector_store
+
+    mock_service._get_memory = Mock(return_value=mock_memory)
+
     engine = NativeEngine(
         repo_path="/tmp/test",
         code_space="code--user123--testrepo",
         bridge=mock_bridge,
         settings=mock_settings,
     )
-    with pytest.raises(EngineCapabilityError, match="locate.*E3"):
-        engine.locate("test query")
+
+    # Should not raise EngineCapabilityError anymore (E3 implements it)
+    with patch("memory_service.get_shared_service", return_value=mock_service):
+        hits = engine.locate("test query")
+
+    # Should return empty list (no hits from mocked Qdrant)
+    assert isinstance(hits, list)
+    assert len(hits) == 0
 
 
 def test_native_engine_detect_changes_not_implemented(mock_bridge, mock_settings):
@@ -140,7 +173,7 @@ def test_native_engine_parse_file(temp_repo, mock_bridge, mock_settings):
     )
 
     test_file = temp_repo / "test_module.py"
-    symbols, edges = engine._parse_file(test_file, temp_repo)
+    symbols, edges = engine._parse_file(test_file, temp_repo, "python")
 
     # Should extract at least the function and class
     assert len(symbols) >= 2

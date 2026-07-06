@@ -203,12 +203,143 @@ class NativeEngine:
         *,
         k: int = 10,
     ) -> list[LocateHit]:
-        """Hybrid code retrieval — requires E3 (embeddings + code_index collection)."""
-        raise EngineCapabilityError(
-            "locate() requires E3 (dense embeddings + code_index collection). "
-            "E2 implements only structural queries (query, neighbors, path). "
-            "Use query() for structure search."
+        """Hybrid code retrieval: dense embeddings + BM25 + graph degree.
+
+        E3 implementation: searches symbol cards (name + signature + docstring +
+        first lines) in the separate code_index Qdrant collection. Fuses dense
+        embedding search + BM25 lexical + degree signal via RRF.
+        """
+        from qdrant_client.models import (
+            FieldCondition,
+            Filter,
+            MatchValue,
         )
+
+        # Get embedding model and Qdrant client from the shared service
+        from memory_service import get_shared_service
+        service = get_shared_service()
+        m = service._get_memory()
+
+        # Ensure code_index collection exists
+        self._ensure_code_index_collection(m)
+
+        # Embed the query
+        query_embedding = m.embedding_model.embed(query, memory_action="search")
+
+        # Dense search
+        dense_filter = Filter(must=[
+            FieldCondition(key="code_space", match=MatchValue(value=self.code_space))
+        ])
+        dense_result = m.vector_store.client.query_points(
+            collection_name="code_index",
+            query=query_embedding,
+            query_filter=dense_filter,
+            limit=k * 2,  # retrieve more for fusion
+            with_payload=True,
+        )
+        dense_hits = list(getattr(dense_result, "points", dense_result) or [])
+
+        # BM25 lexical search (if available)
+        lexical_hits = self._lexical_code_search(m, query, dense_filter, k * 2)
+
+        # Fuse with RRF
+        from memory.ranking import _rrf_fuse
+        fused = _rrf_fuse(dense_hits, lexical_hits, k * 2)
+
+        # Convert to LocateHit and apply degree boost
+        hits: list[tuple[float, LocateHit]] = []
+        for entry in fused[:k * 2]:
+            hit = entry["hit"]
+            payload = getattr(hit, "payload", None) or {}
+
+            # Extract fields
+            fqn = payload.get("fqn", "")
+            kind = payload.get("kind", "")
+            file = payload.get("file", "")
+            line = payload.get("line", 0)
+            signature = payload.get("signature", "")
+            docstring = payload.get("docstring", "")
+            degree = payload.get("degree", 0)
+            anchor_id = payload.get("anchor_id")
+
+            # Base score from RRF
+            base_score = entry["rrf"]
+
+            # Apply degree boost: higher-degree symbols get a small lift
+            # (similar to reinforcement boost pattern in memory/ranking.py)
+            degree_boost = 1.0 + 0.01 * min(degree, 50)  # cap boost at ~1.5x
+            final_score = base_score * degree_boost
+
+            locate_hit = LocateHit(
+                fqn=fqn,
+                kind=kind,
+                file=file,
+                line=line,
+                signature=signature,
+                docstring=docstring,
+                score=final_score,
+                anchor_id=anchor_id,
+            )
+            hits.append((final_score, locate_hit))
+
+        # Sort by final score and return top k
+        hits.sort(key=lambda x: x[0], reverse=True)
+        return [hit for _, hit in hits[:k]]
+
+    def _lexical_code_search(self, m, query: str, query_filter, limit: int) -> list:
+        """BM25 lexical search for code_index collection (mirrors memory search).
+
+        Returns empty list if BM25 not available or query fails.
+        """
+        vs = m.vector_store
+        if not query or getattr(vs, "_has_bm25_slot", False) is not True:
+            return []
+        try:
+            sparse = vs._encode_bm25(query)
+            if sparse is None:
+                return []
+            result = vs.client.query_points(
+                collection_name="code_index",
+                query=sparse,
+                using="bm25",
+                query_filter=query_filter,
+                limit=limit,
+                with_payload=True,
+            )
+            return list(getattr(result, "points", result) or [])
+        except Exception:
+            logger.debug("BM25 code search failed (non-fatal)", exc_info=True)
+            return []
+
+    def _ensure_code_index_collection(self, m):
+        """Create code_index Qdrant collection if it doesn't exist (lazy init)."""
+        from qdrant_client.models import Distance, VectorParams
+
+        client = m.vector_store.client
+        collection_name = "code_index"
+
+        try:
+            client.get_collection(collection_name)
+            return  # already exists
+        except Exception:
+            pass  # doesn't exist, create it
+
+        try:
+            # Get vector size from embedding model
+            vector_size = len(m.embedding_model.embed("test", memory_action="add"))
+
+            # Create collection with same embedding space as memories
+            client.create_collection(
+                collection_name=collection_name,
+                vectors_config=VectorParams(
+                    size=vector_size,
+                    distance=Distance.COSINE,
+                ),
+            )
+            logger.info(f"Created code_index collection (size={vector_size})")
+        except Exception as e:
+            logger.warning(f"Failed to create code_index collection: {e}")
+            raise
 
     def detect_changes(
         self,
@@ -234,16 +365,30 @@ class NativeEngine:
         *,
         incremental: bool = True,
     ) -> IndexReport:
-        """Index a Python codebase into the Neo4j code label-space."""
+        """Index a codebase (Python, TypeScript, Go, Rust, Java) into Neo4j code label-space."""
         start = time.time()
         repo_path = Path(source).resolve()
         if not repo_path.is_dir():
             raise ValueError(f"source must be a directory: {source}")
 
-        # Collect Python files
-        py_files = list(repo_path.rglob("*.py"))
-        if not py_files:
-            logger.info("No Python files found in %s", repo_path)
+        # Collect source files across supported languages
+        file_patterns = {
+            "*.py": "python",
+            "*.ts": "typescript",
+            "*.tsx": "typescript",
+            "*.js": "javascript",
+            "*.jsx": "javascript",
+            "*.go": "go",
+            "*.rs": "rust",
+            "*.java": "java",
+        }
+        source_files = []
+        for pattern, lang in file_patterns.items():
+            for f in repo_path.rglob(pattern):
+                source_files.append((f, lang))
+
+        if not source_files:
+            logger.info("No source files found in %s", repo_path)
             return IndexReport(
                 files_indexed=0,
                 symbols_indexed=0,
@@ -259,24 +404,27 @@ class NativeEngine:
         symbols_indexed = 0
         edges_indexed = 0
 
-        for py_file in py_files:
-            rel_path = str(py_file.relative_to(repo_path))
-            file_hash = self._file_hash(py_file)
+        for source_file, lang in source_files:
+            rel_path = str(source_file.relative_to(repo_path))
+            file_hash = self._file_hash(source_file)
 
             # Incremental: skip unchanged files
             if incremental and self._file_unchanged(rel_path, file_hash):
                 continue
 
             # Parse and index
-            symbols, edges = self._parse_file(py_file, repo_path)
+            symbols, edges = self._parse_file(source_file, repo_path, lang)
             if symbols or edges:
-                self._store_file(rel_path, file_hash, symbols, edges)
+                self._store_file(rel_path, file_hash, symbols, edges, lang)
                 files_indexed += 1
                 symbols_indexed += len(symbols)
                 edges_indexed += len(edges)
 
         # Compute and persist degree on all symbols
         self._compute_degrees()
+
+        # E3: Build and index symbol cards in code_index collection
+        self._index_symbol_cards(repo_path)
 
         duration = time.time() - start
         logger.info(
@@ -313,8 +461,17 @@ class NativeEngine:
         result = self._run_cypher(cypher, code_space=self.code_space, path=rel_path, hash=file_hash)
         return result[0]["unchanged"] if result else False
 
-    def _parse_file(self, py_file: Path, repo_root: Path) -> tuple[list[_Symbol], list[_Edge]]:
-        """Parse a Python file with tree-sitter and extract symbols/edges."""
+    def _parse_file(self, source_file: Path, repo_root: Path, language: str) -> tuple[list[_Symbol], list[_Edge]]:
+        """Parse a source file with tree-sitter and extract symbols/edges.
+
+        Args:
+            source_file: Path to the source file.
+            repo_root: Repository root (for relative paths).
+            language: Language name (python, typescript, javascript, go, rust, java).
+
+        Returns:
+            (symbols, edges) tuples.
+        """
         try:
             from tree_sitter import Language, Parser
         except ImportError:
@@ -323,25 +480,81 @@ class NativeEngine:
                 "Install with: uv sync --extra code-graph"
             ) from None
 
-        # Get the Python language from tree-sitter-language-pack
-        try:
-            import tree_sitter_python
-            language = Language(tree_sitter_python.language())
-        except ImportError:
-            raise RuntimeError(
-                "tree-sitter-python not installed (comes with tree-sitter-language-pack). "
-                "Install with: uv sync --extra code-graph"
-            ) from None
+        # Get the language parser
+        ts_lang = self._get_tree_sitter_language(language)
+        if ts_lang is None:
+            # Language not available, skip
+            logger.debug(f"tree-sitter language not available for {language}")
+            return ([], [])
 
-        parser = Parser(language)
-        source_bytes = py_file.read_bytes()
+        parser = Parser(ts_lang)
+        source_bytes = source_file.read_bytes()
         tree = parser.parse(source_bytes)
         root = tree.root_node
 
-        # Walk the tree directly (simpler than Query API for E2)
-        rel_path = str(py_file.relative_to(repo_root))
-        module_path = rel_path.replace("/", ".").removesuffix(".py")
+        # Build module path from file path
+        rel_path = str(source_file.relative_to(repo_root))
+        module_path = self._build_module_path(rel_path, language)
 
+        symbols: list[_Symbol] = []
+        edges: list[_Edge] = []
+
+        # Delegate to language-specific parser
+        if language == "python":
+            symbols, edges = self._parse_python(root, rel_path, module_path, source_bytes)
+        else:
+            # For E3: simple heuristic extraction for other languages
+            # (tree-sitter query API would be more robust but not required for E3)
+            symbols, edges = self._parse_generic(root, rel_path, module_path, language, source_bytes)
+
+        return symbols, edges
+
+    def _get_tree_sitter_language(self, language: str):
+        """Get the tree-sitter Language object for a given language name."""
+        try:
+            from tree_sitter import Language
+            if language == "python":
+                import tree_sitter_python
+                return Language(tree_sitter_python.language())
+            elif language in ("typescript", "tsx"):
+                import tree_sitter_typescript
+                return Language(tree_sitter_typescript.language_typescript())
+            elif language in ("javascript", "jsx"):
+                import tree_sitter_javascript
+                return Language(tree_sitter_javascript.language())
+            elif language == "go":
+                import tree_sitter_go
+                return Language(tree_sitter_go.language())
+            elif language == "rust":
+                import tree_sitter_rust
+                return Language(tree_sitter_rust.language())
+            elif language == "java":
+                import tree_sitter_java
+                return Language(tree_sitter_java.language())
+        except ImportError:
+            logger.debug(f"tree-sitter parser for {language} not installed")
+            return None
+        return None
+
+    def _build_module_path(self, rel_path: str, language: str) -> str:
+        """Build a module/package path from a file path."""
+        if language == "python":
+            return rel_path.replace("/", ".").removesuffix(".py")
+        elif language in ("typescript", "javascript"):
+            return rel_path.replace("/", ".").removesuffix(".ts").removesuffix(".tsx").removesuffix(".js").removesuffix(".jsx")
+        elif language == "go":
+            # Go uses directory-based packages
+            return str(Path(rel_path).parent).replace("/", ".")
+        elif language == "rust":
+            # Rust uses crate::module paths
+            return rel_path.replace("/", "::").removesuffix(".rs")
+        elif language == "java":
+            # Java uses package.Class
+            return rel_path.replace("/", ".").removesuffix(".java")
+        return rel_path
+
+    def _parse_python(self, root, rel_path: str, module_path: str, source_bytes: bytes) -> tuple[list[_Symbol], list[_Edge]]:
+        """Parse Python AST (preserves E2 logic exactly)."""
         symbols: list[_Symbol] = []
         edges: list[_Edge] = []
 
@@ -442,6 +655,88 @@ class NativeEngine:
         walk(root)
         return symbols, edges
 
+    def _parse_generic(self, root, rel_path: str, module_path: str, language: str, source_bytes: bytes) -> tuple[list[_Symbol], list[_Edge]]:
+        """Generic heuristic parser for non-Python languages (E3).
+
+        Simple tree-walk extraction: function/class/method definitions and call sites.
+        Not LSP-grade but sufficient for E3's locate use case.
+        """
+        symbols: list[_Symbol] = []
+        edges: list[_Edge] = []
+
+        def walk(node, parent_class=None):
+            node_type = node.type
+
+            # Functions/methods (language-specific patterns)
+            if node_type in ("function_declaration", "method_definition", "method_declaration"):
+                name_node = node.child_by_field_name("name")
+                if name_node:
+                    name = name_node.text.decode("utf8", errors="ignore")
+                    if parent_class:
+                        fqn = f"{parent_class}.{name}"
+                        kind = "method"
+                    else:
+                        fqn = f"{module_path}.{name}" if module_path else name
+                        kind = "function"
+                    symbols.append(_Symbol(
+                        fqn=fqn,
+                        kind=kind,
+                        file=rel_path,
+                        line=node.start_point[0] + 1,
+                        end_line=node.end_point[0] + 1,
+                    ))
+
+            # Classes/structs/interfaces
+            elif node_type in ("class_declaration", "struct_item", "interface_declaration", "type_declaration"):
+                name_node = node.child_by_field_name("name")
+                if name_node:
+                    name = name_node.text.decode("utf8", errors="ignore")
+                    fqn = f"{module_path}.{name}" if module_path else name
+                    kind = "class" if "class" in node_type else "type"
+                    symbols.append(_Symbol(
+                        fqn=fqn,
+                        kind=kind,
+                        file=rel_path,
+                        line=node.start_point[0] + 1,
+                        end_line=node.end_point[0] + 1,
+                    ))
+                    # Recurse into body to find methods
+                    for child in node.children:
+                        walk(child, parent_class=fqn)
+                    return
+
+            # Imports (best-effort)
+            elif node_type in ("import_statement", "import_declaration", "use_declaration"):
+                # Extract imported name (varies by language)
+                imported = node.text.decode("utf8", errors="ignore")
+                if len(imported) < 200:  # sanity check
+                    edges.append(_Edge(
+                        source_fqn=module_path or rel_path,
+                        target_fqn=imported,
+                        relation="IMPORTS",
+                        extraction="extracted",
+                    ))
+
+            # Calls (inferred)
+            elif node_type in ("call_expression", "method_invocation"):
+                func_node = node.child_by_field_name("function")
+                if func_node:
+                    target = func_node.text.decode("utf8", errors="ignore")
+                    if len(target) < 100:
+                        edges.append(_Edge(
+                            source_fqn=module_path or rel_path,
+                            target_fqn=target,
+                            relation="CALLS",
+                            extraction="inferred",
+                        ))
+
+            # Recurse
+            for child in node.children:
+                walk(child, parent_class=parent_class)
+
+        walk(root)
+        return symbols, edges
+
     def _ensure_repo_node(self, path: str):
         """Create or update the (:CodeRepo) node."""
         cypher = """
@@ -457,14 +752,21 @@ class NativeEngine:
         file_hash: str,
         symbols: list[_Symbol],
         edges: list[_Edge],
+        language: str = "python",
     ):
         """Store a file + its symbols + edges in Neo4j (with deadlock retry)."""
         # Store the file node
         file_cypher = """
         MERGE (f:CodeFile {code_space: $code_space, path: $path})
-        SET f.hash = $hash, f.language = 'python'
+        SET f.hash = $hash, f.language = $language
         """
-        self._run_cypher_with_retry(file_cypher, code_space=self.code_space, path=rel_path, hash=file_hash)
+        self._run_cypher_with_retry(
+            file_cypher,
+            code_space=self.code_space,
+            path=rel_path,
+            hash=file_hash,
+            language=language,
+        )
 
         # Store symbols
         for sym in symbols:
@@ -520,6 +822,162 @@ class NativeEngine:
         SET s.degree = out_deg + in_deg
         """
         self._run_cypher(cypher, code_space=self.code_space)
+
+    def _index_symbol_cards(self, repo_path: Path):
+        """Build symbol cards and index them in the code_index Qdrant collection (E3).
+
+        For each symbol, builds a card: name + signature + docstring + first N lines
+        of source, embeds it, and upserts to code_index with payload containing all
+        searchable metadata.
+        """
+        from memory_service import get_shared_service
+        from qdrant_client.models import PointStruct
+        import uuid
+
+        service = get_shared_service()
+        m = service._get_memory()
+        self._ensure_code_index_collection(m)
+
+        # Fetch all symbols with degree
+        cypher = """
+        MATCH (s:CodeSymbol {code_space: $code_space})
+        RETURN s.fqn AS fqn, s.kind AS kind, s.file AS file, s.span AS span,
+               coalesce(s.degree, 0) AS degree
+        """
+        symbols = self._run_cypher(cypher, code_space=self.code_space)
+
+        if not symbols:
+            logger.info("No symbols to index in code_index")
+            return
+
+        # Build symbol cards (text for embedding)
+        cards = []
+        points_data = []
+        for sym in symbols:
+            fqn = sym["fqn"]
+            kind = sym["kind"]
+            file_path = sym["file"]
+            span = sym["span"] or "1:1"
+            line = int(span.split(":")[0])
+            degree = sym["degree"]
+
+            # Build the symbol card text
+            signature, docstring, first_lines = self._extract_symbol_details(
+                repo_path / file_path, fqn, line
+            )
+            card_text = self._build_symbol_card(fqn, kind, signature, docstring, first_lines)
+
+            cards.append(card_text)
+            points_data.append({
+                "id": str(uuid.uuid4()),
+                "fqn": fqn,
+                "kind": kind,
+                "file": file_path,
+                "line": line,
+                "signature": signature,
+                "docstring": docstring,
+                "degree": degree,
+                "anchor_id": None,  # E4: anchors deferred
+            })
+
+        # Batch embed all cards
+        logger.info(f"Embedding {len(cards)} symbol cards for code_index")
+        embeddings = m.embedding_model.embed_batch(cards, memory_action="add")
+
+        if len(embeddings) != len(cards):
+            logger.warning(
+                f"Embedding mismatch: {len(embeddings)} embeddings for {len(cards)} cards"
+            )
+            return
+
+        # Build points for Qdrant
+        points = []
+        for i, (embed, data) in enumerate(zip(embeddings, points_data)):
+            points.append(PointStruct(
+                id=data["id"],
+                vector=embed,
+                payload={
+                    "code_space": self.code_space,
+                    "fqn": data["fqn"],
+                    "kind": data["kind"],
+                    "file": data["file"],
+                    "line": data["line"],
+                    "signature": data["signature"],
+                    "docstring": data["docstring"],
+                    "degree": data["degree"],
+                    "anchor_id": data["anchor_id"],
+                },
+            ))
+
+        # Upsert to code_index
+        m.vector_store.client.upsert(
+            collection_name="code_index",
+            points=points,
+        )
+        logger.info(f"Indexed {len(points)} symbols into code_index collection")
+
+    def _build_symbol_card(
+        self, fqn: str, kind: str, signature: str, docstring: str, first_lines: str
+    ) -> str:
+        """Build a symbol card for embedding: name + signature + docstring + source."""
+        parts = [f"{kind} {fqn}"]
+        if signature:
+            parts.append(f"Signature: {signature}")
+        if docstring:
+            parts.append(f"Doc: {docstring}")
+        if first_lines:
+            parts.append(f"Source:\n{first_lines}")
+        return "\n".join(parts)
+
+    def _extract_symbol_details(
+        self, file_path: Path, fqn: str, line: int
+    ) -> tuple[str, str, str]:
+        """Extract signature, docstring, and first N lines for a symbol.
+
+        Returns: (signature, docstring, first_lines)
+        """
+        if not file_path.exists():
+            return ("", "", "")
+
+        try:
+            lines = file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except Exception:
+            return ("", "", "")
+
+        # Simple heuristic extraction (tree-sitter query would be more accurate but E3 doesn't require LSP-grade)
+        signature = ""
+        docstring = ""
+        first_lines = ""
+
+        if line > 0 and line <= len(lines):
+            # Signature: the definition line
+            def_line = lines[line - 1].strip()
+            signature = def_line
+
+            # Docstring: look for triple-quoted string in next few lines
+            doc_lines = []
+            in_doc = False
+            for i in range(line, min(line + 10, len(lines))):
+                l = lines[i].strip()
+                if '"""' in l or "'''" in l:
+                    if not in_doc:
+                        in_doc = True
+                        doc_lines.append(l.split('"""')[-1].split("'''")[-1])
+                        if l.count('"""') >= 2 or l.count("'''") >= 2:
+                            break
+                    else:
+                        doc_lines.append(l.split('"""')[0].split("'''")[0])
+                        break
+                elif in_doc:
+                    doc_lines.append(l)
+            docstring = " ".join(doc_lines).strip()
+
+            # First N lines of source (skip docstring)
+            start = line
+            end = min(line + 5, len(lines))
+            first_lines = "\n".join(lines[start - 1:end])
+
+        return (signature, docstring, first_lines)
 
     # ── Internal query helpers ───────────────────────────────────────
 
