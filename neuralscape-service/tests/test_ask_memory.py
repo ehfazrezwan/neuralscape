@@ -498,7 +498,7 @@ class TestPerspectiveAndSpecificityDisciplines:
 
 
 # ──────────────────────────────────────────────
-# Speaker attribution rendering (T22 / MED-2)
+# Speaker attribution rendering (T2.2 / MED-2)
 # ──────────────────────────────────────────────
 
 

@@ -332,7 +332,10 @@ def _render_evidence(rows: list) -> str:
         content = _clip_content((mem.memory or "").strip(), budget).replace("\n", " ")
         created = getattr(mem, "created_at", None) or "unknown time"
         category = getattr(mem, "category", None) or "uncategorized"
-        speaker = getattr(mem, "speaker", None)
+        # Normalize + cap the speaker before it enters the prompt: flatten
+        # newlines and bound length so legacy/connector data can't distort the
+        # evidence formatting (Copilot review). Empty after strip → omit.
+        speaker = (getattr(mem, "speaker", None) or "").strip().replace("\n", " ")[:40].strip()
         occurred = getattr(mem, "occurred_at", None) if render_events else None
 
         # Build the metadata annotation: (timestamp; category; speaker if present)
