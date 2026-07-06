@@ -902,6 +902,14 @@ class SearchMixin:
             # otherwise standard-origin graph edges never match their source
             # and lose their v2 metadata / get dropped by v2 filters. The
             # filter is identical for every edge, so it is built ONCE.
+            # Hardening #9 (HELD FOR BENCH VALIDATION): when project_id is set,
+            # include BOTH the project-scoped AND global-scoped pools as
+            # fallback — so a graph edge in a project can enrich from global
+            # memories when no project memories exist. NOTE: this is ranking-
+            # relevant and unverified — Qdrant returns the nearest neighbor by
+            # vector distance across all `should` clauses, so a semantically-
+            # closer GLOBAL memory can override a project one. Validate the
+            # recall/precision impact on the NSBench stack before merging to dev.
             proj = (
                 [FieldCondition(key="metadata.project_id", match=MatchValue(value=project_id))]
                 if project_id else []
@@ -911,6 +919,13 @@ class SearchMixin:
                 should_filters.append(
                     Filter(must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))] + proj)
                 )
+                if project_id:
+                    should_filters.append(
+                        Filter(must=[
+                            FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                            FieldCondition(key="metadata.scope", match=MatchValue(value="global")),
+                        ])
+                    )
             if want_shared:
                 should_filters.append(
                     Filter(must=[FieldCondition(
@@ -918,6 +933,16 @@ class SearchMixin:
                         match=MatchValue(value=MemoryVisibility.SHARED.value),
                     )] + proj)
                 )
+                if project_id:
+                    should_filters.append(
+                        Filter(must=[
+                            FieldCondition(
+                                key="metadata.visibility",
+                                match=MatchValue(value=MemoryVisibility.SHARED.value),
+                            ),
+                            FieldCondition(key="metadata.scope", match=MatchValue(value="global")),
+                        ])
+                    )
             if want_standard:
                 should_filters.append(
                     Filter(must=[FieldCondition(
