@@ -125,16 +125,32 @@ def test_native_engine_locate_implemented(mock_bridge, mock_settings):
     assert len(hits) == 0
 
 
-def test_native_engine_detect_changes_not_implemented(mock_bridge, mock_settings):
-    """Test that detect_changes() raises EngineCapabilityError (E5+)."""
+def test_native_engine_detect_changes_implemented(temp_repo, mock_bridge, mock_settings):
+    """Test that detect_changes() works in E5 (persisted vs fresh)."""
+    from unittest.mock import patch
+
     engine = NativeEngine(
-        repo_path="/tmp/test",
+        repo_path=str(temp_repo),
         code_space="code--user123--testrepo",
         bridge=mock_bridge,
         settings=mock_settings,
     )
-    with pytest.raises(EngineCapabilityError, match="detect_changes.*E5"):
-        engine.detect_changes("HEAD~1")
+
+    # Mock the _fetch_persisted_symbols and _parse_fresh_symbols
+    with patch.object(engine, "_fetch_persisted_symbols") as mock_persisted:
+        with patch.object(engine, "_parse_fresh_symbols") as mock_fresh:
+            mock_persisted.return_value = []
+            mock_fresh.return_value = []
+
+            # Should not raise EngineCapabilityError anymore (E5 implements it)
+            report = engine.detect_changes()
+
+            # Should return a ChangeReport
+            assert hasattr(report, "deleted_symbols")
+            assert hasattr(report, "modified_symbols")
+            assert hasattr(report, "added_symbols")
+            assert hasattr(report, "affected_anchors")
+            assert hasattr(report, "summary")
 
 
 def test_native_engine_semantic_layer_not_implemented(mock_bridge, mock_settings):
