@@ -962,7 +962,10 @@ def _dedup_cron_jobs() -> list:
             dedup_all_memories,
             hour=settings.dedup_cron_hours,
             minute=0,
-            timeout=1800,
+            # dedup_all_memories offloads blocking work to threads; thread-pool
+            # calls are not cooperatively cancellable, so an ARQ timeout would
+            # mark the cron failed while the underlying dedup keeps running.
+            timeout=None,
             unique=True,
             max_tries=1,
             run_at_startup=False,
@@ -1080,7 +1083,7 @@ async def dedup_all_memories(ctx: dict) -> dict:
 
     service: MemoryService = ctx["service"]
     semantic = not dreaming_settings.enabled
-    user_ids = service.get_all_user_ids(batch_size=settings.dedup_batch_size)
+    user_ids = await asyncio.to_thread(service.get_all_user_ids, batch_size=settings.dedup_batch_size)
     logger.info(
         f"Dedup cron: found {len(user_ids)} users (semantic phase "
         f"{'on' if semantic else 'off — dreaming owns near-dup merges'})"
@@ -1089,7 +1092,11 @@ async def dedup_all_memories(ctx: dict) -> dict:
     results = []
     for uid in user_ids:
         try:
-            result = service.dedup_memories(uid, semantic=semantic)
+            # Offload blocking dedup work to a thread pool so the event loop
+            # stays responsive (health checks, ARQ timeout, concurrent jobs).
+            # dedup_memories does sync Qdrant scroll pagination + embedding/LLM
+            # calls that would otherwise freeze the loop for minutes at scale.
+            result = await asyncio.to_thread(service.dedup_memories, uid, semantic=semantic)
             results.append(result)
             removed = result["exact_duplicates_removed"] + result["semantic_duplicates_removed"]
             if removed:

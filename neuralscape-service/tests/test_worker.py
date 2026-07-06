@@ -400,6 +400,7 @@ class TestDedupCronGate:
             jobs = worker._dedup_cron_jobs()
         assert len(jobs) == 1
         assert jobs[0].coroutine is worker.dedup_all_memories
+        assert jobs[0].timeout_s is None
 
     def test_graph_worker_settings_uses_gate(self):
         # The class attribute was built through the gate at import time —
