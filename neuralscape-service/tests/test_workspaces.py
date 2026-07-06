@@ -10,7 +10,8 @@ Validates:
 """
 
 import pytest
-from memory_service import get_shared_service
+from unittest.mock import MagicMock
+from memory_service import MemoryService
 from memory.groups import _build_group_id
 from extensions.dreaming.consolidate import pool_key, PoolBatch, decide
 from extensions.dreaming.card import card_target
@@ -47,32 +48,31 @@ def test_workspace_pool_key():
 
 
 def test_workspace_dedup_isolation(service):
-    """Same content in memory vs reference workspace = distinct memories."""
-    # Store the same content in memory workspace (default)
-    mem1 = service.store_raw(
-        content="The user prefers dark mode.",
-        user_id="user123",
-        category="preference",
-        workspace=None,  # memory type
-    )
-    # Store same content in reference workspace
-    ref1 = service.store_raw(
-        content="The user prefers dark mode.",
-        user_id="user123",
-        category="preference",
-        workspace="ref-manual",
-    )
-    # Different IDs — dedup didn't collapse them
-    assert mem1[0].id != ref1[0].id
+    """Memory vs reference workspace target different dedup filters, so the same
+    content can't collapse across workspaces; two memory-type lookups build the
+    same filter, so same-workspace content still dedups."""
 
-    # Storing same content again in memory should dedup
-    mem2 = service.store_raw(
-        content="The user prefers dark mode.",
-        user_id="user123",
-        category="preference",
-        workspace=None,
-    )
-    assert mem2[0].id == mem1[0].id  # dedup hit
+    def _dedup_must(workspace):
+        client = MagicMock()
+        client.scroll.return_value = ([], None)
+        service._memory.vector_store.client = client
+        service._find_by_content_hash(
+            user_id="user123",
+            content_hash="samehash",
+            scope="global",
+            workspace=workspace,
+        )
+        return client.scroll.call_args[1]["scroll_filter"].must
+
+    mem_must = _dedup_must(None)
+    ref_must = _dedup_must("ref-manual")
+    mem_must_again = _dedup_must(None)
+
+    # Memory and reference resolve to different row sets — no cross-workspace
+    # dedup collapse (a user note and a book sentence stay distinct).
+    assert mem_must != ref_must
+    # Two memory-type lookups are identical — same-workspace content dedups.
+    assert mem_must == mem_must_again
 
 
 def test_workspace_card_exclusion():
@@ -161,83 +161,96 @@ async def test_workspace_dreaming_action_filter():
 
 
 def test_workspace_search_default_excludes_reference(service):
-    """Default search (workspaces=None) excludes reference content."""
-    # Store in memory workspace
-    service.store_raw(
-        content="User likes Python",
-        user_id="user123",
-        category="preference",
-        workspace=None,
-    )
-    # Store in reference workspace
-    service.store_raw(
-        content="Reference book chapter on Python",
-        user_id="user123",
-        category="domain_knowledge",
-        workspace="ref-book",
-    )
+    """Default search (workspaces=None → ["memory"]) fences reference content out
+    at the pool post-filter; an explicit workspace list opens the door to it."""
+    # Isolate the vector-pool post-filter: stub the graph + lexical legs.
+    service._search_graph_for_visibility = MagicMock(return_value=[])
+    service._lexical_pool_hits = MagicMock(return_value=[])
 
-    # Default search (workspaces=None → ["memory"])
-    results = service.search(
-        query="Python",
-        user_id="user123",
-        workspaces=None,  # defaults to ["memory"]
+    mem_hit = _qhit(
+        "m1", "User likes Python",
+        {"workspace": None, "category": "preference", "scope": "global"},
     )
-    # Only the memory-type result
-    assert len(results) == 1
-    assert "User likes Python" in results[0].memory
+    ref_hit = _qhit(
+        "r1", "Reference book chapter on Python",
+        {"workspace": "ref-book", "category": "domain_knowledge", "scope": "global"},
+    )
+    service._memory.vector_store.client.query_points.return_value = _qresult([mem_hit, ref_hit])
 
-    # Explicit reference workspace search
-    ref_results = service.search(
-        query="Python",
-        user_id="user123",
-        workspaces=["ref-book"],
-    )
-    assert len(ref_results) == 1
-    assert "Reference book" in ref_results[0].memory
+    # Default: memory only.
+    memories = [r.memory for r in service.search(query="Python", user_id="user123", workspaces=None)]
+    assert "User likes Python" in memories
+    assert "Reference book chapter on Python" not in memories
+
+    # Explicit reference workspace: reference only.
+    service._memory.vector_store.client.query_points.return_value = _qresult([mem_hit, ref_hit])
+    ref_memories = [
+        r.memory
+        for r in service.search(query="Python", user_id="user123", workspaces=["ref-book"])
+    ]
+    assert "Reference book chapter on Python" in ref_memories
+    assert "User likes Python" not in ref_memories
 
 
 def test_workspace_retag_operation(service):
-    """retag_memories supports set_workspace operation."""
-    # Store a memory
-    mem = service.store_raw(
-        content="Test fact",
-        user_id="user123",
-        category="domain_knowledge",
-        tags=["test"],
-    )
-    mid = mem[0].id
+    """retag_memories set_workspace moves a matched row into a reference
+    workspace via a payload update carrying metadata.workspace."""
+    pt = MagicMock()
+    pt.id = "mid-1"
+    pt.payload = {
+        "user_id": "user123",
+        "data": "Test fact",
+        "metadata": {
+            "tags": ["test"],
+            "category": "preference",  # global scope — no project_id needed
+            "visibility": "private",
+            "owner_user_id": "user123",
+        },
+    }
+    client = service._memory.vector_store.client
+    client.scroll.return_value = ([pt], None)  # offset None → single sweep
 
-    # Retag to move to reference workspace
     result = service.retag_memories(
-        caller_user_id="user123",
+        caller_user_id="user123",  # owner → edit permitted
         filters={"tags_contains": ["test"]},
         ops={"set_workspace": "ref-migrated"},
         dry_run=False,
     )
-    assert result["matched"] >= 1
-    assert result["updated"] >= 1
+    assert result["matched"] == 1
+    assert result["updated"] == 1
 
-    # Verify the workspace changed (search in the new workspace)
-    results = service.search(
-        query="Test fact",
-        user_id="user123",
-        workspaces=["ref-migrated"],
-    )
-    assert any(r.id == mid for r in results)
+    # The row was rewritten with the new workspace stamp.
+    service._memory.vector_store.update.assert_called_once()
+    _, kwargs = service._memory.vector_store.update.call_args
+    assert kwargs["payload"]["metadata"]["workspace"] == "ref-migrated"
 
-    # Default search no longer finds it
-    default_results = service.search(
-        query="Test fact",
-        user_id="user123",
-        workspaces=None,  # defaults to ["memory"]
-    )
-    assert not any(r.id == mid for r in default_results)
+
+def _qhit(mid, data, metadata, score=0.9):
+    """Build a mock Qdrant point (query_points hit)."""
+    h = MagicMock()
+    h.id = mid
+    h.score = score
+    h.payload = {"data": data, "metadata": metadata}
+    return h
+
+
+def _qresult(hits):
+    """Wrap hits in a mock query_points result (.points)."""
+    r = MagicMock()
+    r.points = hits
+    return r
 
 
 @pytest.fixture
 def service():
-    """Shared MemoryService for tests (mocked dependencies)."""
-    # This would use a real service in integration tests;
-    # for unit tests, mock Qdrant/Neo4j/Redis.
-    return get_shared_service()
+    """MemoryService with mocked internals — no live embedding/DB (unit test)."""
+    svc = MemoryService()
+    svc._memory = MagicMock(name="Memory")
+    svc._graphiti = MagicMock(name="Graphiti")
+    svc._bridge = MagicMock(name="AsyncBridge")
+    svc._memory.graph = MagicMock()
+    svc._memory.graph.graphiti = svc._graphiti
+    svc._memory.graph._bridge = svc._bridge
+    svc._memory.embedding_model.embed.return_value = [0.1] * 768
+    svc._memory.vector_store.client.query_points.return_value = _qresult([])
+    return svc

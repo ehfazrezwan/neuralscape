@@ -72,8 +72,6 @@ class SearchMixin:
         from qdrant_client.models import (
             FieldCondition,
             Filter,
-            IsEmpty,
-            IsNull,
             MatchAny,
             MatchValue,
         )

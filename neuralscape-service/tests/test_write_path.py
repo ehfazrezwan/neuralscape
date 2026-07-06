@@ -225,13 +225,13 @@ def _stateful_hash_dedup(service):
     dedup behaves like a real Qdrant collection across calls."""
     store: dict[tuple, MemoryResponse] = {}
 
-    def fake_find(user_id, content_hash, scope, project_id=None, visibility=None):
-        return store.get((user_id, content_hash, scope, project_id))
+    def fake_find(user_id, content_hash, scope, project_id=None, visibility=None, workspace=None):
+        return store.get((user_id, content_hash, scope, project_id, workspace))
 
     def record_insert(vectors, ids, payloads):
         for mid, p in zip(ids, payloads):
             meta = p["metadata"]
-            store[(p["user_id"], p["hash"], meta["scope"], meta["project_id"])] = (
+            store[(p["user_id"], p["hash"], meta["scope"], meta["project_id"], meta.get("workspace"))] = (
                 MemoryResponse(
                     id=mid,
                     memory=p["data"],
@@ -565,7 +565,7 @@ class TestStoreRawBatchTwoPass:
             for i in (2, 7)
         }
         service._find_by_content_hash = (
-            lambda user_id, content_hash, scope, project_id=None, visibility=None:
+            lambda user_id, content_hash, scope, project_id=None, visibility=None, workspace=None:
             dup_rows.get(content_hash)
         )
         service._bump_times_derived = MagicMock()

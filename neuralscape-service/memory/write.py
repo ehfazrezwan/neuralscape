@@ -932,12 +932,17 @@ class WriteMixin:
             # absent/None/"memory" (all three represent the memory workspace).
             # Non-None workspace must match exactly.
             if workspace is None:
-                from qdrant_client.models import IsEmpty, IsNull
+                # Memory type: match rows whose workspace is absent/null (legacy
+                # + memory-type rows never write the field) OR explicitly "memory".
+                # The nested should = OR; it excludes reference rows (which carry
+                # a non-memory workspace) so a memory write can't dedup onto a
+                # book passage of identical content.
+                from qdrant_client.models import IsEmptyCondition, PayloadField
                 must.append(
-                    FieldCondition(
-                        key="metadata.workspace",
-                        match=IsEmpty() | IsNull() | MatchValue(value="memory"),
-                    )
+                    Filter(should=[
+                        IsEmptyCondition(is_empty=PayloadField(key="metadata.workspace")),
+                        FieldCondition(key="metadata.workspace", match=MatchValue(value="memory")),
+                    ])
                 )
             else:
                 must.append(FieldCondition(key="metadata.workspace", match=MatchValue(value=workspace)))

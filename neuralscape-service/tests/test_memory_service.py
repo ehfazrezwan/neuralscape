@@ -2195,8 +2195,9 @@ class TestFindByContentHashProjectScope:
         mock_client.scroll.assert_called_once()
         call_kwargs = mock_client.scroll.call_args[1]
         scroll_filter = call_kwargs["scroll_filter"]
-        # 4 conditions when project scope: user_id, hash, scope, project_id
-        assert len(scroll_filter.must) == 4
+        # 5 conditions when project scope: user_id, hash, scope, project_id,
+        # + the WT6 workspace-partition condition (memory-type nested should).
+        assert len(scroll_filter.must) == 5
 
     def test_project_scope_without_project_id_skips_filter(self, service):
         """scope='project' but project_id=None: no project_id filter appended."""
@@ -2212,8 +2213,9 @@ class TestFindByContentHashProjectScope:
         )
 
         scroll_filter = mock_client.scroll.call_args[1]["scroll_filter"]
-        # 3 conditions when no project_id: user_id, hash, scope
-        assert len(scroll_filter.must) == 3
+        # 4 conditions when no project_id: user_id, hash, scope,
+        # + the WT6 workspace-partition condition (memory-type nested should).
+        assert len(scroll_filter.must) == 4
 
 
 # ──────────────────────────────────────────────
