@@ -153,6 +153,15 @@ def extract_keywords(question: str, max_terms: int = 8) -> list[str]:
     return seen
 
 
+def _evidence_shares_keywords(mem, keywords: list[str], min_overlap: int = 2) -> bool:
+    """True when evidence row ``mem`` shares at least ``min_overlap`` keywords."""
+    if not keywords:
+        return False
+    content = (getattr(mem, "memory", None) or "").lower()
+    matches = sum(1 for kw in keywords if kw in content)
+    return matches >= min_overlap
+
+
 def _make_llm_call(tier: ReasoningTier):
     """Build the timeout-capped, lightly-retried answering-LLM callable.
 
@@ -337,8 +346,11 @@ _DISCIPLINES_FULL = """Disciplines (follow strictly):
 3. CONTRADICTIONS: when two memories genuinely contradict, surface BOTH with their
    timestamps, prefer the newer/valid one, and say explicitly that you are preferring it
    because it is newer.
-4. ABSTENTION: "I don't know" is a correct answer. If the evidence does not contain the
-   answer, abstain — NEVER fabricate facts, dates, or memory ids.
+4. ABSTENTION: abstain ONLY when NO evidence row bears on the question. If at least one
+   evidence row is on-topic (shares the question's key entities or keywords) but doesn't
+   give a verbatim answer, commit to the BEST-SUPPORTED answer from that evidence rather
+   than saying "I don't know". When evidence truly has nothing relevant, abstain honestly.
+   NEVER fabricate facts, dates, or memory ids not in the evidence.
 5. CITATIONS: cite supporting memory ids inline like [<id>]. Only ids from the EVIDENCE
    list are valid citations.
 6. PERSPECTIVE: memories distilled from dialogs may carry generic speaker labels
@@ -661,6 +673,35 @@ async def ask_memory(
     if not answer:
         answer = "I don't know — the evidence did not yield an answer."
         abstained = True
+
+    # ── Bounded second-chance pass for false abstention (T2.1) ──
+    # When abstained AND keyword-overlapping evidence exists, re-ask ONCE
+    # with those rows promoted (calibrates recall vs false abstention).
+    if settings.ask_second_chance and abstained and evidence:
+        question_kws = extract_keywords(question)
+        relevant_ids = [
+            mid for mid, mem in evidence.items()
+            if _evidence_shares_keywords(mem, question_kws, min_overlap=2)
+        ]
+        if relevant_ids:
+            searches.append("second-chance (promoted keyword-overlapping rows)")
+            # Re-ask with keyword-overlapping rows promoted to top of evidence.
+            prompt = _build_prompt(
+                question, evidence, tier, 0, enumeration,
+                relevant_ids,  # promoted keyword_ids param
+                keyword_scan_capped,
+            )
+            raw2 = await call(prompt)
+            parsed2 = _parse_llm_json(raw2)
+            if parsed2 is not None and "answer" in parsed2:
+                answer2 = str(parsed2.get("answer") or "").strip()
+                abstained2 = bool(parsed2.get("abstained")) or not answer2
+                if not abstained2 and answer2:
+                    # Second-chance produced a non-abstained answer: use it.
+                    answer = answer2
+                    raw_citations2 = parsed2.get("citations") or []
+                    citations = [str(c) for c in raw_citations2 if str(c) in evidence]
+                    abstained = False
 
     # E2: measured token baseline of everything retrieved as evidence — the
     # cost a memoryless caller would have paid to read it all. Internal key
