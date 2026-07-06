@@ -25,7 +25,10 @@ class EngineCapabilityError(Exception):
 
 @dataclass(frozen=True)
 class LocateHit:
-    """One hybrid-retrieval hit from locate() — symbol name/signature + file:line."""
+    """One hybrid-retrieval hit from locate() — symbol name/signature + file:line.
+
+    E4: enriched with attached memories via anchors (decisions/gotchas/bugfixes).
+    """
 
     fqn: str  # fully-qualified symbol name
     kind: str  # function / class / method / module / ...
@@ -35,6 +38,7 @@ class LocateHit:
     docstring: str  # first paragraph
     score: float
     anchor_id: str | None = None  # E4 (anchors): the stable key for memory linkage
+    memories: list[dict] | None = None  # E4: [{id, content, category, ...}, ...]
 
 
 @dataclass(frozen=True)
