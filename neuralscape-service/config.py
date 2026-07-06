@@ -221,6 +221,11 @@ class Settings(BaseSettings):
     # never overridable (see prompts.append_operator_guidance).
     extraction_instructions_enabled: bool = True
     extraction_instructions_max_tokens: int = 2000
+    # When True, the extraction prompt mandates speaker attribution and
+    # broadens scope to multi-party social/episodic contexts. Default False
+    # (byte-identical to pre-T1.1 prompt) preserves backward compat for
+    # existing solo-coding users. The benchmark opts in via docker-compose.bench.yml.
+    extraction_require_speaker: bool = False
 
     # ── Data-layer connectors ─────────────────────────────────────────
     # When enabled, the service hosts connectors (Notion/Drive/MCP/REST),
