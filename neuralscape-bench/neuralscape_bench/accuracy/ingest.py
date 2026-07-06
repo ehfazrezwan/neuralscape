@@ -67,9 +67,10 @@ async def _with_backoff(coro_factory, *, max_retries: int = 6, base_delay: float
 async def ingest_conversation(client: NeuralscapeClient, conv: Conversation, *,
                               suite: str, manifest: IngestManifest,
                               poll_timeout_s: float, poll_interval_s: float,
+                              namespace: str | None = None,
                               log=print) -> dict:
     """Ingest one conversation's sessions in order (temporal fidelity)."""
-    user_id = bench_user_id(suite, conv.conv_id)
+    user_id = bench_user_id(suite, conv.conv_id, namespace)
     done = manifest.sessions_done(conv.conv_id)
     stored = skipped = failed = 0
     for session in conv.sessions:
@@ -117,6 +118,7 @@ async def ingest_conversation(client: NeuralscapeClient, conv: Conversation, *,
 async def ingest_suite(client: NeuralscapeClient, data: SuiteData, *,
                        manifest: IngestManifest, concurrency: int = 2,
                        poll_timeout_s: float = 300.0, poll_interval_s: float = 1.0,
+                       namespace: str | None = None,
                        log=print) -> dict:
     """Ingest every conversation (bounded parallelism across conversations)."""
     sem = asyncio.Semaphore(max(1, concurrency))
@@ -126,7 +128,8 @@ async def ingest_suite(client: NeuralscapeClient, data: SuiteData, *,
         async with sem:
             res = await ingest_conversation(
                 client, conv, suite=data.suite, manifest=manifest,
-                poll_timeout_s=poll_timeout_s, poll_interval_s=poll_interval_s, log=log)
+                poll_timeout_s=poll_timeout_s, poll_interval_s=poll_interval_s,
+                namespace=namespace, log=log)
             results.append(res)
             done = len(results)
             if done % 10 == 0 or done == len(data.conversations):
