@@ -378,52 +378,52 @@ class NativeEngine:
 
     def detect_changes(
         self,
-        since: str | None = None,
+        since: str | bytes | None = None,
     ) -> ChangeReport:
-        """Blast-radius detection: compare persisted index vs fresh working-tree parse.
+        """Blast-radius detection: compare persisted/snapshot index vs fresh parse.
 
-        E5 implementation: compares the CURRENTLY-persisted code graph (in Neo4j,
-        from the last index) against a FRESH parse of the working tree. Detects
-        deleted/modified/added symbols and computes affected anchors via blast-radius
-        BFS over CALLS/IMPORTS edges.
+        E5: Compares persisted Neo4j index vs fresh working-tree parse.
+        E6: Extends to support snapshot-based comparison — `since` can be snapshot bytes.
 
         Args:
-            since: Reserved for E6 (git ref / snapshot comparison). E5 always
-                   compares persisted-index vs fresh-parse.
+            since: None (E5: persisted vs fresh), or bytes (E6: snapshot vs current).
 
         Returns:
             ChangeReport with deleted/modified/added symbols and affected anchors.
         """
-        # E6 note: `since` will enable git-ref or snapshot-artifact comparison.
-        # E5 always compares the persisted Neo4j index vs a fresh parse.
-        if since is not None:
-            logger.warning(
-                "detect_changes(since=%r) deferred to E6; E5 compares persisted vs fresh",
-                since
+        # Determine baseline: persisted or snapshot
+        if since is None:
+            # E5 path: persisted Neo4j index
+            baseline = self._fetch_persisted_symbols()
+        elif isinstance(since, bytes):
+            # E6 path: snapshot artifact
+            baseline = self._parse_snapshot_symbols(since)
+        else:
+            # Unknown type (git ref support deferred)
+            raise ValueError(
+                f"detect_changes(since): unsupported type {type(since)}. "
+                "E6 supports bytes (snapshot) or None (persisted). Git ref deferred."
             )
-
-        # 1. Fetch persisted symbols from Neo4j
-        persisted = self._fetch_persisted_symbols()
 
         # 2. Parse fresh working tree
         fresh = self._parse_fresh_symbols()
 
         # 3. Classify changes
-        persisted_fqns = {s["fqn"] for s in persisted}
+        baseline_fqns = {s["fqn"] for s in baseline}
         fresh_fqns = {s["fqn"] for s in fresh}
 
-        deleted_symbols = sorted(persisted_fqns - fresh_fqns)
-        added_symbols = sorted(fresh_fqns - persisted_fqns)
+        deleted_symbols = sorted(baseline_fqns - fresh_fqns)
+        added_symbols = sorted(fresh_fqns - baseline_fqns)
 
         # Modified: signature or body_hash changed
-        persisted_map = {s["fqn"]: s for s in persisted}
+        baseline_map = {s["fqn"]: s for s in baseline}
         fresh_map = {s["fqn"]: s for s in fresh}
         modified_symbols = []
-        for fqn in persisted_fqns & fresh_fqns:
-            p = persisted_map[fqn]
+        for fqn in baseline_fqns & fresh_fqns:
+            b = baseline_map[fqn]
             f = fresh_map[fqn]
             # Compare body_hash (cheap) or fall back to signature comparison
-            if p.get("body_hash") != f.get("body_hash"):
+            if b.get("body_hash") != f.get("body_hash"):
                 modified_symbols.append(fqn)
 
         modified_symbols.sort()
@@ -436,9 +436,11 @@ class NativeEngine:
         affected_anchors = self._collect_affected_anchors(affected_fqns)
 
         # 6. Build summary
+        source = "snapshot" if isinstance(since, bytes) else "persisted"
         summary = (
             f"Detected {len(deleted_symbols)} deleted, "
-            f"{len(modified_symbols)} modified, {len(added_symbols)} added symbols. "
+            f"{len(modified_symbols)} modified, {len(added_symbols)} added symbols "
+            f"(vs {source}). "
             f"Blast radius: {len(affected_fqns)} affected symbols, "
             f"{len(affected_anchors)} anchors flagged."
         )
@@ -542,11 +544,263 @@ class NativeEngine:
         )
 
     def export_snapshot(self) -> bytes:
-        """Export snapshot — requires E6 (content-addressed snapshots)."""
-        raise EngineCapabilityError(
-            "export_snapshot() requires E6 (index-in-CI snapshot export). "
-            "E2 stores the live index in Neo4j only."
+        """Export code graph snapshot as portable, content-addressed artifact.
+
+        E6: Serializes all :CodeRepo/:CodeFile/:CodeSymbol nodes, all edges, and all
+        :CodeAnchor nodes + ANCHORED links for the current code_space. Uses stdlib
+        json+gzip for compression. Includes a header with format version, metadata,
+        and content hash for verification.
+
+        Returns:
+            Compressed snapshot bytes (gzipped JSON).
+        """
+        import gzip
+        import json
+
+        # Extract repo name from code_space
+        parts = self.code_space.split("--")
+        repo = parts[-1] if len(parts) >= 3 else "unknown"
+
+        # Fetch all nodes
+        nodes_cypher = """
+        MATCH (n)
+        WHERE n.code_space = $code_space
+          AND (n:CodeRepo OR n:CodeFile OR n:CodeSymbol OR n:CodeAnchor)
+        RETURN labels(n) AS labels, properties(n) AS props
+        """
+        nodes = self._run_cypher(nodes_cypher, code_space=self.code_space)
+
+        # Fetch all edges between code nodes
+        edges_cypher = """
+        MATCH (s)-[r]->(t)
+        WHERE s.code_space = $code_space
+          AND t.code_space = $code_space
+          AND (
+            (s:CodeSymbol AND t:CodeSymbol AND type(r) IN ['CALLS', 'IMPORTS', 'DEFINES', 'INHERITS', 'REFERENCES'])
+            OR (s:CodeSymbol AND t:CodeAnchor AND type(r) = 'ANCHORED')
+          )
+        RETURN type(r) AS rel_type, properties(r) AS props,
+               labels(s) AS source_labels, properties(s) AS source_props,
+               labels(t) AS target_labels, properties(t) AS target_props
+        """
+        edges = self._run_cypher(edges_cypher, code_space=self.code_space)
+
+        # Build snapshot payload
+        snapshot = {
+            "nodes": [
+                {"labels": n["labels"], "properties": n["props"]}
+                for n in nodes
+            ],
+            "edges": [
+                {
+                    "type": e["rel_type"],
+                    "properties": e["props"],
+                    "source": {"labels": e["source_labels"], "properties": e["source_props"]},
+                    "target": {"labels": e["target_labels"], "properties": e["target_props"]},
+                }
+                for e in edges
+            ],
+        }
+
+        # Compute content hash
+        snapshot_json = json.dumps(snapshot, sort_keys=True)
+        content_hash = hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest()
+
+        # Build header
+        header = {
+            "format_version": "1.0",
+            "code_space": self.code_space,
+            "repo": repo,
+            "symbol_count": sum(1 for n in nodes if "CodeSymbol" in n["labels"]),
+            "edge_count": len(edges),
+            "content_hash": content_hash,
+        }
+
+        # Combine header + payload
+        envelope = {
+            "header": header,
+            "snapshot": snapshot,
+        }
+
+        # Serialize and compress
+        envelope_json = json.dumps(envelope, sort_keys=True)
+        compressed = gzip.compress(envelope_json.encode("utf-8"))
+        logger.info(
+            "Exported snapshot: %d nodes, %d edges, %d bytes (code_space=%s)",
+            len(nodes), len(edges), len(compressed), self.code_space,
         )
+        return compressed
+
+    def import_snapshot(self, data: bytes):
+        """Import a code graph snapshot into Neo4j (CI-built index → deployment).
+
+        E6: Rebuilds the code label-space for the snapshot's code_space by MERGE-ing
+        all nodes and edges. Idempotent (re-import produces no duplicates). Uses
+        the graph_patcher-style deadlock retry pattern.
+
+        Args:
+            data: Compressed snapshot bytes (from export_snapshot).
+        """
+        import gzip
+        import json
+
+        # Decompress and parse
+        decompressed = gzip.decompress(data)
+        envelope = json.loads(decompressed.decode("utf-8"))
+
+        header = envelope["header"]
+        snapshot = envelope["snapshot"]
+
+        # Verify format version
+        if header["format_version"] != "1.0":
+            raise ValueError(f"Unsupported snapshot format: {header['format_version']}")
+
+        # Verify content hash
+        snapshot_json = json.dumps(snapshot, sort_keys=True)
+        computed_hash = hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest()
+        if computed_hash != header["content_hash"]:
+            raise ValueError(
+                f"Snapshot corrupted: content_hash mismatch "
+                f"(expected {header['content_hash']}, got {computed_hash})"
+            )
+
+        logger.info(
+            "Importing snapshot: %d nodes, %d edges (code_space=%s)",
+            len(snapshot["nodes"]), len(snapshot["edges"]), header["code_space"]
+        )
+
+        # MERGE nodes (order: CodeRepo → CodeFile → CodeSymbol → CodeAnchor)
+        # to respect foreign-key-like dependencies
+        node_order = ["CodeRepo", "CodeFile", "CodeSymbol", "CodeAnchor"]
+        for label_filter in node_order:
+            nodes_to_merge = [
+                n for n in snapshot["nodes"] if label_filter in n["labels"]
+            ]
+            for node in nodes_to_merge:
+                self._merge_node(node["labels"], node["properties"])
+
+        # MERGE edges
+        for edge in snapshot["edges"]:
+            self._merge_edge(
+                edge["source"]["labels"],
+                edge["source"]["properties"],
+                edge["type"],
+                edge["target"]["labels"],
+                edge["target"]["properties"],
+                edge["properties"],
+            )
+
+        logger.info("Snapshot import complete (code_space=%s)", header["code_space"])
+
+    def _merge_node(self, labels: list[str], props: dict):
+        """MERGE a node by its primary key (code_space + label-specific key).
+
+        Uses deadlock retry pattern.
+        """
+        # Determine primary key based on label
+        label = labels[0]  # First label is the primary type
+        if label == "CodeRepo":
+            match_key = "code_space"
+        elif label == "CodeFile":
+            match_key = "code_space, path"
+        elif label == "CodeSymbol":
+            match_key = "code_space, fqn"
+        elif label == "CodeAnchor":
+            match_key = "code_space, repo, fqn"
+        else:
+            logger.warning(f"Unknown label for merge: {label}")
+            return
+
+        # Build MERGE cypher (SET all properties)
+        label_str = ":".join(labels)
+        set_clauses = ", ".join(f"n.{k} = ${k}" for k in props.keys())
+        cypher = f"""
+        MERGE (n:{label_str} {{{match_key.replace(", ", ": $")}: ${match_key.replace(", ", ", ")}$}})
+        SET {set_clauses}
+        """
+        # Clean up the match clause to use actual keys
+        if label == "CodeRepo":
+            cypher = f"MERGE (n:{label_str} {{code_space: $code_space}}) SET {set_clauses}"
+        elif label == "CodeFile":
+            cypher = f"MERGE (n:{label_str} {{code_space: $code_space, path: $path}}) SET {set_clauses}"
+        elif label == "CodeSymbol":
+            cypher = f"MERGE (n:{label_str} {{code_space: $code_space, fqn: $fqn}}) SET {set_clauses}"
+        elif label == "CodeAnchor":
+            cypher = f"MERGE (n:{label_str} {{code_space: $code_space, repo: $repo, fqn: $fqn}}) SET {set_clauses}"
+
+        self._run_cypher_with_retry(cypher, **props)
+
+    def _merge_edge(
+        self,
+        source_labels: list[str],
+        source_props: dict,
+        rel_type: str,
+        target_labels: list[str],
+        target_props: dict,
+        edge_props: dict,
+    ):
+        """MERGE an edge between two nodes (deadlock retry).
+
+        Resolves source and target by their primary keys, then creates/updates the edge.
+        """
+        # Build match predicates for source and target
+        src_label = source_labels[0]
+        tgt_label = target_labels[0]
+
+        # Determine match keys
+        src_match = self._build_match_predicate(src_label, source_props)
+        tgt_match = self._build_match_predicate(tgt_label, target_props)
+
+        # Build edge SET clause
+        set_clause = (
+            ", ".join(f"r.{k} = ${k}" for k in edge_props.keys())
+            if edge_props
+            else ""
+        )
+        set_part = f"SET {set_clause}" if set_clause else ""
+
+        cypher = f"""
+        MATCH (s:{src_label} {src_match})
+        MATCH (t:{tgt_label} {tgt_match})
+        MERGE (s)-[r:{rel_type}]->(t)
+        {set_part}
+        """
+
+        # Merge all props (source, target, edge)
+        all_props = {**source_props, **target_props, **edge_props}
+        # Prefix source/target props to avoid collisions
+        params = {}
+        for k, v in source_props.items():
+            params[f"src_{k}"] = v
+        for k, v in target_props.items():
+            params[f"tgt_{k}"] = v
+        params.update(edge_props)
+
+        # Rebuild cypher with prefixed params
+        src_match_prefixed = self._build_match_predicate(src_label, source_props, prefix="src_")
+        tgt_match_prefixed = self._build_match_predicate(tgt_label, target_props, prefix="tgt_")
+        cypher = f"""
+        MATCH (s:{src_label} {src_match_prefixed})
+        MATCH (t:{tgt_label} {tgt_match_prefixed})
+        MERGE (s)-[r:{rel_type}]->(t)
+        {set_part}
+        """
+
+        self._run_cypher_with_retry(cypher, **params)
+
+    def _build_match_predicate(self, label: str, props: dict, prefix: str = "") -> str:
+        """Build a Cypher match predicate for a node by its primary key."""
+        if label == "CodeRepo":
+            return f"{{code_space: ${prefix}code_space}}"
+        elif label == "CodeFile":
+            return f"{{code_space: ${prefix}code_space, path: ${prefix}path}}"
+        elif label == "CodeSymbol":
+            return f"{{code_space: ${prefix}code_space, fqn: ${prefix}fqn}}"
+        elif label == "CodeAnchor":
+            return f"{{code_space: ${prefix}code_space, repo: ${prefix}repo, fqn: ${prefix}fqn}}"
+        else:
+            # Fallback: use code_space only
+            return f"{{code_space: ${prefix}code_space}}"
 
     # ── Internal indexing helpers ────────────────────────────────────
 
@@ -1414,6 +1668,40 @@ class NativeEngine:
                     "body_hash": body_hash,
                 })
         return fresh_symbols
+
+    def _parse_snapshot_symbols(self, snapshot_data: bytes) -> list[dict]:
+        """Parse symbols from a snapshot artifact (E6).
+
+        Extracts CodeSymbol nodes from the snapshot and returns them in the same
+        format as _fetch_persisted_symbols() for change comparison.
+
+        Args:
+            snapshot_data: Compressed snapshot bytes.
+
+        Returns:
+            List of symbol dicts with fqn, kind, file, span, body_hash.
+        """
+        import gzip
+        import json
+
+        # Decompress and parse
+        decompressed = gzip.decompress(snapshot_data)
+        envelope = json.loads(decompressed.decode("utf-8"))
+        snapshot = envelope["snapshot"]
+
+        # Extract CodeSymbol nodes
+        symbols = []
+        for node in snapshot["nodes"]:
+            if "CodeSymbol" in node["labels"]:
+                props = node["properties"]
+                symbols.append({
+                    "fqn": props.get("fqn", ""),
+                    "kind": props.get("kind", ""),
+                    "file": props.get("file", ""),
+                    "span": props.get("span", ""),
+                    "body_hash": props.get("body_hash", ""),
+                })
+        return symbols
 
     def _blast_radius_bfs(self, roots: list[str], max_depth: int = 3) -> set[str]:
         """BFS over CALLS/IMPORTS edges from root symbols to find affected symbols.

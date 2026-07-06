@@ -165,16 +165,49 @@ def test_native_engine_semantic_layer_not_implemented(mock_bridge, mock_settings
         engine.semantic_layer()
 
 
-def test_native_engine_export_snapshot_not_implemented(mock_bridge, mock_settings):
-    """Test that export_snapshot() raises EngineCapabilityError (E6+)."""
+def test_native_engine_export_snapshot_implemented(mock_bridge, mock_settings):
+    """Test that export_snapshot() produces deterministic bytes (E6)."""
+    from unittest.mock import patch
+
     engine = NativeEngine(
         repo_path="/tmp/test",
         code_space="code--user123--testrepo",
         bridge=mock_bridge,
         settings=mock_settings,
     )
-    with pytest.raises(EngineCapabilityError, match="export_snapshot.*E6"):
-        engine.export_snapshot()
+
+    # Mock fixture graph data
+    fixture_nodes = [
+        {"labels": ["CodeRepo"], "props": {"code_space": "code--user--repo", "name": "repo", "path": "/repo"}},
+        {"labels": ["CodeSymbol"], "props": {"code_space": "code--user--repo", "fqn": "mod.foo", "kind": "function", "file": "mod.py", "span": "1:5", "body_hash": "abc123"}},
+    ]
+    fixture_edges = [
+        {
+            "rel_type": "ANCHORED",
+            "props": {},
+            "source_labels": ["CodeSymbol"],
+            "source_props": {"code_space": "code--user--repo", "fqn": "mod.foo"},
+            "target_labels": ["CodeAnchor"],
+            "target_props": {"code_space": "code--user--repo", "repo": "repo", "fqn": "mod.foo"},
+        }
+    ]
+
+    with patch.object(engine, "_run_cypher") as mock_cypher:
+        # First call: nodes query
+        # Second call: edges query
+        mock_cypher.side_effect = [fixture_nodes, fixture_edges]
+
+        snapshot_bytes = engine.export_snapshot()
+
+    # Verify it's compressed bytes
+    assert isinstance(snapshot_bytes, bytes)
+    assert len(snapshot_bytes) > 0
+
+    # Verify deterministic: same input → same output
+    with patch.object(engine, "_run_cypher") as mock_cypher:
+        mock_cypher.side_effect = [fixture_nodes, fixture_edges]
+        snapshot_bytes2 = engine.export_snapshot()
+    assert snapshot_bytes == snapshot_bytes2
 
 
 def test_native_engine_parse_file(temp_repo, mock_bridge, mock_settings):
@@ -199,6 +232,242 @@ def test_native_engine_parse_file(temp_repo, mock_bridge, mock_settings):
 
     # Should have some edges (at least the DEFINES for the method)
     assert len(edges) > 0
+
+
+def test_export_import_snapshot_roundtrip(mock_bridge, mock_settings):
+    """Test snapshot export → import round-trip preserves nodes/edges (E6)."""
+    from unittest.mock import patch, call
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user--repo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+
+    # Fixture graph: 2 symbols, 1 anchor, 2 edges
+    fixture_nodes = [
+        {"labels": ["CodeRepo"], "props": {"code_space": "code--user--repo", "name": "repo", "path": "/repo"}},
+        {"labels": ["CodeSymbol"], "props": {"code_space": "code--user--repo", "fqn": "mod.foo", "kind": "function", "file": "mod.py", "span": "1:5", "body_hash": "abc", "degree": 1}},
+        {"labels": ["CodeSymbol"], "props": {"code_space": "code--user--repo", "fqn": "mod.bar", "kind": "function", "file": "mod.py", "span": "7:10", "body_hash": "def", "degree": 0}},
+        {"labels": ["CodeAnchor"], "props": {"code_space": "code--user--repo", "repo": "repo", "fqn": "mod.foo"}},
+    ]
+    fixture_edges = [
+        {
+            "rel_type": "CALLS",
+            "props": {"extraction": "extracted", "epistemic_level": "explicit"},
+            "source_labels": ["CodeSymbol"],
+            "source_props": {"code_space": "code--user--repo", "fqn": "mod.foo"},
+            "target_labels": ["CodeSymbol"],
+            "target_props": {"code_space": "code--user--repo", "fqn": "mod.bar"},
+        },
+        {
+            "rel_type": "ANCHORED",
+            "props": {},
+            "source_labels": ["CodeSymbol"],
+            "source_props": {"code_space": "code--user--repo", "fqn": "mod.foo"},
+            "target_labels": ["CodeAnchor"],
+            "target_props": {"code_space": "code--user--repo", "repo": "repo", "fqn": "mod.foo"},
+        },
+    ]
+
+    # Export
+    with patch.object(engine, "_run_cypher") as mock_cypher:
+        mock_cypher.side_effect = [fixture_nodes, fixture_edges]
+        snapshot_bytes = engine.export_snapshot()
+
+    # Import into a fresh engine (simulate deployment)
+    with patch.object(engine, "_run_cypher_with_retry") as mock_retry:
+        engine.import_snapshot(snapshot_bytes)
+
+        # Verify all nodes were MERGE'd (4 nodes)
+        merge_calls = [c for c in mock_retry.call_args_list]
+        assert len(merge_calls) >= 4  # 4 nodes + 2 edges
+
+        # Check that repo, symbols, anchor were all merged
+        # Extract both positional and keyword args
+        cypher_texts = []
+        for c in merge_calls:
+            if c.args:
+                cypher_texts.append(str(c.args[0]))
+            elif c.kwargs and "cypher" in c.kwargs:
+                cypher_texts.append(str(c.kwargs["cypher"]))
+
+        # Debug: print actual calls if assertions fail
+        if not any("CodeRepo" in c for c in cypher_texts):
+            print(f"DEBUG: No CodeRepo found in {len(cypher_texts)} calls")
+            for i, c in enumerate(cypher_texts):
+                print(f"  Call {i}: {c[:100]}")
+
+        assert any("CodeRepo" in c for c in cypher_texts), f"CodeRepo not found in calls: {cypher_texts}"
+        assert any("CodeSymbol" in c for c in cypher_texts), f"CodeSymbol not found in calls: {cypher_texts}"
+        assert any("CodeAnchor" in c for c in cypher_texts), f"CodeAnchor not found in calls: {cypher_texts}"
+
+
+def test_import_snapshot_idempotent(mock_bridge, mock_settings):
+    """Test that re-importing the same snapshot produces no duplicates (E6)."""
+    from unittest.mock import patch
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user--repo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+
+    # Minimal fixture
+    fixture_nodes = [
+        {"labels": ["CodeSymbol"], "props": {"code_space": "code--user--repo", "fqn": "mod.foo", "kind": "function", "file": "mod.py", "span": "1:5", "body_hash": "abc"}},
+    ]
+    fixture_edges = []
+
+    # Export
+    with patch.object(engine, "_run_cypher") as mock_cypher:
+        mock_cypher.side_effect = [fixture_nodes, fixture_edges]
+        snapshot_bytes = engine.export_snapshot()
+
+    # Import twice
+    with patch.object(engine, "_run_cypher_with_retry") as mock_retry:
+        engine.import_snapshot(snapshot_bytes)
+        first_call_count = mock_retry.call_count
+
+        mock_retry.reset_mock()
+        engine.import_snapshot(snapshot_bytes)
+        second_call_count = mock_retry.call_count
+
+        # Same number of MERGE calls (idempotent)
+        assert first_call_count == second_call_count
+
+
+def test_detect_changes_snapshot_based(temp_repo, mock_bridge, mock_settings):
+    """Test detect_changes with snapshot baseline vs current (E6)."""
+    from unittest.mock import patch
+
+    engine = NativeEngine(
+        repo_path=str(temp_repo),
+        code_space="code--user--repo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+
+    # Create a snapshot with 2 symbols
+    snapshot_symbols = [
+        {"fqn": "mod.foo", "kind": "function", "file": "mod.py", "span": "1:5", "body_hash": "old_hash"},
+        {"fqn": "mod.bar", "kind": "function", "file": "mod.py", "span": "7:10", "body_hash": "bar_hash"},
+    ]
+
+    # Fresh parse has 3 symbols: foo (modified), bar (unchanged), baz (added)
+    fresh_symbols = [
+        {"fqn": "mod.foo", "kind": "function", "file": "mod.py", "span": "1:5", "body_hash": "new_hash"},  # modified
+        {"fqn": "mod.bar", "kind": "function", "file": "mod.py", "span": "7:10", "body_hash": "bar_hash"},  # unchanged
+        {"fqn": "mod.baz", "kind": "function", "file": "mod.py", "span": "12:15", "body_hash": "baz_hash"},  # added
+    ]
+
+    # Create snapshot bytes
+    import gzip
+    import json
+    snapshot_data = {
+        "nodes": [
+            {"labels": ["CodeSymbol"], "properties": s}
+            for s in snapshot_symbols
+        ],
+        "edges": [],
+    }
+    header = {
+        "format_version": "1.0",
+        "code_space": "code--user--repo",
+        "repo": "repo",
+        "symbol_count": 2,
+        "edge_count": 0,
+        "content_hash": "dummy",
+    }
+    import hashlib
+    snapshot_json = json.dumps(snapshot_data, sort_keys=True)
+    header["content_hash"] = hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest()
+    envelope = {"header": header, "snapshot": snapshot_data}
+    snapshot_bytes = gzip.compress(json.dumps(envelope, sort_keys=True).encode("utf-8"))
+
+    with patch.object(engine, "_parse_fresh_symbols", return_value=fresh_symbols):
+        with patch.object(engine, "_blast_radius_bfs", return_value=set()):
+            report = engine.detect_changes(since=snapshot_bytes)
+
+    # Verify changes detected
+    assert "mod.foo" in report.modified_symbols  # body_hash changed
+    assert "mod.baz" in report.added_symbols  # new symbol
+    assert len(report.deleted_symbols) == 0  # nothing deleted
+    assert "snapshot" in report.summary  # confirms snapshot baseline
+
+
+def test_detect_changes_persisted_still_works(temp_repo, mock_bridge, mock_settings):
+    """Test that E5's persisted-vs-fresh path still works after E6 (E5 regression test)."""
+    from unittest.mock import patch
+
+    engine = NativeEngine(
+        repo_path=str(temp_repo),
+        code_space="code--user--repo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+
+    persisted = [
+        {"fqn": "mod.foo", "kind": "function", "file": "mod.py", "span": "1:5", "body_hash": "abc"},
+    ]
+    fresh = [
+        {"fqn": "mod.bar", "kind": "function", "file": "mod.py", "span": "7:10", "body_hash": "def"},
+    ]
+
+    with patch.object(engine, "_fetch_persisted_symbols", return_value=persisted):
+        with patch.object(engine, "_parse_fresh_symbols", return_value=fresh):
+            with patch.object(engine, "_blast_radius_bfs", return_value=set()):
+                report = engine.detect_changes(since=None)
+
+    # Verify E5 behavior: persisted baseline
+    assert "mod.foo" in report.deleted_symbols
+    assert "mod.bar" in report.added_symbols
+    assert "persisted" in report.summary  # confirms persisted baseline
+
+
+def test_snapshot_anchors_survive_roundtrip(mock_bridge, mock_settings):
+    """Test that CodeAnchor nodes and ANCHORED edges survive snapshot round-trip (E6)."""
+    from unittest.mock import patch
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user--repo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+
+    # Fixture with anchor
+    fixture_nodes = [
+        {"labels": ["CodeSymbol"], "props": {"code_space": "code--user--repo", "fqn": "mod.foo", "kind": "function", "file": "mod.py", "span": "1:5", "body_hash": "abc"}},
+        {"labels": ["CodeAnchor"], "props": {"code_space": "code--user--repo", "repo": "repo", "fqn": "mod.foo"}},
+    ]
+    fixture_edges = [
+        {
+            "rel_type": "ANCHORED",
+            "props": {},
+            "source_labels": ["CodeSymbol"],
+            "source_props": {"code_space": "code--user--repo", "fqn": "mod.foo"},
+            "target_labels": ["CodeAnchor"],
+            "target_props": {"code_space": "code--user--repo", "repo": "repo", "fqn": "mod.foo"},
+        }
+    ]
+
+    # Export
+    with patch.object(engine, "_run_cypher") as mock_cypher:
+        mock_cypher.side_effect = [fixture_nodes, fixture_edges]
+        snapshot_bytes = engine.export_snapshot()
+
+    # Import and verify anchor was restored
+    with patch.object(engine, "_run_cypher_with_retry") as mock_retry:
+        engine.import_snapshot(snapshot_bytes)
+
+        cypher_texts = [str(c.args[0]) if c.args else "" for c in mock_retry.call_args_list]
+        # Verify CodeAnchor MERGE happened
+        assert any("CodeAnchor" in c for c in cypher_texts)
+        # Verify ANCHORED edge was created
+        assert any("ANCHORED" in c for c in cypher_texts)
 
 
 def test_native_engine_file_hash(temp_repo, mock_bridge, mock_settings):
