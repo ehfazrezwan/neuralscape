@@ -1089,7 +1089,11 @@ async def dedup_all_memories(ctx: dict) -> dict:
     results = []
     for uid in user_ids:
         try:
-            result = service.dedup_memories(uid, semantic=semantic)
+            # Offload blocking dedup work to a thread pool so the event loop
+            # stays responsive (health checks, ARQ timeout, concurrent jobs).
+            # dedup_memories does sync Qdrant scroll pagination + embedding/LLM
+            # calls that would otherwise freeze the loop for minutes at scale.
+            result = await asyncio.to_thread(service.dedup_memories, uid, semantic=semantic)
             results.append(result)
             removed = result["exact_duplicates_removed"] + result["semantic_duplicates_removed"]
             if removed:
