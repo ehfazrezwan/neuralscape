@@ -584,17 +584,21 @@ class TestPerspectiveResolution:
         assert "PERSPECTIVE:" in discipline_section
 
     @pytest.mark.asyncio
-    async def test_perspective_forbids_meta_disclaimers(self):
-        """The discipline explicitly forbids 'I do not have X, but you mentioned…'
-        hedging when evidence answers the substance."""
+    async def test_perspective_forbids_meta_disclaimers_on_label_mismatch(self):
+        """The discipline forbids 'I don't have X, but you mentioned…' hedging
+        specifically for speaker/pronoun/label mismatches (not a blanket rule)."""
         svc = _service([_mem("m1", "x")])
         llm = _answer_llm("ans")
         await ask_memory(svc, question="q?", user_id="u",
                          reasoning_level="high", llm_call=llm)
         prompt = llm.prompts[0]
         discipline_section = prompt.split("EVIDENCE:")[0]
-        assert "Never hedge with meta-disclaimers" in discipline_section
-        assert "I do not have X, but you mentioned" in discipline_section
+        # The narrowed wording: applies to perspective/label mismatch only
+        assert "speaker/pronoun/label mismatch" in discipline_section
+        assert "Do not hedge by denying you know a" in discipline_section
+        assert "fact solely because of a speaker/pronoun/label mismatch" in discipline_section
+        # The blanket "commit to the fact itself" is gone (over-commit fix)
+        assert "when the evidence directly answers the substance" not in discipline_section
 
     @pytest.mark.asyncio
     async def test_perspective_directs_first_person_answering(self):
@@ -643,6 +647,31 @@ class TestPerspectiveResolution:
         assert "by Speaker 2" in prompt
         assert "ingestion artifacts, not different people" in prompt
         assert out["abstained"] is False
+
+    @pytest.mark.asyncio
+    async def test_perspective_discipline_preserves_key_elements(self):
+        """T2.1b fix: discipline 6 still forbids perspective-based abstention,
+        but the blanket over-commit clause is narrowed to that scope."""
+        svc = _service([_mem("m1", "x")])
+        llm = _answer_llm("ans")
+        await ask_memory(svc, question="q?", user_id="u",
+                         reasoning_level="high", llm_call=llm)
+        prompt = llm.prompts[0]
+        discipline_section = prompt.split("EVIDENCE:")[0]
+
+        # KEEP: persona-first + label-mismatch-not-grounds-to-abstain guidance
+        assert "answer as the addressed persona" in discipline_section
+        assert "FIRST-PERSON" in discipline_section
+        assert "a label or pronoun mismatch is NEVER" in discipline_section
+        assert "grounds to abstain or to deny knowing the fact" in discipline_section
+        assert "by <speaker>" in discipline_section
+        assert "ingestion artifacts, not different people" in discipline_section
+
+        # NARROWED: no longer a blanket "commit to the fact itself" — it's
+        # scoped to perspective/label-mismatch cases only
+        assert "Do not hedge by denying you know a" in discipline_section
+        assert "speaker/pronoun/label mismatch" in discipline_section
+        assert "commit to the substance the evidence provides" in discipline_section
 
 
 # ──────────────────────────────────────────────

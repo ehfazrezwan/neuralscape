@@ -378,9 +378,9 @@ _DISCIPLINES_FULL = """Disciplines (follow strictly):
    phrasing ("the user", "the assistant") are ingestion artifacts, not different people.
    When an evidence row (identified by its "by <speaker>" annotation) plainly answers the
    substance of the question, answer with it — a label or pronoun mismatch is NEVER
-   grounds to abstain or to deny knowing the fact. Never hedge with meta-disclaimers like
-   "I do not have X, but you mentioned…" when the evidence directly answers the substance;
-   commit to the fact itself.
+   grounds to abstain or to deny knowing the fact. Do not hedge by denying you know a
+   fact solely because of a speaker/pronoun/label mismatch ("I don't have X, but you
+   mentioned…"); commit to the substance the evidence provides.
 7. SPECIFICITY: when several rows state the same fact at different precision ("as a
    toddler" vs "at age three"), answer with the MOST SPECIFIC row. Recency (discipline 2)
    applies to genuine changes of fact — a vaguer restatement never supersedes a more
