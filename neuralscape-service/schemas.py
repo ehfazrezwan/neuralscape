@@ -1137,6 +1137,9 @@ class MemoryResponse(BaseModel):
     confidence: float | None = None
     expires_at: str | None = None
 
+    # T1.2: Speaker attribution (null for memories without speaker metadata)
+    speaker: str | None = None
+
     # Provenance epistemics (A1; null for memories that predate it)
     derived_from: list[str] | None = None
     epistemic_level: str | None = None
