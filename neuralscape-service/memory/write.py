@@ -21,6 +21,7 @@ from memory.ranking import _times_derived_from_metadata
 from memory.retry import retry_transient
 
 logger = logging.getLogger(__name__)
+_SPEAKER_UNSET = object()
 
 
 def _validate_speaker(speaker: str | None) -> str | None:
@@ -924,6 +925,27 @@ class WriteMixin:
             logger.warning(f"Graph enrichment failed (non-critical): {e}")
             return False
 
+    def _backfill_speaker_on_existing_memory(
+        self,
+        *,
+        memory_id: str,
+        speaker: str,
+    ) -> bool:
+        """Best-effort patch to attach missing speaker metadata onto an existing row."""
+        try:
+            client = self._memory.vector_store.client
+            collection = settings.qdrant_collection
+            client.set_payload(
+                collection_name=collection,
+                payload={"speaker": speaker},
+                points=[memory_id],
+                key="metadata",
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"Speaker backfill failed for {memory_id} (non-fatal): {e}")
+            return False
+
     def _find_by_content_hash(
         self,
         user_id: str,
@@ -931,8 +953,9 @@ class WriteMixin:
         scope: str,
         project_id: str | None = None,
         visibility: str | None = None,
+        speaker: str | None | object = _SPEAKER_UNSET,
     ) -> MemoryResponse | None:
-        """Look up a memory by (user_id, hash, scope, visibility) for dedup.
+        """Look up a memory by dedup identity for a best-effort dedup hit.
 
         Returns the existing MemoryResponse on hit, or None if not found.
         Failures here are non-fatal — we'd rather risk a duplicate than
@@ -942,9 +965,13 @@ class WriteMixin:
         (e.g. a dictator's private note vs. an authoritative ``standard``) are
         distinct memories, so a ``standard`` write must not dedup onto a
         pre-existing ``private``/``shared`` row of the same content.
+        ``speaker`` is tri-state:
+        - omitted: preserve legacy behavior (speaker-agnostic lookup)
+        - ``None``: only match rows with no speaker metadata
+        - string: only match rows with that exact speaker
         """
         try:
-            from qdrant_client.models import FieldCondition, Filter, MatchValue
+            from qdrant_client.models import FieldCondition, Filter, IsNullCondition, MatchValue, PayloadField
             client = self._memory.vector_store.client
             collection = settings.qdrant_collection
             must = [
@@ -956,6 +983,10 @@ class WriteMixin:
                 must.append(FieldCondition(key="metadata.visibility", match=MatchValue(value=visibility)))
             if scope == "project" and project_id:
                 must.append(FieldCondition(key="metadata.project_id", match=MatchValue(value=project_id)))
+            if speaker is None:
+                must.append(IsNullCondition(is_null=PayloadField(key="metadata.speaker")))
+            elif speaker is not _SPEAKER_UNSET:
+                must.append(FieldCondition(key="metadata.speaker", match=MatchValue(value=speaker)))
             points, _ = client.scroll(
                 collection_name=collection,
                 scroll_filter=Filter(must=must),
@@ -993,6 +1024,7 @@ class WriteMixin:
                 owner_user_id=metadata.get("owner_user_id"),
                 title=metadata.get("title"),
                 token_estimate=metadata.get("token_estimate"),
+                speaker=metadata.get("speaker"),
             )
         except Exception as e:
             logger.warning(f"Content-hash dedup lookup failed (non-fatal): {e}")
@@ -1356,7 +1388,7 @@ class WriteMixin:
         fact_meta: list[tuple[str, str, str | None, str | None]] = []  # (category, scope, project_id, speaker) per fact
         # Ordered slots: ("new", index-into-texts) | ("dup", existing response)
         ordered: list[tuple[str, object]] = []
-        seen_in_batch: set[tuple[str, str, str | None]] = set()
+        seen_in_batch: set[tuple[str, str, str | None, str | None]] = set()
         dedup_hits = 0
 
         # Normalize speakers list: pad to len(facts) with None if shorter/absent
@@ -1395,7 +1427,7 @@ class WriteMixin:
             chash = content_hash(content)
 
             # In-batch duplicate (extraction-window overlap): keep the first.
-            batch_key = (chash, scope_val, fact_project_id)
+            batch_key = (chash, scope_val, fact_project_id, speaker)
             if batch_key in seen_in_batch:
                 continue
             seen_in_batch.add(batch_key)
@@ -1403,13 +1435,32 @@ class WriteMixin:
             # Storage-level idempotency (audit 27 #21). visibility=None on
             # purpose: conversation-path rows don't stamp metadata.visibility,
             # so a visibility condition would never match them.
-            existing = self._find_by_content_hash(
+            lookup_kwargs = dict(
                 user_id=user_id,
                 content_hash=chash,
                 scope=scope_val,
                 project_id=fact_project_id,
                 visibility=None,
             )
+            existing = (
+                self._find_by_content_hash(**lookup_kwargs)
+                if speaker is None
+                else self._find_by_content_hash(**lookup_kwargs, speaker=speaker)
+            )
+            if existing is None and speaker is not None:
+                existing = self._find_by_content_hash(
+                    user_id=user_id,
+                    content_hash=chash,
+                    scope=scope_val,
+                    project_id=fact_project_id,
+                    visibility=None,
+                    speaker=None,
+                )
+                if existing is not None and self._backfill_speaker_on_existing_memory(
+                    memory_id=existing.id,
+                    speaker=speaker,
+                ):
+                    existing.speaker = speaker
             if existing is not None:
                 # Same reinforcement semantics as the raw path: count the
                 # re-derivation on the survivor, resurrect it if a dream

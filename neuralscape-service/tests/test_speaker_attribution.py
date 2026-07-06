@@ -215,6 +215,32 @@ class TestConversationExtractionWithSpeakers:
         user_fact = next(m for m in stored if "SaaS" in m.memory)
         assert user_fact.speaker == "user"
 
+    def test_same_content_from_different_speakers_stores_distinct_rows(self):
+        svc, client = _mock_service()
+        _mock_extraction(
+            client,
+            [
+                "[personal_fact] Ana: likes sushi",
+                "[personal_fact] Bob: likes sushi",
+            ],
+        )
+
+        stored = svc.extract_and_store(
+            messages=[
+                {"role": "user", "content": "Ana: I like sushi"},
+                {"role": "user", "content": "Bob: I like sushi"},
+            ],
+            user_id="ehfaz",
+        )
+
+        assert len(stored) == 2
+        assert {m.speaker for m in stored} == {"Ana", "Bob"}
+
+        insert_call = svc._memory.vector_store.insert.call_args
+        payloads = insert_call.kwargs["payloads"]
+        assert len(payloads) == 2
+        assert {p["metadata"]["speaker"] for p in payloads} == {"Ana", "Bob"}
+
 
 # ──────────────────────────────────────────────
 # Backward compatibility
@@ -326,6 +352,33 @@ class TestSchemaAndReadPath:
         resp = svc._mem_to_response(mem)
         assert resp.speaker is None
 
+    def test_find_by_content_hash_surfaces_speaker(self):
+        svc = MemoryService()
+        svc._memory = MagicMock()
+        svc._memory.vector_store.client = MagicMock()
+        point = MagicMock()
+        point.id = "m1"
+        point.payload = {
+            "data": "owns a black lab named Trooper",
+            "created_at": "2026-07-06T00:00:00Z",
+            "metadata": {
+                "category": "personal_fact",
+                "scope": "global",
+                "speaker": "Ana",
+            },
+        }
+        svc._memory.vector_store.client.scroll.return_value = ([point], None)
+
+        resp = svc._find_by_content_hash(
+            user_id="ehfaz",
+            content_hash="abc123",
+            scope="global",
+            speaker="Ana",
+        )
+
+        assert resp is not None
+        assert resp.speaker == "Ana"
+
 
 # ──────────────────────────────────────────────
 # Dataset compatibility (preserve speaker names)
@@ -413,3 +466,32 @@ class TestFullRoundtrip:
                 assert resp.speaker == "Ana"
             elif "React" in resp.memory:
                 assert resp.speaker == "assistant"
+
+
+class TestSpeakerAwareDedup:
+    def test_existing_speakerless_row_is_backfilled_on_dedup_hit(self):
+        svc, _ = _mock_service()
+        existing = MemoryResponse(
+            id="existing-1",
+            memory="likes sushi",
+            category="personal_fact",
+            scope="global",
+        )
+        svc._find_by_content_hash = MagicMock(side_effect=[None, existing])
+        svc._backfill_speaker_on_existing_memory = MagicMock(return_value=True)
+
+        stored = svc._batch_store_facts(
+            facts=[("personal_fact", "likes sushi")],
+            speakers=["Ana"],
+            user_id="ehfaz",
+        )
+
+        assert len(stored) == 1
+        assert stored[0].id == "existing-1"
+        assert stored[0].speaker == "Ana"
+        svc._backfill_speaker_on_existing_memory.assert_called_once_with(
+            memory_id="existing-1",
+            speaker="Ana",
+        )
+        assert svc._find_by_content_hash.call_args_list[0].kwargs["speaker"] == "Ana"
+        assert svc._find_by_content_hash.call_args_list[1].kwargs["speaker"] is None
