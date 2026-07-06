@@ -386,6 +386,29 @@ class TestProcessMemoryRetag:
         assert worker.process_memory_retag not in worker.GraphWorkerSettings.functions
 
 
+class TestDedupCronGate:
+    """DEDUP_CRON_HOURS=[] disables the cron instead of registering an
+    empty-hour cron — arq's next-fire search never matches an empty set and
+    spins forever inside the event loop (bench-stack incident 2026-07-06)."""
+
+    def test_empty_hours_registers_no_cron(self):
+        with patch.object(worker.settings, "dedup_cron_hours", set()):
+            assert worker._dedup_cron_jobs() == []
+
+    def test_nonempty_hours_registers_cron(self):
+        with patch.object(worker.settings, "dedup_cron_hours", {0, 6, 12, 18}):
+            jobs = worker._dedup_cron_jobs()
+        assert len(jobs) == 1
+        assert jobs[0].coroutine is worker.dedup_all_memories
+
+    def test_graph_worker_settings_uses_gate(self):
+        # The class attribute was built through the gate at import time —
+        # whatever the current config, no registered cron may carry an
+        # empty hour set.
+        for job in worker.GraphWorkerSettings.cron_jobs:
+            assert getattr(job, "hour", None) not in (set(), frozenset())
+
+
 class TestWorkerTopology:
     def test_graph_worker_owns_graph_queue_and_enrichment(self):
         from config import settings
