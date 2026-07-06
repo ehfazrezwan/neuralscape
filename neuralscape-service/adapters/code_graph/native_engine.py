@@ -378,13 +378,77 @@ class NativeEngine:
 
     def detect_changes(
         self,
-        since: str,
+        since: str | None = None,
     ) -> ChangeReport:
-        """Blast-radius detection — requires E5 (historical snapshots)."""
-        raise EngineCapabilityError(
-            "detect_changes() requires E5 (incremental diff + blast-radius BFS). "
-            "E2 implements incremental indexing by content-hash but no historical "
-            "snapshot comparison. Re-index and manually compare the code_space."
+        """Blast-radius detection: compare persisted index vs fresh working-tree parse.
+
+        E5 implementation: compares the CURRENTLY-persisted code graph (in Neo4j,
+        from the last index) against a FRESH parse of the working tree. Detects
+        deleted/modified/added symbols and computes affected anchors via blast-radius
+        BFS over CALLS/IMPORTS edges.
+
+        Args:
+            since: Reserved for E6 (git ref / snapshot comparison). E5 always
+                   compares persisted-index vs fresh-parse.
+
+        Returns:
+            ChangeReport with deleted/modified/added symbols and affected anchors.
+        """
+        # E6 note: `since` will enable git-ref or snapshot-artifact comparison.
+        # E5 always compares the persisted Neo4j index vs a fresh parse.
+        if since is not None:
+            logger.warning(
+                "detect_changes(since=%r) deferred to E6; E5 compares persisted vs fresh",
+                since
+            )
+
+        # 1. Fetch persisted symbols from Neo4j
+        persisted = self._fetch_persisted_symbols()
+
+        # 2. Parse fresh working tree
+        fresh = self._parse_fresh_symbols()
+
+        # 3. Classify changes
+        persisted_fqns = {s["fqn"] for s in persisted}
+        fresh_fqns = {s["fqn"] for s in fresh}
+
+        deleted_symbols = sorted(persisted_fqns - fresh_fqns)
+        added_symbols = sorted(fresh_fqns - persisted_fqns)
+
+        # Modified: signature or body_hash changed
+        persisted_map = {s["fqn"]: s for s in persisted}
+        fresh_map = {s["fqn"]: s for s in fresh}
+        modified_symbols = []
+        for fqn in persisted_fqns & fresh_fqns:
+            p = persisted_map[fqn]
+            f = fresh_map[fqn]
+            # Compare body_hash (cheap) or fall back to signature comparison
+            if p.get("body_hash") != f.get("body_hash"):
+                modified_symbols.append(fqn)
+
+        modified_symbols.sort()
+
+        # 4. Blast-radius BFS: walk CALLS/IMPORTS from deleted+modified symbols
+        blast_roots = deleted_symbols + modified_symbols
+        affected_fqns = self._blast_radius_bfs(blast_roots, max_depth=3)
+
+        # 5. Collect anchors for affected symbols
+        affected_anchors = self._collect_affected_anchors(affected_fqns)
+
+        # 6. Build summary
+        summary = (
+            f"Detected {len(deleted_symbols)} deleted, "
+            f"{len(modified_symbols)} modified, {len(added_symbols)} added symbols. "
+            f"Blast radius: {len(affected_fqns)} affected symbols, "
+            f"{len(affected_anchors)} anchors flagged."
+        )
+
+        return ChangeReport(
+            deleted_symbols=deleted_symbols,
+            modified_symbols=modified_symbols,
+            added_symbols=added_symbols,
+            affected_anchors=affected_anchors,
+            summary=summary,
         )
 
     def semantic_layer(self) -> list[SemanticFact]:
@@ -806,11 +870,13 @@ class NativeEngine:
             language=language,
         )
 
-        # Store symbols
+        # Store symbols (E5: persist body_hash for change detection)
         for sym in symbols:
+            # Compute body hash from the symbol's source range
+            body_hash = self._compute_symbol_body_hash(rel_path, sym)
             sym_cypher = """
             MERGE (s:CodeSymbol {code_space: $code_space, fqn: $fqn})
-            SET s.kind = $kind, s.file = $file, s.span = $span
+            SET s.kind = $kind, s.file = $file, s.span = $span, s.body_hash = $body_hash
             """
             span = f"{sym.line}:{sym.end_line}"
             self._run_cypher_with_retry(
@@ -820,6 +886,7 @@ class NativeEngine:
                 kind=sym.kind,
                 file=sym.file,
                 span=span,
+                body_hash=body_hash,
             )
 
         # Store edges
@@ -1270,6 +1337,156 @@ class NativeEngine:
                 "edge": edges[i] if i < len(edges) else None,
             })
         return path
+
+    # ── E5 detect_changes helpers ───────────────────────────────────
+
+    def _compute_symbol_body_hash(self, rel_path: str, sym: _Symbol) -> str:
+        """Compute SHA256 hash of a symbol's body content (for change detection).
+
+        Reads the source file and hashes the lines covering the symbol's span.
+        Falls back to empty hash if file doesn't exist or read fails.
+        """
+        try:
+            file_path = self.repo_path / rel_path
+            if not file_path.exists():
+                return ""
+            lines = file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+            # Extract lines from sym.line to sym.end_line (1-indexed)
+            start = max(0, sym.line - 1)
+            end = min(len(lines), sym.end_line)
+            body_lines = lines[start:end]
+            body_text = "\n".join(body_lines)
+            return hashlib.sha256(body_text.encode("utf-8")).hexdigest()
+        except Exception:
+            logger.debug(f"Failed to compute body_hash for {sym.fqn}", exc_info=True)
+            return ""
+
+    def _fetch_persisted_symbols(self) -> list[dict]:
+        """Fetch all persisted symbols from Neo4j with their body_hash."""
+        cypher = """
+        MATCH (s:CodeSymbol {code_space: $code_space})
+        RETURN s.fqn AS fqn, s.kind AS kind, s.file AS file, s.span AS span,
+               s.body_hash AS body_hash
+        """
+        results = self._run_cypher(cypher, code_space=self.code_space)
+        return [
+            {
+                "fqn": r["fqn"],
+                "kind": r.get("kind", ""),
+                "file": r.get("file", ""),
+                "span": r.get("span", ""),
+                "body_hash": r.get("body_hash", ""),
+            }
+            for r in results
+        ]
+
+    def _parse_fresh_symbols(self) -> list[dict]:
+        """Parse the working tree and return symbol descriptors with body_hash.
+
+        Re-parses all source files in the repo (same as index() but without writing).
+        """
+        file_patterns = {
+            "*.py": "python",
+            "*.ts": "typescript",
+            "*.tsx": "typescript",
+            "*.js": "javascript",
+            "*.jsx": "javascript",
+            "*.go": "go",
+            "*.rs": "rust",
+            "*.java": "java",
+        }
+        source_files = []
+        for pattern, lang in file_patterns.items():
+            for f in self.repo_path.rglob(pattern):
+                source_files.append((f, lang))
+
+        fresh_symbols = []
+        for source_file, lang in source_files:
+            rel_path = str(source_file.relative_to(self.repo_path))
+            symbols, _ = self._parse_file(source_file, self.repo_path, lang)
+            for sym in symbols:
+                body_hash = self._compute_symbol_body_hash(rel_path, sym)
+                fresh_symbols.append({
+                    "fqn": sym.fqn,
+                    "kind": sym.kind,
+                    "file": sym.file,
+                    "span": f"{sym.line}:{sym.end_line}",
+                    "body_hash": body_hash,
+                })
+        return fresh_symbols
+
+    def _blast_radius_bfs(self, roots: list[str], max_depth: int = 3) -> set[str]:
+        """BFS over CALLS/IMPORTS edges from root symbols to find affected symbols.
+
+        Args:
+            roots: FQNs of deleted/modified symbols (blast epicenters).
+            max_depth: Maximum BFS depth (default 3).
+
+        Returns:
+            Set of affected FQNs (includes roots).
+        """
+        if not roots:
+            return set()
+
+        # BFS traversal: start from roots, walk outward over CALLS/IMPORTS edges
+        # (both incoming and outgoing — a deleted function affects callers AND callees)
+        affected = set(roots)
+        visited = set(roots)
+        queue = [(fqn, 0) for fqn in roots]
+
+        while queue:
+            current_fqn, depth = queue.pop(0)
+            if depth >= max_depth:
+                continue
+
+            # Fetch neighbors via CALLS/IMPORTS edges (both directions)
+            neighbors = self._get_blast_neighbors(current_fqn)
+            for neighbor_fqn in neighbors:
+                if neighbor_fqn not in visited:
+                    visited.add(neighbor_fqn)
+                    affected.add(neighbor_fqn)
+                    queue.append((neighbor_fqn, depth + 1))
+
+        return affected
+
+    def _get_blast_neighbors(self, fqn: str) -> list[str]:
+        """Get neighbors of a symbol via CALLS/IMPORTS edges (both directions).
+
+        Returns list of neighbor FQNs.
+        """
+        # Out-edges: symbols this one calls/imports
+        out_cypher = """
+        MATCH (s:CodeSymbol {code_space: $code_space, fqn: $fqn})-[r]->(t:CodeSymbol)
+        WHERE type(r) IN ['CALLS', 'IMPORTS']
+        RETURN DISTINCT t.fqn AS neighbor
+        """
+        # In-edges: symbols that call/import this one
+        in_cypher = """
+        MATCH (s:CodeSymbol {code_space: $code_space, fqn: $fqn})<-[r]-(t:CodeSymbol)
+        WHERE type(r) IN ['CALLS', 'IMPORTS']
+        RETURN DISTINCT t.fqn AS neighbor
+        """
+        out_results = self._run_cypher(out_cypher, code_space=self.code_space, fqn=fqn)
+        in_results = self._run_cypher(in_cypher, code_space=self.code_space, fqn=fqn)
+
+        neighbors = [r["neighbor"] for r in out_results + in_results]
+        return list(set(neighbors))  # dedup
+
+    def _collect_affected_anchors(self, affected_fqns: set[str]) -> list[str]:
+        """Collect anchor keys for all affected symbols.
+
+        Returns list of anchor keys in the format "<repo>::<fqn>".
+        """
+        if not affected_fqns:
+            return []
+
+        # Extract repo from code_space
+        parts = self.code_space.split("--")
+        repo = parts[-1] if len(parts) >= 3 else "unknown"
+
+        # Build anchor keys
+        anchor_keys = [f"{repo}::{fqn}" for fqn in affected_fqns]
+        return sorted(anchor_keys)
 
     # ── Neo4j bridge helpers (follow graph_patcher.py pattern) ──────
 
