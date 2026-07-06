@@ -946,6 +946,30 @@ def _dreaming_cron_hours() -> list[int]:
     return [(anchor + h) % 24 for h in range(0, 24, interval)]
 
 
+def _dedup_cron_jobs() -> list:
+    """Dedup cron entry, or nothing when ``DEDUP_CRON_HOURS`` is empty.
+
+    An empty hour set means "cron disabled" and must never reach arq: arq's
+    next-fire search (``cron.py _get_next_dt``) iterates candidate datetimes
+    until one matches — an empty hour set never matches, so it spins forever
+    INSIDE the event loop, pegging a core and starving every queued job
+    (observed on the bench stack, 2026-07-06).
+    """
+    if not settings.dedup_cron_hours:
+        return []
+    return [
+        cron(
+            dedup_all_memories,
+            hour=settings.dedup_cron_hours,
+            minute=0,
+            timeout=1800,
+            unique=True,
+            max_tries=1,
+            run_at_startup=False,
+        ),
+    ]
+
+
 def _strategy_synthesizer_cron_hours() -> list[int]:
     """Resolve the hours the strategy-playbook synthesizer cron fires.
 
@@ -1349,16 +1373,7 @@ class GraphWorkerSettings:
         # SLO — enqueued by _note_session_messages onto the graph queue.
         process_session_summary,
     ]
-    cron_jobs = [
-        cron(
-            dedup_all_memories,
-            hour=settings.dedup_cron_hours,
-            minute=0,
-            timeout=1800,
-            unique=True,
-            max_tries=1,
-            run_at_startup=False,
-        ),
+    cron_jobs = _dedup_cron_jobs() + [
         cron(
             dream_sweep_cron,
             # Imported lazily so importing worker.py doesn't load the
