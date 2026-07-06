@@ -55,8 +55,8 @@ async def _with_backoff(coro_factory, *, max_retries: int = 5, base_delay: float
 
 
 async def answer_one(client: NeuralscapeClient, data: SuiteData, qa: QAItem, *,
-                     k: int, reasoning_level: str) -> dict:
-    user_id = bench_user_id(data.suite, qa.conv_id)
+                     k: int, reasoning_level: str, namespace: str | None = None) -> dict:
+    user_id = bench_user_id(data.suite, qa.conv_id, namespace)
     conv = data.conversation(qa.conv_id)
     record: dict = {
         "qa_id": qa.qa_id,
@@ -109,7 +109,8 @@ async def answer_one(client: NeuralscapeClient, data: SuiteData, qa: QAItem, *,
 
 async def answer_suite(client: NeuralscapeClient, data: SuiteData, *,
                        out_path: Path, k: int = 10, reasoning_level: str = "high",
-                       concurrency: int = 2, log=print) -> dict:
+                       concurrency: int = 2, namespace: str | None = None,
+                       log=print) -> dict:
     """Answer every QA item, appending records to ``out_path`` (resumable).
 
     Resume keys on ``(qa_id, qtype)`` — plain qa_id is not unique in suites
@@ -127,7 +128,8 @@ async def answer_suite(client: NeuralscapeClient, data: SuiteData, *,
 
     async def one(qa: QAItem):
         async with sem:
-            rec = await answer_one(client, data, qa, k=k, reasoning_level=reasoning_level)
+            rec = await answer_one(client, data, qa, k=k, reasoning_level=reasoning_level,
+                                   namespace=namespace)
             async with lock:
                 append_jsonl(out_path, rec)
                 counters["done"] += 1

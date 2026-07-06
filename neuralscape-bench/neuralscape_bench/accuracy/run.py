@@ -43,6 +43,29 @@ def _log(msg: str) -> None:
     print(msg, flush=True)
 
 
+def raw_paths(suite_name: str, run_label: str | None) -> tuple[Path, Path]:
+    """(answers, judged) JSONL paths for a suite; ``run_label`` suffixes both.
+
+    Default (``None``) keeps the baseline paths so re-measures don't
+    resume-skip baseline-answered questions on a shared results dir.
+    """
+    suffix = f"-{run_label}" if run_label else ""
+    return (RAW_DIR / f"answers-{suite_name}{suffix}.jsonl",
+            RAW_DIR / f"judged-{suite_name}{suffix}.jsonl")
+
+
+def manifest_label(target: str, user_namespace: str | None) -> str:
+    """Stack fingerprint for the ingest resume manifest.
+
+    A per-PR ``user_namespace`` gets its own manifest so resume never reports
+    baseline sessions as done and skips the mini-ingest.
+    """
+    label = target.replace("://", "-").replace("/", "").replace(":", "-")
+    if user_namespace:
+        label = f"{label}-ns-{user_namespace}"
+    return label
+
+
 def _suite_options(args, suite_name: str) -> dict:
     opts = dict(get_suite(suite_name).default_options)
     if suite_name == "beam" and args.beam_tier:
@@ -103,9 +126,8 @@ async def _run_paid(args, suite_name: str) -> None:
     from neuralscape_bench.accuracy.judge import GeminiJudge, judge_suite
 
     data = _load(args, suite_name)
-    target_label = args.target.replace("://", "-").replace("/", "").replace(":", "-")
-    answers_path = RAW_DIR / f"answers-{suite_name}.jsonl"
-    judged_path = RAW_DIR / f"judged-{suite_name}.jsonl"
+    target_label = manifest_label(args.target, args.user_namespace)
+    answers_path, judged_path = raw_paths(suite_name, args.run_label)
 
     if args.dry_run:
         st = data.stats()
@@ -120,13 +142,15 @@ async def _run_paid(args, suite_name: str) -> None:
             manifest = IngestManifest.for_run(suite_name, target_label)
             summary = await ingest_suite(
                 client, data, manifest=manifest, concurrency=args.concurrency,
-                poll_timeout_s=args.poll_timeout, log=_log)
+                poll_timeout_s=args.poll_timeout, namespace=args.user_namespace,
+                log=_log)
             _log(f"[ingest] {suite_name}: {json.dumps(summary)}")
         if "answer" in args.phase:
             summary = await answer_suite(
                 client, data, out_path=answers_path, k=args.k,
                 reasoning_level=args.reasoning_level,
-                concurrency=args.concurrency, log=_log)
+                concurrency=args.concurrency, namespace=args.user_namespace,
+                log=_log)
             _log(f"[answer] {suite_name}: {json.dumps(summary)}")
         if "judge" in args.phase:
             api_key = os.environ.get("GOOGLE_API_KEY", "")
@@ -201,6 +225,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--beam-tier", default=None, choices=("100k", "500k", "1m", "10m"))
     ap.add_argument("--membench-categories", default=None,
                     help="Comma list or 'all' (default: highlevel,lowlevel_rec,RecMultiSession)")
+    ap.add_argument("--run-label", default=None,
+                    help="Suffix for raw answer/judged files → "
+                         "results/raw/{answers,judged}-<suite>-<label>.jsonl. "
+                         "Default (none) keeps the baseline paths so re-measures "
+                         "don't resume-skip baseline-answered questions.")
+    ap.add_argument("--user-namespace", default=None,
+                    help="Prefix bench user ids (bench-<namespace>-<suite>-<conv>) "
+                         "for per-PR mini-ingests into an isolated user space; "
+                         "also isolates the ingest resume manifest. Default: none.")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--stack", default=None, choices=("up", "down"),
                     help="Manage the isolated compose stack and exit")
