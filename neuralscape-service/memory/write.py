@@ -444,6 +444,8 @@ class WriteMixin:
         # Data-layer connectors (None → omitted)
         memory_kind: str | None = None,
         source_ref: dict | None = None,
+        # Workspace partition (WT6, None → memory type)
+        workspace: str | None = None,
         # Write-path isolation: when False, skip the slow inline graph.add so
         # the fast vector write returns immediately — the caller is expected to
         # enqueue enrich_graph() onto the graph worker. When return_created is
@@ -523,6 +525,7 @@ class WriteMixin:
             visibility=visibility,
             memory_kind=memory_kind,
             source_ref=source_ref,
+            workspace=workspace,
         )
         if existing is not None:
             # created=False → caller must NOT re-enqueue graph enrichment.
@@ -567,6 +570,7 @@ class WriteMixin:
         visibility: str | None = None,
         memory_kind: str | None = None,
         source_ref: dict | None = None,
+        workspace: str | None = None,
     ) -> tuple[dict | None, MemoryResponse | None]:
         """Validate + resolve + dedup one raw store; everything except the embed.
 
@@ -637,10 +641,14 @@ class WriteMixin:
         chash = content_hash(content)
 
         # ── Content-hash dedup ──
-        # Skip insert if this exact (user_id, scope, hash) already exists.
+        # Skip insert if this exact (user_id, scope, hash, workspace) already exists.
+        # Workspace is part of dedup identity: the same sentence in a book vs a
+        # user note are distinct rows (WT6).
+        effective_workspace = workspace if workspace else None
         existing = self._find_by_content_hash(
             user_id=user_id, content_hash=chash, scope=scope,
             project_id=project_id, visibility=effective_visibility,
+            workspace=effective_workspace,
         )
         if existing is not None:
             logger.info(
@@ -711,6 +719,9 @@ class WriteMixin:
             metadata["memory_kind"] = memory_kind
         if source_ref:
             metadata["source_ref"] = source_ref
+        # Workspace partition (WT6): only stored when set (absent/None = memory type)
+        if workspace is not None:
+            metadata["workspace"] = workspace
 
         payload = {
             "data": content,
@@ -747,6 +758,7 @@ class WriteMixin:
             owner_user_id=user_id,
             title=title,
             token_estimate=token_estimate,
+            workspace=effective_workspace,
         )
 
         prepared = {
@@ -755,14 +767,16 @@ class WriteMixin:
             "payload": payload,
             "response": response,
             "now_iso": now_iso,
-            # (user, hash, scope, project, visibility) — the dedup identity,
-            # exposed so store_raw_batch can collapse in-batch duplicates.
-            "dedup_key": (user_id, chash, scope, project_id, effective_visibility),
+            # (user, hash, scope, project, visibility, workspace) — the dedup identity,
+            # exposed so store_raw_batch can collapse in-batch duplicates. Workspace
+            # is part of the identity: same content in memory vs reference = distinct (WT6).
+            "dedup_key": (user_id, chash, scope, project_id, effective_visibility, effective_workspace),
             # Fields _finalize_raw_store needs for the graph write.
             "user_id": user_id,
             "project_id": project_id,
             "effective_visibility": effective_visibility,
             "source_ref": source_ref,
+            "workspace": effective_workspace,
         }
         return (prepared, None)
 
@@ -811,6 +825,7 @@ class WriteMixin:
                 memory_id=mid,
                 source_ref=prepared["source_ref"],
                 graph_ontology=graph_ontology,
+                workspace=prepared.get("workspace"),
             )
 
     def enrich_graph(
@@ -822,6 +837,7 @@ class WriteMixin:
         memory_id: str,
         source_ref: dict | None = None,
         graph_ontology: dict | None = None,
+        workspace: str | None = None,
     ) -> bool:
         """Add content to the knowledge graph + attach memory_id back-refs.
 
@@ -846,9 +862,10 @@ class WriteMixin:
         """
         if not (self._graphiti and self._bridge):
             return False
-        # Group_id encodes visibility + user namespace so graph search can
-        # scope by allowed groups without re-leaking cross-user facts.
-        group_id = _build_group_id(visibility, user_id, project_id)
+        # Group_id encodes visibility + user namespace + workspace (WT6) so
+        # graph search can scope by allowed groups without re-leaking
+        # cross-user facts or mixing memory/reference pools.
+        group_id = _build_group_id(visibility, user_id, project_id, workspace)
         graph_write_started_at = datetime.now(timezone.utc)
         try:
             retry_transient(
@@ -881,8 +898,9 @@ class WriteMixin:
         scope: str,
         project_id: str | None = None,
         visibility: str | None = None,
+        workspace: str | None = None,
     ) -> MemoryResponse | None:
-        """Look up a memory by (user_id, hash, scope, visibility) for dedup.
+        """Look up a memory by (user_id, hash, scope, visibility, workspace) for dedup.
 
         Returns the existing MemoryResponse on hit, or None if not found.
         Failures here are non-fatal — we'd rather risk a duplicate than
@@ -892,6 +910,10 @@ class WriteMixin:
         (e.g. a dictator's private note vs. an authoritative ``standard``) are
         distinct memories, so a ``standard`` write must not dedup onto a
         pre-existing ``private``/``shared`` row of the same content.
+
+        ``workspace`` (WT6) is also part of the key: the same sentence in a
+        reference book vs. a user note are distinct memories. Absent/None =
+        memory type (default); matches rows with workspace absent/None/"memory".
         """
         try:
             from qdrant_client.models import FieldCondition, Filter, MatchValue
@@ -906,6 +928,19 @@ class WriteMixin:
                 must.append(FieldCondition(key="metadata.visibility", match=MatchValue(value=visibility)))
             if scope == "project" and project_id:
                 must.append(FieldCondition(key="metadata.project_id", match=MatchValue(value=project_id)))
+            # Workspace filter (WT6): absent/None matches rows with workspace
+            # absent/None/"memory" (all three represent the memory workspace).
+            # Non-None workspace must match exactly.
+            if workspace is None:
+                from qdrant_client.models import IsEmpty, IsNull
+                must.append(
+                    FieldCondition(
+                        key="metadata.workspace",
+                        match=IsEmpty() | IsNull() | MatchValue(value="memory"),
+                    )
+                )
+            else:
+                must.append(FieldCondition(key="metadata.workspace", match=MatchValue(value=workspace)))
             points, _ = client.scroll(
                 collection_name=collection,
                 scroll_filter=Filter(must=must),
@@ -943,6 +978,7 @@ class WriteMixin:
                 owner_user_id=metadata.get("owner_user_id"),
                 title=metadata.get("title"),
                 token_estimate=metadata.get("token_estimate"),
+                workspace=metadata.get("workspace"),
             )
         except Exception as e:
             logger.warning(f"Content-hash dedup lookup failed (non-fatal): {e}")
@@ -1249,6 +1285,7 @@ class WriteMixin:
         memory_kind: str | None = None,
         source_ref: dict | None = None,
         occurred_at: str | None = None,
+        workspace: str | None = None,
     ) -> list[MemoryResponse]:
         """Store multiple categorized facts via a single batch embed + single Qdrant upsert.
 
@@ -1330,20 +1367,23 @@ class WriteMixin:
             chash = content_hash(content)
 
             # In-batch duplicate (extraction-window overlap): keep the first.
-            batch_key = (chash, scope_val, fact_project_id)
+            # WT6: workspace is part of the batch key too.
+            batch_key = (chash, scope_val, fact_project_id, workspace)
             if batch_key in seen_in_batch:
                 continue
             seen_in_batch.add(batch_key)
 
             # Storage-level idempotency (audit 27 #21). visibility=None on
             # purpose: conversation-path rows don't stamp metadata.visibility,
-            # so a visibility condition would never match them.
+            # so a visibility condition would never match them. workspace defaults
+            # to None here (memory type) unless the caller overrode it.
             existing = self._find_by_content_hash(
                 user_id=user_id,
                 content_hash=chash,
                 scope=scope_val,
                 project_id=fact_project_id,
                 visibility=None,
+                workspace=workspace,
             )
             if existing is not None:
                 # Same reinforcement semantics as the raw path: count the
@@ -1383,6 +1423,8 @@ class WriteMixin:
                     **({"source_ref": source_ref} if source_ref else {}),
                     # Event time: only stored when known (never defaulted).
                     **({"occurred_at": occurred_at} if occurred_at is not None else {}),
+                    # Workspace partition (WT6): only stored when set.
+                    **({"workspace": workspace} if workspace is not None else {}),
                 },
             }
 

@@ -152,7 +152,15 @@ def card_target(vault: Path, batch: PoolBatch, operator_user_id: str) -> tuple[b
     (shared project pool). Project-scoped private pools and the global
     shared pool carry no card. A non-operator user's card is maintained in
     Redis but never rendered into the operator's vault (pool isolation).
+
+    WT6: reference workspaces (workspace ≠ None and ≠ "memory") are excluded
+    — the card structurally cannot see reference content, preventing the
+    leak that triggered this partition (trading books poisoning "you are a trader").
     """
+    # Gate reference workspaces out of card eligibility entirely (WT6).
+    if batch.workspace and batch.workspace != "memory":
+        return False, None
+
     if batch.visibility == "shared" and batch.project_id:
         from .librarian import pool_dir
 
@@ -291,6 +299,18 @@ async def update_card(
         m for m in batch.memories
         if not m.get("dream_tombstoned") and (m.get("content") or "").strip()
     ]
+    # WT6: belt-and-braces — even in the memory pool, order personal_fact/
+    # preference/interaction first so imported reference content (if somehow
+    # present) can't dominate the 40-line card. Card-eligible pools shouldn't
+    # have reference workspace rows (card_target gates them), but this ordering
+    # ensures domain_knowledge imports can't swamp a user's actual preferences.
+    _personal_categories = {"personal_fact", "preference", "interaction"}
+    live.sort(
+        key=lambda m: (
+            0 if m.get("category") in _personal_categories else 1,
+            m.get("created_at") or "",
+        )
+    )
     prior = load_card(redis, batch.pool) or {}
     prior_lines = sanitize_card_lines(prior.get("lines"))
     if not live and not prior_lines:

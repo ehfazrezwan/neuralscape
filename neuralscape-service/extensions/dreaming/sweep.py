@@ -374,8 +374,12 @@ async def _dream_pool(
             })
 
         # 7. REM: reflect + store insights
+        # WT6: skip reflection for reference workspaces — reference content is
+        # imported doctrine, not user-context to reflect on or synthesize into
+        # higher-order insights.
+        is_reference_workspace = batch.workspace and batch.workspace != "memory"
         insights: list[dict] = []
-        if settings.reflection_enabled:
+        if settings.reflection_enabled and not is_reference_workspace:
             # A5: surprisal-targeted REM. One batched vector retrieve, then
             # each staged dict gains a `surprisal` score (cosine distance
             # from the pool centroid); reflect() biases its substrate toward

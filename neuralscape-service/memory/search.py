@@ -47,6 +47,7 @@ class SearchMixin:
         limit: int,
         query_embedding: list[float] | None = None,
         visibility_value: str = MemoryVisibility.SHARED.value,
+        workspaces: list[str] | None = None,
     ) -> list[MemoryResponse]:
         """Search Qdrant for cross-writer memories of a given visibility.
 
@@ -62,10 +63,17 @@ class SearchMixin:
         single ``search()`` doesn't re-embed the same query for every pool/scope
         (the embed round-trip dominates read latency); falls back to embedding
         ``query`` when not provided.
+
+        ``workspaces`` (WT6) filters by workspace partition. Default ``None``
+        is treated as ``["memory"]`` (memory-type workspace only — reference
+        workspaces fenced out). Pass explicit workspace names to search
+        reference content.
         """
         from qdrant_client.models import (
             FieldCondition,
             Filter,
+            IsEmpty,
+            IsNull,
             MatchAny,
             MatchValue,
         )
@@ -100,6 +108,18 @@ class SearchMixin:
         if concepts:
             must.append(FieldCondition(key="metadata.concepts", match=MatchAny(any=concepts)))
 
+        # Workspace filter (WT6): default to memory type only (reference fenced out).
+        # Explicit workspaces list opens the door to reference content. For now,
+        # simple implementation: filter post-retrieval if needed. A future optimization
+        # can use Qdrant's should/must filter combinations.
+        # When workspaces=None or ["memory"], exclude any rows with non-memory workspace.
+        effective_workspaces = workspaces if workspaces is not None else ["memory"]
+        if effective_workspaces == ["memory"]:
+            # Memory-only: exclude rows with a non-None, non-"memory" workspace.
+            # This is done post-retrieval for simplicity (Qdrant's filter syntax
+            # doesn't cleanly express "IsEmpty OR IsNull OR MatchValue('memory')").
+            pass  # Applied as post-filter below
+
         # qdrant-client v1.13+ removed `.search()` in favor of `.query_points()`;
         # the response wraps hits in a `.points` attribute.
         qfilter = Filter(must=must, must_not=must_not)
@@ -123,6 +143,12 @@ class SearchMixin:
             hit = entry["hit"]
             payload = getattr(hit, "payload", None) or {}
             metadata = payload.get("metadata", {})
+            # Workspace filter (WT6): post-retrieval filter by workspace list.
+            # Absent/None/"memory" all represent the memory workspace.
+            hit_workspace = metadata.get("workspace")
+            workspace_normalized = hit_workspace if hit_workspace else "memory"
+            if workspace_normalized not in effective_workspaces:
+                continue  # Skip this hit — it's from a non-requested workspace
             # Lexical-only hits carry a raw BM25 score (not cosine-comparable);
             # impute the pool's dense floor so the cross-pool score sort stays
             # meaningful without ever letting a keyword match outrank a
@@ -208,6 +234,7 @@ class SearchMixin:
             observation_type=observation_type,
             concepts=concepts,
             limit=limit,
+                            workspaces=workspaces,
             query_embedding=query_embedding,
             visibility_value=MemoryVisibility.STANDARD.value,
         )
@@ -225,6 +252,7 @@ class SearchMixin:
         concepts: list[str] | None,
         limit: int,
         query: str = "",
+        workspaces: list[str] | None = None,
     ) -> list[MemoryResponse]:
         """Search Qdrant for the caller's own memories using a precomputed vector.
 
@@ -282,11 +310,19 @@ class SearchMixin:
         fused = _rrf_fuse(dense_hits, lexical_hits, limit)
         dense_floor = _dense_score_floor(dense_hits)
 
+        # Workspace filter (WT6): same post-retrieval filter as shared pool
+        effective_workspaces = workspaces if workspaces is not None else ["memory"]
+
         out: list[MemoryResponse] = []
         for entry in fused:
             hit = entry["hit"]
             payload = getattr(hit, "payload", None) or {}
             metadata = payload.get("metadata", {})
+            # Workspace filter (WT6): post-retrieval filter by workspace list
+            hit_workspace = metadata.get("workspace")
+            workspace_normalized = hit_workspace if hit_workspace else "memory"
+            if workspace_normalized not in effective_workspaces:
+                continue  # Skip this hit — it's from a non-requested workspace
             # Lexical-only hits: impute the pool's dense floor (see
             # _search_shared_pool for the rationale).
             raw_score = getattr(hit, "score", None) if entry["dense"] else dense_floor
@@ -323,6 +359,8 @@ class SearchMixin:
         # Multi-user pool selection
         visibility: str | None = None,
         include_shared: bool = True,
+        # Workspace partition (WT6): default ["memory"] fences out reference content
+        workspaces: list[str] | None = None,
         # Internal write-path mode (audit 27 #12): vector pools only — no
         # graph pass, no graph enrichment, no recall-trace logging.
         vector_only: bool = False,
@@ -401,6 +439,7 @@ class SearchMixin:
                             project_id=project_id, categories=categories, scope=None,
                             domain=domain, observation_type=observation_type,
                             concepts=concepts, limit=limit, query=query,
+                            workspaces=workspaces,
                         )
                     )
                     vector_responses.extend(
@@ -409,6 +448,7 @@ class SearchMixin:
                             project_id=None, categories=categories, scope="global",
                             domain=domain, observation_type=observation_type,
                             concepts=concepts, limit=limit, query=query,
+                            workspaces=workspaces,
                         )
                     )
                 else:
@@ -418,6 +458,7 @@ class SearchMixin:
                             project_id=project_id, categories=categories, scope=scope,
                             domain=domain, observation_type=observation_type,
                             concepts=concepts, limit=limit, query=query,
+                            workspaces=workspaces,
                         )
                     )
             except Exception as e:
@@ -457,6 +498,7 @@ class SearchMixin:
                             observation_type=observation_type,
                             concepts=concepts,
                             limit=limit,
+                            workspaces=workspaces,
                             query_embedding=query_embedding,
                         )
                     )
@@ -471,6 +513,7 @@ class SearchMixin:
                             observation_type=observation_type,
                             concepts=concepts,
                             limit=limit,
+                            workspaces=workspaces,
                             query_embedding=query_embedding,
                         )
                     )
@@ -486,6 +529,7 @@ class SearchMixin:
                             observation_type=observation_type,
                             concepts=concepts,
                             limit=limit,
+                            workspaces=workspaces,
                             query_embedding=query_embedding,
                         )
                     )
@@ -520,6 +564,7 @@ class SearchMixin:
                         observation_type=observation_type,
                         concepts=concepts,
                         limit=limit,
+                            workspaces=workspaces,
                         query_embedding=query_embedding,
                     )
                 )
