@@ -1055,6 +1055,8 @@ class TestContradictions:
         prompt = llm.prompts[0]
         assert "2026-01-01" in prompt and "2026-06-01" in prompt
         assert "CONTRADICTIONS" in prompt
+        # The commit-to-winner rule is actually present (matches the docstring).
+        assert "state the winner" in prompt and "as THE answer" in prompt
         # Chronological order in the evidence block: older row first.
         assert prompt.index("m-old") < prompt.index("m-new")
         assert set(out["citations"]) == {"m-new", "m-old"}
