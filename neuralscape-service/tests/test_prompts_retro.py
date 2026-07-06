@@ -199,28 +199,28 @@ class TestLegacyParserBackwardCompat:
 class TestMultipleColonsCorrected:
     """Fix the false-positive test that locked in wrong behavior."""
 
-    def test_sentence_fragment_not_parsed_as_speaker(self):
-        """'uses microservices: ...' should NOT parse 'uses microservices' as speaker.
+    def test_sentence_fragment_parsed_as_speaker_but_gated_by_flag(self):
+        """'uses microservices: ...' parses as speaker with rich parser, but is gated.
 
-        The old test asserted this WAS parsed as a speaker, locking in a false
-        positive. The correct behavior: a verb phrase is not a speaker. However,
-        the current permissive regex (≤40 chars, followed by ': ') DOES match it.
+        The permissive regex (≤40 chars, followed by ': ') matches verb phrases
+        like "uses microservices" as speakers, which is a known parser issue
+        (retro review flagged it). However, this only matters when
+        extraction_require_speaker is True — the speaker is only stored and used
+        for dedup when the flag is ON. With the flag OFF (legacy/default), the
+        legacy parser folds any prefix back into content, preserving byte-identical
+        backward-compat (no speaker split, no content mutation).
 
-        This test documents the INTENDED behavior (no speaker), even though the
-        current implementation may still parse it. The retro review flagged this
-        as a parser issue; a future fix might reject leading verb phrases.
+        This test asserts the rich parser's current (permissive) behavior, which
+        is acceptable because it's gated behind a flag. A future stricter parser
+        might reject verb phrases, but until then the flag isolates the impact.
         """
         response = '{"facts": ["[architecture] uses microservices: API: Gateway: Auth"]}'
         [pf] = parse_extraction_response_rich(response)
-        # Current behavior: the regex matches "uses microservices" as speaker.
-        # INTENDED behavior (aspirational): pf.speaker should be None.
-        # For now, document what we get:
-        if pf.speaker == "uses microservices":
-            # This is the current (permissive) behavior — the regex allows it.
-            # The retro review noted this as a parser issue; a stricter guard
-            # would reject verb phrases. Until then, at least the content is correct.
-            assert pf.content == "API: Gateway: Auth"
-        else:
-            # If a future fix rejects this, the whole string should be content.
-            assert pf.speaker is None
-            assert "microservices" in pf.content
+        # The permissive regex matches "uses microservices" as speaker.
+        assert pf.speaker == "uses microservices"
+        assert pf.content == "API: Gateway: Auth"
+        # The legacy parser (flag OFF) would fold this back into content:
+        from prompts import parse_extraction_response
+        [(cat, content)] = parse_extraction_response(response)
+        assert cat == "architecture"
+        assert content == "uses microservices: API: Gateway: Auth"

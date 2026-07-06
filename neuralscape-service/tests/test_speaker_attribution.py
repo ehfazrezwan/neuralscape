@@ -5,7 +5,7 @@ and surfacing it through the read path, enabling multi-party memory.
 """
 
 import json
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -88,10 +88,15 @@ def _mock_extraction(client, facts_response):
     client.models.generate_content.return_value = response
 
 
+@patch("memory.write.settings")
 class TestConversationExtractionWithSpeakers:
     """E2E conversation extraction → speaker persisted in metadata."""
 
-    def test_two_party_conversation_distinct_speakers(self):
+    def test_two_party_conversation_distinct_speakers(self, mock_settings):
+        mock_settings.extraction_require_speaker = True
+        mock_settings.extraction_window_messages = 50
+        mock_settings.extraction_window_overlap = 2
+        mock_settings.qdrant_collection = "test_coll"
         svc, client = _mock_service()
         # Simulate a two-party conversation with speaker-prefixed facts
         _mock_extraction(
@@ -130,7 +135,11 @@ class TestConversationExtractionWithSpeakers:
         assert payloads[1]["metadata"]["speaker"] == "assistant"
         assert payloads[2]["metadata"]["speaker"] == "team"
 
-    def test_fact_without_speaker_stores_none(self):
+    def test_fact_without_speaker_stores_none(self, mock_settings):
+        mock_settings.extraction_require_speaker = True
+        mock_settings.extraction_window_messages = 50
+        mock_settings.extraction_window_overlap = 2
+        mock_settings.qdrant_collection = "test_coll"
         svc, client = _mock_service()
         # Fact without speaker prefix
         _mock_extraction(client, ["[preference] Prefers dark mode"])
@@ -148,7 +157,11 @@ class TestConversationExtractionWithSpeakers:
         payloads = insert_call.kwargs["payloads"]
         assert "speaker" not in payloads[0]["metadata"]
 
-    def test_bogus_speaker_not_parsed(self):
+    def test_bogus_speaker_not_parsed(self, mock_settings):
+        mock_settings.extraction_require_speaker = True
+        mock_settings.extraction_window_messages = 50
+        mock_settings.extraction_window_overlap = 2
+        mock_settings.qdrant_collection = "test_coll"
         svc, client = _mock_service()
         # The rich parser's regex rejects oversized speakers (>40 chars) at
         # parse time, so they're never extracted — they remain in the content.
@@ -171,7 +184,11 @@ class TestConversationExtractionWithSpeakers:
         # Content includes the unparsed speaker prefix (regex didn't match)
         assert oversized_speaker in stored[0].memory
 
-    def test_edge_case_speaker_exactly_40_chars(self):
+    def test_edge_case_speaker_exactly_40_chars(self, mock_settings):
+        mock_settings.extraction_require_speaker = True
+        mock_settings.extraction_window_messages = 50
+        mock_settings.extraction_window_overlap = 2
+        mock_settings.qdrant_collection = "test_coll"
         svc, client = _mock_service()
         # Exactly 40 chars should parse and validate successfully
         speaker_40 = "a" * 40
@@ -190,7 +207,11 @@ class TestConversationExtractionWithSpeakers:
         assert stored[0].speaker == speaker_40
         assert stored[0].memory == "Prefers tabs over spaces"
 
-    def test_assistant_attributed_fact_preserved(self):
+    def test_assistant_attributed_fact_preserved(self, mock_settings):
+        mock_settings.extraction_require_speaker = True
+        mock_settings.extraction_window_messages = 50
+        mock_settings.extraction_window_overlap = 2
+        mock_settings.qdrant_collection = "test_coll"
         svc, client = _mock_service()
         # Test that assistant-attributed facts are correctly extracted
         _mock_extraction(
@@ -215,7 +236,11 @@ class TestConversationExtractionWithSpeakers:
         user_fact = next(m for m in stored if "SaaS" in m.memory)
         assert user_fact.speaker == "user"
 
-    def test_same_content_from_different_speakers_stores_distinct_rows(self):
+    def test_same_content_from_different_speakers_stores_distinct_rows(self, mock_settings):
+        mock_settings.extraction_require_speaker = True
+        mock_settings.extraction_window_messages = 50
+        mock_settings.extraction_window_overlap = 2
+        mock_settings.qdrant_collection = "test_coll"
         svc, client = _mock_service()
         _mock_extraction(
             client,
@@ -385,10 +410,15 @@ class TestSchemaAndReadPath:
 # ──────────────────────────────────────────────
 
 
+@patch("memory.write.settings")
 class TestDatasetSpeakerPreservation:
     """Dataset speaker names (e.g., 'Speaker 1:', 'Ana:') are preserved."""
 
-    def test_dataset_style_speaker_names_preserved(self):
+    def test_dataset_style_speaker_names_preserved(self, mock_settings):
+        mock_settings.extraction_require_speaker = True
+        mock_settings.extraction_window_messages = 50
+        mock_settings.extraction_window_overlap = 2
+        mock_settings.qdrant_collection = "test_coll"
         svc, client = _mock_service()
         # Simulate dataset-style speaker prefixes
         _mock_extraction(
@@ -420,10 +450,15 @@ class TestDatasetSpeakerPreservation:
 # ──────────────────────────────────────────────
 
 
+@patch("memory.write.settings")
 class TestFullRoundtrip:
     """Store with speaker → read back → speaker present."""
 
-    def test_store_and_read_preserves_speaker(self):
+    def test_store_and_read_preserves_speaker(self, mock_settings):
+        mock_settings.extraction_require_speaker = True
+        mock_settings.extraction_window_messages = 50
+        mock_settings.extraction_window_overlap = 2
+        mock_settings.qdrant_collection = "test_coll"
         svc, client = _mock_service()
 
         # Mock a two-party conversation
