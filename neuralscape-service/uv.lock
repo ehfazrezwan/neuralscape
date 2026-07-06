@@ -2016,6 +2016,8 @@ dependencies = [
 [package.optional-dependencies]
 code-graph = [
     { name = "graphifyy" },
+    { name = "tree-sitter" },
+    { name = "tree-sitter-language-pack" },
 ]
 dev = [
     { name = "httpx" },
@@ -2055,6 +2057,8 @@ requires-dist = [
     { name = "spacy", specifier = ">=3.7" },
     { name = "structlog", specifier = ">=24.0.0" },
     { name = "tiktoken", specifier = ">=0.13.0" },
+    { name = "tree-sitter", marker = "extra == 'code-graph'", specifier = ">=0.23.0" },
+    { name = "tree-sitter-language-pack", marker = "extra == 'code-graph'", specifier = ">=0.1.0" },
     { name = "uvicorn", specifier = ">=0.32.0" },
 ]
 provides-extras = ["dev", "code-graph"]
@@ -4399,6 +4403,23 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/08/dc/4944abf3a8bc630262e93e0857bd7044d521995c1f6af50650e4fe1fdde0/tree_sitter_kotlin-1.1.0-cp39-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:5960034a5c5bcc7ccb21dc7a29e4267ac4f0ef37884f39d75695eac7f004deff", size = 328921, upload-time = "2025-01-09T19:02:10.346Z" },
     { url = "https://files.pythonhosted.org/packages/24/c9/5cca0a44db41224f7f10992450af17ff432c1a336852efb312246d5705e5/tree_sitter_kotlin-1.1.0-cp39-abi3-win_amd64.whl", hash = "sha256:d4d3f330f515ba8b91da04a5335eb9ff3ce071c7b7855958912f2560f6e14976", size = 315933, upload-time = "2025-01-09T19:02:12.637Z" },
     { url = "https://files.pythonhosted.org/packages/fb/b9/12fa97f63d2b7517c6f5d16938f0c5bfe84d925c652c75ff1c5e29bf6a44/tree_sitter_kotlin-1.1.0-cp39-abi3-win_arm64.whl", hash = "sha256:e030f127a7d07952907adb9070248bd42fb86dc76fd92744727551b50e131ee7", size = 310414, upload-time = "2025-01-09T19:02:16.23Z" },
+]
+
+[[package]]
+name = "tree-sitter-language-pack"
+version = "1.12.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "tree-sitter" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/72/ba/286954ebe16f106967c1c316679dab95153eaf5db5ac505fd7cf6aee5250/tree_sitter_language_pack-1.12.2.tar.gz", hash = "sha256:c5b8428a2fd4bb3eeeac73056fe0c4af6a5d67a20b8317e9eab84f88bf62de5a", size = 81210, upload-time = "2026-07-02T05:25:16.823Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6d/e0/bc99ea0d06db11e45289a8a3ab43929ca25f7ead57af8398135ee03fe09f/tree_sitter_language_pack-1.12.2-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:a7b5c2b4d3124adc8e5b960c55401f1340a515122ca607e6f375a24dfa3ee5da", size = 2121958, upload-time = "2026-07-02T05:25:06.602Z" },
+    { url = "https://files.pythonhosted.org/packages/39/c6/0205ee11715d76a5c1674d7541c057f19c4d6af8ce43b53f90d265de7ca9/tree_sitter_language_pack-1.12.2-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:bbc1925e4ab74d8854aabb4ab92caf2a9f234dc85c639748795aa905ee4080b1", size = 2011075, upload-time = "2026-07-02T05:25:08.699Z" },
+    { url = "https://files.pythonhosted.org/packages/6e/b0/517928ef68fc832bea09d37c98a9813bbd51c44461989490b754e655acbf/tree_sitter_language_pack-1.12.2-cp310-abi3-manylinux_2_34_aarch64.whl", hash = "sha256:d279f035ffe4e954479a86b50b99bc9458430ef587c114d515c4fe74b8596deb", size = 2170162, upload-time = "2026-07-02T05:25:10.393Z" },
+    { url = "https://files.pythonhosted.org/packages/48/8b/4d5725d3a120e7662f609f3cbdd7816f93d4c3c720f327001140bf815f87/tree_sitter_language_pack-1.12.2-cp310-abi3-manylinux_2_34_x86_64.whl", hash = "sha256:3a59156882d7180a7833577c269cd7dc9b4c36263659cf96df95169de515018e", size = 2282350, upload-time = "2026-07-02T05:25:11.926Z" },
+    { url = "https://files.pythonhosted.org/packages/f2/10/293bd8f7efe8f47dd0ad3e03875f0f7b01caf67e6c8b52a1254f99ab4da3/tree_sitter_language_pack-1.12.2-cp310-abi3-win_amd64.whl", hash = "sha256:f587da7195f7a17a09f06d10a8f9e38102a799b693f81cdea6df53587f23ef41", size = 2055338, upload-time = "2026-07-02T05:25:13.512Z" },
+    { url = "https://files.pythonhosted.org/packages/e9/62/28a14cc28ed4b790edc865492b566bb22f7f28ed387419655fa38bb2899e/tree_sitter_language_pack-1.12.2-cp310-abi3-win_arm64.whl", hash = "sha256:5b651701387d26ae3bbc93eb8617d2fae26ce459f267ea27632598201ccb2055", size = 1967260, upload-time = "2026-07-02T05:25:15.4Z" },
 ]
 
 [[package]]

@@ -88,24 +88,28 @@ def resolve_graph_path(graph_id: str | None, user_id: str, settings) -> str:
 def get_engine(graph_id: str | None, user_id: str, settings) -> CodeIntelEngine:
     """Engine-selection factory: returns the right CodeIntelEngine for the graph ref.
 
-    E1: always returns GraphifyJsonEngine for .json artifact paths (the only kind
-    that exists today). E2+ will detect repo:<name> refs and return NativeEngine.
-
-    The engine is cached per resolved path until (mtime, size) changes — same
-    hot-reload discipline as the old load_graph_cached.
+    E2: detects repo:<name> refs and returns NativeEngine; .json artifact paths
+    still return GraphifyJsonEngine. Engines are cached per ref (repo: by name,
+    .json by mtime+size).
 
     Args:
-        graph_id: Artifact id or None (uses default path).
+        graph_id: Artifact id, repo:<name> ref, or None (uses default path).
         user_id: Owner-scoped resolution.
         settings: Config for default path.
 
     Returns:
-        A CodeIntelEngine (today: GraphifyJsonEngine).
+        A CodeIntelEngine (GraphifyJsonEngine or NativeEngine).
 
     Raises:
         CodeGraphNotConfigured: No graph_id and no default configured.
-        CodeGraphError: graph_id doesn't resolve or isn't a .json artifact.
+        CodeGraphError: graph_id doesn't resolve or repo path not found.
     """
+    # E2: detect repo:<name> refs
+    if graph_id and graph_id.startswith("repo:"):
+        repo_name = graph_id.removeprefix("repo:")
+        return _get_native_engine(repo_name, user_id, settings)
+
+    # E1 path: .json artifacts
     path = resolve_graph_path(graph_id, user_id, settings)
     try:
         s = Path(path).stat()
@@ -123,6 +127,67 @@ def get_engine(graph_id: str | None, user_id: str, settings) -> CodeIntelEngine:
         G = load_code_graph(path)
         engine = GraphifyJsonEngine(G, path)
         _ctx_cache[path] = {"key": key, "engine": engine}
+        return engine
+
+
+def _get_native_engine(repo_name: str, user_id: str, settings) -> CodeIntelEngine:
+    """Get or create a cached NativeEngine for a repo:<name> ref (E2).
+
+    The repo path is resolved from settings.code_repos[repo_name] (a dict mapping
+    repo names to filesystem paths). Engines are cached by code_space key.
+
+    Raises:
+        CodeGraphError: repo_name not in configured repos or path doesn't exist.
+    """
+    from adapters.code_graph.native_engine import NativeEngine
+
+    # Resolve repo path from settings
+    repos = getattr(settings, "code_repos", {})
+    if not repos:
+        raise CodeGraphError(
+            "No code_repos configured. Set CODE_REPOS env var (JSON dict) "
+            "mapping repo names to filesystem paths."
+        )
+    repo_path = repos.get(repo_name)
+    if not repo_path:
+        raise CodeGraphError(
+            f"No repo configured with name {repo_name!r}. "
+            f"Available repos: {', '.join(repos.keys())}"
+        )
+    repo_path = Path(os.path.expanduser(repo_path))
+    if not repo_path.is_dir():
+        raise CodeGraphError(f"Repo path does not exist: {repo_path}")
+
+    # Build the code_space partition key
+    code_space = f"code--{user_id}--{repo_name}"
+
+    # Check cache (keyed by code_space, no mtime check — NativeEngine reads from Neo4j)
+    cache_key = f"native:{code_space}"
+    ent = _ctx_cache.get(cache_key)
+    if ent is not None:
+        return ent["engine"]
+
+    with _ctx_lock:
+        ent = _ctx_cache.get(cache_key)
+        if ent is not None:
+            return ent["engine"]
+
+        # Get the Graphiti bridge from the shared MemoryService
+        from memory_service import get_shared_service
+        service = get_shared_service()
+        service._get_memory()  # ensure bridge is initialized
+        bridge = service._bridge
+        if bridge is None:
+            raise CodeGraphError("Graphiti bridge not initialized (Neo4j unavailable)")
+
+        # Create NativeEngine
+        engine = NativeEngine(
+            repo_path=str(repo_path),
+            code_space=code_space,
+            bridge=bridge,
+            settings=settings,
+        )
+        _ctx_cache[cache_key] = {"engine": engine}
         return engine
 
 
