@@ -166,16 +166,16 @@ class CodeIntelEngine(Protocol):
 
     def detect_changes(
         self,
-        since: str,
+        since: str | bytes | None = None,
     ) -> ChangeReport:
         """Real blast-radius BFS: what broke since a git ref / index snapshot.
 
-        E2+ only. Compares the current index against a historical snapshot
-        (git ref or an exported artifact) and walks CALLS/IMPORTS edges to
-        compute affected symbols. Feeds E5's dreaming liveness consumer.
+        E5: Compares persisted Neo4j index vs fresh working-tree parse (since=None).
+        E6: Extends to support snapshot-based comparison (since=bytes).
 
         Args:
-            since: Git ref (commit-ish) or snapshot artifact id.
+            since: None (persisted vs fresh), bytes (snapshot vs current), or
+                   str (git ref, deferred).
 
         Raises:
             EngineCapabilityError: When the engine lacks change detection.
