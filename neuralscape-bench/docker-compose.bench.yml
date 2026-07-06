@@ -31,3 +31,6 @@ services:
   neuralscape:
     ports: !override
       - "${BENCH_API_PORT:-8299}:8199"
+    environment:
+      # Benchmark-only: opt into multi-party speaker attribution. Production defaults False.
+      - EXTRACTION_REQUIRE_SPEAKER=true

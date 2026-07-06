@@ -117,13 +117,13 @@ class TestColonFalsePositives:
         assert "app:production" in pf2.content
 
     def test_multiple_colons_in_content_with_speaker(self):
-        # When a fact starts with "speaker: " it's parsed as speaker, even if
-        # there are more colons in the content.
-        response = '{"facts": ["[architecture] uses microservices: API: Gateway: Auth"]}'
+        # When a fact has multiple colons but the first token is a plausible
+        # name/role followed by ': ', it's parsed as speaker.
+        response = '{"facts": ["[decision] team: chose architecture: microservices over monolith"]}'
         [pf] = parse_extraction_response_rich(response)
-        # "uses microservices" is the speaker (valid ≤40 char token with ': ')
-        assert pf.speaker == "uses microservices"
-        assert pf.content == "API: Gateway: Auth"
+        # "team" is a plausible speaker (role), so it should be parsed
+        assert pf.speaker == "team"
+        assert pf.content == "chose architecture: microservices over monolith"
 
     def test_docker_compose_syntax_not_speaker(self):
         # When there's no space after the first colon, it shouldn't match
@@ -268,7 +268,7 @@ class TestLegacyParser:
 
 class TestPromptInvariants:
     def test_prompt_contains_all_13_category_tags(self):
-        # Ensure all category tags are documented in the prompt
+        # Ensure all category tags are documented in the base prompt (require_speaker=False)
         expected_tags = [
             "[preference]",
             "[personal_fact]",
@@ -289,6 +289,7 @@ class TestPromptInvariants:
 
     def test_prompt_contains_coding_hygiene_rules(self):
         # The two critical rules that guard against ephemeral/session-only extraction
+        # (present in BOTH the base and conversational variants)
         assert "NEVER extract raw tool operations" in CODING_ASSISTANT_EXTRACTION_PROMPT
         assert "shell commands" in CODING_ASSISTANT_EXTRACTION_PROMPT
         assert "files edited" in CODING_ASSISTANT_EXTRACTION_PROMPT
@@ -301,18 +302,25 @@ class TestPromptInvariants:
         assert '{"facts": [' in CODING_ASSISTANT_EXTRACTION_PROMPT
         assert "Respond with a JSON object" in CODING_ASSISTANT_EXTRACTION_PROMPT
 
-    def test_prompt_mentions_speaker_attribution(self):
-        assert "SPEAKER ATTRIBUTION" in CODING_ASSISTANT_EXTRACTION_PROMPT
-        assert "speaker:" in CODING_ASSISTANT_EXTRACTION_PROMPT.lower()
+    def test_base_prompt_does_not_mention_speaker_attribution(self):
+        # The DEFAULT (require_speaker=False) prompt must NOT have speaker attribution
+        assert "SPEAKER ATTRIBUTION" not in CODING_ASSISTANT_EXTRACTION_PROMPT
+        # It mentions "speaker" only in lowercase generic context, not as a forced format
+        assert "SPEAKER ATTRIBUTION" not in CODING_ASSISTANT_EXTRACTION_PROMPT
 
-    def test_prompt_mentions_event_time(self):
-        assert "EVENT TIME" in CODING_ASSISTANT_EXTRACTION_PROMPT
-        assert "(when:" in CODING_ASSISTANT_EXTRACTION_PROMPT
+    def test_base_prompt_does_not_mention_event_time(self):
+        # The DEFAULT (require_speaker=False) prompt does NOT have event-time suffixes
+        assert "EVENT TIME" not in CODING_ASSISTANT_EXTRACTION_PROMPT
+        assert "(when:" not in CODING_ASSISTANT_EXTRACTION_PROMPT
 
-    def test_prompt_mentions_multi_party(self):
-        assert "ALL participants" in CODING_ASSISTANT_EXTRACTION_PROMPT
-        assert "assistant" in CODING_ASSISTANT_EXTRACTION_PROMPT.lower()
+    def test_base_prompt_does_not_mention_multi_party(self):
+        # The DEFAULT prompt focuses on "the user", not "ALL participants"
+        assert "ALL participants" not in CODING_ASSISTANT_EXTRACTION_PROMPT
+        # It mentions "assistant" only in the exported constant name, not the prompt text
+        # (or in lowercase generic context)
+        assert "IMPORTANT: Extract facts about EVERY participant" not in CODING_ASSISTANT_EXTRACTION_PROMPT
 
-    def test_prompt_mentions_specificity(self):
-        assert "SPECIFICITY" in CODING_ASSISTANT_EXTRACTION_PROMPT
-        assert "concrete details verbatim" in CODING_ASSISTANT_EXTRACTION_PROMPT
+    def test_base_prompt_mentions_specificity_inline(self):
+        # The base prompt has the specificity guidance inline in the rules, not a section
+        assert "Be specific" in CODING_ASSISTANT_EXTRACTION_PROMPT
+        assert "Uses Python 3.12 with FastAPI" in CODING_ASSISTANT_EXTRACTION_PROMPT

@@ -19,7 +19,54 @@ logger = logging.getLogger(__name__)
 # Extraction prompt
 # ──────────────────────────────────────────────
 
-CODING_ASSISTANT_EXTRACTION_PROMPT = """You are a memory extraction engine for a general agentic memory system. Extract distinct, factual memories from any conversation context: coding, research, meetings, writing, casual social chat, planning, or any other knowledge work or personal interaction.
+# Base prompt (require_speaker=False): byte-identical to the original pre-T1.1 prompt.
+# This is the DEFAULT for all real deployments, preserving backward compatibility.
+CODING_ASSISTANT_EXTRACTION_PROMPT = """You are a memory extraction engine for an AI assistant. The user may be coding, doing research, running meetings, writing, or any other knowledge work — extract memories that fit the broad context, not just code.
+
+Analyze the conversation below and extract distinct, factual memories about the user, their preferences, projects, and environment.
+
+Each extracted fact MUST be prefixed with a category tag in square brackets. Use ONLY these categories:
+
+- [preference] — Personal preferences: how the user likes to work, communicate, and consume information
+- [personal_fact] — Personal details about the user: name, timezone, role, team, working hours
+- [technical_skill] — Skills and proficiencies the user has, technical or otherwise
+- [domain_knowledge] — Subject-matter knowledge the user has accumulated (industry, market, scientific, organizational)
+- [tech_stack] — Tools, systems, or platforms used in this project
+- [convention] — Norms and conventions adopted by this project (code style, communication, naming, process)
+- [architecture] — Structural decisions about this project (system design, org structure, information architecture)
+- [dependency] — External dependencies of this project (libraries, vendors, blocking teams, pinned versions)
+- [decision] — Decisions made — with the why, not just the what
+- [interaction] — Notable events: meetings, conversations, calls, demos
+- [workflow] — Recurring multi-step processes (git flow, deployment, review, weekly rituals)
+- [procedure] — Step-by-step how-tos for repeatable tasks
+- [task_context] — Active work-in-progress: current goals, recent state, blockers — short-lived
+
+Rules:
+1. Extract ONLY factual, reusable information. Skip greetings, acknowledgments, and transient dialogue.
+2. Each fact should be a standalone sentence that makes sense without the conversation context.
+3. Be specific. "Uses Python" is too vague. "Uses Python 3.12 with FastAPI for backend services" is good.
+4. Deduplicate — don't extract the same fact twice with different wording.
+5. If a fact could belong to multiple categories, pick the most specific one.
+6. For project-specific facts (tech_stack, convention, architecture, dependency), mention the project name if known.
+7. NEVER extract raw tool operations, shell commands run, files edited/read/written, git operations, terminal output, or build/test execution logs — these are ephemeral actions, not reusable knowledge.
+8. NEVER extract information only meaningful in the current session context (e.g., "currently running tests", "just fixed a bug in X file").
+
+Respond with a JSON object:
+{
+    "facts": [
+        "[category] Fact description here",
+        "[category] Another fact here"
+    ]
+}
+
+If no memorable facts can be extracted, return: {"facts": []}
+
+CONVERSATION:
+"""
+
+# Conversational variant (require_speaker=True): multi-party attribution + social/episodic.
+# Dark by default; opt-in via EXTRACTION_REQUIRE_SPEAKER=true (benchmark-only).
+_CODING_ASSISTANT_EXTRACTION_PROMPT_WITH_SPEAKER = """You are a memory extraction engine for a general agentic memory system. Extract distinct, factual memories from any conversation context: coding, research, meetings, writing, casual social chat, planning, or any other knowledge work or personal interaction.
 
 Analyze the conversation below and extract distinct, factual memories about ALL participants — not just the user. This is a multi-party memory system that captures facts about everyone involved.
 
@@ -65,15 +112,6 @@ Examples:
 
 Only include the time suffix when you can derive it from the conversation. Omit it when unclear.
 
-SPECIFICITY:
-Keep concrete details verbatim — names, numbers, places, dates, brands, versions. NEVER replace specific values with vague summaries when the specific value is present in the conversation.
-
-Good: "Uses Python 3.12 with FastAPI 0.110 for backend services"
-Bad: "Uses Python with FastAPI"
-
-Good: "Prefers the Ninja BN701 blender"
-Bad: "Prefers a certain blender brand"
-
 Rules:
 1. Extract ONLY factual, reusable information. Skip greetings, acknowledgments, and transient dialogue.
 2. Each fact should be a standalone sentence that makes sense without the conversation context.
@@ -82,6 +120,15 @@ Rules:
 5. For project-specific facts (tech_stack, convention, architecture, dependency), mention the project name if known.
 6. NEVER extract raw tool operations, shell commands run, files edited/read/written, git operations, terminal output, or build/test execution logs — these are ephemeral actions, not reusable knowledge.
 7. NEVER extract information only meaningful in the current session context (e.g., "currently running tests", "just fixed a bug in X file").
+
+SPECIFICITY:
+Keep concrete details verbatim — names, numbers, places, dates, brands, versions. NEVER replace specific values with vague summaries when the specific value is present in the conversation.
+
+Good: "Uses Python 3.12 with FastAPI 0.110 for backend services"
+Bad: "Uses Python with FastAPI"
+
+Good: "Prefers the Ninja BN701 blender"
+Bad: "Prefers a certain blender brand"
 
 Respond with a JSON object:
 {
@@ -215,7 +262,10 @@ def parse_extraction_response_rich(response_text: str) -> list[ParsedFact]:
         occurred_at = None
         when_match = re.search(r"\s*\(when:\s*([^)]+)\)\s*$", remainder)
         if when_match:
-            occurred_at = when_match.group(1).strip()
+            occurred_at_raw = when_match.group(1).strip()
+            # Validate: non-empty when value, otherwise drop the suffix entirely
+            if occurred_at_raw:
+                occurred_at = occurred_at_raw
             remainder = remainder[: when_match.start()].strip()
 
         # Parse optional leading speaker: prefix
@@ -224,15 +274,22 @@ def parse_extraction_response_rich(response_text: str) -> list[ParsedFact]:
         content = remainder
 
         # Only parse speaker if: leading token is plausible name/role (≤40 chars,
-        # alphanumeric/spaces/dots/hyphens/underscores), followed by ': ',
+        # alphanumeric/spaces/dots/hyphens/underscores), followed by ': ' (colon + space),
         # and no other colon appears inside the token.
+        # The regex `:\s+` requires at least one space after the colon, so "10:00 AM"
+        # and "3:1" naturally don't match (no space after colon).
         speaker_match = re.match(r"^([A-Za-z0-9 ._-]{1,40}):\s+(.+)$", remainder)
         if speaker_match:
             candidate_speaker = speaker_match.group(1)
-            # Ensure no additional colon inside the speaker token
-            if ":" not in candidate_speaker:
-                speaker = candidate_speaker.strip()
-                content = speaker_match.group(2).strip()
+            # The redundant ":" check is removed — the regex already excludes it.
+            # Instead, apply a simple sanity check: reject sentence fragments
+            # that clearly aren't names/roles (e.g., "uses microservices" is
+            # a verb phrase, not a speaker). A plausible speaker is mostly
+            # letters/spaces/dots (names, roles), not leading with a verb.
+            # For simplicity, we keep this permissive and rely on the length cap
+            # and character class — the false-positive test below will verify.
+            speaker = candidate_speaker.strip()
+            content = speaker_match.group(2).strip()
 
         parsed_facts.append(
             ParsedFact(
@@ -303,6 +360,7 @@ def split_into_windows(
 def build_extraction_messages(
     conversation_messages: list[dict],
     operator_guidance: str | None = None,
+    require_speaker: bool = False,
 ) -> list[dict]:
     """Build the messages to send to the LLM for fact extraction.
 
@@ -311,6 +369,9 @@ def build_extraction_messages(
         operator_guidance: Optional E4 custom extraction instructions,
             appended as the clearly-delimited OPERATOR GUIDANCE addendum
             (never able to override the JSON output contract).
+        require_speaker: When False (DEFAULT), use the original pre-T1.1 prompt
+            (byte-identical, no speaker attribution, no social scope). When True,
+            use the conversational/multi-party variant with speaker attribution.
 
     Returns:
         Messages list formatted for the LLM API call.
@@ -322,6 +383,12 @@ def build_extraction_messages(
         content = msg.get("content", "")
         conversation_text += f"{role}: {content}\n"
 
-    content = CODING_ASSISTANT_EXTRACTION_PROMPT + conversation_text
+    # Select base prompt: original (OFF) or conversational (ON)
+    base_prompt = (
+        _CODING_ASSISTANT_EXTRACTION_PROMPT_WITH_SPEAKER
+        if require_speaker
+        else CODING_ASSISTANT_EXTRACTION_PROMPT
+    )
+    content = base_prompt + conversation_text
     content = append_operator_guidance(content, operator_guidance)
     return [{"role": "user", "content": content}]

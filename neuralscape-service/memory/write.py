@@ -197,7 +197,9 @@ class WriteMixin:
         last_exc: Exception | None = None
         for w_idx, window_messages in enumerate(windows):
             extraction_messages = build_extraction_messages(
-                window_messages, operator_guidance=operator_guidance
+                window_messages,
+                operator_guidance=operator_guidance,
+                require_speaker=settings.extraction_require_speaker,
             )
             try:
                 response = retry_transient(
