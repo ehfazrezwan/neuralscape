@@ -186,13 +186,18 @@ class WriteMixin:
 
         from google.genai.types import GenerateContentConfig, HttpOptions
 
-        # Use rich parser to extract speaker attribution (T1.2) and per-fact
-        # event time (T1.3). Both are consumed below: speaker → metadata.speaker,
-        # ParsedFact.occurred_at → per-fact occurred_at (falling back to the
-        # conversation-level occurred_at parameter when absent/non-ISO).
+        # Step 1.5: Choose parser based on extraction_require_speaker flag (FIX 1).
+        # When the flag is OFF (production default), use the LEGACY parser that
+        # folds any naturally-occurring "prefix: content" patterns back into
+        # content without splitting into speaker metadata. This restores byte-
+        # identical backward-compat: stored content and dedup identity match
+        # pre-T1.2 exactly (no speaker metadata, no content mutation).
+        # When the flag is ON, use the rich parser for speaker + occurred_at.
+        use_rich_parser = settings.extraction_require_speaker
         from prompts import ParsedFact
 
         parsed_facts_rich: list[ParsedFact] = []
+        parsed_facts_legacy: list[tuple[str, str]] = []
         window_errors: list[str] = []
         last_exc: Exception | None = None
         for w_idx, window_messages in enumerate(windows):
@@ -212,7 +217,10 @@ class WriteMixin:
                     operation="LLM extraction",
                     fallback_model=settings.gemini_llm_fallback_model,
                 )
-                parsed_facts_rich.extend(parse_extraction_response_rich(response.text))
+                if use_rich_parser:
+                    parsed_facts_rich.extend(parse_extraction_response_rich(response.text))
+                else:
+                    parsed_facts_legacy.extend(parse_extraction_response(response.text))
             except Exception as e:
                 # One window failing must not zero the whole session — keep
                 # the other windows' facts and report the failure honestly
@@ -239,25 +247,36 @@ class WriteMixin:
         }
 
         # Filter out junk facts from extraction.
-        # Check the FULL fact (speaker + content) for junk patterns, not just
-        # the content alone — the rich parser may have extracted a junk-pattern
-        # prefix like "Ran command:" as a speaker, leaving content that doesn't
-        # match the junk regex on its own. Reconstructing catches those.
-        pre_filter_count = len(parsed_facts_rich)
-        parsed_facts_rich = [
-            pf for pf in parsed_facts_rich
-            if not _is_junk_fact(
-                f"{pf.speaker}: {pf.content}" if pf.speaker else pf.content
-            )
-        ]
-        if pre_filter_count != len(parsed_facts_rich):
-            logger.info(
-                f"Filtered {pre_filter_count - len(parsed_facts_rich)} junk facts from extraction"
-            )
-
-        if not parsed_facts_rich:
-            logger.info("No facts extracted from conversation")
-            return ([], stats) if return_stats else []
+        # For rich parser: check the FULL fact (speaker + content) for junk patterns.
+        # For legacy parser: content already includes any prefix.
+        if use_rich_parser:
+            pre_filter_count = len(parsed_facts_rich)
+            parsed_facts_rich = [
+                pf for pf in parsed_facts_rich
+                if not _is_junk_fact(
+                    f"{pf.speaker}: {pf.content}" if pf.speaker else pf.content
+                )
+            ]
+            if pre_filter_count != len(parsed_facts_rich):
+                logger.info(
+                    f"Filtered {pre_filter_count - len(parsed_facts_rich)} junk facts from extraction"
+                )
+            if not parsed_facts_rich:
+                logger.info("No facts extracted from conversation")
+                return ([], stats) if return_stats else []
+        else:
+            pre_filter_count = len(parsed_facts_legacy)
+            parsed_facts_legacy = [
+                (cat, content) for cat, content in parsed_facts_legacy
+                if not _is_junk_fact(content)
+            ]
+            if pre_filter_count != len(parsed_facts_legacy):
+                logger.info(
+                    f"Filtered {pre_filter_count - len(parsed_facts_legacy)} junk facts from extraction"
+                )
+            if not parsed_facts_legacy:
+                logger.info("No facts extracted from conversation")
+                return ([], stats) if return_stats else []
 
         # Step 2: Batch-store all facts (single embed + single Qdrant upsert).
         # T1.2: thread speaker attribution through. We extract (category, content)
@@ -271,22 +290,29 @@ class WriteMixin:
         # embed rejection in production. Raising fails the ARQ job, so
         # /v1/memories/status/{task_id} reports status=failed with the error.
         try:
-            facts = [(pf.category, pf.content) for pf in parsed_facts_rich]
-            speakers = [pf.speaker for pf in parsed_facts_rich]
-            # T1.3: per-fact occurred_at extraction with fallback
-            occurred_ats: list[str | None] = []
-            for pf in parsed_facts_rich:
-                per_fact_time: str | None = None
-                if pf.occurred_at:
-                    try:
-                        per_fact_time = validate_occurred_at(pf.occurred_at)
-                    except (ValueError, TypeError):
-                        # Invalid or relative phrase → use the fallback
+            if use_rich_parser:
+                facts = [(pf.category, pf.content) for pf in parsed_facts_rich]
+                speakers = [pf.speaker for pf in parsed_facts_rich]
+                # T1.3: per-fact occurred_at extraction with fallback
+                occurred_ats: list[str | None] = []
+                for pf in parsed_facts_rich:
+                    per_fact_time: str | None = None
+                    if pf.occurred_at:
+                        try:
+                            per_fact_time = validate_occurred_at(pf.occurred_at)
+                        except (ValueError, TypeError):
+                            # Invalid or relative phrase → use the fallback
+                            per_fact_time = occurred_at
+                    else:
+                        # No per-fact time → use the conversation-level fallback
                         per_fact_time = occurred_at
-                else:
-                    # No per-fact time → use the conversation-level fallback
-                    per_fact_time = occurred_at
-                occurred_ats.append(per_fact_time)
+                    occurred_ats.append(per_fact_time)
+            else:
+                # Legacy path: no speaker metadata, no per-fact occurred_at.
+                # Thread conversation-level occurred_at as before (T1.3 fallback).
+                facts = parsed_facts_legacy
+                speakers = None
+                occurred_ats = None
             stored = self._batch_store_facts(
                 facts=facts,
                 speakers=speakers,
@@ -989,7 +1015,7 @@ class WriteMixin:
         - string: only match rows with that exact speaker
         """
         try:
-            from qdrant_client.models import FieldCondition, Filter, IsNullCondition, MatchValue, PayloadField
+            from qdrant_client.models import FieldCondition, Filter, IsEmptyCondition, MatchValue, PayloadField
             client = self._memory.vector_store.client
             collection = settings.qdrant_collection
             must = [
@@ -1002,7 +1028,11 @@ class WriteMixin:
             if scope == "project" and project_id:
                 must.append(FieldCondition(key="metadata.project_id", match=MatchValue(value=project_id)))
             if speaker is None:
-                must.append(IsNullCondition(is_null=PayloadField(key="metadata.speaker")))
+                # FIX 2: Use IsEmptyCondition to match rows where speaker is missing
+                # or null. IsNullCondition only matches EXPLICIT nulls, but payloads
+                # omit the speaker key when absent (never write speaker: null), so
+                # the backfill lookup was dead code. IsEmptyCondition matches both.
+                must.append(IsEmptyCondition(is_empty=PayloadField(key="metadata.speaker")))
             elif speaker is not _SPEAKER_UNSET:
                 must.append(FieldCondition(key="metadata.speaker", match=MatchValue(value=speaker)))
             points, _ = client.scroll(
