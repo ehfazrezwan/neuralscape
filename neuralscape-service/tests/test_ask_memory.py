@@ -1000,9 +1000,49 @@ class TestCitations:
 
 class TestContradictions:
     @pytest.mark.asyncio
+    async def test_discipline_3_instructs_stating_winner_as_answer(self):
+        """Discipline 3 (T2.3): commit to the recency winner as THE answer,
+        subordinate clause for supersession (not surface-both as primary)."""
+        svc = _service([_mem("m1", "x")])
+        llm = _answer_llm("ans")
+        await ask_memory(svc, question="q?", user_id="u",
+                         reasoning_level="high", llm_call=llm)
+        prompt = llm.prompts[0]
+        discipline_section = prompt.split("EVIDENCE:")[0]
+
+        # NEW wording: state the winner AS THE answer
+        assert "CONTRADICTIONS:" in discipline_section
+        assert "state the winner" in discipline_section
+        assert "as THE answer" in discipline_section
+        assert "subordinate clause" in discipline_section
+        assert "not as a co-equal alternative" in discipline_section
+
+        # OLD wording no longer present: don't surface BOTH as primary behavior
+        assert "surface BOTH with their timestamps" not in discipline_section
+        assert "say explicitly that you are preferring it because it is newer" not in discipline_section
+
+    @pytest.mark.asyncio
+    async def test_discipline_3_scope_guard_no_blanket_commit(self):
+        """T2.3 scope guard: the sharpened discipline 3 is confined to
+        contradictions/recency; it does NOT add a general commit instruction."""
+        svc = _service([_mem("m1", "x")])
+        llm = _answer_llm("ans")
+        await ask_memory(svc, question="q?", user_id="u",
+                         reasoning_level="high", llm_call=llm)
+        prompt = llm.prompts[0]
+        discipline_section = prompt.split("EVIDENCE:")[0]
+
+        # Assert NO blanket over-commit phrasing (LME regression guard)
+        assert "commit to the fact itself" not in discipline_section
+        assert "when the evidence directly answers" not in discipline_section
+        # The discipline is scoped to contradictions, not synthesis generally
+        contradict_disc = discipline_section.split("3. CONTRADICTIONS:")[1].split("4. ")[0]
+        assert "contradict" in contradict_disc.lower()
+
+    @pytest.mark.asyncio
     async def test_evidence_carries_timestamps_and_discipline(self):
         """The prompt must give the model what discipline 3 needs: both
-        conflicting rows WITH their timestamps + the surface-both rule."""
+        conflicting rows WITH their timestamps + the commit-to-winner rule."""
         old = _mem("m-old", "The sync is on Tuesday.", "2026-01-01T00:00:00+00:00")
         new = _mem("m-new", "The sync was rescheduled to Thursday.", "2026-06-01T00:00:00+00:00")
         svc = _service([new, old])
@@ -1014,10 +1054,26 @@ class TestContradictions:
                                reasoning_level="medium", llm_call=llm)
         prompt = llm.prompts[0]
         assert "2026-01-01" in prompt and "2026-06-01" in prompt
-        assert "CONTRADICTIONS" in prompt and "BOTH" in prompt
+        assert "CONTRADICTIONS" in prompt
+        # The commit-to-winner rule is actually present (matches the docstring).
+        assert "state the winner" in prompt and "as THE answer" in prompt
         # Chronological order in the evidence block: older row first.
         assert prompt.index("m-old") < prompt.index("m-new")
         assert set(out["citations"]) == {"m-new", "m-old"}
+
+    @pytest.mark.asyncio
+    async def test_recency_and_specificity_basis_preserved(self):
+        """Discipline 3 (T2.3): winner selection basis mentions event time,
+        storage time, and specificity as tie-break (consistency with disc 2+7)."""
+        svc = _service([_mem("m1", "x")])
+        llm = _answer_llm("ans")
+        await ask_memory(svc, question="q?", user_id="u",
+                         reasoning_level="high", llm_call=llm)
+        prompt = llm.prompts[0]
+        contradict_disc = prompt.split("3. CONTRADICTIONS:")[1].split("4. ")[0]
+        assert "event time" in contradict_disc
+        assert "storage time" in contradict_disc
+        assert "most specific" in contradict_disc
 
     @pytest.mark.asyncio
     async def test_enumeration_dedup_instruction_present(self):
