@@ -362,9 +362,10 @@ _DISCIPLINES_FULL = """Disciplines (follow strictly):
 2. RECENCY: newer memories supersede older ones. "Newer" means the event time (shown as
    "event: …") when present, else the storage time. When rows describe a change ("changed",
    "rescheduled", "now", "moved to"), the newest row is the current truth.
-3. CONTRADICTIONS: when two memories genuinely contradict, surface BOTH with their
-   timestamps, prefer the newer/valid one, and say explicitly that you are preferring it
-   because it is newer.
+3. CONTRADICTIONS: when two memories genuinely contradict, state the winner (the newer one
+   by event time when shown, else storage time; the most specific on ties) as THE answer.
+   Mention the superseded or older value briefly in a subordinate clause if relevant (e.g.,
+   "X, previously Y"), not as a co-equal alternative.
 4. ABSTENTION: abstain ONLY when NO evidence row bears on the question. If at least one
    evidence row is on-topic (shares the question's key entities or keywords) but doesn't
    give a verbatim answer, commit to the BEST-SUPPORTED answer from that evidence rather
