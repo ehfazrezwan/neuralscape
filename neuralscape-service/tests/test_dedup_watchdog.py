@@ -19,13 +19,20 @@ import pytest
 
 @pytest.mark.asyncio
 async def test_dedup_cron_keeps_event_loop_responsive():
-    """Event loop stays responsive during dedup batch (heartbeat advances)."""
+    """Event loop stays responsive during user scan + dedup batch."""
     from worker import dedup_all_memories
 
-    # Build a fake service whose dedup_memories BLOCKS (sync sleep, not async)
-    # to simulate the real production behavior (sync Qdrant scroll + LLM calls).
+    # Build a fake service whose user scan + dedup work BLOCKS (sync sleep, not
+    # async) to simulate the real production behavior (sync Qdrant scroll + LLM
+    # calls).
     fake_service = MagicMock()
-    fake_service.get_all_user_ids.return_value = ["u1", "u2", "u3"]
+
+    def blocking_get_all_user_ids(*, batch_size: int = 100) -> list[str]:
+        """Simulates blocking Qdrant scroll during user enumeration."""
+        time.sleep(0.2)
+        return ["u1", "u2", "u3"]
+
+    fake_service.get_all_user_ids = blocking_get_all_user_ids
 
     def blocking_dedup(user_id: str, *, semantic: bool = True) -> dict:
         """Simulates blocking work (Qdrant scroll + LLM)."""
@@ -57,12 +64,12 @@ async def test_dedup_cron_keeps_event_loop_responsive():
     heartbeat_task.cancel()
 
     # Assert the heartbeat advanced meaningfully DURING the dedup run.
-    # 3 users × 0.2s = 0.6s of blocking work. If the loop were blocked, the
-    # heartbeat would starve (n ≈ 0). With `to_thread`, the loop yields and
-    # the heartbeat should tick ~50-60+ times (0.6s ÷ 0.01s, minus overhead).
-    assert heartbeat_count["n"] >= 50, (
+    # 0.2s user scan + 3 users × 0.2s = 0.8s of blocking work. If the loop
+    # were blocked, the heartbeat would starve (n ≈ 0). With `to_thread`, the
+    # heartbeat should tick ~70-80 times (0.8s ÷ 0.01s, minus overhead).
+    assert heartbeat_count["n"] >= 60, (
         f"Event loop was blocked: heartbeat only ticked {heartbeat_count['n']} "
-        f"times during 0.6s of dedup work (expected ≥50 ticks)"
+        f"times during 0.8s of user scan + dedup work (expected ≥60 ticks)"
     )
 
     # Verify the summary aggregation is correct
