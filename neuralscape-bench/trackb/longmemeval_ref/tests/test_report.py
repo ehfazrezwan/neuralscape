@@ -161,7 +161,7 @@ def test_write_markdown_summary(tmp_path):
     results = {
         "harness": "longmemeval-ref (Track B)",
         "backbone": "neuralscape",
-        "judge": "gemini-2.5-flash",
+        "judge": "gemini-3.1-flash-lite",
         "embedder": "unknown",
         "dataset": "LongMemEval_S",
         "k": 10,

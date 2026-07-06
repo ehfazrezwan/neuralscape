@@ -27,7 +27,7 @@ class LMEHarness:
         target: str,
         token: str | None = None,
         judge_key: str | None = None,
-        judge_model: str = "gemini-2.5-flash",
+        judge_model: str = "gemini-3.1-flash-lite",
         k: int = 10,
         reasoning_level: str = "high",
         sample: int | None = None,

@@ -1,7 +1,7 @@
 """Grading protocol for Track B LongMemEval.
 
 Faithful to the LME reference: LLM judge with abstention handling,
-per-question_type breakdown. Uses the standard judge (gemini-2.5-flash, temp 0).
+per-question_type breakdown. Uses the standard judge (gemini-3.1-flash-lite, temp 0).
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ async def grade_lme_answers(
     *,
     answers_path: Path,
     judged_path: Path,
-    judge_model: str = "gemini-2.5-flash",
+    judge_model: str = "gemini-3.1-flash-lite",
     api_key: str,
     concurrency: int = 4,
     log=print,
@@ -28,7 +28,7 @@ async def grade_lme_answers(
         data: SuiteData with qa_items (needed for gold answers)
         answers_path: Input JSONL (from answer phase)
         judged_path: Output JSONL (resumable)
-        judge_model: Gemini model for grading (default: gemini-2.5-flash)
+        judge_model: Gemini model for grading (default: gemini-3.1-flash-lite)
         api_key: GOOGLE_API_KEY
         concurrency: Parallel judge calls
         log: Logging function

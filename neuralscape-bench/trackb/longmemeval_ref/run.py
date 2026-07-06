@@ -39,8 +39,8 @@ def main():
     )
     parser.add_argument(
         "--judge-model",
-        default="gemini-2.5-flash",
-        help="LLM judge model (default: gemini-2.5-flash)",
+        default="gemini-3.1-flash-lite",
+        help="LLM judge model (default: gemini-3.1-flash-lite)",
     )
     parser.add_argument(
         "--k",

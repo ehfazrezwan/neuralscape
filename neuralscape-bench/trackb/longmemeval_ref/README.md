@@ -9,7 +9,7 @@ This harness faithfully reproduces the **published LongMemEval evaluation protoc
 1. **Ingest**: Store each question's haystack sessions into NS, preserving temporal context (dated sessions).
 2. **Retrieve**: For each question, retrieve top-k memories from NS.
 3. **Answer**: Generate an answer using NS `/v1/ask` endpoint (which mirrors the LME reference's retrieval + answer-generation pipeline).
-4. **Grade**: Judge correctness using LongMemEval's QA-correctness metric with the standard judge (`gemini-2.5-flash`, temp 0).
+4. **Grade**: Judge correctness using LongMemEval's QA-correctness metric with the standard judge (`gemini-3.1-flash-lite`, temp 0).
 
 ### Faithfulness Statement
 
@@ -82,7 +82,7 @@ All result files are tagged:
 {
   "harness": "longmemeval-ref (Track B)",
   "backbone": "neuralscape",
-  "judge": "gemini-2.5-flash",
+  "judge": "gemini-3.1-flash-lite",
   "embedder": "<NS's configured embedder>",
   "dataset": "LongMemEval_S (xiaowu0162/longmemeval-cleaned)"
 }

@@ -112,7 +112,7 @@ async def test_grade_lme_answers(tmp_path, monkeypatch):
     # Mock GeminiJudge to use our fake transport
     original_init = GeminiJudge.__init__
 
-    def mock_init(self, api_key, *, model="gemini-2.5-flash", timeout_s=60.0, max_retries=6, http=None):
+    def mock_init(self, api_key, *, model="gemini-3.1-flash-lite", timeout_s=60.0, max_retries=6, http=None):
         self.model = model
         self._key = api_key
         self._max_retries = max_retries
@@ -149,7 +149,7 @@ async def test_grade_lme_answers(tmp_path, monkeypatch):
         data,
         answers_path=answers_path,
         judged_path=judged_path,
-        judge_model="gemini-2.5-flash",
+        judge_model="gemini-3.1-flash-lite",
         api_key="fake-key",
         concurrency=1,
         log=lambda *_: None,
@@ -163,7 +163,7 @@ async def test_grade_lme_answers(tmp_path, monkeypatch):
     # Verdict written
     [rec] = read_jsonl_records(judged_path)
     assert rec["qa_id"] == "q1"
-    assert rec["judge_model"] == "gemini-2.5-flash"
+    assert rec["judge_model"] == "gemini-3.1-flash-lite"
 
 
 @pytest.mark.asyncio
@@ -172,7 +172,7 @@ async def test_grade_lme_resumable(tmp_path, monkeypatch):
     fake = _FakeGemini(verdict=True)
 
     # Mock GeminiJudge to use our fake transport
-    def mock_init(self, api_key, *, model="gemini-2.5-flash", timeout_s=60.0, max_retries=6, http=None):
+    def mock_init(self, api_key, *, model="gemini-3.1-flash-lite", timeout_s=60.0, max_retries=6, http=None):
         self.model = model
         self._key = api_key
         self._max_retries = max_retries
@@ -206,7 +206,7 @@ async def test_grade_lme_resumable(tmp_path, monkeypatch):
     # First run
     await grade_lme_answers(
         data, answers_path=answers_path, judged_path=judged_path,
-        judge_model="gemini-2.5-flash", api_key="fake-key", concurrency=1,
+        judge_model="gemini-3.1-flash-lite", api_key="fake-key", concurrency=1,
         log=lambda *_: None,
     )
     assert fake.calls == 1
@@ -214,7 +214,7 @@ async def test_grade_lme_resumable(tmp_path, monkeypatch):
     # Second run: should skip
     summary2 = await grade_lme_answers(
         data, answers_path=answers_path, judged_path=judged_path,
-        judge_model="gemini-2.5-flash", api_key="fake-key", concurrency=1,
+        judge_model="gemini-3.1-flash-lite", api_key="fake-key", concurrency=1,
         log=lambda *_: None,
     )
     assert summary2["judged"] == 0

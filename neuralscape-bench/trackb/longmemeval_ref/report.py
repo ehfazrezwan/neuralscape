@@ -26,7 +26,7 @@ def aggregate_results(
     judged_path: Path,
     *,
     backbone: str = "neuralscape",
-    judge_model: str = "gemini-2.5-flash",
+    judge_model: str = "gemini-3.1-flash-lite",
     embedder: str = "unknown",
     k: int = 10,
 ) -> dict:
