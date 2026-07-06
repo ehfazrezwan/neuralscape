@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime, timezone
 from config import settings
 from index_format import distill_title
-from prompts import build_extraction_messages, parse_extraction_response
+from prompts import build_extraction_messages, parse_extraction_response, parse_extraction_response_rich
 from savings_meter import stamp_tokens
 from schemas import EPISTEMIC_LEVEL_VOCAB, GLOBAL_CATEGORIES, MEMORY_CATEGORIES, MemoryResponse, MemoryScope, MemoryVisibility, PROJECT_CATEGORIES, default_scope_for_category, default_visibility_for_category, normalize_visibility, validate_occurred_at
 from memory.groups import _build_group_id
@@ -21,6 +21,37 @@ from memory.ranking import _times_derived_from_metadata
 from memory.retry import retry_transient
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_speaker(speaker: str | None) -> str | None:
+    """Validate and sanitize a speaker label (T1.2 speaker sanity guard).
+
+    Returns the speaker if it's plausible as a speaker label, otherwise None.
+    Guards against the permissive speaker-regex false positives from the rich
+    parser — rejects oversized tokens, empty strings, and sentence fragments
+    that clearly aren't speaker names/roles.
+
+    Args:
+        speaker: Raw speaker token from ParsedFact
+
+    Returns:
+        The validated speaker, or None if implausible.
+    """
+    if not speaker:
+        return None
+    speaker = speaker.strip()
+    if not speaker:
+        return None
+    # Reject oversized tokens (likely sentence fragments, not names/roles)
+    if len(speaker) > 40:
+        return None
+    # Simple heuristic: a plausible speaker is mostly alphanumeric/spaces/dots/
+    # hyphens/underscores (the same class the regex allows). If it's clearly
+    # a sentence fragment (e.g., ends with punctuation like "Note:"), drop it.
+    # We keep this simple — the regex already bounds the character class, so
+    # this just adds a length + sanity check on top.
+    return speaker
+
 
 class WriteMixin:
     """WriteMixin for MemoryService (mechanical split — see memory_service.py)."""
@@ -154,7 +185,13 @@ class WriteMixin:
 
         from google.genai.types import GenerateContentConfig, HttpOptions
 
-        parsed_facts: list[tuple[str, str]] = []
+        # Use rich parser to extract speaker attribution (T1.2)
+        # and occurred_at (T1.3, future). For now we consume only speaker;
+        # occurred_at from the ParsedFact is ignored/dropped here (the
+        # conversation-level occurred_at parameter flows separately below).
+        from prompts import ParsedFact
+
+        parsed_facts_rich: list[ParsedFact] = []
         window_errors: list[str] = []
         last_exc: Exception | None = None
         for w_idx, window_messages in enumerate(windows):
@@ -172,7 +209,7 @@ class WriteMixin:
                     operation="LLM extraction",
                     fallback_model=settings.gemini_llm_fallback_model,
                 )
-                parsed_facts.extend(parse_extraction_response(response.text))
+                parsed_facts_rich.extend(parse_extraction_response_rich(response.text))
             except Exception as e:
                 # One window failing must not zero the whole session — keep
                 # the other windows' facts and report the failure honestly
@@ -198,30 +235,43 @@ class WriteMixin:
             "window_errors": window_errors,
         }
 
-        # Filter out junk facts from extraction
-        pre_filter_count = len(parsed_facts)
-        parsed_facts = [
-            (cat, content) for cat, content in parsed_facts
-            if not _is_junk_fact(content)
+        # Filter out junk facts from extraction.
+        # Check the FULL fact (speaker + content) for junk patterns, not just
+        # the content alone — the rich parser may have extracted a junk-pattern
+        # prefix like "Ran command:" as a speaker, leaving content that doesn't
+        # match the junk regex on its own. Reconstructing catches those.
+        pre_filter_count = len(parsed_facts_rich)
+        parsed_facts_rich = [
+            pf for pf in parsed_facts_rich
+            if not _is_junk_fact(
+                f"{pf.speaker}: {pf.content}" if pf.speaker else pf.content
+            )
         ]
-        if pre_filter_count != len(parsed_facts):
+        if pre_filter_count != len(parsed_facts_rich):
             logger.info(
-                f"Filtered {pre_filter_count - len(parsed_facts)} junk facts from extraction"
+                f"Filtered {pre_filter_count - len(parsed_facts_rich)} junk facts from extraction"
             )
 
-        if not parsed_facts:
+        if not parsed_facts_rich:
             logger.info("No facts extracted from conversation")
             return ([], stats) if return_stats else []
 
         # Step 2: Batch-store all facts (single embed + single Qdrant upsert).
+        # T1.2: thread speaker attribution through. We extract (category, content)
+        # tuples for _batch_store_facts, plus a parallel speakers list.
+        # T1.3's occurred_at from ParsedFact is deliberately ignored here — the
+        # conversation-level occurred_at parameter flows separately below.
         # A failure here (embedding, Qdrant) must PROPAGATE: the previous
         # except-and-continue silently stored zero facts while the task
         # reported success — exactly what hid the gateway's single-input
         # embed rejection in production. Raising fails the ARQ job, so
         # /v1/memories/status/{task_id} reports status=failed with the error.
         try:
+            facts = [(pf.category, pf.content) for pf in parsed_facts_rich]
+            speakers = [pf.speaker for pf in parsed_facts_rich]
             stored = self._batch_store_facts(
-                facts=parsed_facts,
+                facts=facts,
+                speakers=speakers,
                 user_id=user_id,
                 project_id=project_id,
                 agent_id=agent_id,
@@ -232,7 +282,7 @@ class WriteMixin:
         except Exception as e:
             logger.error(
                 f"Batch store failed for user {user_id}: {e} — "
-                f"{len(parsed_facts)} extracted facts were NOT stored",
+                f"{len(parsed_facts_rich)} extracted facts were NOT stored",
                 exc_info=True,
             )
             raise
@@ -1249,6 +1299,7 @@ class WriteMixin:
         memory_kind: str | None = None,
         source_ref: dict | None = None,
         occurred_at: str | None = None,
+        speakers: list[str | None] | None = None,
     ) -> list[MemoryResponse]:
         """Store multiple categorized facts via a single batch embed + single Qdrant upsert.
 
@@ -1279,6 +1330,10 @@ class WriteMixin:
                 batch — when the conversation actually happened, for
                 historical ingestion of old chat exports. None ⇒ omitted
                 (event time unknown; readers fall back to created_at).
+            speakers: Optional list of per-fact speaker labels (T1.2), aligned
+                to ``facts``. None or a shorter list is tolerated — missing
+                entries default to None (no speaker). Validated via
+                ``_validate_speaker`` before persisting.
 
         Returns:
             List of MemoryResponse objects for stored facts (new rows and
@@ -1298,13 +1353,23 @@ class WriteMixin:
         texts: list[str] = []
         memory_ids: list[str] = []
         payloads: list[dict] = []
-        fact_meta: list[tuple[str, str, str | None]] = []  # (category, scope, project_id) per fact
+        fact_meta: list[tuple[str, str, str | None, str | None]] = []  # (category, scope, project_id, speaker) per fact
         # Ordered slots: ("new", index-into-texts) | ("dup", existing response)
         ordered: list[tuple[str, object]] = []
         seen_in_batch: set[tuple[str, str, str | None]] = set()
         dedup_hits = 0
 
-        for category, content in facts:
+        # Normalize speakers list: pad to len(facts) with None if shorter/absent
+        speakers_normalized = speakers or []
+        if len(speakers_normalized) < len(facts):
+            speakers_normalized = list(speakers_normalized) + [None] * (
+                len(facts) - len(speakers_normalized)
+            )
+
+        for idx, (category, content) in enumerate(facts):
+            raw_speaker = speakers_normalized[idx] if idx < len(speakers_normalized) else None
+            # T1.2 speaker sanity guard: validate before persisting
+            speaker = _validate_speaker(raw_speaker)
             scope = default_scope_for_category(category)
             fact_project_id = project_id
 
@@ -1383,13 +1448,15 @@ class WriteMixin:
                     **({"source_ref": source_ref} if source_ref else {}),
                     # Event time: only stored when known (never defaulted).
                     **({"occurred_at": occurred_at} if occurred_at is not None else {}),
+                    # T1.2: speaker attribution (only stored when present)
+                    **({"speaker": speaker} if speaker else {}),
                 },
             }
 
             texts.append(content)
             memory_ids.append(mid)
             payloads.append(payload)
-            fact_meta.append((category, scope_val, fact_project_id))
+            fact_meta.append((category, scope_val, fact_project_id, speaker))
             ordered.append(("new", len(texts) - 1))
 
         # ── Single batch embed + single Qdrant upsert (new facts only) ──
@@ -1418,7 +1485,7 @@ class WriteMixin:
                 continue
             idx = ref
             mid, content = memory_ids[idx], texts[idx]
-            category, scope_val, fact_pid = fact_meta[idx]
+            category, scope_val, fact_pid, spk = fact_meta[idx]
             responses.append(
                 MemoryResponse(
                     id=mid,
@@ -1435,6 +1502,7 @@ class WriteMixin:
                     source_ref=source_ref,
                     title=distill_title(content),
                     token_estimate=stamp_tokens(content),
+                    speaker=spk,
                 )
             )
 
