@@ -186,10 +186,10 @@ class WriteMixin:
 
         from google.genai.types import GenerateContentConfig, HttpOptions
 
-        # Use rich parser to extract speaker attribution (T1.2)
-        # and occurred_at (T1.3, future). For now we consume only speaker;
-        # occurred_at from the ParsedFact is ignored/dropped here (the
-        # conversation-level occurred_at parameter flows separately below).
+        # Use rich parser to extract speaker attribution (T1.2) and per-fact
+        # event time (T1.3). Both are consumed below: speaker → metadata.speaker,
+        # ParsedFact.occurred_at → per-fact occurred_at (falling back to the
+        # conversation-level occurred_at parameter when absent/non-ISO).
         from prompts import ParsedFact
 
         parsed_facts_rich: list[ParsedFact] = []
