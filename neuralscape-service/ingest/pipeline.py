@@ -70,6 +70,10 @@ class IngestDoc:
     # Stamped on every produced passage + fact. None ⇒ omitted (event time
     # unknown; readers fall back to created_at).
     occurred_at: str | None = None
+    # Workspace partition (WT6): absent/"memory" = memory type; any other value
+    # = reference workspace (fenced out of card/reflection/default recall). None
+    # defers to adapter-based defaulting in ingest_document.
+    workspace: str | None = None
 
 
 def _fact_scope(category: str, project_id: str | None) -> tuple[str, str | None]:
@@ -102,6 +106,26 @@ def ingest_document(service, doc: IngestDoc) -> dict:
     # taxonomy/ontology. Request-time typos are already rejected with a 422
     # by ``schemas.validate_adapter_name`` before anything is enqueued.
     adapter = require_adapter(doc.adapter)
+
+    # WT6: workspace defaulting. Non-default adapters (e.g. trading_strategy, code_graph)
+    # DEFAULT to a reference workspace derived from adapter name + optional title, unless
+    # the caller explicitly overrode workspace. This makes the trigger case (trading books
+    # poisoning the identity card) impossible by default — ingested reference content lands
+    # in its own partition, fenced out of card/reflection/default recall.
+    effective_workspace = doc.workspace
+    if effective_workspace is None and adapter.name != "default":
+        # Auto-derive a reference workspace name: adapter-name[--title-slug]
+        base_name = f"ref-{adapter.name}"
+        title_slug = None
+        if doc.source.get("title"):
+            # Slugify title: lowercase, alphanumeric + dashes only
+            import re
+            title_slug = re.sub(r'[^a-z0-9\-]+', '-', doc.source["title"].lower()).strip('-')[:30]
+        effective_workspace = f"{base_name}--{title_slug}" if title_slug else base_name
+        logger.info(
+            f"Auto-derived workspace '{effective_workspace}' for adapter '{adapter.name}' "
+            f"(WT6: reference content fenced from memory pools by default)"
+        )
 
     base = dict(doc.source)  # shallow copy — we never mutate the caller's dict
     # Stamp sync time once for the whole document.
@@ -142,6 +166,7 @@ def ingest_document(service, doc: IngestDoc) -> dict:
                     memory_kind="passage",
                     source_ref=chunk_source,
                     occurred_at=doc.occurred_at,
+                    workspace=effective_workspace,
                     add_to_graph=False,
                 )
                 memory_ids.extend(m.id for m in stored)
@@ -188,6 +213,7 @@ def ingest_document(service, doc: IngestDoc) -> dict:
                     memory_kind="fact",
                     source_ref=base,
                     occurred_at=doc.occurred_at,
+                    workspace=effective_workspace,
                     add_to_graph=False,
                     return_created=True,
                 )

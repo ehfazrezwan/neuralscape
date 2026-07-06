@@ -223,7 +223,8 @@ class EditMixin:
 
         ``filters``: scope / category / project_id / visibility / tags_contains
         (AND semantics). ``ops`` is presence-keyed: add_tags, remove_tags,
-        set_category, set_project_id (explicit None clears the project).
+        set_category, set_project_id (explicit None clears the project),
+        set_workspace (explicit None clears it; WT6 migration tool).
 
         Visibility and content are deliberately NOT bulk-editable. Other
         users' private memories never enter the candidate set (the scroll
@@ -319,11 +320,18 @@ class EditMixin:
                         new_meta.pop("project_id", None)
                     else:
                         new_meta["project_id"] = ops["set_project_id"]
+                # WT6: workspace housekeeping operation
+                if "set_workspace" in ops:
+                    if ops["set_workspace"] is None:
+                        new_meta.pop("workspace", None)
+                    else:
+                        new_meta["workspace"] = ops["set_workspace"]
 
                 changed = (
                     (new_meta.get("tags") or None) != (meta.get("tags") or None)
                     or new_meta.get("category") != meta.get("category")
                     or new_meta.get("project_id") != meta.get("project_id")
+                    or new_meta.get("workspace") != meta.get("workspace")
                 )
                 if not changed:
                     continue  # matched, nothing to change
@@ -352,8 +360,9 @@ class EditMixin:
                 )
                 owner = meta.get("owner_user_id") or payload.get("user_id", "")
                 visibility = meta.get("visibility") or MemoryVisibility.PRIVATE.value
-                old_group = _build_group_id(visibility, owner, meta.get("project_id"))
-                new_group = _build_group_id(visibility, owner, new_meta.get("project_id"))
+                # WT6: include workspace in group_id derivation
+                old_group = _build_group_id(visibility, owner, meta.get("project_id"), meta.get("workspace"))
+                new_group = _build_group_id(visibility, owner, new_meta.get("project_id"), new_meta.get("workspace"))
                 if new_group != old_group:
                     try:
                         self._expire_graph_edges_for_memory(
