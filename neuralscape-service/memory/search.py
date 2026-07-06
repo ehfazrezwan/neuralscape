@@ -791,49 +791,22 @@ class SearchMixin:
             # otherwise standard-origin graph edges never match their source
             # and lose their v2 metadata / get dropped by v2 filters. The
             # filter is identical for every edge, so it is built ONCE.
-            # Audit 27 hardening #9: when project_id is set, include BOTH the
-            # project-scoped AND global-scoped pools as fallback — so a graph
-            # edge in a project can enrich from global memories when no project
-            # memories exist. Qdrant's nearest-neighbor returns the closest
-            # match across all should clauses, so project takes precedence when
-            # present (same semantic distance → project wins on id tie-break).
             proj = (
                 [FieldCondition(key="metadata.project_id", match=MatchValue(value=project_id))]
                 if project_id else []
             )
             should_filters: list = []
             if want_personal and user_id:
-                # Project-scoped personal pool
                 should_filters.append(
                     Filter(must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))] + proj)
                 )
-                # Global-scoped personal pool as fallback (when project_id is set)
-                if project_id:
-                    should_filters.append(
-                        Filter(must=[
-                            FieldCondition(key="user_id", match=MatchValue(value=user_id)),
-                            FieldCondition(key="metadata.scope", match=MatchValue(value="global")),
-                        ])
-                    )
             if want_shared:
-                # Project-scoped shared pool
                 should_filters.append(
                     Filter(must=[FieldCondition(
                         key="metadata.visibility",
                         match=MatchValue(value=MemoryVisibility.SHARED.value),
                     )] + proj)
                 )
-                # Global-scoped shared pool as fallback (when project_id is set)
-                if project_id:
-                    should_filters.append(
-                        Filter(must=[
-                            FieldCondition(
-                                key="metadata.visibility",
-                                match=MatchValue(value=MemoryVisibility.SHARED.value),
-                            ),
-                            FieldCondition(key="metadata.scope", match=MatchValue(value="global")),
-                        ])
-                    )
             if want_standard:
                 should_filters.append(
                     Filter(must=[FieldCondition(
