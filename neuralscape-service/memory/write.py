@@ -186,10 +186,10 @@ class WriteMixin:
 
         from google.genai.types import GenerateContentConfig, HttpOptions
 
-        # Use rich parser to extract speaker attribution (T1.2)
-        # and occurred_at (T1.3, future). For now we consume only speaker;
-        # occurred_at from the ParsedFact is ignored/dropped here (the
-        # conversation-level occurred_at parameter flows separately below).
+        # Use rich parser to extract speaker attribution (T1.2) and per-fact
+        # event time (T1.3). Both are consumed below: speaker → metadata.speaker,
+        # ParsedFact.occurred_at → per-fact occurred_at (falling back to the
+        # conversation-level occurred_at parameter when absent/non-ISO).
         from prompts import ParsedFact
 
         parsed_facts_rich: list[ParsedFact] = []
@@ -262,8 +262,9 @@ class WriteMixin:
         # Step 2: Batch-store all facts (single embed + single Qdrant upsert).
         # T1.2: thread speaker attribution through. We extract (category, content)
         # tuples for _batch_store_facts, plus a parallel speakers list.
-        # T1.3's occurred_at from ParsedFact is deliberately ignored here — the
-        # conversation-level occurred_at parameter flows separately below.
+        # T1.3: Build per-fact occurred_ats from ParsedFact, validating each one.
+        # Valid ISO values use the fact's timestamp; invalid/absent values fall
+        # back to the conversation-level occurred_at parameter.
         # A failure here (embedding, Qdrant) must PROPAGATE: the previous
         # except-and-continue silently stored zero facts while the task
         # reported success — exactly what hid the gateway's single-input
@@ -272,6 +273,20 @@ class WriteMixin:
         try:
             facts = [(pf.category, pf.content) for pf in parsed_facts_rich]
             speakers = [pf.speaker for pf in parsed_facts_rich]
+            # T1.3: per-fact occurred_at extraction with fallback
+            occurred_ats: list[str | None] = []
+            for pf in parsed_facts_rich:
+                per_fact_time: str | None = None
+                if pf.occurred_at:
+                    try:
+                        per_fact_time = validate_occurred_at(pf.occurred_at)
+                    except (ValueError, TypeError):
+                        # Invalid or relative phrase → use the fallback
+                        per_fact_time = occurred_at
+                else:
+                    # No per-fact time → use the conversation-level fallback
+                    per_fact_time = occurred_at
+                occurred_ats.append(per_fact_time)
             stored = self._batch_store_facts(
                 facts=facts,
                 speakers=speakers,
@@ -281,6 +296,7 @@ class WriteMixin:
                 run_id=run_id,
                 source="conversation",
                 occurred_at=occurred_at,
+                occurred_ats=occurred_ats,
             )
         except Exception as e:
             logger.error(
@@ -1334,6 +1350,7 @@ class WriteMixin:
         source_ref: dict | None = None,
         occurred_at: str | None = None,
         speakers: list[str | None] | None = None,
+        occurred_ats: list[str | None] | None = None,
     ) -> list[MemoryResponse]:
         """Store multiple categorized facts via a single batch embed + single Qdrant upsert.
 
@@ -1368,6 +1385,10 @@ class WriteMixin:
                 to ``facts``. None or a shorter list is tolerated — missing
                 entries default to None (no speaker). Validated via
                 ``_validate_speaker`` before persisting.
+            occurred_ats: Optional list of per-fact event times (T1.3), aligned
+                to ``facts``. None or a shorter list is tolerated — missing
+                entries use the conversation-level ``occurred_at`` fallback.
+                Per-fact values take precedence when present.
 
         Returns:
             List of MemoryResponse objects for stored facts (new rows and
@@ -1387,7 +1408,7 @@ class WriteMixin:
         texts: list[str] = []
         memory_ids: list[str] = []
         payloads: list[dict] = []
-        fact_meta: list[tuple[str, str, str | None, str | None]] = []  # (category, scope, project_id, speaker) per fact
+        fact_meta: list[tuple[str, str, str | None, str | None, str | None]] = []  # (category, scope, project_id, speaker, occurred_at) per fact
         # Ordered slots: ("new", index-into-texts) | ("dup", existing response)
         ordered: list[tuple[str, object]] = []
         seen_in_batch: set[tuple[str, str, str | None, str | None]] = set()
@@ -1400,10 +1421,24 @@ class WriteMixin:
                 len(facts) - len(speakers_normalized)
             )
 
+        # Normalize occurred_ats list: pad to len(facts) with occurred_at fallback if shorter/absent
+        occurred_ats_normalized = occurred_ats or []
+        if len(occurred_ats_normalized) < len(facts):
+            occurred_ats_normalized = list(occurred_ats_normalized) + [occurred_at] * (
+                len(facts) - len(occurred_ats_normalized)
+            )
+
         for idx, (category, content) in enumerate(facts):
             raw_speaker = speakers_normalized[idx] if idx < len(speakers_normalized) else None
             # T1.2 speaker sanity guard: validate before persisting
             speaker = _validate_speaker(raw_speaker)
+            # T1.3: per-fact occurred_at (already validated by caller)
+            # Use per-fact value if present, otherwise fall back to conversation-level
+            fact_occurred_at = (
+                occurred_ats_normalized[idx] if idx < len(occurred_ats_normalized) else occurred_at
+            )
+            if fact_occurred_at is None:
+                fact_occurred_at = occurred_at
             scope = default_scope_for_category(category)
             fact_project_id = project_id
 
@@ -1500,7 +1535,8 @@ class WriteMixin:
                     **({"memory_kind": memory_kind} if memory_kind is not None else {}),
                     **({"source_ref": source_ref} if source_ref else {}),
                     # Event time: only stored when known (never defaulted).
-                    **({"occurred_at": occurred_at} if occurred_at is not None else {}),
+                    # T1.3: per-fact value takes precedence when present.
+                    **({"occurred_at": fact_occurred_at} if fact_occurred_at is not None else {}),
                     # T1.2: speaker attribution (only stored when present)
                     **({"speaker": speaker} if speaker else {}),
                 },
@@ -1509,7 +1545,7 @@ class WriteMixin:
             texts.append(content)
             memory_ids.append(mid)
             payloads.append(payload)
-            fact_meta.append((category, scope_val, fact_project_id, speaker))
+            fact_meta.append((category, scope_val, fact_project_id, speaker, fact_occurred_at))
             ordered.append(("new", len(texts) - 1))
 
         # ── Single batch embed + single Qdrant upsert (new facts only) ──
@@ -1538,7 +1574,7 @@ class WriteMixin:
                 continue
             idx = ref
             mid, content = memory_ids[idx], texts[idx]
-            category, scope_val, fact_pid, spk = fact_meta[idx]
+            category, scope_val, fact_pid, spk, fact_occurred_at = fact_meta[idx]
             responses.append(
                 MemoryResponse(
                     id=mid,
@@ -1548,7 +1584,7 @@ class WriteMixin:
                     project_id=fact_pid,
                     source="vector",
                     created_at=now_iso,
-                    occurred_at=occurred_at,
+                    occurred_at=fact_occurred_at,
                     source_type=source_type,
                     epistemic_level="explicit",
                     memory_kind=memory_kind,
