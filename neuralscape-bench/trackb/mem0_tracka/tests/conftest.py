@@ -8,23 +8,36 @@ def mock_memory_class():
     """Mock mem0.Memory class for unit tests."""
 
     class MockMemory:
+        # Class-level capture so callers can assert on kwargs regardless of
+        # which per-conversation instance a call landed on.
+        calls = []
+
         def __init__(self, config):
             self.config = config
             self.added = []
             self.searches = []
 
-        def add(self, messages, user_id=None, **kwargs):
+        def add(self, messages, *, user_id=None, **kwargs):
+            # Mirror vendored signature: add(messages, *, user_id=None, ...)
             self.added.append({"messages": messages, "user_id": user_id})
-            return {"status": "ok"}
+            MockMemory.calls.append(("add", {"user_id": user_id, **kwargs}))
+            return {"results": [{"id": "m1", "memory": "stored", "event": "ADD"}]}
 
-        def search(self, query, user_id=None, limit=10, **kwargs):
-            self.searches.append({"query": query, "user_id": user_id, "limit": limit})
-            # Return mock memories
-            return [
-                {"memory": f"Memory about {query}", "score": 0.9},
-                {"memory": "Another relevant memory", "score": 0.8},
-            ]
+        def search(self, query, *, top_k=20, filters=None, **kwargs):
+            # Mirror vendored signature: search(query, *, top_k=20, filters=None, ...)
+            self.searches.append({"query": query, "top_k": top_k, "filters": filters})
+            MockMemory.calls.append(
+                ("search", {"query": query, "top_k": top_k, "filters": filters})
+            )
+            # mem0 v1.1+ returns {"results": [...]}
+            return {
+                "results": [
+                    {"memory": f"Memory about {query}", "score": 0.9},
+                    {"memory": "Another relevant memory", "score": 0.8},
+                ]
+            }
 
+    MockMemory.calls = []
     return MockMemory
 
 

@@ -18,39 +18,43 @@ This is **Track A control** — the baseline for NS's own Track A scores.
 
 ### Locked Models (Controlled Comparison)
 
+All model ids live in `config.py` as the single source of truth; `report.py`
+reads those same constants so the reported config always matches what the
+mem0 Memory / judge were actually configured with.
+
 ```python
-# mem0 config (via config.py)
-backbone = "gemini-flash-1.5"  # mem0 format for Gemini 1.5 Flash
-embedder = "gemini-embedding-001"
-vector_store = Qdrant local (isolated from production)
-
-# Answer generation
-answer_model = "gemini-3.1-flash-lite"
-answer_temp = 0.0
-
-# Judge
-judge_model = "gemini-3.1-flash-lite"
-judge_temp = 0.0
+# config.py (single source of truth)
+BACKBONE_MODEL  = "gemini-3.1-flash-lite"   # mem0 LLM (extraction + generation)
+EMBEDDER_MODEL  = "gemini-embedding-001"    # mem0 embedder
+JUDGE_MODEL     = "gemini-3.1-flash-lite"   # NSBench GeminiJudge (temp 0)
+ANSWER_MODEL    = BACKBONE_MODEL            # answer generation == backbone
 ```
+
+The vendored mem0 `GeminiLLM` passes `config.model` straight through to the
+`google-genai` client (see `mem0/mem0/llms/gemini.py`), so the **same**
+`gemini-3.1-flash-lite` backbone NS uses works verbatim — there is no
+model-string translation and no downgrade. This is what makes TB.3 a genuine
+identical-backbone control.
 
 ### mem0 Memory Configuration
 
-Each conversation is ingested into a separate `mem0.Memory` instance with a unique `user_id` (format: `{suite}-{conv_id}`). The config dict:
+Each conversation is ingested into a separate `mem0.Memory` instance with a unique `user_id` (format: `{suite}-{conv_id}`). The config dict (built by `config.py`):
 
 ```python
 {
   "llm": {
-    "provider": "google-genai",
+    "provider": "gemini",              # mem0 provider registry key
     "config": {
-      "model": "gemini-flash-1.5",
+      "model": "gemini-3.1-flash-lite",
       "temperature": 0.0,
       "api_key": "<GOOGLE_API_KEY>"
     }
   },
   "embedder": {
-    "provider": "google-genai",
+    "provider": "gemini",             # GoogleGenAIEmbedding
     "config": {
       "model": "gemini-embedding-001",
+      "embedding_dims": 768,
       "api_key": "<GOOGLE_API_KEY>"
     }
   },
@@ -71,7 +75,7 @@ Each conversation is ingested into a separate `mem0.Memory` instance with a uniq
 
 mem0-the-library has **no `/ask` endpoint** — it only provides `.add()` and `.search()`. We generate answers with:
 
-1. **Retrieval**: `memory.search(question, user_id=user_id, limit=k)` → top-k memories
+1. **Retrieval**: `memory.search(question, top_k=k, filters={"user_id": user_id})` → top-k memories (mem0 returns `{"results": [...]}`; the entity id MUST go inside `filters` — top-level `user_id`/`limit` kwargs are rejected by the library)
 2. **Answer prompt**: Mirrors NSBench's `/ask` logic (retrieved memories + question → "provide a concise factual answer")
 3. **Generation**: Direct Gemini call with the same `gemini-3.1-flash-lite` backbone (temp 0)
 
@@ -86,7 +90,13 @@ mem0-the-library has **no `/ask` endpoint** — it only provides `.add()` and `.
    cd neuralscape-bench && uv sync
    ```
 
-2. **mem0 importable**: The `mem0/` subtree must be in the Python path. If `from mem0.memory.main import Memory` fails, this is an orchestrator integration detail (the builder's job is a runnable harness; live-env wiring is the orchestrator's).
+2. **mem0 installed (editable)**: mem0 must be **installed as a package**, not merely on `PYTHONPATH`. `mem0/__init__.py` runs `importlib.metadata.version("mem0ai")` at import time, so a bare `PYTHONPATH=.../mem0` fails with `PackageNotFoundError`. Install it editable from the in-repo subtree, plus its Gemini extra (`google-genai`):
+   ```bash
+   # from the repo root (the mem0/ subtree is the mem0ai package)
+   uv pip install -e mem0/
+   uv pip install google-genai   # required by mem0's GeminiLLM / embedder
+   ```
+   Verify: `python -c "from mem0.memory.main import Memory; print('ok')"`. If the import still fails, that is an orchestrator env-wiring detail — the harness imports mem0 lazily and unit tests run with a mock, so `pytest` stays green without it.
 
 3. **GOOGLE_API_KEY** in the environment (Gemini inference + embeddings).
 
@@ -151,10 +161,11 @@ Retrieval recall at k (session-level attribution, lexical match over distilled m
 
 The orchestrator runs this harness live against the same models to produce the official mem0 baseline scores. Requirements:
 
-1. **mem0 importable**: Ensure the `mem0/` subtree is in `PYTHONPATH` or installed editable (`uv pip install -e mem0/`).
+1. **mem0 installed editable**: `uv pip install -e mem0/` (a bare `PYTHONPATH` does NOT work — `mem0/__init__.py` needs the `mem0ai` package metadata) plus `uv pip install google-genai`.
 2. **Isolated vector store**: Pass `--vector-store-path` to avoid colliding with any production Qdrant.
 3. **GOOGLE_API_KEY**: Set in the environment (inference + embeddings).
 4. **Dataset pre-fetch**: Run fetch phases offline first (free, no API calls).
+5. **Run isolation**: Pass `--run-label <id>` to keep distinct runs' raw files separate; the answer phase also truncates its own answers file each run so re-runs never blend stale records into the report.
 
 ## Testing
 

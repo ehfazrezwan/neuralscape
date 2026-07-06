@@ -49,6 +49,12 @@ def build_result(
     """
     from neuralscape_bench.accuracy.metrics import aggregate  # noqa: PLC0415
 
+    # config.py is the single source of truth for the locked model ids — the
+    # report reflects exactly what the mem0 Memory / judge were configured with.
+    from trackb.mem0_tracka.config import (  # noqa: PLC0415
+        BACKBONE_MODEL, EMBEDDER_MODEL, JUDGE_MODEL, JUDGE_TEMP,
+    )
+
     # Import lazily to allow tests to run without NSBench deps
     metrics = aggregate(judged_records, k=config.get("k", 10))
 
@@ -60,17 +66,17 @@ def build_result(
         "memory_layer": f"mem0-oss {mem0_version}",
         "config": {
             **config,
-            "backbone": "gemini-3.1-flash-lite",
-            "embedder": "gemini-embedding-001",
-            "judge": "gemini-3.1-flash-lite",
-            "judge_temp": 0.0,
+            "backbone": BACKBONE_MODEL,
+            "embedder": EMBEDDER_MODEL,
+            "judge": JUDGE_MODEL,
+            "judge_temp": JUDGE_TEMP,
         },
         "dataset": suite_stats,
         "metrics": metrics,
         "caveats": [
             "mem0 OSS library (vendored subtree) used as the memory layer.",
             "Answer prompt mirroring NSBench /ask logic (not identical; retrieval→context parity approximate).",
-            "Locked models: backbone=gemini-3.1-flash-lite, embedder=gemini-embedding-001, judge=gemini-3.1-flash-lite.",
+            f"Locked models: backbone={BACKBONE_MODEL}, embedder={EMBEDDER_MODEL}, judge={JUDGE_MODEL}.",
             "This is the control for NS Track A head-to-head (same dataset/judge/embedder; only memory layer differs).",
         ],
     }

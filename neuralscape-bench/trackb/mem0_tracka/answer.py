@@ -98,6 +98,20 @@ class GeminiAnswerer:
         return f"[generation failed: {last_err}]"
 
 
+def _extract_memories(results) -> list[dict]:
+    """Normalize mem0.search() output into a list of memory dicts.
+
+    Vendored mem0 (v1.1+) returns ``{"results": [...]}``; older/other shapes
+    may return a bare list. Handle both defensively.
+    """
+    if isinstance(results, dict):
+        items = results.get("results", [])
+        return items if isinstance(items, list) else []
+    if isinstance(results, list):
+        return results
+    return []
+
+
 def _render_answer_prompt(memories: list[dict], question: str) -> str:
     """Build the answer-generation prompt from retrieved memories."""
     mem_text = "\n".join(
@@ -147,9 +161,12 @@ async def answer_suite(
     qa_by_id = {qa.qa_id: qa for qa in data.qa_items}
     log(f"[answer] {data.suite}: {len(data.qa_items)} QA items")
 
+    # Truncate on every fresh answer run so re-runs never blend stale records
+    # into the report (append-only writes below would otherwise mix old + new).
+    # Cross-run isolation is additionally provided by the --run-label suffix on
+    # the filename (see run.py._raw_paths).
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    if not out_path.exists():
-        out_path.write_text("")
+    out_path.write_text("")
 
     sem = asyncio.Semaphore(max(1, concurrency))
     lock = asyncio.Lock()
@@ -162,10 +179,15 @@ async def answer_suite(
             # Initialize Memory for this user (same config)
             memory = memory_class(config_dict)
 
-            # Retrieve memories
+            # Retrieve memories. Vendored mem0 signature is
+            # search(query, *, top_k=20, filters=None, ...) — the entity id
+            # MUST go inside filters (top-level user_id/limit kwargs are
+            # rejected by the library), and results come back as {"results": [...]}.
             try:
-                results = memory.search(qa.question, user_id=user_id, limit=k)
-                memories = results if isinstance(results, list) else []
+                results = memory.search(
+                    qa.question, top_k=k, filters={"user_id": user_id}
+                )
+                memories = _extract_memories(results)
             except Exception as e:
                 logger.warning(f"mem0 search failed for {qa.qa_id}: {e}")
                 memories = []

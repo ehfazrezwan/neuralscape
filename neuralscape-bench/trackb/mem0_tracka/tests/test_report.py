@@ -34,6 +34,27 @@ def test_build_result():
     assert len(result["caveats"]) > 0
 
 
+def test_report_backbone_reads_config_constants():
+    """Report backbone/embedder/judge MUST come from config.py constants.
+
+    Ensures config.py is the single source of truth — no hardcoded/false
+    'identical backbone' claim can drift away from what mem0 actually used.
+    """
+    from trackb.mem0_tracka.config import BACKBONE_MODEL, EMBEDDER_MODEL, JUDGE_MODEL
+
+    result = build_result(
+        "beam",
+        [{"qa_id": "q1", "qtype": "t", "correct": True}],
+        config={"k": 10},
+        suite_stats={},
+    )
+    assert result["config"]["backbone"] == BACKBONE_MODEL
+    assert result["config"]["embedder"] == EMBEDDER_MODEL
+    assert result["config"]["judge"] == JUDGE_MODEL
+    # And the caveat text reflects the real constant, not a stale literal.
+    assert any(BACKBONE_MODEL in c for c in result["caveats"])
+
+
 def test_render_markdown():
     """Should render markdown report."""
     result = {

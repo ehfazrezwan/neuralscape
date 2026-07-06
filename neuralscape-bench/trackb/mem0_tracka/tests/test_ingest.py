@@ -29,6 +29,13 @@ def test_ingest_suite(mock_memory_class, sample_suite_data):
     assert len(log_messages) >= 1
     assert "1/1" in log_messages[-1]
 
+    # add() must be called with the entity id as the vendored `user_id` kwarg
+    # (add signature is add(messages, *, user_id=None, ...)). Guard against a
+    # regression that would pass it positionally or under the wrong name.
+    add_calls = [kw for name, kw in mock_memory_class.calls if name == "add"]
+    assert len(add_calls) == 1
+    assert add_calls[0]["user_id"] == "test_suite-conv1"
+
 
 def test_ingest_suite_multiple_conversations(mock_memory_class):
     """Should handle multiple conversations correctly."""

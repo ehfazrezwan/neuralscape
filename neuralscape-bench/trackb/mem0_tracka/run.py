@@ -68,12 +68,18 @@ def _dataset_dir(suite_name: str) -> Path:
     return DATASETS_DIR / suite_name
 
 
-def _raw_paths(suite_name: str) -> tuple[Path, Path]:
-    """(answers, judged) JSONL paths for a suite."""
+def _raw_paths(suite_name: str, run_label: str | None = None) -> tuple[Path, Path]:
+    """(answers, judged) JSONL paths for a suite.
+
+    ``run_label`` suffixes both filenames so distinct runs are fully isolated
+    on a shared raw dir (mirrors ``neuralscape_bench.accuracy.run``). Default
+    (``None``) keeps the unlabeled baseline paths.
+    """
     RAW_DIR.mkdir(parents=True, exist_ok=True)
+    suffix = f"-{run_label}" if run_label else ""
     return (
-        RAW_DIR / f"answers-{suite_name}.jsonl",
-        RAW_DIR / f"judged-{suite_name}.jsonl",
+        RAW_DIR / f"answers-{suite_name}{suffix}.jsonl",
+        RAW_DIR / f"judged-{suite_name}{suffix}.jsonl",
     )
 
 
@@ -99,7 +105,7 @@ async def run_suite(args, suite_name: str) -> None:
     )
     _log(f"[load] {suite_name}: {data.stats()}")
 
-    answers_path, judged_path = _raw_paths(suite_name)
+    answers_path, judged_path = _raw_paths(suite_name, args.run_label)
 
     # Ingest phase
     if "ingest" in args.phase:
@@ -157,6 +163,12 @@ async def run_suite(args, suite_name: str) -> None:
             if not api_key:
                 raise SystemExit("GOOGLE_API_KEY required for judge phase")
 
+            # If the answer phase ran in this same invocation, the answers were
+            # regenerated from scratch — drop any stale judged records so the
+            # judge's (qa_id, qtype) resume-dedup can't skip the fresh answers.
+            if "answer" in args.phase and judged_path.exists():
+                judged_path.unlink()
+
             judge = GeminiJudge(api_key, model=JUDGE_MODEL)
             try:
                 summary = await judge_suite(
@@ -185,6 +197,7 @@ async def run_suite(args, suite_name: str) -> None:
                 "k": args.k,
                 "sample": args.sample,
                 "seed": args.seed,
+                "run_label": args.run_label,
             },
             suite_stats=data.stats(),
             mem0_version="2.0.2",  # vendored subtree version
@@ -195,8 +208,8 @@ async def run_suite(args, suite_name: str) -> None:
         _log(f"[report] {suite_name} → {json_path}, {md_path}")
 
 
-def main(argv: list[str] | None = None) -> int:
-    """CLI entrypoint."""
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the CLI parser (exposed so tests can verify real flags)."""
     ap = argparse.ArgumentParser(
         description="mem0 Track A control harness (vendored mem0 under NSBench)"
     )
@@ -223,6 +236,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--k", type=int, default=10, help="Retrieval R@k depth")
     ap.add_argument("--concurrency", type=int, default=4)
     ap.add_argument(
+        "--run-label",
+        default=None,
+        help="Suffix for raw answers/judged files → isolate distinct runs on a "
+             "shared raw dir (e.g. --run-label 2026-07-06). Default: baseline.",
+    )
+    ap.add_argument(
         "--vector-store-path",
         type=Path,
         default=None,
@@ -233,7 +252,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Print plan without network calls",
     )
+    return ap
 
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entrypoint."""
+    ap = build_parser()
     args = ap.parse_args(argv)
 
     if args.phase is None:

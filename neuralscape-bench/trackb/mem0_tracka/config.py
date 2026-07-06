@@ -13,15 +13,25 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-# Locked models for controlled comparison
-BACKBONE_MODEL = "gemini-flash-1.5"  # mem0 config format for Gemini 1.5 Flash
+# Locked models for controlled comparison (MUST match NS Track A exactly).
+# The vendored mem0 GeminiLLM passes ``config.model`` straight through to the
+# google-genai client (see mem0/mem0/llms/gemini.py), so the SAME backbone id
+# NS uses works verbatim — this is the whole point of the control. config.py is
+# the single source of truth for the model ids; report.py reads these constants.
+BACKBONE_MODEL = "gemini-3.1-flash-lite"
 EMBEDDER_MODEL = "gemini-embedding-001"
 JUDGE_MODEL = "gemini-3.1-flash-lite"
 JUDGE_TEMP = 0.0
 
-# Answer generation model (same as backbone)
-ANSWER_MODEL = "gemini-3.1-flash-lite"
+# Answer generation model (same as backbone — single source of truth).
+ANSWER_MODEL = BACKBONE_MODEL
 ANSWER_TEMP = 0.0
+
+# mem0 provider ids (see mem0/mem0/utils/factory.py provider registry).
+# Both the LLM and the embedder are registered under the "gemini" provider key.
+LLM_PROVIDER = "gemini"
+EMBEDDER_PROVIDER = "gemini"
+EMBEDDING_DIMS = 768
 
 
 @dataclass
@@ -43,7 +53,7 @@ class Mem0Config:
         """
         return {
             "llm": {
-                "provider": "google-genai",
+                "provider": LLM_PROVIDER,
                 "config": {
                     "model": BACKBONE_MODEL,
                     "temperature": 0.0,
@@ -51,9 +61,10 @@ class Mem0Config:
                 }
             },
             "embedder": {
-                "provider": "google-genai",
+                "provider": EMBEDDER_PROVIDER,
                 "config": {
                     "model": EMBEDDER_MODEL,
+                    "embedding_dims": EMBEDDING_DIMS,
                     "api_key": self.api_key,
                 }
             },
@@ -61,7 +72,7 @@ class Mem0Config:
                 "provider": "qdrant",
                 "config": {
                     "collection_name": "mem0_tracka",
-                    "embedding_model_dims": 768,
+                    "embedding_model_dims": EMBEDDING_DIMS,
                     "path": str(self.vector_store_path),
                     "on_disk": True,
                 }
