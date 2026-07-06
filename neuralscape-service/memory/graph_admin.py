@@ -213,20 +213,69 @@ class GraphAdminMixin:
             logger.warning("get_graph_communities failed: %s", e)
             return []
 
-    def delete_episode(self, episode_uuid: str) -> dict:
-        """Delete a single episodic node from the graph by UUID."""
+    def delete_episode(self, episode_uuid: str, user_id: str | None = None, project_id: str | None = None) -> dict:
+        """Delete a single episodic node from the graph by UUID.
+
+        Args:
+            episode_uuid: The episode UUID to delete.
+            user_id: The caller's user ID for authorization. When None, skips
+                the authorization check (backward-compatible with tests).
+            project_id: Optional project scope for authorization.
+
+        Returns:
+            Dict with message or error. Raises PermissionError if the episode
+            is not in the caller's readable group_ids (same pool rules as reads).
+        """
         g = self._get_graphiti()
         if g is None:
             return {"error": "Graphiti not initialized"}
 
-        try:
-            self._run_on_bridge(
-                g.driver.execute_query(
-                    "MATCH (e:Episodic {uuid: $uuid}) DETACH DELETE e",
-                    uuid=episode_uuid,
+        # Authorization: only delete episodes in the caller's readable group_ids
+        # (same pool union as search: private + shared + standard-when-enabled).
+        # When user_id is None, skip the check (backward-compatible with tests).
+        if user_id is None:
+            # No authz — delete directly (legacy behavior for tests)
+            try:
+                self._run_on_bridge(
+                    g.driver.execute_query(
+                        "MATCH (e:Episodic {uuid: $uuid}) DETACH DELETE e",
+                        uuid=episode_uuid,
+                    )
                 )
-            )
-            return {"message": f"Episode {episode_uuid} deleted"}
+                return {"message": f"Episode {episode_uuid} deleted"}
+            except Exception as e:
+                logger.error(f"Failed to delete episode {episode_uuid}: {e}")
+                return {"error": str(e)}
+
+        group_ids = _get_group_ids(user_id, project_id)
+        try:
+            # First verify the episode exists and is in an authorized group
+            async def _check_and_delete():
+                async with g.driver.session() as session:
+                    # Check episode exists and belongs to an authorized group
+                    check = await session.run(
+                        "MATCH (e:Episodic {uuid: $uuid}) RETURN e.group_id AS group_id",
+                        uuid=episode_uuid,
+                    )
+                    records = await check.data()
+                    if not records:
+                        return {"error": f"Episode {episode_uuid} not found"}
+                    ep_group = records[0].get("group_id")
+                    if ep_group not in group_ids:
+                        raise PermissionError(
+                            f"Episode {episode_uuid} belongs to group {ep_group!r}, "
+                            f"which is not in the caller's readable groups."
+                        )
+                    # Authorized — delete it
+                    await session.run(
+                        "MATCH (e:Episodic {uuid: $uuid}) DETACH DELETE e",
+                        uuid=episode_uuid,
+                    )
+                    return {"message": f"Episode {episode_uuid} deleted"}
+
+            return self._run_on_bridge(_check_and_delete())
+        except PermissionError:
+            raise
         except Exception as e:
             logger.error(f"Failed to delete episode {episode_uuid}: {e}")
             return {"error": str(e)}
@@ -292,7 +341,7 @@ class GraphAdminMixin:
             else:
                 deleted_uuids = []
                 for ep in junk_episodes:
-                    result = self.delete_episode(ep["uuid"])
+                    result = self.delete_episode(ep["uuid"], user_id=user_id, project_id=pid)
                     if "error" not in result:
                         deleted_uuids.append(ep["uuid"])
                 breakdown[group_label] = {

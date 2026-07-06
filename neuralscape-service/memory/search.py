@@ -635,15 +635,17 @@ class SearchMixin:
                 if r.visibility == visibility or r.visibility is None
             ]
 
-        # Deduplicate and enforce caller's limit — ranked vector hits keep
-        # priority; graph rows are appended after, capped within the limit.
+        # Deduplicate without applying limit yet — the memory_kind filter
+        # below may exclude rows, so we apply limit AFTER filtering to avoid
+        # the cap being consumed by filtered-out rows (audit 27 hardening #8).
         combined = self._deduplicate_responses(
-            vector_responses, graph_responses, limit=limit
+            vector_responses, graph_responses, limit=None
         )
 
         # memory_kind filter (data-layer connectors). Legacy memories have no
         # memory_kind, so a "fact" filter treats null as fact (back-compat);
-        # "passage" matches only explicitly-tagged passages.
+        # "passage" matches only explicitly-tagged passages. Applied BEFORE
+        # the top-k truncation so the cap isn't consumed by filtered-out rows.
         if memory_kind == "fact":
             combined = [r for r in combined if (r.memory_kind or "fact") == "fact"]
         elif memory_kind == "passage":
@@ -1186,11 +1188,14 @@ class SearchMixin:
         config.limit = limit
 
         try:
+            # Audit 27 (hardening): filter out invalidated/expired edges from
+            # graph search results — same live-edge discipline as other paths.
             results = self._run_on_bridge(
                 g.search_(
                     query=query,
                     config=config,
                     group_ids=group_ids,
+                    search_filter=_live_edges_filter(),
                 )
             )
 

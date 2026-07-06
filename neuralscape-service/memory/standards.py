@@ -240,7 +240,15 @@ class StandardsMixin:
                     guidelines.append(content)
         if not definition and not steps and not guidelines:
             return None
-        steps.sort(key=lambda st: st[0])
+        # Sort steps numerically by the index after "process-step:" — parse the
+        # integer so step 10 comes after step 2, not lexicographically before it.
+        def _step_index(st: tuple[str, str]) -> int:
+            tag = st[0]
+            try:
+                return int(tag.split(":", 1)[1])
+            except (IndexError, ValueError):
+                return 999_999  # unparseable tags sort last
+        steps.sort(key=_step_index)
         _audit_log.info(
             "process_served",
             slug=slug,
