@@ -212,6 +212,13 @@ class Settings(BaseSettings):
     # Graphiti's episode_content fulltext index (one Cypher call, no
     # embeddings). Measured +5pp on a DMR 100-question stratified sample.
     ask_episode_evidence: bool = True
+    # Bounded second-chance re-ask for false abstentions (T2.1): when the
+    # normal answering loop produces an abstention AND at least one evidence
+    # row shares ≥2 content keywords with the question, re-ask ONCE with
+    # those keyword-matching rows promoted to the top. Measured correction
+    # for over-abstention (DMR: 33/76 answering losses; LoCoMo: 670/993
+    # misses were abstentions where gold evidence was in retrieval top-10).
+    ask_second_chance: bool = True
 
     # ── Custom extraction instructions (roadmap E4) ───────────────────
     # Operator-supplied guidance appended to the extraction prompt as a

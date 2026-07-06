@@ -598,6 +598,192 @@ class TestAbstention:
         assert "I don't know" in prompt
         assert "NEVER fabricate" in prompt
 
+    @pytest.mark.asyncio
+    async def test_strengthened_discipline_4_in_full_prompt(self):
+        """Discipline 4 strengthened: commit to best-supported answer when
+        evidence is on-topic but not verbatim; abstain only when nothing bears."""
+        svc = _service([_mem("m1", "x")])
+        llm = _answer_llm("a")
+        await ask_memory(svc, question="q?", user_id="u",
+                         reasoning_level="high", llm_call=llm)
+        prompt = llm.prompts[0]
+        assert "abstain ONLY when NO evidence row bears on the question" in prompt
+        assert "commit to the BEST-SUPPORTED answer" in prompt
+        assert "on-topic" in prompt
+
+    @pytest.mark.asyncio
+    async def test_brief_discipline_unchanged(self):
+        """Minimal tier keeps brief discipline text (unchanged from baseline)."""
+        svc = _service([_mem("m1", "x")])
+        llm = _answer_llm("a")
+        await ask_memory(svc, question="q?", user_id="u",
+                         reasoning_level="minimal", llm_call=llm)
+        prompt = llm.prompts[0]
+        assert "answer ONLY from the evidence" in prompt
+        # Brief text stays terse — no multi-line discipline enumeration.
+        assert "1. ENUMERATION" not in prompt
+
+
+# ──────────────────────────────────────────────
+# Second-chance pass (T2.1 abstention calibration)
+# ──────────────────────────────────────────────
+
+
+class TestSecondChancePass:
+    @pytest.mark.asyncio
+    async def test_abstained_with_keyword_overlap_triggers_second_chance(self):
+        """When first pass abstains AND evidence shares ≥2 keywords, re-ask
+        with those rows promoted; if the second pass answers, use it."""
+        svc = _service([
+            _mem("m1", "Alice joined the project in Berlin for backend work",
+                 "2026-07-02T00:00:00+00:00"),
+            _mem("m2", "irrelevant note about meetings",
+                 "2026-07-01T00:00:00+00:00"),
+        ])
+        prompts: list[str] = []
+        responses = iter([
+            json.dumps({"action": "answer", "answer": "I don't know",
+                        "citations": [], "abstained": True}),
+            json.dumps({"action": "answer", "answer": "Berlin [m1]",
+                        "citations": ["m1"], "abstained": False}),
+        ])
+
+        async def llm(prompt: str) -> str:
+            prompts.append(prompt)
+            return next(responses)
+
+        out = await ask_memory(svc, question="Where did Alice join the project?",
+                               user_id="u", reasoning_level="low", llm_call=llm)
+        assert len(prompts) == 2  # first pass + second-chance
+        assert out["abstained"] is False
+        assert out["answer"] == "Berlin [m1]"
+        assert out["citations"] == ["m1"]
+        assert prompts[0].index("[m2]") < prompts[0].index("[m1]")
+        assert "MOST RELEVANT to the question" in prompts[1]
+        assert prompts[1].index("[m1]") < prompts[1].index("[m2]")
+        # Audit trail: second-chance recorded in searches.
+        assert any("second-chance" in s for s in out["searches"])
+
+    @pytest.mark.asyncio
+    async def test_second_chance_flag_off_disables_pass(self, monkeypatch):
+        """When ask_second_chance=False, abstention is final (no retry)."""
+        from config import settings
+        monkeypatch.setattr(settings, "ask_second_chance", False)
+        svc = _service([_mem("m1", "Alice joined the project in Berlin")])
+        calls = {"n": 0}
+
+        async def llm(prompt: str) -> str:
+            calls["n"] += 1
+            return json.dumps({"action": "answer", "answer": "I don't know",
+                               "citations": [], "abstained": True})
+
+        out = await ask_memory(svc, question="Where did Alice join?",
+                               user_id="u", reasoning_level="low", llm_call=llm)
+        assert calls["n"] == 1  # no second-chance pass
+        assert out["abstained"] is True
+        assert not any("second-chance" in s for s in out["searches"])
+
+    @pytest.mark.asyncio
+    async def test_no_keyword_overlap_preserves_genuine_abstention(self):
+        """When evidence shares <2 keywords with the question, the abstention
+        stands (genuine "don't know" — no second-chance waste)."""
+        svc = _service([_mem("m1", "Alice prefers tea over coffee")])
+        calls = {"n": 0}
+
+        async def llm(prompt: str) -> str:
+            calls["n"] += 1
+            return json.dumps({"action": "answer", "answer": "I don't know",
+                               "citations": [], "abstained": True})
+
+        out = await ask_memory(svc, question="What is Bob's favorite sport?",
+                               user_id="u", reasoning_level="low", llm_call=llm)
+        assert calls["n"] == 1  # no second-chance (no keyword overlap)
+        assert out["abstained"] is True
+        assert not any("second-chance" in s for s in out["searches"])
+
+    @pytest.mark.asyncio
+    async def test_second_chance_still_abstains_preserved(self):
+        """Second-chance re-ask can still produce an abstention (the promoted
+        rows weren't enough) — the honest "don't know" stands."""
+        svc = _service([_mem("m1", "Alice joined the project in Berlin")])
+        calls = {"n": 0}
+
+        async def llm(prompt: str) -> str:
+            calls["n"] += 1
+            return json.dumps({"action": "answer", "answer": "I don't know",
+                               "citations": [], "abstained": True})
+
+        out = await ask_memory(svc, question="Where did Alice join?",
+                               user_id="u", reasoning_level="low", llm_call=llm)
+        assert calls["n"] == 2  # first + second-chance
+        assert out["abstained"] is True  # second-chance also abstained
+        assert any("second-chance" in s for s in out["searches"])
+
+    @pytest.mark.asyncio
+    async def test_non_abstained_first_pass_unchanged(self):
+        """When the first pass answers (not abstained), no second-chance runs
+        (zero overhead for the common path)."""
+        svc = _service([_mem("m1", "Alice lives in Berlin")])
+        calls = {"n": 0}
+
+        async def llm(prompt: str) -> str:
+            calls["n"] += 1
+            return json.dumps({"action": "answer", "answer": "Berlin [m1]",
+                               "citations": ["m1"], "abstained": False})
+
+        out = await ask_memory(svc, question="Where does Alice live?",
+                               user_id="u", reasoning_level="low", llm_call=llm)
+        assert calls["n"] == 1  # no second-chance
+        assert out["answer"] == "Berlin [m1]"
+        assert out["abstained"] is False
+        assert not any("second-chance" in s for s in out["searches"])
+
+    @pytest.mark.asyncio
+    async def test_keyword_overlap_detection_case_insensitive(self):
+        """Keyword overlap is case-insensitive substring match (reuses
+        extract_keywords lowercasing)."""
+        svc = _service([_mem("m1", "The PROJECT started in BERLIN yesterday")])
+        prompts: list[str] = []
+        responses = iter([
+            json.dumps({"action": "answer", "answer": "I don't know",
+                        "citations": [], "abstained": True}),
+            json.dumps({"action": "answer", "answer": "Berlin [m1]",
+                        "citations": ["m1"], "abstained": False}),
+        ])
+
+        async def llm(prompt: str) -> str:
+            prompts.append(prompt)
+            return next(responses)
+
+        out = await ask_memory(svc, question="where did the project start",
+                               user_id="u", reasoning_level="low", llm_call=llm)
+        assert len(prompts) == 2  # overlap detected ("project" + "start")
+        assert out["abstained"] is False
+
+    @pytest.mark.asyncio
+    async def test_response_schema_unchanged(self):
+        """Second-chance does not change response schema keys (backward compat)."""
+        svc = _service([_mem("m1", "Alice joined in Berlin")])
+        prompts = []
+        responses = iter([
+            json.dumps({"action": "answer", "answer": "I don't know",
+                        "citations": [], "abstained": True}),
+            json.dumps({"action": "answer", "answer": "Berlin [m1]",
+                        "citations": ["m1"], "abstained": False}),
+        ])
+
+        async def llm(prompt: str) -> str:
+            prompts.append(prompt)
+            return next(responses)
+
+        out = await ask_memory(svc, question="Where did Alice join?",
+                               user_id="u", reasoning_level="low", llm_call=llm)
+        # Same keys as before T2.1 (searches list now has second-chance entry).
+        expected_keys = {"status", "reasoning_level", "answer", "citations",
+                         "abstained", "searches", "memories_considered",
+                         "skipped_passes", "_evidence_tokens"}
+        assert set(out.keys()) == expected_keys
+
 
 # ──────────────────────────────────────────────
 # Citations (no fabricated ids)
@@ -936,6 +1122,15 @@ class TestHelpers:
     def test_parse_llm_json_garbage_is_none(self):
         assert ask_mod._parse_llm_json("no json here") is None
         assert ask_mod._parse_llm_json("") is None
+
+    def test_evidence_shares_keywords(self):
+        """Helper for second-chance trigger: detects keyword overlap."""
+        mem = _mem("m1", "Alice joined the project in Berlin for backend work")
+        assert ask_mod._evidence_shares_keywords(mem, ["alice", "project"], min_overlap=2)
+        assert ask_mod._evidence_shares_keywords(mem, ["alice", "backend", "berlin"], min_overlap=2)
+        assert not ask_mod._evidence_shares_keywords(mem, ["alice"], min_overlap=2)  # only 1
+        assert not ask_mod._evidence_shares_keywords(mem, ["bob", "frontend"], min_overlap=2)  # 0
+        assert not ask_mod._evidence_shares_keywords(mem, [], min_overlap=2)  # no keywords
 
 
 # ──────────────────────────────────────────────
