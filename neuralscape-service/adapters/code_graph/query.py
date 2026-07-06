@@ -204,9 +204,17 @@ def query_code_graph(
     depth: int = 3,
     token_budget: int = 2000,
 ) -> str:
-    """Search the code graph (BFS/DFS from scored seed nodes) — routes through engine."""
+    """Search the code graph (BFS/DFS from scored seed nodes) — routes through engine.
+
+    E4: NativeEngine enriches results with attached memories (respects read scope).
+    """
     engine = get_engine(graph_id, user_id, settings)
-    return engine.query(question, mode=mode, depth=depth, token_budget=token_budget)
+    # Try passing user_id for E4 enrichment; GraphifyJsonEngine ignores extra kwargs
+    try:
+        return engine.query(question, mode=mode, depth=depth, token_budget=token_budget, user_id=user_id)
+    except TypeError:
+        # Fallback for engines that don't accept user_id (backward compat)
+        return engine.query(question, mode=mode, depth=depth, token_budget=token_budget)
 
 
 def get_code_neighbors(
@@ -217,9 +225,15 @@ def get_code_neighbors(
     graph_id: str | None = None,
     relation_filter: str = "",
 ) -> str:
-    """Direct in/out neighbors of a node — routes through engine."""
+    """Direct in/out neighbors of a node — routes through engine.
+
+    E4: NativeEngine enriches results with attached memories.
+    """
     engine = get_engine(graph_id, user_id, settings)
-    return engine.neighbors(label, relation_filter=relation_filter)
+    try:
+        return engine.neighbors(label, relation_filter=relation_filter, user_id=user_id)
+    except TypeError:
+        return engine.neighbors(label, relation_filter=relation_filter)
 
 
 def code_path(
@@ -246,15 +260,17 @@ def locate_symbols(
 ):
     """Hybrid code retrieval — routes through engine (E3: NativeEngine only).
 
+    E4: Results enriched with attached memories (respects read scope).
+
     Args:
         query: Natural-language description or symbol name pattern.
-        user_id: Owner-scoped resolution.
+        user_id: Owner-scoped resolution + memory read-scope.
         settings: Config for default path / repo resolution.
         graph_id: Artifact id, repo:<name> ref, or None (uses default).
         k: Max hits to return.
 
     Returns:
-        List of LocateHit dataclasses.
+        List of LocateHit dataclasses (E4: with memories field populated).
 
     Raises:
         EngineCapabilityError: When the engine lacks locate (GraphifyJsonEngine).
@@ -264,4 +280,4 @@ def locate_symbols(
 
     k = max(1, min(int(k), 50))  # clamp to [1, 50]
     engine = get_engine(graph_id, user_id, settings)
-    return engine.locate(query, k=k)
+    return engine.locate(query, k=k, user_id=user_id)

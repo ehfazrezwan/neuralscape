@@ -98,8 +98,13 @@ class NativeEngine:
         mode: str = "bfs",
         depth: int = 3,
         token_budget: int = 2000,
+        user_id: str | None = None,
     ) -> str:
-        """Search the code graph via BFS/DFS from scored seed nodes."""
+        """Search the code graph via BFS/DFS from scored seed nodes.
+
+        E4: Enriches results with attached memories (decisions, gotchas, bugfix
+        history) via anchors, respecting caller's read scope.
+        """
         # Normalize params the same way GraphifyJsonEngine does
         mode = mode if mode in ("bfs", "dfs") else "bfs"
         depth = max(1, min(int(depth), 6))
@@ -122,6 +127,15 @@ class NativeEngine:
             if item.get("edges"):
                 for edge in item["edges"][:3]:  # limit outbound edges shown
                     lines.append(f"  --> {edge['relation']} {edge['target']}")
+
+            # E4: Append attached memories
+            memories = self._get_anchor_memories(item["fqn"], user_id=user_id, limit=2)
+            if memories:
+                lines.append("  Memories:")
+                for mem in memories:
+                    snippet = (mem["content"] or "")[:100]
+                    lines.append(f"    - [{mem['category']}] {snippet}")
+
         return "\n".join(lines)
 
     def neighbors(
@@ -129,8 +143,12 @@ class NativeEngine:
         label: str,
         *,
         relation_filter: str = "",
+        user_id: str | None = None,
     ) -> str:
-        """Direct in/out neighbors of one code-graph symbol."""
+        """Direct in/out neighbors of one code-graph symbol.
+
+        E4: Enriches results with attached memories.
+        """
         # Find the symbol by FQN substring match
         matches = self._find_symbol(label)
         if not matches:
@@ -143,6 +161,16 @@ class NativeEngine:
         # Fetch in/out edges
         edges = self._get_edges(fqn, rel_filter=rel_filter)
         lines = [f"Neighbors of {fqn}:"]
+
+        # E4: Append attached memories for the queried symbol
+        memories = self._get_anchor_memories(fqn, user_id=user_id, limit=2)
+        if memories:
+            lines.append("Attached memories:")
+            for mem in memories:
+                snippet = (mem["content"] or "")[:100]
+                lines.append(f"  - [{mem['category']}] {snippet}")
+            lines.append("")
+
         if not edges:
             lines.append("  (no neighbors matching the filter)")
         for edge in edges:
@@ -202,12 +230,15 @@ class NativeEngine:
         query: str,
         *,
         k: int = 10,
+        user_id: str | None = None,
     ) -> list[LocateHit]:
         """Hybrid code retrieval: dense embeddings + BM25 + graph degree.
 
         E3 implementation: searches symbol cards (name + signature + docstring +
         first lines) in the separate code_index Qdrant collection. Fuses dense
         embedding search + BM25 lexical + degree signal via RRF.
+
+        E4: Enriches results with attached memories (decisions/gotchas/bugfixes).
         """
         from qdrant_client.models import (
             FieldCondition,
@@ -270,6 +301,9 @@ class NativeEngine:
             degree_boost = 1.0 + 0.01 * min(degree, 50)  # cap boost at ~1.5x
             final_score = base_score * degree_boost
 
+            # E4: Fetch attached memories (cap at 3 per hit to avoid bloat)
+            memories = self._get_anchor_memories(fqn, user_id=user_id, limit=3)
+
             locate_hit = LocateHit(
                 fqn=fqn,
                 kind=kind,
@@ -279,6 +313,7 @@ class NativeEngine:
                 docstring=docstring,
                 score=final_score,
                 anchor_id=anchor_id,
+                memories=memories if memories else None,
             )
             hits.append((final_score, locate_hit))
 
@@ -422,6 +457,9 @@ class NativeEngine:
 
         # Compute and persist degree on all symbols
         self._compute_degrees()
+
+        # E4: Create CodeAnchor nodes and link symbols to them
+        self._ensure_anchors()
 
         # E3: Build and index symbol cards in code_index collection
         self._index_symbol_cards(repo_path)
@@ -822,6 +860,142 @@ class NativeEngine:
         SET s.degree = out_deg + in_deg
         """
         self._run_cypher(cypher, code_space=self.code_space)
+
+    def _ensure_anchors(self):
+        """E4: Create CodeAnchor nodes and link symbols to them.
+
+        MERGE anchors keyed by (code_space, repo, fqn) and create
+        (:CodeSymbol)-[:ANCHORED]->(:CodeAnchor) edges. Anchors survive symbol
+        reindexes — symbols are deleted/recreated, anchors persist, and the
+        ANCHORED edges are recreated pointing to the same anchor nodes.
+
+        Uses deadlock retry pattern per graph_patcher.py.
+        """
+        # Extract repo name from code_space: "code--{owner}--{repo}"
+        parts = self.code_space.split("--")
+        repo = parts[-1] if len(parts) >= 3 else "unknown"
+
+        # Cypher: MERGE anchor per symbol, link via ANCHORED
+        cypher = """
+        MATCH (s:CodeSymbol {code_space: $code_space})
+        MERGE (a:CodeAnchor {code_space: $code_space, repo: $repo, fqn: s.fqn})
+        MERGE (s)-[:ANCHORED]->(a)
+        RETURN count(a) AS anchored
+        """
+        result = self._run_cypher_with_retry(
+            cypher,
+            code_space=self.code_space,
+            repo=repo,
+        )
+        count = result[0]["anchored"] if result else 0
+        logger.info(f"Ensured {count} CodeAnchors for {self.code_space}")
+
+    def _get_anchor_memories(
+        self,
+        fqn: str,
+        user_id: str | None = None,
+        limit: int = 3,
+    ) -> list[dict]:
+        """E4: Fetch memories attached to a code anchor by (repo, fqn).
+
+        Respects visibility: returns only memories the caller may read
+        (their own private memories + shared/standard pools).
+
+        Returns list of dicts: [{id, content, category, visibility, ...}, ...]
+        """
+        # Extract repo from code_space
+        parts = self.code_space.split("--")
+        repo = parts[-1] if len(parts) >= 3 else "unknown"
+
+        # Build anchor key: "<repo>::<fqn>"
+        anchor_key = f"{repo}::{fqn}"
+
+        # Search memories by source_ref.external_id match
+        from memory_service import get_shared_service
+        from qdrant_client.models import (
+            FieldCondition,
+            Filter,
+            MatchValue,
+        )
+
+        try:
+            service = get_shared_service()
+            m = service._get_memory()
+            client = m.vector_store.client
+
+            # Build filter: source_ref.external_id = anchor_key AND readable by caller
+            # (visibility = shared OR standard OR (visibility = private AND user_id = caller))
+            must: list = [
+                FieldCondition(
+                    key="metadata.source_ref.external_id",
+                    match=MatchValue(value=anchor_key),
+                )
+            ]
+
+            # Visibility scoping (mirror memory/search.py logic)
+            # Include shared + standard pools for all authenticated users
+            # Plus caller's own private memories if user_id provided
+            if user_id:
+                # Private OR shared OR standard
+                # Qdrant doesn't have OR at filter level, so we do post-filtering
+                # For now, just search and filter in Python
+                pass
+            else:
+                # Anonymous: only shared + standard
+                # Again, Qdrant doesn't support complex OR, so we'll search broadly
+                # and filter
+                pass
+
+            # For simplicity, search without visibility filter and post-filter
+            # (E4 MVP — can optimize later with separate pool searches like memory/search.py)
+            query_filter = Filter(must=must)
+
+            # Use a dummy embedding for search (we're filtering by source_ref, not semantic)
+            # Or just scroll the collection with filter
+            # For MVP, use search with a zero vector (won't match semantically but filter works)
+            import numpy as np
+            vector_size = len(m.embedding_model.embed("test", memory_action="search"))
+            dummy_vector = np.zeros(vector_size).tolist()
+
+            result = client.query_points(
+                collection_name=m.vector_store.collection_name,
+                query=dummy_vector,
+                query_filter=query_filter,
+                limit=limit * 3,  # over-fetch for post-filtering
+                with_payload=True,
+            )
+            hits = list(getattr(result, "points", result) or [])
+
+            # Post-filter by visibility
+            memories = []
+            for hit in hits:
+                payload = getattr(hit, "payload", None) or {}
+                metadata = payload.get("metadata", {})
+                visibility = metadata.get("visibility", "private")
+                owner = metadata.get("user_id")
+
+                # Check readability
+                readable = False
+                if visibility in ("shared", "standard"):
+                    readable = True
+                elif visibility == "private" and user_id and owner == user_id:
+                    readable = True
+
+                if readable:
+                    memories.append({
+                        "id": payload.get("id"),
+                        "content": payload.get("data"),
+                        "category": metadata.get("category"),
+                        "visibility": visibility,
+                        "created_at": metadata.get("created_at"),
+                    })
+                    if len(memories) >= limit:
+                        break
+
+            return memories
+        except Exception:
+            logger.debug(f"Failed to fetch anchor memories for {fqn}", exc_info=True)
+            return []
 
     def _index_symbol_cards(self, repo_path: Path):
         """Build symbol cards and index them in the code_index Qdrant collection (E3).
