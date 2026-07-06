@@ -482,7 +482,7 @@ class TestPerspectiveAndSpecificityDisciplines:
                          user_id="u", reasoning_level="high", llm_call=llm)
         prompt = llm.prompts[0]
         assert "PERSPECTIVE:" in prompt
-        assert "NEVER grounds to abstain" in prompt
+        assert "answer as the addressed persona" in prompt
         assert "SPECIFICITY:" in prompt
         assert "vaguer restatement never supersedes" in prompt
 
@@ -495,6 +495,154 @@ class TestPerspectiveAndSpecificityDisciplines:
         prompt = llm.prompts[0]
         assert "PERSPECTIVE:" not in prompt
         assert "answer ONLY from the evidence" in prompt
+
+
+# ──────────────────────────────────────────────
+# Speaker attribution rendering (T22 / MED-2)
+# ──────────────────────────────────────────────
+
+
+def _mem_with_speaker(mid: str, content: str, speaker: str,
+                      created_at: str = "2026-07-01T00:00:00+00:00") -> MemoryResponse:
+    return MemoryResponse(
+        id=mid, memory=content, category="decision", source="vector",
+        created_at=created_at, score=0.9, speaker=speaker,
+    )
+
+
+class TestSpeakerAttributionRendering:
+    def test_speaker_renders_when_present(self):
+        """When a memory has a speaker, it renders as 'by <speaker>'."""
+        mem = _mem_with_speaker("m1", "I have three dogs", "Alice")
+        rendered = ask_mod._render_evidence([mem])
+        assert "by Alice" in rendered
+        assert "[m1]" in rendered
+        assert "I have three dogs" in rendered
+
+    def test_speaker_omitted_when_absent(self):
+        """Memories without speaker render exactly as before (backward compat)."""
+        mem = _mem("m1", "fact without speaker")
+        rendered = ask_mod._render_evidence([mem])
+        assert "by " not in rendered
+        assert "[m1]" in rendered
+        assert "fact without speaker" in rendered
+
+    def test_speaker_with_event_time(self):
+        """Speaker renders alongside event time when timeline is informative."""
+        # Two memories far apart in time so event times render
+        old = _mem_with_speaker("m1", "old fact", "Bob", "2025-01-01T00:00:00+00:00")
+        old = MemoryResponse(**{**old.model_dump(), "occurred_at": "2025-01-01T00:00:00+00:00"})
+        new = _mem_with_speaker("m2", "new fact", "Alice", "2026-06-01T00:00:00+00:00")
+        new = MemoryResponse(**{**new.model_dump(), "occurred_at": "2026-06-01T00:00:00+00:00"})
+        rendered = ask_mod._render_evidence([old, new])
+        # Both speaker and event time should be present
+        assert "event: 2025-01-01" in rendered
+        assert "by Bob" in rendered
+        assert "event: 2026-06-01" in rendered
+        assert "by Alice" in rendered
+
+    def test_mixed_speaker_and_no_speaker_rows(self):
+        """A mix of rows with and without speaker renders correctly."""
+        with_speaker = _mem_with_speaker("m1", "Alice said this", "Alice")
+        without_speaker = _mem("m2", "generic fact")
+        rendered = ask_mod._render_evidence([with_speaker, without_speaker])
+        lines = rendered.split("\n")
+        assert len(lines) == 2
+        assert "by Alice" in lines[0]
+        assert "by " not in lines[1]
+
+    @pytest.mark.asyncio
+    async def test_speaker_reaches_llm_prompt(self):
+        """The speaker annotation actually reaches the answering LLM."""
+        mem = _mem_with_speaker("m1", "I have two dogs", "Alice")
+        svc = _service([mem])
+        llm = _answer_llm("two dogs [m1]", ["m1"])
+        await ask_memory(svc, question="How many dogs does Alice have?",
+                         user_id="u", reasoning_level="high", llm_call=llm)
+        prompt = llm.prompts[0]
+        assert "by Alice" in prompt
+        assert "[m1]" in prompt
+
+
+# ──────────────────────────────────────────────
+# Perspective resolution (T2.2): first-person, substance-first, no hedging
+# ──────────────────────────────────────────────
+
+
+class TestPerspectiveResolution:
+    @pytest.mark.asyncio
+    async def test_perspective_discipline_references_speaker_annotation(self):
+        """The strengthened PERSPECTIVE discipline references the 'by <speaker>'
+        annotation that now appears in evidence."""
+        svc = _service([_mem("m1", "x")])
+        llm = _answer_llm("ans")
+        await ask_memory(svc, question="q?", user_id="u",
+                         reasoning_level="high", llm_call=llm)
+        prompt = llm.prompts[0]
+        discipline_section = prompt.split("EVIDENCE:")[0]
+        assert "by <speaker>" in discipline_section
+        assert "PERSPECTIVE:" in discipline_section
+
+    @pytest.mark.asyncio
+    async def test_perspective_forbids_meta_disclaimers(self):
+        """The discipline explicitly forbids 'I do not have X, but you mentioned…'
+        hedging when evidence answers the substance."""
+        svc = _service([_mem("m1", "x")])
+        llm = _answer_llm("ans")
+        await ask_memory(svc, question="q?", user_id="u",
+                         reasoning_level="high", llm_call=llm)
+        prompt = llm.prompts[0]
+        discipline_section = prompt.split("EVIDENCE:")[0]
+        assert "Never hedge with meta-disclaimers" in discipline_section
+        assert "I do not have X, but you mentioned" in discipline_section
+
+    @pytest.mark.asyncio
+    async def test_perspective_directs_first_person_answering(self):
+        """The discipline says 'answer as the addressed persona, FIRST-PERSON'."""
+        svc = _service([_mem("m1", "x")])
+        llm = _answer_llm("ans")
+        await ask_memory(svc, question="q?", user_id="u",
+                         reasoning_level="high", llm_call=llm)
+        prompt = llm.prompts[0]
+        discipline_section = prompt.split("EVIDENCE:")[0]
+        assert "answer as the addressed persona" in discipline_section
+        assert "FIRST-PERSON" in discipline_section
+
+    @pytest.mark.asyncio
+    async def test_speaker_labeled_evidence_answers_first_person_question(self):
+        """When a row attributed to a speaker answers the substance, the model
+        should answer first-person without abstaining on label mismatch."""
+        # Alice asks "How many dogs do I have?" — evidence says "Alice has three dogs"
+        # with speaker="Alice". The model should say "three" not "I don't know".
+        mem = _mem_with_speaker("m1", "Alice has three dogs", "Alice")
+        svc = _service([mem])
+        llm = _answer_llm("Three [m1]", ["m1"], abstained=False)
+        out = await ask_memory(svc, question="How many dogs do I have?",
+                               user_id="u", reasoning_level="high", llm_call=llm)
+        prompt = llm.prompts[0]
+        # The prompt contains the speaker attribution
+        assert "by Alice" in prompt
+        # The discipline forbids abstaining on label mismatch
+        discipline_text = prompt.split("EVIDENCE:")[0]
+        assert "a label or pronoun mismatch is NEVER" in discipline_text
+        assert "grounds to abstain or to deny knowing the fact" in discipline_text
+        # The result is not abstained
+        assert out["abstained"] is False
+        assert out["answer"] == "Three [m1]"
+
+    @pytest.mark.asyncio
+    async def test_generic_speaker_label_not_grounds_for_abstention(self):
+        """A 'Speaker 2' or 'the user' label should not block answering when
+        the content matches the question's substance."""
+        mem = _mem_with_speaker("m1", "Speaker 2 owns a golden retriever", "Speaker 2")
+        svc = _service([mem])
+        llm = _answer_llm("A golden retriever [m1]", ["m1"], abstained=False)
+        out = await ask_memory(svc, question="What kind of dog do I own?",
+                               user_id="u", reasoning_level="high", llm_call=llm)
+        prompt = llm.prompts[0]
+        assert "by Speaker 2" in prompt
+        assert "ingestion artifacts, not different people" in prompt
+        assert out["abstained"] is False
 
 
 # ──────────────────────────────────────────────
