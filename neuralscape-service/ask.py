@@ -332,17 +332,26 @@ def _render_evidence(rows: list) -> str:
         content = _clip_content((mem.memory or "").strip(), budget).replace("\n", " ")
         created = getattr(mem, "created_at", None) or "unknown time"
         category = getattr(mem, "category", None) or "uncategorized"
+        # Normalize + cap the speaker before it enters the prompt: flatten
+        # newlines and bound length so legacy/connector data can't distort the
+        # evidence formatting (Copilot review). Empty after strip → omit.
+        speaker = (getattr(mem, "speaker", None) or "").strip().replace("\n", " ")[:40].strip()
         occurred = getattr(mem, "occurred_at", None) if render_events else None
+
+        # Build the metadata annotation: (timestamp; category; speaker if present)
         if occurred:
             # Event time known (historical ingestion) AND the timeline spread
             # makes it informative: show both so the recency discipline
             # reasons over when it HAPPENED, with the storage time still
             # visible for provenance.
-            lines.append(
-                f"[{mem.id}] (event: {occurred}; stored: {created}; {category}) {content}"
-            )
+            meta = f"event: {occurred}; stored: {created}; {category}"
         else:
-            lines.append(f"[{mem.id}] ({created}; {category}) {content}")
+            meta = f"{created}; {category}"
+
+        if speaker:
+            meta += f"; by {speaker}"
+
+        lines.append(f"[{mem.id}] ({meta}) {content}")
     return "\n".join(lines)
 
 
@@ -363,12 +372,15 @@ _DISCIPLINES_FULL = """Disciplines (follow strictly):
    NEVER fabricate facts, dates, or memory ids not in the evidence.
 5. CITATIONS: cite supporting memory ids inline like [<id>]. Only ids from the EVIDENCE
    list are valid citations.
-6. PERSPECTIVE: memories distilled from dialogs may carry generic speaker labels
-   ("Speaker 1", "Speaker 2") or third-person phrasing ("the user", "the assistant")
-   that do not literally match the question's "I/my" or "you/your". These labels are
-   ingestion artifacts, not different people. Resolve perspective from content: when an
-   evidence row plainly answers the substance of the question, answer with it — a label
-   or pronoun mismatch alone is NEVER grounds to abstain or to deny knowing the fact.
+6. PERSPECTIVE: answer as the addressed persona, FIRST-PERSON, using the evidence
+   attributed to that speaker. Evidence rows show speaker attribution like "by <speaker>"
+   when available. Generic speaker labels ("Speaker 1", "Speaker 2") or third-person
+   phrasing ("the user", "the assistant") are ingestion artifacts, not different people.
+   When an evidence row (identified by its "by <speaker>" annotation) plainly answers the
+   substance of the question, answer with it — a label or pronoun mismatch is NEVER
+   grounds to abstain or to deny knowing the fact. Never hedge with meta-disclaimers like
+   "I do not have X, but you mentioned…" when the evidence directly answers the substance;
+   commit to the fact itself.
 7. SPECIFICITY: when several rows state the same fact at different precision ("as a
    toddler" vs "at age three"), answer with the MOST SPECIFIC row. Recency (discipline 2)
    applies to genuine changes of fact — a vaguer restatement never supersedes a more
