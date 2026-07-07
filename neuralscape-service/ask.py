@@ -361,6 +361,16 @@ def _render_evidence(rows: list) -> str:
         if speaker:
             meta += f"; by {speaker}"
 
+        # R4: append Graphiti's bi-temporal validity interval when present,
+        # rendered Graphiti-style (date–date|Present) so the model can reason
+        # about fact recency and contradiction. Only meaningful after R1.
+        valid_at = getattr(mem, "valid_at", None)
+        if valid_at:
+            invalid_at = getattr(mem, "invalid_at", None)
+            start = str(valid_at).split("T")[0]
+            end = str(invalid_at).split("T")[0] if invalid_at else "Present"
+            meta += f"; valid {start}–{end}"
+
         lines.append(f"[{mem.id}] ({meta}) {content}")
     return "\n".join(lines)
 

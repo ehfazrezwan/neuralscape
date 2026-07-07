@@ -309,6 +309,10 @@ class MemoryGraph:
                 "relationship": edge.name,
                 "destination": uuid_to_name.get(edge.target_node_uuid, edge.target_node_uuid),
                 "fact": edge.fact,
+                # R4: surface bi-temporal validity metadata so the MCP
+                # search_knowledge_graph path carries it too (additive).
+                "valid_at": edge.valid_at.isoformat() if edge.valid_at else None,
+                "invalid_at": edge.invalid_at.isoformat() if edge.invalid_at else None,
             })
         return results
 
