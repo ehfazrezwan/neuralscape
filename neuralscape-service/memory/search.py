@@ -378,6 +378,7 @@ class SearchMixin:
                     limit=limit,
                     visibility=visibility,
                     include_shared=include_shared,
+                    include_episodes=settings.graph_episode_recall_enabled,
                 )
             except Exception as e:
                 logger.warning(f"Graph search submit failed (non-critical): {e}")
@@ -575,8 +576,29 @@ class SearchMixin:
                         )
                     )
                     graph_edge_embeddings.append(emb)
+                # R3: consume episodes from the graph search (when flag enabled).
+                # Use the same id/source scheme as ask.py (ep-<uuid12>, source="episode")
+                # so deduplication aligns. Episodes are appended AFTER edge
+                # enrichment to preserve edge_embeddings index alignment.
+                episodes_for_later = []
+                if settings.graph_episode_recall_enabled:
+                    for ep in graph_results.get("episodes", []):
+                        ep_uuid = str(ep.get("uuid") or "")
+                        ep_content = str(ep.get("content") or "")
+                        # Clip episode content to a sane length (same as ask.py).
+                        clipped = ep_content[:600] if len(ep_content) > 600 else ep_content
+                        episodes_for_later.append(
+                            MemoryResponse(
+                                id=f"ep-{ep_uuid[:12]}",
+                                memory=f"[verbatim session excerpt] {clipped}",
+                                source="episode",
+                                score=None,  # rank on merit, not score
+                                created_at=ep.get("created_at") or None,
+                            )
+                        )
             except Exception as e:
                 logger.warning(f"Graph search failed during recall (non-critical): {e}")
+                episodes_for_later = []
 
         # Enrich graph rows with metadata from their nearest source memory
         # (title/category/created_at/v2 fields + the twin back-reference).
@@ -620,6 +642,11 @@ class SearchMixin:
                 # edges. A plain recall is not.
                 allow_embed_fallback=(memory_kind == "passage"),
             )
+
+        # R3: append episode rows after edge enrichment to preserve index alignment
+        # of graph_edge_embeddings with edge rows (episodes have no embeddings).
+        if 'episodes_for_later' in locals() and episodes_for_later:
+            graph_responses.extend(episodes_for_later)
 
         # Multi-user model: post-filter graph rows by enriched visibility.
         # The Graphiti search above already scopes by group_ids, so most
@@ -954,6 +981,7 @@ class SearchMixin:
         limit: int,
         visibility: str | None,
         include_shared: bool,
+        include_episodes: bool = False,
     ) -> dict:
         """search_graph with multi-user visibility scoping.
 
@@ -991,7 +1019,9 @@ class SearchMixin:
             # Default: full read-set (caller's private + shared + standard).
             group_ids = _get_group_ids(user_id, project_id)
 
-        return self._do_graph_search(query=query, group_ids=group_ids, limit=limit)
+        return self._do_graph_search(
+            query=query, group_ids=group_ids, limit=limit, include_episodes=include_episodes
+        )
 
     def _do_graph_search(
         self,
@@ -999,13 +1029,19 @@ class SearchMixin:
         group_ids: list[str],
         limit: int,
         search_config: dict | None = None,
+        include_episodes: bool = False,
     ) -> dict:
         """Internal: run a graph search across the given group_ids."""
         g = self._get_graphiti()
         if g is None:
             return {"edges": [], "nodes": [], "episodes": [], "communities": []}
 
-        from graphiti_core.search.search_config import SearchConfig
+        from graphiti_core.search.search_config import (
+            EpisodeReranker,
+            EpisodeSearchConfig,
+            EpisodeSearchMethod,
+            SearchConfig,
+        )
         from graphiti_core.search.search_config_recipes import EDGE_HYBRID_SEARCH_RRF
 
         # Audit 27 #10: EDGE_HYBRID_SEARCH_RRF is a module-level singleton
@@ -1020,6 +1056,14 @@ class SearchMixin:
                 config = EDGE_HYBRID_SEARCH_RRF.model_copy(deep=True)
         else:
             config = EDGE_HYBRID_SEARCH_RRF.model_copy(deep=True)
+            # R3: when include_episodes AND using the default recipe, add the
+            # bm25 episode leg (no embeddings). Explicit search_configs (e.g.
+            # the delete path with limit=5) stay episode-free.
+            if include_episodes:
+                config.episode_config = EpisodeSearchConfig(
+                    search_methods=[EpisodeSearchMethod.bm25],
+                    reranker=EpisodeReranker.rrf,
+                )
         config.limit = limit
 
         try:
@@ -1046,9 +1090,17 @@ class SearchMixin:
                 {"uuid": n.uuid, "name": n.name, "summary": n.summary}
                 for n in results.nodes
             ]
+            # R3: cap episodes at 3 (ask measured 3 as sweet spot, 5 regressed).
+            # Keep created_at/valid_at if present (R4 will use them).
             episodes = [
-                {"uuid": ep.uuid, "name": ep.name, "content": ep.content}
-                for ep in results.episodes
+                {
+                    "uuid": ep.uuid,
+                    "name": ep.name,
+                    "content": ep.content,
+                    "created_at": getattr(ep, "created_at", None),
+                    "valid_at": getattr(ep, "valid_at", None),
+                }
+                for ep in results.episodes[:3]
             ]
             communities = [
                 {"uuid": c.uuid, "name": c.name} for c in results.communities
