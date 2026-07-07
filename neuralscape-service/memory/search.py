@@ -47,6 +47,12 @@ _GRAPH_SEARCH_POOL = _ThreadPoolExecutor(
 # can never hang a read indefinitely.
 _GRAPH_SEARCH_JOIN_TIMEOUT_S = 45.0
 
+# R3: per-snippet char cap for recall-side episode excerpts. Bounds evidence
+# tokens; the COUNT of episode rows is separately capped at 3 (the ask sweet
+# spot). A plain char cap (not ask.py's sentence-boundary _clip_content) keeps
+# the search mixin free of an ask.py import (which would be circular).
+_EPISODE_SNIPPET_CLIP = 600
+
 class SearchMixin:
     """SearchMixin for MemoryService (mechanical split — see memory_service.py)."""
 
@@ -604,8 +610,12 @@ class SearchMixin:
                     for ep in graph_results.get("episodes", []):
                         ep_uuid = str(ep.get("uuid") or "")
                         ep_content = str(ep.get("content") or "")
-                        # Clip episode content to a sane length (same as ask.py).
-                        clipped = ep_content[:600] if len(ep_content) > 600 else ep_content
+                        # Clip each recall episode snippet to a bounded length.
+                        # (Not the same as ask.py's _clip_content, which clips at
+                        # a sentence/whitespace boundary; a plain char cap keeps
+                        # the recall leg dependency-free — importing ask into the
+                        # search mixin would be circular.)
+                        clipped = ep_content[:_EPISODE_SNIPPET_CLIP]
                         episodes_for_later.append(
                             MemoryResponse(
                                 id=f"ep-{ep_uuid[:12]}",

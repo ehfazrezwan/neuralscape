@@ -218,30 +218,35 @@ class TestR3SearchIntegration:
         assert episode_rows[0].score is None
 
     def test_flag_off_no_episode_rows(self, service):
-        """With flag OFF, search() returns NO episode rows."""
+        """With flag OFF, the recall consumer ignores episodes EVEN IF the graph
+        result carries them — proving the off-path is reversible/byte-identical.
+        (Copilot: the earlier version patched the flag True and mocked empty
+        episodes, so it never exercised the off path.)"""
 
         mock_mem = MagicMock()
         mock_mem.embedding_model.embed.return_value = [0.1] * 768
         mock_mem.search.return_value = {"results": []}
 
-        # Graph search should still be called but without episodes
+        # Graph result DOES carry episodes — the flag-OFF consumer must drop them.
         mock_graph_result = {
             "edges": [],
-            "episodes": [],  # Empty because include_episodes=False
+            "episodes": [
+                {"uuid": str(uuid.uuid4()), "content": "should not surface", "created_at": None},
+            ],
             "nodes": [],
             "communities": [],
         }
 
         with patch.object(service, '_get_memory', return_value=mock_mem):
             with patch.object(service, '_do_graph_search', return_value=mock_graph_result):
-                with patch("memory.search.settings.graph_episode_recall_enabled", True):
+                with patch("memory.search.settings.graph_episode_recall_enabled", False):
                     results = service.search(
                         query="test query",
                         user_id="test_user",
                         project_id=None,
                     )
 
-        # Verify NO episode rows
+        # Verify NO episode rows despite episodes being present in the graph result
         episode_rows = [r for r in results if r.source == "episode"]
         assert len(episode_rows) == 0
 
