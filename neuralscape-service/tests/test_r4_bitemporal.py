@@ -4,65 +4,80 @@ Verifies that Graphiti's valid_at/invalid_at are carried through from the
 graph edges to MemoryResponse objects and rendered in ask() evidence.
 """
 
-import pytest
+import asyncio
+import uuid as _uuid
 from datetime import datetime, timezone
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from memory_service import MemoryService
 from schemas import MemoryResponse
 from ask import _render_evidence
+
+
+@pytest.fixture
+def service():
+    """Minimal MemoryService for exercising the real recall path."""
+    return MemoryService()
 
 
 class TestR4BitemporalMetadata:
     """R4: bi-temporal validity fields surface to the answer layer."""
 
-    def test_edge_dict_includes_iso_temporal_fields(self):
-        """Edge mapping converts datetime valid_at/invalid_at to ISO strings."""
-        # Mock an EntityEdge-like object with datetime temporal fields
-        edge = MagicMock()
-        edge.uuid = "test-uuid-123"
-        edge.name = "works_at"
-        edge.fact = "Alice works at Acme Corp"
-        edge.valid_at = datetime(2024, 1, 15, 10, 30, 0, tzinfo=timezone.utc)
-        edge.invalid_at = datetime(2025, 6, 1, 9, 0, 0, tzinfo=timezone.utc)
-        edge.created_at = datetime(2024, 1, 16, 14, 0, 0, tzinfo=timezone.utc)
+    def test_do_graph_search_edges_include_iso_temporal_fields(self, service):
+        """_do_graph_search (real code under test) converts a LIVE edge's datetime
+        valid_at/created_at to ISO strings on the returned edge dict. Recall only
+        surfaces live edges (invalid_at/expired_at unset — see _edge_is_invalidated),
+        so invalid_at is None here; the invalid_at→ISO path is covered by the
+        adapter test below (that path does not apply the live-edges filter)."""
+        edge = SimpleNamespace(
+            uuid="test-uuid-123",
+            name="works_at",
+            fact="Alice works at Acme Corp",
+            valid_at=datetime(2024, 1, 15, 10, 30, 0, tzinfo=timezone.utc),
+            invalid_at=None,  # live edge — otherwise filtered out of recall
+            created_at=datetime(2024, 1, 16, 14, 0, 0, tzinfo=timezone.utc),
+            expired_at=None,
+        )
+        mock_graphiti = MagicMock()
+        mock_results = SimpleNamespace(edges=[edge], nodes=[], episodes=[], communities=[])
+        mock_graphiti.search_ = MagicMock(return_value=mock_results)
 
-        # Simulate the edge mapping logic from search.py:1112-1120
-        from memory.search import _dt_to_iso
-        edge_dict = {
-            "uuid": edge.uuid,
-            "name": edge.name,
-            "fact": edge.fact,
-            "valid_at": _dt_to_iso(getattr(edge, "valid_at", None)),
-            "invalid_at": _dt_to_iso(getattr(edge, "invalid_at", None)),
-            "created_at": _dt_to_iso(getattr(edge, "created_at", None)),
-        }
+        with patch.object(service, "_get_graphiti", return_value=mock_graphiti):
+            with patch.object(service, "_run_on_bridge", side_effect=lambda x: x):
+                # _enrich_graph_results does a Cypher round-trip; stub it out.
+                with patch.object(service, "_enrich_graph_results", lambda *a, **k: None):
+                    result = service._do_graph_search(
+                        query="q", group_ids=["user--test"], limit=10,
+                    )
+        assert len(result["edges"]) == 1
+        row = result["edges"][0]
+        assert row["valid_at"] == "2024-01-15T10:30:00+00:00"
+        assert row["invalid_at"] is None
+        assert row["created_at"] == "2024-01-16T14:00:00+00:00"
 
-        assert edge_dict["valid_at"] == "2024-01-15T10:30:00+00:00"
-        assert edge_dict["invalid_at"] == "2025-06-01T09:00:00+00:00"
-        assert edge_dict["created_at"] == "2024-01-16T14:00:00+00:00"
+    def test_do_graph_search_edges_handle_none_temporal_fields(self, service):
+        """None temporal fields on the edge come back as None (not a crash)."""
+        edge = SimpleNamespace(
+            uuid="test-uuid-456", name="knows", fact="Bob knows Charlie",
+            valid_at=None, invalid_at=None, created_at=None, expired_at=None,
+        )
+        mock_graphiti = MagicMock()
+        mock_results = SimpleNamespace(edges=[edge], nodes=[], episodes=[], communities=[])
+        mock_graphiti.search_ = MagicMock(return_value=mock_results)
 
-    def test_edge_dict_handles_none_temporal_fields(self):
-        """Edge mapping handles None temporal fields (non-graph rows)."""
-        edge = MagicMock()
-        edge.uuid = "test-uuid-456"
-        edge.name = "knows"
-        edge.fact = "Bob knows Charlie"
-        edge.valid_at = None
-        edge.invalid_at = None
-        edge.created_at = None
-
-        from memory.search import _dt_to_iso
-        edge_dict = {
-            "uuid": edge.uuid,
-            "name": edge.name,
-            "fact": edge.fact,
-            "valid_at": _dt_to_iso(getattr(edge, "valid_at", None)),
-            "invalid_at": _dt_to_iso(getattr(edge, "invalid_at", None)),
-            "created_at": _dt_to_iso(getattr(edge, "created_at", None)),
-        }
-
-        assert edge_dict["valid_at"] is None
-        assert edge_dict["invalid_at"] is None
-        assert edge_dict["created_at"] is None
+        with patch.object(service, "_get_graphiti", return_value=mock_graphiti):
+            with patch.object(service, "_run_on_bridge", side_effect=lambda x: x):
+                with patch.object(service, "_enrich_graph_results", lambda *a, **k: None):
+                    result = service._do_graph_search(
+                        query="q", group_ids=["user--test"], limit=10,
+                    )
+        row = result["edges"][0]
+        assert row["valid_at"] is None
+        assert row["invalid_at"] is None
+        assert row["created_at"] is None
 
     def test_recall_fusion_sets_temporal_fields_on_memory_response(self):
         """Recall fusion populates valid_at/invalid_at on graph MemoryResponse."""
@@ -179,27 +194,33 @@ class TestR4BitemporalMetadata:
         assert dumped["invalid_at"] == "2024-08-01T00:00:00+00:00"
         assert dumped["id"] == "mem-789"
 
-    def test_adapter_resolve_edge_names_includes_temporal_fields(self):
-        """Adapter's _resolve_edge_names includes ISO valid_at/invalid_at (additive)."""
-        # Mock an EntityEdge with bi-temporal fields
-        edge = MagicMock()
-        edge.source_node_uuid = "node-a"
-        edge.target_node_uuid = "node-b"
-        edge.name = "works_with"
-        edge.fact = "Alice works with Bob"
-        edge.valid_at = datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
-        edge.invalid_at = datetime(2024, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
+    def _resolve_one_edge(self, edge):
+        """Invoke the REAL adapter MemoryGraph._resolve_edge_names on a single
+        edge, with EntityNode.get_by_uuids stubbed to name the endpoints."""
+        from mem0.memory.graphiti_memory import MemoryGraph
+        import mem0.memory.graphiti_memory as gm
 
-        # Simulate the adapter's _resolve_edge_names logic
-        # (without async/await for simplicity; focus on field mapping)
-        result = {
-            "source": "Alice",
-            "relationship": edge.name,
-            "destination": "Bob",
-            "fact": edge.fact,
-            "valid_at": edge.valid_at.isoformat() if edge.valid_at else None,
-            "invalid_at": edge.invalid_at.isoformat() if edge.invalid_at else None,
-        }
+        graph = object.__new__(MemoryGraph)
+        graph.graphiti = SimpleNamespace(driver=MagicMock())
+
+        async def _fake_get_by_uuids(driver, uuids):
+            names = {edge.source_node_uuid: "Alice", edge.target_node_uuid: "Bob"}
+            return [SimpleNamespace(uuid=u, name=names.get(u, u)) for u in uuids]
+
+        with patch.object(gm.EntityNode, "get_by_uuids", side_effect=_fake_get_by_uuids):
+            return asyncio.run(graph._resolve_edge_names([edge]))[0]
+
+    def test_adapter_resolve_edge_names_includes_temporal_fields(self):
+        """The REAL _resolve_edge_names emits ISO valid_at/invalid_at (additive).
+        The adapter/MCP path does not apply the live-edges filter, so an
+        invalid_at-bounded edge is preserved here."""
+        edge = SimpleNamespace(
+            source_node_uuid="node-a", target_node_uuid="node-b",
+            name="works_with", fact="Alice works with Bob",
+            valid_at=datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
+            invalid_at=datetime(2024, 12, 31, 23, 59, 59, tzinfo=timezone.utc),
+        )
+        result = self._resolve_one_edge(edge)
 
         assert result["valid_at"] == "2024-01-01T00:00:00+00:00"
         assert result["invalid_at"] == "2024-12-31T23:59:59+00:00"
@@ -210,23 +231,13 @@ class TestR4BitemporalMetadata:
         assert result["fact"] == "Alice works with Bob"
 
     def test_adapter_resolve_edge_names_handles_none_temporal_fields(self):
-        """Adapter's _resolve_edge_names handles None valid_at/invalid_at."""
-        edge = MagicMock()
-        edge.source_node_uuid = "node-c"
-        edge.target_node_uuid = "node-d"
-        edge.name = "knows"
-        edge.fact = "Charlie knows Diana"
-        edge.valid_at = None
-        edge.invalid_at = None
-
-        result = {
-            "source": "Charlie",
-            "relationship": edge.name,
-            "destination": "Diana",
-            "fact": edge.fact,
-            "valid_at": edge.valid_at.isoformat() if edge.valid_at else None,
-            "invalid_at": edge.invalid_at.isoformat() if edge.invalid_at else None,
-        }
+        """The REAL _resolve_edge_names handles None valid_at/invalid_at."""
+        edge = SimpleNamespace(
+            source_node_uuid="node-a", target_node_uuid="node-b",
+            name="knows", fact="Charlie knows Diana",
+            valid_at=None, invalid_at=None,
+        )
+        result = self._resolve_one_edge(edge)
 
         assert result["valid_at"] is None
         assert result["invalid_at"] is None
