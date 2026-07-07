@@ -51,6 +51,28 @@ def _occurred_at_to_datetime(value: str | None) -> datetime | None:
         return None
 
 
+def _speaker_label(msg: dict) -> str:
+    """Line prefix (the "actor") for a conversation message sent to Graphiti's
+    speaker-first ``extract_message`` prompt (R2).
+
+    Prefers a real speaker name over the generic role: the first of
+    ``speaker`` → ``name`` → ``role`` that is present AND sanitizes to a
+    non-empty string is returned; ``"user"`` is the final fallback. Every
+    candidate — including the role fallback — is sanitized (stripped, internal
+    whitespace/newlines collapsed to single spaces) so a whitespace-only or
+    multi-line label can never reintroduce a newline into the episode header.
+    For role-only messages this returns the role verbatim, so ``raw_text`` is
+    byte-identical to the pre-R2 behavior.
+    """
+    for candidate in (msg.get("speaker"), msg.get("name"), msg.get("role"), "user"):
+        if not candidate:
+            continue
+        sanitized = " ".join(str(candidate).strip().split())
+        if sanitized:
+            return sanitized
+    return "user"
+
+
 def _validate_speaker(speaker: str | None) -> str | None:
     """Validate and sanitize a speaker label (T1.2 speaker sanity guard).
 
@@ -372,8 +394,9 @@ class WriteMixin:
             project_id,
         )
         cleaned_messages = _clean_conversation_for_graph(messages)
+
         raw_text = "\n".join(
-            f"{msg.get('role', 'user')}: {msg.get('content', '')}"
+            f"{_speaker_label(msg)}: {msg.get('content', '')}"
             for msg in cleaned_messages
         )
         graph_write_started_at = datetime.now(timezone.utc)
@@ -402,6 +425,7 @@ class WriteMixin:
                         filters={"user_id": user_id, "group_id": group_id},
                         episode_name=episode_name,
                         reference_time=_occurred_at_to_datetime(occurred_at),
+                        episode_source="message",
                         operation="graph storage (extract_and_store)",
                     )
                     # 1-episode → N-memories shape: a single graph.add produces
