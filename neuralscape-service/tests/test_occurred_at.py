@@ -706,3 +706,26 @@ class TestGraphitiReferenceTimeThreading:
         mock_add.assert_called_once()
         call_kwargs = mock_add.call_args[1]
         assert call_kwargs["reference_time"] is None
+
+    def test_enrich_graph_normalizes_z_suffix_and_naive(self, service, monkeypatch):
+        """occurred_at with a 'Z' suffix / naive form normalizes to a UTC datetime
+        (Copilot review: reuse validate_occurred_at rules, don't silently drop)."""
+        from datetime import timezone
+
+        mock_add = MagicMock(return_value={"deleted_entities": [], "added_entities": []})
+        monkeypatch.setattr(service._memory.graph, "add", mock_add)
+
+        # Trailing 'Z' + naive timestamp — must NOT degrade to None.
+        service.enrich_graph(
+            content="Test fact",
+            user_id="u1",
+            project_id=None,
+            visibility="private",
+            memory_id="m1",
+            occurred_at="2023-05-01T12:00:00Z",
+        )
+
+        rt = mock_add.call_args[1]["reference_time"]
+        assert rt is not None
+        assert rt.tzinfo is not None
+        assert rt.astimezone(timezone.utc).isoformat() == "2023-05-01T12:00:00+00:00"

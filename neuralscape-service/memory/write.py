@@ -27,19 +27,25 @@ _SPEAKER_UNSET = object()
 def _occurred_at_to_datetime(value: str | None) -> datetime | None:
     """Parse occurred_at ISO string to datetime for Graphiti reference_time.
 
-    Defensive: returns None on any parse failure so bad values degrade
-    to legacy 'now' behavior instead of raising.
+    Normalizes through ``validate_occurred_at`` first so the same rules the
+    rest of the envelope uses apply here too — a trailing ``Z`` is tolerated,
+    naive timestamps are assumed UTC, and future-skew/invalid values are
+    rejected. Defensive: returns None on any failure so bad or unset values
+    degrade to legacy 'now' behavior instead of raising.
 
     Args:
-        value: ISO 8601 timestamp string (canonical UTC +00:00 from validate_occurred_at)
+        value: ISO 8601 timestamp string (may carry ``Z`` / be naive).
 
     Returns:
-        Parsed datetime or None if value is falsy/unparseable.
+        Parsed timezone-aware datetime, or None if value is falsy/invalid.
     """
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value)
+        normalized = validate_occurred_at(value)  # canonical UTC ISO (+00:00) or None
+        if not normalized:
+            return None
+        return datetime.fromisoformat(normalized)
     except (ValueError, TypeError):
         logger.warning(f"Failed to parse occurred_at '{value}' — falling back to ingestion time")
         return None

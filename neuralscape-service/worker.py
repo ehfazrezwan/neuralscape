@@ -820,8 +820,10 @@ async def process_graph_enrichment(
             memory_id,
         )
         return {"memory_id": memory_id, "enriched": False, "skipped": "memory_missing"}
-    # Extract occurred_at from the fetched memory for bi-temporal dating
-    occurred_at = getattr(mem, "occurred_at", None) or (getattr(mem, "metadata", {}) or {}).get("occurred_at")
+    # Real event time for Graphiti bi-temporal dating: get_memory() surfaces
+    # occurred_at as a top-level MemoryResponse field (mapped from the payload
+    # metadata in _mem_to_response), so read it directly.
+    occurred_at = getattr(mem, "occurred_at", None)
     graph_ontology = None
     if adapter:
         # Strict resolution (audit 27 #36): a queued job carrying an adapter
