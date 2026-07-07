@@ -322,6 +322,7 @@ class MemoryGraph:
         excluded_entity_types=None,
         custom_extraction_instructions=None,
         episode_name=None,
+        reference_time: datetime | None = None,
     ):
         """Add data to the graph via Graphiti's add_episode.
 
@@ -345,6 +346,8 @@ class MemoryGraph:
                 content + group so a re-run can find (and skip) an
                 already-ingested episode. None ⇒ the legacy timestamp-based
                 name (every call mints a distinct episode).
+            reference_time (datetime | None): Real event time for Graphiti
+                bi-temporal dating; None ⇒ ingestion wall-clock (legacy behavior).
 
         Returns:
             dict: {"deleted_entities": [...], "added_entities": [...]}
@@ -373,7 +376,7 @@ class MemoryGraph:
                 name=episode_name or f"mem0_episode_{now.isoformat()}",
                 episode_body=data,
                 source_description=source_description,
-                reference_time=now,
+                reference_time=reference_time or now,
                 source=EpisodeType.text,
                 group_id=group_id,
                 update_communities=self._update_communities,

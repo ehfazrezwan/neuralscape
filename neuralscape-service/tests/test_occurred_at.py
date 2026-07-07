@@ -633,3 +633,76 @@ class TestEventRenderGate:
 
         out = _render_evidence([self._row("solo", occurred_at="2019-01-01T00:00:00+00:00")])
         assert "(event:" not in out
+
+
+# ──────────────────────────────────────────────
+# Piece 7: Graphiti reference_time threading (R1)
+# ──────────────────────────────────────────────
+
+
+class TestGraphitiReferenceTimeThreading:
+    """R1: verify occurred_at threads through to Graphiti's reference_time parameter.
+
+    Change 273edd6 (benchmark nsbench branch) threads occurred_at → add_episode(reference_time=...)
+    for Graphiti bi-temporal dating. This is WRITE-SIDE only (GraphWorker queue) — zero read impact.
+    """
+
+    def test_enrich_graph_threads_occurred_at_to_reference_time(self, service, monkeypatch):
+        """enrich_graph with occurred_at → graph.add receives reference_time."""
+        from datetime import datetime, timezone
+
+        mock_add = MagicMock(return_value={"deleted_entities": [], "added_entities": []})
+        monkeypatch.setattr(service._memory.graph, "add", mock_add)
+
+        occurred_at = "2023-05-01T10:00:00+00:00"
+        service.enrich_graph(
+            content="Test fact",
+            user_id="u1",
+            project_id=None,
+            visibility="private",
+            memory_id="m1",
+            occurred_at=occurred_at,
+        )
+
+        mock_add.assert_called_once()
+        call_kwargs = mock_add.call_args[1]
+        assert "reference_time" in call_kwargs
+        assert call_kwargs["reference_time"] == datetime.fromisoformat(occurred_at)
+
+    def test_enrich_graph_occurred_at_none_passes_none(self, service, monkeypatch):
+        """enrich_graph with occurred_at=None → reference_time=None (legacy fallback)."""
+        mock_add = MagicMock(return_value={"deleted_entities": [], "added_entities": []})
+        monkeypatch.setattr(service._memory.graph, "add", mock_add)
+
+        service.enrich_graph(
+            content="Test fact",
+            user_id="u1",
+            project_id=None,
+            visibility="private",
+            memory_id="m1",
+            occurred_at=None,
+        )
+
+        mock_add.assert_called_once()
+        call_kwargs = mock_add.call_args[1]
+        # When occurred_at is None, reference_time should also be None (fallback to 'now' in graphiti_memory.py)
+        assert call_kwargs["reference_time"] is None
+
+    def test_enrich_graph_unparseable_occurred_at_degrades_to_none(self, service, monkeypatch):
+        """Unparseable occurred_at → reference_time=None without raising."""
+        mock_add = MagicMock(return_value={"deleted_entities": [], "added_entities": []})
+        monkeypatch.setattr(service._memory.graph, "add", mock_add)
+
+        # _occurred_at_to_datetime is defensive: bad values → None (legacy fallback)
+        service.enrich_graph(
+            content="Test fact",
+            user_id="u1",
+            project_id=None,
+            visibility="private",
+            memory_id="m1",
+            occurred_at="not-a-date",
+        )
+
+        mock_add.assert_called_once()
+        call_kwargs = mock_add.call_args[1]
+        assert call_kwargs["reference_time"] is None
