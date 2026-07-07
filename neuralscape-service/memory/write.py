@@ -372,8 +372,23 @@ class WriteMixin:
             project_id,
         )
         cleaned_messages = _clean_conversation_for_graph(messages)
+
+        def _speaker_label(msg: dict) -> str:
+            """Extract speaker label from message, preferring real names over roles.
+
+            Returns the first present of: speaker, name, role (fallback "user").
+            Sanitizes the label: strip whitespace, collapse newlines to space,
+            fall back to role/"user" if empty after sanitization.
+            """
+            label = msg.get("speaker") or msg.get("name") or msg.get("role", "user")
+            if not label:
+                return "user"
+            # Sanitize: strip, collapse newlines/multiple spaces to single space
+            sanitized = " ".join(str(label).strip().split())
+            return sanitized if sanitized else msg.get("role", "user")
+
         raw_text = "\n".join(
-            f"{msg.get('role', 'user')}: {msg.get('content', '')}"
+            f"{_speaker_label(msg)}: {msg.get('content', '')}"
             for msg in cleaned_messages
         )
         graph_write_started_at = datetime.now(timezone.utc)
@@ -402,6 +417,7 @@ class WriteMixin:
                         filters={"user_id": user_id, "group_id": group_id},
                         episode_name=episode_name,
                         reference_time=_occurred_at_to_datetime(occurred_at),
+                        episode_source="message",
                         operation="graph storage (extract_and_store)",
                     )
                     # 1-episode → N-memories shape: a single graph.add produces

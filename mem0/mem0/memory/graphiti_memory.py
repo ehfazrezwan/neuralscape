@@ -323,6 +323,7 @@ class MemoryGraph:
         custom_extraction_instructions=None,
         episode_name=None,
         reference_time: datetime | None = None,
+        episode_source: str = "text",
     ):
         """Add data to the graph via Graphiti's add_episode.
 
@@ -348,6 +349,10 @@ class MemoryGraph:
                 name (every call mints a distinct episode).
             reference_time (datetime | None): Real event time for Graphiti
                 bi-temporal dating; None ⇒ ingestion wall-clock (legacy behavior).
+            episode_source (str): Episode source type for Graphiti extraction.
+                Conversation episodes use "message" to activate Graphiti's
+                speaker-first extract_message prompt; single facts stay "text".
+                Default "text" preserves existing behavior for all current callers.
 
         Returns:
             dict: {"deleted_entities": [...], "added_entities": [...]}
@@ -372,12 +377,17 @@ class MemoryGraph:
             episode_kwargs["custom_extraction_instructions"] = custom_extraction_instructions
 
         async def _add():
+            # Translate episode_source string to EpisodeType enum
+            source_type = (
+                EpisodeType.message if episode_source == "message"
+                else EpisodeType.text
+            )
             result = await self.graphiti.add_episode(
                 name=episode_name or f"mem0_episode_{now.isoformat()}",
                 episode_body=data,
                 source_description=source_description,
                 reference_time=reference_time or now,
-                source=EpisodeType.text,
+                source=source_type,
                 group_id=group_id,
                 update_communities=self._update_communities,
                 **episode_kwargs,
