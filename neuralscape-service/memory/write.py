@@ -24,6 +24,33 @@ logger = logging.getLogger(__name__)
 _SPEAKER_UNSET = object()
 
 
+def _occurred_at_to_datetime(value: str | None) -> datetime | None:
+    """Parse occurred_at ISO string to datetime for Graphiti reference_time.
+
+    Normalizes through ``validate_occurred_at`` first so the same rules the
+    rest of the envelope uses apply here too — a trailing ``Z`` is tolerated,
+    naive timestamps are assumed UTC, and future-skew/invalid values are
+    rejected. Defensive: returns None on any failure so bad or unset values
+    degrade to legacy 'now' behavior instead of raising.
+
+    Args:
+        value: ISO 8601 timestamp string (may carry ``Z`` / be naive).
+
+    Returns:
+        Parsed timezone-aware datetime, or None if value is falsy/invalid.
+    """
+    if not value:
+        return None
+    try:
+        normalized = validate_occurred_at(value)  # canonical UTC ISO (+00:00) or None
+        if not normalized:
+            return None
+        return datetime.fromisoformat(normalized)
+    except (ValueError, TypeError):
+        logger.warning(f"Failed to parse occurred_at '{value}' — falling back to ingestion time")
+        return None
+
+
 def _validate_speaker(speaker: str | None) -> str | None:
     """Validate and sanitize a speaker label (T1.2 speaker sanity guard).
 
@@ -335,11 +362,8 @@ class WriteMixin:
         # Step 3: Add cleaned conversation text to knowledge graph — ONE
         # episode for the whole conversation regardless of extraction
         # windowing (Graphiti handles its own entity windowing internally).
-        # KNOWN RESIDUAL (occurred_at): the episode's Graphiti reference_time
-        # is stamped "now" inside the mem0 subtree's MemoryGraph.add, which
-        # exposes no event-time parameter — threading occurred_at through to
-        # add_episode(reference_time=...) needs a subtree change, deliberately
-        # out of scope here. Event time lives in the Qdrant payload only.
+        # The episode's Graphiti reference_time is the conversation's event
+        # time (occurred_at), falling back to ingestion time when unknown.
         # Conversation extractions are personal (private) by default — the
         # caller's spoken context isn't team-shared automatically.
         group_id = _build_group_id(
@@ -377,6 +401,7 @@ class WriteMixin:
                         data=raw_text,
                         filters={"user_id": user_id, "group_id": group_id},
                         episode_name=episode_name,
+                        reference_time=_occurred_at_to_datetime(occurred_at),
                         operation="graph storage (extract_and_store)",
                     )
                     # 1-episode → N-memories shape: a single graph.add produces
@@ -917,6 +942,7 @@ class WriteMixin:
         memory_id: str,
         source_ref: dict | None = None,
         graph_ontology: dict | None = None,
+        occurred_at: str | None = None,
     ) -> bool:
         """Add content to the knowledge graph + attach memory_id back-refs.
 
@@ -932,6 +958,9 @@ class WriteMixin:
         a knowledge adapter and resolved *per ingest*. When None (the default,
         and every regular memory write), the graph write is byte-for-byte the
         pre-adapter path.
+
+        ``occurred_at`` is the real event time (ISO string); None falls back
+        to ingestion wall-clock (legacy behavior).
 
         Returns True if the graph write actually succeeded, False if it was
         skipped (no graph configured) or swallowed an error. Callers use this
@@ -950,6 +979,7 @@ class WriteMixin:
                 self._memory.graph.add,
                 data=content,
                 filters={"user_id": user_id, "group_id": group_id},
+                reference_time=_occurred_at_to_datetime(occurred_at),
                 operation="enrich_graph add",
                 **(graph_ontology or {}),
             )

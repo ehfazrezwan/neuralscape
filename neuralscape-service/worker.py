@@ -812,13 +812,18 @@ async def process_graph_enrichment(
     # queue: graph enrichment can run minutes after the write, and adding now
     # would resurrect the deleted memory's content in Neo4j. If it's gone from
     # the store, skip rather than re-create graph state for it.
-    if await asyncio.to_thread(service.get_memory, memory_id) is None:
+    mem = await asyncio.to_thread(service.get_memory, memory_id)
+    if mem is None:
         logger.info(
             "Skipping graph enrichment for memory %s — no longer in the store "
             "(deleted/expired while the job was queued).",
             memory_id,
         )
         return {"memory_id": memory_id, "enriched": False, "skipped": "memory_missing"}
+    # Real event time for Graphiti bi-temporal dating: get_memory() surfaces
+    # occurred_at as a top-level MemoryResponse field (mapped from the payload
+    # metadata in _mem_to_response), so read it directly.
+    occurred_at = getattr(mem, "occurred_at", None)
     graph_ontology = None
     if adapter:
         # Strict resolution (audit 27 #36): a queued job carrying an adapter
@@ -836,6 +841,7 @@ async def process_graph_enrichment(
         memory_id=memory_id,
         source_ref=source_ref,
         graph_ontology=graph_ontology,
+        occurred_at=occurred_at,
     )
     if not enriched:
         logger.warning(
