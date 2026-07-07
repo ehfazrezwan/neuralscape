@@ -599,6 +599,12 @@ class SearchMixin:
                                 if emb is not None
                                 else None
                             ),
+                            # R4: surface Graphiti's bi-temporal edge validity
+                            # metadata so the answer layer can reason about
+                            # recency/contradiction (already ISO-stringified).
+                            valid_at=edge.get("valid_at"),
+                            invalid_at=edge.get("invalid_at"),
+                            created_at=edge.get("created_at"),
                         )
                     )
                     graph_edge_embeddings.append(emb)
@@ -1109,7 +1115,14 @@ class SearchMixin:
                 )
             )
             edges = [
-                {"uuid": e.uuid, "name": e.name, "fact": e.fact}
+                {
+                    "uuid": e.uuid,
+                    "name": e.name,
+                    "fact": e.fact,
+                    "valid_at": _dt_to_iso(getattr(e, "valid_at", None)),
+                    "invalid_at": _dt_to_iso(getattr(e, "invalid_at", None)),
+                    "created_at": _dt_to_iso(getattr(e, "created_at", None)),
+                }
                 for e in results.edges
                 # Belt-and-suspenders: some drivers/recipes skip the Cypher
                 # filter constructor, so drop stamped edges here too.
@@ -1280,7 +1293,14 @@ class SearchMixin:
 
             return {
                 "edges": [
-                    {"uuid": e.uuid, "name": e.name, "fact": e.fact}
+                    {
+                        "uuid": e.uuid,
+                        "name": e.name,
+                        "fact": e.fact,
+                        "valid_at": _dt_to_iso(getattr(e, "valid_at", None)),
+                        "invalid_at": _dt_to_iso(getattr(e, "invalid_at", None)),
+                        "created_at": _dt_to_iso(getattr(e, "created_at", None)),
+                    }
                     for e in results.edges
                 ],
                 "nodes": [
