@@ -602,9 +602,14 @@ class SearchMixin:
                             # R4: surface Graphiti's bi-temporal edge validity
                             # metadata so the answer layer can reason about
                             # recency/contradiction (already ISO-stringified).
+                            # Intentionally NOT setting created_at from the edge:
+                            # graph rows keep getting created_at from their nearest
+                            # source memory via enrichment (fills only when None,
+                            # _enrich_graph_with_v2). Setting it here would change
+                            # graph-row created_at (edge-creation vs storage time)
+                            # and shift ask's recency sort — outside R4's scope.
                             valid_at=edge.get("valid_at"),
                             invalid_at=edge.get("invalid_at"),
-                            created_at=edge.get("created_at"),
                         )
                     )
                     graph_edge_embeddings.append(emb)
