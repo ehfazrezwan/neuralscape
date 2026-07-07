@@ -2,12 +2,25 @@
 
 Tests verify:
 1. The adapter translates episode_source string to EpisodeType enum
-2. Role→speaker helper correctly prefers speaker/name over role
+2. The production _speaker_label helper prefers real speaker/name over role
+   and always returns a non-empty, sanitized label.
 """
+import asyncio
+
 import pytest
-from datetime import datetime, timezone
-from unittest.mock import MagicMock, Mock, AsyncMock
+from unittest.mock import Mock, AsyncMock
 from graphiti_core.nodes import EpisodeType
+
+from memory.write import _speaker_label
+
+
+class _SyncBridge:
+    """Lightweight test bridge: run the coroutine to completion on a throwaway
+    loop via asyncio.run(). Avoids the real _AsyncBridge's background
+    event-loop thread (Copilot review: no thread leak across the suite)."""
+
+    def run(self, coro):
+        return asyncio.run(coro)
 
 
 class TestAdapterEpisodeSourceMapping:
@@ -23,11 +36,11 @@ class TestAdapterEpisodeSourceMapping:
     @pytest.fixture
     def memory_graph(self, mock_graphiti):
         """MemoryGraph instance with mocked Graphiti (bypass constructor)."""
-        from mem0.memory.graphiti_memory import MemoryGraph, _AsyncBridge
+        from mem0.memory.graphiti_memory import MemoryGraph
         # Create instance without calling __init__ to avoid config dependencies
         graph = object.__new__(MemoryGraph)
         graph.graphiti = mock_graphiti
-        graph._bridge = _AsyncBridge()
+        graph._bridge = _SyncBridge()
         graph._update_communities = False
         graph._ensure_indices = lambda: None  # skip index creation
         return graph
@@ -40,7 +53,6 @@ class TestAdapterEpisodeSourceMapping:
             episode_source="message",
         )
 
-        # Verify add_episode was called with source=EpisodeType.message
         mock_graphiti.add_episode.assert_called_once()
         call_kwargs = mock_graphiti.add_episode.call_args[1]
         assert call_kwargs["source"] == EpisodeType.message
@@ -58,7 +70,7 @@ class TestAdapterEpisodeSourceMapping:
         assert call_kwargs["source"] == EpisodeType.text
 
     def test_episode_source_default_is_text(self, memory_graph, mock_graphiti):
-        """No episode_source kwarg → defaults to "text" → EpisodeType.text."""
+        """No episode_source kwarg → defaults to "text" → EpisodeType.text (legacy)."""
         memory_graph.add(
             data="Single fact",
             filters={"user_id": "u1"},
@@ -82,45 +94,43 @@ class TestAdapterEpisodeSourceMapping:
 
 
 class TestSpeakerLabelHelper:
-    """Test the _speaker_label helper logic (role→speaker mapping)."""
+    """Test the PRODUCTION _speaker_label helper (role→speaker mapping).
+
+    These call the real memory.write._speaker_label used by extract_and_store,
+    so a regression in the implementation fails the tests (Copilot review).
+    """
 
     def test_speaker_field_preferred(self):
-        """Message with 'speaker' field uses that as the label."""
-        msg = {"role": "user", "speaker": "Alice", "content": "Hello"}
-        # Inline the helper logic to test it
-        label = msg.get("speaker") or msg.get("name") or msg.get("role", "user")
-        sanitized = " ".join(str(label).strip().split())
-        assert sanitized == "Alice"
+        assert _speaker_label({"role": "user", "speaker": "Alice", "content": "Hello"}) == "Alice"
 
     def test_name_field_preferred_over_role(self):
-        """Message with 'name' field (no speaker) uses name."""
-        msg = {"role": "user", "name": "Bob", "content": "Test"}
-        label = msg.get("speaker") or msg.get("name") or msg.get("role", "user")
-        sanitized = " ".join(str(label).strip().split())
-        assert sanitized == "Bob"
+        assert _speaker_label({"role": "user", "name": "Bob", "content": "Test"}) == "Bob"
 
     def test_role_used_when_no_speaker_or_name(self):
-        """Message with only role field uses role."""
-        msg = {"role": "assistant", "content": "Hi"}
-        label = msg.get("speaker") or msg.get("name") or msg.get("role", "user")
-        sanitized = " ".join(str(label).strip().split())
-        assert sanitized == "assistant"
+        assert _speaker_label({"role": "assistant", "content": "Hi"}) == "assistant"
+
+    def test_role_only_is_byte_identical(self):
+        """Role-only messages must produce the exact role string (pre-R2 behavior)."""
+        assert _speaker_label({"role": "user", "content": "x"}) == "user"
+        assert _speaker_label({"role": "assistant", "content": "y"}) == "assistant"
 
     def test_whitespace_collapsed(self):
-        """Speaker labels with whitespace/newlines are sanitized."""
-        msg = {"role": "user", "speaker": "  Alice\n  ", "content": "Test"}
-        label = msg.get("speaker") or msg.get("name") or msg.get("role", "user")
-        sanitized = " ".join(str(label).strip().split())
-        assert sanitized == "Alice"
-
-        msg2 = {"role": "assistant", "speaker": "Bot\nName", "content": "Reply"}
-        label2 = msg2.get("speaker") or msg2.get("name") or msg2.get("role", "user")
-        sanitized2 = " ".join(str(label2).strip().split())
-        assert sanitized2 == "Bot Name"
+        assert _speaker_label({"role": "user", "speaker": "  Alice\n  ", "content": "Test"}) == "Alice"
+        assert _speaker_label({"role": "assistant", "speaker": "Bot\nName", "content": "R"}) == "Bot Name"
 
     def test_empty_speaker_falls_back_to_role(self):
-        """Empty speaker/name field falls back to role."""
-        msg = {"role": "user", "speaker": "", "content": "Test"}
-        label = msg.get("speaker") or msg.get("name") or msg.get("role", "user")
-        # Empty string is falsy, so we get role
-        assert label == "user"
+        """Empty-string speaker is falsy → falls back to role."""
+        assert _speaker_label({"role": "user", "speaker": "", "content": "Test"}) == "user"
+
+    def test_whitespace_only_label_falls_back_to_sanitized_value(self):
+        """A whitespace-only speaker sanitizes to empty and must NOT leak a
+        newline via an unsanitized fallback (Copilot review edge case)."""
+        # speaker is whitespace-only → skip; role is clean → "user"
+        assert _speaker_label({"role": "user", "speaker": "   \n  ", "content": "T"}) == "user"
+        # speaker whitespace-only, role itself multi-line → still sanitized, no newline
+        label = _speaker_label({"role": "a\nb", "speaker": "  \n ", "content": "T"})
+        assert label == "a b"
+        assert "\n" not in label
+
+    def test_no_fields_defaults_to_user(self):
+        assert _speaker_label({"content": "orphan line"}) == "user"
