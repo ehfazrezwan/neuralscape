@@ -13,6 +13,22 @@ from memory.ranking import RRF_K, _dense_score_floor, _reinforcement_boost, _rrf
 
 logger = logging.getLogger(__name__)
 
+
+def _dt_to_iso(value):
+    """Coerce a Graphiti datetime (or already-string) to a canonical ISO string.
+
+    Graphiti edge/episode temporal fields are ``datetime`` objects, but the
+    NS envelope (``MemoryResponse.created_at`` etc.) is ``str | None`` and
+    Pydantic rejects a datetime. Returns ``value.isoformat()`` for datetimes,
+    the value unchanged if it's already a string, else None.
+    """
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
 # ── Overlapped graph pass (audit 27 #9) ────────────────────────────────
 # search() used to run its vector pools to completion and only then start
 # the Graphiti pass — wall time was vector + graph even though the two legs
@@ -550,6 +566,10 @@ class SearchMixin:
         # below for the zero-embed twin decoration (query_batch_points with
         # these vectors instead of re-embedding edge facts).
         graph_edge_embeddings: list[list | None] = []
+        # R3: episode rows are collected here and appended AFTER edge enrichment
+        # so they can never desync graph_edge_embeddings from the edge rows.
+        # Initialized at edge scope so the append below is unconditional.
+        episodes_for_later: list[MemoryResponse] = []
         if graph_future is not None:
             try:
                 graph_results = graph_future.result(
@@ -580,7 +600,6 @@ class SearchMixin:
                 # Use the same id/source scheme as ask.py (ep-<uuid12>, source="episode")
                 # so deduplication aligns. Episodes are appended AFTER edge
                 # enrichment to preserve edge_embeddings index alignment.
-                episodes_for_later = []
                 if settings.graph_episode_recall_enabled:
                     for ep in graph_results.get("episodes", []):
                         ep_uuid = str(ep.get("uuid") or "")
@@ -645,7 +664,7 @@ class SearchMixin:
 
         # R3: append episode rows after edge enrichment to preserve index alignment
         # of graph_edge_embeddings with edge rows (episodes have no embeddings).
-        if 'episodes_for_later' in locals() and episodes_for_later:
+        if episodes_for_later:
             graph_responses.extend(episodes_for_later)
 
         # Multi-user model: post-filter graph rows by enriched visibility.
@@ -1091,14 +1110,17 @@ class SearchMixin:
                 for n in results.nodes
             ]
             # R3: cap episodes at 3 (ask measured 3 as sweet spot, 5 regressed).
-            # Keep created_at/valid_at if present (R4 will use them).
+            # Stringify datetimes to ISO — Graphiti hands back datetime objects,
+            # but MemoryResponse.created_at is `str | None` and would reject a
+            # datetime (silently dropping every episode row via the recall
+            # try/except). Keep created_at/valid_at as ISO strings (R4 uses them).
             episodes = [
                 {
                     "uuid": ep.uuid,
                     "name": ep.name,
                     "content": ep.content,
-                    "created_at": getattr(ep, "created_at", None),
-                    "valid_at": getattr(ep, "valid_at", None),
+                    "created_at": _dt_to_iso(getattr(ep, "created_at", None)),
+                    "valid_at": _dt_to_iso(getattr(ep, "valid_at", None)),
                 }
                 for ep in results.episodes[:3]
             ]

@@ -106,6 +106,43 @@ class TestR3DoGraphSearch:
                 assert all("uuid" in ep for ep in result["episodes"])
                 assert all("content" in ep for ep in result["episodes"])
 
+    def test_datetime_temporal_fields_stringified_to_iso(self, service):
+        """Graphiti hands back datetime created_at/valid_at; _do_graph_search must
+        return them as ISO strings so the recall-fusion MemoryResponse (created_at:
+        str|None) doesn't reject them and silently drop every episode row."""
+        from datetime import datetime, timezone
+
+        dt = datetime(2023, 5, 1, 12, 0, tzinfo=timezone.utc)
+        mock_graphiti = MagicMock()
+        mock_episodes = [
+            SimpleNamespace(
+                uuid=uuid.uuid4(), name="ep0", content="c0",
+                created_at=dt, valid_at=dt,
+            )
+        ]
+        mock_results = SimpleNamespace(
+            edges=[], nodes=[], episodes=mock_episodes, communities=[]
+        )
+        mock_graphiti.search_ = MagicMock(return_value=mock_results)
+
+        with patch.object(service, '_get_graphiti', return_value=mock_graphiti):
+            with patch.object(service, '_run_on_bridge', side_effect=lambda x: x):
+                result = service._do_graph_search(
+                    query="q", group_ids=["user--test"], limit=10,
+                    include_episodes=True,
+                )
+        ep = result["episodes"][0]
+        assert ep["created_at"] == "2023-05-01T12:00:00+00:00"
+        assert ep["valid_at"] == "2023-05-01T12:00:00+00:00"
+        assert isinstance(ep["created_at"], str)
+        # The stringified value must construct a MemoryResponse without raising
+        # (the exact failure that would silently drop episodes in production).
+        MemoryResponse(
+            id=f"ep-{str(ep['uuid'])[:12]}",
+            memory=f"[verbatim session excerpt] {ep['content']}",
+            source="episode", score=None, created_at=ep["created_at"],
+        )
+
     def test_explicit_search_config_ignores_include_episodes(self, service):
         """When explicit search_config is passed, include_episodes is ignored."""
         mock_graphiti = MagicMock()
