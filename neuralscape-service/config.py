@@ -212,6 +212,10 @@ class Settings(BaseSettings):
     # Graphiti's episode_content fulltext index (one Cypher call, no
     # embeddings). Measured +5pp on a DMR 100-question stratified sample.
     ask_episode_evidence: bool = True
+    # R3: recall-side episode leg — when on, service.search() adds up to 3
+    # bm25 episode snippets from Graphiti; additive+capped; flip off if the
+    # read-latency floor is breached (mission constraint: ≤+20%).
+    graph_episode_recall_enabled: bool = True
     # Bounded second-chance re-ask for false abstentions (T2.1): when the
     # normal answering loop produces an abstention AND at least one evidence
     # row shares ≥2 content keywords with the question, re-ask ONCE with

@@ -13,6 +13,22 @@ from memory.ranking import RRF_K, _dense_score_floor, _reinforcement_boost, _rrf
 
 logger = logging.getLogger(__name__)
 
+
+def _dt_to_iso(value):
+    """Coerce a Graphiti datetime (or already-string) to a canonical ISO string.
+
+    Graphiti edge/episode temporal fields are ``datetime`` objects, but the
+    NS envelope (``MemoryResponse.created_at`` etc.) is ``str | None`` and
+    Pydantic rejects a datetime. Returns ``value.isoformat()`` for datetimes,
+    the value unchanged if it's already a string, else None.
+    """
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
 # ── Overlapped graph pass (audit 27 #9) ────────────────────────────────
 # search() used to run its vector pools to completion and only then start
 # the Graphiti pass — wall time was vector + graph even though the two legs
@@ -30,6 +46,12 @@ _GRAPH_SEARCH_POOL = _ThreadPoolExecutor(
 # timeout; this outer join is belt-and-suspenders so a wedged bridge thread
 # can never hang a read indefinitely.
 _GRAPH_SEARCH_JOIN_TIMEOUT_S = 45.0
+
+# R3: per-snippet char cap for recall-side episode excerpts. Bounds evidence
+# tokens; the COUNT of episode rows is separately capped at 3 (the ask sweet
+# spot). A plain char cap (not ask.py's sentence-boundary _clip_content) keeps
+# the search mixin free of an ask.py import (which would be circular).
+_EPISODE_SNIPPET_CLIP = 600
 
 class SearchMixin:
     """SearchMixin for MemoryService (mechanical split — see memory_service.py)."""
@@ -378,6 +400,7 @@ class SearchMixin:
                     limit=limit,
                     visibility=visibility,
                     include_shared=include_shared,
+                    include_episodes=settings.graph_episode_recall_enabled,
                 )
             except Exception as e:
                 logger.warning(f"Graph search submit failed (non-critical): {e}")
@@ -549,6 +572,10 @@ class SearchMixin:
         # below for the zero-embed twin decoration (query_batch_points with
         # these vectors instead of re-embedding edge facts).
         graph_edge_embeddings: list[list | None] = []
+        # R3: episode rows are collected here and appended AFTER edge enrichment
+        # so they can never desync graph_edge_embeddings from the edge rows.
+        # Initialized at edge scope so the append below is unconditional.
+        episodes_for_later: list[MemoryResponse] = []
         if graph_future is not None:
             try:
                 graph_results = graph_future.result(
@@ -575,8 +602,32 @@ class SearchMixin:
                         )
                     )
                     graph_edge_embeddings.append(emb)
+                # R3: consume episodes from the graph search (when flag enabled).
+                # Use the same id/source scheme as ask.py (ep-<uuid12>, source="episode")
+                # so deduplication aligns. Episodes are appended AFTER edge
+                # enrichment to preserve edge_embeddings index alignment.
+                if settings.graph_episode_recall_enabled:
+                    for ep in graph_results.get("episodes", []):
+                        ep_uuid = str(ep.get("uuid") or "")
+                        ep_content = str(ep.get("content") or "")
+                        # Clip each recall episode snippet to a bounded length.
+                        # (Not the same as ask.py's _clip_content, which clips at
+                        # a sentence/whitespace boundary; a plain char cap keeps
+                        # the recall leg dependency-free — importing ask into the
+                        # search mixin would be circular.)
+                        clipped = ep_content[:_EPISODE_SNIPPET_CLIP]
+                        episodes_for_later.append(
+                            MemoryResponse(
+                                id=f"ep-{ep_uuid[:12]}",
+                                memory=f"[verbatim session excerpt] {clipped}",
+                                source="episode",
+                                score=None,  # rank on merit, not score
+                                created_at=ep.get("created_at") or None,
+                            )
+                        )
             except Exception as e:
                 logger.warning(f"Graph search failed during recall (non-critical): {e}")
+                episodes_for_later = []
 
         # Enrich graph rows with metadata from their nearest source memory
         # (title/category/created_at/v2 fields + the twin back-reference).
@@ -620,6 +671,11 @@ class SearchMixin:
                 # edges. A plain recall is not.
                 allow_embed_fallback=(memory_kind == "passage"),
             )
+
+        # R3: append episode rows after edge enrichment to preserve index alignment
+        # of graph_edge_embeddings with edge rows (episodes have no embeddings).
+        if episodes_for_later:
+            graph_responses.extend(episodes_for_later)
 
         # Multi-user model: post-filter graph rows by enriched visibility.
         # The Graphiti search above already scopes by group_ids, so most
@@ -954,6 +1010,7 @@ class SearchMixin:
         limit: int,
         visibility: str | None,
         include_shared: bool,
+        include_episodes: bool = False,
     ) -> dict:
         """search_graph with multi-user visibility scoping.
 
@@ -991,7 +1048,9 @@ class SearchMixin:
             # Default: full read-set (caller's private + shared + standard).
             group_ids = _get_group_ids(user_id, project_id)
 
-        return self._do_graph_search(query=query, group_ids=group_ids, limit=limit)
+        return self._do_graph_search(
+            query=query, group_ids=group_ids, limit=limit, include_episodes=include_episodes
+        )
 
     def _do_graph_search(
         self,
@@ -999,13 +1058,19 @@ class SearchMixin:
         group_ids: list[str],
         limit: int,
         search_config: dict | None = None,
+        include_episodes: bool = False,
     ) -> dict:
         """Internal: run a graph search across the given group_ids."""
         g = self._get_graphiti()
         if g is None:
             return {"edges": [], "nodes": [], "episodes": [], "communities": []}
 
-        from graphiti_core.search.search_config import SearchConfig
+        from graphiti_core.search.search_config import (
+            EpisodeReranker,
+            EpisodeSearchConfig,
+            EpisodeSearchMethod,
+            SearchConfig,
+        )
         from graphiti_core.search.search_config_recipes import EDGE_HYBRID_SEARCH_RRF
 
         # Audit 27 #10: EDGE_HYBRID_SEARCH_RRF is a module-level singleton
@@ -1020,6 +1085,14 @@ class SearchMixin:
                 config = EDGE_HYBRID_SEARCH_RRF.model_copy(deep=True)
         else:
             config = EDGE_HYBRID_SEARCH_RRF.model_copy(deep=True)
+            # R3: when include_episodes AND using the default recipe, add the
+            # bm25 episode leg (no embeddings). Explicit search_configs (e.g.
+            # the delete path with limit=5) stay episode-free.
+            if include_episodes:
+                config.episode_config = EpisodeSearchConfig(
+                    search_methods=[EpisodeSearchMethod.bm25],
+                    reranker=EpisodeReranker.rrf,
+                )
         config.limit = limit
 
         try:
@@ -1046,9 +1119,20 @@ class SearchMixin:
                 {"uuid": n.uuid, "name": n.name, "summary": n.summary}
                 for n in results.nodes
             ]
+            # R3: cap episodes at 3 (ask measured 3 as sweet spot, 5 regressed).
+            # Stringify datetimes to ISO — Graphiti hands back datetime objects,
+            # but MemoryResponse.created_at is `str | None` and would reject a
+            # datetime (silently dropping every episode row via the recall
+            # try/except). Keep created_at/valid_at as ISO strings (R4 uses them).
             episodes = [
-                {"uuid": ep.uuid, "name": ep.name, "content": ep.content}
-                for ep in results.episodes
+                {
+                    "uuid": ep.uuid,
+                    "name": ep.name,
+                    "content": ep.content,
+                    "created_at": _dt_to_iso(getattr(ep, "created_at", None)),
+                    "valid_at": _dt_to_iso(getattr(ep, "valid_at", None)),
+                }
+                for ep in results.episodes[:3]
             ]
             communities = [
                 {"uuid": c.uuid, "name": c.name} for c in results.communities

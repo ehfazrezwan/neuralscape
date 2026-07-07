@@ -261,6 +261,16 @@ def _evidence_rows(
 
     rows = list(evidence.values())
 
+    # R3: cap total episode rows at 3 (the sweet spot; 5 regressed). Recall
+    # and ask both surface episode rows as source=="episode" with ep-<uuid12>
+    # ids; dedup by id means duplicates are already merged, so if >3 distinct
+    # episode rows remain, keep the first 3 deterministically.
+    episode_rows = [r for r in rows if getattr(r, "source", None) == "episode"]
+    if len(episode_rows) > 3:
+        # Keep first 3 episodes, plus all non-episode rows
+        non_episode_rows = [r for r in rows if getattr(r, "source", None) != "episode"]
+        rows = episode_rows[:3] + non_episode_rows
+
     prioritized = set(prioritize_ids or [])
     if len(rows) > _EVIDENCE_MAX_ROWS:
         kw_set = set(keyword_ids) | prioritized
