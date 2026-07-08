@@ -193,6 +193,11 @@ def test_native_engine_semantic_layer_implemented(mock_bridge, mock_settings):
     hotspot = hotspot_facts[0]
     assert "mod.foo" in hotspot.content
     assert "degree 15" in hotspot.content
+    # Hotspot facts are structure-derived → deductive (matches semantic.py)
+    assert hotspot.epistemic_level == "deductive"
+
+    # Community/module facts are inductive
+    assert all(f.epistemic_level == "inductive" for f in community_facts)
 
 
 def test_native_engine_export_snapshot_implemented(mock_bridge, mock_settings):
@@ -658,10 +663,13 @@ def test_compute_communities_guards_large_graphs(mock_bridge, mock_settings):
         settings=mock_settings,
     )
 
-    # Mock 200,001 edges
-    large_edges = [{"source": f"s{i}", "target": f"t{i}"} for i in range(200_001)]
+    # Lightweight stand-in for a >200k-edge result: the guard only calls len(),
+    # then returns immediately — no need to allocate 200k real elements.
+    class _FakeEdges:
+        def __len__(self):
+            return 200_001
 
-    with patch.object(engine, "_run_cypher", return_value=large_edges):
+    with patch.object(engine, "_run_cypher", return_value=_FakeEdges()):
         with patch("adapters.code_graph.native_engine.logger") as mock_logger:
             engine._compute_communities()
 
@@ -672,7 +680,11 @@ def test_compute_communities_guards_large_graphs(mock_bridge, mock_settings):
 
 
 def test_compute_communities_empty_graph(mock_bridge, mock_settings):
-    """Test that empty graphs (no CALLS/IMPORTS) skip gracefully."""
+    """Test that empty graphs (no CALLS/IMPORTS) still populate community_id = -1.
+
+    The no-edges early return MUST NOT leave community_id unset — otherwise
+    semantic_layer() (which filters community_id IS NOT NULL) drops all symbols.
+    """
     from unittest.mock import patch
 
     engine = NativeEngine(
@@ -682,12 +694,18 @@ def test_compute_communities_empty_graph(mock_bridge, mock_settings):
         settings=mock_settings,
     )
 
-    with patch.object(engine, "_run_cypher", return_value=[]):
-        with patch("adapters.code_graph.native_engine.logger") as mock_logger:
-            engine._compute_communities()
+    with patch.object(engine, "_run_cypher", return_value=[]) as mock_cypher:
+        with patch.object(engine, "_run_cypher_with_retry") as mock_retry:
+            with patch("adapters.code_graph.native_engine.logger") as mock_logger:
+                engine._compute_communities()
 
-            # Verify info log about no graph
-            assert mock_logger.info.called
+                # Verify info log about no graph
+                assert mock_logger.info.called
+
+                # Verify singleton community_id = -1 is persisted on all symbols
+                assert mock_retry.called
+                persist_cypher = mock_retry.call_args[0][0]
+                assert "SET s.community_id = -1" in persist_cypher
 
 
 def test_reindex_stable_community_ids(mock_bridge, mock_settings):

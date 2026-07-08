@@ -515,8 +515,8 @@ class NativeEngine:
                 )
             )
 
-        # Generate hotspot (god node) facts for high-degree symbols
-        # A "god node" has degree >= 10 and is not a rationale-only artifact
+        # Generate hotspot (god node) facts for high-degree symbols.
+        # A "god node" is a highly connected symbol (degree >= 10).
         max_god_nodes = getattr(self.settings, "code_graph_max_god_nodes", 15)
         sorted_by_degree = sorted(symbols, key=lambda x: x["degree"], reverse=True)
         hotspots = [s for s in sorted_by_degree if s["degree"] >= 10][:max_god_nodes]
@@ -535,7 +535,10 @@ class NativeEngine:
                         f"degree {hs['degree']}{community_label}. "
                         f"Source: {hs['file']}."
                     ),
-                    epistemic_level="explicit",
+                    # Hotspot status is structure-DERIVED (degree count), not a
+                    # directly stated fact — deductive at extracted confidence,
+                    # matching semantic.py's _god_node_facts mapping.
+                    epistemic_level="deductive",
                     confidence=getattr(self.settings, "code_graph_extracted_confidence", 0.9),
                     external_id=f"symbol:{hs['fqn']}",
                     title=f"Hotspot: {hs['fqn']}",
@@ -1294,7 +1297,7 @@ class NativeEngine:
         """
         edges = self._run_cypher(edge_cypher, code_space=self.code_space)
 
-        # 2. Size guard: if > 200k edges, skip with warning
+        # 2. Size guard: if > 200k edges, skip with warning (leave community_id unset)
         if len(edges) > 200_000:
             logger.warning(
                 f"Skipping community computation for {self.code_space}: "
@@ -1307,14 +1310,21 @@ class NativeEngine:
         for edge in edges:
             G.add_edge(edge["source"], edge["target"])
 
+        # 4. No CALLS/IMPORTS graph: every symbol is a singleton. Still populate
+        #    community_id = -1 on all symbols so the property is never unset
+        #    (semantic_layer() filters on community_id IS NOT NULL).
         if G.number_of_nodes() == 0:
-            logger.info(f"No CALLS/IMPORTS graph for {self.code_space}; skipping communities")
+            logger.info(
+                f"No CALLS/IMPORTS graph for {self.code_space}; "
+                f"assigning singleton community_id=-1 to all symbols"
+            )
+            self._persist_singleton_communities()
             return
 
-        # 4. Run Louvain with deterministic seed
+        # 5. Run Louvain with deterministic seed
         communities = louvain_communities(G, seed=42)
 
-        # 5. Build stable community id mapping (sort communities by min fqn)
+        # 6. Build stable community id mapping (sort communities by min fqn)
         # This ensures same input graph => same community_id assignment
         sorted_communities = sorted(communities, key=lambda c: min(c))
         fqn_to_community_id = {}
@@ -1322,20 +1332,20 @@ class NativeEngine:
             for fqn in community:
                 fqn_to_community_id[fqn] = idx
 
-        # 6. Fetch all symbols to find isolated ones (not in the graph)
+        # 7. Fetch all symbols to find isolated ones (not in the graph)
         all_symbols_cypher = """
         MATCH (s:CodeSymbol {code_space: $code_space})
         RETURN s.fqn AS fqn
         """
         all_symbols = self._run_cypher(all_symbols_cypher, code_space=self.code_space)
 
-        # 7. Assign community_id = -1 to isolated symbols
+        # 8. Assign community_id = -1 to isolated symbols
         for symbol in all_symbols:
             fqn = symbol["fqn"]
             if fqn not in fqn_to_community_id:
                 fqn_to_community_id[fqn] = -1
 
-        # 8. Persist community_id via batched UNWIND SET
+        # 9. Persist community_id via batched UNWIND SET (retry for transient errors)
         if fqn_to_community_id:
             batch_data = [
                 {"fqn": fqn, "community_id": cid}
@@ -1346,7 +1356,7 @@ class NativeEngine:
             MATCH (s:CodeSymbol {code_space: $code_space, fqn: row.fqn})
             SET s.community_id = row.community_id
             """
-            self._run_cypher(
+            self._run_cypher_with_retry(
                 update_cypher,
                 code_space=self.code_space,
                 batch=batch_data,
@@ -1355,6 +1365,18 @@ class NativeEngine:
                 f"Persisted {len(sorted_communities)} communities "
                 f"({len(fqn_to_community_id)} symbols) for {self.code_space}"
             )
+
+    def _persist_singleton_communities(self):
+        """Assign community_id = -1 to every symbol in the code_space.
+
+        Used when there are no CALLS/IMPORTS edges to cluster on — every symbol
+        is its own singleton. Batched UNWIND SET (retry for transient errors).
+        """
+        cypher = """
+        MATCH (s:CodeSymbol {code_space: $code_space})
+        SET s.community_id = -1
+        """
+        self._run_cypher_with_retry(cypher, code_space=self.code_space)
 
     def _ensure_anchors(self):
         """E4: Create CodeAnchor nodes and link symbols to them.
