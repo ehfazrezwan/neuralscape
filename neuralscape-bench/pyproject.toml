@@ -8,6 +8,8 @@ dependencies = [
     "fastapi>=0.115.0",
     "uvicorn>=0.32.0",
     "psutil>=5.9.0",
+    "tree-sitter>=0.23.0",
+    "tree-sitter-python>=0.23.0",
 ]
 
 [project.optional-dependencies]
@@ -26,3 +28,9 @@ packages = ["neuralscape_bench", "icebench"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests", "icebench/tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=0.23.0",
+]
