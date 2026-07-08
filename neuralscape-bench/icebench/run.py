@@ -479,16 +479,16 @@ def _load_systems(
             adapter = NSGraphifyAdapter(rail=rail) if rail else NSGraphifyAdapter()
         elif name == "graphify":
             try:
-                from icebench.systems.graphify_standalone import GraphifyAdapter
+                from icebench.systems.graphify_standalone import GraphifyStandaloneAdapter
 
-                adapter = GraphifyAdapter()
+                adapter = GraphifyStandaloneAdapter()
             except ImportError:
                 print(f"WARNING: {name} adapter not available (H2)", file=sys.stderr)
         elif name == "cbm":
             try:
-                from icebench.systems.cbm_standalone import CBMAdapter
+                from icebench.systems.cbm_standalone import CBMStandaloneAdapter
 
-                adapter = CBMAdapter()
+                adapter = CBMStandaloneAdapter()
             except ImportError:
                 print(f"WARNING: {name} adapter not available (H2)", file=sys.stderr)
         else:
