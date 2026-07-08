@@ -182,6 +182,7 @@ def _write_to_neo4j(
     code_space: str,
     bridge: Any,
     settings: Any,
+    driver: Any = None,
 ):
     """Write CBM symbols and edges to Neo4j using batched UNWIND MERGE.
 
@@ -200,6 +201,7 @@ def _write_to_neo4j(
         code_space=code_space,
         bridge=bridge,
         settings=settings,
+        driver=driver,
     )
 
     logger.info(f"Writing {len(symbols)} symbols to Neo4j (code_space={code_space})...")
@@ -323,6 +325,7 @@ def import_cbm_archive(
     bridge = service._bridge
     if bridge is None:
         raise CBMImportError("Graphiti bridge not initialized (Neo4j unavailable)")
+    driver = getattr(getattr(service, "_graphiti", None), "driver", None)
 
     # Decompress the archive
     logger.info(f"Decompressing {input_file}...")
@@ -349,7 +352,7 @@ def import_cbm_archive(
         symbols, edges = _read_cbm_database(tmp_path)
 
         # Write to Neo4j
-        _write_to_neo4j(symbols, edges, code_space, bridge, settings)
+        _write_to_neo4j(symbols, edges, code_space, bridge, settings, driver)
 
         logger.info(f"Successfully imported {len(symbols)} symbols and {len(edges)} edges")
 

@@ -587,6 +587,32 @@ def test_native_engine_path_no_source(mock_bridge, mock_settings):
     assert "No symbol matching source" in result
 
 
+def test_native_engine_stores_injected_driver(mock_bridge, mock_settings):
+    """Engine runtime fix: the real mem0 _AsyncBridge has no .driver, so the
+    Neo4j driver must be injected via the `driver` param and stored for
+    _run_cypher to use (it prefers self.driver over bridge.driver). The
+    end-to-end execution is covered by the live smoke; here we guard the
+    injection wiring so the never-run bug can't silently return."""
+    from unittest.mock import Mock
+    injected = Mock(name="injected_driver")
+    eng = NativeEngine(
+        repo_path="/tmp/repo",
+        code_space="code--user--test",
+        bridge=mock_bridge,
+        settings=mock_settings,
+        driver=injected,
+    )
+    assert eng.driver is injected
+    # Default (no driver injected) keeps the mock-bridge fallback intact.
+    eng2 = NativeEngine(
+        repo_path="/tmp/repo",
+        code_space="code--user--test",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+    assert eng2.driver is None
+
+
 def test_snapshot_cli_uses_correct_bridge_api(mock_bridge, mock_settings):
     """Test that snapshot_cli constructs engine with correct API (I3 bug fix).
 
@@ -620,12 +646,15 @@ def test_snapshot_cli_uses_correct_bridge_api(mock_bridge, mock_settings):
                     # Verify service._get_memory was called (initializes bridge)
                     mock_service._get_memory.assert_called()
 
-                    # Verify NativeEngine was constructed with correct params
+                    # Verify NativeEngine was constructed with correct params.
+                    # driver comes from service._graphiti.driver (the real
+                    # _AsyncBridge has no .driver — see engine runtime fix).
                     MockEngine.assert_called_with(
                         repo_path="/tmp/repo",
                         code_space="code--user--test",
                         bridge=mock_bridge,  # from service._bridge, not service.graphiti_client
                         settings=mock_settings,  # from module-level, not service.config
+                        driver=mock_service._graphiti.driver,
                     )
 
                     # Verify export was called
@@ -655,6 +684,7 @@ def test_snapshot_cli_uses_correct_bridge_api(mock_bridge, mock_settings):
                         code_space="code--user--test",
                         bridge=mock_bridge,  # from service._bridge
                         settings=mock_settings,  # from module-level
+                        driver=mock_service._graphiti.driver,
                     )
 
                     # Verify import was called

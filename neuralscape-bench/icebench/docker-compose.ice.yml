@@ -9,6 +9,10 @@ services:
     image: neo4j:5-community
     environment:
       - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD:-password}
+      # Match the main stack: the Graphiti driver targets a default DB named
+      # "memory" (NEO4J_DATABASE). Community allows renaming the single default
+      # DB. Only takes effect on a FRESH data dir.
+      - NEO4J_initial_dbms_default__database=${NEO4J_DATABASE:-memory}
       - NEO4J_PLUGINS=["apoc"]
       - NEO4J_dbms_security_procedures_unrestricted=apoc.*
     ports:
@@ -33,15 +37,13 @@ services:
     volumes:
       - /data/ice/stack/qdrant:/qdrant/storage
 
-  docling:
-    image: ds4sd/docling:latest
-    ports:
-      - "5101:5001"  # Shifted from 5001
+  # docling (document→markdown) is not needed for code-graph indexing; omitted
+  # from the ICE benchmark stack to avoid an unnecessary heavy image pull.
 
   neuralscape:
     build:
-      context: ../../neuralscape-service
-      dockerfile: Dockerfile
+      context: ../..
+      dockerfile: neuralscape-service/Dockerfile
       target: runtime
     environment:
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
@@ -50,21 +52,20 @@ services:
       - REDIS_URL=redis://redis:6379
       - QDRANT_URL=http://qdrant:6333
       - DOCLING_URL=http://docling:5001
-      - CODE_REPOS=${CODE_REPOS:-/data/ice/corpora}
+      - CODE_REPOS=${CODE_REPOS:-{}}
     ports:
-      - "8499:8199"  # API (shifted from 8199)
+      - "8599:8199"  # API (shifted from 8199)
     volumes:
       - /data/ice/stack/ingest:/app/ingest_data
     depends_on:
       - neo4j
       - redis
       - qdrant
-      - docling
 
   neuralscape-worker:
     build:
-      context: ../../neuralscape-service
-      dockerfile: Dockerfile
+      context: ../..
+      dockerfile: neuralscape-service/Dockerfile
       target: runtime
     command: arq worker.WorkerSettings
     environment:
@@ -83,8 +84,8 @@ services:
 
   neuralscape-graph-worker:
     build:
-      context: ../../neuralscape-service
-      dockerfile: Dockerfile
+      context: ../..
+      dockerfile: neuralscape-service/Dockerfile
       target: runtime
     command: arq worker.GraphWorkerSettings
     environment:
@@ -101,8 +102,8 @@ services:
 
   neuralscape-ingest-worker:
     build:
-      context: ../../neuralscape-service
-      dockerfile: Dockerfile
+      context: ../..
+      dockerfile: neuralscape-service/Dockerfile
       target: runtime
     command: arq worker.IngestWorkerSettings
     environment:
@@ -118,4 +119,3 @@ services:
       - neo4j
       - redis
       - qdrant
-      - docling
