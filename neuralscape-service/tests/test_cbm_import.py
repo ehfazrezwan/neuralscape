@@ -266,6 +266,60 @@ class TestCBMImport:
             # Verify Cypher was executed (at least for symbols and edges)
             assert mock_run.call_count >= 2
 
+    def test_write_to_neo4j_span_uses_colon(self):
+        """Span is serialized as 'line:end_line' (colon), matching NativeEngine."""
+        symbols = [
+            {
+                "fqn": "test.py::func1",
+                "kind": "function",
+                "file": "test.py",
+                "line": 5,
+                "end_line": 12,
+                "docstring": "",
+            },
+        ]
+        mock_bridge = MagicMock()
+        mock_settings = MagicMock()
+
+        with patch("adapters.code_graph.native_engine.NativeEngine._run_cypher_with_retry") as mock_run:
+            _write_to_neo4j(symbols, [], "code--user--test", mock_bridge, mock_settings)
+
+            # First call is the symbols batch; inspect the span in the params.
+            _, kwargs = mock_run.call_args_list[0]
+            span = kwargs["symbols"][0]["span"]
+            assert span == "5:12", f"span should use colon, got {span!r}"
+
+    def test_write_to_neo4j_drops_disallowed_relation(self):
+        """A relation outside the whitelist is dropped, never interpolated (Cypher injection guard)."""
+        symbols = [
+            {"fqn": "a", "kind": "function", "file": "a.py", "line": 1, "end_line": 2, "docstring": ""},
+            {"fqn": "b", "kind": "function", "file": "a.py", "line": 3, "end_line": 4, "docstring": ""},
+        ]
+        edges = [
+            # Legit relation — should be written.
+            {"source_fqn": "a", "target_fqn": "b", "relation": "CALLS", "extraction": "extracted"},
+            # Malicious/unknown relation — must be dropped, never interpolated.
+            {
+                "source_fqn": "a",
+                "target_fqn": "b",
+                "relation": "CALLS]->() DETACH DELETE n //",
+                "extraction": "extracted",
+            },
+        ]
+        mock_bridge = MagicMock()
+        mock_settings = MagicMock()
+
+        with patch("adapters.code_graph.native_engine.NativeEngine._run_cypher_with_retry") as mock_run:
+            _write_to_neo4j(symbols, edges, "code--user--test", mock_bridge, mock_settings)
+
+            # Collect every cypher string passed to the driver.
+            cyphers = [call.args[0] for call in mock_run.call_args_list]
+            joined = "\n".join(cyphers)
+            # The injection payload must never appear in any executed Cypher.
+            assert "DETACH DELETE" not in joined
+            # The legit CALLS edge must still be written.
+            assert any("[r:CALLS]" in c for c in cyphers)
+
     def test_import_cbm_archive_end_to_end_mocked(self):
         """End-to-end import with mocked Neo4j."""
         try:
@@ -361,11 +415,41 @@ class TestCBMImport:
             tmp_path.unlink(missing_ok=True)
 
 
-def test_cbm_import_degrades_without_extra():
-    """CBM import module degrades gracefully when code-graph extra not installed."""
-    # This test always runs (no skipif) to verify graceful degradation
-    # If CBM_AVAILABLE is False, the imports should have failed cleanly
-    if not CBM_AVAILABLE:
-        # Verify that importing raises ImportError or the module doesn't expose the functions
-        with pytest.raises(ImportError):
-            from adapters.code_graph.cbm_import import import_cbm_archive  # noqa: F401
+@pytest.mark.skipif(not CBM_AVAILABLE, reason="code-graph extra not installed")
+def test_decompress_zst_missing_zstandard_dep():
+    """_decompress_zst raises CBMImportError when zstandard is not installed.
+
+    The module imports fine without the extra (zstandard is imported lazily
+    inside _decompress_zst), so we simulate the missing dependency by poisoning
+    sys.modules so the `import zstandard` inside the function raises ImportError.
+    """
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "zstandard":
+            raise ImportError("No module named 'zstandard'")
+        return real_import(name, *args, **kwargs)
+
+    # Point at an existing file so we get past the exists() check and reach
+    # the guarded `import zstandard`.
+    with tempfile.NamedTemporaryFile(suffix=".zst", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+        tmp.write(b"anything")
+
+    try:
+        # Drop any cached zstandard module so the import statement re-runs.
+        with patch.dict("sys.modules", {"zstandard": None}):
+            with patch("builtins.__import__", side_effect=fake_import):
+                with pytest.raises(CBMImportError, match="zstandard not installed"):
+                    _decompress_zst(tmp_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+@pytest.mark.skipif(not CBM_AVAILABLE, reason="code-graph extra not installed")
+def test_import_cbm_archive_owner_mismatch():
+    """import_cbm_archive rejects a code_space that doesn't belong to owner."""
+    with pytest.raises(CBMImportError, match="does not belong to owner"):
+        import_cbm_archive("/tmp/whatever.db.zst", "code--alice--repo", "bob")

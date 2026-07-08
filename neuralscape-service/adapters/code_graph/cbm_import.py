@@ -33,6 +33,14 @@ logger = logging.getLogger(__name__)
 MAX_DECOMPRESSED_SIZE = 500 * 1024 * 1024  # 500 MB uncompressed
 MAX_SQLITE_SIZE = 100 * 1024 * 1024  # 100 MB SQLite after decompression
 
+# Allowed relationship types (native label-space). CBM edge relations are
+# read from untrusted SQLite and interpolated into the Cypher relationship
+# type, so they MUST be whitelisted — never interpolate an unvalidated string
+# into a query. Any other value is logged and the edge is dropped.
+ALLOWED_RELATIONS = frozenset(
+    {"CALLS", "IMPORTS", "DEFINES", "INHERITS", "REFERENCES"}
+)
+
 
 class CBMImportError(Exception):
     """Base error for CBM import failures."""
@@ -92,8 +100,11 @@ def _validate_sqlite(db_path: Path):
     """
     try:
         conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
+    except sqlite3.DatabaseError as e:
+        raise CBMImportError(f"Not a valid SQLite database: {e}") from e
 
+    try:
+        cursor = conn.cursor()
         # Check for expected tables
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
         tables = {row[0] for row in cursor.fetchall()}
@@ -102,10 +113,10 @@ def _validate_sqlite(db_path: Path):
             raise CBMImportError(
                 f"SQLite database missing expected tables. Found: {tables}"
             )
-
-        conn.close()
     except sqlite3.DatabaseError as e:
         raise CBMImportError(f"Not a valid SQLite database: {e}") from e
+    finally:
+        conn.close()
 
 
 def _read_cbm_database(db_path: Path) -> tuple[list[dict], list[dict]]:
@@ -119,46 +130,48 @@ def _read_cbm_database(db_path: Path) -> tuple[list[dict], list[dict]]:
     """
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
+    try:
+        cursor = conn.cursor()
 
-    # Read nodes/symbols
-    cursor.execute("""
-        SELECT id, fqn, kind, file, line, end_line, docstring
-        FROM nodes
-    """)
-    symbols = []
-    id_to_fqn = {}
-    for row in cursor.fetchall():
-        symbol = {
-            "fqn": row["fqn"],
-            "kind": row["kind"],
-            "file": row["file"],
-            "line": row["line"],
-            "end_line": row["end_line"],
-            "docstring": row["docstring"] or "",
-        }
-        symbols.append(symbol)
-        id_to_fqn[row["id"]] = row["fqn"]
-
-    # Read edges
-    cursor.execute("""
-        SELECT source_id, target_id, relation, extraction
-        FROM edges
-    """)
-    edges = []
-    for row in cursor.fetchall():
-        source_fqn = id_to_fqn.get(row["source_id"])
-        target_fqn = id_to_fqn.get(row["target_id"])
-        if source_fqn and target_fqn:
-            edge = {
-                "source_fqn": source_fqn,
-                "target_fqn": target_fqn,
-                "relation": row["relation"],
-                "extraction": row["extraction"] or "extracted",
+        # Read nodes/symbols
+        cursor.execute("""
+            SELECT id, fqn, kind, file, line, end_line, docstring
+            FROM nodes
+        """)
+        symbols = []
+        id_to_fqn = {}
+        for row in cursor.fetchall():
+            symbol = {
+                "fqn": row["fqn"],
+                "kind": row["kind"],
+                "file": row["file"],
+                "line": row["line"],
+                "end_line": row["end_line"],
+                "docstring": row["docstring"] or "",
             }
-            edges.append(edge)
+            symbols.append(symbol)
+            id_to_fqn[row["id"]] = row["fqn"]
 
-    conn.close()
+        # Read edges
+        cursor.execute("""
+            SELECT source_id, target_id, relation, extraction
+            FROM edges
+        """)
+        edges = []
+        for row in cursor.fetchall():
+            source_fqn = id_to_fqn.get(row["source_id"])
+            target_fqn = id_to_fqn.get(row["target_id"])
+            if source_fqn and target_fqn:
+                edge = {
+                    "source_fqn": source_fqn,
+                    "target_fqn": target_fqn,
+                    "relation": row["relation"],
+                    "extraction": row["extraction"] or "extracted",
+                }
+                edges.append(edge)
+    finally:
+        conn.close()
+
     logger.info(f"Read {len(symbols)} symbols and {len(edges)} edges from CBM database")
     return symbols, edges
 
@@ -201,7 +214,9 @@ def _write_to_neo4j(
                 "fqn": s["fqn"],
                 "kind": s["kind"],
                 "file": s["file"],
-                "span": f"{s['line']}-{s['end_line']}",
+                # Canonical span format is "line:end_line" (colon), matching
+                # NativeEngine (native_engine.py) — a dash would break span parsers.
+                "span": f"{s['line']}:{s['end_line']}",
                 "degree": 0,  # will be computed later if needed
             }
             for s in batch
@@ -233,15 +248,29 @@ def _write_to_neo4j(
             for e in batch
         ]
 
-        # Group by relation type for UNWIND (each relation needs separate query)
+        # Group by relation type for UNWIND (each relation needs separate query).
+        # SECURITY: `relation` is untrusted SQLite data interpolated into the
+        # Cypher relationship type, so it MUST be whitelisted — anything outside
+        # ALLOWED_RELATIONS is logged and dropped (never interpolated).
         by_relation = {}
         for rec in edge_records:
             rel = rec["relation"]
+            if rel not in ALLOWED_RELATIONS:
+                logger.warning(
+                    "Dropping CBM edge with disallowed relation %r "
+                    "(%s -> %s); allowed: %s",
+                    rel,
+                    rec["src_fqn"],
+                    rec["tgt_fqn"],
+                    sorted(ALLOWED_RELATIONS),
+                )
+                continue
             if rel not in by_relation:
                 by_relation[rel] = []
             by_relation[rel].append(rec)
 
         for relation, rels in by_relation.items():
+            # relation is guaranteed to be in ALLOWED_RELATIONS here.
             cypher = f"""
             UNWIND $edges AS edge
             MERGE (src:CodeSymbol {{code_space: edge.code_space, fqn: edge.src_fqn}})
@@ -264,10 +293,25 @@ def import_cbm_archive(
     Args:
         input_file: Path to the graph.db.zst file.
         code_space: Partition key (code--{owner}--{repo}).
-        owner: Owner ID for scoping.
+        owner: Owner ID — must match the code_space's owner segment so a caller
+            cannot accidentally import into another owner's partition.
+
+    Raises:
+        CBMImportError: If code_space does not belong to ``owner``, the file is
+            missing, or the archive/schema is invalid.
     """
     from config import settings
     from memory_service import get_shared_service
+
+    # Guard: code_space MUST be owned by `owner` (format: code--{owner}--{repo}).
+    # This keeps the two arguments coherent and prevents importing into an
+    # unintended partition.
+    expected_prefix = f"code--{owner}--"
+    if not code_space.startswith(expected_prefix):
+        raise CBMImportError(
+            f"code_space {code_space!r} does not belong to owner {owner!r} "
+            f"(expected it to start with {expected_prefix!r})"
+        )
 
     input_path = Path(input_file)
     if not input_path.exists():
