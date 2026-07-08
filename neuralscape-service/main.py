@@ -1366,6 +1366,8 @@ async def v1_code_graph_impact(
     given symbol. Returns a text summary (file:line format). E7: requires
     NativeEngine (repo:<name> refs); raises 501 on GraphifyJsonEngine (.json artifacts).
     """
+    from adapters.code_graph.engine import EngineCapabilityError
+
     cg = _code_graph_or_501()
     caller = _resolve_user_id(request, user_id)
     try:
@@ -1377,6 +1379,9 @@ async def v1_code_graph_impact(
             graph_id=graph_id,
             max_hops=max_hops,
         )
+    except EngineCapabilityError as e:
+        # blast_radius is native-only; graph.json artifacts can't serve it → 501.
+        raise HTTPException(status_code=501, detail=str(e)) from e
     except cg.CodeGraphError as e:
         raise _map_code_graph_error(e) from e
     return {"text": text, "symbol": symbol, "max_hops": max_hops, "graph_id": graph_id}

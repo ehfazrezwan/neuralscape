@@ -393,6 +393,19 @@ def test_rest_code_graph_routes(default_graph):
     assert r.status_code == 404
 
 
+def test_rest_code_impact_graphify_is_501(default_graph):
+    """code_impact (blast_radius) is native-only. On a graph.json engine the
+    route must return 501 (capability error), not 500 (raw AttributeError)."""
+    from fastapi.testclient import TestClient
+
+    import main
+
+    client = TestClient(main.app)
+    r = client.get("/v1/code-graph/impact", params={"symbol": "MemoryEngine"})
+    assert r.status_code == 501
+    assert "native" in r.json()["detail"].lower()
+
+
 def test_rest_code_graph_unconfigured_is_400(monkeypatch):
     from fastapi.testclient import TestClient
 

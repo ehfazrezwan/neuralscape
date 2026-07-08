@@ -399,13 +399,12 @@ class NativeEngine:
         """
         max_hops = max(1, min(int(max_hops), 16))  # clamp to [1, 16]
 
-        # Resolve symbol to FQN (fuzzy match like query/neighbors/path)
-        matches = self._search_symbols(symbol)
+        # Resolve symbol to FQN via the SAME fuzzy resolver neighbors()/path()
+        # use (FQN substring match). Do NOT pass a bare str to _search_symbols
+        # — that expects a keyword list and would iterate characters.
+        matches = self._find_symbol(symbol)
         if not matches:
-            return f"Symbol not found: '{symbol}'"
-        if len(matches) > 1:
-            candidates = ", ".join(m["fqn"] for m in matches[:5])
-            return f"Ambiguous symbol '{symbol}' ({len(matches)} matches). Did you mean: {candidates}?"
+            return f"No symbol matching '{symbol}' found in {self.code_space}."
 
         fqn = matches[0]["fqn"]
 
@@ -446,8 +445,9 @@ class NativeEngine:
         if not results:
             return None
         row = results[0]
-        span = row.get("span", "")
-        line = int(span.split("-")[0]) if span and "-" in span else 0
+        # Native indexer stores spans as "<start>:<end>" (colon) — see _store_file.
+        span = row.get("span") or ""
+        line = int(span.split(":")[0]) if ":" in span else 0
         return {
             "fqn": row.get("fqn", ""),
             "file": row.get("file", ""),

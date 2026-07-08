@@ -1791,6 +1791,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
 
             if not code_graph_available():
                 return [TextContent(type="text", text=json.dumps({"error": _MISSING_EXTRA_MSG}))]
+            from adapters.code_graph.engine import EngineCapabilityError
             from adapters.code_graph.query import (
                 CodeGraphError,
                 code_impact,
@@ -1853,6 +1854,10 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                         graph_id=arguments.get("graph_id"),
                         max_hops=arguments.get("max_hops", 4),
                     )
+            except EngineCapabilityError as e:
+                # e.g. code_impact/locate on a graph.json engine — clean error JSON,
+                # never a raw crash.
+                return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
             except CodeGraphError as e:
                 return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
             except Exception as e:
