@@ -1,7 +1,9 @@
 """
-CBM (codebase-memory-mcp) standalone adapter (H2).
+CBM (codebase-memory-mcp) standalone adapter.
 
-H2 implements this adapter using the pinned CBM binary.
+Drives CBM through its native MCP tools over stdio (or CLI mode).
 """
 
-# TODO: H2 implementation
+from .adapter import CBMStandaloneAdapter
+
+__all__ = ["CBMStandaloneAdapter"]
