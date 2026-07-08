@@ -123,10 +123,24 @@ class ReportGenerator:
         # Load results JSONL
         self.rows = list(read_rows(self.config.results_jsonl))
 
-        # Load score report if provided
+        # Load score report if provided. The scorer (H3) emits a flat
+        # {"scores": [ {system, corpus, op, ...}, ... ], "metadata": {...}}
+        # structure; the report tables want it nested as
+        # {system: {corpus: {op: metrics}}}. Transform on load (tolerate both).
         if self.config.score_report_json and self.config.score_report_json.exists():
             with open(self.config.score_report_json) as f:
-                self.score_report = json.load(f)
+                raw = json.load(f)
+            if isinstance(raw, dict) and "scores" in raw:
+                nested: dict[str, Any] = {}
+                for s in raw.get("scores", []):
+                    sysn, corp, op = s.get("system"), s.get("corpus"), s.get("op")
+                    if sysn is None or corp is None or op is None:
+                        continue
+                    nested.setdefault(sysn, {}).setdefault(corp, {})[op] = s
+                self.score_report = nested
+                self.score_meta = raw.get("metadata", {})
+            else:
+                self.score_report = raw or {}
 
         # Load systems metadata if provided
         if self.config.systems_lock_json and self.config.systems_lock_json.exists():
