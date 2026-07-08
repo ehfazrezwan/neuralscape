@@ -199,28 +199,53 @@ class TestLegacyParserBackwardCompat:
 class TestMultipleColonsCorrected:
     """Fix the false-positive test that locked in wrong behavior."""
 
-    def test_sentence_fragment_parsed_as_speaker_but_gated_by_flag(self):
-        """'uses microservices: ...' parses as speaker with rich parser, but is gated.
+    def test_sentence_fragment_no_longer_parsed_as_speaker(self):
+        """'uses microservices: ...' is a verb phrase, NOT a speaker (F-2).
 
-        The permissive regex (≤40 chars, followed by ': ') matches verb phrases
-        like "uses microservices" as speakers, which is a known parser issue
-        (retro review flagged it). However, this only matters when
-        extraction_require_speaker is True — the speaker is only stored and used
-        for dedup when the flag is ON. With the flag OFF (legacy/default), the
-        legacy parser folds any prefix back into content, preserving byte-identical
-        backward-compat (no speaker split, no content mutation).
-
-        This test asserts the rich parser's current (permissive) behavior, which
-        is acceptable because it's gated behind a flag. A future stricter parser
-        might reject verb phrases, but until then the flag isolates the impact.
+        The char-class regex still matches it, but the F-2 plausibility gate
+        rejects it (not a role word / labelled speaker / proper name), so the
+        whole remainder stays as content — junk never reaches metadata.speaker.
+        Previously this test locked in the permissive behavior
+        (speaker == "uses microservices"); F-2 corrects it.
         """
         response = '{"facts": ["[architecture] uses microservices: API: Gateway: Auth"]}'
         [pf] = parse_extraction_response_rich(response)
-        # The permissive regex matches "uses microservices" as speaker.
-        assert pf.speaker == "uses microservices"
-        assert pf.content == "API: Gateway: Auth"
-        # The legacy parser (flag OFF) would fold this back into content:
+        assert pf.speaker is None
+        # No speaker split → the full remainder is preserved as content.
+        assert pf.content == "uses microservices: API: Gateway: Auth"
+        # The legacy parser (flag OFF) is unchanged: content stays byte-identical.
         from prompts import parse_extraction_response
         [(cat, content)] = parse_extraction_response(response)
         assert cat == "architecture"
         assert content == "uses microservices: API: Gateway: Auth"
+
+    def test_noun_phrase_not_parsed_as_speaker(self):
+        """'Naming convention: ...' (mixed-case noun phrase) is not a speaker (F-2)."""
+        response = '{"facts": ["[convention] Naming convention: use snake_case"]}'
+        [pf] = parse_extraction_response_rich(response)
+        assert pf.speaker is None
+        assert pf.content == "Naming convention: use snake_case"
+
+    def test_plausible_speakers_still_parse(self):
+        """F-2 must NOT drop real speakers: role words, labelled, proper names."""
+        cases = {
+            '{"facts": ["[preference] Ana: prefers tabs"]}': ("Ana", "prefers tabs"),
+            '{"facts": ["[preference] user: prefers tabs"]}': ("user", "prefers tabs"),
+            '{"facts": ["[preference] assistant: suggests spaces"]}': ("assistant", "suggests spaces"),
+            '{"facts": ["[preference] Speaker 1: likes dark mode"]}': ("Speaker 1", "likes dark mode"),
+            '{"facts": ["[personal_fact] Dr. Smith: runs marathons"]}': ("Dr. Smith", "runs marathons"),
+            '{"facts": ["[personal_fact] Bob Jones: lives in Berlin"]}': ("Bob Jones", "lives in Berlin"),
+        }
+        for response, (exp_speaker, exp_content) in cases.items():
+            [pf] = parse_extraction_response_rich(response)
+            assert pf.speaker == exp_speaker, f"{response} → {pf.speaker!r}"
+            assert pf.content == exp_content
+
+    def test_is_plausible_speaker_unit(self):
+        """Direct unit coverage of the F-2 plausibility gate."""
+        from prompts import _is_plausible_speaker
+        for good in ("user", "assistant", "Ana", "Bob Jones", "Dr. Smith", "Speaker 1", "team", "Person 2"):
+            assert _is_plausible_speaker(good), good
+        for bad in ("uses microservices", "Naming convention", "chose to refactor the whole thing",
+                    "", "   ", "x" * 41, "runs the pipeline nightly"):
+            assert not _is_plausible_speaker(bad), bad

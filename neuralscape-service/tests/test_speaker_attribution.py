@@ -190,8 +190,11 @@ class TestConversationExtractionWithSpeakers:
         mock_settings.extraction_window_overlap = 2
         mock_settings.qdrant_collection = "test_coll"
         svc, client = _mock_service()
-        # Exactly 40 chars should parse and validate successfully
-        speaker_40 = "a" * 40
+        # Exactly 40 chars should parse and validate successfully. Use a
+        # plausible (Title-case) single-token name so the F-2 plausibility gate
+        # accepts it — this exercises the 40-char LENGTH boundary, not the
+        # name-shape gate (covered in test_prompts_retro).
+        speaker_40 = "A" + "a" * 39
         _mock_extraction(
             client,
             [f"[preference] {speaker_40}: Prefers tabs over spaces"],
