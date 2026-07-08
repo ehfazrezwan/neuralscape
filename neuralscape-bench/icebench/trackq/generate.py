@@ -97,9 +97,49 @@ def generate_specs(op: str, corpus: Corpus, n: int = 200, seed: int = 42) -> lis
         return _generate_path_le4(corpus, n, rng)
     elif op == "nl_locate":
         return _generate_nl_locate(corpus, n, rng)
+    elif op == "blast_radius":
+        return _generate_blast_radius(corpus, n, rng)
     else:
         logger.warning(f"Unknown operation: {op}")
         return []
+
+
+def _generate_blast_radius(corpus: Corpus, n: int, rng: random.Random) -> list[QuerySpec]:
+    """Generate blast_radius queries: what is affected by changes to symbol X?
+
+    Reuses symbols that HAVE callers (they have a non-trivial impact set). This
+    is primarily a Track-P (latency) op; gold carries the 1-hop callers as an
+    approximate impact ground truth (transitive-impact scoring is a v1 caveat).
+    """
+    if not TREE_SITTER_AVAILABLE:
+        logger.warning("tree-sitter not available; returning empty blast_radius queries")
+        return []
+    try:
+        oracle = TreeSitterOracle(corpus.path, corpus.language)
+        oracle.index()
+    except Exception as e:
+        logger.error(f"Oracle indexing failed: {e}")
+        return []
+
+    symbols_with_callers = []
+    for sym_name in sorted(oracle.symbols.keys()):
+        callers = oracle.get_callers(sym_name)
+        if callers:
+            symbols_with_callers.append((sym_name, callers))
+    if not symbols_with_callers:
+        logger.warning("No symbols with callers found for blast_radius")
+        return []
+
+    rng.shuffle(symbols_with_callers)
+    sampled = symbols_with_callers[:n]
+    return [
+        QuerySpec(
+            op="blast_radius",
+            payload={"symbol": sym_name, "corpus": corpus, "max_hops": 4},
+            gold={"symbol": sym_name, "impacted": callers},
+        )
+        for sym_name, callers in sampled
+    ]
 
 
 def _generate_symbol_lookup(corpus: Corpus, n: int, rng: random.Random) -> list[QuerySpec]:
