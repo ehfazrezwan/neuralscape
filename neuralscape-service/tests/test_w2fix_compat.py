@@ -98,7 +98,12 @@ class TestFlagOffBackwardCompat:
     @patch("memory.write.settings")
     @patch("memory_service.get_shared_service")
     def test_flag_on_speaker_split(self, mock_get_svc, mock_settings):
-        """With flag ON, 'Naming convention: use snake_case' splits into speaker + content."""
+        """With flag ON, a plausible speaker ('Ana: use snake_case') splits into
+        speaker + content and stores speaker in the payload.
+
+        (Uses a real speaker name — F-2 now rejects the old 'Naming convention'
+        noun-phrase example as a bogus speaker; that non-split is covered in
+        test_prompts_retro.test_noun_phrase_not_parsed_as_speaker.)"""
         mock_settings.extraction_require_speaker = True
         mock_settings.extraction_window_messages = 50
         mock_settings.extraction_window_overlap = 2
@@ -113,9 +118,9 @@ class TestFlagOffBackwardCompat:
         svc._genai_model = None
 
         # Mock the Gemini extraction to return a fact with a colon-prefixed pattern.
-        # The rich parser splits it.
+        # The rich parser splits it (plausible speaker).
         mock_response = MagicMock()
-        mock_response.text = '{"facts": ["[convention] Naming convention: use snake_case"]}'
+        mock_response.text = '{"facts": ["[convention] Ana: use snake_case"]}'
 
         with patch("memory.write.retry_transient", return_value=mock_response), \
              patch.object(svc, "_get_genai_client", return_value=MagicMock()):
@@ -134,7 +139,7 @@ class TestFlagOffBackwardCompat:
         assert mem.memory == "use snake_case"
 
         # Assert: speaker metadata is present
-        assert mem.speaker == "Naming convention"
+        assert mem.speaker == "Ana"
 
         # Assert: the insert call has speaker in the payload
         assert svc._memory.vector_store.insert.call_count == 1
@@ -142,7 +147,7 @@ class TestFlagOffBackwardCompat:
         payloads = insert_call.kwargs["payloads"]
         assert len(payloads) == 1
         payload_metadata = payloads[0]["metadata"]
-        assert payload_metadata.get("speaker") == "Naming convention"
+        assert payload_metadata.get("speaker") == "Ana"
 
     @patch("memory.write.settings")
     @patch("memory_service.get_shared_service")

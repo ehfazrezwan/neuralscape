@@ -219,6 +219,43 @@ def parse_category_from_fact(fact: str) -> tuple[str, str]:
     return "personal_fact", fact.strip()
 
 
+# F-2 (Fable checkpoint-2 directive): the leading "token: content" speaker
+# regex below is deliberately broad, so this plausibility gate rejects sentence
+# fragments / noun phrases that clearly aren't speakers ("uses microservices",
+# "Naming convention") before they pollute metadata.speaker, dedup identity, and
+# the `by <speaker>` evidence rendering. Kept as a small, explicit allow-set so
+# the behavior is auditable. Accepts:
+#   - known role words (user / assistant / system / …),
+#   - labelled speakers ("Speaker 1", "Person 2", …),
+#   - proper names: 1–3 tokens, each Title-case or an initial ("Dr. Smith").
+# Trade-off (documented): an all-lowercase personal name that is not a role word
+# is rejected; the benchmark datasets use Title-case names + lowercase roles, so
+# this drops junk without dropping real speakers. Still flag-gated behind
+# extraction_require_speaker until a default-ON flip.
+_SPEAKER_ROLE_WORDS = frozenset({
+    "user", "assistant", "system", "human", "ai", "bot", "agent", "model", "tool",
+    "narrator", "moderator", "interviewer", "interviewee", "team", "speaker",
+    "person", "participant", "guest", "host", "customer", "support", "operator",
+})
+_SPEAKER_LABEL_RE = re.compile(r"^(speaker|person|participant|user|guest|agent)\s+\d+$", re.IGNORECASE)
+_SPEAKER_NAME_TOKEN_RE = re.compile(r"^[A-Z][A-Za-z.'’-]*$")
+
+
+def _is_plausible_speaker(candidate: str) -> bool:
+    """True when ``candidate`` looks like a real speaker name/role (F-2)."""
+    c = (candidate or "").strip()
+    if not c or len(c) > 40:
+        return False
+    if c.lower() in _SPEAKER_ROLE_WORDS:
+        return True
+    if _SPEAKER_LABEL_RE.match(c):
+        return True
+    tokens = c.split()
+    if not (1 <= len(tokens) <= 3):
+        return False
+    return all(_SPEAKER_NAME_TOKEN_RE.match(t) for t in tokens)
+
+
 def parse_extraction_response_rich(response_text: str) -> list[ParsedFact]:
     """Parse the LLM extraction response into ParsedFact objects with metadata.
 
@@ -280,16 +317,15 @@ def parse_extraction_response_rich(response_text: str) -> list[ParsedFact]:
         # and "3:1" naturally don't match (no space after colon).
         speaker_match = re.match(r"^([A-Za-z0-9 ._-]{1,40}):\s+(.+)$", remainder)
         if speaker_match:
-            candidate_speaker = speaker_match.group(1)
-            # The redundant ":" check is removed — the regex already excludes it.
-            # Instead, apply a simple sanity check: reject sentence fragments
-            # that clearly aren't names/roles (e.g., "uses microservices" is
-            # a verb phrase, not a speaker). A plausible speaker is mostly
-            # letters/spaces/dots (names, roles), not leading with a verb.
-            # For simplicity, we keep this permissive and rely on the length cap
-            # and character class — the false-positive test below will verify.
-            speaker = candidate_speaker.strip()
-            content = speaker_match.group(2).strip()
+            candidate_speaker = speaker_match.group(1).strip()
+            # F-2: the char-class regex still admits verb/noun phrases
+            # ("uses microservices", "Naming convention"). Only accept the split
+            # when the candidate is a plausible speaker (role word, labelled
+            # speaker, or proper name); otherwise treat the whole remainder as
+            # content so junk never reaches metadata.speaker / dedup / rendering.
+            if _is_plausible_speaker(candidate_speaker):
+                speaker = candidate_speaker
+                content = speaker_match.group(2).strip()
 
         parsed_facts.append(
             ParsedFact(
