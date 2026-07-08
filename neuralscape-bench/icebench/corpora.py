@@ -5,6 +5,7 @@ Corpora are pinned to exact SHAs in /data/ice/corpora/corpora.lock.json.
 """
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
 from dataclasses import dataclass, asdict
@@ -172,6 +173,11 @@ def fetch_corpus(spec: CorpusSpec, force: bool = False) -> Corpus:
             loc=spec.loc,
             file_count=spec.file_count,
         )
+
+    # If force and a checkout already exists, remove it first (git clone into a
+    # non-empty dir fails).
+    if corpus_path.exists() and force:
+        shutil.rmtree(corpus_path)
 
     # Fetch shallow clone at the pinned SHA
     corpus_path.mkdir(parents=True, exist_ok=True)

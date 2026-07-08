@@ -52,14 +52,16 @@ class ResultRow:
     ts: str | None = None  # UTC ISO timestamp
 
     def __post_init__(self):
-        """Set timestamp if not provided."""
+        """Set timestamp if not provided (UTC ISO-8601, Z-suffixed)."""
         if self.ts is None:
-            self.ts = datetime.now(timezone.utc).isoformat()
+            self.ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def write_row(results_file: Path, row: ResultRow) -> None:
     """
-    Atomically append a result row to the JSONL file.
+    Append a result row to the JSONL file (append-only, not crash-atomic).
+
+    Each row is one JSON line; read_rows skips a partially written final line.
 
     Args:
         results_file: Path to results file.
@@ -86,9 +88,14 @@ def read_rows(results_file: Path) -> Iterator[ResultRow]:
 
     with open(results_file) as f:
         for line in f:
-            if line.strip():
+            if not line.strip():
+                continue
+            try:
                 data = json.loads(line)
-                yield ResultRow(**data)
+            except json.JSONDecodeError:
+                # Tolerate a partially written final line from a crash.
+                continue
+            yield ResultRow(**data)
 
 
 @dataclass

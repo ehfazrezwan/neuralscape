@@ -10,19 +10,18 @@ Subcommands:
 """
 
 import argparse
+import random
 import sys
 from pathlib import Path
-from typing import Any
 
 from icebench.corpora import (
     PINNED_CORPORA,
     save_lock_file,
-    load_lock_file,
     fetch_corpus,
     iter_corpora,
 )
 from icebench.schema import ResultRow, write_row, RunManifest
-from icebench.rail import RailConfig, run_with_rail
+from icebench.rail import RailConfig
 from icebench.adapters.base import SystemAdapter, Corpus
 
 
@@ -31,6 +30,74 @@ RESULTS_DIR = Path("/data/ice/results/raw")
 
 # Number of repetitions per measurement
 N_REPS = 3
+
+# Source-file extensions per language, for picking incremental-touch targets.
+_SOURCE_EXTS = {
+    ".py",
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".go",
+    ".rs",
+    ".java",
+}
+
+
+def _pick_source_files(corpus: Corpus, n: int, seed: int = 42) -> list[str]:
+    """
+    Deterministically pick up to n real source files from a corpus.
+
+    Args:
+        corpus: The corpus to scan.
+        n: Number of files to pick.
+        seed: Random seed (deterministic selection).
+
+    Returns:
+        Absolute file paths (may be fewer than n if the corpus is small).
+    """
+    root = Path(corpus.path)
+    if not root.exists():
+        return []
+
+    candidates = sorted(
+        str(p)
+        for p in root.rglob("*")
+        if p.is_file() and p.suffix in _SOURCE_EXTS and ".git" not in p.parts
+    )
+    if not candidates:
+        return []
+
+    rng = random.Random(seed)
+    rng.shuffle(candidates)
+    return candidates[:n]
+
+
+def _touch_files(paths: list[str]) -> dict[str, bytes]:
+    """
+    Make a trivial reversible edit (append a newline) to each file.
+
+    Args:
+        paths: File paths to touch.
+
+    Returns:
+        Mapping of path -> original bytes, for restoration.
+    """
+    saved: dict[str, bytes] = {}
+    for p in paths:
+        original = Path(p).read_bytes()
+        saved[p] = original
+        Path(p).write_bytes(original + b"\n")
+    return saved
+
+
+def _restore_files(saved: dict[str, bytes]) -> None:
+    """Restore files to their original bytes captured by _touch_files."""
+    for p, original in saved.items():
+        try:
+            Path(p).write_bytes(original)
+        except OSError:
+            pass
 
 
 def cmd_corpora(args: argparse.Namespace) -> int:
@@ -62,8 +129,14 @@ def cmd_index(args: argparse.Namespace) -> int:
     results_file = RESULTS_DIR / f"{args.run_id}.jsonl"
     manifest = RunManifest.load(args.run_id, results_file)
 
-    # Load systems
-    systems = _load_systems(args.systems)
+    rail_config = RailConfig(
+        memory_limit_mb=args.memory_limit_mb,
+        timeout_seconds=args.timeout_seconds,
+    )
+
+    # Load systems with the rail injected so EVERY index/snapshot subprocess
+    # runs under the memory cap + timeout (adapters call run_with_rail).
+    systems = _load_systems(args.systems, rail=rail_config)
     if not systems:
         print("No systems available", file=sys.stderr)
         return 1
@@ -73,11 +146,6 @@ def cmd_index(args: argparse.Namespace) -> int:
     if not corpora:
         print("No corpora available (run 'corpora' subcommand first)", file=sys.stderr)
         return 1
-
-    rail_config = RailConfig(
-        memory_limit_mb=args.memory_limit_mb,
-        timeout_seconds=args.timeout_seconds,
-    )
 
     # Run index benchmarks
     for system in systems:
@@ -161,6 +229,13 @@ def cmd_index(args: argparse.Namespace) -> int:
                 rail_config,
             )
 
+            # Teardown: drop indexed state so shared services (Neo4j/Qdrant)
+            # don't accumulate and skew results / fill the tight root disk.
+            try:
+                system.teardown(corpus)
+            except Exception as e:
+                print(f"  teardown ERROR: {e}", file=sys.stderr)
+
     print("\nIndex benchmark complete")
     return 0
 
@@ -181,21 +256,24 @@ def _run_index_op(
 
     print(f"  {op} rep={rep}...")
 
-    # Map op to method
-    touched_files = []
-    if op == "index_cold":
-        method = system.index_cold
-    elif op == "index_incremental_1":
-        method = lambda c: system.index_incremental(c, touched_files[:1])
-    elif op == "index_incremental_5":
-        method = lambda c: system.index_incremental(c, touched_files[:5])
-    elif op == "index_second":
-        method = system.index_second
-    else:
-        return
-
+    # For incremental ops, make a REAL reversible edit to real source files,
+    # run the incremental index against those paths, then restore the files.
+    saved: dict[str, bytes] = {}
     try:
-        result = method(corpus)
+        if op == "index_cold":
+            result = system.index_cold(corpus)
+        elif op == "index_second":
+            result = system.index_second(corpus)
+        elif op in ("index_incremental_1", "index_incremental_5"):
+            n = 1 if op == "index_incremental_1" else 5
+            touched = _pick_source_files(corpus, n)
+            if not touched:
+                print(f"    SKIP {op}: no source files found in corpus", file=sys.stderr)
+                return
+            saved = _touch_files(touched)
+            result = system.index_incremental(corpus, touched)
+        else:
+            return
 
         row = ResultRow(
             schema="icebench-v1",
@@ -219,6 +297,10 @@ def _run_index_op(
 
     except Exception as e:
         print(f"    ERROR: {e}", file=sys.stderr)
+    finally:
+        # Always restore touched files, even on error.
+        if saved:
+            _restore_files(saved)
 
 
 def _run_snapshot_op(
@@ -369,35 +451,54 @@ def cmd_report(args: argparse.Namespace) -> int:
         return 1
 
 
-def _load_systems(system_names: list[str]) -> list[SystemAdapter]:
-    """Load system adapters by name."""
-    systems = []
+def _load_systems(
+    system_names: list[str], rail: RailConfig | None = None
+) -> list[SystemAdapter]:
+    """
+    Load system adapters by name, injecting the safety rail.
+
+    Args:
+        system_names: Adapter names to load.
+        rail: Rail config to inject onto adapters that support it (so their
+            index/snapshot subprocesses run under the cap + timeout).
+
+    Returns:
+        Constructed adapters.
+    """
+    systems: list[SystemAdapter] = []
 
     for name in system_names:
+        adapter = None
         if name == "ns-ice":
             from icebench.adapters.ns_ice import NSIceAdapter
 
-            systems.append(NSIceAdapter())
+            adapter = NSIceAdapter(rail=rail) if rail else NSIceAdapter()
         elif name == "ns-graphify":
             from icebench.adapters.ns_graphify import NSGraphifyAdapter
 
-            systems.append(NSGraphifyAdapter())
+            adapter = NSGraphifyAdapter(rail=rail) if rail else NSGraphifyAdapter()
         elif name == "graphify":
             try:
                 from icebench.systems.graphify_standalone import GraphifyAdapter
 
-                systems.append(GraphifyAdapter())
+                adapter = GraphifyAdapter()
             except ImportError:
                 print(f"WARNING: {name} adapter not available (H2)", file=sys.stderr)
         elif name == "cbm":
             try:
                 from icebench.systems.cbm_standalone import CBMAdapter
 
-                systems.append(CBMAdapter())
+                adapter = CBMAdapter()
             except ImportError:
                 print(f"WARNING: {name} adapter not available (H2)", file=sys.stderr)
         else:
             print(f"WARNING: Unknown system {name}", file=sys.stderr)
+
+        if adapter is not None:
+            # Best-effort rail injection for H2 adapters (which take no rail arg).
+            if rail is not None and hasattr(adapter, "rail"):
+                adapter.rail = rail
+            systems.append(adapter)
 
     return systems
 
