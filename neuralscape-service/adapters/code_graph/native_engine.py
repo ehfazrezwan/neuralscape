@@ -9,13 +9,12 @@ E2 scope (Python only):
 Label-space schema:
   (:CodeRepo {code_space, name, path})
   (:CodeFile {code_space, path, hash, language, span})
-  (:CodeSymbol {code_space, fqn, kind, file, span, degree})
+  (:CodeSymbol {code_space, fqn, kind, file, span, degree, community_id})
   Edges: CALLS | IMPORTS | DEFINES | INHERITS | REFERENCES
     each with {extraction: "extracted"|"inferred"|"ambiguous"}
 
 Partition key: code_space = "code--{owner}--{repo}" on EVERY node.
-Degree persisted on symbols at index time.
-community_id stubbed (Louvain is a later slice).
+Degree and community_id (Louvain, seed=42) persisted on symbols at index time.
 """
 
 from __future__ import annotations
@@ -454,11 +453,101 @@ class NativeEngine:
         )
 
     def semantic_layer(self) -> list[SemanticFact]:
-        """Semantic distillation — requires Louvain communities (later slice)."""
-        raise EngineCapabilityError(
-            "semantic_layer() requires Louvain community detection (deferred). "
-            "E2 persists degree but not community_id. Use query() for structure."
+        """Semantic distillation from stored degree + community_id properties.
+
+        Returns:
+            - One 'module' fact per community (top members listed)
+            - One 'hotspot' fact per high-degree symbol (god nodes)
+
+        No NetworkX pass at query time — reads persisted properties only.
+        """
+        facts: list[SemanticFact] = []
+
+        # Fetch all symbols with their stored properties
+        cypher = """
+        MATCH (s:CodeSymbol {code_space: $code_space})
+        WHERE s.community_id IS NOT NULL AND s.degree IS NOT NULL
+        RETURN s.fqn AS fqn, s.kind AS kind, s.file AS file,
+               s.degree AS degree, s.community_id AS community_id
+        ORDER BY s.community_id, s.degree DESC
+        """
+        symbols = self._run_cypher(cypher, code_space=self.code_space)
+
+        if not symbols:
+            logger.info(f"No symbols with community_id for {self.code_space}")
+            return facts
+
+        # Group symbols by community
+        from collections import defaultdict
+        communities: dict[int, list[dict]] = defaultdict(list)
+        for sym in symbols:
+            cid = sym["community_id"]
+            if cid >= 0:  # skip singleton community (-1)
+                communities[cid].append(sym)
+
+        # Generate community (module) facts
+        # Limit to top N communities by size
+        max_communities = getattr(self.settings, "code_graph_max_communities", 10)
+        sorted_communities = sorted(
+            communities.items(),
+            key=lambda x: len(x[1]),
+            reverse=True
+        )[:max_communities]
+
+        for cid, members in sorted_communities:
+            # Take top members by degree
+            top_members = sorted(members, key=lambda x: x["degree"], reverse=True)[:8]
+            member_labels = [f"{m['fqn']} ({m['kind']})" for m in top_members]
+            key_members = ", ".join(member_labels)
+
+            facts.append(
+                SemanticFact(
+                    category="module",
+                    content=(
+                        f"Code community {cid} groups {len(members)} symbols. "
+                        f"Key members: {key_members}."
+                    ),
+                    epistemic_level="inductive",
+                    confidence=getattr(self.settings, "code_graph_inferred_confidence", 0.7),
+                    external_id=f"community:{cid}",
+                    title=f"Community {cid}",
+                    tags=["code-structure"],
+                )
+            )
+
+        # Generate hotspot (god node) facts for high-degree symbols
+        # A "god node" has degree >= 10 and is not a rationale-only artifact
+        max_god_nodes = getattr(self.settings, "code_graph_max_god_nodes", 15)
+        sorted_by_degree = sorted(symbols, key=lambda x: x["degree"], reverse=True)
+        hotspots = [s for s in sorted_by_degree if s["degree"] >= 10][:max_god_nodes]
+
+        for hs in hotspots:
+            community_label = (
+                f" in community {hs['community_id']}"
+                if hs["community_id"] >= 0
+                else ""
+            )
+            facts.append(
+                SemanticFact(
+                    category="hotspot",
+                    content=(
+                        f"'{hs['fqn']}' is a highly connected {hs['kind']} with "
+                        f"degree {hs['degree']}{community_label}. "
+                        f"Source: {hs['file']}."
+                    ),
+                    epistemic_level="explicit",
+                    confidence=getattr(self.settings, "code_graph_extracted_confidence", 0.9),
+                    external_id=f"symbol:{hs['fqn']}",
+                    title=f"Hotspot: {hs['fqn']}",
+                    tags=["code-structure", "god-node"],
+                )
+            )
+
+        logger.info(
+            f"Generated {len(facts)} semantic facts for {self.code_space} "
+            f"({len(sorted_communities)} communities, {len(hotspots)} hotspots)"
         )
+        return facts
 
     def index(
         self,
@@ -523,6 +612,9 @@ class NativeEngine:
 
         # Compute and persist degree on all symbols
         self._compute_degrees()
+
+        # I2: Compute and persist Louvain communities
+        self._compute_communities()
 
         # E4: Create CodeAnchor nodes and link symbols to them
         self._ensure_anchors()
@@ -1181,6 +1273,88 @@ class NativeEngine:
         SET s.degree = out_deg + in_deg
         """
         self._run_cypher(cypher, code_space=self.code_space)
+
+    def _compute_communities(self):
+        """Compute Louvain communities at index time and persist community_id.
+
+        Reads CALLS + IMPORTS edges, builds an undirected graph, runs Louvain
+        with seed=42 for determinism, and persists stable community_id on each
+        :CodeSymbol. Guards against graphs > 200k edges (logs warning and skips).
+
+        Isolated symbols (no CALLS/IMPORTS edges) get community_id = -1 (singleton).
+        """
+        import networkx as nx
+        from networkx.algorithms.community import louvain_communities
+
+        # 1. Fetch CALLS + IMPORTS edges for this code_space
+        edge_cypher = """
+        MATCH (s:CodeSymbol {code_space: $code_space})-[r]->(t:CodeSymbol)
+        WHERE type(r) IN ['CALLS', 'IMPORTS']
+        RETURN s.fqn AS source, t.fqn AS target
+        """
+        edges = self._run_cypher(edge_cypher, code_space=self.code_space)
+
+        # 2. Size guard: if > 200k edges, skip with warning
+        if len(edges) > 200_000:
+            logger.warning(
+                f"Skipping community computation for {self.code_space}: "
+                f"{len(edges)} edges exceeds 200k limit"
+            )
+            return
+
+        # 3. Build undirected networkx graph
+        G = nx.Graph()
+        for edge in edges:
+            G.add_edge(edge["source"], edge["target"])
+
+        if G.number_of_nodes() == 0:
+            logger.info(f"No CALLS/IMPORTS graph for {self.code_space}; skipping communities")
+            return
+
+        # 4. Run Louvain with deterministic seed
+        communities = louvain_communities(G, seed=42)
+
+        # 5. Build stable community id mapping (sort communities by min fqn)
+        # This ensures same input graph => same community_id assignment
+        sorted_communities = sorted(communities, key=lambda c: min(c))
+        fqn_to_community_id = {}
+        for idx, community in enumerate(sorted_communities):
+            for fqn in community:
+                fqn_to_community_id[fqn] = idx
+
+        # 6. Fetch all symbols to find isolated ones (not in the graph)
+        all_symbols_cypher = """
+        MATCH (s:CodeSymbol {code_space: $code_space})
+        RETURN s.fqn AS fqn
+        """
+        all_symbols = self._run_cypher(all_symbols_cypher, code_space=self.code_space)
+
+        # 7. Assign community_id = -1 to isolated symbols
+        for symbol in all_symbols:
+            fqn = symbol["fqn"]
+            if fqn not in fqn_to_community_id:
+                fqn_to_community_id[fqn] = -1
+
+        # 8. Persist community_id via batched UNWIND SET
+        if fqn_to_community_id:
+            batch_data = [
+                {"fqn": fqn, "community_id": cid}
+                for fqn, cid in fqn_to_community_id.items()
+            ]
+            update_cypher = """
+            UNWIND $batch AS row
+            MATCH (s:CodeSymbol {code_space: $code_space, fqn: row.fqn})
+            SET s.community_id = row.community_id
+            """
+            self._run_cypher(
+                update_cypher,
+                code_space=self.code_space,
+                batch=batch_data,
+            )
+            logger.info(
+                f"Persisted {len(sorted_communities)} communities "
+                f"({len(fqn_to_community_id)} symbols) for {self.code_space}"
+            )
 
     def _ensure_anchors(self):
         """E4: Create CodeAnchor nodes and link symbols to them.
