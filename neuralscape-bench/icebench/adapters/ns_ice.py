@@ -304,20 +304,20 @@ class NSIceAdapter:
             if op == "symbol_lookup":
                 resp = self.client.get(
                     f"{self.api_url}/v1/code-graph/query",
-                    params={"query": payload["symbol"], "graph_id": code_space},
+                    params={"question": payload["symbol"], "graph_id": code_space},
                 )
             elif op == "neighbors_1hop":
                 resp = self.client.get(
                     f"{self.api_url}/v1/code-graph/neighbors",
-                    params={"symbol": payload["symbol"], "graph_id": code_space},
+                    params={"label": payload["symbol"], "graph_id": code_space},
                 )
             elif op == "path_le4":
                 resp = self.client.get(
                     f"{self.api_url}/v1/code-graph/path",
                     params={
-                        "from_symbol": payload["from"],
-                        "to_symbol": payload["to"],
-                        "max_depth": 4,
+                        "source": payload["from"],
+                        "target": payload["to"],
+                        "max_hops": 4,
                         "graph_id": code_space,
                     },
                 )
