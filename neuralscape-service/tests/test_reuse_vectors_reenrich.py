@@ -134,33 +134,73 @@ class TestRebuildGraphFromVectors:
         assert call2.kwargs["occurred_at"] == "2026-07-07T11:00:00+00:00"
         assert call2.kwargs["source_ref"] == {"url": "https://example.com/doc"}
 
-    def test_wipe_first_calls_graph_delete(self, service):
-        """wipe_first=True expires graph edges before rebuilding."""
-        # Mock scroll to return no points (wipe test only)
+    def test_owner_scope_filter_matches_legacy_top_level_user_id(self, service):
+        """Owner scoping must match BOTH metadata.owner_user_id AND the top-level
+        `user_id` (legacy/private rows) via a should-OR, so legacy rows aren't
+        missed (Copilot review)."""
         service._memory.vector_store.client.scroll.return_value = ([], None)
 
-        # Mock _run_on_bridge to capture the graph wipe calls
-        wipe_calls = []
-        def mock_run_on_bridge(coro, timeout=None):
-            # Capture the async function being called
-            wipe_calls.append(coro)
-            # Close the coroutine to prevent "never awaited" warnings
-            coro.close()
-            return []
+        service.rebuild_graph_from_vectors(user_id="u1")
 
+        scroll_kwargs = service._memory.vector_store.client.scroll.call_args.kwargs
+        sfilter = scroll_kwargs["scroll_filter"]
+        should_keys = [(c.key, c.match.value) for c in (sfilter.should or [])]
+        assert ("metadata.owner_user_id", "u1") in should_keys
+        assert ("user_id", "u1") in should_keys
+
+    def test_wipe_first_wipes_only_private_group_never_shared(self, service):
+        """wipe_first=True expires ONLY the caller's PRIVATE group — never the
+        cross-user SHARED group (Copilot review safety fix)."""
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        service._memory.vector_store.client.scroll.return_value = ([], None)
+
+        # Actually run the wipe coroutine so EntityEdge.get_by_group_ids is invoked.
+        def mock_run_on_bridge(coro, timeout=None):
+            return asyncio.run(coro)
         service._run_on_bridge = mock_run_on_bridge
 
-        # Mock EntityEdge from graphiti_core
         with patch("graphiti_core.edges.EntityEdge") as mock_edge:
-            mock_edge.get_by_group_ids = MagicMock()
-            mock_edge.save_bulk = MagicMock()
+            mock_edge.get_by_group_ids = AsyncMock(return_value=[])
+            mock_edge.save_bulk = AsyncMock(return_value=None)
 
-            result = service.rebuild_graph_from_vectors(
+            service.rebuild_graph_from_vectors(
                 user_id="u1", project_id=None, wipe_first=True
             )
 
-            # Should have attempted graph wipe (2 groups: private + shared global)
-            assert len(wipe_calls) >= 1
+            # Exactly one group wiped, and it is the PRIVATE group — never "shared".
+            assert mock_edge.get_by_group_ids.await_count == 1
+            wiped_groups = [
+                gid
+                for c in mock_edge.get_by_group_ids.await_args_list
+                for gid in (c.kwargs.get("group_ids") or [])
+            ]
+            assert wiped_groups == ["user--u1"]
+            assert all("shared" not in g for g in wiped_groups)
+
+    def test_wipe_first_project_scope_wipes_private_project_group_only(self, service):
+        """Project-scoped wipe touches only the private project group, not shared."""
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        service._memory.vector_store.client.scroll.return_value = ([], None)
+        service._run_on_bridge = lambda coro, timeout=None: asyncio.run(coro)
+
+        with patch("graphiti_core.edges.EntityEdge") as mock_edge:
+            mock_edge.get_by_group_ids = AsyncMock(return_value=[])
+            mock_edge.save_bulk = AsyncMock(return_value=None)
+
+            service.rebuild_graph_from_vectors(
+                user_id="u1", project_id="proj1", wipe_first=True
+            )
+
+            wiped = [
+                gid for c in mock_edge.get_by_group_ids.await_args_list
+                for gid in (c.kwargs.get("group_ids") or [])
+            ]
+            assert wiped == ["user--u1--project--proj1"]
+            assert all("shared" not in g for g in wiped)
 
     def test_global_wipe_without_scope_refused(self, service):
         """wipe_first without user_id is refused for safety."""

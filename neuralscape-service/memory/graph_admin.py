@@ -372,56 +372,70 @@ class GraphAdminMixin:
                 "error": "wipe_first requires user_id (refusing global graph wipe without explicit scope)"
             }
 
-        # Wipe graph for the scope if requested
+        # Trigger lazy mem0/Graphiti init up front (cold instances have
+        # _graphiti/_bridge unset until _get_memory runs) so wipe_first below
+        # actually runs instead of silently no-oping (Copilot review).
+        m = self._get_memory()
+        client = m.vector_store.client
+        collection = settings.qdrant_collection
+
+        # Wipe graph for the scope if requested — PRIVATE groups ONLY.
         if wipe_first:
-            logger.info(f"Wiping graph for user_id={user_id}, project_id={project_id}")
+            logger.info(f"Wiping PRIVATE graph groups for user_id={user_id}, project_id={project_id}")
             try:
                 from memory.groups import _build_group_id
 
-                # Build the group_ids to wipe (private + shared if no project, or project-specific)
-                groups_to_wipe = []
-                if project_id:
-                    # Project-specific: private + shared groups for this project
-                    groups_to_wipe.append(_build_group_id(MemoryVisibility.PRIVATE.value, user_id, project_id))
-                    groups_to_wipe.append(_build_group_id(MemoryVisibility.SHARED.value, user_id, project_id))
-                else:
-                    # Global: private + shared global groups
-                    groups_to_wipe.append(_build_group_id(MemoryVisibility.PRIVATE.value, user_id, None))
-                    groups_to_wipe.append(_build_group_id(MemoryVisibility.SHARED.value, user_id, None))
+                # ONLY the caller's PRIVATE group(s). The SHARED group_id
+                # (`shared` / `shared--project--{pid}`) is CROSS-USER — it holds
+                # every user's shared knowledge — so a per-user rebuild must
+                # never expire it (Copilot review: that would wipe shared graph
+                # state for everyone). Shared-pool rebuilds are out of scope here.
+                groups_to_wipe = [
+                    _build_group_id(MemoryVisibility.PRIVATE.value, user_id, project_id or None)
+                ]
 
                 # Expire all edges in these groups
                 if self._graphiti and self._bridge:
                     from graphiti_core.edges import EntityEdge
-                    for group_id in groups_to_wipe:
+
+                    def _make_expire(gid):
                         async def _expire_group():
                             edges = await EntityEdge.get_by_group_ids(
-                                self._graphiti.driver, group_ids=[group_id], limit=10000
+                                self._graphiti.driver, group_ids=[gid], limit=10000
                             )
                             now = datetime.now(timezone.utc)
                             for edge in edges:
                                 edge.expired_at = now
                             await EntityEdge.save_bulk(self._graphiti.driver, edges)
+                        return _expire_group
+
+                    for group_id in groups_to_wipe:
                         try:
-                            self._run_on_bridge(_expire_group())
+                            self._run_on_bridge(_make_expire(group_id)())
                         except Exception as e:
                             logger.warning(f"Failed to wipe group {group_id} (non-critical): {e}")
             except Exception as e:
                 logger.warning(f"Graph wipe failed (non-critical): {e}")
 
         # Build Qdrant filter for the scope
-        m = self._get_memory()
-        client = m.vector_store.client
-        collection = settings.qdrant_collection
-
         must = []
-        if user_id:
-            # Filter by owner_user_id in metadata
-            must.append(
-                FieldCondition(key="metadata.owner_user_id", match=MatchValue(value=user_id))
-            )
         if project_id:
             must.append(
                 FieldCondition(key="metadata.project_id", match=MatchValue(value=project_id))
+            )
+
+        # Owner scoping: ownership lives EITHER in metadata.owner_user_id
+        # (shared/newer rows) OR the top-level `user_id` (legacy/private rows)
+        # — mirror the retag sweep's should-OR so neither shape is missed
+        # (Copilot review). Qdrant: match = all(must) AND none(must_not) AND
+        # at least one(should) when should is non-empty.
+        should = []
+        if user_id:
+            should.append(
+                FieldCondition(key="metadata.owner_user_id", match=MatchValue(value=user_id))
+            )
+            should.append(
+                FieldCondition(key="user_id", match=MatchValue(value=user_id))
             )
 
         # Exclude verbatim passage chunks (mirror _scroll_standard convention)
@@ -429,7 +443,15 @@ class GraphAdminMixin:
             FieldCondition(key="metadata.memory_kind", match=MatchValue(value="passage"))
         ]
 
-        scroll_filter = Filter(must=must, must_not=must_not) if must or must_not else None
+        scroll_filter = (
+            Filter(
+                must=must or None,
+                must_not=must_not,
+                should=should or None,
+            )
+            if (must or must_not or should)
+            else None
+        )
         page_size = max(1, min(batch_size, 500))
 
         scanned = enriched = failed = skipped = 0
