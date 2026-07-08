@@ -121,70 +121,155 @@ def _save_run(redis, run: DreamRun) -> None:
         logger.warning("DreamRun save failed", exc_info=True)
 
 
-def _consume_code_liveness_flags(service, batch) -> list[dict]:
-    """Consume code_liveness_stale flags and generate deterministic temporal_reframe actions.
+def _gather_code_liveness_actions(service, batch) -> tuple[list[dict], list[str]]:
+    """Gather code_liveness_stale memories via Qdrant and build temporal_reframe actions.
 
-    This is the I4 liveness consumer: gather pool memories with code_liveness_stale=True
-    and emit deterministic temporal_reframe actions (reversible, idempotent).
+    This is the I4 liveness consumer. It does NOT read the staged pool rows
+    (``consolidate.hydrate_pool`` flattens a fixed field set onto each row keyed
+    on ``content`` with NO nested ``metadata`` dict, so the ``code_liveness_stale``
+    flag never survives staging). Instead it scrolls Qdrant directly for the flag
+    — the raw payload is where the flag and the ``data`` text actually live.
+
+    Flags are NOT cleared here: clearing is deferred until AFTER the action is
+    successfully applied (and only when not dry_run) via
+    :func:`_clear_code_liveness_flags`, so a failed/aborted apply leaves the flag
+    set for the next sweep (idempotent, no lost work).
 
     Args:
         service: The MemoryService instance.
-        batch: The staged pool batch from consolidate.stage_pool().
+        batch: The staged pool batch (used only to scope reframes to THIS pool).
 
     Returns:
-        List of temporal_reframe action dicts ready for consolidate.apply_actions().
+        (actions, flagged_ids): temporal_reframe action dicts ready for
+        ``consolidate.apply_actions`` and the raw memory_ids that carried the flag.
     """
-    actions = []
-    for mem in batch.memories:
-        metadata = mem.get("metadata", {})
-        if not metadata.get("code_liveness_stale"):
-            continue
+    from qdrant_client.models import FieldCondition, Filter, MatchValue
 
-        # Generate deterministic temporal_reframe
-        anchor = metadata.get("code_liveness_anchor", "unknown")
-        reason = metadata.get("code_liveness_reason", "code changed")
-        content = mem.get("data", "")
+    try:
+        m = service._get_memory()
+        client = m.vector_store.client
+        collection_name = m.vector_store.collection_name
+    except Exception:
+        logger.warning(
+            "code liveness: cannot access vector store for pool %s (non-fatal)",
+            batch.pool, exc_info=True,
+        )
+        return [], []
 
-        # Deterministic reframe: prepend a temporal marker (reversible)
-        # E.g., "test_function does X" -> "[stale: symbol deleted] test_function does X"
-        reframe_prefix = f"[stale: {reason}] "
-        if not content.startswith("[stale:"):
-            new_content = reframe_prefix + content
-        else:
-            new_content = content  # already reframed
+    # Scope reframes to memories staged in THIS pool. An empty pool id set means
+    # nothing to intersect against — bail rather than reframe cross-pool.
+    pool_ids = {mem["memory_id"] for mem in batch.memories}
+    if not pool_ids:
+        return [], []
 
-        action = {
-            "type": "temporal_reframe",
-            "memory_ids": [mem["memory_id"]],
-            "content": new_content,
-            "confidence": 0.95,
-            "reason": f"Code anchor {anchor} {reason}",
-        }
-        actions.append(action)
+    query_filter = Filter(
+        must=[
+            FieldCondition(
+                key="metadata.code_liveness_stale",
+                match=MatchValue(value=True),
+            )
+        ]
+    )
 
-        # Clear the flag after consuming (idempotency)
-        try:
-            m = service._get_memory()
-            client = m.vector_store.client
-            collection_name = m.vector_store.collection_name
-            client.set_payload(
+    hits = []
+    try:
+        offset = None
+        while True:
+            records, next_offset = client.scroll(
                 collection_name=collection_name,
-                payload={"code_liveness_stale": False},
-                points=[mem["memory_id"]],
-                key="metadata",
+                scroll_filter=query_filter,
+                limit=100,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
             )
-        except Exception:
-            logger.warning(
-                "Failed to clear code_liveness_stale flag for %s (non-fatal)",
-                mem["memory_id"], exc_info=True,
-            )
+            hits.extend(records)
+            if next_offset is None or not records:
+                break
+            offset = next_offset
+            if len(hits) >= 1000:
+                logger.warning(
+                    "code liveness: hit 1000-memory scroll cap for pool %s (truncated)",
+                    batch.pool,
+                )
+                break
+    except Exception:
+        logger.warning(
+            "code liveness scroll failed for pool %s (non-fatal)", batch.pool,
+            exc_info=True,
+        )
+        return [], []
+
+    actions: list[dict] = []
+    flagged_ids: list[str] = []
+    for hit in hits:
+        memory_id = str(getattr(hit, "id", "") or "")
+        if not memory_id or memory_id not in pool_ids:
+            continue  # not in this pool — another pool's sweep handles it
+
+        payload = getattr(hit, "payload", None) or {}
+        # Unwrap mem0's possible double-wrapped metadata.
+        meta = payload.get("metadata", {}) or {}
+        if isinstance(meta.get("metadata"), dict):
+            meta = meta["metadata"]
+
+        reason = meta.get("code_liveness_reason", "code changed")
+        anchor = meta.get("code_liveness_anchor", "unknown")
+        content = payload.get("data", "") or ""
+
+        # Deterministic, reversible reframe: prepend a temporal marker. The
+        # pre-reframe text is stashed by _rewrite_content (dream_prev_content).
+        if content.startswith("[stale:"):
+            new_content = content  # already reframed — idempotent
+        else:
+            new_content = f"[stale: {reason}] {content}"
+
+        if not new_content.strip():
+            continue  # never emit an empty-content reframe
+
+        actions.append(
+            {
+                "type": "temporal_reframe",
+                "memory_ids": [memory_id],
+                "content": new_content,
+                "confidence": 0.95,
+                "reason": f"Code anchor {anchor} {reason}",
+            }
+        )
+        flagged_ids.append(memory_id)
 
     if actions:
         logger.info(
-            "Code liveness consumer: generated %d temporal_reframe actions for pool %s",
+            "code liveness consumer: %d temporal_reframe actions for pool %s",
             len(actions), batch.pool,
         )
-    return actions
+    return actions, flagged_ids
+
+
+def _clear_code_liveness_flags(service, memory_ids: list[str]) -> None:
+    """Clear code_liveness_stale on memories whose reframe was applied (idempotency).
+
+    Called ONLY after ``apply_actions`` succeeds and only when not dry_run —
+    so a dry run or a failed apply leaves the flag set for the next sweep.
+    Best-effort/non-fatal.
+    """
+    if not memory_ids:
+        return
+    try:
+        m = service._get_memory()
+        client = m.vector_store.client
+        collection_name = m.vector_store.collection_name
+        client.set_payload(
+            collection_name=collection_name,
+            payload={"code_liveness_stale": False},
+            points=list(memory_ids),
+            key="metadata",
+        )
+    except Exception:
+        logger.warning(
+            "code liveness: failed to clear stale flags for %d memories (non-fatal)",
+            len(memory_ids), exc_info=True,
+        )
 
 
 async def _make_llm_call(settings: DreamingSettings):
@@ -397,12 +482,17 @@ async def _dream_pool(
             report.status, report.reason = "skipped_unchanged", "staged id set unchanged"
             return report
 
-        # 5b. Code liveness consumer (I4): deterministic temporal_reframe for stale anchors.
-        #     This is a pre-LLM pass: code changes are objective ground truth, not
-        #     speculation. The liveness actions are merged with the LLM's decision.
-        liveness_actions = []
+        # 5b. Code liveness consumer (I4): deterministic temporal_reframe for stale
+        #     anchors. This is a pre-LLM pass: code changes are objective ground
+        #     truth, not speculation. Flags are read straight from Qdrant (the
+        #     staged rows drop them), and the flag is cleared only AFTER the
+        #     reframe applies (step 6b) so a failed apply leaves work for next time.
+        liveness_actions: list[dict] = []
+        liveness_flagged_ids: list[str] = []
         try:
-            liveness_actions = _consume_code_liveness_flags(service, batch)
+            liveness_actions, liveness_flagged_ids = _gather_code_liveness_actions(
+                service, batch
+            )
         except Exception:
             logger.warning(
                 "code liveness consumer failed for pool %s (non-fatal)", pool, exc_info=True,
@@ -428,6 +518,19 @@ async def _dream_pool(
         report.applied = len(applied.applied)
         report.reported = len(to_report)
         report.errors.extend(applied.errors)
+
+        # 6b. Clear code-liveness flags ONLY for reframes that actually applied
+        #     (and never on a dry run) — idempotent: a flag left set is re-swept.
+        if liveness_flagged_ids and not dry_run:
+            applied_ids = {
+                mid
+                for act in applied.applied
+                if act.get("type") == "temporal_reframe"
+                for mid in (act.get("memory_ids") or [])
+            }
+            to_clear = [mid for mid in liveness_flagged_ids if mid in applied_ids]
+            _clear_code_liveness_flags(service, to_clear)
+
         # Fold the applied actions into the staged dicts so the REM and
         # librarian passes below see the post-consolidation view — without
         # this, a row tombstoned seconds ago would still land on topic
