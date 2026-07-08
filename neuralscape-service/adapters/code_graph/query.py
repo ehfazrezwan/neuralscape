@@ -109,6 +109,14 @@ def get_engine(graph_id: str | None, user_id: str, settings) -> CodeIntelEngine:
         repo_name = graph_id.removeprefix("repo:")
         return _get_native_engine(repo_name, user_id, settings)
 
+    # Query-time: a `code--<owner>--<repo>` code_space ref resolves directly to
+    # the native engine for that space. The index already lives in Neo4j/Qdrant,
+    # so reads (query/neighbors/path/locate/impact) need no repo path. This is
+    # what lets an indexed repo be queried by its code_space without a
+    # code_repos entry (e.g. index-in-CI then query the persisted graph).
+    if graph_id and graph_id.startswith("code--"):
+        return _get_native_engine_by_code_space(graph_id, settings)
+
     # E1 path: .json artifacts
     path = resolve_graph_path(graph_id, user_id, settings)
     try:
@@ -185,6 +193,42 @@ def _get_native_engine(repo_name: str, user_id: str, settings) -> CodeIntelEngin
         driver = getattr(getattr(service, "_graphiti", None), "driver", None)
         engine = NativeEngine(
             repo_path=str(repo_path),
+            code_space=code_space,
+            bridge=bridge,
+            settings=settings,
+            driver=driver,
+        )
+        _ctx_cache[cache_key] = {"engine": engine}
+        return engine
+
+
+def _get_native_engine_by_code_space(code_space: str, settings) -> CodeIntelEngine:
+    """Query-time NativeEngine bound to an existing code_space (reads only).
+
+    Unlike ``_get_native_engine`` (which needs a repo path to INDEX), reads
+    only need the code_space — the graph + code_index already live in Neo4j /
+    Qdrant. repo_path is a dummy; index() is never called on this instance.
+    Cached per code_space.
+    """
+    from adapters.code_graph.native_engine import NativeEngine
+
+    cache_key = f"native:{code_space}"
+    ent = _ctx_cache.get(cache_key)
+    if ent is not None:
+        return ent["engine"]
+    with _ctx_lock:
+        ent = _ctx_cache.get(cache_key)
+        if ent is not None:
+            return ent["engine"]
+        from memory_service import get_shared_service
+        service = get_shared_service()
+        service._get_memory()  # ensure bridge is initialized
+        bridge = service._bridge
+        if bridge is None:
+            raise CodeGraphError("Graphiti bridge not initialized (Neo4j unavailable)")
+        driver = getattr(getattr(service, "_graphiti", None), "driver", None)
+        engine = NativeEngine(
+            repo_path="",  # reads don't need a repo path
             code_space=code_space,
             bridge=bridge,
             settings=settings,

@@ -50,27 +50,67 @@ class NSIceAdapter:
     def __init__(
         self,
         api_url: str = "http://localhost:8599",
-        python_bin: str = "python",
         rail: RailConfig | None = None,
         stack_dir: str | None = None,
+        service_dir: str | None = None,
     ):
         """
         Initialize the adapter.
 
+        The index/snapshot CLIs run on the HOST (via `uv run`) against the ice
+        stack's EXPOSED ports, so the safety rail's `/usr/bin/time -v` measures
+        the indexer's own peak RSS / CPU — directly comparable to the host-run
+        competitors (graphify/CBM). Queries go through the REST API (the native
+        surface). Both hit the same ice Neo4j/Qdrant.
+
         Args:
-            api_url: NS API base URL.
-            python_bin: Python binary to use for CLI calls.
-            rail: Safety-rail config (cap + timeout). Runner injects the
-                CLI-configured one; defaults to RailConfig() otherwise.
+            api_url: NS API base URL (host→container mapped, default 8599).
+            rail: Safety-rail config (cap + timeout).
             stack_dir: Bind-mounted stack root for store-size measurement.
+            service_dir: neuralscape-service dir the index CLI runs from
+                (`uv run` resolves its venv there).
         """
         self.name = "ns-ice"
-        self.version = "ns-api@TODO"  # TODO: read from API /health during smoke
         self.api_url = api_url
-        self.python_bin = python_bin
         self.rail = rail or RailConfig()
         self.stack_dir = stack_dir or os.environ.get("ICE_STACK_DIR", DEFAULT_STACK_DIR)
+        self.service_dir = Path(
+            service_dir
+            or os.environ.get("ICE_SERVICE_DIR", "/data/ice/neuralscape/neuralscape-service")
+        )
         self.client = httpx.Client(timeout=120.0)
+        # Env for host-run index/snapshot CLIs → the ice stack's exposed ports.
+        # GOOGLE_API_KEY + NEO4J_PASSWORD inherit from the runner's environment
+        # (sourced from /data/ice/.env at launch).
+        self._cli_env = {
+            **os.environ,
+            "NEO4J_URI": os.environ.get("ICE_NEO4J_URI", "neo4j://localhost:7787"),
+            "NEO4J_DATABASE": os.environ.get("ICE_NEO4J_DATABASE", "memory"),
+            "QDRANT_URL": os.environ.get("ICE_QDRANT_URL", "http://localhost:6433"),
+            "REDIS_URL": os.environ.get("ICE_REDIS_URL", "redis://localhost:6479"),
+        }
+        self.version = self._read_version()
+
+    def _read_version(self) -> str:
+        """Best-effort NS API version from /health (falls back to a marker)."""
+        try:
+            r = self.client.get(f"{self.api_url}/health", timeout=5.0)
+            if r.status_code == 200:
+                return f"ns-ice@{r.json().get('service', 'neuralscape')}"
+        except Exception:
+            pass
+        return "ns-ice@unknown"
+
+    def _index_cmd(self, corpus: Corpus, incremental: bool) -> list[str]:
+        """Host `uv run` invocation of the native index CLI (rail-measured)."""
+        cmd = [
+            "uv", "run", "python", "-m", "adapters.code_graph.native_index_cli",
+            "--repo-path", corpus.path,
+            "--code-space", self._make_code_space(corpus.name),
+        ]
+        if incremental:
+            cmd.append("--incremental")
+        return cmd
 
     def capabilities(self) -> set[str]:
         """NS-ICE supports all 5 op classes."""
@@ -160,36 +200,19 @@ class NSIceAdapter:
         )
 
     def index_cold(self, corpus: Corpus) -> IndexResult:
-        """Run native index CLI (cold/full) under the safety rail."""
-        # ICE-INTEGRATE: E7 provides adapters.code_graph.native_index_cli
-        code_space = self._make_code_space(corpus.name)
-        cmd = [
-            self.python_bin,
-            "-m",
-            "adapters.code_graph.native_index_cli",
-            "--repo-path",
-            corpus.path,
-            "--code-space",
-            code_space,
-        ]
-        res = run_with_rail(cmd, self.rail)
+        """Run native index CLI (cold/full) on the host under the safety rail."""
+        res = run_with_rail(
+            self._index_cmd(corpus, incremental=False),
+            self.rail, cwd=self.service_dir, env=self._cli_env,
+        )
         return self._index_result_from_rail(res, "E7 native_index_cli")
 
     def index_incremental(self, corpus: Corpus, touched: list[str]) -> IndexResult:
-        """Run native index CLI with --incremental under the safety rail."""
-        # ICE-INTEGRATE: E7 provides --incremental on native_index_cli
-        code_space = self._make_code_space(corpus.name)
-        cmd = [
-            self.python_bin,
-            "-m",
-            "adapters.code_graph.native_index_cli",
-            "--repo-path",
-            corpus.path,
-            "--code-space",
-            code_space,
-            "--incremental",
-        ]
-        res = run_with_rail(cmd, self.rail)
+        """Run native index CLI with --incremental on the host under the rail."""
+        res = run_with_rail(
+            self._index_cmd(corpus, incremental=True),
+            self.rail, cwd=self.service_dir, env=self._cli_env,
+        )
         return self._index_result_from_rail(res, "E7 native_index_cli --incremental")
 
     def index_second(self, corpus: Corpus) -> IndexResult:
@@ -216,16 +239,10 @@ class NSIceAdapter:
         code_space = self._make_code_space(corpus.name)
         snapshot_path = Path(corpus.path) / f"snapshot-{corpus.name}.bin"
         cmd = [
-            self.python_bin,
-            "-m",
-            "adapters.code_graph.snapshot_cli",
-            "export",
-            "--code-space",
-            code_space,
-            "--output",
-            str(snapshot_path),
+            "uv", "run", "python", "-m", "adapters.code_graph.snapshot_cli",
+            "export", "--code-space", code_space, "--output", str(snapshot_path),
         ]
-        res = run_with_rail(cmd, self.rail)
+        res = run_with_rail(cmd, self.rail, cwd=self.service_dir, env=self._cli_env)
 
         if res.dnf:
             return SnapshotResult(
@@ -250,16 +267,10 @@ class NSIceAdapter:
         # ICE-INTEGRATE: I3-fixed adapters.code_graph.snapshot_cli
         code_space = self._make_code_space(corpus.name)
         cmd = [
-            self.python_bin,
-            "-m",
-            "adapters.code_graph.snapshot_cli",
-            "import",
-            "--code-space",
-            code_space,
-            "--input",
-            blob_path,
+            "uv", "run", "python", "-m", "adapters.code_graph.snapshot_cli",
+            "import", "--code-space", code_space, "--input", blob_path,
         ]
-        res = run_with_rail(cmd, self.rail)
+        res = run_with_rail(cmd, self.rail, cwd=self.service_dir, env=self._cli_env)
 
         if res.dnf:
             return SnapshotResult(
