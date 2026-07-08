@@ -1,7 +1,9 @@
 """
-Graphify standalone adapter (H2).
+Graphify standalone adapter.
 
-H2 implements this adapter using the pinned graphify CLI.
+Drives graphify as its own standalone product (NOT through Neuralscape).
 """
 
-# TODO: H2 implementation
+from .adapter import GraphifyStandaloneAdapter
+
+__all__ = ["GraphifyStandaloneAdapter"]
