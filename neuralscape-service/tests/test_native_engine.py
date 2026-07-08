@@ -613,6 +613,45 @@ def test_native_engine_stores_injected_driver(mock_bridge, mock_settings):
     assert eng2.driver is None
 
 
+def test_index_symbol_cards_skips_fileless_and_chunks_embeds(mock_bridge, mock_settings):
+    """Engine runtime fixes (never-run before E8):
+    (1) symbols with file=None must be skipped (no `repo_path / None` crash);
+    (2) embeds must be chunked to <=100 (Gemini batchEmbedContents cap).
+    """
+    from unittest.mock import Mock, patch, MagicMock
+    eng = NativeEngine(
+        repo_path="/repo",
+        code_space="code--u--r",
+        bridge=mock_bridge,
+        settings=mock_settings,
+        driver=Mock(),
+    )
+    # 1 file-less symbol (must be skipped) + 150 real ones (must chunk 100+50)
+    syms = [{"fqn": "x.none", "kind": "function", "file": None, "span": "1:1", "degree": 0}]
+    syms += [{"fqn": f"x.f{i}", "kind": "function", "file": "a.py", "span": "1:2", "degree": 1}
+             for i in range(150)]
+
+    m = MagicMock()
+    embed_calls = []
+    def _embed_batch(cards, **kw):
+        embed_calls.append(len(cards))
+        return [[0.0] * 768 for _ in cards]
+    m.embedding_model.embed_batch.side_effect = _embed_batch
+
+    with patch.object(eng, "_run_cypher", return_value=syms), \
+         patch.object(eng, "_ensure_code_index_collection"), \
+         patch.object(eng, "_extract_symbol_details", return_value=("sig", "doc", "lines")), \
+         patch.object(eng, "_build_symbol_card", return_value="card"), \
+         patch("memory_service.get_shared_service", return_value=MagicMock(_get_memory=lambda: m)):
+        eng._index_symbol_cards(Path("/repo"))
+
+    # 150 real cards (file-less skipped) → chunks of 100 then 50
+    assert embed_calls == [100, 50], embed_calls
+    # upsert got exactly the 150 real symbols
+    upsert_kwargs = m.vector_store.client.upsert.call_args.kwargs
+    assert len(upsert_kwargs["points"]) == 150
+
+
 def test_snapshot_cli_uses_correct_bridge_api(mock_bridge, mock_settings):
     """Test that snapshot_cli constructs engine with correct API (I3 bug fix).
 

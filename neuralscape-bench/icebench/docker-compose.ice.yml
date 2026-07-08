@@ -51,7 +51,7 @@ services:
       - NEO4J_PASSWORD=${NEO4J_PASSWORD:-password}
       - REDIS_URL=redis://redis:6379
       - QDRANT_URL=http://qdrant:6333
-      - DOCLING_URL=http://docling:5001
+      - DOCLING_URL=
       - CODE_REPOS=${CODE_REPOS:-{}}
     ports:
       - "8599:8199"  # API (shifted from 8199)
@@ -74,7 +74,7 @@ services:
       - NEO4J_PASSWORD=${NEO4J_PASSWORD:-password}
       - REDIS_URL=redis://redis:6379
       - QDRANT_URL=http://qdrant:6333
-      - DOCLING_URL=http://docling:5001
+      - DOCLING_URL=
     volumes:
       - /data/ice/stack/ingest:/app/ingest_data
     depends_on:
@@ -94,7 +94,7 @@ services:
       - NEO4J_PASSWORD=${NEO4J_PASSWORD:-password}
       - REDIS_URL=redis://redis:6379
       - QDRANT_URL=http://qdrant:6333
-      - DOCLING_URL=http://docling:5001
+      - DOCLING_URL=
     depends_on:
       - neo4j
       - redis
@@ -112,7 +112,7 @@ services:
       - NEO4J_PASSWORD=${NEO4J_PASSWORD:-password}
       - REDIS_URL=redis://redis:6379
       - QDRANT_URL=http://qdrant:6333
-      - DOCLING_URL=http://docling:5001
+      - DOCLING_URL=
     volumes:
       - /data/ice/stack/ingest:/app/ingest_data
     depends_on:

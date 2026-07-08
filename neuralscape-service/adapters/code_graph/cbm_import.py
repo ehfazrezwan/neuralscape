@@ -190,8 +190,11 @@ def _write_to_neo4j(
         symbols: List of symbol dicts.
         edges: List of edge dicts.
         code_space: Partition key (code--{owner}--{repo}).
-        bridge: Graphiti bridge for Neo4j access.
+        bridge: Graphiti async bridge (provides the event loop). The real
+            _AsyncBridge does NOT expose .driver.
         settings: Config object.
+        driver: Graphiti Neo4j async driver (service._graphiti.driver). Required
+            for live Neo4j execution; the bridge alone cannot run Cypher.
     """
     from adapters.code_graph.native_engine import NativeEngine
 
@@ -352,7 +355,7 @@ def import_cbm_archive(
         symbols, edges = _read_cbm_database(tmp_path)
 
         # Write to Neo4j
-        _write_to_neo4j(symbols, edges, code_space, bridge, settings, driver)
+        _write_to_neo4j(symbols, edges, code_space, bridge, settings, driver=driver)
 
         logger.info(f"Successfully imported {len(symbols)} symbols and {len(edges)} edges")
 
