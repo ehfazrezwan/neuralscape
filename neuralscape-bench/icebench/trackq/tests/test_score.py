@@ -5,9 +5,12 @@ import pytest
 from icebench.trackq.score import (
     normalize_answer,
     _normalize_path,
-    _normalize_symbol,
+    _normalize_bare_symbol,
     _parse_ranked_results,
     _parse_symbol_set,
+    _parse_graphify_connections,
+    _parse_ns_ice_neighbors,
+    _parse_graphify_node_location,
     _score_structural,
     OpScore,
 )
@@ -67,16 +70,21 @@ def test_normalize_path_corpus_root_edge_case():
     assert normalized
 
 
-def test_normalize_symbol():
-    """Test symbol normalization."""
+def test_normalize_bare_symbol():
+    """Test bare symbol normalization."""
     # Simple case
-    assert _normalize_symbol("my_function") == "my_function"
+    assert _normalize_bare_symbol("my_function") == "my_function"
 
-    # With whitespace
-    assert _normalize_symbol("  my_function  ") == "my_function"
+    # With whitespace and parens
+    assert _normalize_bare_symbol("  my_function()  ") == "my_function"
 
-    # FQN
-    assert _normalize_symbol("MyClass.method") == "MyClass.method"
+    # FQN - extract last segment
+    assert _normalize_bare_symbol("MyClass.method") == "method"
+    assert _normalize_bare_symbol("src.module.func") == "func"
+    assert _normalize_bare_symbol("pkg::Class::method") == "method"
+
+    # Lowercase normalization
+    assert _normalize_bare_symbol("MyFunction") == "myfunction"
 
 
 def test_normalize_answer_dict():
@@ -285,3 +293,115 @@ def test_score_misalignment_would_fail_without_rep_keying():
     score = _score_structural("sys", "corp", "symbol_lookup", rows, gold_map)
     # rep 0 matches; rep 2 gold is wrong => only 1/2 hit.
     assert score.hit_rate == 0.5
+
+
+# Per-system normalizer tests
+
+
+def test_parse_cbm_neighbors():
+    """Test parsing CBM neighbors_1hop format."""
+    answer = {
+        "data": {
+            "function": "_NonClosingTextIOWrapper",
+            "direction": "both",
+            "callees": [],
+            "callers": [
+                {"name": "_make_text_stream", "qualified_name": "...", "hop": 1},
+                {"name": "_get_stdin", "qualified_name": "...", "hop": 1},
+            ]
+        },
+        "status": "ok"
+    }
+    symbols = _parse_symbol_set(answer, system="cbm")
+    assert symbols == {"_make_text_stream", "_get_stdin"}
+
+
+def test_parse_graphify_connections():
+    """Test parsing Graphify connections format."""
+    text = """Node: _NonClosingTextIOWrapper
+  ID:        src_click_compat_nonclosingtextiowrapper
+  Source:    src/click/_compat.py L55
+  Type:      code
+  Community:
+  Degree:    10
+
+Connections (10):
+  <-- _compat.py [contains] [EXTRACTED]
+  <-- _winconsole.py [imports] [EXTRACTED]
+  <-- _get_text_stdin() [calls] [EXTRACTED]
+  <-- _make_text_stream() [calls] [EXTRACTED]
+  --> SomeClass [uses] [INFERRED]
+"""
+    symbols = _parse_graphify_connections(text)
+    # Should exclude .py files (contains/imports relations)
+    assert "_compat.py" not in symbols
+    assert "_winconsole.py" not in symbols
+    # Should include function names
+    assert "_get_text_stdin" in symbols
+    assert "_make_text_stream" in symbols
+    assert "someclass" in symbols  # normalized to lowercase
+
+
+def test_parse_ns_ice_neighbors():
+    """Test parsing NS-ICE neighbors format."""
+    text = '{"result":"Neighbors of src.click._winconsole._NonClosingTextIOWrapper:\\n  <-- src.click._winconsole [CALLS] [inferred]\\n  <-- src.click.utils [IMPORTS]","graph_id":"code--test"}'
+    symbols = _parse_ns_ice_neighbors(text)
+    # Should extract bare last segment of FQNs
+    assert "_winconsole" in symbols
+    assert "utils" in symbols
+
+
+def test_parse_graphify_node_location():
+    """Test parsing Graphify symbol_lookup node format."""
+    text = """Node: test_sequential_invokes_with_logging()
+  ID:        tests_test_stream_lifecycle_test_sequential_invokes_with_logging
+  Source:    tests/test_stream_lifecycle.py L220
+  Type:      code
+  Community:
+  Degree:    4
+"""
+    result = _parse_graphify_node_location(text)
+    assert result == ("tests/test_stream_lifecycle.py", "test_sequential_invokes_with_logging")
+
+
+def test_normalize_answer_cbm_symbol_lookup():
+    """Test CBM symbol_lookup format."""
+    answer = {
+        "data": {
+            "total": 1,
+            "results": [
+                {
+                    "name": "test_function",
+                    "qualified_name": "module.test_function",
+                    "file_path": "tests/test_file.py",
+                    "label": "Function"
+                }
+            ]
+        },
+        "status": "ok"
+    }
+    result = normalize_answer(answer, system="cbm", for_symbol_lookup=True)
+    assert result == ("tests/test_file.py", "test_function")
+
+
+def test_normalize_answer_ns_ice_nl_locate():
+    """Test NS-ICE nl_locate format."""
+    answer = {
+        "text": '{"results":[{"fqn":"src.module.MyClass.method","kind":"method","file":"src/module.py","line":42}]}',
+        "status": "ok"
+    }
+    result = normalize_answer(answer, system="ns-ice")
+    # Should extract bare symbol from FQN
+    assert result == ("src/module.py", "method")
+
+
+def test_parse_ranked_results_ns_ice():
+    """Test parsing NS-ICE nl_locate ranked results."""
+    answer = {
+        "text": '{"results":[{"fqn":"src.a.foo","file":"src/a.py","line":10},{"fqn":"src.b.foo","file":"src/b.py","line":20}]}',
+        "status": "ok"
+    }
+    results = _parse_ranked_results(answer, system="ns-ice")
+    assert len(results) == 2
+    assert results[0] == ("src/a.py", "foo")
+    assert results[1] == ("src/b.py", "foo")
