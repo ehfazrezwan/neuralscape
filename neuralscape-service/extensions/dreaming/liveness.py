@@ -71,6 +71,7 @@ def detect_affected_memories(
     # (E4 bridge: memories anchored to code use source_ref.external_id = "<repo>::<fqn>")
     m = service._get_memory()
     client = m.vector_store.client
+    collection_name = m.vector_store.collection_name
 
     # Build filter: source_ref.external_id IN affected_anchors
     query_filter = Filter(
@@ -82,21 +83,32 @@ def detect_affected_memories(
         ]
     )
 
-    # Scroll the collection to find all affected memories
-    # (use a dummy vector since we're filtering by metadata, not semantic search)
-    import numpy as np
-    vector_size = len(m.embedding_model.embed("test", memory_action="search"))
-    dummy_vector = np.zeros(vector_size).tolist()
-
+    # Use scroll for metadata-only lookup (no embedder call, no NumPy)
+    hits = []
     try:
-        result = client.query_points(
-            collection_name=m.vector_store.collection_name,
-            query=dummy_vector,
-            query_filter=query_filter,
-            limit=1000,  # cap to avoid runaway queries
-            with_payload=True,
-        )
-        hits = list(getattr(result, "points", result) or [])
+        offset = None
+        while True:
+            scroll_result = client.scroll(
+                collection_name=collection_name,
+                scroll_filter=query_filter,
+                limit=100,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            # scroll returns (records, next_offset)
+            records, next_offset = scroll_result
+            hits.extend(records)
+            if next_offset is None or len(records) == 0:
+                break
+            offset = next_offset
+            # Safety cap
+            if len(hits) >= 1000:
+                logger.warning(
+                    "Code liveness: hit 1000-memory cap for code_space=%s (truncated)",
+                    code_space,
+                )
+                break
     except Exception:
         logger.warning(
             "Failed to fetch affected memories for code changes (non-fatal)",
@@ -170,7 +182,6 @@ def apply_liveness_events(
     if not events:
         return 0
 
-    from config import settings as core_settings
     from datetime import datetime, timezone
 
     flagged = 0
@@ -188,6 +199,7 @@ def apply_liveness_events(
         try:
             m = service._get_memory()
             client = m.vector_store.client
+            collection_name = m.vector_store.collection_name
             patch = {
                 "code_liveness_stale": True,
                 "code_liveness_anchor": event.anchor_key,
@@ -195,7 +207,7 @@ def apply_liveness_events(
                 "code_liveness_flagged_at": datetime.now(timezone.utc).isoformat(),
             }
             client.set_payload(
-                collection_name=core_settings.qdrant_collection,
+                collection_name=collection_name,
                 payload=patch,
                 points=[event.memory_id],
                 key="metadata",
@@ -241,10 +253,20 @@ def process_code_changes_for_liveness(
         return {"events": [], "flagged": 0, "summary": "dreaming disabled"}
 
     # Get the code-graph engine for this code_space
+    # Parse code_space to extract repo_name: "code--{user_id}--{repo_name}"
     try:
-        from adapters.code_graph import get_engine
+        from adapters.code_graph.query import get_engine
+        from config import settings as core_settings
 
-        engine = get_engine(service, code_space=code_space)
+        parts = code_space.split("--")
+        if len(parts) < 3:
+            raise ValueError(f"Invalid code_space format: {code_space}")
+        repo_name = parts[2]
+        user_id = parts[1]
+
+        # Use repo:<name> graph_id format to get NativeEngine
+        graph_id = f"repo:{repo_name}"
+        engine = get_engine(graph_id, user_id, core_settings)
     except Exception:
         logger.warning(
             "Failed to get code-graph engine for %s (non-fatal)", code_space,
