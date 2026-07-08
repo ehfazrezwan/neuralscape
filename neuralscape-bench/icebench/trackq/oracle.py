@@ -78,7 +78,16 @@ class TreeSitterOracle:
         self._indexed = False
 
     def index(self) -> None:
-        """Parse the corpus and extract ground-truth symbols and edges."""
+        """Parse the corpus and extract ground-truth symbols and edges.
+
+        TWO-PASS extraction so forward references resolve correctly:
+          Pass 1 - parse every file and collect ALL symbol definitions (and
+                   imports). This makes the full symbol table available before
+                   any call edge is resolved.
+          Pass 2 - walk the same (cached) parse trees and resolve call edges,
+                   so a call to a function defined LATER in the file (or in a
+                   file parsed later) is still recorded.
+        """
         if self._indexed:
             return
 
@@ -93,11 +102,27 @@ class TreeSitterOracle:
 
         logger.info(f"Found {len(files)} source files")
 
+        # Parse each file once; keep the tree + source alive for both passes.
+        parsed: list[tuple[str, object, bytes]] = []
         for file_path in files:
             try:
-                self._parse_file(file_path)
+                rel_path = str(file_path.relative_to(self.corpus_path))
+                source = file_path.read_bytes()
+                tree = self.parser.parse(source)
+                parsed.append((rel_path, tree, source))
             except Exception as e:
                 logger.warning(f"Failed to parse {file_path}: {e}")
+
+        # Pass 1: symbol definitions + imports (populate the full symbol table).
+        for rel_path, tree, source in parsed:
+            if self.language == "python":
+                self._extract_python_defs(tree.root_node, rel_path, source)
+                self._extract_python_imports(tree.root_node, rel_path, source)
+
+        # Pass 2: resolve call edges now that ALL symbols are known.
+        for rel_path, tree, source in parsed:
+            if self.language == "python":
+                self._extract_python_call_edges(tree.root_node, rel_path, source)
 
         self._indexed = True
         logger.info(f"Indexed {len(self.symbols)} symbols, {len(self.edges)} edges")
@@ -114,24 +139,12 @@ class TreeSitterOracle:
         }
         return mapping.get(language, set())
 
-    def _parse_file(self, file_path: Path) -> None:
-        """Parse a single file and extract symbols and edges."""
-        rel_path = str(file_path.relative_to(self.corpus_path))
+    def _extract_python_defs(self, node, file: str, source: bytes) -> None:
+        """PASS 1: extract Python symbol definitions (functions/classes/methods).
 
-        try:
-            source = file_path.read_bytes()
-        except OSError:
-            return
-
-        tree = self.parser.parse(source)
-
-        if self.language == "python":
-            self._extract_python(tree.root_node, rel_path, source)
-        # Add more languages as tree-sitter-<lang> packages are installed
-
-    def _extract_python(self, node, file: str, source: bytes) -> None:
-        """Extract Python symbols and edges."""
-        # Walk the tree and extract function/class definitions
+        No call edges are resolved here — that happens in pass 2 once the full
+        symbol table exists, so forward references are not missed.
+        """
         def walk(n, class_context: str | None = None):
             if n.type == "function_definition":
                 name_node = n.child_by_field_name("name")
@@ -145,9 +158,6 @@ class TreeSitterOracle:
                         line=n.start_point[0] + 1,  # 1-indexed
                         kind="method" if class_context else "function",
                     )
-
-                    # Extract calls within this function
-                    self._extract_python_calls(n, full_name, file, source)
 
             elif n.type == "class_definition":
                 name_node = n.child_by_field_name("name")
@@ -173,32 +183,48 @@ class TreeSitterOracle:
 
         walk(node)
 
-        # Extract imports
-        self._extract_python_imports(node, file, source)
+    def _extract_python_call_edges(self, node, file: str, source: bytes) -> None:
+        """PASS 2: resolve call edges, tracking the enclosing symbol.
 
-    def _extract_python_calls(self, func_node, from_symbol: str, from_file: str, source: bytes) -> None:
-        """Extract function calls within a function."""
-        def walk(n):
-            if n.type == "call":
+        Walks the tree carrying the current class + function context so each
+        ``call`` node is attributed to the symbol it appears inside. Because the
+        full symbol table is already populated, calls to functions defined later
+        (forward references) resolve correctly.
+        """
+        def walk(n, class_context: str | None, enclosing: str | None):
+            new_enclosing = enclosing
+
+            if n.type == "class_definition":
+                name_node = n.child_by_field_name("name")
+                if name_node:
+                    name = source[name_node.start_byte:name_node.end_byte].decode("utf-8")
+                    class_context = f"{class_context}.{name}" if class_context else name
+
+            elif n.type == "function_definition":
+                name_node = n.child_by_field_name("name")
+                if name_node:
+                    name = source[name_node.start_byte:name_node.end_byte].decode("utf-8")
+                    new_enclosing = f"{class_context}.{name}" if class_context else name
+
+            elif n.type == "call" and enclosing is not None:
                 func = n.child_by_field_name("function")
                 if func:
-                    # Extract the called name (simplified; doesn't resolve fully)
                     called = source[func.start_byte:func.end_byte].decode("utf-8")
-
-                    # Only record if it looks like a known symbol
+                    # Record when the callee is a known symbol (full table now)
+                    # or an attribute-style reference (contains a dot).
                     if called in self.symbols or "." in called:
                         self.edges.append(Edge(
-                            from_symbol=from_symbol,
+                            from_symbol=enclosing,
                             to_symbol=called,
                             kind="calls",
-                            from_file=from_file,
+                            from_file=file,
                             to_file=self.symbols.get(called, Symbol("", "", 0, "")).file,
                         ))
 
             for child in n.children:
-                walk(child)
+                walk(child, class_context, new_enclosing)
 
-        walk(func_node)
+        walk(node, None, None)
 
     def _extract_python_imports(self, node, file: str, source: bytes) -> None:
         """Extract import statements."""

@@ -8,9 +8,10 @@ import json
 import logging
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 from icebench.schema import read_rows
+from icebench.trackq.generate import NL_LOCATE_MIN_SAMPLES
 
 logger = logging.getLogger(__name__)
 
@@ -49,12 +50,12 @@ class ScoreReport:
     metadata: dict  # Includes shared-oracle-bias caveat, LSP agreement %, sample sizes
 
 
-def normalize_answer(answer: str | dict) -> tuple[str, str] | None:
+def normalize_answer(answer: str | dict | None) -> tuple[str, str] | None:
     """
     Normalize an answer to (file, symbol) tuple.
 
     Args:
-        answer: Raw answer from adapter (could be dict with "text", or just text).
+        answer: Raw answer from adapter (dict with "text", plain text, or None).
 
     Returns:
         (relative_path, symbol_fqn) or None if unparseable.
@@ -117,10 +118,13 @@ def _normalize_path(path: str) -> str:
     # Convert to Path and back to string to normalize separators
     p = Path(path)
 
-    # Strip common prefixes like /data/ice/corpora/<name>/
+    # Strip the absolute corpus prefix /data/ice/corpora/<corpus-name>/ when
+    # there is a real relative remainder AFTER the corpus name. We require
+    # len(parts) > 5 (not > 4) so the slice parts[5:] is guaranteed non-empty —
+    # otherwise a corpus-root path would collapse to Path() -> "." (the bug).
     parts = p.parts
-    if len(parts) > 4 and parts[0] == "/" and parts[1] == "data" and parts[2] == "ice" and parts[3] == "corpora":
-        # Skip first 5 parts: /, data, ice, corpora, <corpus-name>
+    if len(parts) > 5 and parts[:4] == ("/", "data", "ice", "corpora"):
+        # Skip the first 5 parts: /, data, ice, corpora, <corpus-name>
         p = Path(*parts[5:])
 
     return str(p)
@@ -165,10 +169,11 @@ def score_results(run_id: str, results_dir: Path) -> int:
         logger.warning("No query results found")
         return 0
 
-    # Load gold answers (from query generation)
-    # For now, we'll regenerate queries to get gold answers
-    # In production, gold answers should be saved during query generation
-    from icebench.trackq.generate import generate_queries
+    # Recover gold answers by regenerating the query specs. The runner does not
+    # persist gold (it only records the system's answer), but generation is
+    # deterministic AND prefix-stable under (op, corpus, seed), so regenerating
+    # with n = max(rep)+1 reproduces the exact gold for every rep index we have.
+    from icebench.trackq.generate import generate_specs
     from icebench.corpora import iter_corpora
 
     # Build corpus map
@@ -187,16 +192,31 @@ def score_results(run_id: str, results_dir: Path) -> int:
             logger.warning(f"Corpus {corpus_name} not found")
             continue
 
-        # Regenerate gold queries
-        # NOTE: This assumes deterministic query generation with same seed
+        # Use the seed recorded on the rows (do NOT hardcode 42). All rows in a
+        # single run/op share the runner's --seed; if they diverge, warn and use
+        # the most common one so alignment stays consistent.
+        seeds = {r.seed for r in group_rows}
+        if len(seeds) > 1:
+            logger.warning(
+                "Mixed seeds %s for %s/%s/%s; using the most common for gold regen",
+                sorted(seeds), system, corpus_name, op,
+            )
+        seed = Counter(r.seed for r in group_rows).most_common(1)[0][0]
+
+        # Reps may be non-contiguous (errored/missing queries). Regenerate enough
+        # specs to cover the highest rep index actually present.
+        max_rep = max(r.rep for r in group_rows)
+        n_needed = max_rep + 1
+
         try:
-            gold_queries = generate_queries(op, corpus, n=len(group_rows), seed=42)
+            gold_specs = generate_specs(op, corpus, n=n_needed, seed=seed)
         except Exception as e:
             logger.error(f"Failed to generate gold queries for {corpus_name}/{op}: {e}")
             continue
 
-        # Build gold map (rep -> gold answer)
-        gold_map = {i: q.gold for i, q in enumerate(gold_queries)}
+        # Build gold map keyed by rep INDEX; align each row by its own row.rep
+        # (handles non-contiguous reps — missing indices are simply absent).
+        gold_map = {i: spec.gold for i, spec in enumerate(gold_specs)}
 
         # Score
         if op == "nl_locate":
@@ -211,14 +231,41 @@ def score_results(run_id: str, results_dir: Path) -> int:
 
         scores.append(op_score)
 
-    # Build metadata
+    # Build metadata. sample_sizes reflects the REAL per-cell query count, and
+    # under-sized nl_locate corpora are flagged so the report can mark them as
+    # non-comparable (never silently dropped).
+    sample_sizes = {
+        f"{s.system}/{s.corpus}/{s.op}": s.n_queries
+        for s in scores
+    }
+    undersized_nl_locate = {
+        f"{s.system}/{s.corpus}/{s.op}": s.n_queries
+        for s in scores
+        if s.op == "nl_locate" and s.n_queries < NL_LOCATE_MIN_SAMPLES
+    }
+    if undersized_nl_locate:
+        logger.warning(
+            "Under-sized nl_locate eval sets (< %d): %s",
+            NL_LOCATE_MIN_SAMPLES, undersized_nl_locate,
+        )
+
     metadata = {
-        "shared_oracle_bias": "Both NS indexer and Track-Q oracle use tree-sitter for parsing. This introduces a shared-oracle bias where both systems may fail on the same malformed code.",
-        "lsp_agreement_pct": None,  # Filled by LSP spot-check
-        "sample_sizes": {
-            f"{s.system}/{s.corpus}/{s.op}": s.n_queries
-            for s in scores
-        },
+        "shared_oracle_bias": (
+            "Both NS indexer and Track-Q oracle use tree-sitter for parsing. "
+            "This introduces a shared-oracle bias where both systems may fail "
+            "on the same malformed code, and structural ground truth is only as "
+            "correct as the oracle's tree-sitter extraction."
+        ),
+        "oracle_independence": (
+            "The Track-Q oracle (icebench/trackq/oracle.py) is a standalone "
+            "module, independent of the NS indexer; they share only the "
+            "tree-sitter parser library."
+        ),
+        "lsp_agreement_pct": None,  # Filled by LSP spot-check; None => skipped
+        "lsp_spot_check": "skipped (pyright/gopls not installable on shared VM)",
+        "nl_locate_min_samples": NL_LOCATE_MIN_SAMPLES,
+        "undersized_nl_locate": undersized_nl_locate,
+        "sample_sizes": sample_sizes,
     }
 
     report = ScoreReport(scores=scores, metadata=metadata)

@@ -110,3 +110,23 @@ def test_oracle_find_paths():
 
     # At least one path should exist
     assert isinstance(paths, list)
+
+
+@pytest.mark.skipif(not TREE_SITTER_AVAILABLE, reason="tree-sitter not available")
+def test_oracle_forward_reference_call():
+    """Two-pass extraction must capture a call to a function defined LATER.
+
+    Regression for the single-pass bug where a call edge was only recorded if
+    the callee was already in the symbol table, missing forward references.
+    """
+    oracle = TreeSitterOracle(str(FIXTURES_DIR), "python")
+    oracle.index()
+
+    # late_callee is defined AFTER early_caller in forward.py.
+    assert "early_caller" in oracle.symbols
+    assert "late_callee" in oracle.symbols
+
+    callers = oracle.get_callers("late_callee")
+    assert "early_caller" in callers, (
+        "forward reference missed: early_caller -> late_callee not recorded"
+    )

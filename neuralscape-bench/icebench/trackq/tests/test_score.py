@@ -8,8 +8,27 @@ from icebench.trackq.score import (
     _normalize_symbol,
     _parse_ranked_results,
     _parse_symbol_set,
+    _score_structural,
     OpScore,
 )
+from icebench.schema import ResultRow
+
+
+def _make_query_row(system, corpus, op, rep, seed, answer, ok=True):
+    """Build a minimal query ResultRow for scoring tests."""
+    return ResultRow(
+        schema="icebench-v1",
+        kind="query",
+        system=system,
+        system_version="test",
+        corpus=corpus,
+        repo_sha="sha",
+        op=op,
+        rep=rep,
+        seed=seed,
+        answer=answer,
+        ok=ok,
+    )
 
 
 def test_normalize_path():
@@ -19,6 +38,11 @@ def test_normalize_path():
     normalized = _normalize_path(path)
     assert normalized == "src/main.py"
 
+    # File directly at corpus root
+    path = "/data/ice/corpora/test-corpus/main.py"
+    normalized = _normalize_path(path)
+    assert normalized == "main.py"
+
     # Already relative
     path = "src/utils.py"
     normalized = _normalize_path(path)
@@ -26,6 +50,21 @@ def test_normalize_path():
 
     # Empty path
     assert _normalize_path("") == ""
+
+
+def test_normalize_path_corpus_root_edge_case():
+    """A corpus-root path must NOT collapse to '.' (off-by-one regression)."""
+    # Path that IS the corpus root (no relative remainder).
+    path = "/data/ice/corpora/test-corpus"
+    normalized = _normalize_path(path)
+    assert normalized != "."
+    assert normalized  # non-empty
+
+    # Trailing slash variant.
+    path = "/data/ice/corpora/test-corpus/"
+    normalized = _normalize_path(path)
+    assert normalized != "."
+    assert normalized
 
 
 def test_normalize_symbol():
@@ -190,3 +229,59 @@ def test_na_handling():
     assert score.recall is None
     assert score.hits_at_1 is None
     assert score.mrr is None
+
+
+def test_score_aligns_gold_by_rep_noncontiguous():
+    """Gold must align to rows by row.rep, not positional order.
+
+    Regression for issue #3: reps can be non-contiguous (errored/missing
+    queries). The scorer keys gold by rep INDEX and looks up each row by its own
+    row.rep, so a missing middle rep does not shift the alignment.
+    """
+    # Gold keyed by rep index. Note rep 1 is intentionally absent from rows.
+    gold_map = {
+        0: {"file": "a.py", "symbol": "foo"},
+        1: {"file": "b.py", "symbol": "bar"},
+        2: {"file": "c.py", "symbol": "baz"},
+    }
+
+    # Rows for reps 0 and 2 only (rep 1 errored and was never recorded).
+    # Row 0 answers correctly; row 2 answers correctly.
+    rows = [
+        _make_query_row(
+            "sys", "corp", "symbol_lookup", rep=0, seed=7,
+            answer={"text": '[{"file": "a.py", "symbol": "foo"}]', "status": "ok"},
+        ),
+        _make_query_row(
+            "sys", "corp", "symbol_lookup", rep=2, seed=7,
+            answer={"text": '[{"file": "c.py", "symbol": "baz"}]', "status": "ok"},
+        ),
+    ]
+
+    score = _score_structural("sys", "corp", "symbol_lookup", rows, gold_map)
+
+    # Both supported rows matched their correctly-aligned gold => hit_rate 1.0.
+    assert score.n_queries == 2
+    assert score.n_supported == 2
+    assert score.hit_rate == 1.0
+
+
+def test_score_misalignment_would_fail_without_rep_keying():
+    """Sanity: if gold for a rep is wrong, the hit is not counted."""
+    gold_map = {
+        0: {"file": "a.py", "symbol": "foo"},
+        2: {"file": "WRONG.py", "symbol": "nope"},
+    }
+    rows = [
+        _make_query_row(
+            "sys", "corp", "symbol_lookup", rep=0, seed=7,
+            answer={"text": '[{"file": "a.py", "symbol": "foo"}]', "status": "ok"},
+        ),
+        _make_query_row(
+            "sys", "corp", "symbol_lookup", rep=2, seed=7,
+            answer={"text": '[{"file": "c.py", "symbol": "baz"}]', "status": "ok"},
+        ),
+    ]
+    score = _score_structural("sys", "corp", "symbol_lookup", rows, gold_map)
+    # rep 0 matches; rep 2 gold is wrong => only 1/2 hit.
+    assert score.hit_rate == 0.5

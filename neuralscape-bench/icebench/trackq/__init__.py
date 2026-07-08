@@ -9,12 +9,13 @@ H3 implements:
 - LSP spot-check (optional, requires pyright/gopls)
 """
 
-from icebench.trackq.generate import generate_queries, QuerySpec
+from icebench.trackq.generate import generate_queries, generate_specs, QuerySpec
 from icebench.trackq.score import score_results, normalize_answer, ScoreReport, OpScore
 from icebench.trackq.oracle import TreeSitterOracle, Symbol, Edge
 
 __all__ = [
-    "generate_queries",
+    "generate_queries",  # runner-facing: returns list[dict] payloads
+    "generate_specs",  # scorer/tests: returns list[QuerySpec] (payload + gold)
     "QuerySpec",
     "score_results",
     "normalize_answer",
