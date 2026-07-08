@@ -375,6 +375,86 @@ class NativeEngine:
             logger.warning(f"Failed to create code_index collection: {e}")
             raise
 
+    def blast_radius(
+        self,
+        symbol: str,
+        *,
+        max_hops: int = 4,
+    ) -> str:
+        """Compute blast radius from a given symbol (E7).
+
+        BFS over CALLS/IMPORTS edges to find all symbols affected by changes to
+        the given symbol. Returns a text summary (file:line format, consistent
+        with locate output).
+
+        Args:
+            symbol: FQN or partial match of the epicenter symbol.
+            max_hops: Maximum BFS depth (1-16, default 4).
+
+        Returns:
+            Text summary of affected symbols (one per line, file:line format).
+
+        Raises:
+            ValueError: Symbol not found or max_hops out of range.
+        """
+        max_hops = max(1, min(int(max_hops), 16))  # clamp to [1, 16]
+
+        # Resolve symbol to FQN (fuzzy match like query/neighbors/path)
+        matches = self._search_symbols(symbol)
+        if not matches:
+            return f"Symbol not found: '{symbol}'"
+        if len(matches) > 1:
+            candidates = ", ".join(m["fqn"] for m in matches[:5])
+            return f"Ambiguous symbol '{symbol}' ({len(matches)} matches). Did you mean: {candidates}?"
+
+        fqn = matches[0]["fqn"]
+
+        # Run BFS blast radius
+        affected_fqns = self._blast_radius_bfs([fqn], max_depth=max_hops)
+
+        if not affected_fqns:
+            return f"No blast radius for '{fqn}' (isolated symbol)."
+
+        # Fetch details for all affected symbols
+        affected_details = []
+        for affected_fqn in sorted(affected_fqns):
+            details = self._get_symbol_details(affected_fqn)
+            if details:
+                affected_details.append(details)
+
+        if not affected_details:
+            return f"Blast radius computed ({len(affected_fqns)} symbols) but details unavailable."
+
+        # Format output (file:line, similar to locate)
+        lines = [f"Blast radius from '{fqn}' (max_hops={max_hops}): {len(affected_details)} symbols"]
+        for detail in affected_details:
+            file = detail.get("file", "unknown")
+            line = detail.get("line", 0)
+            kind = detail.get("kind", "symbol")
+            detail_fqn = detail.get("fqn", "")
+            lines.append(f"  {file}:{line} [{kind}] {detail_fqn}")
+
+        return "\n".join(lines)
+
+    def _get_symbol_details(self, fqn: str) -> dict | None:
+        """Fetch symbol details (file, line, kind) by FQN."""
+        cypher = """
+        MATCH (s:CodeSymbol {code_space: $code_space, fqn: $fqn})
+        RETURN s.fqn AS fqn, s.file AS file, s.kind AS kind, s.span AS span
+        """
+        results = self._run_cypher(cypher, code_space=self.code_space, fqn=fqn)
+        if not results:
+            return None
+        row = results[0]
+        span = row.get("span", "")
+        line = int(span.split("-")[0]) if span and "-" in span else 0
+        return {
+            "fqn": row.get("fqn", ""),
+            "file": row.get("file", ""),
+            "kind": row.get("kind", ""),
+            "line": line,
+        }
+
     def detect_changes(
         self,
         since: str | bytes | None = None,

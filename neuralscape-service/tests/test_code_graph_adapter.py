@@ -332,7 +332,7 @@ async def test_mcp_lists_code_graph_tools():
     import mcp_server
 
     names = {t.name for t in await mcp_server.list_tools()}
-    assert {"query_code_graph", "get_code_neighbors", "code_path"} <= names
+    assert {"query_code_graph", "get_code_neighbors", "code_path", "locate", "code_impact"} <= names
 
 
 @pytest.mark.asyncio
@@ -426,7 +426,7 @@ async def test_mcp_tools_unlisted_without_graphify(no_graphify):
     import mcp_server
 
     names = {t.name for t in await mcp_server.list_tools()}
-    assert not ({"query_code_graph", "get_code_neighbors", "code_path"} & names)
+    assert not ({"query_code_graph", "get_code_neighbors", "code_path", "locate", "code_impact"} & names)
 
 
 @pytest.mark.asyncio

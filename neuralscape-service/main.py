@@ -1352,6 +1352,36 @@ async def v1_code_graph_locate(
     return {"results": results, "graph_id": graph_id, "k": k}
 
 
+@v1_router.get("/code-graph/impact")
+async def v1_code_graph_impact(
+    request: Request,
+    symbol: str = Query(..., min_length=1, max_length=500),
+    max_hops: int = Query(4, ge=1, le=16),
+    graph_id: str | None = Query(None),
+    user_id: str | None = Query(None),
+):
+    """Compute blast radius from a given symbol (E7).
+
+    BFS over CALLS/IMPORTS edges to find all symbols affected by changes to the
+    given symbol. Returns a text summary (file:line format). E7: requires
+    NativeEngine (repo:<name> refs); raises 501 on GraphifyJsonEngine (.json artifacts).
+    """
+    cg = _code_graph_or_501()
+    caller = _resolve_user_id(request, user_id)
+    try:
+        text = await asyncio.to_thread(
+            cg.code_impact,
+            symbol,
+            user_id=caller,
+            settings=settings,
+            graph_id=graph_id,
+            max_hops=max_hops,
+        )
+    except cg.CodeGraphError as e:
+        raise _map_code_graph_error(e) from e
+    return {"text": text, "symbol": symbol, "max_hops": max_hops, "graph_id": graph_id}
+
+
 # ── Connectors (data-layer sources) ──────────────
 
 
