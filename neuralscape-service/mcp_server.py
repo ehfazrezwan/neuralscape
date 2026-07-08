@@ -1207,6 +1207,26 @@ def _code_graph_tools() -> list[Tool]:
                 "required": ["query"],
             },
         ),
+        Tool(
+            name="code_impact",
+            description=(
+                "Compute blast radius from a given symbol: BFS over CALLS/IMPORTS edges "
+                "to find all symbols affected by changes to the given symbol. Returns a "
+                "text summary (file:line format) of affected symbols. Use this to understand "
+                "the impact of modifying or deleting a symbol. E7: requires NativeEngine "
+                "(repo:<name> refs); raises EngineCapabilityError on GraphifyJsonEngine "
+                "(.json artifacts)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "FQN or partial match of the epicenter symbol (e.g., 'UserManager.login', 'fetch_data')"},
+                    "max_hops": {"type": "integer", "default": 4, "description": "Maximum BFS depth (1-16)"},
+                    **_CODE_GRAPH_COMMON_PROPS,
+                },
+                "required": ["symbol"],
+            },
+        ),
     ]
 
 
@@ -1762,7 +1782,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps(
                 {"status": "accepted", "task_id": task_id}))]
 
-        elif name in ("query_code_graph", "get_code_neighbors", "code_path", "locate"):
+        elif name in ("query_code_graph", "get_code_neighbors", "code_path", "locate", "code_impact"):
             # NS-surface delegations to the code-graph adapter (roadmap F2:
             # the interaction interface is ALWAYS Neuralscape). Availability-
             # gated: without the optional extra these tools aren't listed, but
@@ -1771,8 +1791,10 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
 
             if not code_graph_available():
                 return [TextContent(type="text", text=json.dumps({"error": _MISSING_EXTRA_MSG}))]
+            from adapters.code_graph.engine import EngineCapabilityError
             from adapters.code_graph.query import (
                 CodeGraphError,
+                code_impact,
                 code_path,
                 get_code_neighbors,
                 locate_symbols,
@@ -1810,7 +1832,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                         graph_id=arguments.get("graph_id"),
                         max_hops=arguments.get("max_hops", 8),
                     )
-                else:  # locate
+                elif name == "locate":
                     hits = await asyncio.to_thread(
                         locate_symbols,
                         arguments["query"],
@@ -1823,6 +1845,19 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                     from dataclasses import asdict
                     output = [asdict(hit) for hit in hits]
                     return [TextContent(type="text", text=json.dumps(output, default=str, ensure_ascii=False))]
+                else:  # code_impact
+                    text = await asyncio.to_thread(
+                        code_impact,
+                        arguments["symbol"],
+                        user_id=user_id,
+                        settings=settings,
+                        graph_id=arguments.get("graph_id"),
+                        max_hops=arguments.get("max_hops", 4),
+                    )
+            except EngineCapabilityError as e:
+                # e.g. code_impact/locate on a graph.json engine — clean error JSON,
+                # never a raw crash.
+                return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
             except CodeGraphError as e:
                 return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
             except Exception as e:

@@ -281,3 +281,48 @@ def locate_symbols(
     k = max(1, min(int(k), 50))  # clamp to [1, 50]
     engine = get_engine(graph_id, user_id, settings)
     return engine.locate(query, k=k, user_id=user_id)
+
+
+def code_impact(
+    symbol: str,
+    *,
+    user_id: str,
+    settings,
+    graph_id: str | None = None,
+    max_hops: int = 4,
+) -> str:
+    """Blast radius from a symbol — routes through engine (E7: NativeEngine only).
+
+    BFS over CALLS/IMPORTS edges to find all symbols affected by changes to the
+    given symbol. Returns a text summary (file:line format).
+
+    Args:
+        symbol: FQN or partial match of the epicenter symbol.
+        user_id: Owner-scoped resolution.
+        settings: Config for default path / repo resolution.
+        graph_id: Artifact id, repo:<name> ref, or None (uses default).
+        max_hops: Maximum BFS depth (1-16, default 4).
+
+    Returns:
+        Text summary of affected symbols.
+
+    Raises:
+        EngineCapabilityError: When the engine lacks blast_radius (GraphifyJsonEngine).
+        CodeGraphError: graph_id doesn't resolve or repo not configured.
+    """
+    from adapters.code_graph.engine import EngineCapabilityError
+
+    max_hops = max(1, min(int(max_hops), 16))  # clamp to [1, 16]
+    engine = get_engine(graph_id, user_id, settings)
+    # blast_radius is native-only. GraphifyJsonEngine (.json artifacts) has no
+    # such method — surface a clean EngineCapabilityError (→ 501) rather than
+    # letting a bare AttributeError bubble up as an HTTP 500.
+    impact = getattr(engine, "blast_radius", None)
+    if not callable(impact):
+        raise EngineCapabilityError(
+            "code_impact/blast_radius requires the native code-intel engine "
+            "(repo:<name> refs). GraphifyJsonEngine operates on static graph.json "
+            "artifacts and has no blast-radius traversal. Index the repo with the "
+            "native engine (native_index_cli) to use code_impact."
+        )
+    return impact(symbol, max_hops=max_hops)
