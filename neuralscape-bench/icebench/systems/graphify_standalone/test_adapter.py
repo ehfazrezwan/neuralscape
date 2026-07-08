@@ -1,157 +1,183 @@
-"""Tests for Graphify standalone adapter."""
+"""Tests for Graphify standalone adapter.
 
+Pure-python tests use a fake graphify binary + a patched rail so they run
+without the real tool. A live smoke test is guarded on the real install.
+"""
+
+import json
+import stat
 import pytest
 from pathlib import Path
-from icebench.adapters.base import (
-    Corpus,
-    UnsupportedOp,
-    OP_CLASSES,
-)
+from unittest.mock import patch
+
+from icebench.adapters.base import Corpus, UnsupportedOp, OP_CLASSES
+from icebench.rail import RailConfig, RailResult
 from icebench.systems.graphify_standalone import GraphifyStandaloneAdapter
+
+REAL_GRAPHIFY = "/data/ice/tools/graphify/.venv/bin/graphify"
+
+
+def _rail_result(returncode=0, stdout="", stderr="", dnf_timed_out=False, oom=False):
+    return RailResult(
+        returncode=returncode, stdout=stdout, stderr=stderr,
+        wall_s=1.0, peak_rss_mb=42.0, cpu_s=0.5,
+        timed_out=dnf_timed_out, oom_killed=oom,
+        memory_cap_mb=12288, timeout_s=3600, mechanism="ulimit",
+    )
 
 
 @pytest.fixture
-def adapter():
-    """Create a graphify adapter instance."""
-    return GraphifyStandaloneAdapter(
-        graphify_bin="/data/ice/tools/graphify",
-        python_bin="python3",
-    )
+def fake_bin(tmp_path):
+    """A fake graphify executable so Path(bin).exists() passes."""
+    b = tmp_path / "graphify"
+    b.write_text("#!/bin/sh\nexit 0\n")
+    b.chmod(b.stat().st_mode | stat.S_IEXEC)
+    return str(b)
 
 
 @pytest.fixture
 def corpus(tmp_path):
-    """Create a test corpus."""
-    return Corpus(
-        name="test",
-        path=str(tmp_path),
-        repo_sha="abc123",
-        language="python",
-        loc=100,
-        file_count=5,
-    )
+    d = tmp_path / "repo"
+    d.mkdir()
+    return Corpus(name="t", path=str(d), repo_sha="s", language="python", loc=10, file_count=1)
 
 
-def test_adapter_attributes(adapter):
-    """Test adapter has required attributes."""
-    assert adapter.name == "graphify"
-    assert "graphify-cli" in adapter.version
-    assert hasattr(adapter, "capabilities")
-
-
-def test_capabilities(adapter):
-    """Test graphify capabilities are correct subset of OP_CLASSES."""
-    caps = adapter.capabilities()
-    assert isinstance(caps, set)
-    assert caps <= OP_CLASSES  # Subset of valid ops
+def test_capabilities(fake_bin):
+    a = GraphifyStandaloneAdapter(graphify_bin=fake_bin)
+    caps = a.capabilities()
     assert caps == {"symbol_lookup", "neighbors_1hop", "path_le4"}
+    assert caps <= OP_CLASSES
+    assert a.name == "graphify"
 
 
-def test_unsupported_ops(adapter, corpus):
-    """Test that unsupported operations raise UnsupportedOp."""
-    # nl_locate is not supported
+def test_unsupported_ops_raise(fake_bin, corpus):
+    a = GraphifyStandaloneAdapter(graphify_bin=fake_bin)
     with pytest.raises(UnsupportedOp):
-        adapter.query("nl_locate", {"corpus": corpus, "query": "test"})
-
-    # blast_radius is not supported
+        a.query("nl_locate", {"corpus": corpus, "query": "x"})
     with pytest.raises(UnsupportedOp):
-        adapter.query("blast_radius", {"corpus": corpus, "symbol": "test"})
+        a.query("blast_radius", {"corpus": corpus, "symbol": "x"})
 
 
-def test_index_cold_missing_binary(tmp_path):
-    """Test index_cold handles missing graphify binary."""
-    adapter = GraphifyStandaloneAdapter(
-        graphify_bin="/nonexistent/path",
-        python_bin="python3",
+def test_index_missing_binary(corpus):
+    a = GraphifyStandaloneAdapter(graphify_bin="/no/such/graphify")
+    r = a.index_cold(corpus)
+    assert not r.ok and r.dnf and "not found" in r.dnf_reason
+
+
+def test_index_incremental_na(fake_bin, corpus):
+    a = GraphifyStandaloneAdapter(graphify_bin=fake_bin)
+    r = a.index_incremental(corpus, ["f.py"])
+    assert not r.ok and r.dnf and r.dnf_reason == "incremental_na"
+
+
+def test_index_cold_parses_graph_json(fake_bin, corpus):
+    """index_cold routes through the rail and parses graphify's graph.json."""
+    a = GraphifyStandaloneAdapter(graphify_bin=fake_bin)
+
+    def fake_run(cmd, cfg, cwd=None, env=None):
+        # Simulate graphify writing graph.json
+        out = Path(corpus.path) / "graphify-out"
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "graph.json").write_text(json.dumps({
+            "nodes": [
+                {"id": "a", "source_file": "calc.py"},
+                {"id": "b", "source_file": "calc.py"},
+                {"id": "c", "source_file": "utils.py"},
+            ],
+            "edges": [{"source": "a", "target": "b"}],
+        }))
+        return _rail_result(returncode=0)
+
+    with patch("icebench.systems.graphify_standalone.adapter.run_with_rail", side_effect=fake_run):
+        r = a.index_cold(corpus)
+    assert r.ok
+    assert r.symbols == 3
+    assert r.edges == 1
+    assert r.files == 2  # distinct source_file values
+    assert r.peak_rss_mb == 42.0  # rail-measured resources carried through
+
+
+def test_index_dnf_on_rail_breach(fake_bin, corpus):
+    a = GraphifyStandaloneAdapter(graphify_bin=fake_bin)
+    with patch("icebench.systems.graphify_standalone.adapter.run_with_rail",
+               return_value=_rail_result(returncode=-1, dnf_timed_out=True)):
+        r = a.index_cold(corpus)
+    assert not r.ok and r.dnf and r.dnf_reason.startswith("timeout")
+
+
+def test_query_routes_through_rail(fake_bin, corpus):
+    """query() must call run_with_rail (not subprocess.run directly)."""
+    a = GraphifyStandaloneAdapter(graphify_bin=fake_bin)
+    # graph.json must exist for query to proceed
+    out = Path(corpus.path) / "graphify-out"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "graph.json").write_text('{"nodes": [], "edges": []}')
+
+    with patch("icebench.systems.graphify_standalone.adapter.run_with_rail",
+               return_value=_rail_result(returncode=0, stdout="Node: add()")) as m:
+        q = a.query("symbol_lookup", {"corpus": corpus, "symbol": "add()"})
+    assert m.called  # proves the rail was used
+    assert q.ok and "add()" in q.answer["text"]
+
+
+def test_query_requires_indexed_graph(fake_bin, corpus):
+    a = GraphifyStandaloneAdapter(graphify_bin=fake_bin)
+    q = a.query("symbol_lookup", {"corpus": corpus, "symbol": "x"})
+    assert not q.ok and "not indexed" in q.answer["error"]
+
+
+def test_snapshot_roundtrip(fake_bin, corpus):
+    a = GraphifyStandaloneAdapter(graphify_bin=fake_bin)
+    out = Path(corpus.path) / "graphify-out"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "graph.json").write_text('{"nodes": [1], "edges": []}')
+
+    snap = a.export_snapshot(corpus)
+    assert snap and snap.ok and snap.bytes > 0
+    # store size counts the whole graphify-out dir
+    assert a.store_size_bytes(corpus) > 0
+    # import into a fresh corpus location
+    blob = Path(corpus.path) / f"snapshot-{corpus.name}.json"
+    imp = a.import_snapshot(corpus, str(blob))
+    assert imp and imp.ok
+
+
+def test_export_snapshot_na_without_graph(fake_bin, corpus):
+    a = GraphifyStandaloneAdapter(graphify_bin=fake_bin)
+    assert a.export_snapshot(corpus) is None
+
+
+def test_conformance(fake_bin):
+    a = GraphifyStandaloneAdapter(graphify_bin=fake_bin)
+    for m in ("capabilities", "index_cold", "index_incremental", "index_second",
+              "store_size_bytes", "export_snapshot", "import_snapshot", "query",
+              "teardown"):
+        assert callable(getattr(a, m))
+    assert isinstance(a.name, str) and isinstance(a.version, str)
+
+
+# ---- Live smoke test (guarded on the real install) ----
+
+@pytest.mark.skipif(not Path(REAL_GRAPHIFY).exists(), reason="graphify not installed")
+def test_live_index_and_query(tmp_path):
+    """End-to-end against the real graphify 0.9.10 on a tiny fixture."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "calc.py").write_text(
+        "def add(a, b):\n    return a + b\n\n"
+        "def use():\n    return add(1, 2)\n"
     )
-    corpus = Corpus(
-        name="test",
-        path=str(tmp_path),
-        repo_sha="abc123",
-        language="python",
-        loc=100,
-        file_count=5,
+    corpus = Corpus(name="live", path=str(repo), repo_sha="s",
+                    language="python", loc=5, file_count=1)
+    a = GraphifyStandaloneAdapter(
+        graphify_bin=REAL_GRAPHIFY,
+        rail=RailConfig(memory_limit_mb=4096, timeout_seconds=120),
     )
-
-    result = adapter.index_cold(corpus)
-
-    assert not result.ok
-    assert result.dnf
-    assert "not found" in result.dnf_reason
-
-
-def test_index_incremental_na(adapter, corpus):
-    """Test incremental index returns N/A."""
-    result = adapter.index_incremental(corpus, ["file.py"])
-
-    assert not result.ok
-    assert result.dnf
-    assert result.dnf_reason == "incremental_na"
-
-
-def test_snapshot_operations_no_graph(adapter, corpus):
-    """Test snapshot operations when no graph exists."""
-    # Export without graph returns None
-    result = adapter.export_snapshot(corpus)
-    assert result is None
-
-
-def test_import_snapshot(adapter, corpus, tmp_path):
-    """Test snapshot import creates graphify-out directory."""
-    # Create a fake snapshot file
-    snapshot = tmp_path / "snapshot.json"
-    snapshot.write_text('{"nodes": [], "edges": []}')
-
-    result = adapter.import_snapshot(corpus, str(snapshot))
-
-    assert result is not None
-    assert result.ok
-    # Check graphify-out was created
-    graphify_out = Path(corpus.path) / "graphify-out"
-    assert graphify_out.exists()
-
-
-def test_store_size_bytes_no_index(adapter, corpus):
-    """Test store_size_bytes returns 0 when not indexed."""
-    size = adapter.store_size_bytes(corpus)
-    assert size == 0
-
-
-def test_query_without_corpus(adapter):
-    """Test query without corpus in payload."""
-    result = adapter.query("symbol_lookup", {"symbol": "test"})
-    assert not result.ok
-    assert "No corpus specified" in result.answer.get("error", "")
-
-
-def test_conformance_to_protocol(adapter):
-    """Test adapter conforms to SystemAdapter protocol."""
-    # Check all required methods exist
-    assert callable(getattr(adapter, "capabilities", None))
-    assert callable(getattr(adapter, "index_cold", None))
-    assert callable(getattr(adapter, "index_incremental", None))
-    assert callable(getattr(adapter, "index_second", None))
-    assert callable(getattr(adapter, "store_size_bytes", None))
-    assert callable(getattr(adapter, "export_snapshot", None))
-    assert callable(getattr(adapter, "import_snapshot", None))
-    assert callable(getattr(adapter, "query", None))
-    assert callable(getattr(adapter, "teardown", None))
-
-    # Check attributes
-    assert hasattr(adapter, "name")
-    assert hasattr(adapter, "version")
-
-
-@pytest.mark.skipif(
-    not Path("/data/ice/tools/graphify").exists(),
-    reason="Graphify not installed"
-)
-def test_version_detection():
-    """Test version detection from installed graphify."""
-    adapter = GraphifyStandaloneAdapter(
-        graphify_bin="/data/ice/tools/graphify",
-        python_bin="python3",
-    )
-    # Version should start with graphify-cli@
-    # May be "unknown" if not properly installed or importable
-    assert adapter.version.startswith("graphify-cli@")
+    try:
+        r = a.index_cold(corpus)
+        assert r.ok, f"index failed: {r.dnf_reason}"
+        assert r.symbols > 0 and r.files >= 1
+        q = a.query("symbol_lookup", {"corpus": corpus, "symbol": "add()"})
+        assert q.ok
+    finally:
+        a.teardown(corpus)
