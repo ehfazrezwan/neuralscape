@@ -550,3 +550,79 @@ def test_native_engine_path_no_source(mock_bridge, mock_settings):
 
     result = engine.path("nonexistent", "target")
     assert "No symbol matching source" in result
+
+
+def test_snapshot_cli_uses_correct_bridge_api(mock_bridge, mock_settings):
+    """Test that snapshot_cli constructs engine with correct API (I3 bug fix).
+
+    The bug was: snapshot_cli used service.graphiti_client and service.config,
+    which don't exist. Should use service._bridge and module-level settings.
+    """
+    from unittest.mock import patch, MagicMock
+    import tempfile
+    from pathlib import Path
+
+    # Mock get_shared_service
+    mock_service = MagicMock()
+    mock_service._bridge = mock_bridge
+
+    with patch("memory_service.get_shared_service", return_value=mock_service):
+        with patch("config.settings", mock_settings):
+            with patch("adapters.code_graph.native_engine.NativeEngine") as MockEngine:
+                from adapters.code_graph.snapshot_cli import export_snapshot, import_snapshot
+
+                mock_engine = MagicMock()
+                mock_engine.export_snapshot.return_value = b"snapshot_data"
+                MockEngine.return_value = mock_engine
+
+                # Test export_snapshot
+                with tempfile.NamedTemporaryFile(suffix=".dat", delete=False) as tmp:
+                    tmp_path = Path(tmp.name)
+
+                try:
+                    export_snapshot("/tmp/repo", str(tmp_path), "code--user--test")
+
+                    # Verify service._get_memory was called (initializes bridge)
+                    mock_service._get_memory.assert_called()
+
+                    # Verify NativeEngine was constructed with correct params
+                    MockEngine.assert_called_with(
+                        repo_path="/tmp/repo",
+                        code_space="code--user--test",
+                        bridge=mock_bridge,  # from service._bridge, not service.graphiti_client
+                        settings=mock_settings,  # from module-level, not service.config
+                    )
+
+                    # Verify export was called
+                    mock_engine.export_snapshot.assert_called_once()
+                finally:
+                    tmp_path.unlink(missing_ok=True)
+
+                # Reset mocks
+                mock_service.reset_mock()
+                MockEngine.reset_mock()
+                mock_engine.reset_mock()
+
+                # Test import_snapshot
+                with tempfile.NamedTemporaryFile(suffix=".dat", delete=False) as tmp:
+                    tmp_path = Path(tmp.name)
+                    tmp_path.write_bytes(b"snapshot_data")
+
+                try:
+                    import_snapshot(str(tmp_path), "code--user--test")
+
+                    # Verify service._get_memory was called
+                    mock_service._get_memory.assert_called()
+
+                    # Verify NativeEngine was constructed with correct params
+                    MockEngine.assert_called_with(
+                        repo_path="/tmp",
+                        code_space="code--user--test",
+                        bridge=mock_bridge,  # from service._bridge
+                        settings=mock_settings,  # from module-level
+                    )
+
+                    # Verify import was called
+                    mock_engine.import_snapshot.assert_called_once_with(b"snapshot_data")
+                finally:
+                    tmp_path.unlink(missing_ok=True)
