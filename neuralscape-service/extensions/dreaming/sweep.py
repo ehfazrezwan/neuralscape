@@ -26,7 +26,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 
-from . import bridges, card, consolidate, gate, librarian, reflect, surprisal
+from . import bridges, card, consolidate, gate, librarian, liveness, reflect, surprisal
 from .config import DreamingSettings, dreaming_settings
 
 logger = logging.getLogger(__name__)
@@ -119,6 +119,72 @@ def _save_run(redis, run: DreamRun) -> None:
         redis.set(_RUN_KEY, json.dumps(run.to_dict()))
     except Exception:
         logger.warning("DreamRun save failed", exc_info=True)
+
+
+def _consume_code_liveness_flags(service, batch) -> list[dict]:
+    """Consume code_liveness_stale flags and generate deterministic temporal_reframe actions.
+
+    This is the I4 liveness consumer: gather pool memories with code_liveness_stale=True
+    and emit deterministic temporal_reframe actions (reversible, idempotent).
+
+    Args:
+        service: The MemoryService instance.
+        batch: The staged pool batch from consolidate.stage_pool().
+
+    Returns:
+        List of temporal_reframe action dicts ready for consolidate.apply_actions().
+    """
+    actions = []
+    for mem in batch.memories:
+        metadata = mem.get("metadata", {})
+        if not metadata.get("code_liveness_stale"):
+            continue
+
+        # Generate deterministic temporal_reframe
+        anchor = metadata.get("code_liveness_anchor", "unknown")
+        reason = metadata.get("code_liveness_reason", "code changed")
+        content = mem.get("data", "")
+
+        # Deterministic reframe: prepend a temporal marker (reversible)
+        # E.g., "test_function does X" -> "[stale: symbol deleted] test_function does X"
+        reframe_prefix = f"[stale: {reason}] "
+        if not content.startswith("[stale:"):
+            new_content = reframe_prefix + content
+        else:
+            new_content = content  # already reframed
+
+        action = {
+            "type": "temporal_reframe",
+            "memory_ids": [mem["memory_id"]],
+            "content": new_content,
+            "confidence": 0.95,
+            "reason": f"Code anchor {anchor} {reason}",
+        }
+        actions.append(action)
+
+        # Clear the flag after consuming (idempotency)
+        try:
+            m = service._get_memory()
+            client = m.vector_store.client
+            collection_name = m.vector_store.collection_name
+            client.set_payload(
+                collection_name=collection_name,
+                payload={"code_liveness_stale": False},
+                points=[mem["memory_id"]],
+                key="metadata",
+            )
+        except Exception:
+            logger.warning(
+                "Failed to clear code_liveness_stale flag for %s (non-fatal)",
+                mem["memory_id"], exc_info=True,
+            )
+
+    if actions:
+        logger.info(
+            "Code liveness consumer: generated %d temporal_reframe actions for pool %s",
+            len(actions), batch.pool,
+        )
+    return actions
 
 
 async def _make_llm_call(settings: DreamingSettings):
@@ -331,6 +397,17 @@ async def _dream_pool(
             report.status, report.reason = "skipped_unchanged", "staged id set unchanged"
             return report
 
+        # 5b. Code liveness consumer (I4): deterministic temporal_reframe for stale anchors.
+        #     This is a pre-LLM pass: code changes are objective ground truth, not
+        #     speculation. The liveness actions are merged with the LLM's decision.
+        liveness_actions = []
+        try:
+            liveness_actions = _consume_code_liveness_flags(service, batch)
+        except Exception:
+            logger.warning(
+                "code liveness consumer failed for pool %s (non-fatal)", pool, exc_info=True,
+            )
+
         # 6. DEEP: decide + hybrid-posture apply. An LLM failure here means
         #    the pool was never examined — report sweep_failed WITHOUT
         #    stamping the gate or the staged-id marker, so the next cron
@@ -342,6 +419,8 @@ async def _dream_pool(
             logger.error("dream consolidation LLM failed for pool %s: %s", pool, exc)
             report.status, report.reason = "sweep_failed", f"consolidation LLM: {exc}"
             return report
+        # Merge liveness actions (deterministic) with LLM actions
+        actions.extend(liveness_actions)
         to_apply, to_report = consolidate.split_by_posture(
             actions, auto_apply_confidence=settings.auto_apply_confidence
         )

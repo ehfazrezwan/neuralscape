@@ -246,7 +246,7 @@ def test_collect_affected_anchors(mock_bridge, mock_settings, temp_repo):
 
 
 def test_liveness_detect_affected_memories():
-    """Test that liveness consumer detects memories anchored to affected symbols."""
+    """Test that liveness consumer detects memories anchored to affected symbols (using scroll)."""
     from extensions.dreaming.liveness import detect_affected_memories
 
     # Mock service
@@ -255,12 +255,7 @@ def test_liveness_detect_affected_memories():
     mock_vector_store = Mock()
     mock_client = Mock()
 
-    # Mock embedding model
-    embedding_model = Mock()
-    embedding_model.embed = Mock(return_value=[0.1] * 768)
-    mock_memory.embedding_model = embedding_model
-
-    # Mock Qdrant query_points response
+    # Mock Qdrant scroll response (no embedder call needed)
     mock_hit1 = Mock()
     mock_hit1.payload = {
         "id": "mem_123",
@@ -280,9 +275,8 @@ def test_liveness_detect_affected_memories():
         },
     }
 
-    mock_result = Mock()
-    mock_result.points = [mock_hit1, mock_hit2]
-    mock_client.query_points = Mock(return_value=mock_result)
+    # scroll returns (records, next_offset)
+    mock_client.scroll = Mock(return_value=([mock_hit1, mock_hit2], None))
 
     mock_vector_store.client = mock_client
     mock_vector_store.collection_name = "test_collection"
@@ -311,6 +305,10 @@ def test_liveness_detect_affected_memories():
     assert events[0].memory_id == "mem_123"
     assert events[1].memory_id == "mem_456"
     assert events[0].anchor_key == "repo::test_module.modified_function"
+
+    # Verify scroll was called (not query_points)
+    mock_client.scroll.assert_called()
+    assert not hasattr(mock_client, 'query_points') or not mock_client.query_points.called
 
 
 def test_liveness_flags_are_reversible():
@@ -384,10 +382,6 @@ def test_liveness_scoped_invalidation():
     mock_vector_store = Mock()
     mock_client = Mock()
 
-    embedding_model = Mock()
-    embedding_model.embed = Mock(return_value=[0.1] * 768)
-    mock_memory.embedding_model = embedding_model
-
     # Only memories with matching anchor_keys should be returned
     mock_hit1 = Mock()
     mock_hit1.payload = {
@@ -399,9 +393,8 @@ def test_liveness_scoped_invalidation():
         },
     }
 
-    mock_result = Mock()
-    mock_result.points = [mock_hit1]  # Only 1 hit with matching anchor
-    mock_client.query_points = Mock(return_value=mock_result)
+    # scroll returns (records, next_offset)
+    mock_client.scroll = Mock(return_value=([mock_hit1], None))
 
     mock_vector_store.client = mock_client
     mock_vector_store.collection_name = "test_collection"
@@ -424,6 +417,129 @@ def test_liveness_scoped_invalidation():
     # Should only detect the 1 memory in the blast radius
     assert len(events) == 1
     assert events[0].memory_id == "mem_in_radius"
+
+
+def test_liveness_no_embedder_call():
+    """Test that detect_affected_memories does NOT call the embedder (scroll-based)."""
+    from extensions.dreaming.liveness import detect_affected_memories
+
+    # Mock service
+    mock_service = Mock()
+    mock_memory = Mock()
+    mock_vector_store = Mock()
+    mock_client = Mock()
+
+    # Mock embedding model (should NOT be called)
+    embedding_model = Mock()
+    embedding_model.embed = Mock()
+    mock_memory.embedding_model = embedding_model
+
+    # Mock scroll response
+    mock_client.scroll = Mock(return_value=([], None))
+
+    mock_vector_store.client = mock_client
+    mock_vector_store.collection_name = "test_collection"
+    mock_memory.vector_store = mock_vector_store
+    mock_service._get_memory = Mock(return_value=mock_memory)
+
+    change_report = ChangeReport(
+        deleted_symbols=[],
+        modified_symbols=[],
+        added_symbols=[],
+        affected_anchors=["repo::test.func"],
+        summary="test",
+    )
+
+    detect_affected_memories(mock_service, change_report, code_space="code--test--repo")
+
+    # ASSERT: embedder was NOT called
+    embedding_model.embed.assert_not_called()
+
+
+def test_sweep_consumes_liveness_flags():
+    """Test that the dreaming sweep consumes code_liveness_stale flags."""
+    from extensions.dreaming.sweep import _consume_code_liveness_flags
+
+    # Mock service
+    mock_service = Mock()
+    mock_memory = Mock()
+    mock_vector_store = Mock()
+    mock_client = Mock()
+    mock_vector_store.client = mock_client
+    mock_vector_store.collection_name = "test_collection"
+    mock_memory.vector_store = mock_vector_store
+    mock_service._get_memory = Mock(return_value=mock_memory)
+
+    # Mock batch with one flagged memory
+    batch = Mock()
+    batch.pool = "test_pool"
+    batch.memories = [
+        {
+            "memory_id": "mem_stale",
+            "data": "test_function does something",
+            "metadata": {
+                "code_liveness_stale": True,
+                "code_liveness_anchor": "repo::test.func",
+                "code_liveness_reason": "symbol deleted",
+            },
+        },
+        {
+            "memory_id": "mem_fresh",
+            "data": "other memory",
+            "metadata": {},
+        },
+    ]
+
+    actions = _consume_code_liveness_flags(mock_service, batch)
+
+    # Should generate 1 temporal_reframe action
+    assert len(actions) == 1
+    assert actions[0]["type"] == "temporal_reframe"
+    assert actions[0]["memory_ids"] == ["mem_stale"]
+    assert "[stale: symbol deleted]" in actions[0]["content"]
+
+    # Verify flag was cleared
+    mock_client.set_payload.assert_called()
+    call_args = mock_client.set_payload.call_args
+    assert call_args[1]["payload"]["code_liveness_stale"] is False
+
+
+def test_process_code_changes_imports_correctly():
+    """Test that process_code_changes_for_liveness uses the correct import path."""
+    from extensions.dreaming.liveness import process_code_changes_for_liveness
+
+    # Mock service
+    mock_service = Mock()
+
+    # Mock settings
+    with patch("config.settings") as mock_settings:
+        mock_settings.code_repos = {"test": "/tmp/test"}
+
+        # Mock dreaming settings (enabled)
+        with patch("extensions.dreaming.config.dreaming_settings") as mock_dream_settings:
+            mock_dream_settings.enabled = True
+
+            # Mock get_engine (should be from adapters.code_graph.query)
+            with patch("adapters.code_graph.query.get_engine") as mock_get_engine:
+                mock_engine = Mock()
+                mock_engine.detect_changes = Mock(return_value=Mock(
+                    deleted_symbols=[],
+                    modified_symbols=[],
+                    added_symbols=[],
+                    affected_anchors=[],
+                    summary="no changes",
+                ))
+                mock_get_engine.return_value = mock_engine
+
+                result = process_code_changes_for_liveness(
+                    mock_service, code_space="code--user123--test", dry_run=True
+                )
+
+                # Verify get_engine was called with correct signature
+                mock_get_engine.assert_called_once()
+                call_args = mock_get_engine.call_args
+                assert call_args[0][0] == "repo:test"  # graph_id
+                assert call_args[0][1] == "user123"  # user_id
 
 
 def test_detect_changes_no_changes(mock_bridge):
