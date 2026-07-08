@@ -303,6 +303,15 @@ class Settings(BaseSettings):
     # setting: each ingested graph.json is an owner-scoped artifact addressed by
     # its graph_id (stamped into every produced memory's source_ref).
     code_graph_json_path: str = ""
+    # Native code-intel engine (E2+): a JSON dict mapping repo names to on-disk
+    # paths, so a `repo:<name>` graph ref resolves to a filesystem repo the
+    # NativeEngine indexes into its own Neo4j label-space. Set via env
+    # CODE_REPOS='{"myrepo":"/abs/path"}'. Empty ⇒ no native repos configured;
+    # the native engine self-reports "No code_repos configured" and only the
+    # graph.json (GraphifyJsonEngine) path is reachable — byte-for-byte the
+    # pre-E2 behavior. Additive + optional (default {}), so nothing changes for
+    # deployments that don't opt in.
+    code_repos: dict[str, str] = {}
     # Confidence assigned per Graphify edge/insight confidence tag (F1 epistemic
     # mapping): EXTRACTED → epistemic_level="explicit", INFERRED → "deductive"
     # with reduced confidence, AMBIGUOUS → stored only when its assigned

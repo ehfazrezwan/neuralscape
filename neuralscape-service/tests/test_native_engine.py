@@ -1,0 +1,552 @@
+"""Unit tests for NativeEngine (E2 native code-intel indexer)."""
+
+import tempfile
+from pathlib import Path
+from unittest.mock import MagicMock, Mock
+
+import pytest
+
+from adapters.code_graph.engine import EngineCapabilityError, IndexReport
+from adapters.code_graph.native_engine import NativeEngine
+
+
+@pytest.fixture
+def mock_bridge():
+    """Mock Graphiti bridge with a fake Neo4j driver."""
+    import asyncio
+
+    bridge = Mock()
+    bridge._loop = asyncio.new_event_loop()
+
+    # Mock driver that returns empty results
+    async def mock_run(cypher, **params):
+        result = Mock()
+        result.data = Mock(return_value=[])
+        result.single = Mock(return_value=None)
+        return result
+
+    mock_session = Mock()
+    mock_session.run = mock_run
+    mock_session.__aenter__ = Mock(return_value=mock_session)
+    mock_session.__aexit__ = Mock(return_value=None)
+
+    mock_driver = Mock()
+    mock_driver.session = Mock(return_value=mock_session)
+    bridge.driver = mock_driver
+
+    return bridge
+
+
+@pytest.fixture
+def mock_settings():
+    """Mock settings object."""
+    settings = Mock()
+    settings.code_graph_extracted_confidence = 0.9
+    settings.code_graph_inferred_confidence = 0.7
+    settings.code_graph_ambiguous_confidence = 0.5
+    settings.code_graph_ambiguous_floor = 0.6
+    return settings
+
+
+@pytest.fixture
+def temp_repo():
+    """Create a temporary repo with a simple Python file."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_path = Path(tmpdir)
+        test_file = repo_path / "test_module.py"
+        test_file.write_text(
+            """
+def greet(name):
+    '''Say hello.'''
+    return f"Hello, {name}"
+
+class Greeter:
+    def greet(self, name):
+        return greet(name)
+"""
+        )
+        yield repo_path
+
+
+def test_native_engine_init(mock_bridge, mock_settings):
+    """Test NativeEngine initialization."""
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user123--testrepo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+    assert engine.code_space == "code--user123--testrepo"
+    assert str(engine.repo_path) == "/tmp/test"
+
+
+def test_native_engine_locate_implemented(mock_bridge, mock_settings):
+    """Test that locate() now works in E3 (requires mocked embedding)."""
+    from unittest.mock import patch, Mock
+    import uuid
+
+    # Mock the memory service
+    mock_service = Mock()
+    mock_memory = Mock()
+
+    # Mock embedding model
+    embedding_model = Mock()
+    embedding_model.embed = Mock(return_value=[0.1] * 768)
+    mock_memory.embedding_model = embedding_model
+
+    # Mock vector store with Qdrant client
+    vector_store = Mock()
+    qdrant_client = Mock()
+
+    # Mock empty hits
+    qdrant_client.query_points = Mock(return_value=Mock(points=[]))
+    qdrant_client.get_collection = Mock(side_effect=Exception("Not found"))
+    qdrant_client.create_collection = Mock()
+
+    vector_store.client = qdrant_client
+    vector_store._has_bm25_slot = False
+    mock_memory.vector_store = vector_store
+
+    mock_service._get_memory = Mock(return_value=mock_memory)
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user123--testrepo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+
+    # Should not raise EngineCapabilityError anymore (E3 implements it)
+    with patch("memory_service.get_shared_service", return_value=mock_service):
+        hits = engine.locate("test query")
+
+    # Should return empty list (no hits from mocked Qdrant)
+    assert isinstance(hits, list)
+    assert len(hits) == 0
+
+
+def test_native_engine_detect_changes_implemented(temp_repo, mock_bridge, mock_settings):
+    """Test that detect_changes() works in E5 (persisted vs fresh)."""
+    from unittest.mock import patch
+
+    engine = NativeEngine(
+        repo_path=str(temp_repo),
+        code_space="code--user123--testrepo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+
+    # Mock the _fetch_persisted_symbols and _parse_fresh_symbols
+    with patch.object(engine, "_fetch_persisted_symbols") as mock_persisted:
+        with patch.object(engine, "_parse_fresh_symbols") as mock_fresh:
+            mock_persisted.return_value = []
+            mock_fresh.return_value = []
+
+            # Should not raise EngineCapabilityError anymore (E5 implements it)
+            report = engine.detect_changes()
+
+            # Should return a ChangeReport
+            assert hasattr(report, "deleted_symbols")
+            assert hasattr(report, "modified_symbols")
+            assert hasattr(report, "added_symbols")
+            assert hasattr(report, "affected_anchors")
+            assert hasattr(report, "summary")
+
+
+def test_native_engine_semantic_layer_not_implemented(mock_bridge, mock_settings):
+    """Test that semantic_layer() raises EngineCapabilityError (Louvain deferred)."""
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user123--testrepo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+    with pytest.raises(EngineCapabilityError, match="semantic_layer.*Louvain"):
+        engine.semantic_layer()
+
+
+def test_native_engine_export_snapshot_implemented(mock_bridge, mock_settings):
+    """Test that export_snapshot() produces deterministic bytes (E6)."""
+    from unittest.mock import patch
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user123--testrepo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+
+    # Mock fixture graph data
+    fixture_nodes = [
+        {"labels": ["CodeRepo"], "props": {"code_space": "code--user--repo", "name": "repo", "path": "/repo"}},
+        {"labels": ["CodeSymbol"], "props": {"code_space": "code--user--repo", "fqn": "mod.foo", "kind": "function", "file": "mod.py", "span": "1:5", "body_hash": "abc123"}},
+    ]
+    fixture_edges = [
+        {
+            "rel_type": "ANCHORED",
+            "props": {},
+            "source_labels": ["CodeSymbol"],
+            "source_props": {"code_space": "code--user--repo", "fqn": "mod.foo"},
+            "target_labels": ["CodeAnchor"],
+            "target_props": {"code_space": "code--user--repo", "repo": "repo", "fqn": "mod.foo"},
+        }
+    ]
+
+    with patch.object(engine, "_run_cypher") as mock_cypher:
+        # First call: nodes query
+        # Second call: edges query
+        mock_cypher.side_effect = [fixture_nodes, fixture_edges]
+
+        snapshot_bytes = engine.export_snapshot()
+
+    # Verify it's compressed bytes
+    assert isinstance(snapshot_bytes, bytes)
+    assert len(snapshot_bytes) > 0
+
+    # Verify deterministic: same input → same output
+    with patch.object(engine, "_run_cypher") as mock_cypher:
+        mock_cypher.side_effect = [fixture_nodes, fixture_edges]
+        snapshot_bytes2 = engine.export_snapshot()
+    assert snapshot_bytes == snapshot_bytes2
+
+
+def test_native_engine_parse_file(temp_repo, mock_bridge, mock_settings):
+    """Test parsing a Python file with tree-sitter."""
+    pytest.importorskip("tree_sitter_language_pack")
+
+    engine = NativeEngine(
+        repo_path=str(temp_repo),
+        code_space="code--user123--testrepo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+
+    test_file = temp_repo / "test_module.py"
+    symbols, edges = engine._parse_file(test_file, temp_repo, "python")
+
+    # Should extract at least the function and class
+    assert len(symbols) >= 2
+    fqns = [s.fqn for s in symbols]
+    assert "test_module.greet" in fqns
+    assert "test_module.Greeter" in fqns
+
+    # Should have some edges (at least the DEFINES for the method)
+    assert len(edges) > 0
+
+
+def test_export_import_snapshot_roundtrip(mock_bridge, mock_settings):
+    """Test snapshot export → import round-trip preserves nodes/edges (E6)."""
+    from unittest.mock import patch, call
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user--repo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+
+    # Fixture graph: 2 symbols, 1 anchor, 2 edges
+    fixture_nodes = [
+        {"labels": ["CodeRepo"], "props": {"code_space": "code--user--repo", "name": "repo", "path": "/repo"}},
+        {"labels": ["CodeSymbol"], "props": {"code_space": "code--user--repo", "fqn": "mod.foo", "kind": "function", "file": "mod.py", "span": "1:5", "body_hash": "abc", "degree": 1}},
+        {"labels": ["CodeSymbol"], "props": {"code_space": "code--user--repo", "fqn": "mod.bar", "kind": "function", "file": "mod.py", "span": "7:10", "body_hash": "def", "degree": 0}},
+        {"labels": ["CodeAnchor"], "props": {"code_space": "code--user--repo", "repo": "repo", "fqn": "mod.foo"}},
+    ]
+    fixture_edges = [
+        {
+            "rel_type": "CALLS",
+            "props": {"extraction": "extracted", "epistemic_level": "explicit"},
+            "source_labels": ["CodeSymbol"],
+            "source_props": {"code_space": "code--user--repo", "fqn": "mod.foo"},
+            "target_labels": ["CodeSymbol"],
+            "target_props": {"code_space": "code--user--repo", "fqn": "mod.bar"},
+        },
+        {
+            "rel_type": "ANCHORED",
+            "props": {},
+            "source_labels": ["CodeSymbol"],
+            "source_props": {"code_space": "code--user--repo", "fqn": "mod.foo"},
+            "target_labels": ["CodeAnchor"],
+            "target_props": {"code_space": "code--user--repo", "repo": "repo", "fqn": "mod.foo"},
+        },
+    ]
+
+    # Export
+    with patch.object(engine, "_run_cypher") as mock_cypher:
+        mock_cypher.side_effect = [fixture_nodes, fixture_edges]
+        snapshot_bytes = engine.export_snapshot()
+
+    # Import into a fresh engine (simulate deployment)
+    with patch.object(engine, "_run_cypher_with_retry") as mock_retry:
+        engine.import_snapshot(snapshot_bytes)
+
+        # Verify all nodes were MERGE'd (4 nodes)
+        merge_calls = [c for c in mock_retry.call_args_list]
+        assert len(merge_calls) >= 4  # 4 nodes + 2 edges
+
+        # Check that repo, symbols, anchor were all merged
+        # Extract both positional and keyword args
+        cypher_texts = []
+        for c in merge_calls:
+            if c.args:
+                cypher_texts.append(str(c.args[0]))
+            elif c.kwargs and "cypher" in c.kwargs:
+                cypher_texts.append(str(c.kwargs["cypher"]))
+
+        # Debug: print actual calls if assertions fail
+        if not any("CodeRepo" in c for c in cypher_texts):
+            print(f"DEBUG: No CodeRepo found in {len(cypher_texts)} calls")
+            for i, c in enumerate(cypher_texts):
+                print(f"  Call {i}: {c[:100]}")
+
+        assert any("CodeRepo" in c for c in cypher_texts), f"CodeRepo not found in calls: {cypher_texts}"
+        assert any("CodeSymbol" in c for c in cypher_texts), f"CodeSymbol not found in calls: {cypher_texts}"
+        assert any("CodeAnchor" in c for c in cypher_texts), f"CodeAnchor not found in calls: {cypher_texts}"
+
+
+def test_import_snapshot_idempotent(mock_bridge, mock_settings):
+    """Test that re-importing the same snapshot produces no duplicates (E6)."""
+    from unittest.mock import patch
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user--repo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+
+    # Minimal fixture
+    fixture_nodes = [
+        {"labels": ["CodeSymbol"], "props": {"code_space": "code--user--repo", "fqn": "mod.foo", "kind": "function", "file": "mod.py", "span": "1:5", "body_hash": "abc"}},
+    ]
+    fixture_edges = []
+
+    # Export
+    with patch.object(engine, "_run_cypher") as mock_cypher:
+        mock_cypher.side_effect = [fixture_nodes, fixture_edges]
+        snapshot_bytes = engine.export_snapshot()
+
+    # Import twice
+    with patch.object(engine, "_run_cypher_with_retry") as mock_retry:
+        engine.import_snapshot(snapshot_bytes)
+        first_call_count = mock_retry.call_count
+
+        mock_retry.reset_mock()
+        engine.import_snapshot(snapshot_bytes)
+        second_call_count = mock_retry.call_count
+
+        # Same number of MERGE calls (idempotent)
+        assert first_call_count == second_call_count
+
+
+def test_detect_changes_snapshot_based(temp_repo, mock_bridge, mock_settings):
+    """Test detect_changes with snapshot baseline vs current (E6)."""
+    from unittest.mock import patch
+
+    engine = NativeEngine(
+        repo_path=str(temp_repo),
+        code_space="code--user--repo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+
+    # Create a snapshot with 2 symbols
+    snapshot_symbols = [
+        {"fqn": "mod.foo", "kind": "function", "file": "mod.py", "span": "1:5", "body_hash": "old_hash"},
+        {"fqn": "mod.bar", "kind": "function", "file": "mod.py", "span": "7:10", "body_hash": "bar_hash"},
+    ]
+
+    # Fresh parse has 3 symbols: foo (modified), bar (unchanged), baz (added)
+    fresh_symbols = [
+        {"fqn": "mod.foo", "kind": "function", "file": "mod.py", "span": "1:5", "body_hash": "new_hash"},  # modified
+        {"fqn": "mod.bar", "kind": "function", "file": "mod.py", "span": "7:10", "body_hash": "bar_hash"},  # unchanged
+        {"fqn": "mod.baz", "kind": "function", "file": "mod.py", "span": "12:15", "body_hash": "baz_hash"},  # added
+    ]
+
+    # Create snapshot bytes
+    import gzip
+    import json
+    snapshot_data = {
+        "nodes": [
+            {"labels": ["CodeSymbol"], "properties": s}
+            for s in snapshot_symbols
+        ],
+        "edges": [],
+    }
+    header = {
+        "format_version": "1.0",
+        "code_space": "code--user--repo",
+        "repo": "repo",
+        "symbol_count": 2,
+        "edge_count": 0,
+        "content_hash": "dummy",
+    }
+    import hashlib
+    snapshot_json = json.dumps(snapshot_data, sort_keys=True)
+    header["content_hash"] = hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest()
+    envelope = {"header": header, "snapshot": snapshot_data}
+    snapshot_bytes = gzip.compress(json.dumps(envelope, sort_keys=True).encode("utf-8"))
+
+    with patch.object(engine, "_parse_fresh_symbols", return_value=fresh_symbols):
+        with patch.object(engine, "_blast_radius_bfs", return_value=set()):
+            report = engine.detect_changes(since=snapshot_bytes)
+
+    # Verify changes detected
+    assert "mod.foo" in report.modified_symbols  # body_hash changed
+    assert "mod.baz" in report.added_symbols  # new symbol
+    assert len(report.deleted_symbols) == 0  # nothing deleted
+    assert "snapshot" in report.summary  # confirms snapshot baseline
+
+
+def test_detect_changes_persisted_still_works(temp_repo, mock_bridge, mock_settings):
+    """Test that E5's persisted-vs-fresh path still works after E6 (E5 regression test)."""
+    from unittest.mock import patch
+
+    engine = NativeEngine(
+        repo_path=str(temp_repo),
+        code_space="code--user--repo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+
+    persisted = [
+        {"fqn": "mod.foo", "kind": "function", "file": "mod.py", "span": "1:5", "body_hash": "abc"},
+    ]
+    fresh = [
+        {"fqn": "mod.bar", "kind": "function", "file": "mod.py", "span": "7:10", "body_hash": "def"},
+    ]
+
+    with patch.object(engine, "_fetch_persisted_symbols", return_value=persisted):
+        with patch.object(engine, "_parse_fresh_symbols", return_value=fresh):
+            with patch.object(engine, "_blast_radius_bfs", return_value=set()):
+                report = engine.detect_changes(since=None)
+
+    # Verify E5 behavior: persisted baseline
+    assert "mod.foo" in report.deleted_symbols
+    assert "mod.bar" in report.added_symbols
+    assert "persisted" in report.summary  # confirms persisted baseline
+
+
+def test_snapshot_anchors_survive_roundtrip(mock_bridge, mock_settings):
+    """Test that CodeAnchor nodes and ANCHORED edges survive snapshot round-trip (E6)."""
+    from unittest.mock import patch
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user--repo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+
+    # Fixture with anchor
+    fixture_nodes = [
+        {"labels": ["CodeSymbol"], "props": {"code_space": "code--user--repo", "fqn": "mod.foo", "kind": "function", "file": "mod.py", "span": "1:5", "body_hash": "abc"}},
+        {"labels": ["CodeAnchor"], "props": {"code_space": "code--user--repo", "repo": "repo", "fqn": "mod.foo"}},
+    ]
+    fixture_edges = [
+        {
+            "rel_type": "ANCHORED",
+            "props": {},
+            "source_labels": ["CodeSymbol"],
+            "source_props": {"code_space": "code--user--repo", "fqn": "mod.foo"},
+            "target_labels": ["CodeAnchor"],
+            "target_props": {"code_space": "code--user--repo", "repo": "repo", "fqn": "mod.foo"},
+        }
+    ]
+
+    # Export
+    with patch.object(engine, "_run_cypher") as mock_cypher:
+        mock_cypher.side_effect = [fixture_nodes, fixture_edges]
+        snapshot_bytes = engine.export_snapshot()
+
+    # Import and verify anchor was restored
+    with patch.object(engine, "_run_cypher_with_retry") as mock_retry:
+        engine.import_snapshot(snapshot_bytes)
+
+        cypher_texts = [str(c.args[0]) if c.args else "" for c in mock_retry.call_args_list]
+        # Verify CodeAnchor MERGE happened
+        assert any("CodeAnchor" in c for c in cypher_texts)
+        # Verify ANCHORED edge was created
+        assert any("ANCHORED" in c for c in cypher_texts)
+
+
+def test_native_engine_file_hash(temp_repo, mock_bridge, mock_settings):
+    """Test file content hashing."""
+    engine = NativeEngine(
+        repo_path=str(temp_repo),
+        code_space="code--user123--testrepo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+
+    test_file = temp_repo / "test_module.py"
+    hash1 = engine._file_hash(test_file)
+    assert len(hash1) == 64  # SHA256 hex digest
+
+    # Same file should have same hash
+    hash2 = engine._file_hash(test_file)
+    assert hash1 == hash2
+
+
+def test_extraction_to_epistemic_mapping(mock_bridge, mock_settings):
+    """Test confidence → epistemic level mapping."""
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user123--testrepo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+
+    assert engine._extraction_to_epistemic("extracted") == "explicit"
+    assert engine._extraction_to_epistemic("inferred") == "deductive"
+    assert engine._extraction_to_epistemic("ambiguous") == "deductive"
+    assert engine._extraction_to_epistemic("unknown") == "deductive"
+
+
+def test_native_engine_query_no_symbols(mock_bridge, mock_settings):
+    """Test query() when no symbols match."""
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user123--testrepo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+
+    # Mock _search_symbols to return empty
+    engine._search_symbols = Mock(return_value=[])
+
+    result = engine.query("nonexistent")
+    assert "No symbols matching" in result
+    assert "code--user123--testrepo" in result
+
+
+def test_native_engine_neighbors_no_symbol(mock_bridge, mock_settings):
+    """Test neighbors() when symbol not found."""
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user123--testrepo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+
+    # Mock _find_symbol to return empty
+    engine._find_symbol = Mock(return_value=[])
+
+    result = engine.neighbors("nonexistent")
+    assert "No symbol matching" in result
+
+
+def test_native_engine_path_no_source(mock_bridge, mock_settings):
+    """Test path() when source symbol not found."""
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user123--testrepo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+
+    # Mock _find_symbol to return empty for source
+    engine._find_symbol = Mock(return_value=[])
+
+    result = engine.path("nonexistent", "target")
+    assert "No symbol matching source" in result
