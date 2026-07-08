@@ -237,6 +237,7 @@ class SearchMixin:
         concepts: list[str] | None,
         limit: int,
         query_embedding: list[float] | None = None,
+        workspaces: list[str] | None = None,
     ) -> list[MemoryResponse]:
         """Search the authoritative ``standard``-tier pool (dictator-written).
 
@@ -254,7 +255,7 @@ class SearchMixin:
             observation_type=observation_type,
             concepts=concepts,
             limit=limit,
-                            workspaces=workspaces,
+            workspaces=workspaces,
             query_embedding=query_embedding,
             visibility_value=MemoryVisibility.STANDARD.value,
         )
@@ -585,7 +586,7 @@ class SearchMixin:
                         observation_type=observation_type,
                         concepts=concepts,
                         limit=limit,
-                            workspaces=workspaces,
+                        workspaces=workspaces,
                         query_embedding=query_embedding,
                     )
                 )

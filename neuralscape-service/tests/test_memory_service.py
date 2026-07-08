@@ -2626,6 +2626,38 @@ class TestGraphEnrichment:
 
         assert _has_standard_unscoped(qf)
 
+    def test_search_standard_pool_forwards_workspaces(self, service):
+        """Regression (I1 merge): _search_standard_pool must accept + forward
+        ``workspaces`` to _search_shared_pool. dev shipped the wrapper body
+        referencing an undefined ``workspaces`` while omitting it from the
+        signature, so any standard-pool search raised NameError (swallowed as
+        'non-critical' → standards silently vanished from recall). This exercises
+        the real wrapper body so the NameError can't come back."""
+        from schemas import MemoryVisibility
+        captured = {}
+
+        def _fake_shared(**kwargs):
+            captured.update(kwargs)
+            return []
+
+        service._search_shared_pool = _fake_shared
+        out = service._search_standard_pool(
+            m=MagicMock(),
+            query="q",
+            project_id=None,
+            categories=None,
+            scope=None,
+            domain=None,
+            observation_type=None,
+            concepts=None,
+            limit=5,
+            query_embedding=[0.1, 0.2],
+            workspaces=["memory"],
+        )
+        assert out == []
+        assert captured["workspaces"] == ["memory"]
+        assert captured["visibility_value"] == MemoryVisibility.STANDARD.value
+
 
 class TestGraphFilterByV2:
     """Memory-model v2 — _enrich_and_filter_graph drops rows that don't match the filter."""

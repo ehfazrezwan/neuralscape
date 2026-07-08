@@ -180,3 +180,22 @@ class TestDictatorRole:
         cfg = _settings(dictator_user_ids="mark")
         assert cfg.is_dictator(None) is False
         assert cfg.is_dictator("") is False
+
+
+class TestCodeRepos:
+    """E2 config seam: the native code-intel engine resolves repo:<name> refs
+    through settings.code_repos. Without this field it was always {} and the
+    native engine was unreachable in production (Copilot I1 #5)."""
+
+    def test_default_empty(self):
+        cfg = _settings()
+        assert cfg.code_repos == {}
+
+    def test_dict_passed_through(self):
+        cfg = _settings(code_repos={"myrepo": "/abs/path"})
+        assert cfg.code_repos.get("myrepo") == "/abs/path"
+
+    def test_env_json_parsed(self, monkeypatch):
+        monkeypatch.setenv("CODE_REPOS", '{"r1":"/p1","r2":"/p2"}')
+        cfg = _settings()
+        assert cfg.code_repos == {"r1": "/p1", "r2": "/p2"}
