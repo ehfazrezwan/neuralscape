@@ -357,7 +357,7 @@ class NativeEngine:
                coalesce(s.degree, 0) AS degree
         """
         symbols = self._run_cypher(cypher, code_space=self.code_space)
-        scored: list[tuple[float, LocateHit]] = []
+        scored: list[tuple[float, dict]] = []
         for sym in symbols:
             fqn = sym.get("fqn") or ""
             file = sym.get("file")
@@ -372,24 +372,33 @@ class NativeEngine:
             lex = overlap / len(q_tokens)
             degree = sym.get("degree", 0) or 0
             score = lex * (1.0 + 0.01 * min(degree, 50))
+            scored.append((score, sym))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        # Build LocateHits (frozen) for ONLY the top-k, fetching attached
+        # memories per hit here — a common query token can overlap hundreds of
+        # symbols, so doing anchor lookups before truncation was O(matches)
+        # Neo4j round-trips and made locate pathological.
+        hits: list[LocateHit] = []
+        for score, sym in scored[:k]:
+            fqn = sym.get("fqn") or ""
             span = sym.get("span") or "1:1"
             try:
                 line = int(str(span).split(":")[0])
             except (ValueError, IndexError):
                 line = 0
-            scored.append((score, LocateHit(
+            mems = self._get_anchor_memories(fqn, user_id=user_id, limit=3)
+            hits.append(LocateHit(
                 fqn=fqn,
                 kind=sym.get("kind"),
-                file=file,
+                file=sym.get("file"),
                 line=line,
                 signature=None,
                 docstring=None,
                 score=score,
                 anchor_id=None,
-                memories=(self._get_anchor_memories(fqn, user_id=user_id, limit=3) or None),
-            )))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [hit for _, hit in scored[:k]]
+                memories=mems or None,
+            ))
+        return hits
 
     def _lexical_code_search(self, m, query: str, query_filter, limit: int) -> list:
         """BM25 lexical search for code_index collection (mirrors memory search).
