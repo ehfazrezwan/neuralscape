@@ -76,19 +76,27 @@ class NativeEngine:
         code_space: str,
         bridge: Any,
         settings: Any,
+        driver: Any = None,
     ):
         """Initialize with repo path and Neo4j bridge.
 
         Args:
             repo_path: Absolute path to the repo root.
             code_space: Partition key (code--{owner}--{repo}).
-            bridge: Graphiti bridge (provides .driver and ._loop).
+            bridge: Graphiti async bridge (provides ._loop / .run). NOTE: the
+                real mem0 ``_AsyncBridge`` does NOT expose ``.driver`` — the
+                Neo4j driver is passed separately as ``driver``. A mock bridge
+                carrying ``.driver`` still works via the fallback in _run_cypher.
             settings: Config object.
+            driver: Graphiti Neo4j async driver (``service._graphiti.driver``).
+                Required for live Cypher; None ⇒ _run_cypher falls back to
+                ``bridge.driver`` (mock/unit-test path).
         """
         self.repo_path = Path(repo_path)
         self.code_space = code_space
         self.bridge = bridge
         self.settings = settings
+        self.driver = driver
 
     def query(
         self,
@@ -1628,6 +1636,10 @@ class NativeEngine:
             fqn = sym["fqn"]
             kind = sym["kind"]
             file_path = sym["file"]
+            # External / inferred symbols may have no file — they can't be
+            # located or turned into a source-backed card, so skip them.
+            if not file_path:
+                continue
             span = sym["span"] or "1:1"
             line = int(span.split(":")[0])
             degree = sym["degree"]
@@ -1651,9 +1663,15 @@ class NativeEngine:
                 "anchor_id": None,  # E4: anchors deferred
             })
 
-        # Batch embed all cards
+        # Batch embed all cards. Gemini's batchEmbedContents caps at 100
+        # requests per call, so chunk to stay under the limit.
         logger.info(f"Embedding {len(cards)} symbol cards for code_index")
-        embeddings = m.embedding_model.embed_batch(cards, memory_action="add")
+        _EMBED_CHUNK = 100
+        embeddings: list = []
+        for i in range(0, len(cards), _EMBED_CHUNK):
+            embeddings.extend(
+                m.embedding_model.embed_batch(cards[i : i + _EMBED_CHUNK], memory_action="add")
+            )
 
         if len(embeddings) != len(cards):
             logger.warning(
@@ -2067,7 +2085,11 @@ class NativeEngine:
             raise RuntimeError("Bridge loop is not an asyncio event loop")
 
         async def _inner():
-            driver = self.bridge.driver
+            # The real mem0 _AsyncBridge has no .driver; use the injected
+            # Graphiti driver, falling back to bridge.driver for mock bridges.
+            driver = self.driver if self.driver is not None else getattr(self.bridge, "driver", None)
+            if driver is None:
+                raise RuntimeError("No Neo4j driver available (bridge has no .driver and none injected)")
             async with driver.session() as session:
                 result = await session.run(cypher, **params)
                 records = await result.data()

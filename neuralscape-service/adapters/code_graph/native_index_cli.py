@@ -112,11 +112,14 @@ def main(argv: list[str] | None = None) -> int:
 
         from adapters.code_graph.native_engine import NativeEngine
 
+        # Neo4j driver lives on the Graphiti client, not the _AsyncBridge.
+        driver = getattr(getattr(service, "_graphiti", None), "driver", None)
         engine = NativeEngine(
             repo_path=str(repo_path),
             code_space=code_space,
             bridge=bridge,
             settings=settings,
+            driver=driver,
         )
     except Exception as e:
         print(f"Error constructing NativeEngine: {e}", file=sys.stderr)

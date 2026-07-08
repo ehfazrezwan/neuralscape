@@ -36,12 +36,14 @@ def export_snapshot(repo_path: str, output_file: str, code_space: str):
     service = get_shared_service()
     service._get_memory()  # ensure bridge is initialized
     bridge = service._bridge
+    driver = getattr(getattr(service, "_graphiti", None), "driver", None)
 
     engine = NativeEngine(
         repo_path=repo_path,
         code_space=code_space,
         bridge=bridge,
         settings=settings,
+        driver=driver,
     )
 
     logger.info(f"Exporting snapshot from {code_space}...")
@@ -66,6 +68,7 @@ def import_snapshot(input_file: str, code_space: str):
     service = get_shared_service()
     service._get_memory()  # ensure bridge is initialized
     bridge = service._bridge
+    driver = getattr(getattr(service, "_graphiti", None), "driver", None)
 
     # Create engine (repo_path not needed for import, set dummy)
     engine = NativeEngine(
@@ -73,6 +76,7 @@ def import_snapshot(input_file: str, code_space: str):
         code_space=code_space,
         bridge=bridge,
         settings=settings,
+        driver=driver,
     )
 
     input_path = Path(input_file)

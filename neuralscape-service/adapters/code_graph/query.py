@@ -180,12 +180,15 @@ def _get_native_engine(repo_name: str, user_id: str, settings) -> CodeIntelEngin
         if bridge is None:
             raise CodeGraphError("Graphiti bridge not initialized (Neo4j unavailable)")
 
-        # Create NativeEngine
+        # Create NativeEngine. The Neo4j driver lives on the Graphiti client
+        # (service._graphiti.driver); the _AsyncBridge only carries the loop.
+        driver = getattr(getattr(service, "_graphiti", None), "driver", None)
         engine = NativeEngine(
             repo_path=str(repo_path),
             code_space=code_space,
             bridge=bridge,
             settings=settings,
+            driver=driver,
         )
         _ctx_cache[cache_key] = {"engine": engine}
         return engine

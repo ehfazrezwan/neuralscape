@@ -49,7 +49,7 @@ class NSIceAdapter:
 
     def __init__(
         self,
-        api_url: str = "http://localhost:8499",
+        api_url: str = "http://localhost:8599",
         python_bin: str = "python",
         rail: RailConfig | None = None,
         stack_dir: str | None = None,

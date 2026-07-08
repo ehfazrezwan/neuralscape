@@ -35,14 +35,14 @@ class CorpusSpec:
 
 # Pinned corpora (selected for ICEBench)
 PINNED_CORPORA = [
-    # Small Python (~10-30k LOC)
+    # Small Python (~10-30k LOC) — pinned + smoke-validated (pallets/click)
     CorpusSpec(
         name="small-py",
-        url="https://github.com/graphiti-ai/graphiti_core.git",
-        sha="a1b2c3d4e5f6",  # TODO: Pin actual SHA
+        url="https://github.com/pallets/click.git",
+        sha="8a4ce842564ae94ab050062db8525196ad476c19",
         language="python",
-        loc=15000,
-        file_count=120,
+        loc=27082,
+        file_count=76,
     ),
     # Medium Python (~100-300k LOC)
     CorpusSpec(
