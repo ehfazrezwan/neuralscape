@@ -42,8 +42,8 @@ class NSGraphifyAdapter:
 
     def __init__(
         self,
-        api_url: str = "http://localhost:8499",
-        graphify_bin: str = "/data/ice/tools/graphify",
+        api_url: str = "http://localhost:8599",
+        graphify_bin: str = "/data/ice/tools/graphify/.venv/bin/graphify",
         rail: RailConfig | None = None,
     ):
         """
@@ -70,7 +70,7 @@ class NSGraphifyAdapter:
 
     def _graph_json_path(self, corpus: Corpus) -> Path:
         """Path where graphify writes its graph.json for a corpus."""
-        return Path(corpus.path) / "graph.json"
+        return Path(corpus.path) / "graphify-out" / "graph.json"
 
     def index_cold(self, corpus: Corpus) -> IndexResult:
         """Run graphify CLI (under the rail) + ingest graph.json into NS."""
@@ -92,7 +92,7 @@ class NSGraphifyAdapter:
 
         # Heavy step: run graphify under the safety rail (measures RSS/CPU).
         res = run_with_rail(
-            [self.graphify_bin, "analyze", corpus.path],
+            [self.graphify_bin, "extract", corpus.path, "--code-only", "--no-cluster"],
             self.rail,
             cwd=Path(corpus.path),
         )

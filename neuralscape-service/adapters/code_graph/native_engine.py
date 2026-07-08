@@ -247,6 +247,12 @@ class NativeEngine:
 
         E4: Enriches results with attached memories (decisions/gotchas/bugfixes).
         """
+        # Deterministic-by-default: when cloud symbol-card embeddings are off,
+        # locate() uses a fully-local lexical rank over the Neo4j symbol graph
+        # (fqn/file tokens) + graph-degree — no embedder, no network.
+        if not getattr(self.settings, "code_index_embeddings", False):
+            return self._locate_deterministic(query, k=k, user_id=user_id)
+
         from qdrant_client.models import (
             FieldCondition,
             Filter,
@@ -327,6 +333,72 @@ class NativeEngine:
         # Sort by final score and return top k
         hits.sort(key=lambda x: x[0], reverse=True)
         return [hit for _, hit in hits[:k]]
+
+    def _locate_deterministic(
+        self, query: str, *, k: int = 10, user_id: str | None = None
+    ) -> list[LocateHit]:
+        """Deterministic, local, no-network locate (default when embeddings off).
+
+        Ranks :CodeSymbol nodes by lexical token overlap between the query and
+        each symbol's fqn/file, boosted by graph degree. Pure Neo4j read + local
+        scoring — reproducible and API-token-free.
+        """
+        import re as _re
+
+        def _tok(s: str) -> set[str]:
+            return {t for t in _re.split(r"[^a-zA-Z0-9]+", (s or "").lower()) if t}
+
+        q_tokens = _tok(query)
+        if not q_tokens:
+            return []
+        cypher = """
+        MATCH (s:CodeSymbol {code_space: $code_space})
+        RETURN s.fqn AS fqn, s.kind AS kind, s.file AS file, s.span AS span,
+               coalesce(s.degree, 0) AS degree
+        """
+        symbols = self._run_cypher(cypher, code_space=self.code_space)
+        scored: list[tuple[float, dict]] = []
+        for sym in symbols:
+            fqn = sym.get("fqn") or ""
+            file = sym.get("file")
+            cand_tokens = _tok(fqn) | _tok(file or "")
+            if not cand_tokens:
+                continue
+            overlap = len(q_tokens & cand_tokens)
+            if overlap == 0:
+                continue
+            # Lexical score = overlap fraction of the query; degree gives a small
+            # tie-break boost (capped) so hub symbols rank slightly higher.
+            lex = overlap / len(q_tokens)
+            degree = sym.get("degree", 0) or 0
+            score = lex * (1.0 + 0.01 * min(degree, 50))
+            scored.append((score, sym))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        # Build LocateHits (frozen) for ONLY the top-k, fetching attached
+        # memories per hit here — a common query token can overlap hundreds of
+        # symbols, so doing anchor lookups before truncation was O(matches)
+        # Neo4j round-trips and made locate pathological.
+        hits: list[LocateHit] = []
+        for score, sym in scored[:k]:
+            fqn = sym.get("fqn") or ""
+            span = sym.get("span") or "1:1"
+            try:
+                line = int(str(span).split(":")[0])
+            except (ValueError, IndexError):
+                line = 0
+            mems = self._get_anchor_memories(fqn, user_id=user_id, limit=3)
+            hits.append(LocateHit(
+                fqn=fqn,
+                kind=sym.get("kind"),
+                file=sym.get("file"),
+                line=line,
+                signature=None,
+                docstring=None,
+                score=score,
+                anchor_id=None,
+                memories=mems or None,
+            ))
+        return hits
 
     def _lexical_code_search(self, m, query: str, query_filter, limit: int) -> list:
         """BM25 lexical search for code_index collection (mirrors memory search).
@@ -1612,6 +1684,17 @@ class NativeEngine:
         from memory_service import get_shared_service
         from qdrant_client.models import PointStruct
         import uuid
+
+        # Deterministic-by-default: symbol-card embedding uses a cloud embedder,
+        # so it is opt-in (config.code_index_embeddings). When off, skip it
+        # entirely — the graph (nodes/edges/degree/community) is already built,
+        # and locate() falls back to BM25 + graph-degree (local, no network).
+        if not getattr(self.settings, "code_index_embeddings", False):
+            logger.info(
+                "code_index_embeddings=off — skipping symbol-card embedding "
+                "(deterministic/no-network default); locate() uses BM25+degree"
+            )
+            return
 
         service = get_shared_service()
         m = service._get_memory()

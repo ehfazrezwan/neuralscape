@@ -50,23 +50,43 @@ class ScoreReport:
     metadata: dict  # Includes shared-oracle-bias caveat, LSP agreement %, sample sizes
 
 
-def normalize_answer(answer: str | dict | None) -> tuple[str, str] | None:
+def normalize_answer(answer: str | dict | None, system: str = "", for_symbol_lookup: bool = False) -> tuple[str, str] | None:
     """
-    Normalize an answer to (file, symbol) tuple.
+    Normalize an answer to (file, symbol) tuple with per-system format handling.
 
     Args:
         answer: Raw answer from adapter (dict with "text", plain text, or None).
+        system: System name for format-specific parsing.
+        for_symbol_lookup: If True, parse for symbol_lookup op (different format).
 
     Returns:
-        (relative_path, symbol_fqn) or None if unparseable.
+        (relative_path, bare_symbol) or None if unparseable.
     """
     if answer is None:
         return None
 
-    # If answer is a dict, extract the text field
+    # If answer is a dict, extract system-specific data
     if isinstance(answer, dict):
         if "error" in answer or answer.get("status") == "error":
             return None
+
+        # CBM symbol_lookup returns {"data": {"results": [{name, qualified_name, file_path, line, ...}]}}
+        if system == "cbm" and for_symbol_lookup and "data" in answer:
+            data = answer.get("data", {})
+            results = data.get("results", [])
+            if results:
+                first = results[0]
+                # CBM uses "file_path" not "file"
+                file = first.get("file_path", "") or first.get("file", "")
+                name = first.get("name", "")
+                if file or name:
+                    return (_normalize_path(file), _normalize_bare_symbol(name))
+
+        # Graphify returns prose node description with "Source: file LNN"
+        if system == "graphify" and for_symbol_lookup:
+            text = answer.get("text", "")
+            return _parse_graphify_node_location(text)
+
         answer = answer.get("text", "")
 
     if not isinstance(answer, str):
@@ -75,6 +95,22 @@ def normalize_answer(answer: str | dict | None) -> tuple[str, str] | None:
     answer = answer.strip()
     if not answer:
         return None
+
+    # NS-ICE symbol_lookup returns empty result text (not supported properly)
+    # The format is: {"result": "Code graph search results for: <symbol>\n"}
+    # This means symbol_lookup is effectively unsupported for ns-ice
+    if system in ("ns-ice", "ns-ice-det") and for_symbol_lookup:
+        # Try to parse the JSON result
+        try:
+            parsed = json.loads(answer)
+            result = parsed.get("result", "")
+            # If it's just a header with no actual location data, return None
+            if "Code graph search results for:" in result and "\n" in result:
+                lines = result.split("\n")
+                if len(lines) <= 2:  # Just header + maybe empty line
+                    return None
+        except json.JSONDecodeError:
+            pass
 
     # Try to parse as JSON (adapters may return JSON arrays of results)
     try:
@@ -86,7 +122,16 @@ def normalize_answer(answer: str | dict | None) -> tuple[str, str] | None:
                 file = first.get("file", "")
                 symbol = first.get("symbol", "")
                 if file or symbol:
-                    return (_normalize_path(file), _normalize_symbol(symbol))
+                    return (_normalize_path(file), _normalize_bare_symbol(symbol))
+        elif isinstance(parsed, dict):
+            # NS-ICE nl_locate returns {"results": [{fqn, file, ...}]}
+            results = parsed.get("results", [])
+            if results and isinstance(results, list):
+                first = results[0]
+                file = first.get("file", "")
+                fqn = first.get("fqn", "")
+                if file or fqn:
+                    return (_normalize_path(file), _normalize_bare_symbol(fqn))
     except (json.JSONDecodeError, KeyError, IndexError):
         pass
 
@@ -96,9 +141,43 @@ def normalize_answer(answer: str | dict | None) -> tuple[str, str] | None:
     if len(parts) >= 2:
         file = parts[0]
         symbol = parts[-1]  # Last part is usually the symbol
-        return (_normalize_path(file), _normalize_symbol(symbol))
+        return (_normalize_path(file), _normalize_bare_symbol(symbol))
 
     # If no structure found, return None
+    return None
+
+
+def _parse_graphify_node_location(text: str) -> tuple[str, str] | None:
+    """
+    Parse Graphify's node description format for symbol location.
+
+    Format: "Node: symbol\n  ID: ...\n  Source: file.py LNN\n  ..."
+
+    Args:
+        text: Graphify node description.
+
+    Returns:
+        (file, symbol) tuple or None.
+    """
+    lines = text.split("\n")
+    symbol = ""
+    file = ""
+
+    for line in lines:
+        line = line.strip()
+        if line.startswith("Node:"):
+            # Extract symbol name (may have parens like "func()")
+            symbol = line.replace("Node:", "").strip()
+        elif line.startswith("Source:"):
+            # Extract file path (format: "file.py LNN" or "file.py L123")
+            source_part = line.replace("Source:", "").strip()
+            # Split on " L" to get file path
+            if " L" in source_part:
+                file = source_part.split(" L")[0].strip()
+
+    if file and symbol:
+        return (_normalize_path(file), _normalize_bare_symbol(symbol))
+
     return None
 
 
@@ -130,18 +209,6 @@ def _normalize_path(path: str) -> str:
     return str(p)
 
 
-def _normalize_symbol(symbol: str) -> str:
-    """
-    Normalize a symbol name.
-
-    Args:
-        symbol: Raw symbol name.
-
-    Returns:
-        Normalized symbol FQN.
-    """
-    # For now, just strip whitespace
-    return symbol.strip()
 
 
 def score_results(run_id: str, results_dir: Path) -> int:
@@ -352,15 +419,15 @@ def _score_nl_locate(
 
         gold_file = gold.get("file", "")
         gold_symbol = gold.get("symbol", "")
-        gold_normalized = (_normalize_path(gold_file), _normalize_symbol(gold_symbol))
+        gold_normalized = (_normalize_path(gold_file), _normalize_bare_symbol(gold_symbol))
 
         # Parse answer (may be a ranked list)
         answer = row.answer
         if not answer:
             continue
 
-        # Try to parse as JSON array of results
-        results = _parse_ranked_results(answer)
+        # Try to parse as JSON array of results (with system-specific format)
+        results = _parse_ranked_results(answer, system=system)
 
         # Check hits@k
         found_at = None
@@ -400,15 +467,16 @@ def _score_nl_locate(
     )
 
 
-def _parse_ranked_results(answer: str | dict) -> list[tuple[str, str]]:
+def _parse_ranked_results(answer: str | dict, system: str = "") -> list[tuple[str, str]]:
     """
-    Parse a ranked list of results from an answer.
+    Parse a ranked list of results from an answer with per-system format handling.
 
     Args:
         answer: Raw answer (could be dict or string).
+        system: System name for format-specific parsing.
 
     Returns:
-        List of (file, symbol) tuples in rank order.
+        List of (file, bare_symbol) tuples in rank order.
     """
     if isinstance(answer, dict):
         if "error" in answer or answer.get("status") == "error":
@@ -418,22 +486,35 @@ def _parse_ranked_results(answer: str | dict) -> list[tuple[str, str]]:
     if not isinstance(answer, str):
         return []
 
-    # Try to parse as JSON array
+    # Try to parse as JSON (NS-ICE returns JSON with "results" array)
     try:
         parsed = json.loads(answer)
+
+        # NS-ICE nl_locate: {"results": [{fqn, file, kind, ...}]}
+        if isinstance(parsed, dict) and "results" in parsed:
+            results = []
+            for item in parsed.get("results", []):
+                if isinstance(item, dict):
+                    file = item.get("file", "")
+                    fqn = item.get("fqn", "") or item.get("symbol", "")
+                    if file or fqn:
+                        results.append((_normalize_path(file), _normalize_bare_symbol(fqn)))
+            return results
+
+        # Generic JSON array
         if isinstance(parsed, list):
             results = []
             for item in parsed:
                 if isinstance(item, dict):
                     file = item.get("file", "")
-                    symbol = item.get("symbol", "")
-                    results.append((_normalize_path(file), _normalize_symbol(symbol)))
+                    symbol = item.get("symbol", "") or item.get("fqn", "")
+                    results.append((_normalize_path(file), _normalize_bare_symbol(symbol)))
             return results
     except json.JSONDecodeError:
         pass
 
     # Fallback: treat as single result
-    normalized = normalize_answer(answer)
+    normalized = normalize_answer(answer, system=system)
     if normalized:
         return [normalized]
 
@@ -488,9 +569,9 @@ def _score_structural(
 
             gold_file = gold.get("file", "")
             gold_symbol = gold.get("symbol", "")
-            gold_normalized = (_normalize_path(gold_file), _normalize_symbol(gold_symbol))
+            gold_normalized = (_normalize_path(gold_file), _normalize_bare_symbol(gold_symbol))
 
-            answer_normalized = normalize_answer(row.answer)
+            answer_normalized = normalize_answer(row.answer, system=system, for_symbol_lookup=True)
 
             if answer_normalized == gold_normalized:
                 hits += 1
@@ -517,10 +598,11 @@ def _score_structural(
             if not gold:
                 continue
 
-            gold_callers = set(gold.get("callers", []))
+            # Normalize gold callers to bare symbols
+            gold_callers = {_normalize_bare_symbol(c) for c in gold.get("callers", [])}
 
-            # Parse answer as a set of symbols
-            answer_callers = _parse_symbol_set(row.answer)
+            # Parse answer as a set of symbols (with system-specific normalization)
+            answer_callers = _parse_symbol_set(row.answer, system=system)
 
             if not answer_callers and not gold_callers:
                 # Both empty: perfect match
@@ -565,38 +647,168 @@ def _score_structural(
     )
 
 
-def _parse_symbol_set(answer: str | dict) -> set[str]:
+def _parse_symbol_set(answer: str | dict, system: str = "") -> set[str]:
     """
-    Parse a set of symbols from an answer.
+    Parse a set of symbols from an answer, with per-system format normalization.
 
     Args:
         answer: Raw answer.
+        system: System name for format-specific parsing.
 
     Returns:
-        Set of symbol names.
+        Set of normalized symbol names (bare symbols, lowercased).
     """
     if isinstance(answer, dict):
         if "error" in answer or answer.get("status") == "error":
             return set()
+
+        # CBM returns structured data.callers[]
+        if system == "cbm" and "data" in answer:
+            data = answer.get("data", {})
+            callers = data.get("callers", [])
+            return {_normalize_bare_symbol(c.get("name", "")) for c in callers if c.get("name")}
+
         answer = answer.get("text", "")
 
     if not isinstance(answer, str):
         return set()
 
-    # Try to parse as JSON array
+    # Graphify returns prose "Connections (N):\n  <-- name [relation]"
+    if system == "graphify":
+        return _parse_graphify_connections(answer)
+
+    # NS-ICE returns JSON string with "Neighbors of X:\n  <-- fqn [CALLS]"
+    if system in ("ns-ice", "ns-ice-det", "ns-graphify"):
+        return _parse_ns_ice_neighbors(answer)
+
+    # Generic fallback: try to parse as JSON array
     try:
         parsed = json.loads(answer)
         if isinstance(parsed, list):
-            return {str(item).strip() for item in parsed if item}
+            return {_normalize_bare_symbol(str(item)) for item in parsed if item}
     except json.JSONDecodeError:
         pass
 
-    # Fallback: split by commas or newlines
+    # Final fallback: split by commas or newlines
     symbols = set()
     for part in answer.replace(",", "\n").split("\n"):
         part = part.strip()
         if part:
-            symbols.add(part)
+            symbols.add(_normalize_bare_symbol(part))
+
+    return symbols
+
+
+def _normalize_bare_symbol(symbol: str) -> str:
+    """
+    Normalize a symbol to a bare name for comparison.
+
+    Extracts the last segment from dotted/qualified names, strips parens,
+    lowercases for case-insensitive matching.
+
+    Args:
+        symbol: Raw symbol name (may be qualified like "src.module.func" or "module::func").
+
+    Returns:
+        Bare symbol name, lowercased.
+    """
+    if not symbol:
+        return ""
+
+    # Strip whitespace and parentheses
+    symbol = symbol.strip().rstrip("()")
+
+    # Extract last segment from dotted or :: qualified names
+    if "." in symbol:
+        symbol = symbol.split(".")[-1]
+    elif "::" in symbol:
+        symbol = symbol.split("::")[-1]
+
+    return symbol.lower()
+
+
+def _parse_graphify_connections(text: str) -> set[str]:
+    """
+    Parse Graphify's prose connection format.
+
+    Format: "Connections (N):\n  <-- name [relation]\n  --> name [relation]"
+
+    Args:
+        text: Graphify answer text.
+
+    Returns:
+        Set of bare symbol names from connections (excludes file names).
+    """
+    symbols = set()
+
+    # Find the "Connections" section
+    lines = text.split("\n")
+    in_connections = False
+
+    for line in lines:
+        if "Connections (" in line:
+            in_connections = True
+            continue
+
+        if in_connections and line.strip():
+            # Parse lines like "  <-- name [relation]" or "  --> name [relation]"
+            line = line.strip()
+            if line.startswith("<--") or line.startswith("-->"):
+                # Extract the relation type
+                relation = ""
+                if "[" in line and "]" in line:
+                    relation_part = line[line.find("["):line.find("]")+1]
+                    relation = relation_part.strip("[]").strip().lower()
+
+                # Skip file containment relations (these are .py files, not symbols)
+                if relation in ("contains", "imports"):
+                    continue
+
+                # Extract the name between the arrow and the bracket
+                parts = line.split("[", 1)
+                if parts:
+                    name_part = parts[0].replace("<--", "").replace("-->", "").strip()
+                    # Skip file names (ending in .py, .js, etc.)
+                    if name_part and not name_part.endswith((".py", ".js", ".ts", ".go")):
+                        symbols.add(_normalize_bare_symbol(name_part))
+
+    return symbols
+
+
+def _parse_ns_ice_neighbors(text: str) -> set[str]:
+    """
+    Parse NS-ICE neighbor format.
+
+    Format (JSON string): {"result": "Neighbors of X:\\n  <-- fqn [CALLS] [inferred]", ...}
+
+    Args:
+        text: NS-ICE answer text (may be JSON string).
+
+    Returns:
+        Set of bare symbol names from neighbors.
+    """
+    symbols = set()
+
+    # Try to parse as JSON first
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            result = parsed.get("result", "")
+            if result:
+                text = result
+    except json.JSONDecodeError:
+        pass
+
+    # Parse lines like "  <-- fqn [CALLS]" or "  --> fqn [CALLS]"
+    for line in text.split("\n"):
+        line = line.strip()
+        if line.startswith("<--") or line.startswith("-->"):
+            # Extract FQN between arrow and bracket
+            parts = line.split("[", 1)
+            if parts:
+                fqn = parts[0].replace("<--", "").replace("-->", "").strip()
+                if fqn:
+                    symbols.add(_normalize_bare_symbol(fqn))
 
     return symbols
 
@@ -646,13 +858,28 @@ def _score_path(
         # Gold has a list of valid paths
         gold_paths = gold.get("paths", [])
 
-        # If gold has at least one path, and system returned a non-empty answer, count as hit
-        # (Simplified: we don't validate the path structure, just that something was found)
+        # If gold has at least one path, check if system found a path
         if gold_paths:
             answer = row.answer
             if answer and isinstance(answer, dict) and answer.get("status") == "ok":
-                text = answer.get("text", "")
-                if text and text.strip():
+                found_path = False
+
+                # CBM returns {"data": {"rows": [...]}} - non-empty rows means path found
+                if system == "cbm" and "data" in answer:
+                    data = answer.get("data", {})
+                    rows = data.get("rows", [])
+                    if rows:
+                        found_path = True
+
+                # NS-ICE/graphify return text with path description
+                else:
+                    text = answer.get("text", "")
+                    if text and text.strip():
+                        # Check if it's not a "no path" message
+                        if "no path" not in text.lower():
+                            found_path = True
+
+                if found_path:
                     hits += 1
 
     hit_rate = hits / n_supported if n_supported > 0 else 0.0
