@@ -45,6 +45,8 @@ def mock_settings():
     settings.code_graph_inferred_confidence = 0.7
     settings.code_graph_ambiguous_confidence = 0.5
     settings.code_graph_ambiguous_floor = 0.6
+    settings.code_graph_max_communities = 10
+    settings.code_graph_max_god_nodes = 15
     return settings
 
 
@@ -153,16 +155,49 @@ def test_native_engine_detect_changes_implemented(temp_repo, mock_bridge, mock_s
             assert hasattr(report, "summary")
 
 
-def test_native_engine_semantic_layer_not_implemented(mock_bridge, mock_settings):
-    """Test that semantic_layer() raises EngineCapabilityError (Louvain deferred)."""
+def test_native_engine_semantic_layer_implemented(mock_bridge, mock_settings):
+    """Test that semantic_layer() reads stored properties and emits facts (I2)."""
+    from unittest.mock import patch
+
     engine = NativeEngine(
         repo_path="/tmp/test",
         code_space="code--user123--testrepo",
         bridge=mock_bridge,
         settings=mock_settings,
     )
-    with pytest.raises(EngineCapabilityError, match="semantic_layer.*Louvain"):
-        engine.semantic_layer()
+
+    # Mock symbols with community_id and degree
+    mock_symbols = [
+        {"fqn": "mod.foo", "kind": "function", "file": "mod.py", "degree": 15, "community_id": 0},
+        {"fqn": "mod.bar", "kind": "class", "file": "mod.py", "degree": 8, "community_id": 0},
+        {"fqn": "util.baz", "kind": "function", "file": "util.py", "degree": 3, "community_id": 1},
+        {"fqn": "main.run", "kind": "function", "file": "main.py", "degree": 1, "community_id": -1},  # singleton
+    ]
+
+    with patch.object(engine, "_run_cypher", return_value=mock_symbols):
+        facts = engine.semantic_layer()
+
+    # Should return SemanticFact objects
+    assert isinstance(facts, list)
+    assert len(facts) > 0
+
+    # Should have community facts
+    community_facts = [f for f in facts if f.category == "module"]
+    assert len(community_facts) == 2  # communities 0 and 1
+
+    # Should have hotspot facts (degree >= 10)
+    hotspot_facts = [f for f in facts if f.category == "hotspot"]
+    assert len(hotspot_facts) == 1  # only mod.foo has degree >= 10
+
+    # Verify hotspot fact content
+    hotspot = hotspot_facts[0]
+    assert "mod.foo" in hotspot.content
+    assert "degree 15" in hotspot.content
+    # Hotspot facts are structure-derived → deductive (matches semantic.py)
+    assert hotspot.epistemic_level == "deductive"
+
+    # Community/module facts are inductive
+    assert all(f.epistemic_level == "inductive" for f in community_facts)
 
 
 def test_native_engine_export_snapshot_implemented(mock_bridge, mock_settings):
@@ -550,3 +585,243 @@ def test_native_engine_path_no_source(mock_bridge, mock_settings):
 
     result = engine.path("nonexistent", "target")
     assert "No symbol matching source" in result
+
+
+# ── I2: Louvain community tests ──────────────────────────────────────
+
+
+def test_compute_communities_stable_ids(mock_bridge, mock_settings):
+    """Test that community_id assignment is deterministic (same graph => same ids)."""
+    from unittest.mock import patch, MagicMock
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user123--testrepo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+
+    # Mock a connected graph: A -> B -> C, D -> E (2 components)
+    edges = [
+        {"source": "mod.A", "target": "mod.B"},
+        {"source": "mod.B", "target": "mod.C"},
+        {"source": "mod.D", "target": "mod.E"},
+    ]
+    all_symbols = [
+        {"fqn": "mod.A"},
+        {"fqn": "mod.B"},
+        {"fqn": "mod.C"},
+        {"fqn": "mod.D"},
+        {"fqn": "mod.E"},
+        {"fqn": "mod.F"},  # isolated symbol
+    ]
+
+    # Run community computation twice, capture the batch data from the UNWIND call
+    batch_data_list = []
+
+    # First run
+    with patch.object(engine, "_run_cypher") as mock_cypher:
+        mock_cypher.side_effect = [edges, all_symbols, []]
+        engine._compute_communities()
+
+        # Find the call with batch parameter
+        for call in mock_cypher.call_args_list:
+            if "batch" in call.kwargs:
+                batch = sorted(call.kwargs["batch"], key=lambda x: x["fqn"])
+                batch_data_list.append(batch)
+
+    # Second run
+    with patch.object(engine, "_run_cypher") as mock_cypher:
+        mock_cypher.side_effect = [edges, all_symbols, []]
+        engine._compute_communities()
+
+        # Find the call with batch parameter
+        for call in mock_cypher.call_args_list:
+            if "batch" in call.kwargs:
+                batch = sorted(call.kwargs["batch"], key=lambda x: x["fqn"])
+                batch_data_list.append(batch)
+
+    # Verify both runs produced identical assignments
+    assert len(batch_data_list) == 2
+    assert batch_data_list[0] == batch_data_list[1]
+
+    # Verify isolated symbol got community_id = -1
+    batch_data = batch_data_list[0]
+    isolated = [b for b in batch_data if b["fqn"] == "mod.F"]
+    assert len(isolated) == 1
+    assert isolated[0]["community_id"] == -1
+
+
+def test_compute_communities_guards_large_graphs(mock_bridge, mock_settings):
+    """Test that >200k edge graphs are skipped with a warning."""
+    from unittest.mock import patch
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user123--testrepo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+
+    # Lightweight stand-in for a >200k-edge result: the guard only calls len(),
+    # then returns immediately — no need to allocate 200k real elements.
+    class _FakeEdges:
+        def __len__(self):
+            return 200_001
+
+    with patch.object(engine, "_run_cypher", return_value=_FakeEdges()):
+        with patch("adapters.code_graph.native_engine.logger") as mock_logger:
+            engine._compute_communities()
+
+            # Verify warning was logged
+            mock_logger.warning.assert_called_once()
+            warning_msg = mock_logger.warning.call_args[0][0]
+            assert "200k limit" in warning_msg or "200000" in warning_msg
+
+
+def test_compute_communities_empty_graph(mock_bridge, mock_settings):
+    """Test that empty graphs (no CALLS/IMPORTS) still populate community_id = -1.
+
+    The no-edges early return MUST NOT leave community_id unset — otherwise
+    semantic_layer() (which filters community_id IS NOT NULL) drops all symbols.
+    """
+    from unittest.mock import patch
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user123--testrepo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+
+    with patch.object(engine, "_run_cypher", return_value=[]) as mock_cypher:
+        with patch.object(engine, "_run_cypher_with_retry") as mock_retry:
+            with patch("adapters.code_graph.native_engine.logger") as mock_logger:
+                engine._compute_communities()
+
+                # Verify info log about no graph
+                assert mock_logger.info.called
+
+                # Verify singleton community_id = -1 is persisted on all symbols
+                assert mock_retry.called
+                persist_cypher = mock_retry.call_args[0][0]
+                assert "SET s.community_id = -1" in persist_cypher
+
+
+def test_reindex_stable_community_ids(mock_bridge, mock_settings):
+    """Test that reindexing with unchanged graph keeps community_id stable."""
+    from unittest.mock import patch
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user123--testrepo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+
+    # Fixed graph: A <-> B, C <-> D
+    edges = [
+        {"source": "mod.A", "target": "mod.B"},
+        {"source": "mod.B", "target": "mod.A"},
+        {"source": "mod.C", "target": "mod.D"},
+        {"source": "mod.D", "target": "mod.C"},
+    ]
+    all_symbols = [
+        {"fqn": "mod.A"},
+        {"fqn": "mod.B"},
+        {"fqn": "mod.C"},
+        {"fqn": "mod.D"},
+    ]
+
+    # Run twice, capture assignments
+    assignments = []
+
+    # First run
+    with patch.object(engine, "_run_cypher") as mock_cypher:
+        mock_cypher.side_effect = [edges, all_symbols, []]
+        engine._compute_communities()
+
+        # Extract batch from the UNWIND call
+        for call in mock_cypher.call_args_list:
+            if "batch" in call.kwargs:
+                batch = sorted(call.kwargs["batch"], key=lambda x: x["fqn"])
+                assignments.append({b["fqn"]: b["community_id"] for b in batch})
+
+    # Second run
+    with patch.object(engine, "_run_cypher") as mock_cypher:
+        mock_cypher.side_effect = [edges, all_symbols, []]
+        engine._compute_communities()
+
+        # Extract batch from the UNWIND call
+        for call in mock_cypher.call_args_list:
+            if "batch" in call.kwargs:
+                batch = sorted(call.kwargs["batch"], key=lambda x: x["fqn"])
+                assignments.append({b["fqn"]: b["community_id"] for b in batch})
+
+    # Verify both runs produced identical assignments
+    assert len(assignments) == 2
+    assert assignments[0] == assignments[1]
+
+
+def test_semantic_layer_no_communities(mock_bridge, mock_settings):
+    """Test semantic_layer() gracefully handles no community data."""
+    from unittest.mock import patch
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user123--testrepo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+
+    with patch.object(engine, "_run_cypher", return_value=[]):
+        facts = engine.semantic_layer()
+
+    # Should return empty list, not crash
+    assert isinstance(facts, list)
+    assert len(facts) == 0
+
+
+def test_semantic_layer_respects_config_limits(mock_bridge, mock_settings):
+    """Test that semantic_layer() respects max_communities and max_god_nodes settings."""
+    from unittest.mock import patch
+
+    # Override settings
+    mock_settings.code_graph_max_communities = 2
+    mock_settings.code_graph_max_god_nodes = 1
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user123--testrepo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+
+    # Create 3 communities with varying sizes
+    mock_symbols = [
+        # Community 0: 5 symbols (largest)
+        {"fqn": "c0.a", "kind": "function", "file": "c0.py", "degree": 20, "community_id": 0},
+        {"fqn": "c0.b", "kind": "function", "file": "c0.py", "degree": 15, "community_id": 0},
+        {"fqn": "c0.c", "kind": "function", "file": "c0.py", "degree": 12, "community_id": 0},
+        {"fqn": "c0.d", "kind": "function", "file": "c0.py", "degree": 8, "community_id": 0},
+        {"fqn": "c0.e", "kind": "function", "file": "c0.py", "degree": 5, "community_id": 0},
+        # Community 1: 3 symbols
+        {"fqn": "c1.a", "kind": "function", "file": "c1.py", "degree": 11, "community_id": 1},
+        {"fqn": "c1.b", "kind": "function", "file": "c1.py", "degree": 3, "community_id": 1},
+        {"fqn": "c1.c", "kind": "function", "file": "c1.py", "degree": 2, "community_id": 1},
+        # Community 2: 2 symbols (smallest, should be excluded)
+        {"fqn": "c2.a", "kind": "function", "file": "c2.py", "degree": 4, "community_id": 2},
+        {"fqn": "c2.b", "kind": "function", "file": "c2.py", "degree": 1, "community_id": 2},
+    ]
+
+    with patch.object(engine, "_run_cypher", return_value=mock_symbols):
+        facts = engine.semantic_layer()
+
+    # Should have exactly 2 community facts (max_communities=2)
+    community_facts = [f for f in facts if f.category == "module"]
+    assert len(community_facts) == 2
+
+    # Should have exactly 1 hotspot fact (max_god_nodes=1), the highest degree
+    hotspot_facts = [f for f in facts if f.category == "hotspot"]
+    assert len(hotspot_facts) == 1
+    assert "c0.a" in hotspot_facts[0].content  # degree 20 is highest
