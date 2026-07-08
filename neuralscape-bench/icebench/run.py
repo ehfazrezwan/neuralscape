@@ -229,13 +229,12 @@ def cmd_index(args: argparse.Namespace) -> int:
                 rail_config,
             )
 
-            # Teardown: drop indexed state so shared services (Neo4j/Qdrant)
-            # don't accumulate and skew results / fill the tight root disk.
-            try:
-                system.teardown(corpus)
-            except Exception as e:
-                print(f"  teardown ERROR: {e}", file=sys.stderr)
-
+    # NOTE: teardown is intentionally NOT called here. index and query are
+    # separate runner invocations (processes); tearing down the index at the end
+    # of the index phase leaves the query phase with nothing to query (the
+    # competitor adapters store their index on disk / in the tool's own store,
+    # not in adapter instance memory). Cleanup is the caller's responsibility
+    # AFTER querying (see `teardown` subcommand / manual cleanup between runs).
     print("\nIndex benchmark complete")
     return 0
 
