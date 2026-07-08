@@ -312,6 +312,14 @@ class Settings(BaseSettings):
     # pre-E2 behavior. Additive + optional (default {}), so nothing changes for
     # deployments that don't opt in.
     code_repos: dict[str, str] = {}
+    # Deterministic-by-default (product directive): the native code-intel engine
+    # must be deterministic + API-token-free by default. Symbol-card embedding at
+    # index time and the dense leg of `locate` go through a cloud embedder
+    # (Gemini) — so they are OPT-IN. Default OFF ⇒ index skips symbol-card
+    # embedding entirely and `locate` degrades gracefully to BM25 + graph-degree
+    # (local, deterministic, no network). Set true to enable cloud semantic
+    # locate. (A local-embedder option is a planned follow-up.)
+    code_index_embeddings: bool = False
     # Confidence assigned per Graphify edge/insight confidence tag (F1 epistemic
     # mapping): EXTRACTED → epistemic_level="explicit", INFERRED → "deductive"
     # with reduced confidence, AMBIGUOUS → stored only when its assigned

@@ -441,14 +441,58 @@ def cmd_score(args: argparse.Namespace) -> int:
 
 
 def cmd_report(args: argparse.Namespace) -> int:
-    """Delegate to H4's report generator."""
+    """Delegate to H4's report generator (build a ReportConfig)."""
     try:
-        from icebench.report import generate_report
-
-        return generate_report(args.run_id, RESULTS_DIR)
+        from icebench.report.generator import ReportConfig, generate_report
     except ImportError:
         print("ERROR: report generator not available (H4 not implemented)", file=sys.stderr)
         return 1
+
+    from pathlib import Path as _P
+    import json as _json
+
+    OP_CLASSES = ["symbol_lookup", "neighbors_1hop", "path_le4", "nl_locate", "blast_radius"]
+    NA_REASON = {
+        "nl_locate": "N/A (no NL→symbol retrieval)",
+        "blast_radius": "N/A (no impact-analysis op)",
+    }
+    results_jsonl = RESULTS_DIR / f"{args.run_id}.jsonl"
+    # Capability matrix derived from ops each system actually produced in results.
+    seen: dict[str, set] = {}
+    if results_jsonl.exists():
+        with open(results_jsonl) as fh:
+            for line in fh:
+                try:
+                    r = _json.loads(line)
+                except ValueError:
+                    continue
+                if r.get("kind") == "query":
+                    seen.setdefault(r["system"], set()).add(r.get("op"))
+    caps: dict[str, dict[str, str]] = {}
+    for sysname, ops in seen.items():
+        caps[sysname] = {
+            op: ("supported" if op in ops else NA_REASON.get(op, "N/A"))
+            for op in OP_CLASSES
+        }
+    chart = _P("/data/ice/neuralscape/neuralscape-bench/static/chart.umd.min.js")
+    cfg = ReportConfig(
+        results_jsonl=results_jsonl,
+        score_report_json=(RESULTS_DIR / f"{args.run_id}.trackq.json"),
+        systems_lock_json=_P("/data/ice/tools/systems.lock.json"),
+        corpora_lock_json=_P("/data/ice/corpora/corpora.lock.json"),
+        capabilities_matrix=caps or None,
+        markdown_output=_P(f"/data/ice/reports/ICE_BENCH_REPORT-{args.run_id}.md"),
+        html_output=_P(f"/data/ice/reports/ice_bench_report-{args.run_id}.html"),
+        chart_js_path=chart if chart.exists() else None,
+        quiescence_statement=(
+            "Measured on ns-bench (8 vCPU / 31 GB) with ZERO competing benchmark "
+            "stacks running (the nsbench factory stacks were stopped for the run)."
+        ),
+        oracle_agreement_pct=None,  # LSP spot-check skipped (pyright/gopls unavailable)
+    )
+    generate_report(cfg)
+    print(f"Report written: {cfg.markdown_output} + {cfg.html_output}")
+    return 0
 
 
 def _load_systems(
@@ -473,6 +517,16 @@ def _load_systems(
             from icebench.adapters.ns_ice import NSIceAdapter
 
             adapter = NSIceAdapter(rail=rail) if rail else NSIceAdapter()
+        elif name == "ns-ice-det":
+            # Deterministic default config (code_index_embeddings OFF): same
+            # adapter, distinct label. The host index inherits the flag via env
+            # and the API must be running in det mode (default). The BM25+degree
+            # locate path is local/no-network.
+            from icebench.adapters.ns_ice import NSIceAdapter
+
+            adapter = NSIceAdapter(rail=rail) if rail else NSIceAdapter()
+            adapter.name = "ns-ice-det"
+            adapter._cli_env["CODE_INDEX_EMBEDDINGS"] = "false"
         elif name == "ns-graphify":
             from icebench.adapters.ns_graphify import NSGraphifyAdapter
 

@@ -587,6 +587,33 @@ def test_native_engine_path_no_source(mock_bridge, mock_settings):
     assert "No symbol matching source" in result
 
 
+def test_code_index_embeddings_off_skips_embed_and_uses_deterministic_locate(mock_bridge, mock_settings):
+    """DET-1 (deterministic default): with code_index_embeddings OFF,
+    _index_symbol_cards must NOT embed (no cloud call) and locate() must use the
+    local Neo4j lexical+degree path (no embedder), returning ranked hits."""
+    from unittest.mock import patch, MagicMock
+    mock_settings.code_index_embeddings = False
+    eng = NativeEngine(
+        repo_path="/repo", code_space="code--u--r",
+        bridge=mock_bridge, settings=mock_settings, driver=MagicMock(),
+    )
+    # (1) index-time: embedding is skipped entirely.
+    m = MagicMock()
+    with patch("memory_service.get_shared_service", return_value=MagicMock(_get_memory=lambda: m)):
+        eng._index_symbol_cards(Path("/repo"))
+    m.embedding_model.embed_batch.assert_not_called()
+
+    # (2) locate: deterministic local rank over Neo4j symbols (no embedder).
+    syms = [
+        {"fqn": "click.Command", "kind": "class", "file": "click/core.py", "span": "10:20", "degree": 30},
+        {"fqn": "click.testing.CliRunner", "kind": "class", "file": "click/testing.py", "span": "5:9", "degree": 3},
+    ]
+    with patch.object(eng, "_run_cypher", return_value=syms), \
+         patch.object(eng, "_get_anchor_memories", return_value=[]):
+        hits = eng.locate("Command", k=5)
+    assert hits and hits[0].fqn == "click.Command"  # token overlap ranks it first
+
+
 def test_native_engine_stores_injected_driver(mock_bridge, mock_settings):
     """Engine runtime fix: the real mem0 _AsyncBridge has no .driver, so the
     Neo4j driver must be injected via the `driver` param and stored for
