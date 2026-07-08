@@ -64,6 +64,7 @@ class PoolBatch:
     visibility: str          # "shared" | "private"
     owner_user_id: str | None
     project_id: str | None
+    workspace: str | None = None  # WT6: absent/"memory" = memory type, else reference workspace
     memories: list[dict] = field(default_factory=list)
     new_count: int = 0       # new/changed since last dream (volume gate input)
 
@@ -78,12 +79,17 @@ class ActionResult:
 # ── Pool enumeration + LIGHT staging ────────────────────────────────
 
 
-def pool_key(*, visibility: str, owner_user_id: str | None, project_id: str | None) -> str:
-    """Derive the pool key for a memory row (mirrors graph group_id)."""
+def pool_key(*, visibility: str, owner_user_id: str | None, project_id: str | None, workspace: str | None = None) -> str:
+    """Derive the pool key for a memory row (mirrors graph group_id + WT6 workspace suffix)."""
     if visibility == "shared":
-        return f"shared--project--{project_id}" if project_id else "shared"
-    uid = owner_user_id or "unknown"
-    return f"user--{uid}--project--{project_id}" if project_id else f"user--{uid}"
+        base = f"shared--project--{project_id}" if project_id else "shared"
+    else:
+        uid = owner_user_id or "unknown"
+        base = f"user--{uid}--project--{project_id}" if project_id else f"user--{uid}"
+    # Workspace suffix (WT6): absent or "memory" ⇒ no suffix (backward compatible)
+    if workspace and workspace != "memory":
+        return f"{base}--ws--{workspace}"
+    return base
 
 
 # Audit 27 #29: the enumeration scroll pulls ONLY the fields the cheap
@@ -100,6 +106,8 @@ _LIGHT_SCROLL_FIELDS = [
     "metadata.project_id",
     "metadata.dream_tombstoned",
     "metadata.source_type",
+    # WT6: workspace partition for separate pool derivation
+    "metadata.workspace",
     # legacy double-wrapped rows keep their inner dict reachable
     "metadata.metadata",
 ]
@@ -148,11 +156,13 @@ def enumerate_pools(service, *, batch_size: int = 500) -> dict[str, PoolBatch]:
                 continue  # already consolidated away
             owner = meta.get("owner_user_id") or payload.get("user_id")
             project_id = meta.get("project_id")
+            workspace = meta.get("workspace")  # WT6: separate pools per workspace
             is_shared = visibility == "shared"
             key = pool_key(
                 visibility="shared" if is_shared else "private",
                 owner_user_id=None if is_shared else owner,
                 project_id=project_id,
+                workspace=workspace,
             )
             batch = pools.get(key)
             if batch is None:
@@ -162,6 +172,7 @@ def enumerate_pools(service, *, batch_size: int = 500) -> dict[str, PoolBatch]:
                     visibility="shared" if visibility == "shared" else "private",
                     owner_user_id=None if visibility == "shared" else owner,
                     project_id=project_id,
+                    workspace=workspace,
                 )
                 pools[key] = batch
             batch.memories.append(
@@ -339,9 +350,15 @@ async def decide(batch: PoolBatch, llm_call) -> list[dict]:
     (audit 27 #27) — "the LLM never examined this pool" must be
     distinguishable from "the LLM examined it and chose no actions"
     (``{"actions": []}``), because only the latter is a completed sweep.
+
+    WT6: reference workspaces (workspace ≠ None/memory) run a restricted
+    action set — MERGE (dedup) + graded PRUNE only; no REFLECTION or
+    TEMPORAL_REFRAME of reference content (which is imported doctrine, not
+    user-facts to reframe or reflect on).
     """
     if not batch.memories:
         return []
+    is_reference_workspace = batch.workspace and batch.workspace != "memory"
     now = datetime.now(timezone.utc)
     prompt = CONSOLIDATION_PROMPT.format(
         today=now.date().isoformat(),
@@ -371,6 +388,14 @@ async def decide(batch: PoolBatch, llm_call) -> list[dict]:
     valid: list[dict] = []
     for act in actions:
         a_type = act.get("type")
+        # WT6: reference workspace action filter — only MERGE and graded PRUNE.
+        # No REFLECTION (would treat reference doctrine as user insights) or
+        # TEMPORAL_REFRAME (reframing "I do X" doesn't apply to reference text).
+        # INVALIDATE is also excluded: reference content isn't contradiction-
+        # reconcilable — the source is authoritative until re-ingested.
+        if is_reference_workspace:
+            if a_type not in ("merge", "prune"):
+                continue
         mids = [m for m in (act.get("memory_ids") or []) if m in known_ids]
         if a_type == "merge":
             # Enforce the prompt contract in code: dream-authored insights

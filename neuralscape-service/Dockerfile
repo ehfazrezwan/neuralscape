@@ -23,7 +23,8 @@ COPY neuralscape-service/connectors/ neuralscape-service/connectors/
 COPY neuralscape-service/okf/ neuralscape-service/okf/
 
 # Install all dependencies using uv from the neuralscape-service project
-RUN cd neuralscape-service && uv sync --frozen --no-dev
+# E2: include the code-graph extra (tree-sitter + graphifyy) in the builder
+RUN cd neuralscape-service && uv sync --frozen --no-dev --extra code-graph
 
 # Download the small English spaCy model so mem0's keyword-extraction
 # layer finds it at import time. Without this the worker logs a
@@ -115,7 +116,8 @@ COPY neuralscape-service/connectors/ neuralscape-service/connectors/
 COPY neuralscape-service/okf/ neuralscape-service/okf/
 
 # Resolve WITH dev deps so pytest, pytest-asyncio, etc. are available.
-RUN cd neuralscape-service && uv sync --frozen
+# E2: include the code-graph extra so in-container tests can import tree-sitter
+RUN cd neuralscape-service && uv sync --frozen --extra code-graph
 
 # Same spaCy model handling as the runtime stage so unit tests that
 # import mem0's NLP path see the same dependency graph as production.

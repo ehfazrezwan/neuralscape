@@ -21,26 +21,48 @@ class DeleteMixin:
     def delete_memory(self, memory_id: str, caller_user_id: str | None = None) -> dict:
         """Delete a single memory by ID from both vector store and graph.
 
-        ``caller_user_id`` gates deletion of authoritative ``standard``-tier
-        memories to dictators. This is the only delete path with no user
-        namespacing (bulk deletes are already scoped by ``user_id``), so
-        without this check any caller could remove a binding standard by ID.
+        ``caller_user_id`` enforces the same ownership/visibility rules as
+        bulk delete: private memories are owner-only; shared memories allow
+        deletion by the author or a dictator; standard-tier memories are
+        dictator-only. This is the only delete path with no user namespacing
+        (bulk deletes are already scoped by ``user_id``), so without this
+        check any caller could remove anyone's private memory or a binding
+        standard by ID.
         """
         m = self._get_memory()
 
         # First, get the memory content to find related graph edges
         mem = m.get(memory_id)
 
-        # Standard-tier delete protection: only a dictator may remove standards.
-        if mem is not None:
-            try:
-                vis = getattr(self._mem_to_response(mem), "visibility", None)
-            except Exception:
-                vis = None
-            if vis == MemoryVisibility.STANDARD.value and not settings.is_dictator(caller_user_id):
-                raise PermissionError(
-                    "Only a dictator may delete 'standard'-tier memories."
-                )
+        # Permission gate: enforce ownership/visibility rules when caller_user_id
+        # is provided (backward-compatible: None skips the gate, existing tests).
+        if mem is not None and caller_user_id is not None:
+            metadata = mem.get("metadata", {}) or {}
+            # Unwrap mem0's potential double-wrap
+            if isinstance(metadata.get("metadata"), dict):
+                metadata = metadata["metadata"]
+            owner = metadata.get("owner_user_id") or mem.get("user_id", "")
+            vis = metadata.get("visibility") or MemoryVisibility.PRIVATE.value
+
+            # Dictators may delete anything
+            if not settings.is_dictator(caller_user_id):
+                # Standard tier: dictator-only
+                if vis == MemoryVisibility.STANDARD.value:
+                    raise PermissionError(
+                        "Only a dictator may delete 'standard'-tier memories."
+                    )
+                # Shared tier: author or dictator
+                elif vis == MemoryVisibility.SHARED.value:
+                    if caller_user_id != owner:
+                        raise PermissionError(
+                            f"Only the memory's owner may delete it (owner: {owner!r})."
+                        )
+                # Private tier (or legacy null visibility): owner-only
+                else:
+                    if caller_user_id != owner:
+                        raise PermissionError(
+                            f"Only the memory's owner may delete it (owner: {owner!r})."
+                        )
 
         result = m.delete(memory_id)
 

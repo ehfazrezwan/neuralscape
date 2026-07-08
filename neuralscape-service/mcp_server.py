@@ -1186,6 +1186,27 @@ def _code_graph_tools() -> list[Tool]:
                 "required": ["source", "target"],
             },
         ),
+        Tool(
+            name="locate",
+            description=(
+                "Hybrid code retrieval: find symbols (functions, classes, methods) by "
+                "natural-language description or name pattern. Uses dense embeddings + "
+                "BM25 lexical search + graph degree signal for ranking. Returns file:line "
+                "locations with signatures and docstrings. Use this to find relevant code "
+                "before diving into structure queries (query_code_graph, get_code_neighbors, "
+                "code_path). E3: requires NativeEngine (repo:<name> refs); raises "
+                "EngineCapabilityError on GraphifyJsonEngine (.json artifacts)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Natural-language description or symbol name pattern (e.g., 'authentication logic', 'UserManager')"},
+                    "k": {"type": "integer", "default": 10, "description": "Max hits to return (1-50)"},
+                    **_CODE_GRAPH_COMMON_PROPS,
+                },
+                "required": ["query"],
+            },
+        ),
     ]
 
 
@@ -1741,8 +1762,8 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps(
                 {"status": "accepted", "task_id": task_id}))]
 
-        elif name in ("query_code_graph", "get_code_neighbors", "code_path"):
-            # NS-surface delegations to the graphifyy library (roadmap F2:
+        elif name in ("query_code_graph", "get_code_neighbors", "code_path", "locate"):
+            # NS-surface delegations to the code-graph adapter (roadmap F2:
             # the interaction interface is ALWAYS Neuralscape). Availability-
             # gated: without the optional extra these tools aren't listed, but
             # a stale client may still call them — answer with the remedy.
@@ -1754,6 +1775,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 CodeGraphError,
                 code_path,
                 get_code_neighbors,
+                locate_symbols,
                 query_code_graph,
             )
 
@@ -1778,7 +1800,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                         graph_id=arguments.get("graph_id"),
                         relation_filter=arguments.get("relation_filter", ""),
                     )
-                else:  # code_path
+                elif name == "code_path":
                     text = await asyncio.to_thread(
                         code_path,
                         arguments["source"],
@@ -1788,8 +1810,23 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                         graph_id=arguments.get("graph_id"),
                         max_hops=arguments.get("max_hops", 8),
                     )
+                else:  # locate
+                    hits = await asyncio.to_thread(
+                        locate_symbols,
+                        arguments["query"],
+                        user_id=user_id,
+                        settings=settings,
+                        graph_id=arguments.get("graph_id"),
+                        k=arguments.get("k", 10),
+                    )
+                    # Format locate results as JSON (list of LocateHit dicts)
+                    from dataclasses import asdict
+                    output = [asdict(hit) for hit in hits]
+                    return [TextContent(type="text", text=json.dumps(output, default=str, ensure_ascii=False))]
             except CodeGraphError as e:
                 return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+            except Exception as e:
+                return [TextContent(type="text", text=json.dumps({"error": f"locate failed: {e}"}))]
             return [TextContent(type="text", text=text)]
 
         elif name == "schedule_dream":

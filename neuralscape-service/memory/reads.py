@@ -72,9 +72,13 @@ class ReadsMixin:
 
         # Flatten to a deterministically ordered list (newest first) so paging
         # is stable across calls. created_at may be absent → fall back to id.
+        # Exclude dream-tombstoned rows by default (same must_not as search).
         flat: list[tuple[str, MemoryResponse]] = []
         for result_set in [global_result, project_result]:
             for mem in self._extract_memory_list(result_set):
+                # Exclude dream tombstones (same filter as search/list_memories)
+                if _mem_is_tombstoned(mem):
+                    continue
                 response = self._mem_to_response(mem)
                 # Bucket by the response's resolved category — `_mem_to_response`
                 # unwraps mem0's nested `{metadata: {metadata: {...}}}` shape, so
@@ -145,6 +149,9 @@ class ReadsMixin:
         categories: dict[str, list[MemoryResponse]] = {}
         memories = self._extract_memory_list(result)
         for mem in memories:
+            # Exclude dream tombstones (same filter as search/list_memories)
+            if _mem_is_tombstoned(mem):
+                continue
             response = self._mem_to_response(mem)
             cat = getattr(response, "category", None) or "personal_fact"
             if cat not in categories:
@@ -159,7 +166,8 @@ class ReadsMixin:
 
         # Global context isn't paged — report the full set so the pagination
         # metadata isn't misleading (total=0 with non-empty categories).
-        count = len(memories)
+        # Count reflects the post-tombstone-filter set (what's actually returned).
+        count = sum(len(mems) for mems in categories.values())
         return ContextResponse(
             user_id=user_id,
             categories=categories,
@@ -175,12 +183,27 @@ class ReadsMixin:
     # CRUD operations
     # ──────────────────────────────────────────────
 
-    def get_memory(self, memory_id: str) -> MemoryResponse | None:
-        """Get a single memory by ID."""
+    def get_memory(self, memory_id: str, caller_user_id: str | None = None) -> MemoryResponse | None:
+        """Get a single memory by ID.
+
+        Args:
+            memory_id: The memory ID to retrieve.
+            caller_user_id: Optional caller ID for read authorization. When
+                provided, the memory is only returned if the caller may read
+                it (same pool rules as search: own private, shared, standard).
+
+        Returns:
+            MemoryResponse if found and readable, None otherwise.
+        """
         m = self._get_memory()
         result = m.get(memory_id)
         if not result:
             return None
+        # Apply read gate when caller_user_id is provided (C1, get_memories)
+        if caller_user_id is not None:
+            payload = {"user_id": result.get("user_id"), "metadata": result.get("metadata")}
+            if not self._payload_readable_by(payload, caller_user_id):
+                return None
         return self._mem_to_response(result)
 
     def get_reasoning_chain(
@@ -750,7 +773,7 @@ class ReadsMixin:
         this from "transfer every memory" into "transfer one short string per
         point". The win is in the payload size, not the iteration.
         """
-        client = self._memory.vector_store.client
+        client = self._get_memory().vector_store.client
         collection = settings.qdrant_collection
 
         user_ids: set[str] = set()
