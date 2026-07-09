@@ -121,11 +121,14 @@ def test_get_anchor_memories_respects_read_scope(mock_bridge, mock_memory_servic
     )
 
     # Mock Qdrant to return 3 memories: 1 shared, 1 alice's private, 1 bob's private
+    # Phase E: batched anchor lookup requires source_ref.external_id in metadata
+    anchor_key = "myrepo::utils.parse"  # canonical FQN (src/lib stripped)
     mock_points = [
         MagicMock(payload={
             "id": "mem1",
             "data": "Shared memory about this function",
             "metadata": {
+                "source_ref": {"external_id": anchor_key},
                 "category": "decision",
                 "visibility": "shared",
                 "user_id": "bob",
@@ -136,6 +139,7 @@ def test_get_anchor_memories_respects_read_scope(mock_bridge, mock_memory_servic
             "id": "mem2",
             "data": "Alice's private note",
             "metadata": {
+                "source_ref": {"external_id": anchor_key},
                 "category": "gotcha",
                 "visibility": "private",
                 "user_id": "alice",
@@ -146,6 +150,7 @@ def test_get_anchor_memories_respects_read_scope(mock_bridge, mock_memory_servic
             "id": "mem3",
             "data": "Bob's private note",
             "metadata": {
+                "source_ref": {"external_id": anchor_key},
                 "category": "bugfix",
                 "visibility": "private",
                 "user_id": "bob",
@@ -180,11 +185,14 @@ def test_get_anchor_memories_cap(mock_bridge, mock_memory_service):
     )
 
     # Mock 10 shared memories
+    # Phase E: batched anchor lookup requires source_ref.external_id
+    anchor_key = "myrepo::core.process"
     mock_points = [
         MagicMock(payload={
             "id": f"mem{i}",
             "data": f"Memory {i}",
             "metadata": {
+                "source_ref": {"external_id": anchor_key},
                 "category": "decision",
                 "visibility": "shared",
                 "user_id": "alice",
@@ -236,11 +244,13 @@ def test_locate_enriches_with_memories(mock_bridge, mock_memory_service):
     mock_code_result.points = mock_code_points
 
     # Mock memory search returning 1 attached memory
+    # Phase E: batched anchor lookup requires source_ref.external_id
     mock_mem_points = [
         MagicMock(payload={
             "id": "mem1",
             "data": "This function had a bug in v1.2",
             "metadata": {
+                "source_ref": {"external_id": "myrepo::utils.parse"},
                 "category": "bugfix",
                 "visibility": "shared",
                 "user_id": "alice",
@@ -288,11 +298,13 @@ def test_query_enriches_with_memories(mock_bridge, mock_memory_service):
     ]
 
     # Mock memory search
+    # Phase E: batched anchor lookup requires source_ref.external_id
     mock_mem_points = [
         MagicMock(payload={
             "id": "mem1",
             "data": "Decision: use async for this",
             "metadata": {
+                "source_ref": {"external_id": "myrepo::core.run"},
                 "category": "decision",
                 "visibility": "shared",
                 "user_id": "alice",
@@ -357,6 +369,7 @@ def test_anchor_round_trip_cross_engine_end_to_end(mock_bridge, mock_memory_serv
         "id": "mem-decision",
         "data": "Group dispatches subcommands — decided in ADR-3.",
         "metadata": {
+            "source_ref": {"external_id": expected_key},  # Phase E: batched lookup requires this
             "category": "decision",
             "visibility": "shared",
             "user_id": "bob",
@@ -365,11 +378,14 @@ def test_anchor_round_trip_cross_engine_end_to_end(mock_bridge, mock_memory_serv
     })
 
     def query_points_side_effect(*args, **kwargs):
-        """Return the memory ONLY when the filter carries the expected key."""
+        """Return the memory ONLY when the filter carries the expected key.
+        Phase E: batched lookup uses MatchAny, so check if expected_key is in the list."""
         qf = kwargs.get("query_filter")
+        # Check for MatchAny (batched lookup)
         matched = any(
             getattr(c, "match", None) is not None
-            and getattr(c.match, "value", None) == expected_key
+            and hasattr(c.match, "any")
+            and expected_key in c.match.any
             for c in qf.must
         )
         result = MagicMock()

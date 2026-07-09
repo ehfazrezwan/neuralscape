@@ -606,6 +606,27 @@ class NativeEngine:
             "line": line,
         }
 
+    def get_symbol_inventory(self) -> set[str]:
+        """Get current symbol inventory (canonical FQNs) for liveness tracking.
+
+        Phase E: Used to detect deleted/changed symbols after reindex.
+        Returns canonical FQNs (via to_canonical) so the liveness diff is
+        engine-agnostic.
+
+        Returns:
+            Set of canonical FQNs currently indexed.
+        """
+        # Fetch all symbols from Neo4j (persisted index)
+        cypher = """
+        MATCH (s:CodeSymbol {code_space: $code_space})
+        RETURN coalesce(s.canonical_fqn, s.fqn) AS fqn
+        """
+        results = self._run_cypher(cypher, code_space=self.code_space)
+
+        canonical_fqns = {r["fqn"] for r in results}
+        logger.debug("Native symbol inventory: %d canonical FQNs", len(canonical_fqns))
+        return canonical_fqns
+
     def detect_changes(
         self,
         since: str | bytes | None = None,
@@ -1693,6 +1714,9 @@ class NativeEngine:
     ) -> list[dict]:
         """E4: Fetch memories attached to a code anchor by (repo, canonical FQN).
 
+        Phase E: Refactored to call the batched lookup with a single FQN, keeping
+        the single-symbol method signature working for backward compatibility.
+
         Phase C: Uses CANONICAL FQN (src/lib stripped) so memories anchored to
         a symbol are retrievable regardless of which engine indexed it.
 
@@ -1710,98 +1734,20 @@ class NativeEngine:
         parts = self.code_space.split("--")
         repo = parts[-1] if len(parts) >= 3 else "unknown"
 
-        # Canonicalize the FQN before building the anchor key
-        canonical_fqn = self.to_canonical(fqn)
+        # Phase E: delegate to batched lookup with a single FQN
+        from knowledge.fusion import batched_anchor_lookup
 
-        # Build anchor key: "<repo>::<canonical_fqn>"
-        anchor_key = f"{repo}::{canonical_fqn}"
-
-        # Search memories by source_ref.external_id match
-        from memory_service import get_shared_service
-        from qdrant_client.models import (
-            FieldCondition,
-            Filter,
-            MatchValue,
+        result_by_fqn = batched_anchor_lookup(
+            fqns=[fqn],
+            repo=repo,
+            to_canonical_fn=self.to_canonical,
+            user_id=user_id,
+            limit_per_anchor=limit,
         )
 
-        try:
-            service = get_shared_service()
-            m = service._get_memory()
-            client = m.vector_store.client
-
-            # Build filter: source_ref.external_id = anchor_key AND readable by caller
-            # (visibility = shared OR standard OR (visibility = private AND user_id = caller))
-            must: list = [
-                FieldCondition(
-                    key="metadata.source_ref.external_id",
-                    match=MatchValue(value=anchor_key),
-                )
-            ]
-
-            # Visibility scoping (mirror memory/search.py logic)
-            # Include shared + standard pools for all authenticated users
-            # Plus caller's own private memories if user_id provided
-            if user_id:
-                # Private OR shared OR standard
-                # Qdrant doesn't have OR at filter level, so we do post-filtering
-                # For now, just search and filter in Python
-                pass
-            else:
-                # Anonymous: only shared + standard
-                # Again, Qdrant doesn't support complex OR, so we'll search broadly
-                # and filter
-                pass
-
-            # For simplicity, search without visibility filter and post-filter
-            # (E4 MVP — can optimize later with separate pool searches like memory/search.py)
-            query_filter = Filter(must=must)
-
-            # Use a dummy embedding for search (we're filtering by source_ref, not semantic)
-            # Or just scroll the collection with filter
-            # For MVP, use search with a zero vector (won't match semantically but filter works)
-            import numpy as np
-            vector_size = len(m.embedding_model.embed("test", memory_action="search"))
-            dummy_vector = np.zeros(vector_size).tolist()
-
-            result = client.query_points(
-                collection_name=m.vector_store.collection_name,
-                query=dummy_vector,
-                query_filter=query_filter,
-                limit=limit * 3,  # over-fetch for post-filtering
-                with_payload=True,
-            )
-            hits = list(getattr(result, "points", result) or [])
-
-            # Post-filter by visibility
-            memories = []
-            for hit in hits:
-                payload = getattr(hit, "payload", None) or {}
-                metadata = payload.get("metadata", {})
-                visibility = metadata.get("visibility", "private")
-                owner = metadata.get("user_id")
-
-                # Check readability
-                readable = False
-                if visibility in ("shared", "standard"):
-                    readable = True
-                elif visibility == "private" and user_id and owner == user_id:
-                    readable = True
-
-                if readable:
-                    memories.append({
-                        "id": payload.get("id"),
-                        "content": payload.get("data"),
-                        "category": metadata.get("category"),
-                        "visibility": visibility,
-                        "created_at": metadata.get("created_at"),
-                    })
-                    if len(memories) >= limit:
-                        break
-
-            return memories
-        except Exception:
-            logger.debug(f"Failed to fetch anchor memories for {fqn}", exc_info=True)
-            return []
+        # Return memories for this single FQN (empty list if no matches)
+        canonical_fqn = self.to_canonical(fqn)
+        return result_by_fqn.get(canonical_fqn, [])
 
     def _index_symbol_cards(self, repo_path: Path):
         """Build symbol cards and index them in the code_index Qdrant collection (E3).

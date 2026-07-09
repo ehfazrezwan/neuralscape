@@ -295,3 +295,189 @@ def process_code_changes_for_liveness(
     )
     logger.info(summary)
     return {"events": events, "flagged": flagged, "summary": summary}
+
+
+def detect_inventory_diff_liveness(
+    service,
+    code_space: str,
+    engine,
+    *,
+    previous_inventory: set[str] | None = None,
+    dry_run: bool = False,
+) -> dict:
+    """Phase E: Generalized liveness from external reindex (any engine).
+
+    Diff the engine's current symbol inventory against a previous snapshot
+    (or anchors in Neo4j) to detect deleted/changed symbols, then flag affected
+    memories for dreaming reframe.
+
+    This upgrades E5 to work regardless of which engine (native/CBM/graphify)
+    indexed. The consumer (temporal_reframe) is unchanged; only the per-driver
+    diff PRODUCER is new.
+
+    Args:
+        service: The MemoryService instance.
+        code_space: The code_space partition key.
+        engine: The CodeIntelEngine instance (any driver).
+        previous_inventory: Optional previous symbol inventory (canonical FQNs).
+            If None, fetches current anchors from Neo4j.
+        dry_run: If True, report what would be flagged without writing.
+
+    Returns:
+        Dict with liveness report: {events, flagged, summary}.
+
+    Safety:
+        - Respects dreaming.enabled (no-op if disabled).
+        - All write operations are reversible metadata patches.
+    """
+    from .config import dreaming_settings
+
+    if not dreaming_settings.enabled and not dry_run:
+        logger.info("Dreaming disabled — skipping inventory-diff liveness")
+        return {"events": [], "flagged": 0, "summary": "dreaming disabled"}
+
+    try:
+        # Get current symbol inventory from the engine
+        if not hasattr(engine, "get_symbol_inventory"):
+            logger.warning(
+                "Engine %s doesn't support get_symbol_inventory (liveness unavailable)",
+                type(engine).__name__,
+            )
+            return {"events": [], "flagged": 0, "summary": "inventory method unavailable"}
+
+        current_inventory = engine.get_symbol_inventory()
+
+        # Get previous inventory: either passed in or fetch from anchors
+        if previous_inventory is None:
+            previous_inventory = _fetch_anchor_inventory(code_space)
+
+        # Diff: detect deleted symbols (in previous but not current)
+        deleted_fqns = previous_inventory - current_inventory
+
+        if not deleted_fqns:
+            logger.debug("No deleted symbols detected in inventory diff for %s", code_space)
+            return {"events": [], "flagged": 0, "summary": "no deleted symbols"}
+
+        # Build anchor keys for deleted symbols
+        parts = code_space.split("--")
+        repo = parts[-1] if len(parts) >= 3 else "unknown"
+        deleted_anchors = [f"{repo}::{fqn}" for fqn in deleted_fqns]
+
+        # Search for memories with these anchor keys
+        from qdrant_client.models import FieldCondition, Filter, MatchAny
+
+        m = service._get_memory()
+        client = m.vector_store.client
+        collection_name = m.vector_store.collection_name
+
+        query_filter = Filter(
+            must=[
+                FieldCondition(
+                    key="metadata.source_ref.external_id",
+                    match=MatchAny(any=deleted_anchors),
+                )
+            ]
+        )
+
+        # Scroll to find all affected memories
+        hits = []
+        offset = None
+        while True:
+            scroll_result = client.scroll(
+                collection_name=collection_name,
+                scroll_filter=query_filter,
+                limit=100,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            records, next_offset = scroll_result
+            hits.extend(records)
+            if next_offset is None or len(records) == 0:
+                break
+            offset = next_offset
+            if len(hits) >= 1000:
+                logger.warning(
+                    "Inventory-diff liveness: hit 1000-memory cap for code_space=%s (truncated)",
+                    code_space,
+                )
+                break
+
+        # Build liveness events
+        events = []
+        for hit in hits:
+            payload = getattr(hit, "payload", None) or {}
+            memory_id = payload.get("id")
+            metadata = payload.get("metadata", {})
+            source_ref = metadata.get("source_ref", {})
+            anchor_key = source_ref.get("external_id", "")
+
+            if not memory_id or not anchor_key:
+                continue
+
+            events.append(
+                LivenessEvent(
+                    memory_id=memory_id,
+                    anchor_key=anchor_key,
+                    reason="symbol deleted (inventory diff)",
+                    confidence=0.95,
+                )
+            )
+
+        # Flag the memories
+        flagged = apply_liveness_events(service, events, dry_run=dry_run)
+
+        summary = (
+            f"Inventory-diff liveness for {code_space}: {len(deleted_fqns)} deleted symbols, "
+            f"{len(events)} events, {flagged} memories flagged."
+        )
+        logger.info(summary)
+        return {"events": events, "flagged": flagged, "summary": summary}
+
+    except Exception:
+        logger.warning(
+            "Inventory-diff liveness failed for %s (non-fatal)",
+            code_space,
+            exc_info=True,
+        )
+        return {"events": [], "flagged": 0, "summary": "inventory diff failed"}
+
+
+def _fetch_anchor_inventory(code_space: str) -> set[str]:
+    """Fetch current anchor inventory (canonical FQNs) from Neo4j.
+
+    Args:
+        code_space: The code_space partition key.
+
+    Returns:
+        Set of canonical FQNs that have CodeAnchor nodes.
+    """
+    from adapters.code_graph.query import get_engine
+    from config import settings as core_settings
+
+    try:
+        parts = code_space.split("--")
+        if len(parts) < 3:
+            return set()
+        repo_name = parts[2]
+        user_id = parts[1]
+
+        # Get the engine to access Neo4j (native engine has _code_neo4j)
+        graph_id = f"repo:{repo_name}"
+        engine = get_engine(graph_id, user_id, core_settings)
+
+        # Fetch all CodeAnchor fqns (canonical)
+        cypher = """
+        MATCH (a:CodeAnchor {code_space: $code_space})
+        RETURN a.fqn AS fqn
+        """
+        results = engine._run_cypher(cypher, code_space=code_space)
+        return {r["fqn"] for r in results if r["fqn"]}
+
+    except Exception:
+        logger.warning(
+            "Failed to fetch anchor inventory for %s (non-fatal)",
+            code_space,
+            exc_info=True,
+        )
+        return set()

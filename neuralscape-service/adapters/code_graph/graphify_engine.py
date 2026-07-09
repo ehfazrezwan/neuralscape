@@ -225,6 +225,32 @@ class GraphifyJsonEngine:
             "dense-embedding code_index collection. Use query() for structure search."
         )
 
+    def get_symbol_inventory(self) -> set[str]:
+        """Get current symbol inventory (canonical FQNs) for liveness tracking.
+
+        Phase E: Used to detect deleted/changed symbols after reindex.
+        Returns canonical FQNs (via to_canonical) so the liveness diff is
+        engine-agnostic.
+
+        Returns:
+            Set of canonical FQNs currently indexed.
+        """
+        if not self.G:
+            return set()
+
+        # Extract all node IDs (raw FQNs) and canonicalize them
+        canonical_fqns = set()
+        for node_id in self.G.nodes():
+            try:
+                canonical = self.to_canonical(node_id)
+                canonical_fqns.add(canonical)
+            except Exception:
+                # Skip malformed node IDs
+                continue
+
+        logger.debug("Graphify symbol inventory: %d canonical FQNs", len(canonical_fqns))
+        return canonical_fqns
+
     def detect_changes(
         self,
         since: str,

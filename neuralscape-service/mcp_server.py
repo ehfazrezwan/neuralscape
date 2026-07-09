@@ -1319,9 +1319,8 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
 
     try:
         if name == "recall_memories":
-            # Phase D: wire the router (but don't change behavior yet — Phase E fusion).
-            # The router resolves which system(s) to query; for now we log the decision
-            # but always call the existing search path (base-only, byte-identical output).
+            # Phase E: fusion — when the router says code leg is warranted, execute
+            # it concurrently with base legs and compose sections.
             from knowledge.router import resolve_systems
 
             route_decision = resolve_systems(
@@ -1330,11 +1329,16 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 knowledge_system=arguments.get("knowledge_system"),
                 is_code_tool=False,  # recall_memories is generic recall, not a code tool
             )
-            # Phase D: log the decision but don't act on it (Phase E will compose code legs)
             logger.debug(
                 "recall_memories route decision: %s (layer %d)",
                 route_decision.rationale,
                 route_decision.layer,
+            )
+
+            # Detect if the router wants code fusion (decision rationale mentions it)
+            wants_code_fusion = (
+                "Phase E: will add" in route_decision.rationale
+                or "will compose" in route_decision.rationale
             )
 
             # Run the synchronous, graph-backed search in a worker thread so a
@@ -1350,6 +1354,81 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 visibility=arguments.get("visibility"),
                 include_shared=arguments.get("include_shared", True),
             )
+
+            # Phase E: if code fusion is warranted, run code leg and compose
+            if wants_code_fusion and arguments.get("project_id"):
+                from knowledge.fusion import compose_fusion_answer, batched_anchor_lookup, extract_fqns_from_code_answer
+                from knowledge.registry import get_system
+                from knowledge.base import RecallRequest
+                import concurrent.futures
+
+                # Get a code system (prefer code-cbm if available, fallback to code-native)
+                code_sys = get_system("code-cbm") or get_system("code-native") or get_system("code-graphify")
+
+                if code_sys and code_sys.health().status == "ok":
+                    # Run code leg concurrently with base recall (already completed above)
+                    try:
+                        # Execute code query (use neighbors op as a reasonable default for fusion)
+                        code_req = RecallRequest(
+                            query=arguments["query"],
+                            user_id=user_id,
+                            project_id=arguments.get("project_id"),
+                            limit=arguments.get("limit", 10),
+                            operation="query",  # or neighbors if label-like
+                        )
+                        code_answer = await asyncio.to_thread(code_sys.recall, code_req)
+
+                        # Extract FQNs from code answer
+                        fqns = extract_fqns_from_code_answer(code_answer)
+
+                        # Batched anchor join if FQNs found
+                        anchor_memories = {}
+                        if fqns and arguments.get("project_id"):
+                            # Extract repo from project_id or code_space
+                            repo = arguments.get("project_id", "unknown")
+                            # Get the code system's to_canonical function
+                            if hasattr(code_sys, "_engine") and hasattr(code_sys._engine, "to_canonical"):
+                                to_canonical_fn = code_sys._engine.to_canonical
+                                anchor_memories = await asyncio.to_thread(
+                                    batched_anchor_lookup,
+                                    fqns=fqns,
+                                    repo=repo,
+                                    to_canonical_fn=to_canonical_fn,
+                                    user_id=user_id,
+                                    limit_per_anchor=3,
+                                )
+
+                        # Compose fusion answer
+                        from knowledge.base import SystemAnswer
+                        # Convert base results to SystemAnswer format
+                        base_content = "\n".join([
+                            f"{i+1}. [{r.category}] {r.content[:100]}"
+                            for i, r in enumerate(results)
+                        ])
+                        base_answer = SystemAnswer(
+                            system_name="ns-memory",
+                            content=base_content,
+                            hits=[r.model_dump(exclude_none=True) for r in results],
+                        )
+
+                        fused_text = compose_fusion_answer(
+                            code_answer=code_answer,
+                            anchor_memories=anchor_memories,
+                            base_answer=base_answer,
+                        )
+
+                        # Return fused answer as text
+                        logger.info(
+                            "Phase E: fused answer (%d code FQNs, %d anchored memories, %d base results)",
+                            len(fqns), len(anchor_memories), len(results),
+                        )
+                        return [TextContent(type="text", text=fused_text)]
+
+                    except Exception as e:
+                        logger.warning("Code fusion failed (fallback to base-only): %s", e, exc_info=True)
+                        # Fall through to base-only output below
+
+            # Base-only output (Phase D behavior, or fusion fallback)
             if arguments.get("index_only"):
                 from index_format import index_row
 

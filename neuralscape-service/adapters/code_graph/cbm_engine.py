@@ -380,6 +380,31 @@ class CBMEngine:
 
         return hits
 
+    def get_symbol_inventory(self) -> set[str]:
+        """Get current symbol inventory (canonical FQNs) for liveness tracking.
+
+        Phase E: Used to detect deleted/changed symbols after reindex.
+        Returns canonical FQNs (via to_canonical) so the liveness diff is
+        engine-agnostic.
+
+        Returns:
+            Set of canonical FQNs currently indexed.
+        """
+        project = self._ensure_project()
+
+        # Use index_status to get all indexed functions/symbols
+        # The bridge's /index_status returns {"project": ..., "nodes": N, "edges": E}
+        # but doesn't expose a full symbol list. We need to use search_graph with
+        # a wildcard or enumerate via architecture.
+        #
+        # For now, raise EngineCapabilityError — CBM doesn't expose a full
+        # symbol enumeration via its tools (only search/trace). This will be
+        # revisited if we add a bridge endpoint for it.
+        raise EngineCapabilityError(
+            "CBM doesn't expose full symbol enumeration via its tools. "
+            "Liveness tracking for CBM requires a bridge /list_symbols endpoint."
+        )
+
     def detect_changes(
         self,
         since: str | bytes | None = None,
