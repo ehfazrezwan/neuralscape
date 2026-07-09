@@ -15,13 +15,20 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Download CBM binary from GitHub releases (MIT, v0.9.0)
-# Pinned to specific release tag for reproducibility.
-# Alternative: build from source at commit ee68144, but that requires build-essential
-# and adds ~500MB to the image. Pre-built binary from releases is lighter.
-RUN curl -L -o /usr/local/bin/cbm \
-    https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.9.0/codebase-memory-mcp-linux-x64 \
-    && chmod +x /usr/local/bin/cbm
+# Download CBM binary from GitHub releases (MIT, v0.9.0), pinned by tag for
+# reproducibility. The portable linux-amd64 build is self-contained (no glibc
+# surprises in the slim image). Alternative: build from source at commit ee68144,
+# but that requires build-essential and adds ~500MB — the pre-built portable
+# release tarball is lighter. The tarball contains `codebase-memory-mcp` at the
+# top level alongside LICENSE + THIRD_PARTY_NOTICES.
+ARG CBM_VERSION=v0.9.0
+ARG CBM_ASSET=codebase-memory-mcp-linux-amd64-portable.tar.gz
+RUN curl -fL -o /tmp/cbm.tar.gz \
+    "https://github.com/DeusData/codebase-memory-mcp/releases/download/${CBM_VERSION}/${CBM_ASSET}" \
+    && tar -xzf /tmp/cbm.tar.gz -C /tmp codebase-memory-mcp \
+    && mv /tmp/codebase-memory-mcp /usr/local/bin/cbm \
+    && chmod +x /usr/local/bin/cbm \
+    && rm -f /tmp/cbm.tar.gz
 
 # Install Python dependencies for the bridge
 RUN pip install --no-cache-dir fastapi==0.115.5 uvicorn==0.32.1 pydantic==2.10.3
