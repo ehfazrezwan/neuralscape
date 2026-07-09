@@ -997,3 +997,191 @@ def test_semantic_layer_respects_config_limits(mock_bridge, mock_settings):
     hotspot_facts = [f for f in facts if f.category == "hotspot"]
     assert len(hotspot_facts) == 1
     assert "c0.a" in hotspot_facts[0].content  # degree 20 is highest
+
+
+# ── Phase A: ns-ice (a)-fixes tests ────────────────────────────────────
+
+
+def test_store_file_batched_writes(mock_bridge, mock_settings):
+    """Fix 1: Test that _store_file uses UNWIND batched writes."""
+    from unittest.mock import patch
+    from adapters.code_graph.native_engine import _Symbol, _Edge
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user--repo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+
+    # Create many symbols to trigger batching
+    symbols = [
+        _Symbol(fqn=f"mod.func{i}", kind="function", file="mod.py", line=i, end_line=i+2)
+        for i in range(10)
+    ]
+    edges = [
+        _Edge(source_fqn=f"mod.func{i}", target_fqn=f"mod.func{i+1}", relation="CALLS", extraction="extracted")
+        for i in range(9)
+    ]
+
+    with patch.object(engine, "_run_cypher_with_retry") as mock_retry:
+        with patch.object(engine, "_compute_symbol_body_hash", return_value="hash123"):
+            engine._store_file("mod.py", "file_hash", symbols, edges)
+
+    # Verify UNWIND was used for symbols
+    cypher_calls = [str(c.args[0]) if c.args else "" for c in mock_retry.call_args_list]
+    assert any("UNWIND $rows" in c and "CodeSymbol" in c for c in cypher_calls), "Symbol UNWIND not found"
+
+    # Verify UNWIND was used for edges
+    assert any("UNWIND $rows" in c and "CALLS" in c for c in cypher_calls), "Edge UNWIND not found"
+
+
+def test_store_file_no_phantom_nodes(mock_bridge, mock_settings):
+    """Fix 2: Test that edge writes use MATCH (no phantom nodes for unresolved targets)."""
+    from unittest.mock import patch
+    from adapters.code_graph.native_engine import _Symbol, _Edge
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user--repo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+
+    symbols = [_Symbol(fqn="mod.foo", kind="function", file="mod.py", line=1, end_line=5)]
+    # Edge to unresolved target
+    edges = [_Edge(source_fqn="mod.foo", target_fqn="external.bar", relation="CALLS", extraction="inferred")]
+
+    with patch.object(engine, "_run_cypher_with_retry") as mock_retry:
+        with patch.object(engine, "_compute_symbol_body_hash", return_value="hash123"):
+            engine._store_file("mod.py", "file_hash", symbols, edges)
+
+    # Verify edge cypher uses MATCH (not MERGE) for both endpoints
+    edge_calls = [str(c.args[0]) if c.args else "" for c in mock_retry.call_args_list if "CALLS" in (str(c.args[0]) if c.args else "")]
+    assert len(edge_calls) > 0, "No edge query found"
+    edge_cypher = edge_calls[0]
+    assert "MATCH (src:CodeSymbol" in edge_cypher, "Source should use MATCH"
+    assert "MATCH (tgt:CodeSymbol" in edge_cypher, "Target should use MATCH"
+    assert "MERGE (src:CodeSymbol" not in edge_cypher, "Should not MERGE source"
+    assert "MERGE (tgt:CodeSymbol" not in edge_cypher, "Should not MERGE target"
+
+
+def test_query_returns_matched_symbols(mock_bridge, mock_settings):
+    """Fix 3: Test that query() returns the matched seed symbols."""
+    from unittest.mock import patch
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user--repo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+
+    matched_symbols = [
+        {"fqn": "mod.foo", "kind": "function", "file": "mod.py", "line": 10},
+        {"fqn": "mod.bar", "kind": "function", "file": "mod.py", "line": 20},
+    ]
+
+    with patch.object(engine, "_search_symbols", return_value=matched_symbols):
+        with patch.object(engine, "_traverse", return_value=[]):
+            with patch.object(engine, "_get_anchor_memories", return_value=[]):
+                result = engine.query("foo")
+
+    # Verify matched symbols appear in output
+    assert "mod.foo" in result
+    assert "mod.bar" in result
+    assert "mod.py:10" in result
+    assert "mod.py:20" in result
+
+
+def test_blast_radius_single_cypher(mock_bridge, mock_settings):
+    """Fix 4: Test that _blast_radius_bfs uses a single Cypher query."""
+    from unittest.mock import patch
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user--repo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+
+    # Mock result with callers and callees
+    mock_result = [
+        {
+            "root_fqn": "mod.foo",
+            "callers": ["mod.a", "mod.b"],
+            "callees": ["mod.c", "mod.d"],
+        }
+    ]
+
+    with patch.object(engine, "_run_cypher", return_value=mock_result) as mock_cypher:
+        affected = engine._blast_radius_bfs(["mod.foo"], max_depth=3)
+
+    # Verify only ONE cypher call was made
+    assert mock_cypher.call_count == 1, f"Expected 1 cypher call, got {mock_cypher.call_count}"
+
+    # Verify the query uses variable-length paths
+    cypher = mock_cypher.call_args[0][0]
+    assert "*1..3" in cypher or "*1..{max_depth}" in cypher, "Should use variable-length path"
+
+    # Verify affected symbols include root + callers + callees
+    assert affected == {"mod.foo", "mod.a", "mod.b", "mod.c", "mod.d"}
+
+
+def test_search_symbols_parameterized(mock_bridge, mock_settings):
+    """Fix 5: Test that _search_symbols uses parameterized queries (no injection)."""
+    from unittest.mock import patch
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user--repo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+
+    with patch.object(engine, "_run_cypher", return_value=[]) as mock_cypher:
+        engine._search_symbols(["foo", "bar"], limit=10)
+
+    # Verify parameterized query
+    cypher = mock_cypher.call_args[0][0]
+    params = mock_cypher.call_args[1]
+
+    # Should use $kw0, $kw1 params (not f-string interpolation)
+    assert "$kw0" in cypher, "Should use $kw0 parameter"
+    assert "$kw1" in cypher, "Should use $kw1 parameter"
+    assert "kw0" in params, "Should pass kw0 parameter"
+    assert "kw1" in params, "Should pass kw1 parameter"
+    assert params["kw0"] == "foo"
+    assert params["kw1"] == "bar"
+
+    # Should NOT have interpolated keywords
+    assert "'foo'" not in cypher
+    assert "'bar'" not in cypher
+
+
+def test_search_symbols_injection_safe(mock_bridge, mock_settings):
+    """Fix 5: Test that _search_symbols is safe from Cypher injection."""
+    from unittest.mock import patch
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user--repo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+
+    # Attempt injection with malicious keyword
+    malicious_keywords = ["' OR 1=1 --", "'; DROP TABLE x; --"]
+
+    with patch.object(engine, "_run_cypher", return_value=[]) as mock_cypher:
+        engine._search_symbols(malicious_keywords, limit=10)
+
+    # Verify the malicious strings are passed as parameters (safe)
+    params = mock_cypher.call_args[1]
+    assert params["kw0"] == "' OR 1=1 --"
+    assert params["kw1"] == "'; DROP TABLE x; --"
+
+    # Verify they don't appear in the cypher string itself
+    cypher = mock_cypher.call_args[0][0]
+    assert "OR 1=1" not in cypher
+    assert "DROP TABLE" not in cypher
