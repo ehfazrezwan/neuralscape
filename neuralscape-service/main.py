@@ -2815,6 +2815,69 @@ async def v1_emit_extension_event(req: EmitEventRequest):
     }
 
 
+# ── Project Knowledge Config (Phase D) ──────────────────────────────────
+
+
+class ProjectKnowledgeConfigRequest(BaseModel):
+    """Request to set/update a project's knowledge routing config."""
+
+    project_id: str
+    code_systems: list[str] | None = None
+    fuse_code_into_recall: bool = True  # DEFAULT TRUE per decision #3
+    default_engine: str | None = None
+
+
+class ProjectKnowledgeConfigResponse(BaseModel):
+    """Response for project knowledge config."""
+
+    project_id: str
+    code_systems: list[str]
+    fuse_code_into_recall: bool
+    default_engine: str | None
+
+
+@v1_router.get("/projects/{project_id}/knowledge-config", response_model=ProjectKnowledgeConfigResponse)
+async def v1_get_project_knowledge_config(project_id: str):
+    """Get a project's knowledge routing config (Phase D)."""
+    from knowledge.router import get_project_config
+
+    config = get_project_config(project_id)
+    if config is None:
+        # Return default config if not set
+        return ProjectKnowledgeConfigResponse(
+            project_id=project_id,
+            code_systems=[],
+            fuse_code_into_recall=True,  # DEFAULT TRUE
+            default_engine=None,
+        )
+    return ProjectKnowledgeConfigResponse(
+        project_id=config.project_id,
+        code_systems=config.code_systems,
+        fuse_code_into_recall=config.fuse_code_into_recall,
+        default_engine=config.default_engine,
+    )
+
+
+@v1_router.put("/projects/{project_id}/knowledge-config", response_model=ProjectKnowledgeConfigResponse)
+async def v1_set_project_knowledge_config(project_id: str, req: ProjectKnowledgeConfigRequest):
+    """Set/update a project's knowledge routing config (Phase D)."""
+    from knowledge.router import ProjectKnowledgeConfig, set_project_config
+
+    config = ProjectKnowledgeConfig(
+        project_id=project_id,
+        code_systems=req.code_systems or [],
+        fuse_code_into_recall=req.fuse_code_into_recall,
+        default_engine=req.default_engine,
+    )
+    set_project_config(config)
+    return ProjectKnowledgeConfigResponse(
+        project_id=config.project_id,
+        code_systems=config.code_systems,
+        fuse_code_into_recall=config.fuse_code_into_recall,
+        default_engine=config.default_engine,
+    )
+
+
 # The wiki_synthesizer's /admin/synthesize endpoints were retired with the
 # extension itself — dreaming (its successor) exposes its admin surface at
 # /v1/extensions/dreaming/run and /v1/extensions/dreaming/status via the

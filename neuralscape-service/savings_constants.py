@@ -20,11 +20,12 @@ They are measured, checked-in constants, not runtime estimates:
   same test class.
 """
 
-# Measured 2026-07-08 (E7): 9577 tokens (o200k_base) for the 22 core tools + the
-# 5 code-graph delegation tools (dev install renders the maximal surface).
-# Growth from 9330: the `locate` and `code_impact` tools (E3/E7).
+# Measured 2026-07-09 (Phase D): 10386 tokens (o200k_base) for 24 core tools
+# (22 + 2 project-config tools) + the 5 code-graph delegation tools (dev install
+# renders the maximal surface). Growth from 9577: `get_project_knowledge_config`
+# and `set_project_knowledge_config` (Phase D router).
 # See tests/test_savings_meter.py::TestOverheadConstants.
-MCP_TOOL_SCHEMA_OVERHEAD_TOKENS = 9577
+MCP_TOOL_SCHEMA_OVERHEAD_TOKENS = 10386
 
 # Rendered savings line + detail fields on one response (measured: 67).
 SAVINGS_LINE_OVERHEAD_TOKENS = 70

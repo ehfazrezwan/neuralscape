@@ -217,6 +217,17 @@ async def list_tools() -> list[Tool]:
                             "get_memories(ids=[...]) for the few you need. Default: false."
                         ),
                     },
+                    "knowledge_system": {
+                        "type": "string",
+                        "description": (
+                            "Optional explicit knowledge system override (Phase D+). "
+                            "Registered system names: 'ns-memory' (base, always available), "
+                            "'code-cbm', 'code-native', etc. Omit to use the deterministic router "
+                            "(project config + signal-based classification). Phase D: this routes "
+                            "to the chosen system but generic recall output stays unchanged "
+                            "(fusion composition is Phase E)."
+                        ),
+                    },
                 },
                 "required": ["query"],
             },
@@ -1096,6 +1107,56 @@ async def list_tools() -> list[Tool]:
                 "required": [],
             },
         ),
+        Tool(
+            name="get_project_knowledge_config",
+            description=(
+                "Get a project's knowledge routing config (Phase D): which code systems "
+                "are indexed, whether code fusion is enabled for generic recall, and the "
+                "default engine. Use this to check project settings before querying."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project ID to get config for",
+                    },
+                },
+                "required": ["project_id"],
+            },
+        ),
+        Tool(
+            name="set_project_knowledge_config",
+            description=(
+                "Set/update a project's knowledge routing config (Phase D): which code "
+                "systems are available, whether to fuse code into generic recall (default "
+                "TRUE per decision #3), and which engine to prefer. Typically set at index "
+                "time but can be edited later."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project ID to configure",
+                    },
+                    "code_systems": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of code system names (e.g. ['code-cbm'])",
+                    },
+                    "fuse_code_into_recall": {
+                        "type": "boolean",
+                        "description": "Enable code fusion for generic recall (default TRUE)",
+                    },
+                    "default_engine": {
+                        "type": "string",
+                        "description": "Default code engine name (e.g. 'code-cbm')",
+                    },
+                },
+                "required": ["project_id"],
+            },
+        ),
     ] + _code_graph_tools()
 
 
@@ -1115,6 +1176,16 @@ _CODE_GRAPH_COMMON_PROPS = {
     "user_id": {
         "type": "string",
         "description": "Caller user ID (optional under token auth); scopes graph_id resolution.",
+    },
+    "knowledge_system": {
+        "type": "string",
+        "description": (
+            "Optional explicit knowledge system override (Phase D+). "
+            "Registered code systems: 'code-cbm', 'code-native', 'code-graphify', etc. "
+            "Omit to use the router's decision (project config default_engine or first "
+            "code_system). Phase D: this routes to the chosen backend but doesn't change "
+            "output format yet (backward compat)."
+        ),
     },
 }
 
@@ -1248,6 +1319,24 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
 
     try:
         if name == "recall_memories":
+            # Phase D: wire the router (but don't change behavior yet — Phase E fusion).
+            # The router resolves which system(s) to query; for now we log the decision
+            # but always call the existing search path (base-only, byte-identical output).
+            from knowledge.router import resolve_systems
+
+            route_decision = resolve_systems(
+                query=arguments["query"],
+                project_id=arguments.get("project_id"),
+                knowledge_system=arguments.get("knowledge_system"),
+                is_code_tool=False,  # recall_memories is generic recall, not a code tool
+            )
+            # Phase D: log the decision but don't act on it (Phase E will compose code legs)
+            logger.debug(
+                "recall_memories route decision: %s (layer %d)",
+                route_decision.rationale,
+                route_decision.layer,
+            )
+
             # Run the synchronous, graph-backed search in a worker thread so a
             # slow read can't freeze the MCP server's event loop (which would
             # stall concurrent fire-and-forget writes and time them out).
@@ -1801,6 +1890,35 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 query_code_graph,
             )
 
+            # Phase D: wire the router for code tools (always route to a code system).
+            # The 5 code tools are ALREADY explicit code-routing (layer 1); the only
+            # choice is WHICH backend. Log the decision but keep calling the existing
+            # query.py functions (backward compat; Phase E will wire to system.recall()).
+            from knowledge.router import resolve_systems
+
+            # Map tool name to operation hint for router
+            operation_map = {
+                "query_code_graph": "query",
+                "get_code_neighbors": "neighbors",
+                "code_path": "path",
+                "locate": "locate",
+                "code_impact": "impact",
+            }
+            route_decision = resolve_systems(
+                query=arguments.get("question") or arguments.get("query") or arguments.get("label") or "",
+                project_id=None,  # Code tools don't expose project_id yet (Phase E)
+                knowledge_system=arguments.get("knowledge_system"),
+                graph_id=arguments.get("graph_id"),
+                operation=operation_map.get(name),
+                is_code_tool=True,
+            )
+            logger.debug(
+                "Code tool %s route decision: %s (layer %d)",
+                name,
+                route_decision.rationale,
+                route_decision.layer,
+            )
+
             try:
                 if name == "query_code_graph":
                     text = await asyncio.to_thread(
@@ -1863,6 +1981,53 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             except Exception as e:
                 return [TextContent(type="text", text=json.dumps({"error": f"locate failed: {e}"}))]
             return [TextContent(type="text", text=text)]
+
+        elif name == "get_project_knowledge_config":
+            from knowledge.router import get_project_config
+
+            project_id = arguments.get("project_id")
+            if not project_id:
+                return [TextContent(type="text", text=json.dumps({"error": "project_id required"}))]
+
+            config = get_project_config(project_id)
+            if config is None:
+                # Return default config
+                result = {
+                    "project_id": project_id,
+                    "code_systems": [],
+                    "fuse_code_into_recall": True,
+                    "default_engine": None,
+                }
+            else:
+                result = {
+                    "project_id": config.project_id,
+                    "code_systems": config.code_systems,
+                    "fuse_code_into_recall": config.fuse_code_into_recall,
+                    "default_engine": config.default_engine,
+                }
+            return [TextContent(type="text", text=json.dumps(result, default=str))]
+
+        elif name == "set_project_knowledge_config":
+            from knowledge.router import ProjectKnowledgeConfig, set_project_config
+
+            project_id = arguments.get("project_id")
+            if not project_id:
+                return [TextContent(type="text", text=json.dumps({"error": "project_id required"}))]
+
+            config = ProjectKnowledgeConfig(
+                project_id=project_id,
+                code_systems=arguments.get("code_systems") or [],
+                fuse_code_into_recall=arguments.get("fuse_code_into_recall", True),
+                default_engine=arguments.get("default_engine"),
+            )
+            set_project_config(config)
+            result = {
+                "project_id": config.project_id,
+                "code_systems": config.code_systems,
+                "fuse_code_into_recall": config.fuse_code_into_recall,
+                "default_engine": config.default_engine,
+            }
+            return [TextContent(type="text", text=json.dumps(result, default=str))]
 
         elif name == "schedule_dream":
             # Mirrors POST /v1/extensions/dreaming/run: never sweep in-process
