@@ -96,6 +96,48 @@ try:
         else:
             logger.info("CBM system not enabled (set CBM_ENABLED=true to enable)")
 
+        # Phase F: register GraphifyLibEngine (in-process library, always available
+        # when code-graph extra is installed).
+        #
+        # GraphifyLibEngine is per-code_space (like NativeEngine), so we DON'T register
+        # a singleton engine instance here. Instead, we register a MARKER system that
+        # declares code-graphify-lib is available as a routing target. The actual
+        # GraphifyLibEngine instances are created on-demand by the query.py factory
+        # (_get_graphify_lib_engine), cached per code_space in _ctx_cache.
+        #
+        # This registration makes "code-graphify-lib" ELIGIBLE for routing and
+        # shows up in health checks / registry listings (transport="in-process").
+        try:
+            from knowledge.code_system import CodeKnowledgeSystem
+            from adapters.code_graph.graphify_lib_engine import GraphifyLibEngine
+
+            # Create a placeholder engine (no code_space yet; engine is created per-space
+            # in query.py). The wrapper's health() will check that graphify imports work.
+            # We use a dummy instance just for the registration; real instances are
+            # created per code_space on-demand.
+            placeholder_engine = GraphifyLibEngine(
+                code_space="__registry_placeholder__",
+                source_root="/dev/null",  # never used
+            )
+
+            graphify_lib_system = CodeKnowledgeSystem(
+                name="code-graphify-lib",
+                engine=placeholder_engine,
+                capabilities=frozenset({
+                    "query",
+                    "neighbors",
+                    "path",
+                    "index",
+                    "impact",  # detect_changes with seed symbol
+                }),
+                transport="in-process",
+                version=None,  # Graphify lib version (fetched lazily if needed)
+            )
+            register_system(graphify_lib_system)
+            logger.info("Registered code-graphify-lib system (in-process library, per-code_space)")
+        except Exception as e:
+            logger.warning("GraphifyLibEngine registration failed: %s", e)
+
     else:
         logger.info(
             "code-graph extra not installed; code systems unavailable "

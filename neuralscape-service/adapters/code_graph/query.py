@@ -88,22 +88,28 @@ def resolve_graph_path(graph_id: str | None, user_id: str, settings) -> str:
 def get_engine(graph_id: str | None, user_id: str, settings) -> CodeIntelEngine:
     """Engine-selection factory: returns the right CodeIntelEngine for the graph ref.
 
+    Phase F: detects lib:<code_space> refs and returns GraphifyLibEngine (in-process).
     E2: detects repo:<name> refs and returns NativeEngine; .json artifact paths
     still return GraphifyJsonEngine. Engines are cached per ref (repo: by name,
-    .json by mtime+size).
+    .json by mtime+size, lib: by code_space).
 
     Args:
-        graph_id: Artifact id, repo:<name> ref, or None (uses default path).
+        graph_id: Artifact id, repo:<name> ref, lib:<code_space> ref, or None (uses default path).
         user_id: Owner-scoped resolution.
         settings: Config for default path.
 
     Returns:
-        A CodeIntelEngine (GraphifyJsonEngine or NativeEngine).
+        A CodeIntelEngine (GraphifyJsonEngine, NativeEngine, or GraphifyLibEngine).
 
     Raises:
         CodeGraphNotConfigured: No graph_id and no default configured.
         CodeGraphError: graph_id doesn't resolve or repo path not found.
     """
+    # Phase F: detect lib:<code_space> refs (GraphifyLibEngine in-process)
+    if graph_id and graph_id.startswith("lib:"):
+        code_space = graph_id.removeprefix("lib:")
+        return _get_graphify_lib_engine(code_space, user_id, settings)
+
     # E2: detect repo:<name> refs
     if graph_id and graph_id.startswith("repo:"):
         repo_name = graph_id.removeprefix("repo:")
@@ -235,6 +241,69 @@ def _get_native_engine_by_code_space(code_space: str, settings) -> CodeIntelEngi
             driver=driver,
         )
         _ctx_cache[cache_key] = {"engine": engine}
+        return engine
+
+
+def _get_graphify_lib_engine(code_space: str, user_id: str, settings) -> CodeIntelEngine:
+    """Get or create a cached GraphifyLibEngine for a lib:<code_space> ref (Phase F).
+
+    GraphifyLibEngine is an in-process library engine (not a compose service). The
+    graph is kept warm per code_space (~5.7MB/repo). Cached by code_space.
+
+    Args:
+        code_space: Partition key (code--owner--repo).
+        user_id: Owner (for repo path resolution).
+        settings: Config for repo paths.
+
+    Returns:
+        GraphifyLibEngine instance (cached).
+
+    Raises:
+        CodeGraphError: code_space not configured or source path doesn't exist.
+    """
+    from adapters.code_graph.graphify_lib_engine import GraphifyLibEngine
+
+    # Cache key: lib:<code_space>
+    cache_key = f"lib:{code_space}"
+    ent = _ctx_cache.get(cache_key)
+    if ent is not None:
+        return ent["engine"]
+
+    with _ctx_lock:
+        ent = _ctx_cache.get(cache_key)
+        if ent is not None:
+            return ent["engine"]
+
+        # Resolve source path from settings.code_repos (same pattern as NativeEngine).
+        # code_space format: code--owner--repo
+        parts = code_space.split("--")
+        if len(parts) != 3 or parts[0] != "code":
+            raise CodeGraphError(
+                f"Invalid code_space format: {code_space} "
+                "(expected code--owner--repo)"
+            )
+        repo_name = parts[2]
+
+        repos = getattr(settings, "code_repos", {})
+        if not repos:
+            raise CodeGraphError(
+                "No code_repos configured. Set CODE_REPOS env var (JSON dict) "
+                "mapping repo names to filesystem paths."
+            )
+        repo_path = repos.get(repo_name)
+        if not repo_path:
+            raise CodeGraphError(
+                f"No repo configured with name {repo_name!r}. "
+                f"Available repos: {', '.join(repos.keys())}"
+            )
+        repo_path = Path(os.path.expanduser(repo_path))
+        if not repo_path.is_dir():
+            raise CodeGraphError(f"Repo path does not exist: {repo_path}")
+
+        # Create GraphifyLibEngine (graph not loaded yet; will be built on first index())
+        engine = GraphifyLibEngine(code_space=code_space, source_root=str(repo_path))
+        _ctx_cache[cache_key] = {"engine": engine}
+        logger.info("Created GraphifyLibEngine for %s at %s", code_space, repo_path)
         return engine
 
 

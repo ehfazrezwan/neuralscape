@@ -1,4 +1,4 @@
-"""Three-layer deterministic knowledge system router (Phase D).
+r"""Three-layer deterministic knowledge system router (Phase D).
 
 Resolution order (first hit wins), per PLAN §4:
   1. **Explicit override**: optional `knowledge_system` param (additive to all
@@ -11,8 +11,8 @@ Resolution order (first hit wins), per PLAN §4:
      layer 2 permits code fusion):
        - project has ≥1 healthy indexed code_space (necessary condition — cheap
          registry lookup via `eligible_systems`).
-       - query-shape gate for the EXTRA code leg: FQN-ish token (r`\w+\.\w+\(`, `::`),
-         path-like token (r`\w+/\w+\.\w{1,4}`), backticked snake_case/CamelCase
+       - query-shape gate for the EXTRA code leg: FQN-ish token (r`\\w+\\.\\w+\\(`, `::`),
+         path-like token (r`\\w+/\\w+\\.\\w{1,4}`), backticked snake_case/CamelCase
          identifier, or structural keywords (who calls / where is / defined / imports /
          blast radius). Plain-prose recall on a code project does NOT fan out to code
          (recall precision + latency floor). Ambiguity → base-only (additive: code is

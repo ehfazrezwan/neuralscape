@@ -26,7 +26,9 @@ import logging
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from knowledge.base import SystemAnswer
+    pass
+
+from knowledge.base import SystemAnswer
 
 logger = logging.getLogger(__name__)
 
@@ -229,3 +231,96 @@ def batched_anchor_lookup(
     except Exception:
         logger.warning("Batched anchor lookup failed (non-fatal)", exc_info=True)
         return {}
+
+
+# ── Cross-engine dedup (Phase F) ─────────────────────────────────────
+
+# Per-op precision preferences (PLAN §6 + rootcause §1):
+# - neighbors: CBM is higher-precision (structured call-graph edges)
+# - path: graphify is higher-precision (measured best path accuracy)
+# - query/locate: no strong preference, first wins
+
+_OP_ENGINE_PREFERENCE = {
+    "neighbors": ["code-cbm", "code-graphify-lib", "code-graphify-json", "code-native"],
+    "path": ["code-graphify-lib", "code-graphify-json", "code-cbm", "code-native"],
+    # For query/locate, no strong preference — first-seen wins (order by input)
+}
+
+
+def dedup_code_answers(
+    answers: list[SystemAnswer],
+    *,
+    operation: str = "query",
+) -> SystemAnswer:
+    """Dedup results from multiple code systems on canonical FQN.
+
+    When >1 code system answers the same op (rare; only on explicit "ask both"),
+    dedup on canonical FQN, prefer the higher-precision engine per op class
+    (CBM for neighbors, graphify for path — measured, rootcause §1), attribute BOTH.
+
+    Args:
+        answers: List of SystemAnswer from different code systems.
+        operation: The operation type (neighbors/path/query/locate) for preference.
+
+    Returns:
+        Single SystemAnswer with deduped hits, attributed to all contributing engines.
+    """
+    if len(answers) <= 1:
+        return answers[0] if answers else SystemAnswer(
+            system_name="none",
+            system_version=None,
+            content="",
+            hits=None,
+            metadata={},
+        )
+
+    # Get precision-ordered engine list for this op
+    preferred_order = _OP_ENGINE_PREFERENCE.get(operation, [])
+
+    # Sort answers by preference (preferred engines first, then input order)
+    def engine_priority(ans: SystemAnswer) -> int:
+        try:
+            return preferred_order.index(ans.system_name)
+        except ValueError:
+            return len(preferred_order)  # unknown engines go last
+
+    sorted_answers = sorted(answers, key=engine_priority)
+
+    # Dedup by canonical FQN (if hits are structured)
+    seen_fqns = set()
+    deduped_hits = []
+    contributing_systems = set()
+
+    for answer in sorted_answers:
+        contributing_systems.add(answer.system_name)
+        if answer.hits:
+            for hit in answer.hits:
+                if isinstance(hit, dict) and "fqn" in hit:
+                    fqn = hit["fqn"]
+                    if fqn not in seen_fqns:
+                        seen_fqns.add(fqn)
+                        # Add source attribution to hit metadata
+                        hit["_source_system"] = answer.system_name
+                        deduped_hits.append(hit)
+
+    # Compose content from the preferred (first) answer, note others contributed
+    primary = sorted_answers[0]
+    content_lines = [primary.content] if primary.content else []
+    if len(contributing_systems) > 1:
+        others = [s for s in contributing_systems if s != primary.system_name]
+        content_lines.append(
+            f"\n(Also searched: {', '.join(others)}; results deduped on canonical FQN)"
+        )
+
+    return SystemAnswer(
+        system_name=f"{primary.system_name}+{len(contributing_systems)-1}",
+        system_version=primary.system_version,
+        content="\n".join(content_lines),
+        hits=deduped_hits if deduped_hits else None,
+        metadata={
+            "operation": operation,
+            "deduped": True,
+            "contributing_systems": sorted(contributing_systems),
+            "preferred_system": primary.system_name,
+        },
+    )
