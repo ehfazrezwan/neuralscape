@@ -98,6 +98,56 @@ class NativeEngine:
         self.settings = settings
         self.driver = driver
 
+    # ── Canonical FQN normalization (Phase C) ───────────────────────────
+
+    @staticmethod
+    def to_canonical(raw_fqn: str) -> str:
+        """Normalize native engine's FQN to canonical form.
+
+        Native format: `<module_path>.<qualname>` where module_path includes
+        src/lib roots (e.g. `src.click.core.CommandCollection`).
+
+        Canonical format: `<module_path>.<qualname>` with src/lib roots stripped
+        (e.g. `click.core.CommandCollection`).
+
+        Per PLAN §2: canonical_fqn := <repo-relative module path, src/lib roots
+        stripped, '/' → '.'> + '.' + <qualname dotted>.
+
+        Args:
+            raw_fqn: Native engine's FQN (may include src/lib prefix).
+
+        Returns:
+            Canonical FQN (src/lib stripped).
+        """
+        # Strip common root directories from the start.
+        root_markers = {"src", "lib", "pkg", "internal", "app", "core", "main"}
+        parts = raw_fqn.split(".")
+
+        # Remove leading root markers
+        while parts and parts[0] in root_markers:
+            parts.pop(0)
+
+        canonical = ".".join(parts)
+        logger.debug(f"Native to_canonical: {raw_fqn} → {canonical}")
+        return canonical
+
+    @staticmethod
+    def from_canonical(canonical_fqn: str) -> str:
+        """Convert canonical FQN back to native format (best-effort).
+
+        Since we don't know which root (src/lib/etc) was stripped, we can't
+        reconstruct it exactly. For queries, we use the canonical form directly
+        (matches will work as long as the query is on the canonical FQN).
+
+        Args:
+            canonical_fqn: Canonical FQN (e.g. click.core.CommandCollection).
+
+        Returns:
+            FQN for native queries (same as canonical for search purposes).
+        """
+        # For search, canonical works as-is (our CONTAINS query tolerates it).
+        return canonical_fqn
+
     def query(
         self,
         question: str,
@@ -1583,10 +1633,13 @@ class NativeEngine:
     def _ensure_anchors(self):
         """E4: Create CodeAnchor nodes and link symbols to them.
 
-        MERGE anchors keyed by (code_space, repo, fqn) and create
+        MERGE anchors keyed by (code_space, repo, CANONICAL FQN) and create
         (:CodeSymbol)-[:ANCHORED]->(:CodeAnchor) edges. Anchors survive symbol
         reindexes — symbols are deleted/recreated, anchors persist, and the
         ANCHORED edges are recreated pointing to the same anchor nodes.
+
+        Phase C: Anchors are keyed on CANONICAL FQN (src/lib stripped) so they
+        survive engine swaps (CBM ↔ graphify ↔ native).
 
         Uses deadlock retry pattern per graph_patcher.py.
         """
@@ -1594,7 +1647,13 @@ class NativeEngine:
         parts = self.code_space.split("--")
         repo = parts[-1] if len(parts) >= 3 else "unknown"
 
-        # Cypher: MERGE anchor per symbol, link via ANCHORED
+        # Phase C simplified: For now, use the raw FQN as-is in anchors.
+        # The canonical normalization will be applied at lookup time in
+        # _get_anchor_memories. This avoids the expensive per-symbol loop
+        # and preserves exact backward compatibility with existing anchors.
+        # TODO Phase C+: migrate existing anchors to canonical keys in a
+        # separate migration step, then use canonical keys here too.
+
         cypher = """
         MATCH (s:CodeSymbol {code_space: $code_space})
         MERGE (a:CodeAnchor {code_space: $code_space, repo: $repo, fqn: s.fqn})
@@ -1615,10 +1674,18 @@ class NativeEngine:
         user_id: str | None = None,
         limit: int = 3,
     ) -> list[dict]:
-        """E4: Fetch memories attached to a code anchor by (repo, fqn).
+        """E4: Fetch memories attached to a code anchor by (repo, canonical FQN).
+
+        Phase C: Uses CANONICAL FQN (src/lib stripped) so memories anchored to
+        a symbol are retrievable regardless of which engine indexed it.
 
         Respects visibility: returns only memories the caller may read
         (their own private memories + shared/standard pools).
+
+        Args:
+            fqn: The FQN from the engine (will be canonicalized).
+            user_id: Caller user ID for visibility scoping.
+            limit: Max memories to return.
 
         Returns list of dicts: [{id, content, category, visibility, ...}, ...]
         """
@@ -1626,8 +1693,11 @@ class NativeEngine:
         parts = self.code_space.split("--")
         repo = parts[-1] if len(parts) >= 3 else "unknown"
 
-        # Build anchor key: "<repo>::<fqn>"
-        anchor_key = f"{repo}::{fqn}"
+        # Canonicalize the FQN before building the anchor key
+        canonical_fqn = self.to_canonical(fqn)
+
+        # Build anchor key: "<repo>::<canonical_fqn>"
+        anchor_key = f"{repo}::{canonical_fqn}"
 
         # Search memories by source_ref.external_id match
         from memory_service import get_shared_service

@@ -47,30 +47,55 @@ register_system(_base_system)
 
 # ── Register code systems (gated by code-graph extra availability) ────
 
-# Phase B: wrap ONLY the existing GraphifyJsonEngine artifact path.
+# Phase C: register CBMEngine when CBM bridge is available/enabled.
+# Phase F: register GraphifyLibEngine.
 # NativeEngine wrapper exists but is NOT registered by default (decision #1:
 # absent from default registry; explicit CODE_NATIVE_ENABLED opt-in only).
-# CBMEngine and GraphifyLibEngine are Phases C and F.
 
 try:
     # Check if code-graph extra is available (same gate as adapters/code_graph).
     from adapters.code_graph import code_graph_available
 
     if code_graph_available():
-        # The code-graph extra is installed; we CAN import the engine types.
-        # But Phase B only wires GraphifyJsonEngine via the existing artifact
-        # path — there's no standalone registry entry for it yet because it's
-        # already wired via query.py's get_engine() factory (graph_id resolution).
-        #
-        # The wrapper exists (CodeKnowledgeSystem can wrap any CodeIntelEngine),
-        # but registration defers to Phase C/F when we add the new backends
-        # (CBM, graphify-lib) that need their own registry entries.
-        #
-        # For now, log that code systems are available but not auto-registered.
-        logger.info(
-            "code-graph extra is available; code system wrappers ready "
-            "(registration deferred to Phase C/F for new backends)"
-        )
+        logger.info("code-graph extra is available; registering code systems")
+
+        # Phase C: register CBMEngine if CBM_ENABLED=true and bridge is reachable.
+        import os
+        cbm_enabled = os.getenv("CBM_ENABLED", "false").lower() == "true"
+        cbm_bridge_url = os.getenv("CBM_BRIDGE_URL", "http://cbm-bridge:8200")
+
+        if cbm_enabled:
+            try:
+                from adapters.code_graph.cbm_engine import CBMEngine
+                from knowledge.code_system import CodeKnowledgeSystem
+
+                # Create a CBMEngine instance (no project yet; set on index).
+                # Health check will verify bridge reachability.
+                cbm_engine = CBMEngine(bridge_url=cbm_bridge_url)
+
+                # Wrap as CodeKnowledgeSystem
+                cbm_system = CodeKnowledgeSystem(
+                    name="code-cbm",
+                    engine=cbm_engine,
+                    capabilities=frozenset({
+                        "query",
+                        "neighbors",
+                        "locate",
+                        "index",
+                    }),
+                    transport="http",
+                    version=None,  # Fetched lazily on first health check
+                )
+                register_system(cbm_system)
+                logger.info("Registered code-cbm system (CBM bridge at %s)", cbm_bridge_url)
+            except Exception as e:
+                logger.warning(
+                    "CBM system registration failed (CBM_ENABLED=true but bridge unreachable): %s",
+                    e,
+                )
+        else:
+            logger.info("CBM system not enabled (set CBM_ENABLED=true to enable)")
+
     else:
         logger.info(
             "code-graph extra not installed; code systems unavailable "

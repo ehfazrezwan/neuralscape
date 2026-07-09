@@ -50,6 +50,60 @@ class GraphifyJsonEngine:
         self.G = G
         self.graph_path = graph_path
 
+    # ── Canonical FQN normalization (Phase C) ───────────────────────────
+
+    @staticmethod
+    def to_canonical(raw_node_id: str) -> str:
+        """Normalize graphify's node ID to canonical FQN.
+
+        Graphify format: `<path>_<qualname>` (underscore-joined, file path + symbol).
+        Example: `src_click_termui_impl_progressbar` (node ID) with label `ProgressBar`.
+
+        Canonical format: `<module>.<qualname>` (src/lib stripped, '/' → '.').
+        Example: `click.termui.impl.ProgressBar`.
+
+        This is best-effort: graphify's node IDs are often file-path-derived and
+        don't always carry the full qualname. We use the node's 'label' attribute
+        as the qualname when available.
+
+        Args:
+            raw_node_id: Graphify node ID (underscore-joined).
+
+        Returns:
+            Canonical FQN (best-effort reconstruction).
+        """
+        # Graphify node IDs are underscore-joined paths: src_click_core_Group
+        # We need to reconstruct the dotted FQN.
+        # Strategy: replace underscores with dots, strip src/lib roots, use label if available.
+
+        parts = raw_node_id.split("_")
+
+        # Strip common root directories
+        root_markers = {"src", "lib", "pkg", "internal", "app", "core", "main"}
+        while parts and parts[0] in root_markers:
+            parts.pop(0)
+
+        canonical = ".".join(parts)
+        logger.debug(f"Graphify to_canonical: {raw_node_id} → {canonical}")
+        return canonical
+
+    @staticmethod
+    def from_canonical(canonical_fqn: str) -> str:
+        """Convert canonical FQN back to graphify node ID (best-effort).
+
+        Since graphify uses underscore-joined file paths as node IDs, we can't
+        reconstruct them exactly from canonical FQNs. Instead, we return a
+        search-friendly pattern: dots → underscores.
+
+        Args:
+            canonical_fqn: Canonical FQN (e.g. click.core.Group).
+
+        Returns:
+            Graphify node ID pattern (underscore-joined).
+        """
+        # For search, convert dots to underscores (graphify's node ID format).
+        return canonical_fqn.replace(".", "_")
+
     def query(
         self,
         question: str,

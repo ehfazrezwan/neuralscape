@@ -27,6 +27,15 @@ travel with them and must not be removed.
 - Modified by Neuralscape where noted in
   `docs/neuralscape/14-upstream-delta-report.md`.
 
+## CBM (codebase-memory-mcp)
+
+- Upstream: https://github.com/DeusData/codebase-memory-mcp
+- License: MIT License
+- **Vendored in the CBM bridge service** (`cbm-bridge/Dockerfile` builds from pinned source at v0.9.0 / commit ee68144).
+  The bridge exposes structured JSON tools only (no raw Cypher). CBM binary is
+  built from public MIT-licensed source; no modifications, no redistribution
+  of modified sources.
+
 ## Backing services (not distributed, referenced by `docker-compose.yml`)
 
 These run as separate, unmodified processes pulled as official images at
