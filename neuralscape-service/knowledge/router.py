@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -145,11 +145,21 @@ def _has_coding_signal(query: str) -> bool:
 
 @dataclass
 class RouteDecision:
-    """What the router decided and why (for debug logging + tests)."""
+    """What the router decided and why (for debug logging + tests).
+
+    ``wants_code_fusion`` + ``code_system_names`` are the STRUCTURED fusion signal
+    consumed by the Phase E recall wiring — never infer fusion from ``rationale``
+    text (a wording tweak must not silently toggle behavior). When
+    ``wants_code_fusion`` is True, ``code_system_names`` holds the resolved code
+    system name(s) to compose into recall, honoring project config
+    (``default_engine`` first, else ``code_systems``).
+    """
 
     systems: list[KnowledgeSystem]
     rationale: str  # Human-readable explanation (layer hit, signal present/absent, etc.)
     layer: int  # 1=explicit, 2=project config, 3=signal-based
+    wants_code_fusion: bool = False  # Structured fusion gate (consumed by recall wiring)
+    code_system_names: list[str] = field(default_factory=list)  # Resolved code system(s) for fusion
 
 
 def resolve_systems(
@@ -308,21 +318,31 @@ def resolve_systems(
                 # CRITICAL: Phase D does NOT compose fusion yet; this decision is
                 # recorded but not acted on in recall output (that's Phase E).
                 if proj_cfg.fuse_code_into_recall and _has_coding_signal(query):
-                    # Return base (always) for now; Phase E will compose the code leg.
-                    # The decision is logged but not executed (byte-identical output).
+                    # Phase E: base always answers; the recall wiring composes the
+                    # resolved code system(s) on top. Honor default_engine first,
+                    # else the full code_systems list (respect project config —
+                    # the wiring must NOT re-pick a backend).
                     base = get_system("ns-memory")
+                    resolved = (
+                        [proj_cfg.default_engine]
+                        if proj_cfg.default_engine
+                        else list(proj_cfg.code_systems)
+                    )
                     logger.debug(
                         "Layer 2: project '%s' has code systems + coding signal detected "
-                        "(fusion ON) — Phase D records decision; Phase E will compose",
+                        "(fusion ON) — composing %s",
                         project_id,
+                        resolved,
                     )
                     return RouteDecision(
                         systems=[base] if base else [],
                         rationale=(
                             f"Project config: code fusion enabled + coding signal detected "
-                            f"(Phase D: base-only; Phase E: will add {proj_cfg.code_systems})"
+                            f"(compose {resolved})"
                         ),
                         layer=2,
+                        wants_code_fusion=True,
+                        code_system_names=resolved,
                     )
 
                 # fuse_code_into_recall=False or no coding signal → base-only
@@ -352,21 +372,26 @@ def resolve_systems(
         # Check if project has any healthy code systems
         code_systems = eligible_systems(project_id=project_id, kind="code")
         if code_systems and _has_coding_signal(query):
-            # CRITICAL: Phase D does NOT compose fusion yet. Return base-only;
-            # Phase E will add the code leg.
+            # Phase E: base always answers; the recall wiring composes the resolved
+            # code system(s) on top. No project config here, so use the eligible
+            # healthy code systems (by name) the registry resolved.
             base = get_system("ns-memory")
+            resolved = [s.info.name for s in code_systems]
             logger.debug(
                 "Layer 3: project '%s' has code systems + coding signal detected "
-                "(Phase D: base-only; Phase E: will compose)",
+                "(composing %s)",
                 project_id,
+                resolved,
             )
             return RouteDecision(
                 systems=[base] if base else [],
                 rationale=(
                     f"Signal-based: project has {len(code_systems)} code system(s) + coding signal "
-                    f"(Phase D: base-only; Phase E: will add code leg)"
+                    f"(compose {resolved})"
                 ),
                 layer=3,
+                wants_code_fusion=True,
+                code_system_names=resolved,
             )
 
     # ── Default: base-only (ns-memory) ──

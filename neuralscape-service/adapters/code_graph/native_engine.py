@@ -623,7 +623,9 @@ class NativeEngine:
         """
         results = self._run_cypher(cypher, code_space=self.code_space)
 
-        canonical_fqns = {r["fqn"] for r in results}
+        # Filter out null/falsy fqns — a symbol written before canonical_fqn
+        # existed with no raw fqn would otherwise produce a "repo::None" anchor key.
+        canonical_fqns = {r["fqn"] for r in results if r.get("fqn")}
         logger.debug("Native symbol inventory: %d canonical FQNs", len(canonical_fqns))
         return canonical_fqns
 

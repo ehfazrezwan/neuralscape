@@ -114,6 +114,47 @@ def test_detect_inventory_diff_liveness_engine_without_method():
         assert "inventory method unavailable" in result["summary"]
 
 
+def test_detect_inventory_diff_liveness_capability_error_is_graceful():
+    """Finding 6: an engine that HAS the method but raises EngineCapabilityError
+    (declares the op N/A) degrades gracefully as 'inventory method unavailable' —
+    NOT a hard 'inventory diff failed'.
+    """
+    from adapters.code_graph.engine import EngineCapabilityError
+
+    mock_engine = MagicMock()
+    mock_engine.get_symbol_inventory.side_effect = EngineCapabilityError("no enumeration tool")
+
+    mock_service = MagicMock()
+
+    with patch("extensions.dreaming.config.dreaming_settings") as mock_settings:
+        mock_settings.enabled = True
+
+        result = detect_inventory_diff_liveness(
+            service=mock_service,
+            code_space="code--user--repo",
+            engine=mock_engine,
+            dry_run=False,
+        )
+
+        assert result["flagged"] == 0
+        assert result["summary"] == "inventory method unavailable"
+        assert "failed" not in result["summary"]
+
+
+def test_cbm_engine_inventory_is_honest_capability_gap():
+    """Finding 7: the REAL CBMEngine.get_symbol_inventory raises
+    EngineCapabilityError (no exhaustive symbol-enumeration tool). This is a
+    documented scoped follow-up — CBM inventory-diff liveness needs a bridge
+    /list_symbols endpoint. Native/graphify DO support inventory diff today.
+    """
+    from adapters.code_graph.cbm_engine import CBMEngine
+    from adapters.code_graph.engine import EngineCapabilityError
+
+    engine = CBMEngine(bridge_url="http://cbm-bridge:8200", project="p", code_space="code--u--r")
+    with pytest.raises(EngineCapabilityError):
+        engine.get_symbol_inventory()
+
+
 def test_detect_inventory_diff_liveness_dreaming_disabled():
     """Liveness pass skipped when dreaming is disabled."""
     mock_engine = MagicMock()
@@ -214,13 +255,37 @@ def test_fetch_anchor_inventory_error_handling():
         assert result == set()
 
 
-def test_inventory_diff_liveness_multiple_engines():
-    """Liveness works uniformly across native, CBM, graphify engines."""
-    # This is a meta-test verifying the abstraction: the same
-    # detect_inventory_diff_liveness function works with any engine
-    # as long as it implements get_symbol_inventory().
+def test_native_get_symbol_inventory_filters_falsy_fqns():
+    """Finding 8: null/falsy fqns are filtered out so no 'repo::None' anchor key
+    is ever built from a symbol written before canonical_fqn existed.
+    """
+    from adapters.code_graph.native_engine import NativeEngine
 
-    for engine_name in ["native", "cbm", "graphify"]:
+    engine = NativeEngine(
+        repo_path="/fake", code_space="code--u--r",
+        bridge=MagicMock(), settings=MagicMock(),
+    )
+    with patch.object(
+        engine, "_run_cypher",
+        return_value=[{"fqn": "lib.Foo"}, {"fqn": None}, {"fqn": ""}, {"fqn": "lib.Bar"}],
+    ):
+        inv = engine.get_symbol_inventory()
+
+    assert inv == {"lib.Foo", "lib.Bar"}
+    assert None not in inv
+    assert "" not in inv
+
+
+def test_inventory_diff_liveness_engine_agnostic_consumer():
+    """The consumer is engine-agnostic: detect_inventory_diff_liveness works with
+    ANY engine that can enumerate symbols (get_symbol_inventory returns a set).
+
+    Today that's native + graphify (verified by their real get_symbol_inventory).
+    CBM is a documented capability gap (test_cbm_engine_inventory_is_honest_
+    capability_gap) — it raises EngineCapabilityError and degrades gracefully, so
+    it is intentionally NOT asserted to produce a diff here.
+    """
+    for engine_name in ["native", "graphify"]:
         mock_engine = MagicMock()
         mock_engine.get_symbol_inventory.return_value = {"lib.Foo"}
 

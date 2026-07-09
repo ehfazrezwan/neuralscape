@@ -336,6 +336,8 @@ def detect_inventory_diff_liveness(
         logger.info("Dreaming disabled — skipping inventory-diff liveness")
         return {"events": [], "flagged": 0, "summary": "dreaming disabled"}
 
+    from adapters.code_graph.engine import EngineCapabilityError
+
     try:
         # Get current symbol inventory from the engine
         if not hasattr(engine, "get_symbol_inventory"):
@@ -345,7 +347,18 @@ def detect_inventory_diff_liveness(
             )
             return {"events": [], "flagged": 0, "summary": "inventory method unavailable"}
 
-        current_inventory = engine.get_symbol_inventory()
+        try:
+            current_inventory = engine.get_symbol_inventory()
+        except EngineCapabilityError:
+            # The engine has the method but declares the op N/A (e.g. CBM has no
+            # symbol-enumeration endpoint yet). This is NOT a failure — it's an
+            # honest capability gap; degrade gracefully, distinct from a real error.
+            logger.info(
+                "Engine %s declares get_symbol_inventory N/A (inventory-diff liveness "
+                "unavailable for this backend)",
+                type(engine).__name__,
+            )
+            return {"events": [], "flagged": 0, "summary": "inventory method unavailable"}
 
         # Get previous inventory: either passed in or fetch from anchors
         if previous_inventory is None:

@@ -383,26 +383,28 @@ class CBMEngine:
     def get_symbol_inventory(self) -> set[str]:
         """Get current symbol inventory (canonical FQNs) for liveness tracking.
 
-        Phase E: Used to detect deleted/changed symbols after reindex.
-        Returns canonical FQNs (via to_canonical) so the liveness diff is
-        engine-agnostic.
+        Phase E: honest N/A (SCOPED FOLLOW-UP). The CBM bridge shim exposes only
+        search_graph / trace_path / get_code_snippet / get_architecture /
+        index_status / index_repository / delete_project (PLAN §3.1) — none of
+        which is a complete, bounded symbol enumeration. ``index_status`` returns
+        only counts ({project, nodes, edges}); ``search_graph`` is a name-pattern
+        query, not an exhaustive listing. A faithful inventory needs a new bridge
+        ``/list_symbols`` endpoint on the CBM bridge service (a separate
+        pinned-source image, out of scope for this NS-service PR).
 
-        Returns:
-            Set of canonical FQNs currently indexed.
+        Until that endpoint exists, this raises EngineCapabilityError, and the
+        inventory-diff liveness consumer degrades gracefully ("inventory method
+        unavailable") rather than treating it as a failure. Native and graphify
+        engines DO support inventory diff today.
+
+        Raises:
+            EngineCapabilityError: CBM has no exhaustive symbol-enumeration tool.
         """
-        project = self._ensure_project()
-
-        # Use index_status to get all indexed functions/symbols
-        # The bridge's /index_status returns {"project": ..., "nodes": N, "edges": E}
-        # but doesn't expose a full symbol list. We need to use search_graph with
-        # a wildcard or enumerate via architecture.
-        #
-        # For now, raise EngineCapabilityError — CBM doesn't expose a full
-        # symbol enumeration via its tools (only search/trace). This will be
-        # revisited if we add a bridge endpoint for it.
         raise EngineCapabilityError(
-            "CBM doesn't expose full symbol enumeration via its tools. "
-            "Liveness tracking for CBM requires a bridge /list_symbols endpoint."
+            "CBM has no exhaustive symbol-enumeration tool (index_status returns "
+            "only counts; search_graph is a name-pattern query). Inventory-diff "
+            "liveness for CBM is a scoped follow-up needing a bridge /list_symbols "
+            "endpoint. Native/graphify support inventory diff today."
         )
 
     def detect_changes(

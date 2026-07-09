@@ -228,15 +228,17 @@ def test_layer2_code_tool_no_default_uses_first(mock_registry):
 
 
 def test_layer2_generic_recall_fusion_on_coding_signal(mock_registry):
-    """Layer 2: generic recall on project with fusion ON + coding signal → base-only (Phase D).
+    """Layer 2: generic recall on project with fusion ON + coding signal.
 
-    Phase D only RESOLVES; Phase E will compose the code leg. Output must be
-    byte-identical to today.
+    Base always answers; the STRUCTURED wants_code_fusion + code_system_names
+    fields tell the recall wiring which code system(s) to compose (honoring
+    default_engine). Fusion is NEVER inferred from rationale text.
     """
     set_project_config(
         ProjectKnowledgeConfig(
             project_id="proj3",
             code_systems=["code-cbm"],
+            default_engine="code-cbm",
             fuse_code_into_recall=True,  # DEFAULT TRUE per decision #3
         )
     )
@@ -244,12 +246,14 @@ def test_layer2_generic_recall_fusion_on_coding_signal(mock_registry):
         query="Who calls foo.bar()?",  # Coding signal: FQN token
         project_id="proj3",
     )
-    # Phase D: base-only (fusion composition is Phase E)
+    # Base always answers; fusion is signaled structurally.
     assert len(decision.systems) == 1
     assert decision.systems[0].info.name == "ns-memory"
     assert decision.layer == 2
+    # STRUCTURED fusion signal (finding 1): consumed by wiring, not rationale text.
+    assert decision.wants_code_fusion is True
+    assert decision.code_system_names == ["code-cbm"]
     assert "coding signal detected" in decision.rationale
-    assert "Phase E" in decision.rationale
 
 
 def test_layer2_generic_recall_fusion_on_no_coding_signal(mock_registry):
@@ -268,6 +272,9 @@ def test_layer2_generic_recall_fusion_on_no_coding_signal(mock_registry):
     # No coding signal → falls through to layer 3 (which also returns base-only)
     assert len(decision.systems) == 1
     assert decision.systems[0].info.name == "ns-memory"
+    # Plain prose MUST NOT trigger fusion — preserves byte-identical recall + floor.
+    assert decision.wants_code_fusion is False
+    assert decision.code_system_names == []
 
 
 def test_layer2_fusion_off(mock_registry):
@@ -326,7 +333,7 @@ def test_layer3_no_coding_signal_plain_prose(mock_registry):
 
 
 def test_layer3_project_has_code_plus_signal(mock_registry, monkeypatch):
-    """Layer 3: project with code + coding signal → base-only (Phase D; fusion in E)."""
+    """Layer 3: project with code + coding signal → base answers + structured fusion signal."""
     # Stub: project has no config, but eligible_systems returns code systems
     def mock_eligible_systems(project_id=None, operation=None, kind=None):
         if project_id == "proj-code" and kind == "code":
@@ -339,12 +346,14 @@ def test_layer3_project_has_code_plus_signal(mock_registry, monkeypatch):
         query="Who calls foo.bar()?",  # Coding signal
         project_id="proj-code",
     )
-    # Phase D: base-only (fusion is Phase E)
+    # Base always answers.
     assert len(decision.systems) == 1
     assert decision.systems[0].info.name == "ns-memory"
     assert decision.layer == 3
+    # STRUCTURED fusion signal: resolved from the eligible healthy code systems.
+    assert decision.wants_code_fusion is True
+    assert decision.code_system_names == ["code-cbm"]
     assert "coding signal" in decision.rationale
-    assert "Phase E" in decision.rationale
 
 
 def test_layer3_project_no_code(mock_registry, monkeypatch):
@@ -398,13 +407,12 @@ def test_router_overhead(mock_registry):
 # ── Byte-identical output guarantee (Phase D critical) ──
 
 
-def test_generic_recall_unchanged_without_explicit_param(mock_registry, monkeypatch):
-    """CRITICAL: generic recall output is unchanged (base-only) unless knowledge_system is explicit.
-
-    Phase D only RESOLVES; it does NOT compose code legs yet. Generic recall must be
-    byte-identical to today to preserve the latency floor and keep D/E separable.
+def test_base_always_answers_code_is_additive(mock_registry, monkeypatch):
+    """CRITICAL: base ALWAYS answers — code fusion is an additive enrichment leg,
+    never a replacement. Even with coding signal + code systems, decision.systems
+    is base-only (ns-memory); the code leg is carried by the STRUCTURED
+    wants_code_fusion signal, so plain base recall stays the floor.
     """
-    # Even with project config + coding signal, resolve_systems returns base-only in Phase D
     set_project_config(
         ProjectKnowledgeConfig(
             project_id="proj-unchanged",
@@ -425,10 +433,11 @@ def test_generic_recall_unchanged_without_explicit_param(mock_registry, monkeypa
         project_id="proj-unchanged",
     )
 
-    # MUST return base-only (ns-memory)
+    # base is the ONLY resolved system (code is additive via wants_code_fusion)
     assert len(decision.systems) == 1
     assert decision.systems[0].info.name == "ns-memory"
-    assert "Phase D" in decision.rationale or "Phase E" in decision.rationale
+    assert decision.wants_code_fusion is True
+    assert decision.code_system_names == ["code-cbm"]
 
 
 # ── Project config CRUD ──

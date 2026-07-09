@@ -238,15 +238,19 @@ class GraphifyJsonEngine:
         if not self.G:
             return set()
 
-        # Extract all node IDs (raw FQNs) and canonicalize them
+        # Extract all node IDs (raw FQNs) and canonicalize them. Skip falsy node
+        # ids and falsy canonicals so no "repo::None"/"repo::" anchor key is built.
         canonical_fqns = set()
         for node_id in self.G.nodes():
+            if not node_id:
+                continue
             try:
                 canonical = self.to_canonical(node_id)
-                canonical_fqns.add(canonical)
             except Exception:
                 # Skip malformed node IDs
                 continue
+            if canonical:
+                canonical_fqns.add(canonical)
 
         logger.debug("Graphify symbol inventory: %d canonical FQNs", len(canonical_fqns))
         return canonical_fqns
