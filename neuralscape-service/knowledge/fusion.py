@@ -23,10 +23,6 @@ in-process, MCP-bridge, or HTTP.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    pass
 
 from knowledge.base import SystemAnswer
 
@@ -299,15 +295,18 @@ def dedup_code_answers(
                     fqn = hit["fqn"]
                     if fqn not in seen_fqns:
                         seen_fqns.add(fqn)
-                        # Add source attribution to hit metadata
-                        hit["_source_system"] = answer.system_name
-                        deduped_hits.append(hit)
+                        # COPY the hit before annotating so the caller's original
+                        # hit dicts are never mutated (no caller-visible side effects).
+                        annotated = dict(hit)
+                        annotated["_source_system"] = answer.system_name
+                        deduped_hits.append(annotated)
 
-    # Compose content from the preferred (first) answer, note others contributed
+    # Compose content from the preferred (first) answer, note others contributed.
+    # Sort the "also searched" list so output is deterministic (a set is not).
     primary = sorted_answers[0]
     content_lines = [primary.content] if primary.content else []
     if len(contributing_systems) > 1:
-        others = [s for s in contributing_systems if s != primary.system_name]
+        others = sorted(s for s in contributing_systems if s != primary.system_name)
         content_lines.append(
             f"\n(Also searched: {', '.join(others)}; results deduped on canonical FQN)"
         )

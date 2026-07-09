@@ -97,38 +97,39 @@ try:
             logger.info("CBM system not enabled (set CBM_ENABLED=true to enable)")
 
         # Phase F: register GraphifyLibEngine (in-process library, always available
-        # when code-graph extra is installed).
+        # when the code-graph extra is installed).
         #
-        # GraphifyLibEngine is per-code_space (like NativeEngine), so we DON'T register
-        # a singleton engine instance here. Instead, we register a MARKER system that
-        # declares code-graphify-lib is available as a routing target. The actual
-        # GraphifyLibEngine instances are created on-demand by the query.py factory
-        # (_get_graphify_lib_engine), cached per code_space in _ctx_cache.
+        # GraphifyLibEngine is per-code_space (like NativeEngine), so real engine
+        # instances are created on-demand by the query.py factory
+        # (_get_graphify_lib_engine), cached per code_space in _ctx_cache. The
+        # REGISTRY ENTRY represents the CAPABILITY (graphify library importable /
+        # per-code_space factory available) — NOT a specific loaded graph.
         #
-        # This registration makes "code-graphify-lib" ELIGIBLE for routing and
-        # shows up in health checks / registry listings (transport="in-process").
+        # The wrapped engine here is a capability placeholder: its health() probes
+        # that graphify imports cleanly (independent of any resident graph), so
+        # code-graphify-lib is ELIGIBLE for routing whenever the extra is present
+        # (eligible_systems requires health=="ok"). transport="in-process".
         try:
             from knowledge.code_system import CodeKnowledgeSystem
             from adapters.code_graph.graphify_lib_engine import GraphifyLibEngine
 
-            # Create a placeholder engine (no code_space yet; engine is created per-space
-            # in query.py). The wrapper's health() will check that graphify imports work.
-            # We use a dummy instance just for the registration; real instances are
-            # created per code_space on-demand.
-            placeholder_engine = GraphifyLibEngine(
-                code_space="__registry_placeholder__",
-                source_root="/dev/null",  # never used
+            # Capability placeholder: health() checks graphify importability, not a
+            # loaded graph, so G=None does NOT make the system ineligible. Real
+            # per-code_space instances are built by the query.py factory on demand.
+            capability_engine = GraphifyLibEngine(
+                code_space="__registry_capability__",
+                source_root="/dev/null",  # never used; factory builds real instances
             )
 
             graphify_lib_system = CodeKnowledgeSystem(
                 name="code-graphify-lib",
-                engine=placeholder_engine,
+                engine=capability_engine,
                 capabilities=frozenset({
                     "query",
                     "neighbors",
                     "path",
                     "index",
-                    "impact",  # detect_changes with seed symbol
+                    "impact",  # detect_changes(seed) → blast radius (git-less repos)
                 }),
                 transport="in-process",
                 version=None,  # Graphify lib version (fetched lazily if needed)

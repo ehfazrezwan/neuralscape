@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 
 import networkx as nx
-from graphify.affected import affected_nodes
+from graphify.affected import affected_nodes, resolve_seed
 from graphify.build import build, edge_data
 from graphify.extract import collect_files, extract
 from graphify.security import sanitize_label
@@ -61,6 +61,34 @@ class GraphifyLibEngine:
         self.source_root = Path(source_root)
         self.G = G
         self._indexed_at: float | None = None
+
+    # ── Health / availability probe ──────────────────────────────────────
+
+    def health(self) -> bool:
+        """Availability probe: is the graphify library importable?
+
+        CRITICAL (PLAN §3.3): a code system's registry entry represents the
+        CAPABILITY (graphify library importable / per-code_space factory
+        available), NOT a specific loaded graph. This engine is registered as a
+        per-code_space FACTORY placeholder (G may be None) — its eligibility must
+        reflect that graphify imports cleanly, not that any one graph is resident.
+
+        The module-level ``from graphify.build import build`` at import time means
+        that if this class imported at all, graphify is available. We re-confirm
+        the import here so a broken/partial install reports unreachable rather
+        than falsely "ok".
+
+        Returns:
+            True when graphify is importable (system eligible for routing).
+        """
+        try:
+            import graphify.build  # noqa: F401
+            import graphify.extract  # noqa: F401
+            import graphify.affected  # noqa: F401
+            return True
+        except Exception:
+            logger.warning("GraphifyLibEngine.health: graphify import failed", exc_info=True)
+            return False
 
     # ── Canonical FQN normalization (Phase C) ───────────────────────────
     # Reuse GraphifyJsonEngine's logic (same graphify node naming; don't diverge).
@@ -315,42 +343,77 @@ class GraphifyLibEngine:
     ) -> ChangeReport:
         """Blast-radius via graphify's affected_nodes (reverse BFS).
 
+        For git-less repos, this powers blast_radius: "what is affected if I
+        change X?" The `since` param is overloaded: a str is treated as a seed
+        symbol (or query) and resolved against the graph; bytes/None (git-based
+        diff) is not supported by the in-process library engine.
+
+        The affected node IDs are canonicalized (via to_canonical) so the report
+        is engine-agnostic and aligns with anchor keys.
+
         Args:
-            since: None (working-tree vs last index; not supported yet for graphify lib),
-                   or str (symbol name to compute blast radius for).
+            since: str — seed symbol/query for blast-radius analysis.
 
         Returns:
-            ChangeReport with affected symbols.
+            ChangeReport with the blast-radius symbols under ``modified_symbols``
+            (they may need attention if the seed changes). ``deleted_symbols`` /
+            ``added_symbols`` / ``affected_anchors`` stay empty (no git diff);
+            ``summary`` describes the blast radius. An unresolved seed yields an
+            empty report with an explanatory summary (not an exception).
 
         Raises:
-            EngineCapabilityError: When called without a seed symbol (git-based diff
-                not yet supported for in-process engine).
+            EngineCapabilityError: git-based diff (since=None/bytes) — use a
+                git-aware engine (e.g. code-native).
         """
+        if not isinstance(since, str):
+            # Git-based diff (since=None or bytes) not supported for in-process engine
+            raise EngineCapabilityError(
+                "detect_changes() with git-based diff (since=None/bytes) is not supported "
+                "on GraphifyLibEngine. Pass a seed symbol (str) for blast-radius analysis, "
+                "or use a git-aware engine (e.g. code-native)."
+            )
+
         if not self.G:
-            return ChangeReport(changed_files=[], affected_symbols=[])
+            return ChangeReport(
+                deleted_symbols=[],
+                modified_symbols=[],
+                added_symbols=[],
+                affected_anchors=[],
+                summary="No graph loaded; run index() first.",
+            )
 
-        # Graphify's affected_nodes takes a seed symbol and returns reverse-BFS hits.
-        # For git-less repos, this powers blast_radius: "what breaks if I change X?"
-        # The `since` param is overloaded: str = seed symbol, bytes/None = git-based diff.
-        if isinstance(since, str):
-            # Treat as a seed symbol for blast radius
+        # Resolve the seed (accepts a node id or a natural-language-ish query).
+        seed_node = resolve_seed(self.G, since)
+        if not seed_node:
+            return ChangeReport(
+                deleted_symbols=[],
+                modified_symbols=[],
+                added_symbols=[],
+                affected_anchors=[],
+                summary=f"No node resolved for seed {since!r}; empty blast radius.",
+            )
+
+        # Reverse-BFS blast radius. AffectedHit carries node_id/depth/via_relation.
+        hits = affected_nodes(self.G, seed=seed_node, depth=2)
+        affected: list[str] = []
+        for h in hits:
+            if not h.node_id:
+                continue
             try:
-                hits = affected_nodes(self.G, seed=since, depth=2)
-                affected = [f"{h.label} ({h.location})" for h in hits]
-                logger.debug("Blast radius for %s: %d affected symbols", since, len(affected))
-                return ChangeReport(
-                    changed_files=[],  # No file-level change tracking in lib engine
-                    affected_symbols=affected,
-                )
-            except Exception as e:
-                logger.warning("affected_nodes failed for seed %s: %s", since, e)
-                return ChangeReport(changed_files=[], affected_symbols=[])
+                canonical = self.to_canonical(h.node_id)
+            except Exception:
+                continue
+            if canonical:
+                affected.append(canonical)
 
-        # Git-based diff (since=None or bytes) not supported yet for in-process engine
-        raise EngineCapabilityError(
-            "detect_changes() with git-based diff (since=None/bytes) is not supported "
-            "on GraphifyLibEngine. Pass a seed symbol (str) for blast-radius analysis, "
-            "or use a git-aware engine (e.g. code-native)."
+        logger.debug("Blast radius for %s (node %s): %d affected symbols",
+                     since, seed_node, len(affected))
+        return ChangeReport(
+            deleted_symbols=[],
+            modified_symbols=affected,  # blast-radius: symbols that may be affected
+            added_symbols=[],
+            affected_anchors=[],
+            summary=f"Blast radius for {since!r}: {len(affected)} affected symbol(s).",
         )
 
     def get_symbol_inventory(self) -> set[str]:

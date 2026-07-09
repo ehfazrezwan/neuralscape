@@ -1351,26 +1351,27 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                     include_shared=arguments.get("include_shared", True),
                 )
 
-            # Phase E: resolve the code system(s) the ROUTER decided (structured
-            # signal — never infer fusion from rationale text). Respect project
-            # config (default_engine/code_systems); do NOT re-pick a backend here.
-            code_sys = None
+            # Phase E/F: resolve ALL healthy code system(s) the ROUTER decided
+            # (structured signal — never infer fusion from rationale text). Respect
+            # project config (default_engine/code_systems); do NOT re-pick a backend
+            # here. Phase F: when >1 code system answers the same op, cross-engine
+            # dedup (canonical-FQN + per-op preference) merges them into one answer.
+            code_systems_list = []
             if route_decision.wants_code_fusion and arguments.get("project_id"):
                 from knowledge.registry import get_system
 
                 for _name in route_decision.code_system_names:
                     _cand = get_system(_name)
                     if _cand is not None and _cand.health().status == "ok":
-                        code_sys = _cand
-                        break
+                        code_systems_list.append(_cand)
 
-            if code_sys is not None:
+            if code_systems_list:
                 # Fusion path: run the code leg CONCURRENTLY with the base legs
                 # (overlap the two slowest calls; same intent as search.py's
                 # ThreadPoolExecutor graph-leg overlap).
                 from knowledge.base import RecallRequest
 
-                async def _code_leg():
+                async def _one_code_recall(_sys):
                     try:
                         code_req = RecallRequest(
                             query=arguments["query"],
@@ -1379,15 +1380,40 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                             limit=arguments.get("limit", 10),
                             operation="query",
                         )
-                        return await asyncio.to_thread(code_sys.recall, code_req)
+                        return await asyncio.to_thread(_sys.recall, code_req)
                     except Exception as e:
-                        logger.warning("Code leg failed (base still answers): %s", e, exc_info=True)
+                        logger.warning(
+                            "Code leg (%s) failed (base still answers): %s",
+                            _sys.info.name, e, exc_info=True,
+                        )
                         return None
+
+                async def _code_leg():
+                    # Query every resolved code system concurrently.
+                    answers = await asyncio.gather(
+                        *[_one_code_recall(s) for s in code_systems_list]
+                    )
+                    answers = [a for a in answers if a is not None]
+                    if not answers:
+                        return None
+                    if len(answers) == 1:
+                        return answers[0]
+                    # Phase F cross-engine dedup: >1 code system answered the same
+                    # op → dedup on canonical FQN, per-op precision preference,
+                    # attribute BOTH (PLAN §6). This is the REAL production path.
+                    from knowledge.fusion import dedup_code_answers
+
+                    return dedup_code_answers(answers, operation="query")
 
                 results, code_answer = await asyncio.gather(
                     asyncio.to_thread(_base_search),
                     _code_leg(),
                 )
+
+                # Representative code system for anchor-join engine resolution
+                # (to_canonical / code_space). All code engines canonicalize
+                # compatibly, so the first resolved system is a safe reference.
+                code_sys = code_systems_list[0]
 
                 if code_answer is not None:
                     try:
