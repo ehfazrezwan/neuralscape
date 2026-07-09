@@ -61,7 +61,6 @@ def test_eligible_systems_health_gate():
 
     # Base system should be healthy and eligible (if it registered).
     eligible = eligible_systems()
-    names = [s.info.name for s in eligible]
     # If base registered, it should be eligible (health="ok").
     # If it didn't, eligible is empty (acceptable in minimal test env).
     assert isinstance(eligible, list)
@@ -73,7 +72,6 @@ def test_eligible_systems_capability_filter():
 
     # Base system declares "recall"; it should be eligible for that op.
     recall_systems = eligible_systems(operation="recall")
-    recall_names = [s.info.name for s in recall_systems]
     # If base is healthy, it should be in the list.
     # (Test environment may not have mem0 initialized, so this is lenient.)
     assert isinstance(recall_systems, list)
@@ -88,7 +86,6 @@ def test_eligible_systems_kind_filter():
     from knowledge import eligible_systems
 
     base_systems = eligible_systems(kind="base")
-    base_names = [s.info.name for s in base_systems]
     # ns-memory is kind="base"; if it's healthy, it should be here.
     assert isinstance(base_systems, list)
 
@@ -111,31 +108,99 @@ def test_ns_memory_health():
     assert isinstance(health.details, dict)
 
 
-def test_ns_memory_recall_preserves_behavior():
-    """NSMemorySystem.recall() delegates to the same search path as today.
+def test_ns_memory_recall_reads_real_fields(monkeypatch):
+    """NSMemorySystem.recall() reads the REAL MemoryResponse fields (no skip).
 
-    This is a smoke test: we can't verify byte-identical responses without
-    a full MemoryService fixture (mem0 + Graphiti initialized), but we can
-    check that the wrapper doesn't crash and returns a SystemAnswer.
+    Regression guard for the ``mem.memory_text`` bug: MemoryResponse's text
+    field is ``.memory`` (schemas.py), not ``.memory_text``. By monkeypatching
+    the service's ``search`` to return a real MemoryResponse, this exercises the
+    result-formatting path unconditionally — the old smoke test skipped when
+    mem0 wasn't initialized and so never caught the AttributeError.
+    """
+    from knowledge import get_system
+    from knowledge.base import RecallRequest
+    from schemas import MemoryResponse
+
+    base = get_system("ns-memory")
+    assert base is not None, "Base system should always register"
+
+    fake_results = [
+        MemoryResponse(
+            id="mem-1",
+            memory="User prefers dark mode.",
+            category="preference",
+            score=0.87,
+        ),
+        MemoryResponse(
+            id="mem-2",
+            memory="Deploys happen on Fridays.",
+            category="workflow",
+            score=0.42,
+        ),
+    ]
+
+    captured = {}
+
+    def fake_search(*args, **kwargs):
+        captured.update(kwargs)
+        return fake_results
+
+    # Patch the concrete service the wrapper delegates to.
+    svc = base._get_service()
+    monkeypatch.setattr(svc, "search", fake_search)
+
+    req = RecallRequest(query="test query", user_id="alice", limit=5)
+    answer = base.recall(req)
+
+    # Wrapper read the REAL .memory / .category fields (not .memory_text).
+    assert answer.system_name == "ns-memory"
+    assert "User prefers dark mode." in answer.content
+    assert "Deploys happen on Fridays." in answer.content
+    assert "category=preference" in answer.content
+    # Structured hits are model_dump()s of the MemoryResponse objects.
+    assert isinstance(answer.hits, list)
+    assert len(answer.hits) == 2
+    assert answer.hits[0]["id"] == "mem-1"
+    assert answer.hits[0]["memory"] == "User prefers dark mode."
+    assert answer.hits[0]["score"] == 0.87
+    assert answer.metadata["result_count"] == 2
+    # user_id was threaded through to search (not a fabricated default).
+    assert captured["user_id"] == "alice"
+
+
+def test_ns_memory_recall_empty_results(monkeypatch):
+    """NSMemorySystem.recall() returns an empty answer when search finds nothing."""
+    from knowledge import get_system
+    from knowledge.base import RecallRequest
+
+    base = get_system("ns-memory")
+    assert base is not None
+
+    svc = base._get_service()
+    monkeypatch.setattr(svc, "search", lambda *a, **k: [])
+
+    answer = base.recall(RecallRequest(query="nothing", user_id="alice"))
+    assert answer.system_name == "ns-memory"
+    assert answer.content == "No memories found."
+    assert answer.hits == []
+    assert answer.metadata["result_count"] == 0
+
+
+def test_ns_memory_recall_requires_user_id():
+    """NSMemorySystem.recall() refuses to query without a concrete user_id.
+
+    Regression guard for the fabricated ``user_id="default-user"`` bug: the
+    wrapper must NOT invent a shared default pool (cross-user leakage risk).
+    A missing user_id is a caller error.
     """
     from knowledge import get_system
     from knowledge.base import RecallRequest
 
     base = get_system("ns-memory")
-    if base is None:
-        pytest.skip("Base system not registered (minimal test env)")
+    assert base is not None
 
-    # Simple recall request (may return empty results in test env, that's fine).
-    req = RecallRequest(query="test query", limit=5)
-    try:
-        answer = base.recall(req)
-        assert answer.system_name == "ns-memory"
-        assert isinstance(answer.content, str)
-        assert isinstance(answer.hits, list) or answer.hits is None
-    except Exception as e:
-        # In minimal test env (no mem0), this may fail with a lazy-init error.
-        # That's acceptable for Phase B (pure refactor; service unchanged).
-        pytest.skip(f"MemoryService not initialized in test env: {e}")
+    with pytest.raises(ValueError, match="user_id"):
+        base.recall(RecallRequest(query="test query", limit=5))  # no user_id
 
 
 def test_ns_memory_index_is_noop():

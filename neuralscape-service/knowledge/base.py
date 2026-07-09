@@ -56,10 +56,20 @@ class KnowledgeSystemInfo:
 
 
 class HealthStatus(BaseModel):
-    """Health check result for a knowledge system."""
+    """Health check result for a knowledge system.
+
+    Allowed ``status`` values:
+      - ``ok``            — reachable and ready to serve queries.
+      - ``degraded``      — partially available (e.g. vector up, graph down).
+      - ``unreachable``   — the system reports it can't be reached.
+      - ``not_configured``— the system's backend isn't configured/enabled.
+      - ``error``         — the ``health()`` probe itself raised (distinct from
+                            a system that *reports* unreachable). Emitted by the
+                            /health aggregator when a system's health() throws.
+    """
 
     status: str = Field(
-        description="ok | degraded | unreachable | not_configured"
+        description="ok | degraded | unreachable | not_configured | error"
     )
     details: dict = Field(default_factory=dict, description="Backend-specific diagnostics")
 

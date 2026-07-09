@@ -112,6 +112,18 @@ class NSMemorySystem:
         """
         svc = self._get_service()
 
+        # user_id is REQUIRED for search: the real API paths (REST
+        # _resolve_user_id, MCP current_user_id) always resolve the concrete
+        # caller id and never fall back to a shared pool. Inventing a
+        # "default-user" here would query the wrong pool and risk cross-user
+        # leakage, so a missing id is a caller error, not a silent default.
+        if not req.user_id:
+            raise ValueError(
+                "NSMemorySystem.recall requires RecallRequest.user_id — the "
+                "caller must resolve the concrete user id (as the REST/MCP "
+                "paths do) before recall; refusing to query a shared default pool."
+            )
+
         # Map RecallRequest to SearchMemoryRequest (the existing search contract).
         # RecallRequest has extra code-system fields (operation, label, source,
         # target, mode, depth) that base ignores.
@@ -130,7 +142,7 @@ class NSMemorySystem:
         # Call the existing search facade (SAME code path as today).
         results = svc.search(
             query=search_req.query,
-            user_id=search_req.user_id or "default-user",
+            user_id=search_req.user_id,
             project_id=search_req.project_id,
             categories=None,  # All categories
             scope=None,  # Both scopes
@@ -152,9 +164,11 @@ class NSMemorySystem:
             )
 
         # Format content as a plain-text list (mirrors how MCP tools render today).
+        # MemoryResponse's text field is `.memory` (see schemas.py:1181), not
+        # `.memory_text`; `.category` is an optional str.
         lines = []
         for i, mem in enumerate(results, 1):
-            lines.append(f"{i}. {mem.memory_text} (category={mem.category})")
+            lines.append(f"{i}. {mem.memory} (category={mem.category})")
         content = "\n".join(lines)
 
         # Structured hits: convert MemoryResponse objects to dicts.
