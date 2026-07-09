@@ -220,6 +220,68 @@ async def test_fusion_code_leg_runs_concurrently_with_base(registry_with_code, m
 
 
 @pytest.mark.asyncio
+async def test_fusion_two_code_systems_deduped_in_real_path(registry_with_code, mock_mcp_service):
+    """Phase F finding 7: when >1 code system answers, dedup runs in the REAL path.
+
+    Two code systems (code-cbm + code-graphify-lib) are resolved by the router
+    (project config with NO default_engine → the full code_systems list). Both
+    return an overlapping canonical FQN. The wired recall path must run
+    dedup_code_answers so the fused output attributes BOTH systems (the
+    "Also searched" line) and dedups the overlapping FQN — proving the headline
+    deliverable is live, not dead code.
+    """
+    project_id = "proj-dual"
+    repo = "proj-dual"
+    code_space = f"code--owner--{repo}"
+    shared_fqn = "proj-dual.core.run"     # both systems return this (overlap)
+    cbm_only_fqn = "proj-dual.core.helper"
+
+    # Two code systems, both healthy; overlapping hit on shared_fqn.
+    KNOWLEDGE_REGISTRY["code-cbm"] = _FakeCodeSystem(
+        "code-cbm", code_space,
+        hits=[
+            {"fqn": shared_fqn, "kind": "function", "file": "core.py", "line": 20},
+            {"fqn": cbm_only_fqn, "kind": "function", "file": "core.py", "line": 40},
+        ],
+    )
+    KNOWLEDGE_REGISTRY["code-graphify-lib"] = _FakeCodeSystem(
+        "code-graphify-lib", code_space,
+        hits=[
+            {"fqn": shared_fqn, "kind": "function", "file": "core.py", "line": 20},  # dup
+        ],
+    )
+    # NO default_engine → router resolves the FULL code_systems list (both).
+    set_project_config(ProjectKnowledgeConfig(
+        project_id=project_id,
+        code_systems=["code-cbm", "code-graphify-lib"],
+        fuse_code_into_recall=True,
+    ))
+
+    mock_mcp_service.search.return_value = [
+        MemoryResponse(id="b1", memory="base row", score=0.9, category="decision", source="vector"),
+    ]
+
+    # Keep the anchor join inert; we're asserting the dedup wiring, not anchors.
+    with patch("knowledge.fusion.batched_anchor_lookup", return_value={}):
+        result = await mcp_server.call_tool("recall_memories", {
+            "query": "who calls proj-dual.core.run",   # coding signal
+            "user_id": "bob",
+            "project_id": project_id,
+        })
+
+    text = result[0].text
+    # Fused output present.
+    assert "[structure]" in text
+    # Dedup ran in the real path: the non-primary system is attributed via the
+    # "Also searched" line (only emitted by dedup_code_answers on >1 system).
+    assert "Also searched" in text
+    assert "deduped on canonical FQN" in text
+    # Both system names appear (primary in the structure header, other in the line).
+    assert "code-cbm" in text
+    assert "code-graphify-lib" in text
+
+
+@pytest.mark.asyncio
 async def test_plain_prose_recall_unchanged_no_fusion(registry_with_code, mock_mcp_service):
     """Finding 1 guard: plain prose (no coding signal) → NO fusion, plain JSON output.
 

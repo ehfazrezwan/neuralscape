@@ -192,6 +192,38 @@ class CodeKnowledgeSystem:
                     metadata={"operation": op, "source": req.source, "target": req.target},
                 )
 
+            elif op == "impact":
+                # impact = blast radius: detect_changes(seed) → ChangeReport.
+                # Seed symbol comes from label/source/query (first non-empty).
+                # This is Phase F's "affected powers impact" deliverable.
+                seed = req.label or req.source or req.query
+                report = self._engine.detect_changes(since=seed)
+                # ChangeReport is a dataclass — surface the blast-radius symbols
+                # (modified_symbols) as structured hits + a text rendering.
+                affected = list(getattr(report, "modified_symbols", []) or [])
+                deleted = list(getattr(report, "deleted_symbols", []) or [])
+                added = list(getattr(report, "added_symbols", []) or [])
+                summary = getattr(report, "summary", "") or ""
+                hits = [{"fqn": fqn, "impact": "affected"} for fqn in affected]
+                hits += [{"fqn": fqn, "impact": "deleted"} for fqn in deleted]
+                hits += [{"fqn": fqn, "impact": "added"} for fqn in added]
+                lines = [summary] if summary else []
+                lines += [f"  ~ {fqn}" for fqn in affected]
+                lines += [f"  - {fqn}" for fqn in deleted]
+                lines += [f"  + {fqn}" for fqn in added]
+                content = "\n".join(lines) if lines else "No impact detected."
+                return SystemAnswer(
+                    system_name=self.info.name,
+                    system_version=self._version,
+                    content=content,
+                    hits=hits or None,
+                    metadata={
+                        "operation": op,
+                        "seed": seed,
+                        "affected_count": len(affected),
+                    },
+                )
+
             elif op == "locate":
                 # locate returns list[LocateHit]; convert to structured hits.
                 hits_obj = self._engine.locate(query=req.query, k=req.limit)

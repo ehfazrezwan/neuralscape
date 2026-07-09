@@ -90,9 +90,16 @@ def test_eligible_systems_kind_filter():
     assert isinstance(base_systems, list)
 
     code_systems = eligible_systems(kind="code")
-    # Phase B doesn't register any code systems by default (see knowledge/__init__),
-    # so this should be empty.
-    assert code_systems == []
+    # Phase F: code-graphify-lib (in-process library) is registered and eligible
+    # whenever the code-graph extra is present. When the extra is absent, no code
+    # systems register and this is empty. Assert the shape either way; if any code
+    # systems ARE eligible, code-graphify-lib must be among them.
+    assert isinstance(code_systems, list)
+    names = {s.info.name for s in code_systems}
+    if names:
+        assert "code-graphify-lib" in names, (
+            f"expected code-graphify-lib among eligible code systems; got {names}"
+        )
 
 
 def test_ns_memory_health():

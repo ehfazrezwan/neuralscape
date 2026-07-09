@@ -1,4 +1,4 @@
-"""Three-layer deterministic knowledge system router (Phase D).
+r"""Three-layer deterministic knowledge system router (Phase D).
 
 Resolution order (first hit wins), per PLAN §4:
   1. **Explicit override**: optional `knowledge_system` param (additive to all
