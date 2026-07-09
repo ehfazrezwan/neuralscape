@@ -220,3 +220,211 @@ def test_health_endpoint_aggregates_knowledge_systems(client):
             assert "details" in sys
             # Verify transport is exposed but not affecting health status.
             assert isinstance(sys["transport"], str)
+
+
+# ── CodeKnowledgeSystem dispatch (direct unit tests; no registration needed) ──
+#
+# CodeKnowledgeSystem wraps a CodeIntelEngine and maps RecallRequest.operation →
+# the engine's protocol methods. Phase B registers no code backends by default
+# (the existing engines are per-code_space/per-artifact, so a static registry
+# entry would be a fake), so this dispatch path is otherwise unexercised. These
+# tests close that gap with a mock engine — no registration required.
+
+
+class _FakeLocateHit:
+    """Stub mirroring adapters.code_graph.engine.LocateHit's read surface."""
+
+    def __init__(self, fqn, kind, file, line, signature, docstring, score):
+        self.fqn = fqn
+        self.kind = kind
+        self.file = file
+        self.line = line
+        self.signature = signature
+        self.docstring = docstring
+        self.score = score
+
+
+class _MockCodeIntelEngine:
+    """Minimal CodeIntelEngine stub returning canned values for dispatch tests.
+
+    Records the last call per method so tests can assert the wrapper dispatched
+    to the right engine method with the right args.
+    """
+
+    def __init__(self):
+        self.calls = {}
+
+    def query(self, question, *, mode="bfs", depth=3, token_budget=2000):
+        self.calls["query"] = {
+            "question": question,
+            "mode": mode,
+            "depth": depth,
+            "token_budget": token_budget,
+        }
+        return f"QUERY_RESULT for {question!r} (mode={mode}, depth={depth})"
+
+    def neighbors(self, label, *, relation_filter=""):
+        self.calls["neighbors"] = {"label": label, "relation_filter": relation_filter}
+        return f"NEIGHBORS_RESULT for {label!r}"
+
+    def path(self, source, target, *, max_hops=8):
+        self.calls["path"] = {"source": source, "target": target, "max_hops": max_hops}
+        return f"PATH_RESULT from {source!r} to {target!r}"
+
+    def locate(self, query, *, k=10):
+        self.calls["locate"] = {"query": query, "k": k}
+        return [
+            _FakeLocateHit(
+                fqn="src.mod.Foo.bar",
+                kind="method",
+                file="src/mod.py",
+                line=42,
+                signature="def bar(self, x: int) -> str",
+                docstring="Does a thing.",
+                score=0.91,
+            ),
+            _FakeLocateHit(
+                fqn="src.mod.baz",
+                kind="function",
+                file="src/mod.py",
+                line=100,
+                signature="def baz() -> None",
+                docstring="",
+                score=0.55,
+            ),
+        ]
+
+
+class TestCodeKnowledgeSystemDispatch:
+    """Direct unit tests of the CodeKnowledgeSystem wrapper's op dispatch."""
+
+    def _make_system(self):
+        from knowledge.code_system import CodeKnowledgeSystem
+
+        stub = _MockCodeIntelEngine()
+        system = CodeKnowledgeSystem(
+            name="code-mock",
+            engine=stub,
+            capabilities=frozenset({"query", "neighbors", "path", "locate"}),
+            transport="in-process",
+        )
+        return system, stub
+
+    def test_recall_query_dispatches_to_engine_query(self):
+        from knowledge.base import RecallRequest
+
+        system, stub = self._make_system()
+        answer = system.recall(
+            RecallRequest(operation="query", query="who calls Foo", mode="bfs", depth=2)
+        )
+        assert answer.system_name == "code-mock"
+        assert answer.content  # non-empty
+        assert "QUERY_RESULT" in answer.content
+        # Dispatched to engine.query with the right args.
+        assert stub.calls["query"]["question"] == "who calls Foo"
+        assert stub.calls["query"]["mode"] == "bfs"
+        assert stub.calls["query"]["depth"] == 2
+
+    def test_recall_neighbors_dispatches_to_engine_neighbors(self):
+        from knowledge.base import RecallRequest
+
+        system, stub = self._make_system()
+        answer = system.recall(
+            RecallRequest(operation="neighbors", query="unused", label="Foo")
+        )
+        assert answer.system_name == "code-mock"
+        assert "NEIGHBORS_RESULT" in answer.content
+        assert stub.calls["neighbors"]["label"] == "Foo"
+        assert answer.metadata["label"] == "Foo"
+
+    def test_recall_path_dispatches_to_engine_path(self):
+        from knowledge.base import RecallRequest
+
+        system, stub = self._make_system()
+        answer = system.recall(
+            RecallRequest(
+                operation="path", query="unused", source="A", target="B"
+            )
+        )
+        assert answer.system_name == "code-mock"
+        assert "PATH_RESULT" in answer.content
+        assert stub.calls["path"]["source"] == "A"
+        assert stub.calls["path"]["target"] == "B"
+
+    def test_recall_locate_populates_structured_hits(self):
+        from knowledge.base import RecallRequest
+
+        system, stub = self._make_system()
+        answer = system.recall(
+            RecallRequest(operation="locate", query="find bar", limit=5)
+        )
+        assert answer.system_name == "code-mock"
+        # locate populates structured hits as dicts.
+        assert isinstance(answer.hits, list)
+        assert len(answer.hits) == 2
+        first = answer.hits[0]
+        assert first["fqn"] == "src.mod.Foo.bar"
+        assert first["kind"] == "method"
+        assert first["file"] == "src/mod.py"
+        assert first["line"] == 42
+        assert first["signature"] == "def bar(self, x: int) -> str"
+        assert first["docstring"] == "Does a thing."
+        assert first["score"] == 0.91
+        # limit threaded through to engine.locate's k.
+        assert stub.calls["locate"]["k"] == 5
+        # content is a text rendering alongside the structured hits.
+        assert "src.mod.Foo.bar" in answer.content
+
+    def test_recall_undeclared_op_raises_capability_error(self):
+        from adapters.code_graph.engine import EngineCapabilityError
+        from knowledge.base import RecallRequest
+
+        system, _ = self._make_system()
+        # "impact" is a valid op-class but NOT in this system's capabilities.
+        with pytest.raises(EngineCapabilityError):
+            system.recall(RecallRequest(operation="impact", query="blast radius"))
+
+    def test_health_ok_for_live_stub(self):
+        system, _ = self._make_system()
+        health = system.health()
+        # The stub engine object exists → healthy.
+        assert health.status == "ok"
+
+    def test_transport_declared_never_branched(self):
+        system, stub = self._make_system()
+        assert system.info.transport == "in-process"
+        assert system.info.kind == "code"
+        # The wrapper dispatches identically regardless of transport — the same
+        # recall() path serves any transport. Prove it doesn't read transport by
+        # mutating it to an arbitrary value and confirming dispatch is unchanged.
+        object.__setattr__(system.info, "transport", "http")  # frozen dataclass
+        from knowledge.base import RecallRequest
+
+        answer = system.recall(RecallRequest(operation="neighbors", query="x", label="Foo"))
+        assert "NEIGHBORS_RESULT" in answer.content  # dispatch unaffected by transport
+
+    def test_eligible_systems_includes_registered_code_mock(self):
+        """Registering the mock exercises eligible_systems' code path + cleans up."""
+        from knowledge import (
+            eligible_systems,
+            get_system,
+            list_systems,
+            register_system,
+        )
+        from knowledge.registry import KNOWLEDGE_REGISTRY
+
+        system, _ = self._make_system()
+        assert "code-mock" not in list_systems()  # not leaked from other tests
+        register_system(system)
+        try:
+            # kind + capability filter should include the healthy mock.
+            code_path = eligible_systems(kind="code", operation="path")
+            names = [s.info.name for s in code_path]
+            assert "code-mock" in names
+            # An op the mock doesn't declare excludes it.
+            code_impact = eligible_systems(kind="code", operation="impact")
+            assert "code-mock" not in [s.info.name for s in code_impact]
+        finally:
+            # Unregister so it doesn't leak into other tests.
+            KNOWLEDGE_REGISTRY.pop("code-mock", None)
+        assert get_system("code-mock") is None
