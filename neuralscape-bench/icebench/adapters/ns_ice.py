@@ -49,7 +49,7 @@ class NSIceAdapter:
 
     def __init__(
         self,
-        api_url: str = "http://localhost:8599",
+        api_url: str | None = None,
         rail: RailConfig | None = None,
         stack_dir: str | None = None,
         service_dir: str | None = None,
@@ -64,14 +64,15 @@ class NSIceAdapter:
         surface). Both hit the same ice Neo4j/Qdrant.
 
         Args:
-            api_url: NS API base URL (host→container mapped, default 8599).
+            api_url: NS API base URL (host→container mapped). If None, uses
+                ICE_API_URL env var or defaults to http://localhost:8599.
             rail: Safety-rail config (cap + timeout).
             stack_dir: Bind-mounted stack root for store-size measurement.
             service_dir: neuralscape-service dir the index CLI runs from
                 (`uv run` resolves its venv there).
         """
         self.name = "ns-ice"
-        self.api_url = api_url
+        self.api_url = api_url or os.environ.get("ICE_API_URL", "http://localhost:8599")
         self.rail = rail or RailConfig()
         self.stack_dir = stack_dir or os.environ.get("ICE_STACK_DIR", DEFAULT_STACK_DIR)
         self.service_dir = Path(

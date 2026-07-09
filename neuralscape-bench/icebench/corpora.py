@@ -5,6 +5,7 @@ Corpora are pinned to exact SHAs in /data/ice/corpora/corpora.lock.json.
 """
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -14,10 +15,10 @@ from typing import Iterator
 from icebench.adapters.base import Corpus
 
 
-# Corpora storage directory
-CORPORA_DIR = Path("/data/ice/corpora")
+# Corpora storage directory (env-overridable for isolated test runs)
+CORPORA_DIR = Path(os.environ.get("ICE_CORPORA_DIR", "/data/ice/corpora"))
 
-# Lock file
+# Lock file (derived from CORPORA_DIR)
 LOCK_FILE = CORPORA_DIR / "corpora.lock.json"
 
 

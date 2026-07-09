@@ -175,8 +175,10 @@ def test_cmd_index_end_to_end(tmp_path):
 
     assert rc == 0
 
-    # Teardown was called once (system x corpus).
-    assert fake.teardown_calls == 1
+    # Teardown is NOT called at the end of index phase (intentionally; index and
+    # query are separate processes, and tearing down the index at the end of the
+    # index phase leaves the query phase with nothing to query). See run.py:232-237.
+    assert fake.teardown_calls == 0
 
     # Incremental ran with REAL non-empty touched paths, and the files were
     # actually edited during the call (newline appended), then restored after.
