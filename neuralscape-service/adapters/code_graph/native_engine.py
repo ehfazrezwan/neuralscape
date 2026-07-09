@@ -123,9 +123,25 @@ class NativeEngine:
         if not symbols:
             return f"No symbols matching '{question}' found in {self.code_space}."
 
-        # BFS/DFS traversal from the top-scored symbol
+        # Fix 3: Include matched symbols in output (symbol_lookup fix)
         lines = [f"Code graph search results for: {question}", ""]
+
+        # First, emit the matched seed symbols themselves
         seed_fqn = symbols[0]["fqn"]
+        for sym in symbols:
+            lines.append(
+                f"{sym['fqn']} ({sym['kind']}) in {sym['file']}:{sym['line']}"
+            )
+            # E4: Append attached memories for matched symbols
+            memories = self._get_anchor_memories(sym["fqn"], user_id=user_id, limit=2)
+            if memories:
+                lines.append("  Memories:")
+                for mem in memories:
+                    snippet = (mem["content"] or "")[:100]
+                    lines.append(f"    - [{mem['category']}] {snippet}")
+
+        # Then traverse from the top-scored symbol
+        lines.append("")  # separator
         visited = self._traverse(seed_fqn, mode=mode, depth=depth, budget=token_budget)
         for item in visited:
             lines.append(
@@ -1379,43 +1395,69 @@ class NativeEngine:
             language=language,
         )
 
-        # Store symbols (E5: persist body_hash for change detection)
-        for sym in symbols:
-            # Compute body hash from the symbol's source range
-            body_hash = self._compute_symbol_body_hash(rel_path, sym)
-            sym_cypher = """
-            MERGE (s:CodeSymbol {code_space: $code_space, fqn: $fqn})
-            SET s.kind = $kind, s.file = $file, s.span = $span, s.body_hash = $body_hash
-            """
-            span = f"{sym.line}:{sym.end_line}"
-            self._run_cypher_with_retry(
-                sym_cypher,
-                code_space=self.code_space,
-                fqn=sym.fqn,
-                kind=sym.kind,
-                file=sym.file,
-                span=span,
-                body_hash=body_hash,
-            )
+        # Store symbols in batches (E5: persist body_hash for change detection)
+        # Fix 1: UNWIND-batched writes instead of per-symbol round-trips
+        if symbols:
+            _BATCH_SIZE = 500
+            symbol_rows = []
+            for sym in symbols:
+                # Compute body hash from the symbol's source range
+                body_hash = self._compute_symbol_body_hash(rel_path, sym)
+                span = f"{sym.line}:{sym.end_line}"
+                symbol_rows.append({
+                    "fqn": sym.fqn,
+                    "kind": sym.kind,
+                    "file": sym.file,
+                    "span": span,
+                    "body_hash": body_hash,
+                })
 
-        # Store edges
-        for edge in edges:
-            # Map extraction type to epistemic level (reuse semantic.py's mapping)
-            epistemic = self._extraction_to_epistemic(edge.extraction)
-            edge_cypher = """
-            MERGE (src:CodeSymbol {code_space: $code_space, fqn: $src_fqn})
-            MERGE (tgt:CodeSymbol {code_space: $code_space, fqn: $tgt_fqn})
-            MERGE (src)-[r:%s]->(tgt)
-            SET r.extraction = $extraction, r.epistemic_level = $epistemic
-            """ % edge.relation
-            self._run_cypher_with_retry(
-                edge_cypher,
-                code_space=self.code_space,
-                src_fqn=edge.source_fqn,
-                tgt_fqn=edge.target_fqn,
-                extraction=edge.extraction,
-                epistemic=epistemic,
-            )
+            # Batch symbols into chunks and write
+            for i in range(0, len(symbol_rows), _BATCH_SIZE):
+                batch = symbol_rows[i : i + _BATCH_SIZE]
+                sym_cypher = """
+                UNWIND $rows AS row
+                MERGE (s:CodeSymbol {code_space: $code_space, fqn: row.fqn})
+                SET s.kind = row.kind, s.file = row.file, s.span = row.span, s.body_hash = row.body_hash
+                """
+                self._run_cypher_with_retry(
+                    sym_cypher,
+                    code_space=self.code_space,
+                    rows=batch,
+                )
+
+        # Store edges in batches, grouped by relation type
+        # Fix 2: MATCH both endpoints (only link edges where both symbols exist)
+        if edges:
+            _BATCH_SIZE = 500
+            # Group edges by relation type (dynamic relation type requires grouping)
+            from collections import defaultdict
+            edges_by_relation = defaultdict(list)
+            for edge in edges:
+                epistemic = self._extraction_to_epistemic(edge.extraction)
+                edges_by_relation[edge.relation].append({
+                    "src_fqn": edge.source_fqn,
+                    "tgt_fqn": edge.target_fqn,
+                    "extraction": edge.extraction,
+                    "epistemic": epistemic,
+                })
+
+            # Batch-write each relation type
+            for relation, edge_list in edges_by_relation.items():
+                for i in range(0, len(edge_list), _BATCH_SIZE):
+                    batch = edge_list[i : i + _BATCH_SIZE]
+                    edge_cypher = """
+                    UNWIND $rows AS row
+                    MATCH (src:CodeSymbol {code_space: $code_space, fqn: row.src_fqn})
+                    MATCH (tgt:CodeSymbol {code_space: $code_space, fqn: row.tgt_fqn})
+                    MERGE (src)-[r:%s]->(tgt)
+                    SET r.extraction = row.extraction, r.epistemic_level = row.epistemic
+                    """ % relation
+                    self._run_cypher_with_retry(
+                        edge_cypher,
+                        code_space=self.code_space,
+                        rows=batch,
+                    )
 
     def _extraction_to_epistemic(self, extraction: str) -> str:
         """Map extraction confidence to epistemic level (mirrors semantic.py)."""
@@ -1855,17 +1897,28 @@ class NativeEngine:
 
     def _search_symbols(self, keywords: list[str], limit: int = 10) -> list[dict]:
         """Search symbols by FQN substring match (scored by degree)."""
-        # Simple keyword AND match on FQN
-        where_clauses = [f"toLower(s.fqn) CONTAINS '{kw}'" for kw in keywords]
+        # Fix 5: Parameterize keywords to prevent Cypher injection
+        if not keywords:
+            return []
+
+        # Build WHERE clause with parameterized keywords
+        where_clauses = [f"toLower(s.fqn) CONTAINS toLower($kw{i})" for i in range(len(keywords))]
         where_clause = " AND ".join(where_clauses)
+
         cypher = f"""
         MATCH (s:CodeSymbol {{code_space: $code_space}})
         WHERE {where_clause}
         RETURN s.fqn AS fqn, s.kind AS kind, s.file AS file, s.span AS span, s.degree AS degree
         ORDER BY coalesce(s.degree, 0) DESC
-        LIMIT {limit}
+        LIMIT $limit
         """
-        results = self._run_cypher(cypher, code_space=self.code_space)
+
+        # Build params dict with keyword parameters
+        params = {"code_space": self.code_space, "limit": limit}
+        for i, kw in enumerate(keywords):
+            params[f"kw{i}"] = kw
+
+        results = self._run_cypher(cypher, **params)
         return [
             {
                 "fqn": r["fqn"],
@@ -2093,24 +2146,24 @@ class NativeEngine:
         if not roots:
             return set()
 
-        # BFS traversal: start from roots, walk outward over CALLS/IMPORTS edges
-        # (both incoming and outgoing — a deleted function affects callers AND callees)
+        # Fix 4: Single-Cypher blast radius using variable-length path query
+        # Both incoming and outgoing edges (a deleted function affects callers AND callees)
+        cypher = f"""
+        UNWIND $roots AS root_fqn
+        MATCH (root:CodeSymbol {{code_space: $code_space, fqn: root_fqn}})
+        OPTIONAL MATCH (root)<-[r:CALLS|IMPORTS*1..{max_depth}]-(caller:CodeSymbol)
+        WITH root, collect(DISTINCT caller.fqn) AS callers
+        OPTIONAL MATCH (root)-[r:CALLS|IMPORTS*1..{max_depth}]->(callee:CodeSymbol)
+        WITH root, callers, collect(DISTINCT callee.fqn) AS callees
+        RETURN root.fqn AS root_fqn, callers, callees
+        """
+        results = self._run_cypher(cypher, code_space=self.code_space, roots=roots)
+
+        # Collect all affected FQNs
         affected = set(roots)
-        visited = set(roots)
-        queue = [(fqn, 0) for fqn in roots]
-
-        while queue:
-            current_fqn, depth = queue.pop(0)
-            if depth >= max_depth:
-                continue
-
-            # Fetch neighbors via CALLS/IMPORTS edges (both directions)
-            neighbors = self._get_blast_neighbors(current_fqn)
-            for neighbor_fqn in neighbors:
-                if neighbor_fqn not in visited:
-                    visited.add(neighbor_fqn)
-                    affected.add(neighbor_fqn)
-                    queue.append((neighbor_fqn, depth + 1))
+        for row in results:
+            affected.update(row.get("callers", []) or [])
+            affected.update(row.get("callees", []) or [])
 
         return affected
 

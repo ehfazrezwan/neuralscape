@@ -91,7 +91,7 @@ async def test_code_impact_mcp_tool_unavailable_without_extra():
 def _blast_radius_cypher_router(mock_details_span="20:25"):
     """Build a _run_cypher side_effect that routes by cypher content.
 
-    Simulates: _find_symbol (epicenter resolution), _get_blast_neighbors (BFS),
+    Simulates: _find_symbol (epicenter resolution), _blast_radius_bfs (new single-query),
     _get_symbol_details (per-affected details with a colon-formatted span).
     """
     def _router(cypher, **params):
@@ -103,8 +103,26 @@ def _blast_radius_cypher_router(mock_details_span="20:25"):
                 "file": "app/service.py",
                 "span": "10:15",
             }]
-        # _get_blast_neighbors: CALLS/IMPORTS traversal
-        if "type(r) IN ['CALLS', 'IMPORTS']" in cypher:
+        # New _blast_radius_bfs single-query pattern (Fix 4)
+        if "UNWIND $roots AS root_fqn" in cypher and "OPTIONAL MATCH" in cypher:
+            roots = params.get("roots", [])
+            result = []
+            for root in roots:
+                if root == "app.service.login":
+                    result.append({
+                        "root_fqn": root,
+                        "callers": ["app.api.login_route"],
+                        "callees": [],
+                    })
+                else:
+                    result.append({
+                        "root_fqn": root,
+                        "callers": [],
+                        "callees": [],
+                    })
+            return result
+        # Old _get_blast_neighbors: CALLS/IMPORTS traversal (legacy path, still used by other methods)
+        if "type(r) IN ['CALLS', 'IMPORTS']" in cypher and "RETURN DISTINCT" in cypher:
             fqn = params.get("fqn", "")
             if fqn == "app.service.login":
                 return [{"neighbor": "app.api.login_route"}]

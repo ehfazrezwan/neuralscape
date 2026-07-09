@@ -209,6 +209,8 @@ def test_detect_changes_classifies_symbols(mock_bridge, mock_settings, temp_repo
 
 def test_blast_radius_bfs(mock_bridge, mock_settings, temp_repo):
     """Test that blast-radius BFS reaches transitively-affected symbols."""
+    from unittest.mock import patch
+
     engine = NativeEngine(
         repo_path=str(temp_repo),
         code_space="code--test--repo",
@@ -216,9 +218,19 @@ def test_blast_radius_bfs(mock_bridge, mock_settings, temp_repo):
         settings=mock_settings,
     )
 
+    # Mock the new single-query _blast_radius_bfs implementation (Fix 4)
+    mock_result = [
+        {
+            "root_fqn": "test_module.modified_function",
+            "callers": ["test_module.caller_function"],
+            "callees": [],
+        }
+    ]
+
     # Test BFS directly
     roots = ["test_module.modified_function"]
-    affected = engine._blast_radius_bfs(roots, max_depth=2)
+    with patch.object(engine, "_run_cypher", return_value=mock_result):
+        affected = engine._blast_radius_bfs(roots, max_depth=2)
 
     # Should include the root and its callers
     assert "test_module.modified_function" in affected
