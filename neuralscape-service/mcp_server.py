@@ -1319,9 +1319,8 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
 
     try:
         if name == "recall_memories":
-            # Phase D: wire the router (but don't change behavior yet — Phase E fusion).
-            # The router resolves which system(s) to query; for now we log the decision
-            # but always call the existing search path (base-only, byte-identical output).
+            # Phase E: fusion — when the router says code leg is warranted, execute
+            # it concurrently with base legs and compose sections.
             from knowledge.router import resolve_systems
 
             route_decision = resolve_systems(
@@ -1330,26 +1329,127 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 knowledge_system=arguments.get("knowledge_system"),
                 is_code_tool=False,  # recall_memories is generic recall, not a code tool
             )
-            # Phase D: log the decision but don't act on it (Phase E will compose code legs)
             logger.debug(
-                "recall_memories route decision: %s (layer %d)",
+                "recall_memories route decision: %s (layer %d, fusion=%s, systems=%s)",
                 route_decision.rationale,
                 route_decision.layer,
+                route_decision.wants_code_fusion,
+                route_decision.code_system_names,
             )
 
-            # Run the synchronous, graph-backed search in a worker thread so a
-            # slow read can't freeze the MCP server's event loop (which would
-            # stall concurrent fire-and-forget writes and time them out).
-            results = await asyncio.to_thread(
-                _service.search,
-                query=arguments["query"],
-                user_id=user_id,
-                project_id=arguments.get("project_id"),
-                categories=arguments.get("categories"),
-                limit=arguments.get("limit", 10),
-                visibility=arguments.get("visibility"),
-                include_shared=arguments.get("include_shared", True),
-            )
+            def _base_search():
+                # Run the synchronous, graph-backed search in a worker thread so a
+                # slow read can't freeze the MCP server's event loop (which would
+                # stall concurrent fire-and-forget writes and time them out).
+                return _service.search(
+                    query=arguments["query"],
+                    user_id=user_id,
+                    project_id=arguments.get("project_id"),
+                    categories=arguments.get("categories"),
+                    limit=arguments.get("limit", 10),
+                    visibility=arguments.get("visibility"),
+                    include_shared=arguments.get("include_shared", True),
+                )
+
+            # Phase E: resolve the code system(s) the ROUTER decided (structured
+            # signal — never infer fusion from rationale text). Respect project
+            # config (default_engine/code_systems); do NOT re-pick a backend here.
+            code_sys = None
+            if route_decision.wants_code_fusion and arguments.get("project_id"):
+                from knowledge.registry import get_system
+
+                for _name in route_decision.code_system_names:
+                    _cand = get_system(_name)
+                    if _cand is not None and _cand.health().status == "ok":
+                        code_sys = _cand
+                        break
+
+            if code_sys is not None:
+                # Fusion path: run the code leg CONCURRENTLY with the base legs
+                # (overlap the two slowest calls; same intent as search.py's
+                # ThreadPoolExecutor graph-leg overlap).
+                from knowledge.base import RecallRequest
+
+                async def _code_leg():
+                    try:
+                        code_req = RecallRequest(
+                            query=arguments["query"],
+                            user_id=user_id,
+                            project_id=arguments.get("project_id"),
+                            limit=arguments.get("limit", 10),
+                            operation="query",
+                        )
+                        return await asyncio.to_thread(code_sys.recall, code_req)
+                    except Exception as e:
+                        logger.warning("Code leg failed (base still answers): %s", e, exc_info=True)
+                        return None
+
+                results, code_answer = await asyncio.gather(
+                    asyncio.to_thread(_base_search),
+                    _code_leg(),
+                )
+
+                if code_answer is not None:
+                    try:
+                        from knowledge.fusion import (
+                            batched_anchor_lookup,
+                            compose_fusion_answer,
+                            extract_fqns_from_code_answer,
+                        )
+                        from knowledge.base import SystemAnswer
+
+                        fqns = extract_fqns_from_code_answer(code_answer)
+
+                        # Batched anchor join. CRITICAL: derive repo from the code
+                        # system's code_space (the SAME way _get_anchor_memories
+                        # does) — NOT from project_id, which may differ from the
+                        # repo name and would silently miss every anchor.
+                        anchor_memories = {}
+                        engine = getattr(code_sys, "_engine", None)
+                        if fqns and engine is not None and hasattr(engine, "to_canonical"):
+                            code_space = getattr(engine, "code_space", "") or ""
+                            _parts = code_space.split("--")
+                            repo = _parts[-1] if len(_parts) >= 3 else "unknown"
+                            anchor_memories = await asyncio.to_thread(
+                                batched_anchor_lookup,
+                                fqns=fqns,
+                                repo=repo,
+                                to_canonical_fn=engine.to_canonical,
+                                user_id=user_id,
+                                limit_per_anchor=3,
+                            )
+
+                        # Base recall section — keep FULL memory text (do NOT clip;
+                        # clipping destroys IDs/citations vs normal recall).
+                        # MemoryResponse's text field is `.memory` (not `.content`).
+                        base_content = "\n".join(
+                            f"{i+1}. [{r.category}] {r.memory}"
+                            for i, r in enumerate(results)
+                        )
+                        base_answer = SystemAnswer(
+                            system_name="ns-memory",
+                            content=base_content,
+                            hits=[r.model_dump(exclude_none=True) for r in results],
+                        )
+
+                        fused_text = compose_fusion_answer(
+                            code_answer=code_answer,
+                            anchor_memories=anchor_memories,
+                            base_answer=base_answer,
+                        )
+                        logger.info(
+                            "Phase E: fused answer (%d code FQNs, %d anchored, %d base results)",
+                            len(fqns), len(anchor_memories), len(results),
+                        )
+                        return [TextContent(type="text", text=fused_text)]
+                    except Exception as e:
+                        logger.warning("Fusion compose failed (fallback to base-only): %s", e, exc_info=True)
+                        # Fall through to base-only output with `results` already set.
+            else:
+                # No code fusion — plain base recall (byte-identical to today).
+                results = await asyncio.to_thread(_base_search)
+
+            # Base-only output (Phase D behavior, or fusion fallback)
             if arguments.get("index_only"):
                 from index_format import index_row
 

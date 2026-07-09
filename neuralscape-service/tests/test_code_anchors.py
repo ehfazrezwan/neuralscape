@@ -121,11 +121,16 @@ def test_get_anchor_memories_respects_read_scope(mock_bridge, mock_memory_servic
     )
 
     # Mock Qdrant to return 3 memories: 1 shared, 1 alice's private, 1 bob's private
+    # Phase E: batched anchor lookup requires source_ref.external_id in metadata.
+    # The key MUST equal "{repo}::{to_canonical(fqn)}" — compute it, don't guess.
+    query_fqn = "myrepo.utils.parse"
+    anchor_key = f"myrepo::{NativeEngine.to_canonical(query_fqn)}"
     mock_points = [
         MagicMock(payload={
             "id": "mem1",
             "data": "Shared memory about this function",
             "metadata": {
+                "source_ref": {"external_id": anchor_key},
                 "category": "decision",
                 "visibility": "shared",
                 "user_id": "bob",
@@ -136,6 +141,7 @@ def test_get_anchor_memories_respects_read_scope(mock_bridge, mock_memory_servic
             "id": "mem2",
             "data": "Alice's private note",
             "metadata": {
+                "source_ref": {"external_id": anchor_key},
                 "category": "gotcha",
                 "visibility": "private",
                 "user_id": "alice",
@@ -146,6 +152,7 @@ def test_get_anchor_memories_respects_read_scope(mock_bridge, mock_memory_servic
             "id": "mem3",
             "data": "Bob's private note",
             "metadata": {
+                "source_ref": {"external_id": anchor_key},
                 "category": "bugfix",
                 "visibility": "private",
                 "user_id": "bob",
@@ -161,7 +168,7 @@ def test_get_anchor_memories_respects_read_scope(mock_bridge, mock_memory_servic
     memory.vector_store.client.query_points.return_value = mock_result
 
     # Alice queries (should see: shared + her own private)
-    memories = engine._get_anchor_memories("myrepo.utils.parse", user_id="alice", limit=10)
+    memories = engine._get_anchor_memories(query_fqn, user_id="alice", limit=10)
 
     assert len(memories) == 2
     ids = {m["id"] for m in memories}
@@ -180,11 +187,16 @@ def test_get_anchor_memories_cap(mock_bridge, mock_memory_service):
     )
 
     # Mock 10 shared memories
+    # Phase E: batched anchor lookup requires source_ref.external_id keyed on
+    # "{repo}::{to_canonical(fqn)}" — compute it, don't guess.
+    query_fqn = "myrepo.core.process"
+    anchor_key = f"myrepo::{NativeEngine.to_canonical(query_fqn)}"
     mock_points = [
         MagicMock(payload={
             "id": f"mem{i}",
             "data": f"Memory {i}",
             "metadata": {
+                "source_ref": {"external_id": anchor_key},
                 "category": "decision",
                 "visibility": "shared",
                 "user_id": "alice",
@@ -201,7 +213,7 @@ def test_get_anchor_memories_cap(mock_bridge, mock_memory_service):
     memory.vector_store.client.query_points.return_value = mock_result
 
     # Request limit=3
-    memories = engine._get_anchor_memories("myrepo.core.process", user_id="alice", limit=3)
+    memories = engine._get_anchor_memories(query_fqn, user_id="alice", limit=3)
 
     assert len(memories) <= 3
 
@@ -216,11 +228,12 @@ def test_locate_enriches_with_memories(mock_bridge, mock_memory_service):
     )
 
     # Mock code_index search returning 1 symbol
+    symbol_fqn = "myrepo.utils.parse"
     mock_code_points = [
         MagicMock(
             payload={
                 "code_space": "code--alice--myrepo",
-                "fqn": "myrepo.utils.parse",
+                "fqn": symbol_fqn,
                 "kind": "function",
                 "file": "utils.py",
                 "line": 10,
@@ -235,12 +248,16 @@ def test_locate_enriches_with_memories(mock_bridge, mock_memory_service):
     mock_code_result = MagicMock()
     mock_code_result.points = mock_code_points
 
-    # Mock memory search returning 1 attached memory
+    # Mock memory search returning 1 attached memory.
+    # Phase E: batched anchor lookup requires source_ref.external_id keyed on
+    # "{repo}::{to_canonical(fqn)}" — compute it from the symbol's fqn, don't guess.
+    anchor_key = f"myrepo::{NativeEngine.to_canonical(symbol_fqn)}"
     mock_mem_points = [
         MagicMock(payload={
             "id": "mem1",
             "data": "This function had a bug in v1.2",
             "metadata": {
+                "source_ref": {"external_id": anchor_key},
                 "category": "bugfix",
                 "visibility": "shared",
                 "user_id": "alice",
@@ -281,18 +298,26 @@ def test_query_enriches_with_memories(mock_bridge, mock_memory_service):
         settings=MagicMock(),
     )
 
-    # Mock symbol search + traverse
-    mock_symbols = [{"fqn": "myrepo.core.run", "kind": "function", "file": "core.py", "line": 20}]
+    # Mock symbol search + traverse.
+    # NOTE: real _traverse matches (seed)-[*1..depth]->(t) and returns only the
+    # TARGETS (excludes the seed), so the traverse result is a DISTINCT downstream
+    # node — the seed is emitted once (seed loop), the target once (traverse loop).
+    seed_fqn = "myrepo.core.run"
+    mock_symbols = [{"fqn": seed_fqn, "kind": "function", "file": "core.py", "line": 20}]
     mock_traverse = [
-        {"fqn": "myrepo.core.run", "kind": "function", "file": "core.py", "line": 20, "edges": []},
+        {"fqn": "myrepo.core.helper", "kind": "function", "file": "core.py", "line": 55, "edges": []},
     ]
 
-    # Mock memory search
+    # Mock memory search.
+    # Phase E: batched anchor lookup requires source_ref.external_id keyed on
+    # "{repo}::{to_canonical(fqn)}" — compute it from the seed fqn, don't guess.
+    anchor_key = f"myrepo::{NativeEngine.to_canonical(seed_fqn)}"
     mock_mem_points = [
         MagicMock(payload={
             "id": "mem1",
             "data": "Decision: use async for this",
             "metadata": {
+                "source_ref": {"external_id": anchor_key},
                 "category": "decision",
                 "visibility": "shared",
                 "user_id": "alice",
@@ -311,6 +336,8 @@ def test_query_enriches_with_memories(mock_bridge, mock_memory_service):
 
         result = engine.query("how does run work", user_id="alice")
 
+    # Seed emitted exactly once (real _traverse excludes the seed → no double-emit)
+    assert result.count(f"{seed_fqn} (function)") == 1
     assert "myrepo.core.run" in result
     assert "Memories:" in result
     assert "[decision]" in result
@@ -357,6 +384,7 @@ def test_anchor_round_trip_cross_engine_end_to_end(mock_bridge, mock_memory_serv
         "id": "mem-decision",
         "data": "Group dispatches subcommands — decided in ADR-3.",
         "metadata": {
+            "source_ref": {"external_id": expected_key},  # Phase E: batched lookup requires this
             "category": "decision",
             "visibility": "shared",
             "user_id": "bob",
@@ -365,11 +393,14 @@ def test_anchor_round_trip_cross_engine_end_to_end(mock_bridge, mock_memory_serv
     })
 
     def query_points_side_effect(*args, **kwargs):
-        """Return the memory ONLY when the filter carries the expected key."""
+        """Return the memory ONLY when the filter carries the expected key.
+        Phase E: batched lookup uses MatchAny, so check if expected_key is in the list."""
         qf = kwargs.get("query_filter")
+        # Check for MatchAny (batched lookup)
         matched = any(
             getattr(c, "match", None) is not None
-            and getattr(c.match, "value", None) == expected_key
+            and hasattr(c.match, "any")
+            and expected_key in c.match.any
             for c in qf.must
         )
         result = MagicMock()
