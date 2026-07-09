@@ -78,8 +78,10 @@ class GraphifyJsonEngine:
 
         parts = raw_node_id.split("_")
 
-        # Strip common root directories
-        root_markers = {"src", "lib", "pkg", "internal", "app", "core", "main"}
+        # Strip genuine source-root directories from the start ONLY. Narrow set
+        # (src/lib) so real module names like `core`/`app`/`main` survive — see
+        # NativeEngine.to_canonical for the rationale.
+        root_markers = {"src", "lib"}
         while parts and parts[0] in root_markers:
             parts.pop(0)
 

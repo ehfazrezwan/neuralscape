@@ -119,8 +119,13 @@ class NativeEngine:
         Returns:
             Canonical FQN (src/lib stripped).
         """
-        # Strip common root directories from the start.
-        root_markers = {"src", "lib", "pkg", "internal", "app", "core", "main"}
+        # Strip genuine source-root directories from the start ONLY.
+        # Kept deliberately narrow: `core`/`main`/`app`/`internal`/`pkg` are
+        # real module names (the click corpus has `click.core`), so stripping
+        # them would corrupt canonical FQNs. Only `src`/`lib` are true source
+        # roots that an indexer prepends. Driven by the ≥98% oracle conformance
+        # measurement (test_canonical_fqn_conformance.py).
+        root_markers = {"src", "lib"}
         parts = raw_fqn.split(".")
 
         # Remove leading root markers

@@ -125,8 +125,10 @@ class CBMEngine:
         # Remove cache-path segments (contain hyphens, not valid Python identifiers)
         clean_parts = [p for p in parts if "-" not in p]
 
-        # Strip common root directories (src, lib, etc.) from the start.
-        root_markers = {"src", "lib", "pkg", "internal", "app", "core", "main"}
+        # Strip genuine source-root directories from the start ONLY. Narrow set
+        # (src/lib) so real module names like `core`/`app`/`main` survive — see
+        # NativeEngine.to_canonical for the rationale.
+        root_markers = {"src", "lib"}
         while clean_parts and clean_parts[0] in root_markers:
             clean_parts.pop(0)
 

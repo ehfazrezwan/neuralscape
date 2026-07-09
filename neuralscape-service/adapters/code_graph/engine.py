@@ -61,6 +61,10 @@ class IndexReport:
     edges_indexed: int
     incremental: bool
     duration_s: float
+    # Phase C (plan §3.3): engine version stamp on every IndexReport. Optional
+    # with default None so native/graphify keep working; CBM stamps it from the
+    # bridge's index_status.
+    system_version: str | None = None
 
 
 # ── The protocol ────────────────────────────────────────────────────
