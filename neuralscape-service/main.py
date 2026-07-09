@@ -297,6 +297,9 @@ async def health():
 
     Returns 200 with per-backend status when core services are reachable.
     Returns 503 if critical backends (vector store) are unreachable.
+
+    Phase B addition: includes knowledge_systems section aggregating each
+    registered system's health + info (purely additive; no existing keys changed).
     """
     checks: dict[str, str] = {}
 
@@ -328,18 +331,66 @@ async def health():
     except Exception:
         checks["graph_store"] = "unreachable"
 
+    # Phase B: aggregate knowledge systems health (additive only)
+    knowledge_systems = []
+    try:
+        from knowledge import list_systems, get_system
+
+        for name in list_systems():
+            system = get_system(name)
+            if system:
+                try:
+                    health_status = system.health()
+                    knowledge_systems.append(
+                        {
+                            "name": system.info.name,
+                            "kind": system.info.kind,
+                            "capabilities": sorted(system.info.capabilities),
+                            "transport": system.info.transport,
+                            "health": health_status.status,
+                            "details": health_status.details,
+                        }
+                    )
+                except Exception:
+                    logger.exception("Health check failed for system %s", name)
+                    knowledge_systems.append(
+                        {
+                            "name": name,
+                            "kind": system.info.kind,
+                            "capabilities": sorted(system.info.capabilities),
+                            "transport": system.info.transport,
+                            "health": "error",
+                            "details": {},
+                        }
+                    )
+    except Exception:
+        # If the knowledge registry itself failed to import, log but don't crash health.
+        logger.exception("Failed to aggregate knowledge systems health")
+
     # Overall status: degraded if Redis is down, unhealthy if vector store is down
     if checks.get("vector_store") == "unreachable":
-        return JSONResponse(
-            status_code=503,
-            content={"status": "unhealthy", "service": "neuralscape-memory", "checks": checks},
-        )
+        response_data = {
+            "status": "unhealthy",
+            "service": "neuralscape-memory",
+            "checks": checks,
+        }
+        if knowledge_systems:
+            response_data["knowledge_systems"] = knowledge_systems
+        return JSONResponse(status_code=503, content=response_data)
 
     overall = "ok"
     if any(v != "ok" for v in checks.values()):
         overall = "degraded"
 
-    return {"status": overall, "service": "neuralscape-memory", "checks": checks}
+    response_data = {
+        "status": overall,
+        "service": "neuralscape-memory",
+        "checks": checks,
+    }
+    if knowledge_systems:
+        response_data["knowledge_systems"] = knowledge_systems
+
+    return response_data
 
 
 @app.post("/memories")
