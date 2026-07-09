@@ -121,6 +121,40 @@ def test_normalize_answer_colon_format():
     assert normalized == ("utils.py", "helper_function")
 
 
+def test_normalize_answer_ns_ice_symbol_lookup_hit():
+    """NS-ICE symbol_lookup: parse the matched-symbol line from result text.
+
+    Post Phase-A the engine emits matched symbols; the scorer must extract
+    (file, symbol) from the '<fqn> (<kind>) in <file>:<line>' line, else a
+    correct engine answer scores 0 (rootcause §1 scorer gap).
+    """
+    answer = {
+        "text": '{"result":"Code graph search results for: get_best_encoding\\n\\n'
+        'src.click._compat.get_best_encoding (function) in src/click/_compat.py:42\\n",'
+        '"graph_id":"code--ice-bench--small-py"}',
+        "status": "ok",
+    }
+    normalized = normalize_answer(answer, system="ns-ice-det", for_symbol_lookup=True)
+    assert normalized == ("src/click/_compat.py", "get_best_encoding")
+    # Same for the embeddings variant label.
+    assert normalize_answer(answer, system="ns-ice", for_symbol_lookup=True) == (
+        "src/click/_compat.py",
+        "get_best_encoding",
+    )
+
+
+def test_normalize_answer_ns_ice_symbol_lookup_header_only_miss():
+    """NS-ICE symbol_lookup header-only result (no symbol line) is a genuine miss."""
+    answer = {
+        "text": '{"result":"Code graph search results for: nonexistent_symbol\\n",'
+        '"graph_id":"code--ice-bench--small-py"}',
+        "status": "ok",
+    }
+    assert (
+        normalize_answer(answer, system="ns-ice-det", for_symbol_lookup=True) is None
+    )
+
+
 def test_normalize_answer_none():
     """Test normalizing None/empty answers."""
     assert normalize_answer(None) is None
