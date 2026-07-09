@@ -6,6 +6,7 @@ Scores retrieval quality across structural QA and NL locate queries.
 
 import json
 import logging
+import re
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict, Counter
@@ -96,21 +97,38 @@ def normalize_answer(answer: str | dict | None, system: str = "", for_symbol_loo
     if not answer:
         return None
 
-    # NS-ICE symbol_lookup returns empty result text (not supported properly)
-    # The format is: {"result": "Code graph search results for: <symbol>\n"}
-    # This means symbol_lookup is effectively unsupported for ns-ice
+    # NS-ICE symbol_lookup: extract the matched symbol from the result text.
+    # Post Phase-A, query() emits matched symbols (the lookup fix) as:
+    #   "Code graph search results for: <query>\n\n<fqn> (<kind>) in <file>:<line>\n..."
+    # (traversal output, if any, follows a blank-line separator). We parse the
+    # FIRST matched-symbol line -> (file, symbol). A header-only result (no
+    # symbol lines, e.g. "No symbols matching") is a genuine miss -> None.
+    # Before Phase A this text was always header-only, so this block was never
+    # exercised (rootcause §1); now it must parse real hits or symbol_lookup
+    # scores 0 despite correct engine answers.
     if system in ("ns-ice", "ns-ice-det") and for_symbol_lookup:
-        # Try to parse the JSON result
         try:
             parsed = json.loads(answer)
-            result = parsed.get("result", "")
-            # If it's just a header with no actual location data, return None
-            if "Code graph search results for:" in result and "\n" in result:
-                lines = result.split("\n")
-                if len(lines) <= 2:  # Just header + maybe empty line
-                    return None
+            result = parsed.get("result", "") if isinstance(parsed, dict) else ""
         except json.JSONDecodeError:
-            pass
+            result = ""
+        if result:
+            for line in result.split("\n"):
+                line = line.strip()
+                if not line or line.startswith("Code graph search results for:"):
+                    continue
+                # Match "<fqn> (<kind>) in <file>:<line>"
+                m = re.match(
+                    r"^(?P<fqn>\S+)\s+\(\w+\)\s+in\s+(?P<file>.+):(?P<line>\d+)\s*$",
+                    line,
+                )
+                if m:
+                    return (
+                        _normalize_path(m.group("file")),
+                        _normalize_bare_symbol(m.group("fqn")),
+                    )
+            # Result text present but no parseable symbol line -> genuine miss.
+            return None
 
     # Try to parse as JSON (adapters may return JSON arrays of results)
     try:
