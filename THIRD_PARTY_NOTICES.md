@@ -31,10 +31,13 @@ travel with them and must not be removed.
 
 - Upstream: https://github.com/DeusData/codebase-memory-mcp
 - License: MIT License
-- **Vendored in the CBM bridge service** (`cbm-bridge/Dockerfile` builds from pinned source at v0.9.0 / commit ee68144).
-  The bridge exposes structured JSON tools only (no raw Cypher). CBM binary is
-  built from public MIT-licensed source; no modifications, no redistribution
-  of modified sources.
+- **Used by the CBM bridge service** (`cbm-bridge/Dockerfile`). The Dockerfile
+  DOWNLOADS the prebuilt MIT-licensed release binary (v0.9.0 portable
+  linux-amd64 tarball) from the project's GitHub releases at image-build time and
+  runs it unmodified behind our REST shim. The bridge exposes structured JSON
+  tools only (no raw Cypher). No modifications to CBM; no redistribution of
+  modified sources (the binary is fetched at build time, not vendored into
+  this repo).
 
 ## Backing services (not distributed, referenced by `docker-compose.yml`)
 

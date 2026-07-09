@@ -317,6 +317,96 @@ def test_query_enriches_with_memories(mock_bridge, mock_memory_service):
     assert "Decision: use async" in result
 
 
+def test_anchor_round_trip_cross_engine_end_to_end(mock_bridge, mock_memory_service):
+    """END-TO-END anchor moat: a memory anchored during NATIVE indexing is
+    retrieved via CBM's answer for the SAME symbol, because both engines
+    normalize to the SAME canonical anchor key.
+
+    Flow:
+      1. Native indexed `src.click.core.Group`; an anchor + memory were stored
+         keyed on native's canonical: "myrepo::click.core.Group".
+      2. CBM later answers with its cache-prefixed FQN for the same symbol.
+      3. Fusion canonicalizes CBM's answer with CBM's OWN normalizer, then the
+         anchor lookup builds the key from that canonical form.
+      4. Keys agree → the memory is returned (a genuine hit, not just equal
+         strings): the mock Qdrant only returns the memory when the query
+         filter carries the expected canonical key.
+    """
+    from adapters.code_graph.cbm_engine import CBMEngine
+
+    engine = NativeEngine(
+        repo_path="/fake/path",
+        code_space="code--test--myrepo",
+        bridge=mock_bridge,
+        settings=MagicMock(),
+    )
+
+    # (1) The key the memory was anchored under, derived from NATIVE's raw FQN.
+    native_raw = "src.click.core.Group"
+    expected_key = f"myrepo::{NativeEngine.to_canonical(native_raw)}"  # myrepo::click.core.Group
+
+    # (2) CBM's answer for the same symbol (cache-path-prefixed), canonicalized
+    #     with CBM's OWN normalizer.
+    cbm_raw = "data-ice-corpora-small-py-8a4ce8.src.click.core.Group"
+    cbm_canonical = CBMEngine.to_canonical(cbm_raw)  # click.core.Group
+
+    # Cross-engine agreement is the whole point of the moat.
+    assert cbm_canonical == NativeEngine.to_canonical(native_raw) == "click.core.Group"
+
+    mem_point = MagicMock(payload={
+        "id": "mem-decision",
+        "data": "Group dispatches subcommands — decided in ADR-3.",
+        "metadata": {
+            "category": "decision",
+            "visibility": "shared",
+            "user_id": "bob",
+            "created_at": "2026-01-01T00:00:00Z",
+        },
+    })
+
+    def query_points_side_effect(*args, **kwargs):
+        """Return the memory ONLY when the filter carries the expected key."""
+        qf = kwargs.get("query_filter")
+        matched = any(
+            getattr(c, "match", None) is not None
+            and getattr(c.match, "value", None) == expected_key
+            for c in qf.must
+        )
+        result = MagicMock()
+        result.points = [mem_point] if matched else []
+        return result
+
+    memory = mock_memory_service._get_memory()
+    memory.vector_store.client.query_points.side_effect = query_points_side_effect
+
+    # (3)+(4) Look up via CBM's canonicalized answer; native re-canonicalization
+    # is idempotent on an already-canonical FQN, so the key matches → HIT.
+    memories = engine._get_anchor_memories(cbm_canonical, user_id="bob", limit=3)
+
+    assert len(memories) == 1, "cross-engine anchor join missed — keys diverged"
+    assert memories[0]["id"] == "mem-decision"
+
+
+def test_ensure_anchors_keys_on_canonical_fqn(mock_bridge, tmp_path):
+    """_ensure_anchors MERGEs the CodeAnchor on canonical_fqn (not raw fqn).
+
+    Guards the create-side of the moat: the anchor node key must be the persisted
+    canonical FQN so it agrees with the canonicalized lookup key.
+    """
+    engine = NativeEngine(
+        repo_path=str(tmp_path),
+        code_space="code--test--myrepo",
+        bridge=mock_bridge,
+        settings=MagicMock(),
+    )
+    with patch.object(engine, "_run_cypher_with_retry", return_value=[{"anchored": 1}]) as mock_cypher:
+        engine._ensure_anchors()
+        cypher = mock_cypher.call_args[0][0]
+        # Anchor keyed on canonical_fqn (with coalesce fallback), NOT bare s.fqn.
+        assert "canonical_fqn" in cypher
+        assert "coalesce(s.canonical_fqn, s.fqn)" in cypher
+
+
 def test_boundary_guard_no_code_in_memory_graph(mock_bridge, tmp_path):
     """Guard test: anchors stay in code label-space, never enter memory graph.
 

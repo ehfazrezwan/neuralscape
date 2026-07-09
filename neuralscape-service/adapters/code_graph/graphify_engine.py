@@ -57,24 +57,24 @@ class GraphifyJsonEngine:
         """Normalize graphify's node ID to canonical FQN.
 
         Graphify format: `<path>_<qualname>` (underscore-joined, file path + symbol).
-        Example: `src_click_termui_impl_progressbar` (node ID) with label `ProgressBar`.
+        Example: `src_click_termui_impl_progressbar` (node id).
 
         Canonical format: `<module>.<qualname>` (src/lib stripped, '/' → '.').
-        Example: `click.termui.impl.ProgressBar`.
+        Example: `click.termui.impl.progressbar`.
 
-        This is best-effort: graphify's node IDs are often file-path-derived and
-        don't always carry the full qualname. We use the node's 'label' attribute
-        as the qualname when available.
+        This is best-effort and operates PURELY on the ``raw_node_id`` string
+        (underscore→dot, then strip leading src/lib). It does not consult any
+        node ``label`` attribute — only the id it is given — so the
+        reconstruction is exactly as precise as graphify's file-path-derived id.
 
         Args:
-            raw_node_id: Graphify node ID (underscore-joined).
+            raw_node_id: Graphify node ID (underscore-joined, e.g. src_click_core_Group).
 
         Returns:
-            Canonical FQN (best-effort reconstruction).
+            Canonical FQN (best-effort reconstruction from the node id).
         """
-        # Graphify node IDs are underscore-joined paths: src_click_core_Group
-        # We need to reconstruct the dotted FQN.
-        # Strategy: replace underscores with dots, strip src/lib roots, use label if available.
+        # Graphify node IDs are underscore-joined paths: src_click_core_Group.
+        # Reconstruct the dotted FQN: underscore→dot, then strip leading src/lib.
 
         parts = raw_node_id.split("_")
 

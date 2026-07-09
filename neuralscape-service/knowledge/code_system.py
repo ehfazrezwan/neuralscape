@@ -64,12 +64,35 @@ class CodeKnowledgeSystem:
     def health(self) -> HealthStatus:
         """Health check: is the engine reachable and ready?
 
-        For in-process engines (GraphifyJsonEngine, NativeEngine), health is
-        simple: if the engine object exists, it's healthy (the graph was
-        loaded successfully). External services (CBM in Phase C) will have
-        real reachability checks here.
+        For engines that own a reachability probe (``engine.health()`` — e.g.
+        CBMEngine, which pings the bridge's /health), that probe is authoritative:
+        a DOWN bridge makes this system report ``unreachable`` and become
+        INELIGIBLE for routing (PLAN §3.3 — a down system is never an error to
+        recall; the base always answers).
+
+        For in-process engines with no probe (GraphifyJsonEngine, NativeEngine),
+        health is the cheap check: the engine object (and its loaded graph) exists.
         """
         try:
+            # http/service engines expose a real reachability probe. Prefer it so
+            # a DOWN CBM bridge makes code-cbm ineligible instead of falsely "ok".
+            engine_health = getattr(self._engine, "health", None)
+            if callable(engine_health):
+                ok = engine_health()
+                if ok:
+                    return HealthStatus(
+                        status="ok",
+                        details={"engine_type": type(self._engine).__name__, "probe": True},
+                    )
+                return HealthStatus(
+                    status="unreachable",
+                    details={
+                        "engine_type": type(self._engine).__name__,
+                        "probe": True,
+                        "reason": "engine health probe not-ok (e.g. bridge unreachable)",
+                    },
+                )
+
             # In-process engines: check that the engine's core state exists.
             # GraphifyJsonEngine: has .G (NetworkX graph).
             # NativeEngine: has ._graph_qdrant / ._code_neo4j (checked at init).

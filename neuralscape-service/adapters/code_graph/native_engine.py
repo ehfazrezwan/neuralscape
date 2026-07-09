@@ -1461,6 +1461,10 @@ class NativeEngine:
                 span = f"{sym.line}:{sym.end_line}"
                 symbol_rows.append({
                     "fqn": sym.fqn,
+                    # Phase C: persist the engine-agnostic canonical FQN alongside
+                    # the raw fqn so anchors can be keyed on it end-to-end (create
+                    # and lookup both use the SAME canonical key). See _ensure_anchors.
+                    "canonical_fqn": self.to_canonical(sym.fqn),
                     "kind": sym.kind,
                     "file": sym.file,
                     "span": span,
@@ -1473,7 +1477,8 @@ class NativeEngine:
                 sym_cypher = """
                 UNWIND $rows AS row
                 MERGE (s:CodeSymbol {code_space: $code_space, fqn: row.fqn})
-                SET s.kind = row.kind, s.file = row.file, s.span = row.span, s.body_hash = row.body_hash
+                SET s.kind = row.kind, s.file = row.file, s.span = row.span,
+                    s.body_hash = row.body_hash, s.canonical_fqn = row.canonical_fqn
                 """
                 self._run_cypher_with_retry(
                     sym_cypher,
@@ -1643,8 +1648,17 @@ class NativeEngine:
         reindexes — symbols are deleted/recreated, anchors persist, and the
         ANCHORED edges are recreated pointing to the same anchor nodes.
 
-        Phase C: Anchors are keyed on CANONICAL FQN (src/lib stripped) so they
-        survive engine swaps (CBM ↔ graphify ↔ native).
+        Phase C (anchor moat): the anchor's ``fqn`` is the CANONICAL FQN (src/lib
+        stripped), computed at symbol-write time and persisted as
+        ``s.canonical_fqn`` (see _store_file). This is END-TO-END consistent with
+        _get_anchor_memories, which canonicalizes the incoming FQN before building
+        its lookup key — so create and lookup produce the SAME key, and the
+        cross-engine anchor join hits regardless of which engine (native/CBM/
+        graphify) produced the answer.
+
+        MIGRATION NOTE: pre-existing raw-keyed anchors (there are none on ice/v2
+        — every index here is fresh) would need a one-time rekey to canonical when
+        this reaches `dev`. That migration is a documented follow-up, not this PR.
 
         Uses deadlock retry pattern per graph_patcher.py.
         """
@@ -1652,16 +1666,14 @@ class NativeEngine:
         parts = self.code_space.split("--")
         repo = parts[-1] if len(parts) >= 3 else "unknown"
 
-        # Phase C simplified: For now, use the raw FQN as-is in anchors.
-        # The canonical normalization will be applied at lookup time in
-        # _get_anchor_memories. This avoids the expensive per-symbol loop
-        # and preserves exact backward compatibility with existing anchors.
-        # TODO Phase C+: migrate existing anchors to canonical keys in a
-        # separate migration step, then use canonical keys here too.
-
+        # Key the anchor on the persisted canonical FQN. coalesce() guards the
+        # (transient) case of a symbol written before this field existed.
         cypher = """
         MATCH (s:CodeSymbol {code_space: $code_space})
-        MERGE (a:CodeAnchor {code_space: $code_space, repo: $repo, fqn: s.fqn})
+        MERGE (a:CodeAnchor {
+            code_space: $code_space, repo: $repo,
+            fqn: coalesce(s.canonical_fqn, s.fqn)
+        })
         MERGE (s)-[:ANCHORED]->(a)
         RETURN count(a) AS anchored
         """
@@ -1671,7 +1683,7 @@ class NativeEngine:
             repo=repo,
         )
         count = result[0]["anchored"] if result else 0
-        logger.info(f"Ensured {count} CodeAnchors for {self.code_space}")
+        logger.info(f"Ensured {count} CodeAnchors (canonical FQN) for {self.code_space}")
 
     def _get_anchor_memories(
         self,

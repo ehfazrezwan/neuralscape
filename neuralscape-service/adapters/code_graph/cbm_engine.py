@@ -67,7 +67,7 @@ class CBMEngine:
         self._version: str | None = None
 
     def _call_bridge(self, endpoint: str, data: dict[str, Any]) -> dict[str, Any]:
-        """Call a CBM bridge endpoint.
+        """POST a CBM bridge endpoint (tool calls: search_graph, trace_path, ...).
 
         Args:
             endpoint: Bridge endpoint path (e.g. /search_graph).
@@ -87,6 +87,53 @@ class CBMEngine:
         except httpx.HTTPError as e:
             logger.error(f"CBM bridge call failed: {endpoint} - {e}")
             raise RuntimeError(f"CBM bridge call failed: {e}") from e
+
+    def _get_bridge(self, endpoint: str) -> dict[str, Any]:
+        """GET a CBM bridge endpoint (the bridge exposes /index_status and
+        /health as GET, not POST — a POST there 405s).
+
+        Args:
+            endpoint: Bridge endpoint path (e.g. /index_status, /health).
+
+        Returns:
+            Parsed JSON response.
+
+        Raises:
+            RuntimeError: On HTTP error or timeout.
+        """
+        url = urljoin(self.bridge_url, endpoint)
+        try:
+            resp = self._http_client.get(url)
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.HTTPError as e:
+            logger.error(f"CBM bridge GET failed: {endpoint} - {e}")
+            raise RuntimeError(f"CBM bridge GET failed: {e}") from e
+
+    def health(self) -> bool:
+        """Bridge reachability probe: GET /health (a REAL CBM tool call runs
+        server-side). Returns True iff the bridge reports status ok.
+
+        Used by CodeKnowledgeSystem.health() so a DOWN bridge makes the code-cbm
+        system ineligible for routing (PLAN §3.3). Never raises — a network
+        failure means "not healthy", not a crash.
+        """
+        try:
+            data = self._get_bridge("/health")
+            return data.get("status") == "ok"
+        except Exception:  # noqa: BLE001 — unreachable bridge ⇒ not healthy
+            logger.debug("CBM bridge health probe failed", exc_info=True)
+            return False
+
+    def _fetch_version(self) -> str:
+        """Fetch and cache the CBM version via GET /index_status."""
+        if self._version is None:
+            try:
+                status = self._get_bridge("/index_status")
+                self._version = status.get("cbm_version") or "cbm@unknown"
+            except Exception:  # noqa: BLE001
+                self._version = "cbm@unknown"
+        return self._version
 
     def _ensure_project(self) -> str:
         """Ensure we have a project slug; raise if not."""
@@ -189,11 +236,13 @@ class CBMEngine:
 
         lines = [f"Symbols matching '{question}':"]
         for r in results[:20]:  # Limit to 20 results for readability
-            name = r.get("name", "")
+            # CBM's FQN is `qualified_name` (dotted, cache-prefixed); `name` is
+            # the short symbol name (or a file path for polluted Variable nodes).
+            raw_fqn = r.get("qualified_name") or r.get("name", "")
             kind = r.get("label", "")
             file = r.get("file_path", "")
             line = r.get("line", "")
-            canonical = self.to_canonical(name) if name else ""
+            canonical = self.to_canonical(raw_fqn) if raw_fqn else ""
             lines.append(f"  - {canonical} ({kind}) — {file}:{line}")
 
         return "\n".join(lines)
@@ -206,17 +255,23 @@ class CBMEngine:
     ) -> str:
         """Direct in/out neighbors (maps to CBM trace_path with depth=1).
 
+        CBM ``trace_path`` returns ``{callees:[...], callers:[...]}`` where each
+        step is ``{name, qualified_name, hop}``. Callees are outgoing (CALLS-out),
+        callers are incoming (CALLS-in) — the only relation CBM exposes here is the
+        call edge, so ``relation_filter`` is IGNORED rather than used to drop
+        results (CBM's trace_path carries no edge-type labels to substring-match
+        against; silently emptying the answer would violate neighbors() semantics).
+
         Args:
-            label: Symbol label to look up.
-            relation_filter: Only edges containing this substring (applied client-side).
+            label: Symbol label/FQN to look up.
+            relation_filter: Ignored — CBM exposes no edge-type labels here.
 
         Returns:
-            Text list of neighbors.
+            Text list of neighbors (--> callees, <-- callers).
         """
         project = self._ensure_project()
 
-        # CBM trace_path needs the function name, not the full FQN.
-        # Extract the last part (the actual symbol name).
+        # CBM trace_path keys on the short function name, not the full FQN.
         function_name = label.split(".")[-1]
 
         result = self._call_bridge(
@@ -229,32 +284,25 @@ class CBMEngine:
             },
         )
 
-        paths = result.get("paths", [])
-        if not paths:
+        callees = result.get("callees", [])
+        callers = result.get("callers", [])
+
+        if not callees and not callers:
             return f"No neighbors found for '{label}'."
 
         lines = [f"Neighbors of '{label}':"]
-        rel_filter = (relation_filter or "").lower()
 
-        for path in paths[:50]:  # Limit for readability
-            # CBM path format: [{"name": "...", "kind": "..."}, ...]
-            if len(path) < 2:
-                continue
-            # path[0] is the source, path[1] is the neighbor
-            neighbor = path[1]
-            name = neighbor.get("name", "")
-            kind = neighbor.get("kind", "")
-            canonical = self.to_canonical(name) if name else ""
+        # Outgoing (this symbol calls these)
+        for step in callees[:50]:
+            raw_fqn = step.get("qualified_name") or step.get("name", "")
+            canonical = self.to_canonical(raw_fqn) if raw_fqn else ""
+            lines.append(f"  --> {canonical} [CALLS]")
 
-            # Apply relation filter (CBM doesn't give us edge labels, so skip if filter is set)
-            if rel_filter:
-                continue  # CBM doesn't expose edge relation types in trace_path
-
-            # Determine direction (CBM doesn't tell us, so we use "related")
-            lines.append(f"  -- {canonical} ({kind})")
-
-        if len(lines) == 1:
-            lines.append("  (no neighbors matching the filter)")
+        # Incoming (these call this symbol)
+        for step in callers[:50]:
+            raw_fqn = step.get("qualified_name") or step.get("name", "")
+            canonical = self.to_canonical(raw_fqn) if raw_fqn else ""
+            lines.append(f"  <-- {canonical} [CALLS]")
 
         return "\n".join(lines)
 
@@ -303,12 +351,13 @@ class CBMEngine:
         hits: list[LocateHit] = []
 
         for r in results[:k]:
-            name = r.get("name", "")
+            # CBM's FQN is `qualified_name`; `name` is short/file-path.
+            raw_fqn = r.get("qualified_name") or r.get("name", "")
             kind = r.get("label", "")
             file = r.get("file_path", "")
             line = r.get("line", 0)
 
-            canonical = self.to_canonical(name) if name else ""
+            canonical = self.to_canonical(raw_fqn) if raw_fqn else ""
 
             # Build anchor key: "<repo>::<canonical_fqn>"
             # Extract repo from code_space (code--owner--repo)
@@ -392,13 +441,8 @@ class CBMEngine:
 
         duration = time.time() - start
 
-        # Fetch version if not cached
-        if self._version is None:
-            try:
-                status = self._call_bridge("/index_status", {})
-                self._version = status.get("cbm_version", "cbm@unknown")
-            except Exception:
-                self._version = "cbm@unknown"
+        # Stamp the CBM version (GET /index_status — POST would 405).
+        version = self._fetch_version()
 
         return IndexReport(
             files_indexed=0,  # CBM doesn't report files count
@@ -406,7 +450,7 @@ class CBMEngine:
             edges_indexed=edges,
             incremental=False,  # CBM always does full index
             duration_s=duration,
-            system_version=self._version,
+            system_version=version,
         )
 
     def export_snapshot(self) -> bytes:

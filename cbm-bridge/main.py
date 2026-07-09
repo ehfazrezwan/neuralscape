@@ -74,7 +74,12 @@ class TracePathRequest(BaseModel):
 
 
 class TracePathResponse(BaseModel):
-    paths: list[dict] = Field(default_factory=list)
+    # CBM's trace_path returns callers + callees (each a list of step dicts
+    # {name, qualified_name, hop}), NOT a list of paths. Modeled to the real shape.
+    function: str = ""
+    direction: str = "both"
+    callees: list[dict] = Field(default_factory=list)
+    callers: list[dict] = Field(default_factory=list)
 
 
 class GetCodeSnippetRequest(BaseModel):
@@ -308,7 +313,7 @@ async def search_graph(req: SearchGraphRequest) -> SearchGraphResponse:
 
 @app.post("/trace_path", response_model=TracePathResponse)
 async def trace_path(req: TracePathRequest) -> TracePathResponse:
-    """Trace call paths (neighbors)."""
+    """Trace call relationships (neighbors: callers + callees)."""
     result = await cbm_manager.call_tool(
         "trace_path",
         {
@@ -318,7 +323,12 @@ async def trace_path(req: TracePathRequest) -> TracePathResponse:
             "depth": req.depth,
         },
     )
-    return TracePathResponse(paths=result.get("paths", []))
+    return TracePathResponse(
+        function=result.get("function", req.function_name),
+        direction=result.get("direction", req.direction),
+        callees=result.get("callees", []),
+        callers=result.get("callers", []),
+    )
 
 
 @app.post("/get_code_snippet", response_model=GetCodeSnippetResponse)
