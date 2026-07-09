@@ -83,14 +83,16 @@ def eligible_systems(
       3. System declares the requested ``operation`` in its capabilities
          (if operation is specified).
       4. System matches the requested ``kind`` (if kind is specified).
+      5. HARDENING FIX (M2): For code systems with project_id, system must have
+         a REAL indexed code_space for the project (not a capability placeholder).
 
     **No routing logic** — this is a filtering primitive. The router (Phase D)
     will layer on project config, explicit overrides, and signal-based
-    classification. Phase B only needs honest capability declaration + health
-    gating.
+    classification.
 
     Args:
-        project_id: Optional project filter (reserved for Phase D; unused in Phase B).
+        project_id: Optional project filter. For code systems, filters to only those
+                   with indexed code_spaces for this project (not capability placeholders).
         operation: Op-class name (e.g. "recall", "neighbors", "index"). None = no capability filter.
         kind: System kind filter ("base" | "code"). None = no kind filter.
 
@@ -129,6 +131,34 @@ def eligible_systems(
                 sorted(system.info.capabilities),
             )
             continue
+
+        # M2 FIX: Project-scope filter for code systems. A code system is eligible
+        # for a project ONLY if it has an indexed code_space for that project.
+        # A registered global system or capability placeholder (code_space =
+        # "__registry_capability__") is NOT an indexed project code_space.
+        if project_id is not None and system.info.kind == "code":
+            engine = getattr(system, "_engine", None)
+            if engine is not None:
+                code_space = getattr(engine, "code_space", None)
+                # Capability placeholder: not eligible for specific projects
+                if code_space == "__registry_capability__":
+                    logger.debug(
+                        "System %s ineligible for project %s: capability placeholder",
+                        name,
+                        project_id,
+                    )
+                    continue
+                # Empty/unindexed engine: not eligible
+                if hasattr(engine, "G") and engine.G is None:
+                    logger.debug(
+                        "System %s ineligible for project %s: no indexed graph",
+                        name,
+                        project_id,
+                    )
+                    continue
+                # TODO Phase G: Also check if code_space matches the project's repo
+                # (e.g. code--owner--{project_repo}). For now, any non-placeholder
+                # indexed engine is eligible.
 
         eligible.append(system)
 

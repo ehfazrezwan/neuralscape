@@ -89,20 +89,22 @@ _PATH_PATTERN = re.compile(r"\w+/\w+\.\w{1,4}")
 _BACKTICK_IDENT_PATTERN = re.compile(r"`[a-zA-Z_][a-zA-Z0-9_]*`")
 
 # Structural keywords (who calls / where is / defined / imports / blast radius)
-_STRUCTURAL_KEYWORDS = frozenset({
-    "who calls",
-    "what calls",
-    "where is",
-    "defined",
-    "definition",
-    "imports",
-    "blast radius",
-    "impact",
-    "callers",
-    "callees",
-    "dependencies",
-    "dependents",
-})
+# HARDENING FIX (KI#6): use word-boundary regexes to avoid over-triggering on
+# prose (e.g. "defined" substring-matches "undefined", "impact" in "impacted").
+_STRUCTURAL_KEYWORDS = {
+    r"\bwho calls\b",
+    r"\bwhat calls\b",
+    r"\bwhere is\b",
+    r"\bdefined\b",
+    r"\bdefinition\b",
+    r"\bimports\b",
+    r"\bblast radius\b",
+    r"\bimpact\b",
+    r"\bcallers\b",
+    r"\bcallees\b",
+    r"\bdependencies\b",
+    r"\bdependents\b",
+}
 
 
 def _has_coding_signal(query: str) -> bool:
@@ -117,10 +119,11 @@ def _has_coding_signal(query: str) -> bool:
     """
     query_lower = query.lower()
 
-    # Check structural keywords first (cheapest)
-    for keyword in _STRUCTURAL_KEYWORDS:
-        if keyword in query_lower:
-            logger.debug("Coding signal: structural keyword '%s'", keyword)
+    # Check structural keywords first (cheapest). HARDENING FIX (KI#6): word-boundary
+    # match to avoid over-triggering on prose ("undefined" shouldn't match "defined").
+    for pattern in _STRUCTURAL_KEYWORDS:
+        if re.search(pattern, query_lower):
+            logger.debug("Coding signal: structural keyword pattern '%s'", pattern)
             return True
 
     # Check regex patterns
