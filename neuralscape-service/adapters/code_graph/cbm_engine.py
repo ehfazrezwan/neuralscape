@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from typing import Any
 from urllib.parse import urljoin
 
@@ -28,6 +29,12 @@ from adapters.code_graph.engine import (
 )
 
 logger = logging.getLogger(__name__)
+
+# M4 FIX: Health probe cache TTL (seconds). Prevents hot-path spam.
+_HEALTH_CACHE_TTL = 10.0
+
+# M4 FIX: Health probe timeout (seconds). Bounded to prevent event-loop stall.
+_HEALTH_PROBE_TIMEOUT = 2.0
 
 
 class CBMEngine:
@@ -57,7 +64,7 @@ class CBMEngine:
             bridge_url: Base URL of the CBM bridge (e.g. http://cbm-bridge:8200).
             project: CBM project slug (from index_repository).
             code_space: NS code_space ref (code--owner--repo).
-            timeout: HTTP timeout for bridge calls.
+            timeout: HTTP timeout for bridge calls (operational, not health probe).
         """
         self.bridge_url = bridge_url.rstrip("/")
         self.project = project
@@ -65,6 +72,8 @@ class CBMEngine:
         self.timeout = timeout
         self._http_client = httpx.Client(timeout=timeout)
         self._version: str | None = None
+        # M4 FIX: Health probe cache
+        self._health_cache: tuple[bool, float] | None = None  # (result, timestamp)
 
     def _call_bridge(self, endpoint: str, data: dict[str, Any]) -> dict[str, Any]:
         """POST a CBM bridge endpoint (tool calls: search_graph, trace_path, ...).
@@ -117,13 +126,34 @@ class CBMEngine:
         Used by CodeKnowledgeSystem.health() so a DOWN bridge makes the code-cbm
         system ineligible for routing (PLAN §3.3). Never raises — a network
         failure means "not healthy", not a crash.
+
+        M4 FIX: Short timeout (2s, not 60s) + TTL cache (~10s) to bound hot-path cost.
+        resolve_systems calls health() synchronously on the MCP event loop (mcp_server.py:
+        1365); a black-holed bridge must not stall the loop for 60s per routed recall.
         """
+        # Check cache first
+        if self._health_cache is not None:
+            result, timestamp = self._health_cache
+            if (time.time() - timestamp) < _HEALTH_CACHE_TTL:
+                logger.debug("CBM health: using cached result (age %.1fs)", time.time() - timestamp)
+                return result
+
+        # Probe with bounded timeout (not the operational self.timeout)
         try:
-            data = self._get_bridge("/health")
-            return data.get("status") == "ok"
+            # Create a short-timeout client just for the health probe
+            with httpx.Client(timeout=_HEALTH_PROBE_TIMEOUT) as probe_client:
+                url = urljoin(self.bridge_url, "/health")
+                resp = probe_client.get(url)
+                resp.raise_for_status()
+                data = resp.json()
+                result = data.get("status") == "ok"
         except Exception:  # noqa: BLE001 — unreachable bridge ⇒ not healthy
             logger.debug("CBM bridge health probe failed", exc_info=True)
-            return False
+            result = False
+
+        # Cache the result with timestamp
+        self._health_cache = (result, time.time())
+        return result
 
     def _fetch_version(self) -> str:
         """Fetch and cache the CBM version via GET /index_status."""

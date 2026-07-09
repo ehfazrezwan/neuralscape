@@ -162,7 +162,11 @@ async def list_tools() -> list[Tool]:
                 "vector store. When vector and graph results conflict, prefer graph-sourced results as "
                 "authoritative. Memories ingested from a data layer carry a 'source_ref' (origin "
                 "url/connector + a 'retrieval' handle {mcp_server, tool, args}); use that handle to fetch "
-                "the original source or more context when a result references external content."
+                "the original source or more context when a result references external content. "
+                "OUTPUT FORMAT (M5 hardening): Normal recall returns a JSON array of memory objects. "
+                "When code fusion is enabled (project with coding query), returns a stable JSON envelope: "
+                "{fused: true, sections: {structure: {...}, semantics: {...}, memories: [...]}, ...}. "
+                "This stable envelope ensures clients never receive a surprise type flip."
             ),
             inputSchema={
                 "type": "object",
@@ -220,12 +224,13 @@ async def list_tools() -> list[Tool]:
                     "knowledge_system": {
                         "type": "string",
                         "description": (
-                            "Optional explicit knowledge system override (Phase D+). "
+                            "EXPERIMENTAL (not yet fully implemented in Phase D-F; full through-NS "
+                            "routing is Phase G). Optional explicit knowledge system override. "
                             "Registered system names: 'ns-memory' (base, always available), "
-                            "'code-cbm', 'code-native', etc. Omit to use the deterministic router "
-                            "(project config + signal-based classification). Phase D: this routes "
-                            "to the chosen system but generic recall output stays unchanged "
-                            "(fusion composition is Phase E)."
+                            "'code-cbm', 'code-native', etc. Currently logged for debugging but "
+                            "does not change recall behavior (fusion defaults to router decision). "
+                            "Omit to use the deterministic router (project config + signal-based "
+                            "classification). Phase G will wire explicit routing for all surfaces."
                         ),
                     },
                 },
@@ -1180,11 +1185,11 @@ _CODE_GRAPH_COMMON_PROPS = {
     "knowledge_system": {
         "type": "string",
         "description": (
-            "Optional explicit knowledge system override (Phase D+). "
-            "Registered code systems: 'code-cbm', 'code-native', 'code-graphify', etc. "
-            "Omit to use the router's decision (project config default_engine or first "
-            "code_system). Phase D: this routes to the chosen backend but doesn't change "
-            "output format yet (backward compat)."
+            "EXPERIMENTAL (not yet fully implemented; full through-NS routing is Phase G). "
+            "Optional explicit knowledge system override. Registered code systems: "
+            "'code-cbm', 'code-native', 'code-graphify-lib', etc. Currently logged for "
+            "debugging but code tools still dispatch via the legacy graph_id path (backward "
+            "compat). Phase G will wire explicit routing through the knowledge system seam."
         ),
     },
 }
@@ -1356,6 +1361,12 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             # project config (default_engine/code_systems); do NOT re-pick a backend
             # here. Phase F: when >1 code system answers the same op, cross-engine
             # dedup (canonical-FQN + per-op preference) merges them into one answer.
+            #
+            # HARDENING FIX (M1): skip code systems that are capability placeholders
+            # (no real indexed graph for this project). Never compose a [structure]
+            # section from "No graph loaded" or a placeholder — that would flip
+            # recall_memories output from JSON to fused text for every project_id +
+            # coding query, regressing the production API.
             code_systems_list = []
             if route_decision.wants_code_fusion and arguments.get("project_id"):
                 from knowledge.registry import get_system
@@ -1363,6 +1374,28 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 for _name in route_decision.code_system_names:
                     _cand = get_system(_name)
                     if _cand is not None and _cand.health().status == "ok":
+                        # M1 FIX: filter out capability placeholders / empty engines.
+                        # A code system is eligible for fusion ONLY if it has a REAL
+                        # indexed engine for this project (not "__registry_capability__"
+                        # or an unindexed engine with G=None).
+                        engine = getattr(_cand, "_engine", None)
+                        if engine is not None:
+                            code_space = getattr(engine, "code_space", None)
+                            # Skip capability placeholders (code_space marker)
+                            if code_space == "__registry_capability__":
+                                logger.debug(
+                                    "Skipping %s: capability placeholder (no indexed graph)",
+                                    _name,
+                                )
+                                continue
+                            # Skip engines with no loaded graph (G=None)
+                            if hasattr(engine, "G") and engine.G is None:
+                                logger.debug(
+                                    "Skipping %s: no graph loaded for project %s",
+                                    _name,
+                                    arguments.get("project_id"),
+                                )
+                                continue
                         code_systems_list.append(_cand)
 
             if code_systems_list:
@@ -1458,16 +1491,39 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                             hits=[r.model_dump(exclude_none=True) for r in results],
                         )
 
-                        fused_text = compose_fusion_answer(
-                            code_answer=code_answer,
-                            anchor_memories=anchor_memories,
-                            base_answer=base_answer,
-                        )
+                        # M5 FIX: Return stable JSON envelope for fused output, not type flip.
+                        # Before fix: compose_fusion_answer returns plain text sections,
+                        # flipping output from JSON array to prose text.
+                        # After fix: structured JSON with fused=true flag and sections dict.
+                        fused_sections = {}
+                        if code_answer and code_answer.content:
+                            fused_sections["structure"] = {
+                                "system": code_answer.system_name,
+                                "content": code_answer.content,
+                                "hits": code_answer.hits or [],
+                            }
+                        if anchor_memories:
+                            fused_sections["semantics"] = anchor_memories
+                        if results:
+                            fused_sections["memories"] = [
+                                r.model_dump(exclude_none=True) for r in results
+                            ]
+
+                        fused_output = {
+                            "fused": True,
+                            "sections": fused_sections,
+                            "query": arguments["query"],
+                            "project_id": arguments.get("project_id"),
+                        }
+
                         logger.info(
                             "Phase E: fused answer (%d code FQNs, %d anchored, %d base results)",
                             len(fqns), len(anchor_memories), len(results),
                         )
-                        return [TextContent(type="text", text=fused_text)]
+                        return [TextContent(
+                            type="text",
+                            text=json.dumps(fused_output, default=str, ensure_ascii=False)
+                        )]
                     except Exception as e:
                         logger.warning("Fusion compose failed (fallback to base-only): %s", e, exc_info=True)
                         # Fall through to base-only output with `results` already set.

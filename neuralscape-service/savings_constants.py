@@ -20,12 +20,13 @@ They are measured, checked-in constants, not runtime estimates:
   same test class.
 """
 
-# Measured 2026-07-09 (Phase D): 10386 tokens (o200k_base) for 24 core tools
-# (22 + 2 project-config tools) + the 5 code-graph delegation tools (dev install
-# renders the maximal surface). Growth from 9577: `get_project_knowledge_config`
-# and `set_project_knowledge_config` (Phase D router).
+# Measured 2026-07-09 (Phase D → hardening): 10524 tokens (o200k_base) for 24 core
+# tools (22 + 2 project-config tools) + the 5 code-graph delegation tools (dev install
+# renders the maximal surface). Growth from 10386: hardening fixes added M3 honest
+# schema docs ("EXPERIMENTAL...") to recall_memories + code tools, and M5 stable
+# envelope docs to recall_memories description (+138 tokens).
 # See tests/test_savings_meter.py::TestOverheadConstants.
-MCP_TOOL_SCHEMA_OVERHEAD_TOKENS = 10386
+MCP_TOOL_SCHEMA_OVERHEAD_TOKENS = 10524
 
 # Rendered savings line + detail fields on one response (measured: 67).
 SAVINGS_LINE_OVERHEAD_TOKENS = 70

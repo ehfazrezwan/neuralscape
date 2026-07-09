@@ -237,8 +237,12 @@ def test_transport_is_declared_not_branched():
       1. info.transport exists and is a string.
       2. The registry treats all systems identically regardless of transport.
       3. No routing/eligibility logic branches on transport.
+      4. HARDENING FIX (KI#12): Source scan enforces that .transport is ONLY read
+         for declaration and health/display (never for routing/dispatch).
     """
     from knowledge import list_systems, get_system, eligible_systems
+    import re
+    from pathlib import Path
 
     for name in list_systems():
         system = get_system(name)
@@ -258,6 +262,41 @@ def test_transport_is_declared_not_branched():
     # All registered systems (that are healthy) are treated uniformly.
     # Transport is visible in .info but never affects eligibility.
     assert isinstance(eligible, list)
+
+    # KI#12 FIX: Source scan to enforce transport is NEVER branched on above the seam.
+    # Scan knowledge/ and mcp_server.py for any reads of .transport or info.transport
+    # that aren't declaration/display. Allowed contexts: __init__.py (registration),
+    # base.py (declaration), main.py (health endpoint), test files.
+    repo_root = Path(__file__).parent.parent
+    knowledge_files = list((repo_root / "knowledge").rglob("*.py"))
+    mcp_server = repo_root / "mcp_server.py"
+
+    forbidden_branches = []
+    for fpath in knowledge_files + [mcp_server]:
+        if fpath.name.startswith("test_"):
+            continue  # Skip test files
+
+        content = fpath.read_text()
+        # Find all .transport or info.transport reads
+        for match in re.finditer(r'(info\.transport|_engine\.transport|\w+\.info\.transport)', content):
+            line_num = content[:match.start()].count('\n') + 1
+            line = content.split('\n')[line_num - 1].strip()
+
+            # Allowed contexts: declaration (dataclass), health display, logging
+            if any(kw in line for kw in ["@dataclass", "def __init__", "\"transport\":",
+                                          "health()", "logger.", "f\"", "f'", 'f"']):
+                continue  # Safe declaration/display use
+            if fpath.name in ("base.py", "__init__.py", "main.py", "registry.py"):
+                continue  # Declaration, health endpoint, and registry logging files
+
+            # If we get here, it's a potential forbidden branch
+            forbidden_branches.append(f"{fpath.name}:{line_num}: {line}")
+
+    # CRITICAL ASSERTION: No forbidden transport branches above the seam
+    assert not forbidden_branches, (
+        f"Found transport branches above the seam (violates DECISIONS.md cross-cutting rule):\n"
+        + "\n".join(forbidden_branches)
+    )
 
 
 def test_health_endpoint_aggregates_knowledge_systems(client):

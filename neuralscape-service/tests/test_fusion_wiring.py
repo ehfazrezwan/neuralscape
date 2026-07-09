@@ -157,15 +157,26 @@ async def test_fusion_repo_from_code_space_not_project_id(registry_with_code, mo
         })
 
     text = result[0].text
-    # The anchored memory MUST appear (proves repo derived from code_space).
-    assert "anchored-mem" not in text  # id isn't rendered, content is
-    assert "run() dispatches via async" in text
-    assert "[semantics]" in text
-    assert canonical in text            # anchor grouped under canonical FQN
-    # And the base + structure sections are present too.
-    assert "[structure]" in text
-    assert "[memory]" in text
-    assert "base recall row" in text
+    # M5 hardening: output is now stable JSON envelope (not plain text sections)
+    import json
+    fused = json.loads(text)
+    assert fused["fused"] is True
+    sections = fused["sections"]
+
+    # The anchored memory MUST appear in semantics section (proves repo derived from code_space).
+    assert "semantics" in sections
+    assert canonical in sections["semantics"]
+    anchored_mems = sections["semantics"][canonical]
+    assert len(anchored_mems) > 0
+    assert anchored_mems[0]["id"] == "anchored-mem"
+    assert "run() dispatches via async" in anchored_mems[0]["content"]
+
+    # Structure and memories sections present too.
+    assert "structure" in sections
+    assert sections["structure"]["system"] == "code-fake"
+    assert "memories" in sections
+    assert len(sections["memories"]) == 1
+    assert sections["memories"][0]["memory"] == "base recall row"
 
     # Prove the filter used the CODE_SPACE repo key, not project_id.
     call = fake_m.vector_store.client.query_points.call_args
