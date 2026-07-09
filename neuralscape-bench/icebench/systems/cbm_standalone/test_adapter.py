@@ -49,15 +49,15 @@ def _adapter(fake_bin, tmp_path):
 def test_capabilities(fake_bin, tmp_path):
     a = _adapter(fake_bin, tmp_path)
     caps = a.capabilities()
-    assert caps == {"symbol_lookup", "neighbors_1hop", "path_le4"}
+    # Phase 0: nl_locate wired via search_code (semantic vector search).
+    assert caps == {"symbol_lookup", "neighbors_1hop", "path_le4", "nl_locate"}
     assert caps <= OP_CLASSES
     assert a.name == "cbm"
 
 
 def test_unsupported_ops_raise(fake_bin, tmp_path, corpus):
     a = _adapter(fake_bin, tmp_path)
-    with pytest.raises(UnsupportedOp):
-        a.query("nl_locate", {"corpus": corpus, "query": "x"})
+    # blast_radius remains N/A for CBM (detect_changes is git-diff based).
     with pytest.raises(UnsupportedOp):
         a.query("blast_radius", {"corpus": corpus, "symbol": "x"})
 
@@ -85,6 +85,47 @@ def test_index_cold_parses_and_caches_project(fake_bin, tmp_path, corpus):
     assert r.ok and r.symbols == 24 and r.edges == 46
     assert r.peak_rss_mb == 55.0  # rail resources carried through
     assert a._project_names[corpus.name] == "slug-x"  # slug cached
+
+
+def test_index_cold_deletes_cached_project(fake_bin, tmp_path, corpus):
+    """index_cold clears a pre-resolved project before indexing (true cold)."""
+    a = _adapter(fake_bin, tmp_path)
+    a._project_names[corpus.name] = "slug-x"  # pre-resolved => delete path taken
+    index_payload = json.dumps(
+        {"project": "slug-x", "nodes": 5, "edges": 3, "status": "indexed"}
+    )
+    calls = []
+
+    def fake_run(cmd, cfg, env=None):
+        tool = cmd[2]  # [bin, "cli", <tool>, <json>]
+        calls.append(tool)
+        if tool == "delete_project":
+            return _rail_result(stdout='{"status":"deleted"}')
+        return _rail_result(stdout=index_payload)
+
+    with patch("icebench.systems.cbm_standalone.adapter.run_with_rail", side_effect=fake_run):
+        r = a.index_cold(corpus)
+    assert "delete_project" in calls  # delete ran before index
+    assert r.ok and r.symbols == 5
+
+
+def test_index_cold_delete_failure_is_dnf(fake_bin, tmp_path, corpus):
+    """A failed cold delete must be a loud DNF, never a warm 'cold' number."""
+    a = _adapter(fake_bin, tmp_path)
+    a._project_names[corpus.name] = "slug-x"  # pre-resolved => delete path taken
+
+    def fake_run(cmd, cfg, env=None):
+        tool = cmd[2]
+        if tool == "delete_project":
+            # Simulate a failed delete (nonzero exit).
+            return _rail_result(returncode=1, stderr="delete failed")
+        # index_repository must NOT be reached; if it is, flag it loudly.
+        raise AssertionError("index_repository ran despite failed delete")
+
+    with patch("icebench.systems.cbm_standalone.adapter.run_with_rail", side_effect=fake_run):
+        r = a.index_cold(corpus)
+    assert not r.ok and r.dnf
+    assert "cold_delete_failed" in r.dnf_reason
 
 
 def test_index_dnf_on_oom(fake_bin, tmp_path, corpus):

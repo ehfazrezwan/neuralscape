@@ -45,17 +45,17 @@ def corpus(tmp_path):
 def test_capabilities(fake_bin):
     a = GraphifyStandaloneAdapter(graphify_bin=fake_bin)
     caps = a.capabilities()
-    assert caps == {"symbol_lookup", "neighbors_1hop", "path_le4"}
+    # Phase 0: blast_radius wired via `graphify affected`.
+    assert caps == {"symbol_lookup", "neighbors_1hop", "path_le4", "blast_radius"}
     assert caps <= OP_CLASSES
     assert a.name == "graphify"
 
 
 def test_unsupported_ops_raise(fake_bin, corpus):
     a = GraphifyStandaloneAdapter(graphify_bin=fake_bin)
+    # nl_locate remains N/A for graphify (no NL→symbol semantic search).
     with pytest.raises(UnsupportedOp):
         a.query("nl_locate", {"corpus": corpus, "query": "x"})
-    with pytest.raises(UnsupportedOp):
-        a.query("blast_radius", {"corpus": corpus, "symbol": "x"})
 
 
 def test_index_missing_binary(corpus):
@@ -64,10 +64,37 @@ def test_index_missing_binary(corpus):
     assert not r.ok and r.dnf and "not found" in r.dnf_reason
 
 
-def test_index_incremental_na(fake_bin, corpus):
-    a = GraphifyStandaloneAdapter(graphify_bin=fake_bin)
+def test_index_incremental_missing_binary(corpus):
+    """Incremental with a missing binary is a clean DNF, not a crash."""
+    a = GraphifyStandaloneAdapter(graphify_bin="/no/such/graphify")
     r = a.index_incremental(corpus, ["f.py"])
-    assert not r.ok and r.dnf and r.dnf_reason == "incremental_na"
+    assert not r.ok and r.dnf and "not found" in r.dnf_reason
+
+
+def test_index_incremental_via_update(fake_bin, corpus):
+    """Phase 0: incremental now runs `graphify update` and parses graph.json."""
+    a = GraphifyStandaloneAdapter(graphify_bin=fake_bin)
+
+    def fake_run(cmd, cfg, cwd=None, env=None):
+        # The incremental path must invoke `graphify update`.
+        assert "update" in cmd
+        out = Path(corpus.path) / "graphify-out"
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "graph.json").write_text(json.dumps({
+            "nodes": [
+                {"id": "a", "source_file": "calc.py"},
+                {"id": "b", "source_file": "utils.py"},
+            ],
+            "edges": [{"source": "a", "target": "b"}],
+        }))
+        return _rail_result(returncode=0)
+
+    with patch("icebench.systems.graphify_standalone.adapter.run_with_rail", side_effect=fake_run):
+        r = a.index_incremental(corpus, ["calc.py"])
+    assert r.ok
+    assert r.symbols == 2
+    assert r.edges == 1
+    assert r.files == 2
 
 
 def test_index_cold_parses_graph_json(fake_bin, corpus):

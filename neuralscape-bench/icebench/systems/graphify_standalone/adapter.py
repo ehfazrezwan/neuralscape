@@ -86,15 +86,17 @@ class GraphifyStandaloneAdapter:
 
     def capabilities(self) -> set[str]:
         """
-        Graphify natively supports 5 operations (was wrongly 3 in ice-final).
+        Graphify supports 4 query ops (was wrongly 3 in ice-final).
 
         - symbol_lookup: `graphify explain <symbol>` returns node details
         - neighbors_1hop: `graphify explain <symbol>` returns direct connections
         - path_le4: `graphify path <from> <to>` returns the shortest path
         - blast_radius: `graphify affected <symbol>` reverse traversal for impact
-        - (incremental via `update` is wired through index_incremental)
 
         nl_locate is N/A (no NL→symbol semantic search).
+
+        Separately (NOT a query op, so not in this set): incremental indexing via
+        `graphify update` is wired through index_incremental() — see that method.
         """
         return {"symbol_lookup", "neighbors_1hop", "path_le4", "blast_radius"}
 

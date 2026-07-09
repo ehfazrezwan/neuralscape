@@ -67,32 +67,39 @@ def strip_python_docstrings(source: str) -> str:
         Source with docstrings replaced by empty strings or removed.
     """
     # This is a simplified regex-based approach; a full AST-based stripper would
-    # be more robust but adds complexity. The regex handles the common cases.
+    # be more robust but adds complexity. The regex handles the common cases:
+    # module / def / async def / class docstrings, optionally with a string
+    # prefix (r/b/f/u and combinations, case-insensitive), and separated from
+    # the def/class header by blank or comment lines.
 
-    # Pattern to match docstrings that appear immediately after:
-    # 1. Start of file (module docstring)
-    # 2. def/class lines (function/method/class docstrings)
+    # A triple-quoted string literal with an OPTIONAL prefix (r, b, f, u, rb, ...).
+    # Both """ and ''' variants; DOTALL is set globally so content may span lines.
+    _prefix = r'(?:[rRbBuUfF]{0,2})'
+    _dq = r'"""(?:[^"]|"(?!""))*"""'
+    _sq = r"'''(?:[^']|'(?!''))*'''"
+    _docstring = rf'{_prefix}(?:{_dq}|{_sq})'
 
-    # First pass: module-level docstring at the very beginning
-    # Match optional shebang/encoding, then optional whitespace/comments, then the docstring
+    # First pass: module-level docstring at the very beginning.
+    # Match optional shebang/encoding, then optional whitespace/comments, then
+    # the (possibly prefixed) docstring.
     module_pattern = re.compile(
-        r'^((?:#![^\n]*\n)?(?:\s*#[^\n]*\n|\s*\n)*)'  # Optional shebang + comments/blank lines
-        r'(\s*)("""(?:[^"]|"(?!""))*"""|\'\'\'(?:[^\']|\'(?!\'\'))*\'\'\')',  # The docstring
+        r'^((?:#![^\n]*\n)?(?:[ \t]*#[^\n]*\n|[ \t]*\n)*)'  # shebang + comments/blank lines
+        rf'([ \t]*)({_docstring})',  # the docstring (group 3)
         re.MULTILINE | re.DOTALL
     )
+    result = module_pattern.sub(r'\1', source, count=1)  # keep prefix, drop docstring
 
-    result = module_pattern.sub(r'\1', source, count=1)  # Remove first docstring, keep prefix
-
-    # Second pass: function/class docstrings
-    # Match def/class line, then whitespace, then docstring
+    # Second pass: function / async function / class docstrings. The docstring may
+    # be preceded by blank lines and/or comment lines after the header line.
     func_class_pattern = re.compile(
-        r'((?:^|\n)([ \t]*(?:def|class)\s+[^\n]+:)[ \t]*\n)'  # def/class line with trailing newline
-        r'([ \t]*)("""(?:[^"]|"(?!""))*"""|\'\'\'(?:[^\']|\'(?!\'\'))*\'\'\')',  # Indented docstring
+        r'((?:^|\n)[ \t]*(?:async[ \t]+)?(?:def|class)\s+[^\n]+:[ \t]*\n'  # header line (grp 1 start)
+        r'(?:[ \t]*#[^\n]*\n|[ \t]*\n)*)'  # optional blank/comment lines (still grp 1)
+        rf'([ \t]*)({_docstring})',  # indentation (grp 2) + docstring (grp 3)
         re.MULTILINE | re.DOTALL
     )
 
     def replace_func_docstring(match):
-        # Keep the def/class line, remove the docstring
+        # Keep the header (and any interleaving blank/comment lines), drop the docstring.
         return match.group(1)
 
     result = func_class_pattern.sub(replace_func_docstring, result)
@@ -104,19 +111,17 @@ def filter_corpus_files(
     corpus_root: Path,
     extensions: set[str],
     exclude_tool_output: bool = True,
-    strip_docstrings: bool = False,
-    language: str = "python",
 ) -> Iterator[Path]:
     """
     Iterate over source files in a corpus with optional filtering.
+
+    This yields PATHS only. To read content (optionally with docstring
+    stripping), pass each yielded path to ``read_source_file``.
 
     Args:
         corpus_root: Root directory of the corpus.
         extensions: Set of file extensions to include (e.g., {".py"}).
         exclude_tool_output: If True, skip files in tool output directories.
-        strip_docstrings: If True, process Python files to strip docstrings
-            (NOTE: this is read-only; the files themselves are not modified).
-        language: Language for docstring stripping ("python" or other).
 
     Yields:
         Paths to source files matching the criteria.

@@ -89,18 +89,104 @@ def test_strip_python_docstrings_class():
 
 
 def test_strip_python_docstrings_preserves_strings():
-    """Test that regular strings are preserved."""
+    """Test that non-docstring string literals are preserved."""
     source = '''def foo():
     """Docstring to remove."""
     x = "This is a regular string"
-    y = """Another regular string"""
+    y = "Another regular string"
     return x + y
 '''
     result = strip_python_docstrings(source)
     assert "def foo():" in result
-    # The assignment strings should be preserved (they're not docstrings)
-    # But the immediate-after-def docstring should be gone
+    # The immediate-after-def docstring must be gone.
+    assert "Docstring to remove" not in result
+    # The assigned (non-docstring) string literals must REMAIN.
+    assert '"This is a regular string"' in result
+    assert '"Another regular string"' in result
     assert "return x + y" in result
+
+
+def test_strip_python_docstrings_async_def():
+    """Test stripping docstrings from async functions."""
+    source = '''async def fetch(url):
+    """Fetch the URL asynchronously."""
+    return await client.get(url)
+'''
+    result = strip_python_docstrings(source)
+    assert "async def fetch(url):" in result
+    assert "return await client.get(url)" in result
+    assert "Fetch the URL asynchronously" not in result
+
+
+def test_strip_python_docstrings_after_blank_and_comment_lines():
+    """Test stripping docstrings preceded by blank/comment lines after header."""
+    source = '''def foo():
+
+    # a leading comment
+    """Docstring after blank + comment."""
+    return 1
+
+class Bar:
+
+    """Class docstring after a blank line."""
+    x = 1
+'''
+    result = strip_python_docstrings(source)
+    assert "def foo():" in result
+    assert "class Bar:" in result
+    assert "return 1" in result
+    assert "x = 1" in result
+    # The interleaved comment is preserved; docstrings are gone.
+    assert "# a leading comment" in result
+    assert "Docstring after blank + comment" not in result
+    assert "Class docstring after a blank line" not in result
+
+
+def test_strip_python_docstrings_prefixed():
+    """Test stripping prefixed string docstrings (r/b/f/u variants)."""
+    source = (
+        'def raw_doc():\n'
+        '    r"""Raw docstring with regex."""\n'
+        '    return 1\n'
+        '\n'
+        'def fstr_doc():\n'
+        '    f"""F-string docstring here."""\n'
+        '    return 2\n'
+        '\n'
+        'def bytes_doc():\n'
+        '    b"""Bytes docstring."""\n'
+        '    return 3\n'
+        '\n'
+        'def single_quote_raw():\n'
+        "    r'''Single-quote raw docstring.'''\n"
+        '    return 4\n'
+    )
+    result = strip_python_docstrings(source)
+    assert "def raw_doc():" in result
+    assert "def fstr_doc():" in result
+    assert "def bytes_doc():" in result
+    assert "def single_quote_raw():" in result
+    assert "return 1" in result
+    assert "return 2" in result
+    assert "return 3" in result
+    assert "return 4" in result
+    # All prefixed docstrings must be stripped.
+    assert "Raw docstring" not in result
+    assert "F-string docstring" not in result
+    assert "Bytes docstring" not in result
+    assert "Single-quote raw docstring" not in result
+
+
+def test_strip_python_docstrings_prefixed_module():
+    """Test stripping a prefixed module-level docstring."""
+    source = (
+        'r"""Raw module docstring."""\n'
+        '\n'
+        'import os\n'
+    )
+    result = strip_python_docstrings(source)
+    assert "import os" in result
+    assert "Raw module docstring" not in result
 
 
 def test_strip_python_docstrings_empty():

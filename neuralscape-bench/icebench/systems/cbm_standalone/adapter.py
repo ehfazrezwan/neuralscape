@@ -245,14 +245,32 @@ class CBMStandaloneAdapter:
         cache hit). This is critical for accurate cold-index benchmarking —
         CBM's caching made rep0 the only true cold measurement, with later reps
         being ~0.13s no-ops.
+
+        A FAILED delete is fatal: if we cannot clear the cached project, the
+        subsequent index_repository can hit a warm cache and silently report a
+        fake "cold" number — exactly the contamination this fix removes. So a
+        delete failure is surfaced as a DNF rather than proceeding.
         """
         # Delete any existing project to force a true cold index.
         project = self._resolve_project(corpus)
         if project:
             try:
-                self._cli("delete_project", {"project": project})
-            except Exception:
-                pass
+                res = self._cli("delete_project", {"project": project})
+            except Exception as e:
+                return IndexResult(
+                    wall_s=0, peak_rss_mb=0, cpu_s=0, symbols=0, edges=0, files=0,
+                    ok=False, dnf=True,
+                    dnf_reason=f"cold_delete_failed ({e})",
+                )
+            # A rail breach or nonzero exit means the project may still be cached;
+            # fail loudly rather than measure a warm "cold" index.
+            if res.dnf or res.returncode != 0:
+                reason = res.dnf_reason if res.dnf else f"exit_code_{res.returncode}"
+                return IndexResult(
+                    wall_s=res.wall_s, peak_rss_mb=res.peak_rss_mb, cpu_s=res.cpu_s,
+                    symbols=0, edges=0, files=0, ok=False, dnf=True,
+                    dnf_reason=f"cold_delete_failed ({reason})",
+                )
             self._project_names.pop(corpus.name, None)
 
         return self._index(corpus)
