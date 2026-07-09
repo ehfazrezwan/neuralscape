@@ -14,6 +14,7 @@ NS ingest is a local HTTP call whose wall time is added on top.
 """
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -42,7 +43,7 @@ class NSGraphifyAdapter:
 
     def __init__(
         self,
-        api_url: str = "http://localhost:8599",
+        api_url: str | None = None,
         graphify_bin: str = "/data/ice/tools/graphify/.venv/bin/graphify",
         rail: RailConfig | None = None,
     ):
@@ -50,14 +51,15 @@ class NSGraphifyAdapter:
         Initialize the adapter.
 
         Args:
-            api_url: NS API base URL.
+            api_url: NS API base URL. If None, uses ICE_API_URL env var or
+                defaults to http://localhost:8599.
             graphify_bin: Path to graphify binary (H2 pins it).
             rail: Safety-rail config (cap + timeout). Runner injects the
                 CLI-configured one; defaults to RailConfig() otherwise.
         """
         self.name = "ns-graphify"
         self.version = "graphify-cli@TODO+ns-api@TODO"  # H2 pins versions
-        self.api_url = api_url
+        self.api_url = api_url or os.environ.get("ICE_API_URL", "http://localhost:8599")
         self.graphify_bin = graphify_bin
         self.rail = rail or RailConfig()
         self.client = httpx.Client(timeout=120.0)

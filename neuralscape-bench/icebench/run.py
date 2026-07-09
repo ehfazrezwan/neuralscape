@@ -10,23 +10,26 @@ Subcommands:
 """
 
 import argparse
+import os
 import random
 import sys
 from pathlib import Path
 
 from icebench.corpora import (
+    CORPORA_DIR,
     PINNED_CORPORA,
     save_lock_file,
     fetch_corpus,
     iter_corpora,
 )
+from icebench.corpus_filters import is_tool_output
 from icebench.schema import ResultRow, write_row, RunManifest
 from icebench.rail import RailConfig
 from icebench.adapters.base import SystemAdapter, Corpus
 
 
-# Results directory
-RESULTS_DIR = Path("/data/ice/results/raw")
+# Results directory (env-overridable for isolated test runs)
+RESULTS_DIR = Path(os.environ.get("ICE_RESULTS_DIR", "/data/ice/results/raw"))
 
 # Number of repetitions per measurement
 N_REPS = 3
@@ -48,6 +51,9 @@ def _pick_source_files(corpus: Corpus, n: int, seed: int = 42) -> list[str]:
     """
     Deterministically pick up to n real source files from a corpus.
 
+    Excludes tool-generated output directories (graphify-out/, etc.) to prevent
+    indexing tools' own artifacts as source code.
+
     Args:
         corpus: The corpus to scan.
         n: Number of files to pick.
@@ -63,7 +69,10 @@ def _pick_source_files(corpus: Corpus, n: int, seed: int = 42) -> list[str]:
     candidates = sorted(
         str(p)
         for p in root.rglob("*")
-        if p.is_file() and p.suffix in _SOURCE_EXTS and ".git" not in p.parts
+        if p.is_file()
+        and p.suffix in _SOURCE_EXTS
+        and ".git" not in p.parts
+        and not is_tool_output(p, root)
     )
     if not candidates:
         return []
@@ -450,6 +459,11 @@ def cmd_report(args: argparse.Namespace) -> int:
     from pathlib import Path as _P
     import json as _json
 
+    # Env-overridable paths for isolated test runs
+    tools_dir = _P(os.environ.get("ICE_TOOLS_DIR", "/data/ice/tools"))
+    reports_dir = _P(os.environ.get("ICE_REPORTS_DIR", "/data/ice/reports"))
+    bench_root = _P(os.environ.get("ICE_BENCH_ROOT", "/data/ice/neuralscape/neuralscape-bench"))
+
     OP_CLASSES = ["symbol_lookup", "neighbors_1hop", "path_le4", "nl_locate", "blast_radius"]
     NA_REASON = {
         "nl_locate": "N/A (no NL→symbol retrieval)",
@@ -473,15 +487,15 @@ def cmd_report(args: argparse.Namespace) -> int:
             op: ("supported" if op in ops else NA_REASON.get(op, "N/A"))
             for op in OP_CLASSES
         }
-    chart = _P("/data/ice/neuralscape/neuralscape-bench/static/chart.umd.min.js")
+    chart = bench_root / "static" / "chart.umd.min.js"
     cfg = ReportConfig(
         results_jsonl=results_jsonl,
         score_report_json=(RESULTS_DIR / f"{args.run_id}.trackq.json"),
-        systems_lock_json=_P("/data/ice/tools/systems.lock.json"),
-        corpora_lock_json=_P("/data/ice/corpora/corpora.lock.json"),
+        systems_lock_json=tools_dir / "systems.lock.json",
+        corpora_lock_json=CORPORA_DIR / "corpora.lock.json",
         capabilities_matrix=caps or None,
-        markdown_output=_P(f"/data/ice/reports/ICE_BENCH_REPORT-{args.run_id}.md"),
-        html_output=_P(f"/data/ice/reports/ice_bench_report-{args.run_id}.html"),
+        markdown_output=reports_dir / f"ICE_BENCH_REPORT-{args.run_id}.md",
+        html_output=reports_dir / f"ice_bench_report-{args.run_id}.html",
         chart_js_path=chart if chart.exists() else None,
         quiescence_statement=(
             "Measured on ns-bench (8 vCPU / 31 GB) with ZERO competing benchmark "

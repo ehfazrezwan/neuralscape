@@ -86,15 +86,17 @@ class GraphifyStandaloneAdapter:
 
     def capabilities(self) -> set[str]:
         """
-        Graphify natively supports 3 structural operations.
+        Graphify natively supports 5 operations (was wrongly 3 in ice-final).
 
         - symbol_lookup: `graphify explain <symbol>` returns node details
         - neighbors_1hop: `graphify explain <symbol>` returns direct connections
         - path_le4: `graphify path <from> <to>` returns the shortest path
+        - blast_radius: `graphify affected <symbol>` reverse traversal for impact
+        - (incremental via `update` is wired through index_incremental)
 
-        nl_locate and blast_radius are N/A (see module docstring).
+        nl_locate is N/A (no NL→symbol semantic search).
         """
-        return {"symbol_lookup", "neighbors_1hop", "path_le4"}
+        return {"symbol_lookup", "neighbors_1hop", "path_le4", "blast_radius"}
 
     def _graphify_out_path(self, corpus: Corpus) -> Path:
         """Directory where graphify writes its output for a corpus."""
@@ -171,14 +173,59 @@ class GraphifyStandaloneAdapter:
 
     def index_incremental(self, corpus: Corpus, touched: list[str]) -> IndexResult:
         """
-        Graphify has no incremental index mode => N/A.
+        Graphify incremental index via `graphify update` (added in Phase 0).
 
-        Returns DNF with dnf_reason='incremental_na' so the runner records N/A
-        rather than emulating an incremental run.
+        The `update` command re-extracts code files and updates the graph without
+        needing an LLM. This was wrongly N/A'd in the ice-final run.
         """
+        if not Path(self.graphify_bin).exists():
+            return IndexResult(
+                wall_s=0, peak_rss_mb=0, cpu_s=0, symbols=0, edges=0, files=0,
+                ok=False, dnf=True,
+                dnf_reason=f"graphify not found: {self.graphify_bin}",
+            )
+
+        cmd = [
+            self.graphify_bin,
+            "update",
+            corpus.path,
+            "--no-cluster",
+        ]
+        res = run_with_rail(cmd, self.rail)
+
+        if res.dnf:
+            return IndexResult(
+                wall_s=res.wall_s, peak_rss_mb=res.peak_rss_mb, cpu_s=res.cpu_s,
+                symbols=0, edges=0, files=0, ok=False, dnf=True,
+                dnf_reason=res.dnf_reason,
+            )
+        if res.returncode != 0:
+            return IndexResult(
+                wall_s=res.wall_s, peak_rss_mb=res.peak_rss_mb, cpu_s=res.cpu_s,
+                symbols=0, edges=0, files=0, ok=False,
+            )
+
+        # Parse updated graph.json for counts
+        graph_json_path = self._graph_json_path(corpus)
+        if not graph_json_path.exists():
+            return IndexResult(
+                wall_s=res.wall_s, peak_rss_mb=res.peak_rss_mb, cpu_s=res.cpu_s,
+                symbols=0, edges=0, files=0, ok=False,
+            )
+
+        try:
+            with open(graph_json_path) as f:
+                graph_data = json.load(f)
+            nodes = graph_data.get("nodes", [])
+            symbols = len(nodes)
+            edges = len(graph_data.get("edges", []))
+            files = len({n.get("source_file") for n in nodes if n.get("source_file")})
+        except (OSError, json.JSONDecodeError):
+            symbols = edges = files = 0
+
         return IndexResult(
-            wall_s=0, peak_rss_mb=0, cpu_s=0, symbols=0, edges=0, files=0,
-            ok=False, dnf=True, dnf_reason="incremental_na",
+            wall_s=res.wall_s, peak_rss_mb=res.peak_rss_mb, cpu_s=res.cpu_s,
+            symbols=symbols, edges=edges, files=files, ok=True,
         )
 
     def index_second(self, corpus: Corpus) -> IndexResult:
@@ -298,6 +345,15 @@ class GraphifyStandaloneAdapter:
                 self.graphify_bin, "path",
                 payload.get("from", ""), payload.get("to", ""),
                 "--graph", str(graph_json_path),
+            ]
+        elif op == "blast_radius":
+            # `graphify affected <symbol>` - reverse traversal for impact analysis
+            symbol = payload.get("symbol", "")
+            depth = payload.get("max_hops", 4)
+            cmd = [
+                self.graphify_bin, "affected", symbol,
+                "--graph", str(graph_json_path),
+                "--depth", str(depth),
             ]
         else:  # pragma: no cover - guarded by capabilities() check above
             raise UnsupportedOp(f"Unexpected op: {op}")

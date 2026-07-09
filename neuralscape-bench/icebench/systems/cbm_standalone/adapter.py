@@ -176,15 +176,16 @@ class CBMStandaloneAdapter:
 
     def capabilities(self) -> set[str]:
         """
-        CBM supports 3 structural operations via its MCP/CLI tools.
+        CBM supports 4 operations via its MCP/CLI tools (was wrongly 3 in ice-final).
 
         - symbol_lookup: search_graph (name_pattern)
         - neighbors_1hop: trace_path (depth=1, direction=both)
         - path_le4: query_graph (Cypher variable-length path [*1..4])
+        - nl_locate: search_code (semantic vector search over code chunks)
 
-        nl_locate and blast_radius are N/A (see module docstring).
+        blast_radius is N/A (detect_changes is git-diff based, not general impact).
         """
-        return {"symbol_lookup", "neighbors_1hop", "path_le4"}
+        return {"symbol_lookup", "neighbors_1hop", "path_le4", "nl_locate"}
 
     # ---- indexing ----
 
@@ -237,7 +238,23 @@ class CBMStandaloneAdapter:
         )
 
     def index_cold(self, corpus: Corpus) -> IndexResult:
-        """Cold (from-scratch) index of the corpus."""
+        """
+        Cold (from-scratch) index of the corpus.
+
+        Deletes any existing project first to ensure a true cold index (not a
+        cache hit). This is critical for accurate cold-index benchmarking —
+        CBM's caching made rep0 the only true cold measurement, with later reps
+        being ~0.13s no-ops.
+        """
+        # Delete any existing project to force a true cold index.
+        project = self._resolve_project(corpus)
+        if project:
+            try:
+                self._cli("delete_project", {"project": project})
+            except Exception:
+                pass
+            self._project_names.pop(corpus.name, None)
+
         return self._index(corpus)
 
     def index_incremental(self, corpus: Corpus, touched: list[str]) -> IndexResult:
@@ -436,6 +453,11 @@ class CBMStandaloneAdapter:
             )
             args = {"project": project, "query": cypher}
             tool = "query_graph"
+        elif op == "nl_locate":
+            # `search_code` does semantic vector search over code chunks
+            query = payload.get("query", "")
+            args = {"project": project, "pattern": query}
+            tool = "search_code"
         else:  # pragma: no cover - guarded by capabilities() check above
             raise UnsupportedOp(f"Unexpected op: {op}")
 
