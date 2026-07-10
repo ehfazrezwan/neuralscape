@@ -114,7 +114,11 @@ def normalize_answer(answer: str | dict | None, system: str = "", for_symbol_loo
     # Before Phase A this text was always header-only, so this block was never
     # exercised (rootcause §1); now it must parse real hits or symbol_lookup
     # scores 0 despite correct engine answers.
-    if system in ("ns-ice", "ns-ice-det") and for_symbol_lookup:
+    # ns-native (Phase G-final GF3) drives the SAME NativeEngine through the
+    # routed REST surface, so its symbol_lookup rendering is byte-identical to
+    # ns-ice's ("<fqn> (<kind>) in <file>:<line>", possibly followed by inline
+    # "Memories:" E4 enrichment lines, which this parser correctly skips).
+    if system in ("ns-ice", "ns-ice-det", "ns-native") and for_symbol_lookup:
         try:
             parsed = json.loads(answer)
             result = parsed.get("result", "") if isinstance(parsed, dict) else ""
@@ -710,7 +714,10 @@ def _parse_symbol_set(answer: str | dict, system: str = "") -> set[str]:
     # (ns-graphify-lib uses graphify's own "-- label [rel]" node-label rendering,
     # not FQN arrows, so it is NOT added here — its set-based accuracy remains a
     # documented format follow-up.)
-    if system in ("ns-ice", "ns-ice-det", "ns-graphify", "ns-cbm"):
+    # ns-native (GF3) uses the same NativeEngine arrow rendering as ns-ice
+    # ("Neighbors of X:\n  <-- fqn [CALLS]"; "(no neighbors ...)" -> empty set,
+    # the honest ~0 native result by design).
+    if system in ("ns-ice", "ns-ice-det", "ns-graphify", "ns-cbm", "ns-native"):
         return _parse_ns_ice_neighbors(answer)
 
     # ns-graphify-lib (through-NS) renders neighbors with graphify's own
