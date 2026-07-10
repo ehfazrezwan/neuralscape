@@ -311,13 +311,17 @@ class NSCbmAdapter:
 
     def teardown(self, corpus: Corpus) -> None:
         """
-        Delete the code_space's graph state (best-effort, never raises).
+        Reset the code_space so the next index rep is truly cold (best-effort).
+
+        R-C: `DELETE /v1/code-graph/graph?graph_id=<code_space>&system=code-cbm`
+        routes to the CBM bridge's delete_project; the NS memory graph + anchors
+        are untouched. Never raises.
         """
         code_space = self._make_code_space(corpus.name)
         try:
             self.client.delete(
                 f"{self.api_url}/v1/code-graph/graph",
-                params={"graph_id": code_space},
+                params={"graph_id": code_space, "system": "code-cbm"},
             )
         except httpx.RequestError:
             pass

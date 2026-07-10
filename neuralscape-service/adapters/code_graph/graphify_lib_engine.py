@@ -416,6 +416,27 @@ class GraphifyLibEngine:
             summary=f"Blast radius for {since!r}: {len(affected)} affected symbol(s).",
         )
 
+    def teardown(self) -> dict:
+        """R-C: drop the in-process graph for a true cold rebuild.
+
+        Clears the NetworkX graph + build timestamp; the next read lazily
+        rebuilds from source (``resolve_code_engine`` builds when ``G is None``).
+        The caller (``code_dispatch.teardown_code_space``) additionally evicts
+        this engine's ``_ctx_cache`` entry so the next bind is a fresh instance.
+        GraphifyLibEngine keeps nothing on disk and never holds the memory graph,
+        so there is nothing else to reset — the moat is untouched.
+
+        Idempotent: tearing down an already-empty engine drops 0.
+        """
+        n = self.G.number_of_nodes() if self.G is not None else 0
+        self.G = None
+        self._indexed_at = None
+        logger.info(
+            "GraphifyLib teardown code_space=%s: dropped %d-node in-process graph",
+            self.code_space, n,
+        )
+        return {"nodes_dropped": n}
+
     def get_symbol_inventory(self) -> set[str]:
         """Get current symbol inventory (canonical FQNs) for liveness tracking.
 

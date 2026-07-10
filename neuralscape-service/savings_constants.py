@@ -28,8 +28,10 @@ They are measured, checked-in constants, not runtime estimates:
 # tools (+277 tokens). Intentional, per the acceptance rule. Then +6 (10807) in
 # the Fable-review pass: recall_memories knowledge_system schema reworded to be
 # honest that the fusion gate (not this param) governs its code leg.
-# See tests/test_savings_meter.py::TestOverheadConstants.
-MCP_TOOL_SCHEMA_OVERHEAD_TOKENS = 10807
+# Then +208 (11015) in the residuals PR (R-C): the new code_graph_delete MCP tool
+# (through-NS cold-delete twin of DELETE /v1/code-graph/graph). Intentional, per
+# the acceptance rule. See tests/test_savings_meter.py::TestOverheadConstants.
+MCP_TOOL_SCHEMA_OVERHEAD_TOKENS = 11015
 
 # Rendered savings line + detail fields on one response (measured: 67).
 SAVINGS_LINE_OVERHEAD_TOKENS = 70

@@ -354,15 +354,28 @@ class CBMEngine:
         # CBM trace_path keys on the short function name, not the full FQN.
         function_name = label.split(".")[-1]
 
-        result = self._call_bridge(
-            "/trace_path",
-            {
-                "project": project,
-                "function_name": function_name,
-                "direction": "both",
-                "depth": 1,
-            },
-        )
+        # R-B defense-in-depth: even with the bridge's soft-degrade, a per-symbol
+        # bridge/CBM failure (e.g. an older bridge image that still 500s, or a
+        # transient CLI error) must NOT propagate as an error to the recall
+        # caller. neighbors degrades to honest N/A (empty) — the base always
+        # answers (PLAN §3.3). A genuinely-down bridge is already caught upstream
+        # by the health probe (code-cbm becomes ineligible for routing).
+        try:
+            result = self._call_bridge(
+                "/trace_path",
+                {
+                    "project": project,
+                    "function_name": function_name,
+                    "direction": "both",
+                    "depth": 1,
+                },
+            )
+        except RuntimeError as e:
+            logger.warning(
+                "CBM neighbors degraded to empty for %r (bridge trace_path failed): %s",
+                label, e,
+            )
+            return f"No neighbors found for '{label}'."
 
         callees = result.get("callees", [])
         callers = result.get("callers", [])
@@ -516,6 +529,30 @@ class CBMEngine:
         raise EngineCapabilityError(
             "CBM doesn't expose semantic layer (communities/hotspots) via its tools."
         )
+
+    def teardown(self) -> dict:
+        """R-C: delete this code_space's CBM project via the bridge (cold reset).
+
+        Maps to the bridge's ``/delete_project`` (CBM's own index cache). Touches
+        only CBM state — never the NS memory graph or the memory↔code anchors,
+        which live in Qdrant. Idempotent: an unbound project (index ran in
+        another process and this instance never resolved a slug) is a no-op.
+
+        Returns:
+            {"deleted": bool, "project": str|None, ...}
+        """
+        project = getattr(self, "project", None)
+        if not project:
+            return {"deleted": False, "reason": "no bound project (nothing to delete)"}
+        try:
+            result = self._call_bridge("/delete_project", {"project": project})
+        except RuntimeError as e:
+            # A delete failure must not raise to the caller (honest degrade).
+            logger.warning("CBM teardown delete_project failed for %s: %s", project, e)
+            return {"deleted": False, "project": project, "reason": str(e)}
+        # After a successful delete this instance's slug is stale.
+        self.project = None
+        return {"deleted": True, "project": project, "status": result.get("status", "deleted")}
 
     def index(
         self,

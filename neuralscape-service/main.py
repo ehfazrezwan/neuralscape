@@ -1635,6 +1635,33 @@ async def v1_code_graph_index(req: CodeIndexRequest, request: Request):
     )
 
 
+@v1_router.delete("/code-graph/graph")
+async def v1_code_graph_delete(
+    request: Request,
+    graph_id: str = Query(..., min_length=1, description="code_space to reset (code--owner--repo)"),
+    system: str = Query(..., description="Target code system: code-cbm | code-graphify-lib | code-native"),
+    user_id: str | None = Query(None),
+):
+    """R-C: reset a code system's index for one code_space (true cold-delete).
+
+    Routes to the engine's ``teardown`` (native: drop the code_space label-space +
+    symbol cards, CodeAnchor preserved; cbm: bridge ``delete_project``;
+    graphify-lib: drop the in-process graph + evict its cache). Scoped strictly
+    to the code_space; it NEVER touches the memory graph or the memory↔code
+    anchors — those join on the memory's ``source_ref`` in Qdrant and are left
+    intact (assert-anchors-survive contract). Idempotent (a non-existent space
+    deletes 0). Enables truly cold per-rep index measurements in ICEBench.
+    """
+    _code_graph_or_501()
+    caller = _resolve_user_id(request, user_id)
+    from knowledge.code_dispatch import teardown_code_space
+
+    result = await asyncio.to_thread(
+        teardown_code_space, system, graph_id, caller, settings
+    )
+    return result
+
+
 # ── Connectors (data-layer sources) ──────────────
 
 

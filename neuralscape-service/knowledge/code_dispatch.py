@@ -179,6 +179,88 @@ def _resolve_cbm_engine(code_space: str, settings, *, for_index: bool):
     return engine
 
 
+def _evict_engine_cache(system_name: str, code_space: str) -> None:
+    """Evict any cached engine for (system, code_space) so the next bind is cold."""
+    from adapters.code_graph import query as cg_query
+
+    if system_name == "code-native":
+        cg_query._ctx_cache.pop(f"native:{code_space}", None)
+    elif system_name == "code-graphify-lib":
+        cg_query._ctx_cache.pop(f"lib:{code_space}", None)
+    elif system_name == "code-cbm":
+        _cbm_cache.pop(code_space, None)
+        _cbm_unbound_until.pop(code_space, None)
+
+
+def teardown_code_space(
+    system_name: str,
+    code_space: str,
+    user_id: str,
+    settings,
+) -> dict:
+    """R-C: reset a code system's index for one ``code_space`` (true cold-delete).
+
+    Binds the engine WITHOUT a read-time warmup (``for_index=True`` — graphify
+    must not lazily rebuild a graph just to drop it) and delegates to the
+    engine's ``teardown()``:
+      - native: drop the code_space label-space (CodeRepo/CodeFile/CodeSymbol +
+        edges) + code_index symbol cards; CodeAnchor + memory graph preserved.
+      - graphify-lib: drop the in-process NetworkX graph + evict the cache.
+      - cbm: bridge ``/delete_project``.
+
+    Scoped strictly to the code_space; NEVER touches the memory graph or the
+    memory↔code anchors (they join on the memory's ``source_ref`` in Qdrant).
+    Idempotent. Returns a structured result; ``deleted`` is False (with a
+    reason) when the space is unbindable or the engine has no teardown.
+    """
+    engine = resolve_code_engine(
+        system_name, code_space, user_id, settings, for_index=True
+    )
+    if engine is None:
+        return {
+            "deleted": False,
+            "system": system_name,
+            "code_space": code_space,
+            "reason": "unbindable (unknown system / repo not configured / bridge down)",
+        }
+
+    # CBM's delete_project needs the project slug; the index ran in another
+    # process, so bind it from the bridge if this instance hasn't resolved it.
+    if system_name == "code-cbm" and not getattr(engine, "project", None):
+        repo_path = repo_path_for_code_space(code_space, settings)
+        if repo_path:
+            try:
+                engine.resolve_project_from_source(repo_path)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "teardown_code_space: could not resolve CBM slug for %s",
+                    code_space, exc_info=True,
+                )
+
+    teardown = getattr(engine, "teardown", None)
+    if not callable(teardown):
+        return {
+            "deleted": False,
+            "system": system_name,
+            "code_space": code_space,
+            "reason": "engine has no teardown",
+        }
+
+    engine_result = teardown() or {}
+    _evict_engine_cache(system_name, code_space)
+    # Honor the engine's own verdict: engines that can report "nothing deleted"
+    # (cbm: no bound project / bridge failure) set engine_result["deleted"]=False;
+    # engines that always succeed when they run (native/graphify) omit it → True.
+    # Don't paper a no-op delete as deleted:True (Copilot #205).
+    deleted = bool(engine_result.get("deleted", True))
+    return {
+        "deleted": deleted,
+        "system": system_name,
+        "code_space": code_space,
+        "engine_result": engine_result,
+    }
+
+
 def resolve_bound_code_system(
     system_name: str,
     code_space: str,

@@ -199,10 +199,14 @@ class CBMManager:
 
             if proc.returncode != 0:
                 error_msg = stderr.decode() if stderr else "Unknown error"
-                logger.error(f"CBM tool {tool} failed: {error_msg}")
+                logger.error(f"CBM tool {tool} exited non-zero: {error_msg}")
+                # Distinct "exited non-zero" marker: this is the tool-ran-but-
+                # rejected-the-input case (e.g. an untraceable symbol) that
+                # /trace_path is allowed to soft-degrade. Generic/infra faults
+                # below use a DIFFERENT detail so the gate can't mask them.
                 raise HTTPException(
                     status_code=500,
-                    detail=f"CBM tool {tool} failed: {error_msg}"
+                    detail=f"CBM tool {tool} exited non-zero: {error_msg}"
                 )
 
             # Parse JSON from stdout
@@ -223,6 +227,13 @@ class CBMManager:
                 status_code=504,
                 detail=f"CBM tool {tool} timed out after {self.timeout}s"
             )
+        except HTTPException:
+            # Fable MUST-FIX: our own inner 500s (non-zero exit, invalid JSON)
+            # must propagate with their ORIGINAL detail — the generic catch-all
+            # below would otherwise re-wrap them as "CBM tool ... failed: 500: ..."
+            # and that rewrap would slip past /trace_path's degrade gate, masking
+            # invalid-JSON / infra faults the gate must let through.
+            raise
         except Exception as e:
             logger.exception(f"CBM tool {tool} failed unexpectedly")
             raise HTTPException(
@@ -313,16 +324,44 @@ async def search_graph(req: SearchGraphRequest) -> SearchGraphResponse:
 
 @app.post("/trace_path", response_model=TracePathResponse)
 async def trace_path(req: TracePathRequest) -> TracePathResponse:
-    """Trace call relationships (neighbors: callers + callees)."""
-    result = await cbm_manager.call_tool(
-        "trace_path",
-        {
-            "project": req.project,
-            "function_name": req.function_name,
-            "direction": req.direction,
-            "depth": req.depth,
-        },
-    )
+    """Trace call relationships (neighbors: callers + callees).
+
+    Contract (R-B): a per-symbol trace failure is a NOT-FOUND, not a bridge
+    fault. CBM's CLI exits non-zero for symbols it can't trace (unknown /
+    uncallable function names — 13/60 in the engine comparison), which
+    ``call_tool`` surfaces as HTTP 500. That is the wrong contract for a
+    neighbors lookup: an unknown symbol simply has no neighbors. So we
+    soft-degrade a 500 here to an EMPTY result (200, no callers/callees) — the
+    honest N/A the caller expects — while genuine infra faults (timeout → 504)
+    still propagate. This keeps `/trace_path` from ever 500-ing on a symbol.
+    """
+    try:
+        result = await cbm_manager.call_tool(
+            "trace_path",
+            {
+                "project": req.project,
+                "function_name": req.function_name,
+                "direction": req.direction,
+                "depth": req.depth,
+            },
+        )
+    except HTTPException as e:
+        # Degrade ONLY the CBM-CLI-tool "exited non-zero" case (the tool ran but
+        # rejected an untraceable / unknown symbol) — a genuine "no neighbors" →
+        # return empty (honest N/A). Every OTHER 500 (invalid JSON, missing
+        # binary, unexpected faults — all with a different detail after the
+        # call_tool double-wrap fix) and 504 timeouts are REAL faults and must
+        # propagate unchanged (Copilot #205 + Fable MUST-FIX).
+        detail = str(e.detail or "")
+        if e.status_code == 500 and "exited non-zero" in detail:
+            logger.warning(
+                "trace_path soft-degrade to empty for %r (project=%s): %s",
+                req.function_name, req.project, detail,
+            )
+            return TracePathResponse(
+                function=req.function_name, direction=req.direction
+            )
+        raise
     return TracePathResponse(
         function=result.get("function", req.function_name),
         direction=result.get("direction", req.direction),

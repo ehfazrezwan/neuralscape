@@ -892,6 +892,80 @@ class NativeEngine:
             duration_s=duration,
         )
 
+    def teardown(self) -> dict:
+        """R-C: drop this code_space's label-space for a true cold reset.
+
+        Deletes the code GRAPH (CodeRepo/CodeFile/CodeSymbol + their edges) and
+        the code_index symbol cards for this code_space, so a subsequent
+        ``index()`` is a genuine cold build (not an incremental skip). Scoped
+        strictly to ``self.code_space``.
+
+        THE MOAT SURVIVES: this NEVER touches the memory Qdrant collection or any
+        Memory/Entity node, and it PRESERVES CodeAnchor nodes (the code-side
+        anchor points designed to outlive a symbol reindex — see
+        ``_ensure_anchors``). Memory↔code recall joins on the memory's
+        ``source_ref`` in Qdrant, which is left fully intact.
+
+        Idempotent: tearing down a non-existent code_space removes 0 and returns
+        cleanly.
+
+        Returns:
+            {"nodes_deleted": int, "cards_cleared": bool}
+        """
+        # Label-anchored deletes (one per code label) so Neo4j uses a label scan
+        # + code_space predicate — NOT a full-DB node scan that would walk the
+        # entire memory graph (Fable SHOULD-FIX). CodeAnchor is deliberately
+        # excluded so the moat's code-side anchor points survive.
+        nodes_deleted = 0
+        for label in ("CodeRepo", "CodeFile", "CodeSymbol"):
+            rows = self._run_cypher(
+                f"MATCH (n:{label} {{code_space: $code_space}}) "
+                f"DETACH DELETE n RETURN count(n) AS deleted",
+                code_space=self.code_space,
+            )
+            nodes_deleted += int(rows[0]["deleted"]) if rows else 0
+        cards_cleared = self._delete_code_index_cards()
+        logger.info(
+            "Native teardown code_space=%s: %d graph nodes deleted, cards_cleared=%s "
+            "(CodeAnchor + memory graph preserved)",
+            self.code_space, nodes_deleted, cards_cleared,
+        )
+        return {"nodes_deleted": nodes_deleted, "cards_cleared": cards_cleared}
+
+    def _delete_code_index_cards(self) -> bool:
+        """Delete this code_space's symbol cards from the code_index collection.
+
+        Best-effort and scoped by the ``code_space`` payload field (the same key
+        locate() filters on). Returns True if the delete was issued, False if the
+        collection/store was unavailable (nothing to clear).
+        """
+        try:
+            from qdrant_client.models import (
+                FieldCondition,
+                Filter,
+                FilterSelector,
+                MatchValue,
+            )
+
+            from memory_service import get_shared_service
+
+            service = get_shared_service()
+            m = service._get_memory()
+            client = m.vector_store.client
+            flt = Filter(
+                must=[FieldCondition(key="code_space", match=MatchValue(value=self.code_space))]
+            )
+            client.delete(
+                collection_name="code_index",
+                points_selector=FilterSelector(filter=flt),
+            )
+            return True
+        except Exception:  # noqa: BLE001 — no code_index / store down ⇒ nothing to clear
+            logger.debug(
+                "code_index card delete skipped for %s", self.code_space, exc_info=True
+            )
+            return False
+
     def export_snapshot(self) -> bytes:
         """Export code graph snapshot as portable, content-addressed artifact.
 
