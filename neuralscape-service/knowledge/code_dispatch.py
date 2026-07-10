@@ -248,8 +248,13 @@ def teardown_code_space(
 
     engine_result = teardown() or {}
     _evict_engine_cache(system_name, code_space)
+    # Honor the engine's own verdict: engines that can report "nothing deleted"
+    # (cbm: no bound project / bridge failure) set engine_result["deleted"]=False;
+    # engines that always succeed when they run (native/graphify) omit it → True.
+    # Don't paper a no-op delete as deleted:True (Copilot #205).
+    deleted = bool(engine_result.get("deleted", True))
     return {
-        "deleted": True,
+        "deleted": deleted,
         "system": system_name,
         "code_space": code_space,
         "engine_result": engine_result,

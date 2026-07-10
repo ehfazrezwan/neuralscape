@@ -146,6 +146,21 @@ def test_teardown_code_space_routes_and_evicts_cache():
         cg_query._ctx_cache.pop("native:code--o--r", None)
 
 
+def test_teardown_code_space_honors_engine_deleted_false():
+    """Copilot #205: when the engine reports it deleted nothing (cbm: no project /
+    bridge failure), the top-level `deleted` must be False, not paved to True."""
+    from knowledge import code_dispatch
+
+    fake_engine = MagicMock()
+    fake_engine.teardown.return_value = {"deleted": False, "reason": "no bound project"}
+    with patch.object(code_dispatch, "resolve_code_engine", return_value=fake_engine):
+        res = code_dispatch.teardown_code_space(
+            "code-cbm", "code--o--r", "u1", SimpleNamespace()
+        )
+    assert res["deleted"] is False
+    assert res["engine_result"]["reason"] == "no bound project"
+
+
 def test_teardown_code_space_unbindable():
     from knowledge import code_dispatch
 

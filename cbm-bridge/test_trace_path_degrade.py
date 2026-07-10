@@ -22,7 +22,7 @@ _spec.loader.exec_module(main)
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 def test_trace_path_soft_degrades_cbm_500_to_empty(monkeypatch):
@@ -51,6 +51,21 @@ def test_trace_path_propagates_timeout_504(monkeypatch):
     with pytest.raises(HTTPException) as ei:
         _run(main.trace_path(req))
     assert ei.value.status_code == 504
+
+
+def test_trace_path_propagates_non_trace_500(monkeypatch):
+    """A 500 that is NOT a trace_path CLI failure (e.g. invalid JSON) must NOT be
+    masked as empty — it propagates so real bridge faults surface (Copilot #205)."""
+    mgr = AsyncMock()
+    mgr.call_tool.side_effect = HTTPException(
+        status_code=500, detail="CBM returned invalid JSON: Expecting value"
+    )
+    monkeypatch.setattr(main, "cbm_manager", mgr)
+
+    req = main.TracePathRequest(project="p", function_name="x", direction="both", depth=1)
+    with pytest.raises(HTTPException) as ei:
+        _run(main.trace_path(req))
+    assert ei.value.status_code == 500
 
 
 def test_trace_path_passes_through_success(monkeypatch):

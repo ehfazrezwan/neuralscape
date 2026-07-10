@@ -335,12 +335,17 @@ async def trace_path(req: TracePathRequest) -> TracePathResponse:
             },
         )
     except HTTPException as e:
-        # 500 = CBM CLI failed on this symbol → treat as "no neighbors" (empty).
-        # 504 (timeout) / other statuses are real faults → propagate unchanged.
-        if e.status_code == 500:
+        # Degrade ONLY the CBM-CLI-tool failure (non-zero exit on an
+        # untraceable / unknown symbol), which call_tool surfaces as a 500 whose
+        # detail contains "CBM tool trace_path failed". That case is a genuine
+        # "no neighbors" → return empty (honest N/A). Other 500s (invalid JSON,
+        # missing binary, unexpected faults) and 504 timeouts are REAL faults and
+        # must propagate unchanged — don't mask them (Copilot #205).
+        detail = e.detail or ""
+        if e.status_code == 500 and "trace_path failed" in detail:
             logger.warning(
                 "trace_path soft-degrade to empty for %r (project=%s): %s",
-                req.function_name, req.project, e.detail,
+                req.function_name, req.project, detail,
             )
             return TracePathResponse(
                 function=req.function_name, direction=req.direction
