@@ -88,6 +88,14 @@ def normalize_answer(answer: str | dict | None, system: str = "", for_symbol_loo
             text = answer.get("text", "")
             return _parse_graphify_node_location(text)
 
+        # ns-cbm (through-NS) symbol_lookup returns the code-tool JSON envelope
+        # {"text": "{\"result\": \"Symbols matching 'X':\n  - <fqn> (<kind>) — <file>:<line>\"}"}
+        # (Phase G-final GF1 — format-only parser, no adapter intelligence; the
+        # engine already returned the correct hit, the scorer just couldn't read
+        # this rendering). A genuine "no match" result -> None (honest miss).
+        if system == "ns-cbm" and for_symbol_lookup:
+            return _parse_cbm_symbol_lookup(answer.get("text", ""))
+
         answer = answer.get("text", "")
 
     if not isinstance(answer, str):
@@ -705,6 +713,14 @@ def _parse_symbol_set(answer: str | dict, system: str = "") -> set[str]:
     if system in ("ns-ice", "ns-ice-det", "ns-graphify", "ns-cbm"):
         return _parse_ns_ice_neighbors(answer)
 
+    # ns-graphify-lib (through-NS) renders neighbors with graphify's own
+    # node-label form: {"result": "Neighbors of X:\n  -- <label> [rel] [PROV]"}
+    # — NOT the FQN-arrow form, so it needs its own parser (Phase G-final GF1,
+    # format-only). Mirrors the standalone-graphify honesty exactly: skip
+    # contains/imports containment edges + file-name labels, keep call/ref edges.
+    if system == "ns-graphify-lib":
+        return _parse_graphify_lib_neighbors(answer)
+
     # Generic fallback: try to parse as JSON array
     try:
         parsed = json.loads(answer)
@@ -833,6 +849,103 @@ def _parse_ns_ice_neighbors(text: str) -> set[str]:
                 fqn = parts[0].replace("<--", "").replace("-->", "").strip()
                 if fqn:
                     symbols.add(_normalize_bare_symbol(fqn))
+
+    return symbols
+
+
+def _parse_cbm_symbol_lookup(text: str) -> tuple[str, str] | None:
+    """Parse ns-cbm's through-NS symbol_lookup rendering (Phase G-final GF1).
+
+    The code-tool JSON envelope carries a ``result`` string of the form::
+
+        Symbols matching 'X':
+          - <fqn> (<kind>) — <file>:<line>
+
+    We parse the FIRST matched-symbol line -> (normalized_file, bare_symbol),
+    exactly what the (file, symbol) oracle compares against. A header-only
+    result ("No symbols matching ...") -> None (genuine miss). This is a
+    format-only reader: the engine already returned the correct hit; the scorer
+    previously fell through to the generic path and scored 0.
+
+    Args:
+        text: The ns-cbm answer's ``text`` field (the JSON envelope string, or a
+            bare result string).
+
+    Returns:
+        (file, symbol) tuple, or None when no symbol line is parseable.
+    """
+    try:
+        parsed = json.loads(text)
+        result = parsed.get("result", "") if isinstance(parsed, dict) else ""
+    except (json.JSONDecodeError, TypeError):
+        result = text if isinstance(text, str) else ""
+    if not result:
+        return None
+
+    for line in result.split("\n"):
+        line = line.strip()
+        if not line.startswith("-"):
+            continue
+        line = line.lstrip("-").strip()
+        # "<fqn> (<kind>) — <file>:<line>" (em-dash, en-dash, or hyphen separator;
+        # the line number may be empty in the truncated rendering).
+        m = re.match(
+            r"^(?P<fqn>\S+)\s+\(\w+\)\s+[—–-]\s+(?P<file>.+?):(?P<line>\d*)\s*$",
+            line,
+        )
+        if m:
+            return (
+                _normalize_path(m.group("file")),
+                _normalize_bare_symbol(m.group("fqn")),
+            )
+    return None
+
+
+def _parse_graphify_lib_neighbors(text: str) -> set[str]:
+    """Parse ns-graphify-lib's through-NS neighbors rendering (Phase G-final GF1).
+
+    The code-tool JSON envelope carries a ``result`` string of the form::
+
+        Neighbors of X:
+          -- <label> [<relation>] [<PROVENANCE>]
+
+    This is graphify's own node-label form (``--`` prefix, label may end in
+    ``()``, two bracket groups), distinct from the FQN-arrow form the ns-ice /
+    ns-cbm parser reads. Filtering mirrors ``_parse_graphify_connections``
+    EXACTLY so the number is apples-to-apples with standalone graphify (same
+    engine): skip ``contains``/``imports`` containment edges and file-name
+    labels, keep call/reference/method edges. Format-only — no semantics added.
+
+    Args:
+        text: The ns-graphify-lib answer's ``text`` field (JSON envelope string).
+
+    Returns:
+        Set of bare neighbor symbol names.
+    """
+    symbols: set[str] = set()
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            text = parsed.get("result", "") or ""
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line.startswith("--"):
+            continue
+        body = line[2:].strip()  # strip the leading "--"
+        # Relation is the FIRST bracket group; provenance is the second.
+        relation = ""
+        if "[" in body and "]" in body:
+            relation = body[body.find("[") + 1:body.find("]")].strip().lower()
+        # Skip file containment/import edges (same as standalone graphify).
+        if relation in ("contains", "imports"):
+            continue
+        name_part = body.split("[", 1)[0].strip()
+        # Skip file-name labels (not symbols), same as standalone graphify.
+        if name_part and not name_part.endswith((".py", ".js", ".ts", ".go")):
+            symbols.add(_normalize_bare_symbol(name_part))
 
     return symbols
 

@@ -114,7 +114,7 @@ def test_extract_fqns_from_code_answer():
 
 
 def test_extract_fqns_from_code_answer_no_hits():
-    """Extract FQNs when answer has no hits."""
+    """Extract FQNs when answer has no hits and no FQN-shaped tokens."""
     code_answer = SystemAnswer(
         system_name="code-native",
         content="text only answer",
@@ -124,6 +124,40 @@ def test_extract_fqns_from_code_answer_no_hits():
     fqns = extract_fqns_from_code_answer(code_answer)
 
     assert fqns == []
+
+
+def test_extract_fqns_content_fallback_query_op():
+    """Phase G-final GF2: query-op answers carry no hits — parse FQNs from content.
+
+    The fusion code leg runs the query op (hits=None); without a content fallback
+    the batched anchor join never fires. Dotted FQN-shaped tokens are extracted;
+    file paths are skipped.
+    """
+    code_answer = SystemAnswer(
+        system_name="code-native",
+        content=(
+            "Code graph search results for: Command\n\n"
+            "click.core.Command (class) in src/click/core.py:956\n"
+            "click.core.BaseCommand (class) in src/click/core.py:900\n"
+        ),
+        hits=None,
+    )
+    fqns = extract_fqns_from_code_answer(code_answer)
+    assert "click.core.Command" in fqns
+    assert "click.core.BaseCommand" in fqns
+    # File paths (core.py) must NOT be treated as FQNs.
+    assert not any(f.endswith(".py") for f in fqns)
+
+
+def test_extract_fqns_hits_take_precedence_over_content():
+    """Structured hits win; the content fallback only fires when hits are empty."""
+    code_answer = SystemAnswer(
+        system_name="code-cbm",
+        content="unrelated.module.symbol mentioned in prose",
+        hits=[{"fqn": "click.core.Command", "kind": "class"}],
+    )
+    fqns = extract_fqns_from_code_answer(code_answer)
+    assert fqns == ["click.core.Command"]
 
 
 def test_batched_anchor_lookup_single_query():

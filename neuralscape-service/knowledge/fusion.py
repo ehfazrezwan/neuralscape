@@ -23,10 +23,20 @@ in-process, MCP-bridge, or HTTP.
 from __future__ import annotations
 
 import logging
+import re
 
 from knowledge.base import SystemAnswer
 
 logger = logging.getLogger(__name__)
+
+# A dotted FQN-shaped token: >=2 identifier segments joined by dots
+# (e.g. ``click.core.Command``, ``src.click.core.Command``,
+# ``tests.test_options.test_x``). Used only as a content fallback for
+# extract_fqns_from_code_answer.
+_FQN_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+\b")
+# Bound the content-derived FQN list so a large traversal answer can't build an
+# unbounded MatchAny filter for the batched anchor join.
+_MAX_CONTENT_FQNS = 60
 
 
 def compose_fusion_answer(
@@ -94,19 +104,51 @@ def compose_fusion_answer(
 
 
 def extract_fqns_from_code_answer(code_answer: SystemAnswer) -> list[str]:
-    """Extract FQN list from a code system's structured hits.
+    """Extract the FQN list to drive the batched anchor join.
+
+    Preference order:
+      1. Structured ``.hits`` with an ``fqn`` field (locate/neighbors/impact ops).
+      2. **Content fallback** (Phase G-final GF2): the fusion code leg runs the
+         ``query`` op, whose ``CodeKnowledgeSystem`` rendering is text-only
+         (``hits=None``). Without this fallback the flagship "who calls X and why
+         is it like this" flow could never populate the ``[semantics]`` section
+         live — the anchor join had no FQNs to join on. We parse dotted
+         FQN-shaped tokens out of the rendered content. This is a format-only
+         reader, NOT engine intelligence: every token is canonicalized by the
+         engine's ``to_canonical`` and matched via a ``MatchAny(external_id)``
+         filter, so a non-FQN token simply matches no anchor (no false joins).
+         Bounded to ``_MAX_CONTENT_FQNS`` to keep the Qdrant filter small.
 
     Args:
-        code_answer: SystemAnswer from a code system with .hits (structured).
+        code_answer: SystemAnswer from a code system.
 
     Returns:
-        List of FQNs found in the answer's hits.
+        De-duplicated FQN list (structured hits first; else content-derived).
     """
-    fqns = []
+    fqns: list[str] = []
+    seen: set[str] = set()
     if code_answer.hits:
         for hit in code_answer.hits:
             if isinstance(hit, dict) and "fqn" in hit:
-                fqns.append(hit["fqn"])
+                f = hit["fqn"]
+                if f and f not in seen:
+                    seen.add(f)
+                    fqns.append(f)
+
+    if not fqns and getattr(code_answer, "content", None):
+        for m in _FQN_RE.findall(code_answer.content):
+            # File paths (``foo.py``) are not symbols — skip them.
+            if m.endswith((".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java")):
+                continue
+            if m not in seen:
+                seen.add(m)
+                fqns.append(m)
+            if len(fqns) >= _MAX_CONTENT_FQNS:
+                logger.debug(
+                    "extract_fqns: content FQN cap (%d) reached; truncating",
+                    _MAX_CONTENT_FQNS,
+                )
+                break
     return fqns
 
 
