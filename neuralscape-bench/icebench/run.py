@@ -569,6 +569,10 @@ def _load_systems(
             from icebench.adapters.ns_native import NSNativeAdapter
 
             adapter = NSNativeAdapter()
+        elif name == "ns-auto":
+            from icebench.adapters.ns_auto import NSAutoAdapter
+
+            adapter = NSAutoAdapter()
         elif name == "graphify":
             try:
                 from icebench.systems.graphify_standalone import GraphifyStandaloneAdapter

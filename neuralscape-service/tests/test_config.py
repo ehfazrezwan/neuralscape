@@ -199,3 +199,30 @@ class TestCodeRepos:
         monkeypatch.setenv("CODE_REPOS", '{"r1":"/p1","r2":"/p2"}')
         cfg = _settings()
         assert cfg.code_repos == {"r1": "/p1", "r2": "/p2"}
+
+
+class TestCodeOpPreference:
+    """AR1 auto-routing: CODE_OP_PREFERENCE (per-op engine map) env parsing.
+
+    A blank env value (the common `${CODE_OP_PREFERENCE:-}` pattern) must degrade
+    to {} rather than crash startup — regression for a live crash hit during the
+    auto-routing measured run (pydantic's JSON source can't parse "")."""
+
+    def test_default_empty(self):
+        assert _settings().code_op_preference == {}
+
+    def test_env_empty_string_degrades_to_empty(self, monkeypatch):
+        monkeypatch.setenv("CODE_OP_PREFERENCE", "")
+        assert _settings().code_op_preference == {}
+
+    def test_env_blank_string_degrades_to_empty(self, monkeypatch):
+        monkeypatch.setenv("CODE_OP_PREFERENCE", "   ")
+        assert _settings().code_op_preference == {}
+
+    def test_env_json_parsed(self, monkeypatch):
+        monkeypatch.setenv("CODE_OP_PREFERENCE", '{"neighbors":["code-cbm","code-native"]}')
+        assert _settings().code_op_preference == {"neighbors": ["code-cbm", "code-native"]}
+
+    def test_dict_passed_through(self):
+        cfg = _settings(code_op_preference={"query": ["code-native"]})
+        assert cfg.code_op_preference == {"query": ["code-native"]}

@@ -31,7 +31,10 @@ They are measured, checked-in constants, not runtime estimates:
 # Then +208 (11015) in the residuals PR (R-C): the new code_graph_delete MCP tool
 # (through-NS cold-delete twin of DELETE /v1/code-graph/graph). Intentional, per
 # the acceptance rule. See tests/test_savings_meter.py::TestOverheadConstants.
-MCP_TOOL_SCHEMA_OVERHEAD_TOKENS = 11015
+# Then +126 (11141) in the auto-routing PR (AR2/AR3): the recall_memories +
+# code-tool knowledge_system param docs now document the 'auto' value (per-op
+# auto-selection of the measured-best healthy engine). Intentional, per the rule.
+MCP_TOOL_SCHEMA_OVERHEAD_TOKENS = 11141
 
 # Rendered savings line + detail fields on one response (measured: 67).
 SAVINGS_LINE_OVERHEAD_TOKENS = 70

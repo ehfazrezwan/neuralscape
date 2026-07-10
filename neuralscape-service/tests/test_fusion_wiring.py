@@ -185,6 +185,68 @@ async def test_fusion_repo_from_code_space_not_project_id(registry_with_code, mo
 
 
 @pytest.mark.asyncio
+async def test_recall_auto_leg_routes_per_op_and_attributes(registry_with_code, mock_mcp_service):
+    """AR2/AR3 + MF-1 regression: knowledge_system="auto" drives the REAL recall
+    auto leg (resolve_auto_bound_system, NOT mocked) — routing the NL leg op to
+    its best engine and attributing it in the fused `routing` envelope.
+
+    This is the exact call site Fable found crashing (project_id passed
+    positionally to a keyword-only param). It must run cleanly and fuse.
+    """
+    project_id = "proj-beta"
+    repo = "widgets"
+    code_space = f"code--owner--{repo}"
+    symbol_fqn = "widgets.core.build"
+    canonical = NativeEngine.to_canonical(symbol_fqn)
+
+    # Register a fake code system under the locate winner name (auto: locate→native).
+    KNOWLEDGE_REGISTRY["code-native"] = _FakeCodeSystem(
+        "code-native", code_space,
+        hits=[{"fqn": symbol_fqn, "kind": "function", "file": "core.py", "line": 10}],
+    )
+    # Project config carries the code_space (the auto leg needs it) + fusion on.
+    set_project_config(ProjectKnowledgeConfig(
+        project_id=project_id, code_systems=["code-native"],
+        default_engine="code-native", fuse_code_into_recall=True,
+        code_space=code_space,
+    ))
+
+    mock_mcp_service.search.return_value = [
+        MemoryResponse(id="b1", memory="base row", score=0.9, category="decision", source="vector"),
+    ]
+
+    fake_service = MagicMock()
+    fake_m = MagicMock()
+    fake_service._get_memory.return_value = fake_m
+    fake_m.vector_store.client.scroll.return_value = ([], None)  # no anchors needed here
+    fake_m.vector_store.collection_name = "mems"
+
+    # The REAL resolve_auto_bound_system runs; only the engine BIND is stubbed to
+    # return our registered fake (avoids building a real engine). This exercises
+    # the keyword project_id forwarding (MF-1) and the per-op leg resolution.
+    def fake_bind(name, cs, uid, settings, **kw):
+        return KNOWLEDGE_REGISTRY.get(name)
+
+    with patch("memory_service.get_shared_service", return_value=fake_service), \
+         patch("knowledge.code_dispatch.resolve_bound_code_system", side_effect=fake_bind):
+        result = await mcp_server.call_tool("recall_memories", {
+            "query": "who calls widgets.core.build",   # coding signal
+            "user_id": "bob",
+            "project_id": project_id,
+            "knowledge_system": "auto",                 # AR2 auto leg
+        })
+
+    import json
+    fused = json.loads(result[0].text)
+    assert fused["fused"] is True
+    # AR3: the fused envelope attributes the served engine + auto routing.
+    assert fused["routing"]["op"] == "locate"           # NL leg prefers locate
+    assert fused["routing"]["served_by"] == "code-native"
+    assert fused["routing"]["routed_by"] == "auto"
+    assert fused["sections"]["structure"]["system"] == "code-native"
+
+
+@pytest.mark.asyncio
 async def test_fusion_code_leg_runs_concurrently_with_base(registry_with_code, mock_mcp_service):
     """Finding 2: the code leg overlaps the base legs (not serialized).
 

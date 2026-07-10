@@ -1306,18 +1306,24 @@ async def _dispatch_code_system(
     relation_filter: str | None = None,
     token_budget: int | None = None,
 ):
-    """Phase G: route a code-graph op through resolve_systems → a bound engine.
+    """Route a code-graph op through the router/auto-router → a bound engine.
 
-    Called only when the caller passed an explicit ``knowledge_system`` — the
-    generic (native/graphify-json) path stays byte-identical when it's absent.
-    The router validates health + capability (layer 1 explicit); a real
-    per-``code_space`` engine is then bound and its ``recall`` is invoked. Mirrors
-    the MCP code-tool routing (transport-agnostic; nothing branches on transport).
+    Called when the caller passed a ``knowledge_system`` — either an explicit
+    engine name (layer 1 override) or the sentinel ``"auto"`` (AR2: per-op
+    auto-selection of the measured-best HEALTHY capable engine). The generic
+    (native/graphify-json) path stays byte-identical when ``knowledge_system`` is
+    absent. Mirrors the MCP code-tool routing (transport-agnostic; nothing
+    branches on transport).
 
-    Returns the SystemAnswer. Raises HTTPException on unavailable/incapable/unbindable.
+    Returns the SystemAnswer (``answer.system_name`` = the engine that actually
+    served — for ``auto`` this is the resolved engine, the AR3 attribution).
+    Raises HTTPException on unavailable/incapable/unbindable.
     """
     from knowledge.base import RecallRequest
-    from knowledge.code_dispatch import resolve_bound_code_system
+    from knowledge.code_dispatch import (
+        resolve_auto_bound_system,
+        resolve_bound_code_system,
+    )
     from knowledge.router import resolve_systems
 
     if not code_space:
@@ -1326,39 +1332,54 @@ async def _dispatch_code_system(
             detail="knowledge_system requires graph_id (the code_space, e.g. code--owner--repo)",
         )
 
-    decision = resolve_systems(
-        query=query or label or source or "code",
-        project_id=None,
-        knowledge_system=knowledge_system,
-        operation=operation,
-        is_code_tool=True,
-    )
-    resolved = decision.systems[0] if decision.systems else None
-    # The router falls back to base (ns-memory) when the requested code system is
-    # missing / unhealthy / lacks the capability — surface that as a clean error
-    # rather than silently answering from memory on a code tool.
-    if resolved is None or resolved.info.name != knowledge_system:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"knowledge_system '{knowledge_system}' is unavailable or does not "
-                f"support '{operation}' ({decision.rationale})"
-            ),
+    if knowledge_system == "auto":
+        # AR2 auto-selection: resolve + bind the best healthy engine for this op,
+        # falling through candidates on a miss. Bind OFF the loop (lazy graphify
+        # build / CBM bridge probe).
+        bound, _served, _reason = await asyncio.to_thread(
+            resolve_auto_bound_system, operation, code_space, caller, settings
         )
+        if bound is None:
+            # No capable healthy engine → honest N/A (503, not a fabricated 200).
+            raise HTTPException(
+                status_code=503,
+                detail=f"auto-routing found no healthy engine for '{operation}' ({_reason})",
+            )
+    else:
+        decision = resolve_systems(
+            query=query or label or source or "code",
+            project_id=None,
+            knowledge_system=knowledge_system,
+            operation=operation,
+            is_code_tool=True,
+        )
+        resolved = decision.systems[0] if decision.systems else None
+        # The router falls back to base (ns-memory) when the requested code system
+        # is missing / unhealthy / lacks the capability — surface that as a clean
+        # error rather than silently answering from memory on a code tool.
+        if resolved is None or resolved.info.name != knowledge_system:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"knowledge_system '{knowledge_system}' is unavailable or does not "
+                    f"support '{operation}' ({decision.rationale})"
+                ),
+            )
 
-    # Bind OFF the event loop: the bind may lazy-build a graphify graph (~seconds)
-    # or probe the CBM bridge (network) — never on the loop (Fable must-fix #1).
-    bound = await asyncio.to_thread(
-        resolve_bound_code_system, knowledge_system, code_space, caller, settings
-    )
-    if bound is None:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"could not bind an engine for '{knowledge_system}' at code_space "
-                f"'{code_space}' (repo not in CODE_REPOS / not indexed / bridge down)"
-            ),
+        # Bind OFF the event loop: the bind may lazy-build a graphify graph
+        # (~seconds) or probe the CBM bridge (network) — never on the loop
+        # (Fable must-fix #1).
+        bound = await asyncio.to_thread(
+            resolve_bound_code_system, knowledge_system, code_space, caller, settings
         )
+        if bound is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"could not bind an engine for '{knowledge_system}' at code_space "
+                    f"'{code_space}' (repo not in CODE_REPOS / not indexed / bridge down)"
+                ),
+            )
 
     req = RecallRequest(
         query=query or label or source or "code",
@@ -1395,7 +1416,7 @@ async def v1_code_graph_query(
     depth: int = Query(3, ge=1, le=6),
     token_budget: int = Query(2000, ge=100, le=20000),
     graph_id: str | None = Query(None, description="Artifact id of an ingested graph.json bundle (owner-scoped); omit for the configured default graph"),
-    knowledge_system: str | None = Query(None, description="Phase G: route to a specific code knowledge system (code-cbm | code-graphify-lib | code-native); graph_id carries the code_space. Omit for the default native/graphify-json path."),
+    knowledge_system: str | None = Query(None, description="Route to a code knowledge system (code-cbm | code-graphify-lib | code-native), or 'auto' for per-op auto-selection of the measured-best healthy engine; graph_id carries the code_space. Omit for the default native/graphify-json path."),
     user_id: str | None = Query(None),
 ):
     """Search the code graph (BFS/DFS from scored seeds) — Graphify's query, NS's surface."""
@@ -1406,7 +1427,12 @@ async def v1_code_graph_query(
             knowledge_system, "query", graph_id, caller,
             query=question, mode=mode, depth=depth, token_budget=token_budget,
         )
-        return {"result": answer.content, "graph_id": graph_id, "system": knowledge_system}
+        return {
+            "result": answer.content,
+            "graph_id": graph_id,
+            "system": answer.system_name,  # AR3: engine that actually served
+            "routed_by": knowledge_system,  # "auto" or the explicit pin
+        }
     try:
         text = await asyncio.to_thread(
             cg.query_code_graph,
@@ -1429,7 +1455,7 @@ async def v1_code_graph_neighbors(
     label: str = Query(..., min_length=1, max_length=500),
     relation_filter: str = Query("", max_length=100),
     graph_id: str | None = Query(None),
-    knowledge_system: str | None = Query(None, description="Phase G: route to a specific code knowledge system; graph_id carries the code_space."),
+    knowledge_system: str | None = Query(None, description="Route to a code knowledge system (code-cbm | code-graphify-lib | code-native) or 'auto' (per-op auto-selection); graph_id carries the code_space."),
     user_id: str | None = Query(None),
 ):
     """Direct in/out neighbors of one code-graph node, with relation + confidence tags."""
@@ -1440,7 +1466,12 @@ async def v1_code_graph_neighbors(
             knowledge_system, "neighbors", graph_id, caller,
             query=label, label=label, relation_filter=relation_filter,
         )
-        return {"result": answer.content, "graph_id": graph_id, "system": knowledge_system}
+        return {
+            "result": answer.content,
+            "graph_id": graph_id,
+            "system": answer.system_name,  # AR3: engine that actually served
+            "routed_by": knowledge_system,  # "auto" or the explicit pin
+        }
     try:
         text = await asyncio.to_thread(
             cg.get_code_neighbors,
@@ -1462,7 +1493,7 @@ async def v1_code_graph_path(
     target: str = Query(..., min_length=1, max_length=500),
     max_hops: int = Query(8, ge=1, le=32),
     graph_id: str | None = Query(None),
-    knowledge_system: str | None = Query(None, description="Phase G: route to a specific code knowledge system; graph_id carries the code_space."),
+    knowledge_system: str | None = Query(None, description="Route to a code knowledge system (code-cbm | code-graphify-lib | code-native) or 'auto' (per-op auto-selection); graph_id carries the code_space."),
     user_id: str | None = Query(None),
 ):
     """Shortest connection path between two code-graph symbols (how does A reach B?)."""
@@ -1473,7 +1504,12 @@ async def v1_code_graph_path(
             knowledge_system, "path", graph_id, caller,
             query=source, source=source, target=target, max_hops=max_hops,
         )
-        return {"result": answer.content, "graph_id": graph_id, "system": knowledge_system}
+        return {
+            "result": answer.content,
+            "graph_id": graph_id,
+            "system": answer.system_name,  # AR3: engine that actually served
+            "routed_by": knowledge_system,  # "auto" or the explicit pin
+        }
     try:
         text = await asyncio.to_thread(
             cg.code_path,
@@ -1495,7 +1531,7 @@ async def v1_code_graph_locate(
     query: str = Query(..., min_length=1, max_length=500),
     k: int = Query(10, ge=1, le=50),
     graph_id: str | None = Query(None),
-    knowledge_system: str | None = Query(None, description="Phase G: route to a specific code knowledge system; graph_id carries the code_space."),
+    knowledge_system: str | None = Query(None, description="Route to a code knowledge system (code-cbm | code-graphify-lib | code-native) or 'auto' (per-op auto-selection); graph_id carries the code_space."),
     user_id: str | None = Query(None),
 ):
     """Hybrid code retrieval: find symbols by description or name pattern (E3).
@@ -1515,7 +1551,8 @@ async def v1_code_graph_locate(
             "results": answer.hits or [],
             "result": answer.content,
             "graph_id": graph_id,
-            "system": knowledge_system,
+            "system": answer.system_name,  # AR3: engine that actually served
+            "routed_by": knowledge_system,  # "auto" or the explicit pin
             "k": k,
         }
     try:
@@ -1541,7 +1578,7 @@ async def v1_code_graph_impact(
     symbol: str = Query(..., min_length=1, max_length=500),
     max_hops: int = Query(4, ge=1, le=16),
     graph_id: str | None = Query(None),
-    knowledge_system: str | None = Query(None, description="Phase G: route to a specific code knowledge system; graph_id carries the code_space."),
+    knowledge_system: str | None = Query(None, description="Route to a code knowledge system (code-cbm | code-graphify-lib | code-native) or 'auto' (per-op auto-selection); graph_id carries the code_space."),
     user_id: str | None = Query(None),
 ):
     """Compute blast radius from a given symbol (E7).
@@ -1564,7 +1601,8 @@ async def v1_code_graph_impact(
             "symbol": symbol,
             "max_hops": max_hops,
             "graph_id": graph_id,
-            "system": knowledge_system,
+            "system": answer.system_name,  # AR3: engine that actually served
+            "routed_by": knowledge_system,  # "auto" or the explicit pin
         }
     try:
         text = await asyncio.to_thread(

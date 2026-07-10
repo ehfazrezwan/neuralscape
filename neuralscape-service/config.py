@@ -1,10 +1,12 @@
+import json
 import os
 from pathlib import Path
+from typing import Annotated
 from urllib.parse import urlparse
 
 from arq.connections import RedisSettings
 from pydantic import field_validator, model_validator
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, NoDecode
 
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
 
@@ -337,6 +339,19 @@ class Settings(BaseSettings):
     code_graph_max_god_nodes: int = 10
     code_graph_max_surprises: int = 10
     code_graph_max_rationale: int = 100
+    # AR1 (auto-routing): per-op code-engine preference map (best→worst), the
+    # DEPLOYMENT override layer between per-project config and the measured-winner
+    # default (`knowledge/autoroute.DEFAULT_CODE_OP_PREFERENCE`). Keyed by internal
+    # op-class (query|neighbors|path|locate|impact); each value is an ordered list
+    # of code-system names. Empty ⇒ use the built-in measured defaults (accuracy
+    # primary, latency tiebreak: symbol_lookup→native, structure→graphify-lib,
+    # nl_locate→native). Set via env, e.g.
+    # CODE_OP_PREFERENCE='{"neighbors":["code-cbm","code-graphify-lib"]}'.
+    # Auto-routing is CONFIG, not hardcoded branches — this is the tuning seam.
+    # NoDecode: parse the env value ourselves (validator below) so a blank env
+    # (the common `${CODE_OP_PREFERENCE:-}` pattern → empty string) degrades to
+    # {} instead of crashing pydantic's JSON source parser at startup.
+    code_op_preference: Annotated[dict[str, list[str]], NoDecode] = {}
 
     # Auth
     # Legacy single shared API key. When set without `neuralscape_user_token_secret`,
@@ -460,6 +475,23 @@ class Settings(BaseSettings):
     def _validate_positive_ttl(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("OAuth token TTLs must be > 0 seconds")
+        return value
+
+    @field_validator("code_op_preference", mode="before")
+    @classmethod
+    def _parse_op_preference(cls, value):
+        # AR1: CODE_OP_PREFERENCE is a JSON dict env var, but marked NoDecode so
+        # WE parse it. Deployments commonly wire optional env via
+        # `${CODE_OP_PREFERENCE:-}`, which sets it to an EMPTY STRING when unset —
+        # pydantic's default JSON source would crash on "" at startup (hit live
+        # during the auto-routing run). Treat blank as "unset" → default {}
+        # (measured-winner defaults); otherwise JSON-decode the string.
+        if value is None:
+            return {}
+        if isinstance(value, str):
+            if value.strip() == "":
+                return {}
+            return json.loads(value)
         return value
 
     @field_validator(

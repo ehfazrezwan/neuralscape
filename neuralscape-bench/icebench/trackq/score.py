@@ -17,6 +17,46 @@ from icebench.trackq.generate import NL_LOCATE_MIN_SAMPLES
 logger = logging.getLogger(__name__)
 
 
+# ── AR4: ns-auto per-op served-engine → bench-system parser mapping ──
+#
+# The `ns-auto` pseudo-system lets NS auto-select the best engine PER OP, so a
+# single ns-auto run's answers come from DIFFERENT engines depending on the op
+# (symbol_lookup→native, neighbors→graphify-lib, …) and — under health fallback —
+# possibly a different engine than the measured winner. The answer format is
+# therefore whichever engine actually served. Each through-NS response attributes
+# that engine (AR3: the `system` field / the adapter's `served_by`), so the scorer
+# just delegates to that engine's existing format parser. No new parsing logic —
+# purely a dispatch by attribution.
+_AUTO_ENGINE_TO_SYSTEM = {
+    "code-native": "ns-native",
+    "code-graphify-lib": "ns-graphify-lib",
+    "code-cbm": "ns-cbm",
+}
+
+
+def _resolve_auto_system(system: str, answer) -> str:
+    """Map ns-auto's per-op SERVED engine to its bench-system parser name.
+
+    Reads the served engine from the answer's ``served_by`` (set by the ns-auto
+    adapter) or, failing that, the response envelope's ``system`` field. Returns
+    the original ``system`` unchanged for every non-auto system (no-op).
+    """
+    if system != "ns-auto":
+        return system
+    served = None
+    if isinstance(answer, dict):
+        served = answer.get("served_by")
+        if not served:
+            txt = answer.get("text", "")
+            if isinstance(txt, str) and txt:
+                try:
+                    parsed = json.loads(txt)
+                    served = parsed.get("system") if isinstance(parsed, dict) else None
+                except json.JSONDecodeError:
+                    served = None
+    return _AUTO_ENGINE_TO_SYSTEM.get(served, system)
+
+
 @dataclass
 class OpScore:
     """Scores for a single operation."""
@@ -65,6 +105,9 @@ def normalize_answer(answer: str | dict | None, system: str = "", for_symbol_loo
     """
     if answer is None:
         return None
+
+    # AR4: ns-auto → delegate to the engine that actually served this op.
+    system = _resolve_auto_system(system, answer)
 
     # If answer is a dict, extract system-specific data
     if isinstance(answer, dict):
@@ -508,6 +551,9 @@ def _parse_ranked_results(answer: str | dict, system: str = "") -> list[tuple[st
     Returns:
         List of (file, bare_symbol) tuples in rank order.
     """
+    # AR4: ns-auto → delegate to the engine that actually served this op.
+    system = _resolve_auto_system(system, answer)
+
     if isinstance(answer, dict):
         if "error" in answer or answer.get("status") == "error":
             return []
@@ -688,6 +734,9 @@ def _parse_symbol_set(answer: str | dict, system: str = "") -> set[str]:
     Returns:
         Set of normalized symbol names (bare symbols, lowercased).
     """
+    # AR4: ns-auto → delegate to the engine that actually served this op.
+    system = _resolve_auto_system(system, answer)
+
     if isinstance(answer, dict):
         if "error" in answer or answer.get("status") == "error":
             return set()
