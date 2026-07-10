@@ -1445,23 +1445,32 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 # ThreadPoolExecutor graph-leg overlap).
                 from knowledge.base import RecallRequest
 
+                # GF2: for a natural-language recall query, prefer the LOCATE op
+                # (dense semantic search → structured hits with real module-
+                # qualified FQNs) over the QUERY op (keyword symbol match, which
+                # does not resolve NL questions). This is what lets the batched
+                # anchor join fire on REAL code hits — locate returns .hits[].fqn,
+                # so no content parsing is needed.
+                #
+                # Copilot fix: decide the op ONCE for the whole code leg (the
+                # capability intersection) so every answer is the SAME op — mixing
+                # locate (.hits) and query (text-only) answers would break the
+                # dedup's "same op" comparability. Use locate only when EVERY
+                # resolved system supports it; else query for all.
+                _leg_op = (
+                    "locate"
+                    if all("locate" in s.info.capabilities for s in code_systems_list)
+                    else "query"
+                )
+
                 async def _one_code_recall(_sys):
                     try:
-                        # GF2: for a natural-language recall query, prefer the
-                        # LOCATE op (dense semantic search → structured hits with
-                        # real module-qualified FQNs) over the QUERY op (keyword
-                        # symbol match, which does not resolve NL questions). This
-                        # is what lets the batched anchor join fire on REAL code
-                        # hits — locate returns .hits[].fqn, so no content parsing
-                        # is needed. Engines without locate (graphify-lib) fall
-                        # back to query (+ the echo-guarded content fallback).
-                        _op = "locate" if "locate" in _sys.info.capabilities else "query"
                         code_req = RecallRequest(
                             query=arguments["query"],
                             user_id=user_id,
                             project_id=arguments.get("project_id"),
                             limit=arguments.get("limit", 10),
-                            operation=_op,
+                            operation=_leg_op,
                         )
                         return await asyncio.to_thread(_sys.recall, code_req)
                     except Exception as e:
@@ -1481,12 +1490,12 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                         return None
                     if len(answers) == 1:
                         return answers[0]
-                    # Phase F cross-engine dedup: >1 code system answered the same
-                    # op → dedup on canonical FQN, per-op precision preference,
-                    # attribute BOTH (PLAN §6). This is the REAL production path.
+                    # Phase F cross-engine dedup: >1 code system answered the SAME
+                    # op (all _leg_op now) → dedup on canonical FQN, per-op
+                    # precision preference, attribute BOTH (PLAN §6).
                     from knowledge.fusion import dedup_code_answers
 
-                    return dedup_code_answers(answers, operation="query")
+                    return dedup_code_answers(answers, operation=_leg_op)
 
                 results, code_answer = await asyncio.gather(
                     asyncio.to_thread(_base_search),

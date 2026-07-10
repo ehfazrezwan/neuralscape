@@ -242,6 +242,7 @@ def batched_anchor_lookup(
             scroll_filter=query_filter,
             limit=len(anchor_keys) * limit_per_anchor * 2,  # over-fetch for post-filter
             with_payload=True,
+            with_vectors=False,  # Copilot: payload-only join — don't ship vectors
         )
         if isinstance(scroll_result, tuple):
             hits = list(scroll_result[0] or [])
