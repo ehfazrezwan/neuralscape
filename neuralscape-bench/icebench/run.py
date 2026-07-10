@@ -277,6 +277,9 @@ def _run_index_op(
             if os.environ.get("ICE_COLD_TEARDOWN", "").lower() in ("1", "true", "yes"):
                 try:
                     system.teardown(corpus)
+                    # Make per-rep cold-ness provable from the raw log, not just
+                    # inferable from timing (Fable SHOULD-FIX).
+                    print(f"    teardown-before-cold ok (rep={rep})")
                 except Exception as e:  # never fail the rep on cleanup
                     print(f"    teardown-before-cold failed (continuing): {e}", file=sys.stderr)
             result = system.index_cold(corpus)

@@ -912,14 +912,18 @@ class NativeEngine:
         Returns:
             {"nodes_deleted": int, "cards_cleared": bool}
         """
-        cypher = """
-        MATCH (n {code_space: $code_space})
-        WHERE n:CodeRepo OR n:CodeFile OR n:CodeSymbol
-        DETACH DELETE n
-        RETURN count(n) AS deleted
-        """
-        rows = self._run_cypher(cypher, code_space=self.code_space)
-        nodes_deleted = int(rows[0]["deleted"]) if rows else 0
+        # Label-anchored deletes (one per code label) so Neo4j uses a label scan
+        # + code_space predicate — NOT a full-DB node scan that would walk the
+        # entire memory graph (Fable SHOULD-FIX). CodeAnchor is deliberately
+        # excluded so the moat's code-side anchor points survive.
+        nodes_deleted = 0
+        for label in ("CodeRepo", "CodeFile", "CodeSymbol"):
+            rows = self._run_cypher(
+                f"MATCH (n:{label} {{code_space: $code_space}}) "
+                f"DETACH DELETE n RETURN count(n) AS deleted",
+                code_space=self.code_space,
+            )
+            nodes_deleted += int(rows[0]["deleted"]) if rows else 0
         cards_cleared = self._delete_code_index_cards()
         logger.info(
             "Native teardown code_space=%s: %d graph nodes deleted, cards_cleared=%s "

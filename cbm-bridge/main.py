@@ -199,10 +199,14 @@ class CBMManager:
 
             if proc.returncode != 0:
                 error_msg = stderr.decode() if stderr else "Unknown error"
-                logger.error(f"CBM tool {tool} failed: {error_msg}")
+                logger.error(f"CBM tool {tool} exited non-zero: {error_msg}")
+                # Distinct "exited non-zero" marker: this is the tool-ran-but-
+                # rejected-the-input case (e.g. an untraceable symbol) that
+                # /trace_path is allowed to soft-degrade. Generic/infra faults
+                # below use a DIFFERENT detail so the gate can't mask them.
                 raise HTTPException(
                     status_code=500,
-                    detail=f"CBM tool {tool} failed: {error_msg}"
+                    detail=f"CBM tool {tool} exited non-zero: {error_msg}"
                 )
 
             # Parse JSON from stdout
@@ -223,6 +227,13 @@ class CBMManager:
                 status_code=504,
                 detail=f"CBM tool {tool} timed out after {self.timeout}s"
             )
+        except HTTPException:
+            # Fable MUST-FIX: our own inner 500s (non-zero exit, invalid JSON)
+            # must propagate with their ORIGINAL detail — the generic catch-all
+            # below would otherwise re-wrap them as "CBM tool ... failed: 500: ..."
+            # and that rewrap would slip past /trace_path's degrade gate, masking
+            # invalid-JSON / infra faults the gate must let through.
+            raise
         except Exception as e:
             logger.exception(f"CBM tool {tool} failed unexpectedly")
             raise HTTPException(
@@ -335,14 +346,14 @@ async def trace_path(req: TracePathRequest) -> TracePathResponse:
             },
         )
     except HTTPException as e:
-        # Degrade ONLY the CBM-CLI-tool failure (non-zero exit on an
-        # untraceable / unknown symbol), which call_tool surfaces as a 500 whose
-        # detail contains "CBM tool trace_path failed". That case is a genuine
-        # "no neighbors" → return empty (honest N/A). Other 500s (invalid JSON,
-        # missing binary, unexpected faults) and 504 timeouts are REAL faults and
-        # must propagate unchanged — don't mask them (Copilot #205).
-        detail = e.detail or ""
-        if e.status_code == 500 and "trace_path failed" in detail:
+        # Degrade ONLY the CBM-CLI-tool "exited non-zero" case (the tool ran but
+        # rejected an untraceable / unknown symbol) — a genuine "no neighbors" →
+        # return empty (honest N/A). Every OTHER 500 (invalid JSON, missing
+        # binary, unexpected faults — all with a different detail after the
+        # call_tool double-wrap fix) and 504 timeouts are REAL faults and must
+        # propagate unchanged (Copilot #205 + Fable MUST-FIX).
+        detail = str(e.detail or "")
+        if e.status_code == 500 and "exited non-zero" in detail:
             logger.warning(
                 "trace_path soft-degrade to empty for %r (project=%s): %s",
                 req.function_name, req.project, detail,

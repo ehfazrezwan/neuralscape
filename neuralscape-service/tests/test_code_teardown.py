@@ -28,27 +28,35 @@ def _native(code_space="code--o--r"):
 
 
 def test_native_teardown_deletes_only_code_graph_preserves_anchors():
-    """native teardown DETACH DELETEs CodeRepo/CodeFile/CodeSymbol — NOT CodeAnchor,
-    NOT Memory/Entity. The moat (CodeAnchor + memory) survives."""
+    """native teardown DETACH DELETEs CodeRepo/CodeFile/CodeSymbol via label-anchored
+    matches (no full-DB scan) — NOT CodeAnchor, NOT Memory/Entity. The moat
+    (CodeAnchor + memory) survives."""
     eng = _native()
-    captured = {}
+    calls = []
 
     def fake_run(cypher, **params):
-        captured["cypher"] = cypher
-        captured["params"] = params
-        return [{"deleted": 5}]
+        calls.append((cypher, params))
+        return [{"deleted": 2}]
 
     with patch.object(eng, "_run_cypher", side_effect=fake_run), \
          patch.object(eng, "_delete_code_index_cards", return_value=True):
         res = eng.teardown()
 
-    cy = captured["cypher"]
-    assert "CodeRepo" in cy and "CodeFile" in cy and "CodeSymbol" in cy
-    # The anchor + memory layers must NOT be in the delete set.
-    assert "CodeAnchor" not in cy
-    assert "Memory" not in cy and "Entity" not in cy
-    assert captured["params"]["code_space"] == "code--o--r"
-    assert res == {"nodes_deleted": 5, "cards_cleared": True}
+    # One label-anchored delete per code label (label scan, not a full-DB scan).
+    assert len(calls) == 3
+    labels = {"CodeRepo": False, "CodeFile": False, "CodeSymbol": False}
+    for cy, params in calls:
+        assert params["code_space"] == "code--o--r"
+        # label-anchored: `MATCH (n:<Label> {code_space: ...})`, never label-less.
+        assert "MATCH (n {code_space" not in cy
+        # never touch the anchor / memory layers
+        assert "CodeAnchor" not in cy
+        assert "Memory" not in cy and "Entity" not in cy
+        for lbl in labels:
+            if f":{lbl} " in cy:
+                labels[lbl] = True
+    assert all(labels.values()), labels
+    assert res == {"nodes_deleted": 6, "cards_cleared": True}  # 2 per label × 3
 
 
 def test_native_delete_code_index_cards_only_targets_code_index():
