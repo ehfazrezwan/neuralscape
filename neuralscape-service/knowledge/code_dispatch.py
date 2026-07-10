@@ -261,6 +261,60 @@ def teardown_code_space(
     }
 
 
+def resolve_auto_bound_system(
+    operation: str,
+    code_space: str,
+    user_id: str,
+    settings,
+    *,
+    project_id: str | None = None,
+):
+    """AR2: auto-select + bind the best engine for one op (no explicit pin).
+
+    Resolves the ordered candidate engines for ``operation`` via
+    ``autoroute.resolve_op_engine`` (registered + capable + registry-healthy,
+    measured-winner order), then binds the FIRST that actually binds for
+    ``code_space`` and reports a healthy bound engine — falling through to the
+    next candidate on any bind/health miss. This is where "choose whatever works
+    best, per op" becomes concrete: symbol_lookup→native, neighbors→graphify,
+    etc., with graceful fallback to the next-best when the top engine is down.
+
+    Returns ``(bound_system | None, engine_name | None, reason)``. A None system
+    means no capable healthy engine could be bound → the caller returns honest
+    N/A (never fabricates). Nothing branches on transport (DECISIONS.md rule).
+    """
+    from knowledge.autoroute import resolve_op_engine
+
+    resolution = resolve_op_engine(
+        operation, project_id=project_id, settings=settings
+    )
+    tried: list[str] = []
+    for name in resolution.candidates:
+        bound = resolve_bound_code_system(name, code_space, user_id, settings)
+        if bound is None:
+            tried.append(f"{name}(unbindable)")
+            continue
+        try:
+            if bound.health().status != "ok":
+                tried.append(f"{name}(unhealthy)")
+                continue
+        except Exception:  # noqa: BLE001
+            tried.append(f"{name}(health-error)")
+            continue
+        reason = f"auto: {resolution.op} → {name}"
+        if tried:
+            reason += f" (skipped {tried})"
+        logger.debug("resolve_auto_bound_system: %s", reason)
+        return bound, name, reason
+
+    reason = (
+        f"auto: no bindable healthy engine for {resolution.op} "
+        f"(candidates={resolution.candidates}, tried={tried}; {resolution.reason})"
+    )
+    logger.debug("resolve_auto_bound_system: %s", reason)
+    return None, None, reason
+
+
 def resolve_bound_code_system(
     system_name: str,
     code_space: str,

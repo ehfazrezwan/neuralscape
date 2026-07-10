@@ -58,6 +58,11 @@ class ProjectKnowledgeConfig:
     # Phase G: the code_space this project's code system indexed (code--owner--repo).
     # Set at index time so the recall-fusion path can bind a real per-space engine.
     code_space: str | None = None
+    # AR1 (auto-routing): per-project per-op engine-preference override map
+    # (op-class → ordered engine names). The highest-priority layer of
+    # autoroute.preference_for_op, above settings.code_op_preference and the
+    # measured-winner default. None ⇒ this project inherits those lower layers.
+    op_preference: dict[str, list[str]] | None = None
 
     def __post_init__(self):
         if self.code_systems is None:
@@ -95,6 +100,7 @@ def get_project_config(project_id: str | None) -> ProjectKnowledgeConfig | None:
         fuse_code_into_recall=bool(raw.get("fuse_code_into_recall", True)),
         default_engine=raw.get("default_engine"),
         code_space=raw.get("code_space"),
+        op_preference=raw.get("op_preference"),
     )
     _PROJECT_CONFIGS[project_id] = cfg
     return cfg
@@ -113,6 +119,7 @@ def set_project_config(config: ProjectKnowledgeConfig) -> None:
             "fuse_code_into_recall": config.fuse_code_into_recall,
             "default_engine": config.default_engine,
             "code_space": config.code_space,
+            "op_preference": config.op_preference,
         },
     )
 
@@ -239,6 +246,13 @@ def resolve_systems(
     MUST return base-only to stay byte-identical to today.
     """
     from knowledge.registry import eligible_systems, get_system
+
+    # AR2: "auto" is the per-op auto-router sentinel, NOT an explicit engine pin.
+    # Treat it as unspecified so resolution falls through to project config /
+    # signal-gated fusion (layers 2/3); the caller then resolves each op-leg to
+    # its measured-best healthy engine via knowledge.autoroute.
+    if knowledge_system == "auto":
+        knowledge_system = None
 
     # ── Layer 1: Explicit override ──
 

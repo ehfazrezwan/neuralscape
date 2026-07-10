@@ -337,6 +337,16 @@ class Settings(BaseSettings):
     code_graph_max_god_nodes: int = 10
     code_graph_max_surprises: int = 10
     code_graph_max_rationale: int = 100
+    # AR1 (auto-routing): per-op code-engine preference map (best→worst), the
+    # DEPLOYMENT override layer between per-project config and the measured-winner
+    # default (`knowledge/autoroute.DEFAULT_CODE_OP_PREFERENCE`). Keyed by internal
+    # op-class (query|neighbors|path|locate|impact); each value is an ordered list
+    # of code-system names. Empty ⇒ use the built-in measured defaults (accuracy
+    # primary, latency tiebreak: symbol_lookup→native, structure→graphify-lib,
+    # nl_locate→native). Set via env, e.g.
+    # CODE_OP_PREFERENCE='{"neighbors":["code-cbm","code-graphify-lib"]}'.
+    # Auto-routing is CONFIG, not hardcoded branches — this is the tuning seam.
+    code_op_preference: dict[str, list[str]] = {}
 
     # Auth
     # Legacy single shared API key. When set without `neuralscape_user_token_secret`,
