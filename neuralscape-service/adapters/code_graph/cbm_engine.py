@@ -171,6 +171,56 @@ class CBMEngine:
             raise RuntimeError("No CBM project set (index() must be called first)")
         return self.project
 
+    def resolve_project_from_source(self, repo_path: str) -> str | None:
+        """Cross-process bind: resolve CBM's project slug for a repo path.
+
+        Phase G: the through-NS index runs on the ingest worker (a separate
+        process from the API), so the API's recall path can't read the slug from
+        an in-process index() call. CBM assigns the slug at index time and the
+        bridge's ``/index_status`` (CBM ``list_projects``) reports each project's
+        ``root_path``. We match on the real (symlink-resolved) repo path — the
+        same resolution the standalone CBM bench adapter uses — so any process
+        can bind to an already-indexed project. Sets and returns ``self.project``.
+
+        Args:
+            repo_path: Filesystem path of the indexed repo (from settings.code_repos).
+
+        Returns:
+            The CBM project slug, or None if the repo isn't indexed / bridge down.
+        """
+        if self.project:
+            return self.project
+        import os
+
+        # Bounded probe (not the 60s operational client): the read-path bind runs
+        # near the request path, so a wedged bridge must not stall for 60s
+        # (Fable must-fix #1; mirrors the M4 health-probe bound).
+        try:
+            with httpx.Client(timeout=_HEALTH_PROBE_TIMEOUT) as probe:
+                resp = probe.get(urljoin(self.bridge_url, "/index_status"))
+                resp.raise_for_status()
+                status = resp.json()
+        except Exception:  # noqa: BLE001 — bridge down ⇒ can't bind (base still answers)
+            logger.warning("CBM resolve_project_from_source: /index_status unreachable")
+            return None
+
+        target = os.path.realpath(repo_path)
+        for proj in status.get("projects", []) or []:
+            root = proj.get("root_path")
+            if root and os.path.realpath(root) == target:
+                name = proj.get("name")
+                if name:
+                    self.project = name
+                    logger.info(
+                        "CBM bound project '%s' for repo %s (code_space=%s)",
+                        name, repo_path, self.code_space,
+                    )
+                    return name
+        logger.warning(
+            "CBM resolve_project_from_source: no indexed project matches %s", repo_path
+        )
+        return None
+
     # ── Canonical FQN normalization (Phase C core deliverable) ──────────
 
     @staticmethod

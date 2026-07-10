@@ -1289,6 +1289,104 @@ def _map_code_graph_error(e: Exception) -> HTTPException:
     return HTTPException(status_code=404, detail=str(e))
 
 
+async def _dispatch_code_system(
+    knowledge_system: str,
+    operation: str,
+    code_space: str | None,
+    caller: str,
+    *,
+    query: str,
+    label: str | None = None,
+    source: str | None = None,
+    target: str | None = None,
+    mode: str = "bfs",
+    depth: int = 3,
+    limit: int = 10,
+    max_hops: int | None = None,
+    relation_filter: str | None = None,
+    token_budget: int | None = None,
+):
+    """Phase G: route a code-graph op through resolve_systems → a bound engine.
+
+    Called only when the caller passed an explicit ``knowledge_system`` — the
+    generic (native/graphify-json) path stays byte-identical when it's absent.
+    The router validates health + capability (layer 1 explicit); a real
+    per-``code_space`` engine is then bound and its ``recall`` is invoked. Mirrors
+    the MCP code-tool routing (transport-agnostic; nothing branches on transport).
+
+    Returns the SystemAnswer. Raises HTTPException on unavailable/incapable/unbindable.
+    """
+    from knowledge.base import RecallRequest
+    from knowledge.code_dispatch import resolve_bound_code_system
+    from knowledge.router import resolve_systems
+
+    if not code_space:
+        raise HTTPException(
+            status_code=400,
+            detail="knowledge_system requires graph_id (the code_space, e.g. code--owner--repo)",
+        )
+
+    decision = resolve_systems(
+        query=query or label or source or "code",
+        project_id=None,
+        knowledge_system=knowledge_system,
+        operation=operation,
+        is_code_tool=True,
+    )
+    resolved = decision.systems[0] if decision.systems else None
+    # The router falls back to base (ns-memory) when the requested code system is
+    # missing / unhealthy / lacks the capability — surface that as a clean error
+    # rather than silently answering from memory on a code tool.
+    if resolved is None or resolved.info.name != knowledge_system:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"knowledge_system '{knowledge_system}' is unavailable or does not "
+                f"support '{operation}' ({decision.rationale})"
+            ),
+        )
+
+    # Bind OFF the event loop: the bind may lazy-build a graphify graph (~seconds)
+    # or probe the CBM bridge (network) — never on the loop (Fable must-fix #1).
+    bound = await asyncio.to_thread(
+        resolve_bound_code_system, knowledge_system, code_space, caller, settings
+    )
+    if bound is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"could not bind an engine for '{knowledge_system}' at code_space "
+                f"'{code_space}' (repo not in CODE_REPOS / not indexed / bridge down)"
+            ),
+        )
+
+    req = RecallRequest(
+        query=query or label or source or "code",
+        user_id=caller,
+        operation=operation,
+        label=label,
+        source=source,
+        target=target,
+        mode=mode,
+        depth=depth,
+        limit=limit,
+        max_hops=max_hops,
+        relation_filter=relation_filter,
+        token_budget=token_budget,
+    )
+    from adapters.code_graph.engine import EngineCapabilityError
+
+    try:
+        return await asyncio.to_thread(bound.recall, req)
+    except EngineCapabilityError as e:
+        # Honest N/A (e.g. CBM path via banned Cypher) → 501, not a 500 crash.
+        raise HTTPException(status_code=501, detail=str(e)) from e
+    except RuntimeError as e:
+        # e.g. an unbound engine slipped through — degrade to a clean 400, never a
+        # raw 500 (Fable must-fix #2).
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
 @v1_router.get("/code-graph/query")
 async def v1_code_graph_query(
     request: Request,
@@ -1297,11 +1395,18 @@ async def v1_code_graph_query(
     depth: int = Query(3, ge=1, le=6),
     token_budget: int = Query(2000, ge=100, le=20000),
     graph_id: str | None = Query(None, description="Artifact id of an ingested graph.json bundle (owner-scoped); omit for the configured default graph"),
+    knowledge_system: str | None = Query(None, description="Phase G: route to a specific code knowledge system (code-cbm | code-graphify-lib | code-native); graph_id carries the code_space. Omit for the default native/graphify-json path."),
     user_id: str | None = Query(None),
 ):
     """Search the code graph (BFS/DFS from scored seeds) — Graphify's query, NS's surface."""
     cg = _code_graph_or_501()
     caller = _resolve_user_id(request, user_id)
+    if knowledge_system:
+        answer = await _dispatch_code_system(
+            knowledge_system, "query", graph_id, caller,
+            query=question, mode=mode, depth=depth, token_budget=token_budget,
+        )
+        return {"result": answer.content, "graph_id": graph_id, "system": knowledge_system}
     try:
         text = await asyncio.to_thread(
             cg.query_code_graph,
@@ -1324,11 +1429,18 @@ async def v1_code_graph_neighbors(
     label: str = Query(..., min_length=1, max_length=500),
     relation_filter: str = Query("", max_length=100),
     graph_id: str | None = Query(None),
+    knowledge_system: str | None = Query(None, description="Phase G: route to a specific code knowledge system; graph_id carries the code_space."),
     user_id: str | None = Query(None),
 ):
     """Direct in/out neighbors of one code-graph node, with relation + confidence tags."""
     cg = _code_graph_or_501()
     caller = _resolve_user_id(request, user_id)
+    if knowledge_system:
+        answer = await _dispatch_code_system(
+            knowledge_system, "neighbors", graph_id, caller,
+            query=label, label=label, relation_filter=relation_filter,
+        )
+        return {"result": answer.content, "graph_id": graph_id, "system": knowledge_system}
     try:
         text = await asyncio.to_thread(
             cg.get_code_neighbors,
@@ -1350,11 +1462,18 @@ async def v1_code_graph_path(
     target: str = Query(..., min_length=1, max_length=500),
     max_hops: int = Query(8, ge=1, le=32),
     graph_id: str | None = Query(None),
+    knowledge_system: str | None = Query(None, description="Phase G: route to a specific code knowledge system; graph_id carries the code_space."),
     user_id: str | None = Query(None),
 ):
     """Shortest connection path between two code-graph symbols (how does A reach B?)."""
     cg = _code_graph_or_501()
     caller = _resolve_user_id(request, user_id)
+    if knowledge_system:
+        answer = await _dispatch_code_system(
+            knowledge_system, "path", graph_id, caller,
+            query=source, source=source, target=target, max_hops=max_hops,
+        )
+        return {"result": answer.content, "graph_id": graph_id, "system": knowledge_system}
     try:
         text = await asyncio.to_thread(
             cg.code_path,
@@ -1376,6 +1495,7 @@ async def v1_code_graph_locate(
     query: str = Query(..., min_length=1, max_length=500),
     k: int = Query(10, ge=1, le=50),
     graph_id: str | None = Query(None),
+    knowledge_system: str | None = Query(None, description="Phase G: route to a specific code knowledge system; graph_id carries the code_space."),
     user_id: str | None = Query(None),
 ):
     """Hybrid code retrieval: find symbols by description or name pattern (E3).
@@ -1386,6 +1506,18 @@ async def v1_code_graph_locate(
     """
     cg = _code_graph_or_501()
     caller = _resolve_user_id(request, user_id)
+    if knowledge_system:
+        answer = await _dispatch_code_system(
+            knowledge_system, "locate", graph_id, caller,
+            query=query, limit=k,
+        )
+        return {
+            "results": answer.hits or [],
+            "result": answer.content,
+            "graph_id": graph_id,
+            "system": knowledge_system,
+            "k": k,
+        }
     try:
         hits = await asyncio.to_thread(
             cg.locate_symbols,
@@ -1409,6 +1541,7 @@ async def v1_code_graph_impact(
     symbol: str = Query(..., min_length=1, max_length=500),
     max_hops: int = Query(4, ge=1, le=16),
     graph_id: str | None = Query(None),
+    knowledge_system: str | None = Query(None, description="Phase G: route to a specific code knowledge system; graph_id carries the code_space."),
     user_id: str | None = Query(None),
 ):
     """Compute blast radius from a given symbol (E7).
@@ -1421,6 +1554,18 @@ async def v1_code_graph_impact(
 
     cg = _code_graph_or_501()
     caller = _resolve_user_id(request, user_id)
+    if knowledge_system:
+        answer = await _dispatch_code_system(
+            knowledge_system, "impact", graph_id, caller,
+            query=symbol, label=symbol, max_hops=max_hops,
+        )
+        return {
+            "text": answer.content,
+            "symbol": symbol,
+            "max_hops": max_hops,
+            "graph_id": graph_id,
+            "system": knowledge_system,
+        }
     try:
         text = await asyncio.to_thread(
             cg.code_impact,
@@ -1436,6 +1581,58 @@ async def v1_code_graph_impact(
     except cg.CodeGraphError as e:
         raise _map_code_graph_error(e) from e
     return {"text": text, "symbol": symbol, "max_hops": max_hops, "graph_id": graph_id}
+
+
+class CodeIndexRequest(BaseModel):
+    """Phase G: through-NS index trigger for a code knowledge system."""
+
+    repo_source: str = Field(..., min_length=1, description="Absolute path (or ref) of the repo to index")
+    system: str = Field(..., description="Target code system: code-cbm | code-graphify-lib | code-native")
+    project_id: str | None = Field(None, description="Project scope; sets routing config so later recalls route to this engine")
+    code_space: str | None = Field(None, description="Explicit code_space (code--owner--repo); default derived from user_id + repo basename")
+    user_id: str | None = Field(None)
+
+
+@v1_router.post("/code-graph/index")
+async def v1_code_graph_index(req: CodeIndexRequest, request: Request):
+    """Phase G: index a repo INTO a code knowledge system through NS (additive).
+
+    Enqueues on the ingest queue (PLAN §5) and returns 202 + a task id to poll
+    via ``GET /v1/memories/status/{task_id}``. The worker resolves the engine for
+    ``system``, runs ``engine.index(repo_source)``, records
+    ``{repo_sha, indexed_at, engine_version}`` per code_space, sets the project's
+    routing config, and runs the external-engine liveness diff. Idempotent at the
+    engine level (a re-index of the same code_space overwrites); each call gets a
+    unique job id so a re-index always re-runs (not coalesced on a cached result).
+    """
+    _code_graph_or_501()
+    caller = _resolve_user_id(request, req.user_id)
+
+    code_space = req.code_space
+    if not code_space:
+        from pathlib import Path as _P
+
+        repo_name = _P(req.repo_source.rstrip("/")).name or "repo"
+        code_space = f"code--{caller}--{repo_name}"
+
+    payload = {
+        "system": req.system,
+        "repo_source": req.repo_source,
+        "code_space": code_space,
+        "project_id": req.project_id,
+        "user_id": caller,
+    }
+    task_id = await _task_manager.enqueue_code_index(payload)
+    return JSONResponse(
+        status_code=202,
+        content={
+            "task_id": task_id,
+            "poll_url": f"/v1/memories/status/{task_id}",
+            "code_space": code_space,
+            "system": req.system,
+            "status": "accepted",
+        },
+    )
 
 
 # ── Connectors (data-layer sources) ──────────────

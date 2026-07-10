@@ -51,7 +51,10 @@ def _code_graph_tool_names() -> set[str]:
 
     if not code_graph_available():
         return set()
-    return {"query_code_graph", "get_code_neighbors", "code_path", "locate", "code_impact"}
+    return {
+        "query_code_graph", "get_code_neighbors", "code_path", "locate", "code_impact",
+        "code_graph_index",  # Phase G: through-NS index trigger
+    }
 
 
 class TestListTools:

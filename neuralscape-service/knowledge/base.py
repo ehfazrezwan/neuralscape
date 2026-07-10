@@ -99,6 +99,10 @@ class RecallRequest(BaseModel):
     target: str | None = Field(default=None, description="For path: target symbol")
     mode: str | None = Field(default="bfs", description="For query: bfs | dfs")
     depth: int | None = Field(default=3, description="For query: traversal depth")
+    # Phase G: forward caller caps so routed code ops honor them (not hardcoded).
+    max_hops: int | None = Field(default=None, description="For path/impact: max hops")
+    relation_filter: str | None = Field(default=None, description="For neighbors: relation filter")
+    token_budget: int | None = Field(default=None, description="For query: max output tokens")
 
 
 class SystemAnswer(BaseModel):

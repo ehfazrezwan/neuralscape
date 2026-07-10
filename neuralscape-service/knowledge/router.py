@@ -55,26 +55,66 @@ class ProjectKnowledgeConfig:
     code_systems: list[str] = None  # ["code-cbm"] or ["code-graphify"] etc.
     fuse_code_into_recall: bool = True  # DEFAULT TRUE per decision #3
     default_engine: str | None = None  # "code-cbm" or "code-graphify"
+    # Phase G: the code_space this project's code system indexed (code--owner--repo).
+    # Set at index time so the recall-fusion path can bind a real per-space engine.
+    code_space: str | None = None
 
     def __post_init__(self):
         if self.code_systems is None:
             self.code_systems = []
 
 
-# Stub: in-memory project config store (Phase D; Phase E will persist to Redis/Neo4j)
+# Phase G: project config is persisted via knowledge.index_store (Redis-backed,
+# best-effort, in-memory L1) so a config set by the ingest worker at index time
+# is visible to the API's recall path. _PROJECT_CONFIGS remains as a direct
+# in-memory fast-path/back-compat mirror for callers/tests that set config in the
+# same process without Redis.
 _PROJECT_CONFIGS: dict[str, ProjectKnowledgeConfig] = {}
 
 
 def get_project_config(project_id: str | None) -> ProjectKnowledgeConfig | None:
-    """Get the project's knowledge routing config, or None if not set."""
+    """Get the project's knowledge routing config, or None if not set.
+
+    Reads the in-process mirror first (free), then the cross-process store
+    (index_store; bounded Redis GET on a miss). A miss returns None — recall
+    output stays byte-identical to pre-Phase-G behavior.
+    """
     if not project_id:
         return None
-    return _PROJECT_CONFIGS.get(project_id)
+    hit = _PROJECT_CONFIGS.get(project_id)
+    if hit is not None:
+        return hit
+    from knowledge import index_store
+
+    raw = index_store.load_project_config(project_id)
+    if not raw:
+        return None
+    cfg = ProjectKnowledgeConfig(
+        project_id=project_id,
+        code_systems=list(raw.get("code_systems") or []),
+        fuse_code_into_recall=bool(raw.get("fuse_code_into_recall", True)),
+        default_engine=raw.get("default_engine"),
+        code_space=raw.get("code_space"),
+    )
+    _PROJECT_CONFIGS[project_id] = cfg
+    return cfg
 
 
 def set_project_config(config: ProjectKnowledgeConfig) -> None:
-    """Set (or update) a project's knowledge routing config."""
+    """Set (or update) a project's knowledge routing config (in-process + persisted)."""
     _PROJECT_CONFIGS[config.project_id] = config
+    from knowledge import index_store
+
+    index_store.save_project_config(
+        config.project_id,
+        {
+            "project_id": config.project_id,
+            "code_systems": list(config.code_systems or []),
+            "fuse_code_into_recall": config.fuse_code_into_recall,
+            "default_engine": config.default_engine,
+            "code_space": config.code_space,
+        },
+    )
 
 
 # ── Query-shape coding-signal gate (layer 3) ──
