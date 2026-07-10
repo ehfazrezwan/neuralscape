@@ -544,6 +544,14 @@ def _load_systems(
             from icebench.adapters.ns_graphify import NSGraphifyAdapter
 
             adapter = NSGraphifyAdapter(rail=rail) if rail else NSGraphifyAdapter()
+        elif name == "ns-cbm":
+            from icebench.adapters.ns_cbm import NSCbmAdapter
+
+            adapter = NSCbmAdapter()
+        elif name == "ns-graphify-lib":
+            from icebench.adapters.ns_graphify_lib import NSGraphifyLibAdapter
+
+            adapter = NSGraphifyLibAdapter()
         elif name == "graphify":
             try:
                 from icebench.systems.graphify_standalone import GraphifyStandaloneAdapter
