@@ -178,7 +178,6 @@ def batched_anchor_lookup(
     """
     from memory_service import get_shared_service
     from qdrant_client.models import FieldCondition, Filter, MatchAny
-    import numpy as np
 
     if not fqns:
         return {}
@@ -201,23 +200,24 @@ def batched_anchor_lookup(
         ]
         query_filter = Filter(must=must)
 
-        # Use a dummy embedding for the query (we're filtering by source_ref, not semantic)
-        # Handle mocks/tests where embedding_model may not be set up
-        try:
-            vector_size = len(m.embedding_model.embed("test", memory_action="search"))
-        except (AttributeError, Exception):
-            # Fallback for tests: use a default vector size (768 for Gemini)
-            vector_size = 768
-        dummy_vector = np.zeros(vector_size).tolist()
-
-        result = client.query_points(
+        # Phase G-final (GF2): use scroll (filter-only, NO query vector) rather
+        # than query_points with a throwaway zero vector. The anchor join filters
+        # purely by source_ref.external_id — similarity ordering is meaningless
+        # here — so scroll is the right primitive. This also removes a live
+        # embedding_model.embed("test") call that was being made on EVERY fused
+        # recall solely to learn the vector dimension (~400 ms per call, the
+        # dominant fused-leg overhead the GF2 probe measured; the plan predicted
+        # ~20-40 ms for the join itself). scroll returns (points, next_offset).
+        scroll_result = client.scroll(
             collection_name=m.vector_store.collection_name,
-            query=dummy_vector,
-            query_filter=query_filter,
+            scroll_filter=query_filter,
             limit=len(anchor_keys) * limit_per_anchor * 2,  # over-fetch for post-filter
             with_payload=True,
         )
-        hits = list(getattr(result, "points", result) or [])
+        if isinstance(scroll_result, tuple):
+            hits = list(scroll_result[0] or [])
+        else:  # tolerate mocks that return a bare iterable
+            hits = list(getattr(scroll_result, "points", scroll_result) or [])
 
         # Group results by anchor key and apply visibility post-filter
         memories_by_anchor: dict[str, list[dict]] = {key: [] for key in anchor_keys}

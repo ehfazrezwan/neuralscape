@@ -199,7 +199,8 @@ def test_batched_anchor_lookup_single_query():
                 }
             ),
         ]
-        mock_client.query_points.return_value = mock_result
+        # GF2: batched_anchor_lookup now uses scroll (filter-only) → (points, offset)
+        mock_client.scroll.return_value = (mock_result.points, None)
 
         # Call batched_anchor_lookup with 3 FQNs
         def mock_to_canonical(fqn):
@@ -213,12 +214,14 @@ def test_batched_anchor_lookup_single_query():
             limit_per_anchor=3,
         )
 
-        # CRITICAL ASSERTION: query_points called EXACTLY ONCE (batched query)
-        assert mock_client.query_points.call_count == 1
+        # CRITICAL ASSERTION: scroll called EXACTLY ONCE (batched query), and NO
+        # embedding call was made just to size a dummy vector (GF2 fix).
+        assert mock_client.scroll.call_count == 1
+        assert mock_m.embedding_model.embed.call_count == 0
 
         # Verify the filter had all 3 anchor keys in MatchAny
-        call_args = mock_client.query_points.call_args
-        query_filter = call_args.kwargs["query_filter"]
+        call_args = mock_client.scroll.call_args
+        query_filter = call_args.kwargs["scroll_filter"]
         match_any_condition = query_filter.must[0].match
         assert len(match_any_condition.any) == 3
         assert "click::click.core.CommandCollection" in match_any_condition.any
@@ -295,7 +298,7 @@ def test_batched_anchor_lookup_visibility_preserved():
                 }
             ),
         ]
-        mock_client.query_points.return_value = mock_result
+        mock_client.scroll.return_value = (mock_result.points, None)
 
         result = batched_anchor_lookup(
             fqns=["Foo"],

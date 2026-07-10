@@ -140,12 +140,11 @@ async def test_fusion_repo_from_code_space_not_project_id(registry_with_code, mo
             "category": "decision", "visibility": "shared", "user_id": "bob",
         },
     })
-    qdrant_result = MagicMock(); qdrant_result.points = [mem_point]
-
     fake_service = MagicMock()
     fake_m = MagicMock()
     fake_service._get_memory.return_value = fake_m
-    fake_m.vector_store.client.query_points.return_value = qdrant_result
+    # GF2: anchor join uses scroll (filter-only) → (points, next_offset)
+    fake_m.vector_store.client.scroll.return_value = ([mem_point], None)
     fake_m.vector_store.collection_name = "mems"
     fake_m.embedding_model.embed.return_value = [0.0] * 768
 
@@ -179,8 +178,8 @@ async def test_fusion_repo_from_code_space_not_project_id(registry_with_code, mo
     assert sections["memories"][0]["memory"] == "base recall row"
 
     # Prove the filter used the CODE_SPACE repo key, not project_id.
-    call = fake_m.vector_store.client.query_points.call_args
-    match_any = call.kwargs["query_filter"].must[0].match
+    call = fake_m.vector_store.client.scroll.call_args
+    match_any = call.kwargs["scroll_filter"].must[0].match
     assert correct_key in match_any.any
     assert f"{project_id}::{canonical}" not in match_any.any
 
