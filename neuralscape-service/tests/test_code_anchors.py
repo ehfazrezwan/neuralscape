@@ -161,11 +161,9 @@ def test_get_anchor_memories_respects_read_scope(mock_bridge, mock_memory_servic
         }),
     ]
 
-    mock_result = MagicMock()
-    mock_result.points = mock_points
-
     memory = mock_memory_service._get_memory()
-    memory.vector_store.client.query_points.return_value = mock_result
+    # GF2: batched anchor lookup uses scroll (filter-only) → (points, next_offset)
+    memory.vector_store.client.scroll.return_value = (mock_points, None)
 
     # Alice queries (should see: shared + her own private)
     memories = engine._get_anchor_memories(query_fqn, user_id="alice", limit=10)
@@ -206,16 +204,14 @@ def test_get_anchor_memories_cap(mock_bridge, mock_memory_service):
         for i in range(10)
     ]
 
-    mock_result = MagicMock()
-    mock_result.points = mock_points
-
     memory = mock_memory_service._get_memory()
-    memory.vector_store.client.query_points.return_value = mock_result
+    # GF2: batched anchor lookup uses scroll (filter-only) → (points, next_offset)
+    memory.vector_store.client.scroll.return_value = (mock_points, None)
 
     # Request limit=3
     memories = engine._get_anchor_memories(query_fqn, user_id="alice", limit=3)
 
-    assert len(memories) <= 3
+    assert len(memories) == 3  # capped from 10 (GF2: was trivially 0 pre-scroll-mock)
 
 
 def test_locate_enriches_with_memories(mock_bridge, mock_memory_service):
@@ -270,11 +266,9 @@ def test_locate_enriches_with_memories(mock_bridge, mock_memory_service):
 
     memory = mock_memory_service._get_memory()
 
-    # First call: code_index search; second call: memory search
-    memory.vector_store.client.query_points.side_effect = [
-        mock_code_result,  # dense search
-        mock_mem_result,   # memory anchor search
-    ]
+    # Dense locate still uses query_points; GF2: the anchor lookup uses scroll.
+    memory.vector_store.client.query_points.return_value = mock_code_result
+    memory.vector_store.client.scroll.return_value = (mock_mem_points, None)
 
     # Mock BM25 (disabled)
     with patch.object(engine, "_lexical_code_search", return_value=[]):
@@ -325,11 +319,9 @@ def test_query_enriches_with_memories(mock_bridge, mock_memory_service):
             }
         })
     ]
-    mock_mem_result = MagicMock()
-    mock_mem_result.points = mock_mem_points
-
     memory = mock_memory_service._get_memory()
-    memory.vector_store.client.query_points.return_value = mock_mem_result
+    # GF2: batched anchor lookup uses scroll (filter-only) → (points, next_offset)
+    memory.vector_store.client.scroll.return_value = (mock_mem_points, None)
 
     with patch.object(engine, "_search_symbols", return_value=mock_symbols), \
          patch.object(engine, "_traverse", return_value=mock_traverse):
@@ -392,10 +384,10 @@ def test_anchor_round_trip_cross_engine_end_to_end(mock_bridge, mock_memory_serv
         },
     })
 
-    def query_points_side_effect(*args, **kwargs):
+    def scroll_side_effect(*args, **kwargs):
         """Return the memory ONLY when the filter carries the expected key.
-        Phase E: batched lookup uses MatchAny, so check if expected_key is in the list."""
-        qf = kwargs.get("query_filter")
+        GF2: batched lookup uses scroll(scroll_filter=...) with MatchAny → (points, offset)."""
+        qf = kwargs.get("scroll_filter")
         # Check for MatchAny (batched lookup)
         matched = any(
             getattr(c, "match", None) is not None
@@ -403,12 +395,10 @@ def test_anchor_round_trip_cross_engine_end_to_end(mock_bridge, mock_memory_serv
             and expected_key in c.match.any
             for c in qf.must
         )
-        result = MagicMock()
-        result.points = [mem_point] if matched else []
-        return result
+        return ([mem_point] if matched else [], None)
 
     memory = mock_memory_service._get_memory()
-    memory.vector_store.client.query_points.side_effect = query_points_side_effect
+    memory.vector_store.client.scroll.side_effect = scroll_side_effect
 
     # (3)+(4) Look up via CBM's canonicalized answer; native re-canonicalization
     # is idempotent on an already-canonical FQN, so the key matches → HIT.
