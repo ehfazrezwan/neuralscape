@@ -1412,8 +1412,14 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                     _reg_cs = getattr(_reg_eng, "code_space", None) if _reg_eng else None
                     _bind_cs = (
                         _reg_cs if _reg_cs and _reg_cs != "__registry_capability__"
-                        else (_cfg_code_space or "")
+                        else _cfg_code_space
                     )
+                    if not _bind_cs:
+                        # No code_space (registry placeholder + no project config) →
+                        # can't serve a real code answer; skip rather than attempt a
+                        # doomed bind (avoids log noise / a wasted bridge probe).
+                        logger.debug("Skipping %s: no code_space to bind", _name)
+                        continue
                     # Bind OFF the loop (may lazy-build graphify / probe CBM bridge).
                     _cand = await asyncio.to_thread(
                         resolve_bound_code_system, _name, _bind_cs, user_id, settings

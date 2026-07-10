@@ -795,12 +795,14 @@ async def process_code_index(ctx: dict, payload: dict) -> dict:
          enumerate symbols (graphify/native), honest graceful N/A for CBM.
 
     Idempotent: re-indexing the same code_space overwrites metadata + reindexes
-    the backend (CBM full re-index; graphify rebuild; native incremental).
+    the backend. The through-NS index always runs a FULL build
+    (``engine.index(incremental=False)``) for every engine, so a re-index is a
+    clean deterministic rebuild rather than a partial incremental.
     """
     import time
 
     from adapters.code_graph import code_graph_available
-    from knowledge.code_dispatch import repo_path_for_code_space, resolve_code_engine
+    from knowledge.code_dispatch import resolve_code_engine
 
     service: MemoryService = ctx["service"]
     system = payload["system"]

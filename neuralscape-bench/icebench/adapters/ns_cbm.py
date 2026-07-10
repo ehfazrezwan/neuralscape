@@ -13,10 +13,8 @@ Format-only adapter: NO added intelligence, NO query rewriting, NO fallback
 beyond parsing the REST response.
 """
 
-import json
 import os
 import time
-from pathlib import Path
 
 import httpx
 
