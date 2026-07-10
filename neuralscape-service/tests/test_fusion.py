@@ -149,6 +149,37 @@ def test_extract_fqns_content_fallback_query_op():
     assert not any(f.endswith(".py") for f in fqns)
 
 
+def test_extract_fqns_no_echo_join_on_miss():
+    """GF2 echo-join guard: a MISS header echoing the query must NOT anchor.
+
+    Native/CBM echo the question in the miss/header lines; harvesting FQNs from
+    those would join on a symbol the engine never resolved. Header lines are
+    skipped AND query-echoed tokens are excluded.
+    """
+    # Native "no symbols" miss echoing the query -> zero FQNs.
+    miss = SystemAnswer(
+        system_name="code-native",
+        content="No symbols matching 'Command.invoke()' found in code--x.",
+        hits=None,
+    )
+    assert extract_fqns_from_code_answer(miss, query="Command.invoke()") == []
+
+    # A real hit line survives, but the echoed query token is still excluded.
+    hit = SystemAnswer(
+        system_name="code-native",
+        content=(
+            "Code graph search results for: Command.invoke()\n\n"
+            "click.core.Command.invoke (method) in src/click/core.py:1400\n"
+        ),
+        hits=None,
+    )
+    fqns = extract_fqns_from_code_answer(hit, query="Command.invoke()")
+    # The module-qualified FQN from the hit line survives...
+    assert "click.core.Command.invoke" in fqns
+    # ...but the bare echoed token does not.
+    assert "Command.invoke" not in fqns
+
+
 def test_extract_fqns_hits_take_precedence_over_content():
     """Structured hits win; the content fallback only fires when hits are empty."""
     code_answer = SystemAnswer(

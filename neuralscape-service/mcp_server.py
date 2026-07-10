@@ -1447,12 +1447,21 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
 
                 async def _one_code_recall(_sys):
                     try:
+                        # GF2: for a natural-language recall query, prefer the
+                        # LOCATE op (dense semantic search → structured hits with
+                        # real module-qualified FQNs) over the QUERY op (keyword
+                        # symbol match, which does not resolve NL questions). This
+                        # is what lets the batched anchor join fire on REAL code
+                        # hits — locate returns .hits[].fqn, so no content parsing
+                        # is needed. Engines without locate (graphify-lib) fall
+                        # back to query (+ the echo-guarded content fallback).
+                        _op = "locate" if "locate" in _sys.info.capabilities else "query"
                         code_req = RecallRequest(
                             query=arguments["query"],
                             user_id=user_id,
                             project_id=arguments.get("project_id"),
                             limit=arguments.get("limit", 10),
-                            operation="query",
+                            operation=_op,
                         )
                         return await asyncio.to_thread(_sys.recall, code_req)
                     except Exception as e:
@@ -1498,7 +1507,11 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                         )
                         from knowledge.base import SystemAnswer
 
-                        fqns = extract_fqns_from_code_answer(code_answer)
+                        # Pass the query so the content fallback can exclude
+                        # echoed query tokens (GF2 echo-join guard).
+                        fqns = extract_fqns_from_code_answer(
+                            code_answer, query=arguments["query"]
+                        )
 
                         # Batched anchor join. CRITICAL: derive repo from the code
                         # system's code_space (the SAME way _get_anchor_memories

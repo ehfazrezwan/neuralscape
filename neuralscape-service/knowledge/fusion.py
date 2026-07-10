@@ -37,6 +37,20 @@ _FQN_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+\b")
 # Bound the content-derived FQN list so a large traversal answer can't build an
 # unbounded MatchAny filter for the batched anchor join.
 _MAX_CONTENT_FQNS = 60
+# Echo/status line prefixes (lowercased) that echo the QUESTION rather than a hit.
+# The content fallback must NOT harvest FQNs from these, or a query token would
+# anchor-join even when the engine resolved nothing (the "echo-join" defect).
+_ECHO_PREFIXES = (
+    "code graph search results for:",  # native query header echoes the question
+    "no symbols matching",             # native/cbm miss echoes the question
+    "symbols matching ",               # cbm hit header echoes the question (FQNs follow)
+    "neighbors of",                    # neighbors header echoes the label
+    "no neighbors",
+    "no path",
+    "no node",
+    "traversal:",                      # graphify BFS header echoes Start seeds
+    "start:",
+)
 
 
 def compose_fusion_answer(
@@ -103,24 +117,28 @@ def compose_fusion_answer(
     return "\n".join(sections)
 
 
-def extract_fqns_from_code_answer(code_answer: SystemAnswer) -> list[str]:
+def extract_fqns_from_code_answer(code_answer: SystemAnswer, query: str | None = None) -> list[str]:
     """Extract the FQN list to drive the batched anchor join.
 
     Preference order:
       1. Structured ``.hits`` with an ``fqn`` field (locate/neighbors/impact ops).
       2. **Content fallback** (Phase G-final GF2): the fusion code leg runs the
          ``query`` op, whose ``CodeKnowledgeSystem`` rendering is text-only
-         (``hits=None``). Without this fallback the flagship "who calls X and why
-         is it like this" flow could never populate the ``[semantics]`` section
-         live — the anchor join had no FQNs to join on. We parse dotted
-         FQN-shaped tokens out of the rendered content. This is a format-only
-         reader, NOT engine intelligence: every token is canonicalized by the
-         engine's ``to_canonical`` and matched via a ``MatchAny(external_id)``
-         filter, so a non-FQN token simply matches no anchor (no false joins).
-         Bounded to ``_MAX_CONTENT_FQNS`` to keep the Qdrant filter small.
+         (``hits=None``). Without this the flagship "who calls X and why is it
+         like this" flow could never populate the ``[semantics]`` section live —
+         the anchor join had no FQNs to join on. We parse dotted FQN-shaped
+         tokens out of the rendered content, but ONLY from genuine hit/traversal
+         lines: echo/status header lines (``_ECHO_PREFIXES``) are skipped, and
+         (when ``query`` is provided) tokens whose lowercase appears verbatim in
+         the query are excluded. Together these kill the "echo-join" — a query
+         token like ``Command.invoke`` echoed in a *miss* header must NOT anchor
+         when the engine resolved nothing. This is a format-only reader, NOT
+         engine intelligence; bounded to ``_MAX_CONTENT_FQNS``.
 
     Args:
         code_answer: SystemAnswer from a code system.
+        query: The originating query, for echo exclusion (recommended). When
+            None, only header-line skipping guards against the echo.
 
     Returns:
         De-duplicated FQN list (structured hits first; else content-derived).
@@ -136,19 +154,30 @@ def extract_fqns_from_code_answer(code_answer: SystemAnswer) -> list[str]:
                     fqns.append(f)
 
     if not fqns and getattr(code_answer, "content", None):
-        for m in _FQN_RE.findall(code_answer.content):
-            # File paths (``foo.py``) are not symbols — skip them.
-            if m.endswith((".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java")):
+        q_low = (query or "").lower()
+        for line in code_answer.content.split("\n"):
+            stripped = line.strip()
+            low = stripped.lower()
+            # Skip echo/status headers — they carry the question, not a hit.
+            if any(low.startswith(p) for p in _ECHO_PREFIXES):
                 continue
-            if m not in seen:
-                seen.add(m)
-                fqns.append(m)
-            if len(fqns) >= _MAX_CONTENT_FQNS:
-                logger.debug(
-                    "extract_fqns: content FQN cap (%d) reached; truncating",
-                    _MAX_CONTENT_FQNS,
-                )
-                break
+            for m in _FQN_RE.findall(stripped):
+                # File paths (``foo.py``) are not symbols — skip them.
+                if m.endswith((".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java")):
+                    continue
+                # Echo guard: a token that appears verbatim in the query is the
+                # user's own phrasing echoed back, not a resolved code hit.
+                if q_low and m.lower() in q_low:
+                    continue
+                if m not in seen:
+                    seen.add(m)
+                    fqns.append(m)
+                if len(fqns) >= _MAX_CONTENT_FQNS:
+                    logger.debug(
+                        "extract_fqns: content FQN cap (%d) reached; truncating",
+                        _MAX_CONTENT_FQNS,
+                    )
+                    return fqns
     return fqns
 
 
