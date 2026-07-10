@@ -282,14 +282,26 @@ def resolve_auto_bound_system(
     Returns ``(bound_system | None, engine_name | None, reason)``. A None system
     means no capable healthy engine could be bound → the caller returns honest
     N/A (never fabricates). Nothing branches on transport (DECISIONS.md rule).
-    """
-    from knowledge.autoroute import resolve_op_engine
 
-    resolution = resolve_op_engine(
-        operation, project_id=project_id, settings=settings
-    )
+    Resolution is LAZY (Fable SF-1): it walks the preference list and applies the
+    registered/capability/bind/health gates per candidate, stopping at the first
+    that binds healthy — so on the happy path (top engine serves) it never probes
+    the fallbacks (e.g. no CBM bridge probe when graphify serves neighbors).
+    """
+    from knowledge.autoroute import normalize_op, preference_for_op
+    from knowledge.registry import get_system
+
+    op = normalize_op(operation)
+    prefs = preference_for_op(op, project_id=project_id, settings=settings)
     tried: list[str] = []
-    for name in resolution.candidates:
+    for name in prefs:
+        sys = get_system(name)
+        if sys is None:
+            tried.append(f"{name}(not-registered)")
+            continue
+        if op not in sys.info.capabilities:
+            tried.append(f"{name}(no-cap)")
+            continue
         bound = resolve_bound_code_system(name, code_space, user_id, settings)
         if bound is None:
             tried.append(f"{name}(unbindable)")
@@ -301,16 +313,13 @@ def resolve_auto_bound_system(
         except Exception:  # noqa: BLE001
             tried.append(f"{name}(health-error)")
             continue
-        reason = f"auto: {resolution.op} → {name}"
+        reason = f"auto: {op} → {name}"
         if tried:
             reason += f" (skipped {tried})"
         logger.debug("resolve_auto_bound_system: %s", reason)
         return bound, name, reason
 
-    reason = (
-        f"auto: no bindable healthy engine for {resolution.op} "
-        f"(candidates={resolution.candidates}, tried={tried}; {resolution.reason})"
-    )
+    reason = f"auto: no bindable healthy engine for {op} (preference={prefs}, tried={tried})"
     logger.debug("resolve_auto_bound_system: %s", reason)
     return None, None, reason
 

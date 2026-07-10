@@ -47,7 +47,12 @@ logger = logging.getLogger(__name__)
 # bind miss, so a last-resort degrade beats an honest-but-total N/A only when
 # every better engine is unavailable.
 DEFAULT_CODE_OP_PREFERENCE: dict[str, list[str]] = {
-    "query": ["code-native", "code-cbm", "code-graphify-lib"],
+    # query == symbol_lookup: native (0.983) > cbm (0.517). graphify-lib is
+    # deliberately EXCLUDED (Fable SF-4): its `query` op renders a BFS traversal,
+    # not a symbol locator (0.00), so falling back to it would return traversal
+    # text that is simply not a lookup — worse than an honest N/A. A deployment
+    # that wants it as a last resort can add it via code_op_preference.
+    "query": ["code-native", "code-cbm"],
     "neighbors": ["code-graphify-lib", "code-cbm", "code-native"],
     "path": ["code-graphify-lib", "code-native"],
     "locate": ["code-native", "code-cbm"],

@@ -1447,7 +1447,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                         _cand, _served, _reason = await asyncio.to_thread(
                             resolve_auto_bound_system,
                             _try_op, _cfg_code_space, user_id, settings,
-                            arguments.get("project_id"),
+                            project_id=arguments.get("project_id"),  # keyword-only (MF-1)
                         )
                         if _cand is not None:
                             code_systems_list.append(_cand)
@@ -2251,13 +2251,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 query_code_graph,
             )
 
-            # Phase D: wire the router for code tools (always route to a code system).
-            # The 5 code tools are ALREADY explicit code-routing (layer 1); the only
-            # choice is WHICH backend. Log the decision but keep calling the existing
-            # query.py functions (backward compat; Phase E will wire to system.recall()).
-            from knowledge.router import resolve_systems
-
-            # Map tool name to operation hint for router
+            # Map tool name to operation hint (router/auto-router op-class).
             operation_map = {
                 "query_code_graph": "query",
                 "get_code_neighbors": "neighbors",
@@ -2265,30 +2259,10 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 "locate": "locate",
                 "code_impact": "impact",
             }
-            # "auto" is the per-op auto-router sentinel, NOT an explicit engine pin —
-            # pass None to resolve_systems so it doesn't warn "system 'auto' not
-            # registered"; the auto branch below uses resolve_auto_bound_system.
-            _ks_for_router = arguments.get("knowledge_system")
-            if _ks_for_router == "auto":
-                _ks_for_router = None
-            route_decision = resolve_systems(
-                query=arguments.get("question") or arguments.get("query") or arguments.get("label") or "",
-                project_id=None,  # Code tools don't expose project_id yet (Phase E)
-                knowledge_system=_ks_for_router,
-                graph_id=arguments.get("graph_id"),
-                operation=operation_map.get(name),
-                is_code_tool=True,
-            )
-            logger.debug(
-                "Code tool %s route decision: %s (layer %d)",
-                name,
-                route_decision.rationale,
-                route_decision.layer,
-            )
-
-            # Phase G: when the caller gives an explicit knowledge_system, dispatch
+            # Phase G / AR2: when the caller gives a knowledge_system, dispatch
             # through the bound engine's system.recall() (mirrors the REST twins).
             # graph_id carries the code_space. Omit → legacy query.py path below.
+            # "auto" is the per-op auto-router sentinel (not an engine pin).
             explicit_system = arguments.get("knowledge_system")
             if explicit_system:
                 code_space = arguments.get("graph_id")
@@ -2311,8 +2285,23 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                             f"auto-routing found no healthy engine for '{operation}' "
                             f"({_reason})")}))]
                 else:
+                    # SF-2: only run the router for a real pin (not for "auto").
                     from knowledge.code_dispatch import resolve_bound_code_system
+                    from knowledge.router import resolve_systems
 
+                    route_decision = resolve_systems(
+                        query=arguments.get("question") or arguments.get("query")
+                        or arguments.get("label") or "",
+                        project_id=None,
+                        knowledge_system=explicit_system,
+                        graph_id=arguments.get("graph_id"),
+                        operation=operation,
+                        is_code_tool=True,
+                    )
+                    logger.debug(
+                        "Code tool %s route decision: %s (layer %d)",
+                        name, route_decision.rationale, route_decision.layer,
+                    )
                     resolved = route_decision.systems[0] if route_decision.systems else None
                     if resolved is None or resolved.info.name != explicit_system:
                         return [TextContent(type="text", text=json.dumps({"error": (
@@ -2347,6 +2336,18 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                     return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
                 except Exception as e:  # noqa: BLE001
                     return [TextContent(type="text", text=json.dumps({"error": f"{name} failed: {e}"}))]
+                # AR3 (MF-2): under "auto", attribute the SERVED engine in a JSON
+                # envelope so the auto-choice (and any health-fallback) is visible —
+                # matching the REST twins. `auto` is a new contract, so no existing
+                # consumer breaks; a real pin keeps the byte-identical bare output.
+                if explicit_system == "auto":
+                    if name == "locate":
+                        return [TextContent(type="text", text=json.dumps(
+                            {"results": answer.hits or [], "system": answer.system_name,
+                             "routed_by": "auto"}, default=str, ensure_ascii=False))]
+                    return [TextContent(type="text", text=json.dumps(
+                        {"result": answer.content, "system": answer.system_name,
+                         "routed_by": "auto"}, default=str, ensure_ascii=False))]
                 if name == "locate":
                     return [TextContent(type="text", text=json.dumps(
                         answer.hits or [], default=str, ensure_ascii=False))]

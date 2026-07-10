@@ -172,18 +172,24 @@ def test_resolve_health_probe_raising_is_ineligible_not_fatal():
 # ── AR2: resolve_auto_bound_system bind + health fallthrough ─────────
 
 
+_EMPTY_SETTINGS = SimpleNamespace(code_op_preference={})
+
+
 def test_auto_bound_binds_first_candidate():
     from knowledge import code_dispatch
 
     bound = _sys("code-graphify-lib", _GRAPHIFY_CAPS)
-    resolution = AutoResolution(op="neighbors", best="code-graphify-lib",
-                                candidates=["code-graphify-lib", "code-cbm"])
-    with patch.object(autoroute, "resolve_op_engine", return_value=resolution), \
+    reg = _registry(
+        _sys("code-graphify-lib", _GRAPHIFY_CAPS),
+        _sys("code-cbm", _CBM_CAPS),
+        _sys("code-native", _NATIVE_CAPS),
+    )
+    with patch("knowledge.registry.get_system", side_effect=reg), \
          patch.object(code_dispatch, "resolve_bound_code_system", return_value=bound):
         sys_, name, reason = code_dispatch.resolve_auto_bound_system(
-            "neighbors", "code--o--r", "u1", SimpleNamespace()
+            "neighbors", "code--o--r", "u1", _EMPTY_SETTINGS
         )
-    assert name == "code-graphify-lib"
+    assert name == "code-graphify-lib"  # neighbors default winner
     assert sys_ is bound
     assert "code-graphify-lib" in reason
 
@@ -193,16 +199,19 @@ def test_auto_bound_falls_through_on_bind_miss():
     from knowledge import code_dispatch
 
     good = _sys("code-cbm", _CBM_CAPS)
-    resolution = AutoResolution(op="neighbors", best="code-graphify-lib",
-                                candidates=["code-graphify-lib", "code-cbm"])
+    reg = _registry(
+        _sys("code-graphify-lib", _GRAPHIFY_CAPS),
+        _sys("code-cbm", _CBM_CAPS),
+        _sys("code-native", _NATIVE_CAPS),
+    )
 
     def fake_bind(name, cs, uid, settings, **kw):
         return None if name == "code-graphify-lib" else good  # graphify unbindable
 
-    with patch.object(autoroute, "resolve_op_engine", return_value=resolution), \
+    with patch("knowledge.registry.get_system", side_effect=reg), \
          patch.object(code_dispatch, "resolve_bound_code_system", side_effect=fake_bind):
         sys_, name, reason = code_dispatch.resolve_auto_bound_system(
-            "neighbors", "code--o--r", "u1", SimpleNamespace()
+            "neighbors", "code--o--r", "u1", _EMPTY_SETTINGS
         )
     assert name == "code-cbm"  # fell through
     assert sys_ is good
@@ -214,16 +223,19 @@ def test_auto_bound_falls_through_on_unhealthy_bound_engine():
 
     sick = _sys("code-graphify-lib", _GRAPHIFY_CAPS, health="unreachable")
     good = _sys("code-cbm", _CBM_CAPS)
-    resolution = AutoResolution(op="neighbors", best="code-graphify-lib",
-                                candidates=["code-graphify-lib", "code-cbm"])
+    reg = _registry(
+        _sys("code-graphify-lib", _GRAPHIFY_CAPS),
+        _sys("code-cbm", _CBM_CAPS),
+        _sys("code-native", _NATIVE_CAPS),
+    )
 
     def fake_bind(name, cs, uid, settings, **kw):
         return sick if name == "code-graphify-lib" else good
 
-    with patch.object(autoroute, "resolve_op_engine", return_value=resolution), \
+    with patch("knowledge.registry.get_system", side_effect=reg), \
          patch.object(code_dispatch, "resolve_bound_code_system", side_effect=fake_bind):
         sys_, name, reason = code_dispatch.resolve_auto_bound_system(
-            "neighbors", "code--o--r", "u1", SimpleNamespace()
+            "neighbors", "code--o--r", "u1", _EMPTY_SETTINGS
         )
     assert name == "code-cbm"
     assert "graphify-lib(unhealthy)" in reason
@@ -232,11 +244,62 @@ def test_auto_bound_falls_through_on_unhealthy_bound_engine():
 def test_auto_bound_none_when_no_candidate_binds():
     from knowledge import code_dispatch
 
-    resolution = AutoResolution(op="impact", best=None, candidates=[])
-    with patch.object(autoroute, "resolve_op_engine", return_value=resolution), \
+    reg = _registry(_sys("code-graphify-lib", _GRAPHIFY_CAPS))
+    with patch("knowledge.registry.get_system", side_effect=reg), \
          patch.object(code_dispatch, "resolve_bound_code_system", return_value=None):
         sys_, name, reason = code_dispatch.resolve_auto_bound_system(
-            "impact", "code--o--r", "u1", SimpleNamespace()
+            "impact", "code--o--r", "u1", SimpleNamespace(code_op_preference={})
         )
     assert sys_ is None and name is None
     assert "no bindable healthy engine" in reason
+
+
+def test_auto_bound_lazy_does_not_bind_fallbacks_on_happy_path():
+    """SF-1: the top engine binds healthy → fallbacks are never bound/probed."""
+    from knowledge import code_dispatch
+
+    reg = _registry(
+        _sys("code-graphify-lib", _GRAPHIFY_CAPS),
+        _sys("code-cbm", _CBM_CAPS),
+        _sys("code-native", _NATIVE_CAPS),
+    )
+    top = _sys("code-graphify-lib", _GRAPHIFY_CAPS)
+    bind_calls = []
+
+    def fake_bind(name, cs, uid, settings, **kw):
+        bind_calls.append(name)
+        return top if name == "code-graphify-lib" else None
+
+    with patch("knowledge.registry.get_system", side_effect=reg), \
+         patch.object(code_dispatch, "resolve_bound_code_system", side_effect=fake_bind):
+        sys_, name, _ = code_dispatch.resolve_auto_bound_system(
+            "neighbors", "code--o--r", "u1", SimpleNamespace(code_op_preference={})
+        )
+    assert name == "code-graphify-lib"
+    assert bind_calls == ["code-graphify-lib"]  # cbm/native never bound (lazy)
+
+
+def test_auto_bound_passes_project_id_keyword(monkeypatch):
+    """MF-1 regression: project_id is keyword-only; a positional call would crash.
+
+    This calls the REAL resolve_auto_bound_system (no mock of it) with project_id,
+    the exact shape the recall fusion leg uses — the bug Fable found (TypeError).
+    """
+    from knowledge import code_dispatch
+
+    seen = {}
+
+    def fake_pref(op, *, project_id=None, settings=None):
+        seen["project_id"] = project_id
+        return ["code-native"]
+
+    reg = _registry(_sys("code-native", _NATIVE_CAPS))
+    bound = _sys("code-native", _NATIVE_CAPS)
+    monkeypatch.setattr(autoroute, "preference_for_op", fake_pref)
+    with patch("knowledge.registry.get_system", side_effect=reg), \
+         patch.object(code_dispatch, "resolve_bound_code_system", return_value=bound):
+        sys_, name, _ = code_dispatch.resolve_auto_bound_system(
+            "locate", "code--o--r", "u1", SimpleNamespace(), project_id="proj-42"
+        )
+    assert name == "code-native"
+    assert seen["project_id"] == "proj-42"  # forwarded, not dropped/crashed
