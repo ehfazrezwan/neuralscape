@@ -192,8 +192,14 @@ class CBMEngine:
             return self.project
         import os
 
+        # Bounded probe (not the 60s operational client): the read-path bind runs
+        # near the request path, so a wedged bridge must not stall for 60s
+        # (Fable must-fix #1; mirrors the M4 health-probe bound).
         try:
-            status = self._get_bridge("/index_status")
+            with httpx.Client(timeout=_HEALTH_PROBE_TIMEOUT) as probe:
+                resp = probe.get(urljoin(self.bridge_url, "/index_status"))
+                resp.raise_for_status()
+                status = resp.json()
         except Exception:  # noqa: BLE001 — bridge down ⇒ can't bind (base still answers)
             logger.warning("CBM resolve_project_from_source: /index_status unreachable")
             return None

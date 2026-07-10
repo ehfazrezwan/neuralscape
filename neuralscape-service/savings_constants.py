@@ -25,9 +25,11 @@ They are measured, checked-in constants, not runtime estimates:
 # renders the maximal surface). Growth from 10524: Phase G adds the new
 # code_graph_index tool and un-gates the knowledge_system param docs (removed the
 # "EXPERIMENTAL" caveat, documented explicit routing) on recall_memories + code
-# tools (+277 tokens). Intentional, per the acceptance rule.
+# tools (+277 tokens). Intentional, per the acceptance rule. Then +6 (10807) in
+# the Fable-review pass: recall_memories knowledge_system schema reworded to be
+# honest that the fusion gate (not this param) governs its code leg.
 # See tests/test_savings_meter.py::TestOverheadConstants.
-MCP_TOOL_SCHEMA_OVERHEAD_TOKENS = 10801
+MCP_TOOL_SCHEMA_OVERHEAD_TOKENS = 10807
 
 # Rendered savings line + detail fields on one response (measured: 67).
 SAVINGS_LINE_OVERHEAD_TOKENS = 70

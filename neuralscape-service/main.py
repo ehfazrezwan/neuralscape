@@ -1302,6 +1302,9 @@ async def _dispatch_code_system(
     mode: str = "bfs",
     depth: int = 3,
     limit: int = 10,
+    max_hops: int | None = None,
+    relation_filter: str | None = None,
+    token_budget: int | None = None,
 ):
     """Phase G: route a code-graph op through resolve_systems → a bound engine.
 
@@ -1343,7 +1346,11 @@ async def _dispatch_code_system(
             ),
         )
 
-    bound = resolve_bound_code_system(knowledge_system, code_space, caller, settings)
+    # Bind OFF the event loop: the bind may lazy-build a graphify graph (~seconds)
+    # or probe the CBM bridge (network) — never on the loop (Fable must-fix #1).
+    bound = await asyncio.to_thread(
+        resolve_bound_code_system, knowledge_system, code_space, caller, settings
+    )
     if bound is None:
         raise HTTPException(
             status_code=400,
@@ -1363,6 +1370,9 @@ async def _dispatch_code_system(
         mode=mode,
         depth=depth,
         limit=limit,
+        max_hops=max_hops,
+        relation_filter=relation_filter,
+        token_budget=token_budget,
     )
     from adapters.code_graph.engine import EngineCapabilityError
 
@@ -1371,6 +1381,10 @@ async def _dispatch_code_system(
     except EngineCapabilityError as e:
         # Honest N/A (e.g. CBM path via banned Cypher) → 501, not a 500 crash.
         raise HTTPException(status_code=501, detail=str(e)) from e
+    except RuntimeError as e:
+        # e.g. an unbound engine slipped through — degrade to a clean 400, never a
+        # raw 500 (Fable must-fix #2).
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @v1_router.get("/code-graph/query")
@@ -1390,7 +1404,7 @@ async def v1_code_graph_query(
     if knowledge_system:
         answer = await _dispatch_code_system(
             knowledge_system, "query", graph_id, caller,
-            query=question, mode=mode, depth=depth,
+            query=question, mode=mode, depth=depth, token_budget=token_budget,
         )
         return {"result": answer.content, "graph_id": graph_id, "system": knowledge_system}
     try:
@@ -1424,7 +1438,7 @@ async def v1_code_graph_neighbors(
     if knowledge_system:
         answer = await _dispatch_code_system(
             knowledge_system, "neighbors", graph_id, caller,
-            query=label, label=label,
+            query=label, label=label, relation_filter=relation_filter,
         )
         return {"result": answer.content, "graph_id": graph_id, "system": knowledge_system}
     try:
@@ -1457,7 +1471,7 @@ async def v1_code_graph_path(
     if knowledge_system:
         answer = await _dispatch_code_system(
             knowledge_system, "path", graph_id, caller,
-            query=source, source=source, target=target,
+            query=source, source=source, target=target, max_hops=max_hops,
         )
         return {"result": answer.content, "graph_id": graph_id, "system": knowledge_system}
     try:
@@ -1543,7 +1557,7 @@ async def v1_code_graph_impact(
     if knowledge_system:
         answer = await _dispatch_code_system(
             knowledge_system, "impact", graph_id, caller,
-            query=symbol, label=symbol,
+            query=symbol, label=symbol, max_hops=max_hops,
         )
         return {
             "text": answer.content,
@@ -1587,8 +1601,9 @@ async def v1_code_graph_index(req: CodeIndexRequest, request: Request):
     via ``GET /v1/memories/status/{task_id}``. The worker resolves the engine for
     ``system``, runs ``engine.index(repo_source)``, records
     ``{repo_sha, indexed_at, engine_version}`` per code_space, sets the project's
-    routing config, and runs the external-engine liveness diff. Idempotent
-    (re-index of the same code_space coalesces onto one job).
+    routing config, and runs the external-engine liveness diff. Idempotent at the
+    engine level (a re-index of the same code_space overwrites); each call gets a
+    unique job id so a re-index always re-runs (not coalesced on a cached result).
     """
     _code_graph_or_501()
     caller = _resolve_user_id(request, req.user_id)

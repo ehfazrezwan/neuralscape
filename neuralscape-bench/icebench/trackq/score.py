@@ -695,8 +695,14 @@ def _parse_symbol_set(answer: str | dict, system: str = "") -> set[str]:
     if system == "graphify":
         return _parse_graphify_connections(answer)
 
-    # NS-ICE returns JSON string with "Neighbors of X:\n  <-- fqn [CALLS]"
-    if system in ("ns-ice", "ns-ice-det", "ns-graphify"):
+    # NS-ICE returns JSON string with "Neighbors of X:\n  <-- fqn [CALLS]".
+    # Phase G: ns-cbm's through-NS neighbors answer uses the IDENTICAL arrow
+    # format ("Neighbors of 'X':\n  --> fqn [CALLS]"), so it parses cleanly here
+    # (Fable must-fix #7 — format normalization, not adapter intelligence).
+    # (ns-graphify-lib uses graphify's own "-- label [rel]" node-label rendering,
+    # not FQN arrows, so it is NOT added here — its set-based accuracy remains a
+    # documented format follow-up.)
+    if system in ("ns-ice", "ns-ice-det", "ns-graphify", "ns-cbm"):
         return _parse_ns_ice_neighbors(answer)
 
     # Generic fallback: try to parse as JSON array

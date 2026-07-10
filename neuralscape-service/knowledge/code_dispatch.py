@@ -102,6 +102,10 @@ def resolve_code_engine(
                     logger.warning(
                         "graphify-lib lazy build failed for %s", code_space, exc_info=True
                     )
+            # Still no graph → unbindable; degrade (Fable must-fix #2) instead of
+            # returning an engine that answers "No graph loaded" as a 200.
+            if getattr(engine, "G", None) is None:
+                return None
         return engine
 
     if system_name == "code-native":
@@ -122,9 +126,23 @@ def resolve_code_engine(
 # are reused across requests (mirrors query._ctx_cache).
 _cbm_cache: dict[str, object] = {}
 
+# Negative cache: code_space → monotonic expiry, for read-path binds that failed
+# (bridge down / repo not indexed). Prevents a per-request /index_status probe on
+# an unbindable space from recurring (Fable must-fix #1). Short TTL so a
+# just-indexed space becomes bindable quickly.
+_cbm_unbound_until: dict[str, float] = {}
+_CBM_NEG_TTL = 15.0
+
 
 def _resolve_cbm_engine(code_space: str, settings, *, for_index: bool):
-    """Build/get a CBMEngine bound to ``code_space`` (project slug via the bridge)."""
+    """Build/get a CBMEngine bound to ``code_space`` (project slug via the bridge).
+
+    Read path: returns None when the project can't be bound (bridge down / repo
+    not indexed / not in CODE_REPOS) so the caller degrades cleanly instead of
+    later raising a RuntimeError from ``_ensure_project`` (Fable must-fix #2).
+    """
+    import time
+
     from adapters.code_graph.cbm_engine import CBMEngine
 
     ent = _cbm_cache.get(code_space)
@@ -135,13 +153,29 @@ def _resolve_cbm_engine(code_space: str, settings, *, for_index: bool):
         engine = CBMEngine(bridge_url=bridge_url, code_space=code_space)
         _cbm_cache[code_space] = engine
 
-    # On the read path, bind the CBM project slug from the bridge if not yet
-    # known (index runs in another process). On the index path the caller's
-    # engine.index() sets the slug from the index_repository response.
-    if not for_index and not getattr(engine, "project", None):
-        repo_path = repo_path_for_code_space(code_space, settings)
-        if repo_path:
-            engine.resolve_project_from_source(repo_path)
+    if for_index:
+        # The caller's engine.index() sets the slug from the index_repository
+        # response; no read-path bind needed.
+        return engine
+
+    # Read path: bind the CBM project slug from the bridge if not yet known
+    # (index runs in another process).
+    if getattr(engine, "project", None):
+        return engine
+
+    # Negative cache: skip the probe if we recently failed to bind this space.
+    exp = _cbm_unbound_until.get(code_space)
+    if exp is not None and time.monotonic() < exp:
+        return None
+
+    repo_path = repo_path_for_code_space(code_space, settings)
+    slug = engine.resolve_project_from_source(repo_path) if repo_path else None
+    if not slug:
+        # Unbindable (bridge down / repo not indexed / not configured). Degrade:
+        # return None so the caller answers from base / returns a clean error.
+        _cbm_unbound_until[code_space] = time.monotonic() + _CBM_NEG_TTL
+        return None
+    _cbm_unbound_until.pop(code_space, None)
     return engine
 
 
@@ -166,15 +200,16 @@ def resolve_bound_code_system(
 
     registered = get_system(system_name)
 
-    # If the registry already holds a REAL bound system for a usable code_space
-    # (not a capability placeholder), use it directly — this is the production
-    # path once per-space systems are registered, and it's what test fakes rely
-    # on. A placeholder is CBM's unbound engine (code_space None) or graphify's
-    # "__registry_capability__" marker.
+    # If the registry already holds a REAL bound system for THIS EXACT code_space
+    # (not a capability placeholder, not a different space), use it directly —
+    # this is the production path once per-space systems are registered, and it's
+    # what test fakes rely on. Comparing the space (not just "is it real") is the
+    # moat guard: registry keys are per-backend, so a per-space entry for
+    # code--b--Y must NOT satisfy a request for code--a--X (Fable must-fix #3).
     if registered is not None:
         eng = getattr(registered, "_engine", None)
         cs = getattr(eng, "code_space", None) if eng is not None else None
-        if cs and cs != "__registry_capability__":
+        if cs and cs != "__registry_capability__" and cs == code_space:
             return registered
 
     engine = resolve_code_engine(
@@ -184,11 +219,13 @@ def resolve_bound_code_system(
         return None
 
     # Carry capabilities/transport/version verbatim from the registered
-    # placeholder (getattr — defensive, and never a routing branch on transport;
-    # DECISIONS.md cross-cutting rule: transport is declared, not branched).
+    # placeholder. This is a declaration carry-through into a wrapper constructor,
+    # NEVER a routing branch on transport (DECISIONS.md cross-cutting rule).
+    # code_dispatch.py is on the transport-invariant test's allowlist as a
+    # system-construction file (peer to __init__.py / code_system.py).
     if registered is not None:
         capabilities = registered.info.capabilities
-        transport = getattr(registered.info, "transport", "in-process")
+        transport = registered.info.transport
         version = getattr(registered, "_version", None)
     else:
         # System not registered (e.g. CBM disabled) — permissive capability set

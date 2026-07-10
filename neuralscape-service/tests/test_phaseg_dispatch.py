@@ -55,6 +55,30 @@ def test_resolve_bound_prefers_real_registered_system():
         registry.KNOWLEDGE_REGISTRY.pop("code-x", None)
 
 
+def test_resolve_bound_does_not_bind_wrong_code_space():
+    """MF3 moat guard: a registered real system for code--o--r must NOT satisfy a
+    request for a DIFFERENT code_space — it rebinds instead of returning the wrong
+    engine."""
+    from knowledge import registry
+    from knowledge.code_dispatch import resolve_bound_code_system
+
+    real = SimpleNamespace(
+        info=KnowledgeSystemInfo(name="code-x", kind="code",
+                                 capabilities=frozenset({"query"}), transport="in-process"),
+        _engine=SimpleNamespace(code_space="code--o--r"),
+    )
+    registry.KNOWLEDGE_REGISTRY["code-x"] = real
+    try:
+        with patch("knowledge.code_dispatch.resolve_code_engine", return_value=None) as m:
+            # Request a DIFFERENT space → must NOT return `real`; falls to rebind
+            # (which we stub to None), so the result is None, never the wrong engine.
+            got = resolve_bound_code_system("code-x", "code--o--OTHER", "u1", SimpleNamespace())
+        assert got is None
+        m.assert_called_once()  # it attempted a rebind rather than returning `real`
+    finally:
+        registry.KNOWLEDGE_REGISTRY.pop("code-x", None)
+
+
 def test_resolve_bound_rebinds_placeholder(tmp_path):
     """A capability placeholder is rebound to a per-code_space engine."""
     from knowledge import registry

@@ -151,7 +151,7 @@ class CodeKnowledgeSystem:
                     question=req.query,
                     mode=req.mode or "bfs",
                     depth=req.depth or 3,
-                    token_budget=2000,  # RecallRequest doesn't expose this yet; use default
+                    token_budget=req.token_budget or 2000,
                 )
                 return SystemAnswer(
                     system_name=self.info.name,
@@ -166,7 +166,7 @@ class CodeKnowledgeSystem:
                     raise ValueError("neighbors operation requires 'label' parameter")
                 content = self._engine.neighbors(
                     label=req.label,
-                    relation_filter="",  # RecallRequest doesn't expose this yet
+                    relation_filter=req.relation_filter or "",
                 )
                 return SystemAnswer(
                     system_name=self.info.name,
@@ -182,7 +182,7 @@ class CodeKnowledgeSystem:
                 content = self._engine.path(
                     source=req.source,
                     target=req.target,
-                    max_hops=8,  # RecallRequest doesn't expose this yet; use default
+                    max_hops=req.max_hops or 8,
                 )
                 return SystemAnswer(
                     system_name=self.info.name,

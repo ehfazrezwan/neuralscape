@@ -224,13 +224,13 @@ async def list_tools() -> list[Tool]:
                     "knowledge_system": {
                         "type": "string",
                         "description": (
-                            "Optional explicit knowledge-system override (additive). Registered "
-                            "system names: 'ns-memory' (base, always available), 'code-cbm', "
-                            "'code-graphify-lib', 'code-native'. When given, routing dispatches "
-                            "explicitly to that system (layer-1 override); omit to use the "
-                            "deterministic router (project config + coding-signal classification). "
-                            "Generic recall stays base-only unless a coding signal + indexed code "
-                            "system warrant a fusion leg."
+                            "Optional knowledge-system hint (additive). NOTE: on recall_memories "
+                            "the code leg is governed by the deterministic router's fusion gate "
+                            "(project config + coding signal) — passing this param does NOT force "
+                            "an explicit code system here (that behavior is on the code tools: "
+                            "query_code_graph / get_code_neighbors / code_path / locate / "
+                            "code_impact and their REST twins). Generic recall stays base-only "
+                            "unless a coding signal + an indexed code system warrant a fusion leg."
                         ),
                     },
                 },
@@ -1414,7 +1414,10 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                         _reg_cs if _reg_cs and _reg_cs != "__registry_capability__"
                         else (_cfg_code_space or "")
                     )
-                    _cand = resolve_bound_code_system(_name, _bind_cs, user_id, settings)
+                    # Bind OFF the loop (may lazy-build graphify / probe CBM bridge).
+                    _cand = await asyncio.to_thread(
+                        resolve_bound_code_system, _name, _bind_cs, user_id, settings
+                    )
                     if _cand is None:
                         logger.debug("Skipping %s: could not bind engine (code_space=%r)",
                                      _name, _bind_cs)
@@ -2183,7 +2186,9 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 from knowledge.base import RecallRequest
                 from knowledge.code_dispatch import resolve_bound_code_system
 
-                bound = resolve_bound_code_system(explicit_system, code_space, user_id, settings)
+                bound = await asyncio.to_thread(
+                    resolve_bound_code_system, explicit_system, code_space, user_id, settings
+                )
                 if bound is None:
                     return [TextContent(type="text", text=json.dumps({"error": (
                         f"could not bind engine for '{explicit_system}' at code_space "
@@ -2200,6 +2205,9 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                     mode=arguments.get("mode", "bfs"),
                     depth=arguments.get("depth", 3),
                     limit=arguments.get("k", 10),
+                    max_hops=arguments.get("max_hops"),
+                    relation_filter=arguments.get("relation_filter"),
+                    token_budget=arguments.get("token_budget"),
                 )
                 try:
                     answer = await asyncio.to_thread(bound.recall, creq)

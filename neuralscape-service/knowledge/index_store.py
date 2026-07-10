@@ -31,20 +31,36 @@ _CFG_PREFIX = "ns:code-projcfg:"        # + project_id  → project config (JSON
 # Bounded so a wedged Redis can't stall the request path (router <1ms budget).
 _SOCKET_TIMEOUT = 1.0
 
-# In-memory L1 (also the sole store when Redis is unavailable).
+# In-memory L1 (also the sole store when Redis is unavailable). Entries carry a
+# monotonic write time; when Redis is up, a positive hit older than _L1_TTL is
+# re-read from Redis so a reindex that changed default_engine/code_space becomes
+# visible to a long-running process (Fable should-fix a).
 _mem_meta: dict[str, dict] = {}
 _mem_cfg: dict[str, dict] = {}
+_mem_cfg_at: dict[str, float] = {}
+_L1_TTL = 30.0
 
 _client = None
-_client_tried = False
+_client_probe_at = 0.0
+_CLIENT_RETRY = 30.0
 
 
 def _redis():
-    """Lazy best-effort sync Redis client; None when unavailable."""
-    global _client, _client_tried
-    if _client_tried:
+    """Lazy best-effort sync Redis client; None when unavailable.
+
+    Retries the connection at most every _CLIENT_RETRY seconds rather than
+    latching a single failure forever (Fable should-fix b), so a Redis that was
+    briefly down at first touch becomes usable without a process restart.
+    """
+    global _client, _client_probe_at
+    import time as _t
+
+    if _client is not None:
         return _client
-    _client_tried = True
+    now = _t.monotonic()
+    if now - _client_probe_at < _CLIENT_RETRY:
+        return None
+    _client_probe_at = now
     try:
         import redis  # redis-py (dependency of arq)
 
@@ -106,7 +122,10 @@ def get_index(code_space: str) -> dict | None:
 
 def save_project_config(project_id: str, config: dict) -> None:
     """Persist a project's routing config (best-effort; never raises)."""
+    import time as _t
+
     _mem_cfg[project_id] = dict(config)
+    _mem_cfg_at[project_id] = _t.monotonic()
     r = _redis()
     if r is None:
         return
@@ -119,33 +138,40 @@ def save_project_config(project_id: str, config: dict) -> None:
 def load_project_config(project_id: str) -> dict | None:
     """Fetch a project's routing config (L1 → Redis). None if unset.
 
-    On the router hot path: an L1 hit is free; a miss costs at most one bounded
-    Redis GET (then cached). A None result keeps recall output byte-identical.
+    On the router hot path: a fresh L1 hit is free; a miss (or an L1 entry older
+    than _L1_TTL) costs at most one bounded Redis GET (then cached). A None result
+    keeps recall output byte-identical. The TTL re-read lets a reindex that
+    changed default_engine/code_space become visible to a long-running process
+    (Fable should-fix a).
     """
+    import time as _t
+
     hit = _mem_cfg.get(project_id)
-    if hit is not None:
+    if hit is not None and (_t.monotonic() - _mem_cfg_at.get(project_id, 0.0)) < _L1_TTL:
         return hit
     r = _redis()
     if r is None:
-        return None
+        return hit  # Redis down → serve the (possibly stale) L1 value, if any
     try:
         raw = r.get(_CFG_PREFIX + project_id)
     except Exception:  # noqa: BLE001
-        return None
+        return hit
     if not raw:
-        return None
+        return hit
     try:
         cfg = json.loads(raw)
     except (ValueError, TypeError):
-        return None
+        return hit
     _mem_cfg[project_id] = cfg
+    _mem_cfg_at[project_id] = _t.monotonic()
     return cfg
 
 
 def _reset_for_tests() -> None:
     """Clear in-memory caches + force client re-resolution (test hook)."""
-    global _client, _client_tried
+    global _client, _client_probe_at
     _mem_meta.clear()
     _mem_cfg.clear()
+    _mem_cfg_at.clear()
     _client = None
-    _client_tried = False
+    _client_probe_at = 0.0
