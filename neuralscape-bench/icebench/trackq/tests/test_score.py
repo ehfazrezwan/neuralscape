@@ -418,6 +418,62 @@ def test_normalize_answer_cbm_symbol_lookup():
     assert result == ("tests/test_file.py", "test_function")
 
 
+def test_normalize_answer_ns_cbm_symbol_lookup_through_ns():
+    """Phase G-final GF1: ns-cbm through-NS symbol_lookup rendering.
+
+    The code-tool JSON envelope carries a ``result`` string with the
+    ``Symbols matching 'X':\n  - <fqn> (<kind>) — <file>:<line>`` form (em-dash
+    separator; the line number may be truncated/empty). Format-only parser.
+    """
+    answer = {
+        "text": (
+            '{"result":"Symbols matching \'test_seq\':\\n'
+            "  - tests.test_stream_lifecycle.test_seq (Function) — "
+            'tests/test_stream_lifecycle.py:","graph_id":"code--x","system":"code-cbm"}'
+        ),
+        "status": "ok",
+    }
+    result = normalize_answer(answer, system="ns-cbm", for_symbol_lookup=True)
+    assert result == ("tests/test_stream_lifecycle.py", "test_seq")
+
+
+def test_normalize_answer_ns_cbm_symbol_lookup_miss():
+    """ns-cbm symbol_lookup with no matching-symbol line -> honest miss (None)."""
+    answer = {
+        "text": '{"result":"No symbols matching \'nope\'.","graph_id":"code--x"}',
+        "status": "ok",
+    }
+    assert normalize_answer(answer, system="ns-cbm", for_symbol_lookup=True) is None
+
+
+def test_parse_ns_graphify_lib_neighbors_through_ns():
+    """Phase G-final GF1: ns-graphify-lib through-NS neighbors rendering.
+
+    graphify's node-label form: ``Neighbors of X:\n  -- <label> [rel] [PROV]``.
+    Filtering mirrors standalone graphify EXACTLY: drop contains/imports
+    containment edges + file-name labels; keep call/reference/method edges.
+    """
+    answer = {
+        "text": (
+            '{"result":"Neighbors of _NonClosingTextIOWrapper:\\n'
+            "  -- _compat.py [contains] [EXTRACTED]\\n"
+            "  -- _winconsole.py [imports] [EXTRACTED]\\n"
+            "  -- _make_text_stream() [calls] [EXTRACTED]\\n"
+            "  -- .__del__() [method] [EXTRACTED]\\n"
+            '  -- BinaryIO [references] [EXTRACTED]","graph_id":"code--x"}'
+        ),
+        "status": "ok",
+    }
+    symbols = _parse_symbol_set(answer, system="ns-graphify-lib")
+    # File-containment/import edges + file-name labels excluded (same as standalone).
+    assert "_compat.py" not in symbols
+    assert "_winconsole.py" not in symbols
+    # Call / method / reference edges kept, normalized to bare symbols.
+    assert "_make_text_stream" in symbols
+    assert "__del__" in symbols
+    assert "binaryio" in symbols
+
+
 def test_normalize_answer_ns_ice_nl_locate():
     """Test NS-ICE nl_locate format."""
     answer = {

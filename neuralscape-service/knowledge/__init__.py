@@ -139,6 +139,58 @@ try:
         except Exception as e:
             logger.warning("GraphifyLibEngine registration failed: %s", e)
 
+        # Phase G-final (GF3): register the frozen NativeEngine as a first-class
+        # code system when CODE_NATIVE_ENABLED=true. Default-OFF (LOCKED decision
+        # #1 keeps native a frozen opt-in fallback in prod); the bench stack opts
+        # in so native runs the SAME through-NS routing + POST /v1/code-graph/index
+        # path as cbm/graphify-lib for a clean apples-to-apples comparison.
+        #
+        # Like graphify-lib, NativeEngine is per-code_space: this entry is a
+        # CAPABILITY placeholder (code_space="__registry_capability__"; real
+        # per-space instances are built by the query.py factory on demand). Its
+        # __init__ is lazy (no Neo4j at construction), so the placeholder is safe
+        # to build at import even when Neo4j is down.
+        native_enabled = os.getenv("CODE_NATIVE_ENABLED", "false").lower() == "true"
+        if native_enabled:
+            try:
+                from adapters.code_graph.native_engine import NativeEngine
+                from knowledge.code_system import CodeKnowledgeSystem
+
+                try:
+                    from config import settings as _ns_settings
+                except Exception:  # noqa: BLE001 — settings optional for placeholder
+                    _ns_settings = None
+
+                native_capability_engine = NativeEngine(
+                    repo_path="",  # never used; real instances built by factory
+                    code_space="__registry_capability__",
+                    bridge=None,
+                    settings=_ns_settings,
+                    driver=None,
+                )
+                native_system = CodeKnowledgeSystem(
+                    name="code-native",
+                    engine=native_capability_engine,
+                    # NativeEngine supports every op (symbol_lookup via locate,
+                    # neighbors, path, blast_radius via impact, query, index).
+                    capabilities=frozenset(
+                        {"query", "neighbors", "path", "locate", "impact", "index"}
+                    ),
+                    transport="in-process",
+                    version=None,
+                )
+                register_system(native_system)
+                logger.info(
+                    "Registered code-native system (CODE_NATIVE_ENABLED=true; frozen fallback)"
+                )
+            except Exception as e:
+                logger.warning("NativeEngine registration failed: %s", e)
+        else:
+            logger.info(
+                "code-native not enabled (set CODE_NATIVE_ENABLED=true to enable "
+                "the frozen native engine as a first-class code system)"
+            )
+
     else:
         logger.info(
             "code-graph extra not installed; code systems unavailable "

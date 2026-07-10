@@ -23,10 +23,34 @@ in-process, MCP-bridge, or HTTP.
 from __future__ import annotations
 
 import logging
+import re
 
 from knowledge.base import SystemAnswer
 
 logger = logging.getLogger(__name__)
+
+# A dotted FQN-shaped token: >=2 identifier segments joined by dots
+# (e.g. ``click.core.Command``, ``src.click.core.Command``,
+# ``tests.test_options.test_x``). Used only as a content fallback for
+# extract_fqns_from_code_answer.
+_FQN_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+\b")
+# Bound the content-derived FQN list so a large traversal answer can't build an
+# unbounded MatchAny filter for the batched anchor join.
+_MAX_CONTENT_FQNS = 60
+# Echo/status line prefixes (lowercased) that echo the QUESTION rather than a hit.
+# The content fallback must NOT harvest FQNs from these, or a query token would
+# anchor-join even when the engine resolved nothing (the "echo-join" defect).
+_ECHO_PREFIXES = (
+    "code graph search results for:",  # native query header echoes the question
+    "no symbols matching",             # native/cbm miss echoes the question
+    "symbols matching ",               # cbm hit header echoes the question (FQNs follow)
+    "neighbors of",                    # neighbors header echoes the label
+    "no neighbors",
+    "no path",
+    "no node",
+    "traversal:",                      # graphify BFS header echoes Start seeds
+    "start:",
+)
 
 
 def compose_fusion_answer(
@@ -93,20 +117,67 @@ def compose_fusion_answer(
     return "\n".join(sections)
 
 
-def extract_fqns_from_code_answer(code_answer: SystemAnswer) -> list[str]:
-    """Extract FQN list from a code system's structured hits.
+def extract_fqns_from_code_answer(code_answer: SystemAnswer, query: str | None = None) -> list[str]:
+    """Extract the FQN list to drive the batched anchor join.
+
+    Preference order:
+      1. Structured ``.hits`` with an ``fqn`` field (locate/neighbors/impact ops).
+      2. **Content fallback** (Phase G-final GF2): the fusion code leg runs the
+         ``query`` op, whose ``CodeKnowledgeSystem`` rendering is text-only
+         (``hits=None``). Without this the flagship "who calls X and why is it
+         like this" flow could never populate the ``[semantics]`` section live —
+         the anchor join had no FQNs to join on. We parse dotted FQN-shaped
+         tokens out of the rendered content, but ONLY from genuine hit/traversal
+         lines: echo/status header lines (``_ECHO_PREFIXES``) are skipped, and
+         (when ``query`` is provided) tokens whose lowercase appears verbatim in
+         the query are excluded. Together these kill the "echo-join" — a query
+         token like ``Command.invoke`` echoed in a *miss* header must NOT anchor
+         when the engine resolved nothing. This is a format-only reader, NOT
+         engine intelligence; bounded to ``_MAX_CONTENT_FQNS``.
 
     Args:
-        code_answer: SystemAnswer from a code system with .hits (structured).
+        code_answer: SystemAnswer from a code system.
+        query: The originating query, for echo exclusion (recommended). When
+            None, only header-line skipping guards against the echo.
 
     Returns:
-        List of FQNs found in the answer's hits.
+        De-duplicated FQN list (structured hits first; else content-derived).
     """
-    fqns = []
+    fqns: list[str] = []
+    seen: set[str] = set()
     if code_answer.hits:
         for hit in code_answer.hits:
             if isinstance(hit, dict) and "fqn" in hit:
-                fqns.append(hit["fqn"])
+                f = hit["fqn"]
+                if f and f not in seen:
+                    seen.add(f)
+                    fqns.append(f)
+
+    if not fqns and getattr(code_answer, "content", None):
+        q_low = (query or "").lower()
+        for line in code_answer.content.split("\n"):
+            stripped = line.strip()
+            low = stripped.lower()
+            # Skip echo/status headers — they carry the question, not a hit.
+            if any(low.startswith(p) for p in _ECHO_PREFIXES):
+                continue
+            for m in _FQN_RE.findall(stripped):
+                # File paths (``foo.py``) are not symbols — skip them.
+                if m.endswith((".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java")):
+                    continue
+                # Echo guard: a token that appears verbatim in the query is the
+                # user's own phrasing echoed back, not a resolved code hit.
+                if q_low and m.lower() in q_low:
+                    continue
+                if m not in seen:
+                    seen.add(m)
+                    fqns.append(m)
+                if len(fqns) >= _MAX_CONTENT_FQNS:
+                    logger.debug(
+                        "extract_fqns: content FQN cap (%d) reached; truncating",
+                        _MAX_CONTENT_FQNS,
+                    )
+                    return fqns
     return fqns
 
 
@@ -136,7 +207,6 @@ def batched_anchor_lookup(
     """
     from memory_service import get_shared_service
     from qdrant_client.models import FieldCondition, Filter, MatchAny
-    import numpy as np
 
     if not fqns:
         return {}
@@ -159,23 +229,25 @@ def batched_anchor_lookup(
         ]
         query_filter = Filter(must=must)
 
-        # Use a dummy embedding for the query (we're filtering by source_ref, not semantic)
-        # Handle mocks/tests where embedding_model may not be set up
-        try:
-            vector_size = len(m.embedding_model.embed("test", memory_action="search"))
-        except (AttributeError, Exception):
-            # Fallback for tests: use a default vector size (768 for Gemini)
-            vector_size = 768
-        dummy_vector = np.zeros(vector_size).tolist()
-
-        result = client.query_points(
+        # Phase G-final (GF2): use scroll (filter-only, NO query vector) rather
+        # than query_points with a throwaway zero vector. The anchor join filters
+        # purely by source_ref.external_id — similarity ordering is meaningless
+        # here — so scroll is the right primitive. This also removes a live
+        # embedding_model.embed("test") call that was being made on EVERY fused
+        # recall solely to learn the vector dimension (~400 ms per call, the
+        # dominant fused-leg overhead the GF2 probe measured; the plan predicted
+        # ~20-40 ms for the join itself). scroll returns (points, next_offset).
+        scroll_result = client.scroll(
             collection_name=m.vector_store.collection_name,
-            query=dummy_vector,
-            query_filter=query_filter,
+            scroll_filter=query_filter,
             limit=len(anchor_keys) * limit_per_anchor * 2,  # over-fetch for post-filter
             with_payload=True,
+            with_vectors=False,  # Copilot: payload-only join — don't ship vectors
         )
-        hits = list(getattr(result, "points", result) or [])
+        if isinstance(scroll_result, tuple):
+            hits = list(scroll_result[0] or [])
+        else:  # tolerate mocks that return a bare iterable
+            hits = list(getattr(scroll_result, "points", scroll_result) or [])
 
         # Group results by anchor key and apply visibility post-filter
         memories_by_anchor: dict[str, list[dict]] = {key: [] for key in anchor_keys}

@@ -543,3 +543,40 @@ class TestCodeKnowledgeSystemDispatch:
             # Unregister so it doesn't leak into other tests.
             KNOWLEDGE_REGISTRY.pop("code-mock", None)
         assert get_system("code-mock") is None
+
+
+def test_code_native_registers_under_flag(monkeypatch):
+    """Phase G-final (GF3): code-native is a first-class system when the flag is on.
+
+    Default-OFF (frozen fallback per LOCKED decision #1); CODE_NATIVE_ENABLED=true
+    registers it as a capability placeholder with all ops, in-process transport,
+    healthy (its __init__ is lazy so no Neo4j needed at construction).
+    """
+    from adapters.code_graph import code_graph_available
+
+    if not code_graph_available():
+        import pytest
+
+        pytest.skip("code-graph extra not installed")
+
+    import importlib
+
+    import knowledge
+    from knowledge.registry import KNOWLEDGE_REGISTRY
+
+    monkeypatch.setenv("CODE_NATIVE_ENABLED", "true")
+    try:
+        importlib.reload(knowledge)
+        sysn = knowledge.get_system("code-native")
+        assert sysn is not None
+        assert sysn.info.transport == "in-process"
+        assert {"neighbors", "path", "locate", "impact", "index", "query"}.issubset(
+            sysn.info.capabilities
+        )
+        assert sysn.health().status == "ok"
+    finally:
+        KNOWLEDGE_REGISTRY.pop("code-native", None)
+        monkeypatch.delenv("CODE_NATIVE_ENABLED", raising=False)
+        importlib.reload(knowledge)  # restore default registry (no code-native)
+
+    assert knowledge.get_system("code-native") is None

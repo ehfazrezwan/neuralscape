@@ -114,7 +114,7 @@ def test_extract_fqns_from_code_answer():
 
 
 def test_extract_fqns_from_code_answer_no_hits():
-    """Extract FQNs when answer has no hits."""
+    """Extract FQNs when answer has no hits and no FQN-shaped tokens."""
     code_answer = SystemAnswer(
         system_name="code-native",
         content="text only answer",
@@ -124,6 +124,71 @@ def test_extract_fqns_from_code_answer_no_hits():
     fqns = extract_fqns_from_code_answer(code_answer)
 
     assert fqns == []
+
+
+def test_extract_fqns_content_fallback_query_op():
+    """Phase G-final GF2: query-op answers carry no hits — parse FQNs from content.
+
+    The fusion code leg runs the query op (hits=None); without a content fallback
+    the batched anchor join never fires. Dotted FQN-shaped tokens are extracted;
+    file paths are skipped.
+    """
+    code_answer = SystemAnswer(
+        system_name="code-native",
+        content=(
+            "Code graph search results for: Command\n\n"
+            "click.core.Command (class) in src/click/core.py:956\n"
+            "click.core.BaseCommand (class) in src/click/core.py:900\n"
+        ),
+        hits=None,
+    )
+    fqns = extract_fqns_from_code_answer(code_answer)
+    assert "click.core.Command" in fqns
+    assert "click.core.BaseCommand" in fqns
+    # File paths (core.py) must NOT be treated as FQNs.
+    assert not any(f.endswith(".py") for f in fqns)
+
+
+def test_extract_fqns_no_echo_join_on_miss():
+    """GF2 echo-join guard: a MISS header echoing the query must NOT anchor.
+
+    Native/CBM echo the question in the miss/header lines; harvesting FQNs from
+    those would join on a symbol the engine never resolved. Header lines are
+    skipped AND query-echoed tokens are excluded.
+    """
+    # Native "no symbols" miss echoing the query -> zero FQNs.
+    miss = SystemAnswer(
+        system_name="code-native",
+        content="No symbols matching 'Command.invoke()' found in code--x.",
+        hits=None,
+    )
+    assert extract_fqns_from_code_answer(miss, query="Command.invoke()") == []
+
+    # A real hit line survives, but the echoed query token is still excluded.
+    hit = SystemAnswer(
+        system_name="code-native",
+        content=(
+            "Code graph search results for: Command.invoke()\n\n"
+            "click.core.Command.invoke (method) in src/click/core.py:1400\n"
+        ),
+        hits=None,
+    )
+    fqns = extract_fqns_from_code_answer(hit, query="Command.invoke()")
+    # The module-qualified FQN from the hit line survives...
+    assert "click.core.Command.invoke" in fqns
+    # ...but the bare echoed token does not.
+    assert "Command.invoke" not in fqns
+
+
+def test_extract_fqns_hits_take_precedence_over_content():
+    """Structured hits win; the content fallback only fires when hits are empty."""
+    code_answer = SystemAnswer(
+        system_name="code-cbm",
+        content="unrelated.module.symbol mentioned in prose",
+        hits=[{"fqn": "click.core.Command", "kind": "class"}],
+    )
+    fqns = extract_fqns_from_code_answer(code_answer)
+    assert fqns == ["click.core.Command"]
 
 
 def test_batched_anchor_lookup_single_query():
@@ -165,7 +230,8 @@ def test_batched_anchor_lookup_single_query():
                 }
             ),
         ]
-        mock_client.query_points.return_value = mock_result
+        # GF2: batched_anchor_lookup now uses scroll (filter-only) → (points, offset)
+        mock_client.scroll.return_value = (mock_result.points, None)
 
         # Call batched_anchor_lookup with 3 FQNs
         def mock_to_canonical(fqn):
@@ -179,12 +245,14 @@ def test_batched_anchor_lookup_single_query():
             limit_per_anchor=3,
         )
 
-        # CRITICAL ASSERTION: query_points called EXACTLY ONCE (batched query)
-        assert mock_client.query_points.call_count == 1
+        # CRITICAL ASSERTION: scroll called EXACTLY ONCE (batched query), and NO
+        # embedding call was made just to size a dummy vector (GF2 fix).
+        assert mock_client.scroll.call_count == 1
+        assert mock_m.embedding_model.embed.call_count == 0
 
         # Verify the filter had all 3 anchor keys in MatchAny
-        call_args = mock_client.query_points.call_args
-        query_filter = call_args.kwargs["query_filter"]
+        call_args = mock_client.scroll.call_args
+        query_filter = call_args.kwargs["scroll_filter"]
         match_any_condition = query_filter.must[0].match
         assert len(match_any_condition.any) == 3
         assert "click::click.core.CommandCollection" in match_any_condition.any
@@ -261,7 +329,7 @@ def test_batched_anchor_lookup_visibility_preserved():
                 }
             ),
         ]
-        mock_client.query_points.return_value = mock_result
+        mock_client.scroll.return_value = (mock_result.points, None)
 
         result = batched_anchor_lookup(
             fqns=["Foo"],
