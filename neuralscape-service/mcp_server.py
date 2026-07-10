@@ -224,13 +224,13 @@ async def list_tools() -> list[Tool]:
                     "knowledge_system": {
                         "type": "string",
                         "description": (
-                            "EXPERIMENTAL (not yet fully implemented in Phase D-F; full through-NS "
-                            "routing is Phase G). Optional explicit knowledge system override. "
-                            "Registered system names: 'ns-memory' (base, always available), "
-                            "'code-cbm', 'code-native', etc. Currently logged for debugging but "
-                            "does not change recall behavior (fusion defaults to router decision). "
-                            "Omit to use the deterministic router (project config + signal-based "
-                            "classification). Phase G will wire explicit routing for all surfaces."
+                            "Optional explicit knowledge-system override (additive). Registered "
+                            "system names: 'ns-memory' (base, always available), 'code-cbm', "
+                            "'code-graphify-lib', 'code-native'. When given, routing dispatches "
+                            "explicitly to that system (layer-1 override); omit to use the "
+                            "deterministic router (project config + coding-signal classification). "
+                            "Generic recall stays base-only unless a coding signal + indexed code "
+                            "system warrant a fusion leg."
                         ),
                     },
                 },
@@ -1185,11 +1185,11 @@ _CODE_GRAPH_COMMON_PROPS = {
     "knowledge_system": {
         "type": "string",
         "description": (
-            "EXPERIMENTAL (not yet fully implemented; full through-NS routing is Phase G). "
-            "Optional explicit knowledge system override. Registered code systems: "
-            "'code-cbm', 'code-native', 'code-graphify-lib', etc. Currently logged for "
-            "debugging but code tools still dispatch via the legacy graph_id path (backward "
-            "compat). Phase G will wire explicit routing through the knowledge system seam."
+            "Optional explicit code system override (additive). Registered code systems: "
+            "'code-cbm', 'code-graphify-lib', 'code-native'. When given (together with "
+            "graph_id as the code_space), the tool dispatches to that engine via the "
+            "knowledge-system seam; omit to use the legacy graph_id ref-shape path "
+            "(native/graphify-json). Mirrors the REST /v1/code-graph tools."
         ),
     },
 }
@@ -1303,6 +1303,28 @@ def _code_graph_tools() -> list[Tool]:
                 "required": ["symbol"],
             },
         ),
+        Tool(
+            name="code_graph_index",
+            description=(
+                "Phase G: index a repository INTO a code knowledge system through "
+                "Neuralscape (async). Enqueues on the ingest queue and returns a "
+                "task_id to poll via the memory status endpoint. Once complete, the "
+                "corpus is queryable via the code tools with knowledge_system set. "
+                "Records repo_sha/indexed_at/engine_version per code_space, sets the "
+                "project's routing config, and runs the external-engine liveness diff."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo_source": {"type": "string", "description": "Absolute path (or ref) of the repo to index"},
+                    "system": {"type": "string", "description": "Target code system: code-cbm | code-graphify-lib | code-native"},
+                    "project_id": {"type": "string", "description": "Project scope; sets routing config so later recalls route to this engine"},
+                    "code_space": {"type": "string", "description": "Explicit code_space (code--owner--repo); default derived from user_id + repo basename"},
+                    "user_id": {"type": "string", "description": "Caller user ID (optional under token auth)"},
+                },
+                "required": ["repo_source", "system"],
+            },
+        ),
     ]
 
 
@@ -1367,36 +1389,46 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             # section from "No graph loaded" or a placeholder — that would flip
             # recall_memories output from JSON to fused text for every project_id +
             # coding query, regressing the production API.
+            # Phase G: resolve REAL per-code_space engines (not the registry
+            # capability placeholders). The project's routing config carries the
+            # code_space the code system indexed; bind an engine to it via the
+            # code_dispatch seam. Without a code_space we cannot serve a real code
+            # answer — skip fusion so recall output stays byte-identical (the M1
+            # hardening invariant: never compose from a placeholder / empty engine).
             code_systems_list = []
             if route_decision.wants_code_fusion and arguments.get("project_id"):
+                from knowledge.code_dispatch import resolve_bound_code_system
                 from knowledge.registry import get_system
+                from knowledge.router import get_project_config
 
+                _proj_cfg = get_project_config(arguments.get("project_id"))
+                _cfg_code_space = getattr(_proj_cfg, "code_space", None) if _proj_cfg else None
                 for _name in route_decision.code_system_names:
-                    _cand = get_system(_name)
-                    if _cand is not None and _cand.health().status == "ok":
-                        # M1 FIX: filter out capability placeholders / empty engines.
-                        # A code system is eligible for fusion ONLY if it has a REAL
-                        # indexed engine for this project (not "__registry_capability__"
-                        # or an unindexed engine with G=None).
-                        engine = getattr(_cand, "_engine", None)
-                        if engine is not None:
-                            code_space = getattr(engine, "code_space", None)
-                            # Skip capability placeholders (code_space marker)
-                            if code_space == "__registry_capability__":
-                                logger.debug(
-                                    "Skipping %s: capability placeholder (no indexed graph)",
-                                    _name,
-                                )
-                                continue
-                            # Skip engines with no loaded graph (G=None)
-                            if hasattr(engine, "G") and engine.G is None:
-                                logger.debug(
-                                    "Skipping %s: no graph loaded for project %s",
-                                    _name,
-                                    arguments.get("project_id"),
-                                )
-                                continue
-                        code_systems_list.append(_cand)
+                    # Prefer the registered system's own code_space when it's a
+                    # real (pre-bound) entry; otherwise use the project config's
+                    # code_space to bind a per-space engine to the placeholder.
+                    _reg = get_system(_name)
+                    _reg_eng = getattr(_reg, "_engine", None) if _reg else None
+                    _reg_cs = getattr(_reg_eng, "code_space", None) if _reg_eng else None
+                    _bind_cs = (
+                        _reg_cs if _reg_cs and _reg_cs != "__registry_capability__"
+                        else (_cfg_code_space or "")
+                    )
+                    _cand = resolve_bound_code_system(_name, _bind_cs, user_id, settings)
+                    if _cand is None:
+                        logger.debug("Skipping %s: could not bind engine (code_space=%r)",
+                                     _name, _bind_cs)
+                        continue
+                    if _cand.health().status != "ok":
+                        logger.debug("Skipping %s: unhealthy", _name)
+                        continue
+                    # Guard (M1 invariant): an engine with no loaded graph can't serve —
+                    # never compose a [structure] section from an empty/placeholder engine.
+                    _eng = getattr(_cand, "_engine", None)
+                    if _eng is not None and hasattr(_eng, "G") and _eng.G is None:
+                        logger.debug("Skipping %s: no graph loaded", _name)
+                        continue
+                    code_systems_list.append(_cand)
 
             if code_systems_list:
                 # Fusion path: run the code leg CONCURRENTLY with the base legs
@@ -2053,6 +2085,38 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps(
                 {"status": "accepted", "task_id": task_id}))]
 
+        elif name == "code_graph_index":
+            # Phase G: through-NS index trigger (MCP twin of POST /v1/code-graph/index).
+            from adapters.code_graph import _MISSING_EXTRA_MSG, code_graph_available
+
+            if not code_graph_available():
+                return [TextContent(type="text", text=json.dumps({"error": _MISSING_EXTRA_MSG}))]
+            repo_source = arguments.get("repo_source")
+            system = arguments.get("system")
+            if not repo_source or not system:
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": "repo_source and system are required"}))]
+            code_space = arguments.get("code_space")
+            if not code_space:
+                from pathlib import Path as _P
+
+                repo_name = _P(str(repo_source).rstrip("/")).name or "repo"
+                code_space = f"code--{user_id}--{repo_name}"
+            task_id = await _task_manager.enqueue_code_index({
+                "system": system,
+                "repo_source": repo_source,
+                "code_space": code_space,
+                "project_id": arguments.get("project_id"),
+                "user_id": user_id,
+            })
+            return [TextContent(type="text", text=json.dumps({
+                "status": "accepted",
+                "task_id": task_id,
+                "poll_url": f"/v1/memories/status/{task_id}",
+                "code_space": code_space,
+                "system": system,
+            }))]
+
         elif name in ("query_code_graph", "get_code_neighbors", "code_path", "locate", "code_impact"):
             # NS-surface delegations to the code-graph adapter (roadmap F2:
             # the interaction interface is ALWAYS Neuralscape). Availability-
@@ -2100,6 +2164,53 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 route_decision.rationale,
                 route_decision.layer,
             )
+
+            # Phase G: when the caller gives an explicit knowledge_system, dispatch
+            # through the bound engine's system.recall() (mirrors the REST twins).
+            # graph_id carries the code_space. Omit → legacy query.py path below.
+            explicit_system = arguments.get("knowledge_system")
+            if explicit_system:
+                code_space = arguments.get("graph_id")
+                operation = operation_map.get(name)
+                if not code_space:
+                    return [TextContent(type="text", text=json.dumps(
+                        {"error": "knowledge_system requires graph_id (the code_space)"}))]
+                resolved = route_decision.systems[0] if route_decision.systems else None
+                if resolved is None or resolved.info.name != explicit_system:
+                    return [TextContent(type="text", text=json.dumps({"error": (
+                        f"knowledge_system '{explicit_system}' unavailable or does not "
+                        f"support '{operation}' ({route_decision.rationale})")}))]
+                from knowledge.base import RecallRequest
+                from knowledge.code_dispatch import resolve_bound_code_system
+
+                bound = resolve_bound_code_system(explicit_system, code_space, user_id, settings)
+                if bound is None:
+                    return [TextContent(type="text", text=json.dumps({"error": (
+                        f"could not bind engine for '{explicit_system}' at code_space "
+                        f"'{code_space}'")}))]
+                creq = RecallRequest(
+                    query=(arguments.get("question") or arguments.get("query")
+                           or arguments.get("label") or arguments.get("source")
+                           or arguments.get("symbol") or "code"),
+                    user_id=user_id,
+                    operation=operation,
+                    label=arguments.get("label") or arguments.get("symbol"),
+                    source=arguments.get("source"),
+                    target=arguments.get("target"),
+                    mode=arguments.get("mode", "bfs"),
+                    depth=arguments.get("depth", 3),
+                    limit=arguments.get("k", 10),
+                )
+                try:
+                    answer = await asyncio.to_thread(bound.recall, creq)
+                except EngineCapabilityError as e:
+                    return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+                except Exception as e:  # noqa: BLE001
+                    return [TextContent(type="text", text=json.dumps({"error": f"{name} failed: {e}"}))]
+                if name == "locate":
+                    return [TextContent(type="text", text=json.dumps(
+                        answer.hits or [], default=str, ensure_ascii=False))]
+                return [TextContent(type="text", text=answer.content)]
 
             try:
                 if name == "query_code_graph":

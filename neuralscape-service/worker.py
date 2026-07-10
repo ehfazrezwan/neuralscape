@@ -777,6 +777,136 @@ async def process_ingest_okf_bundle(ctx: dict, payload: dict) -> dict:
     return {"filename": filename, **result}
 
 
+async def process_code_index(ctx: dict, payload: dict) -> dict:
+    """Phase G: index a repo INTO a code knowledge system through NS.
+
+    ``payload`` = ``{system, repo_source, code_space, project_id, user_id}``.
+
+    Runs on the ingest queue (PLAN §5: uniform observability + 202-task
+    semantics; CBM's ~1.3s doesn't need the queue but the rail/observability do).
+    Steps:
+      1. Resolve the real per-code_space engine for ``system`` and call
+         ``engine.index(repo_source)``.
+      2. Record ``{repo_sha, indexed_at, engine_version, symbols, edges}`` per
+         code_space and set the project routing config (``code_systems`` /
+         ``default_engine``) so later recalls route to the indexed engine.
+      3. Run the external-engine liveness diff → the existing dreaming consumer
+         (``detect_inventory_diff_liveness``): real events for engines that can
+         enumerate symbols (graphify/native), honest graceful N/A for CBM.
+
+    Idempotent: re-indexing the same code_space overwrites metadata + reindexes
+    the backend (CBM full re-index; graphify rebuild; native incremental).
+    """
+    import time
+
+    from adapters.code_graph import code_graph_available
+    from knowledge.code_dispatch import repo_path_for_code_space, resolve_code_engine
+
+    service: MemoryService = ctx["service"]
+    system = payload["system"]
+    repo_source = payload["repo_source"]
+    code_space = payload["code_space"]
+    project_id = payload.get("project_id")
+    user_id = payload.get("user_id") or settings.default_user_id
+
+    if not code_graph_available():
+        return {"ok": False, "error": "code-graph extra not installed", "code_space": code_space}
+
+    engine = resolve_code_engine(system, code_space, user_id, settings, for_index=True)
+    if engine is None:
+        return {
+            "ok": False,
+            "error": f"could not resolve engine for system={system!r} code_space={code_space!r} "
+                     "(repo not in CODE_REPOS / bridge down)",
+            "code_space": code_space,
+            "system": system,
+        }
+
+    # 1. Index.
+    report = await asyncio.to_thread(engine.index, repo_source, incremental=False)
+    symbols = getattr(report, "symbols_indexed", 0)
+    edges = getattr(report, "edges_indexed", 0)
+    files = getattr(report, "files_indexed", 0)
+    duration_s = getattr(report, "duration_s", 0.0)
+    engine_version = getattr(report, "system_version", None)
+
+    # 2. Record metadata + set routing config.
+    repo_sha = await asyncio.to_thread(_git_head_sha, repo_source)
+    indexed_at = time.time()
+    from knowledge import index_store
+    from knowledge.router import ProjectKnowledgeConfig, set_project_config
+
+    meta = {
+        "system": system,
+        "repo_source": repo_source,
+        "repo_sha": repo_sha,
+        "indexed_at": indexed_at,
+        "engine_version": engine_version,
+        "symbols": symbols,
+        "edges": edges,
+        # CBM binds its project slug from the bridge on read; stash it if known.
+        "cbm_project": getattr(engine, "project", None),
+    }
+    await asyncio.to_thread(index_store.record_index, code_space, meta)
+    if project_id:
+        await asyncio.to_thread(
+            set_project_config,
+            ProjectKnowledgeConfig(
+                project_id=project_id,
+                code_systems=[system],
+                fuse_code_into_recall=True,
+                default_engine=system,
+                code_space=code_space,
+            ),
+        )
+
+    # 3. External-engine liveness diff → dreaming consumer (best-effort).
+    liveness = {"events": [], "flagged": 0, "summary": "skipped"}
+    try:
+        from extensions.dreaming.liveness import detect_inventory_diff_liveness
+
+        liveness = await asyncio.to_thread(
+            detect_inventory_diff_liveness, service, code_space, engine
+        )
+    except Exception as e:  # noqa: BLE001 — liveness is best-effort, never fails an index
+        logger.warning("Inventory-diff liveness failed for %s (non-fatal): %s", code_space, e)
+        liveness = {"events": [], "flagged": 0, "summary": f"liveness error: {e}"}
+
+    logger.info(
+        "Through-NS index complete: system=%s code_space=%s symbols=%d edges=%d in %.2fs",
+        system, code_space, symbols, edges, duration_s,
+    )
+    return {
+        "ok": True,
+        "code_space": code_space,
+        "system": system,
+        "symbols_indexed": symbols,
+        "edges_indexed": edges,
+        "files_indexed": files,
+        "duration_s": duration_s,
+        "engine_version": engine_version,
+        "repo_sha": repo_sha,
+        "indexed_at": indexed_at,
+        "liveness": {"flagged": liveness.get("flagged", 0), "summary": liveness.get("summary", "")},
+    }
+
+
+def _git_head_sha(repo_path: str) -> str | None:
+    """Best-effort ``git rev-parse HEAD`` for staleness stamping (None if git-less)."""
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["git", "-C", repo_path, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode == 0:
+            return out.stdout.strip() or None
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 async def process_graph_enrichment(
     ctx: dict,
     memory_id: str,
@@ -1436,6 +1566,7 @@ class IngestWorkerSettings:
         process_ingest_file,
         process_ingest_okf_bundle,
         process_connector_sync,
+        process_code_index,
     ]
     cron_jobs = [
         cron(
