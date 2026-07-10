@@ -313,16 +313,39 @@ async def search_graph(req: SearchGraphRequest) -> SearchGraphResponse:
 
 @app.post("/trace_path", response_model=TracePathResponse)
 async def trace_path(req: TracePathRequest) -> TracePathResponse:
-    """Trace call relationships (neighbors: callers + callees)."""
-    result = await cbm_manager.call_tool(
-        "trace_path",
-        {
-            "project": req.project,
-            "function_name": req.function_name,
-            "direction": req.direction,
-            "depth": req.depth,
-        },
-    )
+    """Trace call relationships (neighbors: callers + callees).
+
+    Contract (R-B): a per-symbol trace failure is a NOT-FOUND, not a bridge
+    fault. CBM's CLI exits non-zero for symbols it can't trace (unknown /
+    uncallable function names — 13/60 in the engine comparison), which
+    ``call_tool`` surfaces as HTTP 500. That is the wrong contract for a
+    neighbors lookup: an unknown symbol simply has no neighbors. So we
+    soft-degrade a 500 here to an EMPTY result (200, no callers/callees) — the
+    honest N/A the caller expects — while genuine infra faults (timeout → 504)
+    still propagate. This keeps `/trace_path` from ever 500-ing on a symbol.
+    """
+    try:
+        result = await cbm_manager.call_tool(
+            "trace_path",
+            {
+                "project": req.project,
+                "function_name": req.function_name,
+                "direction": req.direction,
+                "depth": req.depth,
+            },
+        )
+    except HTTPException as e:
+        # 500 = CBM CLI failed on this symbol → treat as "no neighbors" (empty).
+        # 504 (timeout) / other statuses are real faults → propagate unchanged.
+        if e.status_code == 500:
+            logger.warning(
+                "trace_path soft-degrade to empty for %r (project=%s): %s",
+                req.function_name, req.project, e.detail,
+            )
+            return TracePathResponse(
+                function=req.function_name, direction=req.direction
+            )
+        raise
     return TracePathResponse(
         function=result.get("function", req.function_name),
         direction=result.get("direction", req.direction),

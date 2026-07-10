@@ -128,7 +128,9 @@ class CodeKnowledgeSystem:
           - "neighbors" → engine.neighbors(label, relation_filter)
           - "path" → engine.path(source, target, max_hops)
           - "locate" → engine.locate(query, k)
-          - "impact" → engine.detect_changes() (Phase E)
+          - "impact" → engine.blast_radius(seed) if present (native's symbol
+            BFS), else engine.detect_changes(since=<seed str>) (graphify's
+            affected_nodes). NOT native's git-state detect_changes — see below.
 
         Raises EngineCapabilityError if the operation isn't in the system's
         declared capabilities (honest N/A).
@@ -193,10 +195,32 @@ class CodeKnowledgeSystem:
                 )
 
             elif op == "impact":
-                # impact = blast radius: detect_changes(seed) → ChangeReport.
-                # Seed symbol comes from label/source/query (first non-empty).
-                # This is Phase F's "affected powers impact" deliverable.
+                # impact = symbol-seeded blast radius. This is DISTINCT from
+                # detect_changes ("what changed since a git ref"): seeding a
+                # git-state engine with a *symbol* raises (native's
+                # detect_changes only accepts None/bytes → the R-A 500). So
+                # prefer the engine's dedicated symbol blast-radius method
+                # (native's BFS over CALLS/IMPORTS → text) when it exists, and
+                # only fall back to detect_changes(since=<symbol str>) for
+                # engines that model blast radius that way (graphify's
+                # affected_nodes overloads a str seed). detect_changes with
+                # git-state (None/bytes) stays a distinct engine op, not reached
+                # here — impact never conflates the two.
                 seed = req.label or req.source or req.query
+                blast = getattr(self._engine, "blast_radius", None)
+                if callable(blast):
+                    content = blast(seed, max_hops=req.max_hops or 4)
+                    return SystemAnswer(
+                        system_name=self.info.name,
+                        system_version=self._version,
+                        content=content,
+                        hits=None,  # native blast_radius renders file:line text
+                        metadata={
+                            "operation": op,
+                            "seed": seed,
+                            "mode": "symbol_blast_radius",
+                        },
+                    )
                 report = self._engine.detect_changes(since=seed)
                 # ChangeReport is a dataclass — surface the blast-radius symbols
                 # (modified_symbols) as structured hits + a text rendering.

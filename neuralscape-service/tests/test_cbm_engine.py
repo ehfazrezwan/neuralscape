@@ -128,6 +128,32 @@ class TestCBMEngine:
         engine = CBMEngine(bridge_url="http://localhost:8200", project="test-project")
         assert "No neighbors found" in engine.neighbors("lonely")
 
+    @patch("adapters.code_graph.cbm_engine.httpx.Client.post")
+    def test_neighbors_degrades_to_empty_on_bridge_500(self, mock_post):
+        """R-B: a bridge/CBM failure on a symbol degrades to honest N/A, never a raise.
+
+        Even if an older bridge image still 500s on an untraceable symbol
+        (`raise_for_status` → HTTPStatusError → RuntimeError in `_call_bridge`),
+        neighbors() must return an empty "No neighbors" answer rather than
+        propagating the error to the recall caller (PLAN §3.3: the base always
+        answers; a per-symbol failure is not a recall error).
+        """
+        import httpx
+
+        r = Mock()
+        r.status_code = 500
+        request = httpx.Request("POST", "http://localhost:8200/trace_path")
+        response = httpx.Response(500, request=request, text="CBM tool trace_path failed")
+        r.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "500", request=request, response=response
+        )
+        mock_post.return_value = r
+
+        engine = CBMEngine(bridge_url="http://localhost:8200", project="test-project")
+        # Must NOT raise — degrades to empty (honest N/A).
+        result = engine.neighbors("untraceable_symbol")
+        assert "No neighbors found for 'untraceable_symbol'" in result
+
     def test_path_raises_capability_error(self):
         """path() raises EngineCapabilityError (raw Cypher is banned)."""
         engine = CBMEngine(bridge_url="http://localhost:8200", project="test-project")

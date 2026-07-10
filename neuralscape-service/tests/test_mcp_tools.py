@@ -54,6 +54,7 @@ def _code_graph_tool_names() -> set[str]:
     return {
         "query_code_graph", "get_code_neighbors", "code_path", "locate", "code_impact",
         "code_graph_index",  # Phase G: through-NS index trigger
+        "code_graph_delete",  # R-C: through-NS cold-delete twin
     }
 
 

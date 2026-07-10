@@ -1325,6 +1325,26 @@ def _code_graph_tools() -> list[Tool]:
                 "required": ["repo_source", "system"],
             },
         ),
+        Tool(
+            name="code_graph_delete",
+            description=(
+                "R-C: reset a code system's index for one code_space (true "
+                "cold-delete; MCP twin of DELETE /v1/code-graph/graph). Routes to "
+                "the engine's teardown (native: drop the code_space label-space + "
+                "symbol cards; cbm: bridge delete_project; graphify-lib: drop the "
+                "in-process graph). Scoped strictly to the code_space; NEVER "
+                "touches the memory graph or the memory↔code anchors. Idempotent."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "graph_id": {"type": "string", "description": "code_space to reset (code--owner--repo)"},
+                    "system": {"type": "string", "description": "Target code system: code-cbm | code-graphify-lib | code-native"},
+                    "user_id": {"type": "string", "description": "Caller user ID (optional under token auth)"},
+                },
+                "required": ["graph_id", "system"],
+            },
+        ),
     ]
 
 
@@ -2147,6 +2167,24 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 "code_space": code_space,
                 "system": system,
             }))]
+
+        elif name == "code_graph_delete":
+            # R-C: through-NS cold-delete (MCP twin of DELETE /v1/code-graph/graph).
+            from adapters.code_graph import _MISSING_EXTRA_MSG, code_graph_available
+
+            if not code_graph_available():
+                return [TextContent(type="text", text=json.dumps({"error": _MISSING_EXTRA_MSG}))]
+            graph_id = arguments.get("graph_id")
+            system = arguments.get("system")
+            if not graph_id or not system:
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": "graph_id and system are required"}))]
+            from knowledge.code_dispatch import teardown_code_space
+
+            result = await asyncio.to_thread(
+                teardown_code_space, system, graph_id, user_id, settings
+            )
+            return [TextContent(type="text", text=json.dumps(result))]
 
         elif name in ("query_code_graph", "get_code_neighbors", "code_path", "locate", "code_impact"):
             # NS-surface delegations to the code-graph adapter (roadmap F2:

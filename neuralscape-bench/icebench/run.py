@@ -269,6 +269,16 @@ def _run_index_op(
     saved: dict[str, bytes] = {}
     try:
         if op == "index_cold":
+            # R-C: opt-in true-cold reps. When ICE_COLD_TEARDOWN is set, reset the
+            # index before each cold rep so reps 2-3 aren't cache-warm (the
+            # through-NS index has no per-rep cold-delete otherwise). Default off
+            # so competitor/standalone runs keep their existing behavior. The
+            # last rep's index_second/query phase leaves a warm index behind.
+            if os.environ.get("ICE_COLD_TEARDOWN", "").lower() in ("1", "true", "yes"):
+                try:
+                    system.teardown(corpus)
+                except Exception as e:  # never fail the rep on cleanup
+                    print(f"    teardown-before-cold failed (continuing): {e}", file=sys.stderr)
             result = system.index_cold(corpus)
         elif op == "index_second":
             result = system.index_second(corpus)

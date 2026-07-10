@@ -340,18 +340,18 @@ class NSNativeAdapter:
 
     def teardown(self, corpus: Corpus) -> None:
         """
-        Delete the code_space's graph state (best-effort, never raises).
+        Reset the code_space's graph state so the next index rep is truly cold.
 
-        NOTE (honest): the `DELETE /v1/code-graph/graph` route is not implemented
-        server-side, so this is currently a silent no-op — the through-NS index is
-        not force-cold per rep. The trustworthy cold number is rep0 / the index
-        payload's true engine duration. Documented in the comparison report.
+        R-C: `DELETE /v1/code-graph/graph?graph_id=<code_space>&system=code-native`
+        is now implemented server-side (drops the native code label-space +
+        symbol cards; CodeAnchor + the memory graph are preserved). This makes
+        per-rep cold index measurements real. Best-effort — never raises.
         """
         code_space = self._make_code_space(corpus.name)
         try:
             self.client.delete(
                 f"{self.api_url}/v1/code-graph/graph",
-                params={"graph_id": code_space},
+                params={"graph_id": code_space, "system": _SYSTEM},
             )
         except httpx.RequestError:
             pass
