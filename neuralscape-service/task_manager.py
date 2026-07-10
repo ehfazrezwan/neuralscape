@@ -294,23 +294,20 @@ class TaskManager:
         """Phase G: enqueue a through-NS code-index task on the ingest queue.
 
         ``payload`` = ``{system, repo_source, code_space, project_id, user_id}``.
-        The job id is deterministic on (system, code_space) so re-triggering an
-        index for the same space coalesces onto one job rather than stacking
-        (idempotent re-index). Runs on the ingest queue for uniform observability
-        + 202-task semantics (PLAN §5).
+        Runs on the ingest queue for uniform observability + 202-task semantics
+        (PLAN §5). Indexing is **idempotent at the engine level** — a re-index of
+        the same code_space overwrites (CBM full re-index; graphify rebuild;
+        native incremental) — so the job id is left UNIQUE per call (ARQ-assigned)
+        rather than coalesced on (system, code_space): a completed/failed job's
+        result would otherwise be cached under a deterministic id and a later
+        re-index would return the stale result instead of re-running.
         """
-        partition = payload.get("user_id") or "ingest"
-        job_id = _generate_job_id(
-            f"code-index:{payload.get('system')}:{payload.get('code_space')}",
-            partition,
-        )
         job = await self.pool.enqueue_job(
             "process_code_index",
             payload,
-            _job_id=job_id,
             _queue_name=settings.ingest_queue_name,
         )
-        task_id = job_id if job is None else job.job_id
+        task_id = job.job_id
         await self._track_task(payload.get("user_id"), task_id)
         return task_id
 
