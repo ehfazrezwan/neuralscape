@@ -17,6 +17,11 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
 ]
+# The token-savings navigation benchmark drives a Gemini agent via google-genai.
+# Optional so the core bench stays light; install with `uv sync --extra tokensave`.
+tokensave = [
+    "google-genai>=1.0.0",
+]
 
 [build-system]
 requires = ["hatchling"]
