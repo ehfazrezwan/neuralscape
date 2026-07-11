@@ -100,6 +100,29 @@ def test_memory_tool_locate_formats_and_stashes_ranked(monkeypatch):
     assert "src/pkg/mod.py:1" in res.observation
 
 
+def test_memory_tool_symbol_lookup_parses_query_prose_envelope(monkeypatch):
+    """Regression (Fable MUST-FIX): /query returns {"result": "<prose>"}, not the
+    structured {"results": [...]} that /locate returns. The tool must parse the
+    prose and surface file:line + a ranked list for first-hop matching."""
+    mt = MemoryTool(api_url="http://x", corpus_name="small-py")
+    envelope = json.dumps({
+        "result": (
+            "Code graph search results for: alpha\n\n"
+            "src.pkg.mod.alpha (function) in src/pkg/mod.py:1\n"
+            "  Memories:\n    - [decision] keep alpha stable\n"
+        ),
+        "graph_id": "code--ice-bench--small-py",
+        "system": "code-native",
+    })
+    monkeypatch.setattr(mt, "_get", lambda e, p: (True, envelope))
+    res = mt.code_memory(op="symbol_lookup", symbol="alpha")
+    assert res.ok
+    assert res.raw["ranked"] and res.raw["ranked"][0] == ["src/pkg/mod.py", "src.pkg.mod.alpha"]
+    assert "src/pkg/mod.py:1" in res.observation  # line surfaced -> no file read needed
+    # and it first-hop-hits gold via bare-symbol normalization
+    assert first_hop_hit("symbol_lookup", res.raw, {"file": "src/pkg/mod.py", "symbol": "alpha"}, k=1)
+
+
 def test_memory_tool_requires_args():
     mt = MemoryTool(api_url="http://x", corpus_name="small-py")
     assert not mt.code_memory(op="locate").ok

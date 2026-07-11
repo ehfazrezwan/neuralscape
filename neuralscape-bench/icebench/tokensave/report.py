@@ -145,30 +145,30 @@ def to_markdown(agg: dict, meta: dict) -> str:
     base = agg.get("baseline")
     if base:
         lines.append("### Baseline (no code memory — file tools only)\n")
-        lines.append("| Op class | n | correctness | mean tokens | mean file reads | tokens/correct |")
-        lines.append("|---|---|---|---|---|---|")
+        lines.append("| Op class | n | correctness | mean tokens | median tokens | mean file reads | tokens/correct |")
+        lines.append("|---|---|---|---|---|---|---|")
         for op in OP_ORDER:
             b = base["by_op"].get(op)
             if b:
                 lines.append(
                     f"| {op} | {b['n']} | {_fmt(b['correctness'],True)} | "
-                    f"{_fmt(b['mean_tokens'])} | {b['mean_file_reads']:.1f} | "
+                    f"{_fmt(b['mean_tokens'])} | {_fmt(b['median_tokens'])} | {b['mean_file_reads']:.1f} | "
                     f"{_fmt(b['tokens_per_correct'])} |"
                 )
         o = base["overall"]
         lines.append(
             f"| **overall** | {o['n']} | {_fmt(o['correctness'],True)} | "
-            f"{_fmt(o['mean_tokens'])} | {o['mean_file_reads']:.1f} | "
+            f"{_fmt(o['mean_tokens'])} | {_fmt(o['median_tokens'])} | {o['mean_file_reads']:.1f} | "
             f"{_fmt(o['tokens_per_correct'])} |\n"
         )
 
     for arm, arm_agg in agg.get("arms", {}).items():
         lines.append(f"### With code memory — arm `{arm}`\n")
         lines.append(
-            "| Op class | n | correctness | mean tokens | first-hop@1 | first-hop@5 | "
-            "mean file reads | tokens saved | % saved |"
+            "| Op class | n | correctness | mean tokens | median tokens | first-hop@1 | first-hop@5 | "
+            "mean file reads | tokens saved (mean) | % saved |"
         )
-        lines.append("|---|---|---|---|---|---|---|---|---|")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|")
         sav = agg["savings"].get(arm, {})
         for op in OP_ORDER:
             a = arm_agg["by_op"].get(op)
@@ -177,6 +177,7 @@ def to_markdown(agg: dict, meta: dict) -> str:
             s = sav.get("by_op", {}).get(op, {})
             lines.append(
                 f"| {op} | {a['n']} | {_fmt(a['correctness'],True)} | {_fmt(a['mean_tokens'])} | "
+                f"{_fmt(a['median_tokens'])} | "
                 f"{_fmt(a['first_hop_hit_1_rate'],True)} | {_fmt(a['first_hop_hit_5_rate'],True)} | "
                 f"{a['mean_file_reads']:.1f} | {_fmt(s.get('tokens_saved'))} | "
                 f"{_fmt(s.get('pct_saved'),True)} |"
@@ -185,6 +186,7 @@ def to_markdown(agg: dict, meta: dict) -> str:
         so = sav.get("overall", {})
         lines.append(
             f"| **overall** | {o['n']} | {_fmt(o['correctness'],True)} | {_fmt(o['mean_tokens'])} | "
+            f"{_fmt(o['median_tokens'])} | "
             f"{_fmt(o['first_hop_hit_1_rate'],True)} | {_fmt(o['first_hop_hit_5_rate'],True)} | "
             f"{o['mean_file_reads']:.1f} | {_fmt(so.get('tokens_saved'))} | "
             f"{_fmt(so.get('pct_saved'),True)} |\n"

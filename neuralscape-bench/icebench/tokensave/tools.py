@@ -251,14 +251,56 @@ class MemoryTool:
                 items.append({"file": file, "symbol": sym, "line": line, "snippet": snippet})
         return items
 
+    @staticmethod
+    def _parse_query_prose(text: str) -> list[dict]:
+        """Parse the ``/v1/code-graph/query`` (symbol_lookup) envelope.
+
+        That endpoint returns ``{"result": "Code graph search results for: <q>\\n\\n
+        <fqn> (<kind>) in <file>:<line>\\n..."}`` — prose, NOT the structured
+        ``{"results": [...]}`` that ``/locate`` returns. We parse each matched line
+        into ``{file, line, symbol}`` with the SAME regex the Track-Q scorer uses
+        (score.normalize_answer), so first-hop matching stays consistent. (Without
+        this the tool fed the agent a garbled colon-split fallback — the bug Fable
+        caught that zeroed symbol_lookup first-hop.)
+        """
+        import json as _json
+        import re as _re
+
+        items: list[dict] = []
+        try:
+            parsed = _json.loads(text)
+        except (ValueError, TypeError):
+            return items
+        result = parsed.get("result", "") if isinstance(parsed, dict) else ""
+        if not result:
+            return items
+        for line in result.split("\n"):
+            line = line.strip()
+            if (not line or line.startswith("Code graph search results for:")
+                    or line.startswith("Memories") or line.startswith("- [")):
+                continue
+            m = _re.match(r"^(?P<fqn>\S+)\s+\(\w+\)\s+in\s+(?P<file>.+):(?P<line>\d+)\s*$", line)
+            if m:
+                items.append({
+                    "file": m.group("file"), "symbol": m.group("fqn"),
+                    "line": int(m.group("line")), "snippet": "",
+                })
+        return items
+
     def _format(self, op: str, text: str) -> ToolResult:
         # Lazy import so the module has no hard dependency on the scorer at import
         # time (keeps unit tests that only exercise FileTools lightweight).
         from icebench.trackq.score import _parse_ranked_results, _parse_symbol_set
 
         if op in ("locate", "symbol_lookup"):
-            ranked = _parse_ranked_results(text, system="ns-native")
-            items = self._extract_items(text)
+            if op == "locate":
+                # /locate returns structured {"results": [{fqn, file, line, ...}]}
+                ranked = _parse_ranked_results(text, system="ns-native")
+                items = self._extract_items(text)
+            else:
+                # /query (symbol_lookup) returns the {"result": "<prose>"} envelope
+                items = self._parse_query_prose(text)
+                ranked = [(it["file"], it["symbol"]) for it in items]
             top_items = items[:MEMORY_TOP_K]
             if not ranked and not top_items:
                 return ToolResult(
