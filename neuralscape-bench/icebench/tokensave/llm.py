@@ -123,6 +123,19 @@ class GeminiClient:
                 pass
         self.config = types.GenerateContentConfig(**cfg_kwargs)
 
+    def close(self) -> None:
+        """Best-effort close of the underlying genai/httpx client."""
+        try:
+            self.client.close()
+        except Exception:  # pragma: no cover - SDK variance
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
     # -- content builders (own the provider content format) ----------------- #
     def make_user_message(self, text: str):
         types = self._types

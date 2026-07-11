@@ -82,7 +82,11 @@ def _run_one(task, rep, llm, corpus, condition, api_url, knowledge_system, max_s
     dispatch = _make_dispatch(file_tools, memory_tool)
 
     t0 = time.perf_counter()
-    result = run_agent(llm, dispatch, task.prompt, max_steps=max_steps)
+    try:
+        result = run_agent(llm, dispatch, task.prompt, max_steps=max_steps)
+    finally:
+        if memory_tool is not None:
+            memory_tool.close()  # avoid HTTP client FD leaks over long runs
     latency_s = time.perf_counter() - t0
 
     ans_score = score_answer(task.op_class, result.answer, task.gold)
@@ -158,7 +162,10 @@ def main():
         tasks = tasks[: args.limit]
     logger.info("condition=%s arm=%s tasks=%d reps=%d", args.condition, args.arm, len(tasks), args.reps)
 
-    # Build the shared LLM client for this condition (tool decls + system prompt).
+    # Tool decls + system prompt for this condition. A fresh GeminiClient is
+    # built PER TASK inside the worker (below) rather than shared across the
+    # ThreadPoolExecutor — this sidesteps any question of google-genai client
+    # thread-safety and avoids shared mutable state. Client construction is cheap.
     from icebench.tokensave.llm import GeminiClient
 
     if args.condition == "memory":
@@ -171,7 +178,11 @@ def main():
     model_kwargs = {}
     if args.model:
         model_kwargs["model"] = args.model
-    llm = GeminiClient(tool_decls=tool_decls, system_instruction=system, **model_kwargs)
+
+    # Report the resolved model once (constructed and discarded — cheap).
+    _probe = GeminiClient(tool_decls=tool_decls, system_instruction=system, **model_kwargs)
+    resolved_model = _probe.model
+    _probe.close()
 
     units = [(t, rep) for t in tasks for rep in range(args.reps)]
     rows = []
@@ -180,10 +191,14 @@ def main():
     def _work(unit):
         task, rep = unit
         try:
-            row = _run_one(
-                task, rep, llm, corpus, args.condition,
-                args.api_url, args.knowledge_system, args.max_steps,
-            )
+            llm = GeminiClient(tool_decls=tool_decls, system_instruction=system, **model_kwargs)
+            try:
+                row = _run_one(
+                    task, rep, llm, corpus, args.condition,
+                    args.api_url, args.knowledge_system, args.max_steps,
+                )
+            finally:
+                llm.close()
             row["arm"] = args.arm
             return row
         except Exception as e:  # noqa: BLE001 - one task failing shouldn't kill the run
@@ -222,7 +237,7 @@ def main():
         "arm": args.arm,
         "condition": args.condition,
         "knowledge_system": args.knowledge_system if args.condition == "memory" else None,
-        "model": llm.model,
+        "model": resolved_model,
         "seed": args.seed,
         "corpus": args.corpus_name,
         "n_rows": n,

@@ -32,7 +32,7 @@ packages = ["neuralscape_bench", "icebench"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests", "icebench/tests"]
+testpaths = ["tests", "icebench/tests", "icebench/trackq/tests", "icebench/tokensave/tests"]
 
 [dependency-groups]
 dev = [

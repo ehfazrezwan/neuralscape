@@ -16,15 +16,11 @@ back to the LLM and the structured ``raw`` payload the scorer inspects (e.g. the
 ranked results a ``code_memory`` call produced, for first-hop-hit accounting).
 """
 
-import logging
-import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
-
-logger = logging.getLogger(__name__)
 
 # Keep observations bounded so a single tool call can't blow up token counts in
 # an unrealistic way (real agents face context limits too). These caps apply to
@@ -174,6 +170,19 @@ class MemoryTool:
         self.graph_id = _code_space(corpus_name)
         self.knowledge_system = knowledge_system
         self.client = httpx.Client(timeout=timeout_s)
+
+    def close(self) -> None:
+        """Close the underlying HTTP client (avoid FD leaks over long runs)."""
+        try:
+            self.client.close()
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
     # ---- REST calls ------------------------------------------------------- #
     def _get(self, endpoint: str, params: dict) -> tuple[bool, str]:
