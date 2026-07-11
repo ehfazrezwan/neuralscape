@@ -80,6 +80,7 @@ class GeminiClient:
         temperature: float = 0.0,
         seed: int = 42,
         thinking_budget: int = 0,
+        max_output_tokens: int = 8192,
         max_retries: int = DEFAULT_MAX_RETRIES,
     ):
         from google import genai
@@ -100,6 +101,11 @@ class GeminiClient:
         cfg_kwargs = dict(
             temperature=temperature,
             seed=seed,
+            # Realistic output cap: real agents don't emit tens of thousands of
+            # output tokens. Prevents rare degenerate enumeration blow-ups (e.g.
+            # listing every caller of a popular helper) from dominating token
+            # accounting. Well above any legitimate answer length.
+            max_output_tokens=max_output_tokens,
             tools=tools,
             system_instruction=system_instruction,
             # Force the model to actually call our tools rather than free-text.
