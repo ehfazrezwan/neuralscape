@@ -17,6 +17,11 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
 ]
+# The token-savings navigation benchmark drives a Gemini agent via google-genai.
+# Optional so the core bench stays light; install with `uv sync --extra tokensave`.
+tokensave = [
+    "google-genai>=1.0.0",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -27,7 +32,7 @@ packages = ["neuralscape_bench", "icebench"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests", "icebench/tests"]
+testpaths = ["tests", "icebench/tests", "icebench/trackq/tests", "icebench/tokensave/tests"]
 
 [dependency-groups]
 dev = [
