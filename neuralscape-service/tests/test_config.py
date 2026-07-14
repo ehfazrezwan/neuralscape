@@ -267,3 +267,20 @@ class TestCodeEmbedderPosture:
     def test_invalid_rejected(self):
         with pytest.raises(Exception):
             _settings(code_embedder="bogus")
+
+
+class TestNeighborsResolver:
+    """Wave 3 neighbors resolver posture: off | jedi (default jedi)."""
+
+    def test_default_is_jedi(self):
+        assert _settings().code_neighbors_resolver == "jedi"
+
+    def test_off_accepted(self):
+        assert _settings(code_neighbors_resolver="off").code_neighbors_resolver == "off"
+
+    def test_case_insensitive(self):
+        assert _settings(code_neighbors_resolver="JEDI").code_neighbors_resolver == "jedi"
+
+    def test_invalid_rejected(self):
+        with pytest.raises(Exception):
+            _settings(code_neighbors_resolver="lsp")
