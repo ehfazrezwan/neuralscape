@@ -309,9 +309,13 @@ class NativeEngine:
         return mode if mode in ("off", "local", "cloud") else "local"
 
     def _neighbors_resolver_mode(self) -> str:
-        """Resolve the neighbors call-graph resolver: "off" | "jedi" (Wave 3)."""
+        """Resolve the neighbors call-graph resolver: "off" | "jedi" | "lsp".
+
+        "jedi" (Wave 3) is in-process Jedi; "lsp" (resolver-svc mission) calls the
+        external pyright resolver service and falls back to Jedi if it is down.
+        """
         mode = getattr(self.settings, "code_neighbors_resolver", "jedi")
-        return mode if mode in ("off", "jedi") else "jedi"
+        return mode if mode in ("off", "jedi", "lsp") else "jedi"
 
     def locate(
         self,
@@ -1054,7 +1058,7 @@ class NativeEngine:
         # (the store MATCHes both endpoints, so cross-file targets must already be
         # in the graph).
         resolver_mode = self._neighbors_resolver_mode()
-        self._resolver_collect = resolver_mode == "jedi"
+        self._resolver_collect = resolver_mode in ("jedi", "lsp")
         self._pending_call_sites: dict[str, list[dict]] = {}
         symbols_by_file: dict[str, list[tuple[int, int, str]]] = {}
 
@@ -1926,18 +1930,14 @@ class NativeEngine:
         total_sites = sum(len(v) for v in sites_by_file.values())
         if not total_sites:
             return 0
-        try:
-            import jedi  # noqa: F401  — probe so a truly-missing dep warns here
-            from adapters.code_graph.code_resolve import JediCallResolver
-        except Exception:
+        resolver, provenance = self._build_call_resolver(repo_path)
+        if resolver is None:
             logger.warning(
-                "jedi resolver unavailable — neighbors stays heuristic (~0 CALLS)",
-                exc_info=True,
+                "no call resolver available — neighbors stays heuristic (~0 CALLS)",
             )
             return 0
 
         _t0 = _time.time()
-        resolver = JediCallResolver(repo_path)
         resolved: list[dict] = []
         resolved_count = 0
         for rel_path, sites in sites_by_file.items():
@@ -1973,26 +1973,70 @@ class NativeEngine:
             seen.add(key)
             uniq.append(e)
 
-        self._store_resolved_call_edges(uniq)
+        self._store_resolved_call_edges(uniq, provenance)
         logger.info(
-            "Jedi neighbors resolver: %d/%d call sites resolved to in-repo "
+            "%s neighbors resolver: %d/%d call sites resolved to in-repo "
             "symbols → %d distinct CALLS edges (%d files) in %.2fs",
-            resolved_count, total_sites, len(uniq), len(sites_by_file),
+            provenance, resolved_count, total_sites, len(uniq), len(sites_by_file),
             _time.time() - _t0,
         )
         return len(uniq)
 
+    def _build_call_resolver(self, repo_path: Path):
+        """Select the neighbors call resolver, returning ``(resolver, provenance)``.
+
+        - ``lsp``: the external pyright resolver service (resolver-svc). Probed
+          first; if unreachable we transparently fall back to in-process Jedi so a
+          down service degrades gracefully rather than dropping every edge (the
+          brief keeps Jedi as the fallback).
+        - ``jedi``: in-process Jedi.
+
+        Returns ``(None, None)`` only when neither resolver can be constructed.
+        The ``provenance`` string tags stored CALLS edges (``r.resolver``) so the
+        stale-edge cleanup and the meter reflect what actually resolved.
+        """
+        mode = self._neighbors_resolver_mode()
+        if mode == "lsp":
+            try:
+                from adapters.code_graph.code_resolve_lsp import LspCallResolver
+
+                url = getattr(
+                    self.settings, "code_resolver_url", "http://resolver-svc:8201"
+                )
+                resolver = LspCallResolver(repo_path, url)
+                resolver.health()  # raises if the service is down/unhealthy
+                logger.info("neighbors resolver: using pyright service at %s", url)
+                return resolver, "lsp"
+            except Exception:
+                logger.warning(
+                    "LSP resolver unavailable — falling back to in-process Jedi",
+                    exc_info=True,
+                )
+                # fall through to Jedi
+
+        try:
+            import jedi  # noqa: F401  — probe so a truly-missing dep warns here
+            from adapters.code_graph.code_resolve import JediCallResolver
+
+            return JediCallResolver(repo_path), "jedi"
+        except Exception:
+            logger.warning("jedi resolver unavailable", exc_info=True)
+            return None, None
+
     def _delete_stale_resolved_calls(self, files: list[str]) -> None:
-        """Delete resolver='jedi' CALLS edges whose SOURCE symbol lives in one of
-        the re-parsed ``files``, so a call removed by an edit doesn't survive an
-        incremental reindex (MF-1: keeps the resolved graph — and the neighbors
-        count on the meter — from monotonically over-inflating)."""
+        """Delete any resolver-produced CALLS edge (r.resolver set — 'jedi' or
+        'lsp') whose SOURCE symbol lives in one of the re-parsed ``files``, so a
+        call removed by an edit doesn't survive an incremental reindex (MF-1: keeps
+        the resolved graph — and the neighbors count on the meter — from
+        monotonically over-inflating). Matching ANY resolver (not just the active
+        one) also means switching resolvers, e.g. jedi→lsp, cleanly replaces the
+        prior resolver's edges for the re-parsed files instead of double-counting."""
         if not files:
             return
         try:
             self._run_cypher_with_retry(
-                "MATCH (src:CodeSymbol {code_space: $cs})-[r:CALLS {resolver: 'jedi'}]->() "
-                "WHERE src.file IN $files DELETE r",
+                "MATCH (src:CodeSymbol {code_space: $cs})-[r:CALLS]->() "
+                "WHERE src.file IN $files AND r.resolver IS NOT NULL DELETE r",
                 cs=self.code_space, files=files,
             )
         except Exception:
@@ -2051,10 +2095,12 @@ class NativeEngine:
             spans.append((start, end, r.get("fqn") or ""))
         return spans
 
-    def _store_resolved_call_edges(self, edges: list[dict]) -> None:
+    def _store_resolved_call_edges(
+        self, edges: list[dict], provenance: str = "jedi"
+    ) -> None:
         """Store resolved CALLS edges, MATCHing both endpoints (both symbols exist
         by now). extraction='extracted' (statically resolved → epistemic explicit);
-        r.resolver='jedi' marks the provenance."""
+        r.resolver=<provenance> ('jedi' | 'lsp') marks which resolver produced it."""
         if not edges:
             return
         _BATCH = 500
@@ -2066,9 +2112,11 @@ class NativeEngine:
             MATCH (tgt:CodeSymbol {code_space: $cs, fqn: row.tgt_fqn})
             MERGE (src)-[r:CALLS]->(tgt)
             SET r.extraction = 'extracted', r.epistemic_level = 'explicit',
-                r.resolver = 'jedi'
+                r.resolver = $provenance
             """
-            self._run_cypher_with_retry(cypher, cs=self.code_space, rows=batch)
+            self._run_cypher_with_retry(
+                cypher, cs=self.code_space, rows=batch, provenance=provenance
+            )
 
     def _compute_degrees(self):
         """Compute in+out degree for all symbols and persist it."""

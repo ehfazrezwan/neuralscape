@@ -392,6 +392,10 @@ class Settings(BaseSettings):
     # may miss (drops the edge, rarely mis-resolves). All acceptable for a Python
     # call-graph view on an ASCII-dominant corpus.
     code_neighbors_resolver: str = "jedi"
+    # Resolver-service URL for CODE_NEIGHBORS_RESOLVER=lsp (pyright over REST, the
+    # precise-neighbors resolver-svc — CBM-bridge pattern). Index-time only, so a
+    # down service degrades to in-process Jedi rather than failing the index.
+    code_resolver_url: str = "http://resolver-svc:8201"
     # LEGACY (superseded by `code_embedder`). Kept for back-compat: a deployment
     # that explicitly set this True to opt into cloud embeddings is migrated to
     # code_embedder="cloud" by the validator below. Default False.
@@ -651,9 +655,9 @@ class Settings(BaseSettings):
     @classmethod
     def _validate_code_neighbors_resolver(cls, value: str) -> str:
         v = (value or "").strip().lower()
-        if v not in {"off", "jedi"}:
+        if v not in {"off", "jedi", "lsp"}:
             raise ValueError(
-                f"CODE_NEIGHBORS_RESOLVER must be one of off|jedi (got {value!r})"
+                f"CODE_NEIGHBORS_RESOLVER must be one of off|jedi|lsp (got {value!r})"
             )
         return v
 

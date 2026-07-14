@@ -270,7 +270,8 @@ class TestCodeEmbedderPosture:
 
 
 class TestNeighborsResolver:
-    """Wave 3 neighbors resolver posture: off | jedi (default jedi)."""
+    """Neighbors resolver posture: off | jedi | lsp (default jedi). 'lsp' calls
+    the external pyright resolver service (resolver-svc)."""
 
     def test_default_is_jedi(self):
         assert _settings().code_neighbors_resolver == "jedi"
@@ -278,9 +279,16 @@ class TestNeighborsResolver:
     def test_off_accepted(self):
         assert _settings(code_neighbors_resolver="off").code_neighbors_resolver == "off"
 
+    def test_lsp_accepted(self):
+        assert _settings(code_neighbors_resolver="lsp").code_neighbors_resolver == "lsp"
+
     def test_case_insensitive(self):
         assert _settings(code_neighbors_resolver="JEDI").code_neighbors_resolver == "jedi"
+        assert _settings(code_neighbors_resolver="LSP").code_neighbors_resolver == "lsp"
+
+    def test_resolver_url_default(self):
+        assert _settings().code_resolver_url == "http://resolver-svc:8201"
 
     def test_invalid_rejected(self):
         with pytest.raises(Exception):
-            _settings(code_neighbors_resolver="lsp")
+            _settings(code_neighbors_resolver="bogus")
