@@ -308,6 +308,11 @@ class NativeEngine:
         mode = getattr(self.settings, "code_embedder", "local")
         return mode if mode in ("off", "local", "cloud") else "local"
 
+    def _neighbors_resolver_mode(self) -> str:
+        """Resolve the neighbors call-graph resolver: "off" | "jedi" (Wave 3)."""
+        mode = getattr(self.settings, "code_neighbors_resolver", "jedi")
+        return mode if mode in ("off", "jedi") else "jedi"
+
     def locate(
         self,
         query: str,
@@ -1043,6 +1048,16 @@ class NativeEngine:
         symbols_indexed = 0
         edges_indexed = 0
 
+        # Wave 3: when the neighbors resolver is on, collect Python call sites
+        # during the parse (into self._pending_call_sites) and the per-file symbol
+        # spans, then resolve + store real CALLS edges AFTER all symbols exist
+        # (the store MATCHes both endpoints, so cross-file targets must already be
+        # in the graph).
+        resolver_mode = self._neighbors_resolver_mode()
+        self._resolver_collect = resolver_mode == "jedi"
+        self._pending_call_sites: dict[str, list[dict]] = {}
+        symbols_by_file: dict[str, list[tuple[int, int, str]]] = {}
+
         for source_file, lang in source_files:
             rel_path = str(source_file.relative_to(repo_path))
             file_hash = self._file_hash(source_file)
@@ -1058,6 +1073,17 @@ class NativeEngine:
                 files_indexed += 1
                 symbols_indexed += len(symbols)
                 edges_indexed += len(edges)
+            if self._resolver_collect and lang == "python":
+                symbols_by_file[rel_path] = [
+                    (s.line, s.end_line, s.fqn) for s in symbols
+                ]
+
+        # Wave 3: resolve Python call sites to real symbols and store CALLS edges
+        # BEFORE degree/community so both reflect the real call graph.
+        if self._resolver_collect:
+            edges_indexed += self._resolve_and_store_calls(repo_path, symbols_by_file)
+        self._resolver_collect = False
+        self._pending_call_sites = {}
 
         # Compute and persist degree on all symbols
         self._compute_degrees()
@@ -1529,11 +1555,33 @@ class NativeEngine:
         return rel_path
 
     def _parse_python(self, root, rel_path: str, module_path: str, source_bytes: bytes) -> tuple[list[_Symbol], list[_Edge]]:
-        """Parse Python AST (preserves E2 logic exactly)."""
+        """Parse Python AST.
+
+        Wave 3: when the neighbors resolver is on (``_resolver_collect``), the walk
+        tracks the ENCLOSING function/method of each call and records the call site
+        (position + real source FQN) into ``self._pending_call_sites`` for
+        Jedi resolution after all files are indexed, and does NOT mint the legacy
+        phantom ``{module}.{rawtext}`` CALLS edge (which _store_file would drop
+        anyway). Resolver off ⇒ the exact E2 heuristic behavior is preserved.
+        """
         symbols: list[_Symbol] = []
         edges: list[_Edge] = []
+        collect_calls = getattr(self, "_resolver_collect", False)
+        call_sink = (
+            self._pending_call_sites.setdefault(rel_path, [])
+            if collect_calls else None
+        )
 
-        def walk(node, parent_class=None):
+        def _callee_name_node(func_node):
+            # The token to resolve: the final identifier of the callee. For
+            # ``a.b.c(...)`` that's ``c`` (the attribute); for ``foo(...)`` it's
+            # ``foo`` itself.
+            if func_node.type == "attribute":
+                attr = func_node.child_by_field_name("attribute")
+                return attr if attr is not None else func_node
+            return func_node
+
+        def walk(node, parent_class=None, enclosing_func=None):
             """Recursive tree walker."""
             node_type = node.type
 
@@ -1564,6 +1612,11 @@ class NativeEngine:
                         line=node.start_point[0] + 1,
                         end_line=node.end_point[0] + 1,
                     ))
+                    # Recurse the body with THIS function as the enclosing scope so
+                    # calls inside it attribute to a real symbol source (Wave 3).
+                    for child in node.children:
+                        walk(child, parent_class=parent_class, enclosing_func=fqn)
+                    return
 
             # Class definitions
             elif node_type == "class_definition":
@@ -1610,22 +1663,35 @@ class NativeEngine:
                         extraction="extracted",
                     ))
 
-            # Call expressions (inferred edges)
+            # Call expressions
             elif node_type == "call":
                 func_node = node.child_by_field_name("function")
                 if func_node:
-                    target_name = func_node.text.decode("utf8")
-                    # Best-effort FQN (inferred)
-                    edges.append(_Edge(
-                        source_fqn=module_path,
-                        target_fqn=f"{module_path}.{target_name}",
-                        relation="CALLS",
-                        extraction="inferred",
-                    ))
+                    if collect_calls:
+                        # Record the call site for Jedi resolution — only when it
+                        # sits inside a real function/method, so the CALLS edge has
+                        # a real symbol source (module-level calls can't attach).
+                        if enclosing_func is not None:
+                            name_node = _callee_name_node(func_node)
+                            sp = name_node.start_point
+                            call_sink.append({
+                                "line": sp[0] + 1,   # Jedi: 1-based line
+                                "col": sp[1],        # Jedi: 0-based column
+                                "src_fqn": enclosing_func,
+                            })
+                    else:
+                        # Legacy heuristic (resolver off): best-effort phantom FQN.
+                        target_name = func_node.text.decode("utf8")
+                        edges.append(_Edge(
+                            source_fqn=module_path,
+                            target_fqn=f"{module_path}.{target_name}",
+                            relation="CALLS",
+                            extraction="inferred",
+                        ))
 
             # Recurse to children (unless we already handled them above)
             for child in node.children:
-                walk(child, parent_class=parent_class)
+                walk(child, parent_class=parent_class, enclosing_func=enclosing_func)
 
         walk(root)
         return symbols, edges
@@ -1819,6 +1885,142 @@ class NativeEngine:
         elif extraction in ("inferred", "ambiguous"):
             return "deductive"
         return "deductive"  # fallback
+
+    # ── Wave 3: neighbors call resolution (Jedi) ─────────────────────
+
+    def _resolve_and_store_calls(
+        self, repo_path: Path, symbols_by_file: dict[str, list[tuple[int, int, str]]]
+    ) -> int:
+        """Resolve collected Python call sites to real symbols and store CALLS
+        edges. Returns the number of distinct resolved edges stored.
+
+        Best-effort: if Jedi is unavailable the neighbors graph simply stays as it
+        was (no phantom edges were minted), never failing the index.
+        """
+        sites_by_file = getattr(self, "_pending_call_sites", {})
+        total_sites = sum(len(v) for v in sites_by_file.values())
+        if not total_sites:
+            return 0
+        try:
+            from adapters.code_graph.code_resolve import JediCallResolver
+        except Exception:
+            logger.warning(
+                "jedi resolver unavailable — neighbors stays heuristic (~0 CALLS)",
+                exc_info=True,
+            )
+            return 0
+
+        resolver = JediCallResolver(repo_path)
+        resolved: list[dict] = []
+        resolved_count = 0
+        for rel_path, sites in sites_by_file.items():
+            abs_path = repo_path / rel_path
+            try:
+                source = abs_path.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            defs = resolver.resolve_file(
+                abs_path, source, [(s["line"], s["col"]) for s in sites]
+            )
+            for site, (def_path, def_line) in zip(sites, defs):
+                if not def_path or def_line is None:
+                    continue  # unresolved (stdlib/external/dynamic) → dropped
+                tgt = self._map_def_to_fqn(
+                    def_path, def_line, repo_path, symbols_by_file
+                )
+                if not tgt:
+                    continue  # resolved outside the repo's indexed symbols
+                src = site["src_fqn"]
+                if src == tgt:
+                    continue  # skip trivial self-recursion self-loops
+                resolved_count += 1
+                resolved.append({"src_fqn": src, "tgt_fqn": tgt})
+
+        # Dedup (src, tgt) — many call sites share the same edge.
+        seen: set[tuple[str, str]] = set()
+        uniq: list[dict] = []
+        for e in resolved:
+            key = (e["src_fqn"], e["tgt_fqn"])
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(e)
+
+        self._store_resolved_call_edges(uniq)
+        logger.info(
+            "Jedi neighbors resolver: %d/%d call sites resolved to in-repo "
+            "symbols → %d distinct CALLS edges (%d files)",
+            resolved_count, total_sites, len(uniq), len(sites_by_file),
+        )
+        return len(uniq)
+
+    def _map_def_to_fqn(
+        self,
+        def_abs_path: str,
+        def_line: int,
+        repo_root: Path,
+        symbols_by_file: dict[str, list[tuple[int, int, str]]],
+    ) -> str | None:
+        """Map a Jedi definition ``(abs_path, line)`` to the EXACT stored symbol
+        FQN whose span contains that line — so a resolved target always matches an
+        existing :CodeSymbol (never a new phantom). Prefers the innermost span
+        (largest start). Falls back to a Neo4j lookup for files not in
+        ``symbols_by_file`` (incremental reindex: unchanged files weren't parsed)."""
+        try:
+            rel = str(Path(def_abs_path).resolve().relative_to(Path(repo_root).resolve()))
+        except Exception:
+            return None  # definition lives outside the repo → external, drop
+        spans = symbols_by_file.get(rel)
+        if spans is None:
+            spans = self._symbol_spans_for_file(rel)
+        best: tuple[int, int, str] | None = None
+        for start, end, fqn in spans:
+            hi = end or start
+            if start <= def_line <= hi and (best is None or start > best[0]):
+                best = (start, hi, fqn)
+        return best[2] if best else None
+
+    def _symbol_spans_for_file(self, rel_path: str) -> list[tuple[int, int, str]]:
+        """Load (start_line, end_line, fqn) for every symbol in a file from Neo4j
+        (incremental fallback for _map_def_to_fqn)."""
+        try:
+            rows = self._run_cypher(
+                "MATCH (s:CodeSymbol {code_space: $cs, file: $file}) "
+                "RETURN s.fqn AS fqn, s.span AS span",
+                cs=self.code_space, file=rel_path,
+            )
+        except Exception:
+            return []
+        spans: list[tuple[int, int, str]] = []
+        for r in rows:
+            span = str(r.get("span") or "0:0")
+            parts = span.split(":")
+            try:
+                start = int(parts[0])
+                end = int(parts[1]) if len(parts) > 1 else start
+            except (ValueError, IndexError):
+                continue
+            spans.append((start, end, r.get("fqn") or ""))
+        return spans
+
+    def _store_resolved_call_edges(self, edges: list[dict]) -> None:
+        """Store resolved CALLS edges, MATCHing both endpoints (both symbols exist
+        by now). extraction='extracted' (statically resolved → epistemic explicit);
+        r.resolver='jedi' marks the provenance."""
+        if not edges:
+            return
+        _BATCH = 500
+        for i in range(0, len(edges), _BATCH):
+            batch = edges[i : i + _BATCH]
+            cypher = """
+            UNWIND $rows AS row
+            MATCH (src:CodeSymbol {code_space: $cs, fqn: row.src_fqn})
+            MATCH (tgt:CodeSymbol {code_space: $cs, fqn: row.tgt_fqn})
+            MERGE (src)-[r:CALLS]->(tgt)
+            SET r.extraction = 'extracted', r.epistemic_level = 'explicit',
+                r.resolver = 'jedi'
+            """
+            self._run_cypher_with_retry(cypher, cs=self.code_space, rows=batch)
 
     def _compute_degrees(self):
         """Compute in+out degree for all symbols and persist it."""

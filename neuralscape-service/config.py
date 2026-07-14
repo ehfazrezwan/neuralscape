@@ -369,6 +369,21 @@ class Settings(BaseSettings):
     # signature + docstring + source). This is the C1 lift and the deterministic
     # backbone of locate; disable only to isolate the dense leg in measurement.
     code_locate_lexical_cards: bool = True
+    # Neighbors call-graph resolver (Wave 3). The heuristic parser attributed
+    # every call to its MODULE and minted a phantom `{module}.{rawtext}` target,
+    # so _store_file's "both endpoints must exist" MATCH dropped essentially all
+    # CALLS edges → neighbors was ~0 by design. The resolver statically resolves
+    # each call to the REAL enclosing-function source and definition target so
+    # CALLS edges land on real symbols:
+    #   "off"  — legacy heuristic (phantom targets, ~0 neighbors)
+    #   "jedi" — DEFAULT — Jedi (pure-Python, token-free) resolves Python call
+    #            targets to real FQNs; unresolved (stdlib/external) targets are
+    #            DROPPED, not minted as phantoms. Python-only; other languages
+    #            keep the heuristic path. Runs at index time (background), so its
+    #            cost is off the interactive path. tree-sitter-stack-graphs (the
+    #            brief's stretch primary) is not pip-installable (Rust crate; a
+    #            container-gate landmine), so Jedi is the shipped resolver.
+    code_neighbors_resolver: str = "jedi"
     # LEGACY (superseded by `code_embedder`). Kept for back-compat: a deployment
     # that explicitly set this True to opt into cloud embeddings is migrated to
     # code_embedder="cloud" by the validator below. Default False.
@@ -621,6 +636,16 @@ class Settings(BaseSettings):
         if v not in {"off", "local", "cloud"}:
             raise ValueError(
                 f"CODE_EMBEDDER must be one of off|local|cloud (got {value!r})"
+            )
+        return v
+
+    @field_validator("code_neighbors_resolver")
+    @classmethod
+    def _validate_code_neighbors_resolver(cls, value: str) -> str:
+        v = (value or "").strip().lower()
+        if v not in {"off", "jedi"}:
+            raise ValueError(
+                f"CODE_NEIGHBORS_RESOLVER must be one of off|jedi (got {value!r})"
             )
         return v
 
