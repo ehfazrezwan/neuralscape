@@ -165,7 +165,25 @@ class Settings(BaseSettings):
     # `rederivation_savings_estimate` field: tokens an agent would burn
     # re-deriving/re-discovering a fact from sources ≈ multiplier × the
     # fact's stored token count. Never blended into the measured headline.
+    # Configurable + DISCLOSED in the metrics payload (M5) so the estimate
+    # is auditable rather than a hidden constant.
     savings_rederivation_multiplier: float = 10.0
+    # ── Meter M1-M5 additive knobs ────────────────────────────────────
+    # M3 — code-nav read-avoidance baseline. For a code locate/neighbors/
+    # query the true baseline is the FILE(S) the model would otherwise have
+    # read to find the answer, not the memory-content size. We never read
+    # files on the hot path, so we book a DISCLOSED per-distinct-file
+    # estimate (labeled in the metrics payload). Default is a conservative
+    # mid-size source-file token count; deployments tune it to their corpus.
+    savings_code_nav_avoided_read_tokens_per_file: int = 1500
+    # M2 — bounce window: an index-only/locate event that is followed by a
+    # full-fetch of the SAME item within this many seconds saved nothing (the
+    # client re-read anyway); its credited baseline is deducted from the
+    # bounce-adjusted total. Kept short so stale arms expire on their own.
+    savings_bounce_window_seconds: int = 900
+    # M4 — per-task rollup TTL: task/session correlation totals expire after
+    # this long so the task-grain keyspace stays bounded.
+    savings_task_rollup_ttl_seconds: int = 7 * 86400
 
     # ── Session summarizer slots + context assembler (roadmap E3) ─────
     # Per-session rolling summaries, refreshed as conversation writes cross

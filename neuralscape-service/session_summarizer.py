@@ -373,6 +373,24 @@ async def refresh_slot(
         pipe.execute()
 
     await asyncio.to_thread(_store)
+
+    # M1 — compaction lifecycle: baseline = the transcript messages folded
+    # into this summary, served = the resulting rolling summary. Best-effort,
+    # off the request path (this runs on the graph worker); a meter failure
+    # never fails the refresh.
+    try:
+        import savings_meter as sm
+
+        if sm._meter_enabled() and user_id:
+            baseline_tok = text_tokens(render_messages_block(new_messages))
+            event = sm.measure_compaction(
+                baseline_tok, record["tokens"], item_id=slot, corr_id=session_id
+            )
+            if event is not None:
+                await asyncio.to_thread(sm.record_event, user_id, event)
+    except Exception:
+        logger.debug("compaction savings metering failed (non-fatal)", exc_info=True)
+
     return {
         "status": "refreshed",
         "slot": slot,

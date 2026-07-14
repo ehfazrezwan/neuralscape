@@ -90,6 +90,7 @@ def _meter_mcp_index_bg(op: str, user_id: str, hits, body: dict) -> None:
         event = sm.measure_recall(op, hits, index_payload=payload)
         if event is not None:
             sm.record_event(user_id, event)
+            sm.arm_bounce(user_id, hits)  # M2: served as index rows
 
     try:
         import telemetry
@@ -108,6 +109,7 @@ def _meter_mcp_full_bg(op: str, user_id: str, hits) -> None:
         event = sm.measure_recall(op, hits, served_full=True)
         if event is not None:
             sm.record_event(user_id, event)
+            sm.check_and_deduct_bounce(user_id, hits)  # M2: full-fetch after index
 
     try:
         import telemetry

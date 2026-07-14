@@ -23,6 +23,7 @@ import savings_meter as sm
 from config import settings
 from index_format import estimate_tokens
 from savings_constants import (
+    LIFECYCLE_STAGES,
     MCP_TOOL_SCHEMA_OVERHEAD_TOKENS,
     SAVINGS_LINE_OVERHEAD_TOKENS,
 )
@@ -212,16 +213,21 @@ class FakePipeline:
         self._redis = redis
         self._ops: list = []
 
-    def xadd(self, *a, **kw):
-        self._ops.append(("xadd", a, kw))
+    def __getattr__(self, name):
+        # Record any buffered command (xadd/hincrby/sadd/expire/set/delete/…)
+        # and replay it against the FakeRedis on execute().
+        def _record(*a, **kw):
+            self._ops.append((name, a, kw))
+            return self
 
-    def hincrby(self, *a, **kw):
-        self._ops.append(("hincrby", a, kw))
+        return _record
 
     def execute(self):
+        results = []
         for op, a, kw in self._ops:
-            getattr(self._redis, op)(*a, **kw)
+            results.append(getattr(self._redis, op)(*a, **kw))
         self._ops = []
+        return results
 
 
 class FakeRedis:
@@ -229,11 +235,27 @@ class FakeRedis:
         self.streams: dict[str, list[dict]] = {}
         self.hashes: dict[str, dict[str, int]] = {}
         self.kv: dict[str, str] = {}
+        self.sets: dict[str, set] = {}
 
     def set(self, key, value, nx=False, ex=None):
         if nx and key in self.kv:
             return None
         self.kv[key] = value
+        return True
+
+    def get(self, key):
+        return self.kv.get(key)
+
+    def delete(self, *keys):
+        n = 0
+        for k in keys:
+            for store in (self.kv, self.hashes, self.sets, self.streams):
+                if k in store:
+                    del store[k]
+                    n += 1
+        return n
+
+    def expire(self, key, ttl):  # TTL is irrelevant to these synchronous tests
         return True
 
     def xadd(self, key, fields, maxlen=None, approximate=None):
@@ -245,6 +267,15 @@ class FakeRedis:
 
     def hgetall(self, key):
         return {k: str(v) for k, v in self.hashes.get(key, {}).items()}
+
+    def sadd(self, key, *members):
+        s = self.sets.setdefault(key, set())
+        before = len(s)
+        s.update(str(m) for m in members)
+        return len(s) - before
+
+    def smembers(self, key):
+        return set(self.sets.get(key, set()))
 
     def pipeline(self):
         return FakePipeline(self)
@@ -264,7 +295,11 @@ class TestLedger:
         assert schema["op"] == "tool_schema"
         assert schema["net"] == -MCP_TOOL_SCHEMA_OVERHEAD_TOKENS
         assert event["op"] == "search_index"
-        assert set(event) == {"ts", "op", "baseline", "served", "overhead", "net", "rederiv_est"}
+        # M1/M2/M4: rows now also carry lifecycle/item_id/corr_id + adjusted net.
+        assert set(event) == {
+            "ts", "op", "lifecycle", "item_id", "corr_id",
+            "baseline", "served", "overhead", "net", "adjusted", "rederiv_est",
+        }
 
     def test_schema_charged_once_per_day(self):
         r = FakeRedis()
@@ -428,3 +463,185 @@ class TestRestSavingsLine:
         assert body["tool_schema_overhead_tokens"] == MCP_TOOL_SCHEMA_OVERHEAD_TOKENS
         assert body["user"]["user_id"] == "alice"
         assert body["user"]["net_tokens_saved"] == 90 - MCP_TOOL_SCHEMA_OVERHEAD_TOKENS
+
+
+# ── M1: per-event lifecycle-tagged ledger ────────────────────────────
+
+
+class TestLifecycleTagging:
+    def test_events_carry_stage_and_bucket_per_lifecycle(self):
+        r = FakeRedis()
+        sm.record_event(
+            "alice",
+            sm.measure_recall(
+                "search_index",
+                [_hit("m1", "x" * 200, token_estimate=200)],
+                index_payload="rows",
+            ),
+            redis=r,
+        )
+        sm.record_event("alice", sm.measure_ingest(5000, 400, item_id="doc1"), redis=r)
+        sm.record_event(
+            "alice",
+            sm.measure_code_nav(
+                "code_nav_locate", served_text="path/to/f.py:12", files=["path/to/f.py"]
+            ),
+            redis=r,
+        )
+        sm.record_event("alice", sm.measure_compaction(3000, 200, item_id="slot0"), redis=r)
+        snap = sm.metrics_snapshot("alice", redis=r)
+        by_lc = snap["user"]["by_lifecycle"]
+        # every distinct stage exercised shows up, including the tool_schema
+        # charge which is booked under context_assembly.
+        assert {"retrieval", "ingest", "code_nav", "compaction", "context_assembly"} <= set(by_lc)
+        assert by_lc["ingest"]["baseline_tokens"] == 5000
+        assert by_lc["compaction"]["baseline_tokens"] == 3000
+        # per-op breakdown carries the op keys too
+        assert "search_index" in snap["user"]["by_op"]
+        assert "ingest" in snap["user"]["by_op"]
+
+    def test_event_records_item_and_corr_id(self):
+        r = FakeRedis()
+        ev = sm.measure_ingest(100, 10, item_id="doc-9", corr_id="run-1")
+        assert ev.lifecycle_stage == "ingest"
+        assert ev.item_id == "doc-9"
+        assert ev.corr_id == "run-1"
+        sm.record_event("alice", ev, redis=r)
+        row = r.streams[sm.LEDGER_KEY.format(user_id="alice")][-1]
+        assert row["item_id"] == "doc-9"
+        assert row["corr_id"] == "run-1"
+        assert row["lifecycle"] == "ingest"
+
+
+# ── M2: bounce-adjusted net ──────────────────────────────────────────
+
+
+class TestBounceAdjustment:
+    def test_served_then_refetched_deducts_only_adjusted(self):
+        r = FakeRedis()
+        hit = _hit("11111111-1111-1111-1111-111111111111", "content " * 50, token_estimate=400)
+        sm.arm_bounce("alice", [hit], redis=r)  # served as an index row
+        sm.record_event(
+            "alice",
+            sm.measure_recall("search_index", [hit], index_payload="rows"),
+            redis=r,
+        )
+        before = sm.metrics_snapshot("alice", redis=r)["user"]
+        deducted = sm.check_and_deduct_bounce("alice", [hit], redis=r)  # full-fetch
+        assert deducted == 1
+        after = sm.metrics_snapshot("alice", redis=r)["user"]
+        # raw net is untouched; only the bounce-adjusted net moves, by the
+        # credited baseline share (the item's stored token count).
+        assert after["net_tokens_saved"] == before["net_tokens_saved"]
+        assert after["adjusted_net_tokens_saved"] == before["adjusted_net_tokens_saved"] - 400
+
+    def test_refetch_is_one_shot(self):
+        r = FakeRedis()
+        hit = _hit("22222222-2222-2222-2222-222222222222", "z" * 100, token_estimate=200)
+        sm.arm_bounce("alice", [hit], redis=r)
+        assert sm.check_and_deduct_bounce("alice", [hit], redis=r) == 1
+        # the marker is consumed — a second full-fetch is not a bounce
+        assert sm.check_and_deduct_bounce("alice", [hit], redis=r) == 0
+
+    def test_no_bounce_without_prior_arm(self):
+        r = FakeRedis()
+        hit = _hit("33333333-3333-3333-3333-333333333333", "x", token_estimate=50)
+        assert sm.check_and_deduct_bounce("alice", [hit], redis=r) == 0
+
+
+# ── M3: code-nav avoided-read baseline ───────────────────────────────
+
+
+class TestCodeNavBaseline:
+    def test_baseline_counts_distinct_files(self):
+        ev = sm.measure_code_nav(
+            "code_nav_locate",
+            served_text="short",
+            files=["a.py", "a.py", "b.py"],  # 2 distinct
+            avoided_read_tokens=1000,
+        )
+        assert ev.lifecycle_stage == "code_nav"
+        assert ev.baseline_tokens == 2000  # 2 distinct files × 1000
+        assert ev.served_tokens == sm.count_tokens("short")
+        assert ev.net_tokens_saved == 2000 - ev.served_tokens
+
+    def test_baseline_uses_settings_default_per_file(self):
+        per_file = settings.savings_code_nav_avoided_read_tokens_per_file
+        ev = sm.measure_code_nav("code_nav_neighbors", served_tokens=10, file_count=3)
+        assert ev.baseline_tokens == 3 * per_file
+
+    def test_zero_files_is_zero_baseline_not_content_size(self):
+        ev = sm.measure_code_nav("code_nav_query", served_text="a long answer " * 20)
+        assert ev.baseline_tokens == 0  # nothing located → nothing avoided
+
+
+# ── M4: per-task rollup ──────────────────────────────────────────────
+
+
+class TestPerTaskRollup:
+    def test_events_roll_up_by_corr_id(self):
+        r = FakeRedis()
+        sm.record_event("alice", sm.measure_ask(1000, "short answer", corr_id="task-7"), redis=r)
+        sm.record_event(
+            "alice",
+            sm.measure_recall(
+                "search_index",
+                [_hit("m1", "y" * 80, token_estimate=80)],
+                index_payload="r",
+                corr_id="task-7",
+            ),
+            redis=r,
+        )
+        # an event under a different corr_id must not roll into task-7
+        sm.record_event("alice", sm.measure_ask(500, "a", corr_id="other"), redis=r)
+        snap = sm.metrics_snapshot("alice", redis=r, task_id="task-7")
+        assert snap["task"]["corr_id"] == "task-7"
+        assert snap["task"]["events"] == 2  # the schema charge has no corr_id
+
+    def test_task_absent_when_not_requested(self):
+        r = FakeRedis()
+        sm.record_event("alice", sm.measure_ask(100, "a", corr_id="t"), redis=r)
+        snap = sm.metrics_snapshot("alice", redis=r)
+        assert "task" not in snap
+
+
+# ── M5/M6: metrics payload shape + honesty labels ────────────────────
+
+
+class TestMetricsPayloadShapeM6:
+    def test_honesty_labels_and_breakdowns_present(self):
+        r = FakeRedis()
+        sm.record_event(
+            "alice",
+            sm.measure_recall(
+                "search_index",
+                [_hit("m1", "z" * 120, token_estimate=120)],
+                index_payload="rows",
+            ),
+            redis=r,
+        )
+        body = sm.metrics_snapshot("alice", redis=r)
+        # M5 honesty surface
+        assert body["tokenizer"] == settings.savings_tokenizer
+        assert "tokenizer_basis_note" in body
+        assert body["rederivation_multiplier"] == settings.savings_rederivation_multiplier
+        assert "rederivation_note" in body
+        assert "code_nav_baseline_note" in body
+        assert body["code_nav_avoided_read_tokens_per_file"] == (
+            settings.savings_code_nav_avoided_read_tokens_per_file
+        )
+        assert set(body["lifecycle_stages"]) == set(LIFECYCLE_STAGES)
+        # M6 breakdowns on both scopes + adjusted net
+        for scope in ("user", "instance"):
+            assert "by_lifecycle" in body[scope]
+            assert "by_op" in body[scope]
+            assert "adjusted_net_tokens_saved" in body[scope]
+
+    def test_new_entrypoints_short_circuit_when_disabled(self):
+        settings.savings_meter_enabled = False
+        assert sm.measure_ingest(100, 10) is None
+        assert sm.measure_code_nav("code_nav_locate", files=["a.py"]) is None
+        assert sm.measure_compaction(100, 10) is None
+        assert sm.measure_assemble(100, 10) is None
+        assert sm.arm_bounce("alice", [_hit("m1", "x", token_estimate=5)]) is False
+        assert sm.check_and_deduct_bounce("alice", [_hit("m1", "x", token_estimate=5)]) == 0
