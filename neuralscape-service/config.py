@@ -383,6 +383,14 @@ class Settings(BaseSettings):
     #            cost is off the interactive path. tree-sitter-stack-graphs (the
     #            brief's stretch primary) is not pip-installable (Rust crate; a
     #            container-gate landmine), so Jedi is the shipped resolver.
+    # Honest exclusions of the resolved graph (all here in one place): module-level
+    # and class-body calls (no function source to attach); trivial self-recursion
+    # self-loops; dynamic dispatch beyond Jedi's static inference; nested-function
+    # FQNs are flattened (module.inner), which can collide with a same-named
+    # top-level def; call-site columns are tree-sitter BYTE offsets while Jedi
+    # wants character offsets, so a callee preceded by multi-byte chars on its line
+    # may miss (drops the edge, rarely mis-resolves). All acceptable for a Python
+    # call-graph view on an ASCII-dominant corpus.
     code_neighbors_resolver: str = "jedi"
     # LEGACY (superseded by `code_embedder`). Kept for back-compat: a deployment
     # that explicitly set this True to opt into cloud embeddings is migrated to

@@ -145,6 +145,77 @@ def test_resolve_and_store_no_sites_is_noop(mini_repo, resolver_settings):
     assert eng._resolve_and_store_calls(mini_repo, {}) == 0
 
 
+def test_method_calls_resolve_and_module_level_skipped(tmp_path, resolver_settings):
+    """A method call (self.other()) resolves to the real method FQN as source; a
+    module-level call is skipped (no function source to attach)."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "w.py").write_text(
+        "class Widget:\n"
+        "    def draw(self):\n"
+        "        return self.render()\n"   # method→method, line 3
+        "\n"
+        "    def render(self):\n"
+        "        return 1\n"
+        "\n"
+        "def build():\n"
+        "    return Widget()\n"            # function→class (constructor), line 9
+        "\n"
+        "w = Widget()\n"                    # MODULE-LEVEL call, line 11 → skipped
+    )
+    eng = _engine(tmp_path, resolver_settings)
+    eng._resolver_collect = True
+    eng._pending_call_sites = {}
+    syms, _ = eng._parse_file(pkg / "w.py", tmp_path, "python")
+    symbols_by_file = {"pkg/w.py": [(s.line, s.end_line, s.fqn) for s in syms]}
+
+    stored = []
+    with patch.object(eng, "_run_cypher_with_retry",
+                      side_effect=lambda c, **k: (stored.extend(k["rows"]) if "r:CALLS" in c else None) or []):
+        eng._resolve_and_store_calls(tmp_path, symbols_by_file)
+
+    pairs = {(e["src_fqn"], e["tgt_fqn"]) for e in stored}
+    assert ("pkg.w.Widget.draw", "pkg.w.Widget.render") in pairs  # method→method
+    assert ("pkg.w.build", "pkg.w.Widget") in pairs               # func→class ctor
+    # The module-level `w = Widget()` has no function source → no edge from module.
+    assert not any(src == "pkg.w" for src, _ in pairs)
+
+
+def test_symbol_spans_for_file_parses_neo4j_spans(mini_repo, resolver_settings):
+    eng = _engine(mini_repo, resolver_settings)
+    rows = [
+        {"fqn": "pkg.a.helper", "span": "1:2"},
+        {"fqn": "pkg.a.main", "span": "4:5"},
+        {"fqn": "pkg.a.bad", "span": "notaspan"},  # malformed → skipped
+    ]
+    with patch.object(eng, "_run_cypher", return_value=rows):
+        spans = eng._symbol_spans_for_file("pkg/a.py")
+    assert (1, 2, "pkg.a.helper") in spans
+    assert (4, 5, "pkg.a.main") in spans
+    assert all(fqn != "pkg.a.bad" for _, _, fqn in spans)
+
+
+def test_stale_resolved_calls_deleted_on_reindex(mini_repo, resolver_settings):
+    """MF-1: _resolve_and_store_calls clears prior resolver='jedi' CALLS from the
+    re-parsed files BEFORE re-merging — and does so even when a file now has zero
+    call sites (all calls removed)."""
+    eng = _engine(mini_repo, resolver_settings)
+    # Simulate a re-parse of a file that now has NO call sites.
+    eng._pending_call_sites = {"pkg/a.py": []}
+
+    calls = []
+    with patch.object(eng, "_run_cypher_with_retry",
+                      side_effect=lambda c, **k: calls.append((c, k)) or []):
+        n = eng._resolve_and_store_calls(mini_repo, {})
+
+    assert n == 0  # no sites → no new edges
+    # …but the stale-edge DELETE still ran for the re-parsed file.
+    deletes = [(c, k) for c, k in calls if "DELETE r" in c and "CALLS" in c]
+    assert deletes, "stale resolved-CALLS cleanup must run even with zero sites"
+    assert deletes[0][1]["files"] == ["pkg/a.py"]
+
+
 def test_resolved_edges_match_only_never_mint_symbol_nodes(mini_repo, resolver_settings):
     """Anchor survival: the resolver only ADDS CALLS edges between EXISTING symbols
     (MATCH both endpoints) — it never MERGEs :CodeSymbol nodes, so it can't mint a
@@ -162,9 +233,10 @@ def test_resolved_edges_match_only_never_mint_symbol_nodes(mini_repo, resolver_s
                       side_effect=lambda c, **k: cyphers.append(c) or []):
         eng._resolve_and_store_calls(mini_repo, symbols_by_file)
 
-    call_cyphers = [c for c in cyphers if "r:CALLS" in c]
-    assert call_cyphers, "expected at least one CALLS edge write"
-    for c in call_cyphers:
+    # The edge-store cypher (MERGE the relationship), not the stale-edge DELETE.
+    store_cyphers = [c for c in cyphers if "MERGE (src)-[r:CALLS]" in c]
+    assert store_cyphers, "expected at least one CALLS edge write"
+    for c in store_cyphers:
         assert "MATCH (src:CodeSymbol" in c and "MATCH (tgt:CodeSymbol" in c
         # Endpoints are MATCHed, not MERGEd → no node creation.
         assert "MERGE (src:CodeSymbol" not in c and "MERGE (tgt:CodeSymbol" not in c

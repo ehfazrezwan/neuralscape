@@ -1058,32 +1058,40 @@ class NativeEngine:
         self._pending_call_sites: dict[str, list[dict]] = {}
         symbols_by_file: dict[str, list[tuple[int, int, str]]] = {}
 
-        for source_file, lang in source_files:
-            rel_path = str(source_file.relative_to(repo_path))
-            file_hash = self._file_hash(source_file)
+        # try/finally so a parse/store/resolve failure can never leave
+        # _resolver_collect stuck True — that would make later _parse_file callers
+        # (e.g. detect_changes) silently collect call sites and suppress legacy
+        # CALLS edges (nit-1).
+        try:
+            for source_file, lang in source_files:
+                rel_path = str(source_file.relative_to(repo_path))
+                file_hash = self._file_hash(source_file)
 
-            # Incremental: skip unchanged files
-            if incremental and self._file_unchanged(rel_path, file_hash):
-                continue
+                # Incremental: skip unchanged files
+                if incremental and self._file_unchanged(rel_path, file_hash):
+                    continue
 
-            # Parse and index
-            symbols, edges = self._parse_file(source_file, repo_path, lang)
-            if symbols or edges:
-                self._store_file(rel_path, file_hash, symbols, edges, lang)
-                files_indexed += 1
-                symbols_indexed += len(symbols)
-                edges_indexed += len(edges)
-            if self._resolver_collect and lang == "python":
-                symbols_by_file[rel_path] = [
-                    (s.line, s.end_line, s.fqn) for s in symbols
-                ]
+                # Parse and index
+                symbols, edges = self._parse_file(source_file, repo_path, lang)
+                if symbols or edges:
+                    self._store_file(rel_path, file_hash, symbols, edges, lang)
+                    files_indexed += 1
+                    symbols_indexed += len(symbols)
+                    edges_indexed += len(edges)
+                if self._resolver_collect and lang == "python":
+                    symbols_by_file[rel_path] = [
+                        (s.line, s.end_line, s.fqn) for s in symbols
+                    ]
 
-        # Wave 3: resolve Python call sites to real symbols and store CALLS edges
-        # BEFORE degree/community so both reflect the real call graph.
-        if self._resolver_collect:
-            edges_indexed += self._resolve_and_store_calls(repo_path, symbols_by_file)
-        self._resolver_collect = False
-        self._pending_call_sites = {}
+            # Wave 3: resolve Python call sites to real symbols and store CALLS
+            # edges BEFORE degree/community so both reflect the real call graph.
+            if self._resolver_collect:
+                edges_indexed += self._resolve_and_store_calls(
+                    repo_path, symbols_by_file
+                )
+        finally:
+            self._resolver_collect = False
+            self._pending_call_sites = {}
 
         # Compute and persist degree on all symbols
         self._compute_degrees()
@@ -1897,11 +1905,23 @@ class NativeEngine:
         Best-effort: if Jedi is unavailable the neighbors graph simply stays as it
         was (no phantom edges were minted), never failing the index.
         """
+        import time as _time
+
         sites_by_file = getattr(self, "_pending_call_sites", {})
+        # MF-1: every re-parsed Python file cleared its prior resolver='jedi' CALLS
+        # so a call REMOVED by an edit doesn't linger — otherwise the resolved
+        # graph could only grow and the neighbors count would monotonically
+        # over-inflate under incremental reindex (a meter-honesty failure). Runs
+        # BEFORE the early return: a file whose calls were all deleted still needs
+        # clearing. sites_by_file keys every parsed Python file (setdefault in the
+        # walk), so its keys are exactly the re-parse set.
+        self._delete_stale_resolved_calls(list(sites_by_file.keys()))
+
         total_sites = sum(len(v) for v in sites_by_file.values())
         if not total_sites:
             return 0
         try:
+            import jedi  # noqa: F401  — probe so a truly-missing dep warns here
             from adapters.code_graph.code_resolve import JediCallResolver
         except Exception:
             logger.warning(
@@ -1910,6 +1930,7 @@ class NativeEngine:
             )
             return 0
 
+        _t0 = _time.time()
         resolver = JediCallResolver(repo_path)
         resolved: list[dict] = []
         resolved_count = 0
@@ -1949,10 +1970,27 @@ class NativeEngine:
         self._store_resolved_call_edges(uniq)
         logger.info(
             "Jedi neighbors resolver: %d/%d call sites resolved to in-repo "
-            "symbols → %d distinct CALLS edges (%d files)",
+            "symbols → %d distinct CALLS edges (%d files) in %.2fs",
             resolved_count, total_sites, len(uniq), len(sites_by_file),
+            _time.time() - _t0,
         )
         return len(uniq)
+
+    def _delete_stale_resolved_calls(self, files: list[str]) -> None:
+        """Delete resolver='jedi' CALLS edges whose SOURCE symbol lives in one of
+        the re-parsed ``files``, so a call removed by an edit doesn't survive an
+        incremental reindex (MF-1: keeps the resolved graph — and the neighbors
+        count on the meter — from monotonically over-inflating)."""
+        if not files:
+            return
+        try:
+            self._run_cypher_with_retry(
+                "MATCH (src:CodeSymbol {code_space: $cs})-[r:CALLS {resolver: 'jedi'}]->() "
+                "WHERE src.file IN $files DELETE r",
+                cs=self.code_space, files=files,
+            )
+        except Exception:
+            logger.debug("stale resolved-CALLS cleanup failed (non-fatal)", exc_info=True)
 
     def _map_def_to_fqn(
         self,
@@ -1972,7 +2010,11 @@ class NativeEngine:
             return None  # definition lives outside the repo → external, drop
         spans = symbols_by_file.get(rel)
         if spans is None:
+            # Incremental: target lives in an unchanged (unparsed) file. Load its
+            # spans from Neo4j once and cache back into symbols_by_file so many
+            # cross-file calls to the same file don't re-query (nit-3).
             spans = self._symbol_spans_for_file(rel)
+            symbols_by_file[rel] = spans
         best: tuple[int, int, str] | None = None
         for start, end, fqn in spans:
             hi = end or start
