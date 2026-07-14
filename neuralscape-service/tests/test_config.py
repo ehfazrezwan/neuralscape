@@ -226,3 +226,38 @@ class TestCodeOpPreference:
     def test_dict_passed_through(self):
         cfg = _settings(code_op_preference={"query": ["code-native"]})
         assert cfg.code_op_preference == {"query": ["code-native"]}
+
+
+class TestCodeEmbedderPosture:
+    """C3 nl_locate posture: code_embedder off|local|cloud with legacy migration.
+
+    The A/B (ICE_V2_NLLOCATE_EMBEDDINGS.md) moved the default from cloud-opt-in to
+    the token-free local hybrid; the legacy boolean is honored for back-compat.
+    """
+
+    def test_default_is_local_token_free(self):
+        s = _settings()
+        assert s.code_embedder == "local"
+        assert s.code_locate_lexical_cards is True
+        assert s.code_embedder_model == "jinaai/jina-embeddings-v2-base-code"
+        assert s.code_embedder_query_prefix == ""
+
+    def test_legacy_cloud_flag_migrates_to_cloud(self):
+        # A deployment that opted into cloud embeddings via the legacy boolean
+        # keeps cloud behavior (validator migrates code_embedder).
+        assert _settings(code_index_embeddings=True).code_embedder == "cloud"
+
+    def test_explicit_posture_wins_over_legacy(self):
+        # An explicit code_embedder is authoritative even if the legacy flag is on.
+        assert _settings(code_embedder="off", code_index_embeddings=True).code_embedder == "off"
+
+    def test_off_and_cloud_accepted(self):
+        assert _settings(code_embedder="off").code_embedder == "off"
+        assert _settings(code_embedder="cloud").code_embedder == "cloud"
+
+    def test_case_insensitive(self):
+        assert _settings(code_embedder="LOCAL").code_embedder == "local"
+
+    def test_invalid_rejected(self):
+        with pytest.raises(Exception):
+            _settings(code_embedder="bogus")
