@@ -119,6 +119,31 @@ def _meter_mcp_full_bg(op: str, user_id: str, hits) -> None:
         logger.debug("savings metering dispatch failed (non-fatal)", exc_info=True)
 
 
+# M3/M5 — MCP code-nav read-avoidance metering. Agents drive code-nav through
+# MCP, so the primary read-avoidance surface is here (not just the REST twins).
+# path/impact are not read-avoidance ops, so they are intentionally absent.
+_CODE_NAV_OPS = {
+    "query_code_graph": "code_nav_query",
+    "get_code_neighbors": "code_nav_neighbors",
+    "locate": "code_nav_locate",
+}
+
+
+def _meter_code_nav_bg(name: str, user_id: str, *, served_text=None, served_obj=None, hits=None) -> None:
+    """Meter one code-nav MCP tool call off the hot path, via the shared
+    savings_meter dispatch (parser + telemetry submit live there), so REST and
+    MCP meter identically. No-op for non-code-nav tools."""
+    op = _CODE_NAV_OPS.get(name)
+    if op is None or not user_id:
+        return
+    import savings_meter as sm
+
+    files = None
+    if hits:
+        files = [h.get("file") for h in hits if isinstance(h, dict) and h.get("file")]
+    sm.meter_code_nav_bg(op, user_id, served_text=served_text, served_obj=served_obj, files=files)
+
+
 def _standard_write_error(visibility, user_id: str) -> list[TextContent] | None:
     """Return an MCP error payload if a ``standard``-tier write isn't allowed.
 
@@ -2344,15 +2369,26 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 # consumer breaks; a real pin keeps the byte-identical bare output.
                 if explicit_system == "auto":
                     if name == "locate":
+                        _meter_code_nav_bg(
+                            name, user_id,
+                            served_obj={"results": answer.hits or []},
+                            hits=answer.hits or [],
+                        )
                         return [TextContent(type="text", text=json.dumps(
                             {"results": answer.hits or [], "system": answer.system_name,
                              "routed_by": "auto"}, default=str, ensure_ascii=False))]
+                    _meter_code_nav_bg(name, user_id, served_text=answer.content)
                     return [TextContent(type="text", text=json.dumps(
                         {"result": answer.content, "system": answer.system_name,
                          "routed_by": "auto"}, default=str, ensure_ascii=False))]
                 if name == "locate":
+                    _meter_code_nav_bg(
+                        name, user_id,
+                        served_obj=answer.hits or [], hits=answer.hits or [],
+                    )
                     return [TextContent(type="text", text=json.dumps(
                         answer.hits or [], default=str, ensure_ascii=False))]
+                _meter_code_nav_bg(name, user_id, served_text=answer.content)
                 return [TextContent(type="text", text=answer.content)]
 
             try:
@@ -2398,6 +2434,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                     # Format locate results as JSON (list of LocateHit dicts)
                     from dataclasses import asdict
                     output = [asdict(hit) for hit in hits]
+                    _meter_code_nav_bg(name, user_id, served_obj=output, hits=output)
                     return [TextContent(type="text", text=json.dumps(output, default=str, ensure_ascii=False))]
                 else:  # code_impact
                     text = await asyncio.to_thread(
@@ -2416,6 +2453,9 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
             except Exception as e:
                 return [TextContent(type="text", text=json.dumps({"error": f"locate failed: {e}"}))]
+            # M3: meter query/neighbors here (locate returned above); path/impact
+            # are no-ops in _meter_code_nav_bg.
+            _meter_code_nav_bg(name, user_id, served_text=text)
             return [TextContent(type="text", text=text)]
 
         elif name == "get_project_knowledge_config":

@@ -645,3 +645,110 @@ class TestMetricsPayloadShapeM6:
         assert sm.measure_assemble(100, 10) is None
         assert sm.arm_bounce("alice", [_hit("m1", "x", token_estimate=5)]) is False
         assert sm.check_and_deduct_bounce("alice", [_hit("m1", "x", token_estimate=5)]) == 0
+
+    def test_snapshot_disabled_with_task_id_returns_none(self):
+        settings.savings_meter_enabled = False
+        snap = sm.metrics_snapshot("alice", redis=FakeRedis(), task_id="t")
+        assert snap["task"] is None
+
+
+# ── MF-1/Copilot C-nav: strict code-file parser (no prose as files) ──
+
+
+class TestCodeNavFileParser:
+    def test_prose_dotted_tokens_are_not_files(self):
+        prose = (
+            "See e.g. np.array and settings.savings; visit example.com or v2.x; "
+            "call os.path.join(foo.bar) and mem0.Memory — i.e. nothing here."
+        )
+        assert sm.distinct_files_in_text(prose) == []
+
+    def test_slash_paths_are_found(self):
+        text = "defined in neuralscape-service/main.py:1554 and adapters/base.py here"
+        files = sm.distinct_files_in_text(text)
+        assert "neuralscape-service/main.py" in files
+        assert "adapters/base.py" in files
+        assert len(files) == 2
+
+    def test_bare_file_requires_line_number(self):
+        # a bare dotted token without a slash or :line is NOT a path…
+        assert sm.distinct_files_in_text("please edit config.py now") == []
+        # …but file.ext:line is an unambiguous code reference.
+        assert sm.distinct_files_in_text("please edit config.py:12 now") == ["config.py"]
+
+    def test_line_suffix_normalized_for_dedup(self):
+        text = "a/b/c.py:10 and a/b/c.py:20 are the same file"
+        assert sm.distinct_files_in_text(text) == ["a/b/c.py"]
+
+    def test_extension_allowlist_rejects_non_code(self):
+        # slash paths but non-code extensions (images/binaries/domains) skipped
+        assert sm.distinct_files_in_text("assets/logo.png and cdn.site/x.woff2") == []
+
+    def test_cap_bounds_file_count(self):
+        text = " ".join(f"pkg/mod{i}.py" for i in range(50))
+        assert len(sm.distinct_files_in_text(text)) == 20  # default cap
+        assert len(sm.distinct_files_in_text(text, cap=5)) == 5
+
+    def test_measure_code_nav_from_prose_answer_books_zero_baseline(self):
+        # end-to-end: a prose query answer with no real paths must not
+        # fabricate avoided-read baseline (the honesty guarantee).
+        prose = "The helper np.array is used across settings.savings and foo.bar."
+        ev = sm.measure_code_nav(
+            "code_nav_query", served_text=prose, files=sm.distinct_files_in_text(prose)
+        )
+        assert ev.baseline_tokens == 0
+
+
+# ── MF-4: adjusted net is DERIVED (net − bounced), never a stored field ──
+
+
+class TestAdjustedDerived:
+    def test_legacy_totals_hash_reads_adjusted_equals_net(self):
+        r = FakeRedis()
+        key = sm.TOTALS_KEY.format(user_id="alice")
+        # a pre-M2 totals hash: net history but NO ``bounced`` field
+        r.hashes[key] = {
+            "events": 5, "baseline": 1000, "served": 100,
+            "overhead": 50, "net": 850, "rederiv_est": 10000,
+        }
+        totals = sm._read_totals(r, key)
+        assert totals["bounced_tokens"] == 0
+        assert totals["adjusted_net_tokens_saved"] == totals["net_tokens_saved"] == 850
+
+    def test_bounce_moves_only_derived_adjusted_not_stored(self):
+        r = FakeRedis()
+        hit = _hit("55555555-5555-5555-5555-555555555555", "c" * 40, token_estimate=300)
+        sm.arm_bounce("alice", [hit], redis=r)
+        sm.record_event("alice", sm.measure_recall("search_index", [hit], index_payload="rows"), redis=r)
+        sm.check_and_deduct_bounce("alice", [hit], redis=r)
+        # the totals hash stores a ``bounced`` accumulator, NOT an ``adjusted`` one
+        totals_hash = r.hashes[sm.TOTALS_KEY.format(user_id="alice")]
+        assert "adjusted" not in totals_hash
+        assert int(totals_hash["bounced"]) == 300
+        user = sm.metrics_snapshot("alice", redis=r)["user"]
+        assert user["adjusted_net_tokens_saved"] == user["net_tokens_saved"] - 300
+
+    def test_zero_token_item_consumes_marker_without_booking_bounce(self):
+        r = FakeRedis()
+        hit = _hit("66666666-6666-6666-6666-666666666666", "", token_estimate=0)
+        sm.arm_bounce("alice", [hit], redis=r)
+        assert sm.check_and_deduct_bounce("alice", [hit], redis=r) == 0  # C2
+        assert sm.check_and_deduct_bounce("alice", [hit], redis=r) == 0  # marker gone
+
+
+# ── C3: unknown lifecycle stages are clamped (never silently lost) ───
+
+
+class TestLifecycleClamp:
+    def test_unknown_stage_clamped_to_retrieval(self):
+        r = FakeRedis()
+        ev = sm.measure_recall(
+            "search_index", [_hit("m1", "x" * 40, token_estimate=40)], index_payload="rows"
+        )
+        ev.lifecycle_stage = "bogus_stage"
+        sm.record_event("alice", ev, redis=r)
+        row = r.streams[sm.LEDGER_KEY.format(user_id="alice")][-1]
+        assert row["lifecycle"] == "retrieval"
+        snap = sm.metrics_snapshot("alice", redis=r)
+        assert "retrieval" in snap["user"]["by_lifecycle"]
+        assert "bogus_stage" not in snap["user"]["by_lifecycle"]

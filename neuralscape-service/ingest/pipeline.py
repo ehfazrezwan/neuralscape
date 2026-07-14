@@ -147,9 +147,17 @@ def ingest_document(service, doc: IngestDoc) -> dict:
     fact_count = 0
     # M1 (ingest lifecycle): sum of the token cost of everything we STORE
     # (the compressed form future recalls serve instead of re-reading the
-    # source). Reads the write-time stamp on each stored row — no tokenizer
-    # work — so it is cheap even with the meter off.
+    # source). Reads the write-time stamp on each stored row — but a dedup hit
+    # can return a legacy row with token_estimate=None, whose hit_tokens would
+    # fall back to tiktoken; so accumulate ONLY when the meter is on, keeping
+    # the kill-switch's "zero tokenizer work when off" guarantee.
     served_tok = 0
+    try:
+        import savings_meter as _sm
+
+        meter_on = _sm._meter_enabled()
+    except Exception:
+        meter_on = False
 
     # ── Passages (verbatim, vector-only) ──
     if doc.index_passages:
@@ -183,7 +191,8 @@ def ingest_document(service, doc: IngestDoc) -> dict:
                 )
                 memory_ids.extend(m.id for m in stored)
                 passage_count += len(stored)
-                served_tok += _served_tokens(stored)
+                if meter_on:
+                    served_tok += _served_tokens(stored)
             except Exception as e:
                 logger.warning(f"Passage store failed (chunk {chunk.index}): {e}")
 
@@ -232,7 +241,8 @@ def ingest_document(service, doc: IngestDoc) -> dict:
                 )
                 memory_ids.extend(m.id for m in stored)
                 fact_count += len(stored)
-                served_tok += _served_tokens(stored)
+                if meter_on:
+                    served_tok += _served_tokens(stored)
                 if created:
                     for m in stored:
                         graph_jobs.append({
@@ -257,15 +267,13 @@ def ingest_document(service, doc: IngestDoc) -> dict:
     # of everything we stored. Best-effort, off any latency-sensitive path
     # (this runs in the ingest worker); a meter failure never fails ingest.
     try:
-        import savings_meter as sm
-
-        if sm._meter_enabled() and doc.user_id:
-            baseline_tok = sm.count_tokens(doc.content or "")
-            event = sm.measure_ingest(
+        if meter_on and doc.user_id:
+            baseline_tok = _sm.count_tokens(doc.content or "")
+            event = _sm.measure_ingest(
                 baseline_tok, served_tok, item_id=parent_id, corr_id=doc.run_id
             )
             if event is not None:
-                sm.record_event(doc.user_id, event)
+                _sm.record_event(doc.user_id, event)
     except Exception:
         logger.debug("ingest savings metering failed (non-fatal)", exc_info=True)
 

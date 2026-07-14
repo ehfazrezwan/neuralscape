@@ -44,7 +44,9 @@ tokenizer call and write-time stamping falls back to the heuristic.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -73,16 +75,19 @@ BOUNCE_KEY = "ns:savings:bounce:{user_id}:{item_id}"
 
 _INSTANCE_SCOPE = "__instance__"
 
-# ``net`` is the RAW measured net; ``adjusted`` is the bounce-corrected net.
-# Both are cumulative and both are surfaced; for a normal event they are
-# equal, for a bounce deduction net==0 and adjusted<0.
+# ``net`` is the RAW measured net; ``bounced`` is the cumulative bounce
+# deduction. The bounce-corrected ``adjusted_net_tokens_saved`` is DERIVED at
+# read time as ``net − bounced`` — never stored as its own accumulator — so a
+# legacy totals hash written before M2 (which has ``net`` history but no
+# ``bounced`` field) reads back ``bounced=0`` ⇒ ``adjusted == net``, correct by
+# construction with no migration and no phantom "bounces ate everything".
 _TOTAL_FIELDS = (
     "events",
     "baseline",
     "served",
     "overhead",
     "net",
-    "adjusted",
+    "bounced",
     "rederiv_est",
 )
 
@@ -196,16 +201,19 @@ class SavingsEvent:
     net_tokens_saved: int  # SIGNED raw net — never clamped to zero
     rederivation_savings_estimate: int  # heuristic; never in net
     # M1/M2/M4 metadata (defaulted so the historical 6-positional
-    # construction stays valid). ``adjusted_net_tokens_saved`` defaults to
-    # the raw net; a bounce deduction sets net=0 and adjusted<0.
+    # construction stays valid). ``bounced_tokens`` is the deduction this event
+    # contributes to the cumulative ``bounced`` accumulator (non-zero only on a
+    # ``bounce`` event); ``adjusted_net_tokens_saved`` = net − bounced is the
+    # per-event bounce-corrected net carried on the stream row.
     adjusted_net_tokens_saved: int | None = None
+    bounced_tokens: int = 0
     lifecycle_stage: str = "retrieval"
     item_id: str | None = None
     corr_id: str | None = None
 
     def __post_init__(self):
         if self.adjusted_net_tokens_saved is None:
-            self.adjusted_net_tokens_saved = self.net_tokens_saved
+            self.adjusted_net_tokens_saved = self.net_tokens_saved - self.bounced_tokens
 
     def detail(self) -> dict:
         """The compact per-response detail surface. Intentionally limited to
@@ -402,6 +410,89 @@ def measure_code_nav(
     )
 
 
+# ── Code-nav file parsing + dispatch (M3, shared by REST + MCP) ──────
+# The avoided-read baseline is driven by the distinct FILES a code answer
+# references. query/neighbors answers never carry a structured file list, so
+# those baselines are parsed from the answer text — which means the parser
+# must be STRICT: it books each distinct file at the disclosed per-file
+# estimate, so a false positive (prose like ``e.g``, ``np.array``,
+# ``settings.savings``, ``example.com``) would fabricate baseline, the exact
+# dishonesty this meter exists to prevent.
+_CODE_NAV_EXTS = frozenset(
+    "py pyi ts tsx js jsx mjs cjs go rs java rb c h cc cpp hpp cs php swift "
+    "kt scala sh bash sql yaml yml toml ini cfg json md rst txt".split()
+)
+# A path must LOOK like a path: a slash-separated path ending in a code
+# extension (optionally ``:line``), OR a bare ``file.ext:line`` reference. A
+# lone dotted token (``np.array``, ``settings.savings``, ``example.com``,
+# ``v2.x``) matches NEITHER alternative.
+_CODE_FILE_RE = re.compile(
+    r"(?<![\w.])"
+    r"(?:"
+    r"[\w\-.]+(?:/[\w\-.]+)+\.(?P<ext1>[A-Za-z][\w]{0,6})(?::\d+)?"  # a/b/c.py[:12]
+    r"|"
+    r"[\w\-.]+\.(?P<ext2>[A-Za-z][\w]{0,6}):\d+"                      # file.py:12
+    r")"
+)
+
+
+def distinct_files_in_text(text: str | None, *, cap: int = 20) -> list[str]:
+    """Distinct code-file paths referenced in a code-nav answer — the files a
+    model would otherwise have opened. Strict on shape (needs a directory
+    separator or a ``:line`` suffix) and gated on a real code/text extension,
+    so prose dotted tokens are never booked as avoided files. Capped so one
+    pathological answer cannot book an unbounded baseline."""
+    if not text:
+        return []
+    seen: dict[str, None] = {}
+    for m in _CODE_FILE_RE.finditer(text):
+        ext = (m.group("ext1") or m.group("ext2") or "").lower()
+        if ext not in _CODE_NAV_EXTS:
+            continue
+        path = re.sub(r":\d+$", "", m.group(0))  # file.py:12 == file.py
+        seen.setdefault(path, None)
+        if len(seen) >= cap:
+            break
+    return list(seen)
+
+
+def meter_code_nav_bg(
+    op: str,
+    user_id: str | None,
+    *,
+    served_text: str | None = None,
+    served_obj=None,
+    files=None,
+) -> None:
+    """Ledger one code-nav op OFF the hot path, from EITHER transport (REST or
+    MCP). Baseline = avoided file-read footprint; served = the compact answer
+    NS returned. ``files`` (from structured hits) is preferred; otherwise the
+    distinct paths are parsed from the served text. Serialization + parsing run
+    inside the telemetry closure, and the meter-off short-circuit is checked
+    first, so a meter-off request does zero extra work."""
+    if not user_id or not _meter_enabled():
+        return
+
+    def _run() -> None:
+        if served_text is not None:
+            text = served_text
+        elif served_obj is not None:
+            text = json.dumps(served_obj, default=str)
+        else:
+            text = ""
+        resolved = list(files) if files else distinct_files_in_text(text)
+        event = measure_code_nav(op, served_text=text, files=resolved)
+        if event is not None:
+            record_event(user_id, event)
+
+    try:
+        import telemetry
+
+        telemetry.submit(_run)
+    except Exception:
+        logger.debug("code-nav metering dispatch failed (non-fatal)", exc_info=True)
+
+
 def measure_compaction(
     baseline_tokens: int,
     served_tokens: int,
@@ -409,9 +500,11 @@ def measure_compaction(
     item_id: str | None = None,
     corr_id: str | None = None,
 ) -> SavingsEvent | None:
-    """Measure one compaction op (M1): baseline = the transcript messages
-    folded into the summary, served = the resulting rolling summary. The net
-    is the recursive-compression saving of the session summarizer."""
+    """Measure one compaction op (M1): baseline = the prior rolling summary
+    that this refresh REPLACES + the transcript messages folded in, served =
+    the resulting new rolling summary. Booking the prior summary in the
+    baseline makes the per-refresh nets telescope to Σ(messages) − S_final over
+    a session — the true recursive-compression saving of the summarizer."""
     if not _meter_enabled():
         return None
     return _make_event(
@@ -454,18 +547,13 @@ def _get_redis():
 
 
 def _increments(event: SavingsEvent) -> dict:
-    adjusted = (
-        event.adjusted_net_tokens_saved
-        if event.adjusted_net_tokens_saved is not None
-        else event.net_tokens_saved
-    )
     return {
         "events": 1,
         "baseline": event.baseline_tokens,
         "served": event.served_tokens,
         "overhead": event.overhead_tokens,
         "net": event.net_tokens_saved,
-        "adjusted": adjusted,
+        "bounced": max(0, int(event.bounced_tokens)),
         "rederiv_est": event.rederivation_savings_estimate,
     }
 
@@ -479,7 +567,17 @@ def _append(r, user_id: str, event: SavingsEvent) -> None:
     from config import settings
 
     incr = _increments(event)
+    # C3 — a lifecycle_stage outside the fixed enum would write buckets the
+    # payload's fixed-enum read never surfaces (silent loss + unbounded keys);
+    # clamp unknown stages to ``retrieval``.
     lifecycle = event.lifecycle_stage or "retrieval"
+    if lifecycle not in LIFECYCLE_STAGES:
+        lifecycle = "retrieval"
+    adjusted = (
+        event.adjusted_net_tokens_saved
+        if event.adjusted_net_tokens_saved is not None
+        else event.net_tokens_saved - incr["bounced"]
+    )
     fields = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "op": event.op,
@@ -490,7 +588,7 @@ def _append(r, user_id: str, event: SavingsEvent) -> None:
         "served": event.served_tokens,
         "overhead": event.overhead_tokens,
         "net": event.net_tokens_saved,
-        "adjusted": incr["adjusted"],
+        "adjusted": adjusted,
         "rederiv_est": event.rederivation_savings_estimate,
     }
     pipe = r.pipeline()
@@ -601,10 +699,18 @@ def check_and_deduct_bounce(user_id: str, hits, redis=None) -> int:
             val = r.get(key)
             if val is None:
                 continue
-            r.delete(key)
+            # C1 — claim the marker atomically: only the racer whose DELETE
+            # actually removed the key deducts, so concurrent full-fetches of
+            # the same item can't double-count.
+            if not r.delete(key):
+                continue
             try:
                 baseline_share = max(0, int(val))
             except (TypeError, ValueError):
+                continue
+            if baseline_share == 0:
+                # C2 — a zero-token item (legacy/empty stamp) saved nothing to
+                # begin with; consume the marker but book no bounce event.
                 continue
             _append(
                 r,
@@ -616,7 +722,7 @@ def check_and_deduct_bounce(user_id: str, hits, redis=None) -> int:
                     overhead_tokens=0,
                     net_tokens_saved=0,  # raw net untouched
                     rederivation_savings_estimate=0,
-                    adjusted_net_tokens_saved=-baseline_share,  # only adjusted moves
+                    bounced_tokens=baseline_share,  # only the derived adjusted moves
                     lifecycle_stage="retrieval",
                     item_id=hid,
                 ),
@@ -645,7 +751,10 @@ def _read_totals(r, key: str) -> dict:
         "served_tokens": out["served"],
         "overhead_tokens": out["overhead"],
         "net_tokens_saved": out["net"],
-        "adjusted_net_tokens_saved": out["adjusted"],
+        # DERIVED — never a stored accumulator (see _TOTAL_FIELDS): legacy
+        # hashes with no ``bounced`` field read 0 ⇒ adjusted == net.
+        "bounced_tokens": out["bounced"],
+        "adjusted_net_tokens_saved": out["net"] - out["bounced"],
         "rederivation_savings_estimate": out["rederiv_est"],
     }
 

@@ -374,15 +374,22 @@ async def refresh_slot(
 
     await asyncio.to_thread(_store)
 
-    # M1 — compaction lifecycle: baseline = the transcript messages folded
-    # into this summary, served = the resulting rolling summary. Best-effort,
-    # off the request path (this runs on the graph worker); a meter failure
-    # never fails the refresh.
+    # M1 — compaction lifecycle. Refresh is RECURSIVE compression: prior
+    # summary + delta messages → a new summary that REPLACES the prior in
+    # served context. So the honest incremental counterfactual is
+    # baseline = prior_summary + folded_messages (served = the new summary),
+    # which telescopes over a session to Σ(messages) − S_final — the true
+    # compaction saving. (Omitting the prior summary would under-state by every
+    # intermediate summary and book spurious negatives once the running summary
+    # exceeds a message batch.) Best-effort, off the request path (graph
+    # worker); a meter failure never fails the refresh.
     try:
         import savings_meter as sm
 
         if sm._meter_enabled() and user_id:
-            baseline_tok = text_tokens(render_messages_block(new_messages))
+            baseline_tok = int((prior or {}).get("tokens") or 0) + text_tokens(
+                render_messages_block(new_messages)
+            )
             event = sm.measure_compaction(
                 baseline_tok, record["tokens"], item_id=slot, corr_id=session_id
             )

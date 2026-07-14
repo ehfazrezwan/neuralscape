@@ -1552,9 +1552,11 @@ async def v1_code_graph_locate(
             query=query, limit=k,
         )
         hits = answer.hits or []
+        # C4: this branch serves both structured rows AND the text summary —
+        # meter both so served isn't undercounted (which would overstate net).
         _meter_code_nav_bg(
             "code_nav_locate", caller,
-            served_text=json.dumps(hits, default=str),
+            served_obj={"results": hits, "result": answer.content},
             files=[h.get("file") for h in hits if isinstance(h, dict) and h.get("file")],
         )
         return {
@@ -1580,10 +1582,11 @@ async def v1_code_graph_locate(
     except cg.CodeGraphError as e:
         raise _map_code_graph_error(e) from e
     # M3: baseline = the distinct enclosing files these hits let the model
-    # skip reading; served = the compact located rows.
+    # skip reading; served = the compact located rows (serialized off the
+    # request path inside the metering closure).
     _meter_code_nav_bg(
         "code_nav_locate", caller,
-        served_text=json.dumps(results, default=str),
+        served_obj={"results": results},
         files=[r.get("file") for r in results if r.get("file")],
     )
     return {"results": results, "graph_id": graph_id, "k": k}
@@ -1946,46 +1949,16 @@ def _meter_full_recall_bg(op: str, user_id: str, hits) -> None:
         logger.debug("savings metering dispatch failed (non-fatal)", exc_info=True)
 
 
-# M3 — code-nav read-avoidance. Distinct file paths referenced in a code
-# answer (path/to/file.ext, optionally with :line) are the files the model
-# would otherwise have opened — the avoided-read footprint.
-import re as _re
+# M3/M5 — code-nav read-avoidance metering. The parser (strict file-shape +
+# extension allowlist + cap) and the off-hot-path dispatch live in
+# savings_meter so BOTH transports (this REST surface + the MCP code tools)
+# meter identically; this is a thin transport shim.
+def _meter_code_nav_bg(op: str, user_id: str, *, served_text=None, served_obj=None, files=None) -> None:
+    import savings_meter as sm
 
-_CODE_FILE_RE = _re.compile(r"[\w./\-]+\.[A-Za-z][\w]{0,6}")
-
-
-def _distinct_files_in_text(text: str | None) -> list[str]:
-    if not text:
-        return []
-    seen: dict[str, None] = {}
-    for m in _CODE_FILE_RE.finditer(text):
-        seen.setdefault(m.group(0), None)
-    return list(seen)
-
-
-def _meter_code_nav_bg(op: str, user_id: str, *, served_text: str, files=None) -> None:
-    """E2/M3: ledger one code-nav op off the hot path. Baseline = avoided
-    file-read footprint (distinct enclosing files × the disclosed per-file
-    estimate); served = the compact answer NS returned. ``files`` (from
-    structured hits) is preferred; otherwise distinct file paths are parsed
-    from the served text as a labeled estimate."""
-    if not user_id:
-        return
-
-    def _run() -> None:
-        import savings_meter as sm
-
-        resolved = files if files else _distinct_files_in_text(served_text)
-        event = sm.measure_code_nav(op, served_text=served_text, files=resolved)
-        if event is not None:
-            sm.record_event(user_id, event)
-
-    try:
-        import telemetry
-
-        telemetry.submit(_run)
-    except Exception:
-        logger.debug("code-nav metering dispatch failed (non-fatal)", exc_info=True)
+    sm.meter_code_nav_bg(
+        op, user_id, served_text=served_text, served_obj=served_obj, files=files
+    )
 
 
 # Union response model: Pydantic v2 smart-union validates the returned model
