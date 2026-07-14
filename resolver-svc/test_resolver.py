@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -98,12 +99,19 @@ def _framed(payload: dict) -> bytes:
 
 
 class _FakeProc:
-    """A subprocess.Popen stand-in exposing stdin (capture) + stdout (scripted)."""
+    """A subprocess.Popen stand-in: stdin captures writes; stdout is a real OS
+    pipe pre-loaded with scripted bytes (so the select-bounded reader exercises
+    the real ``select`` + ``os.read`` path, not a BytesIO shim)."""
 
     def __init__(self, stdout_bytes: bytes):
         self.stdin = io.BytesIO()
-        self.stdout = io.BytesIO(stdout_bytes)
+        self._r, w = os.pipe()
+        os.write(w, stdout_bytes)
+        os.close(w)  # EOF after scripted bytes
         self._alive = True
+
+    def stdout_fd(self):
+        return self._r
 
     def poll(self):
         return None if self._alive else 0
@@ -113,10 +121,21 @@ def test_read_message_parses_frame():
     srv = PyrightServer("/repo")
     payload = {"jsonrpc": "2.0", "id": 1, "result": {"ok": True}}
     srv._proc = _FakeProc(_framed(payload))
+    srv._stdout_fd = srv._proc.stdout_fd()
     import time
 
     msg = srv._read_message(deadline=time.monotonic() + 5)
     assert msg == payload
+
+
+def test_read_message_times_out_when_no_output():
+    srv = PyrightServer("/repo")
+    r, _w = os.pipe()  # nothing ever written → reader must honor the deadline
+    srv._stdout_fd = r
+    import time
+
+    with pytest.raises(Exception):
+        srv._read_message(deadline=time.monotonic() + 0.3)
 
 
 def test_write_frames_content_length():
@@ -138,6 +157,7 @@ def test_request_correlates_and_answers_server_requests():
     server_req = {"jsonrpc": "2.0", "id": 99, "method": "window/workDoneProgress/create", "params": {}}
     real_resp = {"jsonrpc": "2.0", "id": 1, "result": [{"uri": "file:///repo/a.py", "range": {"start": {"line": 0, "character": 0}}}]}
     srv._proc = _FakeProc(_framed(server_req) + _framed(real_resp))
+    srv._stdout_fd = srv._proc.stdout_fd()
     result = srv._request("textDocument/definition", {}, timeout=5)
     assert _normalize_definition(result) == [("/repo/a.py", 1)]
     # We answered the server request with a null result.
@@ -184,13 +204,14 @@ def client(tmp_path, monkeypatch):
         def shutdown(self):
             pass
 
-    monkeypatch.setattr(main, "pool", _Pool())
-    return TestClient(app_with_pool()), repo
-
-
-def app_with_pool():
-    # main.app already constructed; pool is patched in the fixture.
-    return main.app
+    fake_pool = _Pool()
+    # Patch BOTH the module global AND the ServerPool class: the app's lifespan
+    # hook reassigns `pool = ServerPool()` on startup, so if a test enters the
+    # TestClient as a context manager (triggering lifespan) the plain global
+    # patch would be clobbered — patching the constructor keeps the fake in place.
+    monkeypatch.setattr(main, "pool", fake_pool)
+    monkeypatch.setattr(main, "ServerPool", lambda: fake_pool)
+    return TestClient(main.app), repo
 
 
 def test_resolve_calls_in_repo(client):

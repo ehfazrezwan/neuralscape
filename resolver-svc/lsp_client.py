@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import select
 import subprocess
 import threading
 import time
@@ -79,6 +80,8 @@ class PyrightServer:
         self._opened: set[str] = set()  # file URIs already didOpen'd
         self._lock = threading.Lock()
         self._started_at = 0.0
+        self._stdout_fd: int | None = None  # for select-bounded reads
+        self._rbuf = b""  # unparsed bytes carried across _read_message calls
 
     @staticmethod
     def _default_cmd() -> list[str]:
@@ -100,6 +103,7 @@ class PyrightServer:
             stderr=subprocess.DEVNULL,
             bufsize=0,
         )
+        self._stdout_fd = self._proc.stdout.fileno()
         self._initialize()
         self._started_at = time.monotonic()
 
@@ -133,36 +137,52 @@ class PyrightServer:
         except BrokenPipeError as e:
             raise LSPError(f"language server pipe broken: {e}") from e
 
-    def _read_message(self, deadline: float) -> dict:
-        """Read one framed LSP message from stdout (blocking, bounded by deadline)."""
-        if self._proc is None or self._proc.stdout is None:
-            raise LSPError("language server not started")
-        stdout = self._proc.stdout
+    def _recv(self, n: int, deadline: float) -> bytes:
+        """Read up to ``n`` bytes from the server's stdout, bounded by ``deadline``.
 
-        # Read headers up to the blank line.
-        headers: dict[str, str] = {}
-        while True:
-            if time.monotonic() > deadline:
-                raise LSPError("timed out reading LSP header")
-            line = stdout.readline()
-            if line == b"":
-                raise LSPError("language server closed stdout (EOF)")
-            line = line.rstrip(b"\r\n")
-            if line == b"":
-                break
+        Uses ``select`` on the raw fd + ``os.read`` so a stalled language server
+        cannot block past the deadline (a plain ``readline``/``read(n)`` on a
+        blocking pipe would ignore the deadline entirely — the defect this fixes).
+        """
+        if self._stdout_fd is None:
+            raise LSPError("language server not started")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise LSPError("timed out waiting for LSP output")
+        r, _, _ = select.select([self._stdout_fd], [], [], remaining)
+        if not r:
+            raise LSPError("timed out waiting for LSP output")
+        chunk = os.read(self._stdout_fd, n)
+        if chunk == b"":
+            raise LSPError("language server closed stdout (EOF)")
+        return chunk
+
+    def _read_message(self, deadline: float) -> dict:
+        """Read one framed LSP message from stdout, bounded by ``deadline``.
+
+        Buffers across calls (``self._rbuf``): a single ``os.read`` may span
+        message boundaries, and a message may arrive in several reads.
+        """
+        # Accumulate until the header terminator is present.
+        while b"\r\n\r\n" not in self._rbuf:
+            self._rbuf += self._recv(4096, deadline)
+
+        header_blob, _, rest = self._rbuf.partition(b"\r\n\r\n")
+        length = 0
+        for line in header_blob.split(b"\r\n"):
             if b":" in line:
                 k, _, v = line.partition(b":")
-                headers[k.decode("ascii").strip().lower()] = v.decode("ascii").strip()
+                if k.strip().lower() == b"content-length":
+                    try:
+                        length = int(v.strip())
+                    except ValueError:
+                        raise LSPError(f"bad Content-Length: {v!r}")
+        self._rbuf = rest
 
-        length = int(headers.get("content-length", "0"))
-        body = b""
-        while len(body) < length:
-            if time.monotonic() > deadline:
-                raise LSPError("timed out reading LSP body")
-            chunk = stdout.read(length - len(body))
-            if chunk == b"":
-                raise LSPError("language server closed stdout mid-body (EOF)")
-            body += chunk
+        while len(self._rbuf) < length:
+            self._rbuf += self._recv(4096, deadline)
+        body = self._rbuf[:length]
+        self._rbuf = self._rbuf[length:]
         return json.loads(body.decode("utf-8"))
 
     def _request(self, method: str, params: dict, timeout: float = _REQUEST_TIMEOUT) -> dict:

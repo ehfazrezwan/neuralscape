@@ -1940,28 +1940,38 @@ class NativeEngine:
         _t0 = _time.time()
         resolved: list[dict] = []
         resolved_count = 0
-        for rel_path, sites in sites_by_file.items():
-            abs_path = repo_path / rel_path
-            try:
-                source = abs_path.read_text(encoding="utf-8", errors="ignore")
-            except Exception:
-                continue
-            defs = resolver.resolve_file(
-                abs_path, source, [(s["line"], s["col"]) for s in sites]
-            )
-            for site, (def_path, def_line) in zip(sites, defs):
-                if not def_path or def_line is None:
-                    continue  # unresolved (stdlib/external/dynamic) → dropped
-                tgt = self._map_def_to_fqn(
-                    def_path, def_line, repo_path, symbols_by_file
+        try:
+            for rel_path, sites in sites_by_file.items():
+                abs_path = repo_path / rel_path
+                try:
+                    source = abs_path.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    continue
+                defs = resolver.resolve_file(
+                    abs_path, source, [(s["line"], s["col"]) for s in sites]
                 )
-                if not tgt:
-                    continue  # resolved outside the repo's indexed symbols
-                src = site["src_fqn"]
-                if src == tgt:
-                    continue  # skip trivial self-recursion self-loops
-                resolved_count += 1
-                resolved.append({"src_fqn": src, "tgt_fqn": tgt})
+                for site, (def_path, def_line) in zip(sites, defs):
+                    if not def_path or def_line is None:
+                        continue  # unresolved (stdlib/external/dynamic) → dropped
+                    tgt = self._map_def_to_fqn(
+                        def_path, def_line, repo_path, symbols_by_file
+                    )
+                    if not tgt:
+                        continue  # resolved outside the repo's indexed symbols
+                    src = site["src_fqn"]
+                    if src == tgt:
+                        continue  # skip trivial self-recursion self-loops
+                    resolved_count += 1
+                    resolved.append({"src_fqn": src, "tgt_fqn": tgt})
+        finally:
+            # Release any resolver-held resources (LspCallResolver owns an
+            # httpx.Client; leaving it open leaks sockets across many indexes).
+            close = getattr(resolver, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    logger.debug("resolver close failed (non-fatal)", exc_info=True)
 
         # Dedup (src, tgt) — many call sites share the same edge.
         seen: set[tuple[str, str]] = set()

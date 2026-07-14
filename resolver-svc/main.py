@@ -91,11 +91,23 @@ class ServerPool:
 
     def __init__(self):
         self._servers: dict[str, PyrightServer] = {}
-        self._lock = threading.Lock()
+        self._locks: dict[str, threading.Lock] = {}
+        self._registry_lock = threading.Lock()  # guards the dicts only (fast)
+
+    def _lock_for(self, root: str) -> threading.Lock:
+        with self._registry_lock:
+            lk = self._locks.get(root)
+            if lk is None:
+                lk = threading.Lock()
+                self._locks[root] = lk
+            return lk
 
     def get(self, repo_path: str) -> PyrightServer:
         root = str(Path(repo_path).resolve())
-        with self._lock:
+        # Per-root lock so a slow pyright warmup/restart for one repo does NOT
+        # serialize resolve requests for OTHER repos (the registry lock is only
+        # held briefly to fetch/create the per-root lock).
+        with self._lock_for(root):
             srv = self._servers.get(root)
             if srv is not None and srv.is_alive():
                 return srv
@@ -105,14 +117,16 @@ class ServerPool:
             srv = PyrightServer(root)
             srv.start()
             srv.settle()
-            self._servers[root] = srv
+            with self._registry_lock:
+                self._servers[root] = srv
             return srv
 
     def shutdown(self) -> None:
-        with self._lock:
-            for srv in self._servers.values():
-                srv.stop()
+        with self._registry_lock:
+            servers = list(self._servers.values())
             self._servers.clear()
+        for srv in servers:
+            srv.stop()
 
 
 pool: ServerPool | None = None
@@ -173,8 +187,19 @@ def _resolve_repo(req: ResolveCallsRequest) -> ResolveCallsResponse:
     resolved = 0
     total = 0
 
+    repo_root_resolved = Path(repo_root).resolve()
     for f in req.files:
         abs_path = str((Path(repo_root) / f.path).resolve())
+        # Path-traversal guard: a request must not use `../`/symlinks to make the
+        # service read files outside the mounted repo (pyright didOpen reads file
+        # contents). Anything escaping repo_root → all sites unresolved.
+        try:
+            Path(abs_path).relative_to(repo_root_resolved)
+        except ValueError:
+            logger.warning("rejecting out-of-repo file path: %s", f.path)
+            out_files.append(FileDefs(path=f.path, defs=[(None, None)] * len(f.sites)))
+            total += len(f.sites)
+            continue
         defs: list[tuple[str | None, int | None]] = []
         for line1, col in f.sites:
             total += 1

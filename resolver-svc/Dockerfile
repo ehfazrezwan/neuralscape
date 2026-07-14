@@ -24,9 +24,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Pinned pyright (provides `pyright` + `pyright-langserver`). MIT.
+# The install must succeed (no `|| true` swallowing failures — that could ship an
+# image without pyright that only fails at runtime); a separate check asserts the
+# langserver binary is actually on PATH so a broken image fails the BUILD.
 ARG PYRIGHT_VERSION=1.1.411
-RUN npm install -g pyright@${PYRIGHT_VERSION} \
-    && pyright-langserver --help >/dev/null 2>&1 || true
+RUN npm install -g pyright@${PYRIGHT_VERSION}
+RUN command -v pyright-langserver >/dev/null 2>&1 || (echo "pyright-langserver missing after install" && exit 1)
 
 # Isolated venv for the shim (avoids PEP-668 externally-managed conflicts).
 ENV VENV=/opt/venv
