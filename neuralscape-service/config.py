@@ -332,13 +332,46 @@ class Settings(BaseSettings):
     # pre-E2 behavior. Additive + optional (default {}), so nothing changes for
     # deployments that don't opt in.
     code_repos: dict[str, str] = {}
-    # Deterministic-by-default (product directive): the native code-intel engine
-    # must be deterministic + API-token-free by default. Symbol-card embedding at
-    # index time and the dense leg of `locate` go through a cloud embedder
-    # (Gemini) — so they are OPT-IN. Default OFF ⇒ index skips symbol-card
-    # embedding entirely and `locate` degrades gracefully to BM25 + graph-degree
-    # (local, deterministic, no network). Set true to enable cloud semantic
-    # locate. (A local-embedder option is a planned follow-up.)
+    # ── Native code-intel locate: retrieval posture (C3, token-free default) ──
+    # The A/B (reports/ICE_V2_NLLOCATE_EMBEDDINGS.md) proved native locate's 0.16
+    # h@1 was a *configuration artifact*: the old default indexed no symbol-card
+    # text and ranked on fqn/file tokens alone, blind to natural-language
+    # docstring queries. The fix is token-free and quality-≥-cloud:
+    #   - card-text BM25 (always on) alone lifts h@1 0.16 → 0.60, and
+    #   - a LOCAL code embedder dense leg fused with BM25 + graph-degree → ~0.76,
+    #     *beating* cloud embeddings at zero API tokens.
+    #
+    # `code_embedder` is the authoritative posture (supersedes the legacy
+    # `code_index_embeddings` flag below):
+    #   "off"   — no dense leg (BM25 over card text + graph-degree only; C1 ~0.60)
+    #   "local" — DEFAULT — local fastembed ONNX dense leg + BM25 + degree. The
+    #             default jina model measured h@1 ~0.75 in the A/B (§4), in the
+    #             same token-free band as CodeRankEmbed (0.76) and cloud (0.753).
+    #             Token-free / no cloud calls; honors deterministic-by-default.
+    #             Index cost is one-time CPU card-embedding (background reindex);
+    #             per-query +~28ms, negligible.
+    #   "cloud" — Gemini card embeddings (opt-in only; dominated on accuracy AND
+    #             costs ~158K index tokens + ~11/query on this corpus).
+    code_embedder: str = "local"
+    # Local code embedder model. MUST be a fastembed-supported ONNX id (see
+    # fastembed's TextEmbedding.list_supported_models) — this is deliberately the
+    # torch-free path. jina-embeddings-v2-base-code (Apache-2.0, 768-dim) is the
+    # default; fastembed is already a dependency, so it adds no new Python dep or
+    # container-gate landmine. NOTE: CodeRankEmbed is NOT loadable here (not in
+    # fastembed's registry; needs torch + trust_remote_code) — it would require a
+    # different backend and a heavy image delta.
+    code_embedder_model: str = "jinaai/jina-embeddings-v2-base-code"
+    # Query prefix for asymmetric embedders (CodeRankEmbed wants "Represent this
+    # query for searching relevant code: " on queries only). jina is symmetric →
+    # empty. Documents are always embedded bare.
+    code_embedder_query_prefix: str = ""
+    # Always-on token-free lexical leg: BM25 over the symbol-card TEXT (name +
+    # signature + docstring + source). This is the C1 lift and the deterministic
+    # backbone of locate; disable only to isolate the dense leg in measurement.
+    code_locate_lexical_cards: bool = True
+    # LEGACY (superseded by `code_embedder`). Kept for back-compat: a deployment
+    # that explicitly set this True to opt into cloud embeddings is migrated to
+    # code_embedder="cloud" by the validator below. Default False.
     code_index_embeddings: bool = False
     # Confidence assigned per Graphify edge/insight confidence tag (F1 epistemic
     # mapping): EXTRACTED → epistemic_level="explicit", INFERRED → "deductive"
@@ -579,6 +612,32 @@ class Settings(BaseSettings):
                 f"(got overlap={self.extraction_window_overlap}, "
                 f"window={self.extraction_window_messages})"
             )
+        return self
+
+    @field_validator("code_embedder")
+    @classmethod
+    def _validate_code_embedder(cls, value: str) -> str:
+        v = (value or "").strip().lower()
+        if v not in {"off", "local", "cloud"}:
+            raise ValueError(
+                f"CODE_EMBEDDER must be one of off|local|cloud (got {value!r})"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _migrate_legacy_code_embeddings(self) -> "Settings":
+        # Back-compat: a deployment that opted into cloud symbol-card embeddings
+        # via the legacy boolean (code_index_embeddings=True) keeps cloud
+        # behavior — but ONLY when it did not also set the new posture. An
+        # explicit code_embedder ALWAYS wins (including an explicit "local"),
+        # so we migrate only when code_embedder was left at its default and is
+        # still "local". model_fields_set distinguishes explicit from default.
+        if (
+            self.code_index_embeddings
+            and self.code_embedder == "local"
+            and "code_embedder" not in self.model_fields_set
+        ):
+            self.code_embedder = "cloud"
         return self
 
     @field_validator("auth_provider")

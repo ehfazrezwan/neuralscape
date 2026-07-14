@@ -216,11 +216,16 @@ def test_get_anchor_memories_cap(mock_bridge, mock_memory_service):
 
 def test_locate_enriches_with_memories(mock_bridge, mock_memory_service):
     """locate() returns LocateHit with memories field populated."""
+    # Dense leg via the mocked cloud embedder (no local ONNX load); card-text
+    # BM25 leg off (these mocks carry no card corpus).
+    settings = MagicMock()
+    settings.code_embedder = "cloud"
+    settings.code_locate_lexical_cards = False
     engine = NativeEngine(
         repo_path="/fake/path",
         code_space="code--alice--myrepo",
         bridge=mock_bridge,
-        settings=MagicMock(),
+        settings=settings,
     )
 
     # Mock code_index search returning 1 symbol

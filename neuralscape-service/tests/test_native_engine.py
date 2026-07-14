@@ -47,6 +47,13 @@ def mock_settings():
     settings.code_graph_ambiguous_floor = 0.6
     settings.code_graph_max_communities = 10
     settings.code_graph_max_god_nodes = 15
+    # C3 nl_locate posture (mirror real Settings defaults so _code_embedder_mode
+    # resolves cleanly instead of seeing a truthy Mock).
+    settings.code_embedder = "local"
+    settings.code_embedder_model = "jinaai/jina-embeddings-v2-base-code"
+    settings.code_embedder_query_prefix = ""
+    settings.code_locate_lexical_cards = True
+    settings.code_index_embeddings = False
     return settings
 
 
@@ -86,6 +93,10 @@ def test_native_engine_locate_implemented(mock_bridge, mock_settings):
     """Test that locate() now works in E3 (requires mocked embedding)."""
     from unittest.mock import patch, Mock
     import uuid
+    # Exercise the dense leg via the mocked cloud embedder (no local ONNX load);
+    # card-text BM25 leg off (this fixture's bridge has no card corpus).
+    mock_settings.code_embedder = "cloud"
+    mock_settings.code_locate_lexical_cards = False
 
     # Mock the memory service
     mock_service = Mock()
@@ -118,8 +129,10 @@ def test_native_engine_locate_implemented(mock_bridge, mock_settings):
         settings=mock_settings,
     )
 
-    # Should not raise EngineCapabilityError anymore (E3 implements it)
-    with patch("memory_service.get_shared_service", return_value=mock_service):
+    # Should not raise EngineCapabilityError anymore (E3 implements it). Both
+    # legs empty → the deterministic fallback runs (mock _run_cypher returns []).
+    with patch("memory_service.get_shared_service", return_value=mock_service), \
+         patch.object(engine, "_run_cypher", return_value=[]):
         hits = engine.locate("test query")
 
     # Should return empty list (no hits from mocked Qdrant)
@@ -587,31 +600,125 @@ def test_native_engine_path_no_source(mock_bridge, mock_settings):
     assert "No symbol matching source" in result
 
 
-def test_code_index_embeddings_off_skips_embed_and_uses_deterministic_locate(mock_bridge, mock_settings):
-    """DET-1 (deterministic default): with code_index_embeddings OFF,
-    _index_symbol_cards must NOT embed (no cloud call) and locate() must use the
-    local Neo4j lexical+degree path (no embedder), returning ranked hits."""
+def test_code_embedder_off_skips_dense_embed_but_indexes_card_text(mock_bridge, mock_settings):
+    """DET default (code_embedder=off): _index_symbol_cards must NOT embed (no
+    cloud/local dense call) but MUST still write card text onto the graph for the
+    token-free BM25 leg; locate() then ranks over card text (no embedder)."""
     from unittest.mock import patch, MagicMock
-    mock_settings.code_index_embeddings = False
+    from adapters.code_graph import code_locate
+    mock_settings.code_embedder = "off"
     eng = NativeEngine(
-        repo_path="/repo", code_space="code--u--r",
+        repo_path="/repo", code_space="code--u--r-off",
         bridge=mock_bridge, settings=mock_settings, driver=MagicMock(),
     )
-    # (1) index-time: embedding is skipped entirely.
-    m = MagicMock()
-    with patch("memory_service.get_shared_service", return_value=MagicMock(_get_memory=lambda: m)):
-        eng._index_symbol_cards(Path("/repo"))
-    m.embedding_model.embed_batch.assert_not_called()
+    code_locate.invalidate_bm25("code--u--r-off")
 
-    # (2) locate: deterministic local rank over Neo4j symbols (no embedder).
     syms = [
         {"fqn": "click.Command", "kind": "class", "file": "click/core.py", "span": "10:20", "degree": 30},
         {"fqn": "click.testing.CliRunner", "kind": "class", "file": "click/testing.py", "span": "5:9", "degree": 3},
     ]
+    # (1) index-time: no dense embedding; card text written to nodes.
+    m = MagicMock()
     with patch.object(eng, "_run_cypher", return_value=syms), \
+         patch.object(eng, "_extract_symbol_details", return_value=("class Command", "the command", "src")), \
+         patch.object(eng, "_write_card_fields") as write_cards, \
+         patch("memory_service.get_shared_service", return_value=MagicMock(_get_memory=lambda: m)):
+        eng._index_symbol_cards(Path("/repo"))
+    m.embedding_model.embed_batch.assert_not_called()
+    write_cards.assert_called_once()  # card text persisted for BM25
+
+    # (2) locate: BM25 over card text (no embedder). The corpus loads from the
+    # `card` property; feed rows that carry it.
+    card_rows = [
+        {"fqn": "click.Command", "kind": "class", "file": "click/core.py",
+         "span": "10:20", "degree": 30, "signature": "class Command",
+         "docstring": "the command object", "card": "class click.Command\nDoc: the command object"},
+        {"fqn": "click.testing.CliRunner", "kind": "class", "file": "click/testing.py",
+         "span": "5:9", "degree": 3, "signature": "class CliRunner",
+         "docstring": "test runner", "card": "class click.testing.CliRunner\nDoc: test runner"},
+    ]
+    code_locate.invalidate_bm25("code--u--r-off")
+    with patch.object(eng, "_run_cypher", return_value=card_rows), \
          patch.object(eng, "_get_anchor_memories", return_value=[]):
-        hits = eng.locate("Command", k=5)
-    assert hits and hits[0].fqn == "click.Command"  # token overlap ranks it first
+        hits = eng.locate("the command object", k=5)
+    assert hits and hits[0].fqn == "click.Command"  # card-text BM25 ranks it first
+
+
+def test_locate_fuses_dense_and_lexical_on_shared_symbol_id(mock_bridge, mock_settings):
+    """C3 headline mechanism: a symbol hit by BOTH the dense leg and the card-text
+    BM25 leg must fuse into ONE result (shared uuid5 point id) whose RRF score
+    accumulates both legs — so leg agreement ranks it above a single-leg hit."""
+    from unittest.mock import patch, MagicMock
+    from adapters.code_graph import code_locate as cl
+    mock_settings.code_embedder = "cloud"  # dense via mocked embedder (no ONNX)
+    eng = NativeEngine(
+        repo_path="/repo", code_space="code--u--fuse",
+        bridge=mock_bridge, settings=mock_settings, driver=MagicMock(),
+    )
+    cl.invalidate_bm25("code--u--fuse")
+
+    agreed = "pkg.mod.parse"       # in BOTH legs
+    dense_only = "pkg.mod.helper"  # dense only
+
+    # Dense leg returns two points with STABLE ids (as the real index writes).
+    def _pt(fqn):
+        p = MagicMock()
+        p.id = cl.symbol_point_id("code--u--fuse", fqn)
+        p.score = 0.9
+        p.payload = {"fqn": fqn, "kind": "function", "file": "m.py", "line": 1,
+                     "signature": "", "docstring": "", "degree": 0, "anchor_id": None}
+        return p
+    m = MagicMock()
+    m.embedding_model.embed.return_value = [0.1] * 768
+    m.vector_store.client.query_points.return_value = MagicMock(
+        points=[_pt(dense_only), _pt(agreed)]
+    )
+    # BM25 corpus: the agreed symbol's card matches the query strongly.
+    card_rows = [
+        {"fqn": agreed, "kind": "function", "file": "m.py", "span": "1:2", "degree": 0,
+         "signature": "", "docstring": "", "card": "function pkg.mod.parse\nDoc: parse the config"},
+        {"fqn": "pkg.mod.other", "kind": "function", "file": "m.py", "span": "1:2",
+         "degree": 0, "signature": "", "docstring": "", "card": "function pkg.mod.other\nDoc: unrelated"},
+    ]
+    with patch("memory_service.get_shared_service", return_value=MagicMock(_get_memory=lambda: m)), \
+         patch.object(eng, "_run_cypher", return_value=card_rows), \
+         patch.object(eng, "_card_epoch", return_value=1), \
+         patch.object(eng, "_get_anchor_memories", return_value=[]):
+        hits = eng.locate("parse the config", k=10)
+
+    fqns = [h.fqn for h in hits]
+    assert agreed in fqns
+    # The dual-leg symbol appears exactly once (fused, not duplicated)…
+    assert fqns.count(agreed) == 1
+    # …and outranks the dense-only hit thanks to accumulated RRF from both legs.
+    assert fqns.index(agreed) < fqns.index(dense_only)
+
+
+def test_index_dense_leg_offline_degrades_not_fails(mock_bridge, mock_settings):
+    """MF-5: if the local embedder can't be built (e.g. offline model fetch), the
+    index must still persist card text (BM25 stays live) and report dense_degraded
+    rather than hard-failing the whole index job."""
+    from unittest.mock import patch, MagicMock
+    mock_settings.code_embedder = "local"
+    eng = NativeEngine(
+        repo_path="/repo", code_space="code--u--offline",
+        bridge=mock_bridge, settings=mock_settings, driver=MagicMock(),
+    )
+    syms = [{"fqn": "x.f", "kind": "function", "file": "a.py", "span": "1:2", "degree": 1}]
+
+    def _boom(*a, **k):
+        raise RuntimeError("HF download blocked (air-gapped)")
+
+    with patch.object(eng, "_run_cypher", return_value=syms), \
+         patch.object(eng, "_extract_symbol_details", return_value=("def f()", "doc", "src")), \
+         patch.object(eng, "_write_card_fields") as write_cards, \
+         patch.object(eng, "_bump_card_epoch"), \
+         patch.object(eng, "_get_local_code_embedder", side_effect=_boom), \
+         patch("memory_service.get_shared_service", return_value=MagicMock()):
+        degraded = eng._index_symbol_cards(Path("/repo"))
+
+    assert degraded is True          # signalled up to the IndexReport
+    write_cards.assert_called_once()  # card text persisted → BM25 still works
 
 
 def test_native_engine_stores_injected_driver(mock_bridge, mock_settings):
@@ -643,9 +750,10 @@ def test_native_engine_stores_injected_driver(mock_bridge, mock_settings):
 def test_index_symbol_cards_skips_fileless_and_chunks_embeds(mock_bridge, mock_settings):
     """Engine runtime fixes (never-run before E8):
     (1) symbols with file=None must be skipped (no `repo_path / None` crash);
-    (2) embeds must be chunked to <=100 (Gemini batchEmbedContents cap).
+    (2) CLOUD embeds must be chunked to <=100 (Gemini batchEmbedContents cap).
     """
     from unittest.mock import Mock, patch, MagicMock
+    mock_settings.code_embedder = "cloud"  # chunk-by-100 is the cloud path
     eng = NativeEngine(
         repo_path="/repo",
         code_space="code--u--r",
@@ -667,8 +775,9 @@ def test_index_symbol_cards_skips_fileless_and_chunks_embeds(mock_bridge, mock_s
 
     with patch.object(eng, "_run_cypher", return_value=syms), \
          patch.object(eng, "_ensure_code_index_collection"), \
+         patch.object(eng, "_write_card_fields"), \
+         patch.object(eng, "_code_vector_size", return_value=768), \
          patch.object(eng, "_extract_symbol_details", return_value=("sig", "doc", "lines")), \
-         patch.object(eng, "_build_symbol_card", return_value="card"), \
          patch("memory_service.get_shared_service", return_value=MagicMock(_get_memory=lambda: m)):
         eng._index_symbol_cards(Path("/repo"))
 

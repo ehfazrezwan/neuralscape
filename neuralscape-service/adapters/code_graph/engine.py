@@ -65,6 +65,12 @@ class IndexReport:
     # with default None so native/graphify keep working; CBM stamps it from the
     # bridge's index_status.
     system_version: str | None = None
+    # C3: True when the local/cloud dense leg could NOT be built (e.g. the local
+    # ONNX model could not be fetched in an air-gapped deployment). The card-text
+    # BM25 leg still succeeded, so locate degrades to ~0.60 h@1 rather than the
+    # index job hard-failing. None ⇒ dense leg not applicable (code_embedder=off)
+    # or fully succeeded.
+    dense_degraded: bool | None = None
 
 
 # ── The protocol ────────────────────────────────────────────────────

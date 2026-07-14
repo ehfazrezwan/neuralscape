@@ -40,9 +40,21 @@ def mock_bridge():
 
 @pytest.fixture
 def mock_settings():
-    """Mock settings object."""
+    """Mock settings object.
+
+    These E3 tests exercise the DENSE + degree fusion via a mocked embedder, so
+    the fixture pins ``code_embedder="cloud"`` (dense leg uses the mocked
+    ``embedding_model.embed`` rather than loading a real local ONNX model) and
+    turns the card-text BM25 leg off (no card corpus in these mocks). The C3
+    local + BM25 path has dedicated tests in test_code_locate.py.
+    """
     settings = Mock()
     settings.code_graph_extracted_confidence = 0.9
+    settings.code_embedder = "cloud"
+    settings.code_embedder_model = "jinaai/jina-embeddings-v2-base-code"
+    settings.code_embedder_query_prefix = ""
+    settings.code_locate_lexical_cards = False
+    settings.code_index_embeddings = True
     return settings
 
 
