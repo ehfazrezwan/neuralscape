@@ -344,17 +344,22 @@ class Settings(BaseSettings):
     # `code_embedder` is the authoritative posture (supersedes the legacy
     # `code_index_embeddings` flag below):
     #   "off"   — no dense leg (BM25 over card text + graph-degree only; C1 ~0.60)
-    #   "local" — DEFAULT — local fastembed ONNX dense leg + BM25 + degree (C3
-    #             ~0.76). Token-free / no cloud calls; honors deterministic-by-
-    #             default. Index cost is one-time CPU card-embedding (background
-    #             reindex); per-query +~28ms, negligible.
+    #   "local" — DEFAULT — local fastembed ONNX dense leg + BM25 + degree. The
+    #             default jina model measured h@1 ~0.75 in the A/B (§4), in the
+    #             same token-free band as CodeRankEmbed (0.76) and cloud (0.753).
+    #             Token-free / no cloud calls; honors deterministic-by-default.
+    #             Index cost is one-time CPU card-embedding (background reindex);
+    #             per-query +~28ms, negligible.
     #   "cloud" — Gemini card embeddings (opt-in only; dominated on accuracy AND
     #             costs ~158K index tokens + ~11/query on this corpus).
     code_embedder: str = "local"
-    # Local code embedder model (fastembed ONNX id). jina-embeddings-v2-base-code
-    # (Apache-2.0, 768-dim) is torch-free and validated in the same token-free
-    # band as cloud (A/B §4). fastembed is already a dependency, so this adds no
-    # new Python dep or container-gate landmine.
+    # Local code embedder model. MUST be a fastembed-supported ONNX id (see
+    # fastembed's TextEmbedding.list_supported_models) — this is deliberately the
+    # torch-free path. jina-embeddings-v2-base-code (Apache-2.0, 768-dim) is the
+    # default; fastembed is already a dependency, so it adds no new Python dep or
+    # container-gate landmine. NOTE: CodeRankEmbed is NOT loadable here (not in
+    # fastembed's registry; needs torch + trust_remote_code) — it would require a
+    # different backend and a heavy image delta.
     code_embedder_model: str = "jinaai/jina-embeddings-v2-base-code"
     # Query prefix for asymmetric embedders (CodeRankEmbed wants "Represent this
     # query for searching relevant code: " on queries only). jina is symmetric →
@@ -621,12 +626,17 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _migrate_legacy_code_embeddings(self) -> "Settings":
-        # Back-compat: a deployment that explicitly opted into cloud symbol-card
-        # embeddings via the legacy boolean (code_index_embeddings=True) keeps
-        # cloud behavior UNLESS it also set the new posture. Only migrate when
-        # code_embedder is still the default "local" — an explicit code_embedder
-        # always wins. New/unset deployments get the token-free local default.
-        if self.code_index_embeddings and self.code_embedder == "local":
+        # Back-compat: a deployment that opted into cloud symbol-card embeddings
+        # via the legacy boolean (code_index_embeddings=True) keeps cloud
+        # behavior — but ONLY when it did not also set the new posture. An
+        # explicit code_embedder ALWAYS wins (including an explicit "local"),
+        # so we migrate only when code_embedder was left at its default and is
+        # still "local". model_fields_set distinguishes explicit from default.
+        if (
+            self.code_index_embeddings
+            and self.code_embedder == "local"
+            and "code_embedder" not in self.model_fields_set
+        ):
             self.code_embedder = "cloud"
         return self
 

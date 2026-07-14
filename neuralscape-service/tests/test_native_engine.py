@@ -644,6 +644,83 @@ def test_code_embedder_off_skips_dense_embed_but_indexes_card_text(mock_bridge, 
     assert hits and hits[0].fqn == "click.Command"  # card-text BM25 ranks it first
 
 
+def test_locate_fuses_dense_and_lexical_on_shared_symbol_id(mock_bridge, mock_settings):
+    """C3 headline mechanism: a symbol hit by BOTH the dense leg and the card-text
+    BM25 leg must fuse into ONE result (shared uuid5 point id) whose RRF score
+    accumulates both legs — so leg agreement ranks it above a single-leg hit."""
+    from unittest.mock import patch, MagicMock
+    from adapters.code_graph import code_locate as cl
+    mock_settings.code_embedder = "cloud"  # dense via mocked embedder (no ONNX)
+    eng = NativeEngine(
+        repo_path="/repo", code_space="code--u--fuse",
+        bridge=mock_bridge, settings=mock_settings, driver=MagicMock(),
+    )
+    cl.invalidate_bm25("code--u--fuse")
+
+    agreed = "pkg.mod.parse"       # in BOTH legs
+    dense_only = "pkg.mod.helper"  # dense only
+
+    # Dense leg returns two points with STABLE ids (as the real index writes).
+    def _pt(fqn):
+        p = MagicMock()
+        p.id = cl.symbol_point_id("code--u--fuse", fqn)
+        p.score = 0.9
+        p.payload = {"fqn": fqn, "kind": "function", "file": "m.py", "line": 1,
+                     "signature": "", "docstring": "", "degree": 0, "anchor_id": None}
+        return p
+    m = MagicMock()
+    m.embedding_model.embed.return_value = [0.1] * 768
+    m.vector_store.client.query_points.return_value = MagicMock(
+        points=[_pt(dense_only), _pt(agreed)]
+    )
+    # BM25 corpus: the agreed symbol's card matches the query strongly.
+    card_rows = [
+        {"fqn": agreed, "kind": "function", "file": "m.py", "span": "1:2", "degree": 0,
+         "signature": "", "docstring": "", "card": "function pkg.mod.parse\nDoc: parse the config"},
+        {"fqn": "pkg.mod.other", "kind": "function", "file": "m.py", "span": "1:2",
+         "degree": 0, "signature": "", "docstring": "", "card": "function pkg.mod.other\nDoc: unrelated"},
+    ]
+    with patch("memory_service.get_shared_service", return_value=MagicMock(_get_memory=lambda: m)), \
+         patch.object(eng, "_run_cypher", return_value=card_rows), \
+         patch.object(eng, "_card_epoch", return_value=1), \
+         patch.object(eng, "_get_anchor_memories", return_value=[]):
+        hits = eng.locate("parse the config", k=10)
+
+    fqns = [h.fqn for h in hits]
+    assert agreed in fqns
+    # The dual-leg symbol appears exactly once (fused, not duplicated)…
+    assert fqns.count(agreed) == 1
+    # …and outranks the dense-only hit thanks to accumulated RRF from both legs.
+    assert fqns.index(agreed) < fqns.index(dense_only)
+
+
+def test_index_dense_leg_offline_degrades_not_fails(mock_bridge, mock_settings):
+    """MF-5: if the local embedder can't be built (e.g. offline model fetch), the
+    index must still persist card text (BM25 stays live) and report dense_degraded
+    rather than hard-failing the whole index job."""
+    from unittest.mock import patch, MagicMock
+    mock_settings.code_embedder = "local"
+    eng = NativeEngine(
+        repo_path="/repo", code_space="code--u--offline",
+        bridge=mock_bridge, settings=mock_settings, driver=MagicMock(),
+    )
+    syms = [{"fqn": "x.f", "kind": "function", "file": "a.py", "span": "1:2", "degree": 1}]
+
+    def _boom(*a, **k):
+        raise RuntimeError("HF download blocked (air-gapped)")
+
+    with patch.object(eng, "_run_cypher", return_value=syms), \
+         patch.object(eng, "_extract_symbol_details", return_value=("def f()", "doc", "src")), \
+         patch.object(eng, "_write_card_fields") as write_cards, \
+         patch.object(eng, "_bump_card_epoch"), \
+         patch.object(eng, "_get_local_code_embedder", side_effect=_boom), \
+         patch("memory_service.get_shared_service", return_value=MagicMock()):
+        degraded = eng._index_symbol_cards(Path("/repo"))
+
+    assert degraded is True          # signalled up to the IndexReport
+    write_cards.assert_called_once()  # card text persisted → BM25 still works
+
+
 def test_native_engine_stores_injected_driver(mock_bridge, mock_settings):
     """Engine runtime fix: the real mem0 _AsyncBridge has no .driver, so the
     Neo4j driver must be injected via the `driver` param and stored for

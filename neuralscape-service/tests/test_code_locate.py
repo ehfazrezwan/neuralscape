@@ -100,7 +100,7 @@ def test_bm25_deterministic_order_on_ties():
 # ── module BM25 cache ────────────────────────────────────────────────
 
 
-def test_get_or_build_bm25_caches_and_invalidates():
+def test_get_or_build_bm25_caches_and_rebuilds_on_epoch_bump():
     cl.invalidate_bm25("cs-test")
     calls = {"n": 0}
 
@@ -108,23 +108,40 @@ def test_get_or_build_bm25_caches_and_invalidates():
         calls["n"] += 1
         return [{"fqn": "a.b", "card": "parse the config file"}]
 
-    idx1, p1 = cl.get_or_build_bm25("cs-test", loader)
-    idx2, p2 = cl.get_or_build_bm25("cs-test", loader)
-    assert calls["n"] == 1  # second call served from cache
+    idx1, p1 = cl.get_or_build_bm25("cs-test", 1, loader)
+    idx2, p2 = cl.get_or_build_bm25("cs-test", 1, loader)
+    assert calls["n"] == 1  # same epoch → served from cache
     assert idx1 is idx2 and p1 is p2
     assert idx1.search("parse config", k=1)  # index is usable
 
+    # A bumped epoch (cross-process reindex signal) forces a rebuild.
+    cl.get_or_build_bm25("cs-test", 2, loader)
+    assert calls["n"] == 2
+
+    # Explicit same-process invalidation also rebuilds.
     cl.invalidate_bm25("cs-test")
-    cl.get_or_build_bm25("cs-test", loader)
-    assert calls["n"] == 2  # rebuilt after invalidation
+    cl.get_or_build_bm25("cs-test", 2, loader)
+    assert calls["n"] == 3
     cl.invalidate_bm25("cs-test")
 
 
-def test_get_or_build_bm25_handles_empty_loader():
+def test_get_or_build_bm25_never_caches_empty_corpus():
+    """MF-1: an empty corpus (locate before first index) must NOT be cached, else
+    the API would pin the empty result forever and stay at the 0.16 fallback."""
     cl.invalidate_bm25("cs-empty")
-    idx, payloads = cl.get_or_build_bm25("cs-empty", lambda: [])
-    assert payloads == []
-    assert idx.search("x", k=1) == []
+    calls = {"n": 0}
+
+    def empty_then_full():
+        calls["n"] += 1
+        return [] if calls["n"] == 1 else [{"fqn": "a.b", "card": "parse config"}]
+
+    idx, payloads = cl.get_or_build_bm25("cs-empty", 5, empty_then_full)
+    assert payloads == [] and idx.search("x", k=1) == []
+    # Same epoch, but the empty result was NOT cached → loader runs again and now
+    # sees the freshly-indexed corpus.
+    idx2, payloads2 = cl.get_or_build_bm25("cs-empty", 5, empty_then_full)
+    assert calls["n"] == 2
+    assert payloads2 and idx2.search("parse config", k=1)
     cl.invalidate_bm25("cs-empty")
 
 
@@ -136,6 +153,17 @@ def test_get_code_embedder_lazy_and_cached():
     emb2 = cl.get_code_embedder("jinaai/jina-embeddings-v2-base-code")
     assert emb1 is emb2  # process-cached (one ONNX load)
     assert emb1._backend is None  # not loaded until first embed → no network here
+
+
+def test_get_code_embedder_keyed_by_prefix():
+    """Same model + different prefix must NOT reuse the same embedder (that would
+    apply the wrong query prefix and corrupt query embeddings)."""
+    bare = cl.get_code_embedder("some/model", query_prefix="")
+    pref = cl.get_code_embedder("some/model", query_prefix="Q: ")
+    assert bare is not pref
+    assert bare.query_prefix == "" and pref.query_prefix == "Q: "
+    # Same (model, prefix) still caches.
+    assert cl.get_code_embedder("some/model", query_prefix="Q: ") is pref
 
 
 def test_code_embedder_query_prefix_applied(monkeypatch):

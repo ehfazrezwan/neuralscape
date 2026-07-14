@@ -251,6 +251,12 @@ class TestCodeEmbedderPosture:
         # An explicit code_embedder is authoritative even if the legacy flag is on.
         assert _settings(code_embedder="off", code_index_embeddings=True).code_embedder == "off"
 
+    def test_explicit_local_not_migrated_even_with_legacy_flag(self):
+        # Copilot edge case: an EXPLICIT code_embedder="local" must NOT be
+        # migrated to cloud by the legacy flag (would silently enable token use).
+        s = _settings(code_embedder="local", code_index_embeddings=True)
+        assert s.code_embedder == "local"
+
     def test_off_and_cloud_accepted(self):
         assert _settings(code_embedder="off").code_embedder == "off"
         assert _settings(code_embedder="cloud").code_embedder == "cloud"

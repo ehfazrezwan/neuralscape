@@ -332,15 +332,22 @@ class NativeEngine:
         mode = self._code_embedder_mode()
         lexical_on = getattr(self.settings, "code_locate_lexical_cards", True)
 
+        # Retrieve a wider candidate pool per leg than k so the degree boost can
+        # legitimately promote a strong-but-lower-ranked hit before truncation
+        # (matches the A/B sidecar: boost the whole fused pool, then take top-k).
+        pool = max(k * 4, 40)
         lexical_hits = (
-            self._locate_lexical_cards(query, k * 2) if lexical_on else []
+            self._locate_lexical_cards(query, pool) if lexical_on else []
         )
         dense_hits: list = []
         if mode in ("local", "cloud"):
             try:
-                dense_hits = self._locate_dense(query, k * 2, mode)
+                dense_hits = self._locate_dense(query, pool, mode)
             except Exception:
-                logger.debug("dense locate leg failed (non-fatal)", exc_info=True)
+                logger.warning(
+                    "dense locate leg failed (%s mode) — degrading to BM25", mode,
+                    exc_info=True,
+                )
 
         # Ultimate fallback: no card text indexed yet AND no dense vectors (e.g.
         # a graph built before card-text indexing) → the legacy fqn/file overlap
@@ -349,12 +356,14 @@ class NativeEngine:
             return self._locate_deterministic(query, k=k, user_id=user_id)
 
         from memory.ranking import _rrf_fuse
-        fused = _rrf_fuse(dense_hits, lexical_hits, k * 2)
+        fused = _rrf_fuse(dense_hits, lexical_hits, pool)
 
-        # Score with the degree boost first, then fetch anchor memories for ONLY
-        # the final top-k (bounded Neo4j round-trips).
+        # Apply the degree boost to the WHOLE fused pool, then truncate — a
+        # high-degree hit at fused rank > k can legitimately outrank an unboosted
+        # earlier one. Anchor memories are then fetched for ONLY the final top-k
+        # (bounded Neo4j round-trips).
         scored: list[tuple[float, dict]] = []
-        for entry in fused[: k * 2]:
+        for entry in fused:
             payload = getattr(entry["hit"], "payload", None) or {}
             degree = payload.get("degree", 0) or 0
             degree_boost = 1.0 + 0.01 * min(degree, 50)  # cap boost at ~1.5x
@@ -386,17 +395,27 @@ class NativeEngine:
 
         service = get_shared_service()
         m = service._get_memory()
-        self._ensure_code_index_collection(
-            m, vector_size=self._code_vector_size(m, mode)
-        )
+        # Query path: the collection is created at index time, so this is the
+        # fast existence check (no dim computation / embed("test") per query).
+        self._ensure_code_index_collection(m)
 
         if mode == "local":
             query_embedding = self._get_local_code_embedder().embed_query(query)
         else:  # cloud
             query_embedding = m.embedding_model.embed(query, memory_action="search")
 
+        # MF-2: filter on the EMBEDDER IDENTITY, not just code_space. Both the
+        # local (jina) and cloud (Gemini) embedders are 768-dim, so a mode switch
+        # without a reindex would otherwise search the other space's vectors and
+        # fuse silent garbage. Tagging each point with its embedder and filtering
+        # here means a stale-embedder point simply doesn't match → the dense leg
+        # returns empty and locate degrades to BM25 (0.60) until reindex.
         dense_filter = Filter(must=[
-            FieldCondition(key="code_space", match=MatchValue(value=self.code_space))
+            FieldCondition(key="code_space", match=MatchValue(value=self.code_space)),
+            FieldCondition(
+                key="embedder",
+                match=MatchValue(value=self._code_embedder_identity(mode)),
+            ),
         ])
         dense_result = m.vector_store.client.query_points(
             collection_name="code_index",
@@ -406,6 +425,19 @@ class NativeEngine:
             with_payload=True,
         )
         return list(getattr(dense_result, "points", dense_result) or [])
+
+    def _code_embedder_identity(self, mode: str) -> str:
+        """Stable identity of the active code embedder (``mode:model``), stamped on
+        each code_index point and matched at query time so vectors from a
+        different embedder are never fused into results (MF-2)."""
+        if mode == "local":
+            model = getattr(
+                self.settings, "code_embedder_model",
+                "jinaai/jina-embeddings-v2-base-code",
+            )
+            return f"local:{model}"
+        model = getattr(self.settings, "gemini_embedder_model", "cloud")
+        return f"cloud:{model}"
 
     def _locate_lexical_cards(self, query: str, limit: int) -> list:
         """Lexical leg of locate: Okapi BM25 over the symbol-card text (name +
@@ -425,7 +457,7 @@ class NativeEngine:
             return []
         try:
             index, payloads = get_or_build_bm25(
-                self.code_space, self._load_card_corpus
+                self.code_space, self._card_epoch(), self._load_card_corpus
             )
         except Exception:
             logger.debug("BM25 card corpus build failed (non-fatal)", exc_info=True)
@@ -470,6 +502,32 @@ class NativeEngine:
                 "card": r.get("card") or "",
             })
         return payloads
+
+    def _card_epoch(self) -> int:
+        """The code_space's card epoch — a counter bumped on :CodeRepo at every
+        reindex. Cheap Cypher; drives cross-process BM25 cache invalidation
+        (MF-1: the API process can't see the worker's in-process invalidate)."""
+        try:
+            rows = self._run_cypher(
+                "MATCH (r:CodeRepo {code_space: $cs}) "
+                "RETURN coalesce(r.card_epoch, 0) AS epoch",
+                cs=self.code_space,
+            )
+            return int(rows[0]["epoch"]) if rows else 0
+        except Exception:
+            return 0
+
+    def _bump_card_epoch(self) -> None:
+        """Advance the code_space's card epoch (invalidates every process's BM25
+        cache on the next locate). Best-effort — never fails an index."""
+        try:
+            self._run_cypher_with_retry(
+                "MERGE (r:CodeRepo {code_space: $cs}) "
+                "SET r.card_epoch = coalesce(r.card_epoch, 0) + 1",
+                cs=self.code_space,
+            )
+        except Exception:
+            logger.debug("card_epoch bump failed (non-fatal)", exc_info=True)
 
     def _get_local_code_embedder(self):
         """Process-cached local code embedder (fastembed ONNX, token-free)."""
@@ -600,23 +658,32 @@ class NativeEngine:
         client = m.vector_store.client
         collection_name = "code_index"
 
-        if vector_size is None:
-            vector_size = len(m.embedding_model.embed("test", memory_action="add"))
+        # Resolve the target dim LAZILY: the hot query path (collection exists,
+        # no recreate) must not pay an embed("test") call just to confirm the
+        # collection is there. Only the create / mismatch-check branches need it.
+        _resolved: dict = {"size": vector_size}
+
+        def _size() -> int:
+            if _resolved["size"] is None:
+                _resolved["size"] = len(
+                    m.embedding_model.embed("test", memory_action="add")
+                )
+            return _resolved["size"]
 
         try:
             info = client.get_collection(collection_name)
-            if recreate_on_mismatch:
-                existing = self._collection_vector_size(info)
-                if existing is not None and existing != vector_size:
-                    logger.info(
-                        "code_index dim %s != active embedder dim %s — recreating",
-                        existing, vector_size,
-                    )
-                    client.delete_collection(collection_name)
-                else:
-                    return  # exists and compatible
+            if not recreate_on_mismatch:
+                return  # exists — fast path, no dim computation
+            existing = self._collection_vector_size(info)
+            want = _size()
+            if existing is not None and existing != want:
+                logger.info(
+                    "code_index dim %s != active embedder dim %s — recreating",
+                    existing, want,
+                )
+                client.delete_collection(collection_name)
             else:
-                return  # already exists
+                return  # exists and compatible
         except Exception:
             pass  # doesn't exist (or get failed) → create below
 
@@ -624,11 +691,11 @@ class NativeEngine:
             client.create_collection(
                 collection_name=collection_name,
                 vectors_config=VectorParams(
-                    size=vector_size,
+                    size=_size(),
                     distance=Distance.COSINE,
                 ),
             )
-            logger.info(f"Created code_index collection (size={vector_size})")
+            logger.info(f"Created code_index collection (size={_size()})")
         except Exception as e:
             logger.warning(f"Failed to create code_index collection: {e}")
             raise
@@ -1001,8 +1068,8 @@ class NativeEngine:
         # E4: Create CodeAnchor nodes and link symbols to them
         self._ensure_anchors()
 
-        # E3: Build and index symbol cards in code_index collection
-        self._index_symbol_cards(repo_path)
+        # E3/C3: build symbol cards (card text for BM25 + optional dense vectors).
+        dense_degraded = self._index_symbol_cards(repo_path)
 
         duration = time.time() - start
         logger.info(
@@ -1015,6 +1082,7 @@ class NativeEngine:
             edges_indexed=edges_indexed,
             incremental=incremental,
             duration_s=duration,
+            dense_degraded=dense_degraded,
         )
 
     def teardown(self) -> dict:
@@ -1050,6 +1118,9 @@ class NativeEngine:
             )
             nodes_deleted += int(rows[0]["deleted"]) if rows else 0
         cards_cleared = self._delete_code_index_cards()
+        # Drop this process's cached BM25 corpus too (MF-1) — the graph is gone.
+        from adapters.code_graph.code_locate import invalidate_bm25
+        invalidate_bm25(self.code_space)
         logger.info(
             "Native teardown code_space=%s: %d graph nodes deleted, cards_cleared=%s "
             "(CodeAnchor + memory graph preserved)",
@@ -1981,7 +2052,8 @@ class NativeEngine:
         if not symbols:
             logger.info("No symbols to index in code_index")
             invalidate_bm25(self.code_space)
-            return
+            self._bump_card_epoch()
+            return None
 
         # Build symbol cards (shared card text for BM25 + optional dense embed)
         cards: list[str] = []
@@ -2026,70 +2098,97 @@ class NativeEngine:
             })
 
         # Always persist card text onto the graph (powers the BM25 lexical leg),
-        # then invalidate the cached corpus so the next locate rebuilds it.
+        # bump the card epoch (cross-process BM25 cache invalidation, MF-1), and
+        # invalidate this process's cache immediately.
         self._write_card_fields(node_updates)
         invalidate_bm25(self.code_space)
+        self._bump_card_epoch()
 
         if mode == "off":
             logger.info(
                 "code_embedder=off — %d symbol cards indexed for BM25 (token-free "
                 "deterministic default); no dense vectors", len(node_updates)
             )
-            return
+            return None  # dense leg not applicable
 
         # Dense leg: embed cards (local fastembed by default; cloud only opted in).
+        # MF-5: an offline/air-gapped deployment (the audience for a token-free
+        # default) can't fetch the local ONNX model on first use — so the ENTIRE
+        # dense stage is best-effort. On any failure we keep the already-written
+        # BM25 cards (locate degrades to ~0.60 h@1) instead of failing the whole
+        # index job, and signal the degradation up to the IndexReport.
         from memory_service import get_shared_service
         from qdrant_client.models import PointStruct
 
-        service = get_shared_service()
-        m = service._get_memory()
-        vector_size = self._code_vector_size(m, mode)
-        self._ensure_code_index_collection(
-            m, vector_size=vector_size, recreate_on_mismatch=True
-        )
-
-        if mode == "local":
-            logger.info("Embedding %d symbol cards (local code embedder)", len(cards))
-            embeddings = self._get_local_code_embedder().embed_documents(cards)
-        else:  # cloud — Gemini batchEmbedContents caps at 100 per call
-            logger.info("Embedding %d symbol cards (cloud embedder)", len(cards))
-            _EMBED_CHUNK = 100
-            embeddings = []
-            for i in range(0, len(cards), _EMBED_CHUNK):
-                embeddings.extend(
-                    m.embedding_model.embed_batch(
-                        cards[i : i + _EMBED_CHUNK], memory_action="add"
-                    )
-                )
-
-        if len(embeddings) != len(cards):
-            logger.warning(
-                f"Embedding mismatch: {len(embeddings)} embeddings for {len(cards)} cards"
+        try:
+            service = get_shared_service()
+            m = service._get_memory()
+            vector_size = self._code_vector_size(m, mode)
+            # recreate_on_mismatch handles a true dim change (e.g. a non-768 cloud
+            # model); the per-point embedder tag (below) handles same-dim switches.
+            self._ensure_code_index_collection(
+                m, vector_size=vector_size, recreate_on_mismatch=True
             )
-            return
 
-        # Stable per-symbol point id → dense + lexical legs fuse on identity and
-        # a reindex overwrites in place (idempotent, no duplicate points).
-        points = []
-        for embed, data in zip(embeddings, points_data):
-            points.append(PointStruct(
-                id=symbol_point_id(self.code_space, data["fqn"]),
-                vector=embed,
-                payload={
-                    "code_space": self.code_space,
-                    "fqn": data["fqn"],
-                    "kind": data["kind"],
-                    "file": data["file"],
-                    "line": data["line"],
-                    "signature": data["signature"],
-                    "docstring": data["docstring"],
-                    "degree": data["degree"],
-                    "anchor_id": data["anchor_id"],
-                },
-            ))
+            if mode == "local":
+                logger.info("Embedding %d symbol cards (local code embedder)", len(cards))
+                embeddings = self._get_local_code_embedder().embed_documents(cards)
+            else:  # cloud — Gemini batchEmbedContents caps at 100 per call
+                logger.info("Embedding %d symbol cards (cloud embedder)", len(cards))
+                _EMBED_CHUNK = 100
+                embeddings = []
+                for i in range(0, len(cards), _EMBED_CHUNK):
+                    embeddings.extend(
+                        m.embedding_model.embed_batch(
+                            cards[i : i + _EMBED_CHUNK], memory_action="add"
+                        )
+                    )
 
-        m.vector_store.client.upsert(collection_name="code_index", points=points)
-        logger.info(f"Indexed {len(points)} symbols into code_index collection")
+            if len(embeddings) != len(cards):
+                logger.warning(
+                    f"Embedding mismatch: {len(embeddings)} embeddings for "
+                    f"{len(cards)} cards — dense leg skipped (BM25 still active)"
+                )
+                return True  # degraded: card text is indexed, dense is not
+
+            # MF-2: clear this code_space's existing cards first so a reindex can't
+            # leave stale points behind — legacy uuid4 points or points from a
+            # different embedder (whose vectors live in another space) — which RRF
+            # would otherwise fuse as garbage. Then upsert with a stable per-symbol
+            # id (dense + lexical fuse on identity; reindex is idempotent) and the
+            # embedder identity stamped on each point (matched at query time).
+            self._delete_code_index_cards()
+            identity = self._code_embedder_identity(mode)
+            points = []
+            for embed, data in zip(embeddings, points_data):
+                points.append(PointStruct(
+                    id=symbol_point_id(self.code_space, data["fqn"]),
+                    vector=embed,
+                    payload={
+                        "code_space": self.code_space,
+                        "embedder": identity,
+                        "fqn": data["fqn"],
+                        "kind": data["kind"],
+                        "file": data["file"],
+                        "line": data["line"],
+                        "signature": data["signature"],
+                        "docstring": data["docstring"],
+                        "degree": data["degree"],
+                        "anchor_id": data["anchor_id"],
+                    },
+                ))
+
+            m.vector_store.client.upsert(collection_name="code_index", points=points)
+            logger.info(f"Indexed {len(points)} symbols into code_index collection")
+            return False  # dense leg fully built
+        except Exception:
+            logger.warning(
+                "Dense code-index leg failed (%s mode); card-text BM25 still "
+                "active so locate degrades to ~0.60 h@1 rather than failing the "
+                "index. Common cause: local embedder model unavailable offline.",
+                mode, exc_info=True,
+            )
+            return True  # degraded
 
     def _write_card_fields(self, updates: list[dict]) -> None:
         """Batch-write card text (+ signature/docstring) onto :CodeSymbol nodes."""

@@ -73,7 +73,7 @@ _CAMEL_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _WORD_RE = re.compile(r"[a-z0-9]+")
 
 
-def tokenize(text: str) -> list[str]:
+def tokenize(text: str | None) -> list[str]:
     """Lowercase word tokens, splitting camelCase and snake_case so identifiers
     like ``setIndentation`` / ``set_indentation`` match a docstring's "set
     indentation". Deterministic and dependency-free."""
@@ -156,26 +156,38 @@ class LexHit:
 
 
 # ── Module-level BM25 corpus cache (survives per-request engine instances) ──
+#
+# Cross-process correctness (MF-1): indexing runs in the ingest-worker process
+# while locate() is served by the API process, so a same-process
+# invalidate_bm25() at index time does NOT reach the API's cache. Each cache
+# entry is therefore tagged with the code_space's card EPOCH (a counter bumped on
+# :CodeRepo at every reindex); a locate whose epoch differs from the cached one
+# rebuilds. An EMPTY corpus is never cached — otherwise a locate issued before
+# the first index would pin the empty result forever, keeping the API at the 0.16
+# deterministic fallback even after a successful index.
 
-_BM25_CACHE: dict[str, tuple[BM25Index, list[dict]]] = {}
+_BM25_CACHE: dict[str, tuple[int, BM25Index, list[dict]]] = {}
 
 
-def get_or_build_bm25(code_space: str, loader) -> tuple[BM25Index, list[dict]]:
-    """Return a cached ``(BM25Index, payloads)`` for ``code_space``, building it
-    via ``loader()`` (which returns ``list[payload_dict]`` each carrying a
-    ``card`` text field) on a cache miss. Invalidated by :func:`invalidate_bm25`
-    at (re)index time."""
+def get_or_build_bm25(
+    code_space: str, epoch: int, loader
+) -> tuple[BM25Index, list[dict]]:
+    """Return a cached ``(BM25Index, payloads)`` for ``(code_space, epoch)``,
+    rebuilding via ``loader()`` (returns ``list[payload_dict]`` each carrying a
+    ``card`` text field) on a miss or when the card epoch advanced. An empty
+    corpus is returned but NOT cached, so it re-checks on the next call."""
     cached = _BM25_CACHE.get(code_space)
-    if cached is not None:
-        return cached
+    if cached is not None and cached[0] == epoch:
+        return cached[1], cached[2]
     payloads = loader() or []
     index = BM25Index([p.get("card") or "" for p in payloads])
-    _BM25_CACHE[code_space] = (index, payloads)
+    if payloads:
+        _BM25_CACHE[code_space] = (epoch, index, payloads)
     return index, payloads
 
 
 def invalidate_bm25(code_space: str) -> None:
-    """Drop the cached BM25 corpus for a code_space (call after (re)indexing)."""
+    """Drop the cached BM25 corpus for a code_space (same-process reindex/teardown)."""
     _BM25_CACHE.pop(code_space, None)
 
 
@@ -222,9 +234,14 @@ class CodeEmbedder:
 
 
 def get_code_embedder(model: str, query_prefix: str = "") -> CodeEmbedder:
-    """Process-cached :class:`CodeEmbedder` keyed by model (one ONNX load)."""
-    emb = _EMBEDDER_CACHE.get(model)
+    """Process-cached :class:`CodeEmbedder`. Keyed by (model, query_prefix) so the
+    same model used with different prefixes (asymmetric vs symmetric) never
+    silently reuses an embedder carrying the wrong query prefix — that would
+    corrupt query embeddings. The underlying ONNX backend is still loaded once
+    per model via fastembed's own model cache."""
+    key = f"{model}\x00{query_prefix or ''}"
+    emb = _EMBEDDER_CACHE.get(key)
     if emb is None:
         emb = CodeEmbedder(model, query_prefix=query_prefix)
-        _EMBEDDER_CACHE[model] = emb
+        _EMBEDDER_CACHE[key] = emb
     return emb
