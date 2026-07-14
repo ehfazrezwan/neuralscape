@@ -182,6 +182,35 @@ def test_method_calls_resolve_and_module_level_skipped(tmp_path, resolver_settin
     assert not any(src == "pkg.w" for src, _ in pairs)
 
 
+def test_default_arg_call_not_attributed_to_function(tmp_path, resolver_settings):
+    """A call in a default-argument expression is evaluated in the ENCLOSING scope
+    at def time, so it must NOT be attributed to the function body (Copilot)."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "d.py").write_text(
+        "def factory():\n"
+        "    return 1\n"
+        "\n"
+        "def consumer(x=factory()):\n"   # default-arg call at MODULE scope
+        "    return x\n"
+    )
+    eng = _engine(tmp_path, resolver_settings)
+    eng._resolver_collect = True
+    eng._pending_call_sites = {}
+    syms, _ = eng._parse_file(pkg / "d.py", tmp_path, "python")
+    symbols_by_file = {"pkg/d.py": [(s.line, s.end_line, s.fqn) for s in syms]}
+
+    stored = []
+    with patch.object(eng, "_run_cypher_with_retry",
+                      side_effect=lambda c, **k: (stored.extend(k["rows"]) if "r:CALLS" in c and "MERGE" in c else None) or []):
+        eng._resolve_and_store_calls(tmp_path, symbols_by_file)
+
+    pairs = {(e["src_fqn"], e["tgt_fqn"]) for e in stored}
+    # The default-arg factory() call is module-level → NOT consumer→factory.
+    assert ("pkg.d.consumer", "pkg.d.factory") not in pairs
+
+
 def test_symbol_spans_for_file_parses_neo4j_spans(mini_repo, resolver_settings):
     eng = _engine(mini_repo, resolver_settings)
     rows = [

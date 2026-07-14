@@ -1620,10 +1620,16 @@ class NativeEngine:
                         line=node.start_point[0] + 1,
                         end_line=node.end_point[0] + 1,
                     ))
-                    # Recurse the body with THIS function as the enclosing scope so
-                    # calls inside it attribute to a real symbol source (Wave 3).
+                    # Only the BODY (the `block` child) runs inside this function;
+                    # the parameter list (default-arg expressions) and return
+                    # annotation evaluate in the ENCLOSING scope at def time, so
+                    # their calls attribute outward — not to this function
+                    # (Copilot). Decorators are a sibling `decorated_definition`
+                    # node, already outside. (tree-sitter wrapper nodes aren't
+                    # identity-comparable, so match the body by type.)
                     for child in node.children:
-                        walk(child, parent_class=parent_class, enclosing_func=fqn)
+                        scope = fqn if child.type == "block" else enclosing_func
+                        walk(child, parent_class=parent_class, enclosing_func=scope)
                     return
 
             # Class definitions
