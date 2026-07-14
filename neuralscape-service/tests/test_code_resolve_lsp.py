@@ -189,6 +189,27 @@ def test_delete_stale_matches_any_resolver(repo):
     assert "{resolver: 'jedi'}" not in seen["cypher"]
 
 
+def test_map_def_to_fqn_require_start_filters_attribute_edges(repo):
+    """Fable MF-1: with require_start (lsp), a def landing INSIDE a method's span
+    but not on its start line (e.g. an attribute assignment) must NOT map to that
+    method — only exact def/class lines resolve. Jedi mode (containment) still maps."""
+    eng = _engine(repo, "lsp")
+    symbols_by_file = {
+        # Dog class 1-6; __init__ method 2-3 (def on line 2, `self.cb=...` on line 3).
+        "b.py": [(1, 6, "b.Dog"), (2, 3, "b.Dog.__init__")],
+    }
+    b_abs = str(repo / "b.py")
+    # line 3 = the `self.cb = ...` assignment inside __init__'s span (not a start).
+    # lsp (require_start=True): filtered → None (no false caller→__init__ edge).
+    assert eng._map_def_to_fqn(b_abs, 3, repo, symbols_by_file, require_start=True) is None
+    # jedi (containment): still maps to the innermost span (legacy behavior kept).
+    assert eng._map_def_to_fqn(b_abs, 3, repo, symbols_by_file) == "b.Dog.__init__"
+    # A real def line (2 = def __init__) resolves under both.
+    assert eng._map_def_to_fqn(b_abs, 2, repo, symbols_by_file, require_start=True) == "b.Dog.__init__"
+    # A class construction (line 1 = class Dog) resolves under require_start.
+    assert eng._map_def_to_fqn(b_abs, 1, repo, symbols_by_file, require_start=True) == "b.Dog"
+
+
 def test_lsp_end_to_end_stores_lsp_provenance(repo):
     """Engine resolve+store with the LSP resolver mocked to return a cross-file
     def resolves to the real FQN and tags the edge resolver='lsp'."""

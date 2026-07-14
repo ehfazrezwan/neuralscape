@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -46,8 +47,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# A resolve request for a whole repo may open many files; give pyright room.
-RESOLVE_TIMEOUT = int(os.getenv("RESOLVER_TIMEOUT", "600"))
+# Per-definition LSP round-trip deadline (bounds a stalled langserver). The
+# whole-repo request budget is enforced client-side by the NS driver's httpx
+# timeout; here we bound each individual textDocument/definition call.
+REQUEST_DEADLINE = float(os.getenv("RESOLVER_REQUEST_TIMEOUT", "30"))
 
 
 # ── Request/response models ─────────────────────────────────────────
@@ -161,8 +164,6 @@ async def health() -> JSONResponse:
     Does NOT warm a repo (no workspace yet at boot) — a version probe is the
     honest 'the toolchain is present and runnable' signal.
     """
-    import shutil
-
     bin_name = os.getenv("PYRIGHT_LANGSERVER", "pyright-langserver")
     if shutil.which(bin_name) is None:
         return JSONResponse(
@@ -200,6 +201,12 @@ def _resolve_repo(req: ResolveCallsRequest) -> ResolveCallsResponse:
             out_files.append(FileDefs(path=f.path, defs=[(None, None)] * len(f.sites)))
             total += len(f.sites)
             continue
+        # MF-2: re-open from disk so a warm server picks up on-disk edits (incremental
+        # reindex correctness). Once per file; per-site requests then find it open.
+        try:
+            srv.refresh_document(abs_path)
+        except LSPError:
+            logger.debug("refresh_document failed for %s", f.path, exc_info=True)
         defs: list[tuple[str | None, int | None]] = []
         for line1, col in f.sites:
             total += 1
@@ -207,7 +214,7 @@ def _resolve_repo(req: ResolveCallsRequest) -> ResolveCallsResponse:
                 # tree-sitter/Jedi convention (1-based line, 0-based col) → LSP
                 # 0-based position. Col is a byte offset upstream; on ASCII text
                 # that equals the UTF-16 char offset LSP wants (documented caveat).
-                hits = srv.request_definition(abs_path, line1 - 1, col)
+                hits = srv.request_definition(abs_path, line1 - 1, col, timeout=REQUEST_DEADLINE)
             except LSPError:
                 logger.debug("definition failed at %s:%d:%d", f.path, line1, col, exc_info=True)
                 defs.append((None, None))

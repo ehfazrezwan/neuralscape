@@ -178,7 +178,10 @@ class _FakeServer:
     def is_alive(self):
         return True
 
-    def request_definition(self, abs_path, line0, char0):
+    def refresh_document(self, abs_path):
+        pass
+
+    def request_definition(self, abs_path, line0, char0, timeout=30):
         rel = str(Path(abs_path).resolve().relative_to(Path(self.root).resolve()))
         return self._mapping.get((rel, line0, char0), [])
 
@@ -261,9 +264,17 @@ def test_resolve_calls_bad_repo_path(client):
     assert resp.status_code == 400
 
 
-def test_health_ok_or_unavailable(client, monkeypatch):
+def test_health_ok_when_langserver_present(client, monkeypatch):
     tc, _ = client
-    # Force the binary "present" branch.
-    monkeypatch.setattr(lsp_client, "os", lsp_client.os)  # no-op keep import
+    monkeypatch.setattr(main.shutil, "which", lambda _bin: "/usr/bin/pyright-langserver")
     resp = tc.get("/health")
-    assert resp.status_code in (200, 503)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+
+
+def test_health_unavailable_when_langserver_missing(client, monkeypatch):
+    tc, _ = client
+    monkeypatch.setattr(main.shutil, "which", lambda _bin: None)
+    resp = tc.get("/health")
+    assert resp.status_code == 503
+    assert resp.json()["status"] == "unavailable"

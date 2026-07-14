@@ -251,13 +251,33 @@ class PyrightServer:
         )
         self._opened.add(uri)
 
+    def refresh_document(self, file_path: str) -> None:
+        """Re-open ``file_path`` from disk so a WARM server sees on-disk edits.
+
+        MF-2: an opened document's sent text shadows the file on disk for the life
+        of the server, and the pool keeps one warm server per repo indefinitely. On
+        an incremental reindex after edits, resolving against reindex #1's text
+        yields shifted line numbers → wrong FQN mapping. Sending didClose + a fresh
+        didOpen makes pyright re-read current contents. Called once per file per
+        resolve request (before its sites), so per-site request_definition then
+        finds it already open."""
+        with self._lock:
+            if not self.is_alive():
+                raise LSPError("language server not alive")
+            uri = path_to_uri(file_path)
+            if uri in self._opened:
+                self._notify("textDocument/didClose", {"textDocument": {"uri": uri}})
+                self._opened.discard(uri)
+            self._ensure_open(file_path)
+
     def request_definition(
-        self, file_path: str, line0: int, char0: int
+        self, file_path: str, line0: int, char0: int, timeout: float = _REQUEST_TIMEOUT
     ) -> list[tuple[str, int]]:
         """Resolve the definition at 0-based ``(line0, char0)`` in ``file_path``.
 
         Returns a list of ``(abs_def_path, def_line_1based)``. Empty when pyright
         resolves nothing in-repo (stdlib/external/dynamic → dropped by the caller).
+        ``timeout`` bounds the round-trip so a stalled server can't hang the request.
         """
         with self._lock:
             if not self.is_alive():
@@ -269,6 +289,7 @@ class PyrightServer:
                     "textDocument": {"uri": path_to_uri(file_path)},
                     "position": {"line": line0, "character": char0},
                 },
+                timeout=timeout,
             )
         return _normalize_definition(result)
 

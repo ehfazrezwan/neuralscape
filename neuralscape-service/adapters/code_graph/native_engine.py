@@ -1940,6 +1940,12 @@ class NativeEngine:
         _t0 = _time.time()
         resolved: list[dict] = []
         resolved_count = 0
+        # MF-1: the LSP path carries no definition-kind info, so require the
+        # resolved def to land on a symbol's exact span start (a real def/class
+        # line) — this filters callable-attribute resolutions that would otherwise
+        # mint false edges to the enclosing method/class. Jedi already kind-filters,
+        # so it keeps plain span containment.
+        require_start = provenance == "lsp"
         try:
             for rel_path, sites in sites_by_file.items():
                 abs_path = repo_path / rel_path
@@ -1954,7 +1960,8 @@ class NativeEngine:
                     if not def_path or def_line is None:
                         continue  # unresolved (stdlib/external/dynamic) → dropped
                     tgt = self._map_def_to_fqn(
-                        def_path, def_line, repo_path, symbols_by_file
+                        def_path, def_line, repo_path, symbols_by_file,
+                        require_start=require_start,
                     )
                     if not tgt:
                         continue  # resolved outside the repo's indexed symbols
@@ -2058,12 +2065,24 @@ class NativeEngine:
         def_line: int,
         repo_root: Path,
         symbols_by_file: dict[str, list[tuple[int, int, str]]],
+        require_start: bool = False,
     ) -> str | None:
-        """Map a Jedi definition ``(abs_path, line)`` to the EXACT stored symbol
-        FQN whose span contains that line — so a resolved target always matches an
-        existing :CodeSymbol (never a new phantom). Prefers the innermost span
-        (largest start). Falls back to a Neo4j lookup for files not in
-        ``symbols_by_file`` (incremental reindex: unchanged files weren't parsed)."""
+        """Map a resolver definition ``(abs_path, line)`` to the EXACT stored symbol
+        FQN — so a resolved target always matches an existing :CodeSymbol (never a
+        new phantom). Falls back to a Neo4j lookup for files not in
+        ``symbols_by_file`` (incremental reindex: unchanged files weren't parsed).
+
+        ``require_start`` (Fable MF-1): when True, only accept a definition that
+        lands on a symbol's **span START** (its ``def``/``class`` line), not merely
+        within its span. Jedi kind-filters to function/class before returning, so
+        its def line is always a def line; the LSP path has no kind info, so a call
+        on a callable-valued ATTRIBUTE (``self.cb = lambda...``; ``d.cb()``) would
+        otherwise resolve to the assignment line INSIDE the enclosing method's span
+        and containment-map to a false ``caller → Method`` / ``caller → Class``
+        edge. Requiring an exact span-start match drops those (an assignment line is
+        never a symbol's start line) while keeping every real function/method/class
+        call (pyright's targetSelectionRange points at the def/class line, == the
+        stored span start). Used for lsp provenance; jedi keeps containment."""
         try:
             rel = str(Path(def_abs_path).resolve().relative_to(Path(repo_root).resolve()))
         except Exception:
@@ -2078,7 +2097,12 @@ class NativeEngine:
         best: tuple[int, int, str] | None = None
         for start, end, fqn in spans:
             hi = end or start
-            if start <= def_line <= hi and (best is None or start > best[0]):
+            if require_start:
+                # Exact def/class line only (see docstring — filters attribute /
+                # assignment resolutions that land mid-span).
+                if start == def_line and (best is None or start > best[0]):
+                    best = (start, hi, fqn)
+            elif start <= def_line <= hi and (best is None or start > best[0]):
                 best = (start, hi, fqn)
         return best[2] if best else None
 
@@ -2601,7 +2625,20 @@ class NativeEngine:
         ]
 
     def _find_symbol(self, label: str) -> list[dict]:
-        """Find symbols by FQN substring match."""
+        """Find symbols by FQN substring match.
+
+        NOTE (resolver-svc mission diagnosis): this unordered ``CONTAINS`` +
+        ``LIMIT 5`` returns an arbitrary ``matches[0]``, so an ambiguous bare label
+        like ``Argument`` can resolve to ``tests…test_argument_order`` (name merely
+        *contains* "argument") instead of the class ``…core.Argument`` — capping the
+        neighbors benchmark regardless of resolver quality. A ranked lookup
+        (exact-FQN → exact-final-segment → substring; then def kind; then degree)
+        plus caller-direction filtering for "who calls X" lifts the pyright graph's
+        neighbors from ~50% to ~70% F1 in offline measurement (see
+        ICE_V2_RESOLVER_RESULT.md). That fix touches the shared interactive query
+        path (all engines, latency-sensitive) so it is scoped as a follow-up, not
+        bundled into this resolver PR — the change here is intentionally left
+        minimal to avoid regressing the default jedi path."""
         cypher = """
         MATCH (s:CodeSymbol {code_space: $code_space})
         WHERE toLower(s.fqn) CONTAINS toLower($label)
