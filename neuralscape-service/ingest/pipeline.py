@@ -76,6 +76,13 @@ class IngestDoc:
     workspace: str | None = None
 
 
+def _served_tokens(stored) -> int:
+    """Token cost of stored rows via their write-time stamp (no tokenizer)."""
+    from savings_meter import hit_tokens
+
+    return sum(hit_tokens(m) for m in stored)
+
+
 def _fact_scope(category: str, project_id: str | None) -> tuple[str, str | None]:
     """Resolve (scope, project_id) for an extracted fact, mirroring _batch_store_facts."""
     scope = default_scope_for_category(category)
@@ -138,6 +145,19 @@ def ingest_document(service, doc: IngestDoc) -> dict:
     memory_ids: list[str] = []
     passage_count = 0
     fact_count = 0
+    # M1 (ingest lifecycle): sum of the token cost of everything we STORE
+    # (the compressed form future recalls serve instead of re-reading the
+    # source). Reads the write-time stamp on each stored row — but a dedup hit
+    # can return a legacy row with token_estimate=None, whose hit_tokens would
+    # fall back to tiktoken; so accumulate ONLY when the meter is on, keeping
+    # the kill-switch's "zero tokenizer work when off" guarantee.
+    served_tok = 0
+    try:
+        import savings_meter as _sm
+
+        meter_on = _sm._meter_enabled()
+    except Exception:
+        meter_on = False
 
     # ── Passages (verbatim, vector-only) ──
     if doc.index_passages:
@@ -171,6 +191,8 @@ def ingest_document(service, doc: IngestDoc) -> dict:
                 )
                 memory_ids.extend(m.id for m in stored)
                 passage_count += len(stored)
+                if meter_on:
+                    served_tok += _served_tokens(stored)
             except Exception as e:
                 logger.warning(f"Passage store failed (chunk {chunk.index}): {e}")
 
@@ -219,6 +241,8 @@ def ingest_document(service, doc: IngestDoc) -> dict:
                 )
                 memory_ids.extend(m.id for m in stored)
                 fact_count += len(stored)
+                if meter_on:
+                    served_tok += _served_tokens(stored)
                 if created:
                     for m in stored:
                         graph_jobs.append({
@@ -237,6 +261,22 @@ def ingest_document(service, doc: IngestDoc) -> dict:
         f"({len(graph_jobs)} graph jobs deferred, "
         f"connector={base.get('connector_type')}/{base.get('connector_id')})"
     )
+
+    # M1 — ingest lifecycle: baseline = the full source document a client
+    # would otherwise re-read to extract these facts; served = the token cost
+    # of everything we stored. Best-effort, off any latency-sensitive path
+    # (this runs in the ingest worker); a meter failure never fails ingest.
+    try:
+        if meter_on and doc.user_id:
+            baseline_tok = _sm.count_tokens(doc.content or "")
+            event = _sm.measure_ingest(
+                baseline_tok, served_tok, item_id=parent_id, corr_id=doc.run_id
+            )
+            if event is not None:
+                _sm.record_event(doc.user_id, event)
+    except Exception:
+        logger.debug("ingest savings metering failed (non-fatal)", exc_info=True)
+
     return {
         "passages": passage_count,
         "facts": fact_count,

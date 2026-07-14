@@ -1,13 +1,11 @@
 """E2 — token-economics telemetry: the honest meter.
 
-Measured, not modeled. Per recall op (search / index_only / get_memories /
-timeline / ask) the meter computes both sides of the counterfactual:
+Measured, not modeled. Per lifecycle op the meter computes both sides of the
+counterfactual:
 
-- ``baseline_tokens`` — real token cost of the FULL content of every hit
-  (what a memoryless client would have had to read),
-- ``served_tokens`` — token cost of the memory content actually returned in
-  full (index-only ops serve zero content; full-payload ops serve exactly
-  the baseline; ask serves the synthesized answer),
+- ``baseline_tokens`` — real token cost of the FULL content a memoryless
+  client would have had to read to get the same answer,
+- ``served_tokens`` — token cost of what NS actually returned in full,
 - ``overhead_tokens`` — NS's own injected material: the rendered index rows
   + the savings line on this response, plus the per-release MCP tool-schema
   constant charged once per user per UTC day as its own ledger entry
@@ -20,28 +18,42 @@ timeline / ask) the meter computes both sides of the counterfactual:
 each fact from sources) is a clearly-labeled heuristic ESTIMATE kept in a
 separate field and NEVER blended into the measured headline.
 
+Lifecycle model (M1). Every event carries a ``lifecycle_stage`` — one of
+``retrieval | ingest | context_assembly | code_nav | compaction`` — so the
+meter can slice savings per stage, and an optional ``item_id`` /
+``corr_id`` (task/session correlation, M4). Per-event rows land in the
+append-only stream alongside the O(1) cumulative totals, which are now also
+bucketed per-lifecycle and per-op.
+
+Bounce accounting (M2). An index-only / locate op that is followed by a
+full-fetch of the SAME item within a window saved nothing — the client
+re-read the content anyway, so its overhead was pure cost. We surface BOTH
+the raw ``net_tokens_saved`` and the ``adjusted_net_tokens_saved`` that
+deducts those bounced credits.
+
+Code-nav baseline (M3). For code locate/neighbors/query the baseline is the
+avoided FILE-READ footprint (a disclosed per-distinct-file estimate), not
+the memory-content size — the read-avoidance number.
+
 Hot-path economics: baselines come from the ``token_estimate`` stamped on
-each memory at write time (a real tiktoken count once this module is live;
-the len/4 heuristic on legacy rows), so a recall tokenizes only the small
-rendered index payload — never the full contents again. Kill-switch:
+each memory at write time, so a recall tokenizes only the small rendered
+index payload — never the full contents again. Kill-switch:
 ``SAVINGS_METER_ENABLED=false`` short-circuits every entry point before any
 tokenizer call and write-time stamping falls back to the heuristic.
-
-Ledger: append-only per-user Redis stream ``ns:savings:{user_id}`` with
-entries ``{ts, op, baseline, served, overhead, net, rederiv_est}``
-(maxlen ~100k, approximate trim) plus O(1) cumulative totals in Redis
-hashes (per-user and instance-wide) surfaced by ``GET /v1/metrics``.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import threading
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from index_format import estimate_tokens
 from savings_constants import (
+    LIFECYCLE_STAGES,
     MCP_TOOL_SCHEMA_OVERHEAD_TOKENS,
     SAVINGS_LINE_OVERHEAD_TOKENS,
 )
@@ -52,14 +64,39 @@ LEDGER_KEY = "ns:savings:{user_id}"
 TOTALS_KEY = "ns:savings:totals:{user_id}"
 INSTANCE_TOTALS_KEY = "ns:savings:totals:__instance__"
 _SCHEMA_MARK_KEY = "ns:savings:schema-charged:{user_id}:{day}"
+# Per-lifecycle / per-op / per-task rollup keys (M1, M4). ``scope`` is either
+# a user_id or the ``__instance__`` sentinel.
+LIFECYCLE_TOTALS_KEY = "ns:savings:lc:{scope}:{lifecycle}"
+OP_TOTALS_KEY = "ns:savings:op:{scope}:{op}"
+OPS_SET_KEY = "ns:savings:ops:{scope}"
+TASK_TOTALS_KEY = "ns:savings:task:{user_id}:{corr_id}"
+# M2 — short-lived "this item was served as an index row" marker.
+BOUNCE_KEY = "ns:savings:bounce:{user_id}:{item_id}"
 
-_TOTAL_FIELDS = ("events", "baseline", "served", "overhead", "net", "rederiv_est")
+_INSTANCE_SCOPE = "__instance__"
+
+# ``net`` is the RAW measured net; ``bounced`` is the cumulative bounce
+# deduction. The bounce-corrected ``adjusted_net_tokens_saved`` is DERIVED at
+# read time as ``net − bounced`` — never stored as its own accumulator — so a
+# legacy totals hash written before M2 (which has ``net`` history but no
+# ``bounced`` field) reads back ``bounced=0`` ⇒ ``adjusted == net``, correct by
+# construction with no migration and no phantom "bounces ate everything".
+_TOTAL_FIELDS = (
+    "events",
+    "baseline",
+    "served",
+    "overhead",
+    "net",
+    "bounced",
+    "rederiv_est",
+)
 
 # ── Tokenizer (lazy, cached, failure-tolerant) ──────────────────────
 
 _encoder = None
 _encoder_failed = False
 _encoder_lock = threading.Lock()
+_alt_encoders: dict[str, object] = {}
 _redis = None
 
 
@@ -93,11 +130,36 @@ def _get_encoder():
     return _encoder
 
 
-def count_tokens(text: str | None) -> int:
-    """Real token count of ``text``. Only call when the meter is enabled."""
+def _get_alt_encoder(encoding: str):
+    """Lazy tiktoken encoding for an explicitly-requested basis (M5 optional
+    per-model tokenizer). Cached; falls back to None (heuristic) on failure."""
+    if encoding in _alt_encoders:
+        return _alt_encoders[encoding]
+    with _encoder_lock:
+        if encoding in _alt_encoders:
+            return _alt_encoders[encoding]
+        try:
+            import tiktoken
+
+            enc = tiktoken.get_encoding(encoding)
+        except Exception:
+            enc = None
+            logger.warning(
+                "tiktoken encoding %r unavailable — using the len/4 heuristic",
+                encoding, exc_info=True,
+            )
+        _alt_encoders[encoding] = enc
+    return enc
+
+
+def count_tokens(text: str | None, *, encoding: str | None = None) -> int:
+    """Real token count of ``text``. Only call when the meter is enabled.
+
+    ``encoding`` selects an alternate tiktoken basis (M5) — e.g. ``cl100k_base``
+    for a client billed on that tokenizer; omit for the configured default."""
     if not text:
         return 0
-    enc = _get_encoder()
+    enc = _get_alt_encoder(encoding) if encoding else _get_encoder()
     if enc is None:  # tokenizer unavailable — degrade, don't break recall
         return estimate_tokens(text)
     return len(enc.encode(text))
@@ -136,16 +198,47 @@ class SavingsEvent:
     baseline_tokens: int
     served_tokens: int
     overhead_tokens: int
-    net_tokens_saved: int  # SIGNED — never clamped to zero
+    net_tokens_saved: int  # SIGNED raw net — never clamped to zero
     rederivation_savings_estimate: int  # heuristic; never in net
+    # M1/M2/M4 metadata (defaulted so the historical 6-positional
+    # construction stays valid). ``bounced_tokens`` is the deduction this event
+    # contributes to the cumulative ``bounced`` accumulator (non-zero only on a
+    # ``bounce`` event); ``adjusted_net_tokens_saved`` = net − bounced is the
+    # per-event bounce-corrected net carried on the stream row.
+    adjusted_net_tokens_saved: int | None = None
+    bounced_tokens: int = 0
+    lifecycle_stage: str = "retrieval"
+    item_id: str | None = None
+    corr_id: str | None = None
+
+    def __post_init__(self):
+        if self.adjusted_net_tokens_saved is None:
+            self.adjusted_net_tokens_saved = self.net_tokens_saved - self.bounced_tokens
 
     def detail(self) -> dict:
-        d = asdict(self)
-        d.pop("op", None)
-        return d
+        """The compact per-response detail surface. Intentionally limited to
+        the core measured fields so the rendered savings line stays within
+        ``SAVINGS_LINE_OVERHEAD_TOKENS`` (the lifecycle/correlation metadata
+        rides the ledger + metrics payload, not this line)."""
+        return {
+            "baseline_tokens": self.baseline_tokens,
+            "served_tokens": self.served_tokens,
+            "overhead_tokens": self.overhead_tokens,
+            "net_tokens_saved": self.net_tokens_saved,
+            "rederivation_savings_estimate": self.rederivation_savings_estimate,
+        }
 
 
-def _make_event(op: str, baseline: int, served: int, overhead: int) -> SavingsEvent:
+def _make_event(
+    op: str,
+    baseline: int,
+    served: int,
+    overhead: int,
+    *,
+    lifecycle_stage: str = "retrieval",
+    item_id: str | None = None,
+    corr_id: str | None = None,
+) -> SavingsEvent:
     from config import settings
 
     saved = baseline - served
@@ -158,6 +251,9 @@ def _make_event(op: str, baseline: int, served: int, overhead: int) -> SavingsEv
         rederivation_savings_estimate=int(
             baseline * max(0.0, settings.savings_rederivation_multiplier)
         ),
+        lifecycle_stage=lifecycle_stage,
+        item_id=item_id,
+        corr_id=corr_id,
     )
 
 
@@ -169,6 +265,8 @@ def measure_recall(
     served_text: str | None = None,
     index_payload: str | None = None,
     include_line_overhead: bool = False,
+    lifecycle_stage: str = "retrieval",
+    corr_id: str | None = None,
 ) -> SavingsEvent | None:
     """Measure one recall op. Returns None when the meter is disabled
     (guaranteeing zero tokenizer calls on the hot path).
@@ -197,21 +295,33 @@ def measure_recall(
         overhead += count_tokens(index_payload)
     if include_line_overhead:
         overhead += SAVINGS_LINE_OVERHEAD_TOKENS
-    return _make_event(op, baseline, served, overhead)
+    return _make_event(
+        op, baseline, served, overhead,
+        lifecycle_stage=lifecycle_stage, corr_id=corr_id,
+    )
 
 
-def measure_ask(baseline_tokens: int, answer_text: str | None) -> SavingsEvent | None:
+def measure_ask(
+    baseline_tokens: int,
+    answer_text: str | None,
+    *,
+    corr_id: str | None = None,
+) -> SavingsEvent | None:
     """Measure one ask op: baseline = full content of the retrieved evidence
     (precomputed from stored counts), served = the synthesized answer."""
     if not _meter_enabled():
         return None
     return _make_event(
-        "ask", max(0, int(baseline_tokens)), count_tokens(answer_text or ""), 0
+        "ask", max(0, int(baseline_tokens)), count_tokens(answer_text or ""), 0,
+        lifecycle_stage="retrieval", corr_id=corr_id,
     )
 
 
 def measure_assemble(
-    baseline_tokens: int, served_tokens: int
+    baseline_tokens: int,
+    served_tokens: int,
+    *,
+    corr_id: str | None = None,
 ) -> SavingsEvent | None:
     """Measure one context-assemble op (E3): baseline = the full session
     transcript + full content of every relevant hit (what a memoryless
@@ -221,7 +331,190 @@ def measure_assemble(
     if not _meter_enabled():
         return None
     return _make_event(
-        "context_assemble", max(0, int(baseline_tokens)), max(0, int(served_tokens)), 0
+        "context_assemble",
+        max(0, int(baseline_tokens)),
+        max(0, int(served_tokens)),
+        0,
+        lifecycle_stage="context_assembly",
+        corr_id=corr_id,
+    )
+
+
+def measure_ingest(
+    baseline_tokens: int,
+    served_tokens: int,
+    *,
+    item_id: str | None = None,
+    corr_id: str | None = None,
+) -> SavingsEvent | None:
+    """Measure one ingest op (M1): baseline = the full source document a
+    client would otherwise re-read to extract its facts, served = the total
+    token cost of the distilled facts + passages actually stored. The
+    positive net is the one-time distillation compression — counted, never
+    executed (the LLM extraction cost is provider-side, not injected)."""
+    if not _meter_enabled():
+        return None
+    return _make_event(
+        "ingest",
+        max(0, int(baseline_tokens)),
+        max(0, int(served_tokens)),
+        0,
+        lifecycle_stage="ingest",
+        item_id=item_id,
+        corr_id=corr_id,
+    )
+
+
+def measure_code_nav(
+    op: str,
+    *,
+    served_text: str | None = None,
+    served_tokens: int | None = None,
+    files=None,
+    file_count: int | None = None,
+    avoided_read_tokens: int | None = None,
+    item_id: str | None = None,
+    corr_id: str | None = None,
+) -> SavingsEvent | None:
+    """Measure one code-nav op (M3): locate / neighbors / query.
+
+    The baseline is the AVOIDED FILE-READ footprint — the token cost of the
+    file(s) the model would otherwise have opened to find the answer — NOT
+    the memory-content size. We never read files on the hot path, so we book
+    a DISCLOSED per-distinct-file estimate (``avoided_read_tokens``, default
+    from settings) times the number of distinct files the answer touched.
+    Clearly an estimate; labeled as such in the metrics payload.
+
+    Pass ``files`` (a list — distinct paths are counted) or an explicit
+    ``file_count``; ``served_text``/``served_tokens`` is the compact answer
+    actually returned."""
+    if not _meter_enabled():
+        return None
+    from config import settings
+
+    per_file = (
+        avoided_read_tokens
+        if avoided_read_tokens is not None
+        else settings.savings_code_nav_avoided_read_tokens_per_file
+    )
+    if file_count is None:
+        file_count = len({f for f in (files or []) if f})
+    baseline = max(0, int(file_count)) * max(0, int(per_file))
+    if served_tokens is not None:
+        served = max(0, int(served_tokens))
+    else:
+        served = count_tokens(served_text or "")
+    return _make_event(
+        op, baseline, served, 0,
+        lifecycle_stage="code_nav", item_id=item_id, corr_id=corr_id,
+    )
+
+
+# ── Code-nav file parsing + dispatch (M3, shared by REST + MCP) ──────
+# The avoided-read baseline is driven by the distinct FILES a code answer
+# references. query/neighbors answers never carry a structured file list, so
+# those baselines are parsed from the answer text — which means the parser
+# must be STRICT: it books each distinct file at the disclosed per-file
+# estimate, so a false positive (prose like ``e.g``, ``np.array``,
+# ``settings.savings``, ``example.com``) would fabricate baseline, the exact
+# dishonesty this meter exists to prevent.
+_CODE_NAV_EXTS = frozenset(
+    "py pyi ts tsx js jsx mjs cjs go rs java rb c h cc cpp hpp cs php swift "
+    "kt scala sh bash sql yaml yml toml ini cfg json md rst txt".split()
+)
+# A path must LOOK like a path: a slash-separated path ending in a code
+# extension (optionally ``:line``), OR a bare ``file.ext:line`` reference. A
+# lone dotted token (``np.array``, ``settings.savings``, ``example.com``,
+# ``v2.x``) matches NEITHER alternative.
+_CODE_FILE_RE = re.compile(
+    r"(?<![\w.])"
+    r"(?:"
+    r"[\w\-.]+(?:/[\w\-.]+)+\.(?P<ext1>[A-Za-z][\w]{0,6})(?::\d+)?"  # a/b/c.py[:12]
+    r"|"
+    r"[\w\-.]+\.(?P<ext2>[A-Za-z][\w]{0,6}):\d+"                      # file.py:12
+    r")"
+)
+
+
+def distinct_files_in_text(text: str | None, *, cap: int = 20) -> list[str]:
+    """Distinct code-file paths referenced in a code-nav answer — the files a
+    model would otherwise have opened. Strict on shape (needs a directory
+    separator or a ``:line`` suffix) and gated on a real code/text extension,
+    so prose dotted tokens are never booked as avoided files. Capped so one
+    pathological answer cannot book an unbounded baseline."""
+    if not text:
+        return []
+    seen: dict[str, None] = {}
+    for m in _CODE_FILE_RE.finditer(text):
+        ext = (m.group("ext1") or m.group("ext2") or "").lower()
+        if ext not in _CODE_NAV_EXTS:
+            continue
+        path = re.sub(r":\d+$", "", m.group(0))  # file.py:12 == file.py
+        seen.setdefault(path, None)
+        if len(seen) >= cap:
+            break
+    return list(seen)
+
+
+def meter_code_nav_bg(
+    op: str,
+    user_id: str | None,
+    *,
+    served_text: str | None = None,
+    served_obj=None,
+    files=None,
+) -> None:
+    """Ledger one code-nav op OFF the hot path, from EITHER transport (REST or
+    MCP). Baseline = avoided file-read footprint; served = the compact answer
+    NS returned. ``files`` (from structured hits) is preferred; otherwise the
+    distinct paths are parsed from the served text. Serialization + parsing run
+    inside the telemetry closure, and the meter-off short-circuit is checked
+    first, so a meter-off request does zero extra work."""
+    if not user_id or not _meter_enabled():
+        return
+
+    def _run() -> None:
+        if served_text is not None:
+            text = served_text
+        elif served_obj is not None:
+            text = json.dumps(served_obj, default=str)
+        else:
+            text = ""
+        resolved = list(files) if files else distinct_files_in_text(text)
+        event = measure_code_nav(op, served_text=text, files=resolved)
+        if event is not None:
+            record_event(user_id, event)
+
+    try:
+        import telemetry
+
+        telemetry.submit(_run)
+    except Exception:
+        logger.debug("code-nav metering dispatch failed (non-fatal)", exc_info=True)
+
+
+def measure_compaction(
+    baseline_tokens: int,
+    served_tokens: int,
+    *,
+    item_id: str | None = None,
+    corr_id: str | None = None,
+) -> SavingsEvent | None:
+    """Measure one compaction op (M1): baseline = the prior rolling summary
+    that this refresh REPLACES + the transcript messages folded in, served =
+    the resulting new rolling summary. Booking the prior summary in the
+    baseline makes the per-refresh nets telescope to Σ(messages) − S_final over
+    a session — the true recursive-compression saving of the summarizer."""
+    if not _meter_enabled():
+        return None
+    return _make_event(
+        "compaction",
+        max(0, int(baseline_tokens)),
+        max(0, int(served_tokens)),
+        0,
+        lifecycle_stage="compaction",
+        item_id=item_id,
+        corr_id=corr_id,
     )
 
 
@@ -253,16 +546,49 @@ def _get_redis():
     return _redis
 
 
-def _append(r, user_id: str, event: SavingsEvent) -> None:
-    from config import settings
-
-    fields = {
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "op": event.op,
+def _increments(event: SavingsEvent) -> dict:
+    return {
+        "events": 1,
         "baseline": event.baseline_tokens,
         "served": event.served_tokens,
         "overhead": event.overhead_tokens,
         "net": event.net_tokens_saved,
+        "bounced": max(0, int(event.bounced_tokens)),
+        "rederiv_est": event.rederivation_savings_estimate,
+    }
+
+
+def _bump(pipe, key: str, incr: dict) -> None:
+    for field_name, amount in incr.items():
+        pipe.hincrby(key, field_name, amount)
+
+
+def _append(r, user_id: str, event: SavingsEvent) -> None:
+    from config import settings
+
+    incr = _increments(event)
+    # C3 — a lifecycle_stage outside the fixed enum would write buckets the
+    # payload's fixed-enum read never surfaces (silent loss + unbounded keys);
+    # clamp unknown stages to ``retrieval``.
+    lifecycle = event.lifecycle_stage or "retrieval"
+    if lifecycle not in LIFECYCLE_STAGES:
+        lifecycle = "retrieval"
+    adjusted = (
+        event.adjusted_net_tokens_saved
+        if event.adjusted_net_tokens_saved is not None
+        else event.net_tokens_saved - incr["bounced"]
+    )
+    fields = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "op": event.op,
+        "lifecycle": lifecycle,
+        "item_id": event.item_id or "",
+        "corr_id": event.corr_id or "",
+        "baseline": event.baseline_tokens,
+        "served": event.served_tokens,
+        "overhead": event.overhead_tokens,
+        "net": event.net_tokens_saved,
+        "adjusted": adjusted,
         "rederiv_est": event.rederivation_savings_estimate,
     }
     pipe = r.pipeline()
@@ -272,13 +598,16 @@ def _append(r, user_id: str, event: SavingsEvent) -> None:
         maxlen=settings.savings_ledger_maxlen,
         approximate=True,
     )
-    for key in (TOTALS_KEY.format(user_id=user_id), INSTANCE_TOTALS_KEY):
-        pipe.hincrby(key, "events", 1)
-        pipe.hincrby(key, "baseline", event.baseline_tokens)
-        pipe.hincrby(key, "served", event.served_tokens)
-        pipe.hincrby(key, "overhead", event.overhead_tokens)
-        pipe.hincrby(key, "net", event.net_tokens_saved)
-        pipe.hincrby(key, "rederiv_est", event.rederivation_savings_estimate)
+    for scope in (user_id, _INSTANCE_SCOPE):
+        _bump(pipe, TOTALS_KEY.format(user_id=scope) if scope != _INSTANCE_SCOPE
+              else INSTANCE_TOTALS_KEY, incr)
+        _bump(pipe, LIFECYCLE_TOTALS_KEY.format(scope=scope, lifecycle=lifecycle), incr)
+        _bump(pipe, OP_TOTALS_KEY.format(scope=scope, op=event.op), incr)
+        pipe.sadd(OPS_SET_KEY.format(scope=scope), event.op)
+    if event.corr_id:
+        task_key = TASK_TOTALS_KEY.format(user_id=user_id, corr_id=event.corr_id)
+        _bump(pipe, task_key, incr)
+        pipe.expire(task_key, max(60, int(settings.savings_task_rollup_ttl_seconds)))
     pipe.execute()
 
 
@@ -307,6 +636,7 @@ def record_event(user_id: str, event: SavingsEvent | None, redis=None) -> bool:
                     overhead_tokens=MCP_TOOL_SCHEMA_OVERHEAD_TOKENS,
                     net_tokens_saved=-MCP_TOOL_SCHEMA_OVERHEAD_TOKENS,
                     rederivation_savings_estimate=0,
+                    lifecycle_stage="context_assembly",
                 ),
             )
         _append(r, user_id, event)
@@ -316,61 +646,218 @@ def record_event(user_id: str, event: SavingsEvent | None, redis=None) -> bool:
         return False
 
 
+# ── Bounce accounting (M2) ──────────────────────────────────────────
+
+
+def arm_bounce(user_id: str, hits, redis=None) -> bool:
+    """Mark each hit served as an index row (served content == 0) so a
+    subsequent full-fetch of the same item within the window can be detected
+    as a bounce. Best-effort; never raises."""
+    if not _meter_enabled() or not user_id or not hits:
+        return False
+    try:
+        from config import settings
+
+        r = redis if redis is not None else _get_redis()
+        window = max(1, int(settings.savings_bounce_window_seconds))
+        pipe = r.pipeline()
+        armed = 0
+        for h in hits:
+            hid = getattr(h, "id", None)
+            if not hid:
+                continue
+            pipe.set(
+                BOUNCE_KEY.format(user_id=user_id, item_id=hid),
+                hit_tokens(h),
+                ex=window,
+            )
+            armed += 1
+        if armed:
+            pipe.execute()
+        return armed > 0
+    except Exception:
+        logger.debug("savings bounce arm failed (non-fatal)", exc_info=True)
+        return False
+
+
+def check_and_deduct_bounce(user_id: str, hits, redis=None) -> int:
+    """A full-fetch of items previously served as index rows: those index
+    ops saved nothing (the client re-read the content), so deduct each
+    credited baseline from the bounce-adjusted total via a ``bounce`` event
+    (net=0, adjusted<0). Returns how many bounces were deducted.
+    Best-effort; never raises."""
+    if not _meter_enabled() or not user_id or not hits:
+        return 0
+    deducted = 0
+    try:
+        r = redis if redis is not None else _get_redis()
+        for h in hits:
+            hid = getattr(h, "id", None)
+            if not hid:
+                continue
+            key = BOUNCE_KEY.format(user_id=user_id, item_id=hid)
+            val = r.get(key)
+            if val is None:
+                continue
+            # C1 — claim the marker atomically: only the racer whose DELETE
+            # actually removed the key deducts, so concurrent full-fetches of
+            # the same item can't double-count.
+            if not r.delete(key):
+                continue
+            try:
+                baseline_share = max(0, int(val))
+            except (TypeError, ValueError):
+                continue
+            if baseline_share == 0:
+                # C2 — a zero-token item (legacy/empty stamp) saved nothing to
+                # begin with; consume the marker but book no bounce event.
+                continue
+            _append(
+                r,
+                user_id,
+                SavingsEvent(
+                    op="bounce",
+                    baseline_tokens=0,
+                    served_tokens=0,
+                    overhead_tokens=0,
+                    net_tokens_saved=0,  # raw net untouched
+                    rederivation_savings_estimate=0,
+                    bounced_tokens=baseline_share,  # only the derived adjusted moves
+                    lifecycle_stage="retrieval",
+                    item_id=hid,
+                ),
+            )
+            deducted += 1
+    except Exception:
+        logger.debug("savings bounce check failed (non-fatal)", exc_info=True)
+    return deducted
+
+
+# ── Metrics snapshot ────────────────────────────────────────────────
+
+
 def _read_totals(r, key: str) -> dict:
     raw = r.hgetall(key) or {}
     out = {}
-    for field in _TOTAL_FIELDS:
-        value = raw.get(field) if field in raw else raw.get(field.encode())
+    for field_name in _TOTAL_FIELDS:
+        value = raw.get(field_name) if field_name in raw else raw.get(field_name.encode())
         try:
-            out[field] = int(value) if value is not None else 0
+            out[field_name] = int(value) if value is not None else 0
         except (TypeError, ValueError):
-            out[field] = 0
+            out[field_name] = 0
     return {
         "events": out["events"],
         "baseline_tokens": out["baseline"],
         "served_tokens": out["served"],
         "overhead_tokens": out["overhead"],
         "net_tokens_saved": out["net"],
+        # DERIVED — never a stored accumulator (see _TOTAL_FIELDS): legacy
+        # hashes with no ``bounced`` field read 0 ⇒ adjusted == net.
+        "bounced_tokens": out["bounced"],
+        "adjusted_net_tokens_saved": out["net"] - out["bounced"],
         "rederivation_savings_estimate": out["rederiv_est"],
     }
 
 
-def metrics_snapshot(user_id: str, redis=None) -> dict:
-    """Cumulative savings totals for GET /v1/metrics (per-user + instance)."""
+def _decode(v) -> str:
+    return v.decode() if isinstance(v, (bytes, bytearray)) else str(v)
+
+
+def _read_breakdown(r, scope: str) -> dict:
+    """Per-lifecycle (fixed enum) + per-op (from the ops set) totals for one
+    scope. Only non-empty buckets are returned so the payload stays lean."""
+    by_lifecycle: dict = {}
+    for stage in LIFECYCLE_STAGES:
+        totals = _read_totals(r, LIFECYCLE_TOTALS_KEY.format(scope=scope, lifecycle=stage))
+        if totals["events"]:
+            by_lifecycle[stage] = totals
+    by_op: dict = {}
+    try:
+        members = r.smembers(OPS_SET_KEY.format(scope=scope)) or []
+    except Exception:
+        members = []
+    for op in sorted(_decode(m) for m in members):
+        totals = _read_totals(r, OP_TOTALS_KEY.format(scope=scope, op=op))
+        if totals["events"]:
+            by_op[op] = totals
+    return {"by_lifecycle": by_lifecycle, "by_op": by_op}
+
+
+def metrics_snapshot(user_id: str, redis=None, task_id: str | None = None) -> dict:
+    """Cumulative savings totals for GET /v1/metrics (per-user + instance),
+    now with per-lifecycle + per-op breakdowns and raw vs bounce-adjusted
+    totals (M6), plus the honesty labels (M5)."""
     from config import settings
 
     body: dict = {
         "enabled": bool(settings.savings_meter_enabled),
         "tokenizer": settings.savings_tokenizer,
+        "tokenizer_basis_note": (
+            f"token counts measured with the '{settings.savings_tokenizer}' "
+            "tiktoken encoding; a provider's billing units may differ."
+        ),
         "tool_schema_overhead_tokens": MCP_TOOL_SCHEMA_OVERHEAD_TOKENS,
+        "lifecycle_stages": list(LIFECYCLE_STAGES),
+        "rederivation_multiplier": float(settings.savings_rederivation_multiplier),
+        "rederivation_note": (
+            "rederivation_savings_estimate = rederivation_multiplier × baseline "
+            "tokens; a clearly-labeled heuristic ESTIMATE, never included in "
+            "net_tokens_saved or adjusted_net_tokens_saved."
+        ),
         "note": (
             "net_tokens_saved is measured and signed (may be negative); "
-            "rederivation_savings_estimate is a heuristic estimate and is "
-            "never included in net."
+            "adjusted_net_tokens_saved additionally deducts bounces "
+            "(index/locate ops whose item was re-fetched in full within the "
+            "bounce window); rederivation_savings_estimate is a heuristic "
+            "estimate and is never included in either net."
+        ),
+        "code_nav_avoided_read_tokens_per_file": int(
+            settings.savings_code_nav_avoided_read_tokens_per_file
+        ),
+        "code_nav_baseline_note": (
+            "code_nav baselines are an ESTIMATE of the avoided file-read "
+            "footprint (distinct files × code_nav_avoided_read_tokens_per_file), "
+            "not memory-content size."
         ),
     }
     if not settings.savings_meter_enabled:
         body["user"] = None
         body["instance"] = None
+        if task_id is not None:
+            body["task"] = None
         return body
     try:
         r = redis if redis is not None else _get_redis()
         body["user"] = {
             "user_id": user_id,
             **_read_totals(r, TOTALS_KEY.format(user_id=user_id)),
+            **_read_breakdown(r, user_id),
         }
-        body["instance"] = _read_totals(r, INSTANCE_TOTALS_KEY)
+        body["instance"] = {
+            **_read_totals(r, INSTANCE_TOTALS_KEY),
+            **_read_breakdown(r, _INSTANCE_SCOPE),
+        }
+        if task_id is not None:
+            body["task"] = {
+                "corr_id": task_id,
+                **_read_totals(
+                    r, TASK_TOTALS_KEY.format(user_id=user_id, corr_id=task_id)
+                ),
+            }
     except Exception:
         logger.warning("savings totals read failed", exc_info=True)
         body["user"] = None
         body["instance"] = None
+        if task_id is not None:
+            body["task"] = None
         body["error"] = "ledger unavailable"
     return body
 
 
 def _reset_for_tests() -> None:
     """Drop cached encoder/redis singletons (test isolation only)."""
-    global _encoder, _encoder_failed, _redis
+    global _encoder, _encoder_failed, _redis, _alt_encoders
     _encoder = None
     _encoder_failed = False
     _redis = None
+    _alt_encoders = {}

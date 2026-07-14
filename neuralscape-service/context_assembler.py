@@ -305,7 +305,8 @@ def assemble_context(
             for m in all_msgs
         )
         baseline += sum(sm.hit_tokens(h) for h in query_hits)
-        event = sm.measure_assemble(baseline, used_tokens)
+        # M4: roll this assemble up to the session it served.
+        event = sm.measure_assemble(baseline, used_tokens, corr_id=session_id)
         if event is not None:
             sm.record_event(user_id, event)
             savings = sm.format_savings_line(event)

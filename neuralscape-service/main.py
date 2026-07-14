@@ -1427,6 +1427,7 @@ async def v1_code_graph_query(
             knowledge_system, "query", graph_id, caller,
             query=question, mode=mode, depth=depth, token_budget=token_budget,
         )
+        _meter_code_nav_bg("code_nav_query", caller, served_text=answer.content)
         return {
             "result": answer.content,
             "graph_id": graph_id,
@@ -1446,6 +1447,7 @@ async def v1_code_graph_query(
         )
     except cg.CodeGraphError as e:
         raise _map_code_graph_error(e) from e
+    _meter_code_nav_bg("code_nav_query", caller, served_text=text)
     return {"result": text, "graph_id": graph_id}
 
 
@@ -1466,6 +1468,7 @@ async def v1_code_graph_neighbors(
             knowledge_system, "neighbors", graph_id, caller,
             query=label, label=label, relation_filter=relation_filter,
         )
+        _meter_code_nav_bg("code_nav_neighbors", caller, served_text=answer.content)
         return {
             "result": answer.content,
             "graph_id": graph_id,
@@ -1483,6 +1486,7 @@ async def v1_code_graph_neighbors(
         )
     except cg.CodeGraphError as e:
         raise _map_code_graph_error(e) from e
+    _meter_code_nav_bg("code_nav_neighbors", caller, served_text=text)
     return {"result": text, "graph_id": graph_id}
 
 
@@ -1547,8 +1551,16 @@ async def v1_code_graph_locate(
             knowledge_system, "locate", graph_id, caller,
             query=query, limit=k,
         )
+        hits = answer.hits or []
+        # C4: this branch serves both structured rows AND the text summary —
+        # meter both so served isn't undercounted (which would overstate net).
+        _meter_code_nav_bg(
+            "code_nav_locate", caller,
+            served_obj={"results": hits, "result": answer.content},
+            files=[h.get("file") for h in hits if isinstance(h, dict) and h.get("file")],
+        )
         return {
-            "results": answer.hits or [],
+            "results": hits,
             "result": answer.content,
             "graph_id": graph_id,
             "system": answer.system_name,  # AR3: engine that actually served
@@ -1569,6 +1581,14 @@ async def v1_code_graph_locate(
         results = [asdict(hit) for hit in hits]
     except cg.CodeGraphError as e:
         raise _map_code_graph_error(e) from e
+    # M3: baseline = the distinct enclosing files these hits let the model
+    # skip reading; served = the compact located rows (serialized off the
+    # request path inside the metering closure).
+    _meter_code_nav_bg(
+        "code_nav_locate", caller,
+        served_obj={"results": results},
+        files=[r.get("file") for r in results if r.get("file")],
+    )
     return {"results": results, "graph_id": graph_id, "k": k}
 
 
@@ -1895,6 +1915,10 @@ def _meter_index_recall_bg(op: str, user_id: str, hits, response) -> None:
         event = sm.measure_recall(op, hits, index_payload=payload)
         if event is not None:
             sm.record_event(user_id, event)
+            # M2: these items were served as index rows (content == 0). If the
+            # client full-fetches the same item within the window, that index
+            # saved nothing — arm the bounce detector.
+            sm.arm_bounce(user_id, hits)
 
     try:
         import telemetry
@@ -1913,6 +1937,9 @@ def _meter_full_recall_bg(op: str, user_id: str, hits) -> None:
         event = sm.measure_recall(op, hits, served_full=True)
         if event is not None:
             sm.record_event(user_id, event)
+            # M2: a full-fetch of items previously served as index rows is a
+            # bounce — deduct those illusory index credits.
+            sm.check_and_deduct_bounce(user_id, hits)
 
     try:
         import telemetry
@@ -1920,6 +1947,18 @@ def _meter_full_recall_bg(op: str, user_id: str, hits) -> None:
         telemetry.submit(_measure_and_record)
     except Exception:
         logger.debug("savings metering dispatch failed (non-fatal)", exc_info=True)
+
+
+# M3/M5 — code-nav read-avoidance metering. The parser (strict file-shape +
+# extension allowlist + cap) and the off-hot-path dispatch live in
+# savings_meter so BOTH transports (this REST surface + the MCP code tools)
+# meter identically; this is a thin transport shim.
+def _meter_code_nav_bg(op: str, user_id: str, *, served_text=None, served_obj=None, files=None) -> None:
+    import savings_meter as sm
+
+    sm.meter_code_nav_bg(
+        op, user_id, served_text=served_text, served_obj=served_obj, files=files
+    )
 
 
 # Union response model: Pydantic v2 smart-union validates the returned model
@@ -2240,20 +2279,32 @@ async def v1_event_stream(request: Request, user_id: str | None = Query(default=
 
 
 @v1_router.get("/metrics")
-async def v1_metrics(request: Request, user_id: str | None = Query(default=None)):
+async def v1_metrics(
+    request: Request,
+    user_id: str | None = Query(default=None),
+    task_id: str | None = Query(
+        default=None,
+        description="Optional task/session correlation id — adds a per-task savings rollup (M4) over events tagged with it.",
+    ),
+):
     """Cumulative token-savings totals (E2): per-caller + instance-wide.
 
     Sums the append-only savings ledger (Redis streams ``ns:savings:{user}``)
-    via O(1) running totals. ``net_tokens_saved`` is measured and SIGNED —
-    it includes every overhead charge (index rows, savings lines, and the
-    per-release tool-schema constant charged once per user per UTC day) and
-    may be negative. ``rederivation_savings_estimate`` is the separate,
-    clearly-labeled heuristic — never blended into the measured net.
+    via O(1) running totals, now sliced per-lifecycle and per-op with both
+    the raw ``net_tokens_saved`` and the bounce-corrected
+    ``adjusted_net_tokens_saved`` (M6). ``net_tokens_saved`` is measured and
+    SIGNED — it includes every overhead charge (index rows, savings lines,
+    and the per-release tool-schema constant charged once per user per UTC
+    day) and may be negative. ``rederivation_savings_estimate`` is the
+    separate, clearly-labeled heuristic — never blended into either net.
+
+    Pass ``task_id`` to also get a per-task rollup over events sharing that
+    correlation id.
     """
     import savings_meter as sm
 
     caller = _resolve_user_id(request, user_id)
-    snapshot = await asyncio.to_thread(sm.metrics_snapshot, caller)
+    snapshot = await asyncio.to_thread(sm.metrics_snapshot, caller, None, task_id)
     return {"status": "ok", "savings_meter": snapshot}
 
 

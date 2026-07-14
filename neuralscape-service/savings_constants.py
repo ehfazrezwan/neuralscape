@@ -38,3 +38,22 @@ MCP_TOOL_SCHEMA_OVERHEAD_TOKENS = 11141
 
 # Rendered savings line + detail fields on one response (measured: 67).
 SAVINGS_LINE_OVERHEAD_TOKENS = 70
+
+# ── Lifecycle stages (M1) ────────────────────────────────────────────
+# Every metered event is tagged with the lifecycle stage it belongs to so
+# the meter can slice savings per stage (the Economics dashboard's rows).
+# This is a FIXED enum — new stages are a conscious, checked-in edit — so
+# ``metrics_snapshot`` can enumerate per-stage totals without a Redis SCAN.
+#
+#  retrieval        — recall / index_only / get_memories / timeline / ask
+#  ingest           — document/text distillation (source → stored facts)
+#  context_assembly — session context bundle (E3) + the daily tool-schema charge
+#  code_nav         — code locate / neighbors / query (read-avoidance)
+#  compaction       — rolling session-summary refresh (transcript → summary)
+LIFECYCLE_STAGES = (
+    "retrieval",
+    "ingest",
+    "context_assembly",
+    "code_nav",
+    "compaction",
+)
