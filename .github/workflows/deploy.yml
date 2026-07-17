@@ -6,8 +6,9 @@ name: deploy
 # Rollback = revert the commit on main (or re-run this workflow from an older
 # main SHA via workflow_dispatch).
 #
-# Required repo secrets: VPS_HOST (IP/hostname), VPS_SSH_KEY (dedicated
-# ed25519 private key whose public half is in the VPS authorized_keys).
+# Required repo secrets: VPS_HOST (IP/hostname), VPS_SSH_KEY (dedicated ed25519
+# private key whose public half is in the `deploy` user's authorized_keys on the VPS).
+# Deploys run as the non-root, no-sudo `deploy` user (docker group; owns /opt/neuralscape).
 
 on:
   push:
@@ -57,13 +58,14 @@ jobs:
       - name: Ship image to VPS and roll the stack
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: deploy        # non-root, no-sudo CI user (docker group; owns /opt/neuralscape)
           TAG: ${{ steps.meta.outputs.tag }}
           SHA: ${{ github.sha }}
         run: |
           mkdir -p ~/.ssh
           printf '%s\n' "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          SSH="ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 root@${VPS_HOST}"
+          SSH="ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 ${VPS_USER}@${VPS_HOST}"
 
           IMG="ghcr.io/${{ github.repository_owner }}/neuralscape:${TAG}"
           docker save "$IMG" | gzip -1 | $SSH 'gunzip | docker load'
