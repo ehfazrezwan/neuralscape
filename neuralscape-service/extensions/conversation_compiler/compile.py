@@ -326,9 +326,12 @@ async def compile_date(
     )
 
     # 8. Trigger dedup
+    # DEFENSIVE FIX: wrap sync dedup in asyncio.to_thread to prevent blocking
+    # the event loop when compile_date is called inline (e.g., from session_end
+    # fallback or when ARQ worker runs process_conversation_compile).
     dedup_triggered = False
     try:
-        service.dedup_memories(user_id)
+        await asyncio.to_thread(service.dedup_memories, user_id)
         dedup_triggered = True
     except Exception:
         logger.warning("Post-compile dedup failed (non-critical)")

@@ -166,7 +166,7 @@ async def lifespan(app: FastAPI):
     # Discover and start extensions
     await _extension_registry.discover()
     await _extension_registry.startup_all()
-    _extension_registry.mount_routes(app)
+    _extension_registry.mount_routes(app, task_manager=_task_manager)
 
     # Initialize the connector vault when enabled.
     if settings.connectors_enabled:

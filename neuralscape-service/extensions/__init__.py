@@ -210,12 +210,24 @@ class ExtensionRegistry:
                     extra={"extension": name},
                 )
 
-    def mount_routes(self, app: FastAPI) -> None:
+    def mount_routes(self, app: FastAPI, task_manager=None) -> None:
         """Mount all extension routes onto the FastAPI app.
 
         Each extension's routes are mounted at /v1/extensions/<name>/.
+
+        Args:
+            app: The FastAPI application.
+            task_manager: Optional TaskManager instance to inject into extensions.
         """
         for name, entry in self._extensions.items():
+            # Inject task_manager into extension if it has a _task_manager attribute
+            if task_manager is not None and hasattr(entry.instance, "_task_manager"):
+                entry.instance._task_manager = task_manager
+                logger.debug(
+                    "Injected task_manager into extension",
+                    extra={"extension": name},
+                )
+
             try:
                 router = entry.instance.get_routes()
                 if router is not None:
