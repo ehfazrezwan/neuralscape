@@ -201,6 +201,9 @@ services:
       GEMINI_EMBEDDER_MODEL: ${EMBEDDING_MODEL_NAME:-gemini-embedding-001}
       MCP_TRANSPORT: http
       OBSIDIAN_VAULT_PATH: /data/vault
+      # Concurrency levers (default to today's behavior; raised for the hardened profile via env)
+      UVICORN_WORKERS: ${UVICORN_WORKERS:-1}
+      TO_THREAD_MAX_WORKERS: ${TO_THREAD_MAX_WORKERS:-0}
       # Dreaming admin surface (/v1/extensions/dreaming/*) enqueues sweeps
       # onto the graph worker rather than running them in-process (an
       # in-process sweep starves /health until autoheal kills the API).
@@ -228,7 +231,9 @@ services:
     deploy:
       resources:
         limits:
-          memory: 2G
+          # Multiple uvicorn workers each hold their own interpreter/model state; 3G gives
+          # headroom when UVICORN_WORKERS>1. Workers/other services stay at 2G.
+          memory: 3G
     logging:
       driver: "json-file"
       options:

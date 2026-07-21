@@ -151,12 +151,29 @@ def _get_async_memory():
 _mcp_session_manager = None
 
 
+def _configure_to_thread_executor(loop) -> int | None:
+    """Override the default ThreadPoolExecutor used by asyncio.to_thread when
+    TO_THREAD_MAX_WORKERS>0. Batch-get and code-graph reads run their sync work
+    via asyncio.to_thread; the stdlib default (min(32, cpu+4)) silently caps
+    their concurrency. Returns the size applied, or None if left at default."""
+    n = settings.to_thread_max_workers
+    if n and n > 0:
+        from concurrent.futures import ThreadPoolExecutor
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=n, thread_name_prefix="ns-to-thread"))
+        logger.info("Configured to_thread executor: max_workers=%d", n)
+        return n
+    return None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting Neuralscape Service...")
 
     # Validate required configuration before anything else
     settings.validate_required()
+
+    # Configure asyncio.to_thread executor when TO_THREAD_MAX_WORKERS>0
+    _configure_to_thread_executor(asyncio.get_running_loop())
 
     # Initialize the service (this also initializes mem0 + Graphiti)
     _service._get_memory()
