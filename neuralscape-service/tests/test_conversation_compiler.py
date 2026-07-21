@@ -880,7 +880,6 @@ class TestHandleSessionEnd:
         original_compile_after_hour = compiler_config_module.compiler_settings.compile_after_hour
 
         # Patch compile_date to ensure it's NOT called on the enqueue path
-        from unittest.mock import patch
         with patch("extensions.conversation_compiler.compile_date", new_callable=AsyncMock) as mock_compile:
             try:
                 compiler_config_module.compiler_settings.auto_compile = True
@@ -925,7 +924,6 @@ class TestHandleSessionEnd:
         original_compile_after_hour = compiler_config_module.compiler_settings.compile_after_hour
 
         # Patch compile_date to ensure it IS called exactly once on the fallback path
-        from unittest.mock import patch, AsyncMock
         from extensions.conversation_compiler.compile import CompileResult
         mock_result = CompileResult(date=today, entries=[], session_summaries=[], decisions=[], research=[])
         with patch("extensions.conversation_compiler.compile_date", new_callable=AsyncMock, return_value=mock_result) as mock_compile:
@@ -1009,7 +1007,6 @@ class TestHandleSessionEnd:
         original_compile_after_hour = compiler_config_module.compiler_settings.compile_after_hour
 
         # Patch compile_date to ensure it IS called exactly once when enqueue raises
-        from unittest.mock import patch, AsyncMock
         from extensions.conversation_compiler.compile import CompileResult
         mock_result = CompileResult(date=today, entries=[], session_summaries=[], decisions=[], research=[])
         with patch("extensions.conversation_compiler.compile_date", new_callable=AsyncMock, return_value=mock_result) as mock_compile:
