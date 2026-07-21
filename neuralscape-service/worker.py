@@ -777,6 +777,138 @@ async def process_ingest_okf_bundle(ctx: dict, payload: dict) -> dict:
     return {"filename": filename, **result}
 
 
+async def process_code_index(ctx: dict, payload: dict) -> dict:
+    """Phase G: index a repo INTO a code knowledge system through NS.
+
+    ``payload`` = ``{system, repo_source, code_space, project_id, user_id}``.
+
+    Runs on the ingest queue (PLAN §5: uniform observability + 202-task
+    semantics; CBM's ~1.3s doesn't need the queue but the rail/observability do).
+    Steps:
+      1. Resolve the real per-code_space engine for ``system`` and call
+         ``engine.index(repo_source)``.
+      2. Record ``{repo_sha, indexed_at, engine_version, symbols, edges}`` per
+         code_space and set the project routing config (``code_systems`` /
+         ``default_engine``) so later recalls route to the indexed engine.
+      3. Run the external-engine liveness diff → the existing dreaming consumer
+         (``detect_inventory_diff_liveness``): real events for engines that can
+         enumerate symbols (graphify/native), honest graceful N/A for CBM.
+
+    Idempotent: re-indexing the same code_space overwrites metadata + reindexes
+    the backend. The through-NS index always runs a FULL build
+    (``engine.index(incremental=False)``) for every engine, so a re-index is a
+    clean deterministic rebuild rather than a partial incremental.
+    """
+    import time
+
+    from adapters.code_graph import code_graph_available
+    from knowledge.code_dispatch import resolve_code_engine
+
+    service: MemoryService = ctx["service"]
+    system = payload["system"]
+    repo_source = payload["repo_source"]
+    code_space = payload["code_space"]
+    project_id = payload.get("project_id")
+    user_id = payload.get("user_id") or settings.default_user_id
+
+    if not code_graph_available():
+        return {"ok": False, "error": "code-graph extra not installed", "code_space": code_space}
+
+    engine = resolve_code_engine(system, code_space, user_id, settings, for_index=True)
+    if engine is None:
+        return {
+            "ok": False,
+            "error": f"could not resolve engine for system={system!r} code_space={code_space!r} "
+                     "(repo not in CODE_REPOS / bridge down)",
+            "code_space": code_space,
+            "system": system,
+        }
+
+    # 1. Index.
+    report = await asyncio.to_thread(engine.index, repo_source, incremental=False)
+    symbols = getattr(report, "symbols_indexed", 0)
+    edges = getattr(report, "edges_indexed", 0)
+    files = getattr(report, "files_indexed", 0)
+    duration_s = getattr(report, "duration_s", 0.0)
+    engine_version = getattr(report, "system_version", None)
+
+    # 2. Record metadata + set routing config.
+    repo_sha = await asyncio.to_thread(_git_head_sha, repo_source)
+    indexed_at = time.time()
+    from knowledge import index_store
+    from knowledge.router import ProjectKnowledgeConfig, set_project_config
+
+    meta = {
+        "system": system,
+        "repo_source": repo_source,
+        "repo_sha": repo_sha,
+        "indexed_at": indexed_at,
+        "engine_version": engine_version,
+        "symbols": symbols,
+        "edges": edges,
+        # CBM binds its project slug from the bridge on read; stash it if known.
+        "cbm_project": getattr(engine, "project", None),
+    }
+    await asyncio.to_thread(index_store.record_index, code_space, meta)
+    if project_id:
+        await asyncio.to_thread(
+            set_project_config,
+            ProjectKnowledgeConfig(
+                project_id=project_id,
+                code_systems=[system],
+                fuse_code_into_recall=True,
+                default_engine=system,
+                code_space=code_space,
+            ),
+        )
+
+    # 3. External-engine liveness diff → dreaming consumer (best-effort).
+    liveness = {"events": [], "flagged": 0, "summary": "skipped"}
+    try:
+        from extensions.dreaming.liveness import detect_inventory_diff_liveness
+
+        liveness = await asyncio.to_thread(
+            detect_inventory_diff_liveness, service, code_space, engine
+        )
+    except Exception as e:  # noqa: BLE001 — liveness is best-effort, never fails an index
+        logger.warning("Inventory-diff liveness failed for %s (non-fatal): %s", code_space, e)
+        liveness = {"events": [], "flagged": 0, "summary": f"liveness error: {e}"}
+
+    logger.info(
+        "Through-NS index complete: system=%s code_space=%s symbols=%d edges=%d in %.2fs",
+        system, code_space, symbols, edges, duration_s,
+    )
+    return {
+        "ok": True,
+        "code_space": code_space,
+        "system": system,
+        "symbols_indexed": symbols,
+        "edges_indexed": edges,
+        "files_indexed": files,
+        "duration_s": duration_s,
+        "engine_version": engine_version,
+        "repo_sha": repo_sha,
+        "indexed_at": indexed_at,
+        "liveness": {"flagged": liveness.get("flagged", 0), "summary": liveness.get("summary", "")},
+    }
+
+
+def _git_head_sha(repo_path: str) -> str | None:
+    """Best-effort ``git rev-parse HEAD`` for staleness stamping (None if git-less)."""
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["git", "-C", repo_path, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode == 0:
+            return out.stdout.strip() or None
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 async def process_graph_enrichment(
     ctx: dict,
     memory_id: str,
@@ -812,13 +944,18 @@ async def process_graph_enrichment(
     # queue: graph enrichment can run minutes after the write, and adding now
     # would resurrect the deleted memory's content in Neo4j. If it's gone from
     # the store, skip rather than re-create graph state for it.
-    if await asyncio.to_thread(service.get_memory, memory_id) is None:
+    mem = await asyncio.to_thread(service.get_memory, memory_id)
+    if mem is None:
         logger.info(
             "Skipping graph enrichment for memory %s — no longer in the store "
             "(deleted/expired while the job was queued).",
             memory_id,
         )
         return {"memory_id": memory_id, "enriched": False, "skipped": "memory_missing"}
+    # Real event time for Graphiti bi-temporal dating: get_memory() surfaces
+    # occurred_at as a top-level MemoryResponse field (mapped from the payload
+    # metadata in _mem_to_response), so read it directly.
+    occurred_at = getattr(mem, "occurred_at", None)
     graph_ontology = None
     if adapter:
         # Strict resolution (audit 27 #36): a queued job carrying an adapter
@@ -836,6 +973,7 @@ async def process_graph_enrichment(
         memory_id=memory_id,
         source_ref=source_ref,
         graph_ontology=graph_ontology,
+        occurred_at=occurred_at,
     )
     if not enriched:
         logger.warning(
@@ -944,6 +1082,33 @@ def _dreaming_cron_hours() -> list[int]:
     anchor = dreaming_settings.cron_anchor_hour % 24
     interval = max(1, min(24, dreaming_settings.cron_hours))
     return [(anchor + h) % 24 for h in range(0, 24, interval)]
+
+
+def _dedup_cron_jobs() -> list:
+    """Dedup cron entry, or nothing when ``DEDUP_CRON_HOURS`` is empty.
+
+    An empty hour set means "cron disabled" and must never reach arq: arq's
+    next-fire search (``cron.py _get_next_dt``) iterates candidate datetimes
+    until one matches — an empty hour set never matches, so it spins forever
+    INSIDE the event loop, pegging a core and starving every queued job
+    (observed on the bench stack, 2026-07-06).
+    """
+    if not settings.dedup_cron_hours:
+        return []
+    return [
+        cron(
+            dedup_all_memories,
+            hour=settings.dedup_cron_hours,
+            minute=0,
+            # dedup_all_memories offloads blocking work to threads; thread-pool
+            # calls are not cooperatively cancellable, so an ARQ timeout would
+            # mark the cron failed while the underlying dedup keeps running.
+            timeout=None,
+            unique=True,
+            max_tries=1,
+            run_at_startup=False,
+        ),
+    ]
 
 
 def _strategy_synthesizer_cron_hours() -> list[int]:
@@ -1056,7 +1221,7 @@ async def dedup_all_memories(ctx: dict) -> dict:
 
     service: MemoryService = ctx["service"]
     semantic = not dreaming_settings.enabled
-    user_ids = service.get_all_user_ids(batch_size=settings.dedup_batch_size)
+    user_ids = await asyncio.to_thread(service.get_all_user_ids, batch_size=settings.dedup_batch_size)
     logger.info(
         f"Dedup cron: found {len(user_ids)} users (semantic phase "
         f"{'on' if semantic else 'off — dreaming owns near-dup merges'})"
@@ -1065,7 +1230,11 @@ async def dedup_all_memories(ctx: dict) -> dict:
     results = []
     for uid in user_ids:
         try:
-            result = service.dedup_memories(uid, semantic=semantic)
+            # Offload blocking dedup work to a thread pool so the event loop
+            # stays responsive (health checks, ARQ timeout, concurrent jobs).
+            # dedup_memories does sync Qdrant scroll pagination + embedding/LLM
+            # calls that would otherwise freeze the loop for minutes at scale.
+            result = await asyncio.to_thread(service.dedup_memories, uid, semantic=semantic)
             results.append(result)
             removed = result["exact_duplicates_removed"] + result["semantic_duplicates_removed"]
             if removed:
@@ -1349,16 +1518,7 @@ class GraphWorkerSettings:
         # SLO — enqueued by _note_session_messages onto the graph queue.
         process_session_summary,
     ]
-    cron_jobs = [
-        cron(
-            dedup_all_memories,
-            hour=settings.dedup_cron_hours,
-            minute=0,
-            timeout=1800,
-            unique=True,
-            max_tries=1,
-            run_at_startup=False,
-        ),
+    cron_jobs = _dedup_cron_jobs() + [
         cron(
             dream_sweep_cron,
             # Imported lazily so importing worker.py doesn't load the
@@ -1408,6 +1568,7 @@ class IngestWorkerSettings:
         process_ingest_file,
         process_ingest_okf_bundle,
         process_connector_sync,
+        process_code_index,
     ]
     cron_jobs = [
         cron(

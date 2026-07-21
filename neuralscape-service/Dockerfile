@@ -18,6 +18,7 @@ COPY neuralscape-service/*.py neuralscape-service/
 COPY neuralscape-service/memory/ neuralscape-service/memory/
 COPY neuralscape-service/extensions/ neuralscape-service/extensions/
 COPY neuralscape-service/adapters/ neuralscape-service/adapters/
+COPY neuralscape-service/knowledge/ neuralscape-service/knowledge/
 COPY neuralscape-service/ingest/ neuralscape-service/ingest/
 COPY neuralscape-service/connectors/ neuralscape-service/connectors/
 COPY neuralscape-service/okf/ neuralscape-service/okf/
@@ -62,6 +63,7 @@ COPY neuralscape-service/*.py neuralscape-service/
 COPY neuralscape-service/memory/ neuralscape-service/memory/
 COPY neuralscape-service/extensions/ neuralscape-service/extensions/
 COPY neuralscape-service/adapters/ neuralscape-service/adapters/
+COPY neuralscape-service/knowledge/ neuralscape-service/knowledge/
 COPY neuralscape-service/ingest/ neuralscape-service/ingest/
 COPY neuralscape-service/connectors/ neuralscape-service/connectors/
 COPY neuralscape-service/okf/ neuralscape-service/okf/
@@ -111,6 +113,7 @@ COPY neuralscape-service/*.py neuralscape-service/
 COPY neuralscape-service/memory/ neuralscape-service/memory/
 COPY neuralscape-service/extensions/ neuralscape-service/extensions/
 COPY neuralscape-service/adapters/ neuralscape-service/adapters/
+COPY neuralscape-service/knowledge/ neuralscape-service/knowledge/
 COPY neuralscape-service/ingest/ neuralscape-service/ingest/
 COPY neuralscape-service/connectors/ neuralscape-service/connectors/
 COPY neuralscape-service/okf/ neuralscape-service/okf/

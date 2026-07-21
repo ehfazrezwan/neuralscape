@@ -90,6 +90,7 @@ def _meter_mcp_index_bg(op: str, user_id: str, hits, body: dict) -> None:
         event = sm.measure_recall(op, hits, index_payload=payload)
         if event is not None:
             sm.record_event(user_id, event)
+            sm.arm_bounce(user_id, hits)  # M2: served as index rows
 
     try:
         import telemetry
@@ -108,6 +109,7 @@ def _meter_mcp_full_bg(op: str, user_id: str, hits) -> None:
         event = sm.measure_recall(op, hits, served_full=True)
         if event is not None:
             sm.record_event(user_id, event)
+            sm.check_and_deduct_bounce(user_id, hits)  # M2: full-fetch after index
 
     try:
         import telemetry
@@ -115,6 +117,31 @@ def _meter_mcp_full_bg(op: str, user_id: str, hits) -> None:
         telemetry.submit(_measure_and_record)
     except Exception:
         logger.debug("savings metering dispatch failed (non-fatal)", exc_info=True)
+
+
+# M3/M5 — MCP code-nav read-avoidance metering. Agents drive code-nav through
+# MCP, so the primary read-avoidance surface is here (not just the REST twins).
+# path/impact are not read-avoidance ops, so they are intentionally absent.
+_CODE_NAV_OPS = {
+    "query_code_graph": "code_nav_query",
+    "get_code_neighbors": "code_nav_neighbors",
+    "locate": "code_nav_locate",
+}
+
+
+def _meter_code_nav_bg(name: str, user_id: str, *, served_text=None, served_obj=None, hits=None) -> None:
+    """Meter one code-nav MCP tool call off the hot path, via the shared
+    savings_meter dispatch (parser + telemetry submit live there), so REST and
+    MCP meter identically. No-op for non-code-nav tools."""
+    op = _CODE_NAV_OPS.get(name)
+    if op is None or not user_id:
+        return
+    import savings_meter as sm
+
+    files = None
+    if hits:
+        files = [h.get("file") for h in hits if isinstance(h, dict) and h.get("file")]
+    sm.meter_code_nav_bg(op, user_id, served_text=served_text, served_obj=served_obj, files=files)
 
 
 def _standard_write_error(visibility, user_id: str) -> list[TextContent] | None:
@@ -162,7 +189,11 @@ async def list_tools() -> list[Tool]:
                 "vector store. When vector and graph results conflict, prefer graph-sourced results as "
                 "authoritative. Memories ingested from a data layer carry a 'source_ref' (origin "
                 "url/connector + a 'retrieval' handle {mcp_server, tool, args}); use that handle to fetch "
-                "the original source or more context when a result references external content."
+                "the original source or more context when a result references external content. "
+                "OUTPUT FORMAT (M5 hardening): Normal recall returns a JSON array of memory objects. "
+                "When code fusion is enabled (project with coding query), returns a stable JSON envelope: "
+                "{fused: true, sections: {structure: {...}, semantics: {...}, memories: [...]}, ...}. "
+                "This stable envelope ensures clients never receive a surprise type flip."
             ),
             inputSchema={
                 "type": "object",
@@ -215,6 +246,20 @@ async def list_tools() -> list[Tool]:
                             "glyph, age, tokens, score}) instead of full payloads — "
                             "~50-100 tokens per hit. Filter these, then call "
                             "get_memories(ids=[...]) for the few you need. Default: false."
+                        ),
+                    },
+                    "knowledge_system": {
+                        "type": "string",
+                        "description": (
+                            "Optional knowledge-system hint (additive). NOTE: on recall_memories "
+                            "the code leg is governed by the deterministic router's fusion gate "
+                            "(project config + coding signal) — passing this param does NOT force "
+                            "an explicit code system here (that behavior is on the code tools: "
+                            "query_code_graph / get_code_neighbors / code_path / locate / "
+                            "code_impact and their REST twins). Generic recall stays base-only "
+                            "unless a coding signal + an indexed code system warrant a fusion leg. "
+                            "Pass 'auto' to route the fusion code leg to the measured-best healthy "
+                            "engine for its op (per-op auto-routing)."
                         ),
                     },
                 },
@@ -1096,6 +1141,56 @@ async def list_tools() -> list[Tool]:
                 "required": [],
             },
         ),
+        Tool(
+            name="get_project_knowledge_config",
+            description=(
+                "Get a project's knowledge routing config (Phase D): which code systems "
+                "are indexed, whether code fusion is enabled for generic recall, and the "
+                "default engine. Use this to check project settings before querying."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project ID to get config for",
+                    },
+                },
+                "required": ["project_id"],
+            },
+        ),
+        Tool(
+            name="set_project_knowledge_config",
+            description=(
+                "Set/update a project's knowledge routing config (Phase D): which code "
+                "systems are available, whether to fuse code into generic recall (default "
+                "TRUE per decision #3), and which engine to prefer. Typically set at index "
+                "time but can be edited later."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project ID to configure",
+                    },
+                    "code_systems": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of code system names (e.g. ['code-cbm'])",
+                    },
+                    "fuse_code_into_recall": {
+                        "type": "boolean",
+                        "description": "Enable code fusion for generic recall (default TRUE)",
+                    },
+                    "default_engine": {
+                        "type": "string",
+                        "description": "Default code engine name (e.g. 'code-cbm')",
+                    },
+                },
+                "required": ["project_id"],
+            },
+        ),
     ] + _code_graph_tools()
 
 
@@ -1115,6 +1210,17 @@ _CODE_GRAPH_COMMON_PROPS = {
     "user_id": {
         "type": "string",
         "description": "Caller user ID (optional under token auth); scopes graph_id resolution.",
+    },
+    "knowledge_system": {
+        "type": "string",
+        "description": (
+            "Optional code system override (additive). Registered code systems: "
+            "'code-cbm', 'code-graphify-lib', 'code-native'; or 'auto' to auto-select the "
+            "measured-best healthy engine for this op (per-op auto-routing, with fallback). "
+            "When given (together with graph_id as the code_space), the tool dispatches via "
+            "the knowledge-system seam; omit to use the legacy graph_id ref-shape path "
+            "(native/graphify-json). Mirrors the REST /v1/code-graph tools."
+        ),
     },
 }
 
@@ -1207,6 +1313,68 @@ def _code_graph_tools() -> list[Tool]:
                 "required": ["query"],
             },
         ),
+        Tool(
+            name="code_impact",
+            description=(
+                "Compute blast radius from a given symbol: BFS over CALLS/IMPORTS edges "
+                "to find all symbols affected by changes to the given symbol. Returns a "
+                "text summary (file:line format) of affected symbols. Use this to understand "
+                "the impact of modifying or deleting a symbol. E7: requires NativeEngine "
+                "(repo:<name> refs); raises EngineCapabilityError on GraphifyJsonEngine "
+                "(.json artifacts)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "FQN or partial match of the epicenter symbol (e.g., 'UserManager.login', 'fetch_data')"},
+                    "max_hops": {"type": "integer", "default": 4, "description": "Maximum BFS depth (1-16)"},
+                    **_CODE_GRAPH_COMMON_PROPS,
+                },
+                "required": ["symbol"],
+            },
+        ),
+        Tool(
+            name="code_graph_index",
+            description=(
+                "Phase G: index a repository INTO a code knowledge system through "
+                "Neuralscape (async). Enqueues on the ingest queue and returns a "
+                "task_id to poll via the memory status endpoint. Once complete, the "
+                "corpus is queryable via the code tools with knowledge_system set. "
+                "Records repo_sha/indexed_at/engine_version per code_space, sets the "
+                "project's routing config, and runs the external-engine liveness diff."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo_source": {"type": "string", "description": "Absolute path (or ref) of the repo to index"},
+                    "system": {"type": "string", "description": "Target code system: code-cbm | code-graphify-lib | code-native"},
+                    "project_id": {"type": "string", "description": "Project scope; sets routing config so later recalls route to this engine"},
+                    "code_space": {"type": "string", "description": "Explicit code_space (code--owner--repo); default derived from user_id + repo basename"},
+                    "user_id": {"type": "string", "description": "Caller user ID (optional under token auth)"},
+                },
+                "required": ["repo_source", "system"],
+            },
+        ),
+        Tool(
+            name="code_graph_delete",
+            description=(
+                "R-C: reset a code system's index for one code_space (true "
+                "cold-delete; MCP twin of DELETE /v1/code-graph/graph). Routes to "
+                "the engine's teardown (native: drop the code_space label-space + "
+                "symbol cards; cbm: bridge delete_project; graphify-lib: drop the "
+                "in-process graph). Scoped strictly to the code_space; NEVER "
+                "touches the memory graph or the memory↔code anchors. Idempotent."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "graph_id": {"type": "string", "description": "code_space to reset (code--owner--repo)"},
+                    "system": {"type": "string", "description": "Target code system: code-cbm | code-graphify-lib | code-native"},
+                    "user_id": {"type": "string", "description": "Caller user ID (optional under token auth)"},
+                },
+                "required": ["graph_id", "system"],
+            },
+        ),
     ]
 
 
@@ -1228,19 +1396,298 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
 
     try:
         if name == "recall_memories":
-            # Run the synchronous, graph-backed search in a worker thread so a
-            # slow read can't freeze the MCP server's event loop (which would
-            # stall concurrent fire-and-forget writes and time them out).
-            results = await asyncio.to_thread(
-                _service.search,
+            # Phase E: fusion — when the router says code leg is warranted, execute
+            # it concurrently with base legs and compose sections.
+            from knowledge.router import resolve_systems
+
+            route_decision = resolve_systems(
                 query=arguments["query"],
-                user_id=user_id,
                 project_id=arguments.get("project_id"),
-                categories=arguments.get("categories"),
-                limit=arguments.get("limit", 10),
-                visibility=arguments.get("visibility"),
-                include_shared=arguments.get("include_shared", True),
+                knowledge_system=arguments.get("knowledge_system"),
+                is_code_tool=False,  # recall_memories is generic recall, not a code tool
             )
+            # AR2: auto-route the fusion code leg per-op when the caller passed
+            # knowledge_system="auto" or the project pinned default_engine="auto".
+            # Otherwise the leg honors project config exactly as before (byte-
+            # identical). Generic non-code recall is unaffected (fusion only fires
+            # on the coding-signal gate).
+            _auto_leg = arguments.get("knowledge_system") == "auto"
+            if not _auto_leg and route_decision.wants_code_fusion:
+                from knowledge.router import get_project_config as _gpc
+
+                _pc = _gpc(arguments.get("project_id"))
+                if _pc and getattr(_pc, "default_engine", None) == "auto":
+                    _auto_leg = True
+            logger.debug(
+                "recall_memories route decision: %s (layer %d, fusion=%s, systems=%s)",
+                route_decision.rationale,
+                route_decision.layer,
+                route_decision.wants_code_fusion,
+                route_decision.code_system_names,
+            )
+
+            def _base_search():
+                # Run the synchronous, graph-backed search in a worker thread so a
+                # slow read can't freeze the MCP server's event loop (which would
+                # stall concurrent fire-and-forget writes and time them out).
+                return _service.search(
+                    query=arguments["query"],
+                    user_id=user_id,
+                    project_id=arguments.get("project_id"),
+                    categories=arguments.get("categories"),
+                    limit=arguments.get("limit", 10),
+                    visibility=arguments.get("visibility"),
+                    include_shared=arguments.get("include_shared", True),
+                )
+
+            # Phase E/F: resolve ALL healthy code system(s) the ROUTER decided
+            # (structured signal — never infer fusion from rationale text). Respect
+            # project config (default_engine/code_systems); do NOT re-pick a backend
+            # here. Phase F: when >1 code system answers the same op, cross-engine
+            # dedup (canonical-FQN + per-op preference) merges them into one answer.
+            #
+            # HARDENING FIX (M1): skip code systems that are capability placeholders
+            # (no real indexed graph for this project). Never compose a [structure]
+            # section from "No graph loaded" or a placeholder — that would flip
+            # recall_memories output from JSON to fused text for every project_id +
+            # coding query, regressing the production API.
+            # Phase G: resolve REAL per-code_space engines (not the registry
+            # capability placeholders). The project's routing config carries the
+            # code_space the code system indexed; bind an engine to it via the
+            # code_dispatch seam. Without a code_space we cannot serve a real code
+            # answer — skip fusion so recall output stays byte-identical (the M1
+            # hardening invariant: never compose from a placeholder / empty engine).
+            code_systems_list = []
+            _leg_op_override = None
+            if route_decision.wants_code_fusion and arguments.get("project_id") and _auto_leg:
+                # AR2 auto leg: route the leg op to its own measured-best healthy
+                # engine (per-op auto). NL recall prefers `locate` (dense → real
+                # module-qualified FQNs for the anchor join); fall back to `query`
+                # when no locate-capable engine is healthy.
+                from knowledge.code_dispatch import resolve_auto_bound_system
+                from knowledge.router import get_project_config
+
+                _proj_cfg = get_project_config(arguments.get("project_id"))
+                _cfg_code_space = getattr(_proj_cfg, "code_space", None) if _proj_cfg else None
+                if _cfg_code_space:
+                    for _try_op in ("locate", "query"):
+                        _cand, _served, _reason = await asyncio.to_thread(
+                            resolve_auto_bound_system,
+                            _try_op, _cfg_code_space, user_id, settings,
+                            project_id=arguments.get("project_id"),  # keyword-only (MF-1)
+                        )
+                        if _cand is not None:
+                            code_systems_list.append(_cand)
+                            _leg_op_override = _try_op
+                            logger.debug("recall auto leg: %s", _reason)
+                            break
+                else:
+                    logger.debug("recall auto leg: no code_space to bind; skipping")
+            elif route_decision.wants_code_fusion and arguments.get("project_id"):
+                from knowledge.code_dispatch import resolve_bound_code_system
+                from knowledge.registry import get_system
+                from knowledge.router import get_project_config
+
+                _proj_cfg = get_project_config(arguments.get("project_id"))
+                _cfg_code_space = getattr(_proj_cfg, "code_space", None) if _proj_cfg else None
+                for _name in route_decision.code_system_names:
+                    # Prefer the registered system's own code_space when it's a
+                    # real (pre-bound) entry; otherwise use the project config's
+                    # code_space to bind a per-space engine to the placeholder.
+                    _reg = get_system(_name)
+                    _reg_eng = getattr(_reg, "_engine", None) if _reg else None
+                    _reg_cs = getattr(_reg_eng, "code_space", None) if _reg_eng else None
+                    _bind_cs = (
+                        _reg_cs if _reg_cs and _reg_cs != "__registry_capability__"
+                        else _cfg_code_space
+                    )
+                    if not _bind_cs:
+                        # No code_space (registry placeholder + no project config) →
+                        # can't serve a real code answer; skip rather than attempt a
+                        # doomed bind (avoids log noise / a wasted bridge probe).
+                        logger.debug("Skipping %s: no code_space to bind", _name)
+                        continue
+                    # Bind OFF the loop (may lazy-build graphify / probe CBM bridge).
+                    _cand = await asyncio.to_thread(
+                        resolve_bound_code_system, _name, _bind_cs, user_id, settings
+                    )
+                    if _cand is None:
+                        logger.debug("Skipping %s: could not bind engine (code_space=%r)",
+                                     _name, _bind_cs)
+                        continue
+                    if _cand.health().status != "ok":
+                        logger.debug("Skipping %s: unhealthy", _name)
+                        continue
+                    # Guard (M1 invariant): an engine with no loaded graph can't serve —
+                    # never compose a [structure] section from an empty/placeholder engine.
+                    _eng = getattr(_cand, "_engine", None)
+                    if _eng is not None and hasattr(_eng, "G") and _eng.G is None:
+                        logger.debug("Skipping %s: no graph loaded", _name)
+                        continue
+                    code_systems_list.append(_cand)
+
+            if code_systems_list:
+                # Fusion path: run the code leg CONCURRENTLY with the base legs
+                # (overlap the two slowest calls; same intent as search.py's
+                # ThreadPoolExecutor graph-leg overlap).
+                from knowledge.base import RecallRequest
+
+                # GF2: for a natural-language recall query, prefer the LOCATE op
+                # (dense semantic search → structured hits with real module-
+                # qualified FQNs) over the QUERY op (keyword symbol match, which
+                # does not resolve NL questions). This is what lets the batched
+                # anchor join fire on REAL code hits — locate returns .hits[].fqn,
+                # so no content parsing is needed.
+                #
+                # Copilot fix: decide the op ONCE for the whole code leg (the
+                # capability intersection) so every answer is the SAME op — mixing
+                # locate (.hits) and query (text-only) answers would break the
+                # dedup's "same op" comparability. Use locate only when EVERY
+                # resolved system supports it; else query for all.
+                _leg_op = _leg_op_override or (
+                    "locate"
+                    if all("locate" in s.info.capabilities for s in code_systems_list)
+                    else "query"
+                )
+
+                async def _one_code_recall(_sys):
+                    try:
+                        code_req = RecallRequest(
+                            query=arguments["query"],
+                            user_id=user_id,
+                            project_id=arguments.get("project_id"),
+                            limit=arguments.get("limit", 10),
+                            operation=_leg_op,
+                        )
+                        return await asyncio.to_thread(_sys.recall, code_req)
+                    except Exception as e:
+                        logger.warning(
+                            "Code leg (%s) failed (base still answers): %s",
+                            _sys.info.name, e, exc_info=True,
+                        )
+                        return None
+
+                async def _code_leg():
+                    # Query every resolved code system concurrently.
+                    answers = await asyncio.gather(
+                        *[_one_code_recall(s) for s in code_systems_list]
+                    )
+                    answers = [a for a in answers if a is not None]
+                    if not answers:
+                        return None
+                    if len(answers) == 1:
+                        return answers[0]
+                    # Phase F cross-engine dedup: >1 code system answered the SAME
+                    # op (all _leg_op now) → dedup on canonical FQN, per-op
+                    # precision preference, attribute BOTH (PLAN §6).
+                    from knowledge.fusion import dedup_code_answers
+
+                    return dedup_code_answers(answers, operation=_leg_op)
+
+                results, code_answer = await asyncio.gather(
+                    asyncio.to_thread(_base_search),
+                    _code_leg(),
+                )
+
+                # Representative code system for anchor-join engine resolution
+                # (to_canonical / code_space). All code engines canonicalize
+                # compatibly, so the first resolved system is a safe reference.
+                code_sys = code_systems_list[0]
+
+                if code_answer is not None:
+                    try:
+                        from knowledge.fusion import (
+                            batched_anchor_lookup,
+                            compose_fusion_answer,
+                            extract_fqns_from_code_answer,
+                        )
+                        from knowledge.base import SystemAnswer
+
+                        # Pass the query so the content fallback can exclude
+                        # echoed query tokens (GF2 echo-join guard).
+                        fqns = extract_fqns_from_code_answer(
+                            code_answer, query=arguments["query"]
+                        )
+
+                        # Batched anchor join. CRITICAL: derive repo from the code
+                        # system's code_space (the SAME way _get_anchor_memories
+                        # does) — NOT from project_id, which may differ from the
+                        # repo name and would silently miss every anchor.
+                        anchor_memories = {}
+                        engine = getattr(code_sys, "_engine", None)
+                        if fqns and engine is not None and hasattr(engine, "to_canonical"):
+                            code_space = getattr(engine, "code_space", "") or ""
+                            _parts = code_space.split("--")
+                            repo = _parts[-1] if len(_parts) >= 3 else "unknown"
+                            anchor_memories = await asyncio.to_thread(
+                                batched_anchor_lookup,
+                                fqns=fqns,
+                                repo=repo,
+                                to_canonical_fn=engine.to_canonical,
+                                user_id=user_id,
+                                limit_per_anchor=3,
+                            )
+
+                        # Base recall section — keep FULL memory text (do NOT clip;
+                        # clipping destroys IDs/citations vs normal recall).
+                        # MemoryResponse's text field is `.memory` (not `.content`).
+                        base_content = "\n".join(
+                            f"{i+1}. [{r.category}] {r.memory}"
+                            for i, r in enumerate(results)
+                        )
+                        base_answer = SystemAnswer(
+                            system_name="ns-memory",
+                            content=base_content,
+                            hits=[r.model_dump(exclude_none=True) for r in results],
+                        )
+
+                        # M5 FIX: Return stable JSON envelope for fused output, not type flip.
+                        # Before fix: compose_fusion_answer returns plain text sections,
+                        # flipping output from JSON array to prose text.
+                        # After fix: structured JSON with fused=true flag and sections dict.
+                        fused_sections = {}
+                        if code_answer and code_answer.content:
+                            fused_sections["structure"] = {
+                                "system": code_answer.system_name,
+                                "content": code_answer.content,
+                                "hits": code_answer.hits or [],
+                            }
+                        if anchor_memories:
+                            fused_sections["semantics"] = anchor_memories
+                        if results:
+                            fused_sections["memories"] = [
+                                r.model_dump(exclude_none=True) for r in results
+                            ]
+
+                        fused_output = {
+                            "fused": True,
+                            "sections": fused_sections,
+                            "query": arguments["query"],
+                            "project_id": arguments.get("project_id"),
+                            # AR3: attribute which engine served the code leg op.
+                            "routing": {
+                                "op": _leg_op,
+                                "served_by": code_answer.system_name,
+                                "routed_by": "auto" if _auto_leg else "config",
+                            },
+                        }
+
+                        logger.info(
+                            "Phase E: fused answer (%d code FQNs, %d anchored, %d base results)",
+                            len(fqns), len(anchor_memories), len(results),
+                        )
+                        return [TextContent(
+                            type="text",
+                            text=json.dumps(fused_output, default=str, ensure_ascii=False)
+                        )]
+                    except Exception as e:
+                        logger.warning("Fusion compose failed (fallback to base-only): %s", e, exc_info=True)
+                        # Fall through to base-only output with `results` already set.
+            else:
+                # No code fusion — plain base recall (byte-identical to today).
+                results = await asyncio.to_thread(_base_search)
+
+            # Base-only output (Phase D behavior, or fusion fallback)
             if arguments.get("index_only"):
                 from index_format import index_row
 
@@ -1762,7 +2209,57 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps(
                 {"status": "accepted", "task_id": task_id}))]
 
-        elif name in ("query_code_graph", "get_code_neighbors", "code_path", "locate"):
+        elif name == "code_graph_index":
+            # Phase G: through-NS index trigger (MCP twin of POST /v1/code-graph/index).
+            from adapters.code_graph import _MISSING_EXTRA_MSG, code_graph_available
+
+            if not code_graph_available():
+                return [TextContent(type="text", text=json.dumps({"error": _MISSING_EXTRA_MSG}))]
+            repo_source = arguments.get("repo_source")
+            system = arguments.get("system")
+            if not repo_source or not system:
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": "repo_source and system are required"}))]
+            code_space = arguments.get("code_space")
+            if not code_space:
+                from pathlib import Path as _P
+
+                repo_name = _P(str(repo_source).rstrip("/")).name or "repo"
+                code_space = f"code--{user_id}--{repo_name}"
+            task_id = await _task_manager.enqueue_code_index({
+                "system": system,
+                "repo_source": repo_source,
+                "code_space": code_space,
+                "project_id": arguments.get("project_id"),
+                "user_id": user_id,
+            })
+            return [TextContent(type="text", text=json.dumps({
+                "status": "accepted",
+                "task_id": task_id,
+                "poll_url": f"/v1/memories/status/{task_id}",
+                "code_space": code_space,
+                "system": system,
+            }))]
+
+        elif name == "code_graph_delete":
+            # R-C: through-NS cold-delete (MCP twin of DELETE /v1/code-graph/graph).
+            from adapters.code_graph import _MISSING_EXTRA_MSG, code_graph_available
+
+            if not code_graph_available():
+                return [TextContent(type="text", text=json.dumps({"error": _MISSING_EXTRA_MSG}))]
+            graph_id = arguments.get("graph_id")
+            system = arguments.get("system")
+            if not graph_id or not system:
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": "graph_id and system are required"}))]
+            from knowledge.code_dispatch import teardown_code_space
+
+            result = await asyncio.to_thread(
+                teardown_code_space, system, graph_id, user_id, settings
+            )
+            return [TextContent(type="text", text=json.dumps(result))]
+
+        elif name in ("query_code_graph", "get_code_neighbors", "code_path", "locate", "code_impact"):
             # NS-surface delegations to the code-graph adapter (roadmap F2:
             # the interaction interface is ALWAYS Neuralscape). Availability-
             # gated: without the optional extra these tools aren't listed, but
@@ -1771,13 +2268,128 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
 
             if not code_graph_available():
                 return [TextContent(type="text", text=json.dumps({"error": _MISSING_EXTRA_MSG}))]
+            from adapters.code_graph.engine import EngineCapabilityError
             from adapters.code_graph.query import (
                 CodeGraphError,
+                code_impact,
                 code_path,
                 get_code_neighbors,
                 locate_symbols,
                 query_code_graph,
             )
+
+            # Map tool name to operation hint (router/auto-router op-class).
+            operation_map = {
+                "query_code_graph": "query",
+                "get_code_neighbors": "neighbors",
+                "code_path": "path",
+                "locate": "locate",
+                "code_impact": "impact",
+            }
+            # Phase G / AR2: when the caller gives a knowledge_system, dispatch
+            # through the bound engine's system.recall() (mirrors the REST twins).
+            # graph_id carries the code_space. Omit → legacy query.py path below.
+            # "auto" is the per-op auto-router sentinel (not an engine pin).
+            explicit_system = arguments.get("knowledge_system")
+            if explicit_system:
+                code_space = arguments.get("graph_id")
+                operation = operation_map.get(name)
+                if not code_space:
+                    return [TextContent(type="text", text=json.dumps(
+                        {"error": "knowledge_system requires graph_id (the code_space)"}))]
+                from knowledge.base import RecallRequest
+
+                if explicit_system == "auto":
+                    # AR2 auto-selection: best healthy engine for this op, per-op.
+                    from knowledge.code_dispatch import resolve_auto_bound_system
+
+                    bound, _served, _reason = await asyncio.to_thread(
+                        resolve_auto_bound_system,
+                        operation, code_space, user_id, settings,
+                    )
+                    if bound is None:
+                        return [TextContent(type="text", text=json.dumps({"error": (
+                            f"auto-routing found no healthy engine for '{operation}' "
+                            f"({_reason})")}))]
+                else:
+                    # SF-2: only run the router for a real pin (not for "auto").
+                    from knowledge.code_dispatch import resolve_bound_code_system
+                    from knowledge.router import resolve_systems
+
+                    route_decision = resolve_systems(
+                        query=arguments.get("question") or arguments.get("query")
+                        or arguments.get("label") or "",
+                        project_id=None,
+                        knowledge_system=explicit_system,
+                        graph_id=arguments.get("graph_id"),
+                        operation=operation,
+                        is_code_tool=True,
+                    )
+                    logger.debug(
+                        "Code tool %s route decision: %s (layer %d)",
+                        name, route_decision.rationale, route_decision.layer,
+                    )
+                    resolved = route_decision.systems[0] if route_decision.systems else None
+                    if resolved is None or resolved.info.name != explicit_system:
+                        return [TextContent(type="text", text=json.dumps({"error": (
+                            f"knowledge_system '{explicit_system}' unavailable or does not "
+                            f"support '{operation}' ({route_decision.rationale})")}))]
+                    bound = await asyncio.to_thread(
+                        resolve_bound_code_system, explicit_system, code_space, user_id, settings
+                    )
+                    if bound is None:
+                        return [TextContent(type="text", text=json.dumps({"error": (
+                            f"could not bind engine for '{explicit_system}' at code_space "
+                            f"'{code_space}'")}))]
+                creq = RecallRequest(
+                    query=(arguments.get("question") or arguments.get("query")
+                           or arguments.get("label") or arguments.get("source")
+                           or arguments.get("symbol") or "code"),
+                    user_id=user_id,
+                    operation=operation,
+                    label=arguments.get("label") or arguments.get("symbol"),
+                    source=arguments.get("source"),
+                    target=arguments.get("target"),
+                    mode=arguments.get("mode", "bfs"),
+                    depth=arguments.get("depth", 3),
+                    limit=arguments.get("k", 10),
+                    max_hops=arguments.get("max_hops"),
+                    relation_filter=arguments.get("relation_filter"),
+                    token_budget=arguments.get("token_budget"),
+                )
+                try:
+                    answer = await asyncio.to_thread(bound.recall, creq)
+                except EngineCapabilityError as e:
+                    return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+                except Exception as e:  # noqa: BLE001
+                    return [TextContent(type="text", text=json.dumps({"error": f"{name} failed: {e}"}))]
+                # AR3 (MF-2): under "auto", attribute the SERVED engine in a JSON
+                # envelope so the auto-choice (and any health-fallback) is visible —
+                # matching the REST twins. `auto` is a new contract, so no existing
+                # consumer breaks; a real pin keeps the byte-identical bare output.
+                if explicit_system == "auto":
+                    if name == "locate":
+                        _meter_code_nav_bg(
+                            name, user_id,
+                            served_obj={"results": answer.hits or []},
+                            hits=answer.hits or [],
+                        )
+                        return [TextContent(type="text", text=json.dumps(
+                            {"results": answer.hits or [], "system": answer.system_name,
+                             "routed_by": "auto"}, default=str, ensure_ascii=False))]
+                    _meter_code_nav_bg(name, user_id, served_text=answer.content)
+                    return [TextContent(type="text", text=json.dumps(
+                        {"result": answer.content, "system": answer.system_name,
+                         "routed_by": "auto"}, default=str, ensure_ascii=False))]
+                if name == "locate":
+                    _meter_code_nav_bg(
+                        name, user_id,
+                        served_obj=answer.hits or [], hits=answer.hits or [],
+                    )
+                    return [TextContent(type="text", text=json.dumps(
+                        answer.hits or [], default=str, ensure_ascii=False))]
+                _meter_code_nav_bg(name, user_id, served_text=answer.content)
+                return [TextContent(type="text", text=answer.content)]
 
             try:
                 if name == "query_code_graph":
@@ -1810,7 +2422,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                         graph_id=arguments.get("graph_id"),
                         max_hops=arguments.get("max_hops", 8),
                     )
-                else:  # locate
+                elif name == "locate":
                     hits = await asyncio.to_thread(
                         locate_symbols,
                         arguments["query"],
@@ -1822,12 +2434,76 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                     # Format locate results as JSON (list of LocateHit dicts)
                     from dataclasses import asdict
                     output = [asdict(hit) for hit in hits]
+                    _meter_code_nav_bg(name, user_id, served_obj=output, hits=output)
                     return [TextContent(type="text", text=json.dumps(output, default=str, ensure_ascii=False))]
+                else:  # code_impact
+                    text = await asyncio.to_thread(
+                        code_impact,
+                        arguments["symbol"],
+                        user_id=user_id,
+                        settings=settings,
+                        graph_id=arguments.get("graph_id"),
+                        max_hops=arguments.get("max_hops", 4),
+                    )
+            except EngineCapabilityError as e:
+                # e.g. code_impact/locate on a graph.json engine — clean error JSON,
+                # never a raw crash.
+                return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
             except CodeGraphError as e:
                 return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
             except Exception as e:
                 return [TextContent(type="text", text=json.dumps({"error": f"locate failed: {e}"}))]
+            # M3: meter query/neighbors here (locate returned above); path/impact
+            # are no-ops in _meter_code_nav_bg.
+            _meter_code_nav_bg(name, user_id, served_text=text)
             return [TextContent(type="text", text=text)]
+
+        elif name == "get_project_knowledge_config":
+            from knowledge.router import get_project_config
+
+            project_id = arguments.get("project_id")
+            if not project_id:
+                return [TextContent(type="text", text=json.dumps({"error": "project_id required"}))]
+
+            config = get_project_config(project_id)
+            if config is None:
+                # Return default config
+                result = {
+                    "project_id": project_id,
+                    "code_systems": [],
+                    "fuse_code_into_recall": True,
+                    "default_engine": None,
+                }
+            else:
+                result = {
+                    "project_id": config.project_id,
+                    "code_systems": config.code_systems,
+                    "fuse_code_into_recall": config.fuse_code_into_recall,
+                    "default_engine": config.default_engine,
+                }
+            return [TextContent(type="text", text=json.dumps(result, default=str))]
+
+        elif name == "set_project_knowledge_config":
+            from knowledge.router import ProjectKnowledgeConfig, set_project_config
+
+            project_id = arguments.get("project_id")
+            if not project_id:
+                return [TextContent(type="text", text=json.dumps({"error": "project_id required"}))]
+
+            config = ProjectKnowledgeConfig(
+                project_id=project_id,
+                code_systems=arguments.get("code_systems") or [],
+                fuse_code_into_recall=arguments.get("fuse_code_into_recall", True),
+                default_engine=arguments.get("default_engine"),
+            )
+            set_project_config(config)
+            result = {
+                "project_id": config.project_id,
+                "code_systems": config.code_systems,
+                "fuse_code_into_recall": config.fuse_code_into_recall,
+                "default_engine": config.default_engine,
+            }
+            return [TextContent(type="text", text=json.dumps(result, default=str))]
 
         elif name == "schedule_dream":
             # Mirrors POST /v1/extensions/dreaming/run: never sweep in-process

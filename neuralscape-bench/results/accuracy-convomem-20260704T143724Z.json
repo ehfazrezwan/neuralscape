@@ -1,0 +1,107 @@
+{
+  "suite": "convomem",
+  "display": "ConvoMem",
+  "timestamp": "2026-07-04T14:37:24.405871+00:00",
+  "ns_commit": "0c19a18",
+  "config": {
+    "target": "http://localhost:8398",
+    "k": 10,
+    "reasoning_level": "high",
+    "judge_model": "gemini-2.5-flash",
+    "sample": null,
+    "seed": 42,
+    "suite_options": {
+      "files_per_category": 2
+    }
+  },
+  "dataset": {
+    "conversations": 1047,
+    "sessions": 1253,
+    "turns": 49578,
+    "conversation_chars": 5777676,
+    "qa_items": 1047,
+    "qa_by_type": {
+      "abstention_evidence": 200,
+      "assistant_facts_evidence": 200,
+      "changing_evidence": 199,
+      "implicit_connection_evidence": 74,
+      "preference_evidence": 182,
+      "user_evidence": 192
+    }
+  },
+  "run": {
+    "conversations": 200,
+    "sessions": 1252,
+    "ingest_wall_s": 32832.4,
+    "est_tokens": 1442778
+  },
+  "metrics": {
+    "overall": {
+      "n": 1047,
+      "judged": 1047,
+      "correct": 151,
+      "accuracy": 0.1442
+    },
+    "by_type": {
+      "abstention_evidence": {
+        "n": 200,
+        "judged": 200,
+        "correct": 18,
+        "accuracy": 0.09
+      },
+      "assistant_facts_evidence": {
+        "n": 200,
+        "judged": 200,
+        "correct": 10,
+        "accuracy": 0.05
+      },
+      "changing_evidence": {
+        "n": 199,
+        "judged": 199,
+        "correct": 2,
+        "accuracy": 0.0101
+      },
+      "implicit_connection_evidence": {
+        "n": 74,
+        "judged": 74,
+        "correct": 43,
+        "accuracy": 0.5811
+      },
+      "preference_evidence": {
+        "n": 182,
+        "judged": 182,
+        "correct": 75,
+        "accuracy": 0.4121
+      },
+      "user_evidence": {
+        "n": 192,
+        "judged": 192,
+        "correct": 3,
+        "accuracy": 0.0156
+      }
+    },
+    "abstention": {
+      "n": 200,
+      "correct": 18,
+      "explicit_abstain_flag": 197
+    },
+    "retrieval_recall_at_10": {
+      "n": 1047,
+      "hits": 200,
+      "recall": 0.191
+    }
+  },
+  "published_comparison": [
+    {
+      "system": "MemPalace",
+      "metric": "retrieval recall",
+      "score": "see repo results",
+      "source": "MemPalace repo benchmarks/ (self-reported)"
+    }
+  ],
+  "caveats": [
+    "Competitor figures are self-reported on their own configurations (different answer models, retrieval settings, and judge models).",
+    "Retrieval R@k uses lexical session attribution over distilled memories (see metrics.py) \u2014 not a turn-id echo from the store.",
+    "Dreaming/consolidation disabled for the baseline run; a post-dream re-run is future work (NS's differentiator experiment)."
+  ]
+}

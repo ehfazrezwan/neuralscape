@@ -88,26 +88,40 @@ def resolve_graph_path(graph_id: str | None, user_id: str, settings) -> str:
 def get_engine(graph_id: str | None, user_id: str, settings) -> CodeIntelEngine:
     """Engine-selection factory: returns the right CodeIntelEngine for the graph ref.
 
+    Phase F: detects lib:<code_space> refs and returns GraphifyLibEngine (in-process).
     E2: detects repo:<name> refs and returns NativeEngine; .json artifact paths
     still return GraphifyJsonEngine. Engines are cached per ref (repo: by name,
-    .json by mtime+size).
+    .json by mtime+size, lib: by code_space).
 
     Args:
-        graph_id: Artifact id, repo:<name> ref, or None (uses default path).
+        graph_id: Artifact id, repo:<name> ref, lib:<code_space> ref, or None (uses default path).
         user_id: Owner-scoped resolution.
         settings: Config for default path.
 
     Returns:
-        A CodeIntelEngine (GraphifyJsonEngine or NativeEngine).
+        A CodeIntelEngine (GraphifyJsonEngine, NativeEngine, or GraphifyLibEngine).
 
     Raises:
         CodeGraphNotConfigured: No graph_id and no default configured.
         CodeGraphError: graph_id doesn't resolve or repo path not found.
     """
+    # Phase F: detect lib:<code_space> refs (GraphifyLibEngine in-process)
+    if graph_id and graph_id.startswith("lib:"):
+        code_space = graph_id.removeprefix("lib:")
+        return _get_graphify_lib_engine(code_space, user_id, settings)
+
     # E2: detect repo:<name> refs
     if graph_id and graph_id.startswith("repo:"):
         repo_name = graph_id.removeprefix("repo:")
         return _get_native_engine(repo_name, user_id, settings)
+
+    # Query-time: a `code--<owner>--<repo>` code_space ref resolves directly to
+    # the native engine for that space. The index already lives in Neo4j/Qdrant,
+    # so reads (query/neighbors/path/locate/impact) need no repo path. This is
+    # what lets an indexed repo be queried by its code_space without a
+    # code_repos entry (e.g. index-in-CI then query the persisted graph).
+    if graph_id and graph_id.startswith("code--"):
+        return _get_native_engine_by_code_space(graph_id, settings)
 
     # E1 path: .json artifacts
     path = resolve_graph_path(graph_id, user_id, settings)
@@ -180,14 +194,116 @@ def _get_native_engine(repo_name: str, user_id: str, settings) -> CodeIntelEngin
         if bridge is None:
             raise CodeGraphError("Graphiti bridge not initialized (Neo4j unavailable)")
 
-        # Create NativeEngine
+        # Create NativeEngine. The Neo4j driver lives on the Graphiti client
+        # (service._graphiti.driver); the _AsyncBridge only carries the loop.
+        driver = getattr(getattr(service, "_graphiti", None), "driver", None)
         engine = NativeEngine(
             repo_path=str(repo_path),
             code_space=code_space,
             bridge=bridge,
             settings=settings,
+            driver=driver,
         )
         _ctx_cache[cache_key] = {"engine": engine}
+        return engine
+
+
+def _get_native_engine_by_code_space(code_space: str, settings) -> CodeIntelEngine:
+    """Query-time NativeEngine bound to an existing code_space (reads only).
+
+    Unlike ``_get_native_engine`` (which needs a repo path to INDEX), reads
+    only need the code_space — the graph + code_index already live in Neo4j /
+    Qdrant. repo_path is a dummy; index() is never called on this instance.
+    Cached per code_space.
+    """
+    from adapters.code_graph.native_engine import NativeEngine
+
+    cache_key = f"native:{code_space}"
+    ent = _ctx_cache.get(cache_key)
+    if ent is not None:
+        return ent["engine"]
+    with _ctx_lock:
+        ent = _ctx_cache.get(cache_key)
+        if ent is not None:
+            return ent["engine"]
+        from memory_service import get_shared_service
+        service = get_shared_service()
+        service._get_memory()  # ensure bridge is initialized
+        bridge = service._bridge
+        if bridge is None:
+            raise CodeGraphError("Graphiti bridge not initialized (Neo4j unavailable)")
+        driver = getattr(getattr(service, "_graphiti", None), "driver", None)
+        engine = NativeEngine(
+            repo_path="",  # reads don't need a repo path
+            code_space=code_space,
+            bridge=bridge,
+            settings=settings,
+            driver=driver,
+        )
+        _ctx_cache[cache_key] = {"engine": engine}
+        return engine
+
+
+def _get_graphify_lib_engine(code_space: str, user_id: str, settings) -> CodeIntelEngine:
+    """Get or create a cached GraphifyLibEngine for a lib:<code_space> ref (Phase F).
+
+    GraphifyLibEngine is an in-process library engine (not a compose service). The
+    graph is kept warm per code_space (~5.7MB/repo). Cached by code_space.
+
+    Args:
+        code_space: Partition key (code--owner--repo).
+        user_id: Owner (for repo path resolution).
+        settings: Config for repo paths.
+
+    Returns:
+        GraphifyLibEngine instance (cached).
+
+    Raises:
+        CodeGraphError: code_space not configured or source path doesn't exist.
+    """
+    from adapters.code_graph.graphify_lib_engine import GraphifyLibEngine
+
+    # Cache key: lib:<code_space>
+    cache_key = f"lib:{code_space}"
+    ent = _ctx_cache.get(cache_key)
+    if ent is not None:
+        return ent["engine"]
+
+    with _ctx_lock:
+        ent = _ctx_cache.get(cache_key)
+        if ent is not None:
+            return ent["engine"]
+
+        # Resolve source path from settings.code_repos (same pattern as NativeEngine).
+        # code_space format: code--owner--repo
+        parts = code_space.split("--")
+        if len(parts) != 3 or parts[0] != "code":
+            raise CodeGraphError(
+                f"Invalid code_space format: {code_space} "
+                "(expected code--owner--repo)"
+            )
+        repo_name = parts[2]
+
+        repos = getattr(settings, "code_repos", {})
+        if not repos:
+            raise CodeGraphError(
+                "No code_repos configured. Set CODE_REPOS env var (JSON dict) "
+                "mapping repo names to filesystem paths."
+            )
+        repo_path = repos.get(repo_name)
+        if not repo_path:
+            raise CodeGraphError(
+                f"No repo configured with name {repo_name!r}. "
+                f"Available repos: {', '.join(repos.keys())}"
+            )
+        repo_path = Path(os.path.expanduser(repo_path))
+        if not repo_path.is_dir():
+            raise CodeGraphError(f"Repo path does not exist: {repo_path}")
+
+        # Create GraphifyLibEngine (graph not loaded yet; will be built on first index())
+        engine = GraphifyLibEngine(code_space=code_space, source_root=str(repo_path))
+        _ctx_cache[cache_key] = {"engine": engine}
+        logger.info("Created GraphifyLibEngine for %s at %s", code_space, repo_path)
         return engine
 
 
@@ -281,3 +397,48 @@ def locate_symbols(
     k = max(1, min(int(k), 50))  # clamp to [1, 50]
     engine = get_engine(graph_id, user_id, settings)
     return engine.locate(query, k=k, user_id=user_id)
+
+
+def code_impact(
+    symbol: str,
+    *,
+    user_id: str,
+    settings,
+    graph_id: str | None = None,
+    max_hops: int = 4,
+) -> str:
+    """Blast radius from a symbol — routes through engine (E7: NativeEngine only).
+
+    BFS over CALLS/IMPORTS edges to find all symbols affected by changes to the
+    given symbol. Returns a text summary (file:line format).
+
+    Args:
+        symbol: FQN or partial match of the epicenter symbol.
+        user_id: Owner-scoped resolution.
+        settings: Config for default path / repo resolution.
+        graph_id: Artifact id, repo:<name> ref, or None (uses default).
+        max_hops: Maximum BFS depth (1-16, default 4).
+
+    Returns:
+        Text summary of affected symbols.
+
+    Raises:
+        EngineCapabilityError: When the engine lacks blast_radius (GraphifyJsonEngine).
+        CodeGraphError: graph_id doesn't resolve or repo not configured.
+    """
+    from adapters.code_graph.engine import EngineCapabilityError
+
+    max_hops = max(1, min(int(max_hops), 16))  # clamp to [1, 16]
+    engine = get_engine(graph_id, user_id, settings)
+    # blast_radius is native-only. GraphifyJsonEngine (.json artifacts) has no
+    # such method — surface a clean EngineCapabilityError (→ 501) rather than
+    # letting a bare AttributeError bubble up as an HTTP 500.
+    impact = getattr(engine, "blast_radius", None)
+    if not callable(impact):
+        raise EngineCapabilityError(
+            "code_impact/blast_radius requires the native code-intel engine "
+            "(repo:<name> refs). GraphifyJsonEngine operates on static graph.json "
+            "artifacts and has no blast-radius traversal. Index the repo with the "
+            "native engine (native_index_cli) to use code_impact."
+        )
+    return impact(symbol, max_hops=max_hops)

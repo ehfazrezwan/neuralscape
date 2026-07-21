@@ -9,13 +9,12 @@ E2 scope (Python only):
 Label-space schema:
   (:CodeRepo {code_space, name, path})
   (:CodeFile {code_space, path, hash, language, span})
-  (:CodeSymbol {code_space, fqn, kind, file, span, degree})
+  (:CodeSymbol {code_space, fqn, kind, file, span, degree, community_id})
   Edges: CALLS | IMPORTS | DEFINES | INHERITS | REFERENCES
     each with {extraction: "extracted"|"inferred"|"ambiguous"}
 
 Partition key: code_space = "code--{owner}--{repo}" on EVERY node.
-Degree persisted on symbols at index time.
-community_id stubbed (Louvain is a later slice).
+Degree and community_id (Louvain, seed=42) persisted on symbols at index time.
 """
 
 from __future__ import annotations
@@ -77,19 +76,82 @@ class NativeEngine:
         code_space: str,
         bridge: Any,
         settings: Any,
+        driver: Any = None,
     ):
         """Initialize with repo path and Neo4j bridge.
 
         Args:
             repo_path: Absolute path to the repo root.
             code_space: Partition key (code--{owner}--{repo}).
-            bridge: Graphiti bridge (provides .driver and ._loop).
+            bridge: Graphiti async bridge (provides ._loop / .run). NOTE: the
+                real mem0 ``_AsyncBridge`` does NOT expose ``.driver`` — the
+                Neo4j driver is passed separately as ``driver``. A mock bridge
+                carrying ``.driver`` still works via the fallback in _run_cypher.
             settings: Config object.
+            driver: Graphiti Neo4j async driver (``service._graphiti.driver``).
+                Required for live Cypher; None ⇒ _run_cypher falls back to
+                ``bridge.driver`` (mock/unit-test path).
         """
         self.repo_path = Path(repo_path)
         self.code_space = code_space
         self.bridge = bridge
         self.settings = settings
+        self.driver = driver
+
+    # ── Canonical FQN normalization (Phase C) ───────────────────────────
+
+    @staticmethod
+    def to_canonical(raw_fqn: str) -> str:
+        """Normalize native engine's FQN to canonical form.
+
+        Native format: `<module_path>.<qualname>` where module_path includes
+        src/lib roots (e.g. `src.click.core.CommandCollection`).
+
+        Canonical format: `<module_path>.<qualname>` with src/lib roots stripped
+        (e.g. `click.core.CommandCollection`).
+
+        Per PLAN §2: canonical_fqn := <repo-relative module path, src/lib roots
+        stripped, '/' → '.'> + '.' + <qualname dotted>.
+
+        Args:
+            raw_fqn: Native engine's FQN (may include src/lib prefix).
+
+        Returns:
+            Canonical FQN (src/lib stripped).
+        """
+        # Strip genuine source-root directories from the start ONLY.
+        # Kept deliberately narrow: `core`/`main`/`app`/`internal`/`pkg` are
+        # real module names (the click corpus has `click.core`), so stripping
+        # them would corrupt canonical FQNs. Only `src`/`lib` are true source
+        # roots that an indexer prepends. Driven by the ≥98% oracle conformance
+        # measurement (test_canonical_fqn_conformance.py).
+        root_markers = {"src", "lib"}
+        parts = raw_fqn.split(".")
+
+        # Remove leading root markers
+        while parts and parts[0] in root_markers:
+            parts.pop(0)
+
+        canonical = ".".join(parts)
+        logger.debug(f"Native to_canonical: {raw_fqn} → {canonical}")
+        return canonical
+
+    @staticmethod
+    def from_canonical(canonical_fqn: str) -> str:
+        """Convert canonical FQN back to native format (best-effort).
+
+        Since we don't know which root (src/lib/etc) was stripped, we can't
+        reconstruct it exactly. For queries, we use the canonical form directly
+        (matches will work as long as the query is on the canonical FQN).
+
+        Args:
+            canonical_fqn: Canonical FQN (e.g. click.core.CommandCollection).
+
+        Returns:
+            FQN for native queries (same as canonical for search purposes).
+        """
+        # For search, canonical works as-is (our CONTAINS query tolerates it).
+        return canonical_fqn
 
     def query(
         self,
@@ -116,9 +178,25 @@ class NativeEngine:
         if not symbols:
             return f"No symbols matching '{question}' found in {self.code_space}."
 
-        # BFS/DFS traversal from the top-scored symbol
+        # Fix 3: Include matched symbols in output (symbol_lookup fix)
         lines = [f"Code graph search results for: {question}", ""]
+
+        # First, emit the matched seed symbols themselves
         seed_fqn = symbols[0]["fqn"]
+        for sym in symbols:
+            lines.append(
+                f"{sym['fqn']} ({sym['kind']}) in {sym['file']}:{sym['line']}"
+            )
+            # E4: Append attached memories for matched symbols
+            memories = self._get_anchor_memories(sym["fqn"], user_id=user_id, limit=2)
+            if memories:
+                lines.append("  Memories:")
+                for mem in memories:
+                    snippet = (mem["content"] or "")[:100]
+                    lines.append(f"    - [{mem['category']}] {snippet}")
+
+        # Then traverse from the top-scored symbol
+        lines.append("")  # separator
         visited = self._traverse(seed_fqn, mode=mode, depth=depth, budget=token_budget)
         for item in visited:
             lines.append(
@@ -225,6 +303,20 @@ class NativeEngine:
 
     # ── F2-future methods (E3+) ──────────────────────────────────────
 
+    def _code_embedder_mode(self) -> str:
+        """Resolve the active locate posture: "off" | "local" | "cloud" (C3)."""
+        mode = getattr(self.settings, "code_embedder", "local")
+        return mode if mode in ("off", "local", "cloud") else "local"
+
+    def _neighbors_resolver_mode(self) -> str:
+        """Resolve the neighbors call-graph resolver: "off" | "jedi" | "lsp".
+
+        "jedi" (Wave 3) is in-process Jedi; "lsp" (resolver-svc mission) calls the
+        external pyright resolver service and falls back to Jedi if it is down.
+        """
+        mode = getattr(self.settings, "code_neighbors_resolver", "jedi")
+        return mode if mode in ("off", "jedi", "lsp") else "jedi"
+
     def locate(
         self,
         query: str,
@@ -232,94 +324,306 @@ class NativeEngine:
         k: int = 10,
         user_id: str | None = None,
     ) -> list[LocateHit]:
-        """Hybrid code retrieval: dense embeddings + BM25 + graph degree.
+        """Hybrid code retrieval: card-text BM25 + local dense + graph degree (C3).
 
-        E3 implementation: searches symbol cards (name + signature + docstring +
-        first lines) in the separate code_index Qdrant collection. Fuses dense
-        embedding search + BM25 lexical + degree signal via RRF.
+        The A/B (reports/ICE_V2_NLLOCATE_EMBEDDINGS.md) proved native locate's
+        0.16 h@1 was a config artifact — the old default indexed no card text and
+        ranked on fqn/file tokens, blind to NL docstring queries. The C3 default:
 
-        E4: Enriches results with attached memories (decisions/gotchas/bugfixes).
+        - **Lexical leg (always on, token-free):** Okapi BM25 over the symbol-card
+          TEXT (name + signature + docstring + source). Alone: h@1 0.16 → 0.60.
+        - **Dense leg (default local, token-free):** a local fastembed ONNX code
+          embedder over the same cards; cloud (Gemini) only when opted in.
+        - Fuse both via RRF, apply the graph-degree boost → h@1 ~0.76.
+
+        E4: enriches the top-k with attached memories (decisions/gotchas/bugfixes).
         """
-        from qdrant_client.models import (
-            FieldCondition,
-            Filter,
-            MatchValue,
-        )
+        mode = self._code_embedder_mode()
+        lexical_on = getattr(self.settings, "code_locate_lexical_cards", True)
 
-        # Get embedding model and Qdrant client from the shared service
+        # Retrieve a wider candidate pool per leg than k so the degree boost can
+        # legitimately promote a strong-but-lower-ranked hit before truncation
+        # (matches the A/B sidecar: boost the whole fused pool, then take top-k).
+        pool = max(k * 4, 40)
+        lexical_hits = (
+            self._locate_lexical_cards(query, pool) if lexical_on else []
+        )
+        dense_hits: list = []
+        if mode in ("local", "cloud"):
+            try:
+                dense_hits = self._locate_dense(query, pool, mode)
+            except Exception:
+                logger.warning(
+                    "dense locate leg failed (%s mode) — degrading to BM25", mode,
+                    exc_info=True,
+                )
+
+        # Ultimate fallback: no card text indexed yet AND no dense vectors (e.g.
+        # a graph built before card-text indexing) → the legacy fqn/file overlap
+        # rank, so locate never returns empty for lack of a card corpus.
+        if not lexical_hits and not dense_hits:
+            return self._locate_deterministic(query, k=k, user_id=user_id)
+
+        from memory.ranking import _rrf_fuse
+        fused = _rrf_fuse(dense_hits, lexical_hits, pool)
+
+        # Apply the degree boost to the WHOLE fused pool, then truncate — a
+        # high-degree hit at fused rank > k can legitimately outrank an unboosted
+        # earlier one. Anchor memories are then fetched for ONLY the final top-k
+        # (bounded Neo4j round-trips).
+        scored: list[tuple[float, dict]] = []
+        for entry in fused:
+            payload = getattr(entry["hit"], "payload", None) or {}
+            degree = payload.get("degree", 0) or 0
+            degree_boost = 1.0 + 0.01 * min(degree, 50)  # cap boost at ~1.5x
+            scored.append((entry["rrf"] * degree_boost, payload))
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        hits: list[LocateHit] = []
+        for final_score, payload in scored[:k]:
+            fqn = payload.get("fqn", "")
+            memories = self._get_anchor_memories(fqn, user_id=user_id, limit=3)
+            hits.append(LocateHit(
+                fqn=fqn,
+                kind=payload.get("kind", ""),
+                file=payload.get("file", ""),
+                line=payload.get("line", 0),
+                signature=payload.get("signature", ""),
+                docstring=payload.get("docstring", ""),
+                score=final_score,
+                anchor_id=payload.get("anchor_id"),
+                memories=memories if memories else None,
+            ))
+        return hits
+
+    def _locate_dense(self, query: str, limit: int, mode: str) -> list:
+        """Dense leg of locate: embed the query (local or cloud) and search the
+        code_index collection. Returns Qdrant point hits (``.id``/``.payload``)."""
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
         from memory_service import get_shared_service
+
         service = get_shared_service()
         m = service._get_memory()
-
-        # Ensure code_index collection exists
+        # Query path: the collection is created at index time, so this is the
+        # fast existence check (no dim computation / embed("test") per query).
         self._ensure_code_index_collection(m)
 
-        # Embed the query
-        query_embedding = m.embedding_model.embed(query, memory_action="search")
+        if mode == "local":
+            query_embedding = self._get_local_code_embedder().embed_query(query)
+        else:  # cloud
+            query_embedding = m.embedding_model.embed(query, memory_action="search")
 
-        # Dense search
+        # MF-2: filter on the EMBEDDER IDENTITY, not just code_space. Both the
+        # local (jina) and cloud (Gemini) embedders are 768-dim, so a mode switch
+        # without a reindex would otherwise search the other space's vectors and
+        # fuse silent garbage. Tagging each point with its embedder and filtering
+        # here means a stale-embedder point simply doesn't match → the dense leg
+        # returns empty and locate degrades to BM25 (0.60) until reindex.
         dense_filter = Filter(must=[
-            FieldCondition(key="code_space", match=MatchValue(value=self.code_space))
+            FieldCondition(key="code_space", match=MatchValue(value=self.code_space)),
+            FieldCondition(
+                key="embedder",
+                match=MatchValue(value=self._code_embedder_identity(mode)),
+            ),
         ])
         dense_result = m.vector_store.client.query_points(
             collection_name="code_index",
             query=query_embedding,
             query_filter=dense_filter,
-            limit=k * 2,  # retrieve more for fusion
+            limit=limit,
             with_payload=True,
         )
-        dense_hits = list(getattr(dense_result, "points", dense_result) or [])
+        return list(getattr(dense_result, "points", dense_result) or [])
 
-        # BM25 lexical search (if available)
-        lexical_hits = self._lexical_code_search(m, query, dense_filter, k * 2)
-
-        # Fuse with RRF
-        from memory.ranking import _rrf_fuse
-        fused = _rrf_fuse(dense_hits, lexical_hits, k * 2)
-
-        # Convert to LocateHit and apply degree boost
-        hits: list[tuple[float, LocateHit]] = []
-        for entry in fused[:k * 2]:
-            hit = entry["hit"]
-            payload = getattr(hit, "payload", None) or {}
-
-            # Extract fields
-            fqn = payload.get("fqn", "")
-            kind = payload.get("kind", "")
-            file = payload.get("file", "")
-            line = payload.get("line", 0)
-            signature = payload.get("signature", "")
-            docstring = payload.get("docstring", "")
-            degree = payload.get("degree", 0)
-            anchor_id = payload.get("anchor_id")
-
-            # Base score from RRF
-            base_score = entry["rrf"]
-
-            # Apply degree boost: higher-degree symbols get a small lift
-            # (similar to reinforcement boost pattern in memory/ranking.py)
-            degree_boost = 1.0 + 0.01 * min(degree, 50)  # cap boost at ~1.5x
-            final_score = base_score * degree_boost
-
-            # E4: Fetch attached memories (cap at 3 per hit to avoid bloat)
-            memories = self._get_anchor_memories(fqn, user_id=user_id, limit=3)
-
-            locate_hit = LocateHit(
-                fqn=fqn,
-                kind=kind,
-                file=file,
-                line=line,
-                signature=signature,
-                docstring=docstring,
-                score=final_score,
-                anchor_id=anchor_id,
-                memories=memories if memories else None,
+    def _code_embedder_identity(self, mode: str) -> str:
+        """Stable identity of the active code embedder (``mode:model``), stamped on
+        each code_index point and matched at query time so vectors from a
+        different embedder are never fused into results (MF-2)."""
+        if mode == "local":
+            model = getattr(
+                self.settings, "code_embedder_model",
+                "jinaai/jina-embeddings-v2-base-code",
             )
-            hits.append((final_score, locate_hit))
+            return f"local:{model}"
+        model = getattr(self.settings, "gemini_embedder_model", "cloud")
+        return f"cloud:{model}"
 
-        # Sort by final score and return top k
-        hits.sort(key=lambda x: x[0], reverse=True)
-        return [hit for _, hit in hits[:k]]
+    def _locate_lexical_cards(self, query: str, limit: int) -> list:
+        """Lexical leg of locate: Okapi BM25 over the symbol-card text (name +
+        signature + docstring + source). Token-free, deterministic, always on.
+
+        The corpus is built once per code_space from the ``card`` property that
+        ``_index_symbol_cards`` writes onto each :CodeSymbol, then cached
+        (invalidated at reindex). Returns hits shaped like Qdrant points so they
+        fuse with the dense leg."""
+        from adapters.code_graph.code_locate import (
+            LexHit,
+            get_or_build_bm25,
+            symbol_point_id,
+        )
+
+        if not query:
+            return []
+        try:
+            index, payloads = get_or_build_bm25(
+                self.code_space, self._card_epoch(), self._load_card_corpus
+            )
+        except Exception:
+            logger.debug("BM25 card corpus build failed (non-fatal)", exc_info=True)
+            return []
+        hits = []
+        for doc_i, score in index.search(query, limit):
+            payload = payloads[doc_i]
+            hits.append(LexHit(
+                id=symbol_point_id(self.code_space, payload.get("fqn", "")),
+                payload=payload,
+                score=score,
+            ))
+        return hits
+
+    def _load_card_corpus(self) -> list[dict]:
+        """Load all symbol cards (payload dicts carrying a ``card`` text field)
+        for this code_space from Neo4j — the BM25 loader."""
+        cypher = """
+        MATCH (s:CodeSymbol {code_space: $code_space})
+        WHERE s.card IS NOT NULL
+        RETURN s.fqn AS fqn, s.kind AS kind, s.file AS file, s.span AS span,
+               coalesce(s.degree, 0) AS degree, s.signature AS signature,
+               s.docstring AS docstring, s.card AS card
+        """
+        rows = self._run_cypher(cypher, code_space=self.code_space)
+        payloads: list[dict] = []
+        for r in rows:
+            span = r.get("span") or "1:1"
+            try:
+                line = int(str(span).split(":")[0])
+            except (ValueError, IndexError):
+                line = 0
+            payloads.append({
+                "fqn": r.get("fqn") or "",
+                "kind": r.get("kind") or "",
+                "file": r.get("file") or "",
+                "line": line,
+                "signature": r.get("signature") or "",
+                "docstring": r.get("docstring") or "",
+                "degree": r.get("degree") or 0,
+                "anchor_id": None,
+                "card": r.get("card") or "",
+            })
+        return payloads
+
+    def _card_epoch(self) -> int:
+        """The code_space's card epoch — a counter bumped on :CodeRepo at every
+        reindex. Cheap Cypher; drives cross-process BM25 cache invalidation
+        (MF-1: the API process can't see the worker's in-process invalidate)."""
+        try:
+            rows = self._run_cypher(
+                "MATCH (r:CodeRepo {code_space: $cs}) "
+                "RETURN coalesce(r.card_epoch, 0) AS epoch",
+                cs=self.code_space,
+            )
+            return int(rows[0]["epoch"]) if rows else 0
+        except Exception:
+            return 0
+
+    def _bump_card_epoch(self) -> None:
+        """Advance the code_space's card epoch (invalidates every process's BM25
+        cache on the next locate). Best-effort — never fails an index."""
+        try:
+            self._run_cypher_with_retry(
+                "MERGE (r:CodeRepo {code_space: $cs}) "
+                "SET r.card_epoch = coalesce(r.card_epoch, 0) + 1",
+                cs=self.code_space,
+            )
+        except Exception:
+            logger.debug("card_epoch bump failed (non-fatal)", exc_info=True)
+
+    def _get_local_code_embedder(self):
+        """Process-cached local code embedder (fastembed ONNX, token-free)."""
+        from adapters.code_graph.code_locate import get_code_embedder
+
+        return get_code_embedder(
+            getattr(
+                self.settings,
+                "code_embedder_model",
+                "jinaai/jina-embeddings-v2-base-code",
+            ),
+            getattr(self.settings, "code_embedder_query_prefix", ""),
+        )
+
+    def _code_vector_size(self, m, mode: str) -> int:
+        """Vector dimension of the active code embedder (local vs cloud), so the
+        code_index collection is sized to whatever is actually written."""
+        if mode == "local":
+            probe = self._get_local_code_embedder().embed_documents(["_probe_"])
+            return len(probe[0]) if probe else 768
+        return len(m.embedding_model.embed("test", memory_action="add"))
+
+    def _locate_deterministic(
+        self, query: str, *, k: int = 10, user_id: str | None = None
+    ) -> list[LocateHit]:
+        """Deterministic, local, no-network locate (default when embeddings off).
+
+        Ranks :CodeSymbol nodes by lexical token overlap between the query and
+        each symbol's fqn/file, boosted by graph degree. Pure Neo4j read + local
+        scoring — reproducible and API-token-free.
+        """
+        import re as _re
+
+        def _tok(s: str) -> set[str]:
+            return {t for t in _re.split(r"[^a-zA-Z0-9]+", (s or "").lower()) if t}
+
+        q_tokens = _tok(query)
+        if not q_tokens:
+            return []
+        cypher = """
+        MATCH (s:CodeSymbol {code_space: $code_space})
+        RETURN s.fqn AS fqn, s.kind AS kind, s.file AS file, s.span AS span,
+               coalesce(s.degree, 0) AS degree
+        """
+        symbols = self._run_cypher(cypher, code_space=self.code_space)
+        scored: list[tuple[float, dict]] = []
+        for sym in symbols:
+            fqn = sym.get("fqn") or ""
+            file = sym.get("file")
+            cand_tokens = _tok(fqn) | _tok(file or "")
+            if not cand_tokens:
+                continue
+            overlap = len(q_tokens & cand_tokens)
+            if overlap == 0:
+                continue
+            # Lexical score = overlap fraction of the query; degree gives a small
+            # tie-break boost (capped) so hub symbols rank slightly higher.
+            lex = overlap / len(q_tokens)
+            degree = sym.get("degree", 0) or 0
+            score = lex * (1.0 + 0.01 * min(degree, 50))
+            scored.append((score, sym))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        # Build LocateHits (frozen) for ONLY the top-k, fetching attached
+        # memories per hit here — a common query token can overlap hundreds of
+        # symbols, so doing anchor lookups before truncation was O(matches)
+        # Neo4j round-trips and made locate pathological.
+        hits: list[LocateHit] = []
+        for score, sym in scored[:k]:
+            fqn = sym.get("fqn") or ""
+            span = sym.get("span") or "1:1"
+            try:
+                line = int(str(span).split(":")[0])
+            except (ValueError, IndexError):
+                line = 0
+            mems = self._get_anchor_memories(fqn, user_id=user_id, limit=3)
+            hits.append(LocateHit(
+                fqn=fqn,
+                kind=sym.get("kind"),
+                file=sym.get("file"),
+                line=line,
+                signature=None,
+                docstring=None,
+                score=score,
+                anchor_id=None,
+                memories=mems or None,
+            ))
+        return hits
 
     def _lexical_code_search(self, m, query: str, query_filter, limit: int) -> list:
         """BM25 lexical search for code_index collection (mirrors memory search).
@@ -346,35 +650,185 @@ class NativeEngine:
             logger.debug("BM25 code search failed (non-fatal)", exc_info=True)
             return []
 
-    def _ensure_code_index_collection(self, m):
-        """Create code_index Qdrant collection if it doesn't exist (lazy init)."""
+    def _ensure_code_index_collection(
+        self, m, *, vector_size: int | None = None, recreate_on_mismatch: bool = False
+    ):
+        """Create the code_index Qdrant collection if missing (lazy init).
+
+        ``vector_size`` sizes the collection to the ACTIVE code embedder (local
+        jina 768 vs cloud Gemini dim); defaults to the memory embedder's dim for
+        back-compat. When ``recreate_on_mismatch`` (index path only), an existing
+        collection whose dimension no longer matches the active embedder — e.g.
+        after switching ``code_embedder`` local↔cloud — is dropped and rebuilt,
+        making a mode switch self-healing at reindex time.
+        """
         from qdrant_client.models import Distance, VectorParams
 
         client = m.vector_store.client
         collection_name = "code_index"
 
+        # Resolve the target dim LAZILY: the hot query path (collection exists,
+        # no recreate) must not pay an embed("test") call just to confirm the
+        # collection is there. Only the create / mismatch-check branches need it.
+        _resolved: dict = {"size": vector_size}
+
+        def _size() -> int:
+            if _resolved["size"] is None:
+                _resolved["size"] = len(
+                    m.embedding_model.embed("test", memory_action="add")
+                )
+            return _resolved["size"]
+
         try:
-            client.get_collection(collection_name)
-            return  # already exists
+            info = client.get_collection(collection_name)
+            if not recreate_on_mismatch:
+                return  # exists — fast path, no dim computation
+            existing = self._collection_vector_size(info)
+            want = _size()
+            if existing is not None and existing != want:
+                logger.info(
+                    "code_index dim %s != active embedder dim %s — recreating",
+                    existing, want,
+                )
+                client.delete_collection(collection_name)
+            else:
+                return  # exists and compatible
         except Exception:
-            pass  # doesn't exist, create it
+            pass  # doesn't exist (or get failed) → create below
 
         try:
-            # Get vector size from embedding model
-            vector_size = len(m.embedding_model.embed("test", memory_action="add"))
-
-            # Create collection with same embedding space as memories
             client.create_collection(
                 collection_name=collection_name,
                 vectors_config=VectorParams(
-                    size=vector_size,
+                    size=_size(),
                     distance=Distance.COSINE,
                 ),
             )
-            logger.info(f"Created code_index collection (size={vector_size})")
+            logger.info(f"Created code_index collection (size={_size()})")
         except Exception as e:
             logger.warning(f"Failed to create code_index collection: {e}")
             raise
+
+    @staticmethod
+    def _collection_vector_size(info) -> int | None:
+        """Best-effort extraction of a Qdrant collection's dense vector size."""
+        try:
+            vectors = info.config.params.vectors
+            size = getattr(vectors, "size", None)
+            if size is not None:
+                return int(size)
+            # Named-vector schema: {name: VectorParams}
+            if isinstance(vectors, dict):
+                for vp in vectors.values():
+                    s = getattr(vp, "size", None)
+                    if s is not None:
+                        return int(s)
+        except Exception:
+            return None
+        return None
+
+    def blast_radius(
+        self,
+        symbol: str,
+        *,
+        max_hops: int = 4,
+    ) -> str:
+        """Compute blast radius from a given symbol (E7).
+
+        BFS over CALLS/IMPORTS edges to find all symbols affected by changes to
+        the given symbol. Returns a text summary (file:line format, consistent
+        with locate output).
+
+        Args:
+            symbol: FQN or partial match of the epicenter symbol.
+            max_hops: Maximum BFS depth (1-16, default 4).
+
+        Returns:
+            Text summary of affected symbols (one per line, file:line format).
+
+        Raises:
+            ValueError: Symbol not found or max_hops out of range.
+        """
+        max_hops = max(1, min(int(max_hops), 16))  # clamp to [1, 16]
+
+        # Resolve symbol to FQN via the SAME fuzzy resolver neighbors()/path()
+        # use (FQN substring match). Do NOT pass a bare str to _search_symbols
+        # — that expects a keyword list and would iterate characters.
+        matches = self._find_symbol(symbol)
+        if not matches:
+            return f"No symbol matching '{symbol}' found in {self.code_space}."
+
+        fqn = matches[0]["fqn"]
+
+        # Run BFS blast radius
+        affected_fqns = self._blast_radius_bfs([fqn], max_depth=max_hops)
+
+        if not affected_fqns:
+            return f"No blast radius for '{fqn}' (isolated symbol)."
+
+        # Fetch details for all affected symbols
+        affected_details = []
+        for affected_fqn in sorted(affected_fqns):
+            details = self._get_symbol_details(affected_fqn)
+            if details:
+                affected_details.append(details)
+
+        if not affected_details:
+            return f"Blast radius computed ({len(affected_fqns)} symbols) but details unavailable."
+
+        # Format output (file:line, similar to locate)
+        lines = [f"Blast radius from '{fqn}' (max_hops={max_hops}): {len(affected_details)} symbols"]
+        for detail in affected_details:
+            file = detail.get("file", "unknown")
+            line = detail.get("line", 0)
+            kind = detail.get("kind", "symbol")
+            detail_fqn = detail.get("fqn", "")
+            lines.append(f"  {file}:{line} [{kind}] {detail_fqn}")
+
+        return "\n".join(lines)
+
+    def _get_symbol_details(self, fqn: str) -> dict | None:
+        """Fetch symbol details (file, line, kind) by FQN."""
+        cypher = """
+        MATCH (s:CodeSymbol {code_space: $code_space, fqn: $fqn})
+        RETURN s.fqn AS fqn, s.file AS file, s.kind AS kind, s.span AS span
+        """
+        results = self._run_cypher(cypher, code_space=self.code_space, fqn=fqn)
+        if not results:
+            return None
+        row = results[0]
+        # Native indexer stores spans as "<start>:<end>" (colon) — see _store_file.
+        span = row.get("span") or ""
+        line = int(span.split(":")[0]) if ":" in span else 0
+        return {
+            "fqn": row.get("fqn", ""),
+            "file": row.get("file", ""),
+            "kind": row.get("kind", ""),
+            "line": line,
+        }
+
+    def get_symbol_inventory(self) -> set[str]:
+        """Get current symbol inventory (canonical FQNs) for liveness tracking.
+
+        Phase E: Used to detect deleted/changed symbols after reindex.
+        Returns canonical FQNs (via to_canonical) so the liveness diff is
+        engine-agnostic.
+
+        Returns:
+            Set of canonical FQNs currently indexed.
+        """
+        # Fetch all symbols from Neo4j (persisted index)
+        cypher = """
+        MATCH (s:CodeSymbol {code_space: $code_space})
+        RETURN coalesce(s.canonical_fqn, s.fqn) AS fqn
+        """
+        results = self._run_cypher(cypher, code_space=self.code_space)
+
+        # Filter out null/falsy fqns — a symbol written before canonical_fqn
+        # existed with no raw fqn would otherwise produce a "repo::None" anchor key.
+        canonical_fqns = {r["fqn"] for r in results if r.get("fqn")}
+        logger.debug("Native symbol inventory: %d canonical FQNs", len(canonical_fqns))
+        return canonical_fqns
 
     def detect_changes(
         self,
@@ -454,11 +908,104 @@ class NativeEngine:
         )
 
     def semantic_layer(self) -> list[SemanticFact]:
-        """Semantic distillation — requires Louvain communities (later slice)."""
-        raise EngineCapabilityError(
-            "semantic_layer() requires Louvain community detection (deferred). "
-            "E2 persists degree but not community_id. Use query() for structure."
+        """Semantic distillation from stored degree + community_id properties.
+
+        Returns:
+            - One 'module' fact per community (top members listed)
+            - One 'hotspot' fact per high-degree symbol (god nodes)
+
+        No NetworkX pass at query time — reads persisted properties only.
+        """
+        facts: list[SemanticFact] = []
+
+        # Fetch all symbols with their stored properties
+        cypher = """
+        MATCH (s:CodeSymbol {code_space: $code_space})
+        WHERE s.community_id IS NOT NULL AND s.degree IS NOT NULL
+        RETURN s.fqn AS fqn, s.kind AS kind, s.file AS file,
+               s.degree AS degree, s.community_id AS community_id
+        ORDER BY s.community_id, s.degree DESC
+        """
+        symbols = self._run_cypher(cypher, code_space=self.code_space)
+
+        if not symbols:
+            logger.info(f"No symbols with community_id for {self.code_space}")
+            return facts
+
+        # Group symbols by community
+        from collections import defaultdict
+        communities: dict[int, list[dict]] = defaultdict(list)
+        for sym in symbols:
+            cid = sym["community_id"]
+            if cid >= 0:  # skip singleton community (-1)
+                communities[cid].append(sym)
+
+        # Generate community (module) facts
+        # Limit to top N communities by size
+        max_communities = getattr(self.settings, "code_graph_max_communities", 10)
+        sorted_communities = sorted(
+            communities.items(),
+            key=lambda x: len(x[1]),
+            reverse=True
+        )[:max_communities]
+
+        for cid, members in sorted_communities:
+            # Take top members by degree
+            top_members = sorted(members, key=lambda x: x["degree"], reverse=True)[:8]
+            member_labels = [f"{m['fqn']} ({m['kind']})" for m in top_members]
+            key_members = ", ".join(member_labels)
+
+            facts.append(
+                SemanticFact(
+                    category="module",
+                    content=(
+                        f"Code community {cid} groups {len(members)} symbols. "
+                        f"Key members: {key_members}."
+                    ),
+                    epistemic_level="inductive",
+                    confidence=getattr(self.settings, "code_graph_inferred_confidence", 0.7),
+                    external_id=f"community:{cid}",
+                    title=f"Community {cid}",
+                    tags=["code-structure"],
+                )
+            )
+
+        # Generate hotspot (god node) facts for high-degree symbols.
+        # A "god node" is a highly connected symbol (degree >= 10).
+        max_god_nodes = getattr(self.settings, "code_graph_max_god_nodes", 15)
+        sorted_by_degree = sorted(symbols, key=lambda x: x["degree"], reverse=True)
+        hotspots = [s for s in sorted_by_degree if s["degree"] >= 10][:max_god_nodes]
+
+        for hs in hotspots:
+            community_label = (
+                f" in community {hs['community_id']}"
+                if hs["community_id"] >= 0
+                else ""
+            )
+            facts.append(
+                SemanticFact(
+                    category="hotspot",
+                    content=(
+                        f"'{hs['fqn']}' is a highly connected {hs['kind']} with "
+                        f"degree {hs['degree']}{community_label}. "
+                        f"Source: {hs['file']}."
+                    ),
+                    # Hotspot status is structure-DERIVED (degree count), not a
+                    # directly stated fact — deductive at extracted confidence,
+                    # matching semantic.py's _god_node_facts mapping.
+                    epistemic_level="deductive",
+                    confidence=getattr(self.settings, "code_graph_extracted_confidence", 0.9),
+                    external_id=f"symbol:{hs['fqn']}",
+                    title=f"Hotspot: {hs['fqn']}",
+                    tags=["code-structure", "god-node"],
+                )
+            )
+
+        logger.info(
+            f"Generated {len(facts)} semantic facts for {self.code_space} "
+            f"({len(sorted_communities)} communities, {len(hotspots)} hotspots)"
         )
+        return facts
 
     def index(
         self,
@@ -505,30 +1052,62 @@ class NativeEngine:
         symbols_indexed = 0
         edges_indexed = 0
 
-        for source_file, lang in source_files:
-            rel_path = str(source_file.relative_to(repo_path))
-            file_hash = self._file_hash(source_file)
+        # Wave 3: when the neighbors resolver is on, collect Python call sites
+        # during the parse (into self._pending_call_sites) and the per-file symbol
+        # spans, then resolve + store real CALLS edges AFTER all symbols exist
+        # (the store MATCHes both endpoints, so cross-file targets must already be
+        # in the graph).
+        resolver_mode = self._neighbors_resolver_mode()
+        self._resolver_collect = resolver_mode in ("jedi", "lsp")
+        self._pending_call_sites: dict[str, list[dict]] = {}
+        symbols_by_file: dict[str, list[tuple[int, int, str]]] = {}
 
-            # Incremental: skip unchanged files
-            if incremental and self._file_unchanged(rel_path, file_hash):
-                continue
+        # try/finally so a parse/store/resolve failure can never leave
+        # _resolver_collect stuck True — that would make later _parse_file callers
+        # (e.g. detect_changes) silently collect call sites and suppress legacy
+        # CALLS edges (nit-1).
+        try:
+            for source_file, lang in source_files:
+                rel_path = str(source_file.relative_to(repo_path))
+                file_hash = self._file_hash(source_file)
 
-            # Parse and index
-            symbols, edges = self._parse_file(source_file, repo_path, lang)
-            if symbols or edges:
-                self._store_file(rel_path, file_hash, symbols, edges, lang)
-                files_indexed += 1
-                symbols_indexed += len(symbols)
-                edges_indexed += len(edges)
+                # Incremental: skip unchanged files
+                if incremental and self._file_unchanged(rel_path, file_hash):
+                    continue
+
+                # Parse and index
+                symbols, edges = self._parse_file(source_file, repo_path, lang)
+                if symbols or edges:
+                    self._store_file(rel_path, file_hash, symbols, edges, lang)
+                    files_indexed += 1
+                    symbols_indexed += len(symbols)
+                    edges_indexed += len(edges)
+                if self._resolver_collect and lang == "python":
+                    symbols_by_file[rel_path] = [
+                        (s.line, s.end_line, s.fqn) for s in symbols
+                    ]
+
+            # Wave 3: resolve Python call sites to real symbols and store CALLS
+            # edges BEFORE degree/community so both reflect the real call graph.
+            if self._resolver_collect:
+                edges_indexed += self._resolve_and_store_calls(
+                    repo_path, symbols_by_file
+                )
+        finally:
+            self._resolver_collect = False
+            self._pending_call_sites = {}
 
         # Compute and persist degree on all symbols
         self._compute_degrees()
 
+        # I2: Compute and persist Louvain communities
+        self._compute_communities()
+
         # E4: Create CodeAnchor nodes and link symbols to them
         self._ensure_anchors()
 
-        # E3: Build and index symbol cards in code_index collection
-        self._index_symbol_cards(repo_path)
+        # E3/C3: build symbol cards (card text for BM25 + optional dense vectors).
+        dense_degraded = self._index_symbol_cards(repo_path)
 
         duration = time.time() - start
         logger.info(
@@ -541,7 +1120,85 @@ class NativeEngine:
             edges_indexed=edges_indexed,
             incremental=incremental,
             duration_s=duration,
+            dense_degraded=dense_degraded,
         )
+
+    def teardown(self) -> dict:
+        """R-C: drop this code_space's label-space for a true cold reset.
+
+        Deletes the code GRAPH (CodeRepo/CodeFile/CodeSymbol + their edges) and
+        the code_index symbol cards for this code_space, so a subsequent
+        ``index()`` is a genuine cold build (not an incremental skip). Scoped
+        strictly to ``self.code_space``.
+
+        THE MOAT SURVIVES: this NEVER touches the memory Qdrant collection or any
+        Memory/Entity node, and it PRESERVES CodeAnchor nodes (the code-side
+        anchor points designed to outlive a symbol reindex — see
+        ``_ensure_anchors``). Memory↔code recall joins on the memory's
+        ``source_ref`` in Qdrant, which is left fully intact.
+
+        Idempotent: tearing down a non-existent code_space removes 0 and returns
+        cleanly.
+
+        Returns:
+            {"nodes_deleted": int, "cards_cleared": bool}
+        """
+        # Label-anchored deletes (one per code label) so Neo4j uses a label scan
+        # + code_space predicate — NOT a full-DB node scan that would walk the
+        # entire memory graph (Fable SHOULD-FIX). CodeAnchor is deliberately
+        # excluded so the moat's code-side anchor points survive.
+        nodes_deleted = 0
+        for label in ("CodeRepo", "CodeFile", "CodeSymbol"):
+            rows = self._run_cypher(
+                f"MATCH (n:{label} {{code_space: $code_space}}) "
+                f"DETACH DELETE n RETURN count(n) AS deleted",
+                code_space=self.code_space,
+            )
+            nodes_deleted += int(rows[0]["deleted"]) if rows else 0
+        cards_cleared = self._delete_code_index_cards()
+        # Drop this process's cached BM25 corpus too (MF-1) — the graph is gone.
+        from adapters.code_graph.code_locate import invalidate_bm25
+        invalidate_bm25(self.code_space)
+        logger.info(
+            "Native teardown code_space=%s: %d graph nodes deleted, cards_cleared=%s "
+            "(CodeAnchor + memory graph preserved)",
+            self.code_space, nodes_deleted, cards_cleared,
+        )
+        return {"nodes_deleted": nodes_deleted, "cards_cleared": cards_cleared}
+
+    def _delete_code_index_cards(self) -> bool:
+        """Delete this code_space's symbol cards from the code_index collection.
+
+        Best-effort and scoped by the ``code_space`` payload field (the same key
+        locate() filters on). Returns True if the delete was issued, False if the
+        collection/store was unavailable (nothing to clear).
+        """
+        try:
+            from qdrant_client.models import (
+                FieldCondition,
+                Filter,
+                FilterSelector,
+                MatchValue,
+            )
+
+            from memory_service import get_shared_service
+
+            service = get_shared_service()
+            m = service._get_memory()
+            client = m.vector_store.client
+            flt = Filter(
+                must=[FieldCondition(key="code_space", match=MatchValue(value=self.code_space))]
+            )
+            client.delete(
+                collection_name="code_index",
+                points_selector=FilterSelector(filter=flt),
+            )
+            return True
+        except Exception:  # noqa: BLE001 — no code_index / store down ⇒ nothing to clear
+            logger.debug(
+                "code_index card delete skipped for %s", self.code_space, exc_info=True
+            )
+            return False
 
     def export_snapshot(self) -> bytes:
         """Export code graph snapshot as portable, content-addressed artifact.
@@ -910,11 +1567,33 @@ class NativeEngine:
         return rel_path
 
     def _parse_python(self, root, rel_path: str, module_path: str, source_bytes: bytes) -> tuple[list[_Symbol], list[_Edge]]:
-        """Parse Python AST (preserves E2 logic exactly)."""
+        """Parse Python AST.
+
+        Wave 3: when the neighbors resolver is on (``_resolver_collect``), the walk
+        tracks the ENCLOSING function/method of each call and records the call site
+        (position + real source FQN) into ``self._pending_call_sites`` for
+        Jedi resolution after all files are indexed, and does NOT mint the legacy
+        phantom ``{module}.{rawtext}`` CALLS edge (which _store_file would drop
+        anyway). Resolver off ⇒ the exact E2 heuristic behavior is preserved.
+        """
         symbols: list[_Symbol] = []
         edges: list[_Edge] = []
+        collect_calls = getattr(self, "_resolver_collect", False)
+        call_sink = (
+            self._pending_call_sites.setdefault(rel_path, [])
+            if collect_calls else None
+        )
 
-        def walk(node, parent_class=None):
+        def _callee_name_node(func_node):
+            # The token to resolve: the final identifier of the callee. For
+            # ``a.b.c(...)`` that's ``c`` (the attribute); for ``foo(...)`` it's
+            # ``foo`` itself.
+            if func_node.type == "attribute":
+                attr = func_node.child_by_field_name("attribute")
+                return attr if attr is not None else func_node
+            return func_node
+
+        def walk(node, parent_class=None, enclosing_func=None):
             """Recursive tree walker."""
             node_type = node.type
 
@@ -945,6 +1624,17 @@ class NativeEngine:
                         line=node.start_point[0] + 1,
                         end_line=node.end_point[0] + 1,
                     ))
+                    # Only the BODY (the `block` child) runs inside this function;
+                    # the parameter list (default-arg expressions) and return
+                    # annotation evaluate in the ENCLOSING scope at def time, so
+                    # their calls attribute outward — not to this function
+                    # (Copilot). Decorators are a sibling `decorated_definition`
+                    # node, already outside. (tree-sitter wrapper nodes aren't
+                    # identity-comparable, so match the body by type.)
+                    for child in node.children:
+                        scope = fqn if child.type == "block" else enclosing_func
+                        walk(child, parent_class=parent_class, enclosing_func=scope)
+                    return
 
             # Class definitions
             elif node_type == "class_definition":
@@ -991,22 +1681,35 @@ class NativeEngine:
                         extraction="extracted",
                     ))
 
-            # Call expressions (inferred edges)
+            # Call expressions
             elif node_type == "call":
                 func_node = node.child_by_field_name("function")
                 if func_node:
-                    target_name = func_node.text.decode("utf8")
-                    # Best-effort FQN (inferred)
-                    edges.append(_Edge(
-                        source_fqn=module_path,
-                        target_fqn=f"{module_path}.{target_name}",
-                        relation="CALLS",
-                        extraction="inferred",
-                    ))
+                    if collect_calls:
+                        # Record the call site for Jedi resolution — only when it
+                        # sits inside a real function/method, so the CALLS edge has
+                        # a real symbol source (module-level calls can't attach).
+                        if enclosing_func is not None:
+                            name_node = _callee_name_node(func_node)
+                            sp = name_node.start_point
+                            call_sink.append({
+                                "line": sp[0] + 1,   # Jedi: 1-based line
+                                "col": sp[1],        # Jedi: 0-based column
+                                "src_fqn": enclosing_func,
+                            })
+                    else:
+                        # Legacy heuristic (resolver off): best-effort phantom FQN.
+                        target_name = func_node.text.decode("utf8")
+                        edges.append(_Edge(
+                            source_fqn=module_path,
+                            target_fqn=f"{module_path}.{target_name}",
+                            relation="CALLS",
+                            extraction="inferred",
+                        ))
 
             # Recurse to children (unless we already handled them above)
             for child in node.children:
-                walk(child, parent_class=parent_class)
+                walk(child, parent_class=parent_class, enclosing_func=enclosing_func)
 
         walk(root)
         return symbols, edges
@@ -1124,43 +1827,74 @@ class NativeEngine:
             language=language,
         )
 
-        # Store symbols (E5: persist body_hash for change detection)
-        for sym in symbols:
-            # Compute body hash from the symbol's source range
-            body_hash = self._compute_symbol_body_hash(rel_path, sym)
-            sym_cypher = """
-            MERGE (s:CodeSymbol {code_space: $code_space, fqn: $fqn})
-            SET s.kind = $kind, s.file = $file, s.span = $span, s.body_hash = $body_hash
-            """
-            span = f"{sym.line}:{sym.end_line}"
-            self._run_cypher_with_retry(
-                sym_cypher,
-                code_space=self.code_space,
-                fqn=sym.fqn,
-                kind=sym.kind,
-                file=sym.file,
-                span=span,
-                body_hash=body_hash,
-            )
+        # Store symbols in batches (E5: persist body_hash for change detection)
+        # Fix 1: UNWIND-batched writes instead of per-symbol round-trips
+        if symbols:
+            _BATCH_SIZE = 500
+            symbol_rows = []
+            for sym in symbols:
+                # Compute body hash from the symbol's source range
+                body_hash = self._compute_symbol_body_hash(rel_path, sym)
+                span = f"{sym.line}:{sym.end_line}"
+                symbol_rows.append({
+                    "fqn": sym.fqn,
+                    # Phase C: persist the engine-agnostic canonical FQN alongside
+                    # the raw fqn so anchors can be keyed on it end-to-end (create
+                    # and lookup both use the SAME canonical key). See _ensure_anchors.
+                    "canonical_fqn": self.to_canonical(sym.fqn),
+                    "kind": sym.kind,
+                    "file": sym.file,
+                    "span": span,
+                    "body_hash": body_hash,
+                })
 
-        # Store edges
-        for edge in edges:
-            # Map extraction type to epistemic level (reuse semantic.py's mapping)
-            epistemic = self._extraction_to_epistemic(edge.extraction)
-            edge_cypher = """
-            MERGE (src:CodeSymbol {code_space: $code_space, fqn: $src_fqn})
-            MERGE (tgt:CodeSymbol {code_space: $code_space, fqn: $tgt_fqn})
-            MERGE (src)-[r:%s]->(tgt)
-            SET r.extraction = $extraction, r.epistemic_level = $epistemic
-            """ % edge.relation
-            self._run_cypher_with_retry(
-                edge_cypher,
-                code_space=self.code_space,
-                src_fqn=edge.source_fqn,
-                tgt_fqn=edge.target_fqn,
-                extraction=edge.extraction,
-                epistemic=epistemic,
-            )
+            # Batch symbols into chunks and write
+            for i in range(0, len(symbol_rows), _BATCH_SIZE):
+                batch = symbol_rows[i : i + _BATCH_SIZE]
+                sym_cypher = """
+                UNWIND $rows AS row
+                MERGE (s:CodeSymbol {code_space: $code_space, fqn: row.fqn})
+                SET s.kind = row.kind, s.file = row.file, s.span = row.span,
+                    s.body_hash = row.body_hash, s.canonical_fqn = row.canonical_fqn
+                """
+                self._run_cypher_with_retry(
+                    sym_cypher,
+                    code_space=self.code_space,
+                    rows=batch,
+                )
+
+        # Store edges in batches, grouped by relation type
+        # Fix 2: MATCH both endpoints (only link edges where both symbols exist)
+        if edges:
+            _BATCH_SIZE = 500
+            # Group edges by relation type (dynamic relation type requires grouping)
+            from collections import defaultdict
+            edges_by_relation = defaultdict(list)
+            for edge in edges:
+                epistemic = self._extraction_to_epistemic(edge.extraction)
+                edges_by_relation[edge.relation].append({
+                    "src_fqn": edge.source_fqn,
+                    "tgt_fqn": edge.target_fqn,
+                    "extraction": edge.extraction,
+                    "epistemic": epistemic,
+                })
+
+            # Batch-write each relation type
+            for relation, edge_list in edges_by_relation.items():
+                for i in range(0, len(edge_list), _BATCH_SIZE):
+                    batch = edge_list[i : i + _BATCH_SIZE]
+                    edge_cypher = """
+                    UNWIND $rows AS row
+                    MATCH (src:CodeSymbol {code_space: $code_space, fqn: row.src_fqn})
+                    MATCH (tgt:CodeSymbol {code_space: $code_space, fqn: row.tgt_fqn})
+                    MERGE (src)-[r:%s]->(tgt)
+                    SET r.extraction = row.extraction, r.epistemic_level = row.epistemic
+                    """ % relation
+                    self._run_cypher_with_retry(
+                        edge_cypher,
+                        code_space=self.code_space,
+                        rows=batch,
+                    )
 
     def _extraction_to_epistemic(self, extraction: str) -> str:
         """Map extraction confidence to epistemic level (mirrors semantic.py)."""
@@ -1169,6 +1903,254 @@ class NativeEngine:
         elif extraction in ("inferred", "ambiguous"):
             return "deductive"
         return "deductive"  # fallback
+
+    # ── Wave 3: neighbors call resolution (Jedi) ─────────────────────
+
+    def _resolve_and_store_calls(
+        self, repo_path: Path, symbols_by_file: dict[str, list[tuple[int, int, str]]]
+    ) -> int:
+        """Resolve collected Python call sites to real symbols and store CALLS
+        edges. Returns the number of distinct resolved edges stored.
+
+        Best-effort: if Jedi is unavailable the neighbors graph simply stays as it
+        was (no phantom edges were minted), never failing the index.
+        """
+        import time as _time
+
+        sites_by_file = getattr(self, "_pending_call_sites", {})
+        # MF-1: every re-parsed Python file cleared its prior resolver='jedi' CALLS
+        # so a call REMOVED by an edit doesn't linger — otherwise the resolved
+        # graph could only grow and the neighbors count would monotonically
+        # over-inflate under incremental reindex (a meter-honesty failure). Runs
+        # BEFORE the early return: a file whose calls were all deleted still needs
+        # clearing. sites_by_file keys every parsed Python file (setdefault in the
+        # walk), so its keys are exactly the re-parse set.
+        self._delete_stale_resolved_calls(list(sites_by_file.keys()))
+
+        total_sites = sum(len(v) for v in sites_by_file.values())
+        if not total_sites:
+            return 0
+        resolver, provenance = self._build_call_resolver(repo_path)
+        if resolver is None:
+            logger.warning(
+                "no call resolver available — neighbors stays heuristic (~0 CALLS)",
+            )
+            return 0
+
+        _t0 = _time.time()
+        resolved: list[dict] = []
+        resolved_count = 0
+        # MF-1: the LSP path carries no definition-kind info, so require the
+        # resolved def to land on a symbol's exact span start (a real def/class
+        # line) — this filters callable-attribute resolutions that would otherwise
+        # mint false edges to the enclosing method/class. Jedi already kind-filters,
+        # so it keeps plain span containment.
+        require_start = provenance == "lsp"
+        try:
+            for rel_path, sites in sites_by_file.items():
+                abs_path = repo_path / rel_path
+                try:
+                    source = abs_path.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    continue
+                defs = resolver.resolve_file(
+                    abs_path, source, [(s["line"], s["col"]) for s in sites]
+                )
+                for site, (def_path, def_line) in zip(sites, defs):
+                    if not def_path or def_line is None:
+                        continue  # unresolved (stdlib/external/dynamic) → dropped
+                    tgt = self._map_def_to_fqn(
+                        def_path, def_line, repo_path, symbols_by_file,
+                        require_start=require_start,
+                    )
+                    if not tgt:
+                        continue  # resolved outside the repo's indexed symbols
+                    src = site["src_fqn"]
+                    if src == tgt:
+                        continue  # skip trivial self-recursion self-loops
+                    resolved_count += 1
+                    resolved.append({"src_fqn": src, "tgt_fqn": tgt})
+        finally:
+            # Release any resolver-held resources (LspCallResolver owns an
+            # httpx.Client; leaving it open leaks sockets across many indexes).
+            close = getattr(resolver, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    logger.debug("resolver close failed (non-fatal)", exc_info=True)
+
+        # Dedup (src, tgt) — many call sites share the same edge.
+        seen: set[tuple[str, str]] = set()
+        uniq: list[dict] = []
+        for e in resolved:
+            key = (e["src_fqn"], e["tgt_fqn"])
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(e)
+
+        self._store_resolved_call_edges(uniq, provenance)
+        logger.info(
+            "%s neighbors resolver: %d/%d call sites resolved to in-repo "
+            "symbols → %d distinct CALLS edges (%d files) in %.2fs",
+            provenance, resolved_count, total_sites, len(uniq), len(sites_by_file),
+            _time.time() - _t0,
+        )
+        return len(uniq)
+
+    def _build_call_resolver(self, repo_path: Path):
+        """Select the neighbors call resolver, returning ``(resolver, provenance)``.
+
+        - ``lsp``: the external pyright resolver service (resolver-svc). Probed
+          first; if unreachable we transparently fall back to in-process Jedi so a
+          down service degrades gracefully rather than dropping every edge (the
+          brief keeps Jedi as the fallback).
+        - ``jedi``: in-process Jedi.
+
+        Returns ``(None, None)`` only when neither resolver can be constructed.
+        The ``provenance`` string tags stored CALLS edges (``r.resolver``) so the
+        stale-edge cleanup and the meter reflect what actually resolved.
+        """
+        mode = self._neighbors_resolver_mode()
+        if mode == "lsp":
+            try:
+                from adapters.code_graph.code_resolve_lsp import LspCallResolver
+
+                url = getattr(
+                    self.settings, "code_resolver_url", "http://resolver-svc:8201"
+                )
+                resolver = LspCallResolver(repo_path, url)
+                resolver.health()  # raises if the service is down/unhealthy
+                logger.info("neighbors resolver: using pyright service at %s", url)
+                return resolver, "lsp"
+            except Exception:
+                logger.warning(
+                    "LSP resolver unavailable — falling back to in-process Jedi",
+                    exc_info=True,
+                )
+                # fall through to Jedi
+
+        try:
+            import jedi  # noqa: F401  — probe so a truly-missing dep warns here
+            from adapters.code_graph.code_resolve import JediCallResolver
+
+            return JediCallResolver(repo_path), "jedi"
+        except Exception:
+            logger.warning("jedi resolver unavailable", exc_info=True)
+            return None, None
+
+    def _delete_stale_resolved_calls(self, files: list[str]) -> None:
+        """Delete any resolver-produced CALLS edge (r.resolver set — 'jedi' or
+        'lsp') whose SOURCE symbol lives in one of the re-parsed ``files``, so a
+        call removed by an edit doesn't survive an incremental reindex (MF-1: keeps
+        the resolved graph — and the neighbors count on the meter — from
+        monotonically over-inflating). Matching ANY resolver (not just the active
+        one) also means switching resolvers, e.g. jedi→lsp, cleanly replaces the
+        prior resolver's edges for the re-parsed files instead of double-counting."""
+        if not files:
+            return
+        try:
+            self._run_cypher_with_retry(
+                "MATCH (src:CodeSymbol {code_space: $cs})-[r:CALLS]->() "
+                "WHERE src.file IN $files AND r.resolver IS NOT NULL DELETE r",
+                cs=self.code_space, files=files,
+            )
+        except Exception:
+            logger.debug("stale resolved-CALLS cleanup failed (non-fatal)", exc_info=True)
+
+    def _map_def_to_fqn(
+        self,
+        def_abs_path: str,
+        def_line: int,
+        repo_root: Path,
+        symbols_by_file: dict[str, list[tuple[int, int, str]]],
+        require_start: bool = False,
+    ) -> str | None:
+        """Map a resolver definition ``(abs_path, line)`` to the EXACT stored symbol
+        FQN — so a resolved target always matches an existing :CodeSymbol (never a
+        new phantom). Falls back to a Neo4j lookup for files not in
+        ``symbols_by_file`` (incremental reindex: unchanged files weren't parsed).
+
+        ``require_start`` (Fable MF-1): when True, only accept a definition that
+        lands on a symbol's **span START** (its ``def``/``class`` line), not merely
+        within its span. Jedi kind-filters to function/class before returning, so
+        its def line is always a def line; the LSP path has no kind info, so a call
+        on a callable-valued ATTRIBUTE (``self.cb = lambda...``; ``d.cb()``) would
+        otherwise resolve to the assignment line INSIDE the enclosing method's span
+        and containment-map to a false ``caller → Method`` / ``caller → Class``
+        edge. Requiring an exact span-start match drops those (an assignment line is
+        never a symbol's start line) while keeping every real function/method/class
+        call (pyright's targetSelectionRange points at the def/class line, == the
+        stored span start). Used for lsp provenance; jedi keeps containment."""
+        try:
+            rel = str(Path(def_abs_path).resolve().relative_to(Path(repo_root).resolve()))
+        except Exception:
+            return None  # definition lives outside the repo → external, drop
+        spans = symbols_by_file.get(rel)
+        if spans is None:
+            # Incremental: target lives in an unchanged (unparsed) file. Load its
+            # spans from Neo4j once and cache back into symbols_by_file so many
+            # cross-file calls to the same file don't re-query (nit-3).
+            spans = self._symbol_spans_for_file(rel)
+            symbols_by_file[rel] = spans
+        best: tuple[int, int, str] | None = None
+        for start, end, fqn in spans:
+            hi = end or start
+            if require_start:
+                # Exact def/class line only (see docstring — filters attribute /
+                # assignment resolutions that land mid-span).
+                if start == def_line and (best is None or start > best[0]):
+                    best = (start, hi, fqn)
+            elif start <= def_line <= hi and (best is None or start > best[0]):
+                best = (start, hi, fqn)
+        return best[2] if best else None
+
+    def _symbol_spans_for_file(self, rel_path: str) -> list[tuple[int, int, str]]:
+        """Load (start_line, end_line, fqn) for every symbol in a file from Neo4j
+        (incremental fallback for _map_def_to_fqn)."""
+        try:
+            rows = self._run_cypher(
+                "MATCH (s:CodeSymbol {code_space: $cs, file: $file}) "
+                "RETURN s.fqn AS fqn, s.span AS span",
+                cs=self.code_space, file=rel_path,
+            )
+        except Exception:
+            return []
+        spans: list[tuple[int, int, str]] = []
+        for r in rows:
+            span = str(r.get("span") or "0:0")
+            parts = span.split(":")
+            try:
+                start = int(parts[0])
+                end = int(parts[1]) if len(parts) > 1 else start
+            except (ValueError, IndexError):
+                continue
+            spans.append((start, end, r.get("fqn") or ""))
+        return spans
+
+    def _store_resolved_call_edges(
+        self, edges: list[dict], provenance: str = "jedi"
+    ) -> None:
+        """Store resolved CALLS edges, MATCHing both endpoints (both symbols exist
+        by now). extraction='extracted' (statically resolved → epistemic explicit);
+        r.resolver=<provenance> ('jedi' | 'lsp') marks which resolver produced it."""
+        if not edges:
+            return
+        _BATCH = 500
+        for i in range(0, len(edges), _BATCH):
+            batch = edges[i : i + _BATCH]
+            cypher = """
+            UNWIND $rows AS row
+            MATCH (src:CodeSymbol {code_space: $cs, fqn: row.src_fqn})
+            MATCH (tgt:CodeSymbol {code_space: $cs, fqn: row.tgt_fqn})
+            MERGE (src)-[r:CALLS]->(tgt)
+            SET r.extraction = 'extracted', r.epistemic_level = 'explicit',
+                r.resolver = $provenance
+            """
+            self._run_cypher_with_retry(
+                cypher, cs=self.code_space, rows=batch, provenance=provenance
+            )
 
     def _compute_degrees(self):
         """Compute in+out degree for all symbols and persist it."""
@@ -1182,13 +2164,126 @@ class NativeEngine:
         """
         self._run_cypher(cypher, code_space=self.code_space)
 
+    def _compute_communities(self):
+        """Compute Louvain communities at index time and persist community_id.
+
+        Reads CALLS + IMPORTS edges, builds an undirected graph, runs Louvain
+        with seed=42 for determinism, and persists stable community_id on each
+        :CodeSymbol. Guards against graphs > 200k edges (logs warning and skips).
+
+        Isolated symbols (no CALLS/IMPORTS edges) get community_id = -1 (singleton).
+        """
+        import networkx as nx
+        from networkx.algorithms.community import louvain_communities
+
+        # 1. Fetch CALLS + IMPORTS edges for this code_space
+        edge_cypher = """
+        MATCH (s:CodeSymbol {code_space: $code_space})-[r]->(t:CodeSymbol)
+        WHERE type(r) IN ['CALLS', 'IMPORTS']
+        RETURN s.fqn AS source, t.fqn AS target
+        """
+        edges = self._run_cypher(edge_cypher, code_space=self.code_space)
+
+        # 2. Size guard: if > 200k edges, skip with warning (leave community_id unset)
+        if len(edges) > 200_000:
+            logger.warning(
+                f"Skipping community computation for {self.code_space}: "
+                f"{len(edges)} edges exceeds 200k limit"
+            )
+            return
+
+        # 3. Build undirected networkx graph
+        G = nx.Graph()
+        for edge in edges:
+            G.add_edge(edge["source"], edge["target"])
+
+        # 4. No CALLS/IMPORTS graph: every symbol is a singleton. Still populate
+        #    community_id = -1 on all symbols so the property is never unset
+        #    (semantic_layer() filters on community_id IS NOT NULL).
+        if G.number_of_nodes() == 0:
+            logger.info(
+                f"No CALLS/IMPORTS graph for {self.code_space}; "
+                f"assigning singleton community_id=-1 to all symbols"
+            )
+            self._persist_singleton_communities()
+            return
+
+        # 5. Run Louvain with deterministic seed
+        communities = louvain_communities(G, seed=42)
+
+        # 6. Build stable community id mapping (sort communities by min fqn)
+        # This ensures same input graph => same community_id assignment
+        sorted_communities = sorted(communities, key=lambda c: min(c))
+        fqn_to_community_id = {}
+        for idx, community in enumerate(sorted_communities):
+            for fqn in community:
+                fqn_to_community_id[fqn] = idx
+
+        # 7. Fetch all symbols to find isolated ones (not in the graph)
+        all_symbols_cypher = """
+        MATCH (s:CodeSymbol {code_space: $code_space})
+        RETURN s.fqn AS fqn
+        """
+        all_symbols = self._run_cypher(all_symbols_cypher, code_space=self.code_space)
+
+        # 8. Assign community_id = -1 to isolated symbols
+        for symbol in all_symbols:
+            fqn = symbol["fqn"]
+            if fqn not in fqn_to_community_id:
+                fqn_to_community_id[fqn] = -1
+
+        # 9. Persist community_id via batched UNWIND SET (retry for transient errors)
+        if fqn_to_community_id:
+            batch_data = [
+                {"fqn": fqn, "community_id": cid}
+                for fqn, cid in fqn_to_community_id.items()
+            ]
+            update_cypher = """
+            UNWIND $batch AS row
+            MATCH (s:CodeSymbol {code_space: $code_space, fqn: row.fqn})
+            SET s.community_id = row.community_id
+            """
+            self._run_cypher_with_retry(
+                update_cypher,
+                code_space=self.code_space,
+                batch=batch_data,
+            )
+            logger.info(
+                f"Persisted {len(sorted_communities)} communities "
+                f"({len(fqn_to_community_id)} symbols) for {self.code_space}"
+            )
+
+    def _persist_singleton_communities(self):
+        """Assign community_id = -1 to every symbol in the code_space.
+
+        Used when there are no CALLS/IMPORTS edges to cluster on — every symbol
+        is its own singleton. Batched UNWIND SET (retry for transient errors).
+        """
+        cypher = """
+        MATCH (s:CodeSymbol {code_space: $code_space})
+        SET s.community_id = -1
+        """
+        self._run_cypher_with_retry(cypher, code_space=self.code_space)
+
     def _ensure_anchors(self):
         """E4: Create CodeAnchor nodes and link symbols to them.
 
-        MERGE anchors keyed by (code_space, repo, fqn) and create
+        MERGE anchors keyed by (code_space, repo, CANONICAL FQN) and create
         (:CodeSymbol)-[:ANCHORED]->(:CodeAnchor) edges. Anchors survive symbol
         reindexes — symbols are deleted/recreated, anchors persist, and the
         ANCHORED edges are recreated pointing to the same anchor nodes.
+
+        Phase C (anchor moat): the anchor's ``fqn`` is the CANONICAL FQN (src/lib
+        stripped), computed at symbol-write time and persisted as
+        ``s.canonical_fqn`` (see _store_file). This is END-TO-END consistent with
+        _get_anchor_memories, which canonicalizes the incoming FQN before building
+        its lookup key — so create and lookup produce the SAME key, and the
+        cross-engine anchor join hits regardless of which engine (native/CBM/
+        graphify) produced the answer.
+
+        MIGRATION NOTE: pre-existing raw-keyed anchors (there are none on ice/v2
+        — every index here is fresh) would need a one-time rekey to canonical when
+        this reaches `dev`. That migration is a documented follow-up, not this PR.
 
         Uses deadlock retry pattern per graph_patcher.py.
         """
@@ -1196,10 +2291,14 @@ class NativeEngine:
         parts = self.code_space.split("--")
         repo = parts[-1] if len(parts) >= 3 else "unknown"
 
-        # Cypher: MERGE anchor per symbol, link via ANCHORED
+        # Key the anchor on the persisted canonical FQN. coalesce() guards the
+        # (transient) case of a symbol written before this field existed.
         cypher = """
         MATCH (s:CodeSymbol {code_space: $code_space})
-        MERGE (a:CodeAnchor {code_space: $code_space, repo: $repo, fqn: s.fqn})
+        MERGE (a:CodeAnchor {
+            code_space: $code_space, repo: $repo,
+            fqn: coalesce(s.canonical_fqn, s.fqn)
+        })
         MERGE (s)-[:ANCHORED]->(a)
         RETURN count(a) AS anchored
         """
@@ -1209,7 +2308,7 @@ class NativeEngine:
             repo=repo,
         )
         count = result[0]["anchored"] if result else 0
-        logger.info(f"Ensured {count} CodeAnchors for {self.code_space}")
+        logger.info(f"Ensured {count} CodeAnchors (canonical FQN) for {self.code_space}")
 
     def _get_anchor_memories(
         self,
@@ -1217,10 +2316,21 @@ class NativeEngine:
         user_id: str | None = None,
         limit: int = 3,
     ) -> list[dict]:
-        """E4: Fetch memories attached to a code anchor by (repo, fqn).
+        """E4: Fetch memories attached to a code anchor by (repo, canonical FQN).
+
+        Phase E: Refactored to call the batched lookup with a single FQN, keeping
+        the single-symbol method signature working for backward compatibility.
+
+        Phase C: Uses CANONICAL FQN (src/lib stripped) so memories anchored to
+        a symbol are retrievable regardless of which engine indexed it.
 
         Respects visibility: returns only memories the caller may read
         (their own private memories + shared/standard pools).
+
+        Args:
+            fqn: The FQN from the engine (will be canonicalized).
+            user_id: Caller user ID for visibility scoping.
+            limit: Max memories to return.
 
         Returns list of dicts: [{id, content, category, visibility, ...}, ...]
         """
@@ -1228,110 +2338,40 @@ class NativeEngine:
         parts = self.code_space.split("--")
         repo = parts[-1] if len(parts) >= 3 else "unknown"
 
-        # Build anchor key: "<repo>::<fqn>"
-        anchor_key = f"{repo}::{fqn}"
+        # Phase E: delegate to batched lookup with a single FQN
+        from knowledge.fusion import batched_anchor_lookup
 
-        # Search memories by source_ref.external_id match
-        from memory_service import get_shared_service
-        from qdrant_client.models import (
-            FieldCondition,
-            Filter,
-            MatchValue,
+        result_by_fqn = batched_anchor_lookup(
+            fqns=[fqn],
+            repo=repo,
+            to_canonical_fn=self.to_canonical,
+            user_id=user_id,
+            limit_per_anchor=limit,
         )
 
-        try:
-            service = get_shared_service()
-            m = service._get_memory()
-            client = m.vector_store.client
-
-            # Build filter: source_ref.external_id = anchor_key AND readable by caller
-            # (visibility = shared OR standard OR (visibility = private AND user_id = caller))
-            must: list = [
-                FieldCondition(
-                    key="metadata.source_ref.external_id",
-                    match=MatchValue(value=anchor_key),
-                )
-            ]
-
-            # Visibility scoping (mirror memory/search.py logic)
-            # Include shared + standard pools for all authenticated users
-            # Plus caller's own private memories if user_id provided
-            if user_id:
-                # Private OR shared OR standard
-                # Qdrant doesn't have OR at filter level, so we do post-filtering
-                # For now, just search and filter in Python
-                pass
-            else:
-                # Anonymous: only shared + standard
-                # Again, Qdrant doesn't support complex OR, so we'll search broadly
-                # and filter
-                pass
-
-            # For simplicity, search without visibility filter and post-filter
-            # (E4 MVP — can optimize later with separate pool searches like memory/search.py)
-            query_filter = Filter(must=must)
-
-            # Use a dummy embedding for search (we're filtering by source_ref, not semantic)
-            # Or just scroll the collection with filter
-            # For MVP, use search with a zero vector (won't match semantically but filter works)
-            import numpy as np
-            vector_size = len(m.embedding_model.embed("test", memory_action="search"))
-            dummy_vector = np.zeros(vector_size).tolist()
-
-            result = client.query_points(
-                collection_name=m.vector_store.collection_name,
-                query=dummy_vector,
-                query_filter=query_filter,
-                limit=limit * 3,  # over-fetch for post-filtering
-                with_payload=True,
-            )
-            hits = list(getattr(result, "points", result) or [])
-
-            # Post-filter by visibility
-            memories = []
-            for hit in hits:
-                payload = getattr(hit, "payload", None) or {}
-                metadata = payload.get("metadata", {})
-                visibility = metadata.get("visibility", "private")
-                owner = metadata.get("user_id")
-
-                # Check readability
-                readable = False
-                if visibility in ("shared", "standard"):
-                    readable = True
-                elif visibility == "private" and user_id and owner == user_id:
-                    readable = True
-
-                if readable:
-                    memories.append({
-                        "id": payload.get("id"),
-                        "content": payload.get("data"),
-                        "category": metadata.get("category"),
-                        "visibility": visibility,
-                        "created_at": metadata.get("created_at"),
-                    })
-                    if len(memories) >= limit:
-                        break
-
-            return memories
-        except Exception:
-            logger.debug(f"Failed to fetch anchor memories for {fqn}", exc_info=True)
-            return []
+        # Return memories for this single FQN (empty list if no matches)
+        canonical_fqn = self.to_canonical(fqn)
+        return result_by_fqn.get(canonical_fqn, [])
 
     def _index_symbol_cards(self, repo_path: Path):
-        """Build symbol cards and index them in the code_index Qdrant collection (E3).
+        """Build symbol cards and index them for locate (C3).
 
-        For each symbol, builds a card: name + signature + docstring + first N lines
-        of source, embeds it, and upserts to code_index with payload containing all
-        searchable metadata.
+        For each source-backed symbol, builds a card (name + signature + docstring
+        + first N lines of source) and:
+        - **Always** writes the card text (+ signature/docstring) back onto the
+          :CodeSymbol node, powering the token-free BM25 lexical leg (C1). This is
+          the deterministic default — no cloud, no network.
+        - When ``code_embedder`` is local/cloud, ALSO embeds the cards (local
+          fastembed ONNX by default; Gemini only when opted in) and upserts them
+          to the code_index Qdrant collection for the dense leg (C3).
         """
-        from memory_service import get_shared_service
-        from qdrant_client.models import PointStruct
-        import uuid
+        from adapters.code_graph.code_locate import (
+            build_card_text,
+            invalidate_bm25,
+            symbol_point_id,
+        )
 
-        service = get_shared_service()
-        m = service._get_memory()
-        self._ensure_code_index_collection(m)
+        mode = self._code_embedder_mode()
 
         # Fetch all symbols with degree
         cypher = """
@@ -1343,28 +2383,36 @@ class NativeEngine:
 
         if not symbols:
             logger.info("No symbols to index in code_index")
-            return
+            invalidate_bm25(self.code_space)
+            self._bump_card_epoch()
+            return None
 
-        # Build symbol cards (text for embedding)
-        cards = []
-        points_data = []
+        # Build symbol cards (shared card text for BM25 + optional dense embed)
+        cards: list[str] = []
+        points_data: list[dict] = []
+        node_updates: list[dict] = []
         for sym in symbols:
             fqn = sym["fqn"]
             kind = sym["kind"]
             file_path = sym["file"]
+            # External / inferred symbols may have no file — they can't be
+            # located or turned into a source-backed card, so skip them.
+            if not file_path:
+                continue
             span = sym["span"] or "1:1"
-            line = int(span.split(":")[0])
+            try:
+                line = int(str(span).split(":")[0])
+            except (ValueError, IndexError):
+                line = 0
             degree = sym["degree"]
 
-            # Build the symbol card text
             signature, docstring, first_lines = self._extract_symbol_details(
                 repo_path / file_path, fqn, line
             )
-            card_text = self._build_symbol_card(fqn, kind, signature, docstring, first_lines)
+            card_text = build_card_text(fqn, kind, signature, docstring, first_lines)
 
             cards.append(card_text)
             points_data.append({
-                "id": str(uuid.uuid4()),
                 "fqn": fqn,
                 "kind": kind,
                 "file": file_path,
@@ -1374,55 +2422,121 @@ class NativeEngine:
                 "degree": degree,
                 "anchor_id": None,  # E4: anchors deferred
             })
+            node_updates.append({
+                "fqn": fqn,
+                "signature": signature or "",
+                "docstring": docstring or "",
+                "card": card_text,
+            })
 
-        # Batch embed all cards
-        logger.info(f"Embedding {len(cards)} symbol cards for code_index")
-        embeddings = m.embedding_model.embed_batch(cards, memory_action="add")
+        # Always persist card text onto the graph (powers the BM25 lexical leg),
+        # bump the card epoch (cross-process BM25 cache invalidation, MF-1), and
+        # invalidate this process's cache immediately.
+        self._write_card_fields(node_updates)
+        invalidate_bm25(self.code_space)
+        self._bump_card_epoch()
 
-        if len(embeddings) != len(cards):
-            logger.warning(
-                f"Embedding mismatch: {len(embeddings)} embeddings for {len(cards)} cards"
+        if mode == "off":
+            logger.info(
+                "code_embedder=off — %d symbol cards indexed for BM25 (token-free "
+                "deterministic default); no dense vectors", len(node_updates)
             )
+            return None  # dense leg not applicable
+
+        # Dense leg: embed cards (local fastembed by default; cloud only opted in).
+        # MF-5: an offline/air-gapped deployment (the audience for a token-free
+        # default) can't fetch the local ONNX model on first use — so the ENTIRE
+        # dense stage is best-effort. On any failure we keep the already-written
+        # BM25 cards (locate degrades to ~0.60 h@1) instead of failing the whole
+        # index job, and signal the degradation up to the IndexReport.
+        from memory_service import get_shared_service
+        from qdrant_client.models import PointStruct
+
+        try:
+            service = get_shared_service()
+            m = service._get_memory()
+            vector_size = self._code_vector_size(m, mode)
+            # recreate_on_mismatch handles a true dim change (e.g. a non-768 cloud
+            # model); the per-point embedder tag (below) handles same-dim switches.
+            self._ensure_code_index_collection(
+                m, vector_size=vector_size, recreate_on_mismatch=True
+            )
+
+            if mode == "local":
+                logger.info("Embedding %d symbol cards (local code embedder)", len(cards))
+                embeddings = self._get_local_code_embedder().embed_documents(cards)
+            else:  # cloud — Gemini batchEmbedContents caps at 100 per call
+                logger.info("Embedding %d symbol cards (cloud embedder)", len(cards))
+                _EMBED_CHUNK = 100
+                embeddings = []
+                for i in range(0, len(cards), _EMBED_CHUNK):
+                    embeddings.extend(
+                        m.embedding_model.embed_batch(
+                            cards[i : i + _EMBED_CHUNK], memory_action="add"
+                        )
+                    )
+
+            if len(embeddings) != len(cards):
+                logger.warning(
+                    f"Embedding mismatch: {len(embeddings)} embeddings for "
+                    f"{len(cards)} cards — dense leg skipped (BM25 still active)"
+                )
+                return True  # degraded: card text is indexed, dense is not
+
+            # MF-2: clear this code_space's existing cards first so a reindex can't
+            # leave stale points behind — legacy uuid4 points or points from a
+            # different embedder (whose vectors live in another space) — which RRF
+            # would otherwise fuse as garbage. Then upsert with a stable per-symbol
+            # id (dense + lexical fuse on identity; reindex is idempotent) and the
+            # embedder identity stamped on each point (matched at query time).
+            self._delete_code_index_cards()
+            identity = self._code_embedder_identity(mode)
+            points = []
+            for embed, data in zip(embeddings, points_data):
+                points.append(PointStruct(
+                    id=symbol_point_id(self.code_space, data["fqn"]),
+                    vector=embed,
+                    payload={
+                        "code_space": self.code_space,
+                        "embedder": identity,
+                        "fqn": data["fqn"],
+                        "kind": data["kind"],
+                        "file": data["file"],
+                        "line": data["line"],
+                        "signature": data["signature"],
+                        "docstring": data["docstring"],
+                        "degree": data["degree"],
+                        "anchor_id": data["anchor_id"],
+                    },
+                ))
+
+            m.vector_store.client.upsert(collection_name="code_index", points=points)
+            logger.info(f"Indexed {len(points)} symbols into code_index collection")
+            return False  # dense leg fully built
+        except Exception:
+            logger.warning(
+                "Dense code-index leg failed (%s mode); card-text BM25 still "
+                "active so locate degrades to ~0.60 h@1 rather than failing the "
+                "index. Common cause: local embedder model unavailable offline.",
+                mode, exc_info=True,
+            )
+            return True  # degraded
+
+    def _write_card_fields(self, updates: list[dict]) -> None:
+        """Batch-write card text (+ signature/docstring) onto :CodeSymbol nodes."""
+        if not updates:
             return
-
-        # Build points for Qdrant
-        points = []
-        for i, (embed, data) in enumerate(zip(embeddings, points_data)):
-            points.append(PointStruct(
-                id=data["id"],
-                vector=embed,
-                payload={
-                    "code_space": self.code_space,
-                    "fqn": data["fqn"],
-                    "kind": data["kind"],
-                    "file": data["file"],
-                    "line": data["line"],
-                    "signature": data["signature"],
-                    "docstring": data["docstring"],
-                    "degree": data["degree"],
-                    "anchor_id": data["anchor_id"],
-                },
-            ))
-
-        # Upsert to code_index
-        m.vector_store.client.upsert(
-            collection_name="code_index",
-            points=points,
-        )
-        logger.info(f"Indexed {len(points)} symbols into code_index collection")
-
-    def _build_symbol_card(
-        self, fqn: str, kind: str, signature: str, docstring: str, first_lines: str
-    ) -> str:
-        """Build a symbol card for embedding: name + signature + docstring + source."""
-        parts = [f"{kind} {fqn}"]
-        if signature:
-            parts.append(f"Signature: {signature}")
-        if docstring:
-            parts.append(f"Doc: {docstring}")
-        if first_lines:
-            parts.append(f"Source:\n{first_lines}")
-        return "\n".join(parts)
+        cypher = """
+        UNWIND $rows AS row
+        MATCH (s:CodeSymbol {code_space: $code_space, fqn: row.fqn})
+        SET s.signature = row.signature,
+            s.docstring = row.docstring,
+            s.card = row.card
+        """
+        for i in range(0, len(updates), 500):
+            self._run_cypher_with_retry(
+                cypher, code_space=self.code_space, rows=updates[i : i + 500]
+            )
 
     def _extract_symbol_details(
         self, file_path: Path, fqn: str, line: int
@@ -1478,17 +2592,28 @@ class NativeEngine:
 
     def _search_symbols(self, keywords: list[str], limit: int = 10) -> list[dict]:
         """Search symbols by FQN substring match (scored by degree)."""
-        # Simple keyword AND match on FQN
-        where_clauses = [f"toLower(s.fqn) CONTAINS '{kw}'" for kw in keywords]
+        # Fix 5: Parameterize keywords to prevent Cypher injection
+        if not keywords:
+            return []
+
+        # Build WHERE clause with parameterized keywords
+        where_clauses = [f"toLower(s.fqn) CONTAINS toLower($kw{i})" for i in range(len(keywords))]
         where_clause = " AND ".join(where_clauses)
+
         cypher = f"""
         MATCH (s:CodeSymbol {{code_space: $code_space}})
         WHERE {where_clause}
         RETURN s.fqn AS fqn, s.kind AS kind, s.file AS file, s.span AS span, s.degree AS degree
         ORDER BY coalesce(s.degree, 0) DESC
-        LIMIT {limit}
+        LIMIT $limit
         """
-        results = self._run_cypher(cypher, code_space=self.code_space)
+
+        # Build params dict with keyword parameters
+        params = {"code_space": self.code_space, "limit": limit}
+        for i, kw in enumerate(keywords):
+            params[f"kw{i}"] = kw
+
+        results = self._run_cypher(cypher, **params)
         return [
             {
                 "fqn": r["fqn"],
@@ -1500,7 +2625,20 @@ class NativeEngine:
         ]
 
     def _find_symbol(self, label: str) -> list[dict]:
-        """Find symbols by FQN substring match."""
+        """Find symbols by FQN substring match.
+
+        NOTE (resolver-svc mission diagnosis): this unordered ``CONTAINS`` +
+        ``LIMIT 5`` returns an arbitrary ``matches[0]``, so an ambiguous bare label
+        like ``Argument`` can resolve to ``tests…test_argument_order`` (name merely
+        *contains* "argument") instead of the class ``…core.Argument`` — capping the
+        neighbors benchmark regardless of resolver quality. A ranked lookup
+        (exact-FQN → exact-final-segment → substring; then def kind; then degree)
+        plus caller-direction filtering for "who calls X" lifts the pyright graph's
+        neighbors from ~50% to ~70% F1 in offline measurement (see
+        ICE_V2_RESOLVER_RESULT.md). That fix touches the shared interactive query
+        path (all engines, latency-sensitive) so it is scoped as a follow-up, not
+        bundled into this resolver PR — the change here is intentionally left
+        minimal to avoid regressing the default jedi path."""
         cypher = """
         MATCH (s:CodeSymbol {code_space: $code_space})
         WHERE toLower(s.fqn) CONTAINS toLower($label)
@@ -1716,24 +2854,24 @@ class NativeEngine:
         if not roots:
             return set()
 
-        # BFS traversal: start from roots, walk outward over CALLS/IMPORTS edges
-        # (both incoming and outgoing — a deleted function affects callers AND callees)
+        # Fix 4: Single-Cypher blast radius using variable-length path query
+        # Both incoming and outgoing edges (a deleted function affects callers AND callees)
+        cypher = f"""
+        UNWIND $roots AS root_fqn
+        MATCH (root:CodeSymbol {{code_space: $code_space, fqn: root_fqn}})
+        OPTIONAL MATCH (root)<-[r:CALLS|IMPORTS*1..{max_depth}]-(caller:CodeSymbol)
+        WITH root, collect(DISTINCT caller.fqn) AS callers
+        OPTIONAL MATCH (root)-[r:CALLS|IMPORTS*1..{max_depth}]->(callee:CodeSymbol)
+        WITH root, callers, collect(DISTINCT callee.fqn) AS callees
+        RETURN root.fqn AS root_fqn, callers, callees
+        """
+        results = self._run_cypher(cypher, code_space=self.code_space, roots=roots)
+
+        # Collect all affected FQNs
         affected = set(roots)
-        visited = set(roots)
-        queue = [(fqn, 0) for fqn in roots]
-
-        while queue:
-            current_fqn, depth = queue.pop(0)
-            if depth >= max_depth:
-                continue
-
-            # Fetch neighbors via CALLS/IMPORTS edges (both directions)
-            neighbors = self._get_blast_neighbors(current_fqn)
-            for neighbor_fqn in neighbors:
-                if neighbor_fqn not in visited:
-                    visited.add(neighbor_fqn)
-                    affected.add(neighbor_fqn)
-                    queue.append((neighbor_fqn, depth + 1))
+        for row in results:
+            affected.update(row.get("callers", []) or [])
+            affected.update(row.get("callees", []) or [])
 
         return affected
 
@@ -1791,7 +2929,11 @@ class NativeEngine:
             raise RuntimeError("Bridge loop is not an asyncio event loop")
 
         async def _inner():
-            driver = self.bridge.driver
+            # The real mem0 _AsyncBridge has no .driver; use the injected
+            # Graphiti driver, falling back to bridge.driver for mock bridges.
+            driver = self.driver if self.driver is not None else getattr(self.bridge, "driver", None)
+            if driver is None:
+                raise RuntimeError("No Neo4j driver available (bridge has no .driver and none injected)")
             async with driver.session() as session:
                 result = await session.run(cypher, **params)
                 records = await result.data()

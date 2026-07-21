@@ -28,6 +28,18 @@ def test_bench_user_id_sanitizes():
     assert all(c.isalnum() or c in "._-" for c in uid)
 
 
+def test_bench_user_id_namespace():
+    # No namespace → unchanged (baseline stores keep their ids).
+    assert bench_user_id("locomo", "conv-26") == "bench-locomo-conv-26"
+    # Namespace prefixes without colliding with the baseline id.
+    assert bench_user_id("locomo", "conv-26", "t11") == "bench-t11-locomo-conv-26"
+    assert bench_user_id("locomo", "conv-26", None) == "bench-locomo-conv-26"
+    # Namespaced ids stay within the service's 100-char cap + charset.
+    uid = bench_user_id("convomem", "x" * 200, "some/weird ns")
+    assert len(uid) <= 100
+    assert all(c.isalnum() or c in "._-" for c in uid)
+
+
 def test_attribute_memory_picks_source_session():
     sid, score = attribute_memory("User adopted a beagle named Kiwi", _conv())
     assert sid == "s1"

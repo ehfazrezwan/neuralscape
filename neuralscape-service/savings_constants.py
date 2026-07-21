@@ -20,11 +20,40 @@ They are measured, checked-in constants, not runtime estimates:
   same test class.
 """
 
-# Measured 2026-07-05: 9265 tokens (o200k_base) for the 22 core tools + the
-# 3 code-graph delegation tools (dev install renders the maximal surface).
-# Growth from 9130: the `occurred_at` event-time field on the remember tool.
-# See tests/test_savings_meter.py::TestOverheadConstants.
-MCP_TOOL_SCHEMA_OVERHEAD_TOKENS = 9330
+# Measured 2026-07-10 (Phase G): 10801 tokens (o200k_base) for 24 core tools
+# (22 + 2 project-config tools) + the 6 code-graph delegation tools (dev install
+# renders the maximal surface). Growth from 10524: Phase G adds the new
+# code_graph_index tool and un-gates the knowledge_system param docs (removed the
+# "EXPERIMENTAL" caveat, documented explicit routing) on recall_memories + code
+# tools (+277 tokens). Intentional, per the acceptance rule. Then +6 (10807) in
+# the Fable-review pass: recall_memories knowledge_system schema reworded to be
+# honest that the fusion gate (not this param) governs its code leg.
+# Then +208 (11015) in the residuals PR (R-C): the new code_graph_delete MCP tool
+# (through-NS cold-delete twin of DELETE /v1/code-graph/graph). Intentional, per
+# the acceptance rule. See tests/test_savings_meter.py::TestOverheadConstants.
+# Then +126 (11141) in the auto-routing PR (AR2/AR3): the recall_memories +
+# code-tool knowledge_system param docs now document the 'auto' value (per-op
+# auto-selection of the measured-best healthy engine). Intentional, per the rule.
+MCP_TOOL_SCHEMA_OVERHEAD_TOKENS = 11141
 
 # Rendered savings line + detail fields on one response (measured: 67).
 SAVINGS_LINE_OVERHEAD_TOKENS = 70
+
+# ── Lifecycle stages (M1) ────────────────────────────────────────────
+# Every metered event is tagged with the lifecycle stage it belongs to so
+# the meter can slice savings per stage (the Economics dashboard's rows).
+# This is a FIXED enum — new stages are a conscious, checked-in edit — so
+# ``metrics_snapshot`` can enumerate per-stage totals without a Redis SCAN.
+#
+#  retrieval        — recall / index_only / get_memories / timeline / ask
+#  ingest           — document/text distillation (source → stored facts)
+#  context_assembly — session context bundle (E3) + the daily tool-schema charge
+#  code_nav         — code locate / neighbors / query (read-avoidance)
+#  compaction       — rolling session-summary refresh (transcript → summary)
+LIFECYCLE_STAGES = (
+    "retrieval",
+    "ingest",
+    "context_assembly",
+    "code_nav",
+    "compaction",
+)

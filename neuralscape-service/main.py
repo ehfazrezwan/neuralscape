@@ -297,6 +297,9 @@ async def health():
 
     Returns 200 with per-backend status when core services are reachable.
     Returns 503 if critical backends (vector store) are unreachable.
+
+    Phase B addition: includes knowledge_systems section aggregating each
+    registered system's health + info (purely additive; no existing keys changed).
     """
     checks: dict[str, str] = {}
 
@@ -328,18 +331,66 @@ async def health():
     except Exception:
         checks["graph_store"] = "unreachable"
 
+    # Phase B: aggregate knowledge systems health (additive only)
+    knowledge_systems = []
+    try:
+        from knowledge import list_systems, get_system
+
+        for name in list_systems():
+            system = get_system(name)
+            if system:
+                try:
+                    health_status = system.health()
+                    knowledge_systems.append(
+                        {
+                            "name": system.info.name,
+                            "kind": system.info.kind,
+                            "capabilities": sorted(system.info.capabilities),
+                            "transport": system.info.transport,
+                            "health": health_status.status,
+                            "details": health_status.details,
+                        }
+                    )
+                except Exception:
+                    logger.exception("Health check failed for system %s", name)
+                    knowledge_systems.append(
+                        {
+                            "name": name,
+                            "kind": system.info.kind,
+                            "capabilities": sorted(system.info.capabilities),
+                            "transport": system.info.transport,
+                            "health": "error",
+                            "details": {},
+                        }
+                    )
+    except Exception:
+        # If the knowledge registry itself failed to import, log but don't crash health.
+        logger.exception("Failed to aggregate knowledge systems health")
+
     # Overall status: degraded if Redis is down, unhealthy if vector store is down
     if checks.get("vector_store") == "unreachable":
-        return JSONResponse(
-            status_code=503,
-            content={"status": "unhealthy", "service": "neuralscape-memory", "checks": checks},
-        )
+        response_data = {
+            "status": "unhealthy",
+            "service": "neuralscape-memory",
+            "checks": checks,
+        }
+        if knowledge_systems:
+            response_data["knowledge_systems"] = knowledge_systems
+        return JSONResponse(status_code=503, content=response_data)
 
     overall = "ok"
     if any(v != "ok" for v in checks.values()):
         overall = "degraded"
 
-    return {"status": overall, "service": "neuralscape-memory", "checks": checks}
+    response_data = {
+        "status": overall,
+        "service": "neuralscape-memory",
+        "checks": checks,
+    }
+    if knowledge_systems:
+        response_data["knowledge_systems"] = knowledge_systems
+
+    return response_data
 
 
 @app.post("/memories")
@@ -1238,6 +1289,125 @@ def _map_code_graph_error(e: Exception) -> HTTPException:
     return HTTPException(status_code=404, detail=str(e))
 
 
+async def _dispatch_code_system(
+    knowledge_system: str,
+    operation: str,
+    code_space: str | None,
+    caller: str,
+    *,
+    query: str,
+    label: str | None = None,
+    source: str | None = None,
+    target: str | None = None,
+    mode: str = "bfs",
+    depth: int = 3,
+    limit: int = 10,
+    max_hops: int | None = None,
+    relation_filter: str | None = None,
+    token_budget: int | None = None,
+):
+    """Route a code-graph op through the router/auto-router → a bound engine.
+
+    Called when the caller passed a ``knowledge_system`` — either an explicit
+    engine name (layer 1 override) or the sentinel ``"auto"`` (AR2: per-op
+    auto-selection of the measured-best HEALTHY capable engine). The generic
+    (native/graphify-json) path stays byte-identical when ``knowledge_system`` is
+    absent. Mirrors the MCP code-tool routing (transport-agnostic; nothing
+    branches on transport).
+
+    Returns the SystemAnswer (``answer.system_name`` = the engine that actually
+    served — for ``auto`` this is the resolved engine, the AR3 attribution).
+    Raises HTTPException on unavailable/incapable/unbindable.
+    """
+    from knowledge.base import RecallRequest
+    from knowledge.code_dispatch import (
+        resolve_auto_bound_system,
+        resolve_bound_code_system,
+    )
+    from knowledge.router import resolve_systems
+
+    if not code_space:
+        raise HTTPException(
+            status_code=400,
+            detail="knowledge_system requires graph_id (the code_space, e.g. code--owner--repo)",
+        )
+
+    if knowledge_system == "auto":
+        # AR2 auto-selection: resolve + bind the best healthy engine for this op,
+        # falling through candidates on a miss. Bind OFF the loop (lazy graphify
+        # build / CBM bridge probe).
+        bound, _served, _reason = await asyncio.to_thread(
+            resolve_auto_bound_system, operation, code_space, caller, settings
+        )
+        if bound is None:
+            # No capable healthy engine → honest N/A (503, not a fabricated 200).
+            raise HTTPException(
+                status_code=503,
+                detail=f"auto-routing found no healthy engine for '{operation}' ({_reason})",
+            )
+    else:
+        decision = resolve_systems(
+            query=query or label or source or "code",
+            project_id=None,
+            knowledge_system=knowledge_system,
+            operation=operation,
+            is_code_tool=True,
+        )
+        resolved = decision.systems[0] if decision.systems else None
+        # The router falls back to base (ns-memory) when the requested code system
+        # is missing / unhealthy / lacks the capability — surface that as a clean
+        # error rather than silently answering from memory on a code tool.
+        if resolved is None or resolved.info.name != knowledge_system:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"knowledge_system '{knowledge_system}' is unavailable or does not "
+                    f"support '{operation}' ({decision.rationale})"
+                ),
+            )
+
+        # Bind OFF the event loop: the bind may lazy-build a graphify graph
+        # (~seconds) or probe the CBM bridge (network) — never on the loop
+        # (Fable must-fix #1).
+        bound = await asyncio.to_thread(
+            resolve_bound_code_system, knowledge_system, code_space, caller, settings
+        )
+        if bound is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"could not bind an engine for '{knowledge_system}' at code_space "
+                    f"'{code_space}' (repo not in CODE_REPOS / not indexed / bridge down)"
+                ),
+            )
+
+    req = RecallRequest(
+        query=query or label or source or "code",
+        user_id=caller,
+        operation=operation,
+        label=label,
+        source=source,
+        target=target,
+        mode=mode,
+        depth=depth,
+        limit=limit,
+        max_hops=max_hops,
+        relation_filter=relation_filter,
+        token_budget=token_budget,
+    )
+    from adapters.code_graph.engine import EngineCapabilityError
+
+    try:
+        return await asyncio.to_thread(bound.recall, req)
+    except EngineCapabilityError as e:
+        # Honest N/A (e.g. CBM path via banned Cypher) → 501, not a 500 crash.
+        raise HTTPException(status_code=501, detail=str(e)) from e
+    except RuntimeError as e:
+        # e.g. an unbound engine slipped through — degrade to a clean 400, never a
+        # raw 500 (Fable must-fix #2).
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
 @v1_router.get("/code-graph/query")
 async def v1_code_graph_query(
     request: Request,
@@ -1246,11 +1416,24 @@ async def v1_code_graph_query(
     depth: int = Query(3, ge=1, le=6),
     token_budget: int = Query(2000, ge=100, le=20000),
     graph_id: str | None = Query(None, description="Artifact id of an ingested graph.json bundle (owner-scoped); omit for the configured default graph"),
+    knowledge_system: str | None = Query(None, description="Route to a code knowledge system (code-cbm | code-graphify-lib | code-native), or 'auto' for per-op auto-selection of the measured-best healthy engine; graph_id carries the code_space. Omit for the default native/graphify-json path."),
     user_id: str | None = Query(None),
 ):
     """Search the code graph (BFS/DFS from scored seeds) — Graphify's query, NS's surface."""
     cg = _code_graph_or_501()
     caller = _resolve_user_id(request, user_id)
+    if knowledge_system:
+        answer = await _dispatch_code_system(
+            knowledge_system, "query", graph_id, caller,
+            query=question, mode=mode, depth=depth, token_budget=token_budget,
+        )
+        _meter_code_nav_bg("code_nav_query", caller, served_text=answer.content)
+        return {
+            "result": answer.content,
+            "graph_id": graph_id,
+            "system": answer.system_name,  # AR3: engine that actually served
+            "routed_by": knowledge_system,  # "auto" or the explicit pin
+        }
     try:
         text = await asyncio.to_thread(
             cg.query_code_graph,
@@ -1264,6 +1447,7 @@ async def v1_code_graph_query(
         )
     except cg.CodeGraphError as e:
         raise _map_code_graph_error(e) from e
+    _meter_code_nav_bg("code_nav_query", caller, served_text=text)
     return {"result": text, "graph_id": graph_id}
 
 
@@ -1273,11 +1457,24 @@ async def v1_code_graph_neighbors(
     label: str = Query(..., min_length=1, max_length=500),
     relation_filter: str = Query("", max_length=100),
     graph_id: str | None = Query(None),
+    knowledge_system: str | None = Query(None, description="Route to a code knowledge system (code-cbm | code-graphify-lib | code-native) or 'auto' (per-op auto-selection); graph_id carries the code_space."),
     user_id: str | None = Query(None),
 ):
     """Direct in/out neighbors of one code-graph node, with relation + confidence tags."""
     cg = _code_graph_or_501()
     caller = _resolve_user_id(request, user_id)
+    if knowledge_system:
+        answer = await _dispatch_code_system(
+            knowledge_system, "neighbors", graph_id, caller,
+            query=label, label=label, relation_filter=relation_filter,
+        )
+        _meter_code_nav_bg("code_nav_neighbors", caller, served_text=answer.content)
+        return {
+            "result": answer.content,
+            "graph_id": graph_id,
+            "system": answer.system_name,  # AR3: engine that actually served
+            "routed_by": knowledge_system,  # "auto" or the explicit pin
+        }
     try:
         text = await asyncio.to_thread(
             cg.get_code_neighbors,
@@ -1289,6 +1486,7 @@ async def v1_code_graph_neighbors(
         )
     except cg.CodeGraphError as e:
         raise _map_code_graph_error(e) from e
+    _meter_code_nav_bg("code_nav_neighbors", caller, served_text=text)
     return {"result": text, "graph_id": graph_id}
 
 
@@ -1299,11 +1497,23 @@ async def v1_code_graph_path(
     target: str = Query(..., min_length=1, max_length=500),
     max_hops: int = Query(8, ge=1, le=32),
     graph_id: str | None = Query(None),
+    knowledge_system: str | None = Query(None, description="Route to a code knowledge system (code-cbm | code-graphify-lib | code-native) or 'auto' (per-op auto-selection); graph_id carries the code_space."),
     user_id: str | None = Query(None),
 ):
     """Shortest connection path between two code-graph symbols (how does A reach B?)."""
     cg = _code_graph_or_501()
     caller = _resolve_user_id(request, user_id)
+    if knowledge_system:
+        answer = await _dispatch_code_system(
+            knowledge_system, "path", graph_id, caller,
+            query=source, source=source, target=target, max_hops=max_hops,
+        )
+        return {
+            "result": answer.content,
+            "graph_id": graph_id,
+            "system": answer.system_name,  # AR3: engine that actually served
+            "routed_by": knowledge_system,  # "auto" or the explicit pin
+        }
     try:
         text = await asyncio.to_thread(
             cg.code_path,
@@ -1325,6 +1535,7 @@ async def v1_code_graph_locate(
     query: str = Query(..., min_length=1, max_length=500),
     k: int = Query(10, ge=1, le=50),
     graph_id: str | None = Query(None),
+    knowledge_system: str | None = Query(None, description="Route to a code knowledge system (code-cbm | code-graphify-lib | code-native) or 'auto' (per-op auto-selection); graph_id carries the code_space."),
     user_id: str | None = Query(None),
 ):
     """Hybrid code retrieval: find symbols by description or name pattern (E3).
@@ -1335,6 +1546,27 @@ async def v1_code_graph_locate(
     """
     cg = _code_graph_or_501()
     caller = _resolve_user_id(request, user_id)
+    if knowledge_system:
+        answer = await _dispatch_code_system(
+            knowledge_system, "locate", graph_id, caller,
+            query=query, limit=k,
+        )
+        hits = answer.hits or []
+        # C4: this branch serves both structured rows AND the text summary —
+        # meter both so served isn't undercounted (which would overstate net).
+        _meter_code_nav_bg(
+            "code_nav_locate", caller,
+            served_obj={"results": hits, "result": answer.content},
+            files=[h.get("file") for h in hits if isinstance(h, dict) and h.get("file")],
+        )
+        return {
+            "results": hits,
+            "result": answer.content,
+            "graph_id": graph_id,
+            "system": answer.system_name,  # AR3: engine that actually served
+            "routed_by": knowledge_system,  # "auto" or the explicit pin
+            "k": k,
+        }
     try:
         hits = await asyncio.to_thread(
             cg.locate_symbols,
@@ -1349,7 +1581,143 @@ async def v1_code_graph_locate(
         results = [asdict(hit) for hit in hits]
     except cg.CodeGraphError as e:
         raise _map_code_graph_error(e) from e
+    # M3: baseline = the distinct enclosing files these hits let the model
+    # skip reading; served = the compact located rows (serialized off the
+    # request path inside the metering closure).
+    _meter_code_nav_bg(
+        "code_nav_locate", caller,
+        served_obj={"results": results},
+        files=[r.get("file") for r in results if r.get("file")],
+    )
     return {"results": results, "graph_id": graph_id, "k": k}
+
+
+@v1_router.get("/code-graph/impact")
+async def v1_code_graph_impact(
+    request: Request,
+    symbol: str = Query(..., min_length=1, max_length=500),
+    max_hops: int = Query(4, ge=1, le=16),
+    graph_id: str | None = Query(None),
+    knowledge_system: str | None = Query(None, description="Route to a code knowledge system (code-cbm | code-graphify-lib | code-native) or 'auto' (per-op auto-selection); graph_id carries the code_space."),
+    user_id: str | None = Query(None),
+):
+    """Compute blast radius from a given symbol (E7).
+
+    BFS over CALLS/IMPORTS edges to find all symbols affected by changes to the
+    given symbol. Returns a text summary (file:line format). E7: requires
+    NativeEngine (repo:<name> refs); raises 501 on GraphifyJsonEngine (.json artifacts).
+    """
+    from adapters.code_graph.engine import EngineCapabilityError
+
+    cg = _code_graph_or_501()
+    caller = _resolve_user_id(request, user_id)
+    if knowledge_system:
+        answer = await _dispatch_code_system(
+            knowledge_system, "impact", graph_id, caller,
+            query=symbol, label=symbol, max_hops=max_hops,
+        )
+        return {
+            "text": answer.content,
+            "symbol": symbol,
+            "max_hops": max_hops,
+            "graph_id": graph_id,
+            "system": answer.system_name,  # AR3: engine that actually served
+            "routed_by": knowledge_system,  # "auto" or the explicit pin
+        }
+    try:
+        text = await asyncio.to_thread(
+            cg.code_impact,
+            symbol,
+            user_id=caller,
+            settings=settings,
+            graph_id=graph_id,
+            max_hops=max_hops,
+        )
+    except EngineCapabilityError as e:
+        # blast_radius is native-only; graph.json artifacts can't serve it → 501.
+        raise HTTPException(status_code=501, detail=str(e)) from e
+    except cg.CodeGraphError as e:
+        raise _map_code_graph_error(e) from e
+    return {"text": text, "symbol": symbol, "max_hops": max_hops, "graph_id": graph_id}
+
+
+class CodeIndexRequest(BaseModel):
+    """Phase G: through-NS index trigger for a code knowledge system."""
+
+    repo_source: str = Field(..., min_length=1, description="Absolute path (or ref) of the repo to index")
+    system: str = Field(..., description="Target code system: code-cbm | code-graphify-lib | code-native")
+    project_id: str | None = Field(None, description="Project scope; sets routing config so later recalls route to this engine")
+    code_space: str | None = Field(None, description="Explicit code_space (code--owner--repo); default derived from user_id + repo basename")
+    user_id: str | None = Field(None)
+
+
+@v1_router.post("/code-graph/index")
+async def v1_code_graph_index(req: CodeIndexRequest, request: Request):
+    """Phase G: index a repo INTO a code knowledge system through NS (additive).
+
+    Enqueues on the ingest queue (PLAN §5) and returns 202 + a task id to poll
+    via ``GET /v1/memories/status/{task_id}``. The worker resolves the engine for
+    ``system``, runs ``engine.index(repo_source)``, records
+    ``{repo_sha, indexed_at, engine_version}`` per code_space, sets the project's
+    routing config, and runs the external-engine liveness diff. Idempotent at the
+    engine level (a re-index of the same code_space overwrites); each call gets a
+    unique job id so a re-index always re-runs (not coalesced on a cached result).
+    """
+    _code_graph_or_501()
+    caller = _resolve_user_id(request, req.user_id)
+
+    code_space = req.code_space
+    if not code_space:
+        from pathlib import Path as _P
+
+        repo_name = _P(req.repo_source.rstrip("/")).name or "repo"
+        code_space = f"code--{caller}--{repo_name}"
+
+    payload = {
+        "system": req.system,
+        "repo_source": req.repo_source,
+        "code_space": code_space,
+        "project_id": req.project_id,
+        "user_id": caller,
+    }
+    task_id = await _task_manager.enqueue_code_index(payload)
+    return JSONResponse(
+        status_code=202,
+        content={
+            "task_id": task_id,
+            "poll_url": f"/v1/memories/status/{task_id}",
+            "code_space": code_space,
+            "system": req.system,
+            "status": "accepted",
+        },
+    )
+
+
+@v1_router.delete("/code-graph/graph")
+async def v1_code_graph_delete(
+    request: Request,
+    graph_id: str = Query(..., min_length=1, description="code_space to reset (code--owner--repo)"),
+    system: str = Query(..., description="Target code system: code-cbm | code-graphify-lib | code-native"),
+    user_id: str | None = Query(None),
+):
+    """R-C: reset a code system's index for one code_space (true cold-delete).
+
+    Routes to the engine's ``teardown`` (native: drop the code_space label-space +
+    symbol cards, CodeAnchor preserved; cbm: bridge ``delete_project``;
+    graphify-lib: drop the in-process graph + evict its cache). Scoped strictly
+    to the code_space; it NEVER touches the memory graph or the memory↔code
+    anchors — those join on the memory's ``source_ref`` in Qdrant and are left
+    intact (assert-anchors-survive contract). Idempotent (a non-existent space
+    deletes 0). Enables truly cold per-rep index measurements in ICEBench.
+    """
+    _code_graph_or_501()
+    caller = _resolve_user_id(request, user_id)
+    from knowledge.code_dispatch import teardown_code_space
+
+    result = await asyncio.to_thread(
+        teardown_code_space, system, graph_id, caller, settings
+    )
+    return result
 
 
 # ── Connectors (data-layer sources) ──────────────
@@ -1547,6 +1915,10 @@ def _meter_index_recall_bg(op: str, user_id: str, hits, response) -> None:
         event = sm.measure_recall(op, hits, index_payload=payload)
         if event is not None:
             sm.record_event(user_id, event)
+            # M2: these items were served as index rows (content == 0). If the
+            # client full-fetches the same item within the window, that index
+            # saved nothing — arm the bounce detector.
+            sm.arm_bounce(user_id, hits)
 
     try:
         import telemetry
@@ -1565,6 +1937,9 @@ def _meter_full_recall_bg(op: str, user_id: str, hits) -> None:
         event = sm.measure_recall(op, hits, served_full=True)
         if event is not None:
             sm.record_event(user_id, event)
+            # M2: a full-fetch of items previously served as index rows is a
+            # bounce — deduct those illusory index credits.
+            sm.check_and_deduct_bounce(user_id, hits)
 
     try:
         import telemetry
@@ -1572,6 +1947,18 @@ def _meter_full_recall_bg(op: str, user_id: str, hits) -> None:
         telemetry.submit(_measure_and_record)
     except Exception:
         logger.debug("savings metering dispatch failed (non-fatal)", exc_info=True)
+
+
+# M3/M5 — code-nav read-avoidance metering. The parser (strict file-shape +
+# extension allowlist + cap) and the off-hot-path dispatch live in
+# savings_meter so BOTH transports (this REST surface + the MCP code tools)
+# meter identically; this is a thin transport shim.
+def _meter_code_nav_bg(op: str, user_id: str, *, served_text=None, served_obj=None, files=None) -> None:
+    import savings_meter as sm
+
+    sm.meter_code_nav_bg(
+        op, user_id, served_text=served_text, served_obj=served_obj, files=files
+    )
 
 
 # Union response model: Pydantic v2 smart-union validates the returned model
@@ -1892,20 +2279,32 @@ async def v1_event_stream(request: Request, user_id: str | None = Query(default=
 
 
 @v1_router.get("/metrics")
-async def v1_metrics(request: Request, user_id: str | None = Query(default=None)):
+async def v1_metrics(
+    request: Request,
+    user_id: str | None = Query(default=None),
+    task_id: str | None = Query(
+        default=None,
+        description="Optional task/session correlation id — adds a per-task savings rollup (M4) over events tagged with it.",
+    ),
+):
     """Cumulative token-savings totals (E2): per-caller + instance-wide.
 
     Sums the append-only savings ledger (Redis streams ``ns:savings:{user}``)
-    via O(1) running totals. ``net_tokens_saved`` is measured and SIGNED —
-    it includes every overhead charge (index rows, savings lines, and the
-    per-release tool-schema constant charged once per user per UTC day) and
-    may be negative. ``rederivation_savings_estimate`` is the separate,
-    clearly-labeled heuristic — never blended into the measured net.
+    via O(1) running totals, now sliced per-lifecycle and per-op with both
+    the raw ``net_tokens_saved`` and the bounce-corrected
+    ``adjusted_net_tokens_saved`` (M6). ``net_tokens_saved`` is measured and
+    SIGNED — it includes every overhead charge (index rows, savings lines,
+    and the per-release tool-schema constant charged once per user per UTC
+    day) and may be negative. ``rederivation_savings_estimate`` is the
+    separate, clearly-labeled heuristic — never blended into either net.
+
+    Pass ``task_id`` to also get a per-task rollup over events sharing that
+    correlation id.
     """
     import savings_meter as sm
 
     caller = _resolve_user_id(request, user_id)
-    snapshot = await asyncio.to_thread(sm.metrics_snapshot, caller)
+    snapshot = await asyncio.to_thread(sm.metrics_snapshot, caller, None, task_id)
     return {"status": "ok", "savings_meter": snapshot}
 
 
@@ -2727,6 +3126,69 @@ async def v1_emit_extension_event(req: EmitEventRequest):
         "extensions_notified": result.notified_count,
         "responses": result.responses,
     }
+
+
+# ── Project Knowledge Config (Phase D) ──────────────────────────────────
+
+
+class ProjectKnowledgeConfigRequest(BaseModel):
+    """Request to set/update a project's knowledge routing config."""
+
+    project_id: str
+    code_systems: list[str] | None = None
+    fuse_code_into_recall: bool = True  # DEFAULT TRUE per decision #3
+    default_engine: str | None = None
+
+
+class ProjectKnowledgeConfigResponse(BaseModel):
+    """Response for project knowledge config."""
+
+    project_id: str
+    code_systems: list[str]
+    fuse_code_into_recall: bool
+    default_engine: str | None
+
+
+@v1_router.get("/projects/{project_id}/knowledge-config", response_model=ProjectKnowledgeConfigResponse)
+async def v1_get_project_knowledge_config(project_id: str):
+    """Get a project's knowledge routing config (Phase D)."""
+    from knowledge.router import get_project_config
+
+    config = get_project_config(project_id)
+    if config is None:
+        # Return default config if not set
+        return ProjectKnowledgeConfigResponse(
+            project_id=project_id,
+            code_systems=[],
+            fuse_code_into_recall=True,  # DEFAULT TRUE
+            default_engine=None,
+        )
+    return ProjectKnowledgeConfigResponse(
+        project_id=config.project_id,
+        code_systems=config.code_systems,
+        fuse_code_into_recall=config.fuse_code_into_recall,
+        default_engine=config.default_engine,
+    )
+
+
+@v1_router.put("/projects/{project_id}/knowledge-config", response_model=ProjectKnowledgeConfigResponse)
+async def v1_set_project_knowledge_config(project_id: str, req: ProjectKnowledgeConfigRequest):
+    """Set/update a project's knowledge routing config (Phase D)."""
+    from knowledge.router import ProjectKnowledgeConfig, set_project_config
+
+    config = ProjectKnowledgeConfig(
+        project_id=project_id,
+        code_systems=req.code_systems or [],
+        fuse_code_into_recall=req.fuse_code_into_recall,
+        default_engine=req.default_engine,
+    )
+    set_project_config(config)
+    return ProjectKnowledgeConfigResponse(
+        project_id=config.project_id,
+        code_systems=config.code_systems,
+        fuse_code_into_recall=config.fuse_code_into_recall,
+        default_engine=config.default_engine,
+    )
 
 
 # The wiki_synthesizer's /admin/synthesize endpoints were retired with the

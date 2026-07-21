@@ -30,17 +30,20 @@ def export_snapshot(repo_path: str, output_file: str, code_space: str):
     """
     # Import here to avoid circular deps
     from adapters.code_graph.native_engine import NativeEngine
+    from config import settings
     from memory_service import get_shared_service
 
     service = get_shared_service()
-    bridge = service.graphiti_client
-    settings = service.config
+    service._get_memory()  # ensure bridge is initialized
+    bridge = service._bridge
+    driver = getattr(getattr(service, "_graphiti", None), "driver", None)
 
     engine = NativeEngine(
         repo_path=repo_path,
         code_space=code_space,
         bridge=bridge,
         settings=settings,
+        driver=driver,
     )
 
     logger.info(f"Exporting snapshot from {code_space}...")
@@ -59,11 +62,13 @@ def import_snapshot(input_file: str, code_space: str):
         code_space: Partition key (code--{owner}--{repo}).
     """
     from adapters.code_graph.native_engine import NativeEngine
+    from config import settings
     from memory_service import get_shared_service
 
     service = get_shared_service()
-    bridge = service.graphiti_client
-    settings = service.config
+    service._get_memory()  # ensure bridge is initialized
+    bridge = service._bridge
+    driver = getattr(getattr(service, "_graphiti", None), "driver", None)
 
     # Create engine (repo_path not needed for import, set dummy)
     engine = NativeEngine(
@@ -71,6 +76,7 @@ def import_snapshot(input_file: str, code_space: str):
         code_space=code_space,
         bridge=bridge,
         settings=settings,
+        driver=driver,
     )
 
     input_path = Path(input_file)

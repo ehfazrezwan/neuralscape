@@ -50,6 +50,62 @@ class GraphifyJsonEngine:
         self.G = G
         self.graph_path = graph_path
 
+    # ── Canonical FQN normalization (Phase C) ───────────────────────────
+
+    @staticmethod
+    def to_canonical(raw_node_id: str) -> str:
+        """Normalize graphify's node ID to canonical FQN.
+
+        Graphify format: `<path>_<qualname>` (underscore-joined, file path + symbol).
+        Example: `src_click_termui_impl_progressbar` (node id).
+
+        Canonical format: `<module>.<qualname>` (src/lib stripped, '/' → '.').
+        Example: `click.termui.impl.progressbar`.
+
+        This is best-effort and operates PURELY on the ``raw_node_id`` string
+        (underscore→dot, then strip leading src/lib). It does not consult any
+        node ``label`` attribute — only the id it is given — so the
+        reconstruction is exactly as precise as graphify's file-path-derived id.
+
+        Args:
+            raw_node_id: Graphify node ID (underscore-joined, e.g. src_click_core_Group).
+
+        Returns:
+            Canonical FQN (best-effort reconstruction from the node id).
+        """
+        # Graphify node IDs are underscore-joined paths: src_click_core_Group.
+        # Reconstruct the dotted FQN: underscore→dot, then strip leading src/lib.
+
+        parts = raw_node_id.split("_")
+
+        # Strip genuine source-root directories from the start ONLY. Narrow set
+        # (src/lib) so real module names like `core`/`app`/`main` survive — see
+        # NativeEngine.to_canonical for the rationale.
+        root_markers = {"src", "lib"}
+        while parts and parts[0] in root_markers:
+            parts.pop(0)
+
+        canonical = ".".join(parts)
+        logger.debug(f"Graphify to_canonical: {raw_node_id} → {canonical}")
+        return canonical
+
+    @staticmethod
+    def from_canonical(canonical_fqn: str) -> str:
+        """Convert canonical FQN back to graphify node ID (best-effort).
+
+        Since graphify uses underscore-joined file paths as node IDs, we can't
+        reconstruct them exactly from canonical FQNs. Instead, we return a
+        search-friendly pattern: dots → underscores.
+
+        Args:
+            canonical_fqn: Canonical FQN (e.g. click.core.Group).
+
+        Returns:
+            Graphify node ID pattern (underscore-joined).
+        """
+        # For search, convert dots to underscores (graphify's node ID format).
+        return canonical_fqn.replace(".", "_")
+
     def query(
         self,
         question: str,
@@ -168,6 +224,36 @@ class GraphifyJsonEngine:
             "GraphifyJsonEngine operates on static graph.json artifacts and has no "
             "dense-embedding code_index collection. Use query() for structure search."
         )
+
+    def get_symbol_inventory(self) -> set[str]:
+        """Get current symbol inventory (canonical FQNs) for liveness tracking.
+
+        Phase E: Used to detect deleted/changed symbols after reindex.
+        Returns canonical FQNs (via to_canonical) so the liveness diff is
+        engine-agnostic.
+
+        Returns:
+            Set of canonical FQNs currently indexed.
+        """
+        if not self.G:
+            return set()
+
+        # Extract all node IDs (raw FQNs) and canonicalize them. Skip falsy node
+        # ids and falsy canonicals so no "repo::None"/"repo::" anchor key is built.
+        canonical_fqns = set()
+        for node_id in self.G.nodes():
+            if not node_id:
+                continue
+            try:
+                canonical = self.to_canonical(node_id)
+            except Exception:
+                # Skip malformed node IDs
+                continue
+            if canonical:
+                canonical_fqns.add(canonical)
+
+        logger.debug("Graphify symbol inventory: %d canonical FQNs", len(canonical_fqns))
+        return canonical_fqns
 
     def detect_changes(
         self,

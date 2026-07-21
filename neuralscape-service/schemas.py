@@ -1192,6 +1192,12 @@ class MemoryResponse(BaseModel):
     # to the storage time.
     occurred_at: str | None = None
 
+    # R4: Graphiti bi-temporal edge validity interval (when a fact became true /
+    # ceased to be true; ISO 8601). None for non-graph rows or when the edge
+    # validity is unknown. Only meaningful after R1 threads real event time in.
+    valid_at: str | None = None
+    invalid_at: str | None = None
+
     # Memory-model v2 (all optional, render as null for legacy memories)
     domain: str | None = None
     observation_type: str | None = None
@@ -1200,6 +1206,9 @@ class MemoryResponse(BaseModel):
     related_memory_ids: list[str] | None = None
     confidence: float | None = None
     expires_at: str | None = None
+
+    # T1.2: Speaker attribution (null for memories without speaker metadata)
+    speaker: str | None = None
 
     # Provenance epistemics (A1; null for memories that predate it)
     derived_from: list[str] | None = None

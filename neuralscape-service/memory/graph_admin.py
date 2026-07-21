@@ -367,3 +367,232 @@ class GraphAdminMixin:
             "breakdown": breakdown,
             "samples": all_samples[:15],
         }
+
+    def rebuild_graph_from_vectors(
+        self,
+        *,
+        user_id: str | None = None,
+        project_id: str | None = None,
+        wipe_first: bool = False,
+        batch_size: int = 256,
+        max_rows: int | None = None,
+    ) -> dict:
+        """Rebuild the knowledge graph from EXISTING Qdrant vector rows WITHOUT re-extracting or re-embedding.
+
+        This is the efficiency win for future re-ingests where only graph-side
+        logic changed (e.g. R1 reference_time, R2 message-type, R4 bitemporal
+        fields): it re-enriches the graph per stored vector row, bypassing the
+        write-path content-hash dedup graph-skip (audit R6).
+
+        The dedup skip (worker.py ~line 251-253 `if created and memories:`)
+        means re-asserting an existing fact returns created=False and skips
+        graph enrichment, starving Graphiti's contradiction/dup engine. This
+        batch rebuild path sidesteps that skip by enriching every row directly.
+
+        CRITICAL SEMANTIC SCOPE:
+        - Single-fact path (store_raw/remember/ingest_document): 1 Qdrant
+          vector row ⇄ 1 graph episode. A vector→graph rebuild reproduces this
+          graph EXACTLY.
+        - Conversation path (extract_and_store, used by accuracy bench): the
+          graph episode is the RAW CONVERSATION text (one episode per session),
+          while Qdrant holds EXTRACTED FACTS. A vector-only rebuild produces a
+          PER-FACT graph, NOT the original per-conversation graph — and the raw
+          conversation is not in Qdrant. This method is the SINGLE-FACT-equivalent
+          rebuild; conversation-extraction stores need the raw conversations,
+          not just vectors.
+
+        Args:
+            user_id: Scope to user's memories (owner filter). None = all users.
+            project_id: Scope to project. None = all projects.
+            wipe_first: Clear graph for the scope before rebuilding. Requires
+                user_id for safety (refuses global wipe without explicit scope).
+            batch_size: Qdrant scroll page size (1-500, default 256).
+            max_rows: Optional cap on rows processed (for testing / partial rebuilds).
+
+        Returns:
+            Dict with counts: {"scanned": N, "enriched": M, "failed": F, "skipped": S}
+        """
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+        from schemas import MemoryVisibility
+
+        # Safety: refuse global graph wipe without explicit scope
+        if wipe_first and not user_id:
+            return {
+                "error": "wipe_first requires user_id (refusing global graph wipe without explicit scope)"
+            }
+
+        # Trigger lazy mem0/Graphiti init up front (cold instances have
+        # _graphiti/_bridge unset until _get_memory runs) so wipe_first below
+        # actually runs instead of silently no-oping (Copilot review).
+        m = self._get_memory()
+        client = m.vector_store.client
+        collection = settings.qdrant_collection
+
+        # Wipe graph for the scope if requested — PRIVATE groups ONLY.
+        if wipe_first:
+            logger.info(f"Wiping PRIVATE graph groups for user_id={user_id}, project_id={project_id}")
+            try:
+                from memory.groups import _build_group_id
+
+                # ONLY the caller's PRIVATE group(s). The SHARED group_id
+                # (`shared` / `shared--project--{pid}`) is CROSS-USER — it holds
+                # every user's shared knowledge — so a per-user rebuild must
+                # never expire it (Copilot review: that would wipe shared graph
+                # state for everyone). Shared-pool rebuilds are out of scope here.
+                groups_to_wipe = [
+                    _build_group_id(MemoryVisibility.PRIVATE.value, user_id, project_id or None)
+                ]
+
+                # Expire all edges in these groups
+                if self._graphiti and self._bridge:
+                    from graphiti_core.edges import EntityEdge
+
+                    def _make_expire(gid):
+                        async def _expire_group():
+                            edges = await EntityEdge.get_by_group_ids(
+                                self._graphiti.driver, group_ids=[gid], limit=10000
+                            )
+                            now = datetime.now(timezone.utc)
+                            for edge in edges:
+                                edge.expired_at = now
+                            await EntityEdge.save_bulk(self._graphiti.driver, edges)
+                        return _expire_group
+
+                    for group_id in groups_to_wipe:
+                        try:
+                            self._run_on_bridge(_make_expire(group_id)())
+                        except Exception as e:
+                            logger.warning(f"Failed to wipe group {group_id} (non-critical): {e}")
+            except Exception as e:
+                logger.warning(f"Graph wipe failed (non-critical): {e}")
+
+        # Build Qdrant filter for the scope
+        must = []
+        if project_id:
+            must.append(
+                FieldCondition(key="metadata.project_id", match=MatchValue(value=project_id))
+            )
+
+        # Owner scoping: ownership lives EITHER in metadata.owner_user_id
+        # (shared/newer rows) OR the top-level `user_id` (legacy/private rows)
+        # — mirror the retag sweep's should-OR so neither shape is missed
+        # (Copilot review). Qdrant: match = all(must) AND none(must_not) AND
+        # at least one(should) when should is non-empty.
+        should = []
+        if user_id:
+            should.append(
+                FieldCondition(key="metadata.owner_user_id", match=MatchValue(value=user_id))
+            )
+            should.append(
+                FieldCondition(key="user_id", match=MatchValue(value=user_id))
+            )
+
+        # Exclude verbatim passage chunks (mirror _scroll_standard convention)
+        must_not = [
+            FieldCondition(key="metadata.memory_kind", match=MatchValue(value="passage"))
+        ]
+
+        scroll_filter = (
+            Filter(
+                must=must or None,
+                must_not=must_not,
+                should=should or None,
+            )
+            if (must or must_not or should)
+            else None
+        )
+        page_size = max(1, min(batch_size, 500))
+
+        scanned = enriched = failed = skipped = 0
+        offset = None
+
+        logger.info(
+            f"Starting graph rebuild from vectors: user_id={user_id}, project_id={project_id}, "
+            f"max_rows={max_rows}, batch_size={page_size}"
+        )
+
+        while True:
+            # Scroll Qdrant for existing rows
+            try:
+                points, offset = client.scroll(
+                    collection_name=collection,
+                    scroll_filter=scroll_filter,
+                    limit=page_size,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+            except Exception as e:
+                logger.error(f"Qdrant scroll failed: {e}")
+                break
+
+            if not points:
+                break
+
+            for point in points:
+                scanned += 1
+                if max_rows and scanned > max_rows:
+                    logger.info(f"Hit max_rows cap ({max_rows}), stopping")
+                    break
+
+                try:
+                    # Extract fields from the Qdrant point payload
+                    payload = getattr(point, "payload", None) or {}
+                    content = payload.get("data", "")
+                    if not content:
+                        skipped += 1
+                        continue
+
+                    metadata = payload.get("metadata", {}) or {}
+                    # Unwrap double-nested metadata if present
+                    if isinstance(metadata.get("metadata"), dict):
+                        metadata = metadata["metadata"]
+
+                    memory_id = str(getattr(point, "id", ""))
+                    owner_user_id = metadata.get("owner_user_id") or payload.get("user_id")
+                    if not owner_user_id:
+                        logger.warning(f"Row {memory_id} has no owner_user_id, skipping")
+                        skipped += 1
+                        continue
+
+                    row_project_id = metadata.get("project_id")
+                    visibility = metadata.get("visibility") or MemoryVisibility.PRIVATE.value
+                    occurred_at = metadata.get("occurred_at")
+                    source_ref = metadata.get("source_ref")
+
+                    # Call enrich_graph with the stored fields (NO re-extraction, NO re-embedding)
+                    success = self.enrich_graph(
+                        content=content,
+                        user_id=owner_user_id,
+                        project_id=row_project_id,
+                        visibility=visibility,
+                        memory_id=memory_id,
+                        source_ref=source_ref,
+                        occurred_at=occurred_at,
+                    )
+
+                    if success:
+                        enriched += 1
+                    else:
+                        failed += 1
+
+                except Exception as e:
+                    logger.warning(f"Failed to enrich row {getattr(point, 'id', '?')}: {e}")
+                    failed += 1
+
+            if max_rows and scanned >= max_rows:
+                break
+            if offset is None:
+                break
+
+        logger.info(
+            f"Graph rebuild complete: scanned={scanned}, enriched={enriched}, "
+            f"failed={failed}, skipped={skipped}"
+        )
+
+        return {
+            "scanned": scanned,
+            "enriched": enriched,
+            "failed": failed,
+            "skipped": skipped,
+        }

@@ -70,6 +70,11 @@ code-graph = [
     "graphifyy>=0.9.5",
     "tree-sitter>=0.23.0",
     "tree-sitter-language-pack>=0.1.0",
+    "zstandard>=0.22.0",
+    # Wave 3 neighbors resolver: pure-Python static analysis to resolve Python
+    # call targets to real symbols (token-free, index-time only). Trivial dep
+    # (only parso), no compiled extensions.
+    "jedi>=0.19",
 ]
 
 [tool.uv.sources]

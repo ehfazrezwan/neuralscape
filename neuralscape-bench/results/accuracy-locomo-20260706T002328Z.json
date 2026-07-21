@@ -1,0 +1,110 @@
+{
+  "suite": "locomo",
+  "display": "LoCoMo",
+  "timestamp": "2026-07-06T00:23:28.671546+00:00",
+  "ns_commit": "dcc0dd7",
+  "config": {
+    "target": "http://localhost:8398",
+    "k": 10,
+    "reasoning_level": "high",
+    "judge_model": "gemini-2.5-flash",
+    "sample": null,
+    "seed": 42,
+    "suite_options": {}
+  },
+  "dataset": {
+    "conversations": 10,
+    "sessions": 272,
+    "turns": 5882,
+    "conversation_chars": 858764,
+    "qa_items": 1986,
+    "qa_by_type": {
+      "1-multi-hop": 282,
+      "2-temporal": 321,
+      "3-open-domain": 96,
+      "4-single-hop": 841,
+      "5-adversarial": 446
+    }
+  },
+  "run": {
+    "conversations": 10,
+    "sessions": 272,
+    "ingest_wall_s": 3361.1,
+    "est_tokens": 219130
+  },
+  "metrics": {
+    "overall": {
+      "n": 1986,
+      "judged": 1986,
+      "correct": 993,
+      "accuracy": 0.5
+    },
+    "by_type": {
+      "1-multi-hop": {
+        "n": 282,
+        "judged": 282,
+        "correct": 98,
+        "accuracy": 0.3475
+      },
+      "2-temporal": {
+        "n": 321,
+        "judged": 321,
+        "correct": 99,
+        "accuracy": 0.3084
+      },
+      "3-open-domain": {
+        "n": 96,
+        "judged": 96,
+        "correct": 24,
+        "accuracy": 0.25
+      },
+      "4-single-hop": {
+        "n": 841,
+        "judged": 841,
+        "correct": 355,
+        "accuracy": 0.4221
+      },
+      "5-adversarial": {
+        "n": 446,
+        "judged": 446,
+        "correct": 417,
+        "accuracy": 0.935
+      }
+    },
+    "abstention": {
+      "n": 446,
+      "correct": 417,
+      "explicit_abstain_flag": 369
+    },
+    "retrieval_recall_at_10": {
+      "n": 1982,
+      "hits": 1397,
+      "recall": 0.7048
+    }
+  },
+  "published_comparison": [
+    {
+      "system": "mem0",
+      "metric": "LLM-judge overall",
+      "score": "66.9%",
+      "source": "mem0 paper (arXiv 2504.19413)"
+    },
+    {
+      "system": "mem0-graph",
+      "metric": "LLM-judge overall",
+      "score": "68.4%",
+      "source": "mem0 paper (arXiv 2504.19413)"
+    },
+    {
+      "system": "Honcho",
+      "metric": "LLM-judge overall",
+      "score": "89.9%",
+      "source": "honcho.dev/evals (self-reported)"
+    }
+  ],
+  "caveats": [
+    "Competitor figures are self-reported on their own configurations (different answer models, retrieval settings, and judge models).",
+    "Retrieval R@k uses lexical session attribution over distilled memories (see metrics.py) \u2014 not a turn-id echo from the store.",
+    "Dreaming/consolidation disabled for the baseline run; a post-dream re-run is future work (NS's differentiator experiment)."
+  ]
+}
