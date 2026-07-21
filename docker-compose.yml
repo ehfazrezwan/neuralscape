@@ -135,6 +135,47 @@ services:
     profiles:
       - cbm  # Only starts when --profile cbm is specified
 
+  # ── Precise Neighbors Resolver ──────────────────────────────────────
+  # REST shim over pyright-langserver (pyright, MIT): resolves a repo's call
+  # graph to real definitions at INDEX time when CODE_NEIGHBORS_RESOLVER=lsp.
+  # Its own image (Node + pyright + a thin FastAPI shim) — the neuralscape-service
+  # image is deliberately NOT touched (that isolation is the whole point). Runs at
+  # index time only, so it adds ZERO query-latency. Profile-gated
+  # (`--profile resolver`) so the base stack is unaffected. To resolve a repo,
+  # pyright must read its files on disk, so mount each repo to resolve at the SAME
+  # path NS passes as repo_path (supplied by the deployment overlay, exactly like
+  # the cbm-bridge corpus mount — kept out of this generic file).
+  resolver-svc:
+    build:
+      context: resolver-svc
+      dockerfile: Dockerfile
+    ports:
+      - "8201:8201"
+    restart: unless-stopped
+    environment:
+      PORT: 8201
+      PYRIGHT_SETTLE_SECONDS: ${PYRIGHT_SETTLE_SECONDS:-2.0}
+      RESOLVER_TIMEOUT: ${RESOLVER_TIMEOUT:-600}
+    deploy:
+      resources:
+        limits:
+          memory: ${RESOLVER_MEMORY_LIMIT:-4G}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8201/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    labels:
+      com.neuralscape.autoheal: "true"
+    profiles:
+      - resolver  # Only starts when --profile resolver is specified
+
   neuralscape:
     build:
       context: .

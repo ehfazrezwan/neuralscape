@@ -309,9 +309,13 @@ class NativeEngine:
         return mode if mode in ("off", "local", "cloud") else "local"
 
     def _neighbors_resolver_mode(self) -> str:
-        """Resolve the neighbors call-graph resolver: "off" | "jedi" (Wave 3)."""
+        """Resolve the neighbors call-graph resolver: "off" | "jedi" | "lsp".
+
+        "jedi" (Wave 3) is in-process Jedi; "lsp" (resolver-svc mission) calls the
+        external pyright resolver service and falls back to Jedi if it is down.
+        """
         mode = getattr(self.settings, "code_neighbors_resolver", "jedi")
-        return mode if mode in ("off", "jedi") else "jedi"
+        return mode if mode in ("off", "jedi", "lsp") else "jedi"
 
     def locate(
         self,
@@ -1054,7 +1058,7 @@ class NativeEngine:
         # (the store MATCHes both endpoints, so cross-file targets must already be
         # in the graph).
         resolver_mode = self._neighbors_resolver_mode()
-        self._resolver_collect = resolver_mode == "jedi"
+        self._resolver_collect = resolver_mode in ("jedi", "lsp")
         self._pending_call_sites: dict[str, list[dict]] = {}
         symbols_by_file: dict[str, list[tuple[int, int, str]]] = {}
 
@@ -1926,42 +1930,55 @@ class NativeEngine:
         total_sites = sum(len(v) for v in sites_by_file.values())
         if not total_sites:
             return 0
-        try:
-            import jedi  # noqa: F401  — probe so a truly-missing dep warns here
-            from adapters.code_graph.code_resolve import JediCallResolver
-        except Exception:
+        resolver, provenance = self._build_call_resolver(repo_path)
+        if resolver is None:
             logger.warning(
-                "jedi resolver unavailable — neighbors stays heuristic (~0 CALLS)",
-                exc_info=True,
+                "no call resolver available — neighbors stays heuristic (~0 CALLS)",
             )
             return 0
 
         _t0 = _time.time()
-        resolver = JediCallResolver(repo_path)
         resolved: list[dict] = []
         resolved_count = 0
-        for rel_path, sites in sites_by_file.items():
-            abs_path = repo_path / rel_path
-            try:
-                source = abs_path.read_text(encoding="utf-8", errors="ignore")
-            except Exception:
-                continue
-            defs = resolver.resolve_file(
-                abs_path, source, [(s["line"], s["col"]) for s in sites]
-            )
-            for site, (def_path, def_line) in zip(sites, defs):
-                if not def_path or def_line is None:
-                    continue  # unresolved (stdlib/external/dynamic) → dropped
-                tgt = self._map_def_to_fqn(
-                    def_path, def_line, repo_path, symbols_by_file
+        # MF-1: the LSP path carries no definition-kind info, so require the
+        # resolved def to land on a symbol's exact span start (a real def/class
+        # line) — this filters callable-attribute resolutions that would otherwise
+        # mint false edges to the enclosing method/class. Jedi already kind-filters,
+        # so it keeps plain span containment.
+        require_start = provenance == "lsp"
+        try:
+            for rel_path, sites in sites_by_file.items():
+                abs_path = repo_path / rel_path
+                try:
+                    source = abs_path.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    continue
+                defs = resolver.resolve_file(
+                    abs_path, source, [(s["line"], s["col"]) for s in sites]
                 )
-                if not tgt:
-                    continue  # resolved outside the repo's indexed symbols
-                src = site["src_fqn"]
-                if src == tgt:
-                    continue  # skip trivial self-recursion self-loops
-                resolved_count += 1
-                resolved.append({"src_fqn": src, "tgt_fqn": tgt})
+                for site, (def_path, def_line) in zip(sites, defs):
+                    if not def_path or def_line is None:
+                        continue  # unresolved (stdlib/external/dynamic) → dropped
+                    tgt = self._map_def_to_fqn(
+                        def_path, def_line, repo_path, symbols_by_file,
+                        require_start=require_start,
+                    )
+                    if not tgt:
+                        continue  # resolved outside the repo's indexed symbols
+                    src = site["src_fqn"]
+                    if src == tgt:
+                        continue  # skip trivial self-recursion self-loops
+                    resolved_count += 1
+                    resolved.append({"src_fqn": src, "tgt_fqn": tgt})
+        finally:
+            # Release any resolver-held resources (LspCallResolver owns an
+            # httpx.Client; leaving it open leaks sockets across many indexes).
+            close = getattr(resolver, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    logger.debug("resolver close failed (non-fatal)", exc_info=True)
 
         # Dedup (src, tgt) — many call sites share the same edge.
         seen: set[tuple[str, str]] = set()
@@ -1973,26 +1990,70 @@ class NativeEngine:
             seen.add(key)
             uniq.append(e)
 
-        self._store_resolved_call_edges(uniq)
+        self._store_resolved_call_edges(uniq, provenance)
         logger.info(
-            "Jedi neighbors resolver: %d/%d call sites resolved to in-repo "
+            "%s neighbors resolver: %d/%d call sites resolved to in-repo "
             "symbols → %d distinct CALLS edges (%d files) in %.2fs",
-            resolved_count, total_sites, len(uniq), len(sites_by_file),
+            provenance, resolved_count, total_sites, len(uniq), len(sites_by_file),
             _time.time() - _t0,
         )
         return len(uniq)
 
+    def _build_call_resolver(self, repo_path: Path):
+        """Select the neighbors call resolver, returning ``(resolver, provenance)``.
+
+        - ``lsp``: the external pyright resolver service (resolver-svc). Probed
+          first; if unreachable we transparently fall back to in-process Jedi so a
+          down service degrades gracefully rather than dropping every edge (the
+          brief keeps Jedi as the fallback).
+        - ``jedi``: in-process Jedi.
+
+        Returns ``(None, None)`` only when neither resolver can be constructed.
+        The ``provenance`` string tags stored CALLS edges (``r.resolver``) so the
+        stale-edge cleanup and the meter reflect what actually resolved.
+        """
+        mode = self._neighbors_resolver_mode()
+        if mode == "lsp":
+            try:
+                from adapters.code_graph.code_resolve_lsp import LspCallResolver
+
+                url = getattr(
+                    self.settings, "code_resolver_url", "http://resolver-svc:8201"
+                )
+                resolver = LspCallResolver(repo_path, url)
+                resolver.health()  # raises if the service is down/unhealthy
+                logger.info("neighbors resolver: using pyright service at %s", url)
+                return resolver, "lsp"
+            except Exception:
+                logger.warning(
+                    "LSP resolver unavailable — falling back to in-process Jedi",
+                    exc_info=True,
+                )
+                # fall through to Jedi
+
+        try:
+            import jedi  # noqa: F401  — probe so a truly-missing dep warns here
+            from adapters.code_graph.code_resolve import JediCallResolver
+
+            return JediCallResolver(repo_path), "jedi"
+        except Exception:
+            logger.warning("jedi resolver unavailable", exc_info=True)
+            return None, None
+
     def _delete_stale_resolved_calls(self, files: list[str]) -> None:
-        """Delete resolver='jedi' CALLS edges whose SOURCE symbol lives in one of
-        the re-parsed ``files``, so a call removed by an edit doesn't survive an
-        incremental reindex (MF-1: keeps the resolved graph — and the neighbors
-        count on the meter — from monotonically over-inflating)."""
+        """Delete any resolver-produced CALLS edge (r.resolver set — 'jedi' or
+        'lsp') whose SOURCE symbol lives in one of the re-parsed ``files``, so a
+        call removed by an edit doesn't survive an incremental reindex (MF-1: keeps
+        the resolved graph — and the neighbors count on the meter — from
+        monotonically over-inflating). Matching ANY resolver (not just the active
+        one) also means switching resolvers, e.g. jedi→lsp, cleanly replaces the
+        prior resolver's edges for the re-parsed files instead of double-counting."""
         if not files:
             return
         try:
             self._run_cypher_with_retry(
-                "MATCH (src:CodeSymbol {code_space: $cs})-[r:CALLS {resolver: 'jedi'}]->() "
-                "WHERE src.file IN $files DELETE r",
+                "MATCH (src:CodeSymbol {code_space: $cs})-[r:CALLS]->() "
+                "WHERE src.file IN $files AND r.resolver IS NOT NULL DELETE r",
                 cs=self.code_space, files=files,
             )
         except Exception:
@@ -2004,12 +2065,24 @@ class NativeEngine:
         def_line: int,
         repo_root: Path,
         symbols_by_file: dict[str, list[tuple[int, int, str]]],
+        require_start: bool = False,
     ) -> str | None:
-        """Map a Jedi definition ``(abs_path, line)`` to the EXACT stored symbol
-        FQN whose span contains that line — so a resolved target always matches an
-        existing :CodeSymbol (never a new phantom). Prefers the innermost span
-        (largest start). Falls back to a Neo4j lookup for files not in
-        ``symbols_by_file`` (incremental reindex: unchanged files weren't parsed)."""
+        """Map a resolver definition ``(abs_path, line)`` to the EXACT stored symbol
+        FQN — so a resolved target always matches an existing :CodeSymbol (never a
+        new phantom). Falls back to a Neo4j lookup for files not in
+        ``symbols_by_file`` (incremental reindex: unchanged files weren't parsed).
+
+        ``require_start`` (Fable MF-1): when True, only accept a definition that
+        lands on a symbol's **span START** (its ``def``/``class`` line), not merely
+        within its span. Jedi kind-filters to function/class before returning, so
+        its def line is always a def line; the LSP path has no kind info, so a call
+        on a callable-valued ATTRIBUTE (``self.cb = lambda...``; ``d.cb()``) would
+        otherwise resolve to the assignment line INSIDE the enclosing method's span
+        and containment-map to a false ``caller → Method`` / ``caller → Class``
+        edge. Requiring an exact span-start match drops those (an assignment line is
+        never a symbol's start line) while keeping every real function/method/class
+        call (pyright's targetSelectionRange points at the def/class line, == the
+        stored span start). Used for lsp provenance; jedi keeps containment."""
         try:
             rel = str(Path(def_abs_path).resolve().relative_to(Path(repo_root).resolve()))
         except Exception:
@@ -2024,7 +2097,12 @@ class NativeEngine:
         best: tuple[int, int, str] | None = None
         for start, end, fqn in spans:
             hi = end or start
-            if start <= def_line <= hi and (best is None or start > best[0]):
+            if require_start:
+                # Exact def/class line only (see docstring — filters attribute /
+                # assignment resolutions that land mid-span).
+                if start == def_line and (best is None or start > best[0]):
+                    best = (start, hi, fqn)
+            elif start <= def_line <= hi and (best is None or start > best[0]):
                 best = (start, hi, fqn)
         return best[2] if best else None
 
@@ -2051,10 +2129,12 @@ class NativeEngine:
             spans.append((start, end, r.get("fqn") or ""))
         return spans
 
-    def _store_resolved_call_edges(self, edges: list[dict]) -> None:
+    def _store_resolved_call_edges(
+        self, edges: list[dict], provenance: str = "jedi"
+    ) -> None:
         """Store resolved CALLS edges, MATCHing both endpoints (both symbols exist
         by now). extraction='extracted' (statically resolved → epistemic explicit);
-        r.resolver='jedi' marks the provenance."""
+        r.resolver=<provenance> ('jedi' | 'lsp') marks which resolver produced it."""
         if not edges:
             return
         _BATCH = 500
@@ -2066,9 +2146,11 @@ class NativeEngine:
             MATCH (tgt:CodeSymbol {code_space: $cs, fqn: row.tgt_fqn})
             MERGE (src)-[r:CALLS]->(tgt)
             SET r.extraction = 'extracted', r.epistemic_level = 'explicit',
-                r.resolver = 'jedi'
+                r.resolver = $provenance
             """
-            self._run_cypher_with_retry(cypher, cs=self.code_space, rows=batch)
+            self._run_cypher_with_retry(
+                cypher, cs=self.code_space, rows=batch, provenance=provenance
+            )
 
     def _compute_degrees(self):
         """Compute in+out degree for all symbols and persist it."""
@@ -2543,7 +2625,20 @@ class NativeEngine:
         ]
 
     def _find_symbol(self, label: str) -> list[dict]:
-        """Find symbols by FQN substring match."""
+        """Find symbols by FQN substring match.
+
+        NOTE (resolver-svc mission diagnosis): this unordered ``CONTAINS`` +
+        ``LIMIT 5`` returns an arbitrary ``matches[0]``, so an ambiguous bare label
+        like ``Argument`` can resolve to ``tests…test_argument_order`` (name merely
+        *contains* "argument") instead of the class ``…core.Argument`` — capping the
+        neighbors benchmark regardless of resolver quality. A ranked lookup
+        (exact-FQN → exact-final-segment → substring; then def kind; then degree)
+        plus caller-direction filtering for "who calls X" lifts the pyright graph's
+        neighbors from ~50% to ~70% F1 in offline measurement (see
+        ICE_V2_RESOLVER_RESULT.md). That fix touches the shared interactive query
+        path (all engines, latency-sensitive) so it is scoped as a follow-up, not
+        bundled into this resolver PR — the change here is intentionally left
+        minimal to avoid regressing the default jedi path."""
         cypher = """
         MATCH (s:CodeSymbol {code_space: $code_space})
         WHERE toLower(s.fqn) CONTAINS toLower($label)
