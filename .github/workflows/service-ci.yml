@@ -48,10 +48,14 @@ jobs:
   # The graphiti/ and mem0/ subtrees are pruned to library core (see
   # scripts/sync-upstream.sh keep-lists). When upstream app/example manifests
   # slip in (e.g. a pull from the unfiltered remote), dependabot floods the
-  # security tab with alerts for code we never install — 31 stale alerts were
-  # triaged away on 2026-07-22. Fail fast at PR time instead.
+  # security tab with alerts for code we never install — one past sync left
+  # 31 stale alerts to triage away. Fail fast at PR time instead.
   subtree-prune-guard:
+    needs: changes
+    if: needs.changes.outputs.service == 'true' || github.event_name == 'push'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
