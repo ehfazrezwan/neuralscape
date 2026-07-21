@@ -1319,6 +1319,74 @@ async def v1_code_graph_path(
     return {"result": text, "graph_id": graph_id}
 
 
+@v1_router.get("/code-graph/locate")
+async def v1_code_graph_locate(
+    request: Request,
+    query: str = Query(..., min_length=1, max_length=500),
+    k: int = Query(10, ge=1, le=50),
+    graph_id: str | None = Query(None),
+    user_id: str | None = Query(None),
+):
+    """Hybrid code retrieval: find symbols by description or name pattern (E3).
+
+    Uses dense embeddings + BM25 + degree signal. Returns file:line locations with
+    signatures and docstrings. E3: requires NativeEngine (repo:<name> refs); raises
+    501 on GraphifyJsonEngine (.json artifacts).
+    """
+    cg = _code_graph_or_501()
+    caller = _resolve_user_id(request, user_id)
+    try:
+        hits = await asyncio.to_thread(
+            cg.locate_symbols,
+            query,
+            user_id=caller,
+            settings=settings,
+            graph_id=graph_id,
+            k=k,
+        )
+        # Convert LocateHit dataclasses to dicts
+        from dataclasses import asdict
+        results = [asdict(hit) for hit in hits]
+    except cg.CodeGraphError as e:
+        raise _map_code_graph_error(e) from e
+    return {"results": results, "graph_id": graph_id, "k": k}
+
+
+@v1_router.get("/code-graph/impact")
+async def v1_code_graph_impact(
+    request: Request,
+    symbol: str = Query(..., min_length=1, max_length=500),
+    max_hops: int = Query(4, ge=1, le=16),
+    graph_id: str | None = Query(None),
+    user_id: str | None = Query(None),
+):
+    """Compute blast radius from a given symbol (E7).
+
+    BFS over CALLS/IMPORTS edges to find all symbols affected by changes to the
+    given symbol. Returns a text summary (file:line format). E7: requires
+    NativeEngine (repo:<name> refs); raises 501 on GraphifyJsonEngine (.json artifacts).
+    """
+    from adapters.code_graph.engine import EngineCapabilityError
+
+    cg = _code_graph_or_501()
+    caller = _resolve_user_id(request, user_id)
+    try:
+        text = await asyncio.to_thread(
+            cg.code_impact,
+            symbol,
+            user_id=caller,
+            settings=settings,
+            graph_id=graph_id,
+            max_hops=max_hops,
+        )
+    except EngineCapabilityError as e:
+        # blast_radius is native-only; graph.json artifacts can't serve it → 501.
+        raise HTTPException(status_code=501, detail=str(e)) from e
+    except cg.CodeGraphError as e:
+        raise _map_code_graph_error(e) from e
+    return {"text": text, "symbol": symbol, "max_hops": max_hops, "graph_id": graph_id}
+
+
 # ── Connectors (data-layer sources) ──────────────
 
 
@@ -2599,16 +2667,30 @@ async def v1_delete_junk_episodes(
 
 
 @v1_router.delete("/graph/episodes/{episode_uuid}")
-async def v1_delete_episode(episode_uuid: str):
-    """Delete a single episodic node by UUID."""
+async def v1_delete_episode(
+    request: Request,
+    episode_uuid: str,
+    user_id: str | None = Query(default=None),
+    project_id: str | None = Query(default=None),
+):
+    """Delete a single episodic node by UUID.
+
+    Authorization: the episode must belong to one of the caller's readable
+    group_ids (private + shared + standard-when-enabled).
+    """
+    resolved_user_id = _resolve_user_id(request, user_id)
     try:
         result = await asyncio.to_thread(
             _service.delete_episode,
             episode_uuid=episode_uuid,
+            user_id=resolved_user_id,
+            project_id=project_id,
         )
         if "error" in result:
             raise HTTPException(status_code=500, detail=result["error"])
         return {"status": "ok", **result}
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except HTTPException:
         raise
     except Exception as e:

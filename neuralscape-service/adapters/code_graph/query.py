@@ -1,11 +1,17 @@
-"""NS-surface code-structure queries — thin delegations to the graphifyy library.
+"""NS-surface code-structure queries — route through the CodeIntelEngine protocol.
+
+E1 refactor: the three public tools (query_code_graph, get_code_neighbors,
+code_path) now route through the CodeIntelEngine protocol via get_engine(),
+which selects GraphifyJsonEngine for .json artifact graph_ids (the only kind
+that exists today). Zero behavior change: GraphifyJsonEngine wraps the exact
+same graphify library calls that the old direct-call code path used.
 
 **The interaction interface is ALWAYS Neuralscape** (roadmap F2 constraint):
 agents call NS's own ``query_code_graph`` / ``get_code_neighbors`` /
 ``code_path`` MCP tools (or the matching ``/v1/code-graph/*`` REST routes),
-and NS resolves them against a ``graph.json`` via graphifyy's query layer.
-Clients are never pointed at Graphify's own MCP server; the ``source_ref``
-retrieval handles stamped on code-graph memories point back HERE.
+and NS resolves them against a ``graph.json`` via the engine. Clients are
+never pointed at Graphify's own MCP server; the ``source_ref`` retrieval
+handles stamped on code-graph memories point back HERE.
 
 Graph resolution (no arbitrary path reads — the API must not become a file
 oracle):
@@ -14,14 +20,6 @@ oracle):
   owner-scoped via :func:`ingest.storage.find_artifact` (one user cannot read
   another's graph by guessing an id);
 - otherwise the deployment-configured ``settings.code_graph_json_path``.
-
-Query semantics reuse graphify's own scoring/traversal/rendering
-(``_query_graph_text`` / ``_find_node`` / ``_score_nodes``). The neighbor and
-shortest-path renderers are small re-implementations of graphify's MCP tool
-bodies — those live as closures inside ``serve._build_server`` and aren't
-importable, but every non-trivial step (node search, edge access, label
-sanitisation, path-finding) still calls the library. Kept behaviorally aligned
-with graphify's ``get_neighbors`` / ``shortest_path`` tools.
 
 This module imports ``graphify`` at module level — import it only behind
 :func:`adapters.code_graph.code_graph_available`.
@@ -35,10 +33,9 @@ import threading
 from pathlib import Path
 
 import networkx as nx
-from graphify.build import edge_data
-from graphify.security import sanitize_label
-from graphify.serve import _find_node, _query_graph_text, _score_nodes
 
+from adapters.code_graph.engine import CodeIntelEngine
+from adapters.code_graph.graphify_engine import GraphifyJsonEngine
 from adapters.code_graph.semantic import CodeGraphError, load_code_graph
 
 logger = logging.getLogger(__name__)
@@ -48,10 +45,11 @@ class CodeGraphNotConfigured(CodeGraphError):
     """No graph.json to query: no graph_id given and no default path configured."""
 
 
-# ── Graph resolution + cache ────────────────────────────────────────
+# ── Graph resolution + engine cache ────────────────────────────────
 
-# path -> {"key": (mtime_ns, size), "G": nx.Graph} — mtime+size hot-reload,
-# mirroring graphify's own serve-layer cache.
+# E1: path -> {"key": (mtime_ns, size), "engine": CodeIntelEngine} — mtime+size
+# hot-reload, mirroring graphify's own serve-layer cache. E2+ will extend this
+# to cache NativeEngine instances keyed by repo:<name> refs.
 _ctx_lock = threading.Lock()
 _ctx_cache: dict[str, dict] = {}
 
@@ -87,8 +85,40 @@ def resolve_graph_path(graph_id: str | None, user_id: str, settings) -> str:
     return str(Path(os.path.expanduser(default)))
 
 
-def load_graph_cached(path: str) -> nx.Graph:
-    """Load graph.json via the library, cached per path until (mtime, size) changes."""
+def get_engine(graph_id: str | None, user_id: str, settings) -> CodeIntelEngine:
+    """Engine-selection factory: returns the right CodeIntelEngine for the graph ref.
+
+    E2: detects repo:<name> refs and returns NativeEngine; .json artifact paths
+    still return GraphifyJsonEngine. Engines are cached per ref (repo: by name,
+    .json by mtime+size).
+
+    Args:
+        graph_id: Artifact id, repo:<name> ref, or None (uses default path).
+        user_id: Owner-scoped resolution.
+        settings: Config for default path.
+
+    Returns:
+        A CodeIntelEngine (GraphifyJsonEngine or NativeEngine).
+
+    Raises:
+        CodeGraphNotConfigured: No graph_id and no default configured.
+        CodeGraphError: graph_id doesn't resolve or repo path not found.
+    """
+    # E2: detect repo:<name> refs
+    if graph_id and graph_id.startswith("repo:"):
+        repo_name = graph_id.removeprefix("repo:")
+        return _get_native_engine(repo_name, user_id, settings)
+
+    # Query-time: a `code--<owner>--<repo>` code_space ref resolves directly to
+    # the native engine for that space. The index already lives in Neo4j/Qdrant,
+    # so reads (query/neighbors/path/locate/impact) need no repo path. This is
+    # what lets an indexed repo be queried by its code_space without a
+    # code_repos entry (e.g. index-in-CI then query the persisted graph).
+    if graph_id and graph_id.startswith("code--"):
+        return _get_native_engine_by_code_space(graph_id, settings)
+
+    # E1 path: .json artifacts
+    path = resolve_graph_path(graph_id, user_id, settings)
     try:
         s = Path(path).stat()
     except FileNotFoundError:
@@ -96,21 +126,119 @@ def load_graph_cached(path: str) -> nx.Graph:
     key = (s.st_mtime_ns, s.st_size)
     ent = _ctx_cache.get(path)
     if ent is not None and ent["key"] == key:
-        return ent["G"]
+        return ent["engine"]
     with _ctx_lock:
         ent = _ctx_cache.get(path)
         if ent is not None and ent["key"] == key:
-            return ent["G"]  # another thread built it
+            return ent["engine"]  # another thread built it
+        # Load the graph and wrap it in GraphifyJsonEngine.
         G = load_code_graph(path)
-        _ctx_cache[path] = {"key": key, "G": G}
-        return G
+        engine = GraphifyJsonEngine(G, path)
+        _ctx_cache[path] = {"key": key, "engine": engine}
+        return engine
 
 
-def _resolve_and_load(graph_id: str | None, user_id: str, settings) -> nx.Graph:
-    return load_graph_cached(resolve_graph_path(graph_id, user_id, settings))
+def _get_native_engine(repo_name: str, user_id: str, settings) -> CodeIntelEngine:
+    """Get or create a cached NativeEngine for a repo:<name> ref (E2).
+
+    The repo path is resolved from settings.code_repos[repo_name] (a dict mapping
+    repo names to filesystem paths). Engines are cached by code_space key.
+
+    Raises:
+        CodeGraphError: repo_name not in configured repos or path doesn't exist.
+    """
+    from adapters.code_graph.native_engine import NativeEngine
+
+    # Resolve repo path from settings
+    repos = getattr(settings, "code_repos", {})
+    if not repos:
+        raise CodeGraphError(
+            "No code_repos configured. Set CODE_REPOS env var (JSON dict) "
+            "mapping repo names to filesystem paths."
+        )
+    repo_path = repos.get(repo_name)
+    if not repo_path:
+        raise CodeGraphError(
+            f"No repo configured with name {repo_name!r}. "
+            f"Available repos: {', '.join(repos.keys())}"
+        )
+    repo_path = Path(os.path.expanduser(repo_path))
+    if not repo_path.is_dir():
+        raise CodeGraphError(f"Repo path does not exist: {repo_path}")
+
+    # Build the code_space partition key
+    code_space = f"code--{user_id}--{repo_name}"
+
+    # Check cache (keyed by code_space, no mtime check — NativeEngine reads from Neo4j)
+    cache_key = f"native:{code_space}"
+    ent = _ctx_cache.get(cache_key)
+    if ent is not None:
+        return ent["engine"]
+
+    with _ctx_lock:
+        ent = _ctx_cache.get(cache_key)
+        if ent is not None:
+            return ent["engine"]
+
+        # Get the Graphiti bridge from the shared MemoryService
+        from memory_service import get_shared_service
+        service = get_shared_service()
+        service._get_memory()  # ensure bridge is initialized
+        bridge = service._bridge
+        if bridge is None:
+            raise CodeGraphError("Graphiti bridge not initialized (Neo4j unavailable)")
+
+        # Create NativeEngine. The Neo4j driver lives on the Graphiti client
+        # (service._graphiti.driver); the _AsyncBridge only carries the loop.
+        driver = getattr(getattr(service, "_graphiti", None), "driver", None)
+        engine = NativeEngine(
+            repo_path=str(repo_path),
+            code_space=code_space,
+            bridge=bridge,
+            settings=settings,
+            driver=driver,
+        )
+        _ctx_cache[cache_key] = {"engine": engine}
+        return engine
 
 
-# ── The three delegation queries ────────────────────────────────────
+def _get_native_engine_by_code_space(code_space: str, settings) -> CodeIntelEngine:
+    """Query-time NativeEngine bound to an existing code_space (reads only).
+
+    Unlike ``_get_native_engine`` (which needs a repo path to INDEX), reads
+    only need the code_space — the graph + code_index already live in Neo4j /
+    Qdrant. repo_path is a dummy; index() is never called on this instance.
+    Cached per code_space.
+    """
+    from adapters.code_graph.native_engine import NativeEngine
+
+    cache_key = f"native:{code_space}"
+    ent = _ctx_cache.get(cache_key)
+    if ent is not None:
+        return ent["engine"]
+    with _ctx_lock:
+        ent = _ctx_cache.get(cache_key)
+        if ent is not None:
+            return ent["engine"]
+        from memory_service import get_shared_service
+        service = get_shared_service()
+        service._get_memory()  # ensure bridge is initialized
+        bridge = service._bridge
+        if bridge is None:
+            raise CodeGraphError("Graphiti bridge not initialized (Neo4j unavailable)")
+        driver = getattr(getattr(service, "_graphiti", None), "driver", None)
+        engine = NativeEngine(
+            repo_path="",  # reads don't need a repo path
+            code_space=code_space,
+            bridge=bridge,
+            settings=settings,
+            driver=driver,
+        )
+        _ctx_cache[cache_key] = {"engine": engine}
+        return engine
+
+
+# ── The three delegation queries (now route through the protocol) ──
 
 
 def query_code_graph(
@@ -123,12 +251,17 @@ def query_code_graph(
     depth: int = 3,
     token_budget: int = 2000,
 ) -> str:
-    """Search the code graph (BFS/DFS from scored seed nodes) — graphify's query_graph."""
-    G = _resolve_and_load(graph_id, user_id, settings)
-    mode = mode if mode in ("bfs", "dfs") else "bfs"
-    depth = max(1, min(int(depth), 6))
-    token_budget = max(100, min(int(token_budget), 20_000))
-    return _query_graph_text(G, question, mode=mode, depth=depth, token_budget=token_budget)
+    """Search the code graph (BFS/DFS from scored seed nodes) — routes through engine.
+
+    E4: NativeEngine enriches results with attached memories (respects read scope).
+    """
+    engine = get_engine(graph_id, user_id, settings)
+    # Try passing user_id for E4 enrichment; GraphifyJsonEngine ignores extra kwargs
+    try:
+        return engine.query(question, mode=mode, depth=depth, token_budget=token_budget, user_id=user_id)
+    except TypeError:
+        # Fallback for engines that don't accept user_id (backward compat)
+        return engine.query(question, mode=mode, depth=depth, token_budget=token_budget)
 
 
 def get_code_neighbors(
@@ -139,35 +272,15 @@ def get_code_neighbors(
     graph_id: str | None = None,
     relation_filter: str = "",
 ) -> str:
-    """Direct in/out neighbors of a node — graphify's get_neighbors behavior."""
-    G = _resolve_and_load(graph_id, user_id, settings)
-    matches = _find_node(G, label)
-    if not matches:
-        return f"No node matching '{sanitize_label(label)}' found."
-    nid = matches[0]
-    rel_filter = (relation_filter or "").lower()
-    lines = [f"Neighbors of {sanitize_label(G.nodes[nid].get('label', nid))}:"]
-    for nb in G.successors(nid):
-        d = edge_data(G, nid, nb)
-        rel = d.get("relation", "")
-        if rel_filter and rel_filter not in rel.lower():
-            continue
-        lines.append(
-            f"  --> {sanitize_label(G.nodes[nb].get('label', nb))} "
-            f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]"
-        )
-    for nb in G.predecessors(nid):
-        d = edge_data(G, nb, nid)
-        rel = d.get("relation", "")
-        if rel_filter and rel_filter not in rel.lower():
-            continue
-        lines.append(
-            f"  <-- {sanitize_label(G.nodes[nb].get('label', nb))} "
-            f"[{sanitize_label(str(rel))}] [{sanitize_label(str(d.get('confidence', '')))}]"
-        )
-    if len(lines) == 1:
-        lines.append("  (no neighbors matching the filter)")
-    return "\n".join(lines)
+    """Direct in/out neighbors of a node — routes through engine.
+
+    E4: NativeEngine enriches results with attached memories.
+    """
+    engine = get_engine(graph_id, user_id, settings)
+    try:
+        return engine.neighbors(label, relation_filter=relation_filter, user_id=user_id)
+    except TypeError:
+        return engine.neighbors(label, relation_filter=relation_filter)
 
 
 def code_path(
@@ -179,46 +292,84 @@ def code_path(
     graph_id: str | None = None,
     max_hops: int = 8,
 ) -> str:
-    """Shortest path between two symbols — graphify's shortest_path behavior."""
-    G = _resolve_and_load(graph_id, user_id, settings)
-    src_scored = _score_nodes(G, [t.lower() for t in source.split()])
-    tgt_scored = _score_nodes(G, [t.lower() for t in target.split()])
-    if not src_scored:
-        return f"No node matching source '{sanitize_label(source)}' found."
-    if not tgt_scored:
-        return f"No node matching target '{sanitize_label(target)}' found."
-    src_nid, tgt_nid = src_scored[0][1], tgt_scored[0][1]
-    if src_nid == tgt_nid:
-        return (
-            f"'{sanitize_label(source)}' and '{sanitize_label(target)}' both resolved "
-            f"to the same node '{sanitize_label(src_nid)}'. Use a more specific label."
+    """Shortest path between two symbols — routes through engine."""
+    engine = get_engine(graph_id, user_id, settings)
+    return engine.path(source, target, max_hops=max_hops)
+
+
+def locate_symbols(
+    query: str,
+    *,
+    user_id: str,
+    settings,
+    graph_id: str | None = None,
+    k: int = 10,
+):
+    """Hybrid code retrieval — routes through engine (E3: NativeEngine only).
+
+    E4: Results enriched with attached memories (respects read scope).
+
+    Args:
+        query: Natural-language description or symbol name pattern.
+        user_id: Owner-scoped resolution + memory read-scope.
+        settings: Config for default path / repo resolution.
+        graph_id: Artifact id, repo:<name> ref, or None (uses default).
+        k: Max hits to return.
+
+    Returns:
+        List of LocateHit dataclasses (E4: with memories field populated).
+
+    Raises:
+        EngineCapabilityError: When the engine lacks locate (GraphifyJsonEngine).
+        CodeGraphError: graph_id doesn't resolve or repo not configured.
+    """
+    from adapters.code_graph.engine import EngineCapabilityError
+
+    k = max(1, min(int(k), 50))  # clamp to [1, 50]
+    engine = get_engine(graph_id, user_id, settings)
+    return engine.locate(query, k=k, user_id=user_id)
+
+
+def code_impact(
+    symbol: str,
+    *,
+    user_id: str,
+    settings,
+    graph_id: str | None = None,
+    max_hops: int = 4,
+) -> str:
+    """Blast radius from a symbol — routes through engine (E7: NativeEngine only).
+
+    BFS over CALLS/IMPORTS edges to find all symbols affected by changes to the
+    given symbol. Returns a text summary (file:line format).
+
+    Args:
+        symbol: FQN or partial match of the epicenter symbol.
+        user_id: Owner-scoped resolution.
+        settings: Config for default path / repo resolution.
+        graph_id: Artifact id, repo:<name> ref, or None (uses default).
+        max_hops: Maximum BFS depth (1-16, default 4).
+
+    Returns:
+        Text summary of affected symbols.
+
+    Raises:
+        EngineCapabilityError: When the engine lacks blast_radius (GraphifyJsonEngine).
+        CodeGraphError: graph_id doesn't resolve or repo not configured.
+    """
+    from adapters.code_graph.engine import EngineCapabilityError
+
+    max_hops = max(1, min(int(max_hops), 16))  # clamp to [1, 16]
+    engine = get_engine(graph_id, user_id, settings)
+    # blast_radius is native-only. GraphifyJsonEngine (.json artifacts) has no
+    # such method — surface a clean EngineCapabilityError (→ 501) rather than
+    # letting a bare AttributeError bubble up as an HTTP 500.
+    impact = getattr(engine, "blast_radius", None)
+    if not callable(impact):
+        raise EngineCapabilityError(
+            "code_impact/blast_radius requires the native code-intel engine "
+            "(repo:<name> refs). GraphifyJsonEngine operates on static graph.json "
+            "artifacts and has no blast-radius traversal. Index the repo with the "
+            "native engine (native_index_cli) to use code_impact."
         )
-    try:
-        path_nodes = nx.shortest_path(G.to_undirected(as_view=True), src_nid, tgt_nid)
-    except (nx.NetworkXNoPath, nx.NodeNotFound):
-        return (
-            f"No path found between "
-            f"'{sanitize_label(G.nodes[src_nid].get('label', src_nid))}' and "
-            f"'{sanitize_label(G.nodes[tgt_nid].get('label', tgt_nid))}'."
-        )
-    hops = len(path_nodes) - 1
-    max_hops = max(1, min(int(max_hops), 32))
-    if hops > max_hops:
-        return f"Path exceeds max_hops={max_hops} ({hops} hops found)."
-    segments: list[str] = []
-    for i in range(hops):
-        u, v = path_nodes[i], path_nodes[i + 1]
-        if G.has_edge(u, v):
-            edata, forward = edge_data(G, u, v), True
-        else:
-            edata, forward = edge_data(G, v, u), False
-        rel = sanitize_label(str(edata.get("relation", "")))
-        conf = edata.get("confidence", "")
-        conf_str = f" [{sanitize_label(str(conf))}]" if conf else ""
-        if i == 0:
-            segments.append(sanitize_label(G.nodes[u].get("label", u)))
-        if forward:
-            segments.append(f"--{rel}{conf_str}--> {sanitize_label(G.nodes[v].get('label', v))}")
-        else:
-            segments.append(f"<--{rel}{conf_str}-- {sanitize_label(G.nodes[v].get('label', v))}")
-    return f"Shortest path ({hops} hops):\n  " + " ".join(segments)
+    return impact(symbol, max_hops=max_hops)

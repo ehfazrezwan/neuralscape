@@ -303,6 +303,23 @@ class Settings(BaseSettings):
     # setting: each ingested graph.json is an owner-scoped artifact addressed by
     # its graph_id (stamped into every produced memory's source_ref).
     code_graph_json_path: str = ""
+    # Native code-intel engine (E2+): a JSON dict mapping repo names to on-disk
+    # paths, so a `repo:<name>` graph ref resolves to a filesystem repo the
+    # NativeEngine indexes into its own Neo4j label-space. Set via env
+    # CODE_REPOS='{"myrepo":"/abs/path"}'. Empty ⇒ no native repos configured;
+    # the native engine self-reports "No code_repos configured" and only the
+    # graph.json (GraphifyJsonEngine) path is reachable — byte-for-byte the
+    # pre-E2 behavior. Additive + optional (default {}), so nothing changes for
+    # deployments that don't opt in.
+    code_repos: dict[str, str] = {}
+    # Deterministic-by-default (product directive): the native code-intel engine
+    # must be deterministic + API-token-free by default. Symbol-card embedding at
+    # index time and the dense leg of `locate` go through a cloud embedder
+    # (Gemini) — so they are OPT-IN. Default OFF ⇒ index skips symbol-card
+    # embedding entirely and `locate` degrades gracefully to BM25 + graph-degree
+    # (local, deterministic, no network). Set true to enable cloud semantic
+    # locate. (A local-embedder option is a planned follow-up.)
+    code_index_embeddings: bool = False
     # Confidence assigned per Graphify edge/insight confidence tag (F1 epistemic
     # mapping): EXTRACTED → epistemic_level="explicit", INFERRED → "deductive"
     # with reduced confidence, AMBIGUOUS → stored only when its assigned

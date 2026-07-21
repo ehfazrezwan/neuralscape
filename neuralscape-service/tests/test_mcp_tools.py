@@ -51,13 +51,13 @@ def _code_graph_tool_names() -> set[str]:
 
     if not code_graph_available():
         return set()
-    return {"query_code_graph", "get_code_neighbors", "code_path"}
+    return {"query_code_graph", "get_code_neighbors", "code_path", "locate", "code_impact"}
 
 
 class TestListTools:
     @pytest.mark.asyncio
     async def test_returns_22_core_tools(self):
-        # 22 core tools + the 3 code-graph delegation tools (= 25) when the
+        # 22 core tools + the 5 code-graph delegation tools (= 27) when the
         # optional graphifyy extra is installed (dev installs have it).
         tools = await mcp_server.list_tools()
         assert len(tools) == 22 + len(_code_graph_tool_names())
