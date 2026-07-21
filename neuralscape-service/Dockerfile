@@ -89,7 +89,10 @@ USER appuser
 
 EXPOSE 8199
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8199"]
+# Configurable uvicorn worker count via UVICORN_WORKERS env var (default 1).
+# Multiple workers enable concurrent request handling across CPU cores, but each
+# holds its own interpreter/model state. Default 1 preserves single-process behavior.
+CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port 8199 --workers ${UVICORN_WORKERS:-1}"]
 
 # ── Stage 3: Test ───────────────────────────────────────────────
 # Mirrors runtime but includes dev dependencies (pytest, etc.) and the

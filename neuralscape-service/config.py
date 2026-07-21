@@ -96,6 +96,12 @@ class Settings(BaseSettings):
     ingest_queue_name: str = "neuralscape:ingest"
     arq_max_retries: int = 3
     arq_job_timeout: int = 300  # 5 min max per task
+    # Override the global ThreadPoolExecutor used by asyncio.to_thread (batch-get,
+    # code-graph reads). 0 = use Python default (min(32, cpu+4)); >0 sets explicit
+    # size. The stdlib default silently caps concurrent to_thread calls, which
+    # bottlenecks batch-get under load. Raise this when UVICORN_WORKERS>1 for
+    # proportional concurrency (e.g. workers=4, to_thread=48).
+    to_thread_max_workers: int = 0
 
     # LLM retry (exponential backoff for transient 503/429 errors)
     llm_max_retries: int = 3
