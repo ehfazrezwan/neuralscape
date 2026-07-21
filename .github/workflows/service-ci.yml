@@ -45,6 +45,30 @@ jobs:
               - "docker-compose*.yml"
               - ".github/workflows/service-ci.yml"
 
+  # The graphiti/ and mem0/ subtrees are pruned to library core (see
+  # scripts/sync-upstream.sh keep-lists). When upstream app/example manifests
+  # slip in (e.g. a pull from the unfiltered remote), dependabot floods the
+  # security tab with alerts for code we never install — 31 stale alerts were
+  # triaged away on 2026-07-22. Fail fast at PR time instead.
+  subtree-prune-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Fail if non-core files are tracked under the subtrees
+        run: |
+          bad=$(git ls-files mem0/ graphiti/ \
+            | grep -vE '^mem0/(mem0|pyproject\.toml|poetry\.lock|README\.md|LICENSE|\.agents|\.claude-plugin|\.cursor-plugin|\.gitignore|\.pre-commit-config\.yaml)(/|$)' \
+            | grep -vE '^graphiti/(graphiti_core|pyproject\.toml|uv\.lock|README\.md|LICENSE|py\.typed|\.env\.example|\.gitignore)(/|$)' \
+            || true)
+          if [ -n "$bad" ]; then
+            echo "::error::Non-core files tracked under the pruned subtrees (policy: library core only — they rot into dependabot noise):"
+            echo "$bad"
+            exit 1
+          fi
+          echo "subtrees clean"
+
   host-tests:
     needs: changes
     if: needs.changes.outputs.service == 'true' || github.event_name == 'push'
@@ -65,7 +89,11 @@ jobs:
           enable-cache: true
           cache-dependency-glob: "neuralscape-service/uv.lock"
       - name: Install dependencies
-        run: uv sync --frozen
+        # --extra code-graph: the suite includes code-graph adapter tests
+        # (test_cbm_import, test_code_resolve*) that import zstandard/jedi.
+        # Without the extra they fail on import here while passing in-container
+        # (the image installs it) — a phantom FAILURE on every service PR.
+        run: uv sync --frozen --extra code-graph
       - name: Run fast suite
         run: uv run pytest tests/ --ignore=tests/test_async_pipeline.py -q
 
