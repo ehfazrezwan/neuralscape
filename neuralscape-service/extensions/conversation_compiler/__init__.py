@@ -238,7 +238,11 @@ class ConversationCompilerExtension:
             return None
 
     async def _handle_session_end(self, payload: dict) -> Optional[dict]:
-        """Handle session end: check if auto-compile is needed."""
+        """Handle session end: check if auto-compile is needed.
+
+        Enqueues compilation to ARQ for async processing to avoid blocking
+        the API event loop. Falls back to inline execution when no ARQ pool.
+        """
         user_id = payload.get("user_id", "")
         if not user_id:
             return None
@@ -257,6 +261,22 @@ class ConversationCompilerExtension:
             return None
 
         logger.info("Auto-compile triggered on session end", date=today)
+
+        # PRIMARY FIX: enqueue to ARQ instead of blocking the event loop
+        if self._task_manager and self._task_manager.pool:
+            try:
+                job = await self._task_manager.pool.enqueue_job(
+                    "process_conversation_compile",
+                    today,
+                    user_id,
+                )
+                task_id = job.job_id if job else "duplicate"
+                logger.info("Auto-compile enqueued to ARQ", date=today, task_id=task_id)
+                return {"status": "accepted", "task_id": task_id, "date": today}
+            except Exception:
+                logger.warning("ARQ enqueue failed, falling back to inline compile")
+
+        # Fallback: run inline when no ARQ pool (local dev, test environments)
         try:
             result = await compile_date(today, self.service, self.writer, user_id=user_id)
             self.writer.append_log(f"Auto-compiled {today} on session end")

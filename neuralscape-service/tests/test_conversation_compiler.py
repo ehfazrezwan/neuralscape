@@ -829,3 +829,267 @@ class TestHandleMemoryStored:
         assert result is not None
         cat_file = tmp_vault / "_raw" / "Project" / "Conventions" / "entries.md"
         assert cat_file.exists()
+
+
+# ──────────────────────────────────────────────
+# _handle_session_end tests (issue #213 fix)
+# ──────────────────────────────────────────────
+
+
+class TestHandleSessionEnd:
+    """Tests for the ConversationCompilerExtension._handle_session_end handler.
+
+    Tests the fix for issue #213: session_end must enqueue to ARQ instead of
+    blocking the API event loop with inline compile_date + sync dedup.
+    """
+
+    @pytest.fixture
+    def extension(self, tmp_vault):
+        from extensions.conversation_compiler import ConversationCompilerExtension
+        from extensions.conversation_compiler.obsidian_writer import ObsidianWriter
+
+        ext = ConversationCompilerExtension()
+        ext._writer = ObsidianWriter(vault_path=tmp_vault)
+        ext._service = MagicMock()
+        ext._task_manager = None  # No task manager by default
+        return ext
+
+    @pytest.mark.asyncio
+    async def test_enqueues_to_arq_when_pool_available(self, extension, tmp_vault):
+        """With an ARQ pool, session_end should enqueue, NOT call compile_date inline."""
+        # Mock task manager with a pool
+        mock_task_manager = MagicMock()
+        mock_pool = AsyncMock()
+        mock_job = MagicMock()
+        mock_job.job_id = "job-123"
+        mock_pool.enqueue_job = AsyncMock(return_value=mock_job)
+        mock_task_manager.pool = mock_pool
+        extension._task_manager = mock_task_manager
+
+        # Create an uncompiled daily log for today with proper frontmatter
+        from datetime import datetime
+        today = datetime.now().strftime("%Y-%m-%d")
+        daily_path = tmp_vault / "_raw" / "Daily" / f"{today}.md"
+        daily_path.parent.mkdir(parents=True, exist_ok=True)
+        daily_path.write_text("---\ncompiled: false\n---\n\n# Daily Log\n\n- 10:00 | Test entry\n")
+
+        # Trigger session_end with auto_compile enabled
+        # Patch compiler_settings at the module level where it's imported
+        from extensions.conversation_compiler import config as compiler_config_module
+        original_auto_compile = compiler_config_module.compiler_settings.auto_compile
+        original_compile_after_hour = compiler_config_module.compiler_settings.compile_after_hour
+
+        try:
+            compiler_config_module.compiler_settings.auto_compile = True
+            compiler_config_module.compiler_settings.compile_after_hour = 0
+
+            result = await extension._handle_session_end({"user_id": "ehfaz"})
+        finally:
+            compiler_config_module.compiler_settings.auto_compile = original_auto_compile
+            compiler_config_module.compiler_settings.compile_after_hour = original_compile_after_hour
+
+        # Assert it enqueued to ARQ
+        assert result is not None
+        assert result["status"] == "accepted"
+        assert result["task_id"] == "job-123"
+        assert result["date"] == today
+
+        # Assert enqueue_job was called with correct args
+        mock_pool.enqueue_job.assert_awaited_once_with(
+            "process_conversation_compile",
+            today,
+            "ehfaz",
+        )
+
+    @pytest.mark.asyncio
+    async def test_fallback_to_inline_when_no_pool(self, extension, tmp_vault):
+        """Without an ARQ pool, session_end falls back to inline compile."""
+        # No task manager — fallback path
+        extension._task_manager = None
+
+        # Create an uncompiled daily log for today with proper frontmatter
+        from datetime import datetime
+        today = datetime.now().strftime("%Y-%m-%d")
+        daily_path = tmp_vault / "_raw" / "Daily" / f"{today}.md"
+        daily_path.parent.mkdir(parents=True, exist_ok=True)
+        daily_path.write_text("---\ncompiled: false\n---\n\n# Daily Log\n\n- 10:00 | preference | Test entry\n")
+
+        from extensions.conversation_compiler import config as compiler_config_module
+        original_auto_compile = compiler_config_module.compiler_settings.auto_compile
+        original_compile_after_hour = compiler_config_module.compiler_settings.compile_after_hour
+
+        try:
+            compiler_config_module.compiler_settings.auto_compile = True
+            compiler_config_module.compiler_settings.compile_after_hour = 0
+
+            result = await extension._handle_session_end({"user_id": "ehfaz"})
+        finally:
+            compiler_config_module.compiler_settings.auto_compile = original_auto_compile
+            compiler_config_module.compiler_settings.compile_after_hour = original_compile_after_hour
+
+        # Assert compile_date was called inline (fallback) - verify by checking result structure
+        assert result is not None
+        # Result should NOT have status="accepted" (that's the ARQ path)
+        # It should have the CompileResult fields instead
+        assert "status" not in result or result.get("status") != "accepted"
+        assert "date" in result
+        assert result["date"] == today
+
+    @pytest.mark.asyncio
+    async def test_skips_when_auto_compile_disabled(self, extension):
+        """session_end should skip when auto_compile is disabled."""
+        from extensions.conversation_compiler import config as compiler_config_module
+        original_auto_compile = compiler_config_module.compiler_settings.auto_compile
+
+        try:
+            compiler_config_module.compiler_settings.auto_compile = False
+
+            result = await extension._handle_session_end({"user_id": "ehfaz"})
+
+            assert result is None
+        finally:
+            compiler_config_module.compiler_settings.auto_compile = original_auto_compile
+
+    @pytest.mark.asyncio
+    async def test_skips_when_already_compiled(self, extension, tmp_vault):
+        """session_end should skip when today's log is already compiled."""
+        from datetime import datetime
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        # Mark today's log as compiled
+        daily_path = tmp_vault / "_raw" / "Daily" / f"{today}.md"
+        daily_path.parent.mkdir(parents=True, exist_ok=True)
+        daily_path.write_text("---\ncompiled: true\n---\n\n# Daily Log\n")
+
+        from extensions.conversation_compiler import config as compiler_config_module
+        original_auto_compile = compiler_config_module.compiler_settings.auto_compile
+        original_compile_after_hour = compiler_config_module.compiler_settings.compile_after_hour
+
+        try:
+            compiler_config_module.compiler_settings.auto_compile = True
+            compiler_config_module.compiler_settings.compile_after_hour = 0
+
+            result = await extension._handle_session_end({"user_id": "ehfaz"})
+
+            assert result is None
+        finally:
+            compiler_config_module.compiler_settings.auto_compile = original_auto_compile
+            compiler_config_module.compiler_settings.compile_after_hour = original_compile_after_hour
+
+    @pytest.mark.asyncio
+    async def test_arq_enqueue_exception_falls_back(self, extension, tmp_vault):
+        """If ARQ enqueue fails, should fall back to inline execution."""
+        # Mock task manager with a pool that raises on enqueue
+        mock_task_manager = MagicMock()
+        mock_pool = AsyncMock()
+        mock_pool.enqueue_job = AsyncMock(side_effect=RuntimeError("Redis down"))
+        mock_task_manager.pool = mock_pool
+        extension._task_manager = mock_task_manager
+
+        from datetime import datetime
+        today = datetime.now().strftime("%Y-%m-%d")
+        daily_path = tmp_vault / "_raw" / "Daily" / f"{today}.md"
+        daily_path.parent.mkdir(parents=True, exist_ok=True)
+        daily_path.write_text("---\ncompiled: false\n---\n\n# Daily Log\n\n- 10:00 | preference | Test entry\n")
+
+        from extensions.conversation_compiler import config as compiler_config_module
+        original_auto_compile = compiler_config_module.compiler_settings.auto_compile
+        original_compile_after_hour = compiler_config_module.compiler_settings.compile_after_hour
+
+        try:
+            compiler_config_module.compiler_settings.auto_compile = True
+            compiler_config_module.compiler_settings.compile_after_hour = 0
+
+            result = await extension._handle_session_end({"user_id": "ehfaz"})
+        finally:
+            compiler_config_module.compiler_settings.auto_compile = original_auto_compile
+            compiler_config_module.compiler_settings.compile_after_hour = original_compile_after_hour
+
+        # Assert it fell back to inline compile (ARQ enqueue was attempted but failed)
+        mock_pool.enqueue_job.assert_awaited_once()  # Verify enqueue was attempted
+        assert result is not None
+        # Result should NOT have status="accepted" - it should be the CompileResult
+        assert "status" not in result or result.get("status") != "accepted"
+        assert "date" in result
+        assert result["date"] == today
+
+
+# ──────────────────────────────────────────────
+# compile_date dedup tests (issue #213 defensive fix)
+# ──────────────────────────────────────────────
+
+
+class TestCompileDateDedup:
+    """Tests for the compile_date dedup fix.
+
+    Tests the defensive fix for issue #213: dedup_memories must run via
+    asyncio.to_thread to avoid blocking the event loop.
+    """
+
+    @pytest.mark.asyncio
+    async def test_dedup_runs_via_asyncio_to_thread(self, tmp_vault):
+        """compile_date should invoke dedup via asyncio.to_thread, not directly."""
+        from extensions.conversation_compiler.compile import compile_date
+        from extensions.conversation_compiler.obsidian_writer import ObsidianWriter
+        from datetime import datetime
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        writer = ObsidianWriter(vault_path=tmp_vault)
+
+        # Create a daily log with valid format that get_daily_log_entries will parse
+        daily_path = tmp_vault / "_raw" / "Daily" / f"{today}.md"
+        daily_path.parent.mkdir(parents=True, exist_ok=True)
+        # Format: - **[HH:MM]** `category` content (must match the parser regex)
+        daily_path.write_text(f"---\ndate: {today}\n---\n\n# Daily Log\n\n- **[10:00]** `preference` Test entry\n")
+
+        # Mock the service and its dedup_memories method
+        mock_service = MagicMock()
+        mock_service.dedup_memories = MagicMock()  # Sync method
+
+        # Patch asyncio.to_thread in the compile module where it's used
+        # AND patch the Gemini call so we don't make an actual API call
+        with patch("extensions.conversation_compiler.compile.asyncio.to_thread", new_callable=AsyncMock) as mock_to_thread:
+            with patch("extensions.conversation_compiler.compile._async_call_gemini", new_callable=AsyncMock) as mock_gemini:
+                mock_to_thread.return_value = None  # Dedup succeeds
+                mock_gemini.return_value = "Test summary"  # Mock LLM response
+
+                result = await compile_date(today, mock_service, writer, user_id="ehfaz")
+
+                # Assert dedup was invoked via asyncio.to_thread, NOT directly
+                mock_to_thread.assert_awaited_once()
+                call_args = mock_to_thread.call_args
+                assert call_args[0][0] == mock_service.dedup_memories
+                assert call_args[0][1] == "ehfaz"
+
+                # Assert dedup_triggered is True
+                assert result.dedup_triggered is True
+
+    @pytest.mark.asyncio
+    async def test_dedup_exception_is_caught(self, tmp_vault):
+        """compile_date should catch dedup exceptions and continue."""
+        from extensions.conversation_compiler.compile import compile_date
+        from extensions.conversation_compiler.obsidian_writer import ObsidianWriter
+        from datetime import datetime
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        writer = ObsidianWriter(vault_path=tmp_vault)
+
+        daily_path = tmp_vault / "_raw" / "Daily" / f"{today}.md"
+        daily_path.parent.mkdir(parents=True, exist_ok=True)
+        daily_path.write_text(f"---\ndate: {today}\n---\n\n# Daily Log\n\n- **[10:00]** `preference` Test entry\n")
+
+        mock_service = MagicMock()
+
+        # Patch asyncio.to_thread in the compile module to raise an exception
+        # AND patch Gemini to avoid actual API call
+        with patch("extensions.conversation_compiler.compile.asyncio.to_thread", new_callable=AsyncMock) as mock_to_thread:
+            with patch("extensions.conversation_compiler.compile._async_call_gemini", new_callable=AsyncMock) as mock_gemini:
+                mock_to_thread.side_effect = RuntimeError("Qdrant connection lost")
+                mock_gemini.return_value = "Test summary"
+
+                result = await compile_date(today, mock_service, writer, user_id="ehfaz")
+
+                # Assert dedup_triggered is False (exception was caught)
+                assert result.dedup_triggered is False
+                # Assert compilation succeeded despite dedup failure
+                assert result.date == today
