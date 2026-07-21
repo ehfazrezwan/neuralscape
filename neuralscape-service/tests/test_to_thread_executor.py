@@ -2,7 +2,7 @@
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -15,15 +15,20 @@ async def test_configure_to_thread_executor_sets_custom_size():
 
     loop = asyncio.get_running_loop()
 
-    with patch.object(settings, 'to_thread_max_workers', 24):
+    with (
+        patch.object(settings, 'to_thread_max_workers', 24),
+        patch.object(loop, 'set_default_executor', MagicMock()) as spy,
+    ):
         result = _configure_to_thread_executor(loop)
         assert result == 24
 
-        # Verify the executor was set
-        executor = loop._default_executor
-        assert executor is not None
+        # Assert on the public call, not loop internals: exactly one
+        # ThreadPoolExecutor of the configured size was installed.
+        spy.assert_called_once()
+        executor = spy.call_args.args[0]
         assert isinstance(executor, ThreadPoolExecutor)
         assert executor._max_workers == 24
+        executor.shutdown(wait=False)
 
 
 @pytest.mark.asyncio
@@ -33,13 +38,14 @@ async def test_configure_to_thread_executor_with_zero_returns_none():
     from main import _configure_to_thread_executor
 
     loop = asyncio.get_running_loop()
-    original_executor = loop._default_executor
 
-    with patch.object(settings, 'to_thread_max_workers', 0):
+    with (
+        patch.object(settings, 'to_thread_max_workers', 0),
+        patch.object(loop, 'set_default_executor', MagicMock()) as spy,
+    ):
         result = _configure_to_thread_executor(loop)
         assert result is None
-        # Executor should be unchanged
-        assert loop._default_executor == original_executor
+        spy.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -49,10 +55,11 @@ async def test_configure_to_thread_executor_with_none_returns_none():
     from main import _configure_to_thread_executor
 
     loop = asyncio.get_running_loop()
-    original_executor = loop._default_executor
 
-    with patch.object(settings, 'to_thread_max_workers', None):
+    with (
+        patch.object(settings, 'to_thread_max_workers', None),
+        patch.object(loop, 'set_default_executor', MagicMock()) as spy,
+    ):
         result = _configure_to_thread_executor(loop)
         assert result is None
-        # Executor should be unchanged
-        assert loop._default_executor == original_executor
+        spy.assert_not_called()
