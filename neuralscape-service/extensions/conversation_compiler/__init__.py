@@ -274,7 +274,7 @@ class ConversationCompilerExtension:
                 logger.info("Auto-compile enqueued to ARQ", date=today, task_id=task_id)
                 return {"status": "accepted", "task_id": task_id, "date": today}
             except Exception:
-                logger.warning("ARQ enqueue failed, falling back to inline compile")
+                logger.warning("ARQ enqueue failed, falling back to inline compile", exc_info=True)
 
         # Fallback: run inline when no ARQ pool (local dev, test environments)
         try:

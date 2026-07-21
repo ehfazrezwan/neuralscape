@@ -871,7 +871,7 @@ class TestHandleSessionEnd:
         today = datetime.now().strftime("%Y-%m-%d")
         daily_path = tmp_vault / "_raw" / "Daily" / f"{today}.md"
         daily_path.parent.mkdir(parents=True, exist_ok=True)
-        daily_path.write_text("---\ncompiled: false\n---\n\n# Daily Log\n\n- 10:00 | Test entry\n")
+        daily_path.write_text("---\ncompiled: false\n---\n\n# Daily Log\n\n- **[10:00]** `preference` Test entry\n")
 
         # Trigger session_end with auto_compile enabled
         # Patch compiler_settings at the module level where it's imported
@@ -879,27 +879,33 @@ class TestHandleSessionEnd:
         original_auto_compile = compiler_config_module.compiler_settings.auto_compile
         original_compile_after_hour = compiler_config_module.compiler_settings.compile_after_hour
 
-        try:
-            compiler_config_module.compiler_settings.auto_compile = True
-            compiler_config_module.compiler_settings.compile_after_hour = 0
+        # Patch compile_date to ensure it's NOT called on the enqueue path
+        from unittest.mock import patch
+        with patch("extensions.conversation_compiler.compile_date", new_callable=AsyncMock) as mock_compile:
+            try:
+                compiler_config_module.compiler_settings.auto_compile = True
+                compiler_config_module.compiler_settings.compile_after_hour = 0
 
-            result = await extension._handle_session_end({"user_id": "ehfaz"})
-        finally:
-            compiler_config_module.compiler_settings.auto_compile = original_auto_compile
-            compiler_config_module.compiler_settings.compile_after_hour = original_compile_after_hour
+                result = await extension._handle_session_end({"user_id": "ehfaz"})
+            finally:
+                compiler_config_module.compiler_settings.auto_compile = original_auto_compile
+                compiler_config_module.compiler_settings.compile_after_hour = original_compile_after_hour
 
-        # Assert it enqueued to ARQ
-        assert result is not None
-        assert result["status"] == "accepted"
-        assert result["task_id"] == "job-123"
-        assert result["date"] == today
+            # Assert it enqueued to ARQ
+            assert result is not None
+            assert result["status"] == "accepted"
+            assert result["task_id"] == "job-123"
+            assert result["date"] == today
 
-        # Assert enqueue_job was called with correct args
-        mock_pool.enqueue_job.assert_awaited_once_with(
-            "process_conversation_compile",
-            today,
-            "ehfaz",
-        )
+            # Assert enqueue_job was called with correct args
+            mock_pool.enqueue_job.assert_awaited_once_with(
+                "process_conversation_compile",
+                today,
+                "ehfaz",
+            )
+
+            # Assert compile_date was NOT called (proves ARQ enqueue happened, not inline)
+            mock_compile.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_fallback_to_inline_when_no_pool(self, extension, tmp_vault):
@@ -912,28 +918,34 @@ class TestHandleSessionEnd:
         today = datetime.now().strftime("%Y-%m-%d")
         daily_path = tmp_vault / "_raw" / "Daily" / f"{today}.md"
         daily_path.parent.mkdir(parents=True, exist_ok=True)
-        daily_path.write_text("---\ncompiled: false\n---\n\n# Daily Log\n\n- 10:00 | preference | Test entry\n")
+        daily_path.write_text("---\ncompiled: false\n---\n\n# Daily Log\n\n- **[10:00]** `preference` Test entry\n")
 
         from extensions.conversation_compiler import config as compiler_config_module
         original_auto_compile = compiler_config_module.compiler_settings.auto_compile
         original_compile_after_hour = compiler_config_module.compiler_settings.compile_after_hour
 
-        try:
-            compiler_config_module.compiler_settings.auto_compile = True
-            compiler_config_module.compiler_settings.compile_after_hour = 0
+        # Patch compile_date to ensure it IS called exactly once on the fallback path
+        from unittest.mock import patch, AsyncMock
+        from extensions.conversation_compiler.compile import CompileResult
+        mock_result = CompileResult(date=today, entries=[], session_summaries=[], decisions=[], research=[])
+        with patch("extensions.conversation_compiler.compile_date", new_callable=AsyncMock, return_value=mock_result) as mock_compile:
+            try:
+                compiler_config_module.compiler_settings.auto_compile = True
+                compiler_config_module.compiler_settings.compile_after_hour = 0
 
-            result = await extension._handle_session_end({"user_id": "ehfaz"})
-        finally:
-            compiler_config_module.compiler_settings.auto_compile = original_auto_compile
-            compiler_config_module.compiler_settings.compile_after_hour = original_compile_after_hour
+                result = await extension._handle_session_end({"user_id": "ehfaz"})
+            finally:
+                compiler_config_module.compiler_settings.auto_compile = original_auto_compile
+                compiler_config_module.compiler_settings.compile_after_hour = original_compile_after_hour
 
-        # Assert compile_date was called inline (fallback) - verify by checking result structure
-        assert result is not None
-        # Result should NOT have status="accepted" (that's the ARQ path)
-        # It should have the CompileResult fields instead
-        assert "status" not in result or result.get("status") != "accepted"
-        assert "date" in result
-        assert result["date"] == today
+            # Assert compile_date was called inline (fallback)
+            mock_compile.assert_awaited_once()
+            assert result is not None
+            # Result should NOT have status="accepted" (that's the ARQ path)
+            # It should have the CompileResult fields instead
+            assert "status" not in result or result.get("status") != "accepted"
+            assert "date" in result
+            assert result["date"] == today
 
     @pytest.mark.asyncio
     async def test_skips_when_auto_compile_disabled(self, extension):
@@ -990,28 +1002,35 @@ class TestHandleSessionEnd:
         today = datetime.now().strftime("%Y-%m-%d")
         daily_path = tmp_vault / "_raw" / "Daily" / f"{today}.md"
         daily_path.parent.mkdir(parents=True, exist_ok=True)
-        daily_path.write_text("---\ncompiled: false\n---\n\n# Daily Log\n\n- 10:00 | preference | Test entry\n")
+        daily_path.write_text("---\ncompiled: false\n---\n\n# Daily Log\n\n- **[10:00]** `preference` Test entry\n")
 
         from extensions.conversation_compiler import config as compiler_config_module
         original_auto_compile = compiler_config_module.compiler_settings.auto_compile
         original_compile_after_hour = compiler_config_module.compiler_settings.compile_after_hour
 
-        try:
-            compiler_config_module.compiler_settings.auto_compile = True
-            compiler_config_module.compiler_settings.compile_after_hour = 0
+        # Patch compile_date to ensure it IS called exactly once when enqueue raises
+        from unittest.mock import patch, AsyncMock
+        from extensions.conversation_compiler.compile import CompileResult
+        mock_result = CompileResult(date=today, entries=[], session_summaries=[], decisions=[], research=[])
+        with patch("extensions.conversation_compiler.compile_date", new_callable=AsyncMock, return_value=mock_result) as mock_compile:
+            try:
+                compiler_config_module.compiler_settings.auto_compile = True
+                compiler_config_module.compiler_settings.compile_after_hour = 0
 
-            result = await extension._handle_session_end({"user_id": "ehfaz"})
-        finally:
-            compiler_config_module.compiler_settings.auto_compile = original_auto_compile
-            compiler_config_module.compiler_settings.compile_after_hour = original_compile_after_hour
+                result = await extension._handle_session_end({"user_id": "ehfaz"})
+            finally:
+                compiler_config_module.compiler_settings.auto_compile = original_auto_compile
+                compiler_config_module.compiler_settings.compile_after_hour = original_compile_after_hour
 
-        # Assert it fell back to inline compile (ARQ enqueue was attempted but failed)
-        mock_pool.enqueue_job.assert_awaited_once()  # Verify enqueue was attempted
-        assert result is not None
-        # Result should NOT have status="accepted" - it should be the CompileResult
-        assert "status" not in result or result.get("status") != "accepted"
-        assert "date" in result
-        assert result["date"] == today
+            # Assert enqueue was attempted but failed
+            mock_pool.enqueue_job.assert_awaited_once()
+            # Assert compile_date was called exactly once (fallback after enqueue failed)
+            mock_compile.assert_awaited_once()
+            assert result is not None
+            # Result should NOT have status="accepted" - it should be the CompileResult
+            assert "status" not in result or result.get("status") != "accepted"
+            assert "date" in result
+            assert result["date"] == today
 
 
 # ──────────────────────────────────────────────
