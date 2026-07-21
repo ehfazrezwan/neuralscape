@@ -160,7 +160,7 @@ def _configure_to_thread_executor(loop) -> int | None:
     if n and n > 0:
         from concurrent.futures import ThreadPoolExecutor
         loop.set_default_executor(ThreadPoolExecutor(max_workers=n, thread_name_prefix="ns-to-thread"))
-        logger.info("Configured to_thread executor", max_workers=n)
+        logger.info("Configured to_thread executor: max_workers=%d", n)
         return n
     return None
 
