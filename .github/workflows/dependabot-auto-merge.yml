@@ -1,0 +1,38 @@
+name: dependabot-auto-merge
+
+# Auto-merge dependabot PRs that are low-risk by construction: patch/minor
+# bumps of devDependencies. Everything else (runtime deps, semver-major) stays
+# manual. Merging still waits on ALL required checks — this only flips the
+# auto-merge bit; branch protection remains the gate.
+#
+# Companion to the dependabot ALERT hygiene in service-ci's
+# subtree-prune-guard: alerts stay real, PRs stop silting up (#202-204 sat
+# for two weeks).
+#
+# Requires the repo setting "Allow auto-merge" (enabled 2026-07-22).
+
+on: pull_request
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    if: github.event.pull_request.user.login == 'dependabot[bot]' && github.repository == 'ehfazrezwan/neuralscape'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: "${{ secrets.GITHUB_TOKEN }}"
+      - name: Enable auto-merge for devDependency patch/minor bumps
+        if: >-
+          steps.meta.outputs.dependency-type == 'direct:development' &&
+          (steps.meta.outputs.update-type == 'version-update:semver-patch' ||
+           steps.meta.outputs.update-type == 'version-update:semver-minor')
+        run: gh pr merge --auto --merge "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
