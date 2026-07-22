@@ -153,6 +153,15 @@ def extract_keywords(question: str, max_terms: int = 8) -> list[str]:
     return seen
 
 
+def _evidence_shares_keywords(mem, keywords: list[str], min_overlap: int = 2) -> bool:
+    """True when evidence row ``mem`` shares at least ``min_overlap`` keywords."""
+    if not keywords:
+        return False
+    content = (getattr(mem, "memory", None) or "").lower()
+    matches = sum(1 for kw in keywords if kw in content)
+    return matches >= min_overlap
+
+
 def _make_llm_call(tier: ReasoningTier):
     """Build the timeout-capped, lightly-retried answering-LLM callable.
 
@@ -219,7 +228,12 @@ def _event_dt(mem) -> datetime | None:
     return dt.astimezone(timezone.utc)
 
 
-def _evidence_rows(evidence: dict, keyword_ids: list[str], enumeration: bool) -> list:
+def _evidence_rows(
+    evidence: dict,
+    keyword_ids: list[str],
+    enumeration: bool,
+    prioritize_ids: list[str] | None = None,
+) -> list:
     """Select and order evidence for the prompt (audit 27 #15).
 
     When over the row budget, the keep-set is chosen by priority —
@@ -247,8 +261,19 @@ def _evidence_rows(evidence: dict, keyword_ids: list[str], enumeration: bool) ->
 
     rows = list(evidence.values())
 
+    # R3: cap total episode rows at 3 (the sweet spot; 5 regressed). Recall
+    # and ask both surface episode rows as source=="episode" with ep-<uuid12>
+    # ids; dedup by id means duplicates are already merged, so if >3 distinct
+    # episode rows remain, keep the first 3 deterministically.
+    episode_rows = [r for r in rows if getattr(r, "source", None) == "episode"]
+    if len(episode_rows) > 3:
+        # Keep first 3 episodes, plus all non-episode rows
+        non_episode_rows = [r for r in rows if getattr(r, "source", None) != "episode"]
+        rows = episode_rows[:3] + non_episode_rows
+
+    prioritized = set(prioritize_ids or [])
     if len(rows) > _EVIDENCE_MAX_ROWS:
-        kw_set = set(keyword_ids)
+        kw_set = set(keyword_ids) | prioritized
         # Three stable sorts, applied lowest-priority first:
         rows.sort(key=_created, reverse=True)  # newest first ("" sorts last)
         rows.sort(key=lambda m: (getattr(m, "score", None) is None,
@@ -258,7 +283,11 @@ def _evidence_rows(evidence: dict, keyword_ids: list[str], enumeration: bool) ->
 
     # Chronological ascending for the prompt; timestamp-less survivors last.
     rows.sort(key=lambda m: (0, _created(m)) if _created(m)[0] else (1, ("", "")))
-    if enumeration and keyword_ids:
+    if prioritized:
+        promoted = [m for m in rows if m.id in prioritized]
+        rest = [m for m in rows if m.id not in prioritized]
+        rows = promoted + rest
+    elif enumeration and keyword_ids:
         kw = [m for m in rows if m.id in keyword_ids]
         rest = [m for m in rows if m.id not in keyword_ids]
         rows = kw + rest
@@ -313,17 +342,36 @@ def _render_evidence(rows: list) -> str:
         content = _clip_content((mem.memory or "").strip(), budget).replace("\n", " ")
         created = getattr(mem, "created_at", None) or "unknown time"
         category = getattr(mem, "category", None) or "uncategorized"
+        # Normalize + cap the speaker before it enters the prompt: flatten
+        # newlines and bound length so legacy/connector data can't distort the
+        # evidence formatting (Copilot review). Empty after strip → omit.
+        speaker = (getattr(mem, "speaker", None) or "").strip().replace("\n", " ")[:40].strip()
         occurred = getattr(mem, "occurred_at", None) if render_events else None
+
+        # Build the metadata annotation: (timestamp; category; speaker if present)
         if occurred:
             # Event time known (historical ingestion) AND the timeline spread
             # makes it informative: show both so the recency discipline
             # reasons over when it HAPPENED, with the storage time still
             # visible for provenance.
-            lines.append(
-                f"[{mem.id}] (event: {occurred}; stored: {created}; {category}) {content}"
-            )
+            meta = f"event: {occurred}; stored: {created}; {category}"
         else:
-            lines.append(f"[{mem.id}] ({created}; {category}) {content}")
+            meta = f"{created}; {category}"
+
+        if speaker:
+            meta += f"; by {speaker}"
+
+        # R4: append Graphiti's bi-temporal validity interval when present,
+        # rendered Graphiti-style (date–date|Present) so the model can reason
+        # about fact recency and contradiction. Only meaningful after R1.
+        valid_at = getattr(mem, "valid_at", None)
+        if valid_at:
+            invalid_at = getattr(mem, "invalid_at", None)
+            start = str(valid_at).split("T")[0]
+            end = str(invalid_at).split("T")[0] if invalid_at else "Present"
+            meta += f"; valid {start}–{end}"
+
+        lines.append(f"[{mem.id}] ({meta}) {content}")
     return "\n".join(lines)
 
 
@@ -334,19 +382,26 @@ _DISCIPLINES_FULL = """Disciplines (follow strictly):
 2. RECENCY: newer memories supersede older ones. "Newer" means the event time (shown as
    "event: …") when present, else the storage time. When rows describe a change ("changed",
    "rescheduled", "now", "moved to"), the newest row is the current truth.
-3. CONTRADICTIONS: when two memories genuinely contradict, surface BOTH with their
-   timestamps, prefer the newer/valid one, and say explicitly that you are preferring it
-   because it is newer.
-4. ABSTENTION: "I don't know" is a correct answer. If the evidence does not contain the
-   answer, abstain — NEVER fabricate facts, dates, or memory ids.
+3. CONTRADICTIONS: when two memories genuinely contradict, state the winner (the newer one
+   by event time when shown, else storage time; the most specific on ties) as THE answer.
+   Mention the superseded or older value briefly in a subordinate clause if relevant (e.g.,
+   "X, previously Y"), not as a co-equal alternative.
+4. ABSTENTION: abstain ONLY when NO evidence row bears on the question. If at least one
+   evidence row is on-topic (shares the question's key entities or keywords) but doesn't
+   give a verbatim answer, commit to the BEST-SUPPORTED answer from that evidence rather
+   than saying "I don't know". When evidence truly has nothing relevant, abstain honestly.
+   NEVER fabricate facts, dates, or memory ids not in the evidence.
 5. CITATIONS: cite supporting memory ids inline like [<id>]. Only ids from the EVIDENCE
    list are valid citations.
-6. PERSPECTIVE: memories distilled from dialogs may carry generic speaker labels
-   ("Speaker 1", "Speaker 2") or third-person phrasing ("the user", "the assistant")
-   that do not literally match the question's "I/my" or "you/your". These labels are
-   ingestion artifacts, not different people. Resolve perspective from content: when an
-   evidence row plainly answers the substance of the question, answer with it — a label
-   or pronoun mismatch alone is NEVER grounds to abstain or to deny knowing the fact.
+6. PERSPECTIVE: answer as the addressed persona, FIRST-PERSON, using the evidence
+   attributed to that speaker. Evidence rows show speaker attribution like "by <speaker>"
+   when available. Generic speaker labels ("Speaker 1", "Speaker 2") or third-person
+   phrasing ("the user", "the assistant") are ingestion artifacts, not different people.
+   When an evidence row (identified by its "by <speaker>" annotation) plainly answers the
+   substance of the question, answer with it — a label or pronoun mismatch is NEVER
+   grounds to abstain or to deny knowing the fact. Do not hedge by denying you know a
+   fact solely because of a speaker/pronoun/label mismatch ("I don't have X, but you
+   mentioned…"); commit to the substance the evidence provides.
 7. SPECIFICITY: when several rows state the same fact at different precision ("as a
    toddler" vs "at age three"), answer with the MOST SPECIFIC row. Recency (discipline 2)
    applies to genuine changes of fact — a vaguer restatement never supersedes a more
@@ -365,6 +420,7 @@ def _build_prompt(
     enumeration: bool,
     keyword_ids: list[str],
     keyword_scan_capped: bool = False,
+    prioritize_ids: list[str] | None = None,
 ) -> str:
     """Assemble the answering prompt. Verbosity scales with the tier."""
     parts = [
@@ -394,8 +450,19 @@ def _build_prompt(
             "\nThink through the evidence step by step BEFORE answering, but output ONLY "
             "the JSON object described below — no reasoning text outside it."
         )
+    if prioritize_ids:
+        parts.append(
+            "\nThe evidence rows listed first are the MOST RELEVANT to the question "
+            "(direct keyword/entity overlap). Start with them."
+        )
     parts.append("\nEVIDENCE:")
-    parts.append(_render_evidence(_evidence_rows(evidence, keyword_ids, enumeration)))
+    parts.append(
+        _render_evidence(
+            _evidence_rows(
+                evidence, keyword_ids, enumeration, prioritize_ids=prioritize_ids
+            )
+        )
+    )
     parts.append(f"\nQUESTION: {question}")
 
     if budget > 0:
@@ -661,6 +728,36 @@ async def ask_memory(
     if not answer:
         answer = "I don't know — the evidence did not yield an answer."
         abstained = True
+
+    # ── Bounded second-chance pass for false abstention (T2.1) ──
+    # When abstained AND keyword-overlapping evidence exists, re-ask ONCE
+    # with those rows promoted (calibrates recall vs false abstention).
+    if settings.ask_second_chance and abstained and evidence:
+        question_kws = extract_keywords(question)
+        relevant_ids = [
+            mid for mid, mem in evidence.items()
+            if _evidence_shares_keywords(mem, question_kws, min_overlap=2)
+        ]
+        if relevant_ids:
+            searches.append("second-chance (promoted keyword-overlapping rows)")
+            # Re-ask with keyword-overlapping rows promoted to top of evidence.
+            prompt = _build_prompt(
+                question, evidence, tier, 0, enumeration,
+                keyword_ids,
+                keyword_scan_capped,
+                prioritize_ids=relevant_ids,
+            )
+            raw2 = await call(prompt)
+            parsed2 = _parse_llm_json(raw2)
+            if parsed2 is not None and "answer" in parsed2:
+                answer2 = str(parsed2.get("answer") or "").strip()
+                abstained2 = bool(parsed2.get("abstained")) or not answer2
+                if not abstained2 and answer2:
+                    # Second-chance produced a non-abstained answer: use it.
+                    answer = answer2
+                    raw_citations2 = parsed2.get("citations") or []
+                    citations = [str(c) for c in raw_citations2 if str(c) in evidence]
+                    abstained = False
 
     # E2: measured token baseline of everything retrieved as evidence — the
     # cost a memoryless caller would have paid to read it all. Internal key

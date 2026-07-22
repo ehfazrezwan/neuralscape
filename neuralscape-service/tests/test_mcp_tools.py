@@ -51,16 +51,21 @@ def _code_graph_tool_names() -> set[str]:
 
     if not code_graph_available():
         return set()
-    return {"query_code_graph", "get_code_neighbors", "code_path"}
+    return {
+        "query_code_graph", "get_code_neighbors", "code_path", "locate", "code_impact",
+        "code_graph_index",  # Phase G: through-NS index trigger
+        "code_graph_delete",  # R-C: through-NS cold-delete twin
+    }
 
 
 class TestListTools:
     @pytest.mark.asyncio
     async def test_returns_22_core_tools(self):
-        # 22 core tools + the 3 code-graph delegation tools (= 25) when the
-        # optional graphifyy extra is installed (dev installs have it).
+        # 22 core tools + 2 project-config tools (Phase D) + the 5 code-graph
+        # delegation tools (= 29) when the optional graphifyy extra is installed
+        # (dev installs have it).
         tools = await mcp_server.list_tools()
-        assert len(tools) == 22 + len(_code_graph_tool_names())
+        assert len(tools) == 24 + len(_code_graph_tool_names())
 
     @pytest.mark.asyncio
     async def test_tool_names(self):
@@ -89,6 +94,8 @@ class TestListTools:
             "ask_memory",
             "checkpoint",
             "queue_status",
+            "get_project_knowledge_config",  # Phase D
+            "set_project_knowledge_config",  # Phase D
         } | _code_graph_tool_names()
         assert names == expected
 

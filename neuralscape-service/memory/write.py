@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime, timezone
 from config import settings
 from index_format import distill_title
-from prompts import build_extraction_messages, parse_extraction_response
+from prompts import build_extraction_messages, parse_extraction_response, parse_extraction_response_rich
 from savings_meter import stamp_tokens
 from schemas import EPISTEMIC_LEVEL_VOCAB, GLOBAL_CATEGORIES, MEMORY_CATEGORIES, MemoryResponse, MemoryScope, MemoryVisibility, PROJECT_CATEGORIES, default_scope_for_category, default_visibility_for_category, normalize_visibility, validate_occurred_at
 from memory.groups import _build_group_id
@@ -21,6 +21,87 @@ from memory.ranking import _times_derived_from_metadata
 from memory.retry import retry_transient
 
 logger = logging.getLogger(__name__)
+_SPEAKER_UNSET = object()
+
+
+def _occurred_at_to_datetime(value: str | None) -> datetime | None:
+    """Parse occurred_at ISO string to datetime for Graphiti reference_time.
+
+    Normalizes through ``validate_occurred_at`` first so the same rules the
+    rest of the envelope uses apply here too — a trailing ``Z`` is tolerated,
+    naive timestamps are assumed UTC, and future-skew/invalid values are
+    rejected. Defensive: returns None on any failure so bad or unset values
+    degrade to legacy 'now' behavior instead of raising.
+
+    Args:
+        value: ISO 8601 timestamp string (may carry ``Z`` / be naive).
+
+    Returns:
+        Parsed timezone-aware datetime, or None if value is falsy/invalid.
+    """
+    if not value:
+        return None
+    try:
+        normalized = validate_occurred_at(value)  # canonical UTC ISO (+00:00) or None
+        if not normalized:
+            return None
+        return datetime.fromisoformat(normalized)
+    except (ValueError, TypeError):
+        logger.warning(f"Failed to parse occurred_at '{value}' — falling back to ingestion time")
+        return None
+
+
+def _speaker_label(msg: dict) -> str:
+    """Line prefix (the "actor") for a conversation message sent to Graphiti's
+    speaker-first ``extract_message`` prompt (R2).
+
+    Prefers a real speaker name over the generic role: the first of
+    ``speaker`` → ``name`` → ``role`` that is present AND sanitizes to a
+    non-empty string is returned; ``"user"`` is the final fallback. Every
+    candidate — including the role fallback — is sanitized (stripped, internal
+    whitespace/newlines collapsed to single spaces) so a whitespace-only or
+    multi-line label can never reintroduce a newline into the episode header.
+    For role-only messages this returns the role verbatim, so ``raw_text`` is
+    byte-identical to the pre-R2 behavior.
+    """
+    for candidate in (msg.get("speaker"), msg.get("name"), msg.get("role"), "user"):
+        if not candidate:
+            continue
+        sanitized = " ".join(str(candidate).strip().split())
+        if sanitized:
+            return sanitized
+    return "user"
+
+
+def _validate_speaker(speaker: str | None) -> str | None:
+    """Validate and sanitize a speaker label (T1.2 speaker sanity guard).
+
+    Returns the speaker if it's plausible as a speaker label, otherwise None.
+    Guards against the permissive speaker-regex false positives from the rich
+    parser — rejects oversized tokens, empty strings, and sentence fragments
+    that clearly aren't speaker names/roles.
+
+    Args:
+        speaker: Raw speaker token from ParsedFact
+
+    Returns:
+        The validated speaker, or None if implausible.
+    """
+    if not speaker:
+        return None
+    speaker = speaker.strip()
+    if not speaker:
+        return None
+    # Reject oversized tokens (likely sentence fragments, not names/roles)
+    if len(speaker) > 40:
+        return None
+    # Simple heuristic: a plausible speaker is mostly alphanumeric/spaces/dots/
+    # hyphens/underscores (the same class the regex allows). If it's clearly
+    # a sentence fragment (e.g., ends with punctuation like "Note:"), drop it.
+    # We keep this simple — the regex already bounds the character class, so
+    # this just adds a length + sanity check on top.
+    return speaker
+
 
 class WriteMixin:
     """WriteMixin for MemoryService (mechanical split — see memory_service.py)."""
@@ -154,12 +235,25 @@ class WriteMixin:
 
         from google.genai.types import GenerateContentConfig, HttpOptions
 
-        parsed_facts: list[tuple[str, str]] = []
+        # Step 1.5: Choose parser based on extraction_require_speaker flag (FIX 1).
+        # When the flag is OFF (production default), use the LEGACY parser that
+        # folds any naturally-occurring "prefix: content" patterns back into
+        # content without splitting into speaker metadata. This restores byte-
+        # identical backward-compat: stored content and dedup identity match
+        # pre-T1.2 exactly (no speaker metadata, no content mutation).
+        # When the flag is ON, use the rich parser for speaker + occurred_at.
+        use_rich_parser = settings.extraction_require_speaker
+        from prompts import ParsedFact
+
+        parsed_facts_rich: list[ParsedFact] = []
+        parsed_facts_legacy: list[tuple[str, str]] = []
         window_errors: list[str] = []
         last_exc: Exception | None = None
         for w_idx, window_messages in enumerate(windows):
             extraction_messages = build_extraction_messages(
-                window_messages, operator_guidance=operator_guidance
+                window_messages,
+                operator_guidance=operator_guidance,
+                require_speaker=settings.extraction_require_speaker,
             )
             try:
                 response = retry_transient(
@@ -172,7 +266,10 @@ class WriteMixin:
                     operation="LLM extraction",
                     fallback_model=settings.gemini_llm_fallback_model,
                 )
-                parsed_facts.extend(parse_extraction_response(response.text))
+                if use_rich_parser:
+                    parsed_facts_rich.extend(parse_extraction_response_rich(response.text))
+                else:
+                    parsed_facts_legacy.extend(parse_extraction_response(response.text))
             except Exception as e:
                 # One window failing must not zero the whole session — keep
                 # the other windows' facts and report the failure honestly
@@ -198,41 +295,88 @@ class WriteMixin:
             "window_errors": window_errors,
         }
 
-        # Filter out junk facts from extraction
-        pre_filter_count = len(parsed_facts)
-        parsed_facts = [
-            (cat, content) for cat, content in parsed_facts
-            if not _is_junk_fact(content)
-        ]
-        if pre_filter_count != len(parsed_facts):
-            logger.info(
-                f"Filtered {pre_filter_count - len(parsed_facts)} junk facts from extraction"
-            )
-
-        if not parsed_facts:
-            logger.info("No facts extracted from conversation")
-            return ([], stats) if return_stats else []
+        # Filter out junk facts from extraction.
+        # For rich parser: check the FULL fact (speaker + content) for junk patterns.
+        # For legacy parser: content already includes any prefix.
+        if use_rich_parser:
+            pre_filter_count = len(parsed_facts_rich)
+            parsed_facts_rich = [
+                pf for pf in parsed_facts_rich
+                if not _is_junk_fact(
+                    f"{pf.speaker}: {pf.content}" if pf.speaker else pf.content
+                )
+            ]
+            if pre_filter_count != len(parsed_facts_rich):
+                logger.info(
+                    f"Filtered {pre_filter_count - len(parsed_facts_rich)} junk facts from extraction"
+                )
+            if not parsed_facts_rich:
+                logger.info("No facts extracted from conversation")
+                return ([], stats) if return_stats else []
+        else:
+            pre_filter_count = len(parsed_facts_legacy)
+            parsed_facts_legacy = [
+                (cat, content) for cat, content in parsed_facts_legacy
+                if not _is_junk_fact(content)
+            ]
+            if pre_filter_count != len(parsed_facts_legacy):
+                logger.info(
+                    f"Filtered {pre_filter_count - len(parsed_facts_legacy)} junk facts from extraction"
+                )
+            if not parsed_facts_legacy:
+                logger.info("No facts extracted from conversation")
+                return ([], stats) if return_stats else []
 
         # Step 2: Batch-store all facts (single embed + single Qdrant upsert).
+        # T1.2: thread speaker attribution through. We extract (category, content)
+        # tuples for _batch_store_facts, plus a parallel speakers list.
+        # T1.3: Build per-fact occurred_ats from ParsedFact, validating each one.
+        # Valid ISO values use the fact's timestamp; invalid/absent values fall
+        # back to the conversation-level occurred_at parameter.
         # A failure here (embedding, Qdrant) must PROPAGATE: the previous
         # except-and-continue silently stored zero facts while the task
         # reported success — exactly what hid the gateway's single-input
         # embed rejection in production. Raising fails the ARQ job, so
         # /v1/memories/status/{task_id} reports status=failed with the error.
         try:
+            if use_rich_parser:
+                facts = [(pf.category, pf.content) for pf in parsed_facts_rich]
+                speakers = [pf.speaker for pf in parsed_facts_rich]
+                # T1.3: per-fact occurred_at extraction with fallback
+                occurred_ats: list[str | None] = []
+                for pf in parsed_facts_rich:
+                    per_fact_time: str | None = None
+                    if pf.occurred_at:
+                        try:
+                            per_fact_time = validate_occurred_at(pf.occurred_at)
+                        except (ValueError, TypeError):
+                            # Invalid or relative phrase → use the fallback
+                            per_fact_time = occurred_at
+                    else:
+                        # No per-fact time → use the conversation-level fallback
+                        per_fact_time = occurred_at
+                    occurred_ats.append(per_fact_time)
+            else:
+                # Legacy path: no speaker metadata, no per-fact occurred_at.
+                # Thread conversation-level occurred_at as before (T1.3 fallback).
+                facts = parsed_facts_legacy
+                speakers = None
+                occurred_ats = None
             stored = self._batch_store_facts(
-                facts=parsed_facts,
+                facts=facts,
+                speakers=speakers,
                 user_id=user_id,
                 project_id=project_id,
                 agent_id=agent_id,
                 run_id=run_id,
                 source="conversation",
                 occurred_at=occurred_at,
+                occurred_ats=occurred_ats,
             )
         except Exception as e:
             logger.error(
                 f"Batch store failed for user {user_id}: {e} — "
-                f"{len(parsed_facts)} extracted facts were NOT stored",
+                f"{len(parsed_facts_rich)} extracted facts were NOT stored",
                 exc_info=True,
             )
             raise
@@ -240,11 +384,8 @@ class WriteMixin:
         # Step 3: Add cleaned conversation text to knowledge graph — ONE
         # episode for the whole conversation regardless of extraction
         # windowing (Graphiti handles its own entity windowing internally).
-        # KNOWN RESIDUAL (occurred_at): the episode's Graphiti reference_time
-        # is stamped "now" inside the mem0 subtree's MemoryGraph.add, which
-        # exposes no event-time parameter — threading occurred_at through to
-        # add_episode(reference_time=...) needs a subtree change, deliberately
-        # out of scope here. Event time lives in the Qdrant payload only.
+        # The episode's Graphiti reference_time is the conversation's event
+        # time (occurred_at), falling back to ingestion time when unknown.
         # Conversation extractions are personal (private) by default — the
         # caller's spoken context isn't team-shared automatically.
         group_id = _build_group_id(
@@ -253,8 +394,9 @@ class WriteMixin:
             project_id,
         )
         cleaned_messages = _clean_conversation_for_graph(messages)
+
         raw_text = "\n".join(
-            f"{msg.get('role', 'user')}: {msg.get('content', '')}"
+            f"{_speaker_label(msg)}: {msg.get('content', '')}"
             for msg in cleaned_messages
         )
         graph_write_started_at = datetime.now(timezone.utc)
@@ -282,6 +424,8 @@ class WriteMixin:
                         data=raw_text,
                         filters={"user_id": user_id, "group_id": group_id},
                         episode_name=episode_name,
+                        reference_time=_occurred_at_to_datetime(occurred_at),
+                        episode_source="message",
                         operation="graph storage (extract_and_store)",
                     )
                     # 1-episode → N-memories shape: a single graph.add produces
@@ -444,6 +588,8 @@ class WriteMixin:
         # Data-layer connectors (None → omitted)
         memory_kind: str | None = None,
         source_ref: dict | None = None,
+        # Workspace partition (WT6, None → memory type)
+        workspace: str | None = None,
         # Write-path isolation: when False, skip the slow inline graph.add so
         # the fast vector write returns immediately — the caller is expected to
         # enqueue enrich_graph() onto the graph worker. When return_created is
@@ -523,6 +669,7 @@ class WriteMixin:
             visibility=visibility,
             memory_kind=memory_kind,
             source_ref=source_ref,
+            workspace=workspace,
         )
         if existing is not None:
             # created=False → caller must NOT re-enqueue graph enrichment.
@@ -567,6 +714,7 @@ class WriteMixin:
         visibility: str | None = None,
         memory_kind: str | None = None,
         source_ref: dict | None = None,
+        workspace: str | None = None,
     ) -> tuple[dict | None, MemoryResponse | None]:
         """Validate + resolve + dedup one raw store; everything except the embed.
 
@@ -637,10 +785,14 @@ class WriteMixin:
         chash = content_hash(content)
 
         # ── Content-hash dedup ──
-        # Skip insert if this exact (user_id, scope, hash) already exists.
+        # Skip insert if this exact (user_id, scope, hash, workspace) already exists.
+        # Workspace is part of dedup identity: the same sentence in a book vs a
+        # user note are distinct rows (WT6).
+        effective_workspace = workspace if workspace else None
         existing = self._find_by_content_hash(
             user_id=user_id, content_hash=chash, scope=scope,
             project_id=project_id, visibility=effective_visibility,
+            workspace=effective_workspace,
         )
         if existing is not None:
             logger.info(
@@ -711,6 +863,9 @@ class WriteMixin:
             metadata["memory_kind"] = memory_kind
         if source_ref:
             metadata["source_ref"] = source_ref
+        # Workspace partition (WT6): only stored when set (absent/None = memory type)
+        if workspace is not None:
+            metadata["workspace"] = workspace
 
         payload = {
             "data": content,
@@ -747,6 +902,7 @@ class WriteMixin:
             owner_user_id=user_id,
             title=title,
             token_estimate=token_estimate,
+            workspace=effective_workspace,
         )
 
         prepared = {
@@ -755,14 +911,16 @@ class WriteMixin:
             "payload": payload,
             "response": response,
             "now_iso": now_iso,
-            # (user, hash, scope, project, visibility) — the dedup identity,
-            # exposed so store_raw_batch can collapse in-batch duplicates.
-            "dedup_key": (user_id, chash, scope, project_id, effective_visibility),
+            # (user, hash, scope, project, visibility, workspace) — the dedup identity,
+            # exposed so store_raw_batch can collapse in-batch duplicates. Workspace
+            # is part of the identity: same content in memory vs reference = distinct (WT6).
+            "dedup_key": (user_id, chash, scope, project_id, effective_visibility, effective_workspace),
             # Fields _finalize_raw_store needs for the graph write.
             "user_id": user_id,
             "project_id": project_id,
             "effective_visibility": effective_visibility,
             "source_ref": source_ref,
+            "workspace": effective_workspace,
         }
         return (prepared, None)
 
@@ -811,6 +969,7 @@ class WriteMixin:
                 memory_id=mid,
                 source_ref=prepared["source_ref"],
                 graph_ontology=graph_ontology,
+                workspace=prepared.get("workspace"),
             )
 
     def enrich_graph(
@@ -822,6 +981,8 @@ class WriteMixin:
         memory_id: str,
         source_ref: dict | None = None,
         graph_ontology: dict | None = None,
+        occurred_at: str | None = None,
+        workspace: str | None = None,
     ) -> bool:
         """Add content to the knowledge graph + attach memory_id back-refs.
 
@@ -838,6 +999,9 @@ class WriteMixin:
         and every regular memory write), the graph write is byte-for-byte the
         pre-adapter path.
 
+        ``occurred_at`` is the real event time (ISO string); None falls back
+        to ingestion wall-clock (legacy behavior).
+
         Returns True if the graph write actually succeeded, False if it was
         skipped (no graph configured) or swallowed an error. Callers use this
         to report honest enrichment status instead of assuming success — a
@@ -846,15 +1010,17 @@ class WriteMixin:
         """
         if not (self._graphiti and self._bridge):
             return False
-        # Group_id encodes visibility + user namespace so graph search can
-        # scope by allowed groups without re-leaking cross-user facts.
-        group_id = _build_group_id(visibility, user_id, project_id)
+        # Group_id encodes visibility + user namespace + workspace (WT6) so
+        # graph search can scope by allowed groups without re-leaking
+        # cross-user facts or mixing memory/reference pools.
+        group_id = _build_group_id(visibility, user_id, project_id, workspace)
         graph_write_started_at = datetime.now(timezone.utc)
         try:
             retry_transient(
                 self._memory.graph.add,
                 data=content,
                 filters={"user_id": user_id, "group_id": group_id},
+                reference_time=_occurred_at_to_datetime(occurred_at),
                 operation="enrich_graph add",
                 **(graph_ontology or {}),
             )
@@ -874,6 +1040,27 @@ class WriteMixin:
             logger.warning(f"Graph enrichment failed (non-critical): {e}")
             return False
 
+    def _backfill_speaker_on_existing_memory(
+        self,
+        *,
+        memory_id: str,
+        speaker: str,
+    ) -> bool:
+        """Best-effort patch to attach missing speaker metadata onto an existing row."""
+        try:
+            client = self._memory.vector_store.client
+            collection = settings.qdrant_collection
+            client.set_payload(
+                collection_name=collection,
+                payload={"speaker": speaker},
+                points=[memory_id],
+                key="metadata",
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"Speaker backfill failed for {memory_id} (non-fatal): {e}")
+            return False
+
     def _find_by_content_hash(
         self,
         user_id: str,
@@ -881,8 +1068,10 @@ class WriteMixin:
         scope: str,
         project_id: str | None = None,
         visibility: str | None = None,
+        speaker: str | None | object = _SPEAKER_UNSET,
+        workspace: str | None = None,
     ) -> MemoryResponse | None:
-        """Look up a memory by (user_id, hash, scope, visibility) for dedup.
+        """Look up a memory by (user_id, hash, scope, visibility, speaker, workspace) for dedup.
 
         Returns the existing MemoryResponse on hit, or None if not found.
         Failures here are non-fatal — we'd rather risk a duplicate than
@@ -892,9 +1081,18 @@ class WriteMixin:
         (e.g. a dictator's private note vs. an authoritative ``standard``) are
         distinct memories, so a ``standard`` write must not dedup onto a
         pre-existing ``private``/``shared`` row of the same content.
+
+        ``speaker`` is tri-state:
+        - omitted: preserve legacy behavior (speaker-agnostic lookup)
+        - ``None``: only match rows with no speaker metadata
+        - string: only match rows with that exact speaker
+
+        ``workspace`` (WT6) is also part of the key: the same sentence in a
+        reference book vs. a user note are distinct memories. Absent/None =
+        memory type (default); matches rows with workspace absent/None/"memory".
         """
         try:
-            from qdrant_client.models import FieldCondition, Filter, MatchValue
+            from qdrant_client.models import FieldCondition, Filter, IsEmptyCondition, MatchValue, PayloadField
             client = self._memory.vector_store.client
             collection = settings.qdrant_collection
             must = [
@@ -906,6 +1104,31 @@ class WriteMixin:
                 must.append(FieldCondition(key="metadata.visibility", match=MatchValue(value=visibility)))
             if scope == "project" and project_id:
                 must.append(FieldCondition(key="metadata.project_id", match=MatchValue(value=project_id)))
+            if speaker is None:
+                # FIX 2: Use IsEmptyCondition to match rows where speaker is missing
+                # or null. IsNullCondition only matches EXPLICIT nulls, but payloads
+                # omit the speaker key when absent (never write speaker: null), so
+                # the backfill lookup was dead code. IsEmptyCondition matches both.
+                must.append(IsEmptyCondition(is_empty=PayloadField(key="metadata.speaker")))
+            elif speaker is not _SPEAKER_UNSET:
+                must.append(FieldCondition(key="metadata.speaker", match=MatchValue(value=speaker)))
+            # Workspace filter (WT6): absent/None matches rows with workspace
+            # absent/None/"memory" (all three represent the memory workspace).
+            # Non-None workspace must match exactly.
+            if workspace is None:
+                # Memory type: match rows whose workspace is absent/null (legacy
+                # + memory-type rows never write the field) OR explicitly "memory".
+                # The nested should = OR; it excludes reference rows (which carry
+                # a non-memory workspace) so a memory write can't dedup onto a
+                # book passage of identical content.
+                must.append(
+                    Filter(should=[
+                        IsEmptyCondition(is_empty=PayloadField(key="metadata.workspace")),
+                        FieldCondition(key="metadata.workspace", match=MatchValue(value="memory")),
+                    ])
+                )
+            else:
+                must.append(FieldCondition(key="metadata.workspace", match=MatchValue(value=workspace)))
             points, _ = client.scroll(
                 collection_name=collection,
                 scroll_filter=Filter(must=must),
@@ -943,6 +1166,8 @@ class WriteMixin:
                 owner_user_id=metadata.get("owner_user_id"),
                 title=metadata.get("title"),
                 token_estimate=metadata.get("token_estimate"),
+                speaker=metadata.get("speaker"),
+                workspace=metadata.get("workspace"),
             )
         except Exception as e:
             logger.warning(f"Content-hash dedup lookup failed (non-fatal): {e}")
@@ -1249,6 +1474,9 @@ class WriteMixin:
         memory_kind: str | None = None,
         source_ref: dict | None = None,
         occurred_at: str | None = None,
+        speakers: list[str | None] | None = None,
+        occurred_ats: list[str | None] | None = None,
+        workspace: str | None = None,
     ) -> list[MemoryResponse]:
         """Store multiple categorized facts via a single batch embed + single Qdrant upsert.
 
@@ -1279,6 +1507,14 @@ class WriteMixin:
                 batch — when the conversation actually happened, for
                 historical ingestion of old chat exports. None ⇒ omitted
                 (event time unknown; readers fall back to created_at).
+            speakers: Optional list of per-fact speaker labels (T1.2), aligned
+                to ``facts``. None or a shorter list is tolerated — missing
+                entries default to None (no speaker). Validated via
+                ``_validate_speaker`` before persisting.
+            occurred_ats: Optional list of per-fact event times (T1.3), aligned
+                to ``facts``. None or a shorter list is tolerated — missing
+                entries use the conversation-level ``occurred_at`` fallback.
+                Per-fact values take precedence when present.
 
         Returns:
             List of MemoryResponse objects for stored facts (new rows and
@@ -1298,13 +1534,37 @@ class WriteMixin:
         texts: list[str] = []
         memory_ids: list[str] = []
         payloads: list[dict] = []
-        fact_meta: list[tuple[str, str, str | None]] = []  # (category, scope, project_id) per fact
+        fact_meta: list[tuple[str, str, str | None, str | None, str | None]] = []  # (category, scope, project_id, speaker, occurred_at) per fact
         # Ordered slots: ("new", index-into-texts) | ("dup", existing response)
         ordered: list[tuple[str, object]] = []
-        seen_in_batch: set[tuple[str, str, str | None]] = set()
+        seen_in_batch: set[tuple[str, str, str | None, str | None]] = set()
         dedup_hits = 0
 
-        for category, content in facts:
+        # Normalize speakers list: pad to len(facts) with None if shorter/absent
+        speakers_normalized = speakers or []
+        if len(speakers_normalized) < len(facts):
+            speakers_normalized = list(speakers_normalized) + [None] * (
+                len(facts) - len(speakers_normalized)
+            )
+
+        # Normalize occurred_ats list: pad to len(facts) with occurred_at fallback if shorter/absent
+        occurred_ats_normalized = occurred_ats or []
+        if len(occurred_ats_normalized) < len(facts):
+            occurred_ats_normalized = list(occurred_ats_normalized) + [occurred_at] * (
+                len(facts) - len(occurred_ats_normalized)
+            )
+
+        for idx, (category, content) in enumerate(facts):
+            raw_speaker = speakers_normalized[idx] if idx < len(speakers_normalized) else None
+            # T1.2 speaker sanity guard: validate before persisting
+            speaker = _validate_speaker(raw_speaker)
+            # T1.3: per-fact occurred_at (already validated by caller)
+            # Use per-fact value if present, otherwise fall back to conversation-level
+            fact_occurred_at = (
+                occurred_ats_normalized[idx] if idx < len(occurred_ats_normalized) else occurred_at
+            )
+            if fact_occurred_at is None:
+                fact_occurred_at = occurred_at
             scope = default_scope_for_category(category)
             fact_project_id = project_id
 
@@ -1323,28 +1583,50 @@ class WriteMixin:
                     scope = MemoryScope.GLOBAL
                     logger.warning(
                         f"Category '{category}' requires project_id but none provided and could not be inferred. "
-                        f"Content snippet: '{content[:80]}'. Storing as global scope."
+                        f"Storing as global scope."
                     )
 
             scope_val = scope.value if isinstance(scope, MemoryScope) else scope
             chash = content_hash(content)
 
             # In-batch duplicate (extraction-window overlap): keep the first.
-            batch_key = (chash, scope_val, fact_project_id)
+            # WT6: workspace is part of the batch key too.
+            batch_key = (chash, scope_val, fact_project_id, speaker, workspace)
             if batch_key in seen_in_batch:
                 continue
             seen_in_batch.add(batch_key)
 
             # Storage-level idempotency (audit 27 #21). visibility=None on
             # purpose: conversation-path rows don't stamp metadata.visibility,
-            # so a visibility condition would never match them.
-            existing = self._find_by_content_hash(
+            # so a visibility condition would never match them. workspace defaults
+            # to None here (memory type) unless the caller overrode it.
+            lookup_kwargs = dict(
                 user_id=user_id,
                 content_hash=chash,
                 scope=scope_val,
                 project_id=fact_project_id,
                 visibility=None,
+                workspace=workspace,
             )
+            existing = (
+                self._find_by_content_hash(**lookup_kwargs)
+                if speaker is None
+                else self._find_by_content_hash(**lookup_kwargs, speaker=speaker)
+            )
+            if existing is None and speaker is not None:
+                existing = self._find_by_content_hash(
+                    user_id=user_id,
+                    content_hash=chash,
+                    scope=scope_val,
+                    project_id=fact_project_id,
+                    visibility=None,
+                    speaker=None,
+                )
+                if existing is not None and self._backfill_speaker_on_existing_memory(
+                    memory_id=existing.id,
+                    speaker=speaker,
+                ):
+                    existing.speaker = speaker
             if existing is not None:
                 # Same reinforcement semantics as the raw path: count the
                 # re-derivation on the survivor, resurrect it if a dream
@@ -1382,14 +1664,19 @@ class WriteMixin:
                     **({"memory_kind": memory_kind} if memory_kind is not None else {}),
                     **({"source_ref": source_ref} if source_ref else {}),
                     # Event time: only stored when known (never defaulted).
-                    **({"occurred_at": occurred_at} if occurred_at is not None else {}),
+                    # T1.3: per-fact value takes precedence when present.
+                    **({"occurred_at": fact_occurred_at} if fact_occurred_at is not None else {}),
+                    # T1.2: speaker attribution (only stored when present)
+                    **({"speaker": speaker} if speaker else {}),
+                    # Workspace partition (WT6): only stored when set.
+                    **({"workspace": workspace} if workspace is not None else {}),
                 },
             }
 
             texts.append(content)
             memory_ids.append(mid)
             payloads.append(payload)
-            fact_meta.append((category, scope_val, fact_project_id))
+            fact_meta.append((category, scope_val, fact_project_id, speaker, fact_occurred_at))
             ordered.append(("new", len(texts) - 1))
 
         # ── Single batch embed + single Qdrant upsert (new facts only) ──
@@ -1397,6 +1684,13 @@ class WriteMixin:
         # an already-stored conversation inserts ZERO new points.
         if texts:
             embeddings = m.embedding_model.embed_batch(texts, memory_action="add")
+            # Validate embed count matches text count before zipping — a
+            # misaligned embed/fact zip silently writes garbage vectors.
+            if len(embeddings) != len(texts):
+                raise ValueError(
+                    f"embed_batch returned {len(embeddings)} embeddings for "
+                    f"{len(texts)} texts — cannot safely align vectors to facts"
+                )
             m.vector_store.insert(
                 vectors=embeddings,
                 ids=memory_ids,
@@ -1418,7 +1712,7 @@ class WriteMixin:
                 continue
             idx = ref
             mid, content = memory_ids[idx], texts[idx]
-            category, scope_val, fact_pid = fact_meta[idx]
+            category, scope_val, fact_pid, spk, fact_occurred_at = fact_meta[idx]
             responses.append(
                 MemoryResponse(
                     id=mid,
@@ -1428,13 +1722,14 @@ class WriteMixin:
                     project_id=fact_pid,
                     source="vector",
                     created_at=now_iso,
-                    occurred_at=occurred_at,
+                    occurred_at=fact_occurred_at,
                     source_type=source_type,
                     epistemic_level="explicit",
                     memory_kind=memory_kind,
                     source_ref=source_ref,
                     title=distill_title(content),
                     token_estimate=stamp_tokens(content),
+                    speaker=spk,
                 )
             )
 

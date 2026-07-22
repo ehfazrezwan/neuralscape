@@ -107,6 +107,7 @@ class ConvertMixin:
             owner_user_id=metadata.get("owner_user_id"),
             title=metadata.get("title"),
             token_estimate=metadata.get("token_estimate"),
+            speaker=metadata.get("speaker"),
         )
 
     def _result_to_responses(

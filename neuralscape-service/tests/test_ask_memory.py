@@ -482,7 +482,7 @@ class TestPerspectiveAndSpecificityDisciplines:
                          user_id="u", reasoning_level="high", llm_call=llm)
         prompt = llm.prompts[0]
         assert "PERSPECTIVE:" in prompt
-        assert "NEVER grounds to abstain" in prompt
+        assert "answer as the addressed persona" in prompt
         assert "SPECIFICITY:" in prompt
         assert "vaguer restatement never supersedes" in prompt
 
@@ -495,6 +495,186 @@ class TestPerspectiveAndSpecificityDisciplines:
         prompt = llm.prompts[0]
         assert "PERSPECTIVE:" not in prompt
         assert "answer ONLY from the evidence" in prompt
+
+
+# ──────────────────────────────────────────────
+# Speaker attribution rendering (T2.2 / MED-2)
+# ──────────────────────────────────────────────
+
+
+def _mem_with_speaker(mid: str, content: str, speaker: str,
+                      created_at: str = "2026-07-01T00:00:00+00:00") -> MemoryResponse:
+    return MemoryResponse(
+        id=mid, memory=content, category="decision", source="vector",
+        created_at=created_at, score=0.9, speaker=speaker,
+    )
+
+
+class TestSpeakerAttributionRendering:
+    def test_speaker_renders_when_present(self):
+        """When a memory has a speaker, it renders as 'by <speaker>'."""
+        mem = _mem_with_speaker("m1", "I have three dogs", "Alice")
+        rendered = ask_mod._render_evidence([mem])
+        assert "by Alice" in rendered
+        assert "[m1]" in rendered
+        assert "I have three dogs" in rendered
+
+    def test_speaker_omitted_when_absent(self):
+        """Memories without speaker render exactly as before (backward compat)."""
+        mem = _mem("m1", "fact without speaker")
+        rendered = ask_mod._render_evidence([mem])
+        assert "by " not in rendered
+        assert "[m1]" in rendered
+        assert "fact without speaker" in rendered
+
+    def test_speaker_with_event_time(self):
+        """Speaker renders alongside event time when timeline is informative."""
+        # Two memories far apart in time so event times render
+        old = _mem_with_speaker("m1", "old fact", "Bob", "2025-01-01T00:00:00+00:00")
+        old = MemoryResponse(**{**old.model_dump(), "occurred_at": "2025-01-01T00:00:00+00:00"})
+        new = _mem_with_speaker("m2", "new fact", "Alice", "2026-06-01T00:00:00+00:00")
+        new = MemoryResponse(**{**new.model_dump(), "occurred_at": "2026-06-01T00:00:00+00:00"})
+        rendered = ask_mod._render_evidence([old, new])
+        # Both speaker and event time should be present
+        assert "event: 2025-01-01" in rendered
+        assert "by Bob" in rendered
+        assert "event: 2026-06-01" in rendered
+        assert "by Alice" in rendered
+
+    def test_mixed_speaker_and_no_speaker_rows(self):
+        """A mix of rows with and without speaker renders correctly."""
+        with_speaker = _mem_with_speaker("m1", "Alice said this", "Alice")
+        without_speaker = _mem("m2", "generic fact")
+        rendered = ask_mod._render_evidence([with_speaker, without_speaker])
+        lines = rendered.split("\n")
+        assert len(lines) == 2
+        assert "by Alice" in lines[0]
+        assert "by " not in lines[1]
+
+    @pytest.mark.asyncio
+    async def test_speaker_reaches_llm_prompt(self):
+        """The speaker annotation actually reaches the answering LLM."""
+        mem = _mem_with_speaker("m1", "I have two dogs", "Alice")
+        svc = _service([mem])
+        llm = _answer_llm("two dogs [m1]", ["m1"])
+        await ask_memory(svc, question="How many dogs does Alice have?",
+                         user_id="u", reasoning_level="high", llm_call=llm)
+        prompt = llm.prompts[0]
+        assert "by Alice" in prompt
+        assert "[m1]" in prompt
+
+
+# ──────────────────────────────────────────────
+# Perspective resolution (T2.2): first-person, substance-first, no hedging
+# ──────────────────────────────────────────────
+
+
+class TestPerspectiveResolution:
+    @pytest.mark.asyncio
+    async def test_perspective_discipline_references_speaker_annotation(self):
+        """The strengthened PERSPECTIVE discipline references the 'by <speaker>'
+        annotation that now appears in evidence."""
+        svc = _service([_mem("m1", "x")])
+        llm = _answer_llm("ans")
+        await ask_memory(svc, question="q?", user_id="u",
+                         reasoning_level="high", llm_call=llm)
+        prompt = llm.prompts[0]
+        discipline_section = prompt.split("EVIDENCE:")[0]
+        assert "by <speaker>" in discipline_section
+        assert "PERSPECTIVE:" in discipline_section
+
+    @pytest.mark.asyncio
+    async def test_perspective_forbids_meta_disclaimers_on_label_mismatch(self):
+        """The discipline forbids 'I don't have X, but you mentioned…' hedging
+        specifically for speaker/pronoun/label mismatches (not a blanket rule)."""
+        svc = _service([_mem("m1", "x")])
+        llm = _answer_llm("ans")
+        await ask_memory(svc, question="q?", user_id="u",
+                         reasoning_level="high", llm_call=llm)
+        prompt = llm.prompts[0]
+        discipline_section = prompt.split("EVIDENCE:")[0]
+        # The narrowed wording: applies to perspective/label mismatch only
+        assert "speaker/pronoun/label mismatch" in discipline_section
+        assert "Do not hedge by denying you know a" in discipline_section
+        assert "fact solely because of a speaker/pronoun/label mismatch" in discipline_section
+        # The blanket over-commit phrasing is gone (over-commit fix): assert BOTH
+        # the trigger clause and the "commit to the fact itself" imperative are absent,
+        # so the discipline can't push commitment on non-perspective (synthesis) cases.
+        assert "when the evidence directly answers the substance" not in discipline_section
+        assert "commit to the fact itself" not in discipline_section
+
+    @pytest.mark.asyncio
+    async def test_perspective_directs_first_person_answering(self):
+        """The discipline says 'answer as the addressed persona, FIRST-PERSON'."""
+        svc = _service([_mem("m1", "x")])
+        llm = _answer_llm("ans")
+        await ask_memory(svc, question="q?", user_id="u",
+                         reasoning_level="high", llm_call=llm)
+        prompt = llm.prompts[0]
+        discipline_section = prompt.split("EVIDENCE:")[0]
+        assert "answer as the addressed persona" in discipline_section
+        assert "FIRST-PERSON" in discipline_section
+
+    @pytest.mark.asyncio
+    async def test_speaker_labeled_evidence_answers_first_person_question(self):
+        """When a row attributed to a speaker answers the substance, the model
+        should answer first-person without abstaining on label mismatch."""
+        # Alice asks "How many dogs do I have?" — evidence says "Alice has three dogs"
+        # with speaker="Alice". The model should say "three" not "I don't know".
+        mem = _mem_with_speaker("m1", "Alice has three dogs", "Alice")
+        svc = _service([mem])
+        llm = _answer_llm("Three [m1]", ["m1"], abstained=False)
+        out = await ask_memory(svc, question="How many dogs do I have?",
+                               user_id="u", reasoning_level="high", llm_call=llm)
+        prompt = llm.prompts[0]
+        # The prompt contains the speaker attribution
+        assert "by Alice" in prompt
+        # The discipline forbids abstaining on label mismatch
+        discipline_text = prompt.split("EVIDENCE:")[0]
+        assert "a label or pronoun mismatch is NEVER" in discipline_text
+        assert "grounds to abstain or to deny knowing the fact" in discipline_text
+        # The result is not abstained
+        assert out["abstained"] is False
+        assert out["answer"] == "Three [m1]"
+
+    @pytest.mark.asyncio
+    async def test_generic_speaker_label_not_grounds_for_abstention(self):
+        """A 'Speaker 2' or 'the user' label should not block answering when
+        the content matches the question's substance."""
+        mem = _mem_with_speaker("m1", "Speaker 2 owns a golden retriever", "Speaker 2")
+        svc = _service([mem])
+        llm = _answer_llm("A golden retriever [m1]", ["m1"], abstained=False)
+        out = await ask_memory(svc, question="What kind of dog do I own?",
+                               user_id="u", reasoning_level="high", llm_call=llm)
+        prompt = llm.prompts[0]
+        assert "by Speaker 2" in prompt
+        assert "ingestion artifacts, not different people" in prompt
+        assert out["abstained"] is False
+
+    @pytest.mark.asyncio
+    async def test_perspective_discipline_preserves_key_elements(self):
+        """T2.1b fix: discipline 6 still forbids perspective-based abstention,
+        but the blanket over-commit clause is narrowed to that scope."""
+        svc = _service([_mem("m1", "x")])
+        llm = _answer_llm("ans")
+        await ask_memory(svc, question="q?", user_id="u",
+                         reasoning_level="high", llm_call=llm)
+        prompt = llm.prompts[0]
+        discipline_section = prompt.split("EVIDENCE:")[0]
+
+        # KEEP: persona-first + label-mismatch-not-grounds-to-abstain guidance
+        assert "answer as the addressed persona" in discipline_section
+        assert "FIRST-PERSON" in discipline_section
+        assert "a label or pronoun mismatch is NEVER" in discipline_section
+        assert "grounds to abstain or to deny knowing the fact" in discipline_section
+        assert "by <speaker>" in discipline_section
+        assert "ingestion artifacts, not different people" in discipline_section
+
+        # NARROWED: no longer a blanket "commit to the fact itself" — it's
+        # scoped to perspective/label-mismatch cases only
+        assert "Do not hedge by denying you know a" in discipline_section
+        assert "speaker/pronoun/label mismatch" in discipline_section
+        assert "commit to the substance the evidence provides" in discipline_section
 
 
 # ──────────────────────────────────────────────
@@ -598,6 +778,192 @@ class TestAbstention:
         assert "I don't know" in prompt
         assert "NEVER fabricate" in prompt
 
+    @pytest.mark.asyncio
+    async def test_strengthened_discipline_4_in_full_prompt(self):
+        """Discipline 4 strengthened: commit to best-supported answer when
+        evidence is on-topic but not verbatim; abstain only when nothing bears."""
+        svc = _service([_mem("m1", "x")])
+        llm = _answer_llm("a")
+        await ask_memory(svc, question="q?", user_id="u",
+                         reasoning_level="high", llm_call=llm)
+        prompt = llm.prompts[0]
+        assert "abstain ONLY when NO evidence row bears on the question" in prompt
+        assert "commit to the BEST-SUPPORTED answer" in prompt
+        assert "on-topic" in prompt
+
+    @pytest.mark.asyncio
+    async def test_brief_discipline_unchanged(self):
+        """Minimal tier keeps brief discipline text (unchanged from baseline)."""
+        svc = _service([_mem("m1", "x")])
+        llm = _answer_llm("a")
+        await ask_memory(svc, question="q?", user_id="u",
+                         reasoning_level="minimal", llm_call=llm)
+        prompt = llm.prompts[0]
+        assert "answer ONLY from the evidence" in prompt
+        # Brief text stays terse — no multi-line discipline enumeration.
+        assert "1. ENUMERATION" not in prompt
+
+
+# ──────────────────────────────────────────────
+# Second-chance pass (T2.1 abstention calibration)
+# ──────────────────────────────────────────────
+
+
+class TestSecondChancePass:
+    @pytest.mark.asyncio
+    async def test_abstained_with_keyword_overlap_triggers_second_chance(self):
+        """When first pass abstains AND evidence shares ≥2 keywords, re-ask
+        with those rows promoted; if the second pass answers, use it."""
+        svc = _service([
+            _mem("m1", "Alice joined the project in Berlin for backend work",
+                 "2026-07-02T00:00:00+00:00"),
+            _mem("m2", "irrelevant note about meetings",
+                 "2026-07-01T00:00:00+00:00"),
+        ])
+        prompts: list[str] = []
+        responses = iter([
+            json.dumps({"action": "answer", "answer": "I don't know",
+                        "citations": [], "abstained": True}),
+            json.dumps({"action": "answer", "answer": "Berlin [m1]",
+                        "citations": ["m1"], "abstained": False}),
+        ])
+
+        async def llm(prompt: str) -> str:
+            prompts.append(prompt)
+            return next(responses)
+
+        out = await ask_memory(svc, question="Where did Alice join the project?",
+                               user_id="u", reasoning_level="low", llm_call=llm)
+        assert len(prompts) == 2  # first pass + second-chance
+        assert out["abstained"] is False
+        assert out["answer"] == "Berlin [m1]"
+        assert out["citations"] == ["m1"]
+        assert prompts[0].index("[m2]") < prompts[0].index("[m1]")
+        assert "MOST RELEVANT to the question" in prompts[1]
+        assert prompts[1].index("[m1]") < prompts[1].index("[m2]")
+        # Audit trail: second-chance recorded in searches.
+        assert any("second-chance" in s for s in out["searches"])
+
+    @pytest.mark.asyncio
+    async def test_second_chance_flag_off_disables_pass(self, monkeypatch):
+        """When ask_second_chance=False, abstention is final (no retry)."""
+        from config import settings
+        monkeypatch.setattr(settings, "ask_second_chance", False)
+        svc = _service([_mem("m1", "Alice joined the project in Berlin")])
+        calls = {"n": 0}
+
+        async def llm(prompt: str) -> str:
+            calls["n"] += 1
+            return json.dumps({"action": "answer", "answer": "I don't know",
+                               "citations": [], "abstained": True})
+
+        out = await ask_memory(svc, question="Where did Alice join?",
+                               user_id="u", reasoning_level="low", llm_call=llm)
+        assert calls["n"] == 1  # no second-chance pass
+        assert out["abstained"] is True
+        assert not any("second-chance" in s for s in out["searches"])
+
+    @pytest.mark.asyncio
+    async def test_no_keyword_overlap_preserves_genuine_abstention(self):
+        """When evidence shares <2 keywords with the question, the abstention
+        stands (genuine "don't know" — no second-chance waste)."""
+        svc = _service([_mem("m1", "Alice prefers tea over coffee")])
+        calls = {"n": 0}
+
+        async def llm(prompt: str) -> str:
+            calls["n"] += 1
+            return json.dumps({"action": "answer", "answer": "I don't know",
+                               "citations": [], "abstained": True})
+
+        out = await ask_memory(svc, question="What is Bob's favorite sport?",
+                               user_id="u", reasoning_level="low", llm_call=llm)
+        assert calls["n"] == 1  # no second-chance (no keyword overlap)
+        assert out["abstained"] is True
+        assert not any("second-chance" in s for s in out["searches"])
+
+    @pytest.mark.asyncio
+    async def test_second_chance_still_abstains_preserved(self):
+        """Second-chance re-ask can still produce an abstention (the promoted
+        rows weren't enough) — the honest "don't know" stands."""
+        svc = _service([_mem("m1", "Alice joined the project in Berlin")])
+        calls = {"n": 0}
+
+        async def llm(prompt: str) -> str:
+            calls["n"] += 1
+            return json.dumps({"action": "answer", "answer": "I don't know",
+                               "citations": [], "abstained": True})
+
+        out = await ask_memory(svc, question="Where did Alice join?",
+                               user_id="u", reasoning_level="low", llm_call=llm)
+        assert calls["n"] == 2  # first + second-chance
+        assert out["abstained"] is True  # second-chance also abstained
+        assert any("second-chance" in s for s in out["searches"])
+
+    @pytest.mark.asyncio
+    async def test_non_abstained_first_pass_unchanged(self):
+        """When the first pass answers (not abstained), no second-chance runs
+        (zero overhead for the common path)."""
+        svc = _service([_mem("m1", "Alice lives in Berlin")])
+        calls = {"n": 0}
+
+        async def llm(prompt: str) -> str:
+            calls["n"] += 1
+            return json.dumps({"action": "answer", "answer": "Berlin [m1]",
+                               "citations": ["m1"], "abstained": False})
+
+        out = await ask_memory(svc, question="Where does Alice live?",
+                               user_id="u", reasoning_level="low", llm_call=llm)
+        assert calls["n"] == 1  # no second-chance
+        assert out["answer"] == "Berlin [m1]"
+        assert out["abstained"] is False
+        assert not any("second-chance" in s for s in out["searches"])
+
+    @pytest.mark.asyncio
+    async def test_keyword_overlap_detection_case_insensitive(self):
+        """Keyword overlap is case-insensitive substring match (reuses
+        extract_keywords lowercasing)."""
+        svc = _service([_mem("m1", "The PROJECT started in BERLIN yesterday")])
+        prompts: list[str] = []
+        responses = iter([
+            json.dumps({"action": "answer", "answer": "I don't know",
+                        "citations": [], "abstained": True}),
+            json.dumps({"action": "answer", "answer": "Berlin [m1]",
+                        "citations": ["m1"], "abstained": False}),
+        ])
+
+        async def llm(prompt: str) -> str:
+            prompts.append(prompt)
+            return next(responses)
+
+        out = await ask_memory(svc, question="where did the project start",
+                               user_id="u", reasoning_level="low", llm_call=llm)
+        assert len(prompts) == 2  # overlap detected ("project" + "start")
+        assert out["abstained"] is False
+
+    @pytest.mark.asyncio
+    async def test_response_schema_unchanged(self):
+        """Second-chance does not change response schema keys (backward compat)."""
+        svc = _service([_mem("m1", "Alice joined in Berlin")])
+        prompts = []
+        responses = iter([
+            json.dumps({"action": "answer", "answer": "I don't know",
+                        "citations": [], "abstained": True}),
+            json.dumps({"action": "answer", "answer": "Berlin [m1]",
+                        "citations": ["m1"], "abstained": False}),
+        ])
+
+        async def llm(prompt: str) -> str:
+            prompts.append(prompt)
+            return next(responses)
+
+        out = await ask_memory(svc, question="Where did Alice join?",
+                               user_id="u", reasoning_level="low", llm_call=llm)
+        # Same keys as before T2.1 (searches list now has second-chance entry).
+        expected_keys = {"status", "reasoning_level", "answer", "citations",
+                         "abstained", "searches", "memories_considered",
+                         "skipped_passes", "_evidence_tokens"}
+        assert set(out.keys()) == expected_keys
+
 
 # ──────────────────────────────────────────────
 # Citations (no fabricated ids)
@@ -634,9 +1000,49 @@ class TestCitations:
 
 class TestContradictions:
     @pytest.mark.asyncio
+    async def test_discipline_3_instructs_stating_winner_as_answer(self):
+        """Discipline 3 (T2.3): commit to the recency winner as THE answer,
+        subordinate clause for supersession (not surface-both as primary)."""
+        svc = _service([_mem("m1", "x")])
+        llm = _answer_llm("ans")
+        await ask_memory(svc, question="q?", user_id="u",
+                         reasoning_level="high", llm_call=llm)
+        prompt = llm.prompts[0]
+        discipline_section = prompt.split("EVIDENCE:")[0]
+
+        # NEW wording: state the winner AS THE answer
+        assert "CONTRADICTIONS:" in discipline_section
+        assert "state the winner" in discipline_section
+        assert "as THE answer" in discipline_section
+        assert "subordinate clause" in discipline_section
+        assert "not as a co-equal alternative" in discipline_section
+
+        # OLD wording no longer present: don't surface BOTH as primary behavior
+        assert "surface BOTH with their timestamps" not in discipline_section
+        assert "say explicitly that you are preferring it because it is newer" not in discipline_section
+
+    @pytest.mark.asyncio
+    async def test_discipline_3_scope_guard_no_blanket_commit(self):
+        """T2.3 scope guard: the sharpened discipline 3 is confined to
+        contradictions/recency; it does NOT add a general commit instruction."""
+        svc = _service([_mem("m1", "x")])
+        llm = _answer_llm("ans")
+        await ask_memory(svc, question="q?", user_id="u",
+                         reasoning_level="high", llm_call=llm)
+        prompt = llm.prompts[0]
+        discipline_section = prompt.split("EVIDENCE:")[0]
+
+        # Assert NO blanket over-commit phrasing (LME regression guard)
+        assert "commit to the fact itself" not in discipline_section
+        assert "when the evidence directly answers" not in discipline_section
+        # The discipline is scoped to contradictions, not synthesis generally
+        contradict_disc = discipline_section.split("3. CONTRADICTIONS:")[1].split("4. ")[0]
+        assert "contradict" in contradict_disc.lower()
+
+    @pytest.mark.asyncio
     async def test_evidence_carries_timestamps_and_discipline(self):
         """The prompt must give the model what discipline 3 needs: both
-        conflicting rows WITH their timestamps + the surface-both rule."""
+        conflicting rows WITH their timestamps + the commit-to-winner rule."""
         old = _mem("m-old", "The sync is on Tuesday.", "2026-01-01T00:00:00+00:00")
         new = _mem("m-new", "The sync was rescheduled to Thursday.", "2026-06-01T00:00:00+00:00")
         svc = _service([new, old])
@@ -648,10 +1054,26 @@ class TestContradictions:
                                reasoning_level="medium", llm_call=llm)
         prompt = llm.prompts[0]
         assert "2026-01-01" in prompt and "2026-06-01" in prompt
-        assert "CONTRADICTIONS" in prompt and "BOTH" in prompt
+        assert "CONTRADICTIONS" in prompt
+        # The commit-to-winner rule is actually present (matches the docstring).
+        assert "state the winner" in prompt and "as THE answer" in prompt
         # Chronological order in the evidence block: older row first.
         assert prompt.index("m-old") < prompt.index("m-new")
         assert set(out["citations"]) == {"m-new", "m-old"}
+
+    @pytest.mark.asyncio
+    async def test_recency_and_specificity_basis_preserved(self):
+        """Discipline 3 (T2.3): winner selection basis mentions event time,
+        storage time, and specificity as tie-break (consistency with disc 2+7)."""
+        svc = _service([_mem("m1", "x")])
+        llm = _answer_llm("ans")
+        await ask_memory(svc, question="q?", user_id="u",
+                         reasoning_level="high", llm_call=llm)
+        prompt = llm.prompts[0]
+        contradict_disc = prompt.split("3. CONTRADICTIONS:")[1].split("4. ")[0]
+        assert "event time" in contradict_disc
+        assert "storage time" in contradict_disc
+        assert "most specific" in contradict_disc
 
     @pytest.mark.asyncio
     async def test_enumeration_dedup_instruction_present(self):
@@ -936,6 +1358,15 @@ class TestHelpers:
     def test_parse_llm_json_garbage_is_none(self):
         assert ask_mod._parse_llm_json("no json here") is None
         assert ask_mod._parse_llm_json("") is None
+
+    def test_evidence_shares_keywords(self):
+        """Helper for second-chance trigger: detects keyword overlap."""
+        mem = _mem("m1", "Alice joined the project in Berlin for backend work")
+        assert ask_mod._evidence_shares_keywords(mem, ["alice", "project"], min_overlap=2)
+        assert ask_mod._evidence_shares_keywords(mem, ["alice", "backend", "berlin"], min_overlap=2)
+        assert not ask_mod._evidence_shares_keywords(mem, ["alice"], min_overlap=2)  # only 1
+        assert not ask_mod._evidence_shares_keywords(mem, ["bob", "frontend"], min_overlap=2)  # 0
+        assert not ask_mod._evidence_shares_keywords(mem, [], min_overlap=2)  # no keywords
 
 
 # ──────────────────────────────────────────────

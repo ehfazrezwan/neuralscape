@@ -23,9 +23,13 @@ from pathlib import Path
 import httpx
 
 from neuralscape_bench.client import NeuralscapeClient
-from neuralscape_bench.accuracy.manifest import append_jsonl, load_done_qa_ids
+from neuralscape_bench.accuracy.manifest import append_jsonl, read_jsonl_records
 from neuralscape_bench.accuracy.metrics import attribute_memory, recall_at_k
 from neuralscape_bench.accuracy.schema import QAItem, SuiteData, bench_user_id
+
+
+#: Retry events observed this process (noise telemetry for clean-run audits).
+BACKOFF_EVENTS: list[dict] = []
 
 
 async def _with_backoff(coro_factory, *, max_retries: int = 5, base_delay: float = 2.0):
@@ -36,17 +40,23 @@ async def _with_backoff(coro_factory, *, max_retries: int = 5, base_delay: float
         except httpx.HTTPStatusError as e:
             if e.response.status_code not in (429, 500, 502, 503, 504) or attempt == max_retries - 1:
                 raise
-        except httpx.TransportError:
+            BACKOFF_EVENTS.append({"kind": f"http-{e.response.status_code}", "attempt": attempt + 1})
+            print(f"[backoff] http {e.response.status_code} attempt {attempt + 1}, "
+                  f"sleeping ~{delay:.0f}s", flush=True)
+        except httpx.TransportError as e:
             if attempt == max_retries - 1:
                 raise
+            BACKOFF_EVENTS.append({"kind": type(e).__name__, "attempt": attempt + 1})
+            print(f"[backoff] transport {type(e).__name__} attempt {attempt + 1}, "
+                  f"sleeping ~{delay:.0f}s", flush=True)
         await asyncio.sleep(delay + random.uniform(0, delay / 2))
         delay = min(delay * 2, 60.0)
     raise RuntimeError("unreachable")
 
 
 async def answer_one(client: NeuralscapeClient, data: SuiteData, qa: QAItem, *,
-                     k: int, reasoning_level: str) -> dict:
-    user_id = bench_user_id(data.suite, qa.conv_id)
+                     k: int, reasoning_level: str, namespace: str | None = None) -> dict:
+    user_id = bench_user_id(data.suite, qa.conv_id, namespace)
     conv = data.conversation(qa.conv_id)
     record: dict = {
         "qa_id": qa.qa_id,
@@ -99,10 +109,17 @@ async def answer_one(client: NeuralscapeClient, data: SuiteData, qa: QAItem, *,
 
 async def answer_suite(client: NeuralscapeClient, data: SuiteData, *,
                        out_path: Path, k: int = 10, reasoning_level: str = "high",
-                       concurrency: int = 2, log=print) -> dict:
-    """Answer every QA item, appending records to ``out_path`` (resumable)."""
-    done = load_done_qa_ids(out_path)
-    todo = [qa for qa in data.qa_items if qa.qa_id not in done]
+                       concurrency: int = 2, namespace: str | None = None,
+                       log=print) -> dict:
+    """Answer every QA item, appending records to ``out_path`` (resumable).
+
+    Resume keys on ``(qa_id, qtype)`` — plain qa_id is not unique in suites
+    where file stems repeat across categories (the known ConvoMem id
+    collision), and keying on it would silently skip unanswered items.
+    """
+    done = {(r.get("qa_id"), r.get("qtype"))
+            for r in read_jsonl_records(out_path) if r.get("qa_id")}
+    todo = [qa for qa in data.qa_items if (qa.qa_id, qa.qtype) not in done]
     log(f"[answer] {data.suite}: {len(todo)} to answer ({len(done)} already done)")
 
     sem = asyncio.Semaphore(max(1, concurrency))
@@ -111,7 +128,8 @@ async def answer_suite(client: NeuralscapeClient, data: SuiteData, *,
 
     async def one(qa: QAItem):
         async with sem:
-            rec = await answer_one(client, data, qa, k=k, reasoning_level=reasoning_level)
+            rec = await answer_one(client, data, qa, k=k, reasoning_level=reasoning_level,
+                                   namespace=namespace)
             async with lock:
                 append_jsonl(out_path, rec)
                 counters["done"] += 1
@@ -126,6 +144,7 @@ async def answer_suite(client: NeuralscapeClient, data: SuiteData, *,
         "answered": counters["done"],
         "skipped": len(done),
         "ask_errors": counters["errors"],
+        "backoff_events": len(BACKOFF_EVENTS),
         "wall_s": round(time.perf_counter() - t0, 1),
         "k": k,
         "reasoning_level": reasoning_level,

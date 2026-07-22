@@ -16,13 +16,18 @@ from dataclasses import dataclass, field
 _USER_ID_SAFE = re.compile(r"[^a-zA-Z0-9_.\-]+")
 
 
-def bench_user_id(suite: str, conv_id: str) -> str:
+def bench_user_id(suite: str, conv_id: str, namespace: str | None = None) -> str:
     """Per-conversation NS user id, e.g. ``bench-locomo-conv-26``.
 
     Must satisfy the service's ``_ID_PATTERN`` (``^[a-zA-Z0-9_.\\-]+$``) and
     its 100-char cap — unsafe chars collapse to ``-``.
+
+    ``namespace`` (optional) prefixes the id so a per-PR mini-ingest lands in
+    its own user space — e.g. ``bench-t11-locomo-conv-26`` — without colliding
+    with the shared baseline store. Default (``None``) leaves ids unchanged.
     """
-    raw = f"bench-{suite}-{conv_id}"
+    prefix = f"bench-{namespace}-" if namespace else "bench-"
+    raw = f"{prefix}{suite}-{conv_id}"
     return _USER_ID_SAFE.sub("-", raw)[:100].strip("-")
 
 

@@ -18,12 +18,14 @@ COPY neuralscape-service/*.py neuralscape-service/
 COPY neuralscape-service/memory/ neuralscape-service/memory/
 COPY neuralscape-service/extensions/ neuralscape-service/extensions/
 COPY neuralscape-service/adapters/ neuralscape-service/adapters/
+COPY neuralscape-service/knowledge/ neuralscape-service/knowledge/
 COPY neuralscape-service/ingest/ neuralscape-service/ingest/
 COPY neuralscape-service/connectors/ neuralscape-service/connectors/
 COPY neuralscape-service/okf/ neuralscape-service/okf/
 
 # Install all dependencies using uv from the neuralscape-service project
-RUN cd neuralscape-service && uv sync --frozen --no-dev
+# E2: include the code-graph extra (tree-sitter + graphifyy) in the builder
+RUN cd neuralscape-service && uv sync --frozen --no-dev --extra code-graph
 
 # Download the small English spaCy model so mem0's keyword-extraction
 # layer finds it at import time. Without this the worker logs a
@@ -61,6 +63,7 @@ COPY neuralscape-service/*.py neuralscape-service/
 COPY neuralscape-service/memory/ neuralscape-service/memory/
 COPY neuralscape-service/extensions/ neuralscape-service/extensions/
 COPY neuralscape-service/adapters/ neuralscape-service/adapters/
+COPY neuralscape-service/knowledge/ neuralscape-service/knowledge/
 COPY neuralscape-service/ingest/ neuralscape-service/ingest/
 COPY neuralscape-service/connectors/ neuralscape-service/connectors/
 COPY neuralscape-service/okf/ neuralscape-service/okf/
@@ -86,7 +89,12 @@ USER appuser
 
 EXPOSE 8199
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8199"]
+# Configurable uvicorn worker count via UVICORN_WORKERS env var (default 1).
+# Multiple workers enable concurrent request handling across CPU cores, but each
+# holds its own interpreter/model state. Default 1 preserves single-process behavior.
+# The expansion is validated as a positive integer and quoted so a stray/whitespace
+# value can't word-split into unintended uvicorn arguments (falls back to 1).
+CMD ["sh", "-c", "w=\"${UVICORN_WORKERS:-1}\"; case \"$w\" in ''|*[!0-9]*) w=1;; esac; [ \"$w\" -ge 1 ] 2>/dev/null || w=1; exec uvicorn main:app --host 0.0.0.0 --port 8199 --workers \"$w\""]
 
 # ── Stage 3: Test ───────────────────────────────────────────────
 # Mirrors runtime but includes dev dependencies (pytest, etc.) and the
@@ -110,12 +118,14 @@ COPY neuralscape-service/*.py neuralscape-service/
 COPY neuralscape-service/memory/ neuralscape-service/memory/
 COPY neuralscape-service/extensions/ neuralscape-service/extensions/
 COPY neuralscape-service/adapters/ neuralscape-service/adapters/
+COPY neuralscape-service/knowledge/ neuralscape-service/knowledge/
 COPY neuralscape-service/ingest/ neuralscape-service/ingest/
 COPY neuralscape-service/connectors/ neuralscape-service/connectors/
 COPY neuralscape-service/okf/ neuralscape-service/okf/
 
 # Resolve WITH dev deps so pytest, pytest-asyncio, etc. are available.
-RUN cd neuralscape-service && uv sync --frozen
+# E2: include the code-graph extra so in-container tests can import tree-sitter
+RUN cd neuralscape-service && uv sync --frozen --extra code-graph
 
 # Same spaCy model handling as the runtime stage so unit tests that
 # import mem0's NLP path see the same dependency graph as production.

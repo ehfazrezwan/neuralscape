@@ -13,6 +13,22 @@ from memory.ranking import RRF_K, _dense_score_floor, _reinforcement_boost, _rrf
 
 logger = logging.getLogger(__name__)
 
+
+def _dt_to_iso(value):
+    """Coerce a Graphiti datetime (or already-string) to a canonical ISO string.
+
+    Graphiti edge/episode temporal fields are ``datetime`` objects, but the
+    NS envelope (``MemoryResponse.created_at`` etc.) is ``str | None`` and
+    Pydantic rejects a datetime. Returns ``value.isoformat()`` for datetimes,
+    the value unchanged if it's already a string, else None.
+    """
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
 # ── Overlapped graph pass (audit 27 #9) ────────────────────────────────
 # search() used to run its vector pools to completion and only then start
 # the Graphiti pass — wall time was vector + graph even though the two legs
@@ -31,6 +47,12 @@ _GRAPH_SEARCH_POOL = _ThreadPoolExecutor(
 # can never hang a read indefinitely.
 _GRAPH_SEARCH_JOIN_TIMEOUT_S = 45.0
 
+# R3: per-snippet char cap for recall-side episode excerpts. Bounds evidence
+# tokens; the COUNT of episode rows is separately capped at 3 (the ask sweet
+# spot). A plain char cap (not ask.py's sentence-boundary _clip_content) keeps
+# the search mixin free of an ask.py import (which would be circular).
+_EPISODE_SNIPPET_CLIP = 600
+
 class SearchMixin:
     """SearchMixin for MemoryService (mechanical split — see memory_service.py)."""
 
@@ -47,6 +69,7 @@ class SearchMixin:
         limit: int,
         query_embedding: list[float] | None = None,
         visibility_value: str = MemoryVisibility.SHARED.value,
+        workspaces: list[str] | None = None,
     ) -> list[MemoryResponse]:
         """Search Qdrant for cross-writer memories of a given visibility.
 
@@ -62,6 +85,11 @@ class SearchMixin:
         single ``search()`` doesn't re-embed the same query for every pool/scope
         (the embed round-trip dominates read latency); falls back to embedding
         ``query`` when not provided.
+
+        ``workspaces`` (WT6) filters by workspace partition. Default ``None``
+        is treated as ``["memory"]`` (memory-type workspace only — reference
+        workspaces fenced out). Pass explicit workspace names to search
+        reference content.
         """
         from qdrant_client.models import (
             FieldCondition,
@@ -100,6 +128,18 @@ class SearchMixin:
         if concepts:
             must.append(FieldCondition(key="metadata.concepts", match=MatchAny(any=concepts)))
 
+        # Workspace filter (WT6): default to memory type only (reference fenced out).
+        # Explicit workspaces list opens the door to reference content. For now,
+        # simple implementation: filter post-retrieval if needed. A future optimization
+        # can use Qdrant's should/must filter combinations.
+        # When workspaces=None or ["memory"], exclude any rows with non-memory workspace.
+        effective_workspaces = workspaces if workspaces is not None else ["memory"]
+        if effective_workspaces == ["memory"]:
+            # Memory-only: exclude rows with a non-None, non-"memory" workspace.
+            # This is done post-retrieval for simplicity (Qdrant's filter syntax
+            # doesn't cleanly express "IsEmpty OR IsNull OR MatchValue('memory')").
+            pass  # Applied as post-filter below
+
         # qdrant-client v1.13+ removed `.search()` in favor of `.query_points()`;
         # the response wraps hits in a `.points` attribute.
         qfilter = Filter(must=must, must_not=must_not)
@@ -123,6 +163,12 @@ class SearchMixin:
             hit = entry["hit"]
             payload = getattr(hit, "payload", None) or {}
             metadata = payload.get("metadata", {})
+            # Workspace filter (WT6): post-retrieval filter by workspace list.
+            # Absent/None/"memory" all represent the memory workspace.
+            hit_workspace = metadata.get("workspace")
+            workspace_normalized = hit_workspace if hit_workspace else "memory"
+            if workspace_normalized not in effective_workspaces:
+                continue  # Skip this hit — it's from a non-requested workspace
             # Lexical-only hits carry a raw BM25 score (not cosine-comparable);
             # impute the pool's dense floor so the cross-pool score sort stays
             # meaningful without ever letting a keyword match outrank a
@@ -191,6 +237,7 @@ class SearchMixin:
         concepts: list[str] | None,
         limit: int,
         query_embedding: list[float] | None = None,
+        workspaces: list[str] | None = None,
     ) -> list[MemoryResponse]:
         """Search the authoritative ``standard``-tier pool (dictator-written).
 
@@ -208,6 +255,7 @@ class SearchMixin:
             observation_type=observation_type,
             concepts=concepts,
             limit=limit,
+            workspaces=workspaces,
             query_embedding=query_embedding,
             visibility_value=MemoryVisibility.STANDARD.value,
         )
@@ -225,6 +273,7 @@ class SearchMixin:
         concepts: list[str] | None,
         limit: int,
         query: str = "",
+        workspaces: list[str] | None = None,
     ) -> list[MemoryResponse]:
         """Search Qdrant for the caller's own memories using a precomputed vector.
 
@@ -282,11 +331,19 @@ class SearchMixin:
         fused = _rrf_fuse(dense_hits, lexical_hits, limit)
         dense_floor = _dense_score_floor(dense_hits)
 
+        # Workspace filter (WT6): same post-retrieval filter as shared pool
+        effective_workspaces = workspaces if workspaces is not None else ["memory"]
+
         out: list[MemoryResponse] = []
         for entry in fused:
             hit = entry["hit"]
             payload = getattr(hit, "payload", None) or {}
             metadata = payload.get("metadata", {})
+            # Workspace filter (WT6): post-retrieval filter by workspace list
+            hit_workspace = metadata.get("workspace")
+            workspace_normalized = hit_workspace if hit_workspace else "memory"
+            if workspace_normalized not in effective_workspaces:
+                continue  # Skip this hit — it's from a non-requested workspace
             # Lexical-only hits: impute the pool's dense floor (see
             # _search_shared_pool for the rationale).
             raw_score = getattr(hit, "score", None) if entry["dense"] else dense_floor
@@ -323,6 +380,8 @@ class SearchMixin:
         # Multi-user pool selection
         visibility: str | None = None,
         include_shared: bool = True,
+        # Workspace partition (WT6): default ["memory"] fences out reference content
+        workspaces: list[str] | None = None,
         # Internal write-path mode (audit 27 #12): vector pools only — no
         # graph pass, no graph enrichment, no recall-trace logging.
         vector_only: bool = False,
@@ -378,6 +437,7 @@ class SearchMixin:
                     limit=limit,
                     visibility=visibility,
                     include_shared=include_shared,
+                    include_episodes=settings.graph_episode_recall_enabled,
                 )
             except Exception as e:
                 logger.warning(f"Graph search submit failed (non-critical): {e}")
@@ -401,6 +461,7 @@ class SearchMixin:
                             project_id=project_id, categories=categories, scope=None,
                             domain=domain, observation_type=observation_type,
                             concepts=concepts, limit=limit, query=query,
+                            workspaces=workspaces,
                         )
                     )
                     vector_responses.extend(
@@ -409,6 +470,7 @@ class SearchMixin:
                             project_id=None, categories=categories, scope="global",
                             domain=domain, observation_type=observation_type,
                             concepts=concepts, limit=limit, query=query,
+                            workspaces=workspaces,
                         )
                     )
                 else:
@@ -418,6 +480,7 @@ class SearchMixin:
                             project_id=project_id, categories=categories, scope=scope,
                             domain=domain, observation_type=observation_type,
                             concepts=concepts, limit=limit, query=query,
+                            workspaces=workspaces,
                         )
                     )
             except Exception as e:
@@ -457,6 +520,7 @@ class SearchMixin:
                             observation_type=observation_type,
                             concepts=concepts,
                             limit=limit,
+                            workspaces=workspaces,
                             query_embedding=query_embedding,
                         )
                     )
@@ -471,6 +535,7 @@ class SearchMixin:
                             observation_type=observation_type,
                             concepts=concepts,
                             limit=limit,
+                            workspaces=workspaces,
                             query_embedding=query_embedding,
                         )
                     )
@@ -486,6 +551,7 @@ class SearchMixin:
                             observation_type=observation_type,
                             concepts=concepts,
                             limit=limit,
+                            workspaces=workspaces,
                             query_embedding=query_embedding,
                         )
                     )
@@ -520,6 +586,7 @@ class SearchMixin:
                         observation_type=observation_type,
                         concepts=concepts,
                         limit=limit,
+                        workspaces=workspaces,
                         query_embedding=query_embedding,
                     )
                 )
@@ -549,6 +616,10 @@ class SearchMixin:
         # below for the zero-embed twin decoration (query_batch_points with
         # these vectors instead of re-embedding edge facts).
         graph_edge_embeddings: list[list | None] = []
+        # R3: episode rows are collected here and appended AFTER edge enrichment
+        # so they can never desync graph_edge_embeddings from the edge rows.
+        # Initialized at edge scope so the append below is unconditional.
+        episodes_for_later: list[MemoryResponse] = []
         if graph_future is not None:
             try:
                 graph_results = graph_future.result(
@@ -572,11 +643,46 @@ class SearchMixin:
                                 if emb is not None
                                 else None
                             ),
+                            # R4: surface Graphiti's bi-temporal edge validity
+                            # metadata so the answer layer can reason about
+                            # recency/contradiction (already ISO-stringified).
+                            # Intentionally NOT setting created_at from the edge:
+                            # graph rows keep getting created_at from their nearest
+                            # source memory via enrichment (fills only when None,
+                            # _enrich_graph_with_v2). Setting it here would change
+                            # graph-row created_at (edge-creation vs storage time)
+                            # and shift ask's recency sort — outside R4's scope.
+                            valid_at=edge.get("valid_at"),
+                            invalid_at=edge.get("invalid_at"),
                         )
                     )
                     graph_edge_embeddings.append(emb)
+                # R3: consume episodes from the graph search (when flag enabled).
+                # Use the same id/source scheme as ask.py (ep-<uuid12>, source="episode")
+                # so deduplication aligns. Episodes are appended AFTER edge
+                # enrichment to preserve edge_embeddings index alignment.
+                if settings.graph_episode_recall_enabled:
+                    for ep in graph_results.get("episodes", []):
+                        ep_uuid = str(ep.get("uuid") or "")
+                        ep_content = str(ep.get("content") or "")
+                        # Clip each recall episode snippet to a bounded length.
+                        # (Not the same as ask.py's _clip_content, which clips at
+                        # a sentence/whitespace boundary; a plain char cap keeps
+                        # the recall leg dependency-free — importing ask into the
+                        # search mixin would be circular.)
+                        clipped = ep_content[:_EPISODE_SNIPPET_CLIP]
+                        episodes_for_later.append(
+                            MemoryResponse(
+                                id=f"ep-{ep_uuid[:12]}",
+                                memory=f"[verbatim session excerpt] {clipped}",
+                                source="episode",
+                                score=None,  # rank on merit, not score
+                                created_at=ep.get("created_at") or None,
+                            )
+                        )
             except Exception as e:
                 logger.warning(f"Graph search failed during recall (non-critical): {e}")
+                episodes_for_later = []
 
         # Enrich graph rows with metadata from their nearest source memory
         # (title/category/created_at/v2 fields + the twin back-reference).
@@ -621,6 +727,11 @@ class SearchMixin:
                 allow_embed_fallback=(memory_kind == "passage"),
             )
 
+        # R3: append episode rows after edge enrichment to preserve index alignment
+        # of graph_edge_embeddings with edge rows (episodes have no embeddings).
+        if episodes_for_later:
+            graph_responses.extend(episodes_for_later)
+
         # Multi-user model: post-filter graph rows by enriched visibility.
         # The Graphiti search above already scopes by group_ids, so most
         # rows arrive in the right pool. This pass mops up the edge case
@@ -635,15 +746,17 @@ class SearchMixin:
                 if r.visibility == visibility or r.visibility is None
             ]
 
-        # Deduplicate and enforce caller's limit — ranked vector hits keep
-        # priority; graph rows are appended after, capped within the limit.
+        # Deduplicate without applying limit yet — the memory_kind filter
+        # below may exclude rows, so we apply limit AFTER filtering to avoid
+        # the cap being consumed by filtered-out rows (audit 27 hardening #8).
         combined = self._deduplicate_responses(
-            vector_responses, graph_responses, limit=limit
+            vector_responses, graph_responses, limit=None
         )
 
         # memory_kind filter (data-layer connectors). Legacy memories have no
         # memory_kind, so a "fact" filter treats null as fact (back-compat);
-        # "passage" matches only explicitly-tagged passages.
+        # "passage" matches only explicitly-tagged passages. Applied BEFORE
+        # the top-k truncation so the cap isn't consumed by filtered-out rows.
         if memory_kind == "fact":
             combined = [r for r in combined if (r.memory_kind or "fact") == "fact"]
         elif memory_kind == "passage":
@@ -954,6 +1067,7 @@ class SearchMixin:
         limit: int,
         visibility: str | None,
         include_shared: bool,
+        include_episodes: bool = False,
     ) -> dict:
         """search_graph with multi-user visibility scoping.
 
@@ -991,7 +1105,9 @@ class SearchMixin:
             # Default: full read-set (caller's private + shared + standard).
             group_ids = _get_group_ids(user_id, project_id)
 
-        return self._do_graph_search(query=query, group_ids=group_ids, limit=limit)
+        return self._do_graph_search(
+            query=query, group_ids=group_ids, limit=limit, include_episodes=include_episodes
+        )
 
     def _do_graph_search(
         self,
@@ -999,13 +1115,19 @@ class SearchMixin:
         group_ids: list[str],
         limit: int,
         search_config: dict | None = None,
+        include_episodes: bool = False,
     ) -> dict:
         """Internal: run a graph search across the given group_ids."""
         g = self._get_graphiti()
         if g is None:
             return {"edges": [], "nodes": [], "episodes": [], "communities": []}
 
-        from graphiti_core.search.search_config import SearchConfig
+        from graphiti_core.search.search_config import (
+            EpisodeReranker,
+            EpisodeSearchConfig,
+            EpisodeSearchMethod,
+            SearchConfig,
+        )
         from graphiti_core.search.search_config_recipes import EDGE_HYBRID_SEARCH_RRF
 
         # Audit 27 #10: EDGE_HYBRID_SEARCH_RRF is a module-level singleton
@@ -1020,6 +1142,14 @@ class SearchMixin:
                 config = EDGE_HYBRID_SEARCH_RRF.model_copy(deep=True)
         else:
             config = EDGE_HYBRID_SEARCH_RRF.model_copy(deep=True)
+            # R3: when include_episodes AND using the default recipe, add the
+            # bm25 episode leg (no embeddings). Explicit search_configs (e.g.
+            # the delete path with limit=5) stay episode-free.
+            if include_episodes:
+                config.episode_config = EpisodeSearchConfig(
+                    search_methods=[EpisodeSearchMethod.bm25],
+                    reranker=EpisodeReranker.rrf,
+                )
         config.limit = limit
 
         try:
@@ -1036,7 +1166,14 @@ class SearchMixin:
                 )
             )
             edges = [
-                {"uuid": e.uuid, "name": e.name, "fact": e.fact}
+                {
+                    "uuid": e.uuid,
+                    "name": e.name,
+                    "fact": e.fact,
+                    "valid_at": _dt_to_iso(getattr(e, "valid_at", None)),
+                    "invalid_at": _dt_to_iso(getattr(e, "invalid_at", None)),
+                    "created_at": _dt_to_iso(getattr(e, "created_at", None)),
+                }
                 for e in results.edges
                 # Belt-and-suspenders: some drivers/recipes skip the Cypher
                 # filter constructor, so drop stamped edges here too.
@@ -1046,9 +1183,20 @@ class SearchMixin:
                 {"uuid": n.uuid, "name": n.name, "summary": n.summary}
                 for n in results.nodes
             ]
+            # R3: cap episodes at 3 (ask measured 3 as sweet spot, 5 regressed).
+            # Stringify datetimes to ISO — Graphiti hands back datetime objects,
+            # but MemoryResponse.created_at is `str | None` and would reject a
+            # datetime (silently dropping every episode row via the recall
+            # try/except). Keep created_at/valid_at as ISO strings (R4 uses them).
             episodes = [
-                {"uuid": ep.uuid, "name": ep.name, "content": ep.content}
-                for ep in results.episodes
+                {
+                    "uuid": ep.uuid,
+                    "name": ep.name,
+                    "content": ep.content,
+                    "created_at": _dt_to_iso(getattr(ep, "created_at", None)),
+                    "valid_at": _dt_to_iso(getattr(ep, "valid_at", None)),
+                }
+                for ep in results.episodes[:3]
             ]
             communities = [
                 {"uuid": c.uuid, "name": c.name} for c in results.communities
@@ -1186,17 +1334,27 @@ class SearchMixin:
         config.limit = limit
 
         try:
+            # Audit 27 (hardening): filter out invalidated/expired edges from
+            # graph search results — same live-edge discipline as other paths.
             results = self._run_on_bridge(
                 g.search_(
                     query=query,
                     config=config,
                     group_ids=group_ids,
+                    search_filter=_live_edges_filter(),
                 )
             )
 
             return {
                 "edges": [
-                    {"uuid": e.uuid, "name": e.name, "fact": e.fact}
+                    {
+                        "uuid": e.uuid,
+                        "name": e.name,
+                        "fact": e.fact,
+                        "valid_at": _dt_to_iso(getattr(e, "valid_at", None)),
+                        "invalid_at": _dt_to_iso(getattr(e, "invalid_at", None)),
+                        "created_at": _dt_to_iso(getattr(e, "created_at", None)),
+                    }
                     for e in results.edges
                 ],
                 "nodes": [

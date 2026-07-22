@@ -309,6 +309,10 @@ class MemoryGraph:
                 "relationship": edge.name,
                 "destination": uuid_to_name.get(edge.target_node_uuid, edge.target_node_uuid),
                 "fact": edge.fact,
+                # R4: surface bi-temporal validity metadata so the MCP
+                # search_knowledge_graph path carries it too (additive).
+                "valid_at": edge.valid_at.isoformat() if edge.valid_at else None,
+                "invalid_at": edge.invalid_at.isoformat() if edge.invalid_at else None,
             })
         return results
 
@@ -322,6 +326,8 @@ class MemoryGraph:
         excluded_entity_types=None,
         custom_extraction_instructions=None,
         episode_name=None,
+        reference_time: datetime | None = None,
+        episode_source: str = "text",
     ):
         """Add data to the graph via Graphiti's add_episode.
 
@@ -345,6 +351,12 @@ class MemoryGraph:
                 content + group so a re-run can find (and skip) an
                 already-ingested episode. None ⇒ the legacy timestamp-based
                 name (every call mints a distinct episode).
+            reference_time (datetime | None): Real event time for Graphiti
+                bi-temporal dating; None ⇒ ingestion wall-clock (legacy behavior).
+            episode_source (str): Episode source type for Graphiti extraction.
+                Conversation episodes use "message" to activate Graphiti's
+                speaker-first extract_message prompt; single facts stay "text".
+                Default "text" preserves existing behavior for all current callers.
 
         Returns:
             dict: {"deleted_entities": [...], "added_entities": [...]}
@@ -369,12 +381,17 @@ class MemoryGraph:
             episode_kwargs["custom_extraction_instructions"] = custom_extraction_instructions
 
         async def _add():
+            # Translate episode_source string to EpisodeType enum
+            source_type = (
+                EpisodeType.message if episode_source == "message"
+                else EpisodeType.text
+            )
             result = await self.graphiti.add_episode(
                 name=episode_name or f"mem0_episode_{now.isoformat()}",
                 episode_body=data,
                 source_description=source_description,
-                reference_time=now,
-                source=EpisodeType.text,
+                reference_time=reference_time or now,
+                source=source_type,
                 group_id=group_id,
                 update_communities=self._update_communities,
                 **episode_kwargs,

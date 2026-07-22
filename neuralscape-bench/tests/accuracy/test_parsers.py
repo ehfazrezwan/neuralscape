@@ -97,7 +97,9 @@ def test_beam_parse_haystack_per_user():
     assert conv.conv_id == "1"
     assert [s.session_id for s in conv.sessions] == ["doc-1", "doc-2"]
     q_ku, q_abs = data.qa_items
-    assert q_ku.evidence_session_ids == ("doc-2",)
+    # 100k-tier gold_ids are user-level, not document ids — the parser
+    # deliberately drops them so R@k is skipped instead of flat-zero.
+    assert q_ku.evidence_session_ids == ()
     assert q_ku.rubric == ("Mentions Lisbon as the final destination",)
     assert q_abs.is_abstention
 
@@ -114,6 +116,26 @@ def test_convomem_parse_file():
     assert qa.evidence_session_ids == ("conv-a",)
     assert qa.evidence_texts == ("I mark hot leads in green.",)
     assert qa.qtype == "user_evidence"
+
+
+def test_convomem_ids_namespaced_by_category():
+    """Same file stem in two categories must NOT collide — conv_id doubles as
+    the NS user id, so a collision merges two unrelated conversations into one
+    user's memory space (and breaks qa_id-keyed resume/judge joins)."""
+    a = convomem.parse_file(fixtures.CONVOMEM_FILE, category="user_evidence",
+                            file_stem="fixture")
+    b = convomem.parse_file(fixtures.CONVOMEM_FILE, category="preference_evidence",
+                            file_stem="fixture")
+    assert a.qa_items[0].qa_id != b.qa_items[0].qa_id
+    assert a.conversations[0].conv_id != b.conversations[0].conv_id
+    # and the derived NS user id stays within the service's 100-char cap even
+    # for the longest category name
+    from neuralscape_bench.accuracy.schema import bench_user_id
+    c = convomem.parse_file(fixtures.CONVOMEM_FILE,
+                            category="implicit_connection_evidence",
+                            file_stem="x" * 40)
+    uid = bench_user_id("convomem", c.conversations[0].conv_id)
+    assert len(uid) <= 100
 
 
 # ── MemBench ──

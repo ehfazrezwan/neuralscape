@@ -48,20 +48,26 @@ def _build_group_id(
     visibility: str,
     user_id: str,
     project_id: str | None = None,
+    workspace: str | None = None,
 ) -> str:
-    """Build a Graphiti group_id for the multi-user model.
+    """Build a Graphiti group_id for the multi-user model + workspace partition.
 
-    | visibility | project_id | group_id                          |
-    |------------|------------|-----------------------------------|
-    | private    | None       | user--{user_id}                   |
-    | private    | set        | user--{user_id}--project--{pid}   |
-    | shared     | None       | shared                            |
-    | shared     | set        | shared--project--{project_id}     |
+    | visibility | project_id | workspace    | group_id                                      |
+    |------------|------------|--------------|-----------------------------------------------|
+    | private    | None       | memory/None  | user--{user_id}                               |
+    | private    | set        | memory/None  | user--{user_id}--project--{pid}               |
+    | shared     | None       | memory/None  | shared                                        |
+    | shared     | set        | memory/None  | shared--project--{project_id}                 |
+    | *          | *          | <ref>        | <above>--ws--{workspace}                      |
 
     The user namespace fixes the prior cross-user leak in Graphiti
     (previously all users shared `"global"` / `"project--..."`). The
     `shared` namespace is the team-wide knowledge pool readable by any
     authenticated user.
+
+    Workspace partition (WT6): absent or "memory" ⇒ NO suffix (byte-identical
+    group_ids for existing rows, zero migration). Any other value appends
+    `--ws--{workspace}`, isolating reference content from memory pools.
     """
     # Tolerate enum / str / legacy "MemoryVisibility.X" / None — see
     # normalize_visibility docstring for why this matters. Unrecognized
@@ -74,17 +80,21 @@ def _build_group_id(
         vis = MemoryVisibility.PRIVATE.value
     if vis == MemoryVisibility.STANDARD.value:
         # Authoritative org-wide pool: dictator-written, everyone-readable.
-        if project_id:
-            return f"standard--project--{project_id}"
-        return "standard"
+        base = f"standard--project--{project_id}" if project_id else "standard"
+        if workspace and workspace != "memory":
+            return f"{base}--ws--{workspace}"
+        return base
     if vis == MemoryVisibility.SHARED.value:
-        if project_id:
-            return f"shared--project--{project_id}"
-        return "shared"
+        base = f"shared--project--{project_id}" if project_id else "shared"
+        if workspace and workspace != "memory":
+            return f"{base}--ws--{workspace}"
+        return base
     # private
-    if project_id:
-        return f"user--{user_id}--project--{project_id}"
-    return f"user--{user_id}"
+    base = f"user--{user_id}--project--{project_id}" if project_id else f"user--{user_id}"
+    # Workspace suffix: absent or "memory" ⇒ no suffix (backward compatible)
+    if workspace and workspace != "memory":
+        return f"{base}--ws--{workspace}"
+    return base
 
 
 def _get_group_ids(caller_user_id: str, project_id: str | None = None) -> list[str]:

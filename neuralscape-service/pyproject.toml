@@ -60,13 +60,21 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
 ]
-# Code-graph knowledge adapter (Phase F1): uses Graphify (PyPI: graphifyy) as a
+# Code-graph knowledge adapter (Phase F1+E2): uses Graphify (PyPI: graphifyy) as a
 # library to read/query `graph.json` code graphs and distill their stable
-# semantic layer into memories. OPTIONAL — everything degrades gracefully (the
-# code_graph adapter, ingest extractor, and MCP/REST code-graph tools simply
-# don't register) when this extra isn't installed.
+# semantic layer into memories. E2 adds tree-sitter for native indexing.
+# OPTIONAL — everything degrades gracefully (the code_graph adapter, ingest
+# extractor, and MCP/REST code-graph tools simply don't register) when this
+# extra isn't installed.
 code-graph = [
     "graphifyy>=0.9.5",
+    "tree-sitter>=0.23.0",
+    "tree-sitter-language-pack>=0.1.0",
+    "zstandard>=0.22.0",
+    # Wave 3 neighbors resolver: pure-Python static analysis to resolve Python
+    # call targets to real symbols (token-free, index-time only). Trivial dep
+    # (only parso), no compiled extensions.
+    "jedi>=0.19",
 ]
 
 [tool.uv.sources]

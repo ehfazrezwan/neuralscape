@@ -70,6 +70,17 @@ class IngestDoc:
     # Stamped on every produced passage + fact. None ⇒ omitted (event time
     # unknown; readers fall back to created_at).
     occurred_at: str | None = None
+    # Workspace partition (WT6): absent/"memory" = memory type; any other value
+    # = reference workspace (fenced out of card/reflection/default recall). None
+    # defers to adapter-based defaulting in ingest_document.
+    workspace: str | None = None
+
+
+def _served_tokens(stored) -> int:
+    """Token cost of stored rows via their write-time stamp (no tokenizer)."""
+    from savings_meter import hit_tokens
+
+    return sum(hit_tokens(m) for m in stored)
 
 
 def _fact_scope(category: str, project_id: str | None) -> tuple[str, str | None]:
@@ -103,6 +114,26 @@ def ingest_document(service, doc: IngestDoc) -> dict:
     # by ``schemas.validate_adapter_name`` before anything is enqueued.
     adapter = require_adapter(doc.adapter)
 
+    # WT6: workspace defaulting. Non-default adapters (e.g. trading_strategy, code_graph)
+    # DEFAULT to a reference workspace derived from adapter name + optional title, unless
+    # the caller explicitly overrode workspace. This makes the trigger case (trading books
+    # poisoning the identity card) impossible by default — ingested reference content lands
+    # in its own partition, fenced out of card/reflection/default recall.
+    effective_workspace = doc.workspace
+    if effective_workspace is None and adapter.name != "default":
+        # Auto-derive a reference workspace name: adapter-name[--title-slug]
+        base_name = f"ref-{adapter.name}"
+        title_slug = None
+        if doc.source.get("title"):
+            # Slugify title: lowercase, alphanumeric + dashes only
+            import re
+            title_slug = re.sub(r'[^a-z0-9\-]+', '-', doc.source["title"].lower()).strip('-')[:30]
+        effective_workspace = f"{base_name}--{title_slug}" if title_slug else base_name
+        logger.info(
+            f"Auto-derived workspace '{effective_workspace}' for adapter '{adapter.name}' "
+            f"(WT6: reference content fenced from memory pools by default)"
+        )
+
     base = dict(doc.source)  # shallow copy — we never mutate the caller's dict
     # Stamp sync time once for the whole document.
     base.setdefault("last_synced_at", datetime.now(timezone.utc).isoformat())
@@ -114,6 +145,19 @@ def ingest_document(service, doc: IngestDoc) -> dict:
     memory_ids: list[str] = []
     passage_count = 0
     fact_count = 0
+    # M1 (ingest lifecycle): sum of the token cost of everything we STORE
+    # (the compressed form future recalls serve instead of re-reading the
+    # source). Reads the write-time stamp on each stored row — but a dedup hit
+    # can return a legacy row with token_estimate=None, whose hit_tokens would
+    # fall back to tiktoken; so accumulate ONLY when the meter is on, keeping
+    # the kill-switch's "zero tokenizer work when off" guarantee.
+    served_tok = 0
+    try:
+        import savings_meter as _sm
+
+        meter_on = _sm._meter_enabled()
+    except Exception:
+        meter_on = False
 
     # ── Passages (verbatim, vector-only) ──
     if doc.index_passages:
@@ -142,10 +186,13 @@ def ingest_document(service, doc: IngestDoc) -> dict:
                     memory_kind="passage",
                     source_ref=chunk_source,
                     occurred_at=doc.occurred_at,
+                    workspace=effective_workspace,
                     add_to_graph=False,
                 )
                 memory_ids.extend(m.id for m in stored)
                 passage_count += len(stored)
+                if meter_on:
+                    served_tok += _served_tokens(stored)
             except Exception as e:
                 logger.warning(f"Passage store failed (chunk {chunk.index}): {e}")
 
@@ -188,11 +235,14 @@ def ingest_document(service, doc: IngestDoc) -> dict:
                     memory_kind="fact",
                     source_ref=base,
                     occurred_at=doc.occurred_at,
+                    workspace=effective_workspace,
                     add_to_graph=False,
                     return_created=True,
                 )
                 memory_ids.extend(m.id for m in stored)
                 fact_count += len(stored)
+                if meter_on:
+                    served_tok += _served_tokens(stored)
                 if created:
                     for m in stored:
                         graph_jobs.append({
@@ -211,6 +261,22 @@ def ingest_document(service, doc: IngestDoc) -> dict:
         f"({len(graph_jobs)} graph jobs deferred, "
         f"connector={base.get('connector_type')}/{base.get('connector_id')})"
     )
+
+    # M1 — ingest lifecycle: baseline = the full source document a client
+    # would otherwise re-read to extract these facts; served = the token cost
+    # of everything we stored. Best-effort, off any latency-sensitive path
+    # (this runs in the ingest worker); a meter failure never fails ingest.
+    try:
+        if meter_on and doc.user_id:
+            baseline_tok = _sm.count_tokens(doc.content or "")
+            event = _sm.measure_ingest(
+                baseline_tok, served_tok, item_id=parent_id, corr_id=doc.run_id
+            )
+            if event is not None:
+                _sm.record_event(doc.user_id, event)
+    except Exception:
+        logger.debug("ingest savings metering failed (non-fatal)", exc_info=True)
+
     return {
         "passages": passage_count,
         "facts": fact_count,

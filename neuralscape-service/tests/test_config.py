@@ -180,3 +180,115 @@ class TestDictatorRole:
         cfg = _settings(dictator_user_ids="mark")
         assert cfg.is_dictator(None) is False
         assert cfg.is_dictator("") is False
+
+
+class TestCodeRepos:
+    """E2 config seam: the native code-intel engine resolves repo:<name> refs
+    through settings.code_repos. Without this field it was always {} and the
+    native engine was unreachable in production (Copilot I1 #5)."""
+
+    def test_default_empty(self):
+        cfg = _settings()
+        assert cfg.code_repos == {}
+
+    def test_dict_passed_through(self):
+        cfg = _settings(code_repos={"myrepo": "/abs/path"})
+        assert cfg.code_repos.get("myrepo") == "/abs/path"
+
+    def test_env_json_parsed(self, monkeypatch):
+        monkeypatch.setenv("CODE_REPOS", '{"r1":"/p1","r2":"/p2"}')
+        cfg = _settings()
+        assert cfg.code_repos == {"r1": "/p1", "r2": "/p2"}
+
+
+class TestCodeOpPreference:
+    """AR1 auto-routing: CODE_OP_PREFERENCE (per-op engine map) env parsing.
+
+    A blank env value (the common `${CODE_OP_PREFERENCE:-}` pattern) must degrade
+    to {} rather than crash startup — regression for a live crash hit during the
+    auto-routing measured run (pydantic's JSON source can't parse "")."""
+
+    def test_default_empty(self):
+        assert _settings().code_op_preference == {}
+
+    def test_env_empty_string_degrades_to_empty(self, monkeypatch):
+        monkeypatch.setenv("CODE_OP_PREFERENCE", "")
+        assert _settings().code_op_preference == {}
+
+    def test_env_blank_string_degrades_to_empty(self, monkeypatch):
+        monkeypatch.setenv("CODE_OP_PREFERENCE", "   ")
+        assert _settings().code_op_preference == {}
+
+    def test_env_json_parsed(self, monkeypatch):
+        monkeypatch.setenv("CODE_OP_PREFERENCE", '{"neighbors":["code-cbm","code-native"]}')
+        assert _settings().code_op_preference == {"neighbors": ["code-cbm", "code-native"]}
+
+    def test_dict_passed_through(self):
+        cfg = _settings(code_op_preference={"query": ["code-native"]})
+        assert cfg.code_op_preference == {"query": ["code-native"]}
+
+
+class TestCodeEmbedderPosture:
+    """C3 nl_locate posture: code_embedder off|local|cloud with legacy migration.
+
+    The A/B (ICE_V2_NLLOCATE_EMBEDDINGS.md) moved the default from cloud-opt-in to
+    the token-free local hybrid; the legacy boolean is honored for back-compat.
+    """
+
+    def test_default_is_local_token_free(self):
+        s = _settings()
+        assert s.code_embedder == "local"
+        assert s.code_locate_lexical_cards is True
+        assert s.code_embedder_model == "jinaai/jina-embeddings-v2-base-code"
+        assert s.code_embedder_query_prefix == ""
+
+    def test_legacy_cloud_flag_migrates_to_cloud(self):
+        # A deployment that opted into cloud embeddings via the legacy boolean
+        # keeps cloud behavior (validator migrates code_embedder).
+        assert _settings(code_index_embeddings=True).code_embedder == "cloud"
+
+    def test_explicit_posture_wins_over_legacy(self):
+        # An explicit code_embedder is authoritative even if the legacy flag is on.
+        assert _settings(code_embedder="off", code_index_embeddings=True).code_embedder == "off"
+
+    def test_explicit_local_not_migrated_even_with_legacy_flag(self):
+        # Copilot edge case: an EXPLICIT code_embedder="local" must NOT be
+        # migrated to cloud by the legacy flag (would silently enable token use).
+        s = _settings(code_embedder="local", code_index_embeddings=True)
+        assert s.code_embedder == "local"
+
+    def test_off_and_cloud_accepted(self):
+        assert _settings(code_embedder="off").code_embedder == "off"
+        assert _settings(code_embedder="cloud").code_embedder == "cloud"
+
+    def test_case_insensitive(self):
+        assert _settings(code_embedder="LOCAL").code_embedder == "local"
+
+    def test_invalid_rejected(self):
+        with pytest.raises(Exception):
+            _settings(code_embedder="bogus")
+
+
+class TestNeighborsResolver:
+    """Neighbors resolver posture: off | jedi | lsp (default jedi). 'lsp' calls
+    the external pyright resolver service (resolver-svc)."""
+
+    def test_default_is_jedi(self):
+        assert _settings().code_neighbors_resolver == "jedi"
+
+    def test_off_accepted(self):
+        assert _settings(code_neighbors_resolver="off").code_neighbors_resolver == "off"
+
+    def test_lsp_accepted(self):
+        assert _settings(code_neighbors_resolver="lsp").code_neighbors_resolver == "lsp"
+
+    def test_case_insensitive(self):
+        assert _settings(code_neighbors_resolver="JEDI").code_neighbors_resolver == "jedi"
+        assert _settings(code_neighbors_resolver="LSP").code_neighbors_resolver == "lsp"
+
+    def test_resolver_url_default(self):
+        assert _settings().code_resolver_url == "http://resolver-svc:8201"
+
+    def test_invalid_rejected(self):
+        with pytest.raises(Exception):
+            _settings(code_neighbors_resolver="bogus")

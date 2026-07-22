@@ -466,7 +466,8 @@ class TestStandardDeleteGate:
 
     def test_non_standard_delete_unaffected(self, service):
         service._memory.get.return_value = {
-            "id": "p1", "memory": "note", "metadata": {"visibility": "private"}
+            "id": "p1", "memory": "note", "user_id": "anyone",
+            "metadata": {"visibility": "private", "owner_user_id": "anyone"}
         }
         service._memory.delete.return_value = {"message": "deleted"}
         service.delete_memory("p1", caller_user_id="anyone")
@@ -1548,7 +1549,7 @@ class TestDeleteJunkEpisodes:
         assert result["deleted_count"] == 1
         assert len(result["breakdown"]) == 1
         assert result["breakdown"]["neuralscape"]["deleted_count"] == 1
-        service.delete_episode.assert_called_once_with("ns-1")
+        service.delete_episode.assert_called_once_with("ns-1", user_id="ehfaz", project_id="neuralscape")
 
     def test_delete_handles_partial_failures(self, service):
         """If some deletes fail, only successful ones are counted."""
@@ -2194,8 +2195,9 @@ class TestFindByContentHashProjectScope:
         mock_client.scroll.assert_called_once()
         call_kwargs = mock_client.scroll.call_args[1]
         scroll_filter = call_kwargs["scroll_filter"]
-        # 4 conditions when project scope: user_id, hash, scope, project_id
-        assert len(scroll_filter.must) == 4
+        # 5 conditions when project scope: user_id, hash, scope, project_id,
+        # + the WT6 workspace-partition condition (memory-type nested should).
+        assert len(scroll_filter.must) == 5
 
     def test_project_scope_without_project_id_skips_filter(self, service):
         """scope='project' but project_id=None: no project_id filter appended."""
@@ -2211,8 +2213,9 @@ class TestFindByContentHashProjectScope:
         )
 
         scroll_filter = mock_client.scroll.call_args[1]["scroll_filter"]
-        # 3 conditions when no project_id: user_id, hash, scope
-        assert len(scroll_filter.must) == 3
+        # 4 conditions when no project_id: user_id, hash, scope,
+        # + the WT6 workspace-partition condition (memory-type nested should).
+        assert len(scroll_filter.must) == 4
 
 
 # ──────────────────────────────────────────────
@@ -2622,6 +2625,38 @@ class TestGraphEnrichment:
             return False
 
         assert _has_standard_unscoped(qf)
+
+    def test_search_standard_pool_forwards_workspaces(self, service):
+        """Regression (I1 merge): _search_standard_pool must accept + forward
+        ``workspaces`` to _search_shared_pool. dev shipped the wrapper body
+        referencing an undefined ``workspaces`` while omitting it from the
+        signature, so any standard-pool search raised NameError (swallowed as
+        'non-critical' → standards silently vanished from recall). This exercises
+        the real wrapper body so the NameError can't come back."""
+        from schemas import MemoryVisibility
+        captured = {}
+
+        def _fake_shared(**kwargs):
+            captured.update(kwargs)
+            return []
+
+        service._search_shared_pool = _fake_shared
+        out = service._search_standard_pool(
+            m=MagicMock(),
+            query="q",
+            project_id=None,
+            categories=None,
+            scope=None,
+            domain=None,
+            observation_type=None,
+            concepts=None,
+            limit=5,
+            query_embedding=[0.1, 0.2],
+            workspaces=["memory"],
+        )
+        assert out == []
+        assert captured["workspaces"] == ["memory"]
+        assert captured["visibility_value"] == MemoryVisibility.STANDARD.value
 
 
 class TestGraphFilterByV2:

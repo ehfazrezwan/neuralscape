@@ -110,8 +110,8 @@ def test_enrich_graph_default_passes_no_ontology_kwargs():
         graph_ontology=None,
     )
     call = graph.add_calls[0]
-    # Only data + filters — the pre-adapter contract.
-    assert set(call.keys()) == {"data", "filters"}
+    # Only data + filters + reference_time — the pre-adapter contract (R1 added reference_time threading).
+    assert set(call.keys()) == {"data", "filters", "reference_time"}
 
 
 # ── MemoryGraph.add forwards to add_episode ────────────────────────

@@ -20,8 +20,17 @@ services:
     ports: !reset []
   qdrant:
     ports: !reset []
+    # The restored full-500 DMR store has enough segments to blow through the
+    # docker daemon's default nofile=1024 (qdrant panics at startup: os error 24).
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
   # `!override` REPLACES the base port list (plain merge would keep 8199:8199
   # too and collide with the live stack); `!reset` would wrongly clear it.
   neuralscape:
     ports: !override
       - "${BENCH_API_PORT:-8299}:8199"
+    environment:
+      # Benchmark-only: opt into multi-party speaker attribution. Production defaults False.
+      - EXTRACTION_REQUIRE_SPEAKER=true

@@ -1,10 +1,12 @@
+import json
 import os
 from pathlib import Path
+from typing import Annotated
 from urllib.parse import urlparse
 
 from arq.connections import RedisSettings
 from pydantic import field_validator, model_validator
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, NoDecode
 
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
 
@@ -94,6 +96,12 @@ class Settings(BaseSettings):
     ingest_queue_name: str = "neuralscape:ingest"
     arq_max_retries: int = 3
     arq_job_timeout: int = 300  # 5 min max per task
+    # Override the global ThreadPoolExecutor used by asyncio.to_thread (batch-get,
+    # code-graph reads). 0 = use Python default (min(32, cpu+4)); >0 sets explicit
+    # size. The stdlib default silently caps concurrent to_thread calls, which
+    # bottlenecks batch-get under load. Raise this when UVICORN_WORKERS>1 for
+    # proportional concurrency (e.g. workers=4, to_thread=48).
+    to_thread_max_workers: int = 0
 
     # LLM retry (exponential backoff for transient 503/429 errors)
     llm_max_retries: int = 3
@@ -163,7 +171,25 @@ class Settings(BaseSettings):
     # `rederivation_savings_estimate` field: tokens an agent would burn
     # re-deriving/re-discovering a fact from sources ≈ multiplier × the
     # fact's stored token count. Never blended into the measured headline.
+    # Configurable + DISCLOSED in the metrics payload (M5) so the estimate
+    # is auditable rather than a hidden constant.
     savings_rederivation_multiplier: float = 10.0
+    # ── Meter M1-M5 additive knobs ────────────────────────────────────
+    # M3 — code-nav read-avoidance baseline. For a code locate/neighbors/
+    # query the true baseline is the FILE(S) the model would otherwise have
+    # read to find the answer, not the memory-content size. We never read
+    # files on the hot path, so we book a DISCLOSED per-distinct-file
+    # estimate (labeled in the metrics payload). Default is a conservative
+    # mid-size source-file token count; deployments tune it to their corpus.
+    savings_code_nav_avoided_read_tokens_per_file: int = 1500
+    # M2 — bounce window: an index-only/locate event that is followed by a
+    # full-fetch of the SAME item within this many seconds saved nothing (the
+    # client re-read anyway); its credited baseline is deducted from the
+    # bounce-adjusted total. Kept short so stale arms expire on their own.
+    savings_bounce_window_seconds: int = 900
+    # M4 — per-task rollup TTL: task/session correlation totals expire after
+    # this long so the task-grain keyspace stays bounded.
+    savings_task_rollup_ttl_seconds: int = 7 * 86400
 
     # ── Session summarizer slots + context assembler (roadmap E3) ─────
     # Per-session rolling summaries, refreshed as conversation writes cross
@@ -212,6 +238,17 @@ class Settings(BaseSettings):
     # Graphiti's episode_content fulltext index (one Cypher call, no
     # embeddings). Measured +5pp on a DMR 100-question stratified sample.
     ask_episode_evidence: bool = True
+    # R3: recall-side episode leg — when on, service.search() adds up to 3
+    # bm25 episode snippets from Graphiti; additive+capped; flip off if the
+    # read-latency floor is breached (mission constraint: ≤+20%).
+    graph_episode_recall_enabled: bool = True
+    # Bounded second-chance re-ask for false abstentions (T2.1): when the
+    # normal answering loop produces an abstention AND at least one evidence
+    # row shares ≥2 content keywords with the question, re-ask ONCE with
+    # those keyword-matching rows promoted to the top. Measured correction
+    # for over-abstention (DMR: 33/76 answering losses; LoCoMo: 670/993
+    # misses were abstentions where gold evidence was in retrieval top-10).
+    ask_second_chance: bool = True
 
     # ── Custom extraction instructions (roadmap E4) ───────────────────
     # Operator-supplied guidance appended to the extraction prompt as a
@@ -221,6 +258,11 @@ class Settings(BaseSettings):
     # never overridable (see prompts.append_operator_guidance).
     extraction_instructions_enabled: bool = True
     extraction_instructions_max_tokens: int = 2000
+    # When True, the extraction prompt mandates speaker attribution and
+    # broadens scope to multi-party social/episodic contexts. Default False
+    # (byte-identical to pre-T1.1 prompt) preserves backward compat for
+    # existing solo-coding users. The benchmark opts in via docker-compose.bench.yml.
+    extraction_require_speaker: bool = False
 
     # ── Data-layer connectors ─────────────────────────────────────────
     # When enabled, the service hosts connectors (Notion/Drive/MCP/REST),
@@ -287,6 +329,83 @@ class Settings(BaseSettings):
     # setting: each ingested graph.json is an owner-scoped artifact addressed by
     # its graph_id (stamped into every produced memory's source_ref).
     code_graph_json_path: str = ""
+    # Native code-intel engine (E2+): a JSON dict mapping repo names to on-disk
+    # paths, so a `repo:<name>` graph ref resolves to a filesystem repo the
+    # NativeEngine indexes into its own Neo4j label-space. Set via env
+    # CODE_REPOS='{"myrepo":"/abs/path"}'. Empty ⇒ no native repos configured;
+    # the native engine self-reports "No code_repos configured" and only the
+    # graph.json (GraphifyJsonEngine) path is reachable — byte-for-byte the
+    # pre-E2 behavior. Additive + optional (default {}), so nothing changes for
+    # deployments that don't opt in.
+    code_repos: dict[str, str] = {}
+    # ── Native code-intel locate: retrieval posture (C3, token-free default) ──
+    # The A/B (reports/ICE_V2_NLLOCATE_EMBEDDINGS.md) proved native locate's 0.16
+    # h@1 was a *configuration artifact*: the old default indexed no symbol-card
+    # text and ranked on fqn/file tokens alone, blind to natural-language
+    # docstring queries. The fix is token-free and quality-≥-cloud:
+    #   - card-text BM25 (always on) alone lifts h@1 0.16 → 0.60, and
+    #   - a LOCAL code embedder dense leg fused with BM25 + graph-degree → ~0.76,
+    #     *beating* cloud embeddings at zero API tokens.
+    #
+    # `code_embedder` is the authoritative posture (supersedes the legacy
+    # `code_index_embeddings` flag below):
+    #   "off"   — no dense leg (BM25 over card text + graph-degree only; C1 ~0.60)
+    #   "local" — DEFAULT — local fastembed ONNX dense leg + BM25 + degree. The
+    #             default jina model measured h@1 ~0.75 in the A/B (§4), in the
+    #             same token-free band as CodeRankEmbed (0.76) and cloud (0.753).
+    #             Token-free / no cloud calls; honors deterministic-by-default.
+    #             Index cost is one-time CPU card-embedding (background reindex);
+    #             per-query +~28ms, negligible.
+    #   "cloud" — Gemini card embeddings (opt-in only; dominated on accuracy AND
+    #             costs ~158K index tokens + ~11/query on this corpus).
+    code_embedder: str = "local"
+    # Local code embedder model. MUST be a fastembed-supported ONNX id (see
+    # fastembed's TextEmbedding.list_supported_models) — this is deliberately the
+    # torch-free path. jina-embeddings-v2-base-code (Apache-2.0, 768-dim) is the
+    # default; fastembed is already a dependency, so it adds no new Python dep or
+    # container-gate landmine. NOTE: CodeRankEmbed is NOT loadable here (not in
+    # fastembed's registry; needs torch + trust_remote_code) — it would require a
+    # different backend and a heavy image delta.
+    code_embedder_model: str = "jinaai/jina-embeddings-v2-base-code"
+    # Query prefix for asymmetric embedders (CodeRankEmbed wants "Represent this
+    # query for searching relevant code: " on queries only). jina is symmetric →
+    # empty. Documents are always embedded bare.
+    code_embedder_query_prefix: str = ""
+    # Always-on token-free lexical leg: BM25 over the symbol-card TEXT (name +
+    # signature + docstring + source). This is the C1 lift and the deterministic
+    # backbone of locate; disable only to isolate the dense leg in measurement.
+    code_locate_lexical_cards: bool = True
+    # Neighbors call-graph resolver (Wave 3). The heuristic parser attributed
+    # every call to its MODULE and minted a phantom `{module}.{rawtext}` target,
+    # so _store_file's "both endpoints must exist" MATCH dropped essentially all
+    # CALLS edges → neighbors was ~0 by design. The resolver statically resolves
+    # each call to the REAL enclosing-function source and definition target so
+    # CALLS edges land on real symbols:
+    #   "off"  — legacy heuristic (phantom targets, ~0 neighbors)
+    #   "jedi" — DEFAULT — Jedi (pure-Python, token-free) resolves Python call
+    #            targets to real FQNs; unresolved (stdlib/external) targets are
+    #            DROPPED, not minted as phantoms. Python-only; other languages
+    #            keep the heuristic path. Runs at index time (background), so its
+    #            cost is off the interactive path. tree-sitter-stack-graphs (the
+    #            brief's stretch primary) is not pip-installable (Rust crate; a
+    #            container-gate landmine), so Jedi is the shipped resolver.
+    # Honest exclusions of the resolved graph (all here in one place): module-level
+    # and class-body calls (no function source to attach); trivial self-recursion
+    # self-loops; dynamic dispatch beyond Jedi's static inference; nested-function
+    # FQNs are flattened (module.inner), which can collide with a same-named
+    # top-level def; call-site columns are tree-sitter BYTE offsets while Jedi
+    # wants character offsets, so a callee preceded by multi-byte chars on its line
+    # may miss (drops the edge, rarely mis-resolves). All acceptable for a Python
+    # call-graph view on an ASCII-dominant corpus.
+    code_neighbors_resolver: str = "jedi"
+    # Resolver-service URL for CODE_NEIGHBORS_RESOLVER=lsp (pyright over REST, the
+    # precise-neighbors resolver-svc — CBM-bridge pattern). Index-time only, so a
+    # down service degrades to in-process Jedi rather than failing the index.
+    code_resolver_url: str = "http://resolver-svc:8201"
+    # LEGACY (superseded by `code_embedder`). Kept for back-compat: a deployment
+    # that explicitly set this True to opt into cloud embeddings is migrated to
+    # code_embedder="cloud" by the validator below. Default False.
+    code_index_embeddings: bool = False
     # Confidence assigned per Graphify edge/insight confidence tag (F1 epistemic
     # mapping): EXTRACTED → epistemic_level="explicit", INFERRED → "deductive"
     # with reduced confidence, AMBIGUOUS → stored only when its assigned
@@ -304,6 +423,19 @@ class Settings(BaseSettings):
     code_graph_max_god_nodes: int = 10
     code_graph_max_surprises: int = 10
     code_graph_max_rationale: int = 100
+    # AR1 (auto-routing): per-op code-engine preference map (best→worst), the
+    # DEPLOYMENT override layer between per-project config and the measured-winner
+    # default (`knowledge/autoroute.DEFAULT_CODE_OP_PREFERENCE`). Keyed by internal
+    # op-class (query|neighbors|path|locate|impact); each value is an ordered list
+    # of code-system names. Empty ⇒ use the built-in measured defaults (accuracy
+    # primary, latency tiebreak: symbol_lookup→native, structure→graphify-lib,
+    # nl_locate→native). Set via env, e.g.
+    # CODE_OP_PREFERENCE='{"neighbors":["code-cbm","code-graphify-lib"]}'.
+    # Auto-routing is CONFIG, not hardcoded branches — this is the tuning seam.
+    # NoDecode: parse the env value ourselves (validator below) so a blank env
+    # (the common `${CODE_OP_PREFERENCE:-}` pattern → empty string) degrades to
+    # {} instead of crashing pydantic's JSON source parser at startup.
+    code_op_preference: Annotated[dict[str, list[str]], NoDecode] = {}
 
     # Auth
     # Legacy single shared API key. When set without `neuralscape_user_token_secret`,
@@ -429,6 +561,23 @@ class Settings(BaseSettings):
             raise ValueError("OAuth token TTLs must be > 0 seconds")
         return value
 
+    @field_validator("code_op_preference", mode="before")
+    @classmethod
+    def _parse_op_preference(cls, value):
+        # AR1: CODE_OP_PREFERENCE is a JSON dict env var, but marked NoDecode so
+        # WE parse it. Deployments commonly wire optional env via
+        # `${CODE_OP_PREFERENCE:-}`, which sets it to an EMPTY STRING when unset —
+        # pydantic's default JSON source would crash on "" at startup (hit live
+        # during the auto-routing run). Treat blank as "unset" → default {}
+        # (measured-winner defaults); otherwise JSON-decode the string.
+        if value is None:
+            return {}
+        if isinstance(value, str):
+            if value.strip() == "":
+                return {}
+            return json.loads(value)
+        return value
+
     @field_validator(
         "docling_timeout_s",
         "ingest_max_file_mb",
@@ -496,6 +645,42 @@ class Settings(BaseSettings):
                 f"(got overlap={self.extraction_window_overlap}, "
                 f"window={self.extraction_window_messages})"
             )
+        return self
+
+    @field_validator("code_embedder")
+    @classmethod
+    def _validate_code_embedder(cls, value: str) -> str:
+        v = (value or "").strip().lower()
+        if v not in {"off", "local", "cloud"}:
+            raise ValueError(
+                f"CODE_EMBEDDER must be one of off|local|cloud (got {value!r})"
+            )
+        return v
+
+    @field_validator("code_neighbors_resolver")
+    @classmethod
+    def _validate_code_neighbors_resolver(cls, value: str) -> str:
+        v = (value or "").strip().lower()
+        if v not in {"off", "jedi", "lsp"}:
+            raise ValueError(
+                f"CODE_NEIGHBORS_RESOLVER must be one of off|jedi|lsp (got {value!r})"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _migrate_legacy_code_embeddings(self) -> "Settings":
+        # Back-compat: a deployment that opted into cloud symbol-card embeddings
+        # via the legacy boolean (code_index_embeddings=True) keeps cloud
+        # behavior — but ONLY when it did not also set the new posture. An
+        # explicit code_embedder ALWAYS wins (including an explicit "local"),
+        # so we migrate only when code_embedder was left at its default and is
+        # still "local". model_fields_set distinguishes explicit from default.
+        if (
+            self.code_index_embeddings
+            and self.code_embedder == "local"
+            and "code_embedder" not in self.model_fields_set
+        ):
+            self.code_embedder = "cloud"
         return self
 
     @field_validator("auth_provider")

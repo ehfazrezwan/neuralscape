@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
 import time
+from datetime import datetime
 
 import httpx
 
@@ -23,6 +25,60 @@ from neuralscape_bench.accuracy.schema import Conversation, Session, SuiteData, 
 
 # StoreMemoryRequest caps messages at 500; stay comfortably below.
 MAX_MESSAGES_PER_CALL = 400
+
+
+def parse_session_date(date_str: str | None) -> str | None:
+    """Parse common dataset date formats into ISO 8601 date strings.
+
+    Handles:
+    - LoCoMo format: "1:00 pm on 5 May, 2023"
+    - LongMemEval format: "2023/05/05 ..." (extracts YYYY/MM/DD prefix)
+    - ISO dates already in the right format
+
+    Returns:
+        ISO 8601 date string (YYYY-MM-DD) or None on parse failure.
+    """
+    if not date_str or not date_str.strip():
+        return None
+
+    date_str = date_str.strip()
+
+    # Try LoCoMo format: "1:00 pm on 5 May, 2023"
+    # Pattern: optional time, "on", day, month, year
+    locomo_match = re.search(
+        r"on\s+(\d{1,2})\s+([A-Za-z]+)[,\s]+(\d{4})",
+        date_str,
+        re.IGNORECASE
+    )
+    if locomo_match:
+        day = locomo_match.group(1).zfill(2)
+        month_name = locomo_match.group(2)
+        year = locomo_match.group(3)
+        try:
+            # Parse month name to number
+            dt = datetime.strptime(f"{day} {month_name} {year}", "%d %B %Y")
+            return dt.strftime("%Y-%m-%d")
+        except ValueError:
+            try:
+                # Try abbreviated month
+                dt = datetime.strptime(f"{day} {month_name} {year}", "%d %b %Y")
+                return dt.strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+
+    # Try LongMemEval format: "2023/05/05 ..." (YYYY/MM/DD prefix)
+    longmem_match = re.match(r"(\d{4})/(\d{2})/(\d{2})", date_str)
+    if longmem_match:
+        year, month, day = longmem_match.groups()
+        return f"{year}-{month}-{day}"
+
+    # Try ISO date format (YYYY-MM-DD)
+    iso_match = re.match(r"(\d{4})-(\d{2})-(\d{2})", date_str)
+    if iso_match:
+        return date_str[:10]  # Return just the date part
+
+    # Parse failure
+    return None
 
 
 def session_messages(session: Session) -> list[dict]:
@@ -67,9 +123,10 @@ async def _with_backoff(coro_factory, *, max_retries: int = 6, base_delay: float
 async def ingest_conversation(client: NeuralscapeClient, conv: Conversation, *,
                               suite: str, manifest: IngestManifest,
                               poll_timeout_s: float, poll_interval_s: float,
+                              namespace: str | None = None,
                               log=print) -> dict:
     """Ingest one conversation's sessions in order (temporal fidelity)."""
-    user_id = bench_user_id(suite, conv.conv_id)
+    user_id = bench_user_id(suite, conv.conv_id, namespace)
     done = manifest.sessions_done(conv.conv_id)
     stored = skipped = failed = 0
     for session in conv.sessions:
@@ -83,10 +140,12 @@ async def ingest_conversation(client: NeuralscapeClient, conv: Conversation, *,
         t0 = time.perf_counter()
         task_ids: list[str] = []
         ok = True
+        # T1.3: parse session date to ISO 8601 for event-time grounding
+        occurred_at = parse_session_date(session.date) if session.date else None
         for batch in _batches(messages):
             resp = await _with_backoff(
-                lambda b=batch: client.extract_write(
-                    b, user_id=user_id, run_id=session.session_id)
+                lambda b=batch, oa=occurred_at: client.extract_write(
+                    b, user_id=user_id, run_id=session.session_id, occurred_at=oa)
             )
             task_id = resp.get("task_id")
             if task_id:
@@ -117,6 +176,7 @@ async def ingest_conversation(client: NeuralscapeClient, conv: Conversation, *,
 async def ingest_suite(client: NeuralscapeClient, data: SuiteData, *,
                        manifest: IngestManifest, concurrency: int = 2,
                        poll_timeout_s: float = 300.0, poll_interval_s: float = 1.0,
+                       namespace: str | None = None,
                        log=print) -> dict:
     """Ingest every conversation (bounded parallelism across conversations)."""
     sem = asyncio.Semaphore(max(1, concurrency))
@@ -126,7 +186,8 @@ async def ingest_suite(client: NeuralscapeClient, data: SuiteData, *,
         async with sem:
             res = await ingest_conversation(
                 client, conv, suite=data.suite, manifest=manifest,
-                poll_timeout_s=poll_timeout_s, poll_interval_s=poll_interval_s, log=log)
+                poll_timeout_s=poll_timeout_s, poll_interval_s=poll_interval_s,
+                namespace=namespace, log=log)
             results.append(res)
             done = len(results)
             if done % 10 == 0 or done == len(data.conversations):

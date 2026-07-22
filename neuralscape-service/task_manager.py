@@ -290,6 +290,27 @@ class TaskManager:
             return job_id
         return job.job_id
 
+    async def enqueue_code_index(self, payload: dict) -> str:
+        """Phase G: enqueue a through-NS code-index task on the ingest queue.
+
+        ``payload`` = ``{system, repo_source, code_space, project_id, user_id}``.
+        Runs on the ingest queue for uniform observability + 202-task semantics
+        (PLAN §5). Indexing is **idempotent at the engine level** — a re-index of
+        the same code_space overwrites (CBM full re-index; graphify rebuild;
+        native incremental) — so the job id is left UNIQUE per call (ARQ-assigned)
+        rather than coalesced on (system, code_space): a completed/failed job's
+        result would otherwise be cached under a deterministic id and a later
+        re-index would return the stale result instead of re-running.
+        """
+        job = await self.pool.enqueue_job(
+            "process_code_index",
+            payload,
+            _queue_name=settings.ingest_queue_name,
+        )
+        task_id = job.job_id
+        await self._track_task(payload.get("user_id"), task_id)
+        return task_id
+
     async def enqueue_connector_sync(self, connector_id: str) -> str:
         """Enqueue a connector sync task. Returns job_id.
 

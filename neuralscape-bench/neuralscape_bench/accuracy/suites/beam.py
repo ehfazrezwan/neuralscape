@@ -113,7 +113,12 @@ def parse(queries: list[dict], documents: list[dict], *, tier: str) -> SuiteData
             question=str(q.get("query", "")),
             gold_answer=" | ".join(gold_answers),
             qtype=category,
-            evidence_session_ids=tuple(str(g) for g in (q.get("gold_ids") or [])),
+            # 100k-tier ``gold_ids`` are USER-level (always ``[user_id]``), not
+            # document ids — treating them as session evidence yields a
+            # meaningless flat-zero R@k (verified 2026-07-04: 400/400 queries
+            # have gold_ids == [user_id]; document ids look like "1_s0_0").
+            # No session-level evidence exists in this tier ⇒ skip the metric.
+            evidence_session_ids=(),
             is_abstention=category == "abstention",
             rubric=tuple(str(r) for r in (meta.get("rubric") or [])),
         ))

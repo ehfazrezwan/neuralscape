@@ -1,0 +1,66 @@
+{
+  "suite": "dmr",
+  "display": "DMR (MSC-Self-Instruct)",
+  "timestamp": "2026-07-04T12:11:57.938292+00:00",
+  "ns_commit": "0c19a18",
+  "config": {
+    "target": "http://localhost:8398",
+    "k": 10,
+    "reasoning_level": "high",
+    "judge_model": "gemini-2.5-flash",
+    "sample": null,
+    "seed": 42,
+    "suite_options": {}
+  },
+  "dataset": {
+    "conversations": 500,
+    "sessions": 2500,
+    "turns": 31423,
+    "conversation_chars": 3656560,
+    "qa_items": 500,
+    "qa_by_type": {
+      "dmr": 500
+    }
+  },
+  "run": {
+    "conversations": 500,
+    "sessions": 2499,
+    "ingest_wall_s": 40889.4,
+    "est_tokens": 953295
+  },
+  "metrics": {
+    "overall": {
+      "n": 500,
+      "judged": 500,
+      "correct": 341,
+      "accuracy": 0.682
+    },
+    "by_type": {
+      "dmr": {
+        "n": 500,
+        "judged": 500,
+        "correct": 341,
+        "accuracy": 0.682
+      }
+    }
+  },
+  "published_comparison": [
+    {
+      "system": "MemGPT",
+      "metric": "LLM-judge",
+      "score": "93.4%",
+      "source": "as reported in the Zep paper (arXiv 2501.13956)"
+    },
+    {
+      "system": "Zep",
+      "metric": "LLM-judge",
+      "score": "94.8%",
+      "source": "Zep/Graphiti paper (arXiv 2501.13956)"
+    }
+  ],
+  "caveats": [
+    "Competitor figures are self-reported on their own configurations (different answer models, retrieval settings, and judge models).",
+    "Retrieval R@k uses lexical session attribution over distilled memories (see metrics.py) \u2014 not a turn-id echo from the store.",
+    "Dreaming/consolidation disabled for the baseline run; a post-dream re-run is future work (NS's differentiator experiment)."
+  ]
+}
