@@ -28,7 +28,7 @@
     "test:coverage": "vitest run --coverage"
   },
   "devDependencies": {
-    "@vitest/coverage-v8": "^4.1.9",
+    "@vitest/coverage-v8": "^4.1.11",
     "esbuild": "^0.28.2",
     "typescript": "^6.0.3",
     "vitest": "^4.1.10"
