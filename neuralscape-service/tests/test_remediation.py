@@ -16,9 +16,25 @@ for the read-only helpers introduced here, by the lower-level
 """
 
 import json
+from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+
+@contextmanager
+def _as_user(user_id: str | None):
+    """Set auth.current_user_id for the duration of the block (mirrors
+    test_oauth.py::TestMcpIdentity's set/reset idiom) — the MCP admin
+    tools resolve the caller from this ContextVar, never from `arguments`.
+    """
+    from auth import current_user_id
+
+    token = current_user_id.set(user_id)
+    try:
+        yield
+    finally:
+        current_user_id.reset(token)
 
 
 # ──────────────────────────────────────────────
@@ -717,7 +733,8 @@ class TestMcpAdminSurface:
         import mcp_server
         from config import settings
         monkeypatch.setattr(settings, "dictator_user_ids", "root")
-        result = await mcp_server.call_tool("rescope_private_derivatives", {})
+        with _as_user("alice"):
+            result = await mcp_server.call_tool("rescope_private_derivatives", {})
         data = json.loads(result[0].text)
         assert "error" in data
 
@@ -726,7 +743,8 @@ class TestMcpAdminSurface:
         import mcp_server
         from config import settings
         monkeypatch.setattr(settings, "dictator_user_ids", "root")
-        result = await mcp_server.call_tool("audit_private_leakage", {})
+        with _as_user("alice"):
+            result = await mcp_server.call_tool("audit_private_leakage", {})
         data = json.loads(result[0].text)
         assert "error" in data
 
@@ -735,11 +753,43 @@ class TestMcpAdminSurface:
         import mcp_server
         from config import settings
         monkeypatch.setattr(settings, "dictator_user_ids", "root")
-        result = await mcp_server.call_tool(
-            "rescope_private_derivatives", {"user_id": "bob"}
-        )
+        with _as_user("alice"):
+            result = await mcp_server.call_tool(
+                "rescope_private_derivatives", {"user_id": "bob"}
+            )
         data = json.loads(result[0].text)
         assert "error" in data
+
+    @pytest.mark.asyncio
+    async def test_unauthenticated_caller_denied_even_if_default_user_is_dictator(
+        self, monkeypatch
+    ):
+        """F3 regression: an unauthenticated stdio caller must NOT fall
+        back to `settings.default_user_id` for these admin tools — a
+        deployment could list that default as a dictator, silently
+        granting cross-user admin access to anyone who never authenticated.
+        """
+        import mcp_server
+        from config import settings
+        monkeypatch.setattr(settings, "dictator_user_ids", settings.default_user_id)
+        rescope = MagicMock()
+        audit = MagicMock()
+        monkeypatch.setattr(mcp_server._service, "rescope_private_derivatives", rescope)
+        monkeypatch.setattr(mcp_server._service, "audit_private_leakage", audit)
+
+        with _as_user(None):
+            result = await mcp_server.call_tool("rescope_private_derivatives", {})
+        data = json.loads(result[0].text)
+        assert "error" in data
+        assert "authentication" in data["error"].lower()
+        rescope.assert_not_called()
+
+        with _as_user(None):
+            result = await mcp_server.call_tool("audit_private_leakage", {})
+        data = json.loads(result[0].text)
+        assert "error" in data
+        assert "authentication" in data["error"].lower()
+        audit.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_dry_run_defaults_true_on_mcp(self, monkeypatch):
@@ -758,7 +808,8 @@ class TestMcpAdminSurface:
             }
 
         monkeypatch.setattr(mcp_server._service, "rescope_private_derivatives", _fake)
-        result = await mcp_server.call_tool("rescope_private_derivatives", {})
+        with _as_user("default_user"):
+            result = await mcp_server.call_tool("rescope_private_derivatives", {})
         json.loads(result[0].text)
         assert captured["dry_run"] is True
 
@@ -777,7 +828,8 @@ class TestMcpAdminSurface:
             }
 
         monkeypatch.setattr(mcp_server._service, "audit_private_leakage", _fake)
-        result = await mcp_server.call_tool("audit_private_leakage", {"user_id": "bob"})
+        with _as_user("default_user"):
+            result = await mcp_server.call_tool("audit_private_leakage", {"user_id": "bob"})
         data = json.loads(result[0].text)
         assert captured["user_id"] == "bob"
         assert data["user_id"] == "bob"
@@ -800,9 +852,10 @@ class TestMcpAdminSurface:
         enqueue = AsyncMock(return_value="job-1")
         monkeypatch.setattr(mcp_server._task_manager, "enqueue_graph_enrichment", enqueue)
 
-        result = await mcp_server.call_tool(
-            "rescope_private_derivatives", {"dry_run": False}
-        )
+        with _as_user("default_user"):
+            result = await mcp_server.call_tool(
+                "rescope_private_derivatives", {"dry_run": False}
+            )
         data = json.loads(result[0].text)
         assert data["graph_jobs_enqueued"] == 1
         enqueue.assert_awaited_once_with(

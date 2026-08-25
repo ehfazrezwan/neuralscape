@@ -2757,10 +2757,18 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
         elif name in ("rescope_private_derivatives", "audit_private_leakage"):
             # Admin — private-graph-leakage remediation (memory/remediation.py).
             # Dictator-only for BOTH tools: the caller identity is resolved
-            # from the token/session (never trusted from `arguments`, unlike
-            # the generic `user_id` fallback above) and a non-dictator is
-            # denied outright — same gate shape as _standard_write_error.
-            caller = current_user_id.get() or settings.default_user_id
+            # from the token/session ONLY (never trusted from `arguments`,
+            # unlike the generic `user_id` fallback above, and never
+            # defaulted to `settings.default_user_id` the way unauthenticated
+            # reads are — an unauthenticated stdio caller must not silently
+            # become whatever user a deployment configured as the default,
+            # which could itself be a dictator). A non-dictator (or
+            # unauthenticated caller) is denied outright — same gate shape
+            # as _standard_write_error.
+            caller = current_user_id.get()
+            if not caller:
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": "authentication required"}))]
             if not settings.is_dictator(caller):
                 return [TextContent(type="text", text=json.dumps(
                     {"error": f"User {caller!r} is not authorized to use this admin tool."}))]
