@@ -907,9 +907,11 @@ class WriteMixin:
             # Multi-user model: who owns this memory + who can read it.
             "owner_user_id": user_id,
             "visibility": effective_visibility,
-            # Sensitivity gate provenance (only stamped when the gate actually
-            # forced this write to private — absent otherwise, so a plain
-            # `decision`/`interaction`/etc. write is byte-identical to before).
+            # Sensitivity gate provenance: stamped whenever the content matched a
+            # gated class — `sensitivity_source` records whether the gate forced
+            # private ("regex"/"llm") or the caller bypassed it ("bypassed").
+            # Absent for non-matching content, so a plain `decision`/
+            # `interaction`/etc. write is byte-identical to before.
             **({"sensitivity": sensitivity_class} if sensitivity_class else {}),
             **({"sensitivity_source": sensitivity_source} if sensitivity_source else {}),
             # Retrieval economics (C1): index-row fields

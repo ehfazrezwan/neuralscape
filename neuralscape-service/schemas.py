@@ -1196,19 +1196,25 @@ class MemoryResponse(BaseModel):
     visibility: str | None = None
     owner_user_id: str | None = None
 
-    # Sensitivity gate provenance (null unless the write-time gate forced this
-    # memory to visibility=private). `sensitivity` is one of financial |
-    # equity_compensation | client_commercial | credentials_pii;
-    # `sensitivity_source` is "regex" or "llm" — see memory/sensitivity.py.
+    # Sensitivity gate provenance — stamped whenever the content matched a
+    # gated class (memory/sensitivity.py), whether the gate FORCED
+    # visibility=private or the caller BYPASSED it with sensitivity_override.
+    # `sensitivity` is one of financial | equity_compensation |
+    # client_commercial | credentials_pii; `sensitivity_source` says how the
+    # class was determined ("regex" | "llm") or that the gate was "bypassed".
     sensitivity: str | None = Field(
         default=None,
-        description="Sensitivity class that forced this memory private, if any "
-        "(financial | equity_compensation | client_commercial | credentials_pii).",
+        description="Sensitivity class the content matched at write time, if any "
+        "(financial | equity_compensation | client_commercial | credentials_pii). "
+        "Present whether the gate forced visibility=private or the caller bypassed it; "
+        "see sensitivity_source.",
     )
     sensitivity_source: str | None = Field(
         default=None,
-        description="How the sensitivity class was determined: 'regex' (deterministic "
-        "write-time gate) or 'llm' (model-supplied hint).",
+        description="How the class was applied: 'regex' (deterministic gate forced "
+        "private), 'llm' (model-supplied hint forced private), or 'bypassed' (content "
+        "matched but the caller supplied an explicit visibility with sensitivity_override=True, "
+        "so visibility was NOT forced).",
     )
 
     # Retrieval economics (C1): distilled at write time; null on legacy
