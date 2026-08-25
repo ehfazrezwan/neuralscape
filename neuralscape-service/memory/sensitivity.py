@@ -182,3 +182,68 @@ def classify_sensitivity(text: str) -> str | None:
         return "financial"
 
     return None
+
+
+def resolve_gated_visibility(
+    content: str,
+    category: str,
+    visibility: str | None,
+    sensitivity_override: bool,
+) -> tuple[str, str | None, str | None, str]:
+    """Resolve the visibility a raw store will ACTUALLY land at: the
+    caller's requested visibility (or the per-category default), with the
+    deterministic sensitivity gate layered on top.
+
+    Single source of truth for this resolution, shared by:
+    - ``memory/write.py::_prepare_raw_store``, the write path itself
+      (which layers its own logging on top of the returned
+      ``gate_action``), and
+    - ``worker.py``'s pre-store idempotency dedup check, which must
+      classify a near-duplicate against the visibility the write will
+      ACTUALLY land at, not the caller's raw pre-gate request. Before this
+      was factored out, the dedup check used the requested visibility
+      directly: a gated write (content classifies sensitive, no override)
+      could match an existing SHARED row with the same content at the
+      REQUESTED (shared) visibility and get treated as a dedup hit,
+      skipping the write the gate should have forced private — silently
+      leaving the content shared instead.
+
+    Returns ``(effective_visibility, sensitivity_class, sensitivity_source,
+    gate_action)`` where ``gate_action`` is one of:
+    - ``"none"``: gate disabled, or content didn't classify as sensitive —
+      ``effective_visibility`` is just the requested/default value.
+    - ``"bypassed"``: classified sensitive, but the caller supplied an
+      explicit visibility AND ``sensitivity_override=True``.
+    - ``"forced"``: classified sensitive and not bypassed —
+      ``effective_visibility`` is forced to ``"private"``.
+
+    ``sensitivity_class``/``sensitivity_source`` are non-None whenever the
+    content actually matched a private class (``gate_action`` is
+    ``"forced"`` or ``"bypassed"``) — a bypass still records WHICH class
+    matched and that a caller explicitly overrode it
+    (``sensitivity_source="bypassed"``), rather than silently discarding
+    that signal. Only a non-match (``gate_action == "none"``) carries no
+    sensitivity tag at all. (Reading these fields back out is being added
+    in a sibling branch; this only changes what gets written.)
+    """
+    from config import settings
+    from schemas import MemoryVisibility, default_visibility_for_category, normalize_visibility
+
+    explicit_visibility_requested = visibility is not None
+    effective_visibility = (
+        normalize_visibility(visibility)
+        if visibility is not None
+        else default_visibility_for_category(category).value
+    )
+
+    if not settings.sensitivity_gate_enabled:
+        return effective_visibility, None, None, "none"
+
+    matched_class = classify_sensitivity(content)
+    if matched_class not in settings.sensitivity_private_classes_set():
+        return effective_visibility, None, None, "none"
+
+    if explicit_visibility_requested and sensitivity_override:
+        return effective_visibility, matched_class, "bypassed", "bypassed"
+
+    return MemoryVisibility.PRIVATE.value, matched_class, "regex", "forced"

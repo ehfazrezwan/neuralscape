@@ -249,6 +249,25 @@ class TestWritePathSensitivityGate:
         )
         assert resp.visibility == "shared"
 
+    def test_bypassed_write_still_records_sensitivity_class(self, service):
+        """Cheap nitpick fix: a sensitivity_override bypass must NOT null
+        out the detected class — the write still stamps
+        metadata.sensitivity=<class> with sensitivity_source='bypassed' so
+        the fact that this was a knowing override (not just non-sensitive
+        content) survives on the row, even though visibility stays at the
+        caller's requested (shared) value."""
+        service.store_raw(
+            content="Approved a $50,000 client contract renewal",
+            user_id="alice",
+            category="decision",
+            visibility="shared",
+            sensitivity_override=True,
+            add_to_graph=False,
+        )
+        payload = service._memory.vector_store.insert.call_args[1]["payloads"][0]
+        assert payload["metadata"]["sensitivity"] == "client_commercial"
+        assert payload["metadata"]["sensitivity_source"] == "bypassed"
+
     def test_explicit_shared_without_override_still_forced_private(self, service):
         [resp] = service.store_raw(
             content="Approved a $50,000 client contract renewal",

@@ -19,7 +19,7 @@ from memory.hashing import _infer_project_id, _parse_expires_at, content_hash
 from memory.junk import _clean_conversation_for_graph, _is_junk_fact
 from memory.ranking import _times_derived_from_metadata
 from memory.retry import retry_transient
-from memory.sensitivity import classify_sensitivity
+from memory.sensitivity import classify_sensitivity, resolve_gated_visibility
 
 logger = logging.getLogger(__name__)
 _SPEAKER_UNSET = object()
@@ -377,6 +377,11 @@ class WriteMixin:
                 speakers = None
                 occurred_ats = None
                 sensitivities = [sens for cat, content, sens in folded_all]
+            # F8: track which memory ids are NEWLY CREATED (vs. content-hash
+            # dedup survivors) so the graph-episode-ref stamping below only
+            # touches rows this conversation's episode actually created —
+            # see the loops using ``newly_created_ids``.
+            newly_created_ids: set[str] = set()
             stored = self._batch_store_facts(
                 facts=facts,
                 speakers=speakers,
@@ -388,6 +393,7 @@ class WriteMixin:
                 occurred_at=occurred_at,
                 occurred_ats=occurred_ats,
                 sensitivities=sensitivities,
+                created_ids=newly_created_ids,
             )
         except Exception as e:
             logger.error(
@@ -439,10 +445,18 @@ class WriteMixin:
                     # so a later cascade can resolve by name even without the
                     # uuid (memory/provenance.py resolution order tries name
                     # before falling back to content).
+                    #
+                    # F8: only for NEWLY CREATED rows. ``stored`` also
+                    # contains content-hash dedup survivors that already
+                    # point at their OWN (possibly different) episode;
+                    # repointing a survivor at this episode would make a
+                    # later cascade target the wrong episode and leave the
+                    # survivor's real episode live.
                     for mem in stored:
-                        self._persist_graph_episode_ref(
-                            getattr(mem, "id", "") or "", None, episode_name
-                        )
+                        mid = getattr(mem, "id", "") or ""
+                        if mid not in newly_created_ids:
+                            continue
+                        self._persist_graph_episode_ref(mid, None, episode_name)
                 else:
                     graph_result = retry_transient(
                         self._memory.graph.add,
@@ -474,8 +488,10 @@ class WriteMixin:
                         )
                         # Provenance durability: same episode → N memories;
                         # stamp each row so a later cascade can resolve the
-                        # EXACT episode (memory/provenance.py).
-                        if episode_uuid or episode_name:
+                        # EXACT episode (memory/provenance.py). F8: NEW rows
+                        # only — a dedup survivor already has its own episode
+                        # ref (see the docstring above the sibling loop).
+                        if (episode_uuid or episode_name) and mid in newly_created_ids:
                             self._persist_graph_episode_ref(mid, episode_uuid, episode_name)
         except Exception as e:
             logger.warning(f"Graph storage failed (non-critical): {e}")
@@ -786,61 +802,41 @@ class WriteMixin:
         # storing nothing would make the write and later reads disagree).
         derived_from = derived_from or None
 
-        # Resolve visibility: explicit caller value > per-category default.
-        # ``normalize_visibility`` handles MemoryVisibility enum, plain
-        # str, and the legacy "MemoryVisibility.X" stringified-enum
-        # format from the pre-__str__-override bug (Python 3.11+ str(Enum)
-        # regression). Without normalization, "MemoryVisibility.SHARED"
-        # used to land in Qdrant metadata and break both the GET API
-        # shape and the conversation_compiler event handler.
+        # Resolve visibility: explicit caller value > per-category default,
+        # with the deterministic sensitivity gate layered on top. Both are
+        # ``normalize_visibility``'s enum/str/legacy-stringified-enum
+        # tolerance and the SHARED-category-vs-sensitive-content gate that
+        # forces visibility=private unless the caller both supplied an
+        # explicit visibility AND passed sensitivity_override=True.
+        # ``resolve_gated_visibility`` (memory/sensitivity.py) is the single
+        # source of truth for this resolution — worker.py's pre-store
+        # idempotency dedup check shares it too (F7: it must dedupe against
+        # the RESOLVED visibility the write will land at, not the raw
+        # requested one, or a gated write can coalesce onto — and skip in
+        # favor of — a pre-existing SHARED row with the same content).
         # Resolved BEFORE the scope check because standards force scope below.
         explicit_visibility_requested = visibility is not None
-        effective_visibility = (
-            normalize_visibility(visibility)
-            if visibility is not None
-            else default_visibility_for_category(category).value
+        effective_visibility, sensitivity_class, sensitivity_source, gate_action = (
+            resolve_gated_visibility(content, category, visibility, sensitivity_override)
         )
-
-        # ── Sensitivity gate (deterministic regex floor, zero LLM cost) ──
-        # Several categories default to SHARED (schemas.DEFAULT_VISIBILITY_FOR_
-        # CATEGORY) because the deployment relies on shared team knowledge —
-        # but a caller can label a sensitive fact (a dollar figure, a
-        # credential, a client's commercial terms) with one of those
-        # categories and silently publish it to every seat. When the content
-        # classifies into one of settings.sensitivity_private_classes, force
-        # visibility=private unless the caller both supplied an explicit
-        # visibility AND passed sensitivity_override=True. This never changes
-        # how visibility is chosen for non-sensitive writes.
-        sensitivity_class: str | None = None
-        sensitivity_source: str | None = None
-        if settings.sensitivity_gate_enabled:
-            sensitivity_class = classify_sensitivity(content)
-            if sensitivity_class in settings.sensitivity_private_classes_set():
-                bypassed = explicit_visibility_requested and sensitivity_override
-                if bypassed:
-                    logger.debug(
-                        f"Sensitivity gate: class={sensitivity_class} bypassed via "
-                        f"explicit sensitivity_override (user={user_id}, category={category})"
-                    )
-                    sensitivity_class = None
-                else:
-                    if explicit_visibility_requested and not sensitivity_override:
-                        logger.warning(
-                            f"Sensitivity gate: caller requested visibility="
-                            f"{effective_visibility!r} for a {sensitivity_class} write "
-                            f"without sensitivity_override=True — forcing visibility=private "
-                            f"(user={user_id}, category={category})"
-                        )
-                    else:
-                        logger.info(
-                            f"Sensitivity gate: forcing visibility=private for category="
-                            f"{category} (class={sensitivity_class}, source=regex, "
-                            f"user={user_id})"
-                        )
-                    effective_visibility = MemoryVisibility.PRIVATE.value
-                    sensitivity_source = "regex"
+        if gate_action == "bypassed":
+            logger.debug(
+                f"Sensitivity gate: class={sensitivity_class} bypassed via "
+                f"explicit sensitivity_override (user={user_id}, category={category})"
+            )
+        elif gate_action == "forced":
+            if explicit_visibility_requested and not sensitivity_override:
+                logger.warning(
+                    f"Sensitivity gate: caller requested visibility for a "
+                    f"{sensitivity_class} write without sensitivity_override=True — "
+                    f"forcing visibility=private (user={user_id}, category={category})"
+                )
             else:
-                sensitivity_class = None
+                logger.info(
+                    f"Sensitivity gate: forcing visibility=private for category="
+                    f"{category} (class={sensitivity_class}, source=regex, "
+                    f"user={user_id})"
+                )
 
         # ── Authoritative "standard" tier: gate + force global scope ──
         # The REST route / MCP tool gate this earlier and synchronously, but
@@ -1582,6 +1578,7 @@ class WriteMixin:
         occurred_ats: list[str | None] | None = None,
         workspace: str | None = None,
         sensitivities: list[str | None] | None = None,
+        created_ids: set[str] | None = None,
     ) -> list[MemoryResponse]:
         """Store multiple categorized facts via a single batch embed + single Qdrant upsert.
 
@@ -1627,6 +1624,14 @@ class WriteMixin:
                 the sensitivity gate below — to decide whether the fact gets
                 forced to ``visibility=private``. This path never exposes a
                 caller-supplied ``visibility``, so there is no override.
+            created_ids: Optional output param — when given, every NEWLY
+                CREATED memory's id is added to this set (dedup survivors
+                are NOT added). ``stored`` mixes both kinds in input order
+                and a MemoryResponse alone can't distinguish them, so a
+                caller that must only act on genuinely-new rows (e.g.
+                extract_and_store's graph-episode-ref stamping — F8: a
+                survivor's graph_episode_uuid/name must not be repointed at
+                a DIFFERENT conversation's episode) passes a set here.
 
         Returns:
             List of MemoryResponse objects for stored facts (new rows and
@@ -1825,6 +1830,8 @@ class WriteMixin:
                 fact_forced_visibility, fact_sensitivity, fact_sensitivity_source,
             ))
             ordered.append(("new", len(texts) - 1))
+            if created_ids is not None:
+                created_ids.add(mid)
 
         # ── Single batch embed + single Qdrant upsert (new facts only) ──
         # Skipped entirely when everything dedup'd — a straight ARQ re-run of
