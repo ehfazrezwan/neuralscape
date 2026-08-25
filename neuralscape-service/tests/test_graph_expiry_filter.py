@@ -117,6 +117,12 @@ def _edge(uuid, source, target, expired_at=None, invalid_at=None):
     )
 
 
+def _liveness(uuid, edge_count, live_count):
+    """One row of memory.groups._live_node_uuids' Cypher liveness query
+    result (uuid, total connecting edge count, live-edge count)."""
+    return {"uuid": uuid, "edge_count": edge_count, "live_count": live_count}
+
+
 class TestGetGraphEdgesExpiryFilter:
     def test_excludes_expired_edge_by_default(self, service):
         edges = [_edge("e-live", "n1", "n2"), _edge("e-expired", "n1", "n3", expired_at=_LATER)]
@@ -148,17 +154,17 @@ class TestGetGraphEdgesExpiryFilter:
 class TestGetGraphNodesExpiryFilter:
     def test_excludes_node_whose_only_edge_is_expired(self, service):
         nodes = [_node("n1"), _node("n2")]
-        edges = [_edge("e1", "n1", "other", expired_at=_LATER)]
-        service._run_on_bridge = _bridge_side_effect(nodes, edges)
-        result = service.get_graph_nodes("ehfaz")
         # n1's sole edge is expired -> excluded. n2 has no edges at all
         # ("never connected", not "expired") -> kept.
+        records = [_liveness("n1", 1, 0), _liveness("n2", 0, 0)]
+        service._run_on_bridge = _bridge_side_effect(nodes, records)
+        result = service.get_graph_nodes("ehfaz")
         assert {n["uuid"] for n in result} == {"n2"}
 
     def test_node_with_a_live_edge_kept(self, service):
         nodes = [_node("n1")]
-        edges = [_edge("e1", "n1", "other")]
-        service._run_on_bridge = _bridge_side_effect(nodes, edges)
+        records = [_liveness("n1", 1, 1)]
+        service._run_on_bridge = _bridge_side_effect(nodes, records)
         result = service.get_graph_nodes("ehfaz")
         assert {n["uuid"] for n in result} == {"n1"}
 
@@ -166,14 +172,28 @@ class TestGetGraphNodesExpiryFilter:
         """A freshly-minted entity with no RELATES_TO edges yet is
         'not yet enriched', not 'expired' — must not be excluded."""
         nodes = [_node("n1")]
-        service._run_on_bridge = _bridge_side_effect(nodes, [])
+        records = [_liveness("n1", 0, 0)]
+        service._run_on_bridge = _bridge_side_effect(nodes, records)
         result = service.get_graph_nodes("ehfaz")
         assert {n["uuid"] for n in result} == {"n1"}
 
     def test_mixed_parentage_node_kept_when_any_edge_is_live(self, service):
         nodes = [_node("n1")]
-        edges = [_edge("e1", "n1", "other1", expired_at=_LATER), _edge("e2", "n1", "other2")]
-        service._run_on_bridge = _bridge_side_effect(nodes, edges)
+        records = [_liveness("n1", 2, 1)]
+        service._run_on_bridge = _bridge_side_effect(nodes, records)
+        result = service.get_graph_nodes("ehfaz")
+        assert {n["uuid"] for n in result} == {"n1"}
+
+    def test_live_edge_beyond_small_cap_still_counts(self, service):
+        """F2 regression: the old implementation fetched at most 5000 edges
+        for the WHOLE group and derived liveness in Python, so a node whose
+        one live edge fell past that cap was wrongly dropped. The new
+        liveness query is scoped to the candidate node uuids with no cap —
+        a large total edge_count must not stop a live_count > 0 from being
+        honored."""
+        nodes = [_node("n1")]
+        records = [_liveness("n1", 6000, 1)]
+        service._run_on_bridge = _bridge_side_effect(nodes, records)
         result = service.get_graph_nodes("ehfaz")
         assert {n["uuid"] for n in result} == {"n1"}
 
@@ -184,10 +204,11 @@ class TestGetGraphNodesExpiryFilter:
         assert {n["uuid"] for n in result} == {"n1", "n2"}
         assert service._run_on_bridge.call_count == 1
 
-    def test_edge_lookup_failure_fails_open_to_unfiltered(self, service):
-        """The live-node check is defense-in-depth on top of the edge
-        filter, not the primary mechanism — a failure there must not hide
-        nodes that would otherwise be legitimately listed."""
+    def test_liveness_query_failure_fails_closed_to_no_nodes(self, service):
+        """Security fix (F2): this listing endpoint exists specifically to
+        hide soft-expired PRIVATE content, so a liveness-query failure must
+        fail CLOSED (hide nodes) rather than fail open (leak everything
+        unfiltered) like the old edge-cap implementation did."""
         nodes = [_node("n1")]
         service._get_graphiti = MagicMock(return_value=service._graphiti)
 
@@ -202,12 +223,14 @@ class TestGetGraphNodesExpiryFilter:
 
         service._run_on_bridge = MagicMock(side_effect=_bridge)
         result = service.get_graph_nodes("ehfaz")
-        assert {n["uuid"] for n in result} == {"n1"}
+        assert result == []
 
 
 class TestV1GraphRoutesPassIncludeExpired:
     """REST pass-through: /v1/graph/{nodes,edges} thread include_expired to
-    the service, defaulting to False."""
+    the service, defaulting to False. F5: include_expired=true is a
+    dictator-only escape hatch — a non-dictator caller gets 403, never a
+    silently-filtered 200."""
 
     def test_v1_graph_nodes_defaults_include_expired_false(self, client, mock_service):
         mock_service.get_graph_nodes.return_value = []
@@ -215,7 +238,24 @@ class TestV1GraphRoutesPassIncludeExpired:
         assert resp.status_code == 200
         assert mock_service.get_graph_nodes.call_args.kwargs["include_expired"] is False
 
-    def test_v1_graph_nodes_threads_include_expired_true(self, client, mock_service):
+    def test_v1_graph_nodes_include_expired_true_rejected_for_non_dictator(
+        self, client, mock_service, monkeypatch
+    ):
+        from config import settings
+
+        monkeypatch.setattr(settings, "dictator_user_ids", "someone_else")
+        resp = client.get(
+            "/v1/graph/nodes", params={"user_id": "ehfaz", "include_expired": "true"}
+        )
+        assert resp.status_code == 403
+        mock_service.get_graph_nodes.assert_not_called()
+
+    def test_v1_graph_nodes_include_expired_true_allowed_for_dictator(
+        self, client, mock_service, monkeypatch
+    ):
+        from config import settings
+
+        monkeypatch.setattr(settings, "dictator_user_ids", "ehfaz")
         mock_service.get_graph_nodes.return_value = []
         resp = client.get(
             "/v1/graph/nodes", params={"user_id": "ehfaz", "include_expired": "true"}
@@ -229,7 +269,24 @@ class TestV1GraphRoutesPassIncludeExpired:
         assert resp.status_code == 200
         assert mock_service.get_graph_edges.call_args.kwargs["include_expired"] is False
 
-    def test_v1_graph_edges_threads_include_expired_true(self, client, mock_service):
+    def test_v1_graph_edges_include_expired_true_rejected_for_non_dictator(
+        self, client, mock_service, monkeypatch
+    ):
+        from config import settings
+
+        monkeypatch.setattr(settings, "dictator_user_ids", "someone_else")
+        resp = client.get(
+            "/v1/graph/edges", params={"user_id": "ehfaz", "include_expired": "true"}
+        )
+        assert resp.status_code == 403
+        mock_service.get_graph_edges.assert_not_called()
+
+    def test_v1_graph_edges_include_expired_true_allowed_for_dictator(
+        self, client, mock_service, monkeypatch
+    ):
+        from config import settings
+
+        monkeypatch.setattr(settings, "dictator_user_ids", "ehfaz")
         mock_service.get_graph_edges.return_value = []
         resp = client.get(
             "/v1/graph/edges", params={"user_id": "ehfaz", "include_expired": "true"}
@@ -258,8 +315,20 @@ class TestLegacyGraphRoutesExpiryFilter:
         assert resp.status_code == 200
         assert {e["uuid"] for e in resp.json()["edges"]} == {"e-live"}
 
-    def test_legacy_graph_edges_include_expired_returns_everything(self, client, monkeypatch):
+    def test_legacy_graph_edges_include_expired_true_rejected_for_non_dictator(
+        self, client, monkeypatch
+    ):
+        from config import settings
+
+        monkeypatch.setattr(settings, "dictator_user_ids", "someone_else")
+        resp = client.get("/graph/edges", params={"user_id": "ehfaz", "include_expired": "true"})
+        assert resp.status_code == 403
+
+    def test_legacy_graph_edges_include_expired_returns_everything_for_dictator(
+        self, client, monkeypatch
+    ):
         import main
+        from config import settings
 
         edges = [_edge("e-live", "a", "b"), _edge("e-expired", "a", "c", expired_at=_LATER)]
 
@@ -268,6 +337,7 @@ class TestLegacyGraphRoutesExpiryFilter:
             return edges
 
         monkeypatch.setattr(main, "_run_on_bridge", _fake_run_on_bridge)
+        monkeypatch.setattr(settings, "dictator_user_ids", "ehfaz")
         resp = client.get("/graph/edges", params={"user_id": "ehfaz", "include_expired": "true"})
         assert resp.status_code == 200
         assert {e["uuid"] for e in resp.json()["edges"]} == {"e-live", "e-expired"}
@@ -276,21 +346,55 @@ class TestLegacyGraphRoutesExpiryFilter:
         import main
 
         nodes = [_node("n1"), _node("n2")]
-        edges = [_edge("e1", "n1", "other", expired_at=_LATER)]
+        # Delegates to memory.groups._live_node_uuids (same helper as the
+        # v1/service path — F2's "legacy filter re-implemented" nitpick):
+        # second bridge call is the liveness query, not a raw edge fetch.
+        records = [_liveness("n1", 1, 0), _liveness("n2", 0, 0)]
         calls = {"n": 0}
 
         def _fake_run_on_bridge(coro):
             coro.close()
             calls["n"] += 1
-            return nodes if calls["n"] == 1 else edges
+            return nodes if calls["n"] == 1 else records
 
         monkeypatch.setattr(main, "_run_on_bridge", _fake_run_on_bridge)
         resp = client.get("/graph/nodes", params={"user_id": "ehfaz"})
         assert resp.status_code == 200
         assert {n["uuid"] for n in resp.json()["nodes"]} == {"n2"}
 
-    def test_legacy_graph_nodes_include_expired_skips_edge_lookup(self, client, monkeypatch):
+    def test_legacy_graph_nodes_liveness_query_failure_fails_closed(self, client, monkeypatch):
+        """Same fail-CLOSED contract as the v1/service path (F2)."""
         import main
+
+        nodes = [_node("n1")]
+        calls = {"n": 0}
+
+        def _fake_run_on_bridge(coro):
+            coro.close()
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return nodes
+            raise RuntimeError("bridge down")
+
+        monkeypatch.setattr(main, "_run_on_bridge", _fake_run_on_bridge)
+        resp = client.get("/graph/nodes", params={"user_id": "ehfaz"})
+        assert resp.status_code == 200
+        assert resp.json()["nodes"] == []
+
+    def test_legacy_graph_nodes_include_expired_true_rejected_for_non_dictator(
+        self, client, monkeypatch
+    ):
+        from config import settings
+
+        monkeypatch.setattr(settings, "dictator_user_ids", "someone_else")
+        resp = client.get("/graph/nodes", params={"user_id": "ehfaz", "include_expired": "true"})
+        assert resp.status_code == 403
+
+    def test_legacy_graph_nodes_include_expired_skips_edge_lookup_for_dictator(
+        self, client, monkeypatch
+    ):
+        import main
+        from config import settings
 
         nodes = [_node("n1"), _node("n2")]
         calls = {"n": 0}
@@ -301,6 +405,7 @@ class TestLegacyGraphRoutesExpiryFilter:
             return nodes
 
         monkeypatch.setattr(main, "_run_on_bridge", _fake_run_on_bridge)
+        monkeypatch.setattr(settings, "dictator_user_ids", "ehfaz")
         resp = client.get("/graph/nodes", params={"user_id": "ehfaz", "include_expired": "true"})
         assert resp.status_code == 200
         assert {n["uuid"] for n in resp.json()["nodes"]} == {"n1", "n2"}

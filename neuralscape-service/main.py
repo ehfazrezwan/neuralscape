@@ -541,30 +541,29 @@ async def list_graph_nodes_legacy(
     if g is None:
         raise HTTPException(status_code=503, detail="Graphiti not initialized")
 
-    from graphiti_core.edges import EntityEdge
     from graphiti_core.nodes import EntityNode
-    from memory.groups import _edge_is_invalidated
+    from memory.groups import _live_node_uuids
 
     group_id = _resolve_user_id(request, user_id)
+    _authorize_include_expired(group_id, include_expired)
     try:
         nodes = await asyncio.to_thread(
             _run_on_bridge,
             EntityNode.get_by_group_ids(g.driver, group_ids=[group_id], limit=limit),
         )
         if not include_expired and nodes:
-            edges = await asyncio.to_thread(
-                _run_on_bridge,
-                EntityEdge.get_by_group_ids(g.driver, group_ids=[group_id], limit=5000),
+            uuids = [n.uuid for n in nodes]
+            live = await asyncio.to_thread(
+                _live_node_uuids, _run_on_bridge, g.driver, uuids, [group_id]
             )
-            touched: set[str] = set()
-            live: set[str] = set()
-            for e in edges:
-                is_live = not _edge_is_invalidated(e)
-                for node_uuid in (e.source_node_uuid, e.target_node_uuid):
-                    touched.add(node_uuid)
-                    if is_live:
-                        live.add(node_uuid)
-            nodes = [n for n in nodes if n.uuid not in touched or n.uuid in live]
+            if live is None:
+                logger.warning(
+                    "Legacy list_graph_nodes: liveness query failed, failing "
+                    "CLOSED to no nodes for group_id=%r", group_id,
+                )
+                nodes = []
+            else:
+                nodes = [n for n in nodes if n.uuid in live]
         return {
             "status": "ok",
             "nodes": [
@@ -606,6 +605,7 @@ async def list_graph_edges_legacy(
     from memory.groups import _edge_is_invalidated
 
     group_id = _resolve_user_id(request, user_id)
+    _authorize_include_expired(group_id, include_expired)
     try:
         edges = await asyncio.to_thread(
             _run_on_bridge,
@@ -825,6 +825,28 @@ def _authorize_standard_write(user_id: str, visibility) -> None:
         raise HTTPException(
             status_code=403,
             detail=f"User {user_id!r} is not authorized to write 'standard'-tier memories.",
+        )
+
+
+def _authorize_include_expired(user_id: str, include_expired: bool) -> None:
+    """Reject ``include_expired=true`` on the graph listing routes for
+    non-dictators.
+
+    Security fix: soft-expired nodes/edges can contain retracted PRIVATE
+    content (memory/provenance.py's cascade on a visibility flip/delete).
+    ``include_expired`` is an operator/debug escape hatch — before this gate
+    it was honored for ANY authenticated caller, re-exposing exactly what
+    the cascade removed. No-op when ``include_expired`` is falsy (the
+    default, unfiltered-listing behavior is unaffected). Raises 403 rather
+    than silently ignoring the flag, so a caller learns it's privileged
+    instead of getting a quietly-filtered response that looks like a bug.
+    """
+    if not include_expired:
+        return
+    if not settings.is_dictator(user_id):
+        raise HTTPException(
+            status_code=403,
+            detail=f"User {user_id!r} is not authorized to use include_expired=true.",
         )
 
 
@@ -3057,6 +3079,7 @@ async def v1_graph_nodes(
     ``include_expired=true`` for an operator/debug view.
     """
     resolved_user_id = _resolve_user_id(request, user_id)
+    _authorize_include_expired(resolved_user_id, include_expired)
     nodes = await asyncio.to_thread(
         _service.get_graph_nodes,
         user_id=resolved_user_id,
@@ -3081,6 +3104,7 @@ async def v1_graph_edges(
     ``include_expired=true`` for an operator/debug view.
     """
     resolved_user_id = _resolve_user_id(request, user_id)
+    _authorize_include_expired(resolved_user_id, include_expired)
     edges = await asyncio.to_thread(
         _service.get_graph_edges,
         user_id=resolved_user_id,

@@ -72,34 +72,31 @@ class GraphAdminMixin:
 
     def _filter_live_nodes(self, g, group_ids: list[str], nodes: list) -> list:
         """Drop entity nodes whose connecting RELATES_TO edges are ALL
-        expired/invalidated (see ``get_graph_nodes`` docstring). Reuses the
-        SAME edge-liveness definition as the search path
-        (memory/groups.py::_edge_is_invalidated / _live_edges_filter) rather
-        than inventing a second one. Fails open (returns ``nodes``
-        unfiltered) on a lookup error — this is a defense-in-depth listing
-        filter, not the primary expiry mechanism.
+        expired/invalidated (see ``get_graph_nodes`` docstring).
+
+        Delegates to ``memory.groups._live_node_uuids``, a server-side
+        Cypher liveness query over exactly the candidate node uuids (no
+        cap on group edge count, unlike the prior
+        ``EntityEdge.get_by_group_ids(..., limit=5000)`` approach, which
+        silently mis-classified nodes past the cap). Fails CLOSED on any
+        query error — this is a listing endpoint whose whole purpose is to
+        hide soft-expired PRIVATE content, so a lookup failure must not
+        leak nodes, only hide them (worst case: a stale/live node
+        temporarily missing from the listing, never the reverse).
         """
         if not nodes:
             return nodes
-        from graphiti_core.edges import EntityEdge
+        from memory.groups import _live_node_uuids
 
-        try:
-            edges = self._run_on_bridge(
-                EntityEdge.get_by_group_ids(g.driver, group_ids=group_ids, limit=5000)
+        uuids = [n.uuid for n in nodes]
+        live = _live_node_uuids(self._run_on_bridge, g.driver, uuids, group_ids)
+        if live is None:
+            logger.warning(
+                "Live-node liveness query failed for group_ids=%r "
+                "(failing CLOSED to no nodes)", group_ids,
             )
-        except Exception as e:
-            logger.warning("Live-node edge lookup failed (fail-open to unfiltered): %s", e)
-            return nodes
-
-        touched: set[str] = set()
-        live: set[str] = set()
-        for e in edges:
-            is_live = not _edge_is_invalidated(e)
-            for node_uuid in (e.source_node_uuid, e.target_node_uuid):
-                touched.add(node_uuid)
-                if is_live:
-                    live.add(node_uuid)
-        return [n for n in nodes if n.uuid not in touched or n.uuid in live]
+            return []
+        return [n for n in nodes if n.uuid in live]
 
     def get_graph_edges(
         self,
