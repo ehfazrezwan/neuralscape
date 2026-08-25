@@ -899,11 +899,28 @@ class TestPatchMemory:
     def test_clearing_project_id_flips_flexible_scope_to_global(self, service):
         meta = dict(_SHARED_META, owner_user_id="ehfaz", visibility="private")
         service._memory.vector_store.get.return_value = _edit_point(meta=meta)
+        # Isolate this test's concern (scope/project_id derivation) from the
+        # graph-cascade-resolution concern (covered separately) by making the
+        # cascade resolve cleanly.
+        service._cascade_expire_episode = MagicMock(
+            return_value={"resolved": True, "episode_uuid": "ep-1",
+                          "edges_expired": 0, "nodes_removed": 0, "summaries_cleared": 0}
+        )
         result = service.patch_memory("m1", "ehfaz", {"project_id": None})
         new_meta = service._memory.vector_store.update.call_args.kwargs["payload"]["metadata"]
         assert new_meta["scope"] == "global" and new_meta["project_id"] is None
         # private user--ehfaz--project--neuralscape → user--ehfaz: partition moved
         assert result["graph"] == "migration_pending"
+
+    def test_clearing_project_id_reports_incomplete_when_cascade_unresolved(self, service):
+        """Honest-status regression guard: when the graph is configured but
+        the cascade can't resolve/verify the episode, the migration must NOT
+        report a clean 'migration_pending' — the pre-fix incident here was
+        exactly this silent-success shape."""
+        meta = dict(_SHARED_META, owner_user_id="ehfaz", visibility="private")
+        service._memory.vector_store.get.return_value = _edit_point(meta=meta)
+        result = service.patch_memory("m1", "ehfaz", {"project_id": None})
+        assert result["graph"] == "migration_incomplete"
 
     def test_category_cannot_be_cleared(self, service):
         service._memory.vector_store.get.return_value = _edit_point(meta=dict(_SHARED_META))

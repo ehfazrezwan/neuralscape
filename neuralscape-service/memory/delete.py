@@ -69,11 +69,29 @@ class DeleteMixin:
         # Expire related graph edges (soft-delete, non-critical). Tries the
         # episode-precise cascade first (memory/provenance.py); falls back to
         # the substring heuristic below only when no episode can be resolved.
+        #
+        # Zero-effect detection (audit): surface whether cleanup was actually
+        # VERIFIED, not just attempted — a pre-fix incident here was a silent
+        # no-op reported as a clean success. `graph_cascade` is additive on
+        # mem0's own delete result and is only set when the graph is
+        # configured at all (so a graph-disabled deployment's response shape
+        # is unchanged).
         if mem and self._graphiti and self._bridge:
             try:
-                self._cascade_or_fallback_expire(mem, memory_id=memory_id)
+                cascade_result = self._cascade_or_fallback_expire(mem, memory_id=memory_id)
+                if isinstance(result, dict):
+                    result["graph_cascade"] = "resolved" if cascade_result.get("resolved") else "unresolved"
+                if not cascade_result.get("resolved"):
+                    logger.warning(
+                        "delete_memory(%s): graph episode could not be "
+                        "resolved/verified — cleanup relied on the lossy "
+                        "substring fallback",
+                        memory_id,
+                    )
             except Exception as e:
                 logger.warning(f"Graph edge expiration failed for {memory_id} (non-critical): {e}")
+                if isinstance(result, dict):
+                    result["graph_cascade"] = "error"
 
         return result
 
@@ -111,10 +129,14 @@ class DeleteMixin:
                     f"Deleting ALL memories for user={user_id} including "
                     f"shared writes (include_shared=True)"
                 )
+                unresolved_ids: list[str] = []
                 if self._graphiti and self._bridge:
-                    self._expire_user_graph_writes(user_id)
+                    unresolved_ids = self._expire_user_graph_writes(user_id)
                 m.delete_all(user_id=user_id)
-                return {"message": "All memories deleted (including shared)"}
+                return {
+                    "message": "All memories deleted (including shared)",
+                    "graph_cascade_unresolved_ids": unresolved_ids,
+                }
 
             # Default: remove only private writes. Shared memories stay.
             logger.warning(
@@ -130,6 +152,9 @@ class DeleteMixin:
             deleted_count = 0
             skipped_shared = 0
             skipped_standard = 0
+            # Zero-effect detection: never silently absorb a row whose graph
+            # episode couldn't be resolved/verified — count and report it.
+            unresolved_ids: list[str] = []
             for mem_info in memories_to_delete:
                 meta = mem_info.get("metadata", {}) or {}
                 if isinstance(meta.get("metadata"), dict):
@@ -144,14 +169,23 @@ class DeleteMixin:
                 try:
                     m.vector_store.delete(mid)
                     if self._graphiti and self._bridge:
-                        self._cascade_or_fallback_expire(
+                        cascade_result = self._cascade_or_fallback_expire(
                             {"memory": mem_info.get("data", ""), "metadata": meta},
                             memory_id=mid,
                         )
+                        if not cascade_result.get("resolved"):
+                            logger.warning(
+                                "Bulk delete (null-category) for memory=%s could "
+                                "not resolve/verify graph cleanup", mid,
+                            )
+                            unresolved_ids.append(mid)
                     deleted_count += 1
                 except Exception as e:
                     logger.warning(f"Failed to delete null-category memory {mid}: {e}")
-            return {"message": _deleted_msg("null-category memories", deleted_count, skipped_shared, skipped_standard)}
+            return {
+                "message": _deleted_msg("null-category memories", deleted_count, skipped_shared, skipped_standard),
+                "graph_cascade_unresolved_ids": unresolved_ids,
+            }
 
         # For filtered deletes, we need to list then delete individually
         memories = self.list_memories(
@@ -164,6 +198,7 @@ class DeleteMixin:
         deleted_count = 0
         skipped_shared = 0
         skipped_standard = 0
+        unresolved_ids: list[str] = []
         for mem in memories:
             if not include_shared and getattr(mem, "visibility", None) == MemoryVisibility.SHARED.value:
                 skipped_shared += 1
@@ -176,12 +211,21 @@ class DeleteMixin:
                 full_mem = m.get(mem.id)
                 m.delete(mem.id)
                 if full_mem and self._graphiti and self._bridge:
-                    self._cascade_or_fallback_expire(full_mem, memory_id=mem.id)
+                    cascade_result = self._cascade_or_fallback_expire(full_mem, memory_id=mem.id)
+                    if not cascade_result.get("resolved"):
+                        logger.warning(
+                            "Bulk delete for memory=%s could not resolve/verify "
+                            "graph cleanup", mem.id,
+                        )
+                        unresolved_ids.append(mem.id)
                 deleted_count += 1
             except Exception as e:
                 logger.warning(f"Failed to delete memory {mem.id}: {e}")
 
-        return {"message": _deleted_msg("memories", deleted_count, skipped_shared, skipped_standard)}
+        return {
+            "message": _deleted_msg("memories", deleted_count, skipped_shared, skipped_standard),
+            "graph_cascade_unresolved_ids": unresolved_ids,
+        }
 
     def _delete_private_only(self, user_id: str) -> dict:
         """Delete every PRIVATE memory the user owns; leave shared writes alone.
@@ -278,7 +322,7 @@ class DeleteMixin:
         except Exception as e:
             logger.warning(f"Graph edge expiration failed (non-critical): {e}")
 
-    def _expire_user_graph_writes(self, user_id: str) -> None:
+    def _expire_user_graph_writes(self, user_id: str) -> list[str]:
         """Expire graph edges across every group_id this user authored.
 
         Used by the unfiltered bulk-delete path. Private groups
@@ -287,12 +331,16 @@ class DeleteMixin:
         Shared groups (`shared`, `shared--project--*`) hold team
         knowledge from many writers, so we only expire the specific
         edges this user authored via per-memory cleanup.
+
+        Returns the memory ids whose shared-group episode could not be
+        resolved/verified (zero-effect detection) — never silently
+        dropped, so the caller can report them.
         """
         try:
             user_memories = self._scroll_all_user_memories(user_id)
         except Exception as e:
             logger.warning(f"Failed to scroll memories for graph cleanup (non-critical): {e}")
-            return
+            return []
 
         private_groups: set[str] = set()
         shared_memories: list[dict] = []
@@ -308,7 +356,11 @@ class DeleteMixin:
                 # Don't touch the shared group_id — other users' edges live
                 # there too. Per-memory edge expiration narrows to just
                 # this user's specific facts.
-                shared_memories.append({"memory": payload.get("data", ""), "metadata": metadata})
+                shared_memories.append({
+                    "memory": payload.get("data", ""),
+                    "metadata": metadata,
+                    "id": str(mem.get("id", "")),
+                })
             else:
                 if pid:
                     private_groups.add(f"user--{user_id}--project--{pid}")
@@ -317,11 +369,21 @@ class DeleteMixin:
 
         if private_groups:
             self._expire_graph_edges_for_groups(sorted(private_groups))
+        unresolved_ids: list[str] = []
         for mem in shared_memories:
+            mid = mem.get("id", "")
             try:
-                self._cascade_or_fallback_expire(mem)
+                cascade_result = self._cascade_or_fallback_expire(mem, memory_id=mid)
+                if not cascade_result.get("resolved"):
+                    logger.warning(
+                        "Nuke-all delete for user=%s shared memory=%s could not "
+                        "resolve/verify graph cleanup", user_id, mid,
+                    )
+                    unresolved_ids.append(mid)
             except Exception as e:
                 logger.warning(f"Per-shared-memory edge expiration failed (non-critical): {e}")
+                unresolved_ids.append(mid)
+        return unresolved_ids
 
     def _expire_graph_edges_for_groups(self, group_ids: list[str]) -> None:
         """Expire all graph edges in the given groups (bulk soft-delete)."""

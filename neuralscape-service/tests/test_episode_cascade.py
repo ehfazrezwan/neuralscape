@@ -490,3 +490,171 @@ class TestCallSitesInvokeCascade:
         service._cascade_or_fallback_expire.assert_called_once()
         _, kwargs = service._cascade_or_fallback_expire.call_args
         assert kwargs["group_id"] == "shared--project--neuralscape"  # OLD partition
+
+
+class TestUnconditionalSummaryScrub:
+    """Orchestrator amendment: a node's `summary` AGGREGATES text across
+    every episode that mentions it — there is no safe way to subtract just
+    one episode's contribution from an aggregated summary. So EVERY node
+    the private episode mentions must have its summary cleared, not only
+    the ones that turn out to be sole-mentioned (removed) or, under the
+    OLD framing, only the "otherwise" (surviving) branch. Live-repro
+    finding: a sensitive figure lived ONLY in two entity summaries, both
+    mentioned by several OTHER episodes too — those nodes are exactly the
+    "surviving" case, which the wrapper-level tests above already prove
+    gets cleared. This is a structural regression guard on top of that:
+    it inspects the Cypher text (no live Neo4j in this suite) to prove the
+    `SET n.summary = ''` is not textually gated behind the mention-count
+    CASE/FOREACH that decides node removal — i.e. it is unconditional by
+    construction, not just "correct today because the branches happen to
+    cover every case."
+    """
+
+    def test_summary_clear_is_not_gated_by_mention_count(self, service):
+        import inspect
+
+        src = inspect.getsource(service._clear_or_remove_episode_entities)
+        cypher_start = src.index("MATCH (ep:Episodic {uuid: $episode_uuid})-[:MENTIONS]->(n:Entity)")
+        cypher = src[cypher_start:]
+        set_idx = cypher.index("SET n.summary = ''")
+        mention_count_idx = cypher.index("OPTIONAL MATCH (other:Episodic)")
+        # The clear must run BEFORE mention_count is even computed.
+        assert set_idx < mention_count_idx
+        # And nothing between the MENTIONS match and the clear introduces a
+        # FOREACH/CASE conditional around it.
+        assert "FOREACH" not in cypher[:set_idx]
+        assert "CASE" not in cypher[:set_idx]
+
+
+class TestZeroEffectDetection:
+    """Orchestrator amendment: a pre-fix incident was a SILENT no-op — the
+    substring routine failed to match anything, logged one line, and the
+    caller still reported a clean success. Every caller that surfaces a
+    per-migration/per-delete status must distinguish "verified" from
+    "could not verify" instead of collapsing both into the same happy
+    status, and bulk callers must COUNT + REPORT the specific memory ids
+    that could not be resolved rather than silently absorbing them."""
+
+    def test_delete_memory_surfaces_unresolved_cascade_not_as_success(self, service):
+        service._memory.get.return_value = {
+            "memory": "Prefers tabs", "user_id": "ehfaz",
+            "metadata": {"owner_user_id": "ehfaz", "visibility": "private"},
+        }
+        service._memory.delete.return_value = {"message": "Memory deleted successfully!"}
+        service._cascade_or_fallback_expire = MagicMock(
+            return_value={"resolved": False, "episode_uuid": None,
+                          "edges_expired": 0, "nodes_removed": 0, "summaries_cleared": 0}
+        )
+        result = service.delete_memory("m1")
+        assert result["graph_cascade"] == "unresolved"
+
+    def test_delete_memory_reports_resolved_when_cascade_succeeds(self, service):
+        service._memory.get.return_value = {
+            "memory": "Prefers tabs", "user_id": "ehfaz",
+            "metadata": {"owner_user_id": "ehfaz", "visibility": "private"},
+        }
+        service._memory.delete.return_value = {"message": "Memory deleted successfully!"}
+        service._cascade_or_fallback_expire = MagicMock(
+            return_value={"resolved": True, "episode_uuid": "ep-1",
+                          "edges_expired": 1, "nodes_removed": 0, "summaries_cleared": 1}
+        )
+        result = service.delete_memory("m1")
+        assert result["graph_cascade"] == "resolved"
+
+    def test_retag_reports_unresolved_migration_ids_not_silently(self, service):
+        from types import SimpleNamespace
+
+        pt = SimpleNamespace(
+            id="m1",
+            payload={
+                "data": "Old content",
+                "metadata": {
+                    "scope": "project", "category": "decision", "project_id": "neuralscape",
+                    "owner_user_id": "ehfaz", "visibility": "shared", "tags": ["old-tag"],
+                },
+            },
+        )
+        service._memory.vector_store.client.scroll.return_value = ([pt], None)
+        service._cascade_or_fallback_expire = MagicMock(
+            return_value={"resolved": False, "episode_uuid": None,
+                          "edges_expired": 0, "nodes_removed": 0, "summaries_cleared": 0}
+        )
+
+        result = service.retag_memories(
+            "ehfaz", {"project_id": "neuralscape"}, {"set_project_id": "bon002"}
+        )
+
+        assert result["graph_migrations_unresolved_ids"] == ["m1"]
+
+    def test_retag_no_unresolved_ids_when_cascade_succeeds(self, service):
+        from types import SimpleNamespace
+
+        pt = SimpleNamespace(
+            id="m1",
+            payload={
+                "data": "Old content",
+                "metadata": {
+                    "scope": "project", "category": "decision", "project_id": "neuralscape",
+                    "owner_user_id": "ehfaz", "visibility": "shared", "tags": ["old-tag"],
+                },
+            },
+        )
+        service._memory.vector_store.client.scroll.return_value = ([pt], None)
+        service._cascade_or_fallback_expire = MagicMock(
+            return_value={"resolved": True, "episode_uuid": "ep-1",
+                          "edges_expired": 1, "nodes_removed": 0, "summaries_cleared": 1}
+        )
+
+        result = service.retag_memories(
+            "ehfaz", {"project_id": "neuralscape"}, {"set_project_id": "bon002"}
+        )
+
+        assert result["graph_migrations_unresolved_ids"] == []
+
+    def test_patch_memory_migration_incomplete_when_unresolved(self, service):
+        from types import SimpleNamespace
+
+        point = SimpleNamespace(payload={
+            "data": "Old content",
+            "user_id": "ehfaz",
+            "metadata": {
+                "scope": "project", "category": "decision", "project_id": "neuralscape",
+                "owner_user_id": "ehfaz", "visibility": "shared",
+            },
+        })
+        service._memory.vector_store.get.return_value = point
+        service.get_memory = MagicMock(return_value=MagicMock())
+        service._cascade_expire_episode = MagicMock(
+            return_value={"resolved": False, "episode_uuid": None,
+                          "edges_expired": 0, "nodes_removed": 0, "summaries_cleared": 0}
+        )
+
+        result = service.patch_memory("m1", "ehfaz", {"project_id": "bon002"})
+
+        assert result["graph"] == "migration_incomplete"
+        # A migration is still enqueued into the NEW group either way — the
+        # re-ingest is independent of whether old-group cleanup verified.
+        assert result["graph_job"] is not None
+
+    def test_patch_memory_migration_pending_when_graph_not_configured(self, service):
+        """A graph-disabled deployment must not be spammed with a false
+        'incomplete' status — there's nothing to verify when there's no
+        graph at all. Original behavior preserved."""
+        from types import SimpleNamespace
+
+        point = SimpleNamespace(payload={
+            "data": "Old content",
+            "user_id": "ehfaz",
+            "metadata": {
+                "scope": "project", "category": "decision", "project_id": "neuralscape",
+                "owner_user_id": "ehfaz", "visibility": "shared",
+            },
+        })
+        service._memory.vector_store.get.return_value = point
+        service.get_memory = MagicMock(return_value=MagicMock())
+        service._graphiti = None
+        service._bridge = None
+
+        result = service.patch_memory("m1", "ehfaz", {"project_id": "bon002"})
+
+        assert result["graph"] == "migration_pending"

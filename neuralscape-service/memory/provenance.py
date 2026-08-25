@@ -183,6 +183,15 @@ class ProvenanceMixin:
         Never raises — every failure degrades to a logged no-op, matching
         the non-critical graph-cleanup convention used across the
         delete/edit paths.
+
+        The returned dict always carries ``memory_id`` (echoing the input)
+        alongside the cascade's own keys, so a bulk caller can collect
+        ``memory_id`` for every unresolved row into a reportable list
+        instead of silently absorbing it (audit: the pre-fix substring
+        routine's failure mode was exactly this — a per-item try/except
+        that logged one debug-level line and moved on, so an operator
+        polling task status saw a clean ``completed`` with no indication
+        entire rows were never touched in the graph).
         """
         metadata = mem.get("metadata", {}) or {}
         if isinstance(metadata.get("metadata"), dict):
@@ -201,11 +210,13 @@ class ProvenanceMixin:
             episode_name=metadata.get("graph_episode_name"),
             content=mem.get("memory", ""),
         )
+        result = dict(result, memory_id=memory_id or None)
         if not result.get("resolved"):
             logger.warning(
                 "Episode cascade unresolved for memory=%s group_id=%r — "
                 "falling back to substring edge-expiry heuristic (may leave "
-                "stale/paraphrased facts live in the graph)",
+                "stale/paraphrased facts live in the graph — cannot verify "
+                "cleanup succeeded)",
                 memory_id or "?", group_id,
             )
             try:
@@ -354,27 +365,46 @@ class ProvenanceMixin:
         return int(records[0]["edges_expired"]) if records else 0
 
     def _clear_or_remove_episode_entities(self, episode_uuid: str) -> dict:
-        """For each entity node this episode mentions: remove the node if
-        this episode is its ONLY mention, else clear its ``summary`` so it
-        gets a clean re-summary on the next enrichment pass.
+        """For every entity node this episode mentions: UNCONDITIONALLY
+        clear its ``summary`` — then, additionally, remove the node
+        entirely if this episode is its ONLY mention.
+
+        Summary-clearing is deliberately NOT gated behind the mention-count
+        check (orchestrator amendment, live-repro-confirmed): a node's
+        ``summary`` is an LLM-synthesized AGGREGATE over every episode that
+        mentions it, and there is no safe way to subtract just one
+        episode's contribution from that aggregate. A node mentioned by
+        several OTHER live episodes still had this episode's content
+        folded into its summary — leaving that summary untouched (the
+        old "only clear if sole-mentioned" framing) can leave sensitive
+        text readable through a node that never looked like the "owner"
+        of the leak. So every mentioned node's summary is cleared, full
+        stop, and left to regenerate cleanly on the next enrichment pass.
+        Nodes mentioned ONLY by this episode go further and are removed
+        outright (their clear-then-delete is a harmless, cheap no-op
+        ordering, not a correctness dependency).
 
         Mirrors the ``episode_count == 1`` check in
         ``graphiti_core.graphiti.Graphiti.remove_episode`` (read as a
         pattern reference only — that method hard-deletes edges by sole
         first-parent, which is NOT the semantics wanted here).
 
-        Returns ``{"nodes_removed": int, "summaries_cleared": int}``.
-        Idempotent: once run, the episode's MENTIONS edges are gone (the
-        episode itself gets hard-deleted next), so a second cascade
-        attempt on the same episode finds nothing to mention.
+        Returns ``{"nodes_removed": int, "summaries_cleared": int}`` where
+        the two counts are disjoint: ``nodes_removed`` = sole-mentioned
+        nodes (gone entirely), ``summaries_cleared`` = every OTHER
+        mentioned node (survives, summary now empty). Idempotent: once
+        run, the episode's MENTIONS edges are gone (the episode itself
+        gets hard-deleted next), so a second cascade attempt on the same
+        episode finds nothing to mention.
         """
         cypher = """
         MATCH (ep:Episodic {uuid: $episode_uuid})-[:MENTIONS]->(n:Entity)
         WITH DISTINCT n
+        SET n.summary = ''
+        WITH n
         OPTIONAL MATCH (other:Episodic)-[:MENTIONS]->(n)
         WITH n, count(other) AS mention_count
         FOREACH (_ IN CASE WHEN mention_count <= 1 THEN [1] ELSE [] END | DETACH DELETE n)
-        FOREACH (_ IN CASE WHEN mention_count > 1 THEN [1] ELSE [] END | SET n.summary = '')
         RETURN
           sum(CASE WHEN mention_count <= 1 THEN 1 ELSE 0 END) AS nodes_removed,
           sum(CASE WHEN mention_count > 1 THEN 1 ELSE 0 END) AS summaries_cleared
