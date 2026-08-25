@@ -233,8 +233,16 @@ class DeleteMixin:
         Used by the default (non-include_shared) unfiltered bulk-delete
         path. Scrolls the user's full set, partitions by visibility,
         deletes the private rows one by one via Qdrant (mem0's
-        ``delete_all`` can't be filtered), then expires the per-user
-        private graph groups in bulk.
+        ``delete_all`` can't be filtered).
+
+        Graph cleanup is two-layered (F4): a bulk group-edge expiry is a
+        cheap backstop, but edges alone leave episodes and entity-node
+        summaries live — so every private row also gets the same
+        provenance-exact per-row cascade (``_cascade_or_fallback_expire``)
+        the shared branch (``_expire_user_graph_writes``) already used.
+        Group ids are built via ``_build_group_id`` (workspace-aware),
+        not a manual ``user--{user_id}`` string, so a workspace-partitioned
+        row's group actually gets swept.
         """
         try:
             all_memories = self._scroll_all_user_memories(user_id)
@@ -242,7 +250,8 @@ class DeleteMixin:
             logger.warning(f"Failed to scroll memories for private-only delete: {e}")
             return {"message": "No memories deleted (scroll failed)"}
 
-        private_ids: list[tuple[str, dict]] = []
+        # (memory_id, payload, metadata) for every non-shared row.
+        private_rows: list[tuple[str, dict, dict]] = []
         private_groups: set[str] = set()
         shared_preserved = 0
         for mem in all_memories:
@@ -254,21 +263,43 @@ class DeleteMixin:
             if visibility == MemoryVisibility.SHARED.value:
                 shared_preserved += 1
                 continue
-            private_ids.append((mem["id"], payload))
-            pid = metadata.get("project_id")
-            if pid:
-                private_groups.add(f"user--{user_id}--project--{pid}")
-            else:
-                private_groups.add(f"user--{user_id}")
+            private_rows.append((mem["id"], payload, metadata))
+            private_groups.add(
+                _build_group_id(
+                    visibility, user_id, metadata.get("project_id"), metadata.get("workspace")
+                )
+            )
 
+        # Cheap backstop: bulk-expire every edge in the private groups.
         if self._graphiti and self._bridge and private_groups:
             try:
                 self._expire_graph_edges_for_groups(sorted(private_groups))
             except Exception as e:
                 logger.warning(f"Graph cleanup for private groups failed: {e}")
 
+        # Provenance-exact per-row cascade (episodes + node summaries) —
+        # bounded to the rows just scrolled, never an unbounded search
+        # (NS issue #176).
+        unresolved_ids: list[str] = []
+        if self._graphiti and self._bridge:
+            for mid, payload, metadata in private_rows:
+                try:
+                    cascade_result = self._cascade_or_fallback_expire(
+                        {"memory": payload.get("data", ""), "metadata": metadata},
+                        memory_id=mid,
+                    )
+                    if not cascade_result.get("resolved"):
+                        logger.warning(
+                            "Private-only bulk delete for memory=%s could not "
+                            "resolve/verify graph cleanup", mid,
+                        )
+                        unresolved_ids.append(mid)
+                except Exception as e:
+                    logger.warning(f"Per-private-memory graph cascade failed for {mid} (non-critical): {e}")
+                    unresolved_ids.append(mid)
+
         deleted = 0
-        for mid, payload in private_ids:
+        for mid, payload, _ in private_rows:
             try:
                 self._memory.vector_store.delete(mid)
                 deleted += 1
@@ -278,7 +309,7 @@ class DeleteMixin:
         msg = f"Deleted {deleted} private memories"
         if shared_preserved:
             msg += f" (preserved {shared_preserved} shared)"
-        return {"message": msg}
+        return {"message": msg, "graph_cascade_unresolved_ids": unresolved_ids}
 
     def _expire_graph_edges_for_memory(self, mem: dict) -> None:
         """Soft-delete graph edges related to a memory by setting expired_at."""
@@ -323,17 +354,20 @@ class DeleteMixin:
             logger.warning(f"Graph edge expiration failed (non-critical): {e}")
 
     def _expire_user_graph_writes(self, user_id: str) -> list[str]:
-        """Expire graph edges across every group_id this user authored.
+        """Expire graph edges/episodes/summaries across every group_id this
+        user authored.
 
-        Used by the unfiltered bulk-delete path. Private groups
-        (`user--{user_id}` and `user--{user_id}--project--*`) are
-        expired wholesale — they only contain this user's writes.
-        Shared groups (`shared`, `shared--project--*`) hold team
-        knowledge from many writers, so we only expire the specific
-        edges this user authored via per-memory cleanup.
+        Used by the unfiltered (include_shared=True) bulk-delete path.
+        Private groups (`user--{user_id}` and `user--{user_id}--project--*`,
+        workspace-suffixed when set — via ``_build_group_id``) get a bulk
+        edge-expiry backstop PLUS a provenance-exact per-row cascade (F4:
+        edges-only left episodes and entity-node summaries live). Shared
+        groups (`shared`, `shared--project--*`) hold team knowledge from
+        many writers, so we only ever expire the specific edges/episodes
+        this user authored via the same per-memory cascade.
 
-        Returns the memory ids whose shared-group episode could not be
-        resolved/verified (zero-effect detection) — never silently
+        Returns the memory ids whose episode could not be resolved/verified
+        (zero-effect detection, private or shared) — never silently
         dropped, so the caller can report them.
         """
         try:
@@ -343,6 +377,7 @@ class DeleteMixin:
             return []
 
         private_groups: set[str] = set()
+        private_memories: list[dict] = []
         shared_memories: list[dict] = []
         for mem in user_memories:
             payload = mem.get("payload", {}) or {}
@@ -351,7 +386,6 @@ class DeleteMixin:
             if isinstance(metadata.get("metadata"), dict):
                 metadata = metadata["metadata"]
             visibility = metadata.get("visibility") or MemoryVisibility.PRIVATE.value
-            pid = metadata.get("project_id")
             if visibility == MemoryVisibility.SHARED.value:
                 # Don't touch the shared group_id — other users' edges live
                 # there too. Per-memory edge expiration narrows to just
@@ -362,26 +396,32 @@ class DeleteMixin:
                     "id": str(mem.get("id", "")),
                 })
             else:
-                if pid:
-                    private_groups.add(f"user--{user_id}--project--{pid}")
-                else:
-                    private_groups.add(f"user--{user_id}")
+                private_memories.append({
+                    "memory": payload.get("data", ""),
+                    "metadata": metadata,
+                    "id": str(mem.get("id", "")),
+                })
+                private_groups.add(
+                    _build_group_id(
+                        visibility, user_id, metadata.get("project_id"), metadata.get("workspace")
+                    )
+                )
 
         if private_groups:
             self._expire_graph_edges_for_groups(sorted(private_groups))
         unresolved_ids: list[str] = []
-        for mem in shared_memories:
+        for mem in private_memories + shared_memories:
             mid = mem.get("id", "")
             try:
                 cascade_result = self._cascade_or_fallback_expire(mem, memory_id=mid)
                 if not cascade_result.get("resolved"):
                     logger.warning(
-                        "Nuke-all delete for user=%s shared memory=%s could not "
+                        "Nuke-all delete for user=%s memory=%s could not "
                         "resolve/verify graph cleanup", user_id, mid,
                     )
                     unresolved_ids.append(mid)
             except Exception as e:
-                logger.warning(f"Per-shared-memory edge expiration failed (non-critical): {e}")
+                logger.warning(f"Per-memory edge expiration failed (non-critical): {e}")
                 unresolved_ids.append(mid)
         return unresolved_ids
 

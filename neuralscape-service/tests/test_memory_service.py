@@ -916,9 +916,20 @@ class TestPatchMemory:
         """Honest-status regression guard: when the graph is configured but
         the cascade can't resolve/verify the episode, the migration must NOT
         report a clean 'migration_pending' — the pre-fix incident here was
-        exactly this silent-success shape."""
+        exactly this silent-success shape.
+
+        Stub ``_cascade_expire_episode`` explicitly (rather than relying on
+        the fixture's mocked bridge failing internally) — the fixture's
+        mocked-bridge-raises-on-real-Cypher behavior is an implementation
+        detail of the bridge, not this test's actual concern (an unresolved
+        cascade), and coupling to it makes the test fragile to unrelated
+        bridge/liveness-query changes."""
         meta = dict(_SHARED_META, owner_user_id="ehfaz", visibility="private")
         service._memory.vector_store.get.return_value = _edit_point(meta=meta)
+        service._cascade_expire_episode = MagicMock(
+            return_value={"resolved": False, "episode_uuid": None,
+                          "edges_expired": 0, "nodes_removed": 0, "summaries_cleared": 0}
+        )
         result = service.patch_memory("m1", "ehfaz", {"project_id": None})
         assert result["graph"] == "migration_incomplete"
 
@@ -3286,7 +3297,10 @@ class TestExpireUserGraphWrites:
         groups = set(service._expire_graph_edges_for_groups.call_args[0][0])
         assert "user--alice" in groups
         assert "shared" not in groups
-        assert service._expire_graph_edges_for_memory.call_count == 1
+        # F4: the private row now ALSO gets the same per-row provenance
+        # cascade as the shared row (bulk group-edge expiry is a backstop,
+        # not a substitute) — one call per row, private + shared.
+        assert service._expire_graph_edges_for_memory.call_count == 2
 
     def test_scroll_failure_is_non_fatal(self, service):
         """If scrolling memories fails, expire returns quietly rather than
