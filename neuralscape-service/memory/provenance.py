@@ -141,7 +141,7 @@ class ProvenanceMixin:
             node_counts = self._clear_or_remove_episode_entities(resolved_uuid)
             self._delete_episode_node(resolved_uuid)
 
-            logger.warning(
+            logger.info(
                 "Episode cascade expired episode=%s group_id=%r: "
                 "edges_expired=%d nodes_removed=%d summaries_cleared=%d",
                 resolved_uuid, group_id, edges_expired,
@@ -334,6 +334,15 @@ class ProvenanceMixin:
         parentage does not protect it. ``expired_at IS NULL`` in the WHERE
         clause makes this idempotent: a second run finds nothing left to
         expire.
+
+        F6: ``$now`` arrives as an ISO string (``now_iso``); ``datetime()``
+        parses it into Neo4j's native temporal type on the way in, matching
+        what Graphiti itself stores for ``expired_at``/``invalid_at``
+        elsewhere. Storing the raw string instead would desync this write
+        from every other bi-temporal stamp in the graph — a downstream
+        reader that expects a temporal value (e.g. calling ``.isoformat()``
+        on the deserialized property, as the graph listing endpoints do)
+        would break on exactly the edges this cascade just touched.
         """
         cypher = """
         MATCH (ep:Episodic {uuid: $episode_uuid})
@@ -341,7 +350,7 @@ class ProvenanceMixin:
         MATCH ()-[r:RELATES_TO {group_id: $group_id}]->()
         WHERE r.expired_at IS NULL
           AND (r.uuid IN listed_edge_uuids OR $episode_uuid IN coalesce(r.episodes, []))
-        SET r.expired_at = $now
+        SET r.expired_at = datetime($now)
         RETURN count(r) AS edges_expired
         """
 

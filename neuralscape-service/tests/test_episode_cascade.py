@@ -269,6 +269,19 @@ class TestEdgeAndNodeCascadeSemantics:
         service._run_on_bridge = MagicMock(side_effect=RuntimeError("bridge down"))
         assert service._expire_episode_edges("shared", "ep-1", "2026-01-01T00:00:00+00:00") == 0
 
+    def test_expire_episode_edges_stamps_a_native_temporal_value(self, service):
+        """F6 regression: ``$now`` arrives as an ISO string, but the Cypher
+        must parse it into Neo4j's native temporal type (``datetime($now)``)
+        on the way in — a raw string SET would desync ``expired_at`` from
+        every other bi-temporal stamp Graphiti writes, and break a reader
+        that calls ``.isoformat()`` on the deserialized property (e.g. the
+        graph listing endpoints)."""
+        import inspect
+
+        src = inspect.getsource(service._expire_episode_edges)
+        assert "SET r.expired_at = datetime($now)" in src
+        assert "SET r.expired_at = $now\n" not in src
+
 
 class TestEpisodeHardDelete:
     def test_delete_episode_node_issues_detach_delete(self, service):
