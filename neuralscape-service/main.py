@@ -537,15 +537,16 @@ async def list_graph_nodes_legacy(
     memory/graph_admin.py::get_graph_nodes) — pass ``include_expired=true``
     for an operator/debug view.
     """
+    # Authorization before availability: a non-dictator asking for expired
+    # artifacts gets 403 even when the legacy Graphiti handle is unavailable.
+    group_id = _resolve_user_id(request, user_id)
+    _authorize_include_expired(group_id, include_expired)
     g = _get_graphiti()
     if g is None:
         raise HTTPException(status_code=503, detail="Graphiti not initialized")
 
     from graphiti_core.nodes import EntityNode
     from memory.groups import _live_node_uuids
-
-    group_id = _resolve_user_id(request, user_id)
-    _authorize_include_expired(group_id, include_expired)
     try:
         nodes = await asyncio.to_thread(
             _run_on_bridge,
@@ -596,6 +597,10 @@ async def list_graph_edges_legacy(
     memory/graph_admin.py::get_graph_edges) — pass ``include_expired=true``
     for an operator/debug view.
     """
+    # Authorization before availability: a non-dictator asking for expired
+    # artifacts gets 403 even when the legacy Graphiti handle is unavailable.
+    group_id = _resolve_user_id(request, user_id)
+    _authorize_include_expired(group_id, include_expired)
     g = _get_graphiti()
     if g is None:
         raise HTTPException(status_code=503, detail="Graphiti not initialized")
@@ -603,9 +608,6 @@ async def list_graph_edges_legacy(
     from graphiti_core.edges import EntityEdge
     from graphiti_core.errors import GroupsEdgesNotFoundError
     from memory.groups import _edge_is_invalidated
-
-    group_id = _resolve_user_id(request, user_id)
-    _authorize_include_expired(group_id, include_expired)
     try:
         edges = await asyncio.to_thread(
             _run_on_bridge,
