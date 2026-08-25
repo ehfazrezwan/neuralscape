@@ -396,12 +396,13 @@ class RemediationMixin:
         ``MATCH ... RETURN`` statement via ``self._run_on_bridge`` and
         return its records as plain dicts.
 
-        Fail-open, mirroring ``provenance.py::_lookup_episode_uuid``: any
-        error (bridge down, Neo4j hiccup, a mocked/half-initialized bridge
-        in unit tests) returns an empty list instead of raising, so a
-        broken read degrades to "nothing found" rather than crashing an
-        admin request. Every helper below issues exactly one statement
-        through this — none of them ever SET or DELETE.
+        FAILS CLOSED: any error (bridge down, Neo4j hiccup) raises instead
+        of returning an empty list. An audit/remediation read that cannot
+        run must never degrade to "nothing found" — a false-clean audit
+        (``total == 0``) would mask ongoing exposure. The REST/MCP admin
+        wrappers turn the exception into a non-ok result. Every helper
+        below issues exactly one statement through this — none of them
+        ever SET or DELETE.
         """
         async def _run():
             async with self._graphiti.driver.session() as session:
@@ -411,12 +412,12 @@ class RemediationMixin:
         coro = _run()
         try:
             return self._run_on_bridge(coro, timeout=timeout) or []
-        except Exception:
+        except Exception as e:
             coro.close()
-            logger.debug(
-                "remediation read query failed (fail-open): %r", params, exc_info=True,
+            logger.error(
+                "remediation read query failed (failing CLOSED): %r", params, exc_info=True,
             )
-            return []
+            raise RuntimeError(f"remediation read query failed: {e}") from e
 
     def _preview_episode_edges(self, group_id: str, episode_uuid: str) -> list[str]:
         """Read-only: uuids of the still-live ``RELATES_TO`` edges this

@@ -254,6 +254,7 @@ class DeleteMixin:
         private_rows: list[tuple[str, dict, dict]] = []
         private_groups: set[str] = set()
         shared_preserved = 0
+        standard_preserved = 0
         for mem in all_memories:
             payload = mem.get("payload", {}) or {}
             metadata = payload.get("metadata", {}) or {}
@@ -262,6 +263,12 @@ class DeleteMixin:
             visibility = metadata.get("visibility") or MemoryVisibility.PRIVATE.value
             if visibility == MemoryVisibility.SHARED.value:
                 shared_preserved += 1
+                continue
+            if visibility == MemoryVisibility.STANDARD.value:
+                # Authoritative tier is never collateral of a private-only
+                # wipe — standards are removed only through the explicit,
+                # dictator-gated delete paths.
+                standard_preserved += 1
                 continue
             private_rows.append((mem["id"], payload, metadata))
             private_groups.add(
@@ -309,6 +316,8 @@ class DeleteMixin:
         msg = f"Deleted {deleted} private memories"
         if shared_preserved:
             msg += f" (preserved {shared_preserved} shared)"
+        if standard_preserved:
+            msg += f" (preserved {standard_preserved} standard)"
         return {"message": msg, "graph_cascade_unresolved_ids": unresolved_ids}
 
     def _expire_graph_edges_for_memory(self, mem: dict) -> None:
@@ -335,7 +344,9 @@ class DeleteMixin:
             # edges from the shared pool — wrong pool.
             owner = metadata.get("owner_user_id") or mem.get("user_id", "")
             visibility = metadata.get("visibility") or MemoryVisibility.PRIVATE.value
-            group_id = _build_group_id(visibility, owner, metadata.get("project_id"))
+            group_id = _build_group_id(
+                visibility, owner, metadata.get("project_id"), metadata.get("workspace")
+            )
             group_ids = [group_id]
 
             results = self._run_on_bridge(
