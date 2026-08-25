@@ -988,6 +988,8 @@ class WriteMixin:
             source_ref=source_ref,
             visibility=effective_visibility,
             owner_user_id=user_id,
+            sensitivity=sensitivity_class,
+            sensitivity_source=sensitivity_source,
             title=title,
             token_estimate=token_estimate,
             workspace=effective_workspace,
@@ -1263,6 +1265,8 @@ class WriteMixin:
                 source_ref=metadata.get("source_ref"),
                 visibility=metadata.get("visibility"),
                 owner_user_id=metadata.get("owner_user_id"),
+                sensitivity=metadata.get("sensitivity"),
+                sensitivity_source=metadata.get("sensitivity_source"),
                 title=metadata.get("title"),
                 token_estimate=metadata.get("token_estimate"),
                 speaker=metadata.get("speaker"),
@@ -1642,7 +1646,7 @@ class WriteMixin:
         texts: list[str] = []
         memory_ids: list[str] = []
         payloads: list[dict] = []
-        fact_meta: list[tuple[str, str, str | None, str | None, str | None, str | None]] = []  # (category, scope, project_id, speaker, occurred_at, forced_visibility) per fact
+        fact_meta: list[tuple[str, str, str | None, str | None, str | None, str | None, str | None, str | None]] = []  # (category, scope, project_id, speaker, occurred_at, forced_visibility, sensitivity, sensitivity_source) per fact
         # Ordered slots: ("new", index-into-texts) | ("dup", existing response)
         ordered: list[tuple[str, object]] = []
         seen_in_batch: set[tuple[str, str, str | None, str | None]] = set()
@@ -1816,7 +1820,10 @@ class WriteMixin:
             texts.append(content)
             memory_ids.append(mid)
             payloads.append(payload)
-            fact_meta.append((category, scope_val, fact_project_id, speaker, fact_occurred_at, fact_forced_visibility))
+            fact_meta.append((
+                category, scope_val, fact_project_id, speaker, fact_occurred_at,
+                fact_forced_visibility, fact_sensitivity, fact_sensitivity_source,
+            ))
             ordered.append(("new", len(texts) - 1))
 
         # ── Single batch embed + single Qdrant upsert (new facts only) ──
@@ -1852,7 +1859,10 @@ class WriteMixin:
                 continue
             idx = ref
             mid, content = memory_ids[idx], texts[idx]
-            category, scope_val, fact_pid, spk, fact_occurred_at, forced_visibility = fact_meta[idx]
+            (
+                category, scope_val, fact_pid, spk, fact_occurred_at,
+                forced_visibility, fact_sensitivity, fact_sensitivity_source,
+            ) = fact_meta[idx]
             responses.append(
                 MemoryResponse(
                     id=mid,
@@ -1871,6 +1881,8 @@ class WriteMixin:
                     token_estimate=stamp_tokens(content),
                     speaker=spk,
                     visibility=forced_visibility,
+                    sensitivity=fact_sensitivity,
+                    sensitivity_source=fact_sensitivity_source,
                 )
             )
 

@@ -1246,6 +1246,21 @@ class MemoryResponse(BaseModel):
     visibility: str | None = None
     owner_user_id: str | None = None
 
+    # Sensitivity gate provenance (null unless the write-time gate forced this
+    # memory to visibility=private). `sensitivity` is one of financial |
+    # equity_compensation | client_commercial | credentials_pii;
+    # `sensitivity_source` is "regex" or "llm" — see memory/sensitivity.py.
+    sensitivity: str | None = Field(
+        default=None,
+        description="Sensitivity class that forced this memory private, if any "
+        "(financial | equity_compensation | client_commercial | credentials_pii).",
+    )
+    sensitivity_source: str | None = Field(
+        default=None,
+        description="How the sensitivity class was determined: 'regex' (deterministic "
+        "write-time gate) or 'llm' (model-supplied hint).",
+    )
+
     # Retrieval economics (C1): distilled at write time; null on legacy
     # memories (index renderers recompute the heuristic on the fly).
     title: str | None = None

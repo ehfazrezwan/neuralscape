@@ -2148,6 +2148,43 @@ class TestMemToResponseV2:
 
 
 # ──────────────────────────────────────────────
+# Sensitivity gate provenance: _mem_to_response surfaces
+# metadata.sensitivity / metadata.sensitivity_source (see memory/sensitivity.py
+# + memory/write.py for how the write-time gate stamps them).
+# ──────────────────────────────────────────────
+
+
+class TestMemToResponseSensitivity:
+    def test_surfaces_sensitivity_fields(self, service):
+        mem = {
+            "id": "sens-001",
+            "memory": "Approved a $50,000 client contract renewal",
+            "metadata": {
+                "metadata": {
+                    "category": "decision",
+                    "scope": "global",
+                    "visibility": "private",
+                    "sensitivity": "financial",
+                    "sensitivity_source": "regex",
+                }
+            },
+        }
+        resp = service._mem_to_response(mem)
+        assert resp.sensitivity == "financial"
+        assert resp.sensitivity_source == "regex"
+
+    def test_memory_without_sensitivity_yields_none(self, service):
+        mem = {
+            "id": "sens-002",
+            "memory": "Decided to use PostgreSQL for better JSONB support",
+            "metadata": {"metadata": {"category": "decision", "scope": "global", "visibility": "shared"}},
+        }
+        resp = service._mem_to_response(mem)
+        assert resp.sensitivity is None
+        assert resp.sensitivity_source is None
+
+
+# ──────────────────────────────────────────────
 # Memory model v2: schema validation
 # ──────────────────────────────────────────────
 

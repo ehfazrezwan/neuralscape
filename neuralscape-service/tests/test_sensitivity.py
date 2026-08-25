@@ -348,6 +348,45 @@ class TestBatchStoreFactsSensitivityGate:
         assert resp.visibility is None
 
 
+class TestWriteThenReadSurfacesSensitivity:
+    """End-to-end-ish: a financial write forced private by the gate must show
+    both ``visibility=private`` AND the sensitivity provenance on a
+    subsequent ``get_memory`` read — the gap this fix closes (metadata was
+    already persisted at write time; only the read-side surfacing was
+    missing). See memory/convert.py::_mem_to_response and schemas.py's
+    MemoryResponse.sensitivity / sensitivity_source.
+    """
+
+    def test_financial_decision_write_then_read_shows_sensitivity(self, service):
+        [resp] = service.store_raw(
+            content="Budget of $50k approved for the initiative",
+            user_id="alice",
+            category="decision",
+            add_to_graph=False,
+        )
+        assert resp.visibility == "private"
+        assert resp.sensitivity == "financial"
+        assert resp.sensitivity_source == "regex"
+
+        # Simulate the row store_raw just inserted being read back by id —
+        # reconstruct mem0's get()-style dict from what was actually inserted.
+        insert_kwargs = service._memory.vector_store.insert.call_args.kwargs
+        mid = insert_kwargs["ids"][0]
+        payload = insert_kwargs["payloads"][0]
+        service._memory.get.return_value = {
+            "id": mid,
+            "memory": payload["data"],
+            "user_id": payload["user_id"],
+            "metadata": payload["metadata"],
+        }
+
+        read_back = service.get_memory(mid, "alice")
+        assert read_back is not None
+        assert read_back.visibility == "private"
+        assert read_back.sensitivity == "financial"
+        assert read_back.sensitivity_source == "regex"
+
+
 class TestSensitivityPrivateClassesSet:
     def test_default_classes(self):
         assert settings.sensitivity_private_classes_set() == {

@@ -423,6 +423,38 @@ class TestV1ManageMemories:
         resp = client.get("/v1/memories/nonexistent")
         assert resp.status_code == 404
 
+    def test_get_memory_returns_sensitivity_when_set(self, client, mock_service):
+        """A memory the write-time sensitivity gate forced private surfaces
+        `sensitivity`/`sensitivity_source` on read (memory/sensitivity.py +
+        memory/write.py stamp them; memory/convert.py::_mem_to_response maps
+        them through to MemoryResponse)."""
+        from schemas import MemoryResponse
+        mock_service.get_memory.return_value = MemoryResponse(
+            id="m1", memory="Approved a $50,000 client contract renewal",
+            category="decision", visibility="private",
+            sensitivity="financial", sensitivity_source="regex",
+        )
+        resp = client.get("/v1/memories/m1")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["sensitivity"] == "financial"
+        assert data["sensitivity_source"] == "regex"
+
+    def test_get_memory_omits_sensitivity_when_unset(self, client, mock_service):
+        """A plain (non-sensitive) memory's sensitivity fields render null —
+        same as every other optional v2 field on this endpoint (which does
+        not use exclude_none), so this is byte-identical to pre-change output
+        for a memory the gate never touched."""
+        from schemas import MemoryResponse
+        mock_service.get_memory.return_value = MemoryResponse(
+            id="m1", memory="Prefers tabs", category="preference"
+        )
+        resp = client.get("/v1/memories/m1")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["sensitivity"] is None
+        assert data["sensitivity_source"] is None
+
     def test_delete_single_memory(self, client, mock_service):
         mock_service.delete_memory.return_value = {"message": "Memory deleted successfully!"}
         resp = client.delete("/v1/memories/m1")
