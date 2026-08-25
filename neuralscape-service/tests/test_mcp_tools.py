@@ -61,11 +61,12 @@ def _code_graph_tool_names() -> set[str]:
 class TestListTools:
     @pytest.mark.asyncio
     async def test_returns_22_core_tools(self):
-        # 22 core tools + 2 project-config tools (Phase D) + the 5 code-graph
-        # delegation tools (= 29) when the optional graphifyy extra is installed
-        # (dev installs have it).
+        # 22 core tools + 2 project-config tools (Phase D) + 2 private-graph-
+        # leakage remediation tools (rescope_private_derivatives,
+        # audit_private_leakage) + the 5 code-graph delegation tools (= 31)
+        # when the optional graphifyy extra is installed (dev installs have it).
         tools = await mcp_server.list_tools()
-        assert len(tools) == 24 + len(_code_graph_tool_names())
+        assert len(tools) == 26 + len(_code_graph_tool_names())
 
     @pytest.mark.asyncio
     async def test_tool_names(self):
@@ -96,6 +97,8 @@ class TestListTools:
             "queue_status",
             "get_project_knowledge_config",  # Phase D
             "set_project_knowledge_config",  # Phase D
+            "rescope_private_derivatives",  # admin: private-graph-leakage remediation
+            "audit_private_leakage",  # admin: private-graph-leakage remediation (read-only)
         } | _code_graph_tool_names()
         assert names == expected
 

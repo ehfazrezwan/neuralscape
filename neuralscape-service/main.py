@@ -3303,6 +3303,108 @@ async def v1_set_project_knowledge_config(project_id: str, req: ProjectKnowledge
 # extension-route mount. See docs/DREAMING_MODE_SPEC.md.
 
 
+# ══════════════════════════════════════════════
+# Admin — private-graph-leakage remediation
+# ══════════════════════════════════════════════
+#
+# Backward-looking cleanup for the shared→private visibility-flip leak
+# (memory/remediation.py): a memory written while shared, later flipped
+# private, could leave graph artifacts (edges/entity summaries/episode
+# content) live in the shared pool. These are the first /v1/admin/* routes.
+# Dictator-only (see ``_authorize_standard_write`` above for the identical
+# gate pattern this mirrors) — this touches raw Cypher across other users'
+# graph groups, not a self-service surface.
+
+
+class RescopePrivateDerivativesRequest(BaseModel):
+    """Request body for POST /v1/admin/rescope-private-derivatives."""
+
+    user_id: str | None = Field(
+        default=None,
+        description="Target user to remediate. Defaults to the caller. Only a dictator may target another user.",
+    )
+    dry_run: bool = Field(
+        default=True,
+        description="Resolve and count only — no writes. Must be explicitly set false to mutate anything.",
+    )
+
+
+class AuditPrivateLeakageRequest(BaseModel):
+    """Request body for POST /v1/admin/audit-private-leakage."""
+
+    user_id: str | None = Field(
+        default=None,
+        description="Target user to audit. Defaults to the caller. Only a dictator may target another user.",
+    )
+
+
+def _require_dictator_admin(request: Request) -> str:
+    """Resolve the caller's own identity (ignoring any body-supplied
+    target — that's a separate field these admin routes gate below) and
+    reject non-dictators outright. Same status code / error shape as
+    ``_authorize_standard_write``.
+    """
+    caller = _resolve_user_id(request, None)
+    if not settings.is_dictator(caller):
+        raise HTTPException(
+            status_code=403,
+            detail=f"User {caller!r} is not authorized to use this admin tool.",
+        )
+    return caller
+
+
+@v1_router.post("/admin/rescope-private-derivatives")
+async def v1_rescope_private_derivatives(req: RescopePrivateDerivativesRequest, request: Request):
+    """Cascade-expire shared-group graph derivatives of a user's private
+    memories (memory/remediation.py::rescope_private_derivatives).
+
+    ``dry_run`` defaults to true: resolves and counts what WOULD be
+    cascaded without writing anything. Pass ``dry_run: false`` explicitly
+    to mutate. Re-enrichment jobs the service produces (only when a
+    cascade actually removed something and the private side has no
+    episode of its own) are enqueued here on the graph queue — the same
+    pattern ``patch_memory``'s ``graph_job`` uses above.
+    """
+    caller = _require_dictator_admin(request)
+    target = req.user_id or caller
+    try:
+        result = await asyncio.to_thread(
+            _service.rescope_private_derivatives, target, dry_run=req.dry_run
+        )
+    except Exception as e:
+        logger.exception("rescope_private_derivatives failed")
+        raise HTTPException(status_code=500, detail="Failed to rescope private derivatives") from e
+
+    graph_jobs = result.pop("graph_jobs", [])
+    enqueued = 0
+    if graph_jobs:
+        for job in graph_jobs:
+            try:
+                await _task_manager.enqueue_graph_enrichment(**job)
+                enqueued += 1
+            except Exception as e:
+                logger.warning(
+                    f"Re-enrichment enqueue failed for {job.get('memory_id')} (non-critical): {e}"
+                )
+    result["graph_jobs_enqueued"] = enqueued
+    return result
+
+
+@v1_router.post("/admin/audit-private-leakage")
+async def v1_audit_private_leakage(req: AuditPrivateLeakageRequest, request: Request):
+    """Read-only proof of whether any of a user's private memories still
+    have a live derivative in a shared graph group
+    (memory/remediation.py::audit_private_leakage). Never writes.
+    """
+    caller = _require_dictator_admin(request)
+    target = req.user_id or caller
+    try:
+        return await asyncio.to_thread(_service.audit_private_leakage, target)
+    except Exception as e:
+        logger.exception("audit_private_leakage failed")
+        raise HTTPException(status_code=500, detail="Failed to audit private leakage") from e
+
+
 # Mount v1 router
 app.include_router(v1_router)
 
