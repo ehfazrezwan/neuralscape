@@ -85,9 +85,9 @@ flowchart TB
 
 | visibility | project | workspace | group_id |
 |---|---|---|---|
-| private | — / set | default | `user--{uid}` / `user--{uid}--project--{pid}` |
-| shared | — / set | default | `shared` / `shared--project--{pid}` |
-| standard | — / set | default | `standard` / `standard--project--{pid}` |
+| private | — / set | `None` / `"memory"` (no suffix) | `user--{uid}` / `user--{uid}--project--{pid}` |
+| shared | — / set | `None` / `"memory"` (no suffix) | `shared` / `shared--project--{pid}` |
+| standard | — / set | `None` / `"memory"` (no suffix) | `standard` / `standard--project--{pid}` |
 | any | any | `<ref>` | `<above>--ws--{workspace}` |
 
 **Read scoping.** `_get_group_ids(caller, project_id)` returns the readable set: the caller's `user--{id}` namespace, `shared`, the project-scoped equivalents, plus `standard` when enabled. Graph searches pass it as `group_ids`; the vector side filters on `metadata.visibility` / `metadata.owner_user_id`.
@@ -125,14 +125,16 @@ flowchart TB
 
 Seven fix commits (plus a measurement chore) close (c), (d), (f), (g) and harden (e). They do **not** change (a) or (b): partition is still the security boundary, and artifacts still carry no enforceable provenance-derived attributes.
 
+> **Where these live:** the modules marked *(new)* land with the private-graph cascade hotfix (PR #225, branch `hotfix/private-graph-cascade`); until that PR merges they are **not** present on `dev`. Paths below are as they appear on that branch.
+
 | Fix | Module | What it establishes |
 |---|---|---|
-| Exact-provenance cascade | `memory/provenance.py` *(new)* | Resolve a memory's Graphiti **episode** by persisted uuid → verbatim content → deterministic name (all exact equality, never fuzzy), then expire everything it contributed: soft-expire every edge it created *or reaffirmed*, clear the `summary` of every entity it mentions, remove solely-mentioned entities, hard-delete the episode node. Idempotent, never raises, WARNING on failure. |
+| Exact-provenance cascade | `memory/provenance.py` *(new, PR #225)* | Resolve a memory's Graphiti **episode** by persisted uuid → verbatim content → deterministic name (all exact equality, never fuzzy), then expire everything it contributed: soft-expire every edge it created *or reaffirmed*, clear the `summary` of every entity it mentions, remove solely-mentioned entities, hard-delete the episode node. Idempotent, never raises, WARNING on failure. |
 | Durable memory→episode link | `provenance.py::_persist_graph_episode_ref` | Stamps `graph_episode_uuid` / `graph_episode_name` on the Qdrant row at enrich time via an additive nested-key merge, so lifecycle operations resolve the exact episode instead of guessing. |
 | Cascade wired into lifecycle | `memory/edit.py`, `memory/delete.py` | Tier migration and every delete path call `_cascade_or_fallback_expire`; the substring routine survives only as a loudly-logged last resort, and unresolved rows surface in the task result instead of being silently absorbed. |
-| Backward remediation + audit | `memory/remediation.py` *(new)* | `rescope_private_derivatives(user_id, dry_run=True)` derives candidate shared-side groups from `_build_group_id`, resolves each private memory's episode there, and cascades. `audit_private_leakage(user_id)` is a read-only proof across three surfaces (live edges, non-empty entity summaries, raw episode content) plus a clearly-separated heuristic backstop. Dictator-gated, REST + MCP, `dry_run` defaults true. |
-| Write-time sensitivity gate | `memory/sensitivity.py` *(new)*, `config.py`, `prompts.py` | A deterministic, zero-LLM-cost regex floor classifies content into `credentials_pii` / `equity_compensation` / `client_commercial` / `financial`, combined with an optional LLM hint parsed from the existing extraction prompt. A match in the configured class set forces `visibility=private` unless the caller both set `visibility` explicitly *and* passed `sensitivity_override=True`. Feature-flagged and per-class — never blanket privacy. |
-| Expired artifacts excluded from listings | `memory/graph_admin.py` | `get_graph_nodes` / `get_graph_edges` default-exclude expired/invalidated artifacts using the search path's liveness definition, with an `include_expired=True` operator hatch. |
+| Backward remediation + audit | `memory/remediation.py` *(new, PR #225)* | `rescope_private_derivatives(user_id, dry_run=True)` derives candidate shared-side groups from `_build_group_id`, resolves each private memory's episode there, and cascades. `audit_private_leakage(user_id)` is a read-only proof across three surfaces (live edges, non-empty entity summaries, raw episode content) plus a clearly-separated heuristic backstop. Dictator-gated, REST + MCP, `dry_run` defaults true. |
+| Write-time sensitivity gate | `memory/sensitivity.py` *(new, PR #225)*, `config.py`, `prompts.py` | A deterministic, zero-LLM-cost regex floor classifies content into `credentials_pii` / `equity_compensation` / `client_commercial` / `financial`, combined with an optional LLM hint parsed from the existing extraction prompt. A match in the configured class set forces `visibility=private` unless the caller both set `visibility` explicitly *and* passed `sensitivity_override=True`. Feature-flagged and per-class — never blanket privacy. |
+| Expired artifacts excluded from listings | `memory/graph_admin.py` | `get_graph_nodes` / `get_graph_edges` default-exclude expired/invalidated artifacts using the search path's liveness definition (uncapped, fail-closed node liveness), with an `include_expired=True` operator hatch that is **dictator-only** (403 otherwise) — soft-expire is only as safe as every read path that honors the live filter. |
 | Identity fixes | `main.py`, `memory/reads.py` | Legacy root endpoints resolve identity through `_resolve_user_id` (token wins, mismatch → 400). `get_memory` / `get_reasoning_chain` take a caller id; unreadable maps to 404 and an unreadable premise folds into `missing`, so a chain leaks neither content nor existence. |
 
 Two Phase 0 decisions carry forward as v2 invariants:
