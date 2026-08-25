@@ -43,6 +43,7 @@ import re
 
 from schemas import MemoryVisibility
 from memory.groups import _build_group_id
+from memory.provenance import GraphReadError
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,15 @@ logger = logging.getLogger(__name__)
 _CURRENCY_RE = re.compile(r"\$\s?\d[\d,]*(?:\.\d+)?")
 _LONG_DIGIT_RE = re.compile(r"\d{6,}")
 
+
+
+class RemediationReadError(GraphReadError):
+    """A read-only audit/remediation query could not run (bridge/Neo4j down).
+
+    Raised by ``_run_read_cypher`` and deliberately propagated by
+    ``audit_private_leakage`` / ``rescope_private_derivatives`` so a failed
+    read is surfaced as an error — never as a false-clean ``total == 0``.
+    """
 
 class RemediationMixin:
     """RemediationMixin for MemoryService — backward-looking cleanup of
@@ -116,6 +126,8 @@ class RemediationMixin:
 
         try:
             rows = self._scroll_all_user_memories(user_id)
+        except GraphReadError:
+            raise  # infra read failure: never degrade to a false-clean result
         except Exception as e:
             logger.warning(
                 "rescope_private_derivatives: failed to scroll memories for user=%r: %s",
@@ -249,6 +261,8 @@ class RemediationMixin:
 
         try:
             rows = self._scroll_all_user_memories(user_id)
+        except GraphReadError:
+            raise  # infra read failure: never degrade to a false-clean result
         except Exception as e:
             logger.warning(
                 "audit_private_leakage: failed to scroll memories for user=%r: %s",
@@ -380,11 +394,13 @@ class RemediationMixin:
         separate here so dry-run and non-dry-run share one resolve step
         before either decides whether to mutate.
         """
+        # fail_closed: a broken lookup must surface as an error here, never
+        # as "episode not found" (which an audit would count as no leak).
         resolved = None
         if persisted_uuid:
-            resolved = self._lookup_episode_uuid(group_id, "uuid", persisted_uuid)
+            resolved = self._lookup_episode_uuid(group_id, "uuid", persisted_uuid, fail_closed=True)
         if not resolved and content:
-            resolved = self._lookup_episode_uuid(group_id, "content", content)
+            resolved = self._lookup_episode_uuid(group_id, "content", content, fail_closed=True)
         return resolved
 
     # ──────────────────────────────────────────────
@@ -417,7 +433,7 @@ class RemediationMixin:
             logger.error(
                 "remediation read query failed (failing CLOSED): %r", params, exc_info=True,
             )
-            raise RuntimeError(f"remediation read query failed: {e}") from e
+            raise RemediationReadError(f"remediation read query failed: {e}") from e
 
     def _preview_episode_edges(self, group_id: str, episode_uuid: str) -> list[str]:
         """Read-only: uuids of the still-live ``RELATES_TO`` edges this

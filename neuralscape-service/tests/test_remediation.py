@@ -544,7 +544,7 @@ class TestReadOnlyHelpers:
         report a false-clean ``total == 0`` because the read itself failed."""
         import pytest
         service._run_on_bridge = MagicMock(side_effect=RuntimeError("bridge down"))
-        with pytest.raises(RuntimeError, match="remediation read query failed"):
+        with pytest.raises(RuntimeError, match="remediation read query failed"):  # RemediationReadError subclasses RuntimeError
             service._preview_episode_edges("shared", "ep-1")
 
     def test_audit_surfaces_read_failure_instead_of_false_clean(self, service):

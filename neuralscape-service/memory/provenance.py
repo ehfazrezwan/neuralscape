@@ -49,6 +49,15 @@ from memory.groups import _build_group_id
 logger = logging.getLogger(__name__)
 
 
+
+class GraphReadError(RuntimeError):
+    """A read-only graph lookup could not run (bridge/Neo4j down).
+
+    Only raised when a caller asks for ``fail_closed=True`` — audit and
+    remediation reads must never degrade a broken lookup into
+    "episode not found" (which would produce a false-clean result).
+    """
+
 class ProvenanceMixin:
     """ProvenanceMixin for MemoryService — episode-precise graph cascade."""
 
@@ -273,15 +282,21 @@ class ProvenanceMixin:
     # Single-Cypher-statement helpers (each one _run_on_bridge round trip)
     # ──────────────────────────────────────────────
 
-    def _lookup_episode_uuid(self, group_id: str, field: str, value: str) -> str | None:
+    def _lookup_episode_uuid(
+        self, group_id: str, field: str, value: str, *, fail_closed: bool = False
+    ) -> str | None:
         """One cheap Cypher lookup: find an episode's uuid in ``group_id``
         by ``field`` ('uuid' | 'name' | 'content') == ``value``.
 
-        Fail-OPEN like ``write.py::_graph_episode_exists``: any error
+        Default fail-OPEN like ``write.py::_graph_episode_exists``: any error
         (bridge down, Neo4j hiccup, mocked/half-initialized bridge in
         tests) returns None rather than raising, so a broken lookup
-        degrades to "episode not found" — the caller's next resolution
-        attempt (or the substring fallback) still runs.
+        degrades to "episode not found" — the cascade then reports the row
+        as unresolved / ``migration_incomplete`` (visible, not silent).
+
+        ``fail_closed=True`` (audit/remediation): the same error RAISES
+        :class:`GraphReadError` instead, because there "episode not found"
+        would read as "no leak" — a false-clean result.
         """
         if field == "uuid":
             cypher = (
@@ -312,11 +327,15 @@ class ProvenanceMixin:
         coro = _run()
         try:
             records = self._run_on_bridge(coro, timeout=10.0) or []
-        except Exception:
+        except Exception as e:
             coro.close()
+            if fail_closed:
+                logger.error(
+                    "episode lookup by %s failed for group_id=%r (failing CLOSED)", field, group_id, exc_info=True,
+                )
+                raise GraphReadError(f"episode lookup by {field} failed in {group_id}: {e}") from e
             logger.debug(
-                "episode lookup by %s failed for group_id=%r (fail-open)",
-                field, group_id, exc_info=True,
+                "episode lookup by %s failed for group_id=%r (fail-open)", field, group_id, exc_info=True,
             )
             return None
         return records[0]["uuid"] if records else None
