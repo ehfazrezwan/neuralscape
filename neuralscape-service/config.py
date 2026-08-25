@@ -718,6 +718,28 @@ class Settings(BaseSettings):
     def _normalize_supabase_url(cls, value: str) -> str:
         return (value or "").rstrip("/")
 
+    @field_validator("sensitivity_private_classes")
+    @classmethod
+    def _validate_sensitivity_private_classes(cls, value: str) -> str:
+        """Normalize case and reject unknown class names at settings load.
+
+        A typo'd/renamed class here (e.g. "financials" or a class dropped
+        by a future memory/sensitivity.py refactor) would silently never
+        match ``sensitivity_private_classes_set()`` — the sensitivity gate
+        would look "on" but quietly stop forcing that class private. Fail
+        loudly at startup instead.
+        """
+        from memory.sensitivity import SENSITIVITY_CLASSES
+
+        normalized = [c.strip().lower() for c in (value or "").split(",") if c.strip()]
+        unknown = sorted(set(normalized) - set(SENSITIVITY_CLASSES))
+        if unknown:
+            raise ValueError(
+                f"SENSITIVITY_PRIVATE_CLASSES contains unknown class(es) {unknown} — "
+                f"must be a subset of: {sorted(SENSITIVITY_CLASSES)}"
+            )
+        return ",".join(normalized)
+
     # ── parsed views of the comma-separated auth settings ────────────────
     def allowed_domains_set(self) -> set[str]:
         """Lowercased allowed email domains, leading '@' stripped."""

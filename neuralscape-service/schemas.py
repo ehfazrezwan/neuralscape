@@ -478,56 +478,6 @@ class StoreMemoryRequest(BaseModel):
         return validate_occurred_at(v)
 
 
-class IngestTextRequest(BaseModel):
-    """Ingest pasted/provided context: chunk → passages + distilled facts.
-
-    Similar to IngestDocumentRequest but for manually-provided text (not a
-    data-layer connector). A Markdown artifact is persisted on the storage
-    volume (organized by user/project/category) and every produced memory
-    references it via ``source_ref``.
-    """
-    content: str = Field(min_length=1, max_length=2_000_000, description="Context text to ingest")
-    title: str | None = Field(default=None, max_length=200, description="Optional human label for this context")
-    category: str = Field(default="domain_knowledge", description="Category for produced memories")
-    scope: str = Field(default="global", description="'global' or 'project'")
-    project_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
-    user_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
-    visibility: MemoryVisibility | None = Field(default=None)
-    extract_facts: bool = Field(default=True, description="Run LLM extraction for distilled facts")
-    index_passages: bool = Field(default=True, description="Chunk + store verbatim passages")
-    tags: list[str] | None = Field(default=None, max_length=20)
-    adapter: str = Field(
-        default="default",
-        max_length=100,
-        description="Knowledge adapter selecting taxonomy/chunker/extractor/graph-ontology",
-    )
-    workspace: str | None = Field(
-        default=None,
-        max_length=100,
-        pattern=r"^[a-zA-Z0-9_.\-]+$",
-        description="Workspace partition: absent or 'memory' = memory type; any other value = reference workspace",
-    )
-
-    @field_validator("category")
-    @classmethod
-    def _validate_category(cls, v: str) -> str:
-        if v not in MEMORY_CATEGORIES:
-            raise ValueError(f"Invalid category '{v}'. Must be one of: {list(MEMORY_CATEGORIES.keys())}")
-        return v
-
-    @field_validator("scope")
-    @classmethod
-    def _validate_scope(cls, v: str) -> str:
-        if v not in ("global", "project"):
-            raise ValueError("scope must be 'global' or 'project'")
-        return v
-
-    @field_validator("adapter")
-    @classmethod
-    def _validate_adapter(cls, v: str) -> str:
-        return validate_adapter_name(v)
-
-
 class RawMemoryRequest(BaseModel):
     """Store a single pre-categorized fact (no LLM extraction).
 

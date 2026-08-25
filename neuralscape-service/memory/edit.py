@@ -80,7 +80,8 @@ class EditMixin:
         an absent key is untouched. Returns::
 
             {"memory": MemoryResponse, "graph_job": dict | None,
-             "graph": "unchanged" | "reingest_pending" | "migration_pending"}
+             "graph": "unchanged" | "reingest_pending" | "migration_pending"
+                      | "migration_incomplete"}
 
         The caller is responsible for enqueuing ``graph_job`` on the graph
         queue — Graphiti work is minutes-slow and must never run inline on a
@@ -94,6 +95,15 @@ class EditMixin:
           across memories.
         - content: re-embedded here; the graph_job re-ingests so Graphiti's
           contradiction detection expires stale facts.
+
+        ``"migration_incomplete"`` is a partition-migration variant of
+        ``"migration_pending"``: the graph IS configured but the
+        episode-precise cascade could not resolve/verify the OLD group's
+        episode (so it may still be live there) — the caller still gets
+        ``graph_job`` to re-ingest into the NEW group, but should also
+        surface this distinctly (e.g. to an operator polling task status)
+        rather than reporting a clean "migration_pending", which a pre-fix
+        incident showed can silently hide a stuck old-group cascade.
         """
         m = self._get_memory()
         point = m.vector_store.get(vector_id=memory_id)
