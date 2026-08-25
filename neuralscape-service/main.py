@@ -411,14 +411,15 @@ async def health():
 
 
 @app.post("/memories")
-async def add_memory(req: LegacyAddMemoryRequest):
+async def add_memory(req: LegacyAddMemoryRequest, request: Request):
     """Add a memory through mem0 (vector + graph). Legacy endpoint."""
     m = _get_memory()
+    user_id = _resolve_user_id(request, req.user_id)
     try:
         result = await asyncio.to_thread(
             m.add,
             messages=req.messages,
-            user_id=req.user_id or settings.default_user_id,
+            user_id=user_id,
             agent_id=req.agent_id,
             run_id=req.run_id,
             metadata=req.metadata,
@@ -430,14 +431,15 @@ async def add_memory(req: LegacyAddMemoryRequest):
 
 
 @app.post("/search")
-async def search_memories(req: LegacySearchRequest):
+async def search_memories(req: LegacySearchRequest, request: Request):
     """Search memories through mem0. Legacy endpoint."""
     m = _get_memory()
+    user_id = _resolve_user_id(request, req.user_id)
     try:
         result = await asyncio.to_thread(
             m.search,
             query=req.query,
-            user_id=req.user_id or settings.default_user_id,
+            user_id=user_id,
             agent_id=req.agent_id,
             run_id=req.run_id,
             limit=req.limit,
@@ -450,6 +452,7 @@ async def search_memories(req: LegacySearchRequest):
 
 @app.get("/memories")
 async def list_memories(
+    request: Request,
     user_id: str = Query(default=None),
     agent_id: str = Query(default=None),
     run_id: str = Query(default=None),
@@ -457,10 +460,11 @@ async def list_memories(
 ):
     """List all memories for a user. Legacy endpoint."""
     m = _get_memory()
+    user_id = _resolve_user_id(request, user_id)
     try:
         result = await asyncio.to_thread(
             m.get_all,
-            user_id=user_id or settings.default_user_id,
+            user_id=user_id,
             agent_id=agent_id,
             run_id=run_id,
             limit=limit,
@@ -473,16 +477,18 @@ async def list_memories(
 
 @app.delete("/memories")
 async def delete_memories(
+    request: Request,
     user_id: str = Query(default=None),
     agent_id: str = Query(default=None),
     run_id: str = Query(default=None),
 ):
     """Delete all memories for a user. Legacy endpoint."""
     m = _get_memory()
+    user_id = _resolve_user_id(request, user_id)
     try:
         await asyncio.to_thread(
             m.delete_all,
-            user_id=user_id or settings.default_user_id,
+            user_id=user_id,
             agent_id=agent_id,
             run_id=run_id,
         )
@@ -493,11 +499,12 @@ async def delete_memories(
 
 
 @app.post("/memories/async")
-async def add_memory_async(req: LegacyAddMemoryRequest):
+async def add_memory_async(req: LegacyAddMemoryRequest, request: Request):
     """Add a memory in the background (non-blocking). Returns a task_id to poll."""
+    user_id = _resolve_user_id(request, req.user_id)
     task_id = await _task_manager.enqueue_store(
         messages=req.messages,
-        user_id=req.user_id or settings.default_user_id,
+        user_id=user_id,
         agent_id=req.agent_id,
         run_id=req.run_id,
     )
@@ -519,6 +526,7 @@ async def get_task_status(task_id: str):
 # Legacy graph endpoints
 @app.get("/graph/nodes")
 async def list_graph_nodes_legacy(
+    request: Request,
     user_id: str = Query(default=None),
     limit: int = Query(default=50),
 ):
@@ -529,7 +537,7 @@ async def list_graph_nodes_legacy(
 
     from graphiti_core.nodes import EntityNode
 
-    group_id = user_id or settings.default_user_id
+    group_id = _resolve_user_id(request, user_id)
     try:
         nodes = await asyncio.to_thread(
             _run_on_bridge,
@@ -556,6 +564,7 @@ async def list_graph_nodes_legacy(
 
 @app.get("/graph/edges")
 async def list_graph_edges_legacy(
+    request: Request,
     user_id: str = Query(default=None),
     limit: int = Query(default=50),
 ):
@@ -567,7 +576,7 @@ async def list_graph_edges_legacy(
     from graphiti_core.edges import EntityEdge
     from graphiti_core.errors import GroupsEdgesNotFoundError
 
-    group_id = user_id or settings.default_user_id
+    group_id = _resolve_user_id(request, user_id)
     try:
         edges = await asyncio.to_thread(
             _run_on_bridge,
@@ -600,6 +609,7 @@ async def list_graph_edges_legacy(
 
 @app.get("/graph/episodes")
 async def list_graph_episodes_legacy(
+    request: Request,
     user_id: str = Query(default=None),
     limit: int = Query(default=20),
 ):
@@ -608,7 +618,7 @@ async def list_graph_episodes_legacy(
     if g is None:
         raise HTTPException(status_code=503, detail="Graphiti not initialized")
 
-    group_id = user_id or settings.default_user_id
+    group_id = _resolve_user_id(request, user_id)
     now = datetime.now(timezone.utc)
     try:
         episodes = await asyncio.to_thread(
@@ -641,6 +651,7 @@ async def list_graph_episodes_legacy(
 
 @app.get("/graph/communities")
 async def list_graph_communities_legacy(
+    request: Request,
     user_id: str = Query(default=None),
     limit: int = Query(default=20),
 ):
@@ -651,7 +662,7 @@ async def list_graph_communities_legacy(
 
     from graphiti_core.nodes import CommunityNode
 
-    group_id = user_id or settings.default_user_id
+    group_id = _resolve_user_id(request, user_id)
     try:
         communities = await asyncio.to_thread(
             _run_on_bridge,
@@ -676,7 +687,7 @@ async def list_graph_communities_legacy(
 
 
 @app.post("/graph/search")
-async def advanced_graph_search_legacy(req: LegacyGraphSearchRequest):
+async def advanced_graph_search_legacy(req: LegacyGraphSearchRequest, request: Request):
     """Advanced Graphiti search with configurable SearchConfig. Legacy endpoint."""
     g = _get_graphiti()
     if g is None:
@@ -685,7 +696,7 @@ async def advanced_graph_search_legacy(req: LegacyGraphSearchRequest):
     from graphiti_core.search.search_config import SearchConfig
     from graphiti_core.search.search_config_recipes import EDGE_HYBRID_SEARCH_RRF
 
-    group_id = req.user_id or settings.default_user_id
+    group_id = _resolve_user_id(request, req.user_id)
 
     if req.search_config:
         try:
