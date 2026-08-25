@@ -159,9 +159,17 @@ class TaskManager:
         of the SAME text at a different tier (e.g. a dictator promoting a private
         note to a `standard`) would coalesce onto the earlier job's id and be
         silently dropped by ARQ before ever reaching store_raw.
+
+        ``sensitivity_override`` is also part of the key: it changes the
+        STORED visibility (memory/write.py's sensitivity gate forces
+        visibility=private for a sensitive write unless override is set),
+        so two otherwise-identical raw stores that differ only by this flag
+        must not coalesce onto one job id — that would let an override-on
+        request silently absorb (and skip) an override-off request for the
+        same content, or vice versa.
         """
         job_id = _generate_job_id(
-            f"raw:{visibility}:{scope}:{project_id}:{content}", user_id
+            f"raw:{visibility}:{scope}:{project_id}:{sensitivity_override}:{content}", user_id
         )
 
         v2_extras = {

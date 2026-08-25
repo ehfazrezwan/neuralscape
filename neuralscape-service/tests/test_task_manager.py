@@ -115,6 +115,27 @@ class TestEnqueueRawV2:
         assert ids["private"] != ids["standard"]
 
     @pytest.mark.asyncio
+    async def test_job_id_differs_by_sensitivity_override(self, tm):
+        """F1 regression: two enqueues that differ ONLY by
+        sensitivity_override must get distinct job ids. The gate
+        (memory/write.py) resolves a different STORED visibility depending
+        on this flag, so coalescing an override-on request onto an
+        override-off request's job id (or vice versa) would silently drop
+        one of the two writes before it ever reaches store_raw."""
+        tm.pool.enqueue_job.return_value = None
+        ids = {}
+        for override in (False, True):
+            await tm.enqueue_raw(
+                content="same sensitive text",
+                user_id="d",
+                category="decision",
+                visibility="shared",
+                sensitivity_override=override,
+            )
+            ids[override] = tm.pool.enqueue_job.call_args[1]["_job_id"]
+        assert ids[False] != ids[True]
+
+    @pytest.mark.asyncio
     async def test_ingest_file_job_id_differs_by_page_offset(self, tm):
         """Same file re-uploaded with a corrected page_offset must be a NEW job —
         page_offset changes exemplar provenance content, so coalescing onto the
