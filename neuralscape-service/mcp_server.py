@@ -2163,7 +2163,11 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 max_depth = 3
             max_depth = min(max(max_depth, 1), 10)
             chain = await asyncio.to_thread(
-                _service.get_reasoning_chain, arguments["memory_id"], max_depth
+                _service.get_reasoning_chain,
+                arguments["memory_id"],
+                max_depth,
+                50,
+                user_id,
             )
             if chain is None:
                 return [TextContent(type="text", text=json.dumps(

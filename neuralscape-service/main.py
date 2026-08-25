@@ -2807,9 +2807,22 @@ async def v1_list_memories(
 
 
 @v1_router.get("/memories/{memory_id}", response_model=MemoryResponse)
-async def v1_get_memory(memory_id: str):
-    """Get a single memory by ID."""
-    result = await asyncio.to_thread(_service.get_memory, memory_id)
+async def v1_get_memory(
+    memory_id: str,
+    request: Request,
+    user_id: str | None = Query(default=None),
+):
+    """Get a single memory by ID.
+
+    Gated by the caller's effective identity (token > query > default, the
+    same precedence every read path uses): private memories are readable
+    only by their owner; shared/standard memories are readable by any
+    authenticated caller. A memory the caller may not read is reported as
+    404 — identical to not-found — so this can't be used as an existence
+    oracle for another user's private memories.
+    """
+    resolved_user_id = _resolve_user_id(request, user_id)
+    result = await asyncio.to_thread(_service.get_memory, memory_id, resolved_user_id)
     if result is None:
         raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
     return result
@@ -2818,7 +2831,9 @@ async def v1_get_memory(memory_id: str):
 @v1_router.get("/memories/{memory_id}/reasoning_chain")
 async def v1_get_reasoning_chain(
     memory_id: str,
+    request: Request,
     max_depth: int = Query(default=3, ge=1, le=10),
+    user_id: str | None = Query(default=None),
 ):
     """Walk a memory's ``derived_from`` provenance into a reasoning tree.
 
@@ -2828,8 +2843,21 @@ async def v1_get_reasoning_chain(
     write that supplied ``derived_from``) was built from. Cycle-protected
     and capped (~50 nodes); leaves may carry ``missing`` / ``cycle`` /
     ``truncated`` markers. 404 when the root memory doesn't exist.
+
+    Gated by the caller's effective identity: the root memory AND every
+    premise node the walk would otherwise expand are checked against the
+    same read-visibility rule as ``get_memory``/``get_memories_by_ids``. A
+    premise the caller may not read is reported the same as a missing
+    premise (``{"missing": true}``, no content) rather than expanded — so a
+    reasoning chain can never leak another user's private premise content.
     """
-    chain = await asyncio.to_thread(_service.get_reasoning_chain, memory_id, max_depth)
+    resolved_user_id = _resolve_user_id(request, user_id)
+    chain = await asyncio.to_thread(
+        _service.get_reasoning_chain,
+        memory_id,
+        max_depth,
+        caller_user_id=resolved_user_id,
+    )
     if chain is None:
         raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
     return {"status": "ok", "chain": chain}

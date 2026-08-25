@@ -708,6 +708,103 @@ _SHARED_META = {
 }
 
 
+# ──────────────────────────────────────────────
+# IDOR fix: get_memory(id, caller) / get_reasoning_chain(id, caller) read gate
+#
+# Regression coverage for the read-authorization fix: GET-by-id and the
+# reasoning-chain walker must apply the same pool-visibility rule as
+# search()/get_memories_by_ids() (own private, shared, standard-when-enabled)
+# instead of returning any memory to any caller.
+# ──────────────────────────────────────────────
+
+
+def _owned_mem(owner: str, visibility: str = "private", content: str = "secret content", **meta):
+    """A mem0 ``get()``-style dict owned by ``owner`` with the given visibility."""
+    metadata = {"category": "preference", "visibility": visibility, "owner_user_id": owner, **meta}
+    return {"id": "m1", "memory": content, "user_id": owner, "metadata": metadata}
+
+
+class TestGetMemoryReadGate:
+    """service.get_memory(memory_id, caller_user_id) — direct GET-by-id gate."""
+
+    def test_owner_reads_own_private_memory(self, service):
+        service._memory.get.return_value = _owned_mem("alice")
+        result = service.get_memory("m1", "alice")
+        assert result is not None
+        assert result.memory == "secret content"
+
+    def test_different_user_cannot_read_private_memory(self, service):
+        service._memory.get.return_value = _owned_mem("alice")
+        assert service.get_memory("m1", "bob") is None
+
+    def test_different_user_can_read_shared_memory(self, service):
+        service._memory.get.return_value = _owned_mem("alice", visibility="shared")
+        result = service.get_memory("m1", "bob")
+        assert result is not None
+        assert result.memory == "secret content"
+
+    def test_standard_tier_gated_by_settings_flag(self, service):
+        from config import settings
+
+        service._memory.get.return_value = _owned_mem("dictator", visibility="standard")
+        saved = settings.standards_enabled
+        try:
+            settings.standards_enabled = False
+            assert service.get_memory("m1", "bob") is None
+            settings.standards_enabled = True
+            assert service.get_memory("m1", "bob") is not None
+        finally:
+            settings.standards_enabled = saved
+
+    def test_no_caller_id_skips_gate_backward_compat(self, service):
+        """``caller_user_id=None`` (the default) is the pre-existing internal
+        call shape (e.g. patch_memory's post-write re-read) — must stay
+        ungated."""
+        service._memory.get.return_value = _owned_mem("alice")
+        assert service.get_memory("m1") is not None
+
+
+class TestReasoningChainReadGate:
+    """get_reasoning_chain(id, caller_user_id=...) gates the root AND every
+    premise node — an unreadable premise must never surface its content."""
+
+    def _wire(self, service, by_id: dict):
+        service._memory.get.side_effect = lambda mid: by_id.get(mid)
+
+    def test_owner_reads_full_chain(self, service):
+        root = _owned_mem("alice", derived_from=["p1"])
+        premise = _owned_mem("alice", content="alice's private premise")
+        self._wire(service, {"root": root, "p1": premise})
+        chain = service.get_reasoning_chain("root", caller_user_id="alice")
+        assert chain["memory_id"] == "root"
+        assert chain["children"][0]["memory_id"] == "p1"
+        assert chain["children"][0]["content"] == "alice's private premise"
+
+    def test_other_users_private_premise_not_leaked(self, service):
+        root = _owned_mem("alice", visibility="shared", derived_from=["p1"])
+        premise = _owned_mem("alice", content="alice's private premise")
+        self._wire(service, {"root": root, "p1": premise})
+        chain = service.get_reasoning_chain("root", caller_user_id="bob")
+        assert chain["memory_id"] == "root"
+        # Unreadable premise is folded into "missing" — same shape as a
+        # hard-deleted premise, and its content never appears anywhere.
+        assert chain["children"][0] == {"memory_id": "p1", "missing": True, "children": []}
+        import json
+        assert "alice's private premise" not in json.dumps(chain)
+
+    def test_root_unreadable_returns_none(self, service):
+        root = _owned_mem("alice")  # private, caller is a stranger
+        self._wire(service, {"root": root})
+        assert service.get_reasoning_chain("root", caller_user_id="bob") is None
+
+    def test_no_caller_id_skips_gate_backward_compat(self, service):
+        root = _owned_mem("alice", derived_from=["p1"])
+        premise = _owned_mem("alice", content="alice's private premise")
+        self._wire(service, {"root": root, "p1": premise})
+        chain = service.get_reasoning_chain("root")
+        assert chain["children"][0]["content"] == "alice's private premise"
+
+
 class TestPatchMemory:
     @pytest.fixture(autouse=True)
     def _stub_response(self, service):

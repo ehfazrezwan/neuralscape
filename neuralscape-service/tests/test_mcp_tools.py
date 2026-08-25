@@ -653,13 +653,16 @@ class TestGetReasoningChainTool:
             ],
         }
         result = await mcp_server.call_tool(
-            "get_reasoning_chain", {"memory_id": "m1", "max_depth": 5}
+            "get_reasoning_chain", {"memory_id": "m1", "max_depth": 5, "user_id": "ehfaz"}
         )
         data = json.loads(result[0].text)
         assert data["status"] == "ok"
         assert data["chain"]["epistemic_level"] == "inductive"
         assert data["chain"]["children"][0]["memory_id"] == "p1"
-        mock_mcp_service.get_reasoning_chain.assert_called_once_with("m1", 5)
+        # Positional (memory_id, max_depth, node_cap, caller_user_id) — the
+        # caller identity is threaded through so the walk gates the root AND
+        # every premise it resolves.
+        mock_mcp_service.get_reasoning_chain.assert_called_once_with("m1", 5, 50, "ehfaz")
 
     @pytest.mark.asyncio
     async def test_clamps_max_depth_and_defaults(self, mock_mcp_service):
