@@ -19,6 +19,7 @@ from memory.hashing import _infer_project_id, _parse_expires_at, content_hash
 from memory.junk import _clean_conversation_for_graph, _is_junk_fact
 from memory.ranking import _times_derived_from_metadata
 from memory.retry import retry_transient
+from memory.sensitivity import classify_sensitivity
 
 logger = logging.getLogger(__name__)
 _SPEAKER_UNSET = object()
@@ -245,8 +246,14 @@ class WriteMixin:
         use_rich_parser = settings.extraction_require_speaker
         from prompts import ParsedFact
 
-        parsed_facts_rich: list[ParsedFact] = []
-        parsed_facts_legacy: list[tuple[str, str]] = []
+        # Every window is parsed with the rich parser (category, content,
+        # speaker, occurred_at, and the optional sensitivity tag — see
+        # prompts.ParsedFact). Whether the CALLER sees speaker/occurred_at
+        # metadata is still gated by use_rich_parser below; parsing rich
+        # unconditionally just means the optional sensitivity signal survives
+        # even on the legacy (use_rich_parser=False, production-default) path,
+        # instead of being dropped by parse_extraction_response's fold.
+        parsed_facts_all: list[ParsedFact] = []
         window_errors: list[str] = []
         last_exc: Exception | None = None
         for w_idx, window_messages in enumerate(windows):
@@ -266,10 +273,7 @@ class WriteMixin:
                     operation="LLM extraction",
                     fallback_model=settings.gemini_llm_fallback_model,
                 )
-                if use_rich_parser:
-                    parsed_facts_rich.extend(parse_extraction_response_rich(response.text))
-                else:
-                    parsed_facts_legacy.extend(parse_extraction_response(response.text))
+                parsed_facts_all.extend(parse_extraction_response_rich(response.text))
             except Exception as e:
                 # One window failing must not zero the whole session — keep
                 # the other windows' facts and report the failure honestly
@@ -297,11 +301,13 @@ class WriteMixin:
 
         # Filter out junk facts from extraction.
         # For rich parser: check the FULL fact (speaker + content) for junk patterns.
-        # For legacy parser: content already includes any prefix.
+        # For legacy parser: content already includes any prefix — fold it the
+        # same way parse_extraction_response used to, so junk detection sees
+        # exactly the same string it always did.
         if use_rich_parser:
-            pre_filter_count = len(parsed_facts_rich)
+            pre_filter_count = len(parsed_facts_all)
             parsed_facts_rich = [
-                pf for pf in parsed_facts_rich
+                pf for pf in parsed_facts_all
                 if not _is_junk_fact(
                     f"{pf.speaker}: {pf.content}" if pf.speaker else pf.content
                 )
@@ -314,16 +320,23 @@ class WriteMixin:
                 logger.info("No facts extracted from conversation")
                 return ([], stats) if return_stats else []
         else:
-            pre_filter_count = len(parsed_facts_legacy)
-            parsed_facts_legacy = [
-                (cat, content) for cat, content in parsed_facts_legacy
+            # Legacy fold: identical to parse_extraction_response's fold
+            # (speaker prefixed back into content when present), so stored
+            # content + dedup identity stay byte-identical to before.
+            folded_all = [
+                (pf.category, (f"{pf.speaker}: {pf.content}" if pf.speaker else pf.content), pf.sensitivity)
+                for pf in parsed_facts_all
+            ]
+            pre_filter_count = len(folded_all)
+            folded_all = [
+                (cat, content, sens) for cat, content, sens in folded_all
                 if not _is_junk_fact(content)
             ]
-            if pre_filter_count != len(parsed_facts_legacy):
+            if pre_filter_count != len(folded_all):
                 logger.info(
-                    f"Filtered {pre_filter_count - len(parsed_facts_legacy)} junk facts from extraction"
+                    f"Filtered {pre_filter_count - len(folded_all)} junk facts from extraction"
                 )
-            if not parsed_facts_legacy:
+            if not folded_all:
                 logger.info("No facts extracted from conversation")
                 return ([], stats) if return_stats else []
 
@@ -342,6 +355,7 @@ class WriteMixin:
             if use_rich_parser:
                 facts = [(pf.category, pf.content) for pf in parsed_facts_rich]
                 speakers = [pf.speaker for pf in parsed_facts_rich]
+                sensitivities = [pf.sensitivity for pf in parsed_facts_rich]
                 # T1.3: per-fact occurred_at extraction with fallback
                 occurred_ats: list[str | None] = []
                 for pf in parsed_facts_rich:
@@ -359,9 +373,10 @@ class WriteMixin:
             else:
                 # Legacy path: no speaker metadata, no per-fact occurred_at.
                 # Thread conversation-level occurred_at as before (T1.3 fallback).
-                facts = parsed_facts_legacy
+                facts = [(cat, content) for cat, content, sens in folded_all]
                 speakers = None
                 occurred_ats = None
+                sensitivities = [sens for cat, content, sens in folded_all]
             stored = self._batch_store_facts(
                 facts=facts,
                 speakers=speakers,
@@ -372,11 +387,12 @@ class WriteMixin:
                 source="conversation",
                 occurred_at=occurred_at,
                 occurred_ats=occurred_ats,
+                sensitivities=sensitivities,
             )
         except Exception as e:
             logger.error(
                 f"Batch store failed for user {user_id}: {e} — "
-                f"{len(parsed_facts_rich)} extracted facts were NOT stored",
+                f"{len(facts)} extracted facts were NOT stored",
                 exc_info=True,
             )
             raise
@@ -606,6 +622,9 @@ class WriteMixin:
         source_ref: dict | None = None,
         # Workspace partition (WT6, None → memory type)
         workspace: str | None = None,
+        # Sensitivity gate override — see _prepare_raw_store. Only bypasses
+        # the forced-private gate when `visibility` is also explicitly set.
+        sensitivity_override: bool = False,
         # Write-path isolation: when False, skip the slow inline graph.add so
         # the fast vector write returns immediately — the caller is expected to
         # enqueue enrich_graph() onto the graph worker. When return_created is
@@ -686,6 +705,7 @@ class WriteMixin:
             memory_kind=memory_kind,
             source_ref=source_ref,
             workspace=workspace,
+            sensitivity_override=sensitivity_override,
         )
         if existing is not None:
             # created=False → caller must NOT re-enqueue graph enrichment.
@@ -731,6 +751,11 @@ class WriteMixin:
         memory_kind: str | None = None,
         source_ref: dict | None = None,
         workspace: str | None = None,
+        # Sensitivity gate override: bypasses the forced-private gate below
+        # ONLY when combined with an explicit `visibility` (see the gate
+        # logic). False by default — every existing caller that doesn't know
+        # about the gate keeps getting the gate's protection.
+        sensitivity_override: bool = False,
     ) -> tuple[dict | None, MemoryResponse | None]:
         """Validate + resolve + dedup one raw store; everything except the embed.
 
@@ -769,11 +794,53 @@ class WriteMixin:
         # used to land in Qdrant metadata and break both the GET API
         # shape and the conversation_compiler event handler.
         # Resolved BEFORE the scope check because standards force scope below.
+        explicit_visibility_requested = visibility is not None
         effective_visibility = (
             normalize_visibility(visibility)
             if visibility is not None
             else default_visibility_for_category(category).value
         )
+
+        # ── Sensitivity gate (deterministic regex floor, zero LLM cost) ──
+        # Several categories default to SHARED (schemas.DEFAULT_VISIBILITY_FOR_
+        # CATEGORY) because the deployment relies on shared team knowledge —
+        # but a caller can label a sensitive fact (a dollar figure, a
+        # credential, a client's commercial terms) with one of those
+        # categories and silently publish it to every seat. When the content
+        # classifies into one of settings.sensitivity_private_classes, force
+        # visibility=private unless the caller both supplied an explicit
+        # visibility AND passed sensitivity_override=True. This never changes
+        # how visibility is chosen for non-sensitive writes.
+        sensitivity_class: str | None = None
+        sensitivity_source: str | None = None
+        if settings.sensitivity_gate_enabled:
+            sensitivity_class = classify_sensitivity(content)
+            if sensitivity_class in settings.sensitivity_private_classes_set():
+                bypassed = explicit_visibility_requested and sensitivity_override
+                if bypassed:
+                    logger.debug(
+                        f"Sensitivity gate: class={sensitivity_class} bypassed via "
+                        f"explicit sensitivity_override (user={user_id}, category={category})"
+                    )
+                    sensitivity_class = None
+                else:
+                    if explicit_visibility_requested and not sensitivity_override:
+                        logger.warning(
+                            f"Sensitivity gate: caller requested visibility="
+                            f"{effective_visibility!r} for a {sensitivity_class} write "
+                            f"without sensitivity_override=True — forcing visibility=private "
+                            f"(user={user_id}, category={category})"
+                        )
+                    else:
+                        logger.info(
+                            f"Sensitivity gate: forcing visibility=private for category="
+                            f"{category} (class={sensitivity_class}, source=regex, "
+                            f"user={user_id})"
+                        )
+                    effective_visibility = MemoryVisibility.PRIVATE.value
+                    sensitivity_source = "regex"
+            else:
+                sensitivity_class = None
 
         # ── Authoritative "standard" tier: gate + force global scope ──
         # The REST route / MCP tool gate this earlier and synchronously, but
@@ -844,6 +911,11 @@ class WriteMixin:
             # Multi-user model: who owns this memory + who can read it.
             "owner_user_id": user_id,
             "visibility": effective_visibility,
+            # Sensitivity gate provenance (only stamped when the gate actually
+            # forced this write to private — absent otherwise, so a plain
+            # `decision`/`interaction`/etc. write is byte-identical to before).
+            **({"sensitivity": sensitivity_class} if sensitivity_class else {}),
+            **({"sensitivity_source": sensitivity_source} if sensitivity_source else {}),
             # Retrieval economics (C1): index-row fields
             "title": title,
             "token_estimate": token_estimate,
@@ -1358,6 +1430,7 @@ class WriteMixin:
                     visibility=item.get("visibility"),
                     memory_kind=item.get("memory_kind"),
                     source_ref=item.get("source_ref"),
+                    sensitivity_override=item.get("sensitivity_override", False),
                 )
                 if existing is not None:
                     entries.append(("dup", existing))
@@ -1504,6 +1577,7 @@ class WriteMixin:
         speakers: list[str | None] | None = None,
         occurred_ats: list[str | None] | None = None,
         workspace: str | None = None,
+        sensitivities: list[str | None] | None = None,
     ) -> list[MemoryResponse]:
         """Store multiple categorized facts via a single batch embed + single Qdrant upsert.
 
@@ -1542,6 +1616,13 @@ class WriteMixin:
                 to ``facts``. None or a shorter list is tolerated — missing
                 entries use the conversation-level ``occurred_at`` fallback.
                 Per-fact values take precedence when present.
+            sensitivities: Optional list of per-fact LLM-supplied sensitivity
+                hints (financial | equity_compensation | client_commercial |
+                credentials_pii | None), aligned to ``facts``. Combined with
+                a deterministic regex floor over each fact's content — see
+                the sensitivity gate below — to decide whether the fact gets
+                forced to ``visibility=private``. This path never exposes a
+                caller-supplied ``visibility``, so there is no override.
 
         Returns:
             List of MemoryResponse objects for stored facts (new rows and
@@ -1561,7 +1642,7 @@ class WriteMixin:
         texts: list[str] = []
         memory_ids: list[str] = []
         payloads: list[dict] = []
-        fact_meta: list[tuple[str, str, str | None, str | None, str | None]] = []  # (category, scope, project_id, speaker, occurred_at) per fact
+        fact_meta: list[tuple[str, str, str | None, str | None, str | None, str | None]] = []  # (category, scope, project_id, speaker, occurred_at, forced_visibility) per fact
         # Ordered slots: ("new", index-into-texts) | ("dup", existing response)
         ordered: list[tuple[str, object]] = []
         seen_in_batch: set[tuple[str, str, str | None, str | None]] = set()
@@ -1579,6 +1660,13 @@ class WriteMixin:
         if len(occurred_ats_normalized) < len(facts):
             occurred_ats_normalized = list(occurred_ats_normalized) + [occurred_at] * (
                 len(facts) - len(occurred_ats_normalized)
+            )
+
+        # Normalize sensitivities list: pad to len(facts) with None if shorter/absent
+        sensitivities_normalized = sensitivities or []
+        if len(sensitivities_normalized) < len(facts):
+            sensitivities_normalized = list(sensitivities_normalized) + [None] * (
+                len(facts) - len(sensitivities_normalized)
             )
 
         for idx, (category, content) in enumerate(facts):
@@ -1665,6 +1753,28 @@ class WriteMixin:
                 ordered.append(("dup", existing))
                 continue
 
+            # ── Sensitivity gate (deterministic regex floor + optional LLM
+            # hint, zero extra LLM cost) ── This path never receives a
+            # caller-supplied visibility, so there is no override: a sensitive
+            # extracted fact is always forced private. See memory/sensitivity.py
+            # and memory/write.py's _prepare_raw_store for the shared rules.
+            fact_sensitivity: str | None = None
+            fact_sensitivity_source: str | None = None
+            fact_forced_visibility: str | None = None
+            if settings.sensitivity_gate_enabled:
+                regex_class = classify_sensitivity(content)
+                llm_hint = sensitivities_normalized[idx] if idx < len(sensitivities_normalized) else None
+                candidate_class = regex_class or llm_hint
+                if candidate_class in settings.sensitivity_private_classes_set():
+                    fact_sensitivity = candidate_class
+                    fact_sensitivity_source = "regex" if regex_class else "llm"
+                    fact_forced_visibility = MemoryVisibility.PRIVATE.value
+                    logger.info(
+                        f"Sensitivity gate: forcing visibility=private for category="
+                        f"{category} (class={fact_sensitivity}, source={fact_sensitivity_source}, "
+                        f"user={user_id})"
+                    )
+
             mid = str(uuid.uuid4())
             payload = {
                 "data": content,
@@ -1680,6 +1790,9 @@ class WriteMixin:
                     "agent_id": agent_id,
                     "run_id": run_id,
                     "source": source,
+                    **({"visibility": fact_forced_visibility} if fact_forced_visibility else {}),
+                    **({"sensitivity": fact_sensitivity} if fact_sensitivity else {}),
+                    **({"sensitivity_source": fact_sensitivity_source} if fact_sensitivity_source else {}),
                     # Extraction stores directly-stated facts → epistemically
                     # "explicit" (A1). Derived levels are stamped by their
                     # authors (dreaming reflection/merge), never here.
@@ -1703,7 +1816,7 @@ class WriteMixin:
             texts.append(content)
             memory_ids.append(mid)
             payloads.append(payload)
-            fact_meta.append((category, scope_val, fact_project_id, speaker, fact_occurred_at))
+            fact_meta.append((category, scope_val, fact_project_id, speaker, fact_occurred_at, fact_forced_visibility))
             ordered.append(("new", len(texts) - 1))
 
         # ── Single batch embed + single Qdrant upsert (new facts only) ──
@@ -1739,7 +1852,7 @@ class WriteMixin:
                 continue
             idx = ref
             mid, content = memory_ids[idx], texts[idx]
-            category, scope_val, fact_pid, spk, fact_occurred_at = fact_meta[idx]
+            category, scope_val, fact_pid, spk, fact_occurred_at, forced_visibility = fact_meta[idx]
             responses.append(
                 MemoryResponse(
                     id=mid,
@@ -1757,6 +1870,7 @@ class WriteMixin:
                     title=distill_title(content),
                     token_estimate=stamp_tokens(content),
                     speaker=spk,
+                    visibility=forced_visibility,
                 )
             )
 

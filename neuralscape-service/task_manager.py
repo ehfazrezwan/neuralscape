@@ -139,6 +139,10 @@ class TaskManager:
         epistemic_level: str | None = None,
         # Multi-user model
         visibility: str | None = None,
+        # Sensitivity gate override (see memory/sensitivity.py + schemas.
+        # RawMemoryRequest.sensitivity_override) — bypasses the forced-private
+        # gate only when combined with an explicit `visibility` above.
+        sensitivity_override: bool = False,
         # Data-layer connectors
         memory_kind: str | None = None,
         source_ref: dict | None = None,
@@ -172,6 +176,7 @@ class TaskManager:
             "derived_from": derived_from,
             "epistemic_level": epistemic_level,
             "visibility": visibility,
+            "sensitivity_override": sensitivity_override,
             "memory_kind": memory_kind,
             "source_ref": source_ref,
         }

@@ -528,6 +528,26 @@ class Settings(BaseSettings):
     processes_enabled: bool = False
     dictator_user_ids: str = ""   # e.g. "mark,alice"
 
+    # ── Sensitivity gate (write-time, deterministic, zero LLM cost) ──────
+    # Several categories (decision, interaction, architecture, tech_stack,
+    # procedure, workflow, convention, dependency) default to SHARED
+    # visibility (see schemas.DEFAULT_VISIBILITY_FOR_CATEGORY) because the
+    # deployment genuinely relies on shared team knowledge. But a caller can
+    # label a sensitive fact (a dollar figure, a credential, a client's
+    # commercial terms) with one of those categories and silently publish it
+    # to every seat. The gate classifies write content with a deterministic
+    # regex floor (see memory/sensitivity.py) — plus an optional LLM-supplied
+    # hint from the extraction prompt — and forces such writes to `private`
+    # unless the caller explicitly overrides (visibility set +
+    # sensitivity_override=True). This is per-class, not blanket privacy:
+    # only the classes listed in sensitivity_private_classes are forced.
+    #   sensitivity_gate_enabled    → feature flag; True keeps today's fix on.
+    #   sensitivity_private_classes → CSV of sensitivity classes that force
+    #     `private` when matched. Per-deployment: a team that wants
+    #     "financial" facts shared can drop it from the list.
+    sensitivity_gate_enabled: bool = True
+    sensitivity_private_classes: str = "financial,equity_compensation,client_commercial,credentials_pii"
+
     # Service
     host: str = "0.0.0.0"
     port: int = 8199
@@ -737,6 +757,11 @@ class Settings(BaseSettings):
     def is_dictator(self, user_id: str | None) -> bool:
         """True iff `user_id` is an authorized dictator (may write standards)."""
         return bool(user_id) and user_id in self.dictator_user_ids_set()
+
+    # ── sensitivity gate helpers ──────────────────────────────────────────
+    def sensitivity_private_classes_set(self) -> set[str]:
+        """Parsed CSV of sensitivity classes that force `visibility=private`."""
+        return {c.strip() for c in self.sensitivity_private_classes.split(",") if c.strip()}
 
     def validate_required(self) -> None:
         """Validate that all required configuration fields are set.

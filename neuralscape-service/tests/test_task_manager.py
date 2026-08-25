@@ -143,7 +143,9 @@ class TestEnqueueRawV2:
 
     @pytest.mark.asyncio
     async def test_no_v2_fields_packs_empty_extras(self, tm):
-        """Without v2 fields, extras dict is empty (None values dropped)."""
+        """Without v2 fields, extras dict carries only defaulted booleans
+        (None values are dropped; `sensitivity_override` defaults to False,
+        which survives the None-filter since False is not None)."""
         mock_job = MagicMock()
         mock_job.job_id = "job-xyz"
         tm.pool.enqueue_job.return_value = mock_job
@@ -154,7 +156,7 @@ class TestEnqueueRawV2:
             category="preference",
         )
         v2_extras = tm.pool.enqueue_job.call_args[0][9]
-        assert v2_extras == {}
+        assert v2_extras == {"sensitivity_override": False}
 
     @pytest.mark.asyncio
     async def test_duplicate_job_returns_existing_id(self, tm):

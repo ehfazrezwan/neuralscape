@@ -556,6 +556,16 @@ class RawMemoryRequest(BaseModel):
         default=None,
         description="Multi-user model: 'private' (owner only), 'shared' (team-wide), or 'standard' (dictator-only authoritative tier; requires STANDARDS_ENABLED). Defaults per-category.",
     )
+    sensitivity_override: bool = Field(
+        default=False,
+        description=(
+            "Sensitivity gate escape hatch: when the content classifies as "
+            "financial/equity_compensation/client_commercial/credentials_pii, "
+            "the server forces visibility='private' regardless of the "
+            "'visibility' field above, UNLESS this is True *and* 'visibility' "
+            "was explicitly set — both are required to bypass the gate."
+        ),
+    )
 
     # Memory-model v2 (all optional)
     domain: str | None = Field(default=None, description="High-level life-context domain")
@@ -677,6 +687,13 @@ class IngestDocumentRequest(BaseModel):
     project_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
     user_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
     visibility: MemoryVisibility | None = Field(default=None)
+    sensitivity_override: bool = Field(
+        default=False,
+        description=(
+            "Sensitivity gate escape hatch — see RawMemoryRequest.sensitivity_override. "
+            "Applies to every fact this ingest produces."
+        ),
+    )
     extract_facts: bool = Field(default=True, description="Run LLM extraction to also store distilled facts")
     index_passages: bool = Field(default=True, description="Chunk + store verbatim passages")
     tags: list[str] | None = Field(default=None, max_length=20)
@@ -730,6 +747,13 @@ class IngestTextRequest(BaseModel):
     project_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
     user_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
     visibility: MemoryVisibility | None = Field(default=None)
+    sensitivity_override: bool = Field(
+        default=False,
+        description=(
+            "Sensitivity gate escape hatch — see RawMemoryRequest.sensitivity_override. "
+            "Applies to every fact this ingest produces."
+        ),
+    )
     extract_facts: bool = Field(default=True, description="Run LLM extraction to also store distilled facts")
     index_passages: bool = Field(default=True, description="Chunk + store verbatim passages")
     tags: list[str] | None = Field(default=None, max_length=20)

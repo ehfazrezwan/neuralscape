@@ -467,6 +467,16 @@ async def list_tools() -> list[Tool]:
                         ),
                         "enum": ["private", "shared", "standard"],
                     },
+                    "sensitivity_override": {
+                        "type": "boolean",
+                        "description": (
+                            "Sensitivity gate escape hatch. When the content looks "
+                            "financial/equity/client-commercial/credentials, the server "
+                            "forces visibility='private' regardless of the 'visibility' "
+                            "field above — UNLESS this is true AND 'visibility' was also "
+                            "explicitly set. Default: false."
+                        ),
+                    },
                     "wait": {
                         "type": "boolean",
                         "description": "If true, wait for memory to be fully stored before returning. Default: false (fire-and-forget).",
@@ -563,6 +573,13 @@ async def list_tools() -> list[Tool]:
                     "project_id": {"type": "string", "description": "Project id (sets project scope)"},
                     "scope": {"type": "string", "enum": ["global", "project"]},
                     "visibility": {"type": "string", "enum": ["private", "shared", "standard"]},
+                    "sensitivity_override": {
+                        "type": "boolean",
+                        "description": (
+                            "Sensitivity gate escape hatch — see 'remember'. Applies to "
+                            "every fact this ingest produces. Default: false."
+                        ),
+                    },
                     "extract_facts": {"type": "boolean", "description": "Also run LLM extraction for distilled facts (default true)"},
                     "index_passages": {"type": "boolean", "description": "Chunk + store verbatim passages (default true)"},
                     "tags": {"type": "array", "items": {"type": "string"}},
@@ -600,6 +617,13 @@ async def list_tools() -> list[Tool]:
                     "project_id": {"type": "string", "description": "Project id (sets project scope)"},
                     "scope": {"type": "string", "enum": ["global", "project"]},
                     "visibility": {"type": "string", "enum": ["private", "shared", "standard"]},
+                    "sensitivity_override": {
+                        "type": "boolean",
+                        "description": (
+                            "Sensitivity gate escape hatch — see 'remember'. Applies to "
+                            "every fact this ingest produces. Default: false."
+                        ),
+                    },
                     "extract_facts": {"type": "boolean", "description": "Also run LLM extraction for distilled facts (default true)"},
                     "index_passages": {"type": "boolean", "description": "Chunk + store verbatim passages (default true)"},
                     "tags": {"type": "array", "items": {"type": "string"}},
@@ -1814,6 +1838,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 "derived_from": arguments.get("derived_from"),
                 "epistemic_level": arguments.get("epistemic_level"),
                 "visibility": arguments.get("visibility"),
+                "sensitivity_override": arguments.get("sensitivity_override", False),
             }
 
             # Authoritative-tier write-gate: only dictators may write standards.
@@ -1923,6 +1948,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 "scope": scope,
                 "project_id": project_id,
                 "visibility": arguments.get("visibility"),
+                "sensitivity_override": arguments.get("sensitivity_override", False),
                 "tags": arguments.get("tags"),
                 "extract_facts": arguments.get("extract_facts", True),
                 "index_passages": arguments.get("index_passages", True),
@@ -2006,6 +2032,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 "scope": req.scope,
                 "project_id": project_id,
                 "visibility": req.visibility.value if req.visibility else None,
+                "sensitivity_override": req.sensitivity_override,
                 "tags": req.tags,
                 "extract_facts": req.extract_facts,
                 "index_passages": req.index_passages,
