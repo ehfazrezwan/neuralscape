@@ -538,9 +538,24 @@ class TestReadOnlyHelpers:
         result = service._preview_episode_edges("shared", "ep-1")
         assert result == ["e1", "e2"]
 
-    def test_preview_episode_edges_fails_open_on_bridge_error(self, service):
+    def test_preview_episode_edges_fails_closed_on_bridge_error(self, service):
+        """Audit/remediation reads must FAIL CLOSED: a broken bridge raises
+        instead of degrading to "nothing found" — otherwise an audit could
+        report a false-clean ``total == 0`` because the read itself failed."""
+        import pytest
         service._run_on_bridge = MagicMock(side_effect=RuntimeError("bridge down"))
-        assert service._preview_episode_edges("shared", "ep-1") == []
+        with pytest.raises(RuntimeError, match="remediation read query failed"):
+            service._preview_episode_edges("shared", "ep-1")
+
+    def test_audit_surfaces_read_failure_instead_of_false_clean(self, service):
+        """The public audit entrypoint propagates a read failure (so the REST
+        wrapper returns 500 / MCP returns an error) rather than ``total == 0``."""
+        import pytest
+        service._run_on_bridge = MagicMock(side_effect=RuntimeError("bridge down"))
+        service._scroll_all_user_memories = MagicMock(return_value=[{
+            "id": "m1", "payload": {"data": "x", "metadata": {"visibility": "private", "owner_user_id": "u"}}}])
+        with pytest.raises(RuntimeError):
+            service.audit_private_leakage("u")
 
     def test_preview_episode_edges_never_mutates(self, service):
         """Read-only guarantee for dry-run safety: the dispatched Cypher
