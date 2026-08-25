@@ -9,7 +9,7 @@ import re
 
 from datetime import datetime, timezone
 from config import settings
-from memory.groups import _get_group_ids
+from memory.groups import _edge_is_invalidated, _get_group_ids
 from memory.junk import _JUNK_RE
 
 logger = logging.getLogger(__name__)
@@ -22,9 +22,25 @@ class GraphAdminMixin:
     # ──────────────────────────────────────────────
 
     def get_graph_nodes(
-        self, user_id: str, project_id: str | None = None, limit: int = 50
+        self,
+        user_id: str,
+        project_id: str | None = None,
+        limit: int = 50,
+        include_expired: bool = False,
     ) -> list[dict]:
-        """List entity nodes from Graphiti."""
+        """List entity nodes from Graphiti.
+
+        By default excludes nodes whose connecting graph edges are ALL
+        expired/invalidated. ``EntityNode.summary`` is Graphiti's "regional
+        summary of surrounding edges" — once every RELATES_TO edge touching
+        a node has been soft-expired (memory/provenance.py's cascade on a
+        visibility flip/delete, or the dreaming sweep's INVALIDATE/PRUNE/
+        MERGE) that summary describes content that must not be surfaced
+        through this listing endpoint. A node with NO edges at all (never
+        connected to anything) is left alone — that's "not yet enriched",
+        not "expired". Pass ``include_expired=True`` for an operator/debug
+        view that includes everything (never the default).
+        """
         g = self._get_graphiti()
         if g is None:
             return []
@@ -37,6 +53,8 @@ class GraphAdminMixin:
             nodes = self._run_on_bridge(
                 EntityNode.get_by_group_ids(g.driver, group_ids=group_ids, limit=limit)
             )
+            if not include_expired:
+                nodes = self._filter_live_nodes(g, group_ids, nodes)
             return [
                 {
                     "uuid": n.uuid,
@@ -52,10 +70,56 @@ class GraphAdminMixin:
             logger.warning("get_graph_nodes failed: %s", e)
             return []
 
+    def _filter_live_nodes(self, g, group_ids: list[str], nodes: list) -> list:
+        """Drop entity nodes whose connecting RELATES_TO edges are ALL
+        expired/invalidated (see ``get_graph_nodes`` docstring). Reuses the
+        SAME edge-liveness definition as the search path
+        (memory/groups.py::_edge_is_invalidated / _live_edges_filter) rather
+        than inventing a second one. Fails open (returns ``nodes``
+        unfiltered) on a lookup error — this is a defense-in-depth listing
+        filter, not the primary expiry mechanism.
+        """
+        if not nodes:
+            return nodes
+        from graphiti_core.edges import EntityEdge
+
+        try:
+            edges = self._run_on_bridge(
+                EntityEdge.get_by_group_ids(g.driver, group_ids=group_ids, limit=5000)
+            )
+        except Exception as e:
+            logger.warning("Live-node edge lookup failed (fail-open to unfiltered): %s", e)
+            return nodes
+
+        touched: set[str] = set()
+        live: set[str] = set()
+        for e in edges:
+            is_live = not _edge_is_invalidated(e)
+            for node_uuid in (e.source_node_uuid, e.target_node_uuid):
+                touched.add(node_uuid)
+                if is_live:
+                    live.add(node_uuid)
+        return [n for n in nodes if n.uuid not in touched or n.uuid in live]
+
     def get_graph_edges(
-        self, user_id: str, project_id: str | None = None, limit: int = 50
+        self,
+        user_id: str,
+        project_id: str | None = None,
+        limit: int = 50,
+        include_expired: bool = False,
     ) -> list[dict]:
-        """List entity edges (facts) from Graphiti."""
+        """List entity edges (facts) from Graphiti.
+
+        By default excludes soft-expired/invalidated edges — same
+        bi-temporal liveness definition the search path enforces
+        (memory/groups.py::_edge_is_invalidated): an edge with a non-null
+        ``expired_at`` (memory/provenance.py's cascade, or the dreaming
+        sweep) or ``invalid_at`` is dropped. Without this, a listing
+        endpoint would hand back exactly the facts a visibility flip/delete
+        just expired — defeating that cascade entirely. Pass
+        ``include_expired=True`` for an operator/debug view that includes
+        everything (never the default).
+        """
         g = self._get_graphiti()
         if g is None:
             return []
@@ -69,6 +133,8 @@ class GraphAdminMixin:
             edges = self._run_on_bridge(
                 EntityEdge.get_by_group_ids(g.driver, group_ids=group_ids, limit=limit)
             )
+            if not include_expired:
+                edges = [e for e in edges if not _edge_is_invalidated(e)]
             return [
                 {
                     "uuid": e.uuid,

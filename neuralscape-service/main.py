@@ -529,13 +529,21 @@ async def list_graph_nodes_legacy(
     request: Request,
     user_id: str = Query(default=None),
     limit: int = Query(default=50),
+    include_expired: bool = Query(default=False),
 ):
-    """List entity nodes from Graphiti. Legacy endpoint."""
+    """List entity nodes from Graphiti. Legacy endpoint.
+
+    Excludes nodes with no live connecting edges by default (see
+    memory/graph_admin.py::get_graph_nodes) — pass ``include_expired=true``
+    for an operator/debug view.
+    """
     g = _get_graphiti()
     if g is None:
         raise HTTPException(status_code=503, detail="Graphiti not initialized")
 
+    from graphiti_core.edges import EntityEdge
     from graphiti_core.nodes import EntityNode
+    from memory.groups import _edge_is_invalidated
 
     group_id = _resolve_user_id(request, user_id)
     try:
@@ -543,6 +551,20 @@ async def list_graph_nodes_legacy(
             _run_on_bridge,
             EntityNode.get_by_group_ids(g.driver, group_ids=[group_id], limit=limit),
         )
+        if not include_expired and nodes:
+            edges = await asyncio.to_thread(
+                _run_on_bridge,
+                EntityEdge.get_by_group_ids(g.driver, group_ids=[group_id], limit=5000),
+            )
+            touched: set[str] = set()
+            live: set[str] = set()
+            for e in edges:
+                is_live = not _edge_is_invalidated(e)
+                for node_uuid in (e.source_node_uuid, e.target_node_uuid):
+                    touched.add(node_uuid)
+                    if is_live:
+                        live.add(node_uuid)
+            nodes = [n for n in nodes if n.uuid not in touched or n.uuid in live]
         return {
             "status": "ok",
             "nodes": [
@@ -567,14 +589,21 @@ async def list_graph_edges_legacy(
     request: Request,
     user_id: str = Query(default=None),
     limit: int = Query(default=50),
+    include_expired: bool = Query(default=False),
 ):
-    """List entity edges (facts) from Graphiti. Legacy endpoint."""
+    """List entity edges (facts) from Graphiti. Legacy endpoint.
+
+    Excludes soft-expired/invalidated edges by default (see
+    memory/graph_admin.py::get_graph_edges) — pass ``include_expired=true``
+    for an operator/debug view.
+    """
     g = _get_graphiti()
     if g is None:
         raise HTTPException(status_code=503, detail="Graphiti not initialized")
 
     from graphiti_core.edges import EntityEdge
     from graphiti_core.errors import GroupsEdgesNotFoundError
+    from memory.groups import _edge_is_invalidated
 
     group_id = _resolve_user_id(request, user_id)
     try:
@@ -582,6 +611,8 @@ async def list_graph_edges_legacy(
             _run_on_bridge,
             EntityEdge.get_by_group_ids(g.driver, group_ids=[group_id], limit=limit),
         )
+        if not include_expired:
+            edges = [e for e in edges if not _edge_is_invalidated(e)]
         return {
             "status": "ok",
             "edges": [
@@ -3018,14 +3049,20 @@ async def v1_graph_nodes(
     user_id: str | None = Query(default=None),
     project_id: str | None = Query(default=None),
     limit: int = Query(default=50),
+    include_expired: bool = Query(default=False),
 ):
-    """List entity nodes from Graphiti with project_id filter."""
+    """List entity nodes from Graphiti with project_id filter.
+
+    Excludes nodes with no live connecting edges by default — pass
+    ``include_expired=true`` for an operator/debug view.
+    """
     resolved_user_id = _resolve_user_id(request, user_id)
     nodes = await asyncio.to_thread(
         _service.get_graph_nodes,
         user_id=resolved_user_id,
         project_id=project_id,
         limit=limit,
+        include_expired=include_expired,
     )
     return {"status": "ok", "nodes": nodes}
 
@@ -3036,14 +3073,20 @@ async def v1_graph_edges(
     user_id: str | None = Query(default=None),
     project_id: str | None = Query(default=None),
     limit: int = Query(default=50),
+    include_expired: bool = Query(default=False),
 ):
-    """List entity edges (facts) from Graphiti with project_id filter."""
+    """List entity edges (facts) from Graphiti with project_id filter.
+
+    Excludes soft-expired/invalidated edges by default — pass
+    ``include_expired=true`` for an operator/debug view.
+    """
     resolved_user_id = _resolve_user_id(request, user_id)
     edges = await asyncio.to_thread(
         _service.get_graph_edges,
         user_id=resolved_user_id,
         project_id=project_id,
         limit=limit,
+        include_expired=include_expired,
     )
     return {"status": "ok", "edges": edges}
 
