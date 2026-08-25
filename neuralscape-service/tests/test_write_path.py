@@ -374,7 +374,10 @@ class TestGraphEpisodeIdempotency:
         mg._indices_built = True  # skip _ensure_indices
         mg.graphiti = MagicMock()
         mg.graphiti.add_episode = AsyncMock(
-            return_value=SimpleNamespace(edges=[], nodes=[])
+            return_value=SimpleNamespace(
+                edges=[], nodes=[],
+                episode=SimpleNamespace(uuid="ep-uuid", name="ep-name"),
+            )
         )
         mg._bridge = SimpleNamespace(run=lambda coro: asyncio.run(coro))
 

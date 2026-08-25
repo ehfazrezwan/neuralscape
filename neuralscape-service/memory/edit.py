@@ -181,12 +181,15 @@ class EditMixin:
         graph_job = None
         graph_status = "unchanged"
         if new_group != old_group:
-            # Partition migration: soft-expire the memory's edges in the old
-            # group (fast — hybrid search + edge saves, no LLM), then the
+            # Partition migration: expire the memory's episode/edges in the
+            # OLD group (episode-precise cascade first, substring fallback
+            # only if no episode resolves — memory/provenance.py), then the
             # caller re-ingests into the new group via the graph queue.
             try:
-                self._expire_graph_edges_for_memory(
-                    {"memory": payload.get("data", ""), "metadata": meta, "user_id": owner}
+                self._cascade_or_fallback_expire(
+                    {"memory": payload.get("data", ""), "metadata": meta, "user_id": owner},
+                    group_id=old_group,
+                    memory_id=memory_id,
                 )
             except Exception as e:
                 logger.warning(f"Graph edge expiration failed for {memory_id} (non-critical): {e}")
@@ -365,8 +368,10 @@ class EditMixin:
                 new_group = _build_group_id(visibility, owner, new_meta.get("project_id"), new_meta.get("workspace"))
                 if new_group != old_group:
                     try:
-                        self._expire_graph_edges_for_memory(
-                            {"memory": payload.get("data", ""), "metadata": meta, "user_id": owner}
+                        self._cascade_or_fallback_expire(
+                            {"memory": payload.get("data", ""), "metadata": meta, "user_id": owner},
+                            group_id=old_group,
+                            memory_id=str(pt.id),
                         )
                     except Exception as e:
                         logger.warning(f"Graph edge expiration failed for {pt.id} (non-critical): {e}")

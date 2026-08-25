@@ -66,10 +66,12 @@ class DeleteMixin:
 
         result = m.delete(memory_id)
 
-        # Expire related graph edges (soft-delete, non-critical)
+        # Expire related graph edges (soft-delete, non-critical). Tries the
+        # episode-precise cascade first (memory/provenance.py); falls back to
+        # the substring heuristic below only when no episode can be resolved.
         if mem and self._graphiti and self._bridge:
             try:
-                self._expire_graph_edges_for_memory(mem)
+                self._cascade_or_fallback_expire(mem, memory_id=memory_id)
             except Exception as e:
                 logger.warning(f"Graph edge expiration failed for {memory_id} (non-critical): {e}")
 
@@ -142,8 +144,9 @@ class DeleteMixin:
                 try:
                     m.vector_store.delete(mid)
                     if self._graphiti and self._bridge:
-                        self._expire_graph_edges_for_memory(
-                            {"memory": mem_info.get("data", ""), "metadata": meta}
+                        self._cascade_or_fallback_expire(
+                            {"memory": mem_info.get("data", ""), "metadata": meta},
+                            memory_id=mid,
                         )
                     deleted_count += 1
                 except Exception as e:
@@ -173,7 +176,7 @@ class DeleteMixin:
                 full_mem = m.get(mem.id)
                 m.delete(mem.id)
                 if full_mem and self._graphiti and self._bridge:
-                    self._expire_graph_edges_for_memory(full_mem)
+                    self._cascade_or_fallback_expire(full_mem, memory_id=mem.id)
                 deleted_count += 1
             except Exception as e:
                 logger.warning(f"Failed to delete memory {mem.id}: {e}")
@@ -316,7 +319,7 @@ class DeleteMixin:
             self._expire_graph_edges_for_groups(sorted(private_groups))
         for mem in shared_memories:
             try:
-                self._expire_graph_edges_for_memory(mem)
+                self._cascade_or_fallback_expire(mem)
             except Exception as e:
                 logger.warning(f"Per-shared-memory edge expiration failed (non-critical): {e}")
 
@@ -389,7 +392,7 @@ class DeleteMixin:
                     "memory": payload.get("data", ""),
                     "metadata": payload.get("metadata", {}),
                 }
-                self._expire_graph_edges_for_memory(mem)
+                self._cascade_or_fallback_expire(mem, memory_id=memory_id)
             except Exception as e:
                 logger.warning(f"Graph cleanup failed for {memory_id} (non-critical): {e}")
 

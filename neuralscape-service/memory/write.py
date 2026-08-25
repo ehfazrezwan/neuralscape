@@ -418,8 +418,17 @@ class WriteMixin:
                         f"{episode_name} already exists in group {group_id} "
                         f"(re-run of an already-ingested conversation)"
                     )
+                    # Provenance durability: we didn't write the episode this
+                    # time, but its name is still deterministic — persist it
+                    # so a later cascade can resolve by name even without the
+                    # uuid (memory/provenance.py resolution order tries name
+                    # before falling back to content).
+                    for mem in stored:
+                        self._persist_graph_episode_ref(
+                            getattr(mem, "id", "") or "", None, episode_name
+                        )
                 else:
-                    retry_transient(
+                    graph_result = retry_transient(
                         self._memory.graph.add,
                         data=raw_text,
                         filters={"user_id": user_id, "group_id": group_id},
@@ -428,6 +437,7 @@ class WriteMixin:
                         episode_source="message",
                         operation="graph storage (extract_and_store)",
                     )
+                    episode_uuid = (graph_result or {}).get("episode_uuid")
                     # 1-episode → N-memories shape: a single graph.add produces
                     # entities that could legitimately belong to any of the N
                     # extracted memories. We call attach_memory_id once per
@@ -438,13 +448,19 @@ class WriteMixin:
                     # a perfect mapping, but enough for the wiki synthesizer
                     # to walk community → source memory.
                     for mem in stored:
+                        mid = getattr(mem, "id", "") or ""
                         self._attach_memory_id_to_graph_nodes(
                             group_id=group_id,
-                            memory_id=getattr(mem, "id", "") or "",
+                            memory_id=mid,
                             visibility=MemoryVisibility.PRIVATE.value,
                             owner_user_id=user_id,
                             write_started_at=graph_write_started_at,
                         )
+                        # Provenance durability: same episode → N memories;
+                        # stamp each row so a later cascade can resolve the
+                        # EXACT episode (memory/provenance.py).
+                        if episode_uuid or episode_name:
+                            self._persist_graph_episode_ref(mid, episode_uuid, episode_name)
         except Exception as e:
             logger.warning(f"Graph storage failed (non-critical): {e}")
 
@@ -1016,7 +1032,7 @@ class WriteMixin:
         group_id = _build_group_id(visibility, user_id, project_id, workspace)
         graph_write_started_at = datetime.now(timezone.utc)
         try:
-            retry_transient(
+            graph_result = retry_transient(
                 self._memory.graph.add,
                 data=content,
                 filters={"user_id": user_id, "group_id": group_id},
@@ -1035,6 +1051,17 @@ class WriteMixin:
                 write_started_at=graph_write_started_at,
                 source_ref=source_ref,
             )
+            # Provenance durability: this single-fact path does NOT name its
+            # episode deterministically — MemoryGraph.add() mints a
+            # timestamp-based name when no episode_name is supplied. Persist
+            # whatever uuid/name Graphiti actually resolved onto the Qdrant
+            # row so a later visibility flip / delete can cascade-expire the
+            # EXACT episode (memory/provenance.py) instead of falling back to
+            # a lossy heuristic. Additive — never blocks the graph result.
+            episode_uuid = (graph_result or {}).get("episode_uuid")
+            episode_name = (graph_result or {}).get("episode_name")
+            if episode_uuid or episode_name:
+                self._persist_graph_episode_ref(memory_id, episode_uuid, episode_name)
             return True
         except Exception as e:
             logger.warning(f"Graph enrichment failed (non-critical): {e}")

@@ -821,13 +821,31 @@ class TestPatchMemory:
         service.patch_memory("m1", "ehfaz", {"tags": ["ok"]})  # metadata still fine
 
     def test_partition_migration_expires_and_returns_graph_job(self, service):
+        """The migration path routes through the REAL episode cascade
+        (memory/provenance.py), not the substring-match heuristic directly.
+        When the cascade resolves an episode, the legacy substring fallback
+        must not fire at all."""
         meta = dict(_SHARED_META, owner_user_id="ehfaz")
         service._memory.vector_store.get.return_value = _edit_point(meta=meta)
+        service._cascade_expire_episode = MagicMock(
+            return_value={
+                "resolved": True, "episode_uuid": "ep-1",
+                "edges_expired": 2, "nodes_removed": 0, "summaries_cleared": 1,
+            }
+        )
         result = service.patch_memory("m1", "ehfaz", {"project_id": "bon002"})
 
-        service._expire_graph_edges_for_memory.assert_called_once()
-        expired_mem = service._expire_graph_edges_for_memory.call_args.args[0]
-        assert expired_mem["metadata"]["project_id"] == "neuralscape"  # OLD partition
+        service._cascade_expire_episode.assert_called_once()
+        args, kwargs = service._cascade_expire_episode.call_args
+        assert args[0] == "shared--project--neuralscape"  # OLD partition group_id
+        assert kwargs["content"] == "Old content"
+        assert kwargs["episode_uuid"] is None  # no graph_episode_uuid on this legacy row
+        assert kwargs["episode_name"] is None
+
+        # Cascade resolved the episode — the lossy substring fallback must
+        # NOT also fire (it would be redundant and could over-match).
+        service._expire_graph_edges_for_memory.assert_not_called()
+
         job = result["graph_job"]
         assert job == {
             "memory_id": "m1",
@@ -838,6 +856,26 @@ class TestPatchMemory:
             "source_ref": None,
         }
         assert result["graph"] == "migration_pending"
+
+    def test_partition_migration_falls_back_when_cascade_unresolved(self, service):
+        """When the cascade can't resolve an episode (e.g. a pre-fix row
+        with no graph_episode_uuid/name and content that no longer matches
+        verbatim), the legacy substring heuristic still runs as a
+        last-resort fallback — old behavior is preserved, not silently
+        dropped."""
+        meta = dict(_SHARED_META, owner_user_id="ehfaz")
+        service._memory.vector_store.get.return_value = _edit_point(meta=meta)
+        service._cascade_expire_episode = MagicMock(
+            return_value={
+                "resolved": False, "episode_uuid": None,
+                "edges_expired": 0, "nodes_removed": 0, "summaries_cleared": 0,
+            }
+        )
+        service.patch_memory("m1", "ehfaz", {"project_id": "bon002"})
+
+        service._expire_graph_edges_for_memory.assert_called_once()
+        expired_mem = service._expire_graph_edges_for_memory.call_args.args[0]
+        assert expired_mem["metadata"]["project_id"] == "neuralscape"  # OLD partition
 
     def test_not_found_raises_lookup_error(self, service):
         service._memory.vector_store.get.return_value = None

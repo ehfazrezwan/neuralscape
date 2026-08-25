@@ -89,6 +89,7 @@ from memory.core import CoreMixin  # noqa: E402
 from memory.delete import DeleteMixin  # noqa: E402
 from memory.edit import EditMixin  # noqa: E402
 from memory.graph_admin import GraphAdminMixin  # noqa: E402
+from memory.provenance import ProvenanceMixin  # noqa: E402
 from memory.reads import ReadsMixin  # noqa: E402
 from memory.search import SearchMixin  # noqa: E402
 from memory.standards import StandardsMixin  # noqa: E402
@@ -105,6 +106,7 @@ class MemoryService(
     EditMixin,
     DeleteMixin,
     GraphAdminMixin,
+    ProvenanceMixin,
 ):
     """Encapsulates all memory business logic.
 
