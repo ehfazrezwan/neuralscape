@@ -179,9 +179,13 @@ flowchart TB
 
 **Invariant: every derived artifact carries materialized effective access metadata, maintained on creation, reaffirmation, and merge.**
 
-**(i) Stamp the source.** Every episode carries the write's access attributes as first-class properties — `ns_owner_user_id`, `ns_visibility`, `ns_project_id`, `ns_sensitivity`, `ns_memory_id`. These are exactly the values `memory/write.py` already resolves (`effective_visibility`, owner, project, plus the Phase 0 sensitivity class), so stamping costs nothing and makes the episode self-describing rather than describable only by its partition.
+**(i) Stamp the source.** Every episode carries the write's access attributes as first-class properties — `ns_owner_user_id`, `ns_visibility`, `ns_project_id`, `ns_sensitivity`, `ns_memory_id`. On the single-fact path these are exactly the values `memory/write.py` already resolves (`effective_visibility`, owner, project, plus the Phase 0 sensitivity class), so stamping costs nothing and makes the episode self-describing rather than describable only by its partition.
 
-**(ii) Project onto derivatives.** Every entity node and `RELATES_TO` edge carries *materialized effective metadata* aggregated over all episodes behind it: `ns_effective_owners` (set union), `ns_min_visibility` (most restrictive parent), `ns_effective_projects` (union), `ns_max_sensitivity` (most restrictive class present), alongside the parent-episode list edges already carry.
+**(i-a) An episode must be homogeneous in access class — and today one is not.** A single `ns_visibility` can only describe an episode whose facts all share one. `remember_conversation` violates that: `write.py::_batch_store_facts` stores N facts whose tiers come from N per-category defaults and per-fact sensitivity gates, while the graph side builds **one** episode over the whole cleaned transcript, hard-coded into the caller's `private` group. Neither stamp would be correct — `private` over-restricts every derivative of a `shared` fact (silent recall loss), `shared` publishes private transcript text. So Phase 2 changes the write path: group the stored facts by their effective `(visibility, owner_user_id, project_id, sensitivity)` tuple and emit **one episode per partition**, each carrying only the utterances that produced that partition's facts, each stamped homogeneously. **The cost is real:** a mixed conversation becomes 2–3 smaller episodes, so entity resolution runs over shorter contexts and a relation spanning two partitions is no longer co-derived inside one episode (it can still be established by reaffirmation across episodes). The alternative — keep one episode and carry per-fact access metadata on the `MENTIONS` links and `entity_edges` instead — preserves the extraction context but leaves the episode node itself unstampable, and episode listing and full-text search would then have no attribute to fail closed on (L3). NS takes the partition; per-link metadata stays on the table only for ingest paths whose episode body is not user-visible text.
+
+**(ii) Project onto derivatives.** Every entity node and `RELATES_TO` edge carries *materialized effective metadata* aggregated over all episodes behind it: `ns_effective_owners` (set union), `ns_min_visibility` (most restrictive parent), `ns_effective_projects` (union), `ns_max_sensitivity` (most restrictive class present), alongside the parent-episode list edges already carry. Each artifact also carries `ns_source_version` — the projection generation of the parent set it was computed from — which L3 checks (see **Fail-closed**).
+
+Community nodes and their membership edges are derived artifacts too, and they are **not** covered by this projection: they carry synthesized summaries, they are returned by `graph_admin.py::get_graph_communities` and `/graph/communities`, and boundary-aware community building is a Phase 4 item. Until then L3 excludes them from every read surface rather than serving unprojected aggregates (below).
 
 Projecting ingestion-time metadata onto every derived artifact, and evaluating policy against the *combined, deduplicated* set, is the mechanism a commercial Graphiti-based platform describes as a natural consequence of the architecture rather than a bolted-on feature. NS adopts the mechanism; it does **not** adopt the accompanying framing that the combination predicate is entirely the application's business (see L3).
 
@@ -257,15 +261,19 @@ sequenceDiagram
 2. **Direct graph endpoints** — `/v1/graph/search`, `/graph/*`, node/edge/episode listing, episode full-text search: same predicate, same function.
 3. **Vector leg and read-by-id** — a non-derived artifact's own `visibility`/`owner_user_id` *are* its L2 attributes, so the predicate degenerates to today's check, expressed through the same function so there is one definition of "readable".
 
+4. **Communities are excluded, not filtered.** A community node has no projected metadata to evaluate until Phase 4, and its `summary` is an aggregate over an entity set that may straddle a boundary. From Phase 3 enforcement, `get_graph_communities`, `/graph/communities`, and the `communities` key of every graph-search result return **empty** by default, behind a `graph_communities_enabled` flag defaulting off. This is a stated recall regression, not a silent one: it removes an aggregate surface nothing else can bound. Phase 4 re-enables it once communities are synthesized inside one access boundary (§9) and carry the same effective metadata as entities, at which point the exclusion becomes an ordinary predicate evaluation.
+
 **Episode content is an artifact.** `Episodic.content` is memory text; every listing and full-text path over episodes evaluates the same predicate. Phase 0 removed the "expired but still listed" gap for nodes and edges; L3 closes the episode equivalent structurally, by making the check about attributes rather than liveness.
 
-**Fail-closed.** Missing or unparseable effective metadata → predicate false, artifact dropped, WARNING logged. A backfill gap must degrade to reduced recall, never to exposure.
+**Fail-closed.** Missing or unparseable effective metadata → predicate false, artifact dropped, WARNING logged. A backfill gap must degrade to reduced recall, never to exposure. The same rule covers **torn projections**: each episode carries a monotonic `ns_projection_version`, each derived artifact records the `ns_source_version` it was computed from, and an artifact whose recorded version is behind any of its current parents' is treated as having no metadata at all — dropped, and queued for re-projection. A read that races a re-scope therefore sees either the old consistent state or nothing; it can never see an artifact still advertising the permissions its parent has just given up.
 
 ### L4 — Lifecycle
 
 **Invariant: an access-attribute change is a metadata re-projection, and a delete is a provenance cascade. Neither is ever a text match.**
 
-**Visibility change = re-projection.** Today a tier change means "move the row, destroy the old derivation, re-derive from scratch" (Phase 0's cascade + re-enrichment). In v2: update the episode's `ns_visibility` in place, then recompute effective metadata on every artifact whose parent set contains it. No re-extraction, no LLM call, no transient recall loss in the single-parent case.
+**Visibility change = re-projection, in one transaction.** Today a tier change means "move the row, destroy the old derivation, re-derive from scratch" (Phase 0's cascade + re-enrichment). In v2: update the episode's `ns_visibility` in place, then recompute effective metadata on every artifact whose parent set contains it. No re-extraction, no LLM call, no transient recall loss in the single-parent case.
+
+The episode update and the dependent recompute are **a single Cypher write transaction**, not two steps — the whole point of the change is immediate revocation, and a sequence of "restrict the episode, then walk its dependents" has a window in which a concurrent reader sees the new private stamp on the episode while an edge still advertises the old permissive `ns_min_visibility` and passes L3. One statement, bounded by the episode's `entity_edges` and `MENTIONS` sets (the same two primitives `provenance.py` already walks), matches the `_run_on_bridge` single-statement idiom Phase 0 established and keeps the whole re-scope inside one commit. Two backstops for the cases a single transaction cannot cover — a fan-out too large to batch, or a crash mid-commit: the episode's `ns_projection_version` is bumped **first within the transaction**, so any dependent not yet rewritten is stale-by-version and L3 drops it (fail-closed, §L3); and re-scope narrowing (shared → private) is applied before widening work, so a partial application is always more restrictive than the intended end state, never less.
 
 ```mermaid
 flowchart LR
@@ -281,9 +289,11 @@ Edge B is where the hard AND invariant does real work: the edge is neither silen
 
 Entity summaries stay a special case — unconditionally cleared for every entity the re-projected episode mentions, with re-summarization scheduled on the enrichment queue.
 
-**Delete = cascade with support counting.** A fact survives only while at least one *readable* episode still supports it. This is the same rule a commercial Graphiti-based platform describes for right-to-be-forgotten: remove a fact or node only when no remaining episode supports it, so deleting one of three conversations that independently established a relationship does not remove the fact. NS adds one twist — support is counted over episodes **still readable at the querying boundary**, not merely over episodes that still exist. An edge supported only by episodes nobody can read is not a surviving fact; it is a leak with extra steps.
+**Delete = cascade with support counting over compatible parents.** A fact survives only while its *surviving* parent set still projects to an artifact somebody can read. This is the same rule a commercial Graphiti-based platform describes for right-to-be-forgotten — remove a fact or node only when no remaining episode supports it, so deleting one of three conversations that independently established a relationship does not remove the fact — with one correction NS has to make.
 
-Phase 0 implements the deletion half in its strictest form (expire even multi-parent edges). Phase 4 relaxes it to support-counted survival **only** once effective metadata is materialized and trustworthy — never before.
+"Readable episode" is the wrong test, because readability is caller-relative and support is a global property of the artifact. Alice-private and Bob-shared parents are each readable by *someone*, so a per-parent readability count says "supported" while the artifact they jointly project to is readable by nobody — which the AND predicate says must be expired. Support is therefore counted over **compatible parent sets**: partition the surviving parents by access class — the same `(effective owner set, visibility, project, sensitivity)` boundary episodes are made homogeneous on in L2 — and the edge survives iff at least one partition, projected on its own, satisfies `readable(C, ·)` for some principal `C`. That is a property of the artifact, evaluable without a caller. When exactly one partition qualifies, the edge is re-projected over that partition alone and the incompatible parents are dropped from its parent list; when two or more qualify (say two independent shared parents), the edge keeps both; when none does, it is expired and re-derived from whichever parents remain live.
+
+Phase 0 implements the deletion half in its strictest form (expire even multi-parent edges). Phase 4 relaxes it to compatible-set support counting **only** once effective metadata is materialized and trustworthy — never before, and the strict cascade stays the fallback if the fuzz gate does not stay at zero.
 
 **The episode itself is an artifact.** Deleting a memory hard-deletes its episode node, as Phase 0 does. NS deliberately diverges from the "episodes are the raw, non-lossy record and are never discarded" stance: an episode body on the single-fact path *is* the user's text, and a self-hosted product that promises deletion must actually delete it.
 
@@ -306,26 +316,35 @@ flowchart TB
     human -. "a token is issued FOR a seat and can only narrow that seat's reach" .-> agent
 ```
 
-| Role | Can |
-|---|---|
-| **Member** | read/write own private; read shared + standard; write shared; edit own content/tier; edit shared metadata |
-| **Dictator** | Member + write/delete `standard`-tier memories (existing capability, kept as an orthogonal flag rather than a rank) |
-| **Admin** | Member + run remediation/audit for any seat, manage seats and token policy sets, read the change audit |
-| **Owner** | Admin + deployment configuration, sensitivity class set, role assignment |
+`Dictator` is a **capability**, not a rank, and it is deliberately not folded into `Admin`. The two overlap but neither contains the other's intent: dictator is about *authoring org truth and cleaning it up*; Admin is about *administering the deployment's principals*. The matrix below is what each may do — ✓ = already shipped, ○ = arrives with the role in Phase 5.
 
-Today only Member and Dictator exist. Admin/Owner arrive in Phase 5 and must be backward compatible: a deployment with only `dictator_user_ids` set behaves as if dictators are Admins.
+| Capability | Member | Dictator | Admin | Owner |
+|---|:--:|:--:|:--:|:--:|
+| read/write own private; read shared + standard; write shared | ✓ | ✓ | ✓ | ✓ |
+| edit own content/tier; edit shared *metadata* (team housekeeping) | ✓ | ✓ | ✓ | ✓ |
+| write/delete `standard`-tier memories and project standards | | ✓ | | |
+| edit or delete another seat's memory (`_check_edit_permission` bypass) | | ✓ | | |
+| read any card pool (`card_read_allowed` override) | | ✓ | | |
+| run `rescope_private_derivatives` / `audit_private_leakage` for any seat | | ✓ | ○ | ○ |
+| manage seats: invite, disable, assign roles | | | ○ | ○ |
+| issue/attach/detach agent token policy sets; kill switch | | | ○ | ○ |
+| read the change audit and the read audit | | | ○ | ○ |
+| deployment configuration, sensitivity class set, dictator list | | | | ○ |
 
-**Agent plane (ABAC).** A token carries zero or more **policy sets** — named, versioned documents with `mode` (`enforce` | `report_only`), `default` (`deny` for agent tokens, `allow` only for legacy compatibility), `actions` (allow/deny over MCP tool names and REST operation ids, plus a `readonly` macro), and `attributes` (allow/deny predicates over an artifact's effective metadata: visibility, sensitivity, project_id, category, tags, workspace). `report_only` evaluates every rule and logs what *would* have been blocked without blocking it — the dry-run discipline that makes a restrictive rollout survivable.
+**No automatic promotion.** The tempting shortcut — "a deployment with only `dictator_user_ids` set behaves as if dictators are Admins" — is rejected. It is not backward compatible: it silently hands every configured dictator seat management and token-policy control they were never granted, in deployments where `dictator_user_ids` was set for the narrow purpose of authoring the `standard` tier. Instead: Phase 5 introduces `admin_user_ids` (and `owner_user_ids`) as separate configuration, empty by default; a deployment with no Admin configured has no Admin, and the Admin-only capabilities simply do not exist there — every Phase 0 capability keeps working exactly as it does today, because those rows stay dictator-gated. Migration is an explicit operator step (add the ids, restart), surfaced by a startup INFO line naming the dictators and telling the operator which of them, if any, they intended to also make Admins. Once Admin exists, the remediation/audit rows are readable by both — the only place the two roles overlap, and the place a deployment most plausibly wants them to.
 
-Two rules keep this from becoming a privilege-escalation surface:
+**Agent plane (ABAC).** A token carries zero or more **policy sets** — named, versioned documents with `mode` (`enforce` | `report_only`), `default` (`deny` for agent tokens, `allow` only for legacy compatibility), `actions` (allow/deny over MCP tool names and REST operation ids, plus a `readonly` macro), and `attributes` (allow/deny predicates over an artifact's effective metadata: visibility, sensitivity, project_id, category, tags, workspace). `report_only` evaluates every rule and logs what *would* have been blocked without blocking it — the dry-run discipline that makes a *widening* survivable.
+
+Three rules keep this from becoming a privilege-escalation surface:
 
 1. **A policy set can only narrow.** Effective permission is `seat_permissions ∩ policy_set`. Attaching a policy is never a way to reach another seat's private memories.
 2. **The L3 visibility invariant is not expressible in a policy.** No attribute rule turns the AND predicate into an OR. Policies subtract; they never relax confidentiality.
+3. **`report_only` is never a token's initial mode.** A newly issued agent token is created in `enforce` with `default: deny` and no allow rules — it can do nothing until an operator writes the rules it needs. `report_only` is an explicit opt-in on a token that *already* has a scoped, enforcing policy, and it is used to soak a proposed **widening** (new actions, a looser attribute rule) before committing to it. Issuing in `report_only` would invert the guarantee: because `report_only` blocks nothing — the test matrix requires results identical to no policy at all — a token issued that way carries its full human-seat reach for the whole "rollout" window, which is precisely the state default-deny exists to prevent, and precisely the window a prompt-injected agent (A3) needs.
 
 ```yaml
 policy_set:
   name: code_review_agent
-  mode: report_only          # flip to `enforce` after a clean soak
+  mode: enforce              # `report_only` only to soak a widening of an existing policy
   default: deny
   actions:
     allow: [recall_memories, search_knowledge_graph, get_project_context]
@@ -366,7 +385,11 @@ The motivation is A3: an agent that can browse the web can be prompt-injected, a
 | `ns_project_id` | string? | |
 | `ns_sensitivity` | string? | class from the write-time gate |
 | `ns_memory_id` | string | durable reverse link to the Qdrant row |
+| `ns_projection_version` | int | bumped on every access-attribute change; dependents record it (torn-write detection) |
+| `ns_provenance` | string? | `linked` / `mapped` / `unresolved` — how Stage-2 backfill established the above |
 | `ns_schema_version` | int | projection schema version, for staged backfill |
+
+All of these must survive a later re-save of the same episode, which today they would not — see §6.1 item 1.
 
 **`Entity`** and **`RELATES_TO`** — new materialized properties, recomputed at every parent-set change:
 
@@ -377,6 +400,7 @@ The motivation is A3: an agent that can browse the web can be prompt-injected, a
 | `ns_effective_projects` | list\<string\> | set union |
 | `ns_max_sensitivity` | string? | most restrictive class present |
 | `ns_projection_at` | datetime | last recompute — staleness detection |
+| `ns_source_version` | int | max `ns_projection_version` across the parent set at recompute; behind any current parent ⇒ fail closed |
 | `ns_workspace` | string? | reserved (see Q3) |
 
 The heuristic `memory_id` / `ns_visibility` / `ns_owner` stamps from `attach_memory_id` are **superseded**. They stay readable during migration (the wiki synthesizer uses them) and retire at the end of Phase 2. Note the name collision: `Entity.ns_visibility` (single-valued, window-matched, first-writer-wins) is *not* `Entity.ns_min_visibility` (aggregate, provenance-derived, maintained). Phase 2 writes the new properties and leaves the old ones untouched.
@@ -419,7 +443,7 @@ flowchart TB
     SENS --> VIS["effective visibility<br/>(explicit &gt; gate &gt; seat default &gt; category default)"]
     VIS --> ROW["Qdrant row<br/>+ visibility, owner, sensitivity, access_version"]
     VIS --> GID["group_id = _build_group_id(...)<br/>(L1 pre-filter key)"]
-    GID --> EP["Graphiti episode<br/>+ ns_* attribute stamps (L2i)"]
+    GID --> EP["Graphiti episode per access partition<br/>+ ns_* attribute stamps (L2i, L2i-a)"]
     EP --> LINK["persist graph_episode_uuid on the row"]
     EP --> PROJ["project effective metadata onto<br/>new + reaffirmed edges and nodes (L2ii)"]
     PROJ --> AUD["L6 change audit entry"]
@@ -427,7 +451,14 @@ flowchart TB
 
 Changes relative to today:
 
-1. `add_episode` receives the `ns_*` attributes and stamps them (requires a pass-through for arbitrary episode properties in the NS-maintained mem0 Graphiti adapter — a subtree-fork change, so note it in the upstream-delta report).
+1. **Episode stamping is a `graphiti_core` change, not an `add_episode` argument.** Passing `ns_*` values through the adapter is necessary and nowhere near sufficient, for three reasons visible in the vendored subtree:
+   - `EpisodicNode` (`graphiti/graphiti_core/nodes.py:315–325`) declares a **fixed** field set (`source`, `source_description`, `content`, `valid_at`, `entity_edges` on top of `Node`); there is no arbitrary-property bag to carry `ns_*` into the driver, and `EpisodicNode.save` (`nodes.py:334–348`) builds an explicit nine-key `episode_args` dict, so anything not in that dict is never sent.
+   - Every episode save is a **whole-map replace**, so a later save of the same episode silently erases stamps written earlier: `get_episode_node_save_query` — Neo4j `node_db_queries.py:63`, FalkorDB `:56`, Neptune `:35` — is `MERGE (n:Episodic {uuid: $uuid}) SET n = {uuid: …, valid_at: $valid_at}`, and `get_episode_node_save_bulk_query` does the same under `UNWIND` at `:106` (Neo4j), `:98` (FalkorDB), `:75` (Neptune). Only the Kuzu variants (`:39–51`, `:80–92`) set named properties individually and would preserve them.
+   - Reads project a fixed column list: `EPISODIC_NODE_RETURN` (`node_db_queries.py:112–122`) names nine properties, so even a correctly stamped episode comes back without its `ns_*` values and the predicate has nothing to evaluate.
+
+   Phase 2 must therefore enumerate and change **every** episode write and read path in the subtree — the single save, the bulk save, each provider variant, and the return projections — converting `SET n = {…}` to `SET n += {…}` (or an explicit named-property list, as Kuzu already does) and widening the return list. The same defect applies to the artifacts projection writes onto: entity saves at `node_db_queries.py:146, 171, 185, 211, 231, 261` (`SET n = $entity_data` / `SET n = node`) and edge saves at `edge_db_queries.py:70, 79, 115, 133, 144, 180` (`SET e = $edge_data` / `SET r = edge`) are whole-map replaces too, so an ordinary re-save during enrichment would drop `ns_min_visibility` from an edge that already had it — as are the community `HAS_MEMBER` saves (`edge_db_queries.py:234, 271`), which Phase 4 needs when communities come under projection. All of these are map-replace → `+=` conversions plus a widened return projection.
+
+   This is a **subtree fork change** in `graphiti/`, in the same class of re-graft risk as the mem0 graph layer: every upstream sync will try to restore the map-replace form. Record it in `docs/neuralscape/14-upstream-delta-report.md`, and gate it with a **preservation test** that writes an episode with `ns_*` stamps, triggers a re-save through `add_episode` and through the bulk path, and asserts the stamps are still present and still returned by a read — the test that would fail the moment a sync silently re-grafts `SET n = `.
 2. After enrichment, a **projection step** runs on the graph worker: for every edge/node the episode touched, recompute effective metadata over the full parent set. This replaces the time-window `attach_memory_id` heuristic with a provenance-exact operation driven by `EpisodicNode.entity_edges` and the `MENTIONS` relationships — the same two primitives `provenance.py` already uses for the cascade.
 3. Projection is idempotent and cheap (one or two Cypher statements per episode), so retries and duplicate enrichments converge.
 4. The sensitivity classification and its source land on the row, so a later audit can answer "why is this private?".
@@ -457,9 +488,17 @@ flowchart LR
 
 **Stage 1 — forward-only.** New writes stamp and project; no read behavior changes. Shippable on its own.
 
-**Stage 2 — backfill.** An idempotent, resumable graph-worker job: scroll `Episodic` nodes lacking `ns_schema_version` in `group_id` order; derive each episode's attributes from (a) the Qdrant row via `ns_memory_id` / `graph_episode_uuid` where the link exists — authoritative — or otherwise (b) **decode the partition**, since `group_id` is by construction a lossless encoding of `(visibility, owner, project, workspace)`; recompute effective metadata over every edge and entity the episode touches; stamp `ns_schema_version` to keep the scroll resumable. Batches of a few hundred episodes per transaction, on the graph queue so it cannot starve the fast paths.
+**Stage 2 — backfill.** An idempotent, resumable graph-worker job: scroll `Episodic` nodes lacking `ns_schema_version` in `group_id` order; establish each episode's provenance; recompute effective metadata over every edge and entity it touches; stamp `ns_schema_version` to keep the scroll resumable. Batches of a few hundred episodes per transaction, on the graph queue so it cannot starve the fast paths. Provenance is established in three tiers, and only the first two produce a usable stamp:
 
-Step (b) is the one place where partition membership is legitimately treated as ground truth — during migration it is the only record we have, and it is exactly as good as today's enforcement.
+**(a) The durable link — authoritative.** The Qdrant row found via `graph_episode_uuid` (Phase 0) or `ns_memory_id`. Its `visibility` / `owner_user_id` / `project_id` / `sensitivity` are the values the write actually resolved. Every episode written since Phase 0 lands here.
+
+**(b) An explicit legacy mapping — reconstructed, then verified.** For pre-Phase-0 episodes with no persisted link, a one-time pass builds a `(group_id, episode_content_hash) → memory_id` table by walking the Qdrant collection and hashing each row's content the way the episode body was derived, then confirming the candidate row's own `group_id` matches the episode's. This is a *lookup* against real rows, so what it produces is the row's recorded attributes, not an inference. Ambiguous matches (two rows, one hash) resolve to the most restrictive of the candidates.
+
+**(c) Everything else — fail closed.** An episode neither (a) nor (b) can place is stamped `ns_visibility = private`, `ns_effective_owners = {}` (empty, therefore matching no caller), `ns_max_sensitivity` at the most restrictive configured class, and flagged `ns_provenance = unresolved`. It is readable by nobody and appears in a Stage-2 report the operator works through — an owner can be attached by an Admin operation with a change-audit entry, or the episode can be deleted. Unresolved episodes are counted and alerted on; they are a recall loss, and a recall loss is the correct direction for data whose owner we cannot establish.
+
+**What is explicitly not a fallback: decoding `group_id`.** Treating the partition as a lossless encoding of `(visibility, owner, project, workspace)` looks like a free fourth tier. It is not one, in two independent ways. `_build_group_id` **omits the owner entirely** for `shared` and `standard` writes — `shared--project--{pid}` names no user, so an owner simply cannot be recovered from it. And the encoding is not injective: the delimiters `--project--` and `--ws--` are not escaped and the identifiers they join are not constrained to exclude them, so a project id containing `--ws--` produces a string a decoder reads as a workspace suffix, silently assigning the wrong provenance or merging two distinct identities. Decoding would therefore fail *open* on exactly the rows least able to survive it. Partition membership is still trusted for one thing — it is a *check* on candidate (b) matches, never a source of attributes.
+
+**Forward fix.** From Phase 2, `group_id` construction moves to a structured, escaped key (`v2|{visibility}|{owner}|{project}|{workspace}`, each field percent-escaped, empty fields explicit) so future partitions *are* injective and decodable. Old ids keep their current shape and are read as-is; the version prefix makes the two distinguishable, and nothing about correctness depends on decoding either.
 
 **Stage 3 — shadow mode.** Enable the predicate service-wide in `report_only`. Every read logs what it *would* have removed. Operators compare against expected recall and investigate would-blocks on artifacts that should be readable — those indicate backfill gaps, fixed by re-running Stage 2 for the affected groups, never by relaxing the predicate.
 
@@ -485,11 +524,15 @@ The alternative is to compute effective metadata at query time: for each candida
 
 These three subsystems create artifacts that are not any single memory's derivative — the A5 aggregation surface.
 
-**Dreaming / consolidation** (`extensions/dreaming/`) sweeps that invalidate, prune, merge, and synthesize. Under v2: every artifact a sweep creates inherits effective metadata computed over the union of its inputs' parent episodes — same rule, no exception. A merge of two artifacts with different `ns_min_visibility` produces an artifact readable by nobody, which is a signal the merge should not have happened: sweeps must **group merge candidates by effective visibility** and refuse cross-boundary merges rather than manufacture dead artifacts. `graph_patcher.py` is the natural home for the projection helpers — it already owns the raw-Cypher patch idiom and the bridge dispatch pattern.
+**Dreaming / consolidation** (`extensions/dreaming/`) sweeps that invalidate, prune, merge, and synthesize. Under v2: every artifact a sweep creates inherits effective metadata computed over the union of its inputs' parent episodes — same rule, no exception. A merge of two artifacts on different sides of a boundary produces an artifact readable by nobody, which is a signal the merge should not have happened: sweeps must **group merge candidates by the full access boundary key** — `(ns_effective_owners, ns_min_visibility, ns_effective_projects, ns_max_sensitivity)`, the same tuple L2 makes episodes homogeneous on — and refuse cross-boundary merges rather than manufacture dead artifacts. Grouping by visibility alone is not enough, for the reason spelled out under Communities below. `graph_patcher.py` is the natural home for the projection helpers — it already owns the raw-Cypher patch idiom and the bridge dispatch pattern.
 
 **Dedup** keys on `(user_id, content_hash, scope, project_id, visibility, workspace)`. Visibility is already part of the dedup identity, so the same text at two tiers is two rows — correct, and it stays correct. What changes: a dedup *hit* that reaffirms an existing memory adds a parent, so it must trigger a projection recompute on that memory's derived artifacts.
 
-**Communities.** Community detection groups entities and synthesizes community summaries; a community spanning a private and a shared entity is an aggregation leak by construction. Options, increasing in cost: (1) **partition-scoped community building** — detect per effective-visibility class so a community never spans a boundary (cheapest; loses some cross-pool insight); (2) **boundary-aware summarization** — build globally, synthesize one summary per readable subset (N summaries per community); (3) **read-time summarization** for the caller's subset (correct, expensive, defeats precomputation). Phase 4 ships (1); (2) remains open (Q1).
+**Communities.** Community detection groups entities and synthesizes a community summary; a community spanning a private and a shared entity is an aggregation leak by construction, and `get_graph_communities` / `/graph/communities` return that summary verbatim. Two things follow.
+
+*Until Phase 4, communities are excluded from every read surface* (L3, enforcement point 4), because there is no projected metadata on them to evaluate and no way to bound what a global summary aggregated. Excluding a whole surface is a blunt instrument; serving an unprojected aggregate while claiming L2 covers every derived artifact would be worse.
+
+*From Phase 4, communities are built per full access boundary, not per visibility class.* Detecting "one community per effective-visibility class" is the cheap option and it is wrong on its own: Alice-private and Bob-private entities are both `private`, so a visibility-keyed grouping puts them in one community whose union has two effective owners — an artifact readable by nobody under the AND predicate, which nonetheless aggregated and summarized both users' content before anyone evaluated it. The predicate cannot repair that; the summary text already exists. So candidates are grouped by the same **access boundary key** used for merges: same owner set, same visibility, same project, same sensitivity — which in practice means private data gets **one community set synthesized per owner**, and shared/standard data gets the global one. The remaining options are unchanged in cost order: (2) build globally and synthesize one summary per readable subset; (3) summarize at read time for the caller's subset. Phase 4 ships boundary-keyed building; (2) remains open (Q1).
 
 **The wiki/card synthesizer** walks community → source memories using the legacy stamps. It migrates to `ns_effective_owners` during Phase 2, and its output cards are themselves derived artifacts requiring projection.
 
@@ -499,23 +542,28 @@ These three subsystems create artifacts that are not any single memory's derivat
 
 **Keep category-default visibility.** `DEFAULT_VISIBILITY_FOR_CATEGORY` stays. It encodes a genuinely useful intuition — a `decision` or a `convention` is usually team knowledge, a `preference` is usually not — and removing it would make the shared pool useless in exactly the deployments that rely on shared team knowledge. The Phase 0 sensitivity gate is the corrective for the case where a category default would publish something it shouldn't, without turning the whole system private.
 
-**Add a per-seat `default_visibility`,** consulted between the sensitivity gate and the category default:
+**Add a per-seat `default_visibility`,** consulted between the explicit caller value and the category default. The gate is **not** one option in that chain: it is a floor applied *after* the requested value is resolved, exactly as `memory/sensitivity.py::resolve_gated_visibility` implements it today. Writing it as "explicit, else gate" would let a bare `visibility="shared"` outrank a matching sensitivity class without `sensitivity_override=True`, which contradicts the invariant locked below and the Phase 0 behavior:
 
 ```
+requested =
+      explicit caller value                  # visibility is not None
+   else seat default_visibility, if set
+   else category default
+
 effective_visibility =
-      explicit caller value
-   else  sensitivity-gate forced value (unless explicitly overridden)
-   else  seat default_visibility, if set
-   else  category default
+      requested                              # gate disabled, or content did not classify
+   else requested, if (visibility is not None AND sensitivity_override)   # gate_action = "bypassed"
+   else "private"                            # gate_action = "forced" — an explicit value
+                                             # does NOT bypass on its own
 ```
 
-This lets a seat who works mostly on confidential material opt into private-by-default without the deployment going blanket-private, and lets a deployment that is genuinely one shared brain set `shared` for everyone. Default: unset — category defaults apply, preserving today's behavior exactly.
+Note the second branch: the bypass needs *both* an explicit `visibility` and `sensitivity_override=True`. A seat-level or category-level default can never bypass the gate, because neither is an explicit caller value — so opting a whole seat into `shared` still cannot publish credentials. This lets a seat who works mostly on confidential material opt into private-by-default without the deployment going blanket-private, and lets a deployment that is genuinely one shared brain set `shared` for everyone. Default: unset — category defaults apply, preserving today's behavior exactly.
 
 **Sensitivity classes.** The four Phase 0 classes stay: `credentials_pii`, `equity_compensation`, `client_commercial`, `financial`. Locked rules that must not drift without a spec update: credentials/PII trigger alone; strong finance vocabulary triggers alone; a bare currency amount never triggers alone (it must co-occur with finance-adjacent vocabulary); precedence is `credentials_pii > equity_compensation > client_commercial > financial`. The class *set* that forces private is per-deployment configurable (`sensitivity_private_classes`), the gate is flag-controlled (`sensitivity_gate_enabled`, default on), and the escape hatch requires *both* an explicit `visibility` and `sensitivity_override=True`. Phase 5 makes the classes first-class policy attributes — an agent token denied `credentials_pii` regardless of visibility — which is where classification earns its keep beyond the write-time gate.
 
 **`standard` tier unchanged.** Dictator-written, everyone-readable, always injected. In v2 it is simply the least restrictive value of `ns_min_visibility` and participates in the AND rule like everything else (with the caveat in Q2).
 
-**Agent tokens default-deny; human tokens default-allow-within-seat.** A human's token grants exactly their seat's permissions. An agent token starts denying everything and is opened up by an explicit policy set, issued in `report_only` by default so a misconfiguration shows up as log noise rather than a broken agent.
+**Agent tokens default-deny; human tokens default-allow-within-seat.** A human's token grants exactly their seat's permissions. An agent token starts in `enforce` denying everything, and is opened up by an explicit policy set. A misconfigured agent token is therefore a *broken agent* — a loud, immediate, local failure — and not log noise on a token that still has its seat's full reach. `report_only` exists for the opposite direction: soaking a proposed widening of a policy that is already scoped and enforcing (L5, rule 3).
 
 ---
 
@@ -527,10 +575,14 @@ This lets a seat who works mostly on confidential material opt into private-by-d
 |---|---|
 | Predicate (`memory/access.py`) | every (min_visibility × owner-set × caller) combination; missing metadata → fail closed; malformed values → fail closed; standard tier; multi-owner private → readable by nobody |
 | Projection algebra | union of owners/projects; min of visibility across all tier pairs; max of sensitivity; empty / single / 3+ mixed-tier parent sets |
-| Projection maintenance | create; reaffirm; merge (both sides' parents preserved); re-scope; parent delete; idempotent double-apply |
-| Group-id encode/decode | `_build_group_id` round-trips through the Stage-2 decoder for all six shapes plus workspace suffixes |
+| Projection maintenance | create; reaffirm; merge (both sides' parents preserved); re-scope; parent delete; idempotent double-apply; an artifact whose `ns_source_version` is behind a parent fails closed |
+| Episode homogeneity | a conversation whose facts span two tiers produces one episode per access partition, each stamped homogeneously, each containing only its partition's utterances; a single-tier conversation still produces exactly one episode |
+| Episode stamp preservation | `ns_*` survive a re-save through `add_episode`, through the bulk-save path, and are present in the read projection — the guard against a `SET n = ` re-graft (§6.1) |
+| Backfill provenance | tier (a) link resolves; tier (b) mapping resolves and is rejected when the candidate row's `group_id` disagrees; ambiguous match takes the most restrictive; unresolved rows are stamped private / empty-owner and reported, never guessed; `group_id` is never decoded for attributes |
+| Support counting | compatible-parent partitioning: two shared parents survive; private+shared expires; private-Alice+private-Bob expires; one qualifying partition re-projects onto that partition alone |
 | Identity binding | token wins; body mismatch → 400 on every route family incl. legacy; no-secret legacy fallback unchanged; MCP tools take no user argument |
-| Policy sets | default-deny; action allow/deny; attribute allow/deny; deny beats allow; `report_only` blocks nothing but logs everything; a policy cannot widen beyond its seat |
+| Policy sets | default-deny; action allow/deny; attribute allow/deny; deny beats allow; `report_only` blocks nothing but logs everything; a policy cannot widen beyond its seat; **a newly issued agent token is `enforce`+`deny` and can reach nothing until rules are attached — `report_only` is rejected as an initial mode** |
+| Roles | the capability matrix, row by row; a deployment with `dictator_user_ids` and no `admin_user_ids` has no Admin and every Phase 0 dictator capability is unchanged; no dictator is auto-promoted |
 | Sensitivity gate | regex-floor precision (bare amount alone does not trigger; amount + finance vocabulary does); class precedence; LLM-hint parsing with the field absent; forced-private end-to-end; override requires both flags |
 | Cascade (Phase 0 regression) | deterministic-name resolution; content-fallback resolution; mixed parentage expires both; surviving-node summary cleared; sole-mention node removed; idempotency; unresolved rows surfaced not swallowed |
 | Audit | read-audit shape incl. matched predicate and filtered counts; change-audit before/after snapshot; leakage audit zero on a clean fixture |
@@ -543,7 +595,11 @@ Fixture: three synthetic seats — owner, peer, colleague.
 |---|---|
 | Owner writes private; peer searches | peer sees nothing on any surface: vector search, graph search, node/edge listing, episode full-text, `ask`, timeline, get-by-id (404 not 403), reasoning-chain premise |
 | Owner writes shared, then flips to private | peer loses it **immediately** on all surfaces; owner keeps it; no re-extraction latency (v2 re-projection) |
+| Re-scope under concurrent reads | a reader looping against a memory being flipped shared → private sees the old permissive state or nothing, never a private-stamped episode alongside a still-permissive edge or summary |
+| `remember_conversation` mixing a `preference` (private) and a `decision` (shared) | two episodes, stamped `private` and `shared`; the shared fact's derivatives are readable by peers, the private transcript text is not, and no episode carries both |
 | Mixed parentage: owner-private + colleague-shared support the same relation | edge readable by nobody; expired; colleague's episode re-derives a clean fact on the next enrichment |
+| Communities, Phase 3 | `get_graph_communities`, `/graph/communities`, and the `communities` key of graph search return empty for every caller with the flag off |
+| Communities, Phase 4 | a community over Alice-private and Bob-private entities is never built; each owner gets their own community and summary; no community summary contains text from a boundary its reader cannot cross |
 | Shared entity mentioned by a private and a shared episode | entity survives; summary cleared; regenerated summary contains nothing from the private episode |
 | Control-shared: legitimately shared, non-sensitive | remains readable by peers throughout every remediation and backfill run (no over-privatization) |
 | Control-private: private from day one | never readable by peers at any stage |
@@ -595,7 +651,7 @@ flowchart LR
 
 **Scope.** Finish L0 and stand up L6's plumbing before anything depends on it.
 
-**Deliverables.** Audit every route (REST, MCP, admin) for caller-supplied identity and remove the last places a body/query `user_id` can influence scope when a token exists; drop `user_id` parameters from MCP tools that operate on the caller's own memory; startup warning when multi-seat usage is configured without a token secret; an append-only audit sink (structlog channel plus a Redis stream or a Neo4j `(:AuditEvent)` label — decide on retention grounds) with the read- and change-audit record shapes defined and the change audit wired to visibility and dictator-list changes; Admin/Owner roles introduced as configuration only, with dictators grandfathered as Admins.
+**Deliverables.** Audit every route (REST, MCP, admin) for caller-supplied identity and remove the last places a body/query `user_id` can influence scope when a token exists; drop `user_id` parameters from MCP tools that operate on the caller's own memory; startup warning when multi-seat usage is configured without a token secret; an append-only audit sink (structlog channel plus a Redis stream or a Neo4j `(:AuditEvent)` label — decide on retention grounds) with the read- and change-audit record shapes defined and the change audit wired to visibility and dictator-list changes; `admin_user_ids` / `owner_user_ids` introduced as configuration only, empty by default, with **no** automatic promotion of dictators and a startup line telling the operator which seats are dictators today so the migration is a deliberate act.
 
 **Exit criteria.** No route accepts an identity override with a valid token; a tier change produces a change-audit record with a before/after snapshot; the audit sink survives a worker restart; suite and container gate green.
 
@@ -607,11 +663,11 @@ flowchart LR
 
 **Scope.** Materialize effective access metadata everywhere. **No read behavior changes** — pure data enrichment, which is what makes it safe to ship alone.
 
-**Deliverables.** `ns_*` episode stamps at `add_episode` (needs a pass-through in the NS-maintained mem0 Graphiti adapter); a projection routine in `graph_patcher.py` writing the five effective-metadata properties on edges and entities; projection called at every maintenance point (post-enrichment, reaffirmation, entity merge, dedup reaffirmation); Neo4j indexes; the Stage-2 backfill job (idempotent, resumable, `group_id`-decoding fallback); the wiki/card synthesizer migrated off the legacy heuristic stamps.
+**Deliverables.** `ns_*` episode stamps, which means the `graphiti_core` save/return changes enumerated in §6.1 item 1 plus the pass-through in the NS-maintained mem0 Graphiti adapter, plus the stamp-preservation test; **conversation enrichment split into one episode per access partition** (L2 i-a) — the one behavioral change in this phase; a projection routine in `graph_patcher.py` writing the effective-metadata properties on edges and entities; projection called at every maintenance point (post-enrichment, reaffirmation, entity merge, dedup reaffirmation); `ns_projection_version` / `ns_source_version` maintained; Neo4j indexes; the structured escaped `group_id` key for new writes; the Stage-2 backfill job (idempotent, resumable, three-tier provenance, fail-closed on unresolved) and its unresolved-episode report; the wiki/card synthesizer migrated off the legacy heuristic stamps.
 
-**Exit criteria.** Every artifact in a freshly built test graph carries effective metadata matching an independently computed expectation; backfill of a pre-v2 graph produces the same values Stage 1 would have; projection is idempotent under double-apply; no measurable change in read results (asserted, not assumed).
+**Exit criteria.** Every artifact in a freshly built test graph carries effective metadata matching an independently computed expectation; a mixed-tier conversation produces homogeneous episodes and no cross-tier stamp; `ns_*` survive single and bulk re-saves and appear in reads; backfill of a pre-v2 graph produces the same values Stage 1 would have for every resolvable episode and stamps the rest unreadable; projection is idempotent under double-apply; no measurable change in read results (asserted, not assumed).
 
-**Risk.** Medium. Touches the mem0 subtree fork (re-graft risk on the next upstream sync — document in the upstream-delta report). Backfill on a large graph needs batching discipline.
+**Risk.** Medium-high, revised up. Touches **two** subtree forks — the mem0 graph layer and now `graphiti_core`'s node/edge save queries and return projections, where every upstream sync will try to restore the whole-map `SET n = ` form; document both in `docs/neuralscape/14-upstream-delta-report.md` and rely on the preservation test to fail loudly when a sync undoes it. Episode partitioning is a write-path behavior change with a measurable extraction-context cost (L2 i-a), so it needs a recall check on the benchmark suites even though no read behavior changes. Backfill on a large graph needs batching discipline.
 
 ### Phase 3 — Read-boundary predicate (L3)
 
@@ -619,7 +675,7 @@ flowchart LR
 
 **Scope.** Make the predicate the enforcement point. This is the phase that changes the security model.
 
-**Deliverables.** `memory/access.py` (pure, exhaustively unit-tested); predicate applied in the graph leg of search, all graph listing/search endpoints, episode full-text, read-by-id / batch / timeline / reasoning-chain, `/v1/context`, and `ask`; filtering before fusion/rerank; shadow-mode flag then enforcement flag; `_get_group_ids` demoted to "pre-filter" in docstring and call sites; the differential benchmark harness (gate 2).
+**Deliverables.** `memory/access.py` (pure, exhaustively unit-tested); predicate applied in the graph leg of search, all graph listing/search endpoints, episode full-text, read-by-id / batch / timeline / reasoning-chain, `/v1/context`, and `ask`; communities excluded from every read surface behind `graph_communities_enabled` (default off) until Phase 4 projects them; version-mismatch fail-closed; filtering before fusion/rerank; shadow-mode flag then enforcement flag; `_get_group_ids` demoted to "pre-filter" in docstring and call sites; the differential benchmark harness (gate 2).
 
 **Exit criteria.** Shadow mode runs clean for a soak period on a real graph; single-scope suites within noise; the differential harness proves the removed set contains only unreadable artifacts; graph-leg p95 within budget; a deliberately mis-partitioned artifact (planted in the wrong `group_id`) is still refused.
 
@@ -631,9 +687,9 @@ flowchart LR
 
 **Scope.** Replace destroy-and-re-derive with in-place re-projection, and stop synthesis from crossing boundaries.
 
-**Deliverables.** Tier change = update the episode's `ns_visibility` plus recompute dependents (no re-extraction, no transient recall loss in the single-parent case); delete = support-counted cascade over **readable** supporting episodes (safe to relax Phase 0's strict rule only now that L2 is trustworthy); summary regeneration scheduled on the enrichment queue after a clear rather than waiting for an incidental pass; dreaming sweeps grouping merge candidates by effective visibility and refusing cross-boundary merges; communities built per effective-visibility class; episode content treated as an artifact everywhere it can be listed or searched.
+**Deliverables.** Tier change = update the episode's `ns_visibility` plus recompute dependents **in one transaction**, with the version bump first so a partial application fails closed (no re-extraction, no transient recall loss in the single-parent case); delete = support counting over **compatible parent sets** (safe to relax Phase 0's strict rule only now that L2 is trustworthy); summary regeneration scheduled on the enrichment queue after a clear rather than waiting for an incidental pass; dreaming sweeps grouping merge candidates by the full access boundary key and refusing cross-boundary merges; communities built per access boundary key — per owner for private data — and brought under projection, which is what lets Phase 3's blanket community exclusion be lifted; episode content treated as an artifact everywhere it can be listed or searched.
 
-**Exit criteria.** A tier flip is reflected in reads within one request cycle with no re-extraction; the mixed-parentage live scenario passes; deleting one of three independent supports leaves the fact live; no sweep produces an artifact readable by nobody; leakage audit zero after a randomized flip/delete/merge fuzz run.
+**Exit criteria.** A tier flip is reflected in reads within one request cycle with no re-extraction, and a reader racing the flip never observes a mixed state; the mixed-parentage live scenario passes; deleting one of three independent supports leaves the fact live while an Alice-private + Bob-private pair does not; no sweep or community build produces an artifact readable by nobody; community reads re-enabled with the predicate applied; leakage audit zero after a randomized flip/delete/merge fuzz run.
 
 **Risk.** Medium-high. Relaxing the strict cascade is a deliberate loosening and must be gated on the audit staying at zero through the fuzz run.
 
@@ -643,7 +699,7 @@ flowchart LR
 
 **Scope.** Give operators a way to bound an agent's blast radius.
 
-**Deliverables.** Human RBAC (Owner / Admin / Member with Dictator as an orthogonal capability), assignable in configuration and over an Owner-gated endpoint; policy sets (schema, validation, storage, attach/detach, versioning); action rules and attribute rules over effective metadata; default-deny for agent tokens and `report_only` for newly issued ones; an `explain` operation ("would this token be allowed to call X, and why") without which default-deny is unusable; an account-level kill switch; enforcement that policy sets only narrow; and configurable AND/OR predicate groups for **trust/verification** tags only, so applications can make the recall/precision trade the competitor's design contemplates inside a predicate space that structurally excludes confidentiality.
+**Deliverables.** Human RBAC (Owner / Admin / Member with Dictator as an orthogonal capability, no auto-promotion, the capability matrix in L5 as the spec), assignable in configuration and over an Owner-gated endpoint; policy sets (schema, validation, storage, attach/detach, versioning); action rules and attribute rules over effective metadata; newly issued agent tokens created in `enforce` with `default: deny`, with `report_only` available only as an opt-in on an already-scoped policy and rejected as an initial mode; an `explain` operation ("would this token be allowed to call X, and why") without which default-deny is unusable; an account-level kill switch; enforcement that policy sets only narrow; and configurable AND/OR predicate groups for **trust/verification** tags only, so applications can make the recall/precision trade the competitor's design contemplates inside a predicate space that structurally excludes confidentiality.
 
 **Exit criteria.** An agent token denying `credentials_pii` cannot retrieve such an artifact through any surface even when its seat can; a widening policy is rejected at validation; `report_only` yields identical results to no policy while logging every would-block; the kill switch takes effect within one request cycle; `explain` output matches actual enforcement over a randomized rule set.
 
@@ -679,7 +735,7 @@ Two further differences worth stating: NS does **not** send memory content to a 
 
 ## 14. Open questions
 
-**Q1 — Cross-boundary aggregation at write time.** *(Under investigation; blocks the final shape of Phase 4.)* Summaries and consolidations synthesized across a boundary are a leak the read predicate cannot repair, because by the time the predicate runs the content is already mixed. Options: (a) never synthesize across an effective-visibility boundary — simple, loses cross-pool insight; (b) synthesize per readable subset — N summaries per entity, with storage and LLM cost growing in the number of distinct readable subsets, which is small in practice for a small team; (c) synthesize at read time for the caller's subset — correct, expensive, defeats precomputation. Phase 4 ships (a) as the safe default. Whether (b) is worth it depends on how much cross-pool insight (a) actually costs, measurable on the multi-seat benchmark suite once it exists.
+**Q1 — Cross-boundary aggregation at write time.** *(Under investigation; blocks the final shape of Phase 4.)* Summaries and consolidations synthesized across a boundary are a leak the read predicate cannot repair, because by the time the predicate runs the content is already mixed. Options: (a) never synthesize across an access boundary — owner set included, not visibility alone, so private data is summarized per owner — simple, loses cross-pool insight; (b) synthesize per readable subset — N summaries per entity, with storage and LLM cost growing in the number of distinct readable subsets, which is small in practice for a small team; (c) synthesize at read time for the caller's subset — correct, expensive, defeats precomputation. Phase 4 ships (a) as the safe default. Whether (b) is worth it depends on how much cross-pool insight (a) actually costs, measurable on the multi-seat benchmark suite once it exists.
 
 **Q2 — Standard-tier interaction with the AND rule.** A fact co-derived from a `standard` episode (an authoritative org rule) and a `private` one becomes private — meaning an authoritative rule can be pulled out of the standard pool by someone privately restating it. Is that acceptable (it is the consistent application of most-restrictive-wins), or should `standard` be non-contaminating, i.e. a standard-parented fact stays standard and the private parent's contribution is simply not projected onto it? The second is more useful and less consistent. Current leaning: standard episodes are *additive-only* and never raise an artifact's restrictiveness, but a private parent still forces a separate private-scoped derivation. Needs a decision before Phase 3 enforcement.
 
