@@ -170,6 +170,46 @@ class TestProcessMemoryRaw:
         assert ctx["service"].store_raw.call_args[1]["visibility"] == "standard"
 
     @pytest.mark.asyncio
+    async def test_idempotency_check_uses_sensitivity_gate_resolved_visibility(
+        self, ctx, monkeypatch
+    ):
+        """F7 regression: the idempotency pre-check must key on the
+        RESOLVED (post sensitivity-gate) visibility, not the caller's raw
+        requested one. Here the caller requests `shared` (no override) for
+        sensitive content that the gate forces to `private`; a pre-existing
+        SHARED row with the same text must NOT be treated as a dedup hit —
+        doing so would return that shared row and silently skip the write
+        the gate meant to force private, leaving the content shared."""
+        from config import settings
+
+        monkeypatch.setattr(settings, "sensitivity_gate_enabled", True)
+        monkeypatch.setattr(
+            settings,
+            "sensitivity_private_classes",
+            "financial,equity_compensation,client_commercial,credentials_pii",
+        )
+        existing_shared = MemoryResponse(
+            id="shared-1",
+            memory="Approved a $50,000 client contract renewal",
+            category="decision",
+            visibility="shared",
+        )
+        ctx["service"].search.return_value = [existing_shared]
+        ctx["service"].store_raw.return_value = (
+            [MemoryResponse(id="priv-1", memory="Approved a $50,000 client contract renewal", visibility="private")],
+            True,
+        )
+        result = await worker.process_memory_raw(
+            ctx,
+            content="Approved a $50,000 client contract renewal",
+            user_id="ehfaz",
+            category="decision",
+            v2_extras={"visibility": "shared"},
+        )
+        assert "deduplicated" not in result
+        ctx["service"].store_raw.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_idempotency_check_failure_proceeds_with_store(self, ctx):
         """Idempotency search failure must not block the store path."""
         ctx["service"].search.side_effect = Exception("Qdrant transient")

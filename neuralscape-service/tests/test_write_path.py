@@ -355,6 +355,43 @@ class TestGraphEpisodeIdempotency:
         assert service._memory.graph.add.call_count == 2
         assert len(added) == 2
 
+    def test_dedup_survivor_episode_ref_not_repointed(self, service):
+        """F8 regression: a content-hash dedup SURVIVOR in ``stored`` must
+        NOT have its graph_episode_uuid/name repointed at a later
+        conversation's episode — only genuinely NEW rows get stamped.
+        Repointing a survivor would make a later cascade target the wrong
+        episode and leave the survivor's real episode live in the graph."""
+        _stateful_hash_dedup(service)
+        _wire_episode_tracking(service)
+        persist = MagicMock(wraps=service._persist_graph_episode_ref)
+        service._persist_graph_episode_ref = persist
+
+        # Conversation 1: stores one fact ("dark mode").
+        _mock_extraction(service, [["[preference] Loves dark mode themes"]])
+        [survivor] = service.extract_and_store(messages=MESSAGES, user_id="ehfaz")
+        assert persist.call_count == 1
+        persist.reset_mock()
+
+        # Conversation 2: different raw text (-> different episode), whose
+        # extraction re-derives the SAME fact (content-hash dedup survivor)
+        # plus one brand-new fact.
+        other_messages = [{"role": "user", "content": "Completely different session"}]
+        _mock_extraction(
+            service,
+            [["[preference] Loves dark mode themes", "[technical_skill] Knows Rust"]],
+        )
+        stored2 = service.extract_and_store(messages=other_messages, user_id="ehfaz")
+        assert len(stored2) == 2
+        new_fact = next(m for m in stored2 if m.id != survivor.id)
+        assert new_fact.id != survivor.id
+
+        # Only the NEW fact's id got a graph_episode_ref call from this
+        # second conversation — the survivor's ref (from conversation 1)
+        # must be left untouched.
+        persisted_ids = {c.args[0] for c in persist.call_args_list}
+        assert new_fact.id in persisted_ids
+        assert survivor.id not in persisted_ids
+
     def test_exists_probe_failure_fails_open(self, service):
         """A broken lookup degrades to today's behavior (episode added).
 
@@ -374,7 +411,10 @@ class TestGraphEpisodeIdempotency:
         mg._indices_built = True  # skip _ensure_indices
         mg.graphiti = MagicMock()
         mg.graphiti.add_episode = AsyncMock(
-            return_value=SimpleNamespace(edges=[], nodes=[])
+            return_value=SimpleNamespace(
+                edges=[], nodes=[],
+                episode=SimpleNamespace(uuid="ep-uuid", name="ep-name"),
+            )
         )
         mg._bridge = SimpleNamespace(run=lambda coro: asyncio.run(coro))
 

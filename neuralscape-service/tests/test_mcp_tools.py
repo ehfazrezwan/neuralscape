@@ -61,11 +61,12 @@ def _code_graph_tool_names() -> set[str]:
 class TestListTools:
     @pytest.mark.asyncio
     async def test_returns_22_core_tools(self):
-        # 22 core tools + 2 project-config tools (Phase D) + the 5 code-graph
-        # delegation tools (= 29) when the optional graphifyy extra is installed
-        # (dev installs have it).
+        # 22 core tools + 2 project-config tools (Phase D) + 2 private-graph-
+        # leakage remediation tools (rescope_private_derivatives,
+        # audit_private_leakage) + the 5 code-graph delegation tools (= 31)
+        # when the optional graphifyy extra is installed (dev installs have it).
         tools = await mcp_server.list_tools()
-        assert len(tools) == 24 + len(_code_graph_tool_names())
+        assert len(tools) == 26 + len(_code_graph_tool_names())
 
     @pytest.mark.asyncio
     async def test_tool_names(self):
@@ -96,6 +97,8 @@ class TestListTools:
             "queue_status",
             "get_project_knowledge_config",  # Phase D
             "set_project_knowledge_config",  # Phase D
+            "rescope_private_derivatives",  # admin: private-graph-leakage remediation
+            "audit_private_leakage",  # admin: private-graph-leakage remediation (read-only)
         } | _code_graph_tool_names()
         assert names == expected
 
@@ -653,13 +656,16 @@ class TestGetReasoningChainTool:
             ],
         }
         result = await mcp_server.call_tool(
-            "get_reasoning_chain", {"memory_id": "m1", "max_depth": 5}
+            "get_reasoning_chain", {"memory_id": "m1", "max_depth": 5, "user_id": "ehfaz"}
         )
         data = json.loads(result[0].text)
         assert data["status"] == "ok"
         assert data["chain"]["epistemic_level"] == "inductive"
         assert data["chain"]["children"][0]["memory_id"] == "p1"
-        mock_mcp_service.get_reasoning_chain.assert_called_once_with("m1", 5)
+        # Positional (memory_id, max_depth, node_cap, caller_user_id) — the
+        # caller identity is threaded through so the walk gates the root AND
+        # every premise it resolves.
+        mock_mcp_service.get_reasoning_chain.assert_called_once_with("m1", 5, 50, "ehfaz")
 
     @pytest.mark.asyncio
     async def test_clamps_max_depth_and_defaults(self, mock_mcp_service):

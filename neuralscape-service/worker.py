@@ -173,15 +173,27 @@ async def process_memory_raw(
     service: MemoryService = ctx["service"]
     v2_extras = v2_extras or {}
 
-    # Resolve the requested effective visibility so the idempotency check below is
-    # visibility-aware. Without this, a dictator promoting existing private/shared
-    # text to a `standard` would match the old copy and be dropped before ever
-    # reaching store_raw (which is the tier-aware create path). Mirrors store_raw.
-    from schemas import default_visibility_for_category, normalize_visibility
-    _req_vis = v2_extras.get("visibility")
-    _eff_req_vis = (
-        normalize_visibility(_req_vis) if _req_vis
-        else default_visibility_for_category(category).value
+    # Resolve the visibility this write will ACTUALLY land at, so the
+    # idempotency check below is visibility-aware. Without this, a dictator
+    # promoting existing private/shared text to a `standard` would match the
+    # old copy and be dropped before ever reaching store_raw (which is the
+    # tier-aware create path).
+    #
+    # Must use the RESOLVED (post sensitivity-gate) visibility, not the
+    # caller-requested one (F7): store_raw applies the sensitivity gate
+    # internally and can force visibility=private for a `shared`-requested
+    # write. If this pre-check compared against the requested visibility
+    # instead, a gated write with no override could match a pre-existing
+    # SHARED row with the same content and get treated as a dedup hit —
+    # returning that shared row and skipping the write store_raw's gate
+    # would have forced private, silently leaving the content shared.
+    # resolve_gated_visibility (memory/sensitivity.py) is the single source
+    # of truth store_raw itself uses, so this check can never drift from
+    # what store_raw actually decides.
+    from memory.sensitivity import resolve_gated_visibility
+    _eff_req_vis, _, _, _ = resolve_gated_visibility(
+        content, category, v2_extras.get("visibility"),
+        v2_extras.get("sensitivity_override", False),
     )
 
     # Idempotency: skip only when identical content already exists AT THE SAME
@@ -242,6 +254,7 @@ async def process_memory_raw(
         derived_from=v2_extras.get("derived_from"),
         epistemic_level=v2_extras.get("epistemic_level"),
         visibility=v2_extras.get("visibility"),
+        sensitivity_override=v2_extras.get("sensitivity_override", False),
         memory_kind=v2_extras.get("memory_kind"),
         source_ref=v2_extras.get("source_ref"),
         add_to_graph=False,
@@ -456,6 +469,7 @@ async def process_ingest_document(ctx: dict, doc: dict) -> dict:
         scope=doc.get("scope", "global"),
         project_id=doc.get("project_id"),
         visibility=doc.get("visibility"),
+        sensitivity_override=doc.get("sensitivity_override", False),
         tags=doc.get("tags"),
         agent_id=doc.get("agent_id"),
         run_id=doc.get("run_id"),
@@ -656,6 +670,7 @@ async def process_ingest_file(ctx: dict, payload: dict) -> dict:
         scope=options.get("scope", "global"),
         project_id=options.get("project_id"),
         visibility=options.get("visibility"),
+        sensitivity_override=options.get("sensitivity_override", False),
         tags=options.get("tags"),
         agent_id=options.get("agent_id"),
         run_id=options.get("run_id"),

@@ -414,7 +414,17 @@ class MemoryGraph:
                     "destination": target_name,
                 })
 
-            return {"deleted_entities": [], "added_entities": added}
+            # NEURALSCAPE PATCH: surface the resolved episode identity so
+            # callers can persist a durable memory→episode back-reference
+            # (see neuralscape-service/memory/provenance.py). Additive —
+            # existing callers that only read deleted_entities/added_entities
+            # are unaffected.
+            return {
+                "deleted_entities": [],
+                "added_entities": added,
+                "episode_uuid": result.episode.uuid,
+                "episode_name": result.episode.name,
+            }
 
         try:
             return self._bridge.run(_add())

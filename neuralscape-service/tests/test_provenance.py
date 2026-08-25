@@ -285,7 +285,7 @@ class _ChainStub:
         # graph: id → (content, epistemic_level, derived_from)
         self.graph = graph
 
-    def get_memory(self, mid):
+    def get_memory(self, mid, caller_user_id=None):
         if mid not in self.graph:
             return None
         content, level, derived = self.graph[mid]

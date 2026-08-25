@@ -423,10 +423,112 @@ class TestV1ManageMemories:
         resp = client.get("/v1/memories/nonexistent")
         assert resp.status_code == 404
 
+    def test_get_memory_returns_sensitivity_when_set(self, client, mock_service):
+        """A memory the write-time sensitivity gate forced private surfaces
+        `sensitivity`/`sensitivity_source` on read (memory/sensitivity.py +
+        memory/write.py stamp them; memory/convert.py::_mem_to_response maps
+        them through to MemoryResponse)."""
+        from schemas import MemoryResponse
+        mock_service.get_memory.return_value = MemoryResponse(
+            id="m1", memory="Approved a $50,000 client contract renewal",
+            category="decision", visibility="private",
+            sensitivity="financial", sensitivity_source="regex",
+        )
+        resp = client.get("/v1/memories/m1")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["sensitivity"] == "financial"
+        assert data["sensitivity_source"] == "regex"
+
+    def test_get_memory_omits_sensitivity_when_unset(self, client, mock_service):
+        """A plain (non-sensitive) memory's sensitivity fields render null —
+        same as every other optional v2 field on this endpoint (which does
+        not use exclude_none), so this is byte-identical to pre-change output
+        for a memory the gate never touched."""
+        from schemas import MemoryResponse
+        mock_service.get_memory.return_value = MemoryResponse(
+            id="m1", memory="Prefers tabs", category="preference"
+        )
+        resp = client.get("/v1/memories/m1")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["sensitivity"] is None
+        assert data["sensitivity_source"] is None
+
     def test_delete_single_memory(self, client, mock_service):
         mock_service.delete_memory.return_value = {"message": "Memory deleted successfully!"}
         resp = client.delete("/v1/memories/m1")
         assert resp.status_code == 200
+
+
+class TestV1MemoryByIdReadAuthorization:
+    """IDOR fix: GET /v1/memories/{id} and its /reasoning_chain twin must pass
+    the caller's resolved identity into the service so the read gate
+    (private == owner-only, shared/standard == any authenticated caller) is
+    actually applied — not just available.
+
+    ``_service`` is fully mocked here (matching the rest of this file's REST
+    tests), so these only prove the wiring: the resolved caller reaches the
+    service call, and the service's None/missing-marker responses map to 404
+    without leaking whether the memory exists. The real gate logic (private
+    vs shared vs cross-user) is exercised directly against MemoryService in
+    tests/test_memory_service.py's TestGetMemoryReadGate /
+    TestReasoningChainReadGate.
+    """
+
+    def test_get_memory_passes_resolved_caller_id(self, client, mock_service):
+        from schemas import MemoryResponse
+
+        mock_service.get_memory.return_value = MemoryResponse(
+            id="m1", memory="Prefers tabs", category="preference"
+        )
+        resp = client.get("/v1/memories/m1", params={"user_id": "alice"})
+        assert resp.status_code == 200
+        # (memory_id, resolved_caller_user_id) — no longer a bare memory_id call.
+        mock_service.get_memory.assert_called_once_with("m1", "alice")
+
+    def test_get_memory_unreadable_by_caller_maps_to_404(self, client, mock_service):
+        """The service reports a caller-unreadable memory the same as a
+        nonexistent one (None) — the route must 404, not leak a 403 that
+        would confirm the id exists."""
+        mock_service.get_memory.return_value = None
+        resp = client.get("/v1/memories/m1", params={"user_id": "bob"})
+        assert resp.status_code == 404
+        mock_service.get_memory.assert_called_once_with("m1", "bob")
+
+    def test_no_token_secret_configured_legacy_query_user_id_used(self, client, mock_service):
+        """No per-user token secret configured (this file's autouse fixture
+        disables it): the caller identity legacy deployments have always
+        used — the query-string ``user_id`` — must still be what's passed to
+        the service, unchanged by the read-gate fix."""
+        from config import settings
+
+        assert settings.neuralscape_user_token_secret == ""
+        mock_service.get_memory.return_value = None
+        client.get("/v1/memories/m1", params={"user_id": "legacy-caller"})
+        mock_service.get_memory.assert_called_once_with("m1", "legacy-caller")
+
+    def test_get_memory_no_user_id_falls_back_to_default(self, client, mock_service):
+        """No token, no query user_id: falls back to settings.default_user_id
+        (single-user/legacy deployment mode) — unchanged behavior."""
+        mock_service.get_memory.return_value = None
+        client.get("/v1/memories/m1")
+        mock_service.get_memory.assert_called_once_with("m1", "default_user")
+
+    def test_reasoning_chain_passes_resolved_caller_id(self, client, mock_service):
+        mock_service.get_reasoning_chain.return_value = {
+            "memory_id": "m1", "content": "x", "epistemic_level": None, "children": [],
+        }
+        resp = client.get("/v1/memories/m1/reasoning_chain", params={"user_id": "alice"})
+        assert resp.status_code == 200
+        mock_service.get_reasoning_chain.assert_called_once_with(
+            "m1", 3, caller_user_id="alice"
+        )
+
+    def test_reasoning_chain_unreadable_root_maps_to_404(self, client, mock_service):
+        mock_service.get_reasoning_chain.return_value = None
+        resp = client.get("/v1/memories/m1/reasoning_chain", params={"user_id": "bob"})
+        assert resp.status_code == 404
 
 
 def _patch_result(graph="unchanged", graph_job=None):
