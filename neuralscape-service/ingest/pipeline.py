@@ -49,6 +49,11 @@ class IngestDoc:
     scope: str = "global"
     project_id: str | None = None
     visibility: str | None = None
+    # Sensitivity gate override (see memory/sensitivity.py + schemas.
+    # RawMemoryRequest.sensitivity_override) — applied to every passage/fact
+    # this document produces. Only bypasses the forced-private gate when
+    # `visibility` above was also explicitly set.
+    sensitivity_override: bool = False
     tags: list[str] | None = None
     agent_id: str | None = None
     run_id: str | None = None
@@ -183,6 +188,7 @@ def ingest_document(service, doc: IngestDoc) -> dict:
                     run_id=doc.run_id,
                     source_type="imported",
                     visibility=doc.visibility,
+                    sensitivity_override=doc.sensitivity_override,
                     memory_kind="passage",
                     source_ref=chunk_source,
                     occurred_at=doc.occurred_at,
@@ -232,6 +238,7 @@ def ingest_document(service, doc: IngestDoc) -> dict:
                     # no level (they're source text, not extracted claims).
                     epistemic_level="explicit",
                     visibility=doc.visibility,
+                    sensitivity_override=doc.sensitivity_override,
                     memory_kind="fact",
                     source_ref=base,
                     occurred_at=doc.occurred_at,

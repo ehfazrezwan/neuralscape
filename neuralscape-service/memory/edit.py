@@ -80,7 +80,8 @@ class EditMixin:
         an absent key is untouched. Returns::
 
             {"memory": MemoryResponse, "graph_job": dict | None,
-             "graph": "unchanged" | "reingest_pending" | "migration_pending"}
+             "graph": "unchanged" | "reingest_pending" | "migration_pending"
+                      | "migration_incomplete"}
 
         The caller is responsible for enqueuing ``graph_job`` on the graph
         queue — Graphiti work is minutes-slow and must never run inline on a
@@ -94,6 +95,15 @@ class EditMixin:
           across memories.
         - content: re-embedded here; the graph_job re-ingests so Graphiti's
           contradiction detection expires stale facts.
+
+        ``"migration_incomplete"`` is a partition-migration variant of
+        ``"migration_pending"``: the graph IS configured but the
+        episode-precise cascade could not resolve/verify the OLD group's
+        episode (so it may still be live there) — the caller still gets
+        ``graph_job`` to re-ingest into the NEW group, but should also
+        surface this distinctly (e.g. to an operator polling task status)
+        rather than reporting a clean "migration_pending", which a pre-fix
+        incident showed can silently hide a stuck old-group cascade.
         """
         m = self._get_memory()
         point = m.vector_store.get(vector_id=memory_id)
@@ -181,16 +191,39 @@ class EditMixin:
         graph_job = None
         graph_status = "unchanged"
         if new_group != old_group:
-            # Partition migration: soft-expire the memory's edges in the old
-            # group (fast — hybrid search + edge saves, no LLM), then the
+            # Partition migration: expire the memory's episode/edges in the
+            # OLD group (episode-precise cascade first, substring fallback
+            # only if no episode resolves — memory/provenance.py), then the
             # caller re-ingests into the new group via the graph queue.
+            #
+            # A pre-fix incident here was a SILENT no-op: the old substring
+            # routine could fail to match anything, log one line, and this
+            # method would still report a clean "migration_pending" — the
+            # caller (and any operator polling task status) had no signal
+            # that the old group's content was still live. Surface that
+            # distinguishably instead: "migration_incomplete" whenever the
+            # graph is actually configured but the cascade could not
+            # resolve (and therefore could not verify) the episode.
+            graph_available = bool(self._graphiti and self._bridge)
+            cascade_result: dict = {"resolved": False}
             try:
-                self._expire_graph_edges_for_memory(
-                    {"memory": payload.get("data", ""), "metadata": meta, "user_id": owner}
+                cascade_result = self._cascade_or_fallback_expire(
+                    {"memory": payload.get("data", ""), "metadata": meta, "user_id": owner},
+                    group_id=old_group,
+                    memory_id=memory_id,
                 )
             except Exception as e:
                 logger.warning(f"Graph edge expiration failed for {memory_id} (non-critical): {e}")
-            graph_status = "migration_pending"
+            if graph_available and not cascade_result.get("resolved"):
+                logger.warning(
+                    "Partition migration for memory=%s could not resolve/verify "
+                    "graph cleanup in old group=%r — old content may still be "
+                    "live in the shared graph pool until a follow-up cleanup runs",
+                    memory_id, old_group,
+                )
+                graph_status = "migration_incomplete"
+            else:
+                graph_status = "migration_pending"
         elif edits_content:
             graph_status = "reingest_pending"
         if graph_status != "unchanged":
@@ -279,6 +312,10 @@ class EditMixin:
 
         matched = updated = skipped_forbidden = skipped_invalid = 0
         graph_jobs: list[dict] = []
+        # Zero-effect detection (audit): a memory whose episode can't be
+        # resolved must be COUNTED and its id REPORTED, never silently
+        # absorbed by a per-row try/except that only logs.
+        graph_migrations_unresolved_ids: list[str] = []
         offset = None
         while True:
             points, offset = client.scroll(
@@ -364,12 +401,24 @@ class EditMixin:
                 old_group = _build_group_id(visibility, owner, meta.get("project_id"), meta.get("workspace"))
                 new_group = _build_group_id(visibility, owner, new_meta.get("project_id"), new_meta.get("workspace"))
                 if new_group != old_group:
+                    graph_available = bool(self._graphiti and self._bridge)
+                    cascade_result: dict = {"resolved": False}
                     try:
-                        self._expire_graph_edges_for_memory(
-                            {"memory": payload.get("data", ""), "metadata": meta, "user_id": owner}
+                        cascade_result = self._cascade_or_fallback_expire(
+                            {"memory": payload.get("data", ""), "metadata": meta, "user_id": owner},
+                            group_id=old_group,
+                            memory_id=str(pt.id),
                         )
                     except Exception as e:
                         logger.warning(f"Graph edge expiration failed for {pt.id} (non-critical): {e}")
+                    if graph_available and not cascade_result.get("resolved"):
+                        logger.warning(
+                            "Retag partition migration for memory=%s could not "
+                            "resolve/verify graph cleanup in old group=%r — old "
+                            "content may still be live in the shared graph pool",
+                            pt.id, old_group,
+                        )
+                        graph_migrations_unresolved_ids.append(str(pt.id))
                     graph_jobs.append({
                         "memory_id": str(pt.id),
                         "content": payload.get("data", ""),
@@ -391,6 +440,7 @@ class EditMixin:
             skipped_forbidden=skipped_forbidden,
             skipped_invalid=skipped_invalid,
             graph_migrations=len(graph_jobs),
+            graph_migrations_unresolved=len(graph_migrations_unresolved_ids),
             dry_run=dry_run,
         )
         return {
@@ -399,5 +449,9 @@ class EditMixin:
             "skipped_forbidden": skipped_forbidden,
             "skipped_invalid": skipped_invalid,
             "graph_jobs": graph_jobs,
+            # Rows whose old-group episode could not be resolved/verified —
+            # the substring fallback ran but its effect is unverifiable.
+            # Never silently dropped; a caller/operator can act on these ids.
+            "graph_migrations_unresolved_ids": graph_migrations_unresolved_ids,
             "dry_run": dry_run,
         }

@@ -105,6 +105,8 @@ class ConvertMixin:
             source_ref=metadata.get("source_ref"),
             visibility=metadata.get("visibility"),
             owner_user_id=metadata.get("owner_user_id"),
+            sensitivity=metadata.get("sensitivity"),
+            sensitivity_source=metadata.get("sensitivity_source"),
             title=metadata.get("title"),
             token_estimate=metadata.get("token_estimate"),
             speaker=metadata.get("speaker"),

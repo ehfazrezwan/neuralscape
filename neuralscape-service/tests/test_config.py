@@ -182,6 +182,33 @@ class TestDictatorRole:
         assert cfg.is_dictator("") is False
 
 
+class TestSensitivityPrivateClassesValidation:
+    """Config nitpick: SENSITIVITY_PRIVATE_CLASSES must be validated against
+    memory.sensitivity.SENSITIVITY_CLASSES at settings load — a typo'd or
+    stale class name here would silently make the sensitivity gate a no-op
+    for that class instead of failing loudly at startup."""
+
+    def test_default_is_valid(self):
+        cfg = _settings()
+        assert cfg.sensitivity_private_classes_set() == {
+            "financial", "equity_compensation", "client_commercial", "credentials_pii",
+        }
+
+    def test_normalizes_case_and_whitespace(self):
+        cfg = _settings(sensitivity_private_classes=" Financial , CREDENTIALS_PII ")
+        assert cfg.sensitivity_private_classes_set() == {"financial", "credentials_pii"}
+
+    def test_unknown_class_rejected(self):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError, match="unknown class"):
+            _settings(sensitivity_private_classes="financial,not_a_real_class")
+
+    def test_empty_string_is_valid_no_classes_gated(self):
+        cfg = _settings(sensitivity_private_classes="")
+        assert cfg.sensitivity_private_classes_set() == set()
+
+
 class TestCodeRepos:
     """E2 config seam: the native code-intel engine resolves repo:<name> refs
     through settings.code_repos. Without this field it was always {} and the
