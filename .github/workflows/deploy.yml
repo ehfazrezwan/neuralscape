@@ -68,6 +68,7 @@ jobs:
           SSH="ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 ${VPS_USER}@${VPS_HOST}"
 
           IMG="ghcr.io/${{ github.repository_owner }}/neuralscape:${TAG}"
+          LATEST="ghcr.io/${{ github.repository_owner }}/neuralscape:latest"
           docker save "$IMG" | gzip -1 | $SSH 'gunzip | docker load'
 
           $SSH "set -euo pipefail
@@ -75,6 +76,11 @@ jobs:
             git fetch -q origin main
             git checkout -q main 2>/dev/null || git checkout -qb main origin/main
             git reset -q --hard ${SHA}
+            # Tag the just-loaded image as :latest locally so that any plain
+            # 'docker compose up -d' (a restart/recovery that omits the deploy
+            # override) resolves to THIS build via docker-compose.vps.yml's
+            # image pin - never a stale local build-tag.
+            docker tag ${IMG} ${LATEST}
             NS_IMAGE=${IMG} docker compose \
               -f docker-compose.yml -f docker-compose.vps.yml -f docker-compose.deploy.yml \
               --profile tunnel up -d
@@ -88,5 +94,8 @@ jobs:
               [ \$i -eq 12 ] && { echo 'deep health never went green'; exit 1; }
               sleep 10
             done
+            # Only after health is green: drop dangling/unreferenced images so the
+            # box never accumulates stale layers. Keeps in-use + tagged images.
+            docker image prune -f >/dev/null 2>&1 || true
             echo
-            echo \"DEPLOYED ${TAG} (\$(git rev-parse --short HEAD))\""
+            echo \"DEPLOYED ${TAG} (\$(git rev-parse --short HEAD)) - running image: \$(docker inspect --format '{{.Image}}' neuralscape-neuralscape-1 | cut -c8-19)\""
