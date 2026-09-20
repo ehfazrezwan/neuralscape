@@ -4,6 +4,11 @@ All notable changes to the `neuralscape` Claude plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.9.2] - 2026-09-07
+
+### Fixed
+- Bundled MCP connector now points at the production instance so prod is the single source of truth (the URL is a hardcoded literal because Cowork cannot read env vars).
+
 ## [2.9.1] - 2026-07-05
 
 ### Changed

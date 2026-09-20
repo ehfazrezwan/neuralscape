@@ -2,7 +2,7 @@
   "mcpServers": {
     "neuralscape": {
       "type": "http",
-      "url": "https://neuralscape.siliconinja.dev/mcp/"
+      "url": "https://ns.siliconinja.dev/mcp/"
     }
   }
 }
