@@ -829,6 +829,18 @@ class TestPatchMemory:
         assert "updated_at" in call.kwargs["payload"]
         assert result["graph"] == "unchanged" and result["graph_job"] is None
 
+    @pytest.mark.parametrize('changes', [{'content': 'New content'}, {'category': 'interaction'}])
+    def test_edit_invalidates_old_category_evidence(self, service, changes):
+        meta = dict(_SHARED_META, owner_user_id='ehfaz', category_evidence={'stale': True})
+        service._memory.vector_store.get.return_value = _edit_point(meta=meta)
+        service.patch_memory('m1', 'ehfaz', changes)
+        if 'content' in changes:
+            stored = service._memory.update.call_args.kwargs['metadata']['metadata']
+        else:
+            stored = service._memory.vector_store.update.call_args.kwargs['payload']['metadata']
+        assert 'category_evidence' not in stored
+        assert stored['visibility'] == 'shared' and stored['owner_user_id'] == 'ehfaz'
+
     def test_content_edit_passes_merged_metadata_to_mem0(self, service):
         """REGRESSION: mem0's _update_memory rebuilds the ENTIRE payload from
         its metadata kwarg — the old update_memory passed none, wiping every

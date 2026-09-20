@@ -583,12 +583,15 @@ async def resolve_extracted_edge(
             else '',
         )
 
-    llm_response = await llm_client.generate_response(
-        prompt_library.dedupe_edges.resolve_edge(context),
-        response_model=EdgeDuplicate,
-        model_size=ModelSize.small,
-        prompt_name='dedupe_edges.resolve_edge',
-    )
+    decisions = getattr(llm_client, 'decision_client', None)
+    llm_response = await decisions.resolve('edges', context) if decisions is not None else None
+    if llm_response is None:
+        llm_response = await llm_client.generate_response(
+            prompt_library.dedupe_edges.resolve_edge(context),
+            response_model=EdgeDuplicate,
+            model_size=ModelSize.small,
+            prompt_name='dedupe_edges.resolve_edge',
+        )
     response_object = EdgeDuplicate(**llm_response)
     duplicate_facts = response_object.duplicate_facts
 

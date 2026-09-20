@@ -40,7 +40,7 @@ class FakeService:
             return responses, True
         return responses
 
-    def extract_facts_only(self, text, extractor=None, user_id=None, project_id=None):
+    def extract_facts_only(self, text, extractor=None, user_id=None, project_id=None, category_evidence=None):
         return list(self._facts)
 
 
@@ -60,6 +60,22 @@ def _doc(content, **over):
 
 
 class TestIngestDocument:
+    def test_fact_evidence_survives_ingest_without_extra_graph_jobs(self):
+        fact = ('tech_stack', 'Project Cedar uses Redis.')
+        # Pipeline forwards opaque validated evidence to the shared writer;
+        # writer/reader validation is independently covered by its own tests.
+        evidence = {'synthetic_fixture': True}
+        class EvidenceService(FakeService):
+            def extract_facts_only(self, text, **kwargs):
+                kwargs['category_evidence'][fact] = evidence
+                return [fact]
+        svc = EvidenceService()
+        result = ingest_document(svc, _doc(fact[1], project_id='cedar', visibility='private', index_passages=False))
+        assert len(svc.store_calls) == 1
+        assert svc.store_calls[0]['category_evidence'] == evidence
+        assert svc.store_calls[0]['visibility'] == 'private'
+        assert len(result['graph_jobs']) == 1
+
     def test_produces_passages_and_facts(self):
         svc = FakeService(facts=[("domain_knowledge", "Distilled fact one.")])
         content = "Paragraph one. " * 200

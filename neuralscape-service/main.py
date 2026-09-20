@@ -177,6 +177,8 @@ async def lifespan(app: FastAPI):
 
     # Initialize the service (this also initializes mem0 + Graphiti)
     _service._get_memory()
+    from hybrid_inference import warmup_extraction
+    await asyncio.to_thread(warmup_extraction)
     # Connect task manager to Redis
     await _task_manager.connect()
 

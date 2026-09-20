@@ -212,14 +212,22 @@ def parse_bundle(files: Mapping[str, str]) -> list[OkfConcept]:
 def resolve_categories(
     concepts: list[OkfConcept],
     llm_call: Callable[[str], str] | None = None,
+    *,
+    categories: dict[str, str] | None = None,
 ) -> None:
     """Resolve each concept's memory category in place.
 
     Priority: an embedded category extension key (a Neuralscape-exported
     bundle round-trips losslessly) → the exact/alias mapping table → one
-    batched LLM call for the remaining unknown types → the default.
+    batched Jev choices (when enabled) → LLM for unresolved types → default.
+    Explicit adapter taxonomies may be passed by callers; an ordinary bundle's
+    Jev choices use the core 13. Embedded/alias mappings remain authoritative.
     """
-    from schemas import MEMORY_CATEGORIES
+    from config import settings
+    from schemas import CORE_MEMORY_CATEGORIES, MEMORY_CATEGORIES
+
+    target_categories = categories if categories is not None else (
+        CORE_MEMORY_CATEGORIES if settings.jev_categories_enabled else MEMORY_CATEGORIES)
 
     unknown_types: list[str] = []
     for concept in concepts:
@@ -238,30 +246,38 @@ def resolve_categories(
             concept.category = _DEFAULT_CATEGORY
 
     llm_mapping: dict[str, str] = {}
+    if unknown_types:
+        from hybrid_inference import classify_types
+
+        mapping = classify_types(unknown_types[:50], categories=target_categories)
+        if mapping is not None:
+            llm_mapping = mapping
+            unknown_types = [t for t in unknown_types if t.strip().casefold() not in mapping]
     if unknown_types and llm_call is not None:
         try:
             from extensions.dreaming.prompts import parse_json_object
 
             raw = llm_call(
                 TYPE_MAPPING_PROMPT.format(
-                    categories="\n".join(f"- {c}" for c in sorted(MEMORY_CATEGORIES)),
+                    categories="\n".join(f"- {c}" for c in sorted(target_categories)),
                     types="\n".join(f"- {t}" for t in unknown_types[:50]),
                 )
             )
             mapping = parse_json_object(raw or "").get("mapping")
             if isinstance(mapping, dict):
-                llm_mapping = {
-                    str(k).casefold(): str(v)
+                unresolved = {t.strip().casefold() for t in unknown_types[:50]}
+                llm_mapping.update({
+                    str(k).strip().casefold(): str(v)
                     for k, v in mapping.items()
-                    if str(v) in MEMORY_CATEGORIES
-                }
+                    if str(v) in target_categories and str(k).strip().casefold() in unresolved
+                })
         except Exception:
             logger.warning("OKF type-mapping LLM fallback failed (non-fatal)", exc_info=True)
 
     for concept in concepts:
         if concept.category is None:
             concept.category = (
-                llm_mapping.get((concept.type_value or "").casefold()) or _DEFAULT_CATEGORY
+                llm_mapping.get((concept.type_value or "").strip().casefold()) or _DEFAULT_CATEGORY
             )
 
 

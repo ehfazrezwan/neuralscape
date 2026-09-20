@@ -184,6 +184,16 @@ class MemoryGraph:
             api_key=graph_config.graphiti_embedder_api_key,
         )
 
+        if getattr(graph_config, "graphiti_jev_enabled", False):
+            from graphiti_core.llm_client.jev_client import JevDecisions
+
+            llm_client.decision_client = JevDecisions(
+                graph_config.graphiti_jev_api_key,
+                model=graph_config.graphiti_jev_model,
+                threshold=graph_config.graphiti_jev_threshold,
+                timeout=graph_config.graphiti_jev_timeout,
+            )
+
         cross_encoder = _create_cross_encoder(
             provider=graph_config.graphiti_reranker_provider,
             api_key=graph_config.graphiti_llm_api_key,
