@@ -1154,6 +1154,9 @@ class MemoryResponse(BaseModel):
     id: str
     memory: str
     category: str | None = None
+    # Model scores for relevance only, bound to content/category by the service.
+    # These never authorize sharing or change strict category filter semantics.
+    category_evidence: dict | None = None
     scope: str | None = None
     project_id: str | None = None
     tags: list[str] | None = None

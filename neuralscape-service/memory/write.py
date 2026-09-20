@@ -20,6 +20,7 @@ from memory.junk import _clean_conversation_for_graph, _is_junk_fact
 from memory.ranking import _times_derived_from_metadata
 from memory.retry import retry_transient
 from memory.sensitivity import classify_sensitivity, resolve_gated_visibility
+from category_evidence import validated_evidence
 
 logger = logging.getLogger(__name__)
 _SPEAKER_UNSET = object()
@@ -254,9 +255,17 @@ class WriteMixin:
         # even on the legacy (use_rich_parser=False, production-default) path,
         # instead of being dropped by parse_extraction_response's fold.
         parsed_facts_all: list[ParsedFact] = []
+        category_evidence: dict = {}
         window_errors: list[str] = []
         last_exc: Exception | None = None
         for w_idx, window_messages in enumerate(windows):
+            if settings.jev_extraction_enabled and not operator_guidance and not use_rich_parser:
+                from hybrid_inference import extract_source_facts
+
+                source_facts = extract_source_facts(window_messages, category_evidence=category_evidence)
+                if source_facts is not None:
+                    parsed_facts_all.extend(ParsedFact(cat, text, None, None) for cat, text in source_facts)
+                    continue
             extraction_messages = build_extraction_messages(
                 window_messages,
                 operator_guidance=operator_guidance,
@@ -394,6 +403,7 @@ class WriteMixin:
                 occurred_ats=occurred_ats,
                 sensitivities=sensitivities,
                 created_ids=newly_created_ids,
+                **({'category_evidence': category_evidence} if category_evidence else {}),
             )
         except Exception as e:
             logger.error(
@@ -546,6 +556,7 @@ class WriteMixin:
         extractor=None,
         user_id: str | None = None,
         project_id: str | None = None,
+        category_evidence: dict | None = None,
     ) -> list[tuple[str, str]]:
         """Run LLM fact extraction over a block of text and return (category, content) tuples.
 
@@ -566,6 +577,10 @@ class WriteMixin:
         when set, the composed custom extraction instructions are appended
         to the prompt as the OPERATOR GUIDANCE addendum — AFTER the adapter's
         own prompt, so instructions compose with (never replace) adapters.
+
+        ``category_evidence`` is an optional output map keyed by the returned
+        (category, content) tuple. Internal ingest callers persist this evidence
+        on the same memory record; the legacy tuple return contract is unchanged.
         """
         if not text or not text.strip():
             return []
@@ -583,6 +598,18 @@ class WriteMixin:
             extraction_messages[0]["content"] = append_operator_guidance(
                 extraction_messages[0]["content"], operator_guidance
             )
+        # Source-selection lanes cannot honor domain prompts or synthesize
+        # multi-party context. Preserve those contracts by falling back.
+        if not operator_guidance and (settings.jev_extraction_enabled or settings.needle_extraction_enabled):
+            from ingest.extractors import DefaultExtractor
+            from hybrid_inference import extract_source_facts, try_extract
+
+            if extractor is None or type(extractor) is DefaultExtractor:
+                literal = (extract_source_facts([{'role': 'user', 'content': text}],
+                                               category_evidence=category_evidence)
+                           if settings.jev_extraction_enabled else try_extract(text))
+                if literal is not None:
+                    return [(cat, content) for cat, content in literal if not _is_junk_fact(content)]
         client = self._get_genai_client()
         try:
             from google.genai.types import GenerateContentConfig, HttpOptions
@@ -652,6 +679,7 @@ class WriteMixin:
         # per-ingest and forwarded to enrich_graph → add_episode. None ⇒
         # Graphiti's built-in generic extraction (every regular memory write).
         graph_ontology: dict | None = None,
+        category_evidence: dict | None = None,
     ) -> list[MemoryResponse] | tuple[list[MemoryResponse], bool]:
         """Store a single pre-categorized fact directly (no LLM extraction).
 
@@ -722,6 +750,7 @@ class WriteMixin:
             source_ref=source_ref,
             workspace=workspace,
             sensitivity_override=sensitivity_override,
+            category_evidence=category_evidence,
         )
         if existing is not None:
             # created=False → caller must NOT re-enqueue graph enrichment.
@@ -772,6 +801,7 @@ class WriteMixin:
         # logic). False by default — every existing caller that doesn't know
         # about the gate keeps getting the gate's protection.
         sensitivity_override: bool = False,
+        category_evidence: dict | None = None,
     ) -> tuple[dict | None, MemoryResponse | None]:
         """Validate + resolve + dedup one raw store; everything except the embed.
 
@@ -788,6 +818,8 @@ class WriteMixin:
         """
         if category not in MEMORY_CATEGORIES:
             raise ValueError(f"Invalid category: {category}. Must be one of: {list(MEMORY_CATEGORIES.keys())}")
+        if category_evidence is not None and validated_evidence(content, category, category_evidence) is None:
+            raise ValueError('Invalid or stale category evidence')
         if epistemic_level is not None and epistemic_level not in EPISTEMIC_LEVEL_VOCAB:
             raise ValueError(
                 f"Invalid epistemic_level: {epistemic_level}. "
@@ -920,6 +952,8 @@ class WriteMixin:
         }
         if tags:
             metadata["tags"] = tags
+        if category_evidence is not None:
+            metadata['category_evidence'] = validated_evidence(content, category, category_evidence)
         # Memory-model v2 metadata (only stored when set)
         if domain is not None:
             metadata["domain"] = domain
@@ -991,6 +1025,7 @@ class WriteMixin:
             title=title,
             token_estimate=token_estimate,
             workspace=effective_workspace,
+            category_evidence=metadata.get('category_evidence'),
         )
 
         prepared = {
@@ -1433,6 +1468,7 @@ class WriteMixin:
                     memory_kind=item.get("memory_kind"),
                     source_ref=item.get("source_ref"),
                     sensitivity_override=item.get("sensitivity_override", False),
+                    category_evidence=item.get('category_evidence'),
                 )
                 if existing is not None:
                     entries.append(("dup", existing))
@@ -1581,6 +1617,7 @@ class WriteMixin:
         workspace: str | None = None,
         sensitivities: list[str | None] | None = None,
         created_ids: set[str] | None = None,
+        category_evidence: dict | None = None,
     ) -> list[MemoryResponse]:
         """Store multiple categorized facts via a single batch embed + single Qdrant upsert.
 
@@ -1787,6 +1824,7 @@ class WriteMixin:
                     )
 
             mid = str(uuid.uuid4())
+            evidence = validated_evidence(content, category, (category_evidence or {}).get((category, content)))
             payload = {
                 "data": content,
                 "hash": chash,
@@ -1801,6 +1839,7 @@ class WriteMixin:
                     "agent_id": agent_id,
                     "run_id": run_id,
                     "source": source,
+                    **({'category_evidence': evidence} if evidence is not None else {}),
                     **({"visibility": fact_forced_visibility} if fact_forced_visibility else {}),
                     **({"sensitivity": fact_sensitivity} if fact_sensitivity else {}),
                     **({"sensitivity_source": fact_sensitivity_source} if fact_sensitivity_source else {}),
@@ -1892,6 +1931,7 @@ class WriteMixin:
                     visibility=forced_visibility,
                     sensitivity=fact_sensitivity,
                     sensitivity_source=fact_sensitivity_source,
+                    category_evidence=payloads[idx]['metadata'].get('category_evidence'),
                 )
             )
 

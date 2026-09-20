@@ -143,6 +143,8 @@ class EditMixin:
         old_group = _build_group_id(old_visibility, owner, meta.get("project_id"))
 
         new_meta = self._apply_meta_changes(meta, changes)
+        if edits_content or 'category' in changes:
+            new_meta.pop('category_evidence', None)
 
         if edits_visibility:
             new_visibility = normalize_visibility(changes["visibility"])
@@ -352,6 +354,7 @@ class EditMixin:
                         new_meta.pop("tags", None)
                 if ops.get("set_category"):
                     new_meta["category"] = ops["set_category"]
+                    new_meta.pop('category_evidence', None)
                 if "set_project_id" in ops:
                     if ops["set_project_id"] is None:
                         new_meta.pop("project_id", None)

@@ -5,7 +5,7 @@ from typing import Annotated
 from urllib.parse import urlparse
 
 from arq.connections import RedisSettings
-from pydantic import field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode
 
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
@@ -17,6 +17,21 @@ class Settings(BaseSettings):
     gemini_llm_model: str = "gemini-3.1-flash-lite"
     gemini_llm_fallback_model: str = "gemini-2.5-flash"
     gemini_embedder_model: str = "gemini-embedding-001"
+
+    # Hybrid experiments are independently opt-in. Key alone enables nothing.
+    typesafe_api_key: str = Field(default="", repr=False)
+    jev_model: str = "jev-1.13.0"
+    jev_threshold: float = Field(default=0.9, ge=0.5, le=1)
+    jev_timeout_s: float = Field(default=2.0, gt=0, le=30)
+    jev_graph_enabled: bool = False
+    jev_categories_enabled: bool = False
+    jev_extraction_enabled: bool = False
+    jev_extraction_deadline_s: float = Field(default=2.5, gt=0, le=30)
+    jev_rerank_enabled: bool = False
+    jev_rerank_limit: int = Field(default=32, ge=1, le=64)
+    jev_rerank_policy: str = "Prefer direct evidence answering the query; respect explicit versions and dates in the query. Do not confuse topical overlap with an answer."
+    needle_extraction_enabled: bool = False
+    needle_min_confidence: float = Field(default=0.9, ge=0.5, le=1)
 
     # ── LLM gateway (OpenAI-compatible) ───────────────────────────────
     # When enabled, the LLM + embedder (and the graphiti reranker) route
@@ -978,6 +993,11 @@ class Settings(BaseSettings):
                     "password": self.neo4j_password,
                     "database": self.neo4j_database,
                     **graphiti_models,
+                    "graphiti_jev_enabled": self.jev_graph_enabled,
+                    "graphiti_jev_api_key": self.typesafe_api_key,
+                    "graphiti_jev_model": self.jev_model,
+                    "graphiti_jev_threshold": self.jev_threshold,
+                    "graphiti_jev_timeout": self.jev_timeout_s,
                     "store_raw_episode_content": self.store_raw_episode_content,
                     "update_communities": self.update_communities,
                 },

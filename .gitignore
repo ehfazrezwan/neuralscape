@@ -50,6 +50,8 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+# Private inference reports can include model outputs; publish reviewed aggregates only.
+.nsbench-reports/
 cover/
 
 # Translations

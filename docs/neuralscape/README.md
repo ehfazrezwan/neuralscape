@@ -18,6 +18,8 @@ Comprehensive reference for the Neuralscape codebase. Read in order or jump to w
 | 11 | [Deployment](./11-deployment.md) | Docker compose stack, two-stage Dockerfile, env vars, structlog, helper scripts, gotchas |
 | 12 | [UI PRD](./12-ui-prd.md) | Product requirements for the human-facing web UI: features, audience, constraints, states, accessibility |
 | 21 | [Document & File Ingestion](./21-document-ingestion.md) | Ingest files/folders/zips + manual context; Docling/MarkItDown parsing; artifact storage; dedicated ingest worker |
+| 28 | [Hybrid System One Evaluation](./28-hybrid-system-one-evaluation.md) | Jev/Needle feasibility, graph/vector acceptance checks, measured cost/latency, limitations and opt-in testing |
+| 29 | [Jev Extraction Evaluation](./29-jev-extraction-evaluation.md) | Source-selection redesign, held-out extraction benchmarks, graph/vector validation and fallback tradeoffs |
 
 ## Quick links by audience
 

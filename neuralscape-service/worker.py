@@ -1428,6 +1428,8 @@ async def startup(ctx: dict) -> None:
     logger.info("ARQ worker starting up...")
     service = MemoryService()
     service._get_memory()  # warm up connections
+    from hybrid_inference import warmup_extraction
+    await asyncio.to_thread(warmup_extraction)
     ctx["service"] = service
 
     # Initialize extension registry so worker can emit events

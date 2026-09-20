@@ -408,7 +408,7 @@ class _FakeIngestService:
             return responses, True
         return responses
 
-    def extract_facts_only(self, text, extractor=None, user_id=None, project_id=None):
+    def extract_facts_only(self, text, extractor=None, user_id=None, project_id=None, category_evidence=None):
         return list(self._facts)
 
 
