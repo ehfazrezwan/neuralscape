@@ -600,14 +600,13 @@ class WriteMixin:
             )
         # Source-selection lanes cannot honor domain prompts or synthesize
         # multi-party context. Preserve those contracts by falling back.
-        if not operator_guidance and (settings.jev_extraction_enabled or settings.needle_extraction_enabled):
+        if not operator_guidance and settings.jev_extraction_enabled:
             from ingest.extractors import DefaultExtractor
-            from hybrid_inference import extract_source_facts, try_extract
+            from hybrid_inference import extract_source_facts
 
             if extractor is None or type(extractor) is DefaultExtractor:
-                literal = (extract_source_facts([{'role': 'user', 'content': text}],
+                literal = extract_source_facts([{'role': 'user', 'content': text}],
                                                category_evidence=category_evidence)
-                           if settings.jev_extraction_enabled else try_extract(text))
                 if literal is not None:
                     return [(cat, content) for cat, content in literal if not _is_junk_fact(content)]
         client = self._get_genai_client()
@@ -1275,10 +1274,14 @@ class WriteMixin:
             pt = points[0]
             payload = pt.payload or {}
             metadata = payload.get("metadata", {}) or {}
+            evidence = validated_evidence(
+                payload.get("data", ""), metadata.get("category"), metadata.get("category_evidence")
+            )
             return MemoryResponse(
                 id=str(pt.id),
                 memory=payload.get("data", ""),
                 category=metadata.get("category"),
+                category_evidence=evidence,
                 scope=metadata.get("scope"),
                 project_id=metadata.get("project_id"),
                 tags=metadata.get("tags"),

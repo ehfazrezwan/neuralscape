@@ -156,18 +156,6 @@ wheels = [
 ]
 
 [[package]]
-name = "cactus-needle"
-version = "3.0.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "huggingface-hub" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/3c/fc/28dc61b37ef853ee3912f867bc8001baf9847719ed9c076a3ee549e0387a/cactus_needle-3.0.1.tar.gz", hash = "sha256:c734ee57691b7f5e940d1d3da508ea71951c207ccad6739cb0d037c52650280e", size = 101276, upload-time = "2026-09-17T23:11:30.04Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/25/58/c8caa89f16d772356946bd5ca7d21f8b4148c845c04007b6d270523e8d34/cactus_needle-3.0.1-py3-none-any.whl", hash = "sha256:d990c623ecc69f7c7692d31678e88a799caced87780d7fed31c55b6961d75c82", size = 89904, upload-time = "2026-09-17T23:11:28.669Z" },
-]
-
-[[package]]
 name = "catalogue"
 version = "2.0.10"
 source = { registry = "https://pypi.org/simple" }
@@ -2050,9 +2038,6 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
 ]
-hybrid = [
-    { name = "cactus-needle" },
-]
 
 [package.dev-dependencies]
 dev = [
@@ -2066,7 +2051,6 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "arq", specifier = ">=0.26.0" },
-    { name = "cactus-needle", marker = "extra == 'hybrid'", specifier = "==3.0.1" },
     { name = "cryptography", specifier = ">=42.0" },
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "fastembed", specifier = ">=0.3" },
@@ -2093,7 +2077,7 @@ requires-dist = [
     { name = "uvicorn", specifier = ">=0.32.0" },
     { name = "zstandard", marker = "extra == 'code-graph'", specifier = ">=0.22.0" },
 ]
-provides-extras = ["hybrid", "dev", "code-graph"]
+provides-extras = ["dev", "code-graph"]
 
 [package.metadata.requires-dev]
 dev = [

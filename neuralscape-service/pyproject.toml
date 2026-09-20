@@ -55,7 +55,6 @@ dependencies = [
 packages = ["."]
 
 [project.optional-dependencies]
-hybrid = ["cactus-needle==3.0.1"]
 dev = [
     "httpx>=0.27.0",
     "pytest>=8.0.0",

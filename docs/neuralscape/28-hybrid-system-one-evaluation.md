@@ -28,7 +28,7 @@ database operations and fallback still dominate parts of the system.
 | Mem0 graph integration | NS `MemoryGraph` attaches the shared decision adapter to Graphiti's client | No pretend generative provider; extraction client remains intact |
 | Imported OKF type labels | Exact/alias mapping first; scoped core buckets, shared definitions, bounded Jev batches, per-item fallback | Improved pilot; still opt-in pending larger quality evaluation |
 | Combined recall ranking | Optional Jev Noul scores on already-authorized candidates, stable reorder only | Adds API work to current fusion; does not increase candidate recall |
-| Single literal fact extraction | Experimental Needle 3 lane, exact full-source quote required | Pilot accepted 0/12; keep disabled |
+| Single literal fact extraction | Research pilot only; no runtime lane ships in this PR | Pilot accepted 0/12 and the native path lacked process isolation |
 | Mem0 general fact extraction / conversation extraction | Retained | Produces novel text, roles, dates, sensitivity/provenance fields |
 | Graphiti entity/relationship extraction, attributes, summaries | Retained | Open-ended entities, relations and text are not fixed choices |
 | Graphiti temporal conflict resolution | Retained behind Jev abstention | Invalidation is a consequential mutation; confidence alone is not sufficient |
@@ -216,13 +216,10 @@ answers without emojis.” The exact-source guard rejected it; lowering that
 guard to manufacture savings would lose meaning. Candidate classification is
 not sufficiently reliable merely because a function call is valid.
 
-Needle's lane never invokes tools, never accepts suppressed calls, rejects
-missing/nonfinite/low confidence, requires the entire source as a verbatim quote,
-and resets shared native model state before and after each call under a lock.
-It skips multi-sentence/conversation content and custom operator/extractor
-instructions. Missing local weights/engine cause immediate fallback, not a
-download in the write path. **Native inference lacks process-level crash/timeout
-isolation**; that and quality validation are further reasons not to promote it.
+The prototype rejected missing/nonfinite/low confidence and required the entire
+source as a verbatim quote, but native inference lacked process-level
+crash/timeout isolation. The service lane and dependency were removed from this
+PR after review; this negative result remains research context only.
 
 The actual downloaded Needle archive was 35,335,380 bytes, SHA-256
 `c9d915eca282ed42d1a09b143b592adb4cc6744ffe2d294adf5cfc5548170c38`.
@@ -342,7 +339,7 @@ ports; no production volumes):
 ```bash
 docker compose -p ns-hybrid-eval -f neuralscape-bench/docker-compose.hybrid.yml up -d
 cd neuralscape-service
-uv sync --frozen --extra code-graph --extra hybrid
+uv sync --frozen --extra code-graph
 ```
 
 Supply an **absolute path** to your private key file in place of
@@ -368,17 +365,12 @@ Wait until the stores are ready, then run baseline before hybrid:
 
 The rerank script downloads MiniLM on first `--local` run; use
 `--local-model-path /absolute/path/to/model` for pre-provisioned artifacts.
-Downloads are not included in warm latency. Needle is optional and not needed
-for Jev. For a research-only Needle retry, prefetch outside the service process:
-
-```bash
-.venv/bin/python -c 'from needle.agent import fetch; fetch.fetch_weights(generation=3); fetch.fetch_library(generation=3, dest_dir=fetch.cache_dir(3))'
-NEEDLE_EXTRACTION_ENABLED=true .venv/bin/python scripts/benchmark_hybrid.py --arm hybrid --env-file /absolute/path/private.env --output ../.nsbench-reports/hybrid/needle-new.json
-```
+Downloads are not included in warm latency. The rejected Needle prototype is
+not included in the service runtime or benchmark command surface.
 
 For a sandbox service trial, set `JEV_GRAPH_ENABLED=true` first; leave
-`JEV_CATEGORIES_ENABLED`, `JEV_RERANK_ENABLED`, and `NEEDLE_EXTRACTION_ENABLED`
-false. Restart graph workers because clients are constructed at initialization.
+`JEV_CATEGORIES_ENABLED` and `JEV_RERANK_ENABLED` false. Restart graph workers
+because clients are constructed at initialization.
 Test reranking separately with `JEV_RERANK_ENABLED=true`; restart API/search
 workers. Reverting flags and restarting restores the original model paths;
 it does **not undo graph mutations** already made, so use isolated data first.
@@ -395,8 +387,9 @@ Verification before the extraction follow-up: **2,672 passed, 2 skipped** on bot
 host and the built test container. Existing deprecation/mock-coroutine warnings
 remain; this is not a warning-free suite. Fifty new hybrid contract tests cover
 provider errors, malformed choices/scores, timeout fallback, category scoping,
-partial acceptance, batch limits, graph decision wiring, safe reranking and
-Needle grounding/reset behavior. `git diff --check` passes.
+partial acceptance, batch limits, graph decision wiring and safe reranking. The
+initial Needle contract tests were removed with the rejected runtime lane.
+`git diff --check` passes.
 
 The container suite excludes the existing live-ARQ test module. The separate
 graph benchmark above provides actual DB coverage, not API/queue coverage.

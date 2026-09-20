@@ -30,9 +30,6 @@ class Settings(BaseSettings):
     jev_rerank_enabled: bool = False
     jev_rerank_limit: int = Field(default=32, ge=1, le=64)
     jev_rerank_policy: str = "Prefer direct evidence answering the query; respect explicit versions and dates in the query. Do not confuse topical overlap with an answer."
-    needle_extraction_enabled: bool = False
-    needle_min_confidence: float = Field(default=0.9, ge=0.5, le=1)
-
     # ── LLM gateway (OpenAI-compatible) ───────────────────────────────
     # When enabled, the LLM + embedder (and the graphiti reranker) route
     # through an OpenAI-compatible gateway (e.g. an internal Vertex-via-ADC

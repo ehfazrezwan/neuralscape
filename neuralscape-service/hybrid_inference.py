@@ -2,21 +2,14 @@
 from __future__ import annotations
 
 import logging
-import math
-import os
-import re
 import threading
-import time
 import hashlib
 from functools import lru_cache
-from pathlib import Path
 
 from config import settings
 from graphiti_core.llm_client.jev_client import JevDecisions
 
 logger = logging.getLogger(__name__)
-_needle_lock = threading.Lock()
-_needle_model = None
 _guard_lock = threading.Lock()
 
 
@@ -120,75 +113,3 @@ def rerank(query: str, memories: list):
     if scores is None:
         return memories
     return [memories[i] for i in sorted(range(count), key=lambda i: -scores[i])] + memories[count:]
-
-
-def try_extract(text: str, *, telemetry=None) -> list[tuple[str, str]] | None:
-    """Experimental Needle lane for ONE literal assertion, not conversations.
-
-    Entire source text must survive as a quote. Multi-sentence content, custom
-    guidance/ontologies and speaker/date extraction stay with the main model.
-    Suppressed calls, ungrounded fields and missing confidence always abstain.
-    """
-    if not settings.needle_extraction_enabled:
-        return None
-    text = text.strip()
-    if not text or len(text) > 600 or '\n' in text or len(re.findall(r'[.!?](?:\s|$)', text)) > 1:
-        return None
-    started = time.perf_counter()
-    event = {'provider': 'needle', 'model': 'needle3', 'task': 'literal_extraction'}
-    try:
-        # Native base models share global state. Serialize init/reset/complete,
-        # and reset on BOTH sides so tenant text never becomes history.
-        with _needle_lock:
-            global _needle_model
-            if _needle_model is None:
-                os.environ.setdefault('NEEDLE_TELEMETRY', '0')
-                from needle import Needle
-                from needle.agent import fetch
-                from schemas import MEMORY_CATEGORIES
-
-                # Downloads belong in deployment warmup, never the write path.
-                cache = Path(fetch.cache_dir(3))
-                if not (cache / fetch.base_weights(3)).is_file() or not (cache / fetch._lib_name()).is_file():
-                    raise ValueError('model_not_prefetched')
-                _needle_model = Needle(generation=3, auto_date=False, tools=[{
-                    'name': 'extract_memory',
-                    'description': 'Extract one durable factual memory. Copy the entire statement verbatim into quote and classify it.',
-                    'parameters': {'type': 'object', 'properties': {
-                        'quote': {'type': 'string', 'description': 'Exact entire source statement, without paraphrasing.'},
-                        'category': {'type': 'string', 'enum': sorted(MEMORY_CATEGORIES)},
-                    }, 'required': ['quote', 'category']},
-                }])
-                event['cold_start'] = True
-            _needle_model.reset()
-            try:
-                response = _needle_model.complete(text, max_new_tokens=256)
-            finally:
-                _needle_model.reset()
-        confidence = response.get('confidence')
-        if type(confidence) not in (int, float) or not math.isfinite(confidence) or not settings.needle_min_confidence <= confidence <= 1:
-            raise ValueError('uncertain')
-        if response.get('suppressed_calls') or any((response.get('validation') or {}).values()):
-            raise ValueError('ungrounded_or_suppressed')
-        calls = response.get('function_calls') or []
-        if len(calls) != 1 or calls[0].get('name') != 'extract_memory':
-            raise ValueError('invalid_call')
-        arguments = calls[0].get('arguments') or {}
-        from schemas import MEMORY_CATEGORIES
-
-        if set(arguments) != {'quote', 'category'} or arguments['category'] not in MEMORY_CATEGORIES or arguments['quote'] != text:
-            raise ValueError('source_mismatch')
-        event['accepted'] = True
-        return [(arguments['category'], text)]
-    except Exception as exc:
-        # Optional dependency/native runtime failures must not lose memories.
-        event['fallback_reason'] = type(exc).__name__
-        return None
-    finally:
-        event['elapsed_ms'] = (time.perf_counter() - started) * 1000
-        logger.info('hybrid_inference %s', event)
-        if telemetry:
-            try:
-                telemetry(event)
-            except Exception:
-                logger.warning('hybrid_telemetry_failed')

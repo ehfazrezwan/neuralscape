@@ -199,52 +199,12 @@ def test_rerank_is_permutation_preserves_score_and_stable_ties(monkeypatch):
 
 
 def test_disabled_flags_are_noops(monkeypatch):
-    for flag in ('jev_categories_enabled', 'jev_rerank_enabled', 'needle_extraction_enabled'):
+    for flag in ('jev_categories_enabled', 'jev_rerank_enabled'):
         monkeypatch.setattr(settings, flag, False)
     monkeypatch.setattr(hybrid, 'decisions', lambda: pytest.fail('No model calls when disabled'))
     rows = [object(), object()]
     assert hybrid.rerank('Q', rows) is rows
     assert hybrid.classify_types(['label']) is None
-    assert hybrid.try_extract('Fact.') is None
-
-
-def needle_response(text='I prefer short answers.', **changes):
-    return {'confidence': .99, 'function_calls': [{'name': 'extract_memory', 'arguments': {
-        'quote': text, 'category': 'preference'}}], **changes}
-
-
-@pytest.mark.parametrize('response', [needle_response(confidence=None), needle_response(confidence=float('nan')),
-    needle_response(confidence=.2), needle_response(suppressed_calls=[{}]),
-    needle_response(validation={'ungrounded': ['quote']}), needle_response('invented'),
-    needle_response(function_calls=[]), needle_response(function_calls=[{}, {}])])
-def test_needle_uncertain_ungrounded_or_partial_abstains(monkeypatch, response):
-    monkeypatch.setattr(settings, 'needle_extraction_enabled', True)
-    model = Mock()
-    model.complete.return_value = response
-    monkeypatch.setattr(hybrid, '_needle_model', model)
-    assert hybrid.try_extract('I prefer short answers.') is None
-    assert model.reset.call_count == 2
-    model.run.assert_not_called()
-
-
-def test_needle_grounded_and_reset_on_failure(monkeypatch):
-    monkeypatch.setattr(settings, 'needle_extraction_enabled', True)
-    model = Mock()
-    model.complete.return_value = needle_response()
-    monkeypatch.setattr(hybrid, '_needle_model', model)
-    assert hybrid.try_extract('I prefer short answers.') == [('preference', 'I prefer short answers.')]
-    model.complete.side_effect = RuntimeError('engine failed')
-    assert hybrid.try_extract('I prefer short answers.') is None
-    assert model.reset.call_count == 4
-
-
-def test_needle_does_not_handle_conversations(monkeypatch):
-    monkeypatch.setattr(settings, 'needle_extraction_enabled', True)
-    model = Mock()
-    monkeypatch.setattr(hybrid, '_needle_model', model)
-    assert hybrid.try_extract('First fact. Second fact.') is None
-    assert hybrid.try_extract('user: one\nassistant: two') is None
-    model.complete.assert_not_called()
 
 
 def test_graph_config_plumbs_flags_without_changing_generation(monkeypatch):

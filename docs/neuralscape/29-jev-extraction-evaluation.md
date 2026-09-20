@@ -68,9 +68,9 @@ entity/relationship extraction is not replaced by this sentence selector.
 
 Existing storage, sensitivity regex gates, authorization, source metadata and
 graph group boundaries remain in effect. Source offsets ground reconstruction
-but are not persisted as a new provenance field. Needle stays disabled; enabling
-both extraction flags gives Jev precedence, then the original extractor on
-abstention, rather than stacking two speculative extraction fallbacks.
+but are not persisted as a new provenance field. The rejected native Needle
+prototype is not part of the runtime; Jev abstention goes directly to the
+original extractor.
 
 ## Quality findings and limits
 
@@ -161,8 +161,8 @@ Existing warnings remain. Runtime image build, imports, local segmentation and
 default-off smoke checks passed. No production deployment or live-memory rewrite.
 
 Set `JEV_EXTRACTION_ENABLED=true` only in the private configuration of an isolated
-trial and restart its workers. Keep `NEEDLE_EXTRACTION_ENABLED=false`. Configure
-graph/category/rerank flags independently. Returning the flag to false restores
+trial and restart its workers. Configure graph/category/rerank flags
+independently. Returning the flag to false restores
 original extraction but does not undo already stored memories.
 
 From `neuralscape-service`, with the sandbox stores from report 28 running:
@@ -310,7 +310,7 @@ fact-safety independence, whole-window evidence publication, raw/batch/ingest
 round-trips, stale evidence after edits, unchanged permissions, reranker context,
 bounded timeout/capacity, late results, circuit recovery and single recovery probes.
 
-Final source verification: **2,740 passed, 14 skipped** on the host and **2,740
+Final source verification after review cleanup: **2,731 passed, 14 skipped** on the host and **2,731
 passed, 2 skipped** in the Docker test image. Both runs reported 29 warnings,
 including short test JWT keys and unawaited mock coroutines. The final runtime
 image also built successfully and passed imports, local tokenizer/client warmup,
@@ -346,16 +346,15 @@ calls, retroactive reclassification, or deployment changes.
 
 ## Maintainability and upstream-sync audit
 
-The five new runtime modules total 750 lines including comments and whitespace:
-one shared Jev transport/validation adapter (257), service wiring plus the
-experimental Needle lane (194), source selection (143), bounded execution (79),
-and category evidence (77). This is not a minimal one-call substitution, but it
+The five new runtime modules total 672 lines including comments and whitespace:
+one shared Jev transport/validation adapter (257), service wiring (116), source
+selection (143), bounded execution (79), and category evidence (77). This is not
+a minimal one-call substitution, but it
 does not introduce a provider framework, replace vendor generation APIs, fork
 the extraction pipeline, or build the deferred policy engine. Validation,
 whole-window fallback and late-result isolation account for useful complexity.
-The disabled Needle experiment remains the clearest optional scope to split out
-later; it has not earned a production recommendation. Its model weights are not
-bundled or downloaded on the request path.
+The failed Needle experiment was removed from the runtime and dependency graph
+after review rather than shipping an unisolated native path.
 
 Existing subtree ancestry, package layouts and `scripts/sync-upstream.sh` are
 unchanged. There are four modified vendor files and one added adapter:

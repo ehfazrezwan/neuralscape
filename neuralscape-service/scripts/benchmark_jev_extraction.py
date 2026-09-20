@@ -94,7 +94,6 @@ def run(args):
     from memory.write import WriteMixin
     import hybrid_inference
 
-    settings.needle_extraction_enabled = False
     # This benchmark was added and baseline run before the new flag existed.
     if hasattr(settings, 'jev_extraction_enabled'):
         settings.jev_extraction_enabled = args.arm == 'hybrid'

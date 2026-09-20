@@ -33,7 +33,6 @@ def run(args):
     settings.llm_gateway_graphiti_enabled = False
     settings.jev_graph_enabled = args.arm == 'hybrid'
     settings.jev_rerank_enabled = False
-    settings.needle_extraction_enabled = False
     settings.jev_extraction_enabled = args.extract and args.arm == 'hybrid'
     settings.typesafe_api_key = os.environ.get('TYPESAFE_API_KEY', '')
     settings.google_api_key = os.environ['GOOGLE_API_KEY']

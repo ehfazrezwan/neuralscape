@@ -122,6 +122,25 @@ def test_raw_batch_preserves_category_evidence(service):
     assert stored[0].visibility == 'private'
 
 
+def test_raw_dedup_response_preserves_stored_category_evidence(service):
+    text = 'Cedar uses Redis.'
+    evidence = evidence_for(text)
+    payload = {'data': text, 'metadata': {'category': 'tech_stack', 'scope': 'project',
+               'project_id': 'cedar', 'visibility': 'private', 'owner_user_id': 'u',
+               'category_evidence': evidence}}
+    service._memory.vector_store.client.scroll.return_value = (
+        [SimpleNamespace(id='existing', payload=payload)], None
+    )
+    service._find_by_content_hash = MemoryService._find_by_content_hash.__get__(service)
+
+    stored = service.store_raw(text, 'u', 'tech_stack', scope='project', project_id='cedar',
+                               visibility='private', category_evidence=evidence, add_to_graph=False)
+
+    assert stored[0].id == 'existing'
+    assert stored[0].category_evidence == evidence
+    service._memory.embedding_model.embed.assert_not_called()
+
+
 @pytest.mark.parametrize('mutation', [
     {'content_sha256':'wrong'}, {'primary_category':'architecture'}, {'confidence':float('nan')},
     {'mode':'authoritative'}, {'policy_version':'unknown'}, {'probabilities':{'tech_stack':1.0}},

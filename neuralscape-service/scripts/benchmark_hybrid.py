@@ -51,13 +51,6 @@ def cases():
         items.append({"id": f"edge-{len(items)}", "task": "edges", "context": {
             "existing_edges": [{"idx": 0, "fact": old}], "edge_invalidation_candidates": [], "new_edge": new},
             "expected": {"duplicate_facts": duplicate, "contradicted_facts": contradiction}})
-    for text, category, needle in [
-        ("The project uses PostgreSQL as its primary database.", "tech_stack", "PostgreSQL"),
-        ("I prefer concise answers without emojis.", "preference", "concise"),
-        ("We decided to use Redis because queue jobs must survive restarts.", "decision", "Redis"),
-        ("All Python functions in this project must have type annotations.", "convention", "type"),
-    ]:
-        items.append({"id": f"extract-{len(items)}", "task": "extract", "text": text, "expected": [category, needle]})
     return items
 
 
@@ -133,11 +126,9 @@ class Meter:
 
 
 async def execute(case, args, client):
-    from google.genai import types
     from graphiti_core.llm_client.config import LLMConfig
     from graphiti_core.llm_client.gemini_client import GeminiClient
     from graphiti_core.prompts import dedupe_edges, dedupe_nodes
-    from prompts import build_extraction_messages, parse_extraction_response
 
     events = []
     metered = Meter(client, events)
@@ -145,31 +136,18 @@ async def execute(case, args, client):
     started = time.perf_counter()
     row = {"id": case["id"], "task": case["task"], "events": events}
     try:
-        if case["task"] == "extract":
-            result = None
-            if args.arm == "hybrid":
-                from hybrid_inference import try_extract
-                result = await asyncio.to_thread(try_extract, case["text"], telemetry=events.append)
-            if result is None:
-                response = await metered.generate(model=args.model,
-                    contents=build_extraction_messages([{"role": "user", "content": case["text"]}])[0]["content"],
-                    config=types.GenerateContentConfig(http_options=types.HttpOptions(timeout=60_000)))
-                result = parse_extraction_response(response.text or "")
-            category, fragment = case["expected"]
-            row["correct"] = any(c == category and fragment.casefold() in t.casefold() for c, t in result)
-        else:
-            module = dedupe_nodes if case["task"] == "nodes" else dedupe_edges
-            prompt = module.nodes if case["task"] == "nodes" else module.resolve_edge
-            schema = module.NodeResolutions if case["task"] == "nodes" else module.EdgeDuplicate
-            result = None
-            if args.arm == "hybrid":
-                from graphiti_core.llm_client.jev_client import JevDecisions
-                decisions = JevDecisions.from_env(telemetry=events.append)
-                result = await decisions.resolve(case["task"], case["context"])
-            if result is None:
-                result = await fallback.generate_response(prompt(case["context"]), response_model=schema)
-            actual = [r["duplicate_candidate_id"] for r in result["entity_resolutions"]] if case["task"] == "nodes" else result
-            row["correct"] = actual == case["expected"]
+        module = dedupe_nodes if case["task"] == "nodes" else dedupe_edges
+        prompt = module.nodes if case["task"] == "nodes" else module.resolve_edge
+        schema = module.NodeResolutions if case["task"] == "nodes" else module.EdgeDuplicate
+        result = None
+        if args.arm == "hybrid":
+            from graphiti_core.llm_client.jev_client import JevDecisions
+            decisions = JevDecisions.from_env(telemetry=events.append)
+            result = await decisions.resolve(case["task"], case["context"])
+        if result is None:
+            result = await fallback.generate_response(prompt(case["context"]), response_model=schema)
+        actual = [r["duplicate_candidate_id"] for r in result["entity_resolutions"]] if case["task"] == "nodes" else result
+        row["correct"] = actual == case["expected"]
         row["result"] = result  # only the public synthetic fixtures, never live memories
     except Exception as exc:
         row.update(correct=False, error=type(exc).__name__)
