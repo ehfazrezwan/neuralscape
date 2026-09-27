@@ -1,0 +1,256 @@
+"""Contract tests for topology-neutral tenant operation state."""
+
+from __future__ import annotations
+
+import json
+from copy import deepcopy
+
+import pytest
+from pydantic import ValidationError
+
+from contracts_tenancy import (
+    ResourceManifestReference,
+    TenantOperationState,
+    TenantPlacement,
+    validate_operation_transition,
+    validate_placement_publication,
+)
+
+
+VERSION = "candidate-v1"
+
+
+def manifest(
+    *, tenant_id: str = "tenant-a", generation: int = 7, manifest_id: str = "primary"
+) -> dict[str, object]:
+    return {
+        "schema_version": VERSION,
+        "tenant_id": tenant_id,
+        "manifest_id": manifest_id,
+        "manifest_revision": 2,
+        "placement_generation": generation,
+    }
+
+
+def operation(**updates: object) -> TenantOperationState:
+    document: dict[str, object] = {
+        "schema_version": VERSION,
+        "tenant_id": "tenant-a",
+        "operation_id": "operation-1",
+        "operation": "provision",
+        "desired_state": "active",
+        "observed_state": "pending",
+        "placement_generation": 7,
+        "resource_manifests": [manifest()],
+    }
+    document.update(updates)
+    return TenantOperationState.model_validate_json(json.dumps(document))
+
+
+def test_placement_preserves_explicit_tenant_isolation_identity() -> None:
+    placement = TenantPlacement.model_validate_json(
+        json.dumps(
+            {
+                "schema_version": VERSION,
+                "tenant_id": "tenant-a",
+                "generation": 7,
+                "resource_manifests": [manifest()],
+            }
+        )
+    )
+
+    assert placement.tenant_id == "tenant-a"
+    assert placement.resource_manifests[0].tenant_id == "tenant-a"
+
+
+def test_placement_rejects_cross_tenant_manifest_reference() -> None:
+    with pytest.raises(ValidationError, match="tenant_id must match"):
+        TenantPlacement.model_validate_json(
+            json.dumps(
+                {
+                    "schema_version": VERSION,
+                    "tenant_id": "tenant-a",
+                    "generation": 7,
+                    "resource_manifests": [manifest(tenant_id="tenant-b")],
+                }
+            )
+        )
+
+
+def test_placement_rejects_manifest_from_mismatched_generation_epoch() -> None:
+    with pytest.raises(ValidationError, match="placement_generation must match"):
+        TenantPlacement.model_validate_json(
+            json.dumps(
+                {
+                    "schema_version": VERSION,
+                    "tenant_id": "tenant-a",
+                    "generation": 8,
+                    "resource_manifests": [manifest(generation=7)],
+                }
+            )
+        )
+
+
+def test_placement_rejects_duplicate_manifest_identity_and_revision() -> None:
+    with pytest.raises(ValidationError, match="must be unique"):
+        TenantPlacement.model_validate_json(
+            json.dumps(
+                {
+                    "schema_version": VERSION,
+                    "tenant_id": "tenant-a",
+                    "generation": 7,
+                    "resource_manifests": [manifest(), deepcopy(manifest())],
+                }
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("kind", "desired"),
+    [
+        ("provision", "active"),
+        ("suspend", "suspended"),
+        ("resume", "active"),
+        ("export", "unchanged"),
+        ("restore", "active"),
+        ("upgrade", "active"),
+        ("delete", "deleted"),
+    ],
+)
+def test_each_operation_has_an_explicit_desired_result(kind: str, desired: str) -> None:
+    state = operation(
+        operation=kind,
+        desired_state=desired,
+        resource_manifests=[],
+    )
+
+    assert state.desired_state == desired
+
+
+def test_operation_rejects_semantically_wrong_desired_result() -> None:
+    with pytest.raises(ValidationError, match="suspend requires desired_state=suspended"):
+        operation(operation="suspend", desired_state="active")
+
+
+def test_operation_rejects_manifest_from_another_tenant() -> None:
+    with pytest.raises(ValidationError, match="tenant_id must match"):
+        operation(resource_manifests=[manifest(tenant_id="tenant-b")])
+
+
+def test_valid_operation_progress_is_accepted() -> None:
+    pending = operation(observed_state="pending")
+    running = operation(observed_state="running")
+    succeeded = operation(observed_state="succeeded")
+
+    assert validate_operation_transition(pending, running) is running
+    assert validate_operation_transition(running, succeeded) is succeeded
+
+
+@pytest.mark.parametrize(
+    ("previous", "current"),
+    [
+        ("pending", "succeeded"),
+        ("running", "pending"),
+        ("succeeded", "running"),
+        ("failed", "running"),
+        ("cancelled", "running"),
+    ],
+)
+def test_invalid_operation_progress_is_rejected(previous: str, current: str) -> None:
+    with pytest.raises(ValueError, match="invalid observed_state transition"):
+        validate_operation_transition(
+            operation(observed_state=previous),
+            operation(observed_state=current),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "updates"),
+    [
+        ("tenant_id", {"tenant_id": "tenant-b"}),
+        ("operation_id", {"operation_id": "operation-2"}),
+        ("operation", {"operation": "resume", "desired_state": "active"}),
+    ],
+)
+def test_transition_rejects_changed_operation_identity(
+    field: str, updates: dict[str, str]
+) -> None:
+    previous = operation(resource_manifests=[])
+    current = operation(
+        observed_state="running", resource_manifests=[], **updates
+    )
+    with pytest.raises(ValueError, match=f"immutable {field}"):
+        validate_operation_transition(previous, current)
+
+
+def test_transition_rejects_generation_rollback() -> None:
+    with pytest.raises(ValueError, match="cannot decrease"):
+        validate_operation_transition(
+            operation(placement_generation=8, resource_manifests=[]),
+            operation(
+                placement_generation=7,
+                observed_state="running",
+                resource_manifests=[],
+            ),
+        )
+
+
+def test_publication_requires_exact_current_generation() -> None:
+    placement = TenantPlacement.model_validate_json(
+        json.dumps(
+            {
+                "schema_version": VERSION,
+                "tenant_id": "tenant-a",
+                "generation": 7,
+                "resource_manifests": [manifest()],
+            }
+        )
+    )
+
+    assert (
+        validate_placement_publication(
+            placement, expected_tenant_id="tenant-a", current_generation=7
+        )
+        is placement
+    )
+    with pytest.raises(ValueError, match="stale or unexpected"):
+        validate_placement_publication(
+            placement, expected_tenant_id="tenant-a", current_generation=8
+        )
+
+
+def test_publication_rejects_cross_tenant_context() -> None:
+    placement = TenantPlacement.model_validate_json(
+        json.dumps(
+            {
+                "schema_version": VERSION,
+                "tenant_id": "tenant-a",
+                "generation": 7,
+                "resource_manifests": [],
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="tenant_id does not match"):
+        validate_placement_publication(
+            placement, expected_tenant_id="tenant-b", current_generation=7
+        )
+
+
+def test_contracts_require_version_and_reject_unknown_fields() -> None:
+    document = manifest()
+    document.pop("schema_version")
+    with pytest.raises(ValidationError):
+        ResourceManifestReference.model_validate_json(json.dumps(document))
+
+    with pytest.raises(ValidationError):
+        operation(unreviewed_topology="shared-plane")
+
+
+@pytest.mark.parametrize("invalid_generation", [True, -1, 9_007_199_254_740_992])
+def test_generation_uses_safe_counter_bounds(invalid_generation: object) -> None:
+    with pytest.raises(ValidationError):
+        operation(
+            placement_generation=invalid_generation,
+            resource_manifests=[],
+        )
