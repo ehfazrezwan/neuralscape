@@ -11,17 +11,34 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from enum import Enum
-from typing import Any, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
-from pydantic import ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
-from contracts_common import OpaqueId, SafeCounter, VersionedContract
+
+_MAX_SAFE_COUNTER = 9_007_199_254_740_991
+_OpaqueId = Annotated[
+    str,
+    StringConstraints(strict=True, min_length=1, max_length=256),
+]
+_SafeCounter = Annotated[
+    int,
+    Field(strict=True, ge=0, le=_MAX_SAFE_COUNTER),
+]
 
 
-class _ManifestContract(VersionedContract):
-    """Immutable base for evidence that must remain stable once validated."""
+class _ManifestContract(BaseModel):
+    """Strict, immutable base local to the standalone benchmark package."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    schema_version: Literal["candidate-v1"]
 
 
 class RunState(str, Enum):
@@ -66,7 +83,7 @@ class BuildIdentity(_ManifestContract):
 class WorkloadIdentity(_ManifestContract):
     """Exact workload definition and input corpus bytes."""
 
-    workload_id: OpaqueId
+    workload_id: _OpaqueId
     workload_sha256: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     corpus_sha256: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
 
@@ -74,8 +91,8 @@ class WorkloadIdentity(_ManifestContract):
 class ConcurrencySetting(_ManifestContract):
     """One independently named concurrency control."""
 
-    scope: OpaqueId
-    value: SafeCounter
+    scope: _OpaqueId
+    value: _SafeCounter
 
     @field_validator("value")
     @classmethod
@@ -92,14 +109,14 @@ class ResourceReading(_ManifestContract):
     explicitly preserves a missing measurement instead of turning it into zero.
     """
 
-    scope: OpaqueId
-    resource: OpaqueId
-    unit: OpaqueId
+    scope: _OpaqueId
+    resource: _OpaqueId
+    unit: _OpaqueId
     limit_kind: LimitKind
-    limit_value: SafeCounter | None = None
+    limit_value: _SafeCounter | None = None
     observation_kind: ObservationKind
-    observed_value: SafeCounter | None = None
-    unknown_reason: OpaqueId | None = None
+    observed_value: _SafeCounter | None = None
+    unknown_reason: _OpaqueId | None = None
 
     @model_validator(mode="after")
     def validate_availability(self) -> Self:
@@ -127,10 +144,10 @@ class ResourceReading(_ManifestContract):
 class MeasurementProvenance(_ManifestContract):
     """How and where a set of samples was collected."""
 
-    collector: OpaqueId
-    collector_version: OpaqueId
+    collector: _OpaqueId
+    collector_version: _OpaqueId
     clock: Literal["monotonic", "monotonic_raw", "perf_counter"]
-    placement: OpaqueId
+    placement: _OpaqueId
 
 
 class SampleExclusion(_ManifestContract):
@@ -141,8 +158,8 @@ class SampleExclusion(_ManifestContract):
     """
 
     kind: Literal["warmup", "fixture_setup", "invalid_instrumentation"]
-    count: SafeCounter
-    reason: OpaqueId
+    count: _SafeCounter
+    reason: _OpaqueId
 
     @field_validator("count")
     @classmethod
@@ -155,10 +172,10 @@ class SampleExclusion(_ManifestContract):
 class TimingMeasurement(_ManifestContract):
     """Sampling boundary for one timing metric, without benchmark results."""
 
-    name: OpaqueId
+    name: _OpaqueId
     time_unit: Literal["nanoseconds", "microseconds", "milliseconds", "seconds"]
-    attempted_sample_count: SafeCounter
-    included_sample_count: SafeCounter
+    attempted_sample_count: _SafeCounter
+    included_sample_count: _SafeCounter
     provenance: MeasurementProvenance
     exclusions: tuple[SampleExclusion, ...] = ()
 
@@ -180,7 +197,7 @@ class TimingMeasurement(_ManifestContract):
 class RunManifest(_ManifestContract):
     """A reproducible benchmark run envelope with explicit evidence state."""
 
-    run_id: OpaqueId
+    run_id: _OpaqueId
     state: RunState
     build: BuildIdentity
     workload: WorkloadIdentity

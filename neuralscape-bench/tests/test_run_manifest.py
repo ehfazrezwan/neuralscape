@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
+import pydantic
 import pytest
 from pydantic import ValidationError
 
@@ -30,6 +35,60 @@ VERSION = "candidate-v1"
 SHA_A = "sha256:" + "a" * 64
 SHA_B = "sha256:" + "b" * 64
 SHA_C = "sha256:" + "c" * 64
+
+
+def test_standalone_import_and_validation_without_product_modules(tmp_path):
+    bench_root = Path(__file__).resolve().parents[1]
+    site_packages = Path(pydantic.__file__).resolve().parent.parent
+    script = """
+import builtins
+import sys
+
+# Make installed dependencies visible without running site initialization or
+# processing editable .pth files from unrelated packages.
+sys.path.append(sys.argv[1])
+
+real_import = builtins.__import__
+def guarded_import(name, *args, **kwargs):
+    if name == "contracts_common" or name.startswith("contracts_common."):
+        raise AssertionError("product contract import attempted")
+    return real_import(name, *args, **kwargs)
+builtins.__import__ = guarded_import
+
+from pydantic import ValidationError
+from neuralscape_bench.run_manifest import ConcurrencySetting
+
+valid = ConcurrencySetting(
+    schema_version="candidate-v1",
+    scope="standalone-driver",
+    value=1,
+)
+assert valid.value == 1
+try:
+    ConcurrencySetting(
+        schema_version="candidate-v1",
+        scope="standalone-driver",
+        value=True,
+    )
+except ValidationError:
+    pass
+else:
+    raise AssertionError("strict counter accepted a boolean")
+print("standalone validation passed")
+"""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(bench_root)
+    result = subprocess.run(
+        [sys.executable, "-S", "-c", script, str(site_packages)],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "standalone validation passed"
 
 
 def build_identity() -> BuildIdentity:
@@ -205,6 +264,19 @@ def test_bool_is_not_accepted_as_a_counter():
 def test_zero_concurrency_is_rejected_instead_of_describing_a_noop_run():
     with pytest.raises(ValidationError, match="at least one"):
         ConcurrencySetting(schema_version=VERSION, scope="driver", value=0)
+
+
+def test_local_identifier_and_counter_bounds_are_enforced():
+    with pytest.raises(ValidationError):
+        ConcurrencySetting(schema_version=VERSION, scope="", value=1)
+    with pytest.raises(ValidationError):
+        ConcurrencySetting(schema_version=VERSION, scope="x" * 257, value=1)
+    with pytest.raises(ValidationError):
+        ConcurrencySetting(
+            schema_version=VERSION,
+            scope="driver",
+            value=9_007_199_254_740_992,
+        )
 
 
 def test_resource_limit_and_observation_states_are_consistent():
