@@ -255,7 +255,14 @@ def source_versions_match(
     expected: SourceVersion,
     observed: SourceVersion,
 ) -> bool:
-    """Require identity, content revision, and policy epoch to match exactly."""
+    """Require exact equality after deep validation of both version witnesses."""
+
+    expected = SourceVersion.model_validate(
+        expected.model_dump(mode="python", round_trip=True)
+    )
+    observed = SourceVersion.model_validate(
+        observed.model_dump(mode="python", round_trip=True)
+    )
 
     return (
         expected.record_id == observed.record_id
@@ -270,12 +277,25 @@ def validate_required_stage_claim(
     intent: Intent,
     receipts: tuple[StageReceipt, ...],
 ) -> None:
-    """Reject aggregate claims unsupported by latest stage receipts.
+    """Reject aggregate claims unsupported by fully revalidated inputs.
+
+    Existing Pydantic instances are not proof of validity because unchecked
+    construction and copy updates can bypass validators.  This public decision
+    boundary therefore dumps and revalidates each complete nested graph before
+    inspecting it.
 
     Only the greatest attempt number for each required stage is considered.
     An applied receipt satisfies a stage only when its complete per-source
     revision/epoch set exactly matches the intent's expected sources.
     """
+
+    intent = Intent.model_validate(intent.model_dump(mode="python", round_trip=True))
+    receipts = tuple(
+        StageReceipt.model_validate(
+            receipt.model_dump(mode="python", round_trip=True)
+        )
+        for receipt in receipts
+    )
 
     latest: dict[ProcessingStage, StageReceipt] = {}
     for receipt in receipts:

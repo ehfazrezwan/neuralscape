@@ -277,6 +277,114 @@ def test_shared_nested_reference_and_version_values_are_frozen() -> None:
             setattr(value, field_name, replacement)
 
 
+@pytest.mark.parametrize(
+    "required_stages",
+    [
+        (),
+        (ProcessingStage.CANONICAL, ProcessingStage.CANONICAL),
+    ],
+)
+def test_aggregate_boundary_revalidates_copied_intent_stages(
+    required_stages: tuple[ProcessingStage, ...],
+) -> None:
+    command = intent(ProcessingStage.CANONICAL)
+    unchecked = command.model_copy(update={"required_stages": required_stages})
+
+    with pytest.raises(ValidationError, match="required_stages"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED,
+            intent=unchecked,
+            receipts=(receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED),),
+        )
+
+
+def test_aggregate_boundary_revalidates_constructed_intent() -> None:
+    command = intent(ProcessingStage.CANONICAL)
+    values = dict(command.__dict__)
+    values["required_stages"] = ()
+    unchecked = Intent.model_construct(**values)
+
+    with pytest.raises(ValidationError, match="required_stages"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED,
+            intent=unchecked,
+            receipts=(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"attempt": 0}, "attempt"),
+        ({"finished_at": None}, "finished_at"),
+        ({"started_at": datetime(2026, 9, 28, 12, 0)}, "timezone"),
+        (
+            {
+                "started_at": NOW + timedelta(seconds=2),
+                "finished_at": NOW + timedelta(seconds=1),
+            },
+            "cannot precede",
+        ),
+    ],
+)
+def test_aggregate_boundary_revalidates_copied_receipt_invariants(
+    updates: dict[str, object],
+    message: str,
+) -> None:
+    command = intent(ProcessingStage.CANONICAL)
+    valid_receipt = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    unchecked = valid_receipt.model_copy(update=updates)
+
+    with pytest.raises(ValidationError, match=message):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED,
+            intent=command,
+            receipts=(unchecked,),
+        )
+
+
+def test_aggregate_boundary_revalidates_copied_nested_values() -> None:
+    command = intent(ProcessingStage.CANONICAL)
+    valid_receipt = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+
+    invalid_source = command.expected_sources[0].model_copy(
+        update={"content_revision": -1}
+    )
+    invalid_source_command = command.model_copy(
+        update={"expected_sources": (invalid_source,)}
+    )
+    # Revalidating an existing outer instance does not traverse this copied
+    # nested SourceVersion, so the public boundary must dump the full graph.
+    assert Intent.model_validate(invalid_source_command) is invalid_source_command
+    with pytest.raises(ValidationError, match="greater than or equal to 0"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED,
+            intent=invalid_source_command,
+            receipts=(valid_receipt,),
+        )
+
+    reference = ReferenceHandle(
+        kind="memory",
+        id="memory-1",
+        tenant_id="tenant-1",
+        resolver="resolve_memory",
+    )
+    invalid_reference = reference.model_copy(update={"id": ""})
+    invalid_reference_receipt = valid_receipt.model_copy(
+        update={"output_refs": (invalid_reference,)}
+    )
+    assert (
+        StageReceipt.model_validate(invalid_reference_receipt)
+        is invalid_reference_receipt
+    )
+    with pytest.raises(ValidationError, match="at least 1 character"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED,
+            intent=command,
+            receipts=(invalid_reference_receipt,),
+        )
+
+
 def test_legal_transitions_are_forward_only_and_terminal_states_stay_terminal() -> None:
     assert is_legal_intent_transition(IntentStatus.ACCEPTED, IntentStatus.PROCESSING)
     assert is_legal_intent_transition(IntentStatus.PROCESSING, IntentStatus.PARTIAL)
@@ -294,6 +402,15 @@ def test_stale_content_revision_or_policy_epoch_never_matches() -> None:
     assert not source_versions_match(expected, source("memory-1", revision=3, epoch=9))
     assert not source_versions_match(expected, source("memory-1", revision=4, epoch=8))
     assert not source_versions_match(expected, source("another-memory", revision=4, epoch=9))
+
+
+def test_source_version_decision_boundary_revalidates_copied_values() -> None:
+    valid = source("memory-1", revision=4, epoch=9)
+    invalid = valid.model_copy(update={"content_revision": -1})
+
+    assert SourceVersion.model_validate(invalid) is invalid
+    with pytest.raises(ValidationError, match="greater than or equal to 0"):
+        source_versions_match(invalid, invalid)
 
 
 def test_applied_claim_requires_every_required_stage_at_expected_versions() -> None:
