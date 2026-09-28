@@ -147,8 +147,13 @@ def test_valid_operation_progress_is_accepted() -> None:
     running = operation(observed_state="running")
     succeeded = operation(observed_state="succeeded")
 
-    assert validate_operation_transition(pending, running) is running
-    assert validate_operation_transition(running, succeeded) is succeeded
+    running_result = validate_operation_transition(pending, running)
+    succeeded_result = validate_operation_transition(running, succeeded)
+
+    assert running_result == running
+    assert running_result is not running
+    assert succeeded_result == succeeded
+    assert succeeded_result is not succeeded
 
 
 @pytest.mark.parametrize(
@@ -239,12 +244,11 @@ def test_publication_requires_exact_current_generation() -> None:
         )
     )
 
-    assert (
-        validate_placement_publication(
-            placement, expected_tenant_id="tenant-a", current_generation=7
-        )
-        is placement
+    result = validate_placement_publication(
+        placement, expected_tenant_id="tenant-a", current_generation=7
     )
+    assert result == placement
+    assert result is not placement
     with pytest.raises(ValueError, match="stale or unexpected"):
         validate_placement_publication(
             placement, expected_tenant_id="tenant-a", current_generation=8
@@ -266,6 +270,82 @@ def test_publication_rejects_cross_tenant_context() -> None:
     with pytest.raises(ValueError, match="tenant_id does not match"):
         validate_placement_publication(
             placement, expected_tenant_id="tenant-b", current_generation=7
+        )
+
+
+def test_publication_revalidates_copied_nested_manifest_graph() -> None:
+    placement = TenantPlacement.model_validate_json(
+        json.dumps(
+            {
+                "schema_version": VERSION,
+                "tenant_id": "tenant-a",
+                "generation": 7,
+                "resource_manifests": [manifest()],
+            }
+        )
+    )
+    cross_tenant = ResourceManifestReference.model_validate_json(
+        json.dumps(manifest(tenant_id="tenant-b"))
+    )
+    corrupted = placement.model_copy(
+        update={"resource_manifests": (cross_tenant,)}
+    )
+
+    with pytest.raises(ValidationError, match="tenant_id must match"):
+        validate_placement_publication(
+            corrupted,
+            expected_tenant_id="tenant-a",
+            current_generation=7,
+        )
+
+
+@pytest.mark.parametrize("corrupt_previous", [False, True])
+def test_transition_revalidates_copied_operation_graph(
+    corrupt_previous: bool,
+) -> None:
+    previous = operation(resource_manifests=[])
+    current = operation(observed_state="running", resource_manifests=[])
+    cross_tenant = ResourceManifestReference.model_validate_json(
+        json.dumps(manifest(tenant_id="tenant-b"))
+    )
+    corrupted = (previous if corrupt_previous else current).model_copy(
+        update={"resource_manifests": (cross_tenant,)}
+    )
+
+    with pytest.raises(ValidationError, match="tenant_id must match"):
+        validate_operation_transition(
+            corrupted if corrupt_previous else previous,
+            current if corrupt_previous else corrupted,
+        )
+
+
+def test_transition_revalidates_copied_operation_fields() -> None:
+    previous = operation(resource_manifests=[])
+    current = operation(observed_state="running", resource_manifests=[])
+    invalid = current.model_copy(update={"desired_state": "suspended"})
+
+    with pytest.raises(ValidationError, match="requires desired_state"):
+        validate_operation_transition(previous, invalid)
+
+
+def test_publication_revalidates_post_construction_nested_mutation() -> None:
+    placement = TenantPlacement.model_validate_json(
+        json.dumps(
+            {
+                "schema_version": VERSION,
+                "tenant_id": "tenant-a",
+                "generation": 7,
+                "resource_manifests": [manifest()],
+            }
+        )
+    )
+    placement.resource_manifests[0].tenant_id = "tenant-b"
+
+    with pytest.raises(ValidationError, match="tenant_id must match"):
+        validate_placement_publication(
+            placement,
+            expected_tenant_id="tenant-a",
+            current_generation=7,
         )
 
 

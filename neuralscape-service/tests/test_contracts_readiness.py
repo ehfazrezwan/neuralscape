@@ -182,20 +182,90 @@ def test_publication_rejects_stale_and_future_generations() -> None:
 def test_publication_accepts_only_exact_tenant_and_generation() -> None:
     report = publication()
 
-    assert (
-        validate_readiness_publication(
-            report,
-            expected_tenant_id="tenant-a",
-            current_placement_generation=12,
-        )
-        is report
+    result = validate_readiness_publication(
+        report,
+        expected_tenant_id="tenant-a",
+        current_placement_generation=12,
     )
+    assert result == report
+    assert result is not report
     with pytest.raises(ValueError, match="tenant_id does not match"):
         validate_readiness_publication(
             report,
             expected_tenant_id="tenant-b",
             current_placement_generation=12,
         )
+
+
+def test_publication_revalidates_copied_empty_capability_set() -> None:
+    corrupted = publication().model_copy(update={"capabilities": ()})
+
+    with pytest.raises(ValidationError, match="at least one"):
+        validate_readiness_publication(
+            corrupted,
+            expected_tenant_id="tenant-a",
+            current_placement_generation=12,
+        )
+
+
+def test_publication_revalidates_copied_duplicate_capabilities() -> None:
+    exact_reads = observation("exact_reads")
+    corrupted = publication().model_copy(
+        update={"capabilities": (exact_reads, exact_reads.model_copy())}
+    )
+
+    with pytest.raises(ValidationError, match="must be unique"):
+        validate_readiness_publication(
+            corrupted,
+            expected_tenant_id="tenant-a",
+            current_placement_generation=12,
+        )
+
+
+def test_publication_revalidates_nested_capability_graph() -> None:
+    invalid = observation("exact_reads").model_copy(
+        update={"status": "process_running"}
+    )
+    corrupted = publication().model_copy(update={"capabilities": (invalid,)})
+
+    with pytest.raises(ValidationError):
+        validate_readiness_publication(
+            corrupted,
+            expected_tenant_id="tenant-a",
+            current_placement_generation=12,
+        )
+
+
+def test_readiness_evaluation_revalidates_copied_observation_graph() -> None:
+    invalid_status = observation(status="unavailable").model_copy(
+        update={"status": "process_running"}
+    )
+    naive_timestamp = observation().model_copy(
+        update={"observed_at": datetime(2026, 9, 28, 0, 0)}
+    )
+
+    with pytest.raises(ValidationError):
+        evaluate(invalid_status)
+    with pytest.raises(ValidationError):
+        evaluate(naive_timestamp)
+
+
+def test_valid_explicit_healthy_copy_has_same_semantics_as_fresh_input() -> None:
+    copied = observation(status="unavailable").model_copy(
+        update={"status": "healthy"}
+    )
+    fresh = observation(status="healthy")
+
+    assert copied.model_dump() == fresh.model_dump()
+    assert evaluate(copied) == evaluate(fresh) is True
+
+
+def test_readiness_evaluation_revalidates_post_construction_mutation() -> None:
+    item = observation()
+    item.observed_at = datetime(2026, 9, 28, 0, 0)
+
+    with pytest.raises(ValidationError):
+        evaluate(item)
 
 
 @pytest.mark.parametrize(

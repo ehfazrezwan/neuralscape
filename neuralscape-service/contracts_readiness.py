@@ -57,6 +57,22 @@ class TenantReadinessPublication(VersionedContract):
         return self
 
 
+def _validated_observation_snapshot(
+    observation: CapabilityReadiness,
+) -> CapabilityReadiness:
+    return CapabilityReadiness.model_validate(
+        observation.model_dump(mode="python", round_trip=True, warnings=False)
+    )
+
+
+def _validated_publication_snapshot(
+    publication: TenantReadinessPublication,
+) -> TenantReadinessPublication:
+    return TenantReadinessPublication.model_validate(
+        publication.model_dump(mode="python", round_trip=True, warnings=False)
+    )
+
+
 def validate_readiness_publication(
     publication: TenantReadinessPublication,
     *,
@@ -65,6 +81,7 @@ def validate_readiness_publication(
 ) -> TenantReadinessPublication:
     """Reject cross-tenant and stale-generation readiness publication."""
 
+    publication = _validated_publication_snapshot(publication)
     validated_tenant_id = _OPAQUE_ID_ADAPTER.validate_python(
         expected_tenant_id, strict=True
     )
@@ -86,8 +103,12 @@ def capability_is_ready(
     evaluated_at: datetime,
     max_probe_age_seconds: SafeCounter,
 ) -> bool:
-    """Evaluate one capability at an explicit time and age limit."""
+    """Evaluate explicit capability evidence at a supplied time and age limit.
 
+    Structural validation cannot prove that the represented probe occurred.
+    """
+
+    observation = _validated_observation_snapshot(observation)
     validated_evaluation_time = _AWARE_DATETIME_ADAPTER.validate_python(
         evaluated_at, strict=True
     )

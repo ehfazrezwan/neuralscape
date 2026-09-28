@@ -128,10 +128,27 @@ _ALLOWED_OBSERVED_TRANSITIONS: dict[
 }
 
 
+def _validated_operation_snapshot(
+    operation: TenantOperationState,
+) -> TenantOperationState:
+    return TenantOperationState.model_validate(
+        operation.model_dump(mode="python", round_trip=True, warnings=False)
+    )
+
+
+def _validated_placement_snapshot(placement: TenantPlacement) -> TenantPlacement:
+    return TenantPlacement.model_validate(
+        placement.model_dump(mode="python", round_trip=True, warnings=False)
+    )
+
+
 def validate_operation_transition(
     previous: TenantOperationState, current: TenantOperationState
 ) -> TenantOperationState:
     """Reject identity changes, generation rollback, and invalid progress changes."""
+
+    previous = _validated_operation_snapshot(previous)
+    current = _validated_operation_snapshot(current)
 
     immutable_fields = ("tenant_id", "operation_id", "operation", "desired_state")
     for field_name in immutable_fields:
@@ -163,6 +180,7 @@ def validate_placement_publication(
 ) -> TenantPlacement:
     """Accept only a publication for the exact tenant and current generation."""
 
+    placement = _validated_placement_snapshot(placement)
     validated_tenant_id = _OPAQUE_ID_ADAPTER.validate_python(
         expected_tenant_id, strict=True
     )
