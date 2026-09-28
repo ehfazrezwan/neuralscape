@@ -162,6 +162,18 @@ class SelectedContextItem(ContractModel):
 
     @model_validator(mode="after")
     def require_unique_source_versions(self) -> "SelectedContextItem":
+        if self.reference.tenant_id != self.expansion_handle.tenant_id:
+            raise ValueError(
+                "reference and expansion_handle must have the same tenant scope"
+            )
+        if any(
+            checkpoint.source.tenant_id != self.reference.tenant_id
+            for checkpoint in self.freshness.source_checkpoints
+        ):
+            raise ValueError(
+                "source checkpoints must have the selected reference tenant scope"
+            )
+
         record_ids = [str(version.record_id) for version in self.source_versions]
         if len(record_ids) != len(set(record_ids)):
             raise ValueError("source_versions must identify unique records")
@@ -194,8 +206,27 @@ class ContextBundle(VersionedContract):
     def validate_outcome_shape(self) -> "ContextBundle":
         if self.assembly_receipt.kind != "artifact":
             raise ValueError("assembly_receipt requires an artifact reference")
+        if any(
+            item.reference.tenant_id != self.assembly_receipt.tenant_id
+            for item in self.selected_items
+        ):
+            raise ValueError(
+                "selected items and assembly_receipt must share one tenant scope"
+            )
         if len(self.omissions) != len(set(self.omissions)):
             raise ValueError("omission codes must be unique")
+
+        source_versions: dict[str, tuple[int, int]] = {}
+        for item in self.selected_items:
+            for version in item.source_versions:
+                record_id = str(version.record_id)
+                value = (version.content_revision, version.policy_epoch)
+                previous = source_versions.setdefault(record_id, value)
+                if previous != value:
+                    raise ValueError(
+                        "selected items contain conflicting versions for source "
+                        f"{record_id!r}"
+                    )
 
         empty_outcomes = {
             ContextOutcome.NO_RELEVANT_EVIDENCE,
@@ -308,14 +339,46 @@ def upstream_degradation_for(
 
 
 def bundle_fits_request(request: ContextRequest, bundle: ContextBundle) -> bool:
-    """Check request correlation and whole-response budget/basis agreement."""
+    """Conservatively check every request constraint represented by these models.
 
-    return (
-        bundle.request_id == request.request_id
-        and bundle.response_usage.scope == request.response_budget.scope
-        and bundle.response_usage.tokenizer == request.response_budget.tokenizer
-        and bundle.response_usage.tokens <= request.response_budget.max_tokens
-    )
+    Historical items currently lack an applicability interval or point-in-time
+    witness, so this helper never asserts that a historical ``as_of`` request is
+    satisfied.  It also treats partial and failed outcomes as non-satisfying even
+    though those bundles remain valid, informative responses.
+    """
+
+    if (
+        bundle.request_id != request.request_id
+        or bundle.response_usage.scope != request.response_budget.scope
+        or bundle.response_usage.tokenizer != request.response_budget.tokenizer
+        or bundle.response_usage.tokens > request.response_budget.max_tokens
+        or bundle.outcome
+        not in {ContextOutcome.COMPLETE, ContextOutcome.NO_RELEVANT_EVIDENCE}
+    ):
+        return False
+
+    if request.time_perspective is TimePerspective.HISTORICAL:
+        return False
+    if any(
+        item.temporal_status is not TemporalStatus.CURRENT
+        for item in bundle.selected_items
+    ):
+        return False
+
+    if request.freshness_requirement is FreshnessRequirement.CURRENT_VERIFIED:
+        return all(
+            item.freshness.upstream_status is UpstreamVerificationStatus.CURRENT
+            and item.freshness.projection.status is ProjectionStatus.CURRENT
+            for item in bundle.selected_items
+        )
+    if request.freshness_requirement is FreshnessRequirement.CURRENT_KNOWN:
+        return all(
+            item.freshness.upstream_status
+            in {UpstreamVerificationStatus.CURRENT, UpstreamVerificationStatus.STALE}
+            and item.freshness.projection.status is ProjectionStatus.CURRENT
+            for item in bundle.selected_items
+        )
+    return True
 
 
 def receipt_matches_bundle(

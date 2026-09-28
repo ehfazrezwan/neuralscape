@@ -163,6 +163,67 @@ def test_current_aggregate_cannot_hide_stale_checkpoint() -> None:
         FreshnessWitness.model_validate_json(json.dumps(payload))
 
 
+def test_current_upstream_rejects_checkpoint_for_unrelated_source() -> None:
+    payload = {
+        "upstream_status": "current",
+        "source_checkpoints": [
+            _checkpoint(source=_reference("source-x")),
+        ],
+        "projection": {
+            "status": "current",
+            "applied_sources": [_version("source-a", 4)],
+            "verified_at": NOW,
+        },
+    }
+
+    with pytest.raises(ValidationError, match="map to applied source record IDs"):
+        FreshnessWitness.model_validate_json(json.dumps(payload))
+
+
+def test_current_upstream_requires_checkpoint_for_every_applied_source() -> None:
+    payload = {
+        "upstream_status": "current",
+        "source_checkpoints": [_checkpoint()],
+        "projection": {
+            "status": "current",
+            "applied_sources": [
+                _version("source-a", 4),
+                _version("source-b", 9),
+            ],
+            "verified_at": NOW,
+        },
+    }
+
+    with pytest.raises(ValidationError, match="every applied source checkpoint"):
+        FreshnessWitness.model_validate_json(json.dumps(payload))
+
+
+def test_freshness_witness_rejects_mixed_checkpoint_tenant_scope() -> None:
+    other_tenant_source = _reference("source-b")
+    other_tenant_source["tenant_id"] = "tenant-2"
+    payload = {
+        "upstream_status": "stale",
+        "source_checkpoints": [
+            _checkpoint(),
+            _checkpoint(
+                source=other_tenant_source,
+                verification_status="stale",
+            ),
+        ],
+        "projection": {
+            "status": "current",
+            "applied_sources": [
+                _version("source-a", 4),
+                _version("source-b", 9),
+            ],
+            "verified_at": NOW,
+        },
+    }
+
+    with pytest.raises(ValidationError, match="one tenant scope"):
+        FreshnessWitness.model_validate_json(json.dumps(payload))
+
+
 def test_checkpoint_datetimes_must_be_timezone_aware() -> None:
     payload = _checkpoint()
     checkpoint = SourceCheckpoint.model_validate_json(json.dumps(payload))

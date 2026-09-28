@@ -126,7 +126,12 @@ class ProjectionFreshness(ContractModel):
 
 
 class FreshnessWitness(ContractModel):
-    """Independent upstream and local-projection freshness evidence."""
+    """Independent upstream and local-projection freshness evidence.
+
+    A checkpoint's source ID maps directly to ``SourceVersion.record_id``.
+    Current upstream status requires exact checkpoint coverage of every applied
+    source; weaker statuses may have partial coverage but never unrelated sources.
+    """
 
     upstream_status: UpstreamVerificationStatus
     source_checkpoints: tuple[SourceCheckpoint, ...]
@@ -140,9 +145,28 @@ class FreshnessWitness(ContractModel):
         ]
         if len(source_keys) != len(set(source_keys)):
             raise ValueError("source_checkpoints must identify unique sources")
+        checkpoint_tenants = {
+            str(checkpoint.source.tenant_id)
+            for checkpoint in self.source_checkpoints
+        }
+        if len(checkpoint_tenants) > 1:
+            raise ValueError("source checkpoints must share one tenant scope")
+
+        checkpoint_ids = {
+            str(checkpoint.source.id) for checkpoint in self.source_checkpoints
+        }
+        applied_ids = {
+            str(version.record_id) for version in self.projection.applied_sources
+        }
+        if not checkpoint_ids.issubset(applied_ids):
+            raise ValueError(
+                "checkpoint source IDs must map to applied source record IDs"
+            )
         if self.upstream_status is UpstreamVerificationStatus.CURRENT:
-            if not self.source_checkpoints:
-                raise ValueError("current upstream status requires a checkpoint")
+            if checkpoint_ids != applied_ids:
+                raise ValueError(
+                    "current upstream status requires every applied source checkpoint"
+                )
             if any(
                 checkpoint.verification_status
                 is not UpstreamVerificationStatus.CURRENT

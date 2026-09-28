@@ -1,6 +1,7 @@
 """Contract tests for bounded context delivery and safe assembly receipts."""
 
 import json
+from copy import deepcopy
 
 import pytest
 from pydantic import ValidationError
@@ -190,7 +191,10 @@ def test_receipt_fields_require_typed_artifact_references() -> None:
 
 
 def test_budget_is_whole_response_and_uses_the_declared_tokenizer() -> None:
-    request = _validate(ContextRequest, _request())
+    request = _validate(
+        ContextRequest,
+        _request(freshness_requirement="labelled_stale_acceptable"),
+    )
     bundle = _validate(ContextBundle, _bundle())
     assert bundle_fits_request(request, bundle)
 
@@ -209,6 +213,54 @@ def test_budget_is_whole_response_and_uses_the_declared_tokenizer() -> None:
     )
     assert not bundle_fits_request(request, over_budget)
     assert not bundle_fits_request(request, wrong_basis)
+
+
+def test_request_fit_rejects_stale_upstream_for_current_verified() -> None:
+    request = _validate(ContextRequest, _request())
+    stale_bundle = _validate(ContextBundle, _bundle())
+
+    assert not bundle_fits_request(request, stale_bundle)
+
+    current_item = _item()
+    freshness = current_item["freshness"]
+    assert isinstance(freshness, dict)
+    freshness["upstream_status"] = "current"
+    checkpoints = freshness["source_checkpoints"]
+    assert isinstance(checkpoints, list)
+    checkpoint = checkpoints[0]
+    assert isinstance(checkpoint, dict)
+    checkpoint["verification_status"] = "current"
+    current_bundle = _validate(ContextBundle, _bundle(selected_items=[current_item]))
+
+    assert bundle_fits_request(request, current_bundle)
+
+
+def test_request_fit_rejects_historical_item_for_current_request() -> None:
+    item = _item()
+    item["temporal_status"] = "historical"
+    request = _validate(
+        ContextRequest,
+        _request(freshness_requirement="labelled_stale_acceptable"),
+    )
+    bundle = _validate(ContextBundle, _bundle(selected_items=[item]))
+
+    assert not bundle_fits_request(request, bundle)
+
+
+def test_request_fit_does_not_claim_historical_as_of_without_witness() -> None:
+    item = _item()
+    item["temporal_status"] = "historical"
+    request = _validate(
+        ContextRequest,
+        _request(
+            time_perspective="historical",
+            as_of="2026-09-01T00:00:00Z",
+            freshness_requirement="labelled_stale_acceptable",
+        ),
+    )
+    bundle = _validate(ContextBundle, _bundle(selected_items=[item]))
+
+    assert not bundle_fits_request(request, bundle)
 
 
 @pytest.mark.parametrize(
@@ -278,6 +330,74 @@ def test_current_projection_must_match_full_selected_source_set() -> None:
 
     with pytest.raises(ValidationError, match="complete selected source set"):
         _validate(ContextBundle, _bundle(selected_items=[item]))
+
+
+def test_selected_item_rejects_cross_tenant_freshness_scope() -> None:
+    item = _item()
+    freshness = item["freshness"]
+    assert isinstance(freshness, dict)
+    checkpoints = freshness["source_checkpoints"]
+    assert isinstance(checkpoints, list)
+    checkpoint = checkpoints[0]
+    assert isinstance(checkpoint, dict)
+    source = checkpoint["source"]
+    assert isinstance(source, dict)
+    source["tenant_id"] = "tenant-2"
+
+    with pytest.raises(ValidationError, match="selected reference tenant scope"):
+        _validate(ContextBundle, _bundle(selected_items=[item]))
+
+
+def test_bundle_rejects_selected_item_outside_receipt_tenant_scope() -> None:
+    item = _item()
+    reference = item["reference"]
+    expansion = item["expansion_handle"]
+    assert isinstance(reference, dict)
+    assert isinstance(expansion, dict)
+    reference["tenant_id"] = "tenant-2"
+    expansion["tenant_id"] = "tenant-2"
+    freshness = item["freshness"]
+    assert isinstance(freshness, dict)
+    checkpoints = freshness["source_checkpoints"]
+    assert isinstance(checkpoints, list)
+    checkpoint = checkpoints[0]
+    assert isinstance(checkpoint, dict)
+    source = checkpoint["source"]
+    assert isinstance(source, dict)
+    source["tenant_id"] = "tenant-2"
+
+    with pytest.raises(ValidationError, match="share one tenant scope"):
+        _validate(ContextBundle, _bundle(selected_items=[item]))
+
+
+def test_bundle_rejects_conflicting_versions_across_selected_items() -> None:
+    first = _item()
+    second = deepcopy(_item())
+    second["reference"] = _reference("memory", "memory-2")
+    second["expansion_handle"] = _reference("memory", "memory-2")
+    second["source_versions"] = [_version(revision=5)]
+    freshness = second["freshness"]
+    assert isinstance(freshness, dict)
+    projection = freshness["projection"]
+    assert isinstance(projection, dict)
+    projection["applied_sources"] = [_version(revision=5)]
+
+    with pytest.raises(ValidationError, match="conflicting versions"):
+        _validate(ContextBundle, _bundle(selected_items=[first, second]))
+
+
+def test_same_source_version_across_items_has_representable_receipt() -> None:
+    first = _item()
+    second = deepcopy(_item())
+    second["reference"] = _reference("memory", "memory-2")
+    second["expansion_handle"] = _reference("memory", "memory-2")
+    bundle = _validate(ContextBundle, _bundle(selected_items=[first, second]))
+    receipt = _validate(
+        ContextAssemblyReceipt,
+        _receipt(selected_references=[first["reference"], second["reference"]]),
+    )
+
+    assert receipt_matches_bundle(receipt, bundle)
 
 
 def test_receipt_corresponds_to_delivered_bundle_and_revision_set() -> None:
