@@ -121,7 +121,11 @@ def test_source_version_keeps_content_and_policy_progress_independent() -> None:
         content_revision=3,
         policy_epoch=9,
     )
-    changed_content = version.model_copy(update={"content_revision": 4})
+    changed_content = SourceVersion(
+        record_id=version.record_id,
+        content_revision=4,
+        policy_epoch=version.policy_epoch,
+    )
 
     assert changed_content.content_revision == 4
     assert changed_content.policy_epoch == 9
@@ -129,6 +133,75 @@ def test_source_version_keeps_content_and_policy_progress_independent() -> None:
 
     with pytest.raises(ValidationError):
         SourceVersion(record_id="source-A", content_revision=True, policy_epoch=9)
+
+
+@pytest.mark.parametrize(
+    ("value", "field", "replacement"),
+    [
+        (
+            ReferenceHandle(
+                kind="memory",
+                id="memory-1",
+                tenant_id="tenant-1",
+                resolver="exact_lookup",
+            ),
+            "id",
+            "memory-2",
+        ),
+        (
+            SourceVersion(
+                record_id="source-1",
+                content_revision=3,
+                policy_epoch=9,
+            ),
+            "content_revision",
+            4,
+        ),
+    ],
+)
+def test_reference_value_snapshots_reject_assignment(
+    value: ReferenceHandle | SourceVersion,
+    field: str,
+    replacement: object,
+) -> None:
+    with pytest.raises(ValidationError, match="Instance is frozen"):
+        setattr(value, field, replacement)
+
+
+@pytest.mark.parametrize(
+    ("value", "unchecked_update"),
+    [
+        (
+            ReferenceHandle(
+                kind="memory",
+                id="memory-1",
+                tenant_id="tenant-1",
+                resolver="exact_lookup",
+            ),
+            {"kind": "user"},
+        ),
+        (
+            SourceVersion(
+                record_id="source-1",
+                content_revision=3,
+                policy_epoch=9,
+            ),
+            {"content_revision": True},
+        ),
+    ],
+)
+def test_model_copy_updates_are_unchecked_and_require_boundary_revalidation(
+    value: ReferenceHandle | SourceVersion,
+    unchecked_update: dict[str, object],
+) -> None:
+    copied = value.model_copy(update=unchecked_update)
+
+    assert all(
+        getattr(copied, field) == replacement
+        for field, replacement in unchecked_update.items()
+    )
+    with pytest.raises(ValidationError):
+        type(value).model_validate(copied.model_dump())
 
 
 def test_native_and_json_representations_preserve_values() -> None:
