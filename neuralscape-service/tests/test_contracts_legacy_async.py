@@ -1,12 +1,33 @@
 """Characterization tests for the unchanged legacy async wire contract."""
 
+import pytest
+
 from contracts_legacy_async import (
+    LegacyAsyncObservation,
     LegacyAsyncObservationKind,
     observe_redis_unavailable_sync_200,
     observe_task_accepted,
     observe_task_status,
 )
 from schemas import MemoryResponse, StoreMemoryResponse, TaskAcceptedResponse, TaskStatusResponse
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"durable_intent_committed": True},
+        {"all_projections_applied": True},
+    ],
+)
+def test_legacy_guarantee_flags_cannot_be_overridden_by_callers(
+    override: dict[str, bool],
+) -> None:
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        LegacyAsyncObservation(
+            kind=LegacyAsyncObservationKind.QUEUE_ACKNOWLEDGED,
+            task_id="ns-123",
+            **override,
+        )
 
 
 def test_task_accepted_wire_shape_is_unchanged_and_only_acknowledges_queue() -> None:

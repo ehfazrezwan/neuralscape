@@ -1,5 +1,6 @@
 """Positive and adversarial tests for inert lifecycle contracts."""
 
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -21,7 +22,7 @@ from contracts_lifecycle import (
     source_versions_match,
     validate_required_stage_claim,
 )
-from contracts_references import SourceVersion
+from contracts_references import ReferenceHandle, SourceVersion
 
 
 NOW = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
@@ -75,9 +76,37 @@ def receipt(
         applied_sources=sources if sources is not None else (source("memory-1"),),
         output_refs=(),
         error=error,
-        started_at=NOW,
+        started_at=None if status is StageStatus.PENDING else NOW,
         finished_at=NOW + timedelta(seconds=1) if terminal else None,
     )
+
+
+def memory_record(**overrides: object) -> MemoryRecord:
+    values: dict[str, object] = {
+        "schema_version": "candidate-v1",
+        "id": "memory-1",
+        "tenant_id": "tenant-1",
+        "owner_id": "actor-1",
+        "record_kind": MemoryRecordKind.FACT,
+        "applicability": ApplicabilityScope.GLOBAL,
+        "project_id": None,
+        "workspace_id": None,
+        "category": "preference",
+        "author_kind": "user",
+        "source_kind": "direct",
+        "content_revision": 3,
+        "policy_epoch": 7,
+        "lifecycle": MemoryLifecycle.ACTIVE,
+        "body": PlaintextMemoryBody(kind="plaintext", text="Use concise answers"),
+        "source_refs": (),
+        "required_parents": (),
+        "successor_id": None,
+        "retention_hold_ids": (),
+        "occurred_at": None,
+        "recorded_at": NOW,
+    }
+    values.update(overrides)
+    return MemoryRecord(**values)
 
 
 def test_memory_record_keeps_content_revision_and_policy_epoch_independent() -> None:
@@ -152,6 +181,20 @@ def test_record_rejects_scope_mismatch_and_body_after_erasure() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "parents",
+    [
+        (source("parent-a", 3, 7), source("parent-a", 3, 7)),
+        (source("parent-a", 3, 7), source("parent-a", 4, 8)),
+    ],
+)
+def test_record_rejects_duplicate_required_parent_witnesses(
+    parents: tuple[SourceVersion, ...],
+) -> None:
+    with pytest.raises(ValidationError, match="required_parents.*duplicate"):
+        memory_record(required_parents=parents)
+
+
 def test_intent_rejects_empty_or_duplicate_required_stages() -> None:
     with pytest.raises(ValidationError, match="required_stages must not be empty"):
         intent()
@@ -163,6 +206,75 @@ def test_intent_is_an_immutable_command_snapshot() -> None:
     command = intent(ProcessingStage.CANONICAL)
     with pytest.raises(ValidationError, match="frozen"):
         command.operation = "delete"
+
+
+def test_locally_owned_nested_stage_error_is_frozen() -> None:
+    stage_error = StageError(
+        code="projection_failed",
+        retryable=False,
+        safe_message="Projection failed",
+    )
+    failed = StageReceipt(
+        schema_version="candidate-v1",
+        intent_id="intent-1",
+        attempt=1,
+        stage=ProcessingStage.GRAPH,
+        status=StageStatus.FAILED,
+        applied_sources=(),
+        output_refs=(),
+        error=stage_error,
+        started_at=NOW,
+        finished_at=NOW + timedelta(seconds=1),
+    )
+
+    with pytest.raises(ValidationError, match="frozen"):
+        failed.error.retryable = True
+
+
+def test_shared_nested_reference_and_version_values_are_frozen() -> None:
+    reference = ReferenceHandle(
+        kind="memory",
+        id="memory-1",
+        tenant_id="tenant-1",
+        resolver="resolve_memory",
+    )
+    command = Intent(
+        schema_version="candidate-v1",
+        id="intent-1",
+        tenant_id="tenant-1",
+        actor_id="actor-1",
+        credential_id="credential-1",
+        operation="write",
+        target_refs=(reference,),
+        request_digest="sha256:abc",
+        idempotency_key="client-key-1",
+        expected_sources=(source("memory-1"),),
+        required_stages=(ProcessingStage.CANONICAL,),
+        correlation_id="correlation-1",
+        accepted_at=NOW,
+    )
+    applied = StageReceipt(
+        schema_version="candidate-v1",
+        intent_id="intent-1",
+        attempt=1,
+        stage=ProcessingStage.CANONICAL,
+        status=StageStatus.APPLIED,
+        applied_sources=(source("memory-1"),),
+        output_refs=(reference,),
+        error=None,
+        started_at=NOW,
+        finished_at=NOW + timedelta(seconds=1),
+    )
+
+    nested_mutations = [
+        (command.expected_sources[0], "content_revision", 99),
+        (command.target_refs[0], "id", "other-memory"),
+        (applied.applied_sources[0], "policy_epoch", 99),
+        (applied.output_refs[0], "resolver", "other_resolver"),
+    ]
+    for value, field_name, replacement in nested_mutations:
+        with pytest.raises(ValidationError, match="frozen"):
+            setattr(value, field_name, replacement)
 
 
 def test_legal_transitions_are_forward_only_and_terminal_states_stay_terminal() -> None:
@@ -200,11 +312,37 @@ def test_applied_claim_requires_every_required_stage_at_expected_versions() -> N
         StageStatus.APPLIED,
         sources=(source("memory-1", revision=2, epoch=7),),
     )
-    with pytest.raises(ValueError, match="every required stage"):
+    with pytest.raises(ValueError, match="must match expected sources"):
         validate_required_stage_claim(
             claimed_status=IntentStatus.APPLIED,
             intent=command,
             receipts=(receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED), stale_graph),
+        )
+
+
+@pytest.mark.parametrize(
+    "stale_source",
+    [
+        source("memory-1", revision=2, epoch=7),
+        source("memory-1", revision=3, epoch=6),
+    ],
+)
+def test_processing_rejects_latest_applied_receipt_with_stale_witness(
+    stale_source: SourceVersion,
+) -> None:
+    command = intent(ProcessingStage.CANONICAL, ProcessingStage.GRAPH)
+    with pytest.raises(ValueError, match="must match expected sources"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.PROCESSING,
+            intent=command,
+            receipts=(
+                receipt(
+                    ProcessingStage.CANONICAL,
+                    StageStatus.APPLIED,
+                    sources=(stale_source,),
+                ),
+                receipt(ProcessingStage.GRAPH, StageStatus.PROCESSING),
+            ),
         )
 
 
@@ -355,3 +493,88 @@ def test_failed_receipt_requires_error_and_terminal_timing() -> None:
             started_at=None,
             finished_at=None,
         )
+
+
+def test_pending_receipt_cannot_claim_started_work() -> None:
+    with pytest.raises(ValidationError, match="pending stage receipts cannot have started_at"):
+        StageReceipt(
+            schema_version="candidate-v1",
+            intent_id="intent-1",
+            attempt=1,
+            stage=ProcessingStage.GRAPH,
+            status=StageStatus.PENDING,
+            applied_sources=(),
+            output_refs=(),
+            error=None,
+            started_at=NOW,
+            finished_at=None,
+        )
+
+    command = intent(ProcessingStage.GRAPH)
+    validate_required_stage_claim(
+        claimed_status=IntentStatus.ACCEPTED,
+        intent=command,
+        receipts=(receipt(ProcessingStage.GRAPH, StageStatus.PENDING, sources=()),),
+    )
+
+
+def test_all_lifecycle_timestamps_reject_naive_native_datetimes() -> None:
+    naive = datetime(2026, 9, 28, 12, 0)
+
+    with pytest.raises(ValidationError, match="timezone"):
+        memory_record(recorded_at=naive)
+    with pytest.raises(ValidationError, match="timezone"):
+        memory_record(occurred_at=naive)
+
+    command_values = intent(ProcessingStage.CANONICAL).model_dump()
+    command_values["accepted_at"] = naive
+    with pytest.raises(ValidationError, match="timezone"):
+        Intent.model_validate(command_values)
+
+    with pytest.raises(ValidationError, match="timezone"):
+        StageReceipt(
+            schema_version="candidate-v1",
+            intent_id="intent-1",
+            attempt=1,
+            stage=ProcessingStage.GRAPH,
+            status=StageStatus.APPLIED,
+            applied_sources=(source("memory-1"),),
+            output_refs=(),
+            error=None,
+            started_at=naive,
+            finished_at=naive + timedelta(seconds=1),
+        )
+
+
+def test_receipt_json_rejects_naive_mixed_and_reversed_timestamps() -> None:
+    payload = {
+        "schema_version": "candidate-v1",
+        "intent_id": "intent-1",
+        "attempt": 1,
+        "stage": "graph",
+        "status": "applied",
+        "applied_sources": [
+            {"record_id": "memory-1", "content_revision": 3, "policy_epoch": 7}
+        ],
+        "output_refs": [],
+        "error": None,
+        "started_at": "2026-09-28T12:00:00Z",
+        "finished_at": "2026-09-28T12:00:01Z",
+    }
+    assert StageReceipt.model_validate_json(json.dumps(payload)).finished_at is not None
+
+    naive = dict(payload, started_at="2026-09-28T12:00:00")
+    with pytest.raises(ValidationError, match="timezone"):
+        StageReceipt.model_validate_json(json.dumps(naive))
+
+    mixed = dict(payload, finished_at="2026-09-28T12:00:01")
+    with pytest.raises(ValidationError, match="timezone"):
+        StageReceipt.model_validate_json(json.dumps(mixed))
+
+    reversed_times = dict(
+        payload,
+        started_at="2026-09-28T12:00:02Z",
+        finished_at="2026-09-28T12:00:01Z",
+    )
+    with pytest.raises(ValidationError, match="cannot precede"):
+        StageReceipt.model_validate_json(json.dumps(reversed_times))

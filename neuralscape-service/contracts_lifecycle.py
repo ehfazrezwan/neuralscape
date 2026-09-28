@@ -7,11 +7,10 @@ projection.  Callers must establish those runtime properties separately.
 
 from __future__ import annotations
 
-from datetime import datetime
 from enum import Enum
 from typing import Annotated, Literal
 
-from pydantic import ConfigDict, Field, model_validator
+from pydantic import AwareDatetime, ConfigDict, Field, model_validator
 
 from contracts_common import ContractModel, OpaqueId, SafeCounter, VersionedContract
 from contracts_references import ReferenceHandle, SourceVersion
@@ -76,8 +75,8 @@ class MemoryRecord(VersionedContract):
     required_parents: tuple[SourceVersion, ...]
     successor_id: OpaqueId | None
     retention_hold_ids: tuple[OpaqueId, ...]
-    occurred_at: datetime | None
-    recorded_at: datetime
+    occurred_at: AwareDatetime | None
+    recorded_at: AwareDatetime
 
     @model_validator(mode="after")
     def validate_record_semantics(self) -> MemoryRecord:
@@ -95,6 +94,7 @@ class MemoryRecord(VersionedContract):
                 raise ValueError("erased records cannot retain a body")
         elif self.body is None:
             raise ValueError("non-erased records require a body")
+        _require_unique_source_ids(self.required_parents, "required_parents")
         return self
 
 
@@ -107,7 +107,11 @@ class ProcessingStage(str, Enum):
 
 
 class Intent(VersionedContract):
-    """Immutable command data; construction is not durable acceptance."""
+    """Frozen validated command data; construction is not durable acceptance.
+
+    Callers must revalidate data entering from unchecked construction or copy
+    operations; Pydantic's low-level bypasses are outside this guarantee.
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -122,7 +126,7 @@ class Intent(VersionedContract):
     expected_sources: tuple[SourceVersion, ...]
     required_stages: tuple[ProcessingStage, ...]
     correlation_id: OpaqueId
-    accepted_at: datetime
+    accepted_at: AwareDatetime
 
     @model_validator(mode="after")
     def validate_required_stages(self) -> Intent:
@@ -145,13 +149,19 @@ class StageStatus(str, Enum):
 
 
 class StageError(ContractModel):
+    model_config = ConfigDict(frozen=True)
+
     code: OpaqueId
     retryable: bool
     safe_message: Annotated[str, Field(min_length=1, max_length=1024)]
 
 
 class StageReceipt(VersionedContract):
-    """Observation for one attempt at one stage, not aggregate completion."""
+    """Frozen validated observation for one attempt, not aggregate completion.
+
+    Callers must revalidate data entering from unchecked construction or copy
+    operations; Pydantic's low-level bypasses are outside this guarantee.
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -162,8 +172,8 @@ class StageReceipt(VersionedContract):
     applied_sources: tuple[SourceVersion, ...]
     output_refs: tuple[ReferenceHandle, ...]
     error: StageError | None
-    started_at: datetime | None
-    finished_at: datetime | None
+    started_at: AwareDatetime | None
+    finished_at: AwareDatetime | None
 
     @model_validator(mode="after")
     def validate_receipt_semantics(self) -> StageReceipt:
@@ -182,6 +192,8 @@ class StageReceipt(VersionedContract):
             raise ValueError("terminal stage receipts require finished_at")
         if not terminal and self.finished_at is not None:
             raise ValueError("non-terminal stage receipts cannot have finished_at")
+        if self.status is StageStatus.PENDING and self.started_at is not None:
+            raise ValueError("pending stage receipts cannot have started_at")
         if self.status is StageStatus.PROCESSING and self.started_at is None:
             raise ValueError("processing stage receipts require started_at")
         if self.finished_at is not None and self.started_at is None:
@@ -277,6 +289,15 @@ def validate_required_stage_claim(
 
     required = set(intent.required_stages)
     required_receipts = {stage: latest.get(stage) for stage in required}
+    stale_applied = {
+        stage
+        for stage, receipt in required_receipts.items()
+        if receipt is not None
+        and receipt.status is StageStatus.APPLIED
+        and not _source_sets_match(intent.expected_sources, receipt.applied_sources)
+    }
+    if stale_applied:
+        raise ValueError("applied required-stage receipts must match expected sources")
     applied = {
         stage
         for stage, receipt in required_receipts.items()

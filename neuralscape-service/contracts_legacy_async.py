@@ -5,7 +5,7 @@ do not strengthen its guarantees and are deliberately not used by the routes:
 the existing response bodies and status codes remain unchanged.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 from schemas import StoreMemoryResponse, TaskAcceptedResponse, TaskStatusResponse
@@ -34,8 +34,8 @@ class LegacyAsyncObservation:
 
     kind: LegacyAsyncObservationKind
     task_id: str | None
-    durable_intent_committed: bool = False
-    all_projections_applied: bool = False
+    durable_intent_committed: bool = field(default=False, init=False)
+    all_projections_applied: bool = field(default=False, init=False)
 
 
 def observe_task_accepted(response: TaskAcceptedResponse) -> LegacyAsyncObservation:
