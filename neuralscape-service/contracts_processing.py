@@ -11,9 +11,9 @@ from __future__ import annotations
 from collections.abc import Collection
 from typing import Literal
 
-from pydantic import TypeAdapter, model_validator
+from pydantic import ConfigDict, TypeAdapter, model_validator
 
-from contracts_common import ContractModel, OpaqueId, SafeCounter
+from contracts_common import OpaqueId, SafeCounter, VersionedContract
 
 
 ProcessingMode = Literal["operator_trusted", "operator_blind", "strict_local"]
@@ -33,7 +33,7 @@ _OPAQUE_ID_ADAPTER = TypeAdapter(OpaqueId)
 _SAFE_COUNTER_ADAPTER = TypeAdapter(SafeCounter)
 
 
-class ProcessingPolicy(ContractModel):
+class ProcessingPolicy(VersionedContract):
     """Declared locations and recipients that may receive plaintext.
 
     A recipient listed here is only policy-approved.  It must also be present
@@ -41,9 +41,11 @@ class ProcessingPolicy(ContractModel):
     ``attested_worker`` is a routing category, not proof of attestation.
     """
 
+    model_config = ConfigDict(frozen=True, revalidate_instances="always")
+
     mode: ProcessingMode
-    allowed_execution_locations: list[ExecutionLocation]
-    approved_recipient_ids: list[OpaqueId]
+    allowed_execution_locations: tuple[ExecutionLocation, ...]
+    approved_recipient_ids: tuple[OpaqueId, ...]
     fallback_policy: FallbackPolicy
     policy_epoch: SafeCounter
 
@@ -60,7 +62,7 @@ class ProcessingPolicy(ContractModel):
             raise ValueError("approved recipient ids must be unique")
 
         if self.mode == "strict_local":
-            if locations != ["endpoint"]:
+            if locations != ("endpoint",):
                 raise ValueError("strict_local permits only endpoint execution")
             if recipients:
                 raise ValueError("strict_local permits no plaintext recipients")
@@ -108,6 +110,11 @@ def validate_plaintext_dispatch(
     routing precondition; it does not prove endpoint identity or runtime
     assurance.
     """
+
+    try:
+        policy = ProcessingPolicy.model_validate(policy)
+    except (TypeError, ValueError) as exc:
+        raise PlaintextDispatchRejected("processing policy is invalid") from exc
 
     try:
         checked_epoch = _SAFE_COUNTER_ADAPTER.validate_python(

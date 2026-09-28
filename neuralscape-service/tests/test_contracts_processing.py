@@ -12,9 +12,10 @@ from contracts_processing import (
 
 def _strict_local_policy(**changes: object) -> ProcessingPolicy:
     values: dict[str, object] = {
+        "schema_version": "candidate-v1",
         "mode": "strict_local",
-        "allowed_execution_locations": ["endpoint"],
-        "approved_recipient_ids": [],
+        "allowed_execution_locations": ("endpoint",),
+        "approved_recipient_ids": (),
         "fallback_policy": "deny",
         "policy_epoch": 7,
     }
@@ -24,9 +25,10 @@ def _strict_local_policy(**changes: object) -> ProcessingPolicy:
 
 def _external_policy(**changes: object) -> ProcessingPolicy:
     values: dict[str, object] = {
+        "schema_version": "candidate-v1",
         "mode": "operator_trusted",
-        "allowed_execution_locations": ["endpoint", "external_provider"],
-        "approved_recipient_ids": ["provider-a"],
+        "allowed_execution_locations": ("endpoint", "external_provider"),
+        "approved_recipient_ids": ("provider-a",),
         "fallback_policy": "within_approved_recipients",
         "policy_epoch": 7,
     }
@@ -52,9 +54,9 @@ def test_strict_local_accepts_only_local_primary_dispatch() -> None:
 @pytest.mark.parametrize(
     "changes",
     [
-        {"allowed_execution_locations": ["endpoint", "external_provider"]},
-        {"allowed_execution_locations": ["external_provider"]},
-        {"approved_recipient_ids": ["provider-a"]},
+        {"allowed_execution_locations": ("endpoint", "external_provider")},
+        {"allowed_execution_locations": ("external_provider",)},
+        {"approved_recipient_ids": ("provider-a",)},
         {"fallback_policy": "within_approved_recipients"},
     ],
 )
@@ -67,27 +69,27 @@ def test_strict_local_rejects_external_or_fallback_policy(
 
 def test_non_endpoint_policy_requires_explicit_recipient() -> None:
     with pytest.raises(ValidationError, match="approved recipient"):
-        _external_policy(approved_recipient_ids=[])
+        _external_policy(approved_recipient_ids=())
 
 
 def test_recipient_without_non_endpoint_location_is_rejected() -> None:
     with pytest.raises(ValidationError, match="non-endpoint execution location"):
-        _external_policy(allowed_execution_locations=["endpoint"])
+        _external_policy(allowed_execution_locations=("endpoint",))
 
 
 def test_operator_blind_policy_cannot_select_operator_worker() -> None:
     with pytest.raises(ValidationError, match="operator_worker"):
         _external_policy(
             mode="operator_blind",
-            allowed_execution_locations=["operator_worker"],
+            allowed_execution_locations=("operator_worker",),
         )
 
 
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("allowed_execution_locations", ["endpoint", "endpoint"]),
-        ("approved_recipient_ids", ["provider-a", "provider-a"]),
+        ("allowed_execution_locations", ("endpoint", "endpoint")),
+        ("approved_recipient_ids", ("provider-a", "provider-a")),
     ],
 )
 def test_policy_rejects_duplicate_boundary_entries(field: str, value: object) -> None:
@@ -100,6 +102,53 @@ def test_policy_rejects_unknown_fields_and_boolean_epoch() -> None:
         _strict_local_policy(policy_epoch=True)
     with pytest.raises(ValidationError, match="extra"):
         _strict_local_policy(read_access_implies_processing=True)
+
+
+def test_policy_requires_explicit_candidate_version() -> None:
+    policy = _strict_local_policy()
+    values = policy.model_dump(mode="python")
+    values.pop("schema_version")
+
+    assert policy.schema_version == "candidate-v1"
+    assert policy.model_json_schema()["properties"]["schema_version"]["const"] == (
+        "candidate-v1"
+    )
+    assert "schema_version" in policy.model_json_schema()["required"]
+    with pytest.raises(ValidationError):
+        ProcessingPolicy.model_validate(values)
+    with pytest.raises(ValidationError):
+        _strict_local_policy(schema_version=None)
+    with pytest.raises(ValidationError):
+        _strict_local_policy(schema_version="future-v2")
+
+
+def test_policy_and_boundary_collections_are_frozen() -> None:
+    policy = _strict_local_policy()
+
+    with pytest.raises(ValidationError, match="frozen"):
+        policy.mode = "operator_trusted"  # type: ignore[misc]
+    with pytest.raises(AttributeError):
+        policy.allowed_execution_locations.append("external_provider")  # type: ignore[attr-defined]
+    with pytest.raises(AttributeError):
+        policy.approved_recipient_ids.append("provider-a")  # type: ignore[attr-defined]
+
+
+def test_dispatch_revalidates_unchecked_strict_local_copy() -> None:
+    unchecked = _strict_local_policy().model_copy(
+        update={
+            "allowed_execution_locations": ("endpoint", "external_provider"),
+            "approved_recipient_ids": ("provider-a",),
+        }
+    )
+
+    with pytest.raises(PlaintextDispatchRejected, match="policy is invalid"):
+        validate_plaintext_dispatch(
+            unchecked,
+            execution_location="external_provider",
+            recipient_id="provider-a",
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids={"provider-a"},
+        )
 
 
 def test_external_dispatch_requires_policy_and_current_authority() -> None:
@@ -172,7 +221,7 @@ def test_deny_policy_blocks_fallback_after_primary_failure() -> None:
 
 def test_approved_fallback_is_revalidated_against_current_authority() -> None:
     policy = _external_policy(
-        approved_recipient_ids=["provider-a", "provider-b"],
+        approved_recipient_ids=("provider-a", "provider-b"),
     )
 
     validate_plaintext_dispatch(
