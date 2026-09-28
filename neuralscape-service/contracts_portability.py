@@ -36,8 +36,6 @@ def _normalized_bundle_path(value: str) -> str:
         raise ValueError("bundle path must be nonempty and contain no NUL bytes")
     if "\\" in value:
         raise ValueError("bundle path must use POSIX separators")
-    if PureWindowsPath(value).drive:
-        raise ValueError("bundle path must not be Windows drive-qualified")
 
     path = PurePosixPath(value)
     if path.is_absolute() or value.startswith("/"):
@@ -48,6 +46,8 @@ def _normalized_bundle_path(value: str) -> str:
     normalized = path.as_posix()
     if normalized in {"", "."}:
         raise ValueError("bundle path must identify a file")
+    if PureWindowsPath(normalized).drive:
+        raise ValueError("bundle path must not be Windows drive-qualified")
     return normalized
 
 

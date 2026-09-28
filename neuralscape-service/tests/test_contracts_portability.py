@@ -87,6 +87,8 @@ def test_valid_manifest_preserves_opaque_ids_and_serializes() -> None:
         r"C:\outside\records.jsonl",
         "C:/outside/records.jsonl",
         "C:outside/records.jsonl",
+        "./C:/outside/records.jsonl",
+        "./C:outside/records.jsonl",
         "\x00records.jsonl",
         ".",
     ],
@@ -252,6 +254,14 @@ def test_encrypted_mode_requires_protocol_and_declared_envelope_files() -> None:
     missing_envelope["encryption"]["key_envelope_paths"] = ["crypto/missing.bin"]
     with pytest.raises(ValidationError, match="files absent"):
         validate_portable_manifest(missing_envelope)
+
+
+def test_rejects_drive_qualified_envelope_path_after_normalization() -> None:
+    document = valid_manifest()
+    document["encryption"]["key_envelope_paths"] = ["./C:/outside/envelope.bin"]
+
+    with pytest.raises(ValidationError, match="Windows drive-qualified"):
+        validate_portable_manifest(document)
 
 
 def test_plaintext_mode_forbids_crypto_references() -> None:
