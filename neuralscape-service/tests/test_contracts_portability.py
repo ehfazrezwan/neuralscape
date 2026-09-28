@@ -72,7 +72,9 @@ def test_valid_manifest_preserves_opaque_ids_and_serializes() -> None:
     assert isinstance(manifest, PortableManifest)
     assert manifest.canonical_ids[0].id == " Record-1 "
     assert manifest.model_dump(mode="json")["snapshot"]["replay_position"]["position"] == "733"
-    assert validate_portable_manifest(manifest) is manifest
+    revalidated = validate_portable_manifest(manifest)
+    assert revalidated == manifest
+    assert revalidated is not manifest
 
 
 @pytest.mark.parametrize(
@@ -83,6 +85,8 @@ def test_valid_manifest_preserves_opaque_ids_and_serializes() -> None:
         "canonical/../../outside",
         r"..\outside",
         r"C:\outside\records.jsonl",
+        "C:/outside/records.jsonl",
+        "C:outside/records.jsonl",
         "\x00records.jsonl",
         ".",
     ],
@@ -211,6 +215,20 @@ def test_rejects_duplicate_source_identity_mapping() -> None:
         validate_portable_manifest(document)
 
 
+def test_rejects_many_to_one_destination_identity_mapping() -> None:
+    document = valid_manifest()
+    document["identity_mappings"].append(
+        {
+            "source_identity_id": "source-member-3",
+            "destination_identity_id": "destination-member-8",
+            "authority_reference": "mapping-approval-32",
+        }
+    )
+
+    with pytest.raises(ValidationError, match="more than one source identity"):
+        validate_portable_manifest(document)
+
+
 def test_identity_mapping_requires_separate_authority_reference() -> None:
     document = valid_manifest()
     del document["identity_mappings"][0]["authority_reference"]
@@ -224,6 +242,11 @@ def test_encrypted_mode_requires_protocol_and_declared_envelope_files() -> None:
     without_protocol["encryption"]["protocol_reference"] = None
     with pytest.raises(ValidationError, match="protocol reference"):
         validate_portable_manifest(without_protocol)
+
+    without_envelope = valid_manifest()
+    without_envelope["encryption"]["key_envelope_paths"] = []
+    with pytest.raises(ValidationError, match="at least one key envelope"):
+        validate_portable_manifest(without_envelope)
 
     missing_envelope = valid_manifest()
     missing_envelope["encryption"]["key_envelope_paths"] = ["crypto/missing.bin"]
@@ -244,6 +267,38 @@ def test_plaintext_mode_forbids_crypto_references() -> None:
         "key_envelope_paths": [],
     }
     assert validate_portable_manifest(document).encryption.mode == "plaintext_authorized_export"
+
+
+def test_revalidating_instance_rejects_mutated_unsafe_path() -> None:
+    manifest = validate_portable_manifest(valid_manifest())
+    manifest.files[0].path = "../escaped.jsonl"
+
+    with pytest.raises(ValidationError, match="bundle path"):
+        validate_portable_manifest(manifest)
+
+
+def test_revalidating_instance_rejects_mutated_inconsistent_scope() -> None:
+    manifest = validate_portable_manifest(valid_manifest())
+    manifest.scope.kind = "tenant"
+
+    with pytest.raises(ValidationError, match="tenant scope"):
+        validate_portable_manifest(manifest)
+
+
+def test_revalidating_instance_rejects_mutated_duplicate_inventory() -> None:
+    manifest = validate_portable_manifest(valid_manifest())
+    manifest.files.append(manifest.files[0])
+
+    with pytest.raises(ValidationError, match="duplicate normalized file paths"):
+        validate_portable_manifest(manifest)
+
+
+def test_revalidating_instance_rejects_mutated_missing_envelope_file() -> None:
+    manifest = validate_portable_manifest(valid_manifest())
+    manifest.encryption.key_envelope_paths.append("crypto/missing.bin")
+
+    with pytest.raises(ValidationError, match="files absent"):
+        validate_portable_manifest(manifest)
 
 
 def test_unknown_fields_and_missing_schema_version_are_rejected() -> None:

@@ -10,7 +10,7 @@ perform migration transaction and replay checks.
 
 from __future__ import annotations
 
-from pathlib import PurePosixPath
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Literal, Mapping
 
 from pydantic import Field, field_validator, model_validator
@@ -36,6 +36,8 @@ def _normalized_bundle_path(value: str) -> str:
         raise ValueError("bundle path must be nonempty and contain no NUL bytes")
     if "\\" in value:
         raise ValueError("bundle path must use POSIX separators")
+    if PureWindowsPath(value).drive:
+        raise ValueError("bundle path must not be Windows drive-qualified")
 
     path = PurePosixPath(value)
     if path.is_absolute() or value.startswith("/"):
@@ -142,7 +144,7 @@ class DeclaredOmission(ContractModel):
 
 
 class IdentityMapping(ContractModel):
-    """An explicit source-to-destination principal mapping proposal.
+    """An explicit one-to-one source-to-destination principal mapping.
 
     ``authority_reference`` identifies the separate approval evidence an
     importer must resolve.  Its presence is not itself proof of authority.
@@ -170,8 +172,11 @@ class EncryptionReference(ContractModel):
 
     @model_validator(mode="after")
     def _validate_mode(self) -> "EncryptionReference":
-        if self.mode == "encrypted" and self.protocol_reference is None:
-            raise ValueError("encrypted mode requires a protocol reference")
+        if self.mode == "encrypted":
+            if self.protocol_reference is None:
+                raise ValueError("encrypted mode requires a protocol reference")
+            if not self.key_envelope_paths:
+                raise ValueError("encrypted mode requires at least one key envelope path")
         if self.mode == "plaintext_authorized_export":
             if self.protocol_reference is not None or self.key_envelope_paths:
                 raise ValueError(
@@ -224,6 +229,11 @@ class PortableManifest(VersionedContract):
         mapping_sources = [item.source_identity_id for item in self.identity_mappings]
         if len(set(mapping_sources)) != len(mapping_sources):
             raise ValueError("manifest maps a source identity more than once")
+        mapping_destinations = [
+            item.destination_identity_id for item in self.identity_mappings
+        ]
+        if len(set(mapping_destinations)) != len(mapping_destinations):
+            raise ValueError("manifest maps more than one source identity to a destination")
 
         missing_envelopes = set(self.encryption.key_envelope_paths) - set(file_paths)
         if missing_envelopes:
@@ -241,9 +251,8 @@ def validate_portable_manifest(
     actual bytes before any mutation.
     """
 
-    if isinstance(document, PortableManifest):
-        return document
-    return PortableManifest.model_validate(document)
+    candidate = document.model_dump() if isinstance(document, PortableManifest) else document
+    return PortableManifest.model_validate(candidate)
 
 
 __all__ = [
