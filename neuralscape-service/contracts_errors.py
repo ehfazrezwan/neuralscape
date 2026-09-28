@@ -145,11 +145,15 @@ def public_error_for(
 ) -> PublicError:
     """Return the safe public representation for an internal outcome.
 
-    The returned model is a copy so a consumer cannot mutate the canonical
-    mapping used by later calls.
+    The disclosure decision must be an actual boolean; truthy values are not
+    accepted as authorization.  The returned model is a copy so a consumer
+    cannot mutate the canonical mapping used by later calls.
     """
 
-    if disclose_existence and code in _DISCLOSURE_ERRORS:
+    if type(disclose_existence) is not bool:
+        raise TypeError("disclose_existence must be a bool")
+
+    if disclose_existence is True and code in _DISCLOSURE_ERRORS:
         return _DISCLOSURE_ERRORS[code].model_copy()
     return _PUBLIC_ERRORS[code].model_copy()
 

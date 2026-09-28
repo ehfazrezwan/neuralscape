@@ -203,6 +203,22 @@ def test_authorized_error_mapping_can_return_richer_diagnostics() -> None:
     ).code is PublicErrorCode.NOT_FOUND
 
 
+def test_false_disclosure_decision_keeps_existence_sensitive_errors_collapsed() -> None:
+    assert public_error_for(
+        InternalErrorCode.DENIED,
+        disclose_existence=False,
+    ).code is PublicErrorCode.NOT_FOUND
+
+
+@pytest.mark.parametrize("value", ["true", "false", 0, 1, None])
+def test_disclosure_decision_rejects_non_boolean_values(value: object) -> None:
+    with pytest.raises(TypeError, match="disclose_existence must be a bool"):
+        public_error_for(
+            InternalErrorCode.DENIED,
+            disclose_existence=value,
+        )
+
+
 def test_error_mapping_covers_every_internal_outcome_and_returns_copies() -> None:
     mapped = {code: public_error_for(code) for code in InternalErrorCode}
     assert set(mapped) == set(InternalErrorCode)
