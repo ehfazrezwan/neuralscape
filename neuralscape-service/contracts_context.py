@@ -7,9 +7,9 @@ prove authorization, source existence, transactionality, or token counting.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Literal
+from typing import Literal, TypeVar
 
-from pydantic import AwareDatetime, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, Field, model_validator
 
 from contracts_common import ContractModel, OpaqueId, SafeCounter, VersionedContract
 from contracts_freshness import (
@@ -19,6 +19,51 @@ from contracts_freshness import (
     projection_status_for,
 )
 from contracts_references import ReferenceHandle, SourceVersion
+
+
+_ContractT = TypeVar("_ContractT", bound=ContractModel)
+
+
+def _native_contract_graph(value: object) -> object:
+    """Materialize nested model fields without trusting an existing instance."""
+
+    if isinstance(value, BaseModel):
+        fields = {
+            key: _native_contract_graph(item)
+            for key, item in vars(value).items()
+        }
+        extra = getattr(value, "__pydantic_extra__", None)
+        if extra:
+            fields.update(
+                {
+                    key: _native_contract_graph(item)
+                    for key, item in extra.items()
+                }
+            )
+        return fields
+    if isinstance(value, tuple):
+        return tuple(_native_contract_graph(item) for item in value)
+    if isinstance(value, list):
+        return [_native_contract_graph(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _native_contract_graph(item) for key, item in value.items()
+        }
+    return value
+
+
+def _revalidated_snapshot(
+    model_type: type[_ContractT], value: object
+) -> _ContractT | None:
+    """Strictly rebuild a complete contract graph, failing closed on any defect."""
+
+    try:
+        return model_type.model_validate(
+            _native_contract_graph(value),
+            strict=True,
+        )
+    except Exception:
+        return None
 
 
 class TimePerspective(str, Enum):
@@ -347,6 +392,13 @@ def bundle_fits_request(request: ContextRequest, bundle: ContextBundle) -> bool:
     though those bundles remain valid, informative responses.
     """
 
+    request_snapshot = _revalidated_snapshot(ContextRequest, request)
+    bundle_snapshot = _revalidated_snapshot(ContextBundle, bundle)
+    if request_snapshot is None or bundle_snapshot is None:
+        return False
+    request = request_snapshot
+    bundle = bundle_snapshot
+
     if (
         bundle.request_id != request.request_id
         or bundle.response_usage.scope != request.response_budget.scope
@@ -355,6 +407,9 @@ def bundle_fits_request(request: ContextRequest, bundle: ContextBundle) -> bool:
         or bundle.outcome
         not in {ContextOutcome.COMPLETE, ContextOutcome.NO_RELEVANT_EVIDENCE}
     ):
+        return False
+
+    if not bundle.selected_items:
         return False
 
     if request.time_perspective is TimePerspective.HISTORICAL:
@@ -385,6 +440,13 @@ def receipt_matches_bundle(
     receipt: ContextAssemblyReceipt, bundle: ContextBundle
 ) -> bool:
     """Check the public receipt witnesses against the delivered bundle."""
+
+    receipt_snapshot = _revalidated_snapshot(ContextAssemblyReceipt, receipt)
+    bundle_snapshot = _revalidated_snapshot(ContextBundle, bundle)
+    if receipt_snapshot is None or bundle_snapshot is None:
+        return False
+    receipt = receipt_snapshot
+    bundle = bundle_snapshot
 
     selected = tuple(item.reference for item in bundle.selected_items)
     source_versions = {

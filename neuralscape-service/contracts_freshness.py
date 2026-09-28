@@ -10,7 +10,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Sequence
 
-from pydantic import AwareDatetime, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, Field, model_validator
 
 from contracts_common import ContractModel, OpaqueId, VersionedContract
 from contracts_references import ReferenceHandle, SourceVersion
@@ -198,12 +198,44 @@ def projection_status_for(
 
 def _version_map(versions: Sequence[SourceVersion]) -> dict[str, tuple[int, int]]:
     result: dict[str, tuple[int, int]] = {}
-    for version in versions:
+    for supplied_version in versions:
+        version = SourceVersion.model_validate(
+            _native_contract_graph(supplied_version),
+            strict=True,
+        )
         record_id = str(version.record_id)
         if record_id in result:
             raise ValueError(f"duplicate source version for record_id {record_id!r}")
         result[record_id] = (version.content_revision, version.policy_epoch)
     return result
+
+
+def _native_contract_graph(value: object) -> object:
+    """Materialize a model copy so strict validation cannot reuse its instance."""
+
+    if isinstance(value, BaseModel):
+        fields = {
+            key: _native_contract_graph(item)
+            for key, item in vars(value).items()
+        }
+        extra = getattr(value, "__pydantic_extra__", None)
+        if extra:
+            fields.update(
+                {
+                    key: _native_contract_graph(item)
+                    for key, item in extra.items()
+                }
+            )
+        return fields
+    if isinstance(value, tuple):
+        return tuple(_native_contract_graph(item) for item in value)
+    if isinstance(value, list):
+        return [_native_contract_graph(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _native_contract_graph(item) for key, item in value.items()
+        }
+    return value
 
 
 __all__ = [

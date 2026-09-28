@@ -264,6 +264,51 @@ def test_request_fit_does_not_claim_historical_as_of_without_witness() -> None:
 
 
 @pytest.mark.parametrize(
+    "freshness_requirement",
+    ["current_verified", "current_known", "labelled_stale_acceptable"],
+)
+def test_empty_no_evidence_bundle_never_claims_request_fit(
+    freshness_requirement: str,
+) -> None:
+    request = _validate(
+        ContextRequest,
+        _request(freshness_requirement=freshness_requirement),
+    )
+    bundle = _validate(
+        ContextBundle,
+        _bundle(
+            outcome="no_relevant_evidence",
+            selected_items=[],
+        ),
+    )
+
+    assert not bundle_fits_request(request, bundle)
+
+
+def test_request_fit_revalidates_copied_and_constructed_requests() -> None:
+    request = _validate(
+        ContextRequest,
+        _request(freshness_requirement="labelled_stale_acceptable"),
+    )
+    bundle = _validate(ContextBundle, _bundle())
+
+    copied = request.model_copy(
+        update={"freshness_requirement": "unsupported-future-mode"}
+    )
+    constructed = ContextRequest.model_construct(
+        **{
+            **request.model_dump(),
+            "freshness_requirement": "unsupported-future-mode",
+        }
+    )
+    copied_with_extra = request.model_copy(update={"unreviewed_mode": True})
+
+    assert not bundle_fits_request(copied, bundle)
+    assert not bundle_fits_request(constructed, bundle)
+    assert not bundle_fits_request(copied_with_extra, bundle)
+
+
+@pytest.mark.parametrize(
     ("outcome", "omissions"),
     [
         ("no_relevant_evidence", []),
@@ -398,6 +443,117 @@ def test_same_source_version_across_items_has_representable_receipt() -> None:
     )
 
     assert receipt_matches_bundle(receipt, bundle)
+
+
+def test_receipt_match_revalidates_cross_tenant_model_copies() -> None:
+    bundle = _validate(ContextBundle, _bundle())
+    receipt = _validate(ContextAssemblyReceipt, _receipt())
+    item = bundle.selected_items[0]
+    copied_reference = item.reference.model_copy(update={"tenant_id": "tenant-2"})
+    copied_expansion = item.expansion_handle.model_copy(
+        update={"tenant_id": "tenant-2"}
+    )
+    copied_item = item.model_copy(
+        update={
+            "reference": copied_reference,
+            "expansion_handle": copied_expansion,
+        }
+    )
+    copied_bundle = bundle.model_copy(update={"selected_items": (copied_item,)})
+    copied_receipt = receipt.model_copy(
+        update={"selected_references": (copied_reference,)}
+    )
+
+    assert not receipt_matches_bundle(copied_receipt, copied_bundle)
+
+
+def test_receipt_match_revalidates_invalid_nested_source_version_copy() -> None:
+    bundle = _validate(ContextBundle, _bundle())
+    receipt = _validate(ContextAssemblyReceipt, _receipt())
+    item = bundle.selected_items[0]
+    copied_version = item.source_versions[0].model_copy(
+        update={"content_revision": -1}
+    )
+    copied_projection = item.freshness.projection.model_copy(
+        update={"applied_sources": (copied_version,)}
+    )
+    copied_freshness = item.freshness.model_copy(
+        update={"projection": copied_projection}
+    )
+    copied_item = item.model_copy(
+        update={
+            "source_versions": (copied_version,),
+            "freshness": copied_freshness,
+        }
+    )
+    copied_bundle = bundle.model_copy(update={"selected_items": (copied_item,)})
+    copied_receipt = receipt.model_copy(
+        update={"source_versions": (copied_version,)}
+    )
+
+    assert not receipt_matches_bundle(copied_receipt, copied_bundle)
+
+
+def test_helpers_revalidate_copied_cross_item_version_conflict() -> None:
+    first = _item()
+    second = deepcopy(_item())
+    second["reference"] = _reference("memory", "memory-2")
+    second["expansion_handle"] = _reference("memory", "memory-2")
+    bundle = _validate(ContextBundle, _bundle(selected_items=[first, second]))
+    receipt = _validate(
+        ContextAssemblyReceipt,
+        _receipt(selected_references=[first["reference"], second["reference"]]),
+    )
+    request = _validate(
+        ContextRequest,
+        _request(freshness_requirement="labelled_stale_acceptable"),
+    )
+
+    second_item = bundle.selected_items[1]
+    conflicting_version = second_item.source_versions[0].model_copy(
+        update={"content_revision": 5}
+    )
+    conflicting_projection = second_item.freshness.projection.model_copy(
+        update={"applied_sources": (conflicting_version,)}
+    )
+    conflicting_freshness = second_item.freshness.model_copy(
+        update={"projection": conflicting_projection}
+    )
+    conflicting_item = second_item.model_copy(
+        update={
+            "source_versions": (conflicting_version,),
+            "freshness": conflicting_freshness,
+        }
+    )
+    conflicting_bundle = bundle.model_copy(
+        update={"selected_items": (bundle.selected_items[0], conflicting_item)}
+    )
+
+    assert not bundle_fits_request(request, conflicting_bundle)
+    assert not receipt_matches_bundle(receipt, conflicting_bundle)
+
+
+def test_helpers_fail_closed_for_constructed_invalid_bundles_and_receipts() -> None:
+    request = _validate(
+        ContextRequest,
+        _request(freshness_requirement="labelled_stale_acceptable"),
+    )
+    bundle = _validate(ContextBundle, _bundle())
+    receipt = _validate(ContextAssemblyReceipt, _receipt())
+    constructed_bundle = ContextBundle.model_construct(
+        **{
+            **bundle.model_dump(),
+            "selected_items": (),
+        }
+    )
+    constructed_receipt = ContextAssemblyReceipt.model_construct(
+        **{
+            **receipt.model_dump(exclude={"router_version"}),
+        }
+    )
+
+    assert not bundle_fits_request(request, constructed_bundle)
+    assert not receipt_matches_bundle(constructed_receipt, bundle)
 
 
 def test_receipt_corresponds_to_delivered_bundle_and_revision_set() -> None:

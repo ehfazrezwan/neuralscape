@@ -80,6 +80,21 @@ def test_policy_epoch_change_also_invalidates_projection() -> None:
     assert projection_status_for(applied, required) is ProjectionStatus.STALE
 
 
+def test_projection_comparison_revalidates_copied_source_versions() -> None:
+    valid = _source_version("source-a", 4)
+    copied = valid.model_copy(update={"content_revision": -1})
+    constructed = SourceVersion.model_construct(
+        record_id="source-a",
+        content_revision=-1,
+        policy_epoch=2,
+    )
+
+    with pytest.raises(ValidationError):
+        projection_status_for([copied], [copied])
+    with pytest.raises(ValidationError):
+        projection_status_for([constructed], [constructed])
+
+
 def test_stale_upstream_can_coexist_with_healthy_local_projection() -> None:
     payload = {
         "upstream_status": "stale",
