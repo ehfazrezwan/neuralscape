@@ -6,6 +6,7 @@ from contracts_policy import (
     SUPPORTED_POLICY_ACTIONS,
     AccessPolicy,
     PolicyDecision,
+    PolicyEvaluationInput,
     PolicyOutcome,
     PolicyReasonCode,
     PrincipalContext,
@@ -39,8 +40,7 @@ def _decision(
 def evaluate_policy(
     *,
     principal: PrincipalContext,
-    action: str,
-    resource: ReferenceHandle,
+    evaluation: PolicyEvaluationInput,
     policy: AccessPolicy,
 ) -> PolicyDecision:
     """Evaluate exact policy statements, returning a safe allow/deny decision.
@@ -49,6 +49,9 @@ def evaluate_policy(
     reference matching implemented here.  Unknown actions or policy terms fail
     closed.  The function neither resolves the resource nor checks existence.
     """
+
+    action = evaluation.action
+    resource = evaluation.resource
 
     def deny(reason_code: PolicyReasonCode = "not_authorized") -> PolicyDecision:
         return _decision(
@@ -60,7 +63,7 @@ def evaluate_policy(
             reason_code=reason_code,
         )
 
-    if type(action) is not str or action not in SUPPORTED_POLICY_ACTIONS:
+    if action not in SUPPORTED_POLICY_ACTIONS:
         return deny("unsupported_action")
 
     # A snapshot containing terms this evaluator does not understand cannot be
@@ -69,6 +72,11 @@ def evaluate_policy(
     if any(
         statement.action not in SUPPORTED_POLICY_ACTIONS
         for statement in policy.statements
+    ):
+        return deny("unsupported_policy_semantics")
+    if principal.delegation is not None and any(
+        delegated_action not in SUPPORTED_POLICY_ACTIONS
+        for delegated_action in principal.delegation.allowed_actions
     ):
         return deny("unsupported_policy_semantics")
 

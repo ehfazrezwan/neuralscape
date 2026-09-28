@@ -139,6 +139,18 @@ class AccessPolicy(VersionedContract):
         return self
 
 
+class PolicyEvaluationInput(VersionedContract):
+    """Validated action and resource presented to the pure evaluator.
+
+    Raw caller values must cross this boundary before evaluation.  Malformed
+    values produce ordinary contract validation errors; this model does not
+    prescribe transport-specific error mapping.
+    """
+
+    action: OpaqueId
+    resource: ReferenceHandle
+
+
 class PolicyDecision(VersionedContract):
     """Safe result of evaluating one action against one resource value.
 
@@ -157,12 +169,21 @@ class PolicyDecision(VersionedContract):
     evaluated_credential_id: OpaqueId
     evaluated_membership_version: SafeCounter
 
+    @model_validator(mode="after")
+    def validate_outcome_reason(self) -> "PolicyDecision":
+        if self.outcome == "allow" and self.reason_code != "explicit_grant":
+            raise ValueError("allow decisions require the explicit_grant reason")
+        if self.outcome == "deny" and self.reason_code == "explicit_grant":
+            raise ValueError("deny decisions cannot use the explicit_grant reason")
+        return self
+
 
 __all__ = [
     "AccessPolicy",
     "DelegationConstraints",
     "MembershipVersion",
     "PolicyDecision",
+    "PolicyEvaluationInput",
     "PolicyEffect",
     "PolicyOutcome",
     "PolicyReasonCode",

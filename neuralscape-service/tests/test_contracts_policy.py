@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 
 import pytest
@@ -12,6 +13,7 @@ from contracts_policy import (
     DelegationConstraints,
     MembershipVersion,
     PolicyDecision,
+    PolicyEvaluationInput,
     PolicyStatement,
     PrincipalContext,
 )
@@ -102,8 +104,11 @@ def evaluate(
 ) -> PolicyDecision:
     return evaluate_policy(
         principal=principal_value,
-        action=action,
-        resource=resource_value,
+        evaluation=PolicyEvaluationInput(
+            schema_version=VERSION,
+            action=action,
+            resource=resource_value,
+        ),
         policy=policy_value,
     )
 
@@ -282,6 +287,67 @@ def test_unknown_request_and_policy_semantics_fail_closed() -> None:
     known_request = evaluate(principal_value, "read", resource_value, unknown_policy)
     assert known_request.outcome == "deny"
     assert known_request.reason_code == "unsupported_policy_semantics"
+
+
+def test_unknown_delegation_action_semantics_fail_closed() -> None:
+    resource_value = reference("memory-1")
+    delegated = principal(
+        subject_kind="delegated_agent",
+        delegation=DelegationConstraints(
+            delegated_by_subject_id="delegator-a",
+            delegated_by_credential_id="delegator-credential-a",
+            allowed_actions=("read", "future_action"),
+            allowed_resources=(resource_value,),
+        ),
+    )
+    policy_value = policy(
+        statement("read-grant", "allow", "read", resource_value),
+    )
+
+    decision = evaluate(delegated, "read", resource_value, policy_value)
+
+    assert decision.outcome == "deny"
+    assert decision.reason_code == "unsupported_policy_semantics"
+
+
+@pytest.mark.parametrize("malformed_action", [None, True, "", "x" * 257])
+def test_evaluation_input_rejects_malformed_raw_actions(malformed_action: object) -> None:
+    with pytest.raises(ValidationError):
+        PolicyEvaluationInput(
+            schema_version=VERSION,
+            action=malformed_action,
+            resource=reference("memory-1"),
+        )
+
+
+@pytest.mark.parametrize(
+    ("outcome", "reason_code"),
+    [
+        ("allow", "not_authorized"),
+        ("deny", "explicit_grant"),
+    ],
+)
+def test_policy_decision_rejects_contradictory_outcome_reason_pairs(
+    outcome: str,
+    reason_code: str,
+) -> None:
+    payload = {
+        "schema_version": VERSION,
+        "action": "read",
+        "resource": reference("memory-1").model_dump(mode="json"),
+        "outcome": outcome,
+        "reason_code": reason_code,
+        "policy_epoch": 1,
+        "evaluated_tenant_id": "tenant-a",
+        "evaluated_subject_id": "subject-a",
+        "evaluated_credential_id": "credential-a",
+        "evaluated_membership_version": 1,
+    }
+
+    with pytest.raises(ValidationError):
+        PolicyDecision.model_validate(payload)
+    with pytest.raises(ValidationError):
+        PolicyDecision.model_validate_json(json.dumps(payload))
 
 
 def test_reference_value_must_match_exactly_and_is_not_authority() -> None:
