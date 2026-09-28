@@ -14,6 +14,26 @@ from contracts_policy import (
 from contracts_references import ReferenceHandle
 
 
+def _validated_principal_snapshot(principal: PrincipalContext) -> PrincipalContext:
+    return PrincipalContext.model_validate(
+        principal.model_dump(mode="python", round_trip=True, warnings=False)
+    )
+
+
+def _validated_evaluation_snapshot(
+    evaluation: PolicyEvaluationInput,
+) -> PolicyEvaluationInput:
+    return PolicyEvaluationInput.model_validate(
+        evaluation.model_dump(mode="python", round_trip=True, warnings=False)
+    )
+
+
+def _validated_policy_snapshot(policy: AccessPolicy) -> AccessPolicy:
+    return AccessPolicy.model_validate(
+        policy.model_dump(mode="python", round_trip=True, warnings=False)
+    )
+
+
 def _decision(
     *,
     principal: PrincipalContext,
@@ -45,10 +65,16 @@ def evaluate_policy(
 ) -> PolicyDecision:
     """Evaluate exact policy statements, returning a safe allow/deny decision.
 
-    Evaluation is deliberately limited to the action vocabulary and exact
-    reference matching implemented here.  Unknown actions or policy terms fail
-    closed.  The function neither resolves the resource nor checks existence.
+    All three input graphs are reconstructed and validated before authorization
+    logic.  Evaluation is deliberately limited to the action vocabulary and
+    exact reference matching implemented here.  Unknown actions or policy terms
+    fail closed.  The function neither resolves the resource nor checks
+    existence.
     """
+
+    principal = _validated_principal_snapshot(principal)
+    evaluation = _validated_evaluation_snapshot(evaluation)
+    policy = _validated_policy_snapshot(policy)
 
     action = evaluation.action
     resource = evaluation.resource
@@ -133,4 +159,17 @@ def evaluate_policy(
     return deny()
 
 
-__all__ = ["evaluate_policy"]
+def validate_policy_decision(decision: PolicyDecision) -> PolicyDecision:
+    """Return an independent, deeply validated receiving snapshot.
+
+    Contract instances and unchecked copies are not trusted as provenance.  A
+    consumer should use the returned snapshot before serialization or use.
+    Validation does not prove that the decision came from an authority.
+    """
+
+    return PolicyDecision.model_validate(
+        decision.model_dump(mode="python", round_trip=True, warnings=False)
+    )
+
+
+__all__ = ["evaluate_policy", "validate_policy_decision"]

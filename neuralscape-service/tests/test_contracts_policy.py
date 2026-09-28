@@ -17,7 +17,7 @@ from contracts_policy import (
     PolicyStatement,
     PrincipalContext,
 )
-from contracts_policy_reference import evaluate_policy
+from contracts_policy_reference import evaluate_policy, validate_policy_decision
 from contracts_references import ReferenceHandle
 
 
@@ -348,6 +348,180 @@ def test_policy_decision_rejects_contradictory_outcome_reason_pairs(
         PolicyDecision.model_validate(payload)
     with pytest.raises(ValidationError):
         PolicyDecision.model_validate_json(json.dumps(payload))
+
+
+def test_evaluator_revalidates_unchecked_principal_copy_before_grant_logic() -> None:
+    resource_value = reference("memory-1")
+    invalid_principal = principal().model_copy(
+        update={"subject_kind": "delegated_agent"}
+    )
+    policy_value = policy(
+        statement("read-grant", "allow", "read", resource_value),
+    )
+
+    with pytest.raises(ValidationError, match="require delegation constraints"):
+        evaluate_policy(
+            principal=invalid_principal,
+            evaluation=PolicyEvaluationInput(
+                schema_version=VERSION,
+                action="read",
+                resource=resource_value,
+            ),
+            policy=policy_value,
+        )
+
+
+def test_evaluator_revalidates_complete_unchecked_policy_copy() -> None:
+    resource_value = reference("memory-1")
+    stale_policy = policy(
+        statement("read-grant", "allow", "read", resource_value),
+        membership_version=8,
+    )
+    invalid_policy = stale_policy.model_copy(
+        update={
+            "membership_versions": (
+                MembershipVersion(subject_id="subject-a", version=7),
+                MembershipVersion(subject_id="subject-a", version=8),
+            )
+        }
+    )
+
+    with pytest.raises(ValidationError, match="at most one entry per subject"):
+        evaluate_policy(
+            principal=principal(membership_version=7),
+            evaluation=PolicyEvaluationInput(
+                schema_version=VERSION,
+                action="read",
+                resource=resource_value,
+            ),
+            policy=invalid_policy,
+        )
+
+
+def test_evaluator_revalidates_unchecked_evaluation_copy() -> None:
+    resource_value = reference("memory-1")
+    invalid_evaluation = PolicyEvaluationInput(
+        schema_version=VERSION,
+        action="read",
+        resource=resource_value,
+    ).model_copy(update={"action": True})
+
+    with pytest.raises(ValidationError):
+        evaluate_policy(
+            principal=principal(),
+            evaluation=invalid_evaluation,
+            policy=policy(
+                statement("read-grant", "allow", "read", resource_value),
+            ),
+        )
+
+
+@pytest.mark.parametrize("input_graph", ["principal", "evaluation", "policy"])
+def test_evaluator_revalidates_nested_references_in_every_input_graph(
+    input_graph: str,
+) -> None:
+    resource_value = reference("memory-1")
+    invalid_resource = resource_value.model_copy(update={"tenant_id": ""})
+    principal_value = principal()
+    evaluation_value = PolicyEvaluationInput(
+        schema_version=VERSION,
+        action="read",
+        resource=resource_value,
+    )
+    policy_value = policy(
+        statement("read-grant", "allow", "read", resource_value),
+    )
+
+    if input_graph == "principal":
+        valid_constraints = DelegationConstraints(
+            delegated_by_subject_id="delegator-a",
+            delegated_by_credential_id="delegator-credential-a",
+            allowed_actions=("read",),
+            allowed_resources=(resource_value,),
+        )
+        constraints = valid_constraints.model_copy(
+            update={"allowed_resources": (invalid_resource,)}
+        )
+        principal_value = principal(
+            subject_kind="delegated_agent",
+            delegation=valid_constraints,
+        ).model_copy(update={"delegation": constraints})
+    elif input_graph == "evaluation":
+        evaluation_value = evaluation_value.model_copy(
+            update={"resource": invalid_resource}
+        )
+    else:
+        invalid_statement = policy_value.statements[0].model_copy(
+            update={"resource": invalid_resource}
+        )
+        policy_value = policy_value.model_copy(
+            update={"statements": (invalid_statement,)}
+        )
+
+    with pytest.raises(ValidationError):
+        evaluate_policy(
+            principal=principal_value,
+            evaluation=evaluation_value,
+            policy=policy_value,
+        )
+
+
+def test_policy_decision_is_frozen_after_validation() -> None:
+    resource_value = reference("memory-1")
+    decision = evaluate(
+        principal(),
+        "read",
+        resource_value,
+        policy(statement("read-grant", "allow", "read", resource_value)),
+    )
+
+    with pytest.raises(ValidationError, match="frozen"):
+        decision.outcome = "deny"
+
+
+def test_receiving_boundary_revalidates_unchecked_decision_copy() -> None:
+    resource_value = reference("memory-1")
+    decision = evaluate(
+        principal(),
+        "read",
+        resource_value,
+        policy(statement("read-grant", "allow", "read", resource_value)),
+    )
+    contradictory_copy = decision.model_copy(update={"outcome": "deny"})
+
+    with pytest.raises(ValidationError, match="explicit_grant"):
+        validate_policy_decision(contradictory_copy)
+
+
+def test_receiving_boundary_revalidates_nested_reference_copy() -> None:
+    resource_value = reference("memory-1")
+    decision = evaluate(
+        principal(),
+        "read",
+        resource_value,
+        policy(statement("read-grant", "allow", "read", resource_value)),
+    )
+    invalid_resource = decision.resource.model_copy(update={"tenant_id": ""})
+    invalid_decision = decision.model_copy(update={"resource": invalid_resource})
+
+    with pytest.raises(ValidationError):
+        validate_policy_decision(invalid_decision)
+
+
+def test_receiving_boundary_returns_independent_valid_snapshot() -> None:
+    resource_value = reference("memory-1")
+    decision = evaluate(
+        principal(),
+        "read",
+        resource_value,
+        policy(statement("read-grant", "allow", "read", resource_value)),
+    )
+
+    received = validate_policy_decision(decision)
+
+    assert received == decision
+    assert received is not decision
+    assert received.resource is not decision.resource
 
 
 def test_reference_value_must_match_exactly_and_is_not_authority() -> None:

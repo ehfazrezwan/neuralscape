@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import model_validator
+from pydantic import ConfigDict, model_validator
 
 from contracts_common import ContractModel, OpaqueId, SafeCounter, VersionedContract
 from contracts_references import ReferenceHandle
@@ -158,6 +158,8 @@ class PolicyDecision(VersionedContract):
     whether denial came from an explicit statement, absent grant, stale
     membership, tenant mismatch, or delegation ceiling.
     """
+
+    model_config = ConfigDict(frozen=True, revalidate_instances="always")
 
     action: OpaqueId
     resource: ReferenceHandle
