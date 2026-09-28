@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Literal
 
+from pydantic import model_validator
+
 from contracts_common import ContractModel, OpaqueId, SafeCounter
 from contracts_usage import (
     AttributionSnapshot,
@@ -24,6 +26,7 @@ _LEDGER_ORDER: tuple[UsageLedger, ...] = (
 )
 
 ReconciliationErrorCode = Literal[
+    "empty_reconciliation",
     "conflicting_event_id",
     "mixed_tenants",
     "unknown_predecessor",
@@ -34,6 +37,8 @@ ReconciliationErrorCode = Literal[
     "invalid_transition",
     "counter_overflow",
 ]
+LedgerCoverage = Literal["reported", "unreported"]
+LedgerMissingReason = Literal["no_events"]
 
 
 class UsageReconciliationError(ValueError):
@@ -67,18 +72,44 @@ class ReconciledUsageStream(ContractModel):
 
 
 class ReconciledLedger(ContractModel):
-    """One ledger total; ``total_tokens`` is absent if any stream is incomplete."""
+    """One ledger total with explicit evidence coverage.
+
+    ``known_token_subtotal`` may be zero without proving a complete zero total.
+    A ledger with no events is unreported and therefore has no ``total_tokens``.
+    """
 
     ledger: UsageLedger
+    coverage: LedgerCoverage
+    missing_reason: LedgerMissingReason | None
     known_token_subtotal: SafeCounter
     total_tokens: SafeCounter | None
     incomplete_attempt_ids: tuple[OpaqueId, ...]
+
+    @model_validator(mode="after")
+    def validate_coverage(self) -> "ReconciledLedger":
+        if self.coverage == "unreported":
+            if self.missing_reason != "no_events":
+                raise ValueError("unreported ledger requires a no_events reason")
+            if self.known_token_subtotal != 0 or self.total_tokens is not None:
+                raise ValueError("unreported ledger cannot claim measured token totals")
+            if self.incomplete_attempt_ids:
+                raise ValueError("unreported ledger cannot name observed attempts")
+            return self
+
+        if self.missing_reason is not None:
+            raise ValueError("reported ledger cannot have a coverage missing reason")
+        if self.incomplete_attempt_ids:
+            if self.total_tokens is not None:
+                raise ValueError("incomplete reported ledger cannot have a complete total")
+        elif self.total_tokens != self.known_token_subtotal:
+            raise ValueError("complete reported total must equal its known subtotal")
+        return self
 
 
 class UsageReconciliation(ContractModel):
     """Reconciled streams and three totals for exactly one tenant."""
 
-    tenant_id: OpaqueId | None
+    tenant_id: OpaqueId
     streams: tuple[ReconciledUsageStream, ...]
     ledgers: tuple[ReconciledLedger, ...]
 
@@ -179,6 +210,12 @@ def reconcile_usage_events(events: Iterable[UsageEvent]) -> UsageReconciliation:
                 "conflicting_event_id", f"event ID {event.event_id} has two payloads"
             )
 
+    if not by_id:
+        raise UsageReconciliationError(
+            "empty_reconciliation",
+            "at least one event is required to establish tenant and ledger evidence",
+        )
+
     tenant_ids = {event.tenant_id for event in by_id.values()}
     if len(tenant_ids) > 1:
         raise UsageReconciliationError(
@@ -273,13 +310,15 @@ def reconcile_usage_events(events: Iterable[UsageEvent]) -> UsageReconciliation:
         ledgers.append(
             ReconciledLedger(
                 ledger=ledger,
+                coverage="reported" if ledger_streams else "unreported",
+                missing_reason=None if ledger_streams else "no_events",
                 known_token_subtotal=known,
-                total_tokens=known if not incomplete_ids else None,
+                total_tokens=known if ledger_streams and not incomplete_ids else None,
                 incomplete_attempt_ids=incomplete_ids,
             )
         )
 
-    tenant_id = next(iter(tenant_ids)) if tenant_ids else None
+    tenant_id = next(iter(tenant_ids))
     return UsageReconciliation(
         tenant_id=tenant_id,
         streams=tuple(streams),

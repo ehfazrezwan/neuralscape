@@ -1,9 +1,16 @@
 """Adversarial correction and aggregation tests for usage reconciliation."""
 
+from itertools import permutations
+
 import pytest
+from pydantic import ValidationError
 
 from contracts_usage import AttributionSnapshot, TokenQuantity, TokenUsage, UsageEvent
-from contracts_usage_reconcile import UsageReconciliationError, reconcile_usage_events
+from contracts_usage_reconcile import (
+    ReconciledLedger,
+    UsageReconciliationError,
+    reconcile_usage_events,
+)
 
 
 def _quantity(value: int | None, reason: str | None = None) -> TokenQuantity:
@@ -120,9 +127,75 @@ def test_reconciles_three_ledgers_without_cross_ledger_relabelling() -> None:
 
     assert ledgers["service"].total_tokens == 15
     assert ledgers["consuming_agent"].total_tokens == 13
+    assert {ledger.coverage for ledger in ledgers.values()} == {"reported"}
     assert ledgers["evaluation"].known_token_subtotal == 0
     assert ledgers["evaluation"].total_tokens is None
     assert ledgers["evaluation"].incomplete_attempt_ids == ("attempt-eval",)
+
+
+def test_empty_input_cannot_fabricate_tenant_or_ledger_completeness() -> None:
+    assert _error_code([]) == "empty_reconciliation"
+
+
+def test_absent_ledgers_are_unreported_not_complete_zeroes() -> None:
+    result = reconcile_usage_events([_event()])
+    ledgers = {ledger.ledger: ledger for ledger in result.ledgers}
+
+    assert result.tenant_id == "tenant-1"
+    assert ledgers["service"].coverage == "reported"
+    assert ledgers["service"].missing_reason is None
+    assert ledgers["service"].total_tokens == 15
+    for ledger_name in ("consuming_agent", "evaluation"):
+        ledger = ledgers[ledger_name]
+        assert ledger.coverage == "unreported"
+        assert ledger.missing_reason == "no_events"
+        assert ledger.known_token_subtotal == 0
+        assert ledger.total_tokens is None
+        assert ledger.incomplete_attempt_ids == ()
+
+
+def test_explicit_measured_zero_is_a_complete_reported_zero() -> None:
+    zero = _event(
+        usage=_usage(
+            input_tokens=0,
+            output_tokens=0,
+            cache_read_tokens=0,
+            reasoning_tokens=0,
+        )
+    )
+    result = reconcile_usage_events([zero])
+    service = result.ledgers[0]
+
+    assert service.coverage == "reported"
+    assert service.missing_reason is None
+    assert service.known_token_subtotal == 0
+    assert service.total_tokens == 0
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"missing_reason": None},
+        {"known_token_subtotal": 1},
+        {"total_tokens": 0},
+        {"incomplete_attempt_ids": ("attempt-1",)},
+    ],
+)
+def test_unreported_ledger_cannot_claim_observed_or_complete_usage(
+    changes: dict[str, object],
+) -> None:
+    values: dict[str, object] = {
+        "ledger": "consuming_agent",
+        "coverage": "unreported",
+        "missing_reason": "no_events",
+        "known_token_subtotal": 0,
+        "total_tokens": None,
+        "incomplete_attempt_ids": (),
+    }
+    values.update(changes)
+
+    with pytest.raises(ValidationError):
+        ReconciledLedger(**values)
 
 
 def test_correction_is_order_independent_and_exact_duplicate_is_idempotent() -> None:
@@ -141,6 +214,31 @@ def test_correction_is_order_independent_and_exact_duplicate_is_idempotent() -> 
     assert len(forward.streams) == 1
     assert forward.streams[0].head_event_id == "final"
     assert forward.streams[0].total_tokens == 15
+
+
+def test_three_event_correction_chain_is_permutation_invariant() -> None:
+    root = _event(
+        event_id="root",
+        status="pending",
+        attempt_outcome="in_progress",
+        usage=None,
+    )
+    update = _event(
+        event_id="update",
+        predecessor_event_id="root",
+        status="pending",
+        attempt_outcome="in_progress",
+        usage=_usage(input_tokens=8),
+    )
+    final = _event(event_id="final", predecessor_event_id="update")
+
+    results = [
+        reconcile_usage_events(order)
+        for order in permutations((root, update, final))
+    ]
+
+    assert all(result == results[0] for result in results)
+    assert results[0].streams[0].head_event_id == "final"
 
 
 def test_same_event_id_with_different_payload_is_a_conflict() -> None:
