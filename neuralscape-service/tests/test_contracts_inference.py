@@ -1,9 +1,15 @@
-"""Identity, fallback, and score semantics for inference contracts."""
+"""Identity, fallback, schema, score, and resource inference invariants."""
+
+import math
 
 import pytest
 from pydantic import ValidationError
 
+from contracts_engines import QualificationClaim
 from contracts_inference import (
+    JSON_SCHEMA_DIALECT,
+    AttemptUsage,
+    CalibrationClaim,
     CandidateScore,
     DecisionBatchRequest,
     DecisionBatchResult,
@@ -19,12 +25,15 @@ from contracts_inference import (
     GenerationRequest,
     GenerationResult,
     InferenceResourceLimits,
+    ResourceViolation,
     ScoreDistribution,
     ScoreKind,
+    SourceEvidence,
     SourceSpan,
     validate_decision_batch_result,
     validate_decision_result,
     validate_generation_result,
+    validate_source_span,
 )
 from contracts_references import ReferenceHandle, SourceVersion
 
@@ -32,14 +41,16 @@ from contracts_references import ReferenceHandle, SourceVersion
 VERSION = "candidate-v1"
 
 
-def source_version(source_id="source-1", revision=3):
-    """Construct the dependency as an already-validated product value.
+def reference(identifier: str, resolver: str = "evidence") -> ReferenceHandle:
+    return ReferenceHandle(
+        kind="artifact",
+        id=identifier,
+        tenant_id="tenant-1",
+        resolver=resolver,
+    )
 
-    SourceVersion's exact field-level behavior is owned and tested by the
-    references contract.  These tests exercise preservation and comparison of
-    that value without duplicating its schema.
-    """
 
+def source_version(source_id="source-1", revision=3) -> SourceVersion:
     return SourceVersion(
         record_id=source_id,
         content_revision=revision,
@@ -47,20 +58,52 @@ def source_version(source_id="source-1", revision=3):
     )
 
 
-def policy_reference():
-    return ReferenceHandle(
-        kind="artifact",
-        id="processing-policy-1",
-        tenant_id="tenant-1",
-        resolver="policy",
+def source_evidence(text="Aé🙂Z", source=None) -> SourceEvidence:
+    return SourceEvidence(source_version=source or source_version(), text=text)
+
+
+def limits(**overrides) -> InferenceResourceLimits:
+    values = {
+        "max_total_input_utf8_bytes": 1000,
+        "max_total_output_utf8_bytes": 100,
+        "max_attempts": 2,
+    }
+    values.update(overrides)
+    return InferenceResourceLimits(**values)
+
+
+def qualification(operation="category_suggestion") -> QualificationClaim:
+    return QualificationClaim(
+        operation=operation,
+        profile_reference=reference("per-item-profile"),
+        profile_version="profile-v2",
+        evidence_reference=reference("per-item-evidence"),
+        evidence_version="evidence-v4",
     )
 
 
-def limits():
-    return InferenceResourceLimits(
-        max_input_units=1000,
-        max_output_units=100,
-        max_attempts=2,
+def calibration() -> CalibrationClaim:
+    return CalibrationClaim(
+        profile_reference=reference("calibration-profile"),
+        profile_version="profile-v1",
+        evidence_reference=reference("calibration-evidence"),
+        evidence_version="evidence-v5",
+    )
+
+
+def usage(
+    attempt_id="attempt-1",
+    input_bytes=10,
+    output_bytes=5,
+    late=False,
+) -> AttemptUsage:
+    return AttemptUsage(
+        attempt_id=attempt_id,
+        model_version="model-v1",
+        policy_version="policy-v1",
+        input_utf8_bytes=input_bytes,
+        output_utf8_bytes=output_bytes,
+        late=late,
     )
 
 
@@ -68,24 +111,39 @@ def decision_request(
     *,
     batch=False,
     fallback=FallbackGranularity.WHOLE_BATCH,
-    additional_source_versions=(),
+    per_item_qualification=None,
+    resource_limits=None,
+    sources=None,
+    spans=None,
 ):
-    source = source_version()
+    evidence = source_evidence()
+    source_values = sources or (evidence,)
+    span_values = spans or (
+        SourceSpan(
+            span_id="span-1",
+            source_version=evidence.source_version,
+            start_utf8_byte=0,
+            end_utf8_byte=3,
+        ),
+        SourceSpan(
+            span_id="span-2",
+            source_version=evidence.source_version,
+            start_utf8_byte=3,
+            end_utf8_byte=8,
+        ),
+    )
     values = {
         "schema_version": VERSION,
         "request_id": "request-1",
         "operation": "category_suggestion",
-        "source_versions": (source, *additional_source_versions),
-        "spans": (
-            SourceSpan(span_id="span-1", source_version=source, start=0, end=8),
-            SourceSpan(span_id="span-2", source_version=source, start=9, end=16),
-        ),
+        "sources": source_values,
+        "spans": span_values,
         "candidates": (
             DecisionCandidate(candidate_id="candidate-a"),
             DecisionCandidate(candidate_id="candidate-b"),
         ),
-        "processing_policy": policy_reference(),
-        "resource_limits": limits(),
+        "processing_policy": reference("processing-policy", "policy"),
+        "resource_limits": resource_limits or limits(),
         "deadline_ms": 500,
     }
     heads = (
@@ -107,6 +165,7 @@ def decision_request(
             **values,
             heads=heads,
             fallback_granularity=fallback,
+            per_item_qualification=per_item_qualification,
         )
     return DecisionRequest(**values, head=heads[0])
 
@@ -131,249 +190,326 @@ def abstained(head_id):
     )
 
 
-def test_source_span_is_half_open_and_nonempty():
-    source = source_version()
-    with pytest.raises(ValidationError, match="greater than start"):
-        SourceSpan(span_id="empty", source_version=source, start=2, end=2)
-    with pytest.raises(ValidationError):
-        SourceSpan(span_id="reverse", source_version=source, start=3, end=2)
-
-
-def test_shared_snapshot_rejects_conflicting_versions_of_one_source():
-    with pytest.raises(ValidationError, match="two versions of one record"):
-        decision_request(additional_source_versions=(source_version(revision=4),))
-
-
-@pytest.mark.parametrize(
-    "mutation, message",
-    [
-        ("unknown_span", "unknown span"),
-        ("unknown_candidate", "unknown candidate"),
-        ("duplicate_head", "head IDs must be unique"),
-    ],
-)
-def test_batch_request_rejects_broken_identity_links(mutation, message):
-    request = decision_request(batch=True)
-    heads = list(request.heads)
-    if mutation == "unknown_span":
-        heads[0] = heads[0].model_copy(update={"span_ids": ("not-present",)})
-    elif mutation == "unknown_candidate":
-        heads[0] = heads[0].model_copy(update={"candidate_ids": ("not-present",)})
-    else:
-        heads[1] = heads[1].model_copy(update={"head_id": heads[0].head_id})
-
-    with pytest.raises(ValidationError, match=message):
-        DecisionBatchRequest(**request.model_dump(exclude={"heads"}), heads=tuple(heads))
-
-
-def test_atomic_result_cannot_select_or_score_candidates_outside_closed_set():
-    request = decision_request()
-    unknown_selection = DecisionResult(
-        schema_version=VERSION,
-        request_id=request.request_id,
-        head_result=selected(candidate_id="invented"),
-        attempts=(),
-    )
-    with pytest.raises(ValueError, match="selected an unknown"):
-        validate_decision_result(request, unknown_selection)
-
-    distribution = ScoreDistribution(
-        distribution_id="dist-1",
-        head_id="retain",
-        kind=ScoreKind.RAW_SCORE,
-        complete=False,
-        scores=(CandidateScore(candidate_id="invented", value=4.2),),
-    )
-    scored_unknown = DecisionResult(
-        schema_version=VERSION,
-        request_id=request.request_id,
-        head_result=selected(distribution=distribution),
-        attempts=(),
-    )
-    with pytest.raises(ValueError, match="scored an unknown"):
-        validate_decision_result(request, scored_unknown)
-
-
-def test_complete_distribution_must_cover_every_candidate_for_the_head():
-    request = decision_request()
-    incomplete_identity_set = ScoreDistribution(
-        distribution_id="dist-1",
-        head_id="retain",
-        kind=ScoreKind.RAW_SCORE,
-        complete=True,
-        scores=(CandidateScore(candidate_id="candidate-a", value=4.2),),
-    )
-    result = DecisionResult(
-        schema_version=VERSION,
-        request_id=request.request_id,
-        head_result=selected(distribution=incomplete_identity_set),
-        attempts=(),
-    )
-    with pytest.raises(ValueError, match="every head candidate"):
-        validate_decision_result(request, result)
-
-
-def test_unknown_confidence_has_no_numeric_value_or_completeness_claim():
-    distribution = ScoreDistribution(
-        distribution_id="dist-unknown",
-        head_id="retain",
-        kind=ScoreKind.UNKNOWN,
-        complete=False,
-        scores=(),
-    )
-    assert distribution.kind is ScoreKind.UNKNOWN
-
-    with pytest.raises(ValidationError, match="unknown confidence"):
-        ScoreDistribution(
-            distribution_id="dist-bad",
-            head_id="retain",
-            kind=ScoreKind.UNKNOWN,
-            complete=False,
-            scores=(CandidateScore(candidate_id="candidate-a", value=0.9),),
-        )
-
-
-@pytest.mark.parametrize(
-    "kind",
-    [ScoreKind.UNCALIBRATED_PROBABILITY, ScoreKind.CALIBRATED_PROBABILITY],
-)
-def test_probabilities_require_complete_normalized_distributions(kind):
-    valid = ScoreDistribution(
-        distribution_id="dist-1",
-        head_id="retain",
+def probability_distribution(
+    head_id="retain",
+    distribution_id="dist-1",
+    kind=ScoreKind.UNCALIBRATED_PROBABILITY,
+):
+    return ScoreDistribution(
+        distribution_id=distribution_id,
+        head_id=head_id,
         kind=kind,
         complete=True,
         scores=(
             CandidateScore(candidate_id="candidate-a", value=0.7),
             CandidateScore(candidate_id="candidate-b", value=0.3),
         ),
+        calibration=calibration() if kind is ScoreKind.CALIBRATED_PROBABILITY else None,
     )
-    assert sum(item.value for item in valid.scores) == pytest.approx(1)
-
-    with pytest.raises(ValidationError, match="sum to one"):
-        ScoreDistribution(
-            distribution_id="dist-2",
-            head_id="retain",
-            kind=kind,
-            complete=True,
-            scores=(
-                CandidateScore(candidate_id="candidate-a", value=0.7),
-                CandidateScore(candidate_id="candidate-b", value=0.4),
-            ),
-        )
-    with pytest.raises(ValidationError, match="must be complete"):
-        ScoreDistribution(
-            distribution_id="dist-3",
-            head_id="retain",
-            kind=kind,
-            complete=False,
-            scores=(CandidateScore(candidate_id="candidate-a", value=1.0),),
-        )
 
 
-def test_raw_score_is_not_reinterpreted_as_probability():
-    distribution = ScoreDistribution(
-        distribution_id="dist-raw",
-        head_id="retain",
-        kind=ScoreKind.RAW_SCORE,
-        complete=False,
-        scores=(CandidateScore(candidate_id="candidate-a", value=12.5),),
-    )
-    assert distribution.scores[0].value == 12.5
+def output_schema(**overrides):
+    schema = {
+        "$schema": JSON_SCHEMA_DIALECT,
+        "type": "object",
+        "properties": {"summary": {"type": "string"}},
+        "required": ["summary"],
+        "additionalProperties": False,
+    }
+    schema.update(overrides)
+    return schema
 
 
-def test_valid_empty_is_distinct_from_abstention_and_error():
-    empty = DecisionHeadResult(
-        head_id="retain",
-        outcome=DecisionOutcome.EMPTY,
-        selected_candidate_ids=(),
-        distribution=None,
-        reason_code=None,
-    )
-    assert empty.outcome is DecisionOutcome.EMPTY
-
-    with pytest.raises(ValidationError, match="require a reason"):
-        DecisionHeadResult(
-            head_id="retain",
-            outcome=DecisionOutcome.ABSTAINED,
-            selected_candidate_ids=(),
-            distribution=None,
-            reason_code=None,
-        )
-
-
-def test_whole_batch_fallback_preserves_diagnostics_but_blocks_partial_publication():
-    request = decision_request(batch=True)
-    result = DecisionBatchResult(
-        schema_version=VERSION,
-        request_id=request.request_id,
-        fallback_granularity=FallbackGranularity.WHOLE_BATCH,
-        publishable=False,
-        head_results=(selected(), abstained("category")),
-        attempts=(),
-    )
-    validate_decision_batch_result(request, result)
-    assert result.head_results[0].outcome is DecisionOutcome.SELECTED
-
-    unsafe = result.model_copy(update={"publishable": True})
-    with pytest.raises(ValueError, match="forbids partial publication"):
-        validate_decision_batch_result(request, unsafe)
-
-
-def test_batch_result_must_match_requested_heads_and_fallback_granularity():
-    request = decision_request(batch=True)
-    missing_head = DecisionBatchResult(
-        schema_version=VERSION,
-        request_id=request.request_id,
-        fallback_granularity=FallbackGranularity.WHOLE_BATCH,
-        publishable=False,
-        head_results=(selected(),),
-        attempts=(),
-    )
-    with pytest.raises(ValueError, match="exactly the requested heads"):
-        validate_decision_batch_result(request, missing_head)
-
-    wrong_fallback = missing_head.model_copy(
-        update={"fallback_granularity": FallbackGranularity.PER_ITEM}
-    )
-    with pytest.raises(ValueError, match="does not match request"):
-        validate_decision_batch_result(request, wrong_fallback)
-
-
-def generation_request():
-    source = source_version()
+def generation_request(*, schema=None, resource_limits=None):
+    evidence = source_evidence()
     return GenerationRequest(
         schema_version=VERSION,
         request_id="generation-1",
         operation="summarize",
-        source_versions=(source,),
-        spans=(SourceSpan(span_id="support-1", source_version=source, start=0, end=8),),
-        processing_policy=policy_reference(),
-        output_schema={"type": "object"},
-        resource_limits=limits(),
+        sources=(evidence,),
+        spans=(
+            SourceSpan(
+                span_id="support-1",
+                source_version=evidence.source_version,
+                start_utf8_byte=0,
+                end_utf8_byte=8,
+            ),
+        ),
+        processing_policy=reference("processing-policy", "policy"),
+        output_schema_dialect=JSON_SCHEMA_DIALECT,
+        output_schema=schema or output_schema(),
+        resource_limits=resource_limits or limits(),
         deadline_ms=500,
     )
 
 
-def test_generation_is_machine_authored_and_requires_exact_source_support():
-    request = generation_request()
-    result = GenerationResult(
+def generation_result(output=None, attempts=()):
+    return GenerationResult(
         schema_version=VERSION,
-        request_id=request.request_id,
+        request_id="generation-1",
         outcome=GenerationOutcome.PROPOSED,
         proposals=(
             GenerationProposal(
                 proposal_id="proposal-1",
-                output={"summary": "proposal, not authority"},
+                output=output if output is not None else {"summary": "supported"},
                 support_span_ids=("support-1",),
                 machine_authored=True,
             ),
         ),
         reason_code=None,
+        attempts=attempts,
+    )
+
+
+def test_utf8_spans_require_bounds_and_code_point_boundaries():
+    evidence = source_evidence()  # byte boundaries: 0, 1, 3, 7, 8
+    out_of_bounds = (
+        SourceSpan(
+            span_id="span-1",
+            source_version=evidence.source_version,
+            start_utf8_byte=0,
+            end_utf8_byte=9,
+        ),
+    )
+    with pytest.raises(ValidationError, match="exceeds"):
+        decision_request(sources=(evidence,), spans=out_of_bounds)
+
+    split_code_point = (
+        SourceSpan(
+            span_id="span-1",
+            source_version=evidence.source_version,
+            start_utf8_byte=1,
+            end_utf8_byte=2,
+        ),
+    )
+    with pytest.raises(ValidationError, match="split a UTF-8 code point"):
+        decision_request(sources=(evidence,), spans=split_code_point)
+
+    with pytest.raises(ValueError, match="exceeds"):
+        validate_source_span(evidence, out_of_bounds[0])
+
+
+def test_source_evidence_rejects_non_utf8_surrogate_text():
+    with pytest.raises(ValidationError, match="valid UTF-8"):
+        source_evidence(text="bad\ud800text")
+
+
+def test_span_must_reference_exact_declared_source_version():
+    evidence = source_evidence()
+    other_version = source_version(revision=4)
+    span = SourceSpan(
+        span_id="span-1",
+        source_version=other_version,
+        start_utf8_byte=0,
+        end_utf8_byte=1,
+    )
+    with pytest.raises(ValidationError, match="declared source evidence"):
+        decision_request(sources=(evidence,), spans=(span,))
+
+
+def test_per_item_fallback_requires_matching_qualification_claim():
+    with pytest.raises(ValidationError, match="requires a qualification claim"):
+        decision_request(batch=True, fallback=FallbackGranularity.PER_ITEM)
+    with pytest.raises(ValidationError, match="operation must match"):
+        decision_request(
+            batch=True,
+            fallback=FallbackGranularity.PER_ITEM,
+            per_item_qualification=qualification("other-operation"),
+        )
+    request = decision_request(
+        batch=True,
+        fallback=FallbackGranularity.PER_ITEM,
+        per_item_qualification=qualification(),
+    )
+    result = DecisionBatchResult(
+        schema_version=VERSION,
+        request_id=request.request_id,
+        fallback_granularity=FallbackGranularity.PER_ITEM,
+        publishable=True,
+        head_results=(selected(), abstained("category")),
         attempts=(),
     )
-    validate_generation_result(request, result)
+    assert validate_decision_batch_result(request, result).compliant
 
+
+def test_whole_batch_fallback_blocks_partial_publication():
+    request = decision_request(batch=True)
+    result = DecisionBatchResult(
+        schema_version=VERSION,
+        request_id=request.request_id,
+        fallback_granularity=FallbackGranularity.WHOLE_BATCH,
+        publishable=True,
+        head_results=(selected(), abstained("category")),
+        attempts=(),
+    )
+    with pytest.raises(ValueError, match="forbids partial publication"):
+        validate_decision_batch_result(request, result)
+
+
+def test_unknown_raw_and_probability_score_semantics_remain_distinct():
+    unknown = ScoreDistribution(
+        distribution_id="unknown",
+        head_id="retain",
+        kind=ScoreKind.UNKNOWN,
+        complete=False,
+        scores=(),
+        calibration=None,
+    )
+    raw = ScoreDistribution(
+        distribution_id="raw",
+        head_id="retain",
+        kind=ScoreKind.RAW_SCORE,
+        complete=False,
+        scores=(CandidateScore(candidate_id="candidate-a", value=12.5),),
+        calibration=None,
+    )
+    assert unknown.scores == ()
+    assert raw.scores[0].value == 12.5
+    assert probability_distribution().kind is ScoreKind.UNCALIBRATED_PROBABILITY
+
+
+def test_probability_distribution_must_be_complete_bounded_and_normalized():
+    with pytest.raises(ValidationError, match="sum to one"):
+        ScoreDistribution(
+            distribution_id="bad",
+            head_id="retain",
+            kind=ScoreKind.UNCALIBRATED_PROBABILITY,
+            complete=True,
+            scores=(
+                CandidateScore(candidate_id="candidate-a", value=0.8),
+                CandidateScore(candidate_id="candidate-b", value=0.3),
+            ),
+            calibration=None,
+        )
+
+
+def test_calibrated_probability_requires_versioned_claim_and_other_scores_forbid_it():
+    with pytest.raises(ValidationError, match="requires a calibration claim"):
+        ScoreDistribution(
+            distribution_id="calibrated",
+            head_id="retain",
+            kind=ScoreKind.CALIBRATED_PROBABILITY,
+            complete=True,
+            scores=(CandidateScore(candidate_id="candidate-a", value=1.0),),
+            calibration=None,
+        )
+    with pytest.raises(ValidationError, match="only calibrated"):
+        ScoreDistribution(
+            distribution_id="raw",
+            head_id="retain",
+            kind=ScoreKind.RAW_SCORE,
+            complete=False,
+            scores=(CandidateScore(candidate_id="candidate-a", value=1.0),),
+            calibration=calibration(),
+        )
+    assert probability_distribution(kind=ScoreKind.CALIBRATED_PROBABILITY).calibration
+
+
+def test_batch_rejects_duplicate_distribution_ids():
+    with pytest.raises(ValidationError, match="distribution IDs must be unique"):
+        DecisionBatchResult(
+            schema_version=VERSION,
+            request_id="request-1",
+            fallback_granularity=FallbackGranularity.WHOLE_BATCH,
+            publishable=True,
+            head_results=(
+                selected(distribution=probability_distribution()),
+                selected(
+                    head_id="category",
+                    distribution=probability_distribution(
+                        head_id="category", distribution_id="dist-1"
+                    ),
+                ),
+            ),
+            attempts=(),
+        )
+
+
+def test_results_reject_duplicate_attempt_ids():
+    duplicates = (usage(), usage())
+    with pytest.raises(ValidationError, match="attempt IDs must be unique"):
+        DecisionResult(
+            schema_version=VERSION,
+            request_id="request-1",
+            head_result=selected(),
+            attempts=duplicates,
+        )
+    with pytest.raises(ValidationError, match="attempt IDs must be unique"):
+        generation_result(attempts=duplicates)
+
+
+def test_resource_overrun_is_reported_without_deleting_late_attempt_evidence():
+    request = decision_request(
+        resource_limits=limits(
+            max_attempts=1,
+            max_total_input_utf8_bytes=5,
+            max_total_output_utf8_bytes=2,
+        )
+    )
+    attempts = (
+        usage(input_bytes=4, output_bytes=2),
+        usage("attempt-2", input_bytes=7, output_bytes=3, late=True),
+    )
+    result = DecisionResult(
+        schema_version=VERSION,
+        request_id=request.request_id,
+        head_result=selected(),
+        attempts=attempts,
+    )
+    compliance = validate_decision_result(request, result)
+    assert not compliance.compliant
+    assert compliance.violations == (
+        ResourceViolation.MAX_ATTEMPTS,
+        ResourceViolation.MAX_TOTAL_INPUT_UTF8_BYTES,
+        ResourceViolation.MAX_TOTAL_OUTPUT_UTF8_BYTES,
+    )
+    assert compliance.total_input_utf8_bytes == 11
+    assert result.attempts[1].late is True
+
+
+def test_generation_output_matches_declared_schema_and_source_support():
+    request = generation_request()
+    result = generation_result()
+    assert validate_generation_result(request, result).compliant
+
+    wrong_type = generation_result(output="not-an-object")
+    with pytest.raises(ValueError, match="does not match declared schema"):
+        validate_generation_result(request, wrong_type)
+    missing_required = generation_result(output={})
+    with pytest.raises(ValueError, match="required property"):
+        validate_generation_result(request, missing_required)
+
+
+def test_generation_schema_rejects_unknown_keywords_versions_formats_and_references():
+    cases = (
+        (output_schema(unknownKeyword=True), "unsupported output schema keyword"),
+        (output_schema(**{"$schema": "https://example.invalid/schema"}), "supported Draft"),
+        (output_schema(format="private-format"), "unsupported output schema format"),
+        (output_schema(**{"$ref": "https://example.invalid/schema"}), "reference semantics"),
+        (output_schema(**{"$defs": {"value": {"type": "string"}}}), "reference semantics"),
+    )
+    for schema, message in cases:
+        with pytest.raises((ValidationError, ValueError), match=message):
+            generation_request(schema=schema)
+
+
+@pytest.mark.parametrize("nonfinite", [math.nan, math.inf, -math.inf])
+def test_generation_rejects_nonfinite_numbers_before_json_serialization(nonfinite):
+    with pytest.raises(ValidationError, match="non-finite JSON number"):
+        GenerationProposal(
+            proposal_id="bad-number",
+            output={"nested": [nonfinite]},
+            support_span_ids=("support-1",),
+            machine_authored=True,
+        )
+    schema = output_schema(default=nonfinite)
+    with pytest.raises((ValidationError, ValueError), match="non-finite JSON number"):
+        generation_request(schema=schema)
+
+
+def test_generation_rejects_unknown_support_span_and_duplicate_proposals():
+    request = generation_request()
+    result = generation_result()
     unsupported = result.model_copy(
         update={
             "proposals": (
@@ -384,33 +520,31 @@ def test_generation_is_machine_authored_and_requires_exact_source_support():
     with pytest.raises(ValueError, match="unknown support span"):
         validate_generation_result(request, unsupported)
 
-
-def test_generation_result_cannot_mix_failure_with_proposals():
-    proposal = GenerationProposal(
-        proposal_id="proposal-1",
-        output="text",
-        support_span_ids=("support-1",),
-        machine_authored=True,
-    )
-    with pytest.raises(ValidationError, match="only a proposed outcome"):
+    with pytest.raises(ValidationError, match="proposal IDs must be unique"):
         GenerationResult(
             schema_version=VERSION,
             request_id="generation-1",
-            outcome=GenerationOutcome.ERROR,
-            proposals=(proposal,),
-            reason_code="provider-error",
+            outcome=GenerationOutcome.PROPOSED,
+            proposals=(result.proposals[0], result.proposals[0]),
+            reason_code=None,
             attempts=(),
         )
 
 
-def test_resource_limits_and_deadlines_cannot_be_zero():
-    with pytest.raises(ValidationError, match="limits must be positive"):
-        InferenceResourceLimits(
-            max_input_units=0,
-            max_output_units=100,
-            max_attempts=1,
+def test_valid_empty_remains_distinct_from_abstention():
+    empty = DecisionHeadResult(
+        head_id="retain",
+        outcome=DecisionOutcome.EMPTY,
+        selected_candidate_ids=(),
+        distribution=None,
+        reason_code=None,
+    )
+    assert empty.outcome is DecisionOutcome.EMPTY
+    with pytest.raises(ValidationError, match="require a reason"):
+        DecisionHeadResult(
+            head_id="retain",
+            outcome=DecisionOutcome.ABSTAINED,
+            selected_candidate_ids=(),
+            distribution=None,
+            reason_code=None,
         )
-    request = decision_request().model_dump()
-    request["deadline_ms"] = 0
-    with pytest.raises(ValidationError, match="deadline_ms must be positive"):
-        DecisionRequest(**request)

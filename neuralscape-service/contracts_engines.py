@@ -1,20 +1,21 @@
-"""Engine capability declarations that keep distinct operational facts distinct.
+"""Engine capability declarations that keep operational facts distinct.
 
 A manifest describes an implementation; it does not select a provider, grant
-access, or prove that a backend is currently usable.  Callers must evaluate all
-of support, configuration, health, and qualification for each operation.
+access, or prove current usability. Qualification references make a claim
+reviewable but are not themselves proof that the referenced evidence is valid.
 """
 
 from __future__ import annotations
 
-from enum import StrEnum
+from enum import Enum
 
 from pydantic import model_validator
 
 from contracts_common import ContractModel, OpaqueId, VersionedContract
+from contracts_references import ReferenceHandle
 
 
-class EngineAdapterKind(StrEnum):
+class EngineAdapterKind(str, Enum):
     """The architectural seam implemented by an engine adapter."""
 
     VECTOR_STORE = "vector_store"
@@ -23,7 +24,7 @@ class EngineAdapterKind(StrEnum):
     INFERENCE = "inference"
 
 
-class CapabilityHealth(StrEnum):
+class CapabilityHealth(str, Enum):
     """Observed health of one configured operation."""
 
     UNKNOWN = "unknown"
@@ -32,38 +33,56 @@ class CapabilityHealth(StrEnum):
     UNHEALTHY = "unhealthy"
 
 
-class CapabilityOperationState(ContractModel):
-    """Independent facts about one operation on one implementation.
+class QualificationClaim(ContractModel):
+    """Versioned references supporting a qualification claim for one operation.
 
-    Qualification records evidence about semantics and can remain true while a
-    deployment is unconfigured or unhealthy.  Conversely, a healthy operation
-    is not necessarily qualified for a product profile.
+    Validation preserves the claim's identity. It does not resolve the
+    references or prove that the evidence qualifies the operation.
     """
+
+    operation: OpaqueId
+    profile_reference: ReferenceHandle
+    profile_version: OpaqueId
+    evidence_reference: ReferenceHandle
+    evidence_version: OpaqueId
+
+
+class CapabilityOperationState(ContractModel):
+    """Independent deployment and qualification facts for one operation."""
 
     operation: OpaqueId
     supported: bool
     configured: bool
     health: CapabilityHealth
-    qualified: bool
+    qualification: QualificationClaim | None
 
     @model_validator(mode="after")
-    def validate_state(self) -> CapabilityOperationState:
+    def validate_state(self) -> "CapabilityOperationState":
         if self.configured and not self.supported:
             raise ValueError("an unsupported operation cannot be configured")
-        if self.qualified and not self.supported:
+        if self.qualification is not None and not self.supported:
             raise ValueError("an unsupported operation cannot be qualified")
+        if (
+            self.qualification is not None
+            and self.qualification.operation != self.operation
+        ):
+            raise ValueError("qualification operation must match the capability operation")
         if self.health is not CapabilityHealth.UNKNOWN and not self.configured:
             raise ValueError("an unconfigured operation must have unknown health")
         return self
 
-    def is_runtime_eligible(self) -> bool:
-        """Return whether every fact required for qualified dispatch is true."""
+    def has_declared_prerequisites(self) -> bool:
+        """Return whether structural dispatch prerequisites are declared.
+
+        This does not resolve the qualification evidence and therefore is not a
+        runtime authorization or proof of qualification.
+        """
 
         return (
             self.supported
             and self.configured
             and self.health is CapabilityHealth.HEALTHY
-            and self.qualified
+            and self.qualification is not None
         )
 
 
@@ -77,7 +96,7 @@ class CapabilityManifest(VersionedContract):
     operations: tuple[CapabilityOperationState, ...]
 
     @model_validator(mode="after")
-    def validate_unique_values(self) -> CapabilityManifest:
+    def validate_unique_values(self) -> "CapabilityManifest":
         if not self.contract_schema_versions:
             raise ValueError("at least one contract schema version is required")
         if len(set(self.contract_schema_versions)) != len(self.contract_schema_versions):
@@ -97,12 +116,24 @@ class CapabilityManifest(VersionedContract):
 
 
 class CapabilityRequirement(ContractModel):
-    """Facts a consumer requires for a named operation."""
+    """Exact contract and qualification profile required for an operation."""
 
     operation: OpaqueId
+    contract_schema_version: OpaqueId
     require_configured: bool
     require_healthy: bool
-    require_qualified: bool
+    qualification_profile_reference: ReferenceHandle | None
+    qualification_profile_version: OpaqueId | None
+
+    @model_validator(mode="after")
+    def validate_qualification_requirement(self) -> "CapabilityRequirement":
+        supplied = (
+            self.qualification_profile_reference is not None,
+            self.qualification_profile_version is not None,
+        )
+        if supplied[0] != supplied[1]:
+            raise ValueError("qualification profile reference and version are paired")
+        return self
 
 
 class CapabilityViolation(ContractModel):
@@ -116,7 +147,11 @@ def validate_capability_requirements(
     manifest: CapabilityManifest,
     requirements: tuple[CapabilityRequirement, ...],
 ) -> tuple[CapabilityViolation, ...]:
-    """Return every unmet fact without silently substituting another operation."""
+    """Return structurally unmet facts without treating references as proof.
+
+    An empty result means the declarations agree. Runtime dispatch must still
+    resolve and evaluate the referenced qualification evidence.
+    """
 
     violations: list[CapabilityViolation] = []
     for requirement in requirements:
@@ -126,6 +161,13 @@ def validate_capability_requirements(
                 CapabilityViolation(operation=requirement.operation, fact="supported")
             )
             continue
+        if requirement.contract_schema_version not in manifest.contract_schema_versions:
+            violations.append(
+                CapabilityViolation(
+                    operation=requirement.operation,
+                    fact="contract_schema_version",
+                )
+            )
         if requirement.require_configured and not state.configured:
             violations.append(
                 CapabilityViolation(operation=requirement.operation, fact="configured")
@@ -134,8 +176,32 @@ def validate_capability_requirements(
             violations.append(
                 CapabilityViolation(operation=requirement.operation, fact="healthy")
             )
-        if requirement.require_qualified and not state.qualified:
-            violations.append(
-                CapabilityViolation(operation=requirement.operation, fact="qualified")
-            )
+        if requirement.qualification_profile_reference is not None:
+            claim = state.qualification
+            if claim is None:
+                violations.append(
+                    CapabilityViolation(operation=requirement.operation, fact="qualified")
+                )
+            elif (
+                claim.profile_reference != requirement.qualification_profile_reference
+                or claim.profile_version != requirement.qualification_profile_version
+            ):
+                violations.append(
+                    CapabilityViolation(
+                        operation=requirement.operation,
+                        fact="qualification_profile",
+                    )
+                )
     return tuple(violations)
+
+
+__all__ = [
+    "CapabilityHealth",
+    "CapabilityManifest",
+    "CapabilityOperationState",
+    "CapabilityRequirement",
+    "CapabilityViolation",
+    "EngineAdapterKind",
+    "QualificationClaim",
+    "validate_capability_requirements",
+]

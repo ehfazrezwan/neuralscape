@@ -1,5 +1,7 @@
 """Substantive invariants for engine capability declarations."""
 
+from enum import Enum
+
 import pytest
 from pydantic import ValidationError
 
@@ -9,53 +11,97 @@ from contracts_engines import (
     CapabilityOperationState,
     CapabilityRequirement,
     EngineAdapterKind,
+    QualificationClaim,
     validate_capability_requirements,
 )
+from contracts_references import ReferenceHandle
 
 
 VERSION = "candidate-v1"
 
 
-def state(**overrides):
+def reference(identifier: str) -> ReferenceHandle:
+    return ReferenceHandle(
+        kind="artifact",
+        id=identifier,
+        tenant_id="tenant-1",
+        resolver="evidence",
+    )
+
+
+def qualification(
+    operation: str = "retrieve",
+    profile: str = "runtime-profile",
+    profile_version: str = "profile-v1",
+) -> QualificationClaim:
+    return QualificationClaim(
+        operation=operation,
+        profile_reference=reference(profile),
+        profile_version=profile_version,
+        evidence_reference=reference("evidence-1"),
+        evidence_version="evidence-v3",
+    )
+
+
+def state(**overrides) -> CapabilityOperationState:
     values = {
         "operation": "retrieve",
         "supported": True,
         "configured": True,
         "health": CapabilityHealth.HEALTHY,
-        "qualified": True,
+        "qualification": qualification(),
     }
     values.update(overrides)
     return CapabilityOperationState(**values)
 
 
-def manifest(*operations):
+def manifest(*operations, versions=(VERSION,)) -> CapabilityManifest:
     return CapabilityManifest(
         schema_version=VERSION,
         implementation_id="engine-a",
         implementation_version="1.2.3",
         adapter_kind=EngineAdapterKind.MEMORY_ENGINE,
-        contract_schema_versions=(VERSION,),
+        contract_schema_versions=versions,
         operations=operations,
     )
 
 
-def test_runtime_eligibility_requires_all_four_independent_facts():
-    assert state().is_runtime_eligible()
-    assert not state(configured=False, health=CapabilityHealth.UNKNOWN).is_runtime_eligible()
-    assert not state(health=CapabilityHealth.DEGRADED).is_runtime_eligible()
-    assert not state(qualified=False).is_runtime_eligible()
+def requirement(**overrides) -> CapabilityRequirement:
+    values = {
+        "operation": "retrieve",
+        "contract_schema_version": VERSION,
+        "require_configured": True,
+        "require_healthy": True,
+        "qualification_profile_reference": reference("runtime-profile"),
+        "qualification_profile_version": "profile-v1",
+    }
+    values.update(overrides)
+    return CapabilityRequirement(**values)
 
 
-def test_qualification_can_outlive_configuration_and_health_observation():
+def test_public_enums_use_python_310_compatible_str_enum_pattern():
+    assert issubclass(EngineAdapterKind, str)
+    assert issubclass(EngineAdapterKind, Enum)
+    assert issubclass(CapabilityHealth, str)
+    assert EngineAdapterKind.VECTOR_STORE.value == "vector_store"
+
+
+def test_declared_prerequisites_require_all_independent_facts():
+    assert state().has_declared_prerequisites()
+    assert not state(
+        configured=False, health=CapabilityHealth.UNKNOWN
+    ).has_declared_prerequisites()
+    assert not state(health=CapabilityHealth.DEGRADED).has_declared_prerequisites()
+    assert not state(qualification=None).has_declared_prerequisites()
+
+
+def test_qualification_claim_can_outlive_configuration_but_is_not_runtime_eligibility():
     operation = state(
         configured=False,
         health=CapabilityHealth.UNKNOWN,
-        qualified=True,
     )
-
-    assert operation.supported
-    assert operation.qualified
-    assert not operation.is_runtime_eligible()
+    assert operation.qualification is not None
+    assert not operation.has_declared_prerequisites()
 
 
 @pytest.mark.parametrize(
@@ -63,12 +109,20 @@ def test_qualification_can_outlive_configuration_and_health_observation():
     [
         ({"supported": False, "configured": True}, "cannot be configured"),
         (
-            {"supported": False, "configured": False, "qualified": True},
+            {
+                "supported": False,
+                "configured": False,
+                "qualification": qualification(),
+            },
             "cannot be qualified",
         ),
         (
             {"configured": False, "health": CapabilityHealth.HEALTHY},
             "must have unknown health",
+        ),
+        (
+            {"qualification": qualification(operation="export")},
+            "operation must match",
         ),
     ],
 )
@@ -77,66 +131,65 @@ def test_impossible_operational_states_are_rejected(overrides, message):
         state(**overrides)
 
 
-def test_manifest_rejects_duplicate_operations_instead_of_last_write_wins():
+def test_manifest_rejects_duplicate_operations_and_contract_versions():
     with pytest.raises(ValidationError, match="operation declarations must be unique"):
-        manifest(state(), state(qualified=False))
+        manifest(state(), state(qualification=None))
+    with pytest.raises(ValidationError, match="contract schema versions must be unique"):
+        manifest(state(), versions=(VERSION, VERSION))
 
 
-def test_manifest_rejects_duplicate_or_absent_contract_versions():
-    base = {
-        "schema_version": VERSION,
-        "implementation_id": "engine-a",
-        "implementation_version": "1",
-        "adapter_kind": EngineAdapterKind.VECTOR_STORE,
-        "operations": (),
-    }
-    with pytest.raises(ValidationError, match="at least one"):
-        CapabilityManifest(**base, contract_schema_versions=())
-    with pytest.raises(ValidationError, match="must be unique"):
-        CapabilityManifest(**base, contract_schema_versions=(VERSION, VERSION))
+def test_requirement_profile_reference_and_version_are_paired():
+    with pytest.raises(ValidationError, match="are paired"):
+        requirement(qualification_profile_version=None)
 
 
-def test_validator_reports_each_unmet_fact_without_approximating_operations():
+def test_validator_binds_schema_and_qualification_profile_versions():
+    declared = manifest(state(), versions=(VERSION,))
+    assert validate_capability_requirements(declared, (requirement(),)) == ()
+
+    violations = validate_capability_requirements(
+        declared,
+        (
+            requirement(contract_schema_version="candidate-v2"),
+            requirement(qualification_profile_version="profile-v2"),
+        ),
+    )
+    assert [(item.operation, item.fact) for item in violations] == [
+        ("retrieve", "contract_schema_version"),
+        ("retrieve", "qualification_profile"),
+    ]
+
+
+def test_validator_reports_unconfigured_unhealthy_unqualified_and_unknown_operations():
     declared = manifest(
-        state(operation="retrieve", health=CapabilityHealth.DEGRADED, qualified=False),
         state(
-            operation="export",
+            operation="retrieve",
             configured=False,
             health=CapabilityHealth.UNKNOWN,
-            qualified=True,
+            qualification=None,
+        )
+    )
+    violations = validate_capability_requirements(
+        declared,
+        (
+            requirement(),
+            requirement(
+                operation="delete",
+                require_configured=False,
+                require_healthy=False,
+                qualification_profile_reference=None,
+                qualification_profile_version=None,
+            ),
         ),
     )
-    requirements = (
-        CapabilityRequirement(
-            operation="retrieve",
-            require_configured=True,
-            require_healthy=True,
-            require_qualified=True,
-        ),
-        CapabilityRequirement(
-            operation="export",
-            require_configured=True,
-            require_healthy=False,
-            require_qualified=True,
-        ),
-        CapabilityRequirement(
-            operation="delete",
-            require_configured=False,
-            require_healthy=False,
-            require_qualified=False,
-        ),
-    )
-
-    violations = validate_capability_requirements(declared, requirements)
-
     assert [(item.operation, item.fact) for item in violations] == [
+        ("retrieve", "configured"),
         ("retrieve", "healthy"),
         ("retrieve", "qualified"),
-        ("export", "configured"),
         ("delete", "supported"),
     ]
 
 
-def test_unknown_fields_are_rejected_by_the_common_contract_base():
+def test_unknown_fields_are_rejected_by_common_contract_base():
     with pytest.raises(ValidationError, match="extra"):
         state(provider_name="not-a-capability-fact")
