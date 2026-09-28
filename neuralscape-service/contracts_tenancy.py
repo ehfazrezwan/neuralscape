@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import model_validator
+from pydantic import TypeAdapter, model_validator
 
 from contracts_common import OpaqueId, SafeCounter, VersionedContract
 
@@ -37,6 +37,9 @@ _DESIRED_STATE_BY_OPERATION: dict[TenantOperationKind, TenantDesiredState] = {
     "delete": "deleted",
 }
 
+_OPAQUE_ID_ADAPTER = TypeAdapter(OpaqueId)
+_SAFE_COUNTER_ADAPTER = TypeAdapter(SafeCounter)
+
 
 class ResourceManifestReference(VersionedContract):
     """Tenant-bound reference to a resource manifest for one placement generation.
@@ -52,6 +55,26 @@ class ResourceManifestReference(VersionedContract):
     placement_generation: SafeCounter
 
 
+def _validate_manifest_references(
+    *,
+    tenant_id: str,
+    generation: int,
+    references: tuple[ResourceManifestReference, ...],
+) -> None:
+    seen: set[tuple[str, int]] = set()
+    for reference in references:
+        if reference.tenant_id != tenant_id:
+            raise ValueError("resource manifest tenant_id must match owning tenant_id")
+        if reference.placement_generation != generation:
+            raise ValueError(
+                "resource manifest placement_generation must match owning generation"
+            )
+        key = (reference.manifest_id, reference.manifest_revision)
+        if key in seen:
+            raise ValueError("resource manifest references must be unique")
+        seen.add(key)
+
+
 class TenantPlacement(VersionedContract):
     """A topology-neutral placement generation and its resource manifests."""
 
@@ -61,20 +84,11 @@ class TenantPlacement(VersionedContract):
 
     @model_validator(mode="after")
     def validate_manifest_identity(self) -> TenantPlacement:
-        seen: set[tuple[str, int]] = set()
-        for reference in self.resource_manifests:
-            if reference.tenant_id != self.tenant_id:
-                raise ValueError(
-                    "resource manifest tenant_id must match placement tenant_id"
-                )
-            if reference.placement_generation != self.generation:
-                raise ValueError(
-                    "resource manifest placement_generation must match placement generation"
-                )
-            key = (reference.manifest_id, reference.manifest_revision)
-            if key in seen:
-                raise ValueError("resource manifest references must be unique")
-            seen.add(key)
+        _validate_manifest_references(
+            tenant_id=self.tenant_id,
+            generation=self.generation,
+            references=self.resource_manifests,
+        )
         return self
 
 
@@ -94,15 +108,11 @@ class TenantOperationState(VersionedContract):
         expected = _DESIRED_STATE_BY_OPERATION[self.operation]
         if self.desired_state != expected:
             raise ValueError(f"{self.operation} requires desired_state={expected}")
-        for reference in self.resource_manifests:
-            if reference.tenant_id != self.tenant_id:
-                raise ValueError(
-                    "resource manifest tenant_id must match operation tenant_id"
-                )
-            if reference.placement_generation != self.placement_generation:
-                raise ValueError(
-                    "resource manifest placement_generation must match operation generation"
-                )
+        _validate_manifest_references(
+            tenant_id=self.tenant_id,
+            generation=self.placement_generation,
+            references=self.resource_manifests,
+        )
         return self
 
 
@@ -132,6 +142,9 @@ def validate_operation_transition(
         raise ValueError("operation transition cannot decrease placement_generation")
 
     if current.observed_state == previous.observed_state:
+        if current.observed_state in {"succeeded", "failed", "cancelled"}:
+            if current != previous:
+                raise ValueError("terminal operation republication must be identical")
         return current
     allowed = _ALLOWED_OBSERVED_TRANSITIONS[previous.observed_state]
     if current.observed_state not in allowed:
@@ -150,9 +163,15 @@ def validate_placement_publication(
 ) -> TenantPlacement:
     """Accept only a publication for the exact tenant and current generation."""
 
-    if placement.tenant_id != expected_tenant_id:
+    validated_tenant_id = _OPAQUE_ID_ADAPTER.validate_python(
+        expected_tenant_id, strict=True
+    )
+    validated_generation = _SAFE_COUNTER_ADAPTER.validate_python(
+        current_generation, strict=True
+    )
+    if placement.tenant_id != validated_tenant_id:
         raise ValueError("placement publication tenant_id does not match")
-    if placement.generation != current_generation:
+    if placement.generation != validated_generation:
         raise ValueError("placement publication generation is stale or unexpected")
     return placement
 

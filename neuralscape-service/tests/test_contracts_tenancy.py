@@ -137,6 +137,11 @@ def test_operation_rejects_manifest_from_another_tenant() -> None:
         operation(resource_manifests=[manifest(tenant_id="tenant-b")])
 
 
+def test_operation_rejects_exact_duplicate_manifest_references() -> None:
+    with pytest.raises(ValidationError, match="must be unique"):
+        operation(resource_manifests=[manifest(), deepcopy(manifest())])
+
+
 def test_valid_operation_progress_is_accepted() -> None:
     pending = operation(observed_state="pending")
     running = operation(observed_state="running")
@@ -195,6 +200,33 @@ def test_transition_rejects_generation_rollback() -> None:
         )
 
 
+@pytest.mark.parametrize("terminal_state", ["succeeded", "failed", "cancelled"])
+def test_terminal_republication_must_be_exactly_idempotent(
+    terminal_state: str,
+) -> None:
+    terminal = operation(observed_state=terminal_state)
+
+    assert validate_operation_transition(terminal, terminal.model_copy()) == terminal
+
+    with pytest.raises(ValueError, match="must be identical"):
+        validate_operation_transition(
+            terminal,
+            operation(
+                observed_state=terminal_state,
+                placement_generation=8,
+                resource_manifests=[manifest(generation=8)],
+            ),
+        )
+    with pytest.raises(ValueError, match="must be identical"):
+        validate_operation_transition(
+            terminal,
+            operation(
+                observed_state=terminal_state,
+                resource_manifests=[manifest(manifest_id="replacement")],
+            ),
+        )
+
+
 def test_publication_requires_exact_current_generation() -> None:
     placement = TenantPlacement.model_validate_json(
         json.dumps(
@@ -234,6 +266,55 @@ def test_publication_rejects_cross_tenant_context() -> None:
     with pytest.raises(ValueError, match="tenant_id does not match"):
         validate_placement_publication(
             placement, expected_tenant_id="tenant-b", current_generation=7
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid_generation",
+    [True, 7.0, -1, 9_007_199_254_740_992],
+)
+def test_publication_helper_strictly_validates_generation(
+    invalid_generation: object,
+) -> None:
+    placement = TenantPlacement.model_validate_json(
+        json.dumps(
+            {
+                "schema_version": VERSION,
+                "tenant_id": "tenant-a",
+                "generation": 7,
+                "resource_manifests": [],
+            }
+        )
+    )
+
+    with pytest.raises(ValidationError):
+        validate_placement_publication(
+            placement,
+            expected_tenant_id="tenant-a",
+            current_generation=invalid_generation,
+        )
+
+
+@pytest.mark.parametrize("invalid_tenant_id", [1, b"tenant-a", ""])
+def test_publication_helper_strictly_validates_tenant_id(
+    invalid_tenant_id: object,
+) -> None:
+    placement = TenantPlacement.model_validate_json(
+        json.dumps(
+            {
+                "schema_version": VERSION,
+                "tenant_id": "tenant-a",
+                "generation": 7,
+                "resource_manifests": [],
+            }
+        )
+    )
+
+    with pytest.raises(ValidationError):
+        validate_placement_publication(
+            placement,
+            expected_tenant_id=invalid_tenant_id,
+            current_generation=7,
         )
 
 

@@ -6,9 +6,10 @@ derived from process liveness, object construction, or another capability.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal
 
-from pydantic import model_validator
+from pydantic import AwareDatetime, TypeAdapter, model_validator
 
 from contracts_common import OpaqueId, SafeCounter, VersionedContract
 
@@ -23,24 +24,18 @@ CapabilityStatus = Literal[
 ]
 """Operational status without coercing unknown or unavailable to healthy."""
 
+_AWARE_DATETIME_ADAPTER = TypeAdapter(AwareDatetime)
+_OPAQUE_ID_ADAPTER = TypeAdapter(OpaqueId)
+_SAFE_COUNTER_ADAPTER = TypeAdapter(SafeCounter)
+
 
 class CapabilityReadiness(VersionedContract):
-    """One capability observation and the age of its bounded real probe."""
+    """One capability observation timestamped by its bounded real probe."""
 
     capability: ReadinessCapability
     status: CapabilityStatus
-    probe_age_seconds: SafeCounter | None
+    observed_at: AwareDatetime
     detail_code: OpaqueId | None = None
-
-    @model_validator(mode="after")
-    def validate_probe_age(self) -> CapabilityReadiness:
-        measured_statuses = {"healthy", "degraded", "unavailable"}
-        if self.status in measured_statuses and self.probe_age_seconds is None:
-            raise ValueError(f"{self.status} requires probe_age_seconds")
-        if self.status in {"disabled", "unconfigured"}:
-            if self.probe_age_seconds is not None:
-                raise ValueError(f"{self.status} cannot claim a probe age")
-        return self
 
 
 class TenantReadinessPublication(VersionedContract):
@@ -70,9 +65,15 @@ def validate_readiness_publication(
 ) -> TenantReadinessPublication:
     """Reject cross-tenant and stale-generation readiness publication."""
 
-    if publication.tenant_id != expected_tenant_id:
+    validated_tenant_id = _OPAQUE_ID_ADAPTER.validate_python(
+        expected_tenant_id, strict=True
+    )
+    validated_generation = _SAFE_COUNTER_ADAPTER.validate_python(
+        current_placement_generation, strict=True
+    )
+    if publication.tenant_id != validated_tenant_id:
         raise ValueError("readiness publication tenant_id does not match")
-    if publication.placement_generation != current_placement_generation:
+    if publication.placement_generation != validated_generation:
         raise ValueError(
             "readiness publication placement_generation is stale or unexpected"
         )
@@ -80,15 +81,25 @@ def validate_readiness_publication(
 
 
 def capability_is_ready(
-    observation: CapabilityReadiness, *, max_probe_age_seconds: SafeCounter
+    observation: CapabilityReadiness,
+    *,
+    evaluated_at: datetime,
+    max_probe_age_seconds: SafeCounter,
 ) -> bool:
-    """Return readiness for one capability under the caller's explicit age limit."""
+    """Evaluate one capability at an explicit time and age limit."""
 
-    return (
-        observation.status == "healthy"
-        and observation.probe_age_seconds is not None
-        and observation.probe_age_seconds <= max_probe_age_seconds
+    validated_evaluation_time = _AWARE_DATETIME_ADAPTER.validate_python(
+        evaluated_at, strict=True
     )
+    validated_max_age = _SAFE_COUNTER_ADAPTER.validate_python(
+        max_probe_age_seconds, strict=True
+    )
+    if validated_evaluation_time < observation.observed_at:
+        raise ValueError("evaluated_at cannot precede observed_at")
+    age_seconds = (
+        validated_evaluation_time - observation.observed_at
+    ).total_seconds()
+    return observation.status == "healthy" and age_seconds <= validated_max_age
 
 
 __all__ = [
