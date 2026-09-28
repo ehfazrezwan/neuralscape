@@ -172,6 +172,65 @@ def test_explicit_measured_zero_is_a_complete_reported_zero() -> None:
     assert service.total_tokens == 0
 
 
+def test_reconciliation_rejects_unchecked_negative_nested_counter() -> None:
+    event = _event()
+    assert event.usage is not None
+    negative_input = event.usage.input_tokens.model_copy(update={"value": -1})
+    invalid_usage = event.usage.model_copy(update={"input_tokens": negative_input})
+    invalid_event = event.model_copy(update={"usage": invalid_usage})
+
+    assert _error_code([invalid_event]) == "invalid_event"
+
+
+def test_reconciliation_rejects_unchecked_contradictory_event_state() -> None:
+    invalid_event = _event().model_copy(
+        update={
+            "status": "unavailable",
+            "usage_missing_reason": "provider_did_not_report",
+        }
+    )
+
+    assert invalid_event.usage is not None
+    assert _error_code([invalid_event]) == "invalid_event"
+
+
+def test_reconciliation_rejects_direct_nested_mutation() -> None:
+    invalid_event = _event()
+    assert invalid_event.usage is not None
+    invalid_event.usage.input_tokens.value = -1
+
+    assert _error_code([invalid_event]) == "invalid_event"
+
+
+def test_reconciliation_rejects_hidden_extra_from_unchecked_copy() -> None:
+    event = _event()
+    assert event.usage is not None
+    invalid_input = event.usage.input_tokens.model_copy(update={"authority": True})
+    invalid_usage = event.usage.model_copy(update={"input_tokens": invalid_input})
+    invalid_event = event.model_copy(update={"usage": invalid_usage})
+
+    assert _error_code([invalid_event]) == "invalid_event"
+
+
+def test_reconciliation_rejects_cyclic_mutated_input_graph() -> None:
+    invalid_event = _event()
+    invalid_event.usage = invalid_event  # type: ignore[assignment]
+
+    assert _error_code([invalid_event]) == "invalid_event"
+
+
+def test_reconciliation_result_is_isolated_from_later_input_mutation() -> None:
+    event = _event()
+    result = reconcile_usage_events([event])
+    assert event.usage is not None
+    assert result.streams[0].usage is not None
+
+    event.usage.input_tokens.value = 0
+
+    assert result.streams[0].usage.input_tokens.value == 10
+    assert result.streams[0].total_tokens == 15
+
+
 @pytest.mark.parametrize(
     "changes",
     [

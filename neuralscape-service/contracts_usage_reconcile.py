@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Literal
 
-from pydantic import model_validator
+from pydantic import BaseModel, model_validator
 
 from contracts_common import ContractModel, OpaqueId, SafeCounter
 from contracts_usage import (
@@ -27,6 +27,7 @@ _LEDGER_ORDER: tuple[UsageLedger, ...] = (
 
 ReconciliationErrorCode = Literal[
     "empty_reconciliation",
+    "invalid_event",
     "conflicting_event_id",
     "mixed_tenants",
     "unknown_predecessor",
@@ -112,6 +113,64 @@ class UsageReconciliation(ContractModel):
     tenant_id: OpaqueId
     streams: tuple[ReconciledUsageStream, ...]
     ledgers: tuple[ReconciledLedger, ...]
+
+
+def _native_snapshot(value: object, active: set[int] | None = None) -> object:
+    """Copy a nested native/model graph without trusting model construction.
+
+    Reading ``__dict__`` deliberately retains unknown fields injected by
+    unchecked model copies so the destination contract can reject them.
+    """
+
+    if active is None:
+        active = set()
+    if not isinstance(value, (BaseModel, dict, list, tuple, set, frozenset)):
+        return value
+
+    identity = id(value)
+    if identity in active:
+        raise ValueError("cyclic input graph")
+    active.add(identity)
+    try:
+        if isinstance(value, BaseModel):
+            fields = {
+                name: _native_snapshot(field_value, active)
+                for name, field_value in vars(value).items()
+            }
+            extras = getattr(value, "__pydantic_extra__", None)
+            if extras:
+                fields.update(
+                    {
+                        name: _native_snapshot(field_value, active)
+                        for name, field_value in extras.items()
+                    }
+                )
+            return fields
+        if isinstance(value, dict):
+            return {
+                key: _native_snapshot(field_value, active)
+                for key, field_value in value.items()
+            }
+        if isinstance(value, list):
+            return [_native_snapshot(item, active) for item in value]
+        if isinstance(value, tuple):
+            return tuple(_native_snapshot(item, active) for item in value)
+        if isinstance(value, set):
+            return {_native_snapshot(item, active) for item in value}
+        return frozenset(_native_snapshot(item, active) for item in value)
+    finally:
+        active.remove(identity)
+
+
+def _validated_event_snapshot(value: object) -> UsageEvent:
+    """Return a fresh, deeply validated event or one deterministic error."""
+
+    try:
+        return UsageEvent.model_validate(_native_snapshot(value))
+    except Exception as exc:
+        raise UsageReconciliationError(
+            "invalid_event", "an input event failed contract validation"
+        ) from exc
 
 
 def _stream_key(event: UsageEvent) -> tuple[object, ...]:
@@ -201,7 +260,8 @@ def reconcile_usage_events(events: Iterable[UsageEvent]) -> UsageReconciliation:
     """
 
     by_id: dict[str, UsageEvent] = {}
-    for event in events:
+    for supplied_event in events:
+        event = _validated_event_snapshot(supplied_event)
         existing = by_id.get(event.event_id)
         if existing is None:
             by_id[event.event_id] = event
