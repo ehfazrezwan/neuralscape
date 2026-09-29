@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Literal
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from contracts_common import ContractModel, OpaqueId, SafeCounter
 from contracts_usage import (
@@ -54,6 +54,8 @@ class UsageReconciliationError(ValueError):
 class ReconciledUsageStream(ContractModel):
     """The selected head of one attempt/ledger correction chain."""
 
+    model_config = ConfigDict(revalidate_instances="always")
+
     tenant_id: OpaqueId
     task_id: OpaqueId
     session_id: OpaqueId | None
@@ -71,6 +73,35 @@ class ReconciledUsageStream(ContractModel):
     total_tokens: SafeCounter | None
     incomplete_categories: tuple[str, ...]
 
+    @model_validator(mode="after")
+    def validate_usage_summary(self) -> "ReconciledUsageStream":
+        if self.usage is not None:
+            try:
+                self.usage = TokenUsage.model_validate(_native_snapshot(self.usage))
+            except Exception as exc:
+                raise ValueError("stream usage is invalid") from exc
+        if self.status == "final" and self.usage is None:
+            raise ValueError("final stream requires token usage")
+        if self.status == "unavailable" and self.usage is not None:
+            raise ValueError("unavailable stream cannot retain token usage")
+        if self.late_after_cancellation:
+            if self.status != "final" or self.attempt_outcome != "cancelled":
+                raise ValueError(
+                    "late stream must be final usage for a cancelled attempt"
+                )
+
+        known, missing = _token_total(self.usage)
+        if self.status != "final" and "usage_status" not in missing:
+            missing = (*missing, "usage_status")
+        if self.known_token_subtotal != known:
+            raise ValueError("stream subtotal does not match token usage")
+        if self.incomplete_categories != missing:
+            raise ValueError("stream incomplete categories do not match token usage")
+        expected_total = known if not missing else None
+        if self.total_tokens != expected_total:
+            raise ValueError("stream total does not match token usage completeness")
+        return self
+
 
 class ReconciledLedger(ContractModel):
     """One ledger total with explicit evidence coverage.
@@ -78,6 +109,8 @@ class ReconciledLedger(ContractModel):
     ``known_token_subtotal`` may be zero without proving a complete zero total.
     A ledger with no events is unreported and therefore has no ``total_tokens``.
     """
+
+    model_config = ConfigDict(revalidate_instances="always")
 
     ledger: UsageLedger
     coverage: LedgerCoverage
@@ -110,9 +143,81 @@ class ReconciledLedger(ContractModel):
 class UsageReconciliation(ContractModel):
     """Reconciled streams and three totals for exactly one tenant."""
 
+    model_config = ConfigDict(revalidate_instances="always")
+
     tenant_id: OpaqueId
     streams: tuple[ReconciledUsageStream, ...]
     ledgers: tuple[ReconciledLedger, ...]
+
+    @model_validator(mode="after")
+    def validate_result_graph(self) -> "UsageReconciliation":
+        try:
+            self.streams = tuple(
+                ReconciledUsageStream.model_validate(_native_snapshot(stream))
+                for stream in self.streams
+            )
+            self.ledgers = tuple(
+                ReconciledLedger.model_validate(_native_snapshot(ledger))
+                for ledger in self.ledgers
+            )
+        except Exception as exc:
+            raise ValueError(
+                "reconciliation result contains an invalid nested value"
+            ) from exc
+
+        if not self.streams:
+            raise ValueError("reconciliation result requires at least one stream")
+        if any(stream.tenant_id != self.tenant_id for stream in self.streams):
+            raise ValueError("every stream tenant must match the reconciliation tenant")
+        if tuple(ledger.ledger for ledger in self.ledgers) != _LEDGER_ORDER:
+            raise ValueError("result requires one canonical summary for each ledger")
+
+        stream_keys = {
+            (
+                stream.tenant_id,
+                stream.task_id,
+                stream.session_id,
+                stream.intent_id,
+                stream.attempt_id,
+                stream.ledger,
+                stream.operation,
+            )
+            for stream in self.streams
+        }
+        if len(stream_keys) != len(self.streams):
+            raise ValueError("reconciliation result contains duplicate streams")
+        if len({stream.head_event_id for stream in self.streams}) != len(self.streams):
+            raise ValueError("reconciliation result contains duplicate head event ids")
+
+        for ledger_summary in self.ledgers:
+            ledger_streams = tuple(
+                stream
+                for stream in self.streams
+                if stream.ledger == ledger_summary.ledger
+            )
+            incomplete_ids = tuple(
+                stream.attempt_id
+                for stream in ledger_streams
+                if stream.total_tokens is None
+            )
+            known = _checked_sum(
+                stream.known_token_subtotal for stream in ledger_streams
+            )
+            expected = {
+                "coverage": "reported" if ledger_streams else "unreported",
+                "missing_reason": None if ledger_streams else "no_events",
+                "known_token_subtotal": known,
+                "total_tokens": (
+                    known if ledger_streams and not incomplete_ids else None
+                ),
+                "incomplete_attempt_ids": incomplete_ids,
+            }
+            for field_name, expected_value in expected.items():
+                if getattr(ledger_summary, field_name) != expected_value:
+                    raise ValueError(
+                        f"{ledger_summary.ledger} ledger {field_name} does not match streams"
+                    )
+        return self
 
 
 def _native_snapshot(value: object, active: set[int] | None = None) -> object:

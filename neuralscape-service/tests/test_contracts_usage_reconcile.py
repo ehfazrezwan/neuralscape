@@ -1,5 +1,7 @@
 """Adversarial correction and aggregation tests for usage reconciliation."""
 
+import copy
+import json
 from itertools import permutations
 
 import pytest
@@ -8,6 +10,7 @@ from pydantic import ValidationError
 from contracts_usage import AttributionSnapshot, TokenQuantity, TokenUsage, UsageEvent
 from contracts_usage_reconcile import (
     ReconciledLedger,
+    UsageReconciliation,
     UsageReconciliationError,
     reconcile_usage_events,
 )
@@ -95,6 +98,13 @@ def _error_code(events: list[UsageEvent]) -> str:
     return caught.value.code
 
 
+def _assert_result_payload_rejected(payload: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        UsageReconciliation.model_validate(payload)
+    with pytest.raises(ValidationError):
+        UsageReconciliation.model_validate_json(json.dumps(payload))
+
+
 def test_reconciles_three_ledgers_without_cross_ledger_relabelling() -> None:
     service = _event()
     agent = _event(
@@ -131,6 +141,68 @@ def test_reconciles_three_ledgers_without_cross_ledger_relabelling() -> None:
     assert ledgers["evaluation"].known_token_subtotal == 0
     assert ledgers["evaluation"].total_tokens is None
     assert ledgers["evaluation"].incomplete_attempt_ids == ("attempt-eval",)
+
+
+def test_result_rejects_top_tenant_mismatching_stream() -> None:
+    payload = copy.deepcopy(
+        reconcile_usage_events([_event()]).model_dump(mode="python")
+    )
+    payload["tenant_id"] = "tenant-other"
+
+    _assert_result_payload_rejected(payload)
+
+
+def test_result_requires_exactly_one_canonical_summary_per_ledger() -> None:
+    payload = copy.deepcopy(
+        reconcile_usage_events([_event()]).model_dump(mode="python")
+    )
+    service = payload["ledgers"][0]
+    payload["ledgers"] = (service, copy.deepcopy(service), copy.deepcopy(service))
+
+    _assert_result_payload_rejected(payload)
+
+
+def test_result_rejects_ledger_total_mismatching_streams() -> None:
+    payload = copy.deepcopy(
+        reconcile_usage_events([_event()]).model_dump(mode="python")
+    )
+    payload["ledgers"][0]["known_token_subtotal"] = 999
+    payload["ledgers"][0]["total_tokens"] = 999
+
+    _assert_result_payload_rejected(payload)
+
+
+def test_result_rejects_reported_ledger_without_streams() -> None:
+    payload = copy.deepcopy(
+        reconcile_usage_events([_event()]).model_dump(mode="python")
+    )
+    payload["streams"] = ()
+
+    _assert_result_payload_rejected(payload)
+
+
+def test_result_rejects_unavailable_stream_retaining_usage_and_total() -> None:
+    payload = copy.deepcopy(
+        reconcile_usage_events([_event()]).model_dump(mode="python")
+    )
+    payload["streams"][0]["status"] = "unavailable"
+
+    _assert_result_payload_rejected(payload)
+
+
+def test_valid_result_round_trips_through_public_json_contract() -> None:
+    result = reconcile_usage_events([_event()])
+
+    assert UsageReconciliation.model_validate_json(result.model_dump_json()) == result
+
+
+def test_result_revalidation_rejects_hidden_extra_in_nested_copy() -> None:
+    result = reconcile_usage_events([_event()])
+    invalid_stream = result.streams[0].model_copy(update={"authority": True})
+    invalid_result = result.model_copy(update={"streams": (invalid_stream,)})
+
+    with pytest.raises(ValidationError):
+        UsageReconciliation.model_validate(invalid_result)
 
 
 def test_empty_input_cannot_fabricate_tenant_or_ledger_completeness() -> None:
