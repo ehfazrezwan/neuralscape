@@ -6,6 +6,7 @@ prove authorization, source existence, transactionality, or token counting.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from enum import Enum
 from typing import Literal, TypeVar
 
@@ -45,7 +46,13 @@ def _native_contract_graph(
                 for key, item in vars(value).items()
             }
             extra = getattr(value, "__pydantic_extra__", None)
-            if extra:
+            if extra is not None:
+                if not isinstance(extra, Mapping):
+                    raise ValueError("contract extra storage must be a mapping")
+                if fields.keys() & extra.keys():
+                    raise ValueError(
+                        "contract input contains conflicting declared and extra fields"
+                    )
                 fields.update(
                     {
                         key: _native_contract_graph(item, active_containers)

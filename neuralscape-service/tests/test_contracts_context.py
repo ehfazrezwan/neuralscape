@@ -372,6 +372,61 @@ def test_request_fit_rejects_nested_copied_extra_and_cyclic_graph() -> None:
     assert not bundle_fits_request(cyclic_request, bundle)
 
 
+def test_boolean_helpers_reject_conflicting_declared_and_extra_storage() -> None:
+    request = _validate(
+        ContextRequest,
+        _request(freshness_requirement="labelled_stale_acceptable"),
+    )
+    bundle = _validate(ContextBundle, _bundle())
+    receipt = _validate(ContextAssemblyReceipt, _receipt())
+    invalid_request = request.model_copy(
+        update={"freshness_requirement": "unsupported-future-mode"}
+    )
+    object.__setattr__(
+        invalid_request,
+        "__pydantic_extra__",
+        {"freshness_requirement": request.freshness_requirement},
+    )
+    invalid_receipt = receipt.model_copy(update={"receipt_id": ""})
+    object.__setattr__(
+        invalid_receipt,
+        "__pydantic_extra__",
+        {"receipt_id": receipt.receipt_id},
+    )
+
+    assert not bundle_fits_request(invalid_request, bundle)
+    assert not receipt_matches_bundle(invalid_receipt, bundle)
+
+
+def test_boolean_helpers_reject_malformed_extra_storage() -> None:
+    request = _validate(
+        ContextRequest,
+        _request(freshness_requirement="labelled_stale_acceptable"),
+    )
+    bundle = _validate(ContextBundle, _bundle())
+    receipt = _validate(ContextAssemblyReceipt, _receipt())
+    object.__setattr__(request, "__pydantic_extra__", [])
+    object.__setattr__(receipt, "__pydantic_extra__", [])
+
+    assert not bundle_fits_request(request, bundle)
+    assert not receipt_matches_bundle(receipt, bundle)
+
+
+def test_boolean_helper_preserves_nonconflicting_extra_storage() -> None:
+    request = _validate(
+        ContextRequest,
+        _request(freshness_requirement="labelled_stale_acceptable"),
+    )
+    bundle = _validate(ContextBundle, _bundle())
+    object.__setattr__(
+        request,
+        "__pydantic_extra__",
+        {"unreviewed_mode": True},
+    )
+
+    assert not bundle_fits_request(request, bundle)
+
+
 @pytest.mark.parametrize(
     ("outcome", "omissions"),
     [

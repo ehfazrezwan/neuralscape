@@ -108,6 +108,41 @@ def test_projection_comparison_rejects_copied_extras_and_cycles() -> None:
         projection_status_for([copied_with_cycle], [valid])
 
 
+def test_projection_comparison_rejects_conflicting_extra_storage() -> None:
+    valid = _source_version("source-a", 4)
+    corrupted = valid.model_copy(update={"content_revision": -1})
+    object.__setattr__(
+        corrupted,
+        "__pydantic_extra__",
+        {"content_revision": valid.content_revision},
+    )
+
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        projection_status_for([corrupted], [valid])
+
+
+def test_projection_comparison_rejects_malformed_extra_storage() -> None:
+    valid = _source_version("source-a", 4)
+    corrupted = valid.model_copy()
+    object.__setattr__(corrupted, "__pydantic_extra__", [])
+
+    with pytest.raises(ValueError, match="extra storage must be a mapping"):
+        projection_status_for([corrupted], [valid])
+
+
+def test_projection_comparison_preserves_nonconflicting_extra_storage() -> None:
+    valid = _source_version("source-a", 4)
+    corrupted = valid.model_copy()
+    object.__setattr__(
+        corrupted,
+        "__pydantic_extra__",
+        {"unreviewed_revision": 4},
+    )
+
+    with pytest.raises(ValidationError):
+        projection_status_for([corrupted], [valid])
+
+
 def test_projection_comparison_preserves_container_types_for_strict_validation() -> None:
     valid = _source_version("source-a", 4)
     malformed_mapping = {
