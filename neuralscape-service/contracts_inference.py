@@ -106,10 +106,13 @@ class SourceSpan(ContractModel):
         return self
 
 
-def _validate_source_span_values(evidence: SourceEvidence, span: SourceSpan) -> None:
+def _validate_source_span_values(
+    evidence: SourceEvidence,
+    span: SourceSpan,
+    boundaries: frozenset[int],
+) -> None:
     if span.source_version != evidence.source_version:
         raise ValueError("source span does not match the source evidence version")
-    boundaries = evidence.utf8_boundaries()
     if span.end_utf8_byte > max(boundaries):
         raise ValueError("source span exceeds the source UTF-8 byte length")
     if span.start_utf8_byte not in boundaries or span.end_utf8_byte not in boundaries:
@@ -125,7 +128,7 @@ def validate_source_span(evidence: SourceEvidence, span: SourceSpan) -> None:
         label="source evidence",
     )
     span = _validated_contract_snapshot(span, SourceSpan, label="source span")
-    _validate_source_span_values(evidence, span)
+    _validate_source_span_values(evidence, span, evidence.utf8_boundaries())
 
 
 class DecisionCandidate(ContractModel):
@@ -220,17 +223,21 @@ def _validate_source_evidence(
         raise ValueError("at least one source span is required")
     if len(set(span_ids)) != len(span_ids):
         raise ValueError("source span IDs must be unique")
+    boundaries_by_version: dict[tuple[str, int, int], frozenset[int]] = {}
     for span in spans:
-        evidence = evidence_by_version.get(
-            (
-                span.source_version.record_id,
-                span.source_version.content_revision,
-                span.source_version.policy_epoch,
-            )
+        source_key = (
+            span.source_version.record_id,
+            span.source_version.content_revision,
+            span.source_version.policy_epoch,
         )
+        evidence = evidence_by_version.get(source_key)
         if evidence is None:
             raise ValueError("every span must reference declared source evidence")
-        _validate_source_span_values(evidence, span)
+        boundaries = boundaries_by_version.get(source_key)
+        if boundaries is None:
+            boundaries = evidence.utf8_boundaries()
+            boundaries_by_version[source_key] = boundaries
+        _validate_source_span_values(evidence, span, boundaries)
 
 
 class _DecisionInputs(VersionedContract):
@@ -575,6 +582,12 @@ def _reject_unknown_schema_semantics(
 ) -> None:
     if isinstance(schema, bool):
         return
+    declared_dialect = schema.get("$schema")
+    if "$schema" in schema and declared_dialect != JSON_SCHEMA_DIALECT:
+        raise ValueError(
+            f"output schema declares an unsupported dialect at {location}: "
+            f"{declared_dialect}"
+        )
     known = set(validator_class.VALIDATORS) | _SCHEMA_ANNOTATION_KEYWORDS
     for keyword, value in schema.items():
         if keyword in {

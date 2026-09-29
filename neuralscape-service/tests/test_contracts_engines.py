@@ -2,6 +2,7 @@
 
 from enum import Enum
 
+import contracts_engines
 import pytest
 from pydantic import ValidationError
 
@@ -258,3 +259,49 @@ def test_capability_boundary_rejects_unknown_fields_wrong_containers_and_cycles(
 def test_operation_lookup_validates_opaque_scalar(operation):
     with pytest.raises(ValidationError):
         manifest(state()).operation_state(operation)
+
+
+def test_requirement_validation_builds_one_index_from_one_manifest_snapshot(
+    monkeypatch,
+):
+    declared = manifest(
+        state(),
+        state(operation="export", qualification=qualification("export")),
+    )
+    requirements = (
+        requirement(),
+        requirement(operation="export"),
+        requirement(
+            operation="delete",
+            require_configured=False,
+            require_healthy=False,
+            qualification_profile_reference=None,
+            qualification_profile_version=None,
+        ),
+    )
+    counts = {"manifest_snapshots": 0, "operation_indexes": 0}
+    original_snapshot = contracts_engines._validated_contract_snapshot
+    original_lookup = contracts_engines._operation_state_lookup
+
+    def counted_snapshot(value, expected_type, *, label):
+        if expected_type is CapabilityManifest:
+            counts["manifest_snapshots"] += 1
+        return original_snapshot(value, expected_type, label=label)
+
+    def counted_lookup(value):
+        counts["operation_indexes"] += 1
+        return original_lookup(value)
+
+    monkeypatch.setattr(
+        contracts_engines,
+        "_validated_contract_snapshot",
+        counted_snapshot,
+    )
+    monkeypatch.setattr(contracts_engines, "_operation_state_lookup", counted_lookup)
+
+    violations = validate_capability_requirements(declared, requirements)
+
+    assert [(item.operation, item.fact) for item in violations] == [
+        ("delete", "supported")
+    ]
+    assert counts == {"manifest_snapshots": 1, "operation_indexes": 1}

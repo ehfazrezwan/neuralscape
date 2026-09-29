@@ -288,6 +288,14 @@ class CapabilityViolation(ContractModel):
     fact: OpaqueId
 
 
+def _operation_state_lookup(
+    manifest: CapabilityManifest,
+) -> dict[str, CapabilityOperationState]:
+    """Build the exact operation index for one already-validated manifest."""
+
+    return {state.operation: state for state in manifest.operations}
+
+
 def validate_capability_requirements(
     manifest: CapabilityManifest,
     requirements: tuple[CapabilityRequirement, ...],
@@ -308,10 +316,11 @@ def validate_capability_requirements(
         CapabilityRequirement,
         label="capability requirements",
     )
+    states_by_operation = _operation_state_lookup(manifest)
 
     violations: list[CapabilityViolation] = []
     for requirement in requirements:
-        state = manifest.operation_state(requirement.operation)
+        state = states_by_operation.get(requirement.operation)
         if state is None or not state.supported:
             violations.append(
                 CapabilityViolation(operation=requirement.operation, fact="supported")

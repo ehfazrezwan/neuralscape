@@ -307,6 +307,52 @@ def test_span_must_reference_exact_declared_source_version():
         decision_request(sources=(evidence,), spans=(span,))
 
 
+def test_request_computes_utf8_boundaries_once_per_referenced_source(monkeypatch):
+    first = source_evidence(source=source_version("source-1", 3))
+    second = source_evidence(text="BC", source=source_version("source-2", 4))
+    spans = (
+        SourceSpan(
+            span_id="span-1",
+            source_version=first.source_version,
+            start_utf8_byte=0,
+            end_utf8_byte=1,
+        ),
+        SourceSpan(
+            span_id="span-2",
+            source_version=first.source_version,
+            start_utf8_byte=1,
+            end_utf8_byte=3,
+        ),
+        SourceSpan(
+            span_id="span-3",
+            source_version=second.source_version,
+            start_utf8_byte=0,
+            end_utf8_byte=2,
+        ),
+    )
+    calls: dict[str, int] = {}
+    original = SourceEvidence.utf8_boundaries
+
+    def counted_boundaries(self):
+        record_id = self.source_version.record_id
+        calls[record_id] = calls.get(record_id, 0) + 1
+        return original(self)
+
+    monkeypatch.setattr(SourceEvidence, "utf8_boundaries", counted_boundaries)
+
+    request = decision_request(sources=(first, second), spans=spans)
+    assert tuple(span.span_id for span in request.spans) == (
+        "span-1",
+        "span-2",
+        "span-3",
+    )
+    assert calls == {"source-1": 1, "source-2": 1}
+
+    calls.clear()
+    validate_source_span(first, spans[0])
+    assert calls == {"source-1": 1}
+
+
 def test_per_item_fallback_requires_matching_qualification_claim():
     with pytest.raises(ValidationError, match="requires a qualification claim"):
         decision_request(batch=True, fallback=FallbackGranularity.PER_ITEM)
@@ -491,6 +537,60 @@ def test_generation_schema_rejects_unknown_keywords_versions_formats_and_referen
     for schema, message in cases:
         with pytest.raises((ValidationError, ValueError), match=message):
             generation_request(schema=schema)
+
+
+@pytest.mark.parametrize(
+    "nested_schema",
+    [
+        output_schema(
+            properties={
+                "summary": {
+                    "$schema": "https://example.invalid/nested",
+                    "type": "string",
+                }
+            }
+        ),
+        output_schema(
+            properties={"summary": {"$schema": None, "type": "string"}}
+        ),
+        output_schema(
+            **{
+                "if": {
+                    "$schema": "https://example.invalid/nested",
+                    "type": "object",
+                }
+            }
+        ),
+        output_schema(allOf=[{"$schema": "https://example.invalid/nested"}]),
+    ],
+)
+def test_generation_rejects_unsupported_dialect_in_nested_schema_nodes(
+    nested_schema,
+):
+    with pytest.raises((ValidationError, ValueError), match="unsupported dialect"):
+        generation_request(schema=nested_schema)
+
+
+def test_generation_does_not_execute_schema_like_annotation_payloads():
+    schema = output_schema(
+        default={
+            "$schema": "https://example.invalid/annotation-data",
+            "unknownKeyword": True,
+        },
+        examples=[
+            {
+                "$schema": "https://example.invalid/annotation-data",
+                "$ref": "https://example.invalid/not-a-schema-reference",
+            }
+        ],
+    )
+
+    request = generation_request(schema=schema)
+
+    assert request.output_schema["default"]["unknownKeyword"] is True
+    assert request.output_schema["examples"][0]["$ref"].endswith(
+        "not-a-schema-reference"
+    )
 
 
 @pytest.mark.parametrize("nonfinite", [math.nan, math.inf, -math.inf])
