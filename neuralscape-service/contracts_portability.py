@@ -24,6 +24,24 @@ ScopeKind = Literal["tenant", "projects"]
 _WINDOWS_FORBIDDEN_COMPONENT_CHARACTERS = frozenset('<>:"|?*')
 
 
+def _validated_model_extra_storage(value: BaseModel) -> Mapping[Any, Any]:
+    """Return well-formed, disjoint Pydantic extra storage for ``value``."""
+
+    extra = value.__pydantic_extra__
+    if extra is None:
+        return {}
+    if not isinstance(extra, Mapping):
+        raise ValueError("contract model extra storage must be None or a mapping")
+
+    overlap = set(value.__dict__).intersection(extra)
+    if overlap:
+        names = ", ".join(sorted((repr(name) for name in overlap)))
+        raise ValueError(
+            f"contract model has conflicting stored and extra fields: {names}"
+        )
+    return extra
+
+
 def _reject_retained_unknown_fields(root: BaseModel) -> None:
     """Reject undeclared state retained by unchecked Pydantic copies.
 
@@ -50,7 +68,7 @@ def _reject_retained_unknown_fields(root: BaseModel) -> None:
         if isinstance(value, BaseModel):
             declared = type(value).model_fields
             stored = value.__dict__
-            pydantic_extra = value.__pydantic_extra__ or {}
+            pydantic_extra = _validated_model_extra_storage(value)
             retained_names = (
                 set(stored) | set(value.model_fields_set) | set(pydantic_extra)
             )
@@ -109,8 +127,7 @@ def _reconstruct_retained_state(root: BaseModel) -> dict[str, Any]:
         try:
             if isinstance(value, BaseModel):
                 stored = dict(value.__dict__)
-                for name, item in (value.__pydantic_extra__ or {}).items():
-                    stored.setdefault(name, item)
+                stored.update(_validated_model_extra_storage(value))
                 return {name: rebuild(item) for name, item in stored.items()}
 
             if isinstance(value, Mapping):

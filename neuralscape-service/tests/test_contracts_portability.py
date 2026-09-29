@@ -642,6 +642,67 @@ def test_rejects_nested_subclass_field_excluded_from_serialization() -> None:
         validate_portable_manifest(manifest)
 
 
+def _model_at_location(manifest: PortableManifest, location: str) -> object:
+    if location == "manifest":
+        return manifest
+    if location == "file":
+        return manifest.files[0]
+    return manifest.files[0].checksum
+
+
+@pytest.mark.parametrize("malformed_extra", [[], ["retained_unknown"]])
+@pytest.mark.parametrize("location", ["manifest", "file", "checksum"])
+def test_rejects_malformed_pydantic_extra_storage_as_controlled_validation(
+    location: str,
+    malformed_extra: list[str],
+) -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    node = _model_at_location(manifest, location)
+    object.__setattr__(node, "__pydantic_extra__", malformed_extra)
+
+    with pytest.raises(
+        ValidationError,
+        match="contract model extra storage must be None or a mapping",
+    ):
+        validate_portable_manifest(manifest)
+
+
+@pytest.mark.parametrize(
+    ("location", "field_name", "conflicting_value"),
+    [
+        ("manifest", "manifest_id", "different-manifest"),
+        ("file", "path", "../escaped.jsonl"),
+        ("checksum", "algorithm", "sha512"),
+    ],
+)
+@pytest.mark.parametrize("use_same_value", [True, False])
+def test_rejects_overlap_between_stored_and_extra_state(
+    location: str,
+    field_name: str,
+    conflicting_value: str,
+    use_same_value: bool,
+) -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    node = _model_at_location(manifest, location)
+    extra_value = node.__dict__[field_name] if use_same_value else conflicting_value
+    object.__setattr__(node, "__pydantic_extra__", {field_name: extra_value})
+
+    with pytest.raises(
+        ValidationError,
+        match="contract model has conflicting stored and extra fields",
+    ):
+        validate_portable_manifest(manifest)
+
+
+def test_empty_mapping_extra_storage_remains_valid() -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    object.__setattr__(manifest.files[0], "__pydantic_extra__", {})
+
+    revalidated = validate_portable_manifest(manifest)
+
+    assert revalidated.files[0].path == manifest.files[0].path
+
+
 def test_compatible_nested_subclass_without_new_fields_remains_valid() -> None:
     manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
     compatible = CompatibleManifestFile(**manifest.files[0].model_dump())
@@ -652,6 +713,17 @@ def test_compatible_nested_subclass_without_new_fields_remains_valid() -> None:
     assert revalidated.files[0].model_dump() == compatible.model_dump()
     assert type(revalidated.files[0]) is ManifestFile
     assert revalidated.files[0] is not compatible
+
+
+def test_shared_nested_model_is_not_mistaken_for_an_active_cycle() -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    shared_checksum = manifest.files[0].checksum
+    manifest.files[1].checksum = shared_checksum
+
+    revalidated = validate_portable_manifest(manifest)
+
+    assert revalidated.files[0].checksum == shared_checksum
+    assert revalidated.files[1].checksum == shared_checksum
 
 
 @pytest.mark.parametrize(
