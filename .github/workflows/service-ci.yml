@@ -11,7 +11,6 @@ name: service-ci
 
 on:
   pull_request:
-    branches: [dev, main]
   push:
     branches: [dev, main]
     paths:
@@ -101,6 +100,70 @@ jobs:
       - name: Run fast suite
         run: uv run pytest tests/ --ignore=tests/test_async_pipeline.py -q
 
+  python310-contracts:
+    needs: changes
+    if: needs.changes.outputs.service == 'true' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run contract floor suite on Python 3.10
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]; then
+            echo "::error::checkout does not match the candidate SHA"
+            exit 1
+          fi
+
+          required_contract_files=(
+            neuralscape-service/contracts_common.py
+            neuralscape-service/contracts_errors.py
+            neuralscape-service/contracts_references.py
+            neuralscape-service/contracts_engines.py
+            neuralscape-service/contracts_inference.py
+            neuralscape-service/tests/test_contracts_common.py
+            neuralscape-service/tests/test_contracts_engines.py
+            neuralscape-service/tests/test_contracts_inference.py
+          )
+          missing=0
+          for path in "${required_contract_files[@]}"; do
+            if [ ! -f "$path" ]; then
+              echo "::error file=$path::required Python 3.10 contract file is missing"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
+          docker run --rm \
+            --mount "type=bind,source=$GITHUB_WORKSPACE,target=/workspace,readonly" \
+            --workdir /workspace/neuralscape-service \
+            --env PYTHONDONTWRITEBYTECODE=1 \
+            python:3.10-slim \
+            sh -euxc '
+              python -c "import sys; assert sys.version_info[:2] == (3, 10), sys.version"
+              python -m pip install --disable-pip-version-check --no-cache-dir \
+                "pydantic-settings>=2.0.0" \
+                "idna>=3.11,<4" \
+                "jsonschema>=4.26.0,<5" \
+                "pytest>=8.0.0"
+              python -c "import contracts_common, contracts_references, contracts_engines, contracts_inference"
+              # These pure contract tests do not use the service suite
+              # auth/config fixtures. The full host and container jobs still
+              # load conftest.py and exercise the complete service environment.
+              python -m pytest --noconftest -p no:cacheprovider \
+                tests/test_contracts_common.py \
+                tests/test_contracts_engines.py \
+                tests/test_contracts_inference.py \
+                -q
+            '
+
   container-gate:
     needs: changes
     if: needs.changes.outputs.service == 'true' || github.event_name == 'push'
@@ -131,3 +194,49 @@ jobs:
           load: true
           tags: ns-gate-rt:ci
           cache-from: type=gha
+
+  service-gate:
+    if: ${{ always() }}
+    needs: [changes, subtree-prune-guard, host-tests, python310-contracts, container-gate]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require service checks or an intentional non-service skip
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SERVICE_CHANGED: ${{ needs.changes.outputs.service }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          SUBTREE_RESULT: ${{ needs.subtree-prune-guard.result }}
+          HOST_RESULT: ${{ needs.host-tests.result }}
+          PYTHON310_RESULT: ${{ needs.python310-contracts.result }}
+          CONTAINER_RESULT: ${{ needs.container-gate.result }}
+        run: |
+          set -eu
+
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "::error::changes job did not succeed: $CHANGES_RESULT"
+            exit 1
+          fi
+
+          case "$SERVICE_CHANGED" in
+            true|false) ;;
+            *)
+              echo "::error::service filter returned an unknown value: $SERVICE_CHANGED"
+              exit 1
+              ;;
+          esac
+
+          if [ "$EVENT_NAME" = "push" ] || [ "$SERVICE_CHANGED" = "true" ]; then
+            expected="success"
+          elif [ "$EVENT_NAME" = "pull_request" ] && [ "$SERVICE_CHANGED" = "false" ]; then
+            expected="skipped"
+          else
+            echo "::error::unsupported event/filter combination: $EVENT_NAME/$SERVICE_CHANGED"
+            exit 1
+          fi
+
+          for result in "$SUBTREE_RESULT" "$HOST_RESULT" "$PYTHON310_RESULT" "$CONTAINER_RESULT"; do
+            if [ "$result" != "$expected" ]; then
+              echo "::error::service check result '$result'; expected '$expected'"
+              exit 1
+            fi
+          done

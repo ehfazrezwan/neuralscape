@@ -15,6 +15,11 @@ dependencies = [
     "pydantic-settings>=2.0.0",
     "python-dotenv>=1.0.0",
     "google-genai>=1.0.0",
+    # Validates declared generation output schemas locally. Contract validation
+    # rejects reference semantics, so schemas cannot trigger remote resolution.
+    "jsonschema>=4.26.0,<5",
+    # Deterministic IDNA 2008 checker for the candidate JSON Schema format set.
+    "idna>=3.11,<4",
     "arq>=0.26.0",
     "redis[hiredis]>=5.0.0",
     "structlog>=24.0.0",
