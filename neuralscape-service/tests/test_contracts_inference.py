@@ -639,6 +639,122 @@ def test_generation_schema_rejects_unknown_keywords_versions_formats_and_referen
             generation_request(schema=schema)
 
 
+@pytest.mark.parametrize("regex_keyword", ["pattern", "patternProperties"])
+@pytest.mark.parametrize(
+    ("schema_position", "parent_keyword"),
+    [
+        ("root", None),
+        ("container", "properties"),
+        ("container", "dependentSchemas"),
+        ("single", "additionalProperties"),
+        ("single", "contains"),
+        ("single", "if"),
+        ("single", "items"),
+        ("single", "not"),
+        ("single", "propertyNames"),
+        ("single", "unevaluatedItems"),
+        ("single", "unevaluatedProperties"),
+        ("array", "allOf"),
+        ("array", "anyOf"),
+        ("array", "oneOf"),
+        ("array", "prefixItems"),
+    ],
+)
+def test_generation_rejects_executable_regex_at_schema_positions(
+    regex_keyword,
+    schema_position,
+    parent_keyword,
+):
+    regex_schema = (
+        {"pattern": "^bounded$"}
+        if regex_keyword == "pattern"
+        else {"patternProperties": {"^bounded$": {"type": "string"}}}
+    )
+    schema = output_schema()
+    if schema_position == "root":
+        schema.update(regex_schema)
+    elif schema_position == "container":
+        schema[parent_keyword] = {"nested": regex_schema}
+    elif schema_position == "single":
+        schema[parent_keyword] = regex_schema
+    else:
+        schema[parent_keyword] = [regex_schema]
+
+    with pytest.raises(
+        (ValidationError, ValueError),
+        match=f"unsupported executable schema regex.*{regex_keyword}",
+    ):
+        generation_request(schema=schema)
+
+
+def test_generation_allows_incidental_regex_keyword_names_in_json_data():
+    schema = output_schema(
+        properties={
+            "summary": {"type": "string"},
+            "pattern": {"type": "string"},
+            "patternProperties": {"type": "string"},
+        },
+        default={
+            "pattern": "annotation data",
+            "nested": {"patternProperties": "annotation data"},
+        },
+        examples=[
+            {
+                "pattern": "example data",
+                "patternProperties": {"not": "a schema here"},
+            }
+        ],
+    )
+    request = generation_request(schema=schema)
+    result = generation_result(
+        output={
+            "summary": "supported",
+            "pattern": "ordinary property",
+            "patternProperties": "ordinary property",
+        }
+    )
+
+    assert validate_generation_result(request, result).compliant
+
+
+@pytest.mark.parametrize("regex_keyword", ["pattern", "patternProperties"])
+def test_generation_mutated_request_rejects_regex_before_schema_execution(
+    monkeypatch,
+    regex_keyword,
+):
+    request = generation_request()
+    regex_value = (
+        "^bounded$"
+        if regex_keyword == "pattern"
+        else {"^bounded$": {"type": "string"}}
+    )
+    request.output_schema["properties"]["summary"][regex_keyword] = regex_value
+    result = generation_result()
+    validator_class, format_checker_class = contracts_inference._jsonschema_types()
+
+    class ExecutionSentinel:
+        VALIDATORS = validator_class.VALIDATORS
+
+        @classmethod
+        def check_schema(cls, schema):
+            raise AssertionError("unsafe schema reached check_schema")
+
+        def __init__(self, schema, format_checker):
+            raise AssertionError("unsafe schema reached validator construction")
+
+    monkeypatch.setattr(
+        contracts_inference,
+        "_jsonschema_types",
+        lambda: (ExecutionSentinel, format_checker_class),
+    )
+
+    with pytest.raises(
+        (ValidationError, ValueError),
+        match=f"unsupported executable schema regex.*{regex_keyword}",
+    ):
+        validate_generation_result(request, result)
+
+
 @pytest.mark.parametrize(
     ("format_name", "valid_value", "invalid_value"),
     [

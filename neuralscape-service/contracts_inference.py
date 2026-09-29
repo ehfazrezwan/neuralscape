@@ -573,7 +573,6 @@ def validate_decision_batch_result(
 
 _SCHEMA_CONTAINER_KEYWORDS = {
     "dependentSchemas",
-    "patternProperties",
     "properties",
 }
 _SCHEMA_SINGLE_KEYWORDS = {
@@ -590,6 +589,11 @@ _SCHEMA_SINGLE_KEYWORDS = {
     "unevaluatedProperties",
 }
 _SCHEMA_ARRAY_KEYWORDS = {"allOf", "anyOf", "oneOf", "prefixItems"}
+# Python's backtracking regex engine has no execution budget. Candidate-v1
+# therefore keeps executable schema regex out of output validation until a
+# safe engine or a hard execution boundary is qualified. The "regex" format
+# remains a syntax-only instance check and does not match against caller data.
+_UNSUPPORTED_EXECUTABLE_SCHEMA_KEYWORDS = {"pattern", "patternProperties"}
 _SCHEMA_ANNOTATION_KEYWORDS = {
     "$comment",
     "$schema",
@@ -718,6 +722,10 @@ def _reject_unknown_schema_semantics(
         )
     known = set(validator_class.VALIDATORS) | _SCHEMA_ANNOTATION_KEYWORDS
     for keyword, value in schema.items():
+        if keyword in _UNSUPPORTED_EXECUTABLE_SCHEMA_KEYWORDS:
+            raise ValueError(
+                f"unsupported executable schema regex at {location}: {keyword}"
+            )
         if keyword in {
             "$anchor",
             "$defs",
