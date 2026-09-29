@@ -8,12 +8,77 @@ projection.  Callers must establish those runtime properties separately.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Annotated, Literal
+from typing import Annotated, Literal, TypeVar
 
-from pydantic import AwareDatetime, ConfigDict, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 from contracts_common import ContractModel, OpaqueId, SafeCounter, VersionedContract
 from contracts_references import ReferenceHandle, SourceVersion
+
+
+_ModelT = TypeVar("_ModelT", bound=BaseModel)
+
+
+def _native_contract_graph(
+    value: object,
+    active_containers: set[int] | None = None,
+) -> object:
+    """Materialize stored fields without dropping extras or hiding cycles."""
+
+    if active_containers is None:
+        active_containers = set()
+
+    if isinstance(value, (BaseModel, dict, list, tuple)):
+        identity = id(value)
+        if identity in active_containers:
+            raise ValueError("cyclic contract graph is not valid input")
+        active_containers.add(identity)
+        try:
+            if isinstance(value, BaseModel):
+                fields = {
+                    key: _native_contract_graph(item, active_containers)
+                    for key, item in vars(value).items()
+                }
+                extra = getattr(value, "__pydantic_extra__", None)
+                if extra:
+                    if not isinstance(extra, dict):
+                        raise ValueError(
+                            "malformed stored contract extras are not valid input"
+                        )
+                    for key, item in extra.items():
+                        if key in fields:
+                            raise ValueError(
+                                "conflicting stored contract field is not valid input"
+                            )
+                        fields[key] = _native_contract_graph(item, active_containers)
+                return fields
+            if isinstance(value, dict):
+                return {
+                    key: _native_contract_graph(item, active_containers)
+                    for key, item in value.items()
+                }
+            if isinstance(value, list):
+                return [
+                    _native_contract_graph(item, active_containers)
+                    for item in value
+                ]
+            return tuple(
+                _native_contract_graph(item, active_containers) for item in value
+            )
+        finally:
+            active_containers.remove(identity)
+    return value
+
+
+def _revalidated_model(model_type: type[_ModelT], value: object) -> _ModelT:
+    """Strictly reconstruct one expected model from its complete stored graph."""
+
+    if not isinstance(value, model_type):
+        raise TypeError(f"value must be a {model_type.__name__}")
+    return model_type.model_validate(
+        _native_contract_graph(value),
+        strict=True,
+    )
 
 
 class MemoryRecordKind(str, Enum):
@@ -248,6 +313,10 @@ _LEGAL_INTENT_TRANSITIONS: dict[IntentStatus, frozenset[IntentStatus]] = {
 def is_legal_intent_transition(current: IntentStatus, target: IntentStatus) -> bool:
     """Return whether one persisted intent state may advance to another."""
 
+    if not isinstance(current, IntentStatus):
+        raise TypeError("current must be an IntentStatus")
+    if not isinstance(target, IntentStatus):
+        raise TypeError("target must be an IntentStatus")
     return target in _LEGAL_INTENT_TRANSITIONS[current]
 
 
@@ -257,12 +326,8 @@ def source_versions_match(
 ) -> bool:
     """Require exact equality after deep validation of both version witnesses."""
 
-    expected = SourceVersion.model_validate(
-        expected.model_dump(mode="python", round_trip=True)
-    )
-    observed = SourceVersion.model_validate(
-        observed.model_dump(mode="python", round_trip=True)
-    )
+    expected = _revalidated_model(SourceVersion, expected)
+    observed = _revalidated_model(SourceVersion, observed)
 
     return (
         expected.record_id == observed.record_id
@@ -281,21 +346,21 @@ def validate_required_stage_claim(
 
     Existing Pydantic instances are not proof of validity because unchecked
     construction and copy updates can bypass validators.  This public decision
-    boundary therefore dumps and revalidates each complete nested graph before
-    inspecting it.
+    boundary therefore materializes every stored field and revalidates each
+    complete nested graph before inspecting it.
 
     Only the greatest attempt number for each required stage is considered.
     An applied receipt satisfies a stage only when its complete per-source
     revision/epoch set exactly matches the intent's expected sources.
     """
 
-    intent = Intent.model_validate(intent.model_dump(mode="python", round_trip=True))
-    receipts = tuple(
-        StageReceipt.model_validate(
-            receipt.model_dump(mode="python", round_trip=True)
-        )
-        for receipt in receipts
-    )
+    if not isinstance(claimed_status, IntentStatus):
+        raise TypeError("claimed_status must be an IntentStatus")
+    if not isinstance(receipts, tuple):
+        raise TypeError("receipts must be a tuple")
+
+    intent = _revalidated_model(Intent, intent)
+    receipts = tuple(_revalidated_model(StageReceipt, receipt) for receipt in receipts)
 
     latest: dict[ProcessingStage, StageReceipt] = {}
     for receipt in receipts:
@@ -394,6 +459,8 @@ def validate_required_stage_claim(
             applied=applied,
             fence_status=StageStatus.SUPERSEDED,
         )
+    else:
+        raise ValueError("unsupported IntentStatus")
 
 
 def _validate_fenced_terminal_claim(

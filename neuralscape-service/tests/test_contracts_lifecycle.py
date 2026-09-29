@@ -312,6 +312,74 @@ def test_aggregate_boundary_revalidates_constructed_intent() -> None:
         )
 
 
+def test_aggregate_boundary_rejects_copy_injected_extra_fields() -> None:
+    command = intent(ProcessingStage.CANONICAL)
+    valid_receipt = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+
+    extra_intent = command.model_copy(update={"undeclared_mode": True})
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED,
+            intent=extra_intent,
+            receipts=(valid_receipt,),
+        )
+
+    extra_reference = ReferenceHandle(
+        kind="memory",
+        id="memory-1",
+        tenant_id="tenant-1",
+        resolver="resolve_memory",
+    ).model_copy(update={"undeclared_scope": "other"})
+    extra_nested_receipt = valid_receipt.model_copy(
+        update={"output_refs": (extra_reference,)}
+    )
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED,
+            intent=command,
+            receipts=(extra_nested_receipt,),
+        )
+
+
+def test_aggregate_boundary_preserves_sequence_types_during_revalidation() -> None:
+    command = intent(ProcessingStage.CANONICAL)
+    unchecked = command.model_copy(
+        update={"required_stages": [ProcessingStage.CANONICAL]}
+    )
+
+    with pytest.raises(ValidationError, match="valid tuple"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED,
+            intent=unchecked,
+            receipts=(receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED),),
+        )
+
+
+def test_aggregate_boundary_rejects_cyclic_graph_predictably() -> None:
+    command = intent(ProcessingStage.CANONICAL).model_copy(
+        update={"undeclared_cycle": None}
+    )
+    command.__dict__["undeclared_cycle"] = command
+
+    with pytest.raises(ValueError, match="cyclic contract graph"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED,
+            intent=command,
+            receipts=(),
+        )
+
+
+def test_aggregate_boundary_rejects_non_tuple_receipt_collection() -> None:
+    with pytest.raises(TypeError, match="receipts must be a tuple"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED,
+            intent=intent(ProcessingStage.CANONICAL),
+            receipts=[  # type: ignore[arg-type]
+                receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+            ],
+        )
+
+
 @pytest.mark.parametrize(
     ("updates", "message"),
     [
@@ -385,6 +453,58 @@ def test_aggregate_boundary_revalidates_copied_nested_values() -> None:
         )
 
 
+@pytest.mark.parametrize("claimed_status", ["applied", "unknown", object()])
+def test_aggregate_boundary_rejects_non_native_claimed_status(
+    claimed_status: object,
+) -> None:
+    with pytest.raises(TypeError, match="claimed_status must be an IntentStatus"):
+        validate_required_stage_claim(
+            claimed_status=claimed_status,  # type: ignore[arg-type]
+            intent=intent(ProcessingStage.CANONICAL),
+            receipts=(),
+        )
+
+
+def test_aggregate_boundary_dispatches_every_native_status() -> None:
+    single_stage = intent(ProcessingStage.CANONICAL)
+    cases = {
+        IntentStatus.ACCEPTED: (
+            receipt(ProcessingStage.CANONICAL, StageStatus.PENDING),
+        ),
+        IntentStatus.PROCESSING: (
+            receipt(ProcessingStage.CANONICAL, StageStatus.PROCESSING),
+        ),
+        IntentStatus.APPLIED: (
+            receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED),
+        ),
+        IntentStatus.FAILED: (
+            receipt(ProcessingStage.CANONICAL, StageStatus.FAILED),
+        ),
+        IntentStatus.CANCELLED: (
+            receipt(ProcessingStage.CANONICAL, StageStatus.CANCELLED),
+        ),
+        IntentStatus.SUPERSEDED: (
+            receipt(ProcessingStage.CANONICAL, StageStatus.SUPERSEDED),
+        ),
+    }
+    for claimed_status, receipts in cases.items():
+        validate_required_stage_claim(
+            claimed_status=claimed_status,
+            intent=single_stage,
+            receipts=receipts,
+        )
+
+    two_stage = intent(ProcessingStage.CANONICAL, ProcessingStage.GRAPH)
+    validate_required_stage_claim(
+        claimed_status=IntentStatus.PARTIAL,
+        intent=two_stage,
+        receipts=(
+            receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED),
+            receipt(ProcessingStage.GRAPH, StageStatus.SKIPPED),
+        ),
+    )
+
+
 def test_legal_transitions_are_forward_only_and_terminal_states_stay_terminal() -> None:
     assert is_legal_intent_transition(IntentStatus.ACCEPTED, IntentStatus.PROCESSING)
     assert is_legal_intent_transition(IntentStatus.PROCESSING, IntentStatus.PARTIAL)
@@ -393,6 +513,25 @@ def test_legal_transitions_are_forward_only_and_terminal_states_stay_terminal() 
     assert not is_legal_intent_transition(IntentStatus.ACCEPTED, IntentStatus.APPLIED)
     assert not is_legal_intent_transition(IntentStatus.CANCELLED, IntentStatus.PROCESSING)
     assert not is_legal_intent_transition(IntentStatus.SUPERSEDED, IntentStatus.APPLIED)
+
+
+@pytest.mark.parametrize(
+    ("current", "target"),
+    [
+        ("accepted", IntentStatus.PROCESSING),
+        (IntentStatus.ACCEPTED, "processing"),
+        (object(), IntentStatus.PROCESSING),
+    ],
+)
+def test_transition_helper_rejects_non_native_statuses(
+    current: object,
+    target: object,
+) -> None:
+    with pytest.raises(TypeError, match="must be an IntentStatus"):
+        is_legal_intent_transition(  # type: ignore[arg-type]
+            current,
+            target,
+        )
 
 
 def test_stale_content_revision_or_policy_epoch_never_matches() -> None:
@@ -411,6 +550,18 @@ def test_source_version_decision_boundary_revalidates_copied_values() -> None:
     assert SourceVersion.model_validate(invalid) is invalid
     with pytest.raises(ValidationError, match="greater than or equal to 0"):
         source_versions_match(invalid, invalid)
+
+
+def test_source_version_boundary_rejects_copy_injected_extra_fields() -> None:
+    valid = source("memory-1", revision=4, epoch=9)
+    unchecked = valid.model_copy(update={"undeclared_witness": True})
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        source_versions_match(unchecked, valid)
+
+    non_string_key = valid.model_copy(update={1: "undeclared"})  # type: ignore[dict-item]
+    with pytest.raises(ValidationError, match="Keys should be strings"):
+        source_versions_match(non_string_key, valid)
 
 
 def test_applied_claim_requires_every_required_stage_at_expected_versions() -> None:
