@@ -269,6 +269,45 @@ def test_record_rejects_scope_mismatch_and_body_after_erasure() -> None:
         )
 
 
+def test_record_project_scope_rejects_workspace_id_at_model_boundary() -> None:
+    payload = memory_record(
+        applicability=ApplicabilityScope.PROJECT,
+        project_id="project-1",
+    ).model_dump()
+    payload["workspace_id"] = "workspace-1"
+
+    with pytest.raises(
+        ValidationError,
+        match="project applicability cannot carry workspace_id",
+    ):
+        MemoryRecord.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("applicability", "project_id", "workspace_id"),
+    [
+        (ApplicabilityScope.GLOBAL, None, None),
+        (ApplicabilityScope.PROJECT, "project-1", None),
+        (ApplicabilityScope.WORKSPACE, None, "workspace-1"),
+        (ApplicabilityScope.WORKSPACE, "project-1", "workspace-1"),
+    ],
+)
+def test_record_accepts_valid_scope_identifiers(
+    applicability: ApplicabilityScope,
+    project_id: str | None,
+    workspace_id: str | None,
+) -> None:
+    record = memory_record(
+        applicability=applicability,
+        project_id=project_id,
+        workspace_id=workspace_id,
+    )
+
+    assert record.applicability is applicability
+    assert record.project_id == project_id
+    assert record.workspace_id == workspace_id
+
+
 @pytest.mark.parametrize(
     "parents",
     [

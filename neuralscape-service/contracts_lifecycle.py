@@ -138,6 +138,8 @@ class MemoryRecord(VersionedContract):
         elif self.applicability is ApplicabilityScope.PROJECT:
             if self.project_id is None:
                 raise ValueError("project applicability requires project_id")
+            if self.workspace_id is not None:
+                raise ValueError("project applicability cannot carry workspace_id")
         elif self.workspace_id is None:
             raise ValueError("workspace applicability requires workspace_id")
 
