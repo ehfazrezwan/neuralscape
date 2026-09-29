@@ -44,6 +44,21 @@ def test_task_accepted_wire_shape_is_unchanged_and_only_acknowledges_queue() -> 
     assert observation.all_projections_applied is False
 
 
+@pytest.mark.parametrize(
+    "status",
+    ["queued", "processing", "completed", "failed", ""],
+)
+def test_task_accepted_observation_requires_accepted_status(status: str) -> None:
+    response = TaskAcceptedResponse(
+        task_id="ns-123",
+        poll_url="/v1/memories/status/ns-123",
+    )
+    response.status = status
+
+    with pytest.raises(ValueError, match="status must be 'accepted'"):
+        observe_task_accepted(response)
+
+
 def test_completed_status_means_worker_return_not_projection_convergence() -> None:
     response = TaskStatusResponse(
         task_id="ns-123",

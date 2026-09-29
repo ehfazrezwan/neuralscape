@@ -70,13 +70,14 @@ def receipt(
         else None
     )
     terminal = status not in {StageStatus.PENDING, StageStatus.PROCESSING}
+    default_sources = () if status is StageStatus.PENDING else (source("memory-1"),)
     return StageReceipt(
         schema_version="candidate-v1",
         intent_id="intent-1",
         attempt=attempt,
         stage=stage,
         status=status,
-        applied_sources=sources if sources is not None else (source("memory-1"),),
+        applied_sources=sources if sources is not None else default_sources,
         output_refs=(),
         error=error,
         started_at=None if status is StageStatus.PENDING else NOW,
@@ -1084,8 +1085,61 @@ def test_pending_receipt_cannot_claim_started_work() -> None:
     validate_required_stage_claim(
         claimed_status=IntentStatus.ACCEPTED,
         intent=command,
-        receipts=(receipt(ProcessingStage.GRAPH, StageStatus.PENDING, sources=()),),
+        receipts=(receipt(ProcessingStage.GRAPH, StageStatus.PENDING),),
     )
+
+
+@pytest.mark.parametrize("field_name", ["applied_sources", "output_refs"])
+def test_pending_receipt_rejects_result_fields(field_name: str) -> None:
+    values = receipt(ProcessingStage.GRAPH, StageStatus.PENDING).model_dump()
+    if field_name == "applied_sources":
+        values[field_name] = (source("memory-1"),)
+    else:
+        values[field_name] = (
+            ReferenceHandle(
+                kind="memory",
+                id="memory-1",
+                tenant_id="tenant-1",
+                resolver="resolve_memory",
+            ),
+        )
+
+    with pytest.raises(ValidationError, match="cannot carry result fields"):
+        StageReceipt.model_validate(values)
+
+
+@pytest.mark.parametrize(
+    "status",
+    [StageStatus.SKIPPED, StageStatus.CANCELLED, StageStatus.SUPERSEDED],
+)
+def test_prestart_terminal_fences_do_not_invent_started_at(
+    status: StageStatus,
+) -> None:
+    values = receipt(
+        ProcessingStage.GRAPH,
+        status,
+        sources=(),
+    ).model_dump()
+    values["started_at"] = None
+
+    fenced = StageReceipt.model_validate(values)
+
+    assert fenced.started_at is None
+    assert fenced.finished_at is not None
+
+
+@pytest.mark.parametrize("status", [StageStatus.APPLIED, StageStatus.FAILED])
+def test_applied_and_failed_receipts_require_real_start(
+    status: StageStatus,
+) -> None:
+    values = receipt(ProcessingStage.GRAPH, status).model_dump()
+    values["started_at"] = None
+
+    with pytest.raises(
+        ValidationError,
+        match=rf"{status.value} stage receipts require started_at",
+    ):
+        StageReceipt.model_validate(values)
 
 
 def test_all_lifecycle_timestamps_reject_naive_native_datetimes() -> None:

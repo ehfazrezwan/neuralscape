@@ -46,6 +46,8 @@ def observe_task_accepted(response: TaskAcceptedResponse) -> LegacyAsyncObservat
     intent/outbox commit.
     """
 
+    if response.status != "accepted":
+        raise ValueError("task accepted response status must be 'accepted'")
     return LegacyAsyncObservation(
         kind=LegacyAsyncObservationKind.QUEUE_ACKNOWLEDGED,
         task_id=response.task_id,

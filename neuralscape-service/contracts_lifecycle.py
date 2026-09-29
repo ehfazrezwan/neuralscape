@@ -248,12 +248,18 @@ class StageReceipt(VersionedContract):
             raise ValueError("terminal stage receipts require finished_at")
         if not terminal and self.finished_at is not None:
             raise ValueError("non-terminal stage receipts cannot have finished_at")
-        if self.status is StageStatus.PENDING and self.started_at is not None:
-            raise ValueError("pending stage receipts cannot have started_at")
+        if self.status is StageStatus.PENDING:
+            if self.started_at is not None:
+                raise ValueError("pending stage receipts cannot have started_at")
+            if self.applied_sources or self.output_refs:
+                raise ValueError("pending stage receipts cannot carry result fields")
         if self.status is StageStatus.PROCESSING and self.started_at is None:
             raise ValueError("processing stage receipts require started_at")
-        if self.finished_at is not None and self.started_at is None:
-            raise ValueError("finished_at requires started_at")
+        if self.status in {StageStatus.APPLIED, StageStatus.FAILED}:
+            if self.started_at is None:
+                raise ValueError(
+                    f"{self.status.value} stage receipts require started_at"
+                )
         if self.started_at is not None and self.finished_at is not None:
             if self.finished_at < self.started_at:
                 raise ValueError("finished_at cannot precede started_at")
