@@ -13,7 +13,7 @@ from __future__ import annotations
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Literal, Mapping
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from contracts_common import ContractModel, OpaqueId, SafeCounter, VersionedContract
 
@@ -21,6 +21,68 @@ from contracts_common import ContractModel, OpaqueId, SafeCounter, VersionedCont
 ChecksumAlgorithm = Literal["sha256"]
 EncryptionMode = Literal["plaintext_authorized_export", "encrypted"]
 ScopeKind = Literal["tenant", "projects"]
+
+
+def _reject_retained_unknown_fields(root: BaseModel) -> None:
+    """Reject undeclared state retained by unchecked Pydantic copies.
+
+    ``model_copy(update=...)`` deliberately does not validate its update.  For
+    models configured with ``extra="forbid"``, an undeclared update can remain
+    in ``__dict__``/``model_fields_set`` while ``model_dump()`` silently omits
+    it.  Walk the native object graph before dumping so the receiving boundary
+    cannot accept that sanitized subset.  Object identity, rather than value
+    equality, makes shared and cyclic containers safe to inspect.
+    """
+
+    errors: list[dict[str, Any]] = []
+    visited: set[int] = set()
+
+    def walk(value: Any, location: tuple[str | int, ...]) -> None:
+        if not isinstance(value, (BaseModel, Mapping, list, tuple, set, frozenset)):
+            return
+
+        identity = id(value)
+        if identity in visited:
+            return
+        visited.add(identity)
+
+        if isinstance(value, BaseModel):
+            declared = type(value).model_fields
+            stored = value.__dict__
+            pydantic_extra = value.__pydantic_extra__ or {}
+            retained_names = (
+                set(stored) | set(value.model_fields_set) | set(pydantic_extra)
+            )
+
+            for name in sorted(retained_names - set(declared), key=repr):
+                retained_value = stored.get(name, pydantic_extra.get(name))
+                error_location = name if isinstance(name, (str, int)) else repr(name)
+                errors.append(
+                    {
+                        "type": "extra_forbidden",
+                        "loc": (*location, error_location),
+                        "input": retained_value,
+                    }
+                )
+
+            for name in declared:
+                if name in stored:
+                    walk(stored[name], (*location, name))
+            return
+
+        if isinstance(value, Mapping):
+            for index, (key, item) in enumerate(value.items()):
+                walk(key, (*location, "<key>", index))
+                item_location = key if isinstance(key, (str, int)) else index
+                walk(item, (*location, item_location))
+            return
+
+        for index, item in enumerate(value):
+            walk(item, (*location, index))
+
+    walk(root, ())
+    if errors:
+        raise ValidationError.from_exception_data("PortableManifest", errors)
 
 
 def _normalized_bundle_path(value: str) -> str:
@@ -251,7 +313,24 @@ def validate_portable_manifest(
     actual bytes before any mutation.
     """
 
-    candidate = document.model_dump() if isinstance(document, PortableManifest) else document
+    if isinstance(document, PortableManifest):
+        _reject_retained_unknown_fields(document)
+        try:
+            candidate = document.model_dump()
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise ValidationError.from_exception_data(
+                "PortableManifest",
+                [
+                    {
+                        "type": "value_error",
+                        "loc": (),
+                        "input": document,
+                        "ctx": {"error": exc},
+                    }
+                ],
+            ) from exc
+    else:
+        candidate = document
     return PortableManifest.model_validate(candidate)
 
 

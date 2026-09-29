@@ -311,6 +311,129 @@ def test_revalidating_instance_rejects_mutated_missing_envelope_file() -> None:
         validate_portable_manifest(manifest)
 
 
+@pytest.mark.parametrize(
+    "location",
+    [
+        "manifest",
+        "file",
+        "checksum",
+        "scope",
+        "replay_position",
+        "identity_mapping",
+        "encryption",
+    ],
+)
+def test_revalidating_instance_rejects_retained_unknown_fields(location: str) -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+
+    if location == "manifest":
+        candidate = manifest.model_copy(update={"future_contract_field": "deny"})
+        retained_node = candidate
+    else:
+        if location == "file":
+            retained_node = manifest.files[0].model_copy(
+                update={"future_contract_field": "deny"}
+            )
+            manifest.files[0] = retained_node
+        elif location == "checksum":
+            retained_node = manifest.files[0].checksum.model_copy(
+                update={"future_contract_field": "deny"}
+            )
+            manifest.files[0].checksum = retained_node
+        elif location == "scope":
+            retained_node = manifest.scope.model_copy(
+                update={"future_contract_field": "deny"}
+            )
+            manifest.scope = retained_node
+        elif location == "replay_position":
+            retained_node = manifest.snapshot.replay_position.model_copy(
+                update={"future_contract_field": "deny"}
+            )
+            manifest.snapshot.replay_position = retained_node
+        elif location == "identity_mapping":
+            retained_node = manifest.identity_mappings[0].model_copy(
+                update={"future_contract_field": "deny"}
+            )
+            manifest.identity_mappings[0] = retained_node
+        else:
+            retained_node = manifest.encryption.model_copy(
+                update={"future_contract_field": "deny"}
+            )
+            manifest.encryption = retained_node
+        candidate = manifest
+
+    assert retained_node.__dict__["future_contract_field"] == "deny"
+    assert "future_contract_field" in retained_node.model_fields_set
+    with pytest.raises(ValidationError, match="future_contract_field"):
+        validate_portable_manifest(candidate)
+
+
+def test_valid_declared_field_copy_is_normalized_and_deeply_rebuilt() -> None:
+    manifest = validate_portable_manifest(valid_manifest())
+    copied_file = manifest.files[0].model_copy(
+        update={"path": "canonical/./renamed-records.jsonl"}
+    )
+    candidate = manifest.model_copy(update={"files": [copied_file, manifest.files[1]]})
+
+    revalidated = validate_portable_manifest(candidate)
+
+    assert revalidated.files[0].path == "canonical/renamed-records.jsonl"
+    assert revalidated is not candidate
+    assert revalidated.files is not candidate.files
+    assert revalidated.files[0] is not candidate.files[0]
+    assert revalidated.files[0].checksum is not candidate.files[0].checksum
+
+
+@pytest.mark.parametrize("container_kind", ["tuple", "mapping"])
+def test_retained_unknown_field_in_native_container_is_not_sanitized(
+    container_kind: str,
+) -> None:
+    manifest = validate_portable_manifest(valid_manifest())
+    copied_file = manifest.files[0].model_copy(
+        update={"future_contract_field": "deny"}
+    )
+    if container_kind == "tuple":
+        native_container = (copied_file, manifest.files[1])
+    else:
+        native_container = {("opaque", 1): copied_file}
+    candidate = manifest.model_copy(update={"files": native_container})
+
+    with pytest.raises(ValidationError, match="future_contract_field"):
+        validate_portable_manifest(candidate)
+
+
+def test_revalidating_instance_controls_malformed_defined_field() -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    manifest.files[0].__dict__["checksum"] = "not-a-checksum"
+
+    with pytest.raises(ValidationError, match="checksum"):
+        validate_portable_manifest(manifest)
+
+
+@pytest.mark.parametrize("cycle_kind", ["files", "checksum", "replay_position"])
+def test_revalidating_instance_controls_cyclic_defined_fields(cycle_kind: str) -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    if cycle_kind == "files":
+        cyclic_files = []
+        cyclic_files.append(cyclic_files)
+        manifest.__dict__["files"] = cyclic_files
+    elif cycle_kind == "checksum":
+        manifest.files[0].__dict__["checksum"] = manifest.files[0]
+    else:
+        manifest.snapshot.__dict__["replay_position"] = manifest.snapshot
+
+    with pytest.raises(ValidationError):
+        validate_portable_manifest(manifest)
+
+
+def test_mapping_input_cycle_is_a_controlled_validation_failure() -> None:
+    document = valid_manifest()
+    document["files"] = document
+
+    with pytest.raises(ValidationError):
+        validate_portable_manifest(document)
+
+
 def test_unknown_fields_and_missing_schema_version_are_rejected() -> None:
     unknown = valid_manifest()
     unknown["authorization_proven"] = True
