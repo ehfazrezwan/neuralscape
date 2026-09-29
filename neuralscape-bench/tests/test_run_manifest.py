@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -211,7 +212,8 @@ def test_validated_evidence_is_immutable():
         manifest.state = RunState.ABORTED
 
 
-def test_missing_resource_observation_is_explicitly_unknown_not_zero():
+@pytest.mark.parametrize("state", [RunState.COMPLETED, RunState.ABORTED])
+def test_missing_resource_observation_is_explicitly_unknown_not_zero(state):
     unknown = measured_memory().model_copy(
         update={
             "observation_kind": ObservationKind.UNKNOWN,
@@ -221,16 +223,46 @@ def test_missing_resource_observation_is_explicitly_unknown_not_zero():
     )
     manifest = finish_run(
         planned_manifest(),
-        state=RunState.ABORTED,
+        state=state,
         started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
         finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
         resources=(ResourceReading.model_validate(unknown.model_dump()),),
+        measurements=(timing(),) if state is RunState.COMPLETED else (),
     )
 
-    payload = manifest.model_dump(mode="json")
+    reparsed = validate_run_manifest_json(serialize_run_manifest(manifest))
+    assert reparsed == manifest
+    payload = reparsed.model_dump(mode="json")
     assert payload["resources"][0]["observation_kind"] == "unknown"
     assert payload["resources"][0]["observed_value"] is None
     assert payload["resources"][0]["unknown_reason"] == "cgroup metrics unavailable"
+
+
+def test_run_requires_resource_evidence_at_every_receiving_boundary():
+    for manifest in (planned_manifest(), completed_manifest()):
+        data = manifest.model_dump()
+        data["resources"] = ()
+        with pytest.raises(ValidationError, match="at least one resource reading"):
+            RunManifest.model_validate(data)
+
+    payload = json.loads(serialize_run_manifest(completed_manifest()))
+    payload["resources"] = []
+    with pytest.raises(ValidationError, match="at least one resource reading"):
+        validate_run_manifest_json(json.dumps(payload))
+
+    unchecked = completed_manifest().model_copy(update={"resources": ()})
+    with pytest.raises(ValidationError, match="at least one resource reading"):
+        serialize_run_manifest(unchecked)
+
+    with pytest.raises(ValidationError, match="at least one resource reading"):
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(),
+            measurements=(timing(),),
+        )
 
 
 @pytest.mark.parametrize("field,value", [

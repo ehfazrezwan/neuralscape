@@ -244,6 +244,8 @@ class RunManifest(_ManifestContract):
         if len(concurrency_scopes) != len(set(concurrency_scopes)):
             raise ValueError("concurrency scopes must be unique")
 
+        if not self.resources:
+            raise ValueError("at least one resource reading is required")
         resource_keys = [(item.scope, item.resource) for item in self.resources]
         if len(resource_keys) != len(set(resource_keys)):
             raise ValueError("resource scope/name pairs must be unique")
