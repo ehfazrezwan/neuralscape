@@ -296,6 +296,9 @@ class PortableManifest(VersionedContract):
         file_paths = [item.path for item in self.files]
         if len(set(file_paths)) != len(file_paths):
             raise ValueError("manifest contains duplicate normalized file paths")
+        windows_file_paths = [PureWindowsPath(path) for path in file_paths]
+        if len(set(windows_file_paths)) != len(windows_file_paths):
+            raise ValueError("manifest contains colliding Windows file paths")
 
         object_keys = [(item.kind, item.id) for item in self.canonical_ids]
         if len(set(object_keys)) != len(object_keys):

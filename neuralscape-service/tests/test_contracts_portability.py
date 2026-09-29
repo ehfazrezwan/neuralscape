@@ -2,6 +2,7 @@
 
 import sys
 from copy import deepcopy
+from pathlib import PureWindowsPath
 
 import pytest
 from pydantic import ValidationError
@@ -228,6 +229,101 @@ def test_rejects_duplicate_normalized_paths() -> None:
 
     with pytest.raises(ValidationError, match="duplicate normalized file paths"):
         validate_portable_manifest(document)
+
+
+@pytest.mark.parametrize("entrypoint", ["helper", "model_validate", "constructor"])
+@pytest.mark.parametrize(
+    ("first_path", "colliding_path"),
+    [
+        ("canonical/Records.jsonl", "canonical/records.jsonl"),
+        ("Canonical/records.jsonl", "canonical/records.jsonl"),
+        (
+            "canonical/Subdir/records.jsonl",
+            "canonical/subdir/records.jsonl",
+        ),
+        ("canonical/Ä-records.jsonl", "canonical/ä-records.jsonl"),
+    ],
+)
+def test_rejects_file_inventory_collisions_under_windows_path_semantics(
+    entrypoint: str,
+    first_path: str,
+    colliding_path: str,
+) -> None:
+    assert first_path != colliding_path
+    assert PureWindowsPath(first_path) == PureWindowsPath(colliding_path)
+    document = valid_manifest()
+    document["files"][0]["path"] = first_path
+    duplicate = deepcopy(document["files"][0])
+    duplicate["path"] = colliding_path
+    document["files"].append(duplicate)
+
+    with pytest.raises(ValidationError, match="colliding Windows file paths"):
+        if entrypoint == "helper":
+            validate_portable_manifest(document)
+        elif entrypoint == "model_validate":
+            PortableManifest.model_validate(document)
+        else:
+            PortableManifest(**document)
+
+
+@pytest.mark.parametrize("entrypoint", ["helper", "model_validate"])
+def test_rejects_windows_case_collision_in_existing_model_inventory(
+    entrypoint: str,
+) -> None:
+    manifest = validate_portable_manifest(valid_manifest())
+    colliding_file = manifest.files[0].model_copy(
+        update={"path": "canonical/Records.jsonl"}
+    )
+    corrupted = manifest.model_copy(
+        update={"files": [colliding_file, *manifest.files]}
+    )
+
+    with pytest.raises(ValidationError, match="colliding Windows file paths"):
+        if entrypoint == "helper":
+            validate_portable_manifest(corrupted)
+        else:
+            PortableManifest.model_validate(corrupted)
+
+
+def test_unique_mixed_case_inventory_path_preserves_exact_spelling() -> None:
+    document = valid_manifest()
+    document["files"][0]["path"] = "Canonical/Records.JSONL"
+
+    manifest = validate_portable_manifest(document)
+
+    assert manifest.files[0].path == "Canonical/Records.JSONL"
+
+
+@pytest.mark.parametrize(
+    ("first_path", "distinct_path"),
+    [
+        ("canonical/straße.jsonl", "canonical/STRASSE.jsonl"),
+        ("canonical/café.jsonl", "canonical/cafe\u0301.jsonl"),
+        ("canonical/records：payload.jsonl", "canonical/records_payload.jsonl"),
+    ],
+)
+def test_preserves_unicode_paths_distinct_under_windows_path_semantics(
+    first_path: str,
+    distinct_path: str,
+) -> None:
+    assert PureWindowsPath(first_path) != PureWindowsPath(distinct_path)
+    document = valid_manifest()
+    document["files"][0]["path"] = first_path
+    distinct = deepcopy(document["files"][0])
+    distinct["path"] = distinct_path
+    document["files"].append(distinct)
+
+    manifest = validate_portable_manifest(document)
+
+    retained_paths = [
+        item.path
+        for item in manifest.files
+        if item.path in {first_path, distinct_path}
+    ]
+    assert retained_paths == [
+        first_path,
+        distinct_path,
+    ]
 
 
 @pytest.mark.parametrize(
