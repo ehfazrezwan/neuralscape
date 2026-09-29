@@ -25,12 +25,115 @@ class ExampleContract(ContractModel):
     count: SafeCounter
 
 
+class NestedExampleContract(ContractModel):
+    identifier: OpaqueId
+    count: SafeCounter
+
+
+class DerivedNestedExampleContract(NestedExampleContract):
+    category: OpaqueId
+
+
+class ExampleContractGraph(ContractModel):
+    primary: NestedExampleContract
+    by_name: dict[str, NestedExampleContract]
+
+
+class DerivedExampleContractGraph(ContractModel):
+    item: DerivedNestedExampleContract
+
+
 def test_contract_model_is_strict_and_rejects_unknown_fields() -> None:
     with pytest.raises(ValidationError, match="valid integer"):
         ExampleContract(count="1")
 
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         ExampleContract(count=1, authority="admin")
+
+
+def test_nested_contract_instance_revalidates_invalid_known_field_in_mapping() -> None:
+    valid = NestedExampleContract(identifier="value-1", count=1)
+    unchecked = valid.model_copy(update={"count": True})
+
+    assert unchecked.count is True
+    with pytest.raises(ValidationError, match="valid integer"):
+        ExampleContractGraph.model_validate(
+            {
+                "primary": valid,
+                "by_name": {"unchecked": unchecked},
+            }
+        )
+
+
+def test_nested_contract_instance_rejects_retained_unknown_field_in_mapping() -> None:
+    valid = NestedExampleContract(identifier="value-1", count=1)
+    unchecked = valid.model_copy(update={"future_constraint": "deny"})
+
+    assert unchecked.__dict__["future_constraint"] == "deny"
+    assert "future_constraint" in unchecked.model_fields_set
+    assert "future_constraint" not in unchecked.model_dump()
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ExampleContractGraph.model_validate(
+            {
+                "primary": valid,
+                "by_name": {"unchecked": unchecked},
+            }
+        )
+
+
+def test_inherited_contract_revalidation_applies_at_its_declared_boundary() -> None:
+    valid = DerivedNestedExampleContract(
+        identifier="value-1",
+        count=1,
+        category="derived",
+    )
+    unchecked = valid.model_copy(update={"count": True})
+
+    assert DerivedNestedExampleContract.model_config["extra"] == "forbid"
+    assert DerivedNestedExampleContract.model_config["strict"] is True
+    assert (
+        DerivedNestedExampleContract.model_config["revalidate_instances"] == "always"
+    )
+    with pytest.raises(ValidationError, match="valid integer"):
+        DerivedExampleContractGraph.model_validate({"item": unchecked})
+
+    revalidated = DerivedExampleContractGraph.model_validate({"item": valid})
+    assert revalidated.item == valid
+    assert revalidated.item is not valid
+
+
+def test_base_typed_boundary_rejects_subclass_fields_instead_of_dropping() -> None:
+    derived = DerivedNestedExampleContract(
+        identifier="value-1",
+        count=1,
+        category="derived",
+    )
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ExampleContractGraph.model_validate(
+            {
+                "primary": derived,
+                "by_name": {},
+            }
+        )
+
+
+def test_valid_nested_instances_preserve_values_but_are_rebuilt_per_edge() -> None:
+    nested = NestedExampleContract(identifier=" Value/01 ", count=1)
+
+    graph = ExampleContractGraph.model_validate(
+        {
+            "primary": nested,
+            "by_name": {"alias": nested},
+        }
+    )
+
+    assert graph.primary == nested
+    assert graph.by_name["alias"] == nested
+    assert graph.primary is not nested
+    assert graph.by_name["alias"] is not nested
+    assert graph.primary is not graph.by_name["alias"]
+    assert graph.primary.identifier == " Value/01 "
 
 
 def test_version_is_required_and_only_candidate_v1_is_supported() -> None:
