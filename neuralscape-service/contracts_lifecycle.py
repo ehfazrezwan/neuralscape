@@ -350,9 +350,14 @@ def validate_required_stage_claim(
     boundary therefore materializes every stored field and revalidates each
     complete nested graph before inspecting it.
 
-    Only the greatest attempt number for each required stage is considered.
-    An applied receipt satisfies a stage only when its complete per-source
-    revision/epoch set exactly matches the intent's expected sources.
+    Every applied receipt for a required stage must match the intent's complete
+    source revision/epoch set.  Once matching applied evidence exists, that
+    stage remains satisfied; greatest-attempt state describes only stages that
+    remain unsatisfied.
+
+    This checks consistency of caller-supplied reports.  It does not prove an
+    external effect exists, choose authoritative output references, establish
+    retry exhaustion, or select a runtime retry policy.
     """
 
     if not isinstance(claimed_status, IntentStatus):
@@ -363,6 +368,7 @@ def validate_required_stage_claim(
     intent = _revalidated_model(Intent, intent)
     receipts = tuple(_revalidated_model(StageReceipt, receipt) for receipt in receipts)
 
+    required = set(intent.required_stages)
     latest_attempts: dict[ProcessingStage, int] = {}
     for receipt in receipts:
         if receipt.intent_id != intent.id:
@@ -372,7 +378,19 @@ def validate_required_stage_claim(
             latest_attempts[receipt.stage] = receipt.attempt
 
     latest: dict[ProcessingStage, StageReceipt] = {}
+    attempt_receipts: dict[tuple[ProcessingStage, int], StageReceipt] = {}
     for receipt in receipts:
+        if receipt.stage in required:
+            attempt_key = (receipt.stage, receipt.attempt)
+            previous_attempt_receipt = attempt_receipts.get(attempt_key)
+            if previous_attempt_receipt is None:
+                attempt_receipts[attempt_key] = receipt
+            elif receipt != previous_attempt_receipt and (
+                receipt.status is StageStatus.APPLIED
+                or previous_attempt_receipt.status is StageStatus.APPLIED
+            ):
+                raise ValueError("conflicting receipts for the same stage attempt")
+
         if receipt.attempt != latest_attempts[receipt.stage]:
             continue
         previous = latest.get(receipt.stage)
@@ -381,27 +399,24 @@ def validate_required_stage_claim(
         elif receipt != previous:
             raise ValueError("conflicting receipts for the same stage attempt")
 
-    required = set(intent.required_stages)
     required_receipts = {stage: latest.get(stage) for stage in required}
-    stale_applied = {
-        stage
-        for stage, receipt in required_receipts.items()
-        if receipt is not None
-        and receipt.status is StageStatus.APPLIED
-        and not _source_sets_match(intent.expected_sources, receipt.applied_sources)
-    }
-    if stale_applied:
-        raise ValueError("applied required-stage receipts must match expected sources")
-    applied = {
-        stage
-        for stage, receipt in required_receipts.items()
-        if receipt is not None
-        and receipt.status is StageStatus.APPLIED
-        and _source_sets_match(intent.expected_sources, receipt.applied_sources)
+    satisfied: set[ProcessingStage] = set()
+    for receipt in receipts:
+        if receipt.stage not in required or receipt.status is not StageStatus.APPLIED:
+            continue
+        if not _source_sets_match(intent.expected_sources, receipt.applied_sources):
+            raise ValueError(
+                "applied required-stage receipts must match expected sources"
+            )
+        satisfied.add(receipt.stage)
+
+    unsatisfied = required - satisfied
+    unsatisfied_receipts = {
+        stage: required_receipts[stage] for stage in unsatisfied
     }
     partial_failures = {
         stage
-        for stage, receipt in required_receipts.items()
+        for stage, receipt in unsatisfied_receipts.items()
         if receipt is not None
         and receipt.status
         in {
@@ -411,49 +426,41 @@ def validate_required_stage_claim(
     }
 
     if claimed_status is IntentStatus.ACCEPTED:
-        if any(
+        if satisfied or any(
             receipt is not None and receipt.status is not StageStatus.PENDING
-            for receipt in required_receipts.values()
+            for receipt in unsatisfied_receipts.values()
         ):
             raise ValueError("accepted cannot claim started or terminal required stages")
     elif claimed_status is IntentStatus.PROCESSING:
-        if not any(
+        started = bool(satisfied) or any(
+            receipt is not None and receipt.status is StageStatus.PROCESSING
+            for receipt in unsatisfied_receipts.values()
+        )
+        terminal_unsatisfied = any(
             receipt is not None
-            and receipt.status in {StageStatus.PROCESSING, StageStatus.APPLIED}
-            for receipt in required_receipts.values()
-        ) or not any(
-            receipt is None
-            or receipt.status in {StageStatus.PENDING, StageStatus.PROCESSING}
-            for receipt in required_receipts.values()
-        ) or any(
-            receipt is not None
-            and receipt.status
-            in {
-                StageStatus.SKIPPED,
-                StageStatus.FAILED,
-                StageStatus.CANCELLED,
-                StageStatus.SUPERSEDED,
-            }
-            for receipt in required_receipts.values()
-        ):
+            and receipt.status not in {StageStatus.PENDING, StageStatus.PROCESSING}
+            for receipt in unsatisfied_receipts.values()
+        )
+        if not started or not unsatisfied or terminal_unsatisfied:
             raise ValueError(
                 "processing requires started and unfinished required work "
                 "with no terminal failure"
             )
     elif claimed_status is IntentStatus.APPLIED:
-        if applied != required:
+        if satisfied != required:
             raise ValueError("applied requires matching applied receipts for every required stage")
     elif claimed_status is IntentStatus.PARTIAL:
-        if not applied or not partial_failures or applied | partial_failures != required:
+        if not satisfied or not unsatisfied or partial_failures != unsatisfied:
             raise ValueError("partial requires applied and terminal non-applied required stages")
     elif claimed_status is IntentStatus.FAILED:
         statuses = {
             stage: receipt.status
-            for stage, receipt in required_receipts.items()
+            for stage, receipt in unsatisfied_receipts.items()
             if receipt is not None
         }
         if (
-            set(statuses) != required
+            satisfied
+            or set(statuses) != required
             or StageStatus.FAILED not in statuses.values()
             or any(
                 status not in {StageStatus.FAILED, StageStatus.SKIPPED}
@@ -465,14 +472,14 @@ def validate_required_stage_claim(
         _validate_fenced_terminal_claim(
             required=required,
             required_receipts=required_receipts,
-            applied=applied,
+            satisfied=satisfied,
             fence_status=StageStatus.CANCELLED,
         )
     elif claimed_status is IntentStatus.SUPERSEDED:
         _validate_fenced_terminal_claim(
             required=required,
             required_receipts=required_receipts,
-            applied=applied,
+            satisfied=satisfied,
             fence_status=StageStatus.SUPERSEDED,
         )
     else:
@@ -483,15 +490,17 @@ def _validate_fenced_terminal_claim(
     *,
     required: set[ProcessingStage],
     required_receipts: dict[ProcessingStage, StageReceipt | None],
-    applied: set[ProcessingStage],
+    satisfied: set[ProcessingStage],
     fence_status: StageStatus,
 ) -> None:
     fenced = {
         stage
         for stage, receipt in required_receipts.items()
-        if receipt is not None and receipt.status is fence_status
+        if stage not in satisfied
+        and receipt is not None
+        and receipt.status is fence_status
     }
-    if not fenced or applied | fenced != required:
+    if not fenced or satisfied | fenced != required:
         raise ValueError(
             f"{fence_status.value} requires every required stage to be applied "
             f"or {fence_status.value}"

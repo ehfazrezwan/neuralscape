@@ -1024,6 +1024,374 @@ def test_latest_attempts_are_selected_independently_across_stages() -> None:
         )
 
 
+def _assert_only_aggregate_claim(
+    *,
+    command: Intent,
+    receipts: tuple[StageReceipt, ...],
+    expected: IntentStatus,
+) -> None:
+    for ordered_receipts in permutations(receipts):
+        for claim in IntentStatus:
+            if claim is expected:
+                validate_required_stage_claim(
+                    claimed_status=claim,
+                    intent=command,
+                    receipts=ordered_receipts,
+                )
+            else:
+                with pytest.raises(ValueError):
+                    validate_required_stage_claim(
+                        claimed_status=claim,
+                        intent=command,
+                        receipts=ordered_receipts,
+                    )
+
+
+@pytest.mark.parametrize(
+    ("case", "receipts", "expected"),
+    [
+        ("none", (), IntentStatus.ACCEPTED),
+        (
+            "pending",
+            (receipt(ProcessingStage.GRAPH, StageStatus.PENDING),),
+            IntentStatus.ACCEPTED,
+        ),
+        (
+            "processing",
+            (receipt(ProcessingStage.GRAPH, StageStatus.PROCESSING),),
+            IntentStatus.PROCESSING,
+        ),
+        (
+            "applied",
+            (receipt(ProcessingStage.GRAPH, StageStatus.APPLIED),),
+            IntentStatus.APPLIED,
+        ),
+        (
+            "failed_then_applied",
+            (
+                receipt(ProcessingStage.GRAPH, StageStatus.FAILED, sources=()),
+                receipt(ProcessingStage.GRAPH, StageStatus.APPLIED, attempt=2),
+            ),
+            IntentStatus.APPLIED,
+        ),
+        (
+            "failed",
+            (receipt(ProcessingStage.GRAPH, StageStatus.FAILED, sources=()),),
+            IntentStatus.FAILED,
+        ),
+    ],
+)
+def test_single_stage_aggregate_truth_table(
+    case: str,
+    receipts: tuple[StageReceipt, ...],
+    expected: IntentStatus,
+) -> None:
+    del case
+    _assert_only_aggregate_claim(
+        command=intent(ProcessingStage.GRAPH),
+        receipts=receipts,
+        expected=expected,
+    )
+
+
+@pytest.mark.parametrize(
+    "later_status",
+    [
+        StageStatus.PENDING,
+        StageStatus.PROCESSING,
+        StageStatus.SKIPPED,
+        StageStatus.FAILED,
+        StageStatus.CANCELLED,
+        StageStatus.SUPERSEDED,
+    ],
+)
+def test_matching_application_is_monotonic_across_later_attempt_states(
+    later_status: StageStatus,
+) -> None:
+    later_sources = None if later_status is StageStatus.PROCESSING else ()
+    receipts = (
+        receipt(ProcessingStage.GRAPH, StageStatus.APPLIED, attempt=1),
+        receipt(
+            ProcessingStage.GRAPH,
+            later_status,
+            sources=later_sources,
+            attempt=2,
+        ),
+    )
+
+    _assert_only_aggregate_claim(
+        command=intent(ProcessingStage.GRAPH),
+        receipts=receipts,
+        expected=IntentStatus.APPLIED,
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "receipts", "expected"),
+    [
+        (
+            "applied_and_absent",
+            (receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED),),
+            IntentStatus.PROCESSING,
+        ),
+        (
+            "applied_and_pending",
+            (
+                receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED),
+                receipt(ProcessingStage.GRAPH, StageStatus.PENDING),
+            ),
+            IntentStatus.PROCESSING,
+        ),
+        (
+            "applied_and_processing",
+            (
+                receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED),
+                receipt(ProcessingStage.GRAPH, StageStatus.PROCESSING),
+            ),
+            IntentStatus.PROCESSING,
+        ),
+        (
+            "applied_and_failed",
+            (
+                receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED),
+                receipt(ProcessingStage.GRAPH, StageStatus.FAILED, sources=()),
+            ),
+            IntentStatus.PARTIAL,
+        ),
+        (
+            "applied_and_skipped",
+            (
+                receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED),
+                receipt(ProcessingStage.GRAPH, StageStatus.SKIPPED, sources=()),
+            ),
+            IntentStatus.PARTIAL,
+        ),
+        (
+            "prior_applied_then_failed_and_other_failed",
+            (
+                receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED),
+                receipt(
+                    ProcessingStage.CANONICAL,
+                    StageStatus.FAILED,
+                    sources=(),
+                    attempt=2,
+                ),
+                receipt(ProcessingStage.GRAPH, StageStatus.FAILED, sources=()),
+            ),
+            IntentStatus.PARTIAL,
+        ),
+        (
+            "applied_and_cancelled",
+            (
+                receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED),
+                receipt(ProcessingStage.GRAPH, StageStatus.CANCELLED, sources=()),
+            ),
+            IntentStatus.CANCELLED,
+        ),
+        (
+            "applied_and_superseded",
+            (
+                receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED),
+                receipt(
+                    ProcessingStage.GRAPH,
+                    StageStatus.SUPERSEDED,
+                    sources=(),
+                ),
+            ),
+            IntentStatus.SUPERSEDED,
+        ),
+        (
+            "failed_and_skipped",
+            (
+                receipt(ProcessingStage.CANONICAL, StageStatus.FAILED, sources=()),
+                receipt(ProcessingStage.GRAPH, StageStatus.SKIPPED, sources=()),
+            ),
+            IntentStatus.FAILED,
+        ),
+        (
+            "both_cancelled",
+            (
+                receipt(ProcessingStage.CANONICAL, StageStatus.CANCELLED, sources=()),
+                receipt(ProcessingStage.GRAPH, StageStatus.CANCELLED, sources=()),
+            ),
+            IntentStatus.CANCELLED,
+        ),
+        (
+            "both_superseded",
+            (
+                receipt(
+                    ProcessingStage.CANONICAL,
+                    StageStatus.SUPERSEDED,
+                    sources=(),
+                ),
+                receipt(
+                    ProcessingStage.GRAPH,
+                    StageStatus.SUPERSEDED,
+                    sources=(),
+                ),
+            ),
+            IntentStatus.SUPERSEDED,
+        ),
+    ],
+)
+def test_two_stage_aggregate_truth_table(
+    case: str,
+    receipts: tuple[StageReceipt, ...],
+    expected: IntentStatus,
+) -> None:
+    del case
+    _assert_only_aggregate_claim(
+        command=intent(ProcessingStage.CANONICAL, ProcessingStage.GRAPH),
+        receipts=receipts,
+        expected=expected,
+    )
+
+
+@pytest.mark.parametrize(
+    "later_status",
+    [StageStatus.FAILED, StageStatus.CANCELLED, StageStatus.SUPERSEDED],
+)
+def test_all_satisfied_stages_remain_applied_after_later_terminal_attempt(
+    later_status: StageStatus,
+) -> None:
+    receipts = (
+        receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED),
+        receipt(ProcessingStage.GRAPH, StageStatus.APPLIED),
+        receipt(
+            ProcessingStage.CANONICAL,
+            later_status,
+            sources=(),
+            attempt=2,
+        ),
+    )
+
+    _assert_only_aggregate_claim(
+        command=intent(ProcessingStage.CANONICAL, ProcessingStage.GRAPH),
+        receipts=receipts,
+        expected=IntentStatus.APPLIED,
+    )
+
+
+@pytest.mark.parametrize(
+    "stale_source",
+    [
+        source("memory-1", revision=2, epoch=7),
+        source("memory-1", revision=3, epoch=6),
+    ],
+)
+@pytest.mark.parametrize("later_status", [StageStatus.FAILED, StageStatus.APPLIED])
+def test_every_historical_application_must_match_expected_sources(
+    stale_source: SourceVersion,
+    later_status: StageStatus,
+) -> None:
+    later_sources = () if later_status is StageStatus.FAILED else None
+    receipts = (
+        receipt(
+            ProcessingStage.GRAPH,
+            StageStatus.APPLIED,
+            sources=(stale_source,),
+            attempt=1,
+        ),
+        receipt(
+            ProcessingStage.GRAPH,
+            later_status,
+            sources=later_sources,
+            attempt=2,
+        ),
+    )
+
+    for ordered_receipts in permutations(receipts):
+        for claim in IntentStatus:
+            with pytest.raises(ValueError, match="must match expected sources"):
+                validate_required_stage_claim(
+                    claimed_status=claim,
+                    intent=intent(ProcessingStage.GRAPH),
+                    receipts=ordered_receipts,
+                )
+
+
+def test_historical_application_cannot_satisfy_another_intent_or_source_set() -> None:
+    prior_application = receipt(ProcessingStage.GRAPH, StageStatus.APPLIED)
+
+    other_intent = intent(ProcessingStage.GRAPH).model_copy(update={"id": "intent-2"})
+    with pytest.raises(ValueError, match="different intent"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED,
+            intent=other_intent,
+            receipts=(prior_application,),
+        )
+
+    newer_sources = intent(ProcessingStage.GRAPH).model_copy(
+        update={"expected_sources": (source("memory-1", revision=4, epoch=7),)}
+    )
+    with pytest.raises(ValueError, match="must match expected sources"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED,
+            intent=newer_sources,
+            receipts=(prior_application,),
+        )
+
+
+def test_duplicate_historical_applications_remain_idempotent() -> None:
+    receipts = (
+        receipt(ProcessingStage.GRAPH, StageStatus.APPLIED, attempt=1),
+        receipt(ProcessingStage.GRAPH, StageStatus.APPLIED, attempt=1),
+        receipt(
+            ProcessingStage.GRAPH,
+            StageStatus.FAILED,
+            sources=(),
+            attempt=2,
+        ),
+    )
+
+    _assert_only_aggregate_claim(
+        command=intent(ProcessingStage.GRAPH),
+        receipts=receipts,
+        expected=IntentStatus.APPLIED,
+    )
+
+
+@pytest.mark.parametrize("conflict_kind", ["applied_output", "failed"])
+def test_conflicting_historical_applied_attempts_fail_closed(
+    conflict_kind: str,
+) -> None:
+    applied = receipt(ProcessingStage.GRAPH, StageStatus.APPLIED, attempt=1)
+    if conflict_kind == "applied_output":
+        conflicting = applied.model_copy(
+            update={
+                "output_refs": (
+                    ReferenceHandle(
+                        kind="artifact",
+                        id="graph-1",
+                        tenant_id="tenant-1",
+                        resolver="resolve_artifact",
+                    ),
+                )
+            }
+        )
+    else:
+        conflicting = receipt(
+            ProcessingStage.GRAPH,
+            StageStatus.FAILED,
+            sources=(),
+            attempt=1,
+        )
+    receipts = (
+        applied,
+        conflicting,
+        receipt(ProcessingStage.GRAPH, StageStatus.APPLIED, attempt=2),
+    )
+
+    for ordered_receipts in permutations(receipts):
+        for claim in IntentStatus:
+            with pytest.raises(ValueError, match="conflicting receipts"):
+                validate_required_stage_claim(
+                    claimed_status=claim,
+                    intent=intent(ProcessingStage.GRAPH),
+                    receipts=ordered_receipts,
+                )
+
+
 def test_failed_receipt_requires_error_and_terminal_timing() -> None:
     with pytest.raises(ValidationError, match="failed stage receipts require an error"):
         StageReceipt(
