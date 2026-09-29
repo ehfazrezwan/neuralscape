@@ -60,6 +60,7 @@ class SourceCheckpoint(VersionedContract):
     Provider revisions and cursors are opaque within a source.  They must not be
     ordered or compared across sources.  ``observation_only`` is the explicit
     weaker basis for a source that exposes neither kind of version marker.
+    Current and known-stale evidence both require a recorded successful check.
     """
 
     source: ReferenceHandle
@@ -100,11 +101,16 @@ class SourceCheckpoint(VersionedContract):
                     "observation_only cannot claim a provider revision or cursor"
                 )
 
+        if self.verification_status in {
+            UpstreamVerificationStatus.CURRENT,
+            UpstreamVerificationStatus.STALE,
+        } and self.last_successful_verification_at is None:
+            raise ValueError(
+                f"{self.verification_status.value} verification requires "
+                "a successful check time"
+            )
+
         if self.verification_status is UpstreamVerificationStatus.CURRENT:
-            if self.last_successful_verification_at is None:
-                raise ValueError(
-                    "current verification requires a successful check time"
-                )
             if self.reconciliation_state is not ReconciliationState.COMPLETE:
                 raise ValueError(
                     "current verification cannot contain a known source gap"

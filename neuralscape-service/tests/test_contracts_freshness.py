@@ -179,6 +179,106 @@ def test_stale_upstream_can_coexist_with_healthy_local_projection() -> None:
     assert witness.projection.status is ProjectionStatus.CURRENT
 
 
+@pytest.mark.parametrize("verification_status", ["current", "stale"])
+def test_known_checkpoint_requires_successful_time_from_json(
+    verification_status: str,
+) -> None:
+    with pytest.raises(
+        ValidationError,
+        match=(
+            f"{verification_status} verification requires a successful check time"
+        ),
+    ):
+        SourceCheckpoint.model_validate_json(
+            json.dumps(
+                _checkpoint(
+                    verification_status=verification_status,
+                    last_successful_verification_at=None,
+                )
+            )
+        )
+
+
+def test_stale_checkpoint_requires_successful_time_from_native_mapping() -> None:
+    checkpoint = SourceCheckpoint.model_validate_json(
+        json.dumps(_checkpoint(verification_status="stale"))
+    )
+    payload = checkpoint.model_dump(mode="python")
+    payload["last_successful_verification_at"] = None
+
+    with pytest.raises(
+        ValidationError,
+        match="stale verification requires a successful check time",
+    ):
+        SourceCheckpoint.model_validate(payload)
+
+
+def test_stale_checkpoint_copy_is_revalidated_at_witness_boundary() -> None:
+    payload = {
+        "upstream_status": "stale",
+        "source_checkpoints": [
+            _checkpoint(verification_status="stale"),
+        ],
+        "projection": {
+            "status": "current",
+            "applied_sources": [_version("source-a", 4)],
+            "verified_at": NOW,
+        },
+    }
+    witness = FreshnessWitness.model_validate_json(json.dumps(payload))
+    invalid_checkpoint = witness.source_checkpoints[0].model_copy(
+        update={"last_successful_verification_at": None}
+    )
+    invalid_witness = witness.model_copy(
+        update={"source_checkpoints": (invalid_checkpoint,)}
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="stale verification requires a successful check time",
+    ):
+        FreshnessWitness.model_validate(invalid_witness)
+
+
+@pytest.mark.parametrize("verification_status", ["unverified", "unavailable"])
+def test_weaker_checkpoint_statuses_do_not_require_successful_time(
+    verification_status: str,
+) -> None:
+    checkpoint = SourceCheckpoint.model_validate_json(
+        json.dumps(
+            _checkpoint(
+                verification_status=verification_status,
+                last_successful_verification_at=None,
+            )
+        )
+    )
+
+    assert checkpoint.verification_status.value == verification_status
+    assert checkpoint.last_successful_verification_at is None
+
+
+@pytest.mark.parametrize(
+    "verification_method",
+    ["content_digest", "conditional_read"],
+)
+def test_nonrevision_methods_remain_representable_as_unverified(
+    verification_method: str,
+) -> None:
+    checkpoint = SourceCheckpoint.model_validate_json(
+        json.dumps(
+            _checkpoint(
+                verification_status="unverified",
+                verification_method=verification_method,
+                last_successful_verification_at=None,
+                provider_revision=None,
+            )
+        )
+    )
+
+    assert checkpoint.verification_method.value == verification_method
+    assert checkpoint.verification_status is UpstreamVerificationStatus.UNVERIFIED
+
+
 @pytest.mark.parametrize(
     ("checkpoint_status", "message"),
     [
@@ -332,6 +432,20 @@ def test_aggregate_rejects_contradictory_complete_evidence(
         ),
         (
             {"last_successful_verification_at": "2026-09-28T13:00:00Z"},
+            "cannot be after observed_at",
+        ),
+        (
+            {
+                "verification_status": "stale",
+                "last_successful_verification_at": "2026-09-28T13:00:00Z",
+            },
+            "cannot be after observed_at",
+        ),
+        (
+            {
+                "verification_status": "unverified",
+                "last_successful_verification_at": "2026-09-28T13:00:00Z",
+            },
             "cannot be after observed_at",
         ),
     ],
