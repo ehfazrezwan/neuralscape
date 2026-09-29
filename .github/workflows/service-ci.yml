@@ -100,6 +100,81 @@ jobs:
       - name: Run fast suite
         run: uv run pytest tests/ --ignore=tests/test_async_pipeline.py -q
 
+  python310-contracts:
+    needs: changes
+    if: needs.changes.outputs.service == 'true' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run contract floor suite on Python 3.10
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]; then
+            echo "::error::checkout does not match the candidate SHA"
+            exit 1
+          fi
+
+          engine_contract_files=(
+            neuralscape-service/contracts_engines.py
+            neuralscape-service/contracts_inference.py
+            neuralscape-service/tests/test_contracts_engines.py
+            neuralscape-service/tests/test_contracts_inference.py
+          )
+          present=0
+          for path in "${engine_contract_files[@]}"; do
+            if [ -f "$path" ]; then
+              present=$((present + 1))
+            fi
+          done
+
+          if [ "$present" -eq 0 ]; then
+            echo "::notice::engine and inference contracts are deliberately absent on this tree"
+            exit 0
+          fi
+
+          required_contract_files=(
+            neuralscape-service/contracts_common.py
+            neuralscape-service/contracts_errors.py
+            neuralscape-service/contracts_references.py
+            "${engine_contract_files[@]}"
+            neuralscape-service/tests/test_contracts_common.py
+          )
+          missing=0
+          for path in "${required_contract_files[@]}"; do
+            if [ ! -f "$path" ]; then
+              echo "::error file=$path::required Python 3.10 contract file is missing"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
+          docker run --rm \
+            --mount "type=bind,source=$GITHUB_WORKSPACE,target=/workspace,readonly" \
+            --workdir /workspace/neuralscape-service \
+            --env PYTHONDONTWRITEBYTECODE=1 \
+            python:3.10-slim \
+            sh -euxc '
+              python -c "import sys; assert sys.version_info[:2] == (3, 10), sys.version"
+              python -m pip install --disable-pip-version-check --no-cache-dir \
+                "pydantic-settings>=2.0.0" \
+                "jsonschema>=4.26.0,<5" \
+                "pytest>=8.0.0"
+              python -c "import contracts_common, contracts_references, contracts_engines, contracts_inference"
+              python -m pytest -p no:cacheprovider \
+                tests/test_contracts_common.py \
+                tests/test_contracts_engines.py \
+                tests/test_contracts_inference.py \
+                -q
+            '
+
   container-gate:
     needs: changes
     if: needs.changes.outputs.service == 'true' || github.event_name == 'push'
@@ -133,7 +208,7 @@ jobs:
 
   service-gate:
     if: ${{ always() }}
-    needs: [changes, subtree-prune-guard, host-tests, container-gate]
+    needs: [changes, subtree-prune-guard, host-tests, python310-contracts, container-gate]
     runs-on: ubuntu-latest
     steps:
       - name: Require service checks or an intentional non-service skip
@@ -143,6 +218,7 @@ jobs:
           CHANGES_RESULT: ${{ needs.changes.result }}
           SUBTREE_RESULT: ${{ needs.subtree-prune-guard.result }}
           HOST_RESULT: ${{ needs.host-tests.result }}
+          PYTHON310_RESULT: ${{ needs.python310-contracts.result }}
           CONTAINER_RESULT: ${{ needs.container-gate.result }}
         run: |
           set -eu
@@ -169,7 +245,7 @@ jobs:
             exit 1
           fi
 
-          for result in "$SUBTREE_RESULT" "$HOST_RESULT" "$CONTAINER_RESULT"; do
+          for result in "$SUBTREE_RESULT" "$HOST_RESULT" "$PYTHON310_RESULT" "$CONTAINER_RESULT"; do
             if [ "$result" != "$expected" ]; then
               echo "::error::service check result '$result'; expected '$expected'"
               exit 1
