@@ -75,6 +75,34 @@ def smoke_installed_wheel() -> None:
         f"imported module does not belong to installed wheel: {module_path}",
     )
 
+    distributed_files = distribution.files or []
+    index_entry = next(
+        (
+            entry
+            for entry in distributed_files
+            if str(entry) == "neuralscape_bench/static/index.html"
+        ),
+        None,
+    )
+    _require(index_entry is not None, "wheel metadata omits dashboard static/index.html")
+    distributed_index = Path(distribution.locate_file(index_entry)).resolve()
+    _require(
+        distributed_index.is_file(),
+        f"packaged dashboard index is missing: {distributed_index}",
+    )
+    index_text = distributed_index.read_text(encoding="utf-8")
+    _require(
+        "<title>Neuralscape Benchmark</title>" in index_text,
+        "packaged dashboard index could not be loaded or has unexpected content",
+    )
+
+    from neuralscape_bench import dashboard
+
+    _require(
+        dashboard.STATIC_DIR.resolve() == distributed_index.parent,
+        f"dashboard does not use wheel-packaged assets: {dashboard.STATIC_DIR}",
+    )
+
     setting = ConcurrencySetting(
         schema_version="candidate-v1",
         scope="clean-wheel-driver",
@@ -97,6 +125,7 @@ def smoke_installed_wheel() -> None:
     print("python", sys.version.split()[0])
     print("pydantic", pydantic_version)
     print("module", module_path)
+    print("dashboard-index", distributed_index)
     print("requires-dist", requirements)
 
 

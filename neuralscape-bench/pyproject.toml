@@ -31,6 +31,9 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["neuralscape_bench", "icebench"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"static" = "neuralscape_bench/static"
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests", "icebench/tests", "icebench/trackq/tests", "icebench/tokensave/tests"]

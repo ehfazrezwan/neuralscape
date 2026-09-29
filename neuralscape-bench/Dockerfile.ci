@@ -8,6 +8,7 @@ WORKDIR /build
 COPY pyproject.toml README.md ./
 COPY neuralscape_bench ./neuralscape_bench
 COPY icebench ./icebench
+COPY static ./static
 
 RUN python -m pip install --no-cache-dir build \
     && python -m build --wheel --outdir /tmp/wheels \
@@ -47,4 +48,4 @@ COPY icebench/trackq/tests /test-suite/icebench/trackq/tests
 COPY icebench/tokensave/tests /test-suite/icebench/tokensave/tests
 
 WORKDIR /test-suite
-CMD ["sh", "-c", "set -eu; python -m pytest -q -p no:cacheprovider --import-mode=importlib --strict-config --strict-markers --junitxml=/tmp/bench-junit.xml tests icebench/tests icebench/trackq/tests icebench/tokensave/tests; python /usr/local/libexec/ci_wheel_smoke.py --assert-junit /tmp/bench-junit.xml"]
+CMD ["sh", "-c", "set -eu; python -m pytest -q -p no:cacheprovider --import-mode=importlib -o asyncio_mode=auto --strict-config --strict-markers --junitxml=/tmp/bench-junit.xml tests icebench/tests icebench/trackq/tests icebench/tokensave/tests; python /usr/local/libexec/ci_wheel_smoke.py --assert-junit /tmp/bench-junit.xml"]

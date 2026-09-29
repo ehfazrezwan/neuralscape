@@ -64,6 +64,7 @@ jobs:
         run: |
           set -eu
           python -m pytest -q -p no:cacheprovider --import-mode=importlib \
+            -o asyncio_mode=auto \
             --strict-config --strict-markers \
             --junitxml="$RUNNER_TEMP/bench-host-junit.xml" \
             tests icebench/tests icebench/trackq/tests icebench/tokensave/tests
