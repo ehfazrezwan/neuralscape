@@ -11,10 +11,14 @@ from contracts_context import (
     ContextBundle,
     ContextOutcome,
     ContextRequest,
+    ExpansionLineage,
+    SafeDegradationCode,
     SafeOmissionCode,
     bundle_fits_request,
     receipt_matches_bundle,
+    upstream_degradation_for,
 )
+from contracts_freshness import UpstreamVerificationStatus
 
 
 NOW = "2026-09-28T12:00:00Z"
@@ -235,6 +239,48 @@ def test_request_fit_rejects_stale_upstream_for_current_verified() -> None:
     assert bundle_fits_request(request, current_bundle)
 
 
+@pytest.mark.parametrize(
+    ("upstream_status", "projection_status", "expected"),
+    [
+        (
+            upstream,
+            projection,
+            upstream in {"current", "stale"}
+            and projection in {"current", "stale"},
+        )
+        for upstream in ("current", "stale", "unverified", "unavailable")
+        for projection in ("current", "stale", "unknown", "unavailable")
+    ],
+)
+def test_labelled_stale_accepts_only_known_upstream_and_projection_states(
+    upstream_status: str,
+    projection_status: str,
+    expected: bool,
+) -> None:
+    item = _item()
+    freshness = item["freshness"]
+    assert isinstance(freshness, dict)
+    freshness["upstream_status"] = upstream_status
+    checkpoints = freshness["source_checkpoints"]
+    assert isinstance(checkpoints, list)
+    if upstream_status == "current":
+        checkpoint = checkpoints[0]
+        assert isinstance(checkpoint, dict)
+        checkpoint["verification_status"] = "current"
+    elif upstream_status in {"unverified", "unavailable"}:
+        freshness["source_checkpoints"] = []
+    projection = freshness["projection"]
+    assert isinstance(projection, dict)
+    projection["status"] = projection_status
+    request = _validate(
+        ContextRequest,
+        _request(freshness_requirement="labelled_stale_acceptable"),
+    )
+    bundle = _validate(ContextBundle, _bundle(selected_items=[item]))
+
+    assert bundle_fits_request(request, bundle) is expected
+
+
 def test_request_fit_rejects_historical_item_for_current_request() -> None:
     item = _item()
     item["temporal_status"] = "historical"
@@ -306,6 +352,24 @@ def test_request_fit_revalidates_copied_and_constructed_requests() -> None:
     assert not bundle_fits_request(copied, bundle)
     assert not bundle_fits_request(constructed, bundle)
     assert not bundle_fits_request(copied_with_extra, bundle)
+
+
+def test_request_fit_rejects_nested_copied_extra_and_cyclic_graph() -> None:
+    request = _validate(
+        ContextRequest,
+        _request(freshness_requirement="labelled_stale_acceptable"),
+    )
+    bundle = _validate(ContextBundle, _bundle())
+    copied_item = bundle.selected_items[0].model_copy(
+        update={"unreviewed_selection": True}
+    )
+    copied_bundle = bundle.model_copy(update={"selected_items": (copied_item,)})
+    cycle: list[object] = []
+    cycle.append(cycle)
+    cyclic_request = request.model_copy(update={"unreviewed_cycle": cycle})
+
+    assert not bundle_fits_request(request, copied_bundle)
+    assert not bundle_fits_request(cyclic_request, bundle)
 
 
 @pytest.mark.parametrize(
@@ -467,6 +531,100 @@ def test_receipt_match_revalidates_cross_tenant_model_copies() -> None:
     assert not receipt_matches_bundle(copied_receipt, copied_bundle)
 
 
+def test_expansion_lineage_requires_one_tenant_scope() -> None:
+    with pytest.raises(ValidationError, match="endpoints must share one tenant"):
+        _validate(
+            ContextAssemblyReceipt,
+            _receipt(
+                expansion_lineage=[
+                    {
+                        "input_reference": _reference(),
+                        "output_reference": {
+                            **_reference(),
+                            "tenant_id": "tenant-2",
+                        },
+                    }
+                ]
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "lineage_field", ["optimization_lineage", "expansion_lineage"]
+)
+def test_receipt_lineage_uses_selected_reference_tenant(
+    lineage_field: str,
+) -> None:
+    other_tenant = {**_reference(), "tenant_id": "tenant-2"}
+    lineage: object
+    if lineage_field == "optimization_lineage":
+        lineage = [other_tenant]
+    else:
+        lineage = [
+            {
+                "input_reference": other_tenant,
+                "output_reference": other_tenant,
+            }
+        ]
+
+    with pytest.raises(ValidationError, match="selected reference tenant scope"):
+        _validate(ContextAssemblyReceipt, _receipt(**{lineage_field: lineage}))
+
+
+def test_receipt_correspondence_requires_exact_expansion_lineage() -> None:
+    item = _item()
+    item["expansion_handle"] = _reference("artifact", "expansion-1")
+    bundle = _validate(ContextBundle, _bundle(selected_items=[item]))
+    expected_lineage = {
+        "input_reference": item["expansion_handle"],
+        "output_reference": item["reference"],
+    }
+    receipt = _validate(
+        ContextAssemblyReceipt,
+        _receipt(expansion_lineage=[expected_lineage]),
+    )
+
+    assert receipt_matches_bundle(receipt, bundle)
+    assert not receipt_matches_bundle(
+        _validate(ContextAssemblyReceipt, _receipt(expansion_lineage=[])),
+        bundle,
+    )
+    assert not receipt_matches_bundle(
+        _validate(
+            ContextAssemblyReceipt,
+            _receipt(
+                expansion_lineage=[
+                    {
+                        "input_reference": expected_lineage["output_reference"],
+                        "output_reference": expected_lineage["input_reference"],
+                    }
+                ]
+            ),
+        ),
+        bundle,
+    )
+
+
+def test_receipt_match_revalidates_copied_and_constructed_lineage() -> None:
+    bundle = _validate(ContextBundle, _bundle())
+    receipt = _validate(ContextAssemblyReceipt, _receipt())
+    valid_reference = bundle.selected_items[0].reference
+    cross_tenant = valid_reference.model_copy(update={"tenant_id": "tenant-2"})
+
+    copied_lineage = ExpansionLineage(
+        input_reference=valid_reference,
+        output_reference=valid_reference,
+    ).model_copy(update={"output_reference": cross_tenant})
+    constructed_lineage = ExpansionLineage.model_construct(
+        input_reference=valid_reference,
+        output_reference=cross_tenant,
+    )
+
+    for lineage in (copied_lineage, constructed_lineage):
+        copied_receipt = receipt.model_copy(update={"expansion_lineage": (lineage,)})
+        assert not receipt_matches_bundle(copied_receipt, bundle)
+
+
 def test_receipt_match_revalidates_invalid_nested_source_version_copy() -> None:
     bundle = _validate(ContextBundle, _bundle())
     receipt = _validate(ContextAssemblyReceipt, _receipt())
@@ -566,6 +724,83 @@ def test_receipt_corresponds_to_delivered_bundle_and_revision_set() -> None:
         _receipt(source_versions=[_version(revision=3)]),
     )
     assert not receipt_matches_bundle(stale_receipt, bundle)
+
+
+def test_receipt_requires_exact_derived_freshness_degradations() -> None:
+    bundle = _validate(ContextBundle, _bundle())
+
+    assert receipt_matches_bundle(
+        _validate(
+            ContextAssemblyReceipt,
+            _receipt(
+                degradations=[
+                    "upstream_verification_stale",
+                    "compact_form_used",
+                ]
+            ),
+        ),
+        bundle,
+    )
+    assert not receipt_matches_bundle(
+        _validate(ContextAssemblyReceipt, _receipt(degradations=[])),
+        bundle,
+    )
+    assert not receipt_matches_bundle(
+        _validate(
+            ContextAssemblyReceipt,
+            _receipt(degradations=["upstream_verification_unavailable"]),
+        ),
+        bundle,
+    )
+
+
+def test_receipt_aggregates_mixed_item_freshness_degradations() -> None:
+    first = _item()
+    second = deepcopy(_item())
+    second["reference"] = _reference("memory", "memory-2")
+    second["expansion_handle"] = _reference("memory", "memory-2")
+    second["source_versions"] = [_version("source-b", 9)]
+    freshness = second["freshness"]
+    assert isinstance(freshness, dict)
+    freshness["upstream_status"] = "unavailable"
+    freshness["source_checkpoints"] = []
+    projection = freshness["projection"]
+    assert isinstance(projection, dict)
+    projection["status"] = "stale"
+    projection["applied_sources"] = [_version("source-b", 9)]
+    bundle = _validate(ContextBundle, _bundle(selected_items=[first, second]))
+    receipt_data = _receipt(
+        source_versions=[_version(), _version("source-b", 9)],
+        selected_references=[first["reference"], second["reference"]],
+        degradations=[
+            "upstream_verification_stale",
+            "upstream_verification_unavailable",
+            "projection_stale",
+        ],
+    )
+    receipt = _validate(ContextAssemblyReceipt, receipt_data)
+
+    assert receipt_matches_bundle(receipt, bundle)
+    for omitted in receipt_data["degradations"]:
+        degradations = [
+            code for code in receipt_data["degradations"] if code != omitted
+        ]
+        assert not receipt_matches_bundle(
+            _validate(
+                ContextAssemblyReceipt,
+                {**receipt_data, "degradations": degradations},
+            ),
+            bundle,
+        )
+
+
+def test_upstream_degradation_helper_strictly_validates_scalar_input() -> None:
+    assert (
+        upstream_degradation_for(UpstreamVerificationStatus.STALE)
+        is SafeDegradationCode.UPSTREAM_VERIFICATION_STALE
+    )
+    with pytest.raises(ValidationError):
+        upstream_degradation_for("stale")  # type: ignore[arg-type]
 
 
 def test_receipt_rejects_sensitive_diagnostics_and_hidden_counts() -> None:

@@ -95,6 +95,32 @@ def test_projection_comparison_revalidates_copied_source_versions() -> None:
         projection_status_for([constructed], [constructed])
 
 
+def test_projection_comparison_rejects_copied_extras_and_cycles() -> None:
+    valid = _source_version("source-a", 4)
+    copied_with_extra = valid.model_copy(update={"unreviewed_revision": 4})
+    cycle: list[object] = []
+    cycle.append(cycle)
+    copied_with_cycle = valid.model_copy(update={"unreviewed_cycle": cycle})
+
+    with pytest.raises(ValidationError):
+        projection_status_for([copied_with_extra], [valid])
+    with pytest.raises(ValueError, match="cyclic contract input"):
+        projection_status_for([copied_with_cycle], [valid])
+
+
+def test_projection_comparison_preserves_container_types_for_strict_validation() -> None:
+    valid = _source_version("source-a", 4)
+    malformed_mapping = {
+        "record_id": "source-a",
+        "content_revision": 4,
+        "policy_epoch": 2,
+        7: "unknown-key",
+    }
+
+    with pytest.raises(ValidationError):
+        projection_status_for([malformed_mapping], [valid])  # type: ignore[list-item]
+
+
 def test_stale_upstream_can_coexist_with_healthy_local_projection() -> None:
     payload = {
         "upstream_status": "stale",

@@ -9,7 +9,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Literal, TypeVar
 
-from pydantic import AwareDatetime, BaseModel, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, Field, TypeAdapter, model_validator
 
 from contracts_common import ContractModel, OpaqueId, SafeCounter, VersionedContract
 from contracts_freshness import (
@@ -24,32 +24,49 @@ from contracts_references import ReferenceHandle, SourceVersion
 _ContractT = TypeVar("_ContractT", bound=ContractModel)
 
 
-def _native_contract_graph(value: object) -> object:
-    """Materialize nested model fields without trusting an existing instance."""
+def _native_contract_graph(
+    value: object, active_containers: set[int] | None = None
+) -> object:
+    """Materialize complete stored fields and reject cyclic input graphs."""
 
-    if isinstance(value, BaseModel):
-        fields = {
-            key: _native_contract_graph(item)
-            for key, item in vars(value).items()
-        }
-        extra = getattr(value, "__pydantic_extra__", None)
-        if extra:
-            fields.update(
-                {
-                    key: _native_contract_graph(item)
-                    for key, item in extra.items()
-                }
+    if not isinstance(value, (BaseModel, tuple, list, dict)):
+        return value
+
+    if active_containers is None:
+        active_containers = set()
+    value_id = id(value)
+    if value_id in active_containers:
+        raise ValueError("cyclic contract input is not supported")
+    active_containers.add(value_id)
+    try:
+        if isinstance(value, BaseModel):
+            fields = {
+                key: _native_contract_graph(item, active_containers)
+                for key, item in vars(value).items()
+            }
+            extra = getattr(value, "__pydantic_extra__", None)
+            if extra:
+                fields.update(
+                    {
+                        key: _native_contract_graph(item, active_containers)
+                        for key, item in extra.items()
+                    }
+                )
+            return fields
+        if isinstance(value, tuple):
+            return tuple(
+                _native_contract_graph(item, active_containers) for item in value
             )
-        return fields
-    if isinstance(value, tuple):
-        return tuple(_native_contract_graph(item) for item in value)
-    if isinstance(value, list):
-        return [_native_contract_graph(item) for item in value]
-    if isinstance(value, dict):
+        if isinstance(value, list):
+            return [
+                _native_contract_graph(item, active_containers) for item in value
+            ]
         return {
-            key: _native_contract_graph(item) for key, item in value.items()
+            key: _native_contract_graph(item, active_containers)
+            for key, item in value.items()
         }
-    return value
+    finally:
+        active_containers.remove(value_id)
 
 
 def _revalidated_snapshot(
@@ -128,6 +145,16 @@ class SafeDegradationCode(str, Enum):
     PROJECTION_STALE = "projection_stale"
     OPTIONAL_CAPABILITY_UNAVAILABLE = "optional_capability_unavailable"
     COMPACT_FORM_USED = "compact_form_used"
+
+
+_UPSTREAM_STATUS_ADAPTER = TypeAdapter(UpstreamVerificationStatus)
+_FRESHNESS_DEGRADATION_CODES = frozenset(
+    {
+        SafeDegradationCode.UPSTREAM_VERIFICATION_STALE,
+        SafeDegradationCode.UPSTREAM_VERIFICATION_UNAVAILABLE,
+        SafeDegradationCode.PROJECTION_STALE,
+    }
+)
 
 
 class ContextApplicability(ContractModel):
@@ -318,6 +345,12 @@ class ExpansionLineage(ContractModel):
     input_reference: ReferenceHandle
     output_reference: ReferenceHandle
 
+    @model_validator(mode="after")
+    def require_one_tenant_scope(self) -> "ExpansionLineage":
+        if self.input_reference.tenant_id != self.output_reference.tenant_id:
+            raise ValueError("expansion lineage endpoints must share one tenant scope")
+        return self
+
 
 class ContextAssemblyReceipt(VersionedContract):
     """Privacy-aware evidence of observable context assembly decisions.
@@ -359,12 +392,31 @@ class ContextAssemblyReceipt(VersionedContract):
         if len(stages) != len(set(stages)):
             raise ValueError("stage timings must identify unique stages")
 
-        if (
-            SafeDegradationCode.UPSTREAM_VERIFICATION_STALE in self.degradations
-            and SafeDegradationCode.UPSTREAM_VERIFICATION_UNAVAILABLE
-            in self.degradations
-        ):
-            raise ValueError("upstream verification cannot be stale and unavailable")
+        selected_tenants = {
+            str(reference.tenant_id) for reference in self.selected_references
+        }
+        if len(selected_tenants) > 1:
+            raise ValueError("selected references must share one tenant scope")
+        if selected_tenants:
+            selected_tenant = next(iter(selected_tenants))
+            lineage_references = [
+                *self.optimization_lineage,
+                *(
+                    reference
+                    for lineage in self.expansion_lineage
+                    for reference in (
+                        lineage.input_reference,
+                        lineage.output_reference,
+                    )
+                ),
+            ]
+            if any(
+                reference.tenant_id != selected_tenant
+                for reference in lineage_references
+            ):
+                raise ValueError(
+                    "receipt lineage must share the selected reference tenant scope"
+                )
         return self
 
 
@@ -373,6 +425,7 @@ def upstream_degradation_for(
 ) -> SafeDegradationCode | None:
     """Map non-current upstream knowledge to a content-free receipt code."""
 
+    status = _UPSTREAM_STATUS_ADAPTER.validate_python(status, strict=True)
     if status is UpstreamVerificationStatus.STALE:
         return SafeDegradationCode.UPSTREAM_VERIFICATION_STALE
     if status in {
@@ -433,7 +486,35 @@ def bundle_fits_request(request: ContextRequest, bundle: ContextBundle) -> bool:
             and item.freshness.projection.status is ProjectionStatus.CURRENT
             for item in bundle.selected_items
         )
-    return True
+    return all(
+        item.freshness.upstream_status
+        in {UpstreamVerificationStatus.CURRENT, UpstreamVerificationStatus.STALE}
+        and item.freshness.projection.status
+        in {ProjectionStatus.CURRENT, ProjectionStatus.STALE}
+        for item in bundle.selected_items
+    )
+
+
+def _freshness_degradations_for(
+    items: tuple[SelectedContextItem, ...],
+) -> set[SafeDegradationCode]:
+    result: set[SafeDegradationCode] = set()
+    for item in items:
+        upstream = upstream_degradation_for(item.freshness.upstream_status)
+        if upstream is not None:
+            result.add(upstream)
+        if item.freshness.projection.status is ProjectionStatus.STALE:
+            result.add(SafeDegradationCode.PROJECTION_STALE)
+    return result
+
+
+def _reference_key(reference: ReferenceHandle) -> tuple[str, str, str, str]:
+    return (
+        reference.kind,
+        str(reference.id),
+        str(reference.tenant_id),
+        str(reference.resolver),
+    )
 
 
 def receipt_matches_bundle(
@@ -466,6 +547,31 @@ def receipt_matches_bundle(
         )
         for version in receipt.source_versions
     }
+    expected_degradations = _freshness_degradations_for(bundle.selected_items)
+    receipt_freshness_degradations = (
+        set(receipt.degradations) & _FRESHNESS_DEGRADATION_CODES
+    )
+    expected_expansions = {
+        (_reference_key(item.expansion_handle), _reference_key(item.reference))
+        for item in bundle.selected_items
+        if item.expansion_handle != item.reference
+    }
+    receipt_expansions = {
+        (
+            _reference_key(lineage.input_reference),
+            _reference_key(lineage.output_reference),
+        )
+        for lineage in receipt.expansion_lineage
+    }
+    bundle_tenant = bundle.assembly_receipt.tenant_id
+    receipt_lineage_references = [
+        *receipt.optimization_lineage,
+        *(
+            reference
+            for lineage in receipt.expansion_lineage
+            for reference in (lineage.input_reference, lineage.output_reference)
+        ),
+    ]
     return (
         receipt.request_id == bundle.request_id
         and receipt.bundle_id == bundle.bundle_id
@@ -473,6 +579,13 @@ def receipt_matches_bundle(
         and receipt.selected_references == selected
         and receipt_sources == source_versions
         and receipt.exclusions == bundle.omissions
+        and receipt_freshness_degradations == expected_degradations
+        and receipt_expansions == expected_expansions
+        and len(receipt_expansions) == len(receipt.expansion_lineage)
+        and all(
+            reference.tenant_id == bundle_tenant
+            for reference in receipt_lineage_references
+        )
         and receipt.receipt_id == bundle.assembly_receipt.id
         and bundle.assembly_receipt.kind == "artifact"
     )
