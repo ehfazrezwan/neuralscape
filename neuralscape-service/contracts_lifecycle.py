@@ -357,14 +357,22 @@ def validate_required_stage_claim(
     intent = _revalidated_model(Intent, intent)
     receipts = tuple(_revalidated_model(StageReceipt, receipt) for receipt in receipts)
 
-    latest: dict[ProcessingStage, StageReceipt] = {}
+    latest_attempts: dict[ProcessingStage, int] = {}
     for receipt in receipts:
         if receipt.intent_id != intent.id:
             raise ValueError("stage receipt belongs to a different intent")
+        previous_attempt = latest_attempts.get(receipt.stage)
+        if previous_attempt is None or receipt.attempt > previous_attempt:
+            latest_attempts[receipt.stage] = receipt.attempt
+
+    latest: dict[ProcessingStage, StageReceipt] = {}
+    for receipt in receipts:
+        if receipt.attempt != latest_attempts[receipt.stage]:
+            continue
         previous = latest.get(receipt.stage)
-        if previous is None or receipt.attempt > previous.attempt:
+        if previous is None:
             latest[receipt.stage] = receipt
-        elif receipt.attempt == previous.attempt and receipt != previous:
+        elif receipt != previous:
             raise ValueError("conflicting receipts for the same stage attempt")
 
     required = set(intent.required_stages)

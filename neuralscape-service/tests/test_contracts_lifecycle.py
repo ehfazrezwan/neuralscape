@@ -2,6 +2,7 @@
 
 import json
 from datetime import datetime, timedelta, timezone
+from itertools import permutations
 
 import pytest
 from pydantic import ValidationError
@@ -953,30 +954,72 @@ def test_cancelled_claim_can_describe_effects_committed_before_fence() -> None:
     )
 
 
-def test_latest_attempt_controls_stage_claim_and_conflicts_are_rejected() -> None:
+def test_lower_attempt_conflicts_are_ignored_in_every_receipt_order() -> None:
     command = intent(ProcessingStage.GRAPH)
-    validate_required_stage_claim(
-        claimed_status=IntentStatus.APPLIED,
-        intent=command,
-        receipts=(
-            receipt(ProcessingStage.GRAPH, StageStatus.FAILED, attempt=1),
-            receipt(ProcessingStage.GRAPH, StageStatus.APPLIED, attempt=2),
-        ),
+    receipts = (
+        receipt(ProcessingStage.GRAPH, StageStatus.FAILED, attempt=1),
+        receipt(ProcessingStage.GRAPH, StageStatus.CANCELLED, attempt=1),
+        receipt(ProcessingStage.GRAPH, StageStatus.APPLIED, attempt=2),
     )
-
-    with pytest.raises(ValueError, match="conflicting receipts"):
+    for ordered_receipts in permutations(receipts):
         validate_required_stage_claim(
             claimed_status=IntentStatus.APPLIED,
             intent=command,
-            receipts=(
-                receipt(ProcessingStage.GRAPH, StageStatus.APPLIED, attempt=2),
-                receipt(
-                    ProcessingStage.GRAPH,
-                    StageStatus.APPLIED,
-                    sources=(source("memory-1", revision=2, epoch=7),),
-                    attempt=2,
-                ),
-            ),
+            receipts=ordered_receipts,
+        )
+
+
+def test_conflicting_latest_attempt_rejects_every_receipt_order() -> None:
+    command = intent(ProcessingStage.GRAPH)
+    receipts = (
+        receipt(ProcessingStage.GRAPH, StageStatus.SUPERSEDED, attempt=1),
+        receipt(ProcessingStage.GRAPH, StageStatus.APPLIED, attempt=2),
+        receipt(
+            ProcessingStage.GRAPH,
+            StageStatus.APPLIED,
+            sources=(source("memory-1", revision=2, epoch=7),),
+            attempt=2,
+        ),
+    )
+    for ordered_receipts in permutations(receipts):
+        with pytest.raises(ValueError, match="conflicting receipts"):
+            validate_required_stage_claim(
+                claimed_status=IntentStatus.APPLIED,
+                intent=command,
+                receipts=ordered_receipts,
+            )
+
+
+def test_duplicate_latest_receipts_are_idempotent() -> None:
+    command = intent(ProcessingStage.GRAPH)
+    receipts = (
+        receipt(ProcessingStage.GRAPH, StageStatus.SUPERSEDED, attempt=1),
+        receipt(ProcessingStage.GRAPH, StageStatus.APPLIED, attempt=2),
+        receipt(ProcessingStage.GRAPH, StageStatus.APPLIED, attempt=2),
+    )
+    for ordered_receipts in permutations(receipts):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED,
+            intent=command,
+            receipts=ordered_receipts,
+        )
+
+
+def test_latest_attempts_are_selected_independently_across_stages() -> None:
+    command = intent(ProcessingStage.CANONICAL, ProcessingStage.GRAPH)
+    receipts = (
+        receipt(ProcessingStage.GRAPH, StageStatus.CANCELLED, attempt=1),
+        receipt(ProcessingStage.CANONICAL, StageStatus.SUPERSEDED, attempt=1),
+        receipt(ProcessingStage.GRAPH, StageStatus.APPLIED, attempt=3),
+        receipt(ProcessingStage.GRAPH, StageStatus.FAILED, attempt=1),
+        receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED, attempt=2),
+    )
+
+    for ordered_receipts in (receipts, tuple(reversed(receipts))):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED,
+            intent=command,
+            receipts=ordered_receipts,
         )
 
 
