@@ -261,16 +261,20 @@ class SelectedContextItem(ContractModel):
         record_ids = [str(version.record_id) for version in self.source_versions]
         if len(record_ids) != len(set(record_ids)):
             raise ValueError("source_versions must identify unique records")
-        if (
-            self.freshness.projection.status is ProjectionStatus.CURRENT
-            and projection_status_for(
+        declared_projection_status = self.freshness.projection.status
+        if declared_projection_status in {
+            ProjectionStatus.CURRENT,
+            ProjectionStatus.STALE,
+        }:
+            compared_projection_status = projection_status_for(
                 self.freshness.projection.applied_sources, self.source_versions
             )
-            is not ProjectionStatus.CURRENT
-        ):
-            raise ValueError(
-                "a current projection must match the complete selected source set"
-            )
+            if declared_projection_status is not compared_projection_status:
+                raise ValueError(
+                    f"a {declared_projection_status.value} projection must match "
+                    "the complete selected source set comparison "
+                    f"({compared_projection_status.value})"
+                )
         return self
 
 

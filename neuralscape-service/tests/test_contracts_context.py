@@ -19,6 +19,8 @@ from contracts_context import (
     upstream_degradation_for,
 )
 from contracts_freshness import (
+    ProjectionFreshness,
+    ProjectionStatus,
     SourceCheckpoint,
     UpstreamVerificationStatus,
     VerificationMethod,
@@ -40,8 +42,16 @@ def _reference(
     }
 
 
-def _version(record_id: str = "source-a", revision: int = 4) -> dict[str, object]:
-    return {"record_id": record_id, "content_revision": revision, "policy_epoch": 2}
+def _version(
+    record_id: str = "source-a",
+    revision: int = 4,
+    policy_epoch: int = 2,
+) -> dict[str, object]:
+    return {
+        "record_id": record_id,
+        "content_revision": revision,
+        "policy_epoch": policy_epoch,
+    }
 
 
 def _tokenizer() -> dict[str, str]:
@@ -357,6 +367,8 @@ def test_labelled_stale_accepts_only_known_upstream_and_projection_states(
     projection = freshness["projection"]
     assert isinstance(projection, dict)
     projection["status"] = projection_status
+    if projection_status == "stale":
+        projection["applied_sources"] = [_version(revision=3)]
     request = _validate(
         ContextRequest,
         _request(freshness_requirement="labelled_stale_acceptable"),
@@ -604,6 +616,131 @@ def test_current_projection_must_match_full_selected_source_set() -> None:
 
     with pytest.raises(ValidationError, match="complete selected source set"):
         _validate(ContextBundle, _bundle(selected_items=[item]))
+
+
+def test_stale_projection_rejects_equal_selected_source_set() -> None:
+    item = _item()
+    freshness = item["freshness"]
+    assert isinstance(freshness, dict)
+    projection = freshness["projection"]
+    assert isinstance(projection, dict)
+    projection["status"] = "stale"
+
+    with pytest.raises(
+        ValidationError,
+        match="a stale projection must match the complete selected source set",
+    ):
+        _validate(ContextBundle, _bundle(selected_items=[item]))
+
+
+@pytest.mark.parametrize(
+    ("source_versions", "applied_sources"),
+    [
+        (
+            [_version(), _version("source-b", 9)],
+            [_version()],
+        ),
+        (
+            [_version()],
+            [_version(), _version("source-b", 9)],
+        ),
+        (
+            [_version(revision=4)],
+            [_version(revision=3)],
+        ),
+        (
+            [_version(policy_epoch=2)],
+            [_version(policy_epoch=3)],
+        ),
+    ],
+    ids=["missing", "extra", "revision", "policy"],
+)
+def test_stale_projection_accepts_each_complete_set_difference(
+    source_versions: list[dict[str, object]],
+    applied_sources: list[dict[str, object]],
+) -> None:
+    item = _item()
+    item["source_versions"] = source_versions
+    freshness = item["freshness"]
+    assert isinstance(freshness, dict)
+    freshness["upstream_status"] = "unverified"
+    freshness["source_checkpoints"] = []
+    projection = freshness["projection"]
+    assert isinstance(projection, dict)
+    projection["status"] = "stale"
+    projection["applied_sources"] = applied_sources
+
+    bundle = _validate(ContextBundle, _bundle(selected_items=[item]))
+
+    assert (
+        bundle.selected_items[0].freshness.projection.status
+        is ProjectionStatus.STALE
+    )
+
+
+@pytest.mark.parametrize(
+    ("source_versions", "applied_sources"),
+    [
+        ([_version()], [_version()]),
+        (
+            [_version(), _version("source-b", 9)],
+            [_version("source-b", 9), _version()],
+        ),
+    ],
+    ids=["equal", "reordered"],
+)
+def test_current_projection_accepts_equal_or_reordered_complete_set(
+    source_versions: list[dict[str, object]],
+    applied_sources: list[dict[str, object]],
+) -> None:
+    item = _item()
+    item["source_versions"] = source_versions
+    freshness = item["freshness"]
+    assert isinstance(freshness, dict)
+    freshness["upstream_status"] = "unverified"
+    freshness["source_checkpoints"] = []
+    projection = freshness["projection"]
+    assert isinstance(projection, dict)
+    projection["applied_sources"] = applied_sources
+
+    bundle = _validate(ContextBundle, _bundle(selected_items=[item]))
+
+    assert (
+        bundle.selected_items[0].freshness.projection.status
+        is ProjectionStatus.CURRENT
+    )
+
+
+def test_helpers_revalidate_copied_and_constructed_projection_contradictions() -> None:
+    request = _validate(
+        ContextRequest,
+        _request(freshness_requirement="labelled_stale_acceptable"),
+    )
+    bundle = _validate(ContextBundle, _bundle())
+    receipt = _validate(ContextAssemblyReceipt, _receipt())
+    item = bundle.selected_items[0]
+    projection = item.freshness.projection
+    invalid_projections = (
+        projection.model_copy(update={"status": ProjectionStatus.STALE}),
+        ProjectionFreshness.model_construct(
+            **{
+                **projection.__dict__,
+                "status": ProjectionStatus.STALE,
+            }
+        ),
+    )
+
+    assert bundle_matches_reported_evidence(request, bundle)
+    assert receipt_matches_bundle(receipt, bundle)
+    for invalid_projection in invalid_projections:
+        invalid_freshness = item.freshness.model_copy(
+            update={"projection": invalid_projection}
+        )
+        invalid_item = item.model_copy(update={"freshness": invalid_freshness})
+        invalid_bundle = bundle.model_copy(update={"selected_items": (invalid_item,)})
+
+        assert not bundle_matches_reported_evidence(request, invalid_bundle)
+        assert not receipt_matches_bundle(receipt, invalid_bundle)
 
 
 def test_selected_item_rejects_cross_tenant_freshness_scope() -> None:
@@ -1060,6 +1197,8 @@ def test_receipt_reports_each_projection_state_exactly(
     projection = freshness["projection"]
     assert isinstance(projection, dict)
     projection["status"] = projection_status
+    if projection_status == "stale":
+        projection["applied_sources"] = [_version(revision=3)]
     bundle = _validate(ContextBundle, _bundle(selected_items=[item]))
     expected_degradations = ["upstream_verification_stale"]
     if projection_degradation is not None:
@@ -1212,7 +1351,7 @@ def test_receipt_aggregates_mixed_item_freshness_degradations() -> None:
     projection = freshness["projection"]
     assert isinstance(projection, dict)
     projection["status"] = "stale"
-    projection["applied_sources"] = [_version("source-b", 9)]
+    projection["applied_sources"] = [_version("source-b", 8)]
     bundle = _validate(ContextBundle, _bundle(selected_items=[first, second]))
     receipt_data = _receipt(
         source_versions=[_version(), _version("source-b", 9)],
