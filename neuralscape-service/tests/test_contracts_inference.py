@@ -532,16 +532,35 @@ def test_generation_output_matches_declared_schema_and_source_support():
 
 
 def test_generation_boundary_rejects_models_inside_json_values():
-    class ArbitraryModel(BaseModel):
-        payload: str
+    class SchemaShapedModel(BaseModel):
+        summary: str
 
-    model_value = ArbitraryModel(payload="must-not-normalize")
-    proposal = generation_result().proposals[0].model_copy(
-        update={"output": {"summary": model_value}}
+    model_value = SchemaShapedModel(summary="must-not-normalize")
+    base_result = generation_result()
+    declared_proposals = (
+        base_result.proposals[0].model_copy(update={"output": model_value}),
+        base_result.proposals[0].model_copy(
+            update={"output": {"summary": [model_value]}}
+        ),
     )
-    result = generation_result().model_copy(update={"proposals": (proposal,)})
-    with pytest.raises(ValueError, match="JSON value contains a model object"):
-        validate_generation_result(generation_request(), result)
+    native_proposals = (
+        {
+            "proposal_id": "proposal-1",
+            "output": model_value,
+            "support_span_ids": ("support-1",),
+            "machine_authored": True,
+        },
+        {
+            "proposal_id": "proposal-1",
+            "output": {"summary": [model_value]},
+            "support_span_ids": ("support-1",),
+            "machine_authored": True,
+        },
+    )
+    for proposal in (*declared_proposals, *native_proposals):
+        result = base_result.model_copy(update={"proposals": (proposal,)})
+        with pytest.raises(ValueError, match="JSON value contains a model object"):
+            validate_generation_result(generation_request(), result)
 
     request = generation_request()
     request.output_schema["properties"]["summary"]["default"] = {
@@ -550,9 +569,36 @@ def test_generation_boundary_rejects_models_inside_json_values():
     with pytest.raises(ValueError, match="JSON value contains a model object"):
         validate_generation_result(request, generation_result())
 
-    assert validate_generation_result(
-        generation_request(), generation_result()
-    ).compliant
+    ordinary_mapping = {
+        "proposal_id": "proposal-1",
+        "output": {"summary": "ordinary JSON"},
+        "support_span_ids": ("support-1",),
+        "machine_authored": True,
+    }
+    mapping_result = base_result.model_copy(
+        update={"proposals": (ordinary_mapping,)}
+    )
+    assert validate_generation_result(generation_request(), mapping_result).compliant
+
+    unknown_mapping = {**ordinary_mapping, "future_semantics": "deny"}
+    unknown_result = base_result.model_copy(
+        update={"proposals": (unknown_mapping,)}
+    )
+    with pytest.raises(ValidationError, match="extra"):
+        validate_generation_result(generation_request(), unknown_result)
+
+    cycle = []
+    cycle.append(cycle)
+    cyclic_mapping = {**ordinary_mapping, "output": cycle}
+    cyclic_result = base_result.model_copy(
+        update={"proposals": (cyclic_mapping,)}
+    )
+    with pytest.raises(ValueError, match="cyclic contract graph"):
+        validate_generation_result(generation_request(), cyclic_result)
+
+    list_result = base_result.model_copy(update={"proposals": [ordinary_mapping]})
+    with pytest.raises(ValidationError, match="tuple"):
+        validate_generation_result(generation_request(), list_result)
 
 
 def test_generation_schema_validation_stops_after_first_error(monkeypatch):
@@ -596,8 +642,19 @@ def test_generation_schema_rejects_unknown_keywords_versions_formats_and_referen
 @pytest.mark.parametrize(
     ("format_name", "valid_value", "invalid_value"),
     [
+        ("date", "2024-02-29", "2023-02-29"),
+        ("email", "@", "missing-at"),
+        ("idn-email", "δοκιμή@παράδειγμα", "missing-at"),
+        ("idn-hostname", "bücher.example", "bad host"),
         ("ipv4", "192.0.2.1", "999.0.2.1"),
-        ("ipv6", "2001:db8::1", "2001:db8:::1"),
+        ("ipv6", "2001:db8::1", "fe80::1%eth0"),
+        ("regex", "^[a-z]+$", "["),
+        ("time", "1:02:03", "24:00:00"),
+        (
+            "uuid",
+            "123e4567-e89b-12d3-a456-426614174000",
+            "123e4567e89b12d3a456426614174000",
+        ),
     ],
 )
 def test_generation_uses_fixed_contract_owned_format_checkers(
@@ -607,7 +664,17 @@ def test_generation_uses_fixed_contract_owned_format_checkers(
     invalid_value,
 ):
     assert contracts_inference._SUPPORTED_OUTPUT_SCHEMA_FORMATS == frozenset(
-        {"ipv4", "ipv6"}
+        {
+            "date",
+            "email",
+            "idn-email",
+            "idn-hostname",
+            "ipv4",
+            "ipv6",
+            "regex",
+            "time",
+            "uuid",
+        }
     )
     _, format_checker_class = contracts_inference._jsonschema_types()
     monkeypatch.setitem(

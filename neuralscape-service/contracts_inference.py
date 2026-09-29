@@ -8,10 +8,14 @@ source support. Neither kind of result grants authority or publishes content.
 from __future__ import annotations
 
 import math
+import re
+from datetime import date, datetime
 from enum import Enum
-from ipaddress import IPv4Address, IPv6Address
+from ipaddress import AddressValueError, IPv4Address, IPv6Address
 from typing import Annotated, Any, Literal, Mapping
+from uuid import UUID
 
+import idna
 from pydantic import BaseModel, Field, JsonValue, model_validator
 
 from contracts_common import ContractModel, OpaqueId, SafeCounter, VersionedContract
@@ -21,8 +25,20 @@ from contracts_references import ReferenceHandle, SourceVersion
 FiniteNumber = Annotated[float, Field(allow_inf_nan=False)]
 JSON_SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema"
 MAX_SAFE_COUNTER = 9_007_199_254_740_991
-# Candidate-v1 limits formats to deterministic standard-library implementations.
-_SUPPORTED_OUTPUT_SCHEMA_FORMATS = frozenset({"ipv4", "ipv6"})
+_SUPPORTED_OUTPUT_SCHEMA_FORMATS = frozenset(
+    {
+        "date",
+        "email",
+        "idn-email",
+        "idn-hostname",
+        "ipv4",
+        "ipv6",
+        "regex",
+        "time",
+        "uuid",
+    }
+)
+_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$", re.ASCII)
 
 
 class FallbackGranularity(str, Enum):
@@ -587,30 +603,71 @@ def _jsonschema_types() -> tuple[Any, Any]:
     return Draft202012Validator, FormatChecker
 
 
+def _is_date(value: object) -> bool:
+    if not isinstance(value, str):
+        return True
+    return bool(_DATE_PATTERN.fullmatch(value) and date.fromisoformat(value))
+
+
+def _is_email(value: object) -> bool:
+    if not isinstance(value, str):
+        return True
+    return "@" in value
+
+
+def _is_idn_hostname(value: object) -> bool:
+    if not isinstance(value, str):
+        return True
+    idna.encode(value)
+    return True
+
+
 def _is_ipv4(value: object) -> bool:
     if not isinstance(value, str):
         return True
-    try:
-        IPv4Address(value)
-    except ValueError:
-        return False
-    return True
+    return bool(IPv4Address(value))
 
 
 def _is_ipv6(value: object) -> bool:
     if not isinstance(value, str):
         return True
-    try:
-        IPv6Address(value)
-    except ValueError:
-        return False
-    return True
+    address = IPv6Address(value)
+    return not getattr(address, "scope_id", "")
+
+
+def _is_regex(value: object) -> bool:
+    if not isinstance(value, str):
+        return True
+    return bool(re.compile(value))
+
+
+def _is_time(value: object) -> bool:
+    if not isinstance(value, str):
+        return True
+    return bool(datetime.strptime(value, "%H:%M:%S"))
+
+
+def _is_uuid(value: object) -> bool:
+    if not isinstance(value, str):
+        return True
+    UUID(value)
+    return all(value[position] == "-" for position in (8, 13, 18, 23))
 
 
 def _contract_format_checker(format_checker_class: Any) -> Any:
     checker = format_checker_class(formats=())
-    checker.checks("ipv4")(_is_ipv4)
-    checker.checks("ipv6")(_is_ipv6)
+    checker.checks("date", raises=ValueError)(_is_date)
+    checker.checks("email")(_is_email)
+    checker.checks("idn-email")(_is_email)
+    checker.checks(
+        "idn-hostname",
+        raises=(idna.IDNAError, UnicodeError),
+    )(_is_idn_hostname)
+    checker.checks("ipv4", raises=AddressValueError)(_is_ipv4)
+    checker.checks("ipv6", raises=AddressValueError)(_is_ipv6)
+    checker.checks("regex", raises=re.error)(_is_regex)
+    checker.checks("time", raises=ValueError)(_is_time)
+    checker.checks("uuid", raises=ValueError)(_is_uuid)
     return checker
 
 
@@ -689,13 +746,13 @@ def _reject_model_json_values(value: object, location: str) -> None:
         item, item_location = pending.pop()
         if isinstance(item, BaseModel):
             raise ValueError(f"JSON value contains a model object at {item_location}")
-        if not isinstance(item, (dict, list)):
+        if not isinstance(item, (Mapping, list)):
             continue
         identity = id(item)
         if identity in seen_containers:
             continue
         seen_containers.add(identity)
-        if isinstance(item, dict):
+        if isinstance(item, Mapping):
             pending.extend(
                 (nested, f"{item_location}/value/{index}")
                 for index, nested in enumerate(item.values())
@@ -805,6 +862,11 @@ def validate_generation_result(
             if isinstance(proposal, GenerationProposal):
                 _reject_model_json_values(
                     proposal.output,
+                    f"generation result/proposals/{index}/output",
+                )
+            elif isinstance(proposal, Mapping) and "output" in proposal:
+                _reject_model_json_values(
+                    proposal["output"],
                     f"generation result/proposals/{index}/output",
                 )
     request = _validated_contract_snapshot(
