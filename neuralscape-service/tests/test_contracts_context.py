@@ -913,6 +913,164 @@ def test_receipt_requires_exact_derived_freshness_degradations() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("projection_status", "projection_degradation"),
+    [
+        ("current", None),
+        ("stale", "projection_stale"),
+        ("unknown", "projection_unknown"),
+        ("unavailable", "projection_unavailable"),
+    ],
+)
+def test_receipt_reports_each_projection_state_exactly(
+    projection_status: str,
+    projection_degradation: str | None,
+) -> None:
+    item = _item()
+    freshness = item["freshness"]
+    assert isinstance(freshness, dict)
+    projection = freshness["projection"]
+    assert isinstance(projection, dict)
+    projection["status"] = projection_status
+    bundle = _validate(ContextBundle, _bundle(selected_items=[item]))
+    expected_degradations = ["upstream_verification_stale"]
+    if projection_degradation is not None:
+        expected_degradations.append(projection_degradation)
+    receipt = _validate(
+        ContextAssemblyReceipt,
+        _receipt(degradations=expected_degradations),
+    )
+
+    assert receipt_matches_bundle(receipt, bundle)
+
+    if projection_degradation is None:
+        dishonest_degradations = [
+            "upstream_verification_stale",
+            "projection_unknown",
+        ]
+    else:
+        dishonest_degradations = ["upstream_verification_stale"]
+    dishonest_receipt = _validate(
+        ContextAssemblyReceipt,
+        _receipt(degradations=dishonest_degradations),
+    )
+    assert not receipt_matches_bundle(dishonest_receipt, bundle)
+
+
+@pytest.mark.parametrize("projection_status", ["unknown", "unavailable"])
+@pytest.mark.parametrize(
+    "freshness_requirement",
+    ["current_verified", "current_known", "labelled_stale_acceptable"],
+)
+def test_honest_weak_projection_receipt_does_not_relax_request_preference(
+    projection_status: str,
+    freshness_requirement: str,
+) -> None:
+    item = _item()
+    freshness = item["freshness"]
+    assert isinstance(freshness, dict)
+    projection = freshness["projection"]
+    assert isinstance(projection, dict)
+    projection["status"] = projection_status
+    bundle = _validate(ContextBundle, _bundle(selected_items=[item]))
+    receipt = _validate(
+        ContextAssemblyReceipt,
+        _receipt(
+            degradations=[
+                "upstream_verification_stale",
+                f"projection_{projection_status}",
+            ]
+        ),
+    )
+    request = _validate(
+        ContextRequest,
+        _request(freshness_requirement=freshness_requirement),
+    )
+
+    assert receipt_matches_bundle(receipt, bundle)
+    assert not bundle_matches_reported_evidence(request, bundle)
+
+
+def test_receipt_aggregates_mixed_weak_projection_degradations() -> None:
+    first = _item()
+    first_freshness = first["freshness"]
+    assert isinstance(first_freshness, dict)
+    first_projection = first_freshness["projection"]
+    assert isinstance(first_projection, dict)
+    first_projection["status"] = "unknown"
+
+    second = deepcopy(_item())
+    second["reference"] = _reference("memory", "memory-2")
+    second["expansion_handle"] = _reference("memory", "memory-2")
+    second["source_versions"] = [_version("source-b", 9)]
+    second_freshness = second["freshness"]
+    assert isinstance(second_freshness, dict)
+    second_checkpoints = second_freshness["source_checkpoints"]
+    assert isinstance(second_checkpoints, list)
+    second_checkpoint = second_checkpoints[0]
+    assert isinstance(second_checkpoint, dict)
+    second_checkpoint["source"] = _reference("source", "source-b")
+    second_projection = second_freshness["projection"]
+    assert isinstance(second_projection, dict)
+    second_projection["status"] = "unavailable"
+    second_projection["applied_sources"] = [_version("source-b", 9)]
+
+    bundle = _validate(ContextBundle, _bundle(selected_items=[first, second]))
+    receipt_payload = _receipt(
+        source_versions=[_version(), _version("source-b", 9)],
+        selected_references=[first["reference"], second["reference"]],
+        degradations=[
+            "upstream_verification_stale",
+            "projection_unknown",
+            "projection_unavailable",
+        ],
+    )
+    receipt = _validate(ContextAssemblyReceipt, receipt_payload)
+
+    assert receipt_matches_bundle(receipt, bundle)
+    for omitted in ("projection_unknown", "projection_unavailable"):
+        degradations = [
+            code for code in receipt_payload["degradations"] if code != omitted
+        ]
+        assert not receipt_matches_bundle(
+            _validate(
+                ContextAssemblyReceipt,
+                {**receipt_payload, "degradations": degradations},
+            ),
+            bundle,
+        )
+
+
+def test_projection_degradation_codes_fail_closed_across_native_copy_boundary() -> None:
+    item = _item()
+    freshness = item["freshness"]
+    assert isinstance(freshness, dict)
+    projection = freshness["projection"]
+    assert isinstance(projection, dict)
+    projection["status"] = "unknown"
+    bundle = _validate(ContextBundle, _bundle(selected_items=[item]))
+    receipt = _validate(
+        ContextAssemblyReceipt,
+        _receipt(
+            degradations=[
+                "upstream_verification_stale",
+                "projection_unknown",
+            ]
+        ),
+    )
+    copied_with_unvalidated_strings = receipt.model_copy(
+        update={
+            "degradations": (
+                "upstream_verification_stale",
+                "projection_unknown",
+            )
+        }
+    )
+
+    assert receipt_matches_bundle(receipt, bundle)
+    assert not receipt_matches_bundle(copied_with_unvalidated_strings, bundle)
+
+
 def test_receipt_aggregates_mixed_item_freshness_degradations() -> None:
     first = _item()
     second = deepcopy(_item())

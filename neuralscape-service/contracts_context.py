@@ -150,6 +150,8 @@ class SafeDegradationCode(str, Enum):
     UPSTREAM_VERIFICATION_STALE = "upstream_verification_stale"
     UPSTREAM_VERIFICATION_UNAVAILABLE = "upstream_verification_unavailable"
     PROJECTION_STALE = "projection_stale"
+    PROJECTION_UNKNOWN = "projection_unknown"
+    PROJECTION_UNAVAILABLE = "projection_unavailable"
     OPTIONAL_CAPABILITY_UNAVAILABLE = "optional_capability_unavailable"
     COMPACT_FORM_USED = "compact_form_used"
 
@@ -160,6 +162,8 @@ _FRESHNESS_DEGRADATION_CODES = frozenset(
         SafeDegradationCode.UPSTREAM_VERIFICATION_STALE,
         SafeDegradationCode.UPSTREAM_VERIFICATION_UNAVAILABLE,
         SafeDegradationCode.PROJECTION_STALE,
+        SafeDegradationCode.PROJECTION_UNKNOWN,
+        SafeDegradationCode.PROJECTION_UNAVAILABLE,
     }
 )
 
@@ -520,6 +524,10 @@ def _freshness_degradations_for(
             result.add(upstream)
         if item.freshness.projection.status is ProjectionStatus.STALE:
             result.add(SafeDegradationCode.PROJECTION_STALE)
+        elif item.freshness.projection.status is ProjectionStatus.UNKNOWN:
+            result.add(SafeDegradationCode.PROJECTION_UNKNOWN)
+        elif item.freshness.projection.status is ProjectionStatus.UNAVAILABLE:
+            result.add(SafeDegradationCode.PROJECTION_UNAVAILABLE)
     return result
 
 
