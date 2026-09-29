@@ -333,6 +333,10 @@ class ContextBundle(VersionedContract):
         if self.outcome is ContextOutcome.UNAVAILABLE_DEPENDENCY:
             if SafeOmissionCode.DEPENDENCY_UNAVAILABLE not in self.omissions:
                 raise ValueError("unavailable_dependency requires its omission code")
+            if self.capability_status is not CapabilityStatus.UNAVAILABLE:
+                raise ValueError(
+                    "unavailable_dependency requires unavailable capabilities"
+                )
         if self.outcome is ContextOutcome.BUDGET_EXHAUSTED:
             if SafeOmissionCode.BUDGET_LIMIT not in self.omissions:
                 raise ValueError("budget_exhausted requires its omission code")
@@ -367,6 +371,7 @@ class ContextAssemblyReceipt(VersionedContract):
     """
 
     receipt_id: OpaqueId
+    tenant_id: OpaqueId
     request_id: OpaqueId
     bundle_id: OpaqueId
     selector_version: OpaqueId
@@ -399,31 +404,25 @@ class ContextAssemblyReceipt(VersionedContract):
         if len(stages) != len(set(stages)):
             raise ValueError("stage timings must identify unique stages")
 
-        selected_tenants = {
-            str(reference.tenant_id) for reference in self.selected_references
-        }
-        if len(selected_tenants) > 1:
-            raise ValueError("selected references must share one tenant scope")
-        if selected_tenants:
-            selected_tenant = next(iter(selected_tenants))
-            lineage_references = [
-                *self.optimization_lineage,
-                *(
-                    reference
-                    for lineage in self.expansion_lineage
-                    for reference in (
-                        lineage.input_reference,
-                        lineage.output_reference,
-                    )
-                ),
-            ]
-            if any(
-                reference.tenant_id != selected_tenant
-                for reference in lineage_references
-            ):
-                raise ValueError(
-                    "receipt lineage must share the selected reference tenant scope"
+        scoped_references = [
+            *self.selected_references,
+            *self.optimization_lineage,
+            *(
+                reference
+                for lineage in self.expansion_lineage
+                for reference in (
+                    lineage.input_reference,
+                    lineage.output_reference,
                 )
+            ),
+        ]
+        if any(
+            reference.tenant_id != self.tenant_id
+            for reference in scoped_references
+        ):
+            raise ValueError(
+                "receipt references and lineage must share the receipt tenant scope"
+            )
         return self
 
 
@@ -591,6 +590,7 @@ def receipt_matches_bundle(
     return (
         receipt.request_id == bundle.request_id
         and receipt.bundle_id == bundle.bundle_id
+        and receipt.tenant_id == bundle_tenant
         and receipt.response_usage == bundle.response_usage
         and receipt.selected_references == selected
         and receipt_sources == source_versions

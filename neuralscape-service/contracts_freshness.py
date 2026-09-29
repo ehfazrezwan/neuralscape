@@ -130,8 +130,9 @@ class FreshnessWitness(ContractModel):
     """Independent upstream and local-projection freshness evidence.
 
     A checkpoint's source ID maps directly to ``SourceVersion.record_id``.
-    Current upstream status requires exact checkpoint coverage of every applied
-    source; weaker statuses may have partial coverage but never unrelated sources.
+    Current and known-stale upstream statuses require exact checkpoint coverage
+    of every applied source.  Unverified and unavailable statuses may have
+    partial coverage but never unrelated sources.
     """
 
     upstream_status: UpstreamVerificationStatus
@@ -163,8 +164,13 @@ class FreshnessWitness(ContractModel):
             raise ValueError(
                 "checkpoint source IDs must map to applied source record IDs"
             )
+        has_complete_coverage = checkpoint_ids == applied_ids
+        checkpoint_statuses = {
+            checkpoint.verification_status
+            for checkpoint in self.source_checkpoints
+        }
         if self.upstream_status is UpstreamVerificationStatus.CURRENT:
-            if checkpoint_ids != applied_ids:
+            if not has_complete_coverage:
                 raise ValueError(
                     "current upstream status requires every applied source checkpoint"
                 )
@@ -174,6 +180,46 @@ class FreshnessWitness(ContractModel):
                 for checkpoint in self.source_checkpoints
             ):
                 raise ValueError("current upstream status requires current checkpoints")
+        elif self.upstream_status is UpstreamVerificationStatus.STALE:
+            if not has_complete_coverage:
+                raise ValueError(
+                    "stale upstream status requires every applied source checkpoint"
+                )
+            if not checkpoint_statuses.issubset(
+                {
+                    UpstreamVerificationStatus.CURRENT,
+                    UpstreamVerificationStatus.STALE,
+                }
+            ):
+                raise ValueError(
+                    "stale upstream status requires only current or stale checkpoints"
+                )
+            if UpstreamVerificationStatus.STALE not in checkpoint_statuses:
+                raise ValueError(
+                    "stale upstream status requires at least one stale checkpoint"
+                )
+        elif self.upstream_status is UpstreamVerificationStatus.UNVERIFIED:
+            if UpstreamVerificationStatus.UNAVAILABLE in checkpoint_statuses:
+                raise ValueError(
+                    "unverified upstream status cannot hide unavailable checkpoints"
+                )
+            if (
+                has_complete_coverage
+                and UpstreamVerificationStatus.UNVERIFIED
+                not in checkpoint_statuses
+            ):
+                raise ValueError(
+                    "unverified upstream status requires unverified evidence "
+                    "or incomplete checkpoint coverage"
+                )
+        elif (
+            has_complete_coverage
+            and UpstreamVerificationStatus.UNAVAILABLE not in checkpoint_statuses
+        ):
+            raise ValueError(
+                "unavailable upstream status requires unavailable evidence "
+                "or incomplete checkpoint coverage"
+            )
         return self
 
 

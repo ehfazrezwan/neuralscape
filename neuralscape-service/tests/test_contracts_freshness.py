@@ -163,7 +163,8 @@ def test_stale_upstream_can_coexist_with_healthy_local_projection() -> None:
             _checkpoint(
                 verification_status="stale",
                 last_successful_verification_at=EARLIER,
-            )
+            ),
+            _checkpoint(source=_reference("source-b")),
         ],
         "projection": {
             "status": "current",
@@ -176,6 +177,142 @@ def test_stale_upstream_can_coexist_with_healthy_local_projection() -> None:
 
     assert witness.upstream_status is UpstreamVerificationStatus.STALE
     assert witness.projection.status is ProjectionStatus.CURRENT
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_status", "message"),
+    [
+        ("unverified", "only current or stale checkpoints"),
+        ("unavailable", "only current or stale checkpoints"),
+    ],
+)
+def test_stale_aggregate_cannot_hide_weaker_checkpoint_evidence(
+    checkpoint_status: str,
+    message: str,
+) -> None:
+    payload = {
+        "upstream_status": "stale",
+        "source_checkpoints": [
+            _checkpoint(verification_status=checkpoint_status),
+        ],
+        "projection": {
+            "status": "current",
+            "applied_sources": [_version("source-a", 4)],
+            "verified_at": NOW,
+        },
+    }
+
+    with pytest.raises(ValidationError, match=message):
+        FreshnessWitness.model_validate_json(json.dumps(payload))
+
+
+def test_stale_aggregate_requires_complete_applied_source_coverage() -> None:
+    payload = {
+        "upstream_status": "stale",
+        "source_checkpoints": [
+            _checkpoint(verification_status="stale"),
+        ],
+        "projection": {
+            "status": "current",
+            "applied_sources": [
+                _version("source-a", 4),
+                _version("source-b", 9),
+            ],
+            "verified_at": NOW,
+        },
+    }
+
+    with pytest.raises(ValidationError, match="every applied source checkpoint"):
+        FreshnessWitness.model_validate_json(json.dumps(payload))
+
+
+@pytest.mark.parametrize(
+    ("upstream_status", "checkpoint_status"),
+    [
+        ("unverified", "unverified"),
+        ("unavailable", "unavailable"),
+    ],
+)
+def test_weak_aggregates_accept_matching_complete_evidence(
+    upstream_status: str,
+    checkpoint_status: str,
+) -> None:
+    payload = {
+        "upstream_status": upstream_status,
+        "source_checkpoints": [
+            _checkpoint(verification_status=checkpoint_status),
+        ],
+        "projection": {
+            "status": "current",
+            "applied_sources": [_version("source-a", 4)],
+            "verified_at": NOW,
+        },
+    }
+
+    witness = FreshnessWitness.model_validate_json(json.dumps(payload))
+    assert witness.upstream_status.value == upstream_status
+
+
+def test_weak_aggregates_accept_documented_partial_coverage() -> None:
+    for upstream_status in ("unverified", "unavailable"):
+        payload = {
+            "upstream_status": upstream_status,
+            "source_checkpoints": [],
+            "projection": {
+                "status": "current",
+                "applied_sources": [_version("source-a", 4)],
+                "verified_at": NOW,
+            },
+        }
+
+        witness = FreshnessWitness.model_validate_json(json.dumps(payload))
+        assert witness.upstream_status.value == upstream_status
+
+
+@pytest.mark.parametrize(
+    ("upstream_status", "checkpoint_status", "message"),
+    [
+        (
+            "stale",
+            "current",
+            "requires at least one stale checkpoint",
+        ),
+        (
+            "unverified",
+            "current",
+            "requires unverified evidence",
+        ),
+        (
+            "unavailable",
+            "current",
+            "requires unavailable evidence",
+        ),
+        (
+            "unverified",
+            "unavailable",
+            "cannot hide unavailable checkpoints",
+        ),
+    ],
+)
+def test_aggregate_rejects_contradictory_complete_evidence(
+    upstream_status: str,
+    checkpoint_status: str,
+    message: str,
+) -> None:
+    payload = {
+        "upstream_status": upstream_status,
+        "source_checkpoints": [
+            _checkpoint(verification_status=checkpoint_status),
+        ],
+        "projection": {
+            "status": "current",
+            "applied_sources": [_version("source-a", 4)],
+            "verified_at": NOW,
+        },
+    }
+
+    with pytest.raises(ValidationError, match=message):
+        FreshnessWitness.model_validate_json(json.dumps(payload))
 
 
 @pytest.mark.parametrize(

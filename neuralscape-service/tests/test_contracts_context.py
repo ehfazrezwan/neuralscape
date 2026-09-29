@@ -132,6 +132,7 @@ def _receipt(**overrides: object) -> dict[str, object]:
     value: dict[str, object] = {
         "schema_version": "candidate-v1",
         "receipt_id": "receipt-1",
+        "tenant_id": "tenant-1",
         "request_id": "request-1",
         "bundle_id": "bundle-1",
         "selector_version": "selector-1",
@@ -489,6 +490,25 @@ def test_empty_outcomes_remain_distinct(
     assert bundle.outcome.value == outcome
 
 
+@pytest.mark.parametrize("capability_status", ["available", "degraded"])
+def test_unavailable_dependency_requires_unavailable_capability(
+    capability_status: str,
+) -> None:
+    with pytest.raises(
+        ValidationError,
+        match="unavailable_dependency requires unavailable capabilities",
+    ):
+        _validate(
+            ContextBundle,
+            _bundle(
+                outcome="unavailable_dependency",
+                capability_status=capability_status,
+                selected_items=[],
+                omissions=["dependency_unavailable"],
+            ),
+        )
+
+
 def test_incomplete_bundle_requires_safe_reason_without_hidden_counts() -> None:
     bundle = _validate(
         ContextBundle,
@@ -524,6 +544,12 @@ def test_current_projection_must_match_full_selected_source_set() -> None:
     item["source_versions"] = [_version(revision=4), _version("source-b", 9)]
     freshness = item["freshness"]
     assert isinstance(freshness, dict)
+    checkpoints = freshness["source_checkpoints"]
+    assert isinstance(checkpoints, list)
+    source_b_checkpoint = deepcopy(checkpoints[0])
+    source_b_checkpoint["source"] = _reference("source", "source-b")
+    source_b_checkpoint["verification_status"] = "current"
+    checkpoints.append(source_b_checkpoint)
     projection = freshness["projection"]
     assert isinstance(projection, dict)
     projection["applied_sources"] = [
@@ -603,6 +629,44 @@ def test_same_source_version_across_items_has_representable_receipt() -> None:
     assert receipt_matches_bundle(receipt, bundle)
 
 
+def test_empty_bundle_receipt_match_requires_explicit_tenant_scope() -> None:
+    bundle = _validate(
+        ContextBundle,
+        _bundle(
+            outcome="no_relevant_evidence",
+            selected_items=[],
+            omissions=[],
+        ),
+    )
+    receipt_payload = _receipt(
+        source_versions=[],
+        selected_references=[],
+        degradations=[],
+        optimization_lineage=[],
+        expansion_lineage=[],
+    )
+    receipt = _validate(ContextAssemblyReceipt, receipt_payload)
+    cross_tenant_receipt = _validate(
+        ContextAssemblyReceipt,
+        {**receipt_payload, "tenant_id": "tenant-2"},
+    )
+
+    assert receipt_matches_bundle(receipt, bundle)
+    assert not receipt_matches_bundle(cross_tenant_receipt, bundle)
+
+
+def test_receipt_requires_tenant_scope_even_without_references() -> None:
+    payload = _receipt(
+        source_versions=[],
+        selected_references=[],
+        degradations=[],
+    )
+    payload.pop("tenant_id")
+
+    with pytest.raises(ValidationError, match="tenant_id"):
+        _validate(ContextAssemblyReceipt, payload)
+
+
 def test_receipt_match_revalidates_cross_tenant_model_copies() -> None:
     bundle = _validate(ContextBundle, _bundle())
     receipt = _validate(ContextAssemblyReceipt, _receipt())
@@ -644,14 +708,15 @@ def test_expansion_lineage_requires_one_tenant_scope() -> None:
 
 
 @pytest.mark.parametrize(
-    "lineage_field", ["optimization_lineage", "expansion_lineage"]
+    "reference_field",
+    ["selected_references", "optimization_lineage", "expansion_lineage"],
 )
-def test_receipt_lineage_uses_selected_reference_tenant(
-    lineage_field: str,
+def test_receipt_references_and_lineage_use_receipt_tenant(
+    reference_field: str,
 ) -> None:
     other_tenant = {**_reference(), "tenant_id": "tenant-2"}
     lineage: object
-    if lineage_field == "optimization_lineage":
+    if reference_field in {"selected_references", "optimization_lineage"}:
         lineage = [other_tenant]
     else:
         lineage = [
@@ -661,8 +726,8 @@ def test_receipt_lineage_uses_selected_reference_tenant(
             }
         ]
 
-    with pytest.raises(ValidationError, match="selected reference tenant scope"):
-        _validate(ContextAssemblyReceipt, _receipt(**{lineage_field: lineage}))
+    with pytest.raises(ValidationError, match="receipt tenant scope"):
+        _validate(ContextAssemblyReceipt, _receipt(**{reference_field: lineage}))
 
 
 def test_receipt_correspondence_requires_exact_expansion_lineage() -> None:
