@@ -256,8 +256,8 @@ def projection_status_for(
     """Compare complete dependency sets without using a global max revision.
 
     A source's content revision and policy epoch are separate requirements.  A
-    missing, extra, duplicated, or changed source therefore makes the applied
-    projection stale.
+    missing, extra, or changed source therefore makes the applied projection
+    stale.  Duplicate source identities are invalid and raise ``ValueError``.
     """
 
     applied = _version_map(applied_sources)
