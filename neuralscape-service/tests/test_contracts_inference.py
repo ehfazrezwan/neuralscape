@@ -3,7 +3,7 @@
 import math
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 import contracts_inference
 from contracts_engines import QualificationClaim
@@ -308,7 +308,7 @@ def test_span_must_reference_exact_declared_source_version():
         decision_request(sources=(evidence,), spans=(span,))
 
 
-def test_request_computes_span_layout_once_per_referenced_source(monkeypatch):
+def test_request_encodes_each_source_once_without_boundary_set(monkeypatch):
     first = source_evidence(source=source_version("source-1", 3))
     second = source_evidence(text="BC", source=source_version("source-2", 4))
     spans = (
@@ -332,21 +332,18 @@ def test_request_computes_span_layout_once_per_referenced_source(monkeypatch):
         ),
     )
     calls: dict[str, int] = {}
-    extent_calls = 0
-    original = SourceEvidence.utf8_boundaries
+    original = contracts_inference._source_utf8_bytes
 
-    def counted_boundaries(self):
-        record_id = self.source_version.record_id
+    def counted_encoding(evidence):
+        record_id = evidence.source_version.record_id
         calls[record_id] = calls.get(record_id, 0) + 1
-        return original(self)
+        return original(evidence)
 
-    def counted_max(values):
-        nonlocal extent_calls
-        extent_calls += 1
-        return max(values)
+    def forbidden_boundaries(self):
+        raise AssertionError("span validation allocated a boundary set")
 
-    monkeypatch.setattr(SourceEvidence, "utf8_boundaries", counted_boundaries)
-    monkeypatch.setattr(contracts_inference, "max", counted_max, raising=False)
+    monkeypatch.setattr(contracts_inference, "_source_utf8_bytes", counted_encoding)
+    monkeypatch.setattr(SourceEvidence, "utf8_boundaries", forbidden_boundaries)
 
     request = decision_request(sources=(first, second), spans=spans)
     assert tuple(span.span_id for span in request.spans) == (
@@ -355,13 +352,10 @@ def test_request_computes_span_layout_once_per_referenced_source(monkeypatch):
         "span-3",
     )
     assert calls == {"source-1": 1, "source-2": 1}
-    assert extent_calls == 2
 
     calls.clear()
-    extent_calls = 0
     validate_source_span(first, spans[0])
     assert calls == {"source-1": 1}
-    assert extent_calls == 1
 
 
 def test_per_item_fallback_requires_matching_qualification_claim():
@@ -537,6 +531,30 @@ def test_generation_output_matches_declared_schema_and_source_support():
         validate_generation_result(request, missing_required)
 
 
+def test_generation_boundary_rejects_models_inside_json_values():
+    class ArbitraryModel(BaseModel):
+        payload: str
+
+    model_value = ArbitraryModel(payload="must-not-normalize")
+    proposal = generation_result().proposals[0].model_copy(
+        update={"output": {"summary": model_value}}
+    )
+    result = generation_result().model_copy(update={"proposals": (proposal,)})
+    with pytest.raises(ValueError, match="JSON value contains a model object"):
+        validate_generation_result(generation_request(), result)
+
+    request = generation_request()
+    request.output_schema["properties"]["summary"]["default"] = {
+        "nested": [model_value]
+    }
+    with pytest.raises(ValueError, match="JSON value contains a model object"):
+        validate_generation_result(request, generation_result())
+
+    assert validate_generation_result(
+        generation_request(), generation_result()
+    ).compliant
+
+
 def test_generation_schema_validation_stops_after_first_error(monkeypatch):
     request = generation_request()
     result = generation_result(output={})
@@ -573,6 +591,53 @@ def test_generation_schema_rejects_unknown_keywords_versions_formats_and_referen
     for schema, message in cases:
         with pytest.raises((ValidationError, ValueError), match=message):
             generation_request(schema=schema)
+
+
+@pytest.mark.parametrize(
+    ("format_name", "valid_value", "invalid_value"),
+    [
+        ("ipv4", "192.0.2.1", "999.0.2.1"),
+        ("ipv6", "2001:db8::1", "2001:db8:::1"),
+    ],
+)
+def test_generation_uses_fixed_contract_owned_format_checkers(
+    monkeypatch,
+    format_name,
+    valid_value,
+    invalid_value,
+):
+    assert contracts_inference._SUPPORTED_OUTPUT_SCHEMA_FORMATS == frozenset(
+        {"ipv4", "ipv6"}
+    )
+    _, format_checker_class = contracts_inference._jsonschema_types()
+    monkeypatch.setitem(
+        format_checker_class.checkers,
+        format_name,
+        (lambda value: True, ()),
+    )
+    monkeypatch.setitem(
+        format_checker_class.checkers,
+        "private-format",
+        (lambda value: True, ()),
+    )
+
+    schema = output_schema(
+        properties={"address": {"type": "string", "format": format_name}},
+        required=["address"],
+    )
+    request = generation_request(schema=schema)
+    assert validate_generation_result(
+        request,
+        generation_result(output={"address": valid_value}),
+    ).compliant
+    with pytest.raises(ValueError, match="does not match declared schema"):
+        validate_generation_result(
+            request,
+            generation_result(output={"address": invalid_value}),
+        )
+
+    with pytest.raises(ValueError, match="unsupported output schema format"):
+        generation_request(schema=output_schema(format="private-format"))
 
 
 @pytest.mark.parametrize(

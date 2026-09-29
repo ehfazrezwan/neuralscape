@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import math
 from enum import Enum
+from ipaddress import IPv4Address, IPv6Address
 from typing import Annotated, Any, Literal, Mapping
 
-from pydantic import Field, JsonValue, model_validator
+from pydantic import BaseModel, Field, JsonValue, model_validator
 
 from contracts_common import ContractModel, OpaqueId, SafeCounter, VersionedContract
 from contracts_engines import QualificationClaim, _validated_contract_snapshot
@@ -20,6 +21,8 @@ from contracts_references import ReferenceHandle, SourceVersion
 FiniteNumber = Annotated[float, Field(allow_inf_nan=False)]
 JSON_SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema"
 MAX_SAFE_COUNTER = 9_007_199_254_740_991
+# Candidate-v1 limits formats to deterministic standard-library implementations.
+_SUPPORTED_OUTPUT_SCHEMA_FORMATS = frozenset({"ipv4", "ipv6"})
 
 
 class FallbackGranularity(str, Enum):
@@ -74,10 +77,8 @@ class SourceEvidence(ContractModel):
 
     @model_validator(mode="after")
     def validate_utf8(self) -> "SourceEvidence":
-        try:
-            self.text.encode("utf-8")
-        except UnicodeEncodeError as exc:
-            raise ValueError("source evidence must be valid UTF-8 text") from exc
+        if any(0xD800 <= ord(character) <= 0xDFFF for character in self.text):
+            raise ValueError("source evidence must be valid UTF-8 text")
         return self
 
     def utf8_boundaries(self) -> frozenset[int]:
@@ -109,15 +110,26 @@ class SourceSpan(ContractModel):
 def _validate_source_span_values(
     evidence: SourceEvidence,
     span: SourceSpan,
-    boundaries: frozenset[int],
-    byte_extent: int,
+    source_utf8: bytes,
 ) -> None:
     if span.source_version != evidence.source_version:
         raise ValueError("source span does not match the source evidence version")
-    if span.end_utf8_byte > byte_extent:
+    if span.end_utf8_byte > len(source_utf8):
         raise ValueError("source span exceeds the source UTF-8 byte length")
-    if span.start_utf8_byte not in boundaries or span.end_utf8_byte not in boundaries:
+    if not _is_utf8_boundary(source_utf8, span.start_utf8_byte) or not _is_utf8_boundary(
+        source_utf8, span.end_utf8_byte
+    ):
         raise ValueError("source span must not split a UTF-8 code point")
+
+
+def _source_utf8_bytes(evidence: SourceEvidence) -> bytes:
+    return evidence.text.encode("utf-8")
+
+
+def _is_utf8_boundary(source_utf8: bytes, offset: int) -> bool:
+    return offset == len(source_utf8) or (
+        source_utf8[offset] & 0b1100_0000
+    ) != 0b1000_0000
 
 
 def validate_source_span(evidence: SourceEvidence, span: SourceSpan) -> None:
@@ -129,8 +141,7 @@ def validate_source_span(evidence: SourceEvidence, span: SourceSpan) -> None:
         label="source evidence",
     )
     span = _validated_contract_snapshot(span, SourceSpan, label="source span")
-    boundaries = evidence.utf8_boundaries()
-    _validate_source_span_values(evidence, span, boundaries, max(boundaries))
+    _validate_source_span_values(evidence, span, _source_utf8_bytes(evidence))
 
 
 class DecisionCandidate(ContractModel):
@@ -225,9 +236,7 @@ def _validate_source_evidence(
         raise ValueError("at least one source span is required")
     if len(set(span_ids)) != len(span_ids):
         raise ValueError("source span IDs must be unique")
-    span_layout_by_version: dict[
-        tuple[str, int, int], tuple[frozenset[int], int]
-    ] = {}
+    source_utf8_by_version: dict[tuple[str, int, int], bytes] = {}
     for span in spans:
         source_key = (
             span.source_version.record_id,
@@ -237,13 +246,11 @@ def _validate_source_evidence(
         evidence = evidence_by_version.get(source_key)
         if evidence is None:
             raise ValueError("every span must reference declared source evidence")
-        span_layout = span_layout_by_version.get(source_key)
-        if span_layout is None:
-            boundaries = evidence.utf8_boundaries()
-            span_layout = (boundaries, max(boundaries))
-            span_layout_by_version[source_key] = span_layout
-        boundaries, byte_extent = span_layout
-        _validate_source_span_values(evidence, span, boundaries, byte_extent)
+        source_utf8 = source_utf8_by_version.get(source_key)
+        if source_utf8 is None:
+            source_utf8 = _source_utf8_bytes(evidence)
+            source_utf8_by_version[source_key] = source_utf8
+        _validate_source_span_values(evidence, span, source_utf8)
 
 
 class _DecisionInputs(VersionedContract):
@@ -580,10 +587,36 @@ def _jsonschema_types() -> tuple[Any, Any]:
     return Draft202012Validator, FormatChecker
 
 
+def _is_ipv4(value: object) -> bool:
+    if not isinstance(value, str):
+        return True
+    try:
+        IPv4Address(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_ipv6(value: object) -> bool:
+    if not isinstance(value, str):
+        return True
+    try:
+        IPv6Address(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _contract_format_checker(format_checker_class: Any) -> Any:
+    checker = format_checker_class(formats=())
+    checker.checks("ipv4")(_is_ipv4)
+    checker.checks("ipv6")(_is_ipv6)
+    return checker
+
+
 def _reject_unknown_schema_semantics(
     schema: bool | Mapping[str, Any],
     validator_class: Any,
-    format_checker: Any,
     location: str = "$",
 ) -> None:
     if isinstance(schema, bool):
@@ -610,7 +643,8 @@ def _reject_unknown_schema_semantics(
         if keyword not in known:
             raise ValueError(f"unsupported output schema keyword at {location}: {keyword}")
         if keyword == "format" and (
-            not isinstance(value, str) or value not in format_checker.checkers
+            not isinstance(value, str)
+            or value not in _SUPPORTED_OUTPUT_SCHEMA_FORMATS
         ):
             raise ValueError(f"unsupported output schema format at {location}: {value}")
         if keyword in _SCHEMA_CONTAINER_KEYWORDS and isinstance(value, Mapping):
@@ -619,14 +653,12 @@ def _reject_unknown_schema_semantics(
                     _reject_unknown_schema_semantics(
                         nested,
                         validator_class,
-                        format_checker,
                         f"{location}/{keyword}/{name}",
                     )
         elif keyword in _SCHEMA_SINGLE_KEYWORDS and isinstance(value, (bool, Mapping)):
             _reject_unknown_schema_semantics(
                 value,
                 validator_class,
-                format_checker,
                 f"{location}/{keyword}",
             )
         elif keyword in _SCHEMA_ARRAY_KEYWORDS and isinstance(value, list):
@@ -635,7 +667,6 @@ def _reject_unknown_schema_semantics(
                     _reject_unknown_schema_semantics(
                         nested,
                         validator_class,
-                        format_checker,
                         f"{location}/{keyword}/{index}",
                     )
 
@@ -651,13 +682,38 @@ def _validate_finite_json(value: JsonValue, location: str = "$") -> None:
             _validate_finite_json(item, f"{location}/{key}")
 
 
+def _reject_model_json_values(value: object, location: str) -> None:
+    pending = [(value, location)]
+    seen_containers: set[int] = set()
+    while pending:
+        item, item_location = pending.pop()
+        if isinstance(item, BaseModel):
+            raise ValueError(f"JSON value contains a model object at {item_location}")
+        if not isinstance(item, (dict, list)):
+            continue
+        identity = id(item)
+        if identity in seen_containers:
+            continue
+        seen_containers.add(identity)
+        if isinstance(item, dict):
+            pending.extend(
+                (nested, f"{item_location}/value/{index}")
+                for index, nested in enumerate(item.values())
+            )
+        else:
+            pending.extend(
+                (nested, f"{item_location}/{index}")
+                for index, nested in enumerate(item)
+            )
+
+
 def _build_output_validator(schema: Mapping[str, JsonValue]) -> Any:
     validator_class, format_checker_class = _jsonschema_types()
-    format_checker = format_checker_class()
+    format_checker = _contract_format_checker(format_checker_class)
     if schema.get("$schema") != JSON_SCHEMA_DIALECT:
         raise ValueError("output schema must declare the supported Draft 2020-12 dialect")
     _validate_finite_json(dict(schema))
-    _reject_unknown_schema_semantics(schema, validator_class, format_checker)
+    _reject_unknown_schema_semantics(schema, validator_class)
     try:
         validator_class.check_schema(schema)
     except Exception as exc:
@@ -739,6 +795,18 @@ def validate_generation_result(
 ) -> ResourceCompliance:
     """Validate schema/source support and report resource compliance separately."""
 
+    if isinstance(request, GenerationRequest):
+        _reject_model_json_values(
+            request.output_schema,
+            "generation request/output_schema",
+        )
+    if isinstance(result, GenerationResult) and isinstance(result.proposals, tuple):
+        for index, proposal in enumerate(result.proposals):
+            if isinstance(proposal, GenerationProposal):
+                _reject_model_json_values(
+                    proposal.output,
+                    f"generation result/proposals/{index}/output",
+                )
     request = _validated_contract_snapshot(
         request,
         GenerationRequest,
