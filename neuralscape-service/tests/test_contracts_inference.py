@@ -5,6 +5,7 @@ import math
 import pytest
 from pydantic import ValidationError
 
+import contracts_inference
 from contracts_engines import QualificationClaim
 from contracts_inference import (
     JSON_SCHEMA_DIALECT,
@@ -307,7 +308,7 @@ def test_span_must_reference_exact_declared_source_version():
         decision_request(sources=(evidence,), spans=(span,))
 
 
-def test_request_computes_utf8_boundaries_once_per_referenced_source(monkeypatch):
+def test_request_computes_span_layout_once_per_referenced_source(monkeypatch):
     first = source_evidence(source=source_version("source-1", 3))
     second = source_evidence(text="BC", source=source_version("source-2", 4))
     spans = (
@@ -331,6 +332,7 @@ def test_request_computes_utf8_boundaries_once_per_referenced_source(monkeypatch
         ),
     )
     calls: dict[str, int] = {}
+    extent_calls = 0
     original = SourceEvidence.utf8_boundaries
 
     def counted_boundaries(self):
@@ -338,7 +340,13 @@ def test_request_computes_utf8_boundaries_once_per_referenced_source(monkeypatch
         calls[record_id] = calls.get(record_id, 0) + 1
         return original(self)
 
+    def counted_max(values):
+        nonlocal extent_calls
+        extent_calls += 1
+        return max(values)
+
     monkeypatch.setattr(SourceEvidence, "utf8_boundaries", counted_boundaries)
+    monkeypatch.setattr(contracts_inference, "max", counted_max, raising=False)
 
     request = decision_request(sources=(first, second), spans=spans)
     assert tuple(span.span_id for span in request.spans) == (
@@ -347,10 +355,13 @@ def test_request_computes_utf8_boundaries_once_per_referenced_source(monkeypatch
         "span-3",
     )
     assert calls == {"source-1": 1, "source-2": 1}
+    assert extent_calls == 2
 
     calls.clear()
+    extent_calls = 0
     validate_source_span(first, spans[0])
     assert calls == {"source-1": 1}
+    assert extent_calls == 1
 
 
 def test_per_item_fallback_requires_matching_qualification_claim():

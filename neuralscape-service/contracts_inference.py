@@ -110,10 +110,11 @@ def _validate_source_span_values(
     evidence: SourceEvidence,
     span: SourceSpan,
     boundaries: frozenset[int],
+    byte_extent: int,
 ) -> None:
     if span.source_version != evidence.source_version:
         raise ValueError("source span does not match the source evidence version")
-    if span.end_utf8_byte > max(boundaries):
+    if span.end_utf8_byte > byte_extent:
         raise ValueError("source span exceeds the source UTF-8 byte length")
     if span.start_utf8_byte not in boundaries or span.end_utf8_byte not in boundaries:
         raise ValueError("source span must not split a UTF-8 code point")
@@ -128,7 +129,8 @@ def validate_source_span(evidence: SourceEvidence, span: SourceSpan) -> None:
         label="source evidence",
     )
     span = _validated_contract_snapshot(span, SourceSpan, label="source span")
-    _validate_source_span_values(evidence, span, evidence.utf8_boundaries())
+    boundaries = evidence.utf8_boundaries()
+    _validate_source_span_values(evidence, span, boundaries, max(boundaries))
 
 
 class DecisionCandidate(ContractModel):
@@ -223,7 +225,9 @@ def _validate_source_evidence(
         raise ValueError("at least one source span is required")
     if len(set(span_ids)) != len(span_ids):
         raise ValueError("source span IDs must be unique")
-    boundaries_by_version: dict[tuple[str, int, int], frozenset[int]] = {}
+    span_layout_by_version: dict[
+        tuple[str, int, int], tuple[frozenset[int], int]
+    ] = {}
     for span in spans:
         source_key = (
             span.source_version.record_id,
@@ -233,11 +237,13 @@ def _validate_source_evidence(
         evidence = evidence_by_version.get(source_key)
         if evidence is None:
             raise ValueError("every span must reference declared source evidence")
-        boundaries = boundaries_by_version.get(source_key)
-        if boundaries is None:
+        span_layout = span_layout_by_version.get(source_key)
+        if span_layout is None:
             boundaries = evidence.utf8_boundaries()
-            boundaries_by_version[source_key] = boundaries
-        _validate_source_span_values(evidence, span, boundaries)
+            span_layout = (boundaries, max(boundaries))
+            span_layout_by_version[source_key] = span_layout
+        boundaries, byte_extent = span_layout
+        _validate_source_span_values(evidence, span, boundaries, byte_extent)
 
 
 class _DecisionInputs(VersionedContract):
