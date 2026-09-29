@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import AwareDatetime, TypeAdapter, model_validator
+from pydantic import AwareDatetime, BaseModel, TypeAdapter, model_validator
 
 from contracts_common import OpaqueId, SafeCounter, VersionedContract
 
@@ -57,19 +57,59 @@ class TenantReadinessPublication(VersionedContract):
         return self
 
 
+def _snapshot_closed_graph(
+    value: object, active: set[int] | None = None
+) -> object:
+    """Copy a model/native graph without dropping stored undeclared fields."""
+
+    if active is None:
+        active = set()
+    if not isinstance(value, (BaseModel, dict, list, tuple)):
+        return value
+
+    identity = id(value)
+    if identity in active:
+        raise ValueError("contract input graph must be acyclic")
+    active.add(identity)
+    try:
+        if isinstance(value, BaseModel):
+            stored = vars(value)
+            declared = type(value).model_fields
+            undeclared = stored.keys() - declared.keys()
+            extras = getattr(value, "__pydantic_extra__", None)
+            if undeclared or extras:
+                raise ValueError("contract input contains undeclared fields")
+            return {
+                name: _snapshot_closed_graph(field_value, active)
+                for name, field_value in stored.items()
+            }
+        if isinstance(value, dict):
+            return {
+                key: _snapshot_closed_graph(field_value, active)
+                for key, field_value in value.items()
+            }
+        if isinstance(value, list):
+            return [_snapshot_closed_graph(item, active) for item in value]
+        return tuple(_snapshot_closed_graph(item, active) for item in value)
+    finally:
+        active.remove(identity)
+
+
 def _validated_observation_snapshot(
     observation: CapabilityReadiness,
 ) -> CapabilityReadiness:
-    return CapabilityReadiness.model_validate(
-        observation.model_dump(mode="python", round_trip=True, warnings=False)
-    )
+    if not isinstance(observation, CapabilityReadiness):
+        raise TypeError("observation must be a CapabilityReadiness")
+    return CapabilityReadiness.model_validate(_snapshot_closed_graph(observation))
 
 
 def _validated_publication_snapshot(
     publication: TenantReadinessPublication,
 ) -> TenantReadinessPublication:
+    if not isinstance(publication, TenantReadinessPublication):
+        raise TypeError("publication must be a TenantReadinessPublication")
     return TenantReadinessPublication.model_validate(
-        publication.model_dump(mode="python", round_trip=True, warnings=False)
+        _snapshot_closed_graph(publication)
     )
 
 

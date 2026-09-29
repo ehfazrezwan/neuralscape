@@ -299,6 +299,36 @@ def test_publication_revalidates_copied_nested_manifest_graph() -> None:
         )
 
 
+def test_publication_rejects_retained_copied_extra_fields() -> None:
+    placement = TenantPlacement.model_validate_json(
+        json.dumps(
+            {
+                "schema_version": VERSION,
+                "tenant_id": "tenant-a",
+                "generation": 7,
+                "resource_manifests": [manifest()],
+            }
+        )
+    )
+    top_level_extra = placement.model_copy(
+        update={"unreviewed_topology": "shared-plane"}
+    )
+    nested_extra = placement.resource_manifests[0].model_copy(
+        update={"authority": "admin"}
+    )
+    nested_corruption = placement.model_copy(
+        update={"resource_manifests": (nested_extra,)}
+    )
+
+    for corrupted in (top_level_extra, nested_corruption):
+        with pytest.raises(ValueError, match="undeclared fields"):
+            validate_placement_publication(
+                corrupted,
+                expected_tenant_id="tenant-a",
+                current_generation=7,
+            )
+
+
 @pytest.mark.parametrize("corrupt_previous", [False, True])
 def test_transition_revalidates_copied_operation_graph(
     corrupt_previous: bool,
@@ -317,6 +347,46 @@ def test_transition_revalidates_copied_operation_graph(
             corrupted if corrupt_previous else previous,
             current if corrupt_previous else corrupted,
         )
+
+
+@pytest.mark.parametrize("corrupt_previous", [False, True])
+def test_transition_rejects_retained_copied_top_level_extra(
+    corrupt_previous: bool,
+) -> None:
+    previous = operation(resource_manifests=[])
+    current = operation(observed_state="running", resource_manifests=[])
+    corrupted = (previous if corrupt_previous else current).model_copy(
+        update={"unreviewed_policy": "allow"}
+    )
+
+    with pytest.raises(ValueError, match="undeclared fields"):
+        validate_operation_transition(
+            corrupted if corrupt_previous else previous,
+            current if corrupt_previous else corrupted,
+        )
+
+
+def test_transition_rejects_retained_copied_nested_extra() -> None:
+    previous = operation()
+    current = operation(observed_state="running")
+    nested_extra = current.resource_manifests[0].model_copy(
+        update={"authority": "admin"}
+    )
+    corrupted = current.model_copy(
+        update={"resource_manifests": (nested_extra,)}
+    )
+
+    with pytest.raises(ValueError, match="undeclared fields"):
+        validate_operation_transition(previous, corrupted)
+
+
+def test_transition_rejects_cyclic_mutated_input_graph() -> None:
+    previous = operation(resource_manifests=[])
+    current = operation(observed_state="running", resource_manifests=[])
+    current.resource_manifests = (current,)  # type: ignore[assignment]
+
+    with pytest.raises(ValueError, match="must be acyclic"):
+        validate_operation_transition(previous, current)
 
 
 def test_transition_revalidates_copied_operation_fields() -> None:

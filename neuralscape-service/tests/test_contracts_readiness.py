@@ -133,6 +133,21 @@ def test_evaluation_time_must_be_explicit_and_aware() -> None:
 
 
 @pytest.mark.parametrize(
+    "invalid_evaluated_at",
+    ["2026-09-28T00:00:03Z", OBSERVED_AT.timestamp(), True],
+)
+def test_evaluation_time_rejects_coercible_non_datetime_scalars(
+    invalid_evaluated_at: object,
+) -> None:
+    with pytest.raises(ValidationError):
+        capability_is_ready(
+            observation(),
+            evaluated_at=invalid_evaluated_at,
+            max_probe_age_seconds=10,
+        )
+
+
+@pytest.mark.parametrize(
     "invalid_max_age",
     [True, 1.0, -1, 9_007_199_254_740_992],
 )
@@ -236,6 +251,37 @@ def test_publication_revalidates_nested_capability_graph() -> None:
         )
 
 
+def test_publication_rejects_retained_copied_extra_fields() -> None:
+    report = publication()
+    top_level_extra = report.model_copy(update={"process_healthy": True})
+    nested_extra = report.capabilities[0].model_copy(
+        update={"process_healthy": True}
+    )
+    nested_corruption = report.model_copy(
+        update={"capabilities": (nested_extra, *report.capabilities[1:])}
+    )
+
+    for corrupted in (top_level_extra, nested_corruption):
+        with pytest.raises(ValueError, match="undeclared fields"):
+            validate_readiness_publication(
+                corrupted,
+                expected_tenant_id="tenant-a",
+                current_placement_generation=12,
+            )
+
+
+def test_publication_rejects_cyclic_mutated_input_graph() -> None:
+    report = publication()
+    report.capabilities = (report,)  # type: ignore[assignment]
+
+    with pytest.raises(ValueError, match="must be acyclic"):
+        validate_readiness_publication(
+            report,
+            expected_tenant_id="tenant-a",
+            current_placement_generation=12,
+        )
+
+
 def test_readiness_evaluation_revalidates_copied_observation_graph() -> None:
     invalid_status = observation(status="unavailable").model_copy(
         update={"status": "process_running"}
@@ -248,6 +294,13 @@ def test_readiness_evaluation_revalidates_copied_observation_graph() -> None:
         evaluate(invalid_status)
     with pytest.raises(ValidationError):
         evaluate(naive_timestamp)
+
+
+def test_readiness_evaluation_rejects_retained_copied_extra() -> None:
+    corrupted = observation().model_copy(update={"probe_verified": False})
+
+    with pytest.raises(ValueError, match="undeclared fields"):
+        evaluate(corrupted)
 
 
 def test_valid_explicit_healthy_copy_has_same_semantics_as_fresh_input() -> None:
