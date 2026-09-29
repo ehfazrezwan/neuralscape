@@ -509,9 +509,8 @@ def test_aggregate_boundary_revalidates_copied_nested_values() -> None:
     invalid_source_command = command.model_copy(
         update={"expected_sources": (invalid_source,)}
     )
-    # Revalidating an existing outer instance does not traverse this copied
-    # nested SourceVersion, so the public boundary must dump the full graph.
-    assert Intent.model_validate(invalid_source_command) is invalid_source_command
+    with pytest.raises(ValidationError, match="greater than or equal to 0"):
+        Intent.model_validate(invalid_source_command)
     with pytest.raises(ValidationError, match="greater than or equal to 0"):
         validate_required_stage_claim(
             claimed_status=IntentStatus.APPLIED,
@@ -529,10 +528,8 @@ def test_aggregate_boundary_revalidates_copied_nested_values() -> None:
     invalid_reference_receipt = valid_receipt.model_copy(
         update={"output_refs": (invalid_reference,)}
     )
-    assert (
+    with pytest.raises(ValidationError, match="at least 1 character"):
         StageReceipt.model_validate(invalid_reference_receipt)
-        is invalid_reference_receipt
-    )
     with pytest.raises(ValidationError, match="at least 1 character"):
         validate_required_stage_claim(
             claimed_status=IntentStatus.APPLIED,
