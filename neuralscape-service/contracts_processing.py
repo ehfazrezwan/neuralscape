@@ -109,7 +109,9 @@ def validate_plaintext_dispatch(
     cannot authorize forwarding plaintext.  Successful validation is only a
     routing precondition; it does not prove endpoint identity or runtime
     assurance.  Callers must explicitly classify every dispatch as primary or
-    fallback; omission is not treated as a primary dispatch.
+    fallback; omission is not treated as a primary dispatch.  Recipient-only
+    fallback must identify an approved, currently authorized non-endpoint
+    recipient.
     """
 
     try:
@@ -130,8 +132,13 @@ def validate_plaintext_dispatch(
         raise PlaintextDispatchRejected("fallback marker must be a boolean")
     if execution_location not in policy.allowed_execution_locations:
         raise PlaintextDispatchRejected("execution location is not allowed")
-    if is_fallback and policy.fallback_policy == "deny":
-        raise PlaintextDispatchRejected("fallback is denied")
+    if is_fallback:
+        if policy.fallback_policy == "deny":
+            raise PlaintextDispatchRejected("fallback is denied")
+        if execution_location == "endpoint":
+            raise PlaintextDispatchRejected(
+                "recipient fallback requires a non-endpoint execution location"
+            )
 
     if execution_location == "endpoint":
         if recipient_id is not None:
