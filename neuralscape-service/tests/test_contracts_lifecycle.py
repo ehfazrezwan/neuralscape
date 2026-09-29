@@ -547,7 +547,13 @@ def test_source_version_decision_boundary_revalidates_copied_values() -> None:
     valid = source("memory-1", revision=4, epoch=9)
     invalid = valid.model_copy(update={"content_revision": -1})
 
-    assert SourceVersion.model_validate(invalid) is invalid
+    revalidated = SourceVersion.model_validate(valid)
+    assert revalidated == valid
+    assert revalidated is not valid
+    assert source_versions_match(valid, revalidated)
+
+    with pytest.raises(ValidationError, match="greater than or equal to 0"):
+        SourceVersion.model_validate(invalid)
     with pytest.raises(ValidationError, match="greater than or equal to 0"):
         source_versions_match(invalid, invalid)
 
