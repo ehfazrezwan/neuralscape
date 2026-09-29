@@ -32,7 +32,11 @@ SafeCounter = Annotated[
 class ContractModel(BaseModel):
     """Base for strict contracts with a closed set of fields."""
 
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        strict=True,
+        revalidate_instances="always",
+    )
 
 
 class VersionedContract(ContractModel):
