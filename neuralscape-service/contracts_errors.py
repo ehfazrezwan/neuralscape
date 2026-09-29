@@ -151,11 +151,15 @@ def public_error_for(
 ) -> PublicError:
     """Return the safe public representation for an internal outcome.
 
+    The code must be an actual ``InternalErrorCode``; matching strings and
+    other string enums do not establish the internal outcome type.
     The disclosure decision must be an actual boolean; truthy values are not
     accepted as authorization.  The returned model is a copy so a consumer
     cannot mutate the canonical mapping used by later calls.
     """
 
+    if type(code) is not InternalErrorCode:
+        raise TypeError("code must be an InternalErrorCode")
     if type(disclose_existence) is not bool:
         raise TypeError("disclose_existence must be a bool")
 

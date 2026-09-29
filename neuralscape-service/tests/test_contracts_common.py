@@ -481,6 +481,45 @@ def test_disclosure_decision_rejects_non_boolean_values(value: object) -> None:
         )
 
 
+@pytest.mark.parametrize("code", list(InternalErrorCode))
+def test_error_code_boundary_accepts_every_internal_enum_variant(
+    code: InternalErrorCode,
+) -> None:
+    assert isinstance(public_error_for(code).code, PublicErrorCode)
+
+
+@pytest.mark.parametrize("value", [code.value for code in InternalErrorCode])
+def test_error_code_boundary_rejects_known_plain_strings(value: object) -> None:
+    with pytest.raises(TypeError, match="code must be an InternalErrorCode"):
+        public_error_for(value)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "unknown_internal_error",
+        PublicErrorCode.UNAUTHENTICATED,
+        [],
+        {},
+        None,
+        True,
+        False,
+    ],
+)
+def test_error_code_boundary_rejects_other_runtime_types(value: object) -> None:
+    with pytest.raises(TypeError, match="code must be an InternalErrorCode"):
+        public_error_for(value)  # type: ignore[arg-type]
+
+
+def test_error_code_boundary_does_not_hash_an_invalid_value() -> None:
+    class HashTrap:
+        def __hash__(self) -> int:
+            raise AssertionError("invalid values must not reach dictionary lookup")
+
+    with pytest.raises(TypeError, match="code must be an InternalErrorCode"):
+        public_error_for(HashTrap())  # type: ignore[arg-type]
+
+
 def test_error_mapping_covers_every_internal_outcome_and_returns_copies() -> None:
     mapped = {code: public_error_for(code) for code in InternalErrorCode}
     assert set(mapped) == set(InternalErrorCode)
