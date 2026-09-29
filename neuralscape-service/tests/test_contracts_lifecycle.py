@@ -1047,6 +1047,132 @@ def _assert_only_aggregate_claim(
                     )
 
 
+@pytest.mark.parametrize("started_status", [StageStatus.PROCESSING, StageStatus.FAILED])
+def test_historical_start_evidence_survives_pending_retry(
+    started_status: StageStatus,
+) -> None:
+    initial_sources = () if started_status is StageStatus.FAILED else None
+    receipts = (
+        receipt(
+            ProcessingStage.GRAPH,
+            started_status,
+            sources=initial_sources,
+            attempt=1,
+        ),
+        receipt(ProcessingStage.GRAPH, StageStatus.PENDING, attempt=2),
+    )
+
+    _assert_only_aggregate_claim(
+        command=intent(ProcessingStage.GRAPH),
+        receipts=receipts,
+        expected=IntentStatus.PROCESSING,
+    )
+
+
+def test_untouched_pending_stage_remains_accepted() -> None:
+    _assert_only_aggregate_claim(
+        command=intent(ProcessingStage.GRAPH),
+        receipts=(receipt(ProcessingStage.GRAPH, StageStatus.PENDING),),
+        expected=IntentStatus.ACCEPTED,
+    )
+
+
+@pytest.mark.parametrize(
+    "fence_status",
+    [StageStatus.CANCELLED, StageStatus.SUPERSEDED],
+)
+def test_prestart_fence_does_not_invent_start_evidence_for_pending_retry(
+    fence_status: StageStatus,
+) -> None:
+    fence_values = receipt(
+        ProcessingStage.GRAPH,
+        fence_status,
+        sources=(),
+        attempt=1,
+    ).model_dump()
+    fence_values["started_at"] = None
+    prestart_fence = StageReceipt.model_validate(fence_values)
+    receipts = (
+        prestart_fence,
+        receipt(ProcessingStage.GRAPH, StageStatus.PENDING, attempt=2),
+    )
+
+    _assert_only_aggregate_claim(
+        command=intent(ProcessingStage.GRAPH),
+        receipts=receipts,
+        expected=IntentStatus.ACCEPTED,
+    )
+
+
+@pytest.mark.parametrize(
+    "fence_status",
+    [StageStatus.CANCELLED, StageStatus.SUPERSEDED],
+)
+def test_started_fence_is_historical_start_evidence_for_pending_retry(
+    fence_status: StageStatus,
+) -> None:
+    receipts = (
+        receipt(
+            ProcessingStage.GRAPH,
+            fence_status,
+            sources=(),
+            attempt=1,
+        ),
+        receipt(ProcessingStage.GRAPH, StageStatus.PENDING, attempt=2),
+    )
+
+    _assert_only_aggregate_claim(
+        command=intent(ProcessingStage.GRAPH),
+        receipts=receipts,
+        expected=IntentStatus.PROCESSING,
+    )
+
+
+def test_nonrequired_stage_start_does_not_change_required_stage_aggregate() -> None:
+    receipts = (
+        receipt(ProcessingStage.CANONICAL, StageStatus.PROCESSING),
+        receipt(ProcessingStage.GRAPH, StageStatus.PENDING),
+    )
+
+    _assert_only_aggregate_claim(
+        command=intent(ProcessingStage.GRAPH),
+        receipts=receipts,
+        expected=IntentStatus.ACCEPTED,
+    )
+
+
+def test_historical_start_and_latest_pending_are_aggregated_across_stages() -> None:
+    receipts = (
+        receipt(ProcessingStage.CANONICAL, StageStatus.PROCESSING, attempt=1),
+        receipt(ProcessingStage.CANONICAL, StageStatus.PENDING, attempt=2),
+        receipt(ProcessingStage.GRAPH, StageStatus.PENDING),
+    )
+
+    _assert_only_aggregate_claim(
+        command=intent(ProcessingStage.CANONICAL, ProcessingStage.GRAPH),
+        receipts=receipts,
+        expected=IntentStatus.PROCESSING,
+    )
+
+
+def test_latest_terminal_state_still_controls_unsatisfied_started_stage() -> None:
+    receipts = (
+        receipt(ProcessingStage.GRAPH, StageStatus.PROCESSING, attempt=1),
+        receipt(
+            ProcessingStage.GRAPH,
+            StageStatus.FAILED,
+            sources=(),
+            attempt=2,
+        ),
+    )
+
+    _assert_only_aggregate_claim(
+        command=intent(ProcessingStage.GRAPH),
+        receipts=receipts,
+        expected=IntentStatus.FAILED,
+    )
+
+
 @pytest.mark.parametrize(
     ("case", "receipts", "expected"),
     [

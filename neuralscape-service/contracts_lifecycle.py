@@ -355,6 +355,10 @@ def validate_required_stage_claim(
     stage remains satisfied; greatest-attempt state describes only stages that
     remain unsatisfied.
 
+    A non-null ``started_at`` on any historical required-stage receipt is
+    monotonic evidence that work started.  Greatest-attempt state still decides
+    whether unsatisfied work remains unfinished.
+
     This checks consistency of caller-supplied reports.  It does not prove an
     external effect exists, choose authoritative output references, establish
     retry exhaustion, or select a runtime retry policy.
@@ -410,6 +414,11 @@ def validate_required_stage_claim(
             )
         satisfied.add(receipt.stage)
 
+    started_stages = {
+        receipt.stage
+        for receipt in receipts
+        if receipt.stage in required and receipt.started_at is not None
+    }
     unsatisfied = required - satisfied
     unsatisfied_receipts = {
         stage: required_receipts[stage] for stage in unsatisfied
@@ -426,22 +435,18 @@ def validate_required_stage_claim(
     }
 
     if claimed_status is IntentStatus.ACCEPTED:
-        if satisfied or any(
+        if started_stages or any(
             receipt is not None and receipt.status is not StageStatus.PENDING
             for receipt in unsatisfied_receipts.values()
         ):
             raise ValueError("accepted cannot claim started or terminal required stages")
     elif claimed_status is IntentStatus.PROCESSING:
-        started = bool(satisfied) or any(
-            receipt is not None and receipt.status is StageStatus.PROCESSING
-            for receipt in unsatisfied_receipts.values()
-        )
         terminal_unsatisfied = any(
             receipt is not None
             and receipt.status not in {StageStatus.PENDING, StageStatus.PROCESSING}
             for receipt in unsatisfied_receipts.values()
         )
-        if not started or not unsatisfied or terminal_unsatisfied:
+        if not started_stages or not unsatisfied or terminal_unsatisfied:
             raise ValueError(
                 "processing requires started and unfinished required work "
                 "with no terminal failure"
