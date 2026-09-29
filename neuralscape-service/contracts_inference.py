@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 import re
-from datetime import date, datetime
+from datetime import date
 from enum import Enum
 from ipaddress import AddressValueError, IPv4Address, IPv6Address
 from typing import Annotated, Any, Literal, Mapping
@@ -39,6 +39,16 @@ _SUPPORTED_OUTPUT_SCHEMA_FORMATS = frozenset(
     }
 )
 _DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$", re.ASCII)
+_TIME_PATTERN = re.compile(
+    r"(?P<hour>[01][0-9]|2[0-3]):"
+    r"(?P<minute>[0-5][0-9]):"
+    r"(?P<second>[0-5][0-9]|60)"
+    r"(?:\.[0-9]+)?"
+    r"(?:[Zz]|(?P<offset_sign>[+-])"
+    r"(?P<offset_hour>[01][0-9]|2[0-3]):"
+    r"(?P<offset_minute>[0-5][0-9]))",
+    re.ASCII,
+)
 
 
 class FallbackGranularity(str, Enum):
@@ -644,7 +654,22 @@ def _is_regex(value: object) -> bool:
 def _is_time(value: object) -> bool:
     if not isinstance(value, str):
         return True
-    return bool(datetime.strptime(value, "%H:%M:%S"))
+    match = _TIME_PATTERN.fullmatch(value)
+    if match is None:
+        return False
+    if match["second"] != "60":
+        return True
+
+    local_minutes = int(match["hour"]) * 60 + int(match["minute"])
+    if match["offset_sign"] is None:
+        offset_minutes = 0
+    else:
+        offset_minutes = (
+            int(match["offset_hour"]) * 60 + int(match["offset_minute"])
+        )
+        if match["offset_sign"] == "-":
+            offset_minutes = -offset_minutes
+    return (local_minutes - offset_minutes) % (24 * 60) == 23 * 60 + 59
 
 
 def _is_uuid(value: object) -> bool:
@@ -655,6 +680,13 @@ def _is_uuid(value: object) -> bool:
 
 
 def _contract_format_checker(format_checker_class: Any) -> Any:
+    """Build candidate-v1's fixed best-effort format assertion subset.
+
+    This is not the complete Draft 2020-12 Format-Assertion vocabulary.
+    In particular, email and idn-email intentionally use jsonschema's minimal
+    at-sign sanity check rather than claiming full RFC mailbox validation.
+    """
+
     checker = format_checker_class(formats=())
     checker.checks("date", raises=ValueError)(_is_date)
     checker.checks("email")(_is_email)

@@ -649,7 +649,7 @@ def test_generation_schema_rejects_unknown_keywords_versions_formats_and_referen
         ("ipv4", "192.0.2.1", "999.0.2.1"),
         ("ipv6", "2001:db8::1", "fe80::1%eth0"),
         ("regex", "^[a-z]+$", "["),
-        ("time", "1:02:03", "24:00:00"),
+        ("time", "01:02:03Z", "1:02:03"),
         (
             "uuid",
             "123e4567-e89b-12d3-a456-426614174000",
@@ -705,6 +705,51 @@ def test_generation_uses_fixed_contract_owned_format_checkers(
 
     with pytest.raises(ValueError, match="unsupported output schema format"):
         generation_request(schema=output_schema(format="private-format"))
+
+
+@pytest.mark.parametrize(
+    ("value", "valid"),
+    [
+        ("08:30:06Z", True),
+        ("08:30:06z", True),
+        ("08:30:06.123456Z", True),
+        ("01:02:03+05:30", True),
+        ("12:34:56-00:00", True),
+        ("23:59:60Z", True),
+        ("01:29:60+01:30", True),
+        ("15:59:60-08:00", True),
+        ("23:29:60+23:30", True),
+        ("1:02:03Z", False),
+        ("01:02:03", False),
+        ("008:030:006Z", False),
+        ("24:00:00Z", False),
+        ("00:60:00Z", False),
+        ("00:00:61Z", False),
+        ("22:59:60Z", False),
+        ("23:58:60Z", False),
+        ("23:59:60+01:00", False),
+        ("00:29:60+01:30", False),
+        ("01:02:03+24:00", False),
+        ("01:02:03+00:60", False),
+        ("01:02:03Z+00:30", False),
+        ("01:02:03,1Z", False),
+        ("01:02:03Z\n", False),
+        ("1২:00:00Z", False),
+    ],
+)
+def test_generation_time_format_uses_rfc3339_full_time(value, valid):
+    schema = output_schema(
+        properties={"time": {"type": "string", "format": "time"}},
+        required=["time"],
+    )
+    request = generation_request(schema=schema)
+    result = generation_result(output={"time": value})
+
+    if valid:
+        assert validate_generation_result(request, result).compliant
+    else:
+        with pytest.raises(ValueError, match="does not match declared schema"):
+            validate_generation_result(request, result)
 
 
 @pytest.mark.parametrize(
