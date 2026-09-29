@@ -21,6 +21,7 @@ from contracts_common import ContractModel, OpaqueId, SafeCounter, VersionedCont
 ChecksumAlgorithm = Literal["sha256"]
 EncryptionMode = Literal["plaintext_authorized_export", "encrypted"]
 ScopeKind = Literal["tenant", "projects"]
+_WINDOWS_FORBIDDEN_COMPONENT_CHARACTERS = frozenset('<>:"|?*')
 
 
 def _reject_retained_unknown_fields(root: BaseModel) -> None:
@@ -101,6 +102,7 @@ def _normalized_bundle_path(value: str) -> str:
     if "\\" in value:
         raise ValueError("bundle path must use POSIX separators")
 
+    raw_components = value.split("/")
     path = PurePosixPath(value)
     if path.is_absolute() or value.startswith("/"):
         raise ValueError("bundle path must be relative")
@@ -112,6 +114,21 @@ def _normalized_bundle_path(value: str) -> str:
         raise ValueError("bundle path must identify a file")
     if PureWindowsPath(normalized).drive:
         raise ValueError("bundle path must not be Windows drive-qualified")
+    for component in raw_components:
+        if component in {"", ".", ".."}:
+            continue
+        if component.endswith((".", " ")):
+            raise ValueError(
+                "bundle path components must not end with a dot or space"
+            )
+        if any(
+            ord(character) < 32
+            or character in _WINDOWS_FORBIDDEN_COMPONENT_CHARACTERS
+            for character in component
+        ):
+            raise ValueError(
+                "bundle path components must not contain Windows-forbidden characters"
+            )
     if any(PureWindowsPath(part).is_reserved() for part in path.parts):
         raise ValueError(
             "bundle path must not contain a Windows reserved device name"
@@ -320,9 +337,11 @@ def validate_portable_manifest(
     """
 
     if isinstance(document, PortableManifest):
-        _reject_retained_unknown_fields(document)
         try:
+            _reject_retained_unknown_fields(document)
             candidate = document.model_dump()
+        except ValidationError:
+            raise
         except (TypeError, ValueError, RecursionError) as exc:
             raise ValidationError.from_exception_data(
                 "PortableManifest",

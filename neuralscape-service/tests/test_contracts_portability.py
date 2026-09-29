@@ -1,5 +1,6 @@
 """Behavioral and adversarial tests for portable manifest validation."""
 
+import sys
 from copy import deepcopy
 
 import pytest
@@ -154,6 +155,69 @@ def test_rejects_windows_reserved_envelope_paths(reserved_path: str) -> None:
 
     with pytest.raises(ValidationError, match="Windows reserved device name"):
         validate_portable_manifest(document)
+
+
+@pytest.mark.parametrize("target", ["file", "envelope"])
+@pytest.mark.parametrize(
+    "invalid_path",
+    [
+        "records.jsonl:payload",
+        "nested/records.jsonl:payload",
+        "nested/<records>.jsonl",
+        'nested/"records".jsonl',
+        "nested/records|backup.jsonl",
+        "nested/records?.jsonl",
+        "nested/records*.jsonl",
+        "nested/control-\x01.jsonl",
+        "nested/control-\x1f.jsonl",
+        "records.jsonl.",
+        "nested/records.jsonl.",
+        "canonical/records.jsonl./",
+        "records.jsonl ",
+        "nested/records.jsonl ",
+        "canonical/archive /./records.jsonl",
+    ],
+)
+def test_rejects_windows_invalid_file_and_envelope_components(
+    target: str,
+    invalid_path: str,
+) -> None:
+    document = valid_manifest()
+    if target == "file":
+        document["files"][0]["path"] = invalid_path
+    else:
+        document["encryption"]["key_envelope_paths"] = [invalid_path]
+
+    with pytest.raises(ValidationError, match="bundle path components"):
+        validate_portable_manifest(document)
+
+
+@pytest.mark.parametrize(
+    ("safe_path", "normalized"),
+    [
+        ("canonical/records.v1.jsonl", "canonical/records.v1.jsonl"),
+        ("canonical/my records.jsonl", "canonical/my records.jsonl"),
+        ("canonical/semi;colon.jsonl", "canonical/semi;colon.jsonl"),
+        ("canonical/equal=name+copy.jsonl", "canonical/equal=name+copy.jsonl"),
+        ("canonical/[records].jsonl", "canonical/[records].jsonl"),
+        ("canonical/.metadata/records", "canonical/.metadata/records"),
+        ("canonical/records：payload.jsonl", "canonical/records：payload.jsonl"),
+        ("canonical/./safe-records.jsonl", "canonical/safe-records.jsonl"),
+        ("canonical//safe-records.jsonl", "canonical/safe-records.jsonl"),
+    ],
+)
+def test_accepts_windows_safe_near_misses_and_normalization(
+    safe_path: str,
+    normalized: str,
+) -> None:
+    document = valid_manifest()
+    document["files"][1]["path"] = safe_path
+    document["encryption"]["key_envelope_paths"] = [safe_path]
+
+    manifest = validate_portable_manifest(document)
+
+    assert manifest.files[1].path == normalized
+    assert manifest.encryption.key_envelope_paths == [normalized]
 
 
 def test_rejects_duplicate_normalized_paths() -> None:
@@ -536,6 +600,19 @@ def test_mapping_input_cycle_is_a_controlled_validation_failure() -> None:
 
     with pytest.raises(ValidationError):
         validate_portable_manifest(document)
+
+
+def test_deep_unchecked_native_container_is_a_controlled_validation_failure() -> None:
+    manifest = validate_portable_manifest(valid_manifest())
+    deeply_nested: object = "leaf"
+    for _ in range(sys.getrecursionlimit() + 100):
+        deeply_nested = [deeply_nested]
+    corrupted = manifest.model_copy(update={"files": deeply_nested})
+
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(corrupted)
+
+    assert isinstance(raised.value.__cause__, RecursionError)
 
 
 def test_unknown_fields_and_missing_schema_version_are_rejected() -> None:
