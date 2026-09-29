@@ -17,6 +17,7 @@ from contracts_freshness import (
     FreshnessWitness,
     ProjectionStatus,
     UpstreamVerificationStatus,
+    VerificationMethod,
     projection_status_for,
 )
 from contracts_references import ReferenceHandle, SourceVersion
@@ -453,10 +454,13 @@ def bundle_matches_reported_evidence(
 
     This checks request correlation, the reported whole-response token count,
     scope and tokenizer basis, a satisfying reported outcome with selected
-    evidence, current temporal labels, and the requested freshness level.  It
-    does not establish deadline compliance, requested applicability,
-    prerequisite fulfillment, authorization, task relevance, or reference and
-    evidence resolution.
+    evidence, current temporal labels, and the requested freshness level.  A
+    true result is a structural match to caller-reported evidence, not proof of
+    upstream truth.  It does not establish deadline compliance, requested
+    applicability, prerequisite fulfillment, authorization, task relevance,
+    or reference and evidence resolution.  Recognized methods whose
+    known-status evidence protocol is deferred cannot satisfy
+    ``current_verified``.
 
     Historical items currently lack an applicability interval or point-in-time
     witness, so this comparison never matches a historical ``as_of`` request.
@@ -496,6 +500,14 @@ def bundle_matches_reported_evidence(
         return all(
             item.freshness.upstream_status is UpstreamVerificationStatus.CURRENT
             and item.freshness.projection.status is ProjectionStatus.CURRENT
+            and all(
+                checkpoint.verification_method
+                not in {
+                    VerificationMethod.CONTENT_DIGEST,
+                    VerificationMethod.CONDITIONAL_READ,
+                }
+                for checkpoint in item.freshness.source_checkpoints
+            )
             for item in bundle.selected_items
         )
     if request.freshness_requirement is FreshnessRequirement.CURRENT_KNOWN:

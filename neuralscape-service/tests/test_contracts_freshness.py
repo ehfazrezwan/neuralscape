@@ -11,6 +11,7 @@ from contracts_freshness import (
     ProjectionStatus,
     SourceCheckpoint,
     UpstreamVerificationStatus,
+    VerificationMethod,
     projection_status_for,
 )
 from contracts_references import SourceVersion
@@ -277,6 +278,95 @@ def test_nonrevision_methods_remain_representable_as_unverified(
 
     assert checkpoint.verification_method.value == verification_method
     assert checkpoint.verification_status is UpstreamVerificationStatus.UNVERIFIED
+
+
+@pytest.mark.parametrize(
+    "verification_method",
+    [
+        "provider_revision",
+        "opaque_cursor",
+        "observation_only",
+        "content_digest",
+        "conditional_read",
+    ],
+)
+@pytest.mark.parametrize(
+    "verification_status",
+    ["current", "stale", "unverified", "unavailable"],
+)
+def test_checkpoint_method_status_support_matrix(
+    verification_method: str,
+    verification_status: str,
+) -> None:
+    markers: dict[str, object] = {
+        "provider_revision": None,
+        "opaque_cursor": None,
+    }
+    if verification_method == "provider_revision":
+        markers["provider_revision"] = "commit-abc"
+    elif verification_method == "opaque_cursor":
+        markers["opaque_cursor"] = "cursor-abc"
+
+    payload = _checkpoint(
+        verification_method=verification_method,
+        verification_status=verification_status,
+        last_successful_verification_at=(
+            EARLIER
+            if verification_status in {"current", "stale"}
+            else None
+        ),
+        **markers,
+    )
+    known_support_is_deferred = (
+        verification_method in {"content_digest", "conditional_read"}
+        and verification_status in {"current", "stale"}
+    )
+
+    if known_support_is_deferred:
+        with pytest.raises(
+            ValidationError,
+            match="cannot claim current or stale until its evidence protocol",
+        ):
+            SourceCheckpoint.model_validate_json(json.dumps(payload))
+        return
+
+    checkpoint = SourceCheckpoint.model_validate_json(json.dumps(payload))
+    assert checkpoint.verification_method.value == verification_method
+    assert checkpoint.verification_status.value == verification_status
+
+
+@pytest.mark.parametrize(
+    "verification_method",
+    [VerificationMethod.CONTENT_DIGEST, VerificationMethod.CONDITIONAL_READ],
+)
+def test_witness_boundary_rejects_copied_unsupported_known_checkpoint(
+    verification_method: VerificationMethod,
+) -> None:
+    witness = FreshnessWitness.model_validate_json(
+        json.dumps(
+            {
+                "upstream_status": "current",
+                "source_checkpoints": [_checkpoint()],
+                "projection": {
+                    "status": "current",
+                    "applied_sources": [_version("source-a", 4)],
+                    "verified_at": NOW,
+                },
+            }
+        )
+    )
+    invalid_checkpoint = witness.source_checkpoints[0].model_copy(
+        update={"verification_method": verification_method}
+    )
+    invalid_witness = witness.model_copy(
+        update={"source_checkpoints": (invalid_checkpoint,)}
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="cannot claim current or stale until its evidence protocol",
+    ):
+        FreshnessWitness.model_validate(invalid_witness)
 
 
 @pytest.mark.parametrize(

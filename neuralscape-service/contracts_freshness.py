@@ -27,7 +27,12 @@ class UpstreamVerificationStatus(str, Enum):
 
 
 class VerificationMethod(str, Enum):
-    """Basis used to check an upstream source."""
+    """Recognized basis used to check an upstream source.
+
+    Recognition does not imply that this candidate can support a known
+    freshness claim for every method.  Methods without reviewed evidence and
+    resolution semantics remain available for truthful weak-status reports.
+    """
 
     PROVIDER_REVISION = "provider_revision"
     OPAQUE_CURSOR = "opaque_cursor"
@@ -61,6 +66,9 @@ class SourceCheckpoint(VersionedContract):
     ordered or compared across sources.  ``observation_only`` is the explicit
     weaker basis for a source that exposes neither kind of version marker.
     Current and known-stale evidence both require a recorded successful check.
+    ``content_digest`` and ``conditional_read`` are recognized methods, but
+    their known-status evidence protocols are deferred in this candidate; they
+    can currently report only ``unverified`` or ``unavailable``.
     """
 
     source: ReferenceHandle
@@ -108,6 +116,18 @@ class SourceCheckpoint(VersionedContract):
             raise ValueError(
                 f"{self.verification_status.value} verification requires "
                 "a successful check time"
+            )
+
+        if self.verification_status in {
+            UpstreamVerificationStatus.CURRENT,
+            UpstreamVerificationStatus.STALE,
+        } and self.verification_method in {
+            VerificationMethod.CONTENT_DIGEST,
+            VerificationMethod.CONDITIONAL_READ,
+        }:
+            raise ValueError(
+                f"{self.verification_method.value} cannot claim current or stale "
+                "until its evidence protocol is supported"
             )
 
         if self.verification_status is UpstreamVerificationStatus.CURRENT:

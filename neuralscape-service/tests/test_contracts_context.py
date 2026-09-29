@@ -18,7 +18,11 @@ from contracts_context import (
     receipt_matches_bundle,
     upstream_degradation_for,
 )
-from contracts_freshness import UpstreamVerificationStatus
+from contracts_freshness import (
+    SourceCheckpoint,
+    UpstreamVerificationStatus,
+    VerificationMethod,
+)
 
 
 NOW = "2026-09-28T12:00:00Z"
@@ -277,6 +281,47 @@ def test_reported_evidence_rejects_stale_upstream_for_current_verified() -> None
     current_bundle = _validate(ContextBundle, _bundle(selected_items=[current_item]))
 
     assert bundle_matches_reported_evidence(request, current_bundle)
+
+
+@pytest.mark.parametrize(
+    "verification_method",
+    [VerificationMethod.CONTENT_DIGEST, VerificationMethod.CONDITIONAL_READ],
+)
+def test_current_verified_rejects_copied_and_constructed_unsupported_methods(
+    verification_method: VerificationMethod,
+) -> None:
+    current_item = _item()
+    freshness = current_item["freshness"]
+    assert isinstance(freshness, dict)
+    freshness["upstream_status"] = "current"
+    checkpoints = freshness["source_checkpoints"]
+    assert isinstance(checkpoints, list)
+    checkpoint_payload = checkpoints[0]
+    assert isinstance(checkpoint_payload, dict)
+    checkpoint_payload["verification_status"] = "current"
+
+    request = _validate(ContextRequest, _request())
+    bundle = _validate(ContextBundle, _bundle(selected_items=[current_item]))
+    item = bundle.selected_items[0]
+    checkpoint = item.freshness.source_checkpoints[0]
+    invalid_checkpoints = (
+        checkpoint.model_copy(update={"verification_method": verification_method}),
+        SourceCheckpoint.model_construct(
+            **{
+                **checkpoint.__dict__,
+                "verification_method": verification_method,
+            }
+        ),
+    )
+
+    for invalid_checkpoint in invalid_checkpoints:
+        invalid_freshness = item.freshness.model_copy(
+            update={"source_checkpoints": (invalid_checkpoint,)}
+        )
+        invalid_item = item.model_copy(update={"freshness": invalid_freshness})
+        invalid_bundle = bundle.model_copy(update={"selected_items": (invalid_item,)})
+
+        assert not bundle_matches_reported_evidence(request, invalid_bundle)
 
 
 @pytest.mark.parametrize(
