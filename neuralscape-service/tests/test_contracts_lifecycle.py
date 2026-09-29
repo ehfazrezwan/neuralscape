@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from pydantic import ValidationError
 
+from contracts_bodies import MEMORY_BODY_ADAPTER, OpaqueEnvelopeBody, PlaintextBody
 from contracts_lifecycle import (
     ApplicabilityScope,
     Intent,
@@ -13,6 +14,7 @@ from contracts_lifecycle import (
     MemoryLifecycle,
     MemoryRecord,
     MemoryRecordKind,
+    OpaqueEnvelopeMemoryBody,
     PlaintextMemoryBody,
     ProcessingStage,
     StageError,
@@ -140,6 +142,92 @@ def test_memory_record_keeps_content_revision_and_policy_epoch_independent() -> 
         "parent-a": 8,
         "parent-b": 2,
     }
+
+
+def test_memory_record_accepts_canonical_body_variants_in_python() -> None:
+    plaintext = memory_record(
+        body=PlaintextMemoryBody(kind="plaintext", text="exact text")
+    )
+    opaque = memory_record(
+        body=OpaqueEnvelopeMemoryBody(
+            kind="opaque_envelope",
+            envelope_id="envelope-1",
+        )
+    )
+
+    assert isinstance(plaintext.body, PlaintextBody)
+    assert plaintext.body.text == "exact text"
+    assert isinstance(opaque.body, OpaqueEnvelopeBody)
+    assert opaque.body.envelope_id == "envelope-1"
+
+
+@pytest.mark.parametrize(
+    ("body", "body_type"),
+    [
+        ({"kind": "plaintext", "text": "wire text"}, PlaintextBody),
+        (
+            {"kind": "opaque_envelope", "envelope_id": "envelope-1"},
+            OpaqueEnvelopeBody,
+        ),
+    ],
+)
+def test_memory_record_accepts_canonical_body_variants_in_json(
+    body: dict[str, object],
+    body_type: type[PlaintextBody] | type[OpaqueEnvelopeBody],
+) -> None:
+    payload = memory_record().model_dump(mode="json")
+    payload["body"] = body
+
+    record = MemoryRecord.model_validate_json(json.dumps(payload))
+
+    assert isinstance(record.body, body_type)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"kind": "plaintext", "text": "readable", "envelope_id": "env-1"},
+        {"kind": "opaque_envelope", "envelope_id": "env-1", "text": "leak"},
+        {"kind": "encrypted", "envelope_id": "env-1"},
+    ],
+)
+def test_memory_record_rejects_mixed_or_legacy_body_shapes(
+    body: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        memory_record(body=body)
+
+    payload = memory_record().model_dump(mode="json")
+    payload["body"] = body
+    with pytest.raises(ValidationError):
+        MemoryRecord.model_validate_json(json.dumps(payload))
+
+
+def test_memory_record_revalidates_unchecked_body_copy() -> None:
+    valid = PlaintextBody(kind="plaintext", text="body")
+    unchecked = valid.model_copy(update={"text": ""})
+
+    with pytest.raises(ValidationError, match="at least 1 character"):
+        memory_record(body=unchecked)
+
+
+def test_lifecycle_body_schema_is_the_canonical_producer_schema() -> None:
+    assert PlaintextMemoryBody is PlaintextBody
+    assert OpaqueEnvelopeMemoryBody is OpaqueEnvelopeBody
+
+    producer_schema = MEMORY_BODY_ADAPTER.json_schema()
+    record_schema = MemoryRecord.model_json_schema()
+    record_body_union = record_schema["properties"]["body"]["anyOf"][0]
+    assert record_body_union == {
+        "discriminator": producer_schema["discriminator"],
+        "oneOf": producer_schema["oneOf"],
+    }
+    for definition in ("PlaintextBody", "OpaqueEnvelopeBody"):
+        assert record_schema["$defs"][definition] == producer_schema["$defs"][
+            definition
+        ]
+    assert "PlaintextMemoryBody" not in record_schema["$defs"]
+    assert "EncryptedMemoryBody" not in record_schema["$defs"]
 
 
 def test_record_rejects_scope_mismatch_and_body_after_erasure() -> None:

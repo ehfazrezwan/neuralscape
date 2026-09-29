@@ -8,10 +8,11 @@ projection.  Callers must establish those runtime properties separately.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Annotated, Literal, TypeVar
+from typing import Annotated, TypeVar
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
+from contracts_bodies import MemoryBody, OpaqueEnvelopeBody, PlaintextBody
 from contracts_common import ContractModel, OpaqueId, SafeCounter, VersionedContract
 from contracts_references import ReferenceHandle, SourceVersion
 
@@ -101,22 +102,8 @@ class ApplicabilityScope(str, Enum):
     WORKSPACE = "workspace"
 
 
-class PlaintextMemoryBody(ContractModel):
-    kind: Literal["plaintext"]
-    text: Annotated[str, Field(min_length=1)]
-
-
-class EncryptedMemoryBody(ContractModel):
-    """Opaque reference only; this model makes no cryptographic claim."""
-
-    kind: Literal["encrypted"]
-    envelope_id: OpaqueId
-
-
-MemoryBody = Annotated[
-    PlaintextMemoryBody | EncryptedMemoryBody,
-    Field(discriminator="kind"),
-]
+PlaintextMemoryBody = PlaintextBody
+OpaqueEnvelopeMemoryBody = OpaqueEnvelopeBody
 
 
 class MemoryRecord(VersionedContract):
@@ -504,12 +491,12 @@ def _require_unique_source_ids(sources: tuple[SourceVersion, ...], field: str) -
 
 __all__ = [
     "ApplicabilityScope",
-    "EncryptedMemoryBody",
     "Intent",
     "IntentStatus",
     "MemoryLifecycle",
     "MemoryRecord",
     "MemoryRecordKind",
+    "OpaqueEnvelopeMemoryBody",
     "PlaintextMemoryBody",
     "ProcessingStage",
     "StageError",
