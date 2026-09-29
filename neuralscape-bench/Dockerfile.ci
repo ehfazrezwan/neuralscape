@@ -1,0 +1,50 @@
+# syntax=docker/dockerfile:1.7
+
+ARG PYTHON_IMAGE=python:3.11-slim
+
+FROM ${PYTHON_IMAGE} AS wheel-builder
+
+WORKDIR /build
+COPY pyproject.toml README.md ./
+COPY neuralscape_bench ./neuralscape_bench
+COPY icebench ./icebench
+
+RUN python -m pip install --no-cache-dir build \
+    && python -m build --wheel --outdir /tmp/wheels \
+    && test "$(find /tmp/wheels -maxdepth 1 -name 'neuralscape_bench-*.whl' | wc -l)" -eq 1
+
+
+FROM ${PYTHON_IMAGE} AS runtime
+
+ARG PYTHON_IMAGE
+ARG VCS_REF=unknown
+LABEL org.opencontainers.image.base.name="${PYTHON_IMAGE}" \
+      org.opencontainers.image.revision="${VCS_REF}"
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+COPY --from=wheel-builder /tmp/wheels/neuralscape_bench-*.whl /tmp/wheels/
+RUN python -m pip install --no-cache-dir /tmp/wheels/neuralscape_bench-*.whl \
+    && rm -rf /tmp/wheels
+COPY scripts/ci_wheel_smoke.py /usr/local/libexec/ci_wheel_smoke.py
+
+WORKDIR /tmp
+CMD ["python", "/usr/local/libexec/ci_wheel_smoke.py"]
+
+
+FROM runtime AS test
+
+RUN python -m pip install --no-cache-dir \
+    "pytest>=8.0.0" \
+    "pytest-asyncio>=0.23.0"
+
+# Only tests and their fixtures are copied. Package imports must resolve from
+# the wheel installed in the runtime stage, never from a source checkout.
+COPY tests /test-suite/tests
+COPY icebench/tests /test-suite/icebench/tests
+COPY icebench/trackq/tests /test-suite/icebench/trackq/tests
+COPY icebench/tokensave/tests /test-suite/icebench/tokensave/tests
+
+WORKDIR /test-suite
+CMD ["sh", "-c", "set -eu; python -m pytest -q -p no:cacheprovider --import-mode=importlib --strict-config --strict-markers --junitxml=/tmp/bench-junit.xml tests icebench/tests icebench/trackq/tests icebench/tokensave/tests; python /usr/local/libexec/ci_wheel_smoke.py --assert-junit /tmp/bench-junit.xml"]
