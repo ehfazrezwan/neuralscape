@@ -356,6 +356,14 @@ def _validate_transition(predecessor: UsageEvent, successor: UsageEvent) -> None
             raise UsageReconciliationError(
                 "invalid_transition", "a terminal attempt outcome cannot change"
             )
+    if (
+        successor.late_after_cancellation
+        and predecessor.attempt_outcome != "cancelled"
+    ):
+        raise UsageReconciliationError(
+            "invalid_transition",
+            "late usage requires a predecessor recording cancellation",
+        )
     if predecessor.late_after_cancellation and not successor.late_after_cancellation:
         raise UsageReconciliationError(
             "invalid_transition", "late-after-cancellation attribution cannot be removed"
@@ -398,8 +406,10 @@ def reconcile_usage_events(events: Iterable[UsageEvent]) -> UsageReconciliation:
 
     Exact repeats of an event ID are idempotent.  A repeated ID with different
     content, an unknown predecessor, a correction cycle, a branch, or a
-    correction across correlation fields is invalid.  The function has no I/O
-    and produces the same result regardless of input ordering.
+    correction across correlation fields is invalid.  A late-usage marker must
+    follow an event recording cancellation and cannot originate on a stream
+    root.  The function has no I/O and produces the same result regardless of
+    input ordering.
     """
 
     by_id: dict[str, UsageEvent] = {}
@@ -423,6 +433,15 @@ def reconcile_usage_events(events: Iterable[UsageEvent]) -> UsageReconciliation:
     if len(tenant_ids) > 1:
         raise UsageReconciliationError(
             "mixed_tenants", "one reconciliation cannot combine tenant ledgers"
+        )
+
+    if any(
+        event.predecessor_event_id is None and event.late_after_cancellation
+        for event in by_id.values()
+    ):
+        raise UsageReconciliationError(
+            "invalid_transition",
+            "late usage requires a predecessor recording cancellation",
         )
 
     successor_by_id: dict[str, str] = {}

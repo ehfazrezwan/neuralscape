@@ -668,6 +668,96 @@ def test_late_usage_after_cancellation_replaces_unavailable_observation() -> Non
     assert result.streams[0].total_tokens == 15
 
 
+def test_late_marker_is_rejected_on_correction_chain_root() -> None:
+    fabricated_root = _event(
+        attempt_outcome="cancelled",
+        late_after_cancellation=True,
+    )
+
+    assert _error_code([fabricated_root]) == "invalid_transition"
+
+
+def test_late_marker_requires_recorded_predecessor_cancellation() -> None:
+    pending = _event(
+        event_id="pending",
+        status="pending",
+        attempt_outcome="in_progress",
+        usage=None,
+    )
+    fabricated_late = _event(
+        event_id="fabricated-late",
+        predecessor_event_id="pending",
+        attempt_outcome="cancelled",
+        late_after_cancellation=True,
+    )
+
+    assert _error_code([fabricated_late, pending]) == "invalid_transition"
+
+
+def test_valid_late_chain_is_order_independent_and_duplicate_idempotent() -> None:
+    pending = _event(
+        event_id="pending",
+        status="pending",
+        attempt_outcome="in_progress",
+        usage=None,
+    )
+    cancelled = _event(
+        event_id="cancelled",
+        predecessor_event_id="pending",
+        status="unavailable",
+        attempt_outcome="cancelled",
+        usage=None,
+        usage_missing_reason="not_yet_reported",
+    )
+    late = _event(
+        event_id="late",
+        predecessor_event_id="cancelled",
+        attempt_outcome="cancelled",
+        late_after_cancellation=True,
+    )
+    corrected = _event(
+        event_id="corrected",
+        predecessor_event_id="late",
+        attempt_outcome="cancelled",
+        late_after_cancellation=True,
+        usage=_usage(input_tokens=12),
+    )
+
+    forward_with_duplicate = reconcile_usage_events(
+        [pending, cancelled, late, corrected, corrected]
+    )
+    reverse = reconcile_usage_events([corrected, late, cancelled, pending])
+
+    assert forward_with_duplicate == reverse
+    assert reverse.streams[0].head_event_id == "corrected"
+    assert reverse.streams[0].late_after_cancellation is True
+    assert reverse.streams[0].total_tokens == 17
+
+
+def test_late_marker_cannot_be_removed_by_later_correction() -> None:
+    cancelled = _event(
+        event_id="cancelled",
+        status="unavailable",
+        attempt_outcome="cancelled",
+        usage=None,
+        usage_missing_reason="not_yet_reported",
+    )
+    late = _event(
+        event_id="late",
+        predecessor_event_id="cancelled",
+        attempt_outcome="cancelled",
+        late_after_cancellation=True,
+    )
+    removed = _event(
+        event_id="removed",
+        predecessor_event_id="late",
+        attempt_outcome="cancelled",
+        late_after_cancellation=False,
+    )
+
+    assert _error_code([removed, late, cancelled]) == "invalid_transition"
+
+
 def test_late_usage_after_cancellation_must_remain_explicit() -> None:
     unavailable = _event(
         event_id="cancelled",
