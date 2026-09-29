@@ -311,6 +311,55 @@ def test_revalidating_instance_rejects_mutated_missing_envelope_file() -> None:
         validate_portable_manifest(manifest)
 
 
+def test_mixed_mapping_rejects_nested_manifest_file_with_unsafe_path() -> None:
+    manifest = validate_portable_manifest(valid_manifest())
+    document = manifest.model_dump()
+    invalid_file = manifest.files[0].model_copy(update={"path": "../escaped"})
+    document["files"][0] = invalid_file
+
+    assert invalid_file.path == "../escaped"
+    with pytest.raises(ValidationError, match="bundle path"):
+        validate_portable_manifest(document)
+
+
+def test_mixed_mapping_rejects_nested_manifest_file_with_retained_extra() -> None:
+    manifest = validate_portable_manifest(valid_manifest())
+    document = manifest.model_dump()
+    invalid_file = manifest.files[0].model_copy(
+        update={"future_entry_semantics": "deny"}
+    )
+    document["files"][0] = invalid_file
+
+    assert invalid_file.__dict__["future_entry_semantics"] == "deny"
+    assert "future_entry_semantics" in invalid_file.model_fields_set
+    with pytest.raises(ValidationError, match="future_entry_semantics"):
+        validate_portable_manifest(document)
+
+
+@pytest.mark.parametrize("nested_kind", ["producer", "checksum", "scope"])
+def test_mixed_mapping_rejects_other_invalid_nested_models(
+    nested_kind: str,
+) -> None:
+    manifest = validate_portable_manifest(valid_manifest())
+    document = manifest.model_dump()
+
+    if nested_kind == "producer":
+        invalid_node = manifest.producer.model_copy(update={"implementation": ""})
+        document["producer"] = invalid_node
+        error = "implementation"
+    elif nested_kind == "checksum":
+        invalid_node = manifest.files[0].checksum.model_copy(update={"digest": "bad"})
+        document["files"][0]["checksum"] = invalid_node
+        error = "digest"
+    else:
+        invalid_node = manifest.scope.model_copy(update={"tenant_id": ""})
+        document["scope"] = invalid_node
+        error = "tenant_id"
+
+    with pytest.raises(ValidationError, match=error):
+        validate_portable_manifest(document)
+
+
 @pytest.mark.parametrize(
     "location",
     [
