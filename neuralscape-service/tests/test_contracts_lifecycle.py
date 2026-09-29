@@ -322,6 +322,30 @@ def test_record_rejects_duplicate_required_parent_witnesses(
         memory_record(required_parents=parents)
 
 
+@pytest.mark.parametrize(
+    ("field_name", "replacement"),
+    [
+        ("lifecycle", MemoryLifecycle.ERASED),
+        ("applicability", ApplicabilityScope.PROJECT),
+        ("project_id", "project-1"),
+        ("workspace_id", "workspace-1"),
+    ],
+)
+def test_memory_record_is_an_immutable_canonical_snapshot(
+    field_name: str,
+    replacement: object,
+) -> None:
+    record = memory_record()
+
+    with pytest.raises(ValidationError, match="frozen"):
+        setattr(record, field_name, replacement)
+
+    assert record.lifecycle is MemoryLifecycle.ACTIVE
+    assert record.applicability is ApplicabilityScope.GLOBAL
+    assert record.project_id is None
+    assert record.workspace_id is None
+
+
 def test_intent_rejects_empty_or_duplicate_required_stages() -> None:
     with pytest.raises(ValidationError, match="required_stages must not be empty"):
         intent()
@@ -639,6 +663,19 @@ def test_legal_transitions_are_forward_only_and_terminal_states_stay_terminal() 
     assert not is_legal_intent_transition(IntentStatus.SUPERSEDED, IntentStatus.APPLIED)
 
 
+def test_transition_helper_accepts_canonical_native_and_json_statuses() -> None:
+    assert is_legal_intent_transition(
+        IntentStatus.ACCEPTED,
+        IntentStatus.PROCESSING,
+    )
+
+    current = IntentStatus(json.loads('"processing"'))
+    target = IntentStatus(json.loads('"applied"'))
+    assert current is IntentStatus.PROCESSING
+    assert target is IntentStatus.APPLIED
+    assert is_legal_intent_transition(current, target)
+
+
 @pytest.mark.parametrize(
     ("current", "target"),
     [
@@ -656,6 +693,32 @@ def test_transition_helper_rejects_non_native_statuses(
             current,
             target,
         )
+
+
+@pytest.mark.parametrize(
+    ("position", "raw"),
+    [
+        ("current", "accepted"),
+        ("current", "unknown"),
+        ("target", "processing"),
+        ("target", "unknown"),
+    ],
+)
+def test_transition_helper_rejects_forged_exact_type_statuses(
+    position: str,
+    raw: str,
+) -> None:
+    forged = str.__new__(IntentStatus, raw)
+    forged._name_ = "FORGED"
+    forged._value_ = raw
+
+    assert type(forged) is IntentStatus
+    assert not any(forged is member for member in IntentStatus)
+
+    current = forged if position == "current" else IntentStatus.ACCEPTED
+    target = forged if position == "target" else IntentStatus.PROCESSING
+    with pytest.raises(TypeError, match=f"{position} must be an IntentStatus"):
+        is_legal_intent_transition(current, target)
 
 
 def test_stale_content_revision_or_policy_epoch_never_matches() -> None:

@@ -107,7 +107,9 @@ OpaqueEnvelopeMemoryBody = OpaqueEnvelopeBody
 
 
 class MemoryRecord(VersionedContract):
-    """Stable canonical memory identity, distinct from every projection."""
+    """Frozen canonical memory identity, distinct from every projection."""
+
+    model_config = ConfigDict(frozen=True)
 
     id: OpaqueId
     tenant_id: OpaqueId
@@ -302,9 +304,13 @@ _LEGAL_INTENT_TRANSITIONS: dict[IntentStatus, frozenset[IntentStatus]] = {
 def is_legal_intent_transition(current: IntentStatus, target: IntentStatus) -> bool:
     """Return whether one persisted intent state may advance to another."""
 
-    if not isinstance(current, IntentStatus):
+    if type(current) is not IntentStatus or not any(
+        current is member for member in IntentStatus
+    ):
         raise TypeError("current must be an IntentStatus")
-    if not isinstance(target, IntentStatus):
+    if type(target) is not IntentStatus or not any(
+        target is member for member in IntentStatus
+    ):
         raise TypeError("target must be an IntentStatus")
     return target in _LEGAL_INTENT_TRANSITIONS[current]
 
