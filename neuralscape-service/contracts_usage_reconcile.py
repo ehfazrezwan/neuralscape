@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, model_validator
@@ -351,14 +351,36 @@ def _validate_transition(predecessor: UsageEvent, successor: UsageEvent) -> None
             "invalid_transition", "late-after-cancellation attribution cannot be removed"
         )
     if (
-        predecessor.status == "unavailable"
-        and predecessor.attempt_outcome == "cancelled"
+        predecessor.attempt_outcome == "cancelled"
         and successor.status == "final"
         and not successor.late_after_cancellation
     ):
         raise UsageReconciliationError(
             "invalid_transition", "late usage after cancellation must remain explicit"
         )
+
+
+def _validate_no_correction_cycles(
+    by_id: Mapping[str, UsageEvent],
+) -> None:
+    """Reject cycles while resolving every event at most once."""
+
+    resolved: set[str] = set()
+    for start_id in by_id:
+        if start_id in resolved:
+            continue
+
+        path: set[str] = set()
+        current_id: str | None = start_id
+        while current_id is not None and current_id not in resolved:
+            if current_id in path:
+                raise UsageReconciliationError(
+                    "correction_cycle",
+                    f"correction chain containing {current_id} cycles",
+                )
+            path.add(current_id)
+            current_id = by_id[current_id].predecessor_event_id
+        resolved.update(path)
 
 
 def reconcile_usage_events(events: Iterable[UsageEvent]) -> UsageReconciliation:
@@ -413,16 +435,7 @@ def reconcile_usage_events(events: Iterable[UsageEvent]) -> UsageReconciliation:
         _validate_transition(predecessor, event)
 
     # Check cycles independently of input order, including multi-event cycles.
-    for start_id in by_id:
-        seen: set[str] = set()
-        current_id: str | None = start_id
-        while current_id is not None:
-            if current_id in seen:
-                raise UsageReconciliationError(
-                    "correction_cycle", f"correction chain containing {current_id} cycles"
-                )
-            seen.add(current_id)
-            current_id = by_id[current_id].predecessor_event_id
+    _validate_no_correction_cycles(by_id)
 
     roots_by_stream: dict[tuple[object, ...], list[UsageEvent]] = {}
     for event in by_id.values():

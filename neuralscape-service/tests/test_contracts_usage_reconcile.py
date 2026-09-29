@@ -7,6 +7,7 @@ from itertools import permutations
 import pytest
 from pydantic import ValidationError
 
+import contracts_usage_reconcile as usage_reconcile_contracts
 from contracts_usage import AttributionSnapshot, TokenQuantity, TokenUsage, UsageEvent
 from contracts_usage_reconcile import (
     ReconciledLedger,
@@ -415,6 +416,33 @@ def test_correction_cycle_is_invalid() -> None:
     assert _error_code([first, second]) == "correction_cycle"
 
 
+def test_cycle_validation_visits_each_event_once_for_long_valid_chain() -> None:
+    class CountingEventMap(dict[str, UsageEvent]):
+        reads = 0
+
+        def __getitem__(self, event_id: str) -> UsageEvent:
+            self.reads += 1
+            return super().__getitem__(event_id)
+
+    chain_length = 128
+    events = CountingEventMap()
+    predecessor_id = None
+    for index in range(chain_length):
+        event_id = f"event-{index}"
+        events[event_id] = _event(
+            event_id=event_id,
+            predecessor_event_id=predecessor_id,
+            status="pending",
+            attempt_outcome="in_progress",
+            usage=None,
+        )
+        predecessor_id = event_id
+
+    usage_reconcile_contracts._validate_no_correction_cycles(events)
+
+    assert events.reads == chain_length
+
+
 def test_branched_correction_is_invalid() -> None:
     root = _event(event_id="root", status="pending", attempt_outcome="in_progress", usage=None)
     first = _event(event_id="first", predecessor_event_id="root")
@@ -521,3 +549,73 @@ def test_late_usage_after_cancellation_must_remain_explicit() -> None:
         attempt_outcome="cancelled",
     )
     assert _error_code([unavailable, incorrectly_final]) == "invalid_transition"
+
+
+def test_final_usage_after_pending_cancellation_must_be_explicit() -> None:
+    cancelled = _event(
+        event_id="cancelled",
+        status="pending",
+        attempt_outcome="cancelled",
+        usage=None,
+    )
+    incorrectly_final = _event(
+        event_id="late",
+        predecessor_event_id="cancelled",
+        attempt_outcome="cancelled",
+    )
+
+    assert _error_code([incorrectly_final, cancelled]) == "invalid_transition"
+
+
+def test_explicit_final_usage_after_pending_cancellation_is_retained() -> None:
+    cancelled = _event(
+        event_id="cancelled",
+        status="pending",
+        attempt_outcome="cancelled",
+        usage=None,
+    )
+    late = _event(
+        event_id="late",
+        predecessor_event_id="cancelled",
+        attempt_outcome="cancelled",
+        late_after_cancellation=True,
+    )
+
+    result = reconcile_usage_events([late, cancelled])
+
+    assert result.streams[0].head_event_id == "late"
+    assert result.streams[0].late_after_cancellation is True
+
+
+def test_final_cancellation_correction_requires_explicit_late_marker() -> None:
+    cancelled = _event(
+        event_id="cancelled",
+        attempt_outcome="cancelled",
+    )
+    nonexplicit_correction = _event(
+        event_id="nonexplicit",
+        predecessor_event_id="cancelled",
+        attempt_outcome="cancelled",
+    )
+    explicit_correction = _event(
+        event_id="explicit",
+        predecessor_event_id="cancelled",
+        attempt_outcome="cancelled",
+        late_after_cancellation=True,
+    )
+
+    assert _error_code([cancelled, nonexplicit_correction]) == "invalid_transition"
+    result = reconcile_usage_events([cancelled, explicit_correction])
+    assert result.streams[0].head_event_id == "explicit"
+    assert result.streams[0].late_after_cancellation is True
+
+
+def test_independent_final_cancelled_root_does_not_infer_late_usage() -> None:
+    independent = _event(
+        attempt_outcome="cancelled",
+        late_after_cancellation=False,
+    )
+
+    result = reconcile_usage_events([independent])
+
+    assert result.streams[0].late_after_cancellation is False
