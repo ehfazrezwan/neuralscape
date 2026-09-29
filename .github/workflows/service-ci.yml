@@ -150,6 +150,7 @@ jobs:
               python -c "import sys; assert sys.version_info[:2] == (3, 10), sys.version"
               python -m pip install --disable-pip-version-check --no-cache-dir \
                 "pydantic-settings>=2.0.0" \
+                "idna>=3.11,<4" \
                 "jsonschema>=4.26.0,<5" \
                 "pytest>=8.0.0"
               python -c "import contracts_common, contracts_references, contracts_engines, contracts_inference"
