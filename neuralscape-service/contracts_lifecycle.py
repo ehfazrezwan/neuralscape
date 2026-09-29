@@ -8,9 +8,16 @@ projection.  Callers must establish those runtime properties separately.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Annotated, TypeVar
+from typing import Annotated, Literal, TypeVar
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from contracts_bodies import MemoryBody, OpaqueEnvelopeBody, PlaintextBody
 from contracts_common import ContractModel, OpaqueId, SafeCounter, VersionedContract
@@ -162,6 +169,39 @@ class ProcessingStage(str, Enum):
     MARKDOWN = "markdown"
 
 
+class StageEvidenceRequirement(ContractModel):
+    """Declared evidence required for one processing-stage effect."""
+
+    model_config = ConfigDict(frozen=True)
+
+    stage: ProcessingStage
+    effect_id: OpaqueId
+    precondition_source_ids: tuple[OpaqueId, ...]
+    upstream_stages: tuple[ProcessingStage, ...]
+    committed_sources: tuple[SourceVersion, ...]
+    minimum_output_refs: Literal[0, 1]
+
+    @field_validator("minimum_output_refs", mode="before")
+    @classmethod
+    def validate_native_output_minimum(cls, value: object) -> object:
+        if type(value) is not int or value not in {0, 1}:
+            raise ValueError("minimum_output_refs must be the native integer 0 or 1")
+        return value
+
+    @model_validator(mode="after")
+    def validate_requirement_semantics(self) -> StageEvidenceRequirement:
+        if len(set(self.precondition_source_ids)) != len(
+            self.precondition_source_ids
+        ):
+            raise ValueError("precondition_source_ids must not contain duplicates")
+        if len(set(self.upstream_stages)) != len(self.upstream_stages):
+            raise ValueError("upstream_stages must not contain duplicates")
+        if self.stage in self.upstream_stages:
+            raise ValueError("a stage cannot depend on itself")
+        _require_unique_source_ids(self.committed_sources, "committed_sources")
+        return self
+
+
 class Intent(VersionedContract):
     """Frozen validated command data; construction is not durable acceptance.
 
@@ -179,18 +219,50 @@ class Intent(VersionedContract):
     target_refs: tuple[ReferenceHandle, ...]
     request_digest: Annotated[str, Field(min_length=1, max_length=512)]
     idempotency_key: OpaqueId
-    expected_sources: tuple[SourceVersion, ...]
-    required_stages: tuple[ProcessingStage, ...]
+    source_preconditions: tuple[SourceVersion, ...]
+    stage_requirements: tuple[StageEvidenceRequirement, ...]
     correlation_id: OpaqueId
     accepted_at: AwareDatetime
 
     @model_validator(mode="after")
-    def validate_required_stages(self) -> Intent:
-        if not self.required_stages:
-            raise ValueError("required_stages must not be empty")
-        if len(set(self.required_stages)) != len(self.required_stages):
-            raise ValueError("required_stages must not contain duplicates")
-        _require_unique_source_ids(self.expected_sources, "expected_sources")
+    def validate_stage_requirements(self) -> Intent:
+        _require_unique_source_ids(self.source_preconditions, "source_preconditions")
+        if not self.stage_requirements:
+            raise ValueError("stage_requirements must not be empty")
+
+        requirements = {item.stage: item for item in self.stage_requirements}
+        if len(requirements) != len(self.stage_requirements):
+            raise ValueError("stage_requirements must not contain duplicate stages")
+        if len({item.effect_id for item in self.stage_requirements}) != len(
+            self.stage_requirements
+        ):
+            raise ValueError(
+                "stage_requirements must not contain duplicate effect_id values"
+            )
+
+        preconditions = {item.record_id: item for item in self.source_preconditions}
+        for requirement in self.stage_requirements:
+            if set(requirement.precondition_source_ids) - set(preconditions):
+                raise ValueError(
+                    "precondition_source_ids must select declared source_preconditions"
+                )
+            if set(requirement.upstream_stages) - set(requirements):
+                raise ValueError(
+                    "upstream_stages must select declared stage_requirements"
+                )
+
+            calculated_ids = list(requirement.precondition_source_ids)
+            for upstream_stage in requirement.upstream_stages:
+                calculated_ids.extend(
+                    item.record_id
+                    for item in requirements[upstream_stage].committed_sources
+                )
+            if len(calculated_ids) != len(set(calculated_ids)):
+                raise ValueError(
+                    "calculated stage inputs must not contain record_id collisions"
+                )
+
+        _topological_stages(requirements)
         return self
 
 
@@ -224,8 +296,10 @@ class StageReceipt(VersionedContract):
     intent_id: OpaqueId
     attempt: SafeCounter
     stage: ProcessingStage
+    effect_id: OpaqueId
     status: StageStatus
     applied_sources: tuple[SourceVersion, ...]
+    committed_sources: tuple[SourceVersion, ...]
     output_refs: tuple[ReferenceHandle, ...]
     error: StageError | None
     started_at: AwareDatetime | None
@@ -236,6 +310,8 @@ class StageReceipt(VersionedContract):
         if self.attempt < 1:
             raise ValueError("attempt must be at least 1")
         _require_unique_source_ids(self.applied_sources, "applied_sources")
+        _require_unique_source_ids(self.committed_sources, "committed_sources")
+        _require_unique_reference_handles(self.output_refs, "output_refs")
 
         terminal = self.status in {
             StageStatus.APPLIED,
@@ -251,8 +327,12 @@ class StageReceipt(VersionedContract):
         if self.status is StageStatus.PENDING:
             if self.started_at is not None:
                 raise ValueError("pending stage receipts cannot have started_at")
-            if self.applied_sources or self.output_refs:
+            if self.applied_sources or self.committed_sources or self.output_refs:
                 raise ValueError("pending stage receipts cannot carry result fields")
+        if self.status is not StageStatus.APPLIED and self.committed_sources:
+            raise ValueError(
+                "only applied stage receipts may carry committed_sources"
+            )
         if self.status is StageStatus.PROCESSING and self.started_at is None:
             raise ValueError("processing stage receipts require started_at")
         if self.status in {StageStatus.APPLIED, StageStatus.FAILED}:
@@ -350,10 +430,11 @@ def validate_required_stage_claim(
     boundary therefore materializes every stored field and revalidates each
     complete nested graph before inspecting it.
 
-    Every applied receipt for a required stage must match the intent's complete
-    source revision/epoch set.  Once matching applied evidence exists, that
-    stage remains satisfied; greatest-attempt state describes only stages that
-    remain unsatisfied.
+    Every applied receipt for a required stage must match its declared effect,
+    calculated inputs, committed generations, output minimum, and upstream
+    support.  Once matching applied evidence exists, that stage remains
+    satisfied; greatest-attempt state describes only stages that remain
+    unsatisfied.
 
     A non-null ``started_at`` on any historical required-stage receipt is
     monotonic evidence that work started.  Greatest-attempt state still decides
@@ -372,11 +453,15 @@ def validate_required_stage_claim(
     intent = _revalidated_model(Intent, intent)
     receipts = tuple(_revalidated_model(StageReceipt, receipt) for receipt in receipts)
 
-    required = set(intent.required_stages)
+    requirements = {item.stage: item for item in intent.stage_requirements}
+    required = set(requirements)
     latest_attempts: dict[ProcessingStage, int] = {}
     for receipt in receipts:
         if receipt.intent_id != intent.id:
             raise ValueError("stage receipt belongs to a different intent")
+        requirement = requirements.get(receipt.stage)
+        if requirement is not None and receipt.effect_id != requirement.effect_id:
+            raise ValueError("required-stage receipt must match its declared effect_id")
         previous_attempt = latest_attempts.get(receipt.stage)
         if previous_attempt is None or receipt.attempt > previous_attempt:
             latest_attempts[receipt.stage] = receipt.attempt
@@ -405,14 +490,51 @@ def validate_required_stage_claim(
 
     required_receipts = {stage: latest.get(stage) for stage in required}
     satisfied: set[ProcessingStage] = set()
+    applied_by_stage: dict[ProcessingStage, list[StageReceipt]] = {
+        stage: [] for stage in required
+    }
     for receipt in receipts:
-        if receipt.stage not in required or receipt.status is not StageStatus.APPLIED:
-            continue
-        if not _source_sets_match(intent.expected_sources, receipt.applied_sources):
-            raise ValueError(
-                "applied required-stage receipts must match expected sources"
-            )
-        satisfied.add(receipt.stage)
+        if receipt.stage in required and receipt.status is StageStatus.APPLIED:
+            applied_by_stage[receipt.stage].append(receipt)
+
+    for stage in _topological_stages(requirements):
+        requirement = requirements[stage]
+        stage_applications = applied_by_stage[stage]
+        for receipt in stage_applications:
+            expected_inputs = _expected_stage_inputs(intent, requirement, requirements)
+            if not _source_sets_match(expected_inputs, receipt.applied_sources):
+                raise ValueError(
+                    "applied required-stage receipt must match calculated inputs"
+                )
+            if not _source_sets_match(
+                requirement.committed_sources, receipt.committed_sources
+            ):
+                raise ValueError(
+                    "applied required-stage receipt must match committed_sources"
+                )
+            if len(receipt.output_refs) < requirement.minimum_output_refs:
+                raise ValueError(
+                    "applied required-stage receipt does not meet minimum_output_refs"
+                )
+            if not set(requirement.upstream_stages) <= satisfied:
+                raise ValueError(
+                    "applied required-stage receipt requires upstream applied support"
+                )
+        if stage_applications:
+            first = stage_applications[0]
+            for receipt in stage_applications[1:]:
+                if not (
+                    _source_sets_match(first.applied_sources, receipt.applied_sources)
+                    and _source_sets_match(
+                        first.committed_sources, receipt.committed_sources
+                    )
+                    and _reference_sets_match(first.output_refs, receipt.output_refs)
+                ):
+                    raise ValueError(
+                        "applied receipts for a stage must report consistent "
+                        "result sets"
+                    )
+            satisfied.add(stage)
 
     started_stages = {
         receipt.stage
@@ -526,6 +648,61 @@ def _source_sets_match(
     )
 
 
+def _reference_sets_match(
+    expected: tuple[ReferenceHandle, ...],
+    observed: tuple[ReferenceHandle, ...],
+) -> bool:
+    return len(expected) == len(observed) and all(
+        any(item == candidate for candidate in observed) for item in expected
+    )
+
+
+def _require_unique_reference_handles(
+    references: tuple[ReferenceHandle, ...], field: str
+) -> None:
+    for index, reference in enumerate(references):
+        if any(reference == prior for prior in references[:index]):
+            raise ValueError(f"{field} must not contain duplicate handles")
+
+
+def _topological_stages(
+    requirements: dict[ProcessingStage, StageEvidenceRequirement],
+) -> tuple[ProcessingStage, ...]:
+    visiting: set[ProcessingStage] = set()
+    visited: set[ProcessingStage] = set()
+    ordered: list[ProcessingStage] = []
+
+    def visit(stage: ProcessingStage) -> None:
+        if stage in visiting:
+            raise ValueError("stage_requirements upstream graph must be acyclic")
+        if stage in visited:
+            return
+        visiting.add(stage)
+        for upstream in sorted(
+            requirements[stage].upstream_stages, key=lambda item: item.value
+        ):
+            visit(upstream)
+        visiting.remove(stage)
+        visited.add(stage)
+        ordered.append(stage)
+
+    for stage in sorted(requirements, key=lambda item: item.value):
+        visit(stage)
+    return tuple(ordered)
+
+
+def _expected_stage_inputs(
+    intent: Intent,
+    requirement: StageEvidenceRequirement,
+    requirements: dict[ProcessingStage, StageEvidenceRequirement],
+) -> tuple[SourceVersion, ...]:
+    preconditions = {item.record_id: item for item in intent.source_preconditions}
+    selected = [preconditions[item] for item in requirement.precondition_source_ids]
+    for upstream in requirement.upstream_stages:
+        selected.extend(requirements[upstream].committed_sources)
+    return tuple(selected)
+
+
 def _require_unique_source_ids(sources: tuple[SourceVersion, ...], field: str) -> None:
     ids = [source.record_id for source in sources]
     if len(ids) != len(set(ids)):
@@ -542,6 +719,7 @@ __all__ = [
     "OpaqueEnvelopeMemoryBody",
     "PlaintextMemoryBody",
     "ProcessingStage",
+    "StageEvidenceRequirement",
     "StageError",
     "StageReceipt",
     "StageStatus",

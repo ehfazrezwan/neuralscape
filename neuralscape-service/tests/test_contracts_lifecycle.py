@@ -18,6 +18,7 @@ from contracts_lifecycle import (
     OpaqueEnvelopeMemoryBody,
     PlaintextMemoryBody,
     ProcessingStage,
+    StageEvidenceRequirement,
     StageError,
     StageReceipt,
     StageStatus,
@@ -39,6 +40,25 @@ def source(record_id: str, revision: int = 3, epoch: int = 7) -> SourceVersion:
     )
 
 
+def requirement(
+    stage: ProcessingStage,
+    *,
+    effect_id: str | None = None,
+    precondition_source_ids: tuple[str, ...] = ("memory-1",),
+    upstream_stages: tuple[ProcessingStage, ...] = (),
+    committed_sources: tuple[SourceVersion, ...] = (),
+    minimum_output_refs: int = 0,
+) -> StageEvidenceRequirement:
+    return StageEvidenceRequirement(
+        stage=stage,
+        effect_id=effect_id or f"effect-{stage.value}",
+        precondition_source_ids=precondition_source_ids,
+        upstream_stages=upstream_stages,
+        committed_sources=committed_sources,
+        minimum_output_refs=minimum_output_refs,  # type: ignore[arg-type]
+    )
+
+
 def intent(*stages: ProcessingStage) -> Intent:
     return Intent(
         schema_version="candidate-v1",
@@ -50,10 +70,29 @@ def intent(*stages: ProcessingStage) -> Intent:
         target_refs=(),
         request_digest="sha256:abc",
         idempotency_key="client-key-1",
-        expected_sources=(source("memory-1"),),
-        required_stages=stages,
+        source_preconditions=(source("memory-1"),),
+        stage_requirements=tuple(requirement(stage) for stage in stages),
         correlation_id="correlation-1",
         accepted_at=NOW,
+    )
+
+
+def intent_with_requirements(
+    *requirements: StageEvidenceRequirement,
+    source_preconditions: tuple[SourceVersion, ...] = (source("memory-1"),),
+) -> Intent:
+    values = intent(ProcessingStage.CANONICAL).model_dump()
+    values["source_preconditions"] = source_preconditions
+    values["stage_requirements"] = requirements
+    return Intent.model_validate(values)
+
+
+def reference(reference_id: str) -> ReferenceHandle:
+    return ReferenceHandle(
+        kind="artifact",
+        id=reference_id,
+        tenant_id="tenant-1",
+        resolver="resolve_artifact",
     )
 
 
@@ -62,6 +101,9 @@ def receipt(
     status: StageStatus,
     *,
     sources: tuple[SourceVersion, ...] | None = None,
+    committed: tuple[SourceVersion, ...] = (),
+    outputs: tuple[ReferenceHandle, ...] = (),
+    effect_id: str | None = None,
     attempt: int = 1,
 ) -> StageReceipt:
     error = (
@@ -76,9 +118,11 @@ def receipt(
         intent_id="intent-1",
         attempt=attempt,
         stage=stage,
+        effect_id=effect_id or f"effect-{stage.value}",
         status=status,
         applied_sources=sources if sources is not None else default_sources,
-        output_refs=(),
+        committed_sources=committed,
+        output_refs=outputs,
         error=error,
         started_at=None if status is StageStatus.PENDING else NOW,
         finished_at=NOW + timedelta(seconds=1) if terminal else None,
@@ -348,17 +392,429 @@ def test_memory_record_is_an_immutable_canonical_snapshot(
     assert record.workspace_id is None
 
 
-def test_intent_rejects_empty_or_duplicate_required_stages() -> None:
-    with pytest.raises(ValidationError, match="required_stages must not be empty"):
+def test_intent_rejects_empty_or_duplicate_stage_requirements() -> None:
+    with pytest.raises(ValidationError, match="stage_requirements must not be empty"):
         intent()
-    with pytest.raises(ValidationError, match="must not contain duplicates"):
+    with pytest.raises(ValidationError, match="duplicate stages"):
         intent(ProcessingStage.CANONICAL, ProcessingStage.CANONICAL)
+
+
+def test_intent_has_no_flat_stage_or_source_compatibility_aliases() -> None:
+    values = intent(ProcessingStage.CANONICAL).model_dump()
+    values["expected_sources"] = values.pop("source_preconditions")
+    values["required_stages"] = (ProcessingStage.CANONICAL,)
+    values.pop("stage_requirements")
+    with pytest.raises(ValidationError, match="source_preconditions|stage_requirements"):
+        Intent.model_validate(values)
 
 
 def test_intent_is_an_immutable_command_snapshot() -> None:
     command = intent(ProcessingStage.CANONICAL)
     with pytest.raises(ValidationError, match="frozen"):
         command.operation = "delete"
+
+
+@pytest.mark.parametrize("minimum", [True, False, "1", 2, -1])
+def test_stage_requirement_requires_native_binary_output_minimum(
+    minimum: object,
+) -> None:
+    with pytest.raises(ValidationError, match="native integer 0 or 1"):
+        requirement(
+            ProcessingStage.CANONICAL,
+            minimum_output_refs=minimum,  # type: ignore[arg-type]
+        )
+
+
+def test_stage_requirement_is_frozen() -> None:
+    declared = requirement(ProcessingStage.CANONICAL)
+    with pytest.raises(ValidationError, match="frozen"):
+        declared.effect_id = "other-effect"
+
+
+def test_stage_requirement_rejects_duplicate_or_self_referential_inputs() -> None:
+    values = requirement(ProcessingStage.GRAPH).model_dump()
+    invalid_values = (
+        dict(values, precondition_source_ids=("memory-1", "memory-1")),
+        dict(
+            values,
+            upstream_stages=(ProcessingStage.CANONICAL, ProcessingStage.CANONICAL),
+        ),
+        dict(values, upstream_stages=(ProcessingStage.GRAPH,)),
+        dict(
+            values,
+            committed_sources=(source("derived-1"), source("derived-1")),
+        ),
+    )
+    for invalid in invalid_values:
+        with pytest.raises(ValidationError, match="duplicates|depend on itself|record_id"):
+            StageEvidenceRequirement.model_validate(invalid)
+
+
+def test_intent_rejects_duplicate_source_precondition_ids() -> None:
+    with pytest.raises(ValidationError, match="duplicate record_id"):
+        intent_with_requirements(
+            requirement(ProcessingStage.GRAPH),
+            source_preconditions=(source("memory-1"), source("memory-1")),
+        )
+
+
+@pytest.mark.parametrize(
+    ("requirements", "message"),
+    [
+        (
+            (
+                requirement(ProcessingStage.CANONICAL, effect_id="same-effect"),
+                requirement(ProcessingStage.GRAPH, effect_id="same-effect"),
+            ),
+            "duplicate effect_id",
+        ),
+        (
+            (
+                requirement(
+                    ProcessingStage.CANONICAL,
+                    precondition_source_ids=("missing-source",),
+                ),
+            ),
+            "declared source_preconditions",
+        ),
+        (
+            (
+                requirement(
+                    ProcessingStage.GRAPH,
+                    upstream_stages=(ProcessingStage.CANONICAL,),
+                ),
+            ),
+            "declared stage_requirements",
+        ),
+        (
+            (
+                requirement(
+                    ProcessingStage.CANONICAL,
+                    upstream_stages=(ProcessingStage.GRAPH,),
+                ),
+                requirement(
+                    ProcessingStage.GRAPH,
+                    upstream_stages=(ProcessingStage.CANONICAL,),
+                ),
+            ),
+            "acyclic",
+        ),
+    ],
+)
+def test_intent_rejects_invalid_requirement_graphs(
+    requirements: tuple[StageEvidenceRequirement, ...],
+    message: str,
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        intent_with_requirements(*requirements)
+
+
+def test_intent_rejects_calculated_input_id_collision_even_when_equal() -> None:
+    same_source = source("memory-1")
+    with pytest.raises(ValidationError, match="record_id collisions"):
+        intent_with_requirements(
+            requirement(
+                ProcessingStage.CANONICAL,
+                committed_sources=(same_source,),
+            ),
+            requirement(
+                ProcessingStage.GRAPH,
+                precondition_source_ids=("memory-1",),
+                upstream_stages=(ProcessingStage.CANONICAL,),
+            ),
+        )
+
+
+def test_create_then_graph_evidence_is_explicit_and_order_independent() -> None:
+    committed = source("created-memory", revision=1, epoch=1)
+    canonical = requirement(
+        ProcessingStage.CANONICAL,
+        effect_id="create-memory-effect",
+        precondition_source_ids=(),
+        committed_sources=(committed,),
+        minimum_output_refs=1,
+    )
+    graph = requirement(
+        ProcessingStage.GRAPH,
+        effect_id="project-graph-effect",
+        precondition_source_ids=(),
+        upstream_stages=(ProcessingStage.CANONICAL,),
+        minimum_output_refs=1,
+    )
+    canonical_receipt = receipt(
+        ProcessingStage.CANONICAL,
+        StageStatus.APPLIED,
+        effect_id="create-memory-effect",
+        sources=(),
+        committed=(committed,),
+        outputs=(reference("created-memory"),),
+    )
+    graph_receipt = receipt(
+        ProcessingStage.GRAPH,
+        StageStatus.APPLIED,
+        effect_id="project-graph-effect",
+        sources=(committed,),
+        outputs=(reference("graph-view"),),
+    )
+
+    for declared in ((canonical, graph), (graph, canonical)):
+        command = intent_with_requirements(
+            *declared,
+            source_preconditions=(),
+        )
+        for observed in permutations((canonical_receipt, graph_receipt)):
+            validate_required_stage_claim(
+                claimed_status=IntentStatus.APPLIED,
+                intent=command,
+                receipts=observed,
+            )
+
+
+def test_downstream_application_requires_upstream_applied_support() -> None:
+    committed = source("created-memory", revision=1, epoch=1)
+    command = intent_with_requirements(
+        requirement(
+            ProcessingStage.CANONICAL,
+            precondition_source_ids=(),
+            committed_sources=(committed,),
+        ),
+        requirement(
+            ProcessingStage.GRAPH,
+            precondition_source_ids=(),
+            upstream_stages=(ProcessingStage.CANONICAL,),
+        ),
+        source_preconditions=(),
+    )
+    with pytest.raises(ValueError, match="upstream applied support"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.PROCESSING,
+            intent=command,
+            receipts=(
+                receipt(
+                    ProcessingStage.GRAPH,
+                    StageStatus.APPLIED,
+                    sources=(committed,),
+                ),
+            ),
+        )
+
+
+def test_source_free_zero_result_stage_can_apply_with_declared_effect() -> None:
+    command = intent_with_requirements(
+        requirement(
+            ProcessingStage.CANONICAL,
+            effect_id="stable-source-free-effect",
+            precondition_source_ids=(),
+            minimum_output_refs=0,
+        ),
+        source_preconditions=(),
+    )
+    validate_required_stage_claim(
+        claimed_status=IntentStatus.APPLIED,
+        intent=command,
+        receipts=(
+            receipt(
+                ProcessingStage.CANONICAL,
+                StageStatus.APPLIED,
+                effect_id="stable-source-free-effect",
+                sources=(),
+            ),
+        ),
+    )
+
+
+@pytest.mark.parametrize("status", list(StageStatus))
+def test_required_receipt_rejects_wrong_effect_in_every_status(
+    status: StageStatus,
+) -> None:
+    sources = () if status in {StageStatus.PENDING, StageStatus.FAILED} else None
+    with pytest.raises(ValueError, match="declared effect_id"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=intent(ProcessingStage.GRAPH),
+            receipts=(
+                receipt(
+                    ProcessingStage.GRAPH,
+                    status,
+                    effect_id="wrong-effect",
+                    sources=sources,
+                ),
+            ),
+        )
+
+
+def test_required_application_checks_commits_and_output_minimum() -> None:
+    committed = source("derived-1", revision=1, epoch=2)
+    command = intent_with_requirements(
+        requirement(
+            ProcessingStage.GRAPH,
+            committed_sources=(committed,),
+            minimum_output_refs=1,
+        )
+    )
+    cases = (
+        receipt(ProcessingStage.GRAPH, StageStatus.APPLIED),
+        receipt(
+            ProcessingStage.GRAPH,
+            StageStatus.APPLIED,
+            committed=(source("derived-1", revision=2, epoch=2),),
+            outputs=(reference("graph-view"),),
+        ),
+        receipt(
+            ProcessingStage.GRAPH,
+            StageStatus.APPLIED,
+            committed=(source("other-derived", revision=1, epoch=2),),
+            outputs=(reference("graph-view"),),
+        ),
+        receipt(
+            ProcessingStage.GRAPH,
+            StageStatus.APPLIED,
+            committed=(committed,),
+        ),
+    )
+    for invalid in cases:
+        with pytest.raises(ValueError, match="committed_sources|minimum_output_refs"):
+            validate_required_stage_claim(
+                claimed_status=IntentStatus.APPLIED,
+                intent=command,
+                receipts=(invalid,),
+            )
+
+
+def test_non_applied_receipt_cannot_report_committed_sources() -> None:
+    values = receipt(ProcessingStage.GRAPH, StageStatus.FAILED, sources=()).model_dump()
+    values["committed_sources"] = (source("derived-1"),)
+    with pytest.raises(ValidationError, match="only applied"):
+        StageReceipt.model_validate(values)
+
+
+def test_duplicate_output_handles_reject() -> None:
+    duplicate = reference("graph-view")
+    values = receipt(ProcessingStage.GRAPH, StageStatus.APPLIED).model_dump()
+    values["output_refs"] = (duplicate, duplicate)
+    with pytest.raises(ValidationError, match="duplicate handles"):
+        StageReceipt.model_validate(values)
+
+
+def test_historical_applications_require_cross_attempt_output_consensus() -> None:
+    command = intent(ProcessingStage.GRAPH)
+    receipts = (
+        receipt(
+            ProcessingStage.GRAPH,
+            StageStatus.APPLIED,
+            outputs=(reference("graph-a"),),
+        ),
+        receipt(
+            ProcessingStage.GRAPH,
+            StageStatus.APPLIED,
+            outputs=(reference("graph-b"),),
+            attempt=2,
+        ),
+    )
+    for observed in permutations(receipts):
+        with pytest.raises(ValueError, match="consistent result sets"):
+            validate_required_stage_claim(
+                claimed_status=IntentStatus.APPLIED,
+                intent=command,
+                receipts=observed,
+            )
+
+
+def test_cross_attempt_result_consensus_ignores_tuple_order() -> None:
+    outputs = (reference("graph-a"), reference("graph-b"))
+    command = intent(ProcessingStage.GRAPH)
+    validate_required_stage_claim(
+        claimed_status=IntentStatus.APPLIED,
+        intent=command,
+        receipts=(
+            receipt(
+                ProcessingStage.GRAPH,
+                StageStatus.APPLIED,
+                outputs=outputs,
+            ),
+            receipt(
+                ProcessingStage.GRAPH,
+                StageStatus.APPLIED,
+                outputs=tuple(reversed(outputs)),
+                attempt=2,
+            ),
+        ),
+    )
+
+
+def test_aggregate_boundary_revalidates_nested_requirement_copy() -> None:
+    command = intent(ProcessingStage.CANONICAL)
+    invalid_requirement = command.stage_requirements[0].model_copy(
+        update={"minimum_output_refs": True}
+    )
+    unchecked = command.model_copy(
+        update={"stage_requirements": (invalid_requirement,)}
+    )
+    with pytest.raises(ValidationError, match="native integer 0 or 1"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=unchecked,
+            receipts=(),
+        )
+
+
+def test_aggregate_boundary_revalidates_nested_committed_source_copy() -> None:
+    invalid_source = source("derived-1").model_copy(update={"policy_epoch": -1})
+    invalid_requirement = requirement(ProcessingStage.CANONICAL).model_copy(
+        update={"committed_sources": (invalid_source,)}
+    )
+    unchecked = intent(ProcessingStage.CANONICAL).model_copy(
+        update={"stage_requirements": (invalid_requirement,)}
+    )
+    with pytest.raises(ValidationError, match="greater than or equal to 0"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=unchecked,
+            receipts=(),
+        )
+
+
+def test_aggregate_boundary_revalidates_constructed_nested_requirement() -> None:
+    unchecked_requirement = StageEvidenceRequirement.model_construct(
+        stage=ProcessingStage.CANONICAL,
+        effect_id="effect-canonical",
+        precondition_source_ids=("memory-1",),
+        upstream_stages=(),
+        committed_sources=(),
+        minimum_output_refs=True,
+    )
+    unchecked = intent(ProcessingStage.CANONICAL).model_copy(
+        update={"stage_requirements": (unchecked_requirement,)}
+    )
+    with pytest.raises(ValidationError, match="native integer 0 or 1"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=unchecked,
+            receipts=(),
+        )
+
+
+def test_aggregate_boundary_revalidates_mutated_nested_receipt_commit() -> None:
+    committed = source("derived-1")
+    command = intent_with_requirements(
+        requirement(
+            ProcessingStage.CANONICAL,
+            committed_sources=(committed,),
+        )
+    )
+    applied = receipt(
+        ProcessingStage.CANONICAL,
+        StageStatus.APPLIED,
+        committed=(source("derived-1"),),
+    )
+    applied.committed_sources[0].__dict__["policy_epoch"] = -1
+
+    with pytest.raises(ValidationError, match="greater than or equal to 0"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED,
+            intent=command,
+            receipts=(applied,),
+        )
 
 
 def test_locally_owned_nested_stage_error_is_frozen() -> None:
@@ -372,8 +828,10 @@ def test_locally_owned_nested_stage_error_is_frozen() -> None:
         intent_id="intent-1",
         attempt=1,
         stage=ProcessingStage.GRAPH,
+        effect_id="effect-graph",
         status=StageStatus.FAILED,
         applied_sources=(),
+        committed_sources=(),
         output_refs=(),
         error=stage_error,
         started_at=NOW,
@@ -401,8 +859,8 @@ def test_shared_nested_reference_and_version_values_are_frozen() -> None:
         target_refs=(reference,),
         request_digest="sha256:abc",
         idempotency_key="client-key-1",
-        expected_sources=(source("memory-1"),),
-        required_stages=(ProcessingStage.CANONICAL,),
+        source_preconditions=(source("memory-1"),),
+        stage_requirements=(requirement(ProcessingStage.CANONICAL),),
         correlation_id="correlation-1",
         accepted_at=NOW,
     )
@@ -411,8 +869,10 @@ def test_shared_nested_reference_and_version_values_are_frozen() -> None:
         intent_id="intent-1",
         attempt=1,
         stage=ProcessingStage.CANONICAL,
+        effect_id="effect-canonical",
         status=StageStatus.APPLIED,
         applied_sources=(source("memory-1"),),
+        committed_sources=(),
         output_refs=(reference,),
         error=None,
         started_at=NOW,
@@ -420,7 +880,7 @@ def test_shared_nested_reference_and_version_values_are_frozen() -> None:
     )
 
     nested_mutations = [
-        (command.expected_sources[0], "content_revision", 99),
+        (command.source_preconditions[0], "content_revision", 99),
         (command.target_refs[0], "id", "other-memory"),
         (applied.applied_sources[0], "policy_epoch", 99),
         (applied.output_refs[0], "resolver", "other_resolver"),
@@ -431,19 +891,25 @@ def test_shared_nested_reference_and_version_values_are_frozen() -> None:
 
 
 @pytest.mark.parametrize(
-    "required_stages",
+    "stage_requirements",
     [
         (),
         (ProcessingStage.CANONICAL, ProcessingStage.CANONICAL),
     ],
 )
 def test_aggregate_boundary_revalidates_copied_intent_stages(
-    required_stages: tuple[ProcessingStage, ...],
+    stage_requirements: tuple[ProcessingStage, ...],
 ) -> None:
     command = intent(ProcessingStage.CANONICAL)
-    unchecked = command.model_copy(update={"required_stages": required_stages})
+    unchecked = command.model_copy(
+        update={
+            "stage_requirements": tuple(
+                requirement(stage) for stage in stage_requirements
+            )
+        }
+    )
 
-    with pytest.raises(ValidationError, match="required_stages"):
+    with pytest.raises(ValidationError, match="stage_requirements"):
         validate_required_stage_claim(
             claimed_status=IntentStatus.APPLIED,
             intent=unchecked,
@@ -454,10 +920,10 @@ def test_aggregate_boundary_revalidates_copied_intent_stages(
 def test_aggregate_boundary_revalidates_constructed_intent() -> None:
     command = intent(ProcessingStage.CANONICAL)
     values = dict(command.__dict__)
-    values["required_stages"] = ()
+    values["stage_requirements"] = ()
     unchecked = Intent.model_construct(**values)
 
-    with pytest.raises(ValidationError, match="required_stages"):
+    with pytest.raises(ValidationError, match="stage_requirements"):
         validate_required_stage_claim(
             claimed_status=IntentStatus.APPLIED,
             intent=unchecked,
@@ -497,7 +963,7 @@ def test_aggregate_boundary_rejects_copy_injected_extra_fields() -> None:
 def test_aggregate_boundary_preserves_sequence_types_during_revalidation() -> None:
     command = intent(ProcessingStage.CANONICAL)
     unchecked = command.model_copy(
-        update={"required_stages": [ProcessingStage.CANONICAL]}
+        update={"stage_requirements": [requirement(ProcessingStage.CANONICAL)]}
     )
 
     with pytest.raises(ValidationError, match="valid tuple"):
@@ -568,11 +1034,11 @@ def test_aggregate_boundary_revalidates_copied_nested_values() -> None:
     command = intent(ProcessingStage.CANONICAL)
     valid_receipt = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
 
-    invalid_source = command.expected_sources[0].model_copy(
+    invalid_source = command.source_preconditions[0].model_copy(
         update={"content_revision": -1}
     )
     invalid_source_command = command.model_copy(
-        update={"expected_sources": (invalid_source,)}
+        update={"source_preconditions": (invalid_source,)}
     )
     with pytest.raises(ValidationError, match="greater than or equal to 0"):
         Intent.model_validate(invalid_source_command)
@@ -775,7 +1241,7 @@ def test_applied_claim_requires_every_required_stage_at_expected_versions() -> N
         StageStatus.APPLIED,
         sources=(source("memory-1", revision=2, epoch=7),),
     )
-    with pytest.raises(ValueError, match="must match expected sources"):
+    with pytest.raises(ValueError, match="must match calculated inputs"):
         validate_required_stage_claim(
             claimed_status=IntentStatus.APPLIED,
             intent=command,
@@ -794,7 +1260,7 @@ def test_processing_rejects_latest_applied_receipt_with_stale_witness(
     stale_source: SourceVersion,
 ) -> None:
     command = intent(ProcessingStage.CANONICAL, ProcessingStage.GRAPH)
-    with pytest.raises(ValueError, match="must match expected sources"):
+    with pytest.raises(ValueError, match="must match calculated inputs"):
         validate_required_stage_claim(
             claimed_status=IntentStatus.PROCESSING,
             intent=command,
@@ -1141,6 +1607,34 @@ def test_nonrequired_stage_start_does_not_change_required_stage_aggregate() -> N
     )
 
 
+def test_nonrequired_applied_evidence_does_not_count_but_ownership_does() -> None:
+    unrelated = receipt(
+        ProcessingStage.CANONICAL,
+        StageStatus.APPLIED,
+        effect_id="unrelated-effect",
+        sources=(source("unrelated-input"),),
+        committed=(source("unrelated-output"),),
+        outputs=(reference("unrelated-reference"),),
+    )
+    command = intent(ProcessingStage.GRAPH)
+    validate_required_stage_claim(
+        claimed_status=IntentStatus.ACCEPTED,
+        intent=command,
+        receipts=(
+            unrelated,
+            receipt(ProcessingStage.GRAPH, StageStatus.PENDING),
+        ),
+    )
+
+    foreign = unrelated.model_copy(update={"intent_id": "other-intent"})
+    with pytest.raises(ValueError, match="different intent"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=command,
+            receipts=(foreign,),
+        )
+
+
 def test_historical_start_and_latest_pending_are_aggregated_across_stages() -> None:
     receipts = (
         receipt(ProcessingStage.CANONICAL, StageStatus.PROCESSING, attempt=1),
@@ -1406,7 +1900,7 @@ def test_all_satisfied_stages_remain_applied_after_later_terminal_attempt(
     ],
 )
 @pytest.mark.parametrize("later_status", [StageStatus.FAILED, StageStatus.APPLIED])
-def test_every_historical_application_must_match_expected_sources(
+def test_every_historical_application_must_match_calculated_inputs(
     stale_source: SourceVersion,
     later_status: StageStatus,
 ) -> None:
@@ -1428,7 +1922,7 @@ def test_every_historical_application_must_match_expected_sources(
 
     for ordered_receipts in permutations(receipts):
         for claim in IntentStatus:
-            with pytest.raises(ValueError, match="must match expected sources"):
+            with pytest.raises(ValueError, match="must match calculated inputs"):
                 validate_required_stage_claim(
                     claimed_status=claim,
                     intent=intent(ProcessingStage.GRAPH),
@@ -1448,9 +1942,11 @@ def test_historical_application_cannot_satisfy_another_intent_or_source_set() ->
         )
 
     newer_sources = intent(ProcessingStage.GRAPH).model_copy(
-        update={"expected_sources": (source("memory-1", revision=4, epoch=7),)}
+        update={
+            "source_preconditions": (source("memory-1", revision=4, epoch=7),)
+        }
     )
-    with pytest.raises(ValueError, match="must match expected sources"):
+    with pytest.raises(ValueError, match="must match calculated inputs"):
         validate_required_stage_claim(
             claimed_status=IntentStatus.APPLIED,
             intent=newer_sources,
@@ -1525,8 +2021,10 @@ def test_failed_receipt_requires_error_and_terminal_timing() -> None:
             intent_id="intent-1",
             attempt=1,
             stage=ProcessingStage.GRAPH,
+            effect_id="effect-graph",
             status=StageStatus.FAILED,
             applied_sources=(),
+            committed_sources=(),
             output_refs=(),
             error=None,
             started_at=NOW,
@@ -1538,8 +2036,10 @@ def test_failed_receipt_requires_error_and_terminal_timing() -> None:
             intent_id="intent-1",
             attempt=1,
             stage=ProcessingStage.GRAPH,
+            effect_id="effect-graph",
             status=StageStatus.APPLIED,
             applied_sources=(source("memory-1"),),
+            committed_sources=(),
             output_refs=(),
             error=None,
             started_at=NOW,
@@ -1551,8 +2051,10 @@ def test_failed_receipt_requires_error_and_terminal_timing() -> None:
             intent_id="intent-1",
             attempt=1,
             stage=ProcessingStage.GRAPH,
+            effect_id="effect-graph",
             status=StageStatus.PROCESSING,
             applied_sources=(),
+            committed_sources=(),
             output_refs=(),
             error=None,
             started_at=None,
@@ -1567,8 +2069,10 @@ def test_pending_receipt_cannot_claim_started_work() -> None:
             intent_id="intent-1",
             attempt=1,
             stage=ProcessingStage.GRAPH,
+            effect_id="effect-graph",
             status=StageStatus.PENDING,
             applied_sources=(),
+            committed_sources=(),
             output_refs=(),
             error=None,
             started_at=NOW,
@@ -1583,10 +2087,12 @@ def test_pending_receipt_cannot_claim_started_work() -> None:
     )
 
 
-@pytest.mark.parametrize("field_name", ["applied_sources", "output_refs"])
+@pytest.mark.parametrize(
+    "field_name", ["applied_sources", "committed_sources", "output_refs"]
+)
 def test_pending_receipt_rejects_result_fields(field_name: str) -> None:
     values = receipt(ProcessingStage.GRAPH, StageStatus.PENDING).model_dump()
-    if field_name == "applied_sources":
+    if field_name in {"applied_sources", "committed_sources"}:
         values[field_name] = (source("memory-1"),)
     else:
         values[field_name] = (
@@ -1655,8 +2161,10 @@ def test_all_lifecycle_timestamps_reject_naive_native_datetimes() -> None:
             intent_id="intent-1",
             attempt=1,
             stage=ProcessingStage.GRAPH,
+            effect_id="effect-graph",
             status=StageStatus.APPLIED,
             applied_sources=(source("memory-1"),),
+            committed_sources=(),
             output_refs=(),
             error=None,
             started_at=naive,
@@ -1670,10 +2178,12 @@ def test_receipt_json_rejects_naive_mixed_and_reversed_timestamps() -> None:
         "intent_id": "intent-1",
         "attempt": 1,
         "stage": "graph",
+        "effect_id": "effect-graph",
         "status": "applied",
         "applied_sources": [
             {"record_id": "memory-1", "content_revision": 3, "policy_epoch": 7}
         ],
+        "committed_sources": [],
         "output_refs": [],
         "error": None,
         "started_at": "2026-09-28T12:00:00Z",
