@@ -212,14 +212,21 @@ def test_unapproved_location_fails_even_for_authorized_recipient() -> None:
         )
 
 
-def test_deny_policy_blocks_fallback_after_primary_failure() -> None:
+@pytest.mark.parametrize(
+    ("execution_location", "recipient_id"),
+    [("endpoint", None), ("external_provider", "provider-a")],
+)
+def test_deny_policy_blocks_fallback_after_primary_failure(
+    execution_location: str,
+    recipient_id: str | None,
+) -> None:
     policy = _external_policy(fallback_policy="deny")
 
     with pytest.raises(PlaintextDispatchRejected, match="fallback is denied"):
         validate_plaintext_dispatch(
             policy,
-            execution_location="external_provider",
-            recipient_id="provider-a",
+            execution_location=execution_location,  # type: ignore[arg-type]
+            recipient_id=recipient_id,
             current_policy_epoch=7,
             currently_authorized_recipient_ids={"provider-a"},
             is_fallback=True,
@@ -273,6 +280,31 @@ def test_approved_fallback_is_revalidated_against_current_authority() -> None:
         currently_authorized_recipient_ids={"provider-b"},
         is_fallback=True,
     )
+
+
+def test_recipient_only_policy_rejects_endpoint_fallback_but_allows_primary() -> None:
+    policy = _external_policy()
+
+    assert (
+        validate_plaintext_dispatch(
+            policy,
+            execution_location="endpoint",
+            recipient_id=None,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=set(),
+            is_fallback=False,
+        )
+        is None
+    )
+    with pytest.raises(PlaintextDispatchRejected, match="non-endpoint"):
+        validate_plaintext_dispatch(
+            policy,
+            execution_location="endpoint",
+            recipient_id=None,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=set(),
+            is_fallback=True,
+        )
 
 
 def test_endpoint_dispatch_cannot_smuggle_a_recipient_identity() -> None:
