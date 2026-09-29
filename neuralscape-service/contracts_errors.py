@@ -2,9 +2,10 @@
 
 ``InternalErrorCode`` describes outcomes inside an authorized trust boundary.
 ``public_error_for`` maps those outcomes to stable public errors.  Its default
-does not reveal whether a referenced object exists: denial, absence, and a
-wrong reference kind all become ``not_found``.  Set ``disclose_existence``
-only after an independent authorization decision permits richer diagnostics.
+does not reveal whether a referenced object exists: denial, absence, a wrong
+reference kind, and a stale resource revision all become ``not_found``.  Set
+``disclose_existence`` only after an independent authorization decision permits
+richer diagnostics.
 """
 
 from enum import Enum
@@ -88,8 +89,8 @@ _PUBLIC_ERRORS: dict[InternalErrorCode, PublicError] = {
         retryable=False,
     ),
     InternalErrorCode.STALE_REVISION: PublicError(
-        code=PublicErrorCode.STALE_REVISION,
-        message="The supplied revision is stale.",
+        code=PublicErrorCode.NOT_FOUND,
+        message="The requested resource was not found.",
         retryable=False,
     ),
     InternalErrorCode.STALE_POLICY: PublicError(
@@ -133,6 +134,11 @@ _DISCLOSURE_ERRORS: dict[InternalErrorCode, PublicError] = {
     InternalErrorCode.WRONG_REFERENCE_KIND: PublicError(
         code=PublicErrorCode.WRONG_REFERENCE_KIND,
         message="The reference kind does not match the resource.",
+        retryable=False,
+    ),
+    InternalErrorCode.STALE_REVISION: PublicError(
+        code=PublicErrorCode.STALE_REVISION,
+        message="The supplied revision is stale.",
         retryable=False,
     ),
 }

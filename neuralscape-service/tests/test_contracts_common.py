@@ -252,8 +252,9 @@ def test_safe_error_mapping_collapses_existence_sensitive_outcomes() -> None:
     denied = public_error_for(InternalErrorCode.DENIED)
     missing = public_error_for(InternalErrorCode.MISSING_RESOURCE)
     wrong_kind = public_error_for(InternalErrorCode.WRONG_REFERENCE_KIND)
+    stale_revision = public_error_for(InternalErrorCode.STALE_REVISION)
 
-    assert denied == missing == wrong_kind
+    assert denied == missing == wrong_kind == stale_revision
     assert denied.code is PublicErrorCode.NOT_FOUND
     assert "denied" not in denied.message.lower()
 
@@ -267,9 +268,15 @@ def test_authorized_error_mapping_can_return_richer_diagnostics() -> None:
         InternalErrorCode.WRONG_REFERENCE_KIND,
         disclose_existence=True,
     )
+    stale_revision = public_error_for(
+        InternalErrorCode.STALE_REVISION,
+        disclose_existence=True,
+    )
 
     assert denied.code is PublicErrorCode.PERMISSION_DENIED
     assert wrong_kind.code is PublicErrorCode.WRONG_REFERENCE_KIND
+    assert stale_revision.code is PublicErrorCode.STALE_REVISION
+    assert stale_revision.message == "The supplied revision is stale."
     assert public_error_for(
         InternalErrorCode.MISSING_RESOURCE,
         disclose_existence=True,
@@ -277,10 +284,42 @@ def test_authorized_error_mapping_can_return_richer_diagnostics() -> None:
 
 
 def test_false_disclosure_decision_keeps_existence_sensitive_errors_collapsed() -> None:
-    assert public_error_for(
-        InternalErrorCode.DENIED,
+    missing = public_error_for(
+        InternalErrorCode.MISSING_RESOURCE,
         disclose_existence=False,
-    ).code is PublicErrorCode.NOT_FOUND
+    )
+    for code in (
+        InternalErrorCode.DENIED,
+        InternalErrorCode.WRONG_REFERENCE_KIND,
+        InternalErrorCode.STALE_REVISION,
+    ):
+        assert public_error_for(code, disclose_existence=False) == missing
+
+
+def test_stale_revision_default_and_false_are_both_nondisclosing() -> None:
+    missing = public_error_for(InternalErrorCode.MISSING_RESOURCE)
+
+    assert public_error_for(InternalErrorCode.STALE_REVISION) == missing
+    assert public_error_for(
+        InternalErrorCode.STALE_REVISION,
+        disclose_existence=False,
+    ) == missing
+
+
+def test_stale_revision_true_discloses_existing_diagnostic_only() -> None:
+    stale = public_error_for(
+        InternalErrorCode.STALE_REVISION,
+        disclose_existence=True,
+    )
+
+    assert stale.code is PublicErrorCode.STALE_REVISION
+    assert stale.message == "The supplied revision is stale."
+    assert stale.retryable is False
+    for disclose_existence in (False, True):
+        assert public_error_for(
+            InternalErrorCode.STALE_POLICY,
+            disclose_existence=disclose_existence,
+        ).code is PublicErrorCode.STALE_POLICY
 
 
 @pytest.mark.parametrize("value", ["true", "false", 0, 1, None])
