@@ -100,7 +100,7 @@ def validate_plaintext_dispatch(
     recipient_id: OpaqueId | None,
     current_policy_epoch: SafeCounter,
     currently_authorized_recipient_ids: Collection[OpaqueId],
-    is_fallback: bool = False,
+    is_fallback: bool,
 ) -> None:
     """Reject a plaintext dispatch unless declared and current authority agree.
 
@@ -108,7 +108,8 @@ def validate_plaintext_dispatch(
     authority decision.  Read/decrypt access is deliberately not an input and
     cannot authorize forwarding plaintext.  Successful validation is only a
     routing precondition; it does not prove endpoint identity or runtime
-    assurance.
+    assurance.  Callers must explicitly classify every dispatch as primary or
+    fallback; omission is not treated as a primary dispatch.
     """
 
     try:

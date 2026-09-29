@@ -30,9 +30,9 @@ def test_plaintext_body_preserves_exact_text() -> None:
     }
 
 
-def test_encrypted_body_is_only_an_opaque_reference() -> None:
+def test_opaque_envelope_body_is_only_an_opaque_reference() -> None:
     body = parse_memory_body(
-        {"kind": "encrypted", "envelope_id": "envelope/customer-value"}
+        {"kind": "opaque_envelope", "envelope_id": "envelope/customer-value"}
     )
 
     assert isinstance(body, OpaqueEnvelopeBody)
@@ -44,7 +44,7 @@ def test_enclosing_contract_owns_body_version() -> None:
     owner = VersionedBodyOwner.model_validate(
         {
             "schema_version": "candidate-v1",
-            "body": {"kind": "encrypted", "envelope_id": "env-1"},
+            "body": {"kind": "opaque_envelope", "envelope_id": "env-1"},
         }
     )
 
@@ -54,7 +54,7 @@ def test_enclosing_contract_owns_body_version() -> None:
         parse_memory_body(
             {
                 "schema_version": "candidate-v1",
-                "kind": "encrypted",
+                "kind": "opaque_envelope",
                 "envelope_id": "env-1",
             }
         )
@@ -64,7 +64,7 @@ def test_enclosing_contract_owns_body_version() -> None:
     "body",
     [
         PlaintextBody(kind="plaintext", text="secret"),
-        OpaqueEnvelopeBody(kind="encrypted", envelope_id="env-1"),
+        OpaqueEnvelopeBody(kind="opaque_envelope", envelope_id="env-1"),
     ],
 )
 def test_body_variants_are_frozen(body: MemoryBody) -> None:
@@ -74,7 +74,7 @@ def test_body_variants_are_frozen(body: MemoryBody) -> None:
 
 def test_parser_revalidates_unchecked_body_copy() -> None:
     body = PlaintextBody(kind="plaintext", text="secret")
-    unchecked = body.model_copy(update={"kind": "encrypted"})
+    unchecked = body.model_copy(update={"kind": "opaque_envelope"})
 
     with pytest.raises(ValidationError):
         parse_memory_body(unchecked)
@@ -84,7 +84,7 @@ def test_parser_revalidates_unchecked_body_copy() -> None:
     "mixed_body",
     [
         {"kind": "plaintext", "text": "readable", "envelope_id": "env-1"},
-        {"kind": "encrypted", "envelope_id": "env-1", "text": "leak"},
+        {"kind": "opaque_envelope", "envelope_id": "env-1", "text": "leak"},
     ],
 )
 def test_mixed_body_modes_are_rejected(mixed_body: dict[str, object]) -> None:
@@ -92,7 +92,9 @@ def test_mixed_body_modes_are_rejected(mixed_body: dict[str, object]) -> None:
         parse_memory_body(mixed_body)
 
 
-@pytest.mark.parametrize("kind", ["opaque", "ciphertext", "unknown", ""])
+@pytest.mark.parametrize(
+    "kind", ["encrypted", "opaque", "ciphertext", "unknown", ""]
+)
 def test_unsupported_body_modes_are_rejected(kind: str) -> None:
     with pytest.raises(ValidationError):
         parse_memory_body({"kind": kind, "envelope_id": "env-1"})
@@ -102,8 +104,8 @@ def test_unsupported_body_modes_are_rejected(kind: str) -> None:
     "body",
     [
         {"kind": "plaintext", "text": ""},
-        {"kind": "encrypted", "envelope_id": ""},
-        {"kind": "encrypted"},
+        {"kind": "opaque_envelope", "envelope_id": ""},
+        {"kind": "opaque_envelope"},
         {"text": "missing discriminator"},
     ],
 )
@@ -115,7 +117,10 @@ def test_incomplete_body_values_are_rejected(body: dict[str, object]) -> None:
 def test_body_schema_has_a_closed_discriminated_union() -> None:
     schema = MEMORY_BODY_ADAPTER.json_schema()
 
-    assert set(schema["discriminator"]["mapping"]) == {"encrypted", "plaintext"}
+    assert set(schema["discriminator"]["mapping"]) == {
+        "opaque_envelope",
+        "plaintext",
+    }
     assert len(schema["oneOf"]) == 2
     for definition in schema["$defs"].values():
         assert definition["additionalProperties"] is False

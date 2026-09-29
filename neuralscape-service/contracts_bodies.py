@@ -1,8 +1,8 @@
 """Nested body contracts separating readable content from opaque envelopes.
 
-The ``encrypted`` tag records only that the body is represented by an opaque
-envelope identifier.  It does not assert that an envelope exists, that it is
-well formed, or that any cryptographic property has been verified.
+The ``opaque_envelope`` tag records only that the body is represented by an
+opaque envelope identifier.  It does not assert that an envelope exists, that
+it is well formed, or that any cryptographic property has been verified.
 
 Body variants inherit the schema version of their enclosing versioned record;
 they are not standalone wire messages.  :func:`parse_memory_body` validates
@@ -33,7 +33,7 @@ class OpaqueEnvelopeBody(ContractModel):
 
     model_config = ConfigDict(frozen=True, revalidate_instances="always")
 
-    kind: Literal["encrypted"]
+    kind: Literal["opaque_envelope"]
     envelope_id: OpaqueId
 
 

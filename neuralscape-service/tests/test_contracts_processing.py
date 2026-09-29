@@ -46,6 +46,7 @@ def test_strict_local_accepts_only_local_primary_dispatch() -> None:
             recipient_id=None,
             current_policy_epoch=7,
             currently_authorized_recipient_ids=set(),
+            is_fallback=False,
         )
         is None
     )
@@ -148,6 +149,7 @@ def test_dispatch_revalidates_unchecked_strict_local_copy() -> None:
             recipient_id="provider-a",
             current_policy_epoch=7,
             currently_authorized_recipient_ids={"provider-a"},
+            is_fallback=False,
         )
 
 
@@ -160,6 +162,7 @@ def test_external_dispatch_requires_policy_and_current_authority() -> None:
         recipient_id="provider-a",
         current_policy_epoch=7,
         currently_authorized_recipient_ids={"provider-a"},
+        is_fallback=False,
     )
 
     with pytest.raises(PlaintextDispatchRejected, match="current processing authority"):
@@ -169,6 +172,7 @@ def test_external_dispatch_requires_policy_and_current_authority() -> None:
             recipient_id="provider-a",
             current_policy_epoch=7,
             currently_authorized_recipient_ids=set(),
+            is_fallback=False,
         )
 
 
@@ -180,6 +184,7 @@ def test_current_authority_cannot_add_recipient_missing_from_policy() -> None:
             recipient_id="provider-b",
             current_policy_epoch=7,
             currently_authorized_recipient_ids={"provider-a", "provider-b"},
+            is_fallback=False,
         )
 
 
@@ -191,6 +196,7 @@ def test_stale_policy_epoch_fails_closed() -> None:
             recipient_id="provider-a",
             current_policy_epoch=8,
             currently_authorized_recipient_ids={"provider-a"},
+            is_fallback=False,
         )
 
 
@@ -202,12 +208,47 @@ def test_unapproved_location_fails_even_for_authorized_recipient() -> None:
             recipient_id="provider-a",
             current_policy_epoch=7,
             currently_authorized_recipient_ids={"provider-a"},
+            is_fallback=False,
         )
 
 
 def test_deny_policy_blocks_fallback_after_primary_failure() -> None:
     policy = _external_policy(fallback_policy="deny")
 
+    with pytest.raises(PlaintextDispatchRejected, match="fallback is denied"):
+        validate_plaintext_dispatch(
+            policy,
+            execution_location="external_provider",
+            recipient_id="provider-a",
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids={"provider-a"},
+            is_fallback=True,
+        )
+
+
+def test_dispatch_requires_explicit_fallback_classification() -> None:
+    policy = _external_policy(fallback_policy="deny")
+
+    with pytest.raises(TypeError, match="is_fallback"):
+        validate_plaintext_dispatch(  # type: ignore[call-arg]
+            policy,
+            execution_location="external_provider",
+            recipient_id="provider-a",
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids={"provider-a"},
+        )
+
+    assert (
+        validate_plaintext_dispatch(
+            policy,
+            execution_location="external_provider",
+            recipient_id="provider-a",
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids={"provider-a"},
+            is_fallback=False,
+        )
+        is None
+    )
     with pytest.raises(PlaintextDispatchRejected, match="fallback is denied"):
         validate_plaintext_dispatch(
             policy,
@@ -242,4 +283,5 @@ def test_endpoint_dispatch_cannot_smuggle_a_recipient_identity() -> None:
             recipient_id="provider-a",
             current_policy_epoch=7,
             currently_authorized_recipient_ids={"provider-a"},
+            is_fallback=False,
         )
