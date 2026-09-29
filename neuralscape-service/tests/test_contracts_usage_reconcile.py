@@ -107,6 +107,16 @@ def _assert_result_payload_rejected(payload: dict[str, object]) -> None:
         UsageReconciliation.model_validate_json(json.dumps(payload))
 
 
+def _assert_attribution_authority_rejected(value: object) -> None:
+    with pytest.raises(ValidationError) as caught:
+        ReconciledUsageStream.model_validate(value)
+
+    assert [
+        (error["type"], error["loc"])
+        for error in caught.value.errors(include_url=False)
+    ] == [("extra_forbidden", ("attribution", "authority"))]
+
+
 def test_reconciles_three_ledgers_without_cross_ledger_relabelling() -> None:
     service = _event()
     agent = _event(
@@ -215,8 +225,7 @@ def test_stream_rejects_existing_attribution_with_hidden_extra() -> None:
     payload = stream.model_dump(mode="python")
     payload["attribution"] = invalid_attribution
 
-    with pytest.raises(ValidationError, match="stream attribution is invalid"):
-        ReconciledUsageStream.model_validate(payload)
+    _assert_attribution_authority_rejected(payload)
 
 
 def test_existing_stream_revalidation_rejects_attribution_hidden_extra() -> None:
@@ -228,8 +237,7 @@ def test_existing_stream_revalidation_rejects_attribution_hidden_extra() -> None
         update={"attribution": invalid_attribution}
     )
 
-    with pytest.raises(ValidationError, match="stream attribution is invalid"):
-        ReconciledUsageStream.model_validate(invalid_stream)
+    _assert_attribution_authority_rejected(invalid_stream)
 
 
 def test_empty_input_cannot_fabricate_tenant_or_ledger_completeness() -> None:
