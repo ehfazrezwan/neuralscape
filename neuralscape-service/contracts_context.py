@@ -555,7 +555,11 @@ def _reference_key(reference: ReferenceHandle) -> tuple[str, str, str, str]:
 def receipt_matches_bundle(
     receipt: ContextAssemblyReceipt, bundle: ContextBundle
 ) -> bool:
-    """Check the public receipt witnesses against the delivered bundle."""
+    """Check the public receipt witnesses against the delivered bundle.
+
+    Safe omission reasons are unique, unordered codes.  Selected references
+    and other intentionally ordered fields retain their existing comparisons.
+    """
 
     receipt_snapshot = _revalidated_snapshot(ContextAssemblyReceipt, receipt)
     bundle_snapshot = _revalidated_snapshot(ContextBundle, bundle)
@@ -582,6 +586,8 @@ def receipt_matches_bundle(
         )
         for version in receipt.source_versions
     }
+    receipt_exclusions = set(receipt.exclusions)
+    bundle_omissions = set(bundle.omissions)
     expected_degradations = _freshness_degradations_for(bundle.selected_items)
     receipt_freshness_degradations = (
         set(receipt.degradations) & _FRESHNESS_DEGRADATION_CODES
@@ -614,7 +620,7 @@ def receipt_matches_bundle(
         and receipt.response_usage == bundle.response_usage
         and receipt.selected_references == selected
         and receipt_sources == source_versions
-        and receipt.exclusions == bundle.omissions
+        and receipt_exclusions == bundle_omissions
         and receipt_freshness_degradations == expected_degradations
         and receipt_expansions == expected_expansions
         and len(receipt_expansions) == len(receipt.expansion_lineage)

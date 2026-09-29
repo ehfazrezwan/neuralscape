@@ -674,6 +674,89 @@ def test_same_source_version_across_items_has_representable_receipt() -> None:
     assert receipt_matches_bundle(receipt, bundle)
 
 
+def test_receipt_correspondence_treats_omission_codes_as_unordered() -> None:
+    bundle = _validate(
+        ContextBundle,
+        _bundle(
+            outcome="incomplete",
+            capability_status="degraded",
+            omissions=["budget_limit", "deadline_limit"],
+        ),
+    )
+    receipt = _validate(
+        ContextAssemblyReceipt,
+        _receipt(exclusions=["deadline_limit", "budget_limit"]),
+    )
+
+    assert receipt_matches_bundle(receipt, bundle)
+
+
+@pytest.mark.parametrize(
+    "exclusions",
+    [
+        ["budget_limit"],
+        ["budget_limit", "deadline_limit", "policy_restricted"],
+    ],
+)
+def test_receipt_correspondence_rejects_missing_or_extra_omission_codes(
+    exclusions: list[str],
+) -> None:
+    bundle = _validate(
+        ContextBundle,
+        _bundle(
+            outcome="incomplete",
+            capability_status="degraded",
+            omissions=["budget_limit", "deadline_limit"],
+        ),
+    )
+    receipt = _validate(
+        ContextAssemblyReceipt,
+        _receipt(exclusions=exclusions),
+    )
+
+    assert not receipt_matches_bundle(receipt, bundle)
+
+
+def test_duplicate_omission_codes_fail_at_json_and_copied_boundaries() -> None:
+    duplicate_codes = ["budget_limit", "budget_limit"]
+    with pytest.raises(ValidationError, match="omission codes must be unique"):
+        _validate(
+            ContextBundle,
+            _bundle(
+                outcome="incomplete",
+                capability_status="degraded",
+                omissions=duplicate_codes,
+            ),
+        )
+    with pytest.raises(ValidationError, match="exclusion codes must be unique"):
+        _validate(
+            ContextAssemblyReceipt,
+            _receipt(exclusions=duplicate_codes),
+        )
+
+    bundle = _validate(
+        ContextBundle,
+        _bundle(
+            outcome="incomplete",
+            capability_status="degraded",
+            omissions=["budget_limit"],
+        ),
+    )
+    receipt = _validate(
+        ContextAssemblyReceipt,
+        _receipt(exclusions=["budget_limit"]),
+    )
+    duplicated = (
+        SafeOmissionCode.BUDGET_LIMIT,
+        SafeOmissionCode.BUDGET_LIMIT,
+    )
+    copied_bundle = bundle.model_copy(update={"omissions": duplicated})
+    copied_receipt = receipt.model_copy(update={"exclusions": duplicated})
+
+    assert not receipt_matches_bundle(receipt, copied_bundle)
+    assert not receipt_matches_bundle(copied_receipt, bundle)
+
+
 def test_empty_bundle_receipt_match_requires_explicit_tenant_scope() -> None:
     bundle = _validate(
         ContextBundle,
