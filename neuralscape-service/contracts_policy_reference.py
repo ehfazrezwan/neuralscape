@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
+from pydantic import BaseModel
+
 from contracts_policy import (
     SUPPORTED_POLICY_ACTIONS,
     AccessPolicy,
@@ -14,24 +18,94 @@ from contracts_policy import (
 from contracts_references import ReferenceHandle
 
 
+def _complete_contract_input(value: object, active_ids: set[int]) -> object:
+    """Copy a native input graph without normalizing away invalid data."""
+
+    if isinstance(value, BaseModel):
+        identity = id(value)
+        if identity in active_ids:
+            raise ValueError("cyclic contract input is not supported")
+        active_ids.add(identity)
+        try:
+            stored_values = dict(value.__dict__)
+            extra_values = value.__pydantic_extra__
+            if extra_values:
+                for key, item in extra_values.items():
+                    if key in stored_values:
+                        raise ValueError(
+                            "contract input contains duplicate stored fields"
+                        )
+                    stored_values[key] = item
+
+            # An unchecked copy normally stores its update in ``__dict__``.
+            # Retain even an anomalous set-only field so closed-model validation
+            # cannot silently erase evidence of unknown input semantics.
+            declared_fields = type(value).model_fields
+            for field_name in value.__pydantic_fields_set__:
+                if (
+                    field_name not in declared_fields
+                    and field_name not in stored_values
+                ):
+                    stored_values[field_name] = None
+
+            return {
+                key: _complete_contract_input(item, active_ids)
+                for key, item in stored_values.items()
+            }
+        finally:
+            active_ids.remove(identity)
+
+    if isinstance(value, Mapping):
+        identity = id(value)
+        if identity in active_ids:
+            raise ValueError("cyclic contract input is not supported")
+        active_ids.add(identity)
+        try:
+            # Keys are deliberately not stringified or otherwise normalized.
+            return {
+                key: _complete_contract_input(item, active_ids)
+                for key, item in value.items()
+            }
+        finally:
+            active_ids.remove(identity)
+
+    if isinstance(value, list):
+        identity = id(value)
+        if identity in active_ids:
+            raise ValueError("cyclic contract input is not supported")
+        active_ids.add(identity)
+        try:
+            return [_complete_contract_input(item, active_ids) for item in value]
+        finally:
+            active_ids.remove(identity)
+
+    if isinstance(value, tuple):
+        identity = id(value)
+        if identity in active_ids:
+            raise ValueError("cyclic contract input is not supported")
+        active_ids.add(identity)
+        try:
+            return tuple(_complete_contract_input(item, active_ids) for item in value)
+        finally:
+            active_ids.remove(identity)
+
+    return value
+
+
 def _validated_principal_snapshot(principal: PrincipalContext) -> PrincipalContext:
-    return PrincipalContext.model_validate(
-        principal.model_dump(mode="python", round_trip=True, warnings=False)
-    )
+    return PrincipalContext.model_validate(_complete_contract_input(principal, set()))
 
 
 def _validated_evaluation_snapshot(
     evaluation: PolicyEvaluationInput,
 ) -> PolicyEvaluationInput:
     return PolicyEvaluationInput.model_validate(
-        evaluation.model_dump(mode="python", round_trip=True, warnings=False)
+        _complete_contract_input(evaluation, set())
     )
 
 
 def _validated_policy_snapshot(policy: AccessPolicy) -> AccessPolicy:
-    return AccessPolicy.model_validate(
-        policy.model_dump(mode="python", round_trip=True, warnings=False)
-    )
+    return AccessPolicy.model_validate(_complete_contract_input(policy, set()))
 
 
 def _decision(
@@ -167,9 +241,7 @@ def validate_policy_decision(decision: PolicyDecision) -> PolicyDecision:
     Validation does not prove that the decision came from an authority.
     """
 
-    return PolicyDecision.model_validate(
-        decision.model_dump(mode="python", round_trip=True, warnings=False)
-    )
+    return PolicyDecision.model_validate(_complete_contract_input(decision, set()))
 
 
 __all__ = ["evaluate_policy", "validate_policy_decision"]

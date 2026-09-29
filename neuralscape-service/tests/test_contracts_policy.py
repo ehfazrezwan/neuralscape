@@ -416,6 +416,187 @@ def test_evaluator_revalidates_unchecked_evaluation_copy() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "unknown_position",
+    [
+        "principal",
+        "evaluation",
+        "statement",
+        "policy",
+        "membership",
+        "delegation",
+        "reference",
+    ],
+)
+def test_evaluator_rejects_undeclared_fields_in_complete_input_graph(
+    unknown_position: str,
+) -> None:
+    resource_value = reference("memory-1")
+    principal_value = principal()
+    evaluation_value = PolicyEvaluationInput(
+        schema_version=VERSION,
+        action="read",
+        resource=resource_value,
+    )
+    policy_value = policy(
+        statement("read-grant", "allow", "read", resource_value),
+    )
+
+    if unknown_position == "principal":
+        principal_value = principal_value.model_copy(
+            update={"future_constraint": "deny"}
+        )
+    elif unknown_position == "evaluation":
+        evaluation_value = evaluation_value.model_copy(
+            update={"future_constraint": "deny"}
+        )
+    elif unknown_position == "statement":
+        invalid_statement = policy_value.statements[0].model_copy(
+            update={"future_constraint": "deny"}
+        )
+        policy_value = policy_value.model_copy(
+            update={"statements": (invalid_statement,)}
+        )
+    elif unknown_position == "policy":
+        policy_value = policy_value.model_copy(
+            update={"future_constraint": "deny"}
+        )
+    elif unknown_position == "membership":
+        invalid_membership = policy_value.membership_versions[0].model_copy(
+            update={"future_constraint": "deny"}
+        )
+        policy_value = policy_value.model_copy(
+            update={"membership_versions": (invalid_membership,)}
+        )
+    elif unknown_position == "delegation":
+        constraints = DelegationConstraints(
+            delegated_by_subject_id="delegator-a",
+            delegated_by_credential_id="delegator-credential-a",
+            allowed_actions=("read",),
+            allowed_resources=(resource_value,),
+        ).model_copy(update={"future_constraint": "deny"})
+        principal_value = principal(
+            subject_kind="delegated_agent",
+            delegation=constraints,
+        )
+    else:
+        invalid_resource = resource_value.model_copy(
+            update={"future_constraint": "deny"}
+        )
+        invalid_statement = policy_value.statements[0].model_copy(
+            update={"resource": invalid_resource}
+        )
+        policy_value = policy_value.model_copy(
+            update={"statements": (invalid_statement,)}
+        )
+
+    with pytest.raises(ValidationError):
+        evaluate_policy(
+            principal=principal_value,
+            evaluation=evaluation_value,
+            policy=policy_value,
+        )
+
+
+def test_evaluator_preserves_valid_declared_copy_updates() -> None:
+    resource_value = reference("memory-1")
+    evaluation_value = PolicyEvaluationInput(
+        schema_version=VERSION,
+        action="read",
+        resource=resource_value,
+    ).model_copy(update={"action": "update"})
+    read_grant = statement("grant", "allow", "read", resource_value)
+    policy_value = policy(read_grant).model_copy(
+        update={"statements": (read_grant.model_copy(update={"action": "update"}),)}
+    )
+
+    decision = evaluate_policy(
+        principal=principal(),
+        evaluation=evaluation_value,
+        policy=policy_value,
+    )
+
+    assert (decision.outcome, decision.reason_code) == ("allow", "explicit_grant")
+
+
+def test_evaluator_preserves_list_type_for_strict_revalidation() -> None:
+    resource_value = reference("memory-1")
+    grant = statement("read-grant", "allow", "read", resource_value)
+    invalid_policy = policy(grant).model_copy(update={"statements": [grant]})
+
+    with pytest.raises(ValidationError):
+        evaluate_policy(
+            principal=principal(),
+            evaluation=PolicyEvaluationInput(
+                schema_version=VERSION,
+                action="read",
+                resource=resource_value,
+            ),
+            policy=invalid_policy,
+        )
+
+
+def test_evaluator_preserves_invalid_mapping_key_for_revalidation() -> None:
+    resource_value = reference("memory-1")
+    principal_payload: dict[object, object] = principal().model_dump(mode="python")
+    principal_payload[1] = "unknown-semantics"
+
+    with pytest.raises(ValidationError) as exc_info:
+        evaluate_policy(
+            principal=principal_payload,  # type: ignore[arg-type]
+            evaluation=PolicyEvaluationInput(
+                schema_version=VERSION,
+                action="read",
+                resource=resource_value,
+            ),
+            policy=policy(
+                statement("read-grant", "allow", "read", resource_value),
+            ),
+        )
+
+    assert exc_info.value.errors()[0]["type"] == "invalid_key"
+    assert exc_info.value.errors()[0]["loc"] == (1,)
+
+
+@pytest.mark.parametrize("malformed_argument", ["principal", "evaluation", "policy"])
+def test_evaluator_rejects_malformed_scalar_helper_arguments(
+    malformed_argument: str,
+) -> None:
+    resource_value = reference("memory-1")
+    arguments = {
+        "principal": principal(),
+        "evaluation": PolicyEvaluationInput(
+            schema_version=VERSION,
+            action="read",
+            resource=resource_value,
+        ),
+        "policy": policy(statement("read-grant", "allow", "read", resource_value)),
+    }
+    arguments[malformed_argument] = "not-a-contract"
+
+    with pytest.raises(ValidationError):
+        evaluate_policy(**arguments)  # type: ignore[arg-type]
+
+
+def test_evaluator_rejects_cyclic_input_predictably() -> None:
+    cyclic_delegation: list[object] = []
+    cyclic_delegation.append(cyclic_delegation)
+    invalid_principal = principal().model_copy(
+        update={"delegation": cyclic_delegation}
+    )
+
+    with pytest.raises(ValueError, match="cyclic contract input is not supported"):
+        evaluate_policy(
+            principal=invalid_principal,
+            evaluation=PolicyEvaluationInput(
+                schema_version=VERSION,
+                action="read",
+                resource=reference("memory-1"),
+            ),
+            policy=policy(),
+        )
+
+
 @pytest.mark.parametrize("input_graph", ["principal", "evaluation", "policy"])
 def test_evaluator_revalidates_nested_references_in_every_input_graph(
     input_graph: str,
@@ -491,6 +672,24 @@ def test_receiving_boundary_revalidates_unchecked_decision_copy() -> None:
 
     with pytest.raises(ValidationError, match="explicit_grant"):
         validate_policy_decision(contradictory_copy)
+
+
+def test_receiving_boundary_rejects_undeclared_decision_copy_field() -> None:
+    resource_value = reference("memory-1")
+    decision = evaluate(
+        principal(),
+        "read",
+        resource_value,
+        policy(statement("read-grant", "allow", "read", resource_value)),
+    ).model_copy(update={"future_constraint": "deny"})
+
+    with pytest.raises(ValidationError):
+        validate_policy_decision(decision)
+
+
+def test_receiving_boundary_rejects_malformed_scalar_argument() -> None:
+    with pytest.raises(ValidationError):
+        validate_policy_decision("not-a-decision")  # type: ignore[arg-type]
 
 
 def test_receiving_boundary_revalidates_nested_reference_copy() -> None:
