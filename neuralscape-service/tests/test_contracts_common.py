@@ -168,40 +168,80 @@ def test_reference_value_snapshots_reject_assignment(
         setattr(value, field, replacement)
 
 
-@pytest.mark.parametrize(
-    ("value", "unchecked_update"),
-    [
-        (
-            ReferenceHandle(
-                kind="memory",
-                id="memory-1",
-                tenant_id="tenant-1",
-                resolver="exact_lookup",
-            ),
-            {"kind": "user"},
-        ),
-        (
-            SourceVersion(
-                record_id="source-1",
-                content_revision=3,
-                policy_epoch=9,
-            ),
-            {"content_revision": True},
-        ),
-    ],
-)
-def test_model_copy_updates_are_unchecked_and_require_boundary_revalidation(
-    value: ReferenceHandle | SourceVersion,
-    unchecked_update: dict[str, object],
-) -> None:
-    copied = value.model_copy(update=unchecked_update)
-
-    assert all(
-        getattr(copied, field) == replacement
-        for field, replacement in unchecked_update.items()
+def test_reference_handle_revalidates_invalid_known_field_copy() -> None:
+    handle = ReferenceHandle(
+        kind="memory",
+        id="memory-1",
+        tenant_id="tenant-1",
+        resolver="exact_lookup",
     )
+    copied = handle.model_copy(update={"kind": "user"})
+
+    assert copied.kind == "user"
     with pytest.raises(ValidationError):
-        type(value).model_validate(copied.model_dump())
+        ReferenceHandle.model_validate(copied)
+
+
+def test_source_version_revalidates_invalid_known_field_copy() -> None:
+    version = SourceVersion(
+        record_id="source-1",
+        content_revision=3,
+        policy_epoch=9,
+    )
+    copied = version.model_copy(update={"content_revision": True})
+
+    assert copied.content_revision is True
+    with pytest.raises(ValidationError):
+        SourceVersion.model_validate(copied)
+
+
+def test_reference_handle_revalidation_rejects_injected_unknown_field() -> None:
+    handle = ReferenceHandle(
+        kind="memory",
+        id="memory-1",
+        tenant_id="tenant-1",
+        resolver="exact_lookup",
+    )
+    copied = handle.model_copy(update={"authority": "admin"})
+
+    assert "authority" not in copied.model_dump()
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ReferenceHandle.model_validate(copied)
+
+
+def test_source_version_revalidation_rejects_injected_unknown_field() -> None:
+    version = SourceVersion(
+        record_id="source-1",
+        content_revision=3,
+        policy_epoch=9,
+    )
+    copied = version.model_copy(update={"global_revision": 12})
+
+    assert "global_revision" not in copied.model_dump()
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        SourceVersion.model_validate(copied)
+
+
+def test_valid_reference_instances_are_revalidated_without_value_changes() -> None:
+    handle = ReferenceHandle(
+        kind="graph_edge",
+        id=" Edge/01 ",
+        tenant_id="Tenant-A",
+        resolver="graph_resolve",
+    )
+    version = SourceVersion(
+        record_id="source-A",
+        content_revision=3,
+        policy_epoch=9,
+    )
+
+    revalidated_handle = ReferenceHandle.model_validate(handle)
+    revalidated_version = SourceVersion.model_validate(version)
+
+    assert revalidated_handle == handle
+    assert revalidated_handle is not handle
+    assert revalidated_version == version
+    assert revalidated_version is not version
 
 
 def test_native_and_json_representations_preserve_values() -> None:
@@ -221,6 +261,13 @@ def test_native_and_json_representations_preserve_values() -> None:
         "resolver": "graph_resolve",
     }
     assert ReferenceHandle.model_validate_json(handle.model_dump_json()) == handle
+
+    version = SourceVersion(
+        record_id=" Source/01 ",
+        content_revision=3,
+        policy_epoch=9,
+    )
+    assert SourceVersion.model_validate_json(version.model_dump_json()) == version
 
 
 def test_generated_json_schemas_are_closed_and_express_bounds() -> None:
