@@ -1,0 +1,149 @@
+name: bench-ci
+
+on:
+  pull_request:
+    branches: [codex/performance-baseline, dev, main]
+    paths:
+      - "neuralscape-bench/**"
+      - ".github/workflows/bench-ci.yml"
+  push:
+    branches: [dev, main]
+    paths:
+      - "neuralscape-bench/**"
+      - ".github/workflows/bench-ci.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-wheel-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Assert exact checked-out tree
+        run: |
+          set -eu
+          actual_sha=$(git rev-parse HEAD)
+          test "$actual_sha" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          echo "exact tree: $actual_sha"
+          python --version
+      - name: Build and install the bench wheel
+        run: |
+          set -eu
+          python -m pip install --no-cache-dir build
+          python -m build --wheel --outdir "$RUNNER_TEMP/bench-dist" neuralscape-bench
+          set -- "$RUNNER_TEMP"/bench-dist/neuralscape_bench-*.whl
+          test "$#" -eq 1
+          test -f "$1"
+          python -m pip install --no-cache-dir "$1" "pytest>=8.0.0" "pytest-asyncio>=0.23.0"
+      - name: Verify installed-wheel isolation
+        working-directory: ${{ runner.temp }}
+        run: python "$GITHUB_WORKSPACE/neuralscape-bench/scripts/ci_wheel_smoke.py"
+      - name: Copy only declared test fixtures
+        run: |
+          set -eu
+          suite="$RUNNER_TEMP/bench-test-suite"
+          mkdir -p "$suite/icebench/trackq" "$suite/icebench/tokensave"
+          cp -R neuralscape-bench/tests "$suite/tests"
+          cp -R neuralscape-bench/icebench/tests "$suite/icebench/tests"
+          cp -R neuralscape-bench/icebench/trackq/tests "$suite/icebench/trackq/tests"
+          cp -R neuralscape-bench/icebench/tokensave/tests "$suite/icebench/tokensave/tests"
+      - name: Run complete declared bench tests
+        working-directory: ${{ runner.temp }}/bench-test-suite
+        run: |
+          set -eu
+          python -m pytest -q -p no:cacheprovider --import-mode=importlib \
+            -o asyncio_mode=auto \
+            --strict-config --strict-markers \
+            --junitxml="$RUNNER_TEMP/bench-host-junit.xml" \
+            tests icebench/tests icebench/trackq/tests icebench/tokensave/tests
+          python "$GITHUB_WORKSPACE/neuralscape-bench/scripts/ci_wheel_smoke.py" \
+            --assert-junit "$RUNNER_TEMP/bench-host-junit.xml"
+
+  container-wheel-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Assert exact checked-out tree
+        run: |
+          set -eu
+          actual_sha=$(git rev-parse HEAD)
+          test "$actual_sha" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          echo "exact tree: $actual_sha"
+      - name: Resolve and record Python base image
+        id: base
+        run: |
+          set -eu
+          docker pull python:3.11-slim
+          base_image=$(docker image inspect python:3.11-slim --format '{{index .RepoDigests 0}}')
+          case "$base_image" in
+            python@sha256:*) ;;
+            *) echo "::error::unexpected base image identity: $base_image"; exit 1 ;;
+          esac
+          echo "image=$base_image" >> "$GITHUB_OUTPUT"
+          echo "base image: $base_image"
+          docker version
+      - name: Build runtime image from the bench-only context
+        env:
+          BASE_IMAGE: ${{ steps.base.outputs.image }}
+        run: |
+          set -eu
+          docker build --pull \
+            --target runtime \
+            --build-arg PYTHON_IMAGE="$BASE_IMAGE" \
+            --build-arg VCS_REF="$GITHUB_SHA" \
+            --tag "neuralscape-bench-runtime:$GITHUB_SHA" \
+            --file neuralscape-bench/Dockerfile.ci \
+            neuralscape-bench
+          test "$(docker image inspect "neuralscape-bench-runtime:$GITHUB_SHA" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$GITHUB_SHA"
+          test "$(docker image inspect "neuralscape-bench-runtime:$GITHUB_SHA" --format '{{index .Config.Labels "org.opencontainers.image.base.name"}}')" = "$BASE_IMAGE"
+      - name: Smoke the runtime wheel image without network
+        run: docker run --rm --network none "neuralscape-bench-runtime:$GITHUB_SHA"
+      - name: Build installed-wheel test image
+        env:
+          BASE_IMAGE: ${{ steps.base.outputs.image }}
+        run: |
+          set -eu
+          docker build --pull \
+            --target test \
+            --build-arg PYTHON_IMAGE="$BASE_IMAGE" \
+            --build-arg VCS_REF="$GITHUB_SHA" \
+            --tag "neuralscape-bench-test:$GITHUB_SHA" \
+            --file neuralscape-bench/Dockerfile.ci \
+            neuralscape-bench
+      - name: Run complete declared tests in the installed-wheel image
+        run: docker run --rm --network none "neuralscape-bench-test:$GITHUB_SHA"
+
+  bench-gate:
+    if: ${{ always() }}
+    needs: [host-wheel-tests, container-wheel-tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every bench qualification job
+        env:
+          HOST_RESULT: ${{ needs.host-wheel-tests.result }}
+          CONTAINER_RESULT: ${{ needs.container-wheel-tests.result }}
+        run: |
+          set -eu
+          for result in "$HOST_RESULT" "$CONTAINER_RESULT"; do
+            if [ "$result" != "success" ]; then
+              echo "::error::bench qualification result '$result'; expected 'success'"
+              exit 1
+            fi
+          done
