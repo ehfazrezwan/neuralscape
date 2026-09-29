@@ -443,13 +443,22 @@ def upstream_degradation_for(
     return None
 
 
-def bundle_fits_request(request: ContextRequest, bundle: ContextBundle) -> bool:
-    """Conservatively check every request constraint represented by these models.
+def bundle_matches_reported_evidence(
+    request: ContextRequest, bundle: ContextBundle
+) -> bool:
+    """Compare only request correlation and evidence reported by the bundle.
+
+    This checks request correlation, the reported whole-response token count,
+    scope and tokenizer basis, a satisfying reported outcome with selected
+    evidence, current temporal labels, and the requested freshness level.  It
+    does not establish deadline compliance, requested applicability,
+    prerequisite fulfillment, authorization, task relevance, or reference and
+    evidence resolution.
 
     Historical items currently lack an applicability interval or point-in-time
-    witness, so this helper never asserts that a historical ``as_of`` request is
-    satisfied.  It also treats partial and failed outcomes as non-satisfying even
-    though those bundles remain valid, informative responses.
+    witness, so this comparison never matches a historical ``as_of`` request.
+    It also treats partial and failed outcomes as non-matching even though those
+    bundles remain valid, informative responses.
     """
 
     request_snapshot = _revalidated_snapshot(ContextRequest, request)
@@ -618,7 +627,7 @@ __all__ = [
     "TimePerspective",
     "TokenizerBasis",
     "Uncertainty",
-    "bundle_fits_request",
+    "bundle_matches_reported_evidence",
     "receipt_matches_bundle",
     "upstream_degradation_for",
 ]

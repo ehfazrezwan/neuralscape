@@ -14,7 +14,7 @@ from contracts_context import (
     ExpansionLineage,
     SafeDegradationCode,
     SafeOmissionCode,
-    bundle_fits_request,
+    bundle_matches_reported_evidence,
     receipt_matches_bundle,
     upstream_degradation_for,
 )
@@ -200,7 +200,7 @@ def test_budget_is_whole_response_and_uses_the_declared_tokenizer() -> None:
         _request(freshness_requirement="labelled_stale_acceptable"),
     )
     bundle = _validate(ContextBundle, _bundle())
-    assert bundle_fits_request(request, bundle)
+    assert bundle_matches_reported_evidence(request, bundle)
 
     over_budget = _validate(ContextBundle, _bundle(response_usage=_usage(101)))
     wrong_basis = _validate(
@@ -215,15 +215,54 @@ def test_budget_is_whole_response_and_uses_the_declared_tokenizer() -> None:
             }
         ),
     )
-    assert not bundle_fits_request(request, over_budget)
-    assert not bundle_fits_request(request, wrong_basis)
+    assert not bundle_matches_reported_evidence(request, over_budget)
+    assert not bundle_matches_reported_evidence(request, wrong_basis)
 
 
-def test_request_fit_rejects_stale_upstream_for_current_verified() -> None:
+def test_reported_evidence_match_excludes_unobserved_request_fields() -> None:
+    bundle = _validate(ContextBundle, _bundle())
+    requests = [
+        _validate(
+            ContextRequest,
+            _request(
+                freshness_requirement="labelled_stale_acceptable",
+                deadline="2000-01-01T00:00:00Z",
+            ),
+        ),
+        _validate(
+            ContextRequest,
+            _request(
+                freshness_requirement="labelled_stale_acceptable",
+                requested_applicability={
+                    "project_id": "different-project",
+                    "workspace_id": None,
+                },
+            ),
+        ),
+        _validate(
+            ContextRequest,
+            _request(
+                freshness_requirement="labelled_stale_acceptable",
+                prerequisite_receipt=_reference(
+                    "artifact", "unwitnessed-prerequisite"
+                ),
+            ),
+        ),
+    ]
+
+    # True describes only the correlation and evidence reported by the bundle;
+    # the bundle has no witness for these three request fields.
+    assert all(
+        bundle_matches_reported_evidence(request, bundle)
+        for request in requests
+    )
+
+
+def test_reported_evidence_rejects_stale_upstream_for_current_verified() -> None:
     request = _validate(ContextRequest, _request())
     stale_bundle = _validate(ContextBundle, _bundle())
 
-    assert not bundle_fits_request(request, stale_bundle)
+    assert not bundle_matches_reported_evidence(request, stale_bundle)
 
     current_item = _item()
     freshness = current_item["freshness"]
@@ -236,7 +275,7 @@ def test_request_fit_rejects_stale_upstream_for_current_verified() -> None:
     checkpoint["verification_status"] = "current"
     current_bundle = _validate(ContextBundle, _bundle(selected_items=[current_item]))
 
-    assert bundle_fits_request(request, current_bundle)
+    assert bundle_matches_reported_evidence(request, current_bundle)
 
 
 @pytest.mark.parametrize(
@@ -278,10 +317,10 @@ def test_labelled_stale_accepts_only_known_upstream_and_projection_states(
     )
     bundle = _validate(ContextBundle, _bundle(selected_items=[item]))
 
-    assert bundle_fits_request(request, bundle) is expected
+    assert bundle_matches_reported_evidence(request, bundle) is expected
 
 
-def test_request_fit_rejects_historical_item_for_current_request() -> None:
+def test_reported_evidence_rejects_historical_item_for_current_request() -> None:
     item = _item()
     item["temporal_status"] = "historical"
     request = _validate(
@@ -290,10 +329,10 @@ def test_request_fit_rejects_historical_item_for_current_request() -> None:
     )
     bundle = _validate(ContextBundle, _bundle(selected_items=[item]))
 
-    assert not bundle_fits_request(request, bundle)
+    assert not bundle_matches_reported_evidence(request, bundle)
 
 
-def test_request_fit_does_not_claim_historical_as_of_without_witness() -> None:
+def test_reported_evidence_does_not_match_historical_as_of_without_witness() -> None:
     item = _item()
     item["temporal_status"] = "historical"
     request = _validate(
@@ -306,14 +345,14 @@ def test_request_fit_does_not_claim_historical_as_of_without_witness() -> None:
     )
     bundle = _validate(ContextBundle, _bundle(selected_items=[item]))
 
-    assert not bundle_fits_request(request, bundle)
+    assert not bundle_matches_reported_evidence(request, bundle)
 
 
 @pytest.mark.parametrize(
     "freshness_requirement",
     ["current_verified", "current_known", "labelled_stale_acceptable"],
 )
-def test_empty_no_evidence_bundle_never_claims_request_fit(
+def test_empty_no_evidence_bundle_never_matches_reported_evidence(
     freshness_requirement: str,
 ) -> None:
     request = _validate(
@@ -328,10 +367,10 @@ def test_empty_no_evidence_bundle_never_claims_request_fit(
         ),
     )
 
-    assert not bundle_fits_request(request, bundle)
+    assert not bundle_matches_reported_evidence(request, bundle)
 
 
-def test_request_fit_revalidates_copied_and_constructed_requests() -> None:
+def test_reported_evidence_revalidates_copied_and_constructed_requests() -> None:
     request = _validate(
         ContextRequest,
         _request(freshness_requirement="labelled_stale_acceptable"),
@@ -349,12 +388,12 @@ def test_request_fit_revalidates_copied_and_constructed_requests() -> None:
     )
     copied_with_extra = request.model_copy(update={"unreviewed_mode": True})
 
-    assert not bundle_fits_request(copied, bundle)
-    assert not bundle_fits_request(constructed, bundle)
-    assert not bundle_fits_request(copied_with_extra, bundle)
+    assert not bundle_matches_reported_evidence(copied, bundle)
+    assert not bundle_matches_reported_evidence(constructed, bundle)
+    assert not bundle_matches_reported_evidence(copied_with_extra, bundle)
 
 
-def test_request_fit_rejects_nested_copied_extra_and_cyclic_graph() -> None:
+def test_reported_evidence_rejects_nested_copied_extra_and_cyclic_graph() -> None:
     request = _validate(
         ContextRequest,
         _request(freshness_requirement="labelled_stale_acceptable"),
@@ -368,8 +407,8 @@ def test_request_fit_rejects_nested_copied_extra_and_cyclic_graph() -> None:
     cycle.append(cycle)
     cyclic_request = request.model_copy(update={"unreviewed_cycle": cycle})
 
-    assert not bundle_fits_request(request, copied_bundle)
-    assert not bundle_fits_request(cyclic_request, bundle)
+    assert not bundle_matches_reported_evidence(request, copied_bundle)
+    assert not bundle_matches_reported_evidence(cyclic_request, bundle)
 
 
 def test_boolean_helpers_reject_conflicting_declared_and_extra_storage() -> None:
@@ -394,7 +433,7 @@ def test_boolean_helpers_reject_conflicting_declared_and_extra_storage() -> None
         {"receipt_id": receipt.receipt_id},
     )
 
-    assert not bundle_fits_request(invalid_request, bundle)
+    assert not bundle_matches_reported_evidence(invalid_request, bundle)
     assert not receipt_matches_bundle(invalid_receipt, bundle)
 
 
@@ -408,7 +447,7 @@ def test_boolean_helpers_reject_malformed_extra_storage() -> None:
     object.__setattr__(request, "__pydantic_extra__", [])
     object.__setattr__(receipt, "__pydantic_extra__", [])
 
-    assert not bundle_fits_request(request, bundle)
+    assert not bundle_matches_reported_evidence(request, bundle)
     assert not receipt_matches_bundle(receipt, bundle)
 
 
@@ -424,7 +463,7 @@ def test_boolean_helper_preserves_nonconflicting_extra_storage() -> None:
         {"unreviewed_mode": True},
     )
 
-    assert not bundle_fits_request(request, bundle)
+    assert not bundle_matches_reported_evidence(request, bundle)
 
 
 @pytest.mark.parametrize(
@@ -742,7 +781,7 @@ def test_helpers_revalidate_copied_cross_item_version_conflict() -> None:
         update={"selected_items": (bundle.selected_items[0], conflicting_item)}
     )
 
-    assert not bundle_fits_request(request, conflicting_bundle)
+    assert not bundle_matches_reported_evidence(request, conflicting_bundle)
     assert not receipt_matches_bundle(receipt, conflicting_bundle)
 
 
@@ -765,7 +804,7 @@ def test_helpers_fail_closed_for_constructed_invalid_bundles_and_receipts() -> N
         }
     )
 
-    assert not bundle_fits_request(request, constructed_bundle)
+    assert not bundle_matches_reported_evidence(request, constructed_bundle)
     assert not receipt_matches_bundle(constructed_receipt, bundle)
 
 
