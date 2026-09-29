@@ -5,9 +5,45 @@ from copy import deepcopy
 from pathlib import PureWindowsPath
 
 import pytest
-from pydantic import ValidationError
+from pydantic import Field, ValidationError
 
-from contracts_portability import PortableManifest, validate_portable_manifest
+from contracts_portability import (
+    ChecksumDescriptor,
+    EncryptionReference,
+    ExportScope,
+    ManifestFile,
+    PortableManifest,
+    ProducerReference,
+    validate_portable_manifest,
+)
+
+
+class FutureManifestFile(ManifestFile):
+    future_contract_field: str
+
+
+class FutureProducerReference(ProducerReference):
+    future_contract_field: str
+
+
+class FutureChecksumDescriptor(ChecksumDescriptor):
+    future_contract_field: str
+
+
+class FutureExportScope(ExportScope):
+    future_contract_field: str
+
+
+class FutureEncryptionReference(EncryptionReference):
+    future_contract_field: str
+
+
+class CompatibleManifestFile(ManifestFile):
+    pass
+
+
+class ExcludingFutureManifestFile(ManifestFile):
+    future_contract_field: str = Field(exclude=True)
 
 
 def valid_manifest() -> dict:
@@ -524,6 +560,142 @@ def test_revalidating_instance_rejects_mutated_missing_envelope_file() -> None:
 
     with pytest.raises(ValidationError, match="files absent"):
         validate_portable_manifest(manifest)
+
+
+def _manifest_with_nested_runtime_subclass(
+    nested_kind: str,
+) -> tuple[PortableManifest, object]:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    if nested_kind == "file":
+        node = FutureManifestFile(
+            **manifest.files[0].model_dump(),
+            future_contract_field="deny",
+        )
+        manifest.files[0] = node
+    elif nested_kind == "producer":
+        node = FutureProducerReference(
+            **manifest.producer.model_dump(),
+            future_contract_field="deny",
+        )
+        manifest.producer = node
+    elif nested_kind == "checksum":
+        node = FutureChecksumDescriptor(
+            **manifest.files[0].checksum.model_dump(),
+            future_contract_field="deny",
+        )
+        manifest.files[0].checksum = node
+    elif nested_kind == "scope":
+        node = FutureExportScope(
+            **manifest.scope.model_dump(),
+            future_contract_field="deny",
+        )
+        manifest.scope = node
+    else:
+        node = FutureEncryptionReference(
+            **manifest.encryption.model_dump(),
+            future_contract_field="deny",
+        )
+        manifest.encryption = node
+    return manifest, node
+
+
+@pytest.mark.parametrize("entrypoint", ["helper", "model_validate"])
+@pytest.mark.parametrize(
+    "nested_kind",
+    ["file", "producer", "checksum", "scope", "encryption"],
+)
+def test_rejects_declared_fields_from_nested_runtime_subclasses(
+    entrypoint: str,
+    nested_kind: str,
+) -> None:
+    corrupted, node = _manifest_with_nested_runtime_subclass(nested_kind)
+
+    assert node.__dict__["future_contract_field"] == "deny"
+    with pytest.raises(ValidationError, match="future_contract_field"):
+        if entrypoint == "helper":
+            validate_portable_manifest(corrupted)
+        else:
+            PortableManifest.model_validate(corrupted)
+
+
+def test_rejects_undeclared_field_retained_on_nested_runtime_subclass() -> None:
+    corrupted, node = _manifest_with_nested_runtime_subclass("file")
+    unknown = node.model_copy(update={"undeclared_constraint": "deny"})
+    corrupted.files[0] = unknown
+
+    with pytest.raises(ValidationError, match="undeclared_constraint") as raised:
+        validate_portable_manifest(corrupted)
+
+    assert raised.value.errors()[0]["type"] == "extra_forbidden"
+
+
+def test_rejects_nested_subclass_field_excluded_from_serialization() -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    future_file = ExcludingFutureManifestFile(
+        **manifest.files[0].model_dump(),
+        future_contract_field="deny",
+    )
+    manifest.files[0] = future_file
+
+    assert "future_contract_field" not in future_file.model_dump()
+    with pytest.raises(ValidationError, match="future_contract_field"):
+        validate_portable_manifest(manifest)
+
+
+def test_compatible_nested_subclass_without_new_fields_remains_valid() -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    compatible = CompatibleManifestFile(**manifest.files[0].model_dump())
+    manifest.files[0] = compatible
+
+    revalidated = validate_portable_manifest(manifest)
+
+    assert revalidated.files[0].model_dump() == compatible.model_dump()
+    assert type(revalidated.files[0]) is ManifestFile
+    assert revalidated.files[0] is not compatible
+
+
+@pytest.mark.parametrize(
+    "malformed_kind", ["tuple_files", "set_capabilities", "bool_size"]
+)
+def test_subclass_preserving_reconstruction_does_not_normalize_malformed_values(
+    malformed_kind: str,
+) -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    if malformed_kind == "tuple_files":
+        malformed_value = tuple(manifest.files)
+        corrupted = manifest.model_copy(update={"files": malformed_value})
+    elif malformed_kind == "set_capabilities":
+        malformed_value = set(manifest.included_capabilities)
+        corrupted = manifest.model_copy(
+            update={"included_capabilities": malformed_value}
+        )
+    else:
+        malformed_value = True
+        invalid_file = manifest.files[0].model_copy(update={"size_bytes": True})
+        corrupted = manifest.model_copy(
+            update={"files": [invalid_file, manifest.files[1]]}
+        )
+
+    with pytest.raises(ValidationError):
+        validate_portable_manifest(corrupted)
+    if malformed_kind == "tuple_files":
+        assert corrupted.files is malformed_value
+    elif malformed_kind == "set_capabilities":
+        assert corrupted.included_capabilities is malformed_value
+    else:
+        assert corrupted.files[0].size_bytes is malformed_value
+
+
+def test_cyclic_declared_nested_subclass_field_is_a_controlled_failure() -> None:
+    corrupted, node = _manifest_with_nested_runtime_subclass("file")
+    cyclic_value = []
+    cyclic_value.append(cyclic_value)
+    corrupted.files[0] = node.model_copy(
+        update={"future_contract_field": cyclic_value}
+    )
+
+    with pytest.raises(ValidationError):
+        validate_portable_manifest(corrupted)
 
 
 def test_mixed_mapping_rejects_nested_manifest_file_with_unsafe_path() -> None:

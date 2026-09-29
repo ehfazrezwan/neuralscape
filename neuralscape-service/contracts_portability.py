@@ -86,6 +86,51 @@ def _reject_retained_unknown_fields(root: BaseModel) -> None:
         raise ValidationError.from_exception_data("PortableManifest", errors)
 
 
+def _reconstruct_retained_state(root: BaseModel) -> dict[str, Any]:
+    """Copy a model graph without invoking lossy Pydantic serialization.
+
+    Pydantic serializes nested models according to their annotated field type
+    by default, and even duck-typed serialization honors field exclusions.
+    Reconstructing from stored state keeps every runtime subclass field visible
+    to the closed destination schemas.  Container kinds are retained so this
+    receiving boundary cannot turn an invalid tuple or set into a valid list.
+    """
+
+    active: set[int] = set()
+
+    def rebuild(value: Any) -> Any:
+        if not isinstance(value, (BaseModel, Mapping, list, tuple, set, frozenset)):
+            return value
+
+        identity = id(value)
+        if identity in active:
+            raise ValueError("contract input graph must be acyclic")
+        active.add(identity)
+        try:
+            if isinstance(value, BaseModel):
+                stored = dict(value.__dict__)
+                for name, item in (value.__pydantic_extra__ or {}).items():
+                    stored.setdefault(name, item)
+                return {name: rebuild(item) for name, item in stored.items()}
+
+            if isinstance(value, Mapping):
+                return {rebuild(key): rebuild(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [rebuild(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(rebuild(item) for item in value)
+            if isinstance(value, set):
+                return {rebuild(item) for item in value}
+            return frozenset(rebuild(item) for item in value)
+        finally:
+            active.remove(identity)
+
+    reconstructed = rebuild(root)
+    if not isinstance(reconstructed, dict):
+        raise ValueError("contract model reconstruction must produce a mapping")
+    return reconstructed
+
+
 def _normalized_bundle_path(value: str) -> str:
     """Return a canonical relative POSIX bundle path or raise ``ValueError``.
 
@@ -342,7 +387,7 @@ def validate_portable_manifest(
     if isinstance(document, PortableManifest):
         try:
             _reject_retained_unknown_fields(document)
-            candidate = document.model_dump()
+            candidate = _reconstruct_retained_state(document)
         except ValidationError:
             raise
         except (TypeError, ValueError, RecursionError) as exc:
