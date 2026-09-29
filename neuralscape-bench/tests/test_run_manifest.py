@@ -16,6 +16,7 @@ from neuralscape_bench.run_manifest import (
     BuildIdentity,
     CacheCondition,
     ConcurrencySetting,
+    FailureOutcome,
     LimitKind,
     MeasurementProvenance,
     ObservationKind,
@@ -29,6 +30,7 @@ from neuralscape_bench.run_manifest import (
     serialize_run_manifest,
     validate_run_manifest_json,
 )
+from neuralscape_bench.run_manifest import _snapshot_native
 
 
 VERSION = "candidate-v1"
@@ -311,9 +313,51 @@ def test_resource_limit_and_observation_states_are_consistent():
         )
 
 
-def test_sample_accounting_requires_every_attempt_to_be_included_or_excluded():
+def test_sample_accounting_requires_every_attempt_to_have_one_disposition():
     data = timing().model_dump()
     data["included_sample_count"] = 9
+    with pytest.raises(ValidationError, match="must equal attempted"):
+        TimingMeasurement.model_validate(data)
+
+
+def test_timeout_failures_are_counted_without_becoming_exclusions():
+    measurement = TimingMeasurement(
+        schema_version=VERSION,
+        name="read-with-timeouts",
+        time_unit="milliseconds",
+        attempted_sample_count=10,
+        included_sample_count=8,
+        provenance=timing(warmup=False).provenance,
+        failure_outcomes=(
+            FailureOutcome(schema_version=VERSION, kind="timeout", count=2),
+        ),
+    )
+
+    assert measurement.included_sample_count == 8
+    assert measurement.failure_outcomes[0].count == 2
+    assert measurement.exclusions == ()
+
+    manifest = finish_run(
+        planned_manifest(),
+        state=RunState.COMPLETED,
+        started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+        resources=(measured_memory(),),
+        measurements=(measurement,),
+    )
+    reparsed = validate_run_manifest_json(serialize_run_manifest(manifest))
+    assert reparsed.measurements[0].failure_outcomes == measurement.failure_outcomes
+
+
+def test_failure_outcomes_reject_unknown_kinds_and_accounting_mismatches():
+    with pytest.raises(ValidationError):
+        FailureOutcome(schema_version=VERSION, kind="unavailable", count=1)
+
+    data = timing(warmup=False).model_dump()
+    data["included_sample_count"] = 8
+    data["failure_outcomes"] = (
+        FailureOutcome(schema_version=VERSION, kind="error", count=1),
+    )
     with pytest.raises(ValidationError, match="must equal attempted"):
         TimingMeasurement.model_validate(data)
 
@@ -404,3 +448,165 @@ def test_duplicate_scopes_names_and_json_keys_are_rejected():
 
     with pytest.raises(ValueError, match="duplicate JSON key"):
         validate_run_manifest_json('{"schema_version":"candidate-v1","run_id":"a","run_id":"b"}')
+
+
+@pytest.mark.parametrize(
+    "resource,measurement",
+    [
+        (
+            measured_memory().model_copy(update={"observed_value": True}),
+            timing(),
+        ),
+        (
+            measured_memory(),
+            timing().model_copy(update={"time_unit": "fortnights"}),
+        ),
+        (
+            measured_memory(),
+            timing().model_copy(
+                update={
+                    "provenance": timing().provenance.model_copy(
+                        update={"clock": "wall_clock"}
+                    )
+                }
+            ),
+        ),
+        (
+            measured_memory(),
+            TimingMeasurement.model_construct(
+                schema_version=VERSION,
+                name="constructed-invalid",
+                time_unit="fortnights",
+                attempted_sample_count=1,
+                included_sample_count=1,
+                provenance=timing().provenance,
+                exclusions=(),
+                failure_outcomes=(),
+            ),
+        ),
+        (
+            measured_memory().model_copy(update={"future_semantics": "deny"}),
+            timing(),
+        ),
+    ],
+)
+def test_finish_deeply_revalidates_unchecked_nested_models(resource, measurement):
+    with pytest.raises((ValidationError, ValueError)):
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(resource,),
+            measurements=(measurement,),
+        )
+
+
+def test_finish_rejects_undeclared_planned_fields_and_returns_fresh_graph():
+    with pytest.raises(ValueError, match="undeclared stored fields"):
+        finish_run(
+            planned_manifest().model_copy(update={"future_semantics": "deny"}),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(timing(),),
+        )
+
+    resource = measured_memory()
+    measurement = timing()
+    result = finish_run(
+        planned_manifest(),
+        state=RunState.COMPLETED,
+        started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+        resources=(resource,),
+        measurements=(measurement,),
+    )
+    assert result.resources[0] is not resource
+    assert result.measurements[0] is not measurement
+    assert result.measurements[0].provenance is not measurement.provenance
+
+
+def test_finish_revalidates_scalar_and_container_arguments():
+    common = {
+        "planned": planned_manifest(),
+        "state": RunState.COMPLETED,
+        "started_at": datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+        "finished_at": datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+        "resources": (measured_memory(),),
+        "measurements": (timing(),),
+    }
+
+    with pytest.raises(ValidationError):
+        finish_run(**(common | {"state": "completed"}))
+    with pytest.raises(ValidationError, match="explicit UTC offset"):
+        finish_run(
+            **(common | {"started_at": datetime(2026, 9, 28, 8, 0)})
+        )
+    with pytest.raises(ValidationError):
+        finish_run(**(common | {"resources": [measured_memory()]}))
+    with pytest.raises(ValidationError):
+        finish_run(**(common | {"measurements": [timing()]}))
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        completed_manifest().model_copy(update={"state": RunState.PLANNED}),
+        completed_manifest().model_copy(update={"future_semantics": "deny"}),
+        completed_manifest().model_copy(
+            update={
+                "measurements": (
+                    timing().model_copy(update={"time_unit": "fortnights"}),
+                )
+            }
+        ),
+        completed_manifest().model_copy(
+            update={
+                "measurements": (
+                    TimingMeasurement.model_construct(
+                        schema_version=VERSION,
+                        name="constructed-invalid",
+                        time_unit="fortnights",
+                        attempted_sample_count=1,
+                        included_sample_count=1,
+                        provenance=timing().provenance,
+                        exclusions=(),
+                        failure_outcomes=(),
+                    ),
+                )
+            }
+        ),
+    ],
+)
+def test_serializer_rejects_unchecked_invalid_manifest_copies(manifest):
+    with pytest.raises((ValidationError, ValueError)):
+        serialize_run_manifest(manifest)
+
+
+def test_native_snapshot_preserves_mapping_keys_and_sequence_types():
+    value = {"01": [1, 2], 1: ("a", "b")}
+    snapshot = _snapshot_native(value)
+
+    assert tuple(snapshot) == ("01", 1)
+    assert isinstance(snapshot["01"], list)
+    assert isinstance(snapshot[1], tuple)
+
+
+def test_receiving_boundaries_reject_lists_malformed_models_and_cycles():
+    list_resources = completed_manifest().model_copy(
+        update={"resources": [measured_memory()]}
+    )
+    with pytest.raises(ValidationError):
+        serialize_run_manifest(list_resources)
+
+    malformed = RunManifest.model_construct(schema_version=VERSION, run_id="missing")
+    with pytest.raises(ValidationError):
+        serialize_run_manifest(malformed)
+
+    cycle = []
+    cycle.append(cycle)
+    cyclic = completed_manifest().model_copy(update={"resources": cycle})
+    with pytest.raises(ValueError, match="cyclic native input"):
+        serialize_run_manifest(cyclic)

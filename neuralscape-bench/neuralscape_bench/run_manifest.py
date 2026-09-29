@@ -9,6 +9,7 @@ not be synthesized as a zero.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from datetime import datetime
 from enum import Enum
 from typing import Annotated, Any, Literal, Self
@@ -169,6 +170,20 @@ class SampleExclusion(_ManifestContract):
         return value
 
 
+class FailureOutcome(_ManifestContract):
+    """Attempt outcomes that failed the workload rather than measurement setup."""
+
+    kind: Literal["timeout", "error"]
+    count: _SafeCounter
+
+    @field_validator("count")
+    @classmethod
+    def require_positive_count(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("a failure outcome must account for at least one attempt")
+        return value
+
+
 class TimingMeasurement(_ManifestContract):
     """Sampling boundary for one timing metric, without benchmark results."""
 
@@ -178,19 +193,25 @@ class TimingMeasurement(_ManifestContract):
     included_sample_count: _SafeCounter
     provenance: MeasurementProvenance
     exclusions: tuple[SampleExclusion, ...] = ()
+    failure_outcomes: tuple[FailureOutcome, ...] = ()
 
     @model_validator(mode="after")
     def validate_sample_accounting(self) -> Self:
         if self.attempted_sample_count < 1:
             raise ValueError("attempted_sample_count must be at least one")
         excluded = sum(item.count for item in self.exclusions)
-        if self.included_sample_count + excluded != self.attempted_sample_count:
+        failed = sum(item.count for item in self.failure_outcomes)
+        if self.included_sample_count + failed + excluded != self.attempted_sample_count:
             raise ValueError(
-                "included samples plus exclusions must equal attempted samples"
+                "included samples, failure outcomes, and exclusions must equal "
+                "attempted samples"
             )
-        kinds = [item.kind for item in self.exclusions]
-        if len(kinds) != len(set(kinds)):
+        exclusion_kinds = [item.kind for item in self.exclusions]
+        if len(exclusion_kinds) != len(set(exclusion_kinds)):
             raise ValueError("exclusion kinds must be unique within a measurement")
+        failure_kinds = [item.kind for item in self.failure_outcomes]
+        if len(failure_kinds) != len(set(failure_kinds)):
+            raise ValueError("failure outcome kinds must be unique within a measurement")
         return self
 
 
@@ -265,6 +286,72 @@ class RunManifest(_ManifestContract):
         return self
 
 
+def _snapshot_native(value: Any, *, path: str = "$", active: set[int] | None = None) -> Any:
+    """Copy native input without coercion while enforcing closed model storage.
+
+    Pydantic's unchecked construction and copy APIs can create model instances
+    whose stored values have never passed field validation.  They can also add
+    undeclared keys that ``model_dump`` omits.  This snapshot preserves native
+    tuple/list distinctions and mapping keys so strict revalidation sees the
+    caller's actual structure instead of a normalized substitute.
+    """
+
+    if active is None:
+        active = set()
+
+    is_container = isinstance(value, (BaseModel, Mapping, tuple, list))
+    identity = id(value)
+    if is_container:
+        if identity in active:
+            raise ValueError(f"cyclic native input at {path}")
+        active.add(identity)
+
+    try:
+        if isinstance(value, BaseModel):
+            fields = type(value).model_fields
+            stored = vars(value)
+            undeclared = set(stored).difference(fields)
+            extras = getattr(value, "__pydantic_extra__", None)
+            if extras:
+                undeclared.update(extras)
+            if undeclared:
+                names = ", ".join(sorted(repr(name) for name in undeclared))
+                raise ValueError(f"undeclared stored fields at {path}: {names}")
+            return {
+                name: _snapshot_native(stored[name], path=f"{path}.{name}", active=active)
+                for name in fields
+                if name in stored
+            }
+
+        if isinstance(value, Mapping):
+            return {
+                key: _snapshot_native(item, path=f"{path}[{key!r}]", active=active)
+                for key, item in value.items()
+            }
+        if isinstance(value, tuple):
+            return tuple(
+                _snapshot_native(item, path=f"{path}[{index}]", active=active)
+                for index, item in enumerate(value)
+            )
+        if isinstance(value, list):
+            return [
+                _snapshot_native(item, path=f"{path}[{index}]", active=active)
+                for index, item in enumerate(value)
+            ]
+        return value
+    finally:
+        if is_container:
+            active.remove(identity)
+
+
+def _validated_manifest_snapshot(manifest: RunManifest) -> RunManifest:
+    """Return a fresh, deeply validated manifest graph from native evidence."""
+
+    if not isinstance(manifest, RunManifest):
+        raise TypeError("manifest must be a RunManifest")
+    return RunManifest.model_validate(_snapshot_native(manifest))
+
+
 def finish_run(
     planned: RunManifest,
     *,
@@ -276,35 +363,37 @@ def finish_run(
 ) -> RunManifest:
     """Finish a planned run without allowing its declared envelope to change."""
 
-    if planned.state is not RunState.PLANNED:
+    validated_planned = _validated_manifest_snapshot(planned)
+    if validated_planned.state is not RunState.PLANNED:
         raise ValueError("only a planned run can be finished")
+
+    candidate_data = _snapshot_native(validated_planned)
+    candidate_data.update(
+        state=_snapshot_native(state, path="$.state"),
+        started_at=_snapshot_native(started_at, path="$.started_at"),
+        finished_at=_snapshot_native(finished_at, path="$.finished_at"),
+        resources=_snapshot_native(resources, path="$.resources"),
+        measurements=_snapshot_native(measurements, path="$.measurements"),
+    )
+    candidate = RunManifest.model_validate(candidate_data)
 
     planned_resources = {
         (item.scope, item.resource): (item.unit, item.limit_kind, item.limit_value)
-        for item in planned.resources
+        for item in validated_planned.resources
     }
     finished_resources = {
         (item.scope, item.resource): (item.unit, item.limit_kind, item.limit_value)
-        for item in resources
+        for item in candidate.resources
     }
     if finished_resources != planned_resources:
         raise ValueError("finishing a run cannot change its declared resource envelope")
-
-    data = planned.model_dump(mode="python")
-    data.update(
-        state=state,
-        started_at=started_at,
-        finished_at=finished_at,
-        resources=resources,
-        measurements=measurements,
-    )
-    return RunManifest.model_validate(data)
+    return candidate
 
 
 def serialize_run_manifest(manifest: RunManifest) -> bytes:
     """Return canonical UTF-8 JSON bytes for hashing, comparison, and storage."""
 
-    payload = manifest.model_dump(mode="json")
+    payload = _validated_manifest_snapshot(manifest).model_dump(mode="json")
     return json.dumps(
         payload,
         ensure_ascii=False,
