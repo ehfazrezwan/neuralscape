@@ -153,7 +153,10 @@ jobs:
                 "jsonschema>=4.26.0,<5" \
                 "pytest>=8.0.0"
               python -c "import contracts_common, contracts_references, contracts_engines, contracts_inference"
-              python -m pytest -p no:cacheprovider \
+              # These pure contract tests do not use the service suite
+              # auth/config fixtures. The full host and container jobs still
+              # load conftest.py and exercise the complete service environment.
+              python -m pytest --noconftest -p no:cacheprovider \
                 tests/test_contracts_common.py \
                 tests/test_contracts_engines.py \
                 tests/test_contracts_inference.py \
