@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from contracts_usage import AttributionSnapshot, TokenQuantity, TokenUsage, UsageEvent
 from contracts_usage_reconcile import (
     ReconciledLedger,
+    ReconciledUsageStream,
     UsageReconciliation,
     UsageReconciliationError,
     reconcile_usage_events,
@@ -203,6 +204,31 @@ def test_result_revalidation_rejects_hidden_extra_in_nested_copy() -> None:
 
     with pytest.raises(ValidationError):
         UsageReconciliation.model_validate(invalid_result)
+
+
+def test_stream_rejects_existing_attribution_with_hidden_extra() -> None:
+    stream = reconcile_usage_events([_event()]).streams[0]
+    invalid_attribution = stream.attribution.model_copy(
+        update={"authority": "admin"}
+    )
+    payload = stream.model_dump(mode="python")
+    payload["attribution"] = invalid_attribution
+
+    with pytest.raises(ValidationError, match="stream attribution is invalid"):
+        ReconciledUsageStream.model_validate(payload)
+
+
+def test_existing_stream_revalidation_rejects_attribution_hidden_extra() -> None:
+    stream = reconcile_usage_events([_event()]).streams[0]
+    invalid_attribution = stream.attribution.model_copy(
+        update={"authority": "admin"}
+    )
+    invalid_stream = stream.model_copy(
+        update={"attribution": invalid_attribution}
+    )
+
+    with pytest.raises(ValidationError, match="stream attribution is invalid"):
+        ReconciledUsageStream.model_validate(invalid_stream)
 
 
 def test_empty_input_cannot_fabricate_tenant_or_ledger_completeness() -> None:

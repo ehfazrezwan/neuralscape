@@ -75,6 +75,12 @@ class ReconciledUsageStream(ContractModel):
 
     @model_validator(mode="after")
     def validate_usage_summary(self) -> "ReconciledUsageStream":
+        try:
+            self.attribution = AttributionSnapshot.model_validate(
+                _native_snapshot(self.attribution)
+            )
+        except Exception as exc:
+            raise ValueError("stream attribution is invalid") from exc
         if self.usage is not None:
             try:
                 self.usage = TokenUsage.model_validate(_native_snapshot(self.usage))
