@@ -708,6 +708,72 @@ def test_processing_rejects_latest_applied_receipt_with_stale_witness(
         )
 
 
+def test_processing_requires_started_and_unfinished_work() -> None:
+    command = intent(ProcessingStage.CANONICAL, ProcessingStage.GRAPH)
+
+    validate_required_stage_claim(
+        claimed_status=IntentStatus.PROCESSING,
+        intent=command,
+        receipts=(
+            receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED),
+            receipt(ProcessingStage.GRAPH, StageStatus.PENDING),
+        ),
+    )
+    validate_required_stage_claim(
+        claimed_status=IntentStatus.PROCESSING,
+        intent=command,
+        receipts=(receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED),),
+    )
+    validate_required_stage_claim(
+        claimed_status=IntentStatus.PROCESSING,
+        intent=command,
+        receipts=(receipt(ProcessingStage.CANONICAL, StageStatus.PROCESSING),),
+    )
+
+
+@pytest.mark.parametrize(
+    "receipts",
+    [
+        (),
+        (
+            receipt(ProcessingStage.CANONICAL, StageStatus.PENDING),
+            receipt(ProcessingStage.GRAPH, StageStatus.PENDING),
+        ),
+        (
+            receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED),
+            receipt(ProcessingStage.GRAPH, StageStatus.APPLIED),
+        ),
+    ],
+)
+def test_processing_rejects_no_started_or_no_unfinished_work(
+    receipts: tuple[StageReceipt, ...],
+) -> None:
+    with pytest.raises(ValueError, match="started and unfinished"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.PROCESSING,
+            intent=intent(ProcessingStage.CANONICAL, ProcessingStage.GRAPH),
+            receipts=receipts,
+        )
+
+
+def test_accepted_still_allows_empty_or_pending_required_work() -> None:
+    command = intent(ProcessingStage.CANONICAL, ProcessingStage.GRAPH)
+
+    validate_required_stage_claim(
+        claimed_status=IntentStatus.ACCEPTED,
+        intent=command,
+        receipts=(),
+    )
+    validate_required_stage_claim(
+        claimed_status=IntentStatus.ACCEPTED,
+        intent=command,
+        receipts=(
+            receipt(ProcessingStage.CANONICAL, StageStatus.PENDING),
+            receipt(ProcessingStage.GRAPH, StageStatus.PENDING),
+        ),
+    )
+
+
 def test_partial_requires_both_applied_and_terminal_non_applied_stages() -> None:
     command = intent(ProcessingStage.CANONICAL, ProcessingStage.GRAPH)
     validate_required_stage_claim(

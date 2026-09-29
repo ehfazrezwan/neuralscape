@@ -397,7 +397,11 @@ def validate_required_stage_claim(
     elif claimed_status is IntentStatus.PROCESSING:
         if not any(
             receipt is not None
-            and receipt.status in {StageStatus.PENDING, StageStatus.PROCESSING}
+            and receipt.status in {StageStatus.PROCESSING, StageStatus.APPLIED}
+            for receipt in required_receipts.values()
+        ) or not any(
+            receipt is None
+            or receipt.status in {StageStatus.PENDING, StageStatus.PROCESSING}
             for receipt in required_receipts.values()
         ) or any(
             receipt is not None
@@ -410,7 +414,10 @@ def validate_required_stage_claim(
             }
             for receipt in required_receipts.values()
         ):
-            raise ValueError("processing requires an in-flight stage and no terminal failure")
+            raise ValueError(
+                "processing requires started and unfinished required work "
+                "with no terminal failure"
+            )
     elif claimed_status is IntentStatus.APPLIED:
         if applied != required:
             raise ValueError("applied requires matching applied receipts for every required stage")
