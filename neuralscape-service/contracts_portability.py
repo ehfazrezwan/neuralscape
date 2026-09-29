@@ -90,8 +90,10 @@ def _normalized_bundle_path(value: str) -> str:
 
     Backslashes are rejected rather than treated as ordinary POSIX filename
     characters because a later Windows consumer could reinterpret them as path
-    separators.  ``.`` and repeated separators are normalized so aliases can
-    be detected across the complete file inventory.
+    separators.  Windows device names are rejected in every path component so
+    a consumer cannot resolve an apparent file to a device.  ``.`` and repeated
+    separators are normalized so aliases can be detected across the complete
+    file inventory.
     """
 
     if not value or "\x00" in value:
@@ -110,6 +112,10 @@ def _normalized_bundle_path(value: str) -> str:
         raise ValueError("bundle path must identify a file")
     if PureWindowsPath(normalized).drive:
         raise ValueError("bundle path must not be Windows drive-qualified")
+    if any(PureWindowsPath(part).is_reserved() for part in path.parts):
+        raise ValueError(
+            "bundle path must not contain a Windows reserved device name"
+        )
     return normalized
 
 

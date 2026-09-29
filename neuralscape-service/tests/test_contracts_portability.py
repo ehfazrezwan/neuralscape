@@ -101,6 +101,61 @@ def test_rejects_unsafe_file_paths(unsafe_path: str) -> None:
         validate_portable_manifest(document)
 
 
+@pytest.mark.parametrize(
+    "reserved_path",
+    [
+        "NUL",
+        "files/CON.txt",
+        "CON/files.json",
+        "nested/AuX",
+        "nested/PrN.json",
+        "nested/COM1.bin",
+        "nested/lpt9.backup",
+        "nested/CONIN$",
+        "nested/conout$.log",
+        "nested/NUL .txt",
+    ],
+)
+def test_rejects_windows_reserved_device_paths(reserved_path: str) -> None:
+    document = valid_manifest()
+    document["files"][0]["path"] = reserved_path
+
+    with pytest.raises(ValidationError, match="Windows reserved device name"):
+        validate_portable_manifest(document)
+
+
+@pytest.mark.parametrize(
+    "safe_path",
+    [
+        "devices/null.bin",
+        "files/console.txt",
+        "devices/auxiliary.txt",
+        "ports/com0.bin",
+        "ports/com10.bin",
+        "ports/lpt0.bin",
+        "ports/lpt10.bin",
+        "reports/prn-report.json",
+        "reports/conifer.json",
+    ],
+)
+def test_accepts_names_similar_to_windows_devices(safe_path: str) -> None:
+    document = valid_manifest()
+    document["files"][0]["path"] = safe_path
+
+    manifest = validate_portable_manifest(document)
+
+    assert manifest.files[0].path == safe_path
+
+
+@pytest.mark.parametrize("reserved_path", ["keys/NUL.bin", "CON/envelope.bin"])
+def test_rejects_windows_reserved_envelope_paths(reserved_path: str) -> None:
+    document = valid_manifest()
+    document["encryption"]["key_envelope_paths"] = [reserved_path]
+
+    with pytest.raises(ValidationError, match="Windows reserved device name"):
+        validate_portable_manifest(document)
+
+
 def test_rejects_duplicate_normalized_paths() -> None:
     document = valid_manifest()
     duplicate = deepcopy(document["files"][0])
