@@ -7,8 +7,10 @@ callers must not compare or collapse them into a global maximum.
 
 These scalar-only models are frozen value snapshots.  Pydantic's
 ``model_copy(update=...)`` does not validate update data; receiving boundaries
-must validate a dumped payload rather than treating a copied instance as proof
-that its fields still satisfy the contract.
+must reconstruct and validate the complete input graph. Reject or preserve
+undeclared stored fields before reconstruction: ``model_dump()`` can omit
+unknown keys injected by an unchecked copy. A copied or frozen instance is
+not proof that its fields still satisfy the contract.
 """
 
 from typing import Literal
