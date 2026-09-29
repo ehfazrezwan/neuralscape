@@ -548,15 +548,25 @@ def test_evaluator_rejects_undeclared_fields_in_complete_input_graph(
             update={"membership_versions": (invalid_membership,)}
         )
     elif unknown_position == "delegation":
-        constraints = DelegationConstraints(
+        valid_constraints = DelegationConstraints(
             delegated_by_subject_id="delegator-a",
             delegated_by_credential_id="delegator-credential-a",
             allowed_actions=("read",),
             allowed_resources=(resource_value,),
-        ).model_copy(update={"future_constraint": "deny"})
+        )
+        constraints = valid_constraints.model_copy(
+            update={"future_constraint": "deny"}
+        )
+        with pytest.raises(ValidationError, match="future_constraint"):
+            principal(
+                subject_kind="delegated_agent",
+                delegation=constraints,
+            )
         principal_value = principal(
             subject_kind="delegated_agent",
-            delegation=constraints,
+            delegation=valid_constraints,
+        ).model_copy(
+            update={"delegation": constraints}
         )
     else:
         invalid_resource = resource_value.model_copy(
