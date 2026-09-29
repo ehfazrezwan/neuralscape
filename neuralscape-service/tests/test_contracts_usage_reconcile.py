@@ -8,6 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 import contracts_usage_reconcile as usage_reconcile_contracts
+from contracts_common import MAX_SAFE_INTEGER
 from contracts_usage import AttributionSnapshot, TokenQuantity, TokenUsage, UsageEvent
 from contracts_usage_reconcile import (
     ReconciledLedger,
@@ -107,6 +108,13 @@ def _assert_result_payload_rejected(payload: dict[str, object]) -> None:
         UsageReconciliation.model_validate_json(json.dumps(payload))
 
 
+def _assert_stream_payload_rejected(payload: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        ReconciledUsageStream.model_validate(payload)
+    with pytest.raises(ValidationError):
+        ReconciledUsageStream.model_validate_json(json.dumps(payload))
+
+
 def _assert_attribution_authority_rejected(value: object) -> None:
     with pytest.raises(ValidationError) as caught:
         ReconciledUsageStream.model_validate(value)
@@ -153,6 +161,90 @@ def test_reconciles_three_ledgers_without_cross_ledger_relabelling() -> None:
     assert ledgers["evaluation"].known_token_subtotal == 0
     assert ledgers["evaluation"].total_tokens is None
     assert ledgers["evaluation"].incomplete_attempt_ids == ("attempt-eval",)
+
+
+def test_unavailable_streams_preserve_distinct_head_missing_reasons() -> None:
+    initial_missing = _event(
+        event_id="initial-missing",
+        attempt_id="attempt-provider",
+        status="unavailable",
+        attempt_outcome="failed",
+        usage=None,
+        usage_missing_reason="not_yet_reported",
+    )
+    provider_missing = _event(
+        event_id="provider-missing",
+        attempt_id="attempt-provider",
+        predecessor_event_id="initial-missing",
+        status="unavailable",
+        attempt_outcome="failed",
+        usage=None,
+        usage_missing_reason="provider_did_not_report",
+    )
+    dependency_missing = _event(
+        event_id="dependency-missing",
+        attempt_id="attempt-dependency",
+        status="unavailable",
+        attempt_outcome="failed",
+        usage=None,
+        usage_missing_reason="dependency_unavailable",
+    )
+
+    forward = reconcile_usage_events(
+        [initial_missing, provider_missing, dependency_missing]
+    )
+    reverse = reconcile_usage_events(
+        [dependency_missing, provider_missing, initial_missing]
+    )
+
+    assert forward == reverse
+    assert {
+        stream.head_event_id: stream.usage_missing_reason
+        for stream in forward.streams
+    } == {
+        "provider-missing": "provider_did_not_report",
+        "dependency-missing": "dependency_unavailable",
+    }
+
+
+def test_stream_deserialization_rejects_usage_reason_contradictions() -> None:
+    unavailable = reconcile_usage_events(
+        [
+            _event(
+                status="unavailable",
+                attempt_outcome="failed",
+                usage=None,
+                usage_missing_reason="dependency_unavailable",
+            )
+        ]
+    ).streams[0].model_dump(mode="python")
+    final = reconcile_usage_events([_event()]).streams[0].model_dump(mode="python")
+    pending = reconcile_usage_events(
+        [
+            _event(
+                status="pending",
+                attempt_outcome="in_progress",
+                usage=None,
+            )
+        ]
+    ).streams[0].model_dump(mode="python")
+
+    unavailable_without_reason = copy.deepcopy(unavailable)
+    unavailable_without_reason["usage_missing_reason"] = None
+    unavailable_with_usage = copy.deepcopy(unavailable)
+    unavailable_with_usage["usage"] = _usage().model_dump(mode="python")
+    final_with_reason = copy.deepcopy(final)
+    final_with_reason["usage_missing_reason"] = "dependency_unavailable"
+    pending_with_reason = copy.deepcopy(pending)
+    pending_with_reason["usage_missing_reason"] = "not_yet_reported"
+
+    for payload in (
+        unavailable_without_reason,
+        unavailable_with_usage,
+        final_with_reason,
+        pending_with_reason,
+    ):
+        _assert_stream_payload_rejected(payload)
 
 
 def test_result_rejects_top_tenant_mismatching_stream() -> None:
@@ -458,6 +550,13 @@ def test_branched_correction_is_invalid() -> None:
     assert _error_code([root, first, second]) == "branched_correction"
 
 
+def test_multiple_independent_roots_for_one_stream_are_invalid() -> None:
+    first = _event(event_id="first-root")
+    second = _event(event_id="second-root")
+
+    assert _error_code([second, first]) == "multiple_stream_roots"
+
+
 def test_mixed_tenants_cannot_be_aggregated() -> None:
     first = _event()
     second = _event(event_id="other", tenant_id="tenant-2", attempt_id="attempt-2")
@@ -520,6 +619,32 @@ def test_unknown_included_subcategory_does_not_double_count_or_hide_base_total()
 
     assert result.streams[0].total_tokens == 15
     assert result.streams[0].incomplete_categories == ()
+
+
+def test_per_stream_token_subtotal_overflow_is_rejected() -> None:
+    event = _event(
+        usage=_usage(
+            input_tokens=MAX_SAFE_INTEGER,
+            output_tokens=1,
+        )
+    )
+
+    assert _error_code([event]) == "counter_overflow"
+
+
+def test_ledger_token_subtotal_overflow_is_rejected() -> None:
+    first = _event(
+        event_id="first",
+        attempt_id="attempt-first",
+        usage=_usage(input_tokens=MAX_SAFE_INTEGER, output_tokens=0),
+    )
+    second = _event(
+        event_id="second",
+        attempt_id="attempt-second",
+        usage=_usage(input_tokens=1, output_tokens=0),
+    )
+
+    assert _error_code([second, first]) == "counter_overflow"
 
 
 def test_late_usage_after_cancellation_replaces_unavailable_observation() -> None:

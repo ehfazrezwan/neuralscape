@@ -11,6 +11,7 @@ from contracts_common import ContractModel, OpaqueId, SafeCounter
 from contracts_usage import (
     AttributionSnapshot,
     AttemptOutcome,
+    MissingReason,
     TokenUsage,
     UsageEvent,
     UsageLedger,
@@ -69,6 +70,7 @@ class ReconciledUsageStream(ContractModel):
     late_after_cancellation: bool
     attribution: AttributionSnapshot
     usage: TokenUsage | None
+    usage_missing_reason: MissingReason | None
     known_token_subtotal: SafeCounter
     total_tokens: SafeCounter | None
     incomplete_categories: tuple[str, ...]
@@ -86,10 +88,18 @@ class ReconciledUsageStream(ContractModel):
                 self.usage = TokenUsage.model_validate(_native_snapshot(self.usage))
             except Exception as exc:
                 raise ValueError("stream usage is invalid") from exc
-        if self.status == "final" and self.usage is None:
-            raise ValueError("final stream requires token usage")
-        if self.status == "unavailable" and self.usage is not None:
-            raise ValueError("unavailable stream cannot retain token usage")
+        if self.status == "unavailable":
+            if self.usage is not None or self.usage_missing_reason is None:
+                raise ValueError(
+                    "unavailable stream requires no token usage and a missing reason"
+                )
+        else:
+            if self.usage_missing_reason is not None:
+                raise ValueError(
+                    "usage_missing_reason is only valid for unavailable streams"
+                )
+            if self.status == "final" and self.usage is None:
+                raise ValueError("final stream requires token usage")
         if self.late_after_cancellation:
             if self.status != "final" or self.attempt_outcome != "cancelled":
                 raise ValueError(
@@ -469,6 +479,7 @@ def reconcile_usage_events(events: Iterable[UsageEvent]) -> UsageReconciliation:
                 late_after_cancellation=event.late_after_cancellation,
                 attribution=event.attribution,
                 usage=event.usage,
+                usage_missing_reason=event.usage_missing_reason,
                 known_token_subtotal=known,
                 total_tokens=known if not missing else None,
                 incomplete_categories=missing,
