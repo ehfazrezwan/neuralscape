@@ -193,3 +193,68 @@ def test_validator_reports_unconfigured_unhealthy_unqualified_and_unknown_operat
 def test_unknown_fields_are_rejected_by_common_contract_base():
     with pytest.raises(ValidationError, match="extra"):
         state(provider_name="not-a-capability-fact")
+
+
+def test_public_capability_checks_revalidate_mutated_and_unchecked_graphs():
+    operation = state()
+    operation.qualification.operation = "different-operation"
+    with pytest.raises(ValidationError, match="operation must match"):
+        operation.has_declared_prerequisites()
+
+    declared = manifest(state())
+    copied_claim = declared.operations[0].qualification.model_copy(
+        update={"operation": "different-operation"}
+    )
+    copied_state = declared.operations[0].model_copy(
+        update={"qualification": copied_claim}
+    )
+    copied_manifest = declared.model_copy(update={"operations": (copied_state,)})
+    with pytest.raises(ValidationError, match="operation must match"):
+        validate_capability_requirements(copied_manifest, (requirement(),))
+
+
+def test_capability_boundary_rejects_invalid_requirements_duplicates_and_references():
+    declared = manifest(state())
+    unpaired = requirement().model_copy(
+        update={"qualification_profile_version": None}
+    )
+    with pytest.raises(ValidationError, match="are paired"):
+        validate_capability_requirements(declared, (unpaired,))
+
+    duplicate_manifest = declared.model_copy(
+        update={"operations": (declared.operations[0], declared.operations[0])}
+    )
+    with pytest.raises(ValidationError, match="operation declarations must be unique"):
+        validate_capability_requirements(duplicate_manifest, (requirement(),))
+
+    invalid_reference = reference("runtime-profile").model_copy(update={"id": ""})
+    invalid_requirement = requirement().model_copy(
+        update={"qualification_profile_reference": invalid_reference}
+    )
+    with pytest.raises(ValidationError):
+        validate_capability_requirements(declared, (invalid_requirement,))
+
+
+def test_capability_boundary_rejects_unknown_fields_wrong_containers_and_cycles():
+    declared = manifest(state())
+    unknown_state = declared.operations[0].model_copy(
+        update={"future_semantics": "deny"}
+    )
+    unknown_manifest = declared.model_copy(update={"operations": (unknown_state,)})
+    with pytest.raises(ValueError, match="undeclared contract field"):
+        validate_capability_requirements(unknown_manifest, (requirement(),))
+
+    with pytest.raises(TypeError, match="must be a tuple"):
+        validate_capability_requirements(declared, [requirement()])
+
+    cycle = []
+    cycle.append(cycle)
+    cyclic_manifest = declared.model_copy(update={"operations": cycle})
+    with pytest.raises(ValueError, match="cyclic contract graph"):
+        validate_capability_requirements(cyclic_manifest, (requirement(),))
+
+
+@pytest.mark.parametrize("operation", ["", True, "x" * 257])
+def test_operation_lookup_validates_opaque_scalar(operation):
+    with pytest.raises(ValidationError):
+        manifest(state()).operation_state(operation)

@@ -548,3 +548,152 @@ def test_valid_empty_remains_distinct_from_abstention():
             distribution=None,
             reason_code=None,
         )
+
+
+def test_decision_boundaries_revalidate_requests_results_and_nested_models():
+    request = decision_request()
+    result = DecisionResult(
+        schema_version=VERSION,
+        request_id=request.request_id,
+        head_result=selected(distribution=probability_distribution()),
+        attempts=(),
+    )
+    assert validate_decision_result(request, result).compliant
+
+    request.sources[0].text = "A"
+    with pytest.raises(ValidationError, match="exceeds"):
+        validate_decision_result(request, result)
+
+    request = decision_request()
+    result.head_result.distribution.scores[0].value = 9.0
+    with pytest.raises(ValidationError, match="between zero and one|sum to one"):
+        validate_decision_result(request, result)
+
+
+def test_batch_boundary_rejects_unqualified_copy_and_duplicate_diagnostics():
+    request = decision_request(
+        batch=True,
+        fallback=FallbackGranularity.PER_ITEM,
+        per_item_qualification=qualification(),
+    )
+    result = DecisionBatchResult(
+        schema_version=VERSION,
+        request_id=request.request_id,
+        fallback_granularity=FallbackGranularity.PER_ITEM,
+        publishable=True,
+        head_results=(
+            selected(distribution=probability_distribution()),
+            selected(
+                head_id="category",
+                distribution=probability_distribution(
+                    head_id="category", distribution_id="dist-2"
+                ),
+            ),
+        ),
+        attempts=(),
+    )
+
+    unqualified = request.model_copy(update={"per_item_qualification": None})
+    with pytest.raises(ValidationError, match="requires a qualification claim"):
+        validate_decision_batch_result(unqualified, result)
+
+    result.head_results[1].distribution.distribution_id = "dist-1"
+    with pytest.raises(ValidationError, match="distribution IDs must be unique"):
+        validate_decision_batch_result(request, result)
+
+    copied_duplicate = result.model_copy(update={"head_results": result.head_results})
+    with pytest.raises(ValidationError, match="distribution IDs must be unique"):
+        validate_decision_batch_result(request, copied_duplicate)
+
+
+def test_generation_boundary_revalidates_outcome_and_nonfinite_output():
+    request = generation_request()
+    valid = generation_result()
+    reparsed = GenerationResult.model_validate_json(valid.model_dump_json())
+    assert validate_generation_result(request, reparsed).compliant
+
+    result = generation_result()
+    result.outcome = GenerationOutcome.ERROR
+    result.reason_code = "provider-error"
+    with pytest.raises(ValidationError, match="only a proposed outcome"):
+        validate_generation_result(request, result)
+
+    mutated = generation_result()
+    mutated.proposals[0].output = {"summary": math.nan}
+    with pytest.raises(ValidationError, match="non-finite JSON number"):
+        validate_generation_result(request, mutated)
+
+    for nonfinite in (math.nan, math.inf, -math.inf):
+        copied_proposal = generation_result().proposals[0].model_copy(
+            update={"output": {"summary": [nonfinite]}}
+        )
+        copied_result = generation_result().model_copy(
+            update={"proposals": (copied_proposal,)}
+        )
+        with pytest.raises(ValidationError, match="non-finite JSON number"):
+            validate_generation_result(request, copied_result)
+
+
+def test_receiving_boundaries_preserve_container_and_mapping_types():
+    request = decision_request()
+    list_candidates = selected().model_copy(
+        update={"selected_candidate_ids": ["candidate-a"]}
+    )
+    list_result = DecisionResult(
+        schema_version=VERSION,
+        request_id=request.request_id,
+        head_result=selected(),
+        attempts=(),
+    ).model_copy(update={"head_result": list_candidates})
+    with pytest.raises(ValidationError):
+        validate_decision_result(request, list_result)
+
+    generation = generation_result()
+    numeric_key_proposal = generation.proposals[0].model_copy(
+        update={"output": {1: "not-a-JSON-object-key"}}
+    )
+    numeric_key_result = generation.model_copy(
+        update={"proposals": (numeric_key_proposal,)}
+    )
+    with pytest.raises(ValidationError):
+        validate_generation_result(generation_request(), numeric_key_result)
+
+
+def test_receiving_boundaries_reject_unknown_fields_constructed_values_and_cycles():
+    request = decision_request()
+    unknown_result = DecisionResult(
+        schema_version=VERSION,
+        request_id=request.request_id,
+        head_result=selected(),
+        attempts=(),
+    ).model_copy(update={"future_semantics": "deny"})
+    with pytest.raises(ValueError, match="undeclared contract field"):
+        validate_decision_result(request, unknown_result)
+
+    constructed = DecisionResult.model_construct(
+        schema_version=VERSION,
+        request_id=request.request_id,
+        head_result=selected().model_copy(update={"outcome": "invented"}),
+        attempts=(),
+    )
+    with pytest.raises(ValidationError):
+        validate_decision_result(request, constructed)
+
+    cycle = []
+    cycle.append(cycle)
+    cyclic = generation_result().model_copy(update={"proposals": cycle})
+    with pytest.raises(ValueError, match="cyclic contract graph"):
+        validate_generation_result(generation_request(), cyclic)
+
+
+def test_source_span_boundary_revalidates_mutated_inputs():
+    evidence = source_evidence()
+    span = SourceSpan(
+        span_id="span-1",
+        source_version=evidence.source_version,
+        start_utf8_byte=0,
+        end_utf8_byte=8,
+    )
+    evidence.text = "A"
+    with pytest.raises(ValueError, match="exceeds"):
+        validate_source_span(evidence, span)

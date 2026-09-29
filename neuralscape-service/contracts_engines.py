@@ -8,11 +8,145 @@ reviewable but are not themselves proof that the referenced evidence is valid.
 from __future__ import annotations
 
 from enum import Enum
+from typing import Any, TypeVar
 
-from pydantic import model_validator
+from pydantic import BaseModel, TypeAdapter, model_validator
 
 from contracts_common import ContractModel, OpaqueId, VersionedContract
 from contracts_references import ReferenceHandle
+
+
+_ContractT = TypeVar("_ContractT", bound=BaseModel)
+_MAX_SNAPSHOT_DEPTH = 256
+_OPAQUE_ID_ADAPTER = TypeAdapter(OpaqueId)
+
+
+def _snapshot_native_value(
+    value: Any,
+    *,
+    active: set[int],
+    depth: int,
+    location: str,
+) -> Any:
+    """Copy a contract graph without discarding unchecked model state."""
+
+    if depth > _MAX_SNAPSHOT_DEPTH:
+        raise ValueError(f"contract graph nesting exceeds the limit at {location}")
+
+    is_container = isinstance(value, (BaseModel, dict, list, tuple))
+    identity = id(value)
+    if is_container:
+        if identity in active:
+            raise ValueError(f"cyclic contract graph at {location}")
+        active.add(identity)
+
+    try:
+        if isinstance(value, BaseModel):
+            storage = getattr(value, "__dict__", None)
+            fields_set_value = getattr(value, "__pydantic_fields_set__", None)
+            extras_value = getattr(value, "__pydantic_extra__", None)
+            if not isinstance(storage, dict) or not isinstance(
+                fields_set_value, (set, frozenset)
+            ):
+                raise ValueError(f"malformed contract model at {location}")
+            if extras_value is not None and not isinstance(extras_value, dict):
+                raise ValueError(f"malformed contract extras at {location}")
+            declared = set(type(value).model_fields)
+            stored = set(storage)
+            fields_set = set(fields_set_value)
+            extras = extras_value or {}
+            undeclared = (stored | fields_set | set(extras)) - declared
+            if undeclared:
+                names = ", ".join(sorted(str(name) for name in undeclared))
+                raise ValueError(
+                    f"undeclared contract field(s) at {location}: {names}"
+                )
+            return {
+                name: _snapshot_native_value(
+                    storage[name],
+                    active=active,
+                    depth=depth + 1,
+                    location=f"{location}.{name}",
+                )
+                for name in type(value).model_fields
+                if name in storage
+            }
+        if isinstance(value, dict):
+            return {
+                key: _snapshot_native_value(
+                    item,
+                    active=active,
+                    depth=depth + 1,
+                    location=f"{location}[key]",
+                )
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [
+                _snapshot_native_value(
+                    item,
+                    active=active,
+                    depth=depth + 1,
+                    location=f"{location}[{index}]",
+                )
+                for index, item in enumerate(value)
+            ]
+        if isinstance(value, tuple):
+            return tuple(
+                _snapshot_native_value(
+                    item,
+                    active=active,
+                    depth=depth + 1,
+                    location=f"{location}[{index}]",
+                )
+                for index, item in enumerate(value)
+            )
+        return value
+    finally:
+        if is_container:
+            active.remove(identity)
+
+
+def _validated_contract_snapshot(
+    value: Any,
+    expected_type: type[_ContractT],
+    *,
+    label: str,
+) -> _ContractT:
+    """Return a fresh, fully validated closed-contract snapshot."""
+
+    if not isinstance(value, expected_type):
+        raise TypeError(f"{label} must be a {expected_type.__name__}")
+    try:
+        native = _snapshot_native_value(
+            value,
+            active=set(),
+            depth=0,
+            location=label,
+        )
+    except RecursionError as exc:
+        raise ValueError(f"contract graph nesting is invalid at {label}") from exc
+    return expected_type.model_validate(native)
+
+
+def _validated_contract_tuple(
+    values: Any,
+    expected_type: type[_ContractT],
+    *,
+    label: str,
+) -> tuple[_ContractT, ...]:
+    """Validate a tuple argument without normalizing another container type."""
+
+    if not isinstance(values, tuple):
+        raise TypeError(f"{label} must be a tuple")
+    return tuple(
+        _validated_contract_snapshot(
+            value,
+            expected_type,
+            label=f"{label}[{index}]",
+        )
+        for index, value in enumerate(values)
+    )
 
 
 class EngineAdapterKind(str, Enum):
@@ -78,11 +212,16 @@ class CapabilityOperationState(ContractModel):
         runtime authorization or proof of qualification.
         """
 
+        state = _validated_contract_snapshot(
+            self,
+            CapabilityOperationState,
+            label="capability operation state",
+        )
         return (
-            self.supported
-            and self.configured
-            and self.health is CapabilityHealth.HEALTHY
-            and self.qualification is not None
+            state.supported
+            and state.configured
+            and state.health is CapabilityHealth.HEALTHY
+            and state.qualification is not None
         )
 
 
@@ -109,8 +248,14 @@ class CapabilityManifest(VersionedContract):
     def operation_state(self, operation: str) -> CapabilityOperationState | None:
         """Return the exact declared operation, without aliases or approximation."""
 
+        operation = _OPAQUE_ID_ADAPTER.validate_python(operation, strict=True)
+        manifest = _validated_contract_snapshot(
+            self,
+            CapabilityManifest,
+            label="capability manifest",
+        )
         return next(
-            (state for state in self.operations if state.operation == operation),
+            (state for state in manifest.operations if state.operation == operation),
             None,
         )
 
@@ -152,6 +297,17 @@ def validate_capability_requirements(
     An empty result means the declarations agree. Runtime dispatch must still
     resolve and evaluate the referenced qualification evidence.
     """
+
+    manifest = _validated_contract_snapshot(
+        manifest,
+        CapabilityManifest,
+        label="capability manifest",
+    )
+    requirements = _validated_contract_tuple(
+        requirements,
+        CapabilityRequirement,
+        label="capability requirements",
+    )
 
     violations: list[CapabilityViolation] = []
     for requirement in requirements:

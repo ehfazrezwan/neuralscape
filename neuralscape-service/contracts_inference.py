@@ -14,7 +14,7 @@ from typing import Annotated, Any, Literal, Mapping
 from pydantic import Field, JsonValue, model_validator
 
 from contracts_common import ContractModel, OpaqueId, SafeCounter, VersionedContract
-from contracts_engines import QualificationClaim
+from contracts_engines import QualificationClaim, _validated_contract_snapshot
 from contracts_references import ReferenceHandle, SourceVersion
 
 FiniteNumber = Annotated[float, Field(allow_inf_nan=False)]
@@ -106,9 +106,7 @@ class SourceSpan(ContractModel):
         return self
 
 
-def validate_source_span(evidence: SourceEvidence, span: SourceSpan) -> None:
-    """Validate exact source identity, bounds, and UTF-8 code-point boundaries."""
-
+def _validate_source_span_values(evidence: SourceEvidence, span: SourceSpan) -> None:
     if span.source_version != evidence.source_version:
         raise ValueError("source span does not match the source evidence version")
     boundaries = evidence.utf8_boundaries()
@@ -116,6 +114,18 @@ def validate_source_span(evidence: SourceEvidence, span: SourceSpan) -> None:
         raise ValueError("source span exceeds the source UTF-8 byte length")
     if span.start_utf8_byte not in boundaries or span.end_utf8_byte not in boundaries:
         raise ValueError("source span must not split a UTF-8 code point")
+
+
+def validate_source_span(evidence: SourceEvidence, span: SourceSpan) -> None:
+    """Validate exact source identity, bounds, and UTF-8 code-point boundaries."""
+
+    evidence = _validated_contract_snapshot(
+        evidence,
+        SourceEvidence,
+        label="source evidence",
+    )
+    span = _validated_contract_snapshot(span, SourceSpan, label="source span")
+    _validate_source_span_values(evidence, span)
 
 
 class DecisionCandidate(ContractModel):
@@ -220,7 +230,7 @@ def _validate_source_evidence(
         )
         if evidence is None:
             raise ValueError("every span must reference declared source evidence")
-        validate_source_span(evidence, span)
+        _validate_source_span_values(evidence, span)
 
 
 class _DecisionInputs(VersionedContract):
@@ -458,6 +468,16 @@ def validate_decision_result(
 ) -> ResourceCompliance:
     """Validate exact identities and report resource compliance separately."""
 
+    request = _validated_contract_snapshot(
+        request,
+        DecisionRequest,
+        label="decision request",
+    )
+    result = _validated_contract_snapshot(
+        result,
+        DecisionResult,
+        label="decision result",
+    )
     if result.request_id != request.request_id:
         raise ValueError("result request ID does not match request")
     _validate_head_result(request.head, result.head_result)
@@ -470,6 +490,16 @@ def validate_decision_batch_result(
 ) -> ResourceCompliance:
     """Validate identities/fallback and report resource compliance separately."""
 
+    request = _validated_contract_snapshot(
+        request,
+        DecisionBatchRequest,
+        label="decision batch request",
+    )
+    result = _validated_contract_snapshot(
+        result,
+        DecisionBatchResult,
+        label="decision batch result",
+    )
     if result.request_id != request.request_id:
         raise ValueError("result request ID does not match request")
     if result.fallback_granularity is not request.fallback_granularity:
@@ -690,11 +720,22 @@ def validate_generation_result(
 ) -> ResourceCompliance:
     """Validate schema/source support and report resource compliance separately."""
 
+    request = _validated_contract_snapshot(
+        request,
+        GenerationRequest,
+        label="generation request",
+    )
+    result = _validated_contract_snapshot(
+        result,
+        GenerationResult,
+        label="generation result",
+    )
     if result.request_id != request.request_id:
         raise ValueError("result request ID does not match request")
     allowed_span_ids = {span.span_id for span in request.spans}
     output_validator = _build_output_validator(request.output_schema)
     for proposal in result.proposals:
+        _validate_finite_json(proposal.output)
         if not set(proposal.support_span_ids).issubset(allowed_span_ids):
             raise ValueError("proposal references an unknown support span ID")
         errors = sorted(output_validator.iter_errors(proposal.output), key=str)
