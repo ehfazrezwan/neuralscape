@@ -120,30 +120,15 @@ jobs:
             exit 1
           fi
 
-          engine_contract_files=(
-            neuralscape-service/contracts_engines.py
-            neuralscape-service/contracts_inference.py
-            neuralscape-service/tests/test_contracts_engines.py
-            neuralscape-service/tests/test_contracts_inference.py
-          )
-          present=0
-          for path in "${engine_contract_files[@]}"; do
-            if [ -f "$path" ]; then
-              present=$((present + 1))
-            fi
-          done
-
-          if [ "$present" -eq 0 ]; then
-            echo "::notice::engine and inference contracts are deliberately absent on this tree"
-            exit 0
-          fi
-
           required_contract_files=(
             neuralscape-service/contracts_common.py
             neuralscape-service/contracts_errors.py
             neuralscape-service/contracts_references.py
-            "${engine_contract_files[@]}"
+            neuralscape-service/contracts_engines.py
+            neuralscape-service/contracts_inference.py
             neuralscape-service/tests/test_contracts_common.py
+            neuralscape-service/tests/test_contracts_engines.py
+            neuralscape-service/tests/test_contracts_inference.py
           )
           missing=0
           for path in "${required_contract_files[@]}"; do
