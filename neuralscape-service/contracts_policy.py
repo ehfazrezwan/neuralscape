@@ -173,8 +173,15 @@ class PolicyDecision(VersionedContract):
 
     @model_validator(mode="after")
     def validate_outcome_reason(self) -> "PolicyDecision":
-        if self.outcome == "allow" and self.reason_code != "explicit_grant":
-            raise ValueError("allow decisions require the explicit_grant reason")
+        if self.outcome == "allow":
+            if self.reason_code != "explicit_grant":
+                raise ValueError("allow decisions require the explicit_grant reason")
+            if self.action not in SUPPORTED_POLICY_ACTIONS:
+                raise ValueError("allow decisions require a supported action")
+            if self.resource.tenant_id != self.evaluated_tenant_id:
+                raise ValueError(
+                    "allow decision resource tenant must match the evaluated tenant"
+                )
         if self.outcome == "deny" and self.reason_code == "explicit_grant":
             raise ValueError("deny decisions cannot use the explicit_grant reason")
         return self

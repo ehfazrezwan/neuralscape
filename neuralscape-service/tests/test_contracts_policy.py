@@ -113,6 +113,30 @@ def evaluate(
     )
 
 
+def decision_payload(
+    *,
+    action: str = "read",
+    resource_tenant: str = "tenant-a",
+    evaluated_tenant_id: str = "tenant-a",
+    outcome: str = "allow",
+    reason_code: str = "explicit_grant",
+) -> dict[str, object]:
+    return {
+        "schema_version": VERSION,
+        "action": action,
+        "resource": reference("memory-1", tenant_id=resource_tenant).model_dump(
+            mode="python"
+        ),
+        "outcome": outcome,
+        "reason_code": reason_code,
+        "policy_epoch": 1,
+        "evaluated_tenant_id": evaluated_tenant_id,
+        "evaluated_subject_id": "subject-a",
+        "evaluated_credential_id": "credential-a",
+        "evaluated_membership_version": 1,
+    }
+
+
 def test_exact_explicit_grant_records_distinct_authority_witnesses() -> None:
     resource_value = reference("memory-1")
     principal_value = principal(membership_version=7)
@@ -331,23 +355,78 @@ def test_policy_decision_rejects_contradictory_outcome_reason_pairs(
     outcome: str,
     reason_code: str,
 ) -> None:
-    payload = {
-        "schema_version": VERSION,
-        "action": "read",
-        "resource": reference("memory-1").model_dump(mode="json"),
-        "outcome": outcome,
-        "reason_code": reason_code,
-        "policy_epoch": 1,
-        "evaluated_tenant_id": "tenant-a",
-        "evaluated_subject_id": "subject-a",
-        "evaluated_credential_id": "credential-a",
-        "evaluated_membership_version": 1,
-    }
+    payload = decision_payload(outcome=outcome, reason_code=reason_code)
 
     with pytest.raises(ValidationError):
         PolicyDecision.model_validate(payload)
     with pytest.raises(ValidationError):
         PolicyDecision.model_validate_json(json.dumps(payload))
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (
+            decision_payload(action="future-action"),
+            "allow decisions require a supported action",
+        ),
+        (
+            decision_payload(resource_tenant="tenant-b"),
+            "resource tenant must match the evaluated tenant",
+        ),
+    ],
+)
+def test_policy_decision_rejects_structurally_impossible_allow_states(
+    payload: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        PolicyDecision(**payload)
+    with pytest.raises(ValidationError, match=message):
+        PolicyDecision.model_validate(payload)
+    with pytest.raises(ValidationError, match=message):
+        PolicyDecision.model_validate_json(json.dumps(payload))
+
+
+def test_policy_decision_accepts_valid_allow_in_all_representations() -> None:
+    payload = decision_payload()
+
+    constructed = PolicyDecision(**payload)
+    native = PolicyDecision.model_validate(payload)
+    from_json = PolicyDecision.model_validate_json(json.dumps(payload))
+
+    assert constructed == native == from_json
+    assert (constructed.outcome, constructed.reason_code) == (
+        "allow",
+        "explicit_grant",
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        decision_payload(
+            action="future-action",
+            outcome="deny",
+            reason_code="unsupported_action",
+        ),
+        decision_payload(
+            resource_tenant="tenant-b",
+            outcome="deny",
+            reason_code="not_authorized",
+        ),
+    ],
+)
+def test_policy_decision_preserves_relevant_deny_states(
+    payload: dict[str, object],
+) -> None:
+    constructed = PolicyDecision(**payload)
+    native = PolicyDecision.model_validate(payload)
+    from_json = PolicyDecision.model_validate_json(json.dumps(payload))
+
+    assert constructed == native == from_json
+    assert constructed.outcome == "deny"
+    assert validate_policy_decision(constructed) == constructed
 
 
 def test_evaluator_revalidates_unchecked_principal_copy_before_grant_logic() -> None:
@@ -672,6 +751,25 @@ def test_receiving_boundary_revalidates_unchecked_decision_copy() -> None:
 
     with pytest.raises(ValidationError, match="explicit_grant"):
         validate_policy_decision(contradictory_copy)
+
+
+@pytest.mark.parametrize("invalid_field", ["action", "resource_tenant"])
+def test_receiving_boundary_rejects_impossible_unchecked_allow_copy(
+    invalid_field: str,
+) -> None:
+    decision = PolicyDecision(**decision_payload())
+    if invalid_field == "action":
+        invalid_decision = decision.model_copy(update={"action": "future-action"})
+        message = "allow decisions require a supported action"
+    else:
+        invalid_resource = decision.resource.model_copy(
+            update={"tenant_id": "tenant-b"}
+        )
+        invalid_decision = decision.model_copy(update={"resource": invalid_resource})
+        message = "resource tenant must match the evaluated tenant"
+
+    with pytest.raises(ValidationError, match=message):
+        validate_policy_decision(invalid_decision)
 
 
 def test_receiving_boundary_rejects_undeclared_decision_copy_field() -> None:
