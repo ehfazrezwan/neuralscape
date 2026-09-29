@@ -757,9 +757,12 @@ def validate_generation_result(
         _validate_finite_json(proposal.output)
         if not set(proposal.support_span_ids).issubset(allowed_span_ids):
             raise ValueError("proposal references an unknown support span ID")
-        errors = sorted(output_validator.iter_errors(proposal.output), key=str)
-        if errors:
-            raise ValueError(f"proposal output does not match declared schema: {errors[0].message}")
+        first_error = next(output_validator.iter_errors(proposal.output), None)
+        if first_error is not None:
+            raise ValueError(
+                "proposal output does not match declared schema: "
+                f"{first_error.message}"
+            )
     return _resource_compliance(request.resource_limits, result.attempts)
 
 

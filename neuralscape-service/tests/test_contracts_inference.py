@@ -537,6 +537,31 @@ def test_generation_output_matches_declared_schema_and_source_support():
         validate_generation_result(request, missing_required)
 
 
+def test_generation_schema_validation_stops_after_first_error(monkeypatch):
+    request = generation_request()
+    result = generation_result(output={})
+
+    class LazyValidator:
+        consumed = 0
+
+        def iter_errors(self, output):
+            self.consumed += 1
+            yield type("SchemaError", (), {"message": "first schema failure"})()
+            self.consumed += 1
+            raise AssertionError("schema validation consumed a later error")
+
+    validator = LazyValidator()
+    monkeypatch.setattr(
+        contracts_inference,
+        "_build_output_validator",
+        lambda schema: validator,
+    )
+
+    with pytest.raises(ValueError, match="first schema failure"):
+        validate_generation_result(request, result)
+    assert validator.consumed == 1
+
+
 def test_generation_schema_rejects_unknown_keywords_versions_formats_and_references():
     cases = (
         (output_schema(unknownKeyword=True), "unsupported output schema keyword"),
