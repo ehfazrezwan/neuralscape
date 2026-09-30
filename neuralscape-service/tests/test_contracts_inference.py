@@ -823,6 +823,28 @@ def test_generation_uses_fixed_contract_owned_format_checkers(
         generation_request(schema=output_schema(format="private-format"))
 
 
+@pytest.mark.parametrize("compiler_exception", [RecursionError, OverflowError])
+def test_generation_regex_format_maps_compiler_limits_to_schema_mismatch(
+    monkeypatch,
+    compiler_exception,
+):
+    def compiler_limited(value):
+        raise compiler_exception("synthetic compiler limit")
+
+    monkeypatch.setattr(contracts_inference, "_is_regex", compiler_limited)
+    schema = output_schema(
+        properties={"expression": {"type": "string", "format": "regex"}},
+        required=["expression"],
+    )
+    request = generation_request(schema=schema)
+
+    with pytest.raises(ValueError, match="does not match declared schema"):
+        validate_generation_result(
+            request,
+            generation_result(output={"expression": "bounded sentinel"}),
+        )
+
+
 @pytest.mark.parametrize(
     ("value", "valid"),
     [
@@ -934,6 +956,97 @@ def test_generation_rejects_nonfinite_numbers_before_json_serialization(nonfinit
     schema = output_schema(default=nonfinite)
     with pytest.raises((ValidationError, ValueError), match="non-finite JSON number"):
         generation_request(schema=schema)
+
+
+@pytest.mark.parametrize(
+    "json_case",
+    ["schema-value", "schema-key", "output-value", "output-key"],
+)
+def test_generation_rejects_surrogate_json_at_construction(json_case):
+    surrogate = "\ud800"
+    with pytest.raises(ValidationError, match="invalid Unicode JSON string"):
+        if json_case == "schema-value":
+            generation_request(schema=output_schema(description=surrogate))
+        elif json_case == "schema-key":
+            generation_request(schema=output_schema(default={surrogate: "value"}))
+        elif json_case == "output-value":
+            generation_result(output={"summary": surrogate})
+        else:
+            generation_result(output={"summary": "supported", surrogate: "value"})
+
+
+@pytest.mark.parametrize("json_location", ["value", "key"])
+@pytest.mark.parametrize(
+    "boundary",
+    ["request-copy", "request-construct", "proposal-copy", "proposal-construct"],
+)
+def test_generation_receiving_boundary_rejects_surrogate_json(
+    boundary,
+    json_location,
+):
+    surrogate = "\ud800"
+    request = generation_request()
+    result = generation_result()
+
+    if boundary.startswith("request"):
+        schema = (
+            output_schema(description=surrogate)
+            if json_location == "value"
+            else output_schema(default={surrogate: "value"})
+        )
+        if boundary == "request-copy":
+            request = request.model_copy(update={"output_schema": schema})
+        else:
+            fields = {
+                name: getattr(request, name)
+                for name in GenerationRequest.model_fields
+            }
+            fields["output_schema"] = schema
+            request = GenerationRequest.model_construct(**fields)
+    else:
+        output = (
+            {"summary": surrogate}
+            if json_location == "value"
+            else {"summary": "supported", surrogate: "value"}
+        )
+        proposal = result.proposals[0]
+        if boundary == "proposal-copy":
+            proposal = proposal.model_copy(update={"output": output})
+        else:
+            fields = {
+                name: getattr(proposal, name)
+                for name in GenerationProposal.model_fields
+            }
+            fields["output"] = output
+            proposal = GenerationProposal.model_construct(**fields)
+        result = result.model_copy(update={"proposals": (proposal,)})
+
+    with pytest.raises(ValidationError, match="invalid Unicode JSON string"):
+        validate_generation_result(request, result)
+
+
+def test_generation_receiving_boundary_retains_shared_opaque_id_rejection():
+    request = generation_request().model_copy(update={"request_id": "\ud800"})
+
+    with pytest.raises(ValidationError, match="string_unicode"):
+        validate_generation_result(request, generation_result())
+
+
+def test_generation_preserves_valid_unicode_json_values_and_keys():
+    schema = output_schema(
+        description="বাংলা 😀",
+        properties={
+            "summary": {"type": "string"},
+            "ключ": {"type": "string"},
+        },
+        default={"鍵": "值"},
+    )
+    request = generation_request(schema=schema)
+    result = generation_result(output={"summary": "مرحبا 😀", "ключ": "值"})
+
+    assert validate_generation_result(request, result).compliant
+    assert GenerationRequest.model_validate_json(request.model_dump_json()) == request
+    assert GenerationResult.model_validate_json(result.model_dump_json()) == result
 
 
 def test_generation_rejects_unknown_support_span_and_duplicate_proposals():
