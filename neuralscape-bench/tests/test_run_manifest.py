@@ -194,6 +194,15 @@ def completed_manifest() -> RunManifest:
     )
 
 
+def planned_manifest_with_extra_target(target_name: str) -> tuple[RunManifest, object]:
+    manifest = planned_manifest()
+    targets = {
+        "manifest": manifest,
+        "nested_resource": manifest.resources[0],
+    }
+    return manifest, targets[target_name]
+
+
 def test_planned_to_completed_round_trip_is_canonical_and_stable():
     manifest = completed_manifest()
 
@@ -204,6 +213,75 @@ def test_planned_to_completed_round_trip_is_canonical_and_stable():
     assert serialize_run_manifest(reparsed) == first
     assert first.startswith(b'{"build":')
     assert b'"observed_value":402653184' in first
+
+
+@pytest.mark.parametrize("target_name", ["manifest", "nested_resource"])
+@pytest.mark.parametrize(
+    "malformed_extras",
+    [[], (), "", 0, False, ["unexpected"]],
+    ids=[
+        "empty-list",
+        "empty-tuple",
+        "empty-string",
+        "zero",
+        "false",
+        "nonempty-list",
+    ],
+)
+def test_serializer_rejects_malformed_extra_storage(
+    target_name: str,
+    malformed_extras: object,
+):
+    manifest, target = planned_manifest_with_extra_target(target_name)
+    object.__setattr__(target, "__pydantic_extra__", malformed_extras)
+
+    with pytest.raises(ValueError, match="malformed stored extras"):
+        serialize_run_manifest(manifest)
+
+
+@pytest.mark.parametrize("target_name", ["manifest", "nested_resource"])
+@pytest.mark.parametrize(
+    "valid_extras",
+    [None, {}],
+    ids=["none", "empty-dict"],
+)
+def test_serializer_accepts_absent_or_empty_mapping_extra_storage(
+    target_name: str,
+    valid_extras: object,
+):
+    manifest, target = planned_manifest_with_extra_target(target_name)
+    object.__setattr__(target, "__pydantic_extra__", valid_extras)
+
+    assert serialize_run_manifest(manifest) == serialize_run_manifest(
+        planned_manifest()
+    )
+
+
+def test_serializer_rejects_extra_storage_overlapping_declared_fields():
+    manifest = planned_manifest()
+    object.__setattr__(
+        manifest,
+        "__pydantic_extra__",
+        {"run_id": "shadowed-run"},
+    )
+
+    with pytest.raises(ValueError, match="undeclared stored fields.*run_id"):
+        serialize_run_manifest(manifest)
+
+
+def test_finish_rejects_malformed_nested_extra_storage():
+    manifest, target = planned_manifest_with_extra_target("nested_resource")
+    object.__setattr__(target, "__pydantic_extra__", [])
+
+    with pytest.raises(ValueError, match="malformed stored extras"):
+        finish_run(
+            manifest,
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(timing(),),
+        )
 
 
 def test_validated_evidence_is_immutable():

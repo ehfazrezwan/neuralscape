@@ -314,7 +314,9 @@ def _snapshot_native(value: Any, *, path: str = "$", active: set[int] | None = N
             stored = vars(value)
             undeclared = set(stored).difference(fields)
             extras = getattr(value, "__pydantic_extra__", None)
-            if extras:
+            if extras is not None:
+                if not isinstance(extras, Mapping):
+                    raise ValueError(f"malformed stored extras at {path}")
                 undeclared.update(extras)
             if undeclared:
                 names = ", ".join(sorted(repr(name) for name in undeclared))
