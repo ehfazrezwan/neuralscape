@@ -215,6 +215,8 @@ def test_native_engine_semantic_layer_implemented(mock_bridge, mock_settings):
 
 def test_native_engine_export_snapshot_implemented(mock_bridge, mock_settings):
     """Test that export_snapshot() produces deterministic bytes (E6)."""
+    import gzip
+    import json
     from unittest.mock import patch
 
     engine = NativeEngine(
@@ -240,22 +242,35 @@ def test_native_engine_export_snapshot_implemented(mock_bridge, mock_settings):
         }
     ]
 
-    with patch.object(engine, "_run_cypher") as mock_cypher:
-        # First call: nodes query
-        # Second call: edges query
-        mock_cypher.side_effect = [fixture_nodes, fixture_edges]
+    with patch("gzip.time.time", return_value=1_790_792_276):
+        with patch.object(engine, "_run_cypher") as mock_cypher:
+            # First call: nodes query
+            # Second call: edges query
+            mock_cypher.side_effect = [fixture_nodes, fixture_edges]
 
-        snapshot_bytes = engine.export_snapshot()
+            snapshot_bytes = engine.export_snapshot()
 
     # Verify it's compressed bytes
     assert isinstance(snapshot_bytes, bytes)
     assert len(snapshot_bytes) > 0
+    assert snapshot_bytes[:4] == b"\x1f\x8b\x08\x00"
+    assert snapshot_bytes[4:8] == b"\x00\x00\x00\x00"
+    assert snapshot_bytes[8] == 2  # Maximum-compression marker.
+    assert snapshot_bytes[9] == 255  # Stable unknown-OS marker.
 
-    # Verify deterministic: same input → same output
-    with patch.object(engine, "_run_cypher") as mock_cypher:
-        mock_cypher.side_effect = [fixture_nodes, fixture_edges]
-        snapshot_bytes2 = engine.export_snapshot()
+    # Verify deterministic across a wall-clock second boundary.
+    with patch("gzip.time.time", return_value=1_790_792_277):
+        with patch.object(engine, "_run_cypher") as mock_cypher:
+            mock_cypher.side_effect = [fixture_nodes, fixture_edges]
+            snapshot_bytes2 = engine.export_snapshot()
     assert snapshot_bytes == snapshot_bytes2
+
+    envelope = json.loads(gzip.decompress(snapshot_bytes))
+    assert envelope["header"]["format_version"] == "1.0"
+    assert envelope["header"]["symbol_count"] == 1
+    assert envelope["header"]["edge_count"] == 1
+    assert len(envelope["snapshot"]["nodes"]) == 2
+    assert len(envelope["snapshot"]["edges"]) == 1
 
 
 def test_native_engine_parse_file(temp_repo, mock_bridge, mock_settings):
