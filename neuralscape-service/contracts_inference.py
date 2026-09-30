@@ -701,7 +701,10 @@ def _contract_format_checker(format_checker_class: Any) -> Any:
     )(_is_idn_hostname)
     checker.checks("ipv4", raises=AddressValueError)(_is_ipv4)
     checker.checks("ipv6", raises=AddressValueError)(_is_ipv6)
-    checker.checks("regex", raises=re.error)(_is_regex)
+    checker.checks(
+        "regex",
+        raises=(re.error, RecursionError, OverflowError),
+    )(_is_regex)
     checker.checks("time", raises=ValueError)(_is_time)
     checker.checks("uuid", raises=ValueError)(_is_uuid)
     return checker
@@ -768,15 +771,23 @@ def _reject_unknown_schema_semantics(
                     )
 
 
-def _validate_finite_json(value: JsonValue, location: str = "$") -> None:
+def _validate_json_value(value: JsonValue, location: str = "$") -> None:
+    """Reject JSON values that cannot cross the finite UTF-8 wire boundary."""
+
+    if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError(f"invalid Unicode JSON string at {location}") from exc
     if isinstance(value, float) and not math.isfinite(value):
         raise ValueError(f"non-finite JSON number at {location}")
     if isinstance(value, list):
         for index, item in enumerate(value):
-            _validate_finite_json(item, f"{location}/{index}")
+            _validate_json_value(item, f"{location}/{index}")
     elif isinstance(value, dict):
-        for key, item in value.items():
-            _validate_finite_json(item, f"{location}/{key}")
+        for index, (key, item) in enumerate(value.items()):
+            _validate_json_value(key, f"{location}/key/{index}")
+            _validate_json_value(item, f"{location}/value/{index}")
 
 
 def _reject_model_json_values(value: object, location: str) -> None:
@@ -809,7 +820,7 @@ def _build_output_validator(schema: Mapping[str, JsonValue]) -> Any:
     format_checker = _contract_format_checker(format_checker_class)
     if schema.get("$schema") != JSON_SCHEMA_DIALECT:
         raise ValueError("output schema must declare the supported Draft 2020-12 dialect")
-    _validate_finite_json(dict(schema))
+    _validate_json_value(dict(schema))
     _reject_unknown_schema_semantics(schema, validator_class)
     try:
         validator_class.check_schema(schema)
@@ -850,7 +861,7 @@ class GenerationProposal(ContractModel):
 
     @model_validator(mode="after")
     def validate_proposal(self) -> "GenerationProposal":
-        _validate_finite_json(self.output)
+        _validate_json_value(self.output)
         if not self.support_span_ids:
             raise ValueError("a generation proposal requires source support")
         if len(set(self.support_span_ids)) != len(self.support_span_ids):
@@ -924,7 +935,7 @@ def validate_generation_result(
     allowed_span_ids = {span.span_id for span in request.spans}
     output_validator = _build_output_validator(request.output_schema)
     for proposal in result.proposals:
-        _validate_finite_json(proposal.output)
+        _validate_json_value(proposal.output)
         if not set(proposal.support_span_ids).issubset(allowed_span_ids):
             raise ValueError("proposal references an unknown support span ID")
         first_error = next(output_validator.iter_errors(proposal.output), None)
