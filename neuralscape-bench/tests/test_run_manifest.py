@@ -216,14 +216,33 @@ class FalseyPopulatedExtras(dict[str, object]):
         return False
 
 
+class HiddenItemsExtras(dict[str, object]):
+    """Expose keys through iteration while hiding every items() pair."""
+
+    def __init__(self, values: dict[str, object]):
+        super().__init__(values)
+        self.iteration_calls = 0
+        self.items_calls = 0
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        return super().__iter__()
+
+    def items(self):
+        self.items_calls += 1
+        return ()
+
+
 class ChangingItemsExtras(dict[str, object]):
     """Return a different entry inventory if a receiver consumes it twice."""
 
     def __init__(self):
         super().__init__()
+        self.iteration_calls = 0
         self.items_calls = 0
 
     def __iter__(self):
+        self.iteration_calls += 1
         return iter(())
 
     def items(self):
@@ -334,6 +353,31 @@ def test_serializer_rejects_falsey_populated_extra_storage(target_name: str):
         serialize_run_manifest(manifest)
 
 
+@pytest.mark.parametrize(
+    ("target_name", "expected_path"),
+    [
+        ("manifest", "$"),
+        ("nested_resource", "$.resources[0]"),
+    ],
+)
+def test_serializer_rejects_inverse_items_view_once(
+    target_name: str,
+    expected_path: str,
+):
+    manifest, target = planned_manifest_with_extra_target(target_name)
+    extras = HiddenItemsExtras({"future_constraint": "deny"})
+    object.__setattr__(target, "__pydantic_extra__", extras)
+
+    with pytest.raises(ValueError) as exc_info:
+        serialize_run_manifest(manifest)
+
+    message = str(exc_info.value)
+    assert f"undeclared stored fields at {expected_path}:" in message
+    assert "'future_constraint'" in message
+    assert extras.iteration_calls == 1
+    assert extras.items_calls == 1
+
+
 def test_serializer_consumes_one_stable_extra_entry_inventory():
     manifest = planned_manifest()
     extras = ChangingItemsExtras()
@@ -345,6 +389,7 @@ def test_serializer_consumes_one_stable_extra_entry_inventory():
     ):
         serialize_run_manifest(manifest)
 
+    assert extras.iteration_calls == 1
     assert extras.items_calls == 1
 
 
