@@ -380,6 +380,64 @@ def test_transition_rejects_retained_copied_nested_extra() -> None:
         validate_operation_transition(previous, corrupted)
 
 
+@pytest.mark.parametrize(
+    "malformed_extra",
+    [[], (), "", 0, False, ["unreviewed"]],
+    ids=["list", "tuple", "string", "zero", "false", "nonempty-list"],
+)
+def test_transition_rejects_each_malformed_extra_storage_representation(
+    malformed_extra: object,
+) -> None:
+    previous = operation(resource_manifests=[])
+    current = operation(observed_state="running", resource_manifests=[])
+    object.__setattr__(current, "__pydantic_extra__", malformed_extra)
+
+    with pytest.raises(ValueError, match="extra storage must be a mapping"):
+        validate_operation_transition(previous, current)
+
+
+@pytest.mark.parametrize("extra_storage", [None, {}], ids=["none", "empty-mapping"])
+def test_transition_accepts_absent_or_empty_mapping_extra_storage(
+    extra_storage: object,
+) -> None:
+    previous = operation(resource_manifests=[])
+    current = operation(observed_state="running", resource_manifests=[])
+    object.__setattr__(current, "__pydantic_extra__", extra_storage)
+
+    result = validate_operation_transition(previous, current)
+
+    assert result.observed_state == "running"
+
+
+@pytest.mark.parametrize(
+    "stored_extra",
+    [{"unreviewed_policy": "allow"}, {"tenant_id": "tenant-a"}],
+    ids=["unknown", "declared-overlap"],
+)
+def test_transition_rejects_nonempty_mapping_extra_storage(
+    stored_extra: dict[str, object],
+) -> None:
+    previous = operation(resource_manifests=[])
+    current = operation(observed_state="running", resource_manifests=[])
+    object.__setattr__(current, "__pydantic_extra__", stored_extra)
+
+    with pytest.raises(ValueError, match="undeclared fields"):
+        validate_operation_transition(previous, current)
+
+
+def test_transition_rejects_malformed_nested_extra_storage() -> None:
+    previous = operation()
+    current = operation(observed_state="running")
+    object.__setattr__(
+        current.resource_manifests[0],
+        "__pydantic_extra__",
+        [],
+    )
+
+    with pytest.raises(ValueError, match="extra storage must be a mapping"):
+        validate_operation_transition(previous, current)
+
+
 def test_transition_rejects_cyclic_mutated_input_graph() -> None:
     previous = operation(resource_manifests=[])
     current = operation(observed_state="running", resource_manifests=[])
