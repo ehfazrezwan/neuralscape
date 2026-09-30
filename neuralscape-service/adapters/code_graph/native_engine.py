@@ -37,6 +37,47 @@ from adapters.code_graph.engine import (
 
 logger = logging.getLogger(__name__)
 
+_SNAPSHOT_CORE_LABELS = frozenset(
+    {"CodeRepo", "CodeFile", "CodeSymbol", "CodeAnchor"}
+)
+
+
+def _normalize_snapshot_labels(labels: object, *, location: str) -> list[str]:
+    """Return one core label followed by deterministically sorted auxiliaries."""
+    if not isinstance(labels, list):
+        raise ValueError(
+            f"Malformed snapshot labels at {location}: expected a list of strings"
+        )
+    for index, label in enumerate(labels):
+        if not isinstance(label, str):
+            raise ValueError(
+                f"Malformed snapshot labels at {location}: "
+                f"label {index} must be a string"
+            )
+
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for label in labels:
+        if label in seen and label not in duplicates:
+            duplicates.append(label)
+        seen.add(label)
+    if duplicates:
+        raise ValueError(
+            f"Malformed snapshot labels at {location}: "
+            f"duplicate labels {duplicates!r}"
+        )
+
+    core_labels = [label for label in labels if label in _SNAPSHOT_CORE_LABELS]
+    if len(core_labels) != 1:
+        raise ValueError(
+            f"Malformed snapshot labels at {location}: expected exactly one core "
+            f"label, found {core_labels!r}"
+        )
+
+    core_label = core_labels[0]
+    auxiliary_labels = sorted(label for label in labels if label != core_label)
+    return [core_label, *auxiliary_labels]
+
 
 @dataclass
 class _Symbol:
@@ -1246,19 +1287,38 @@ class NativeEngine:
         # Build snapshot payload. Database result order is unspecified, so sort
         # complete records to retain duplicates and deterministically break ties
         # between records that share an identity but differ in other properties.
-        node_records = [
-            {"labels": n["labels"], "properties": n["props"]}
-            for n in nodes
-        ]
-        edge_records = [
-            {
-                "type": e["rel_type"],
-                "properties": e["props"],
-                "source": {"labels": e["source_labels"], "properties": e["source_props"]},
-                "target": {"labels": e["target_labels"], "properties": e["target_props"]},
-            }
-            for e in edges
-        ]
+        node_records = []
+        for index, node in enumerate(nodes):
+            node_records.append(
+                {
+                    "labels": _normalize_snapshot_labels(
+                        node["labels"], location=f"node[{index}].labels"
+                    ),
+                    "properties": node["props"],
+                }
+            )
+        edge_records = []
+        for index, edge in enumerate(edges):
+            edge_records.append(
+                {
+                    "type": edge["rel_type"],
+                    "properties": edge["props"],
+                    "source": {
+                        "labels": _normalize_snapshot_labels(
+                            edge["source_labels"],
+                            location=f"edge[{index}].source.labels",
+                        ),
+                        "properties": edge["source_props"],
+                    },
+                    "target": {
+                        "labels": _normalize_snapshot_labels(
+                            edge["target_labels"],
+                            location=f"edge[{index}].target.labels",
+                        ),
+                        "properties": edge["target_props"],
+                    },
+                }
+            )
 
         def canonical_record_key(record: dict) -> str:
             return json.dumps(record, sort_keys=True, separators=(",", ":"))
@@ -1338,6 +1398,29 @@ class NativeEngine:
                 f"(expected {header['content_hash']}, got {computed_hash})"
             )
 
+        # Validate and normalize every label array before issuing any writes. Hash
+        # verification intentionally uses the original representation so historical
+        # format-1.0 artifacts remain valid regardless of auxiliary-label position.
+        normalized_node_labels = [
+            _normalize_snapshot_labels(
+                node["labels"], location=f"node[{index}].labels"
+            )
+            for index, node in enumerate(snapshot["nodes"])
+        ]
+        normalized_edge_labels = [
+            (
+                _normalize_snapshot_labels(
+                    edge["source"]["labels"],
+                    location=f"edge[{index}].source.labels",
+                ),
+                _normalize_snapshot_labels(
+                    edge["target"]["labels"],
+                    location=f"edge[{index}].target.labels",
+                ),
+            )
+            for index, edge in enumerate(snapshot["edges"])
+        ]
+
         logger.info(
             "Importing snapshot: %d nodes, %d edges (code_space=%s)",
             len(snapshot["nodes"]), len(snapshot["edges"]), header["code_space"]
@@ -1348,18 +1431,22 @@ class NativeEngine:
         node_order = ["CodeRepo", "CodeFile", "CodeSymbol", "CodeAnchor"]
         for label_filter in node_order:
             nodes_to_merge = [
-                n for n in snapshot["nodes"] if label_filter in n["labels"]
+                (node, labels)
+                for node, labels in zip(snapshot["nodes"], normalized_node_labels)
+                if labels[0] == label_filter
             ]
-            for node in nodes_to_merge:
-                self._merge_node(node["labels"], node["properties"])
+            for node, labels in nodes_to_merge:
+                self._merge_node(labels, node["properties"])
 
         # MERGE edges
-        for edge in snapshot["edges"]:
+        for edge, (source_labels, target_labels) in zip(
+            snapshot["edges"], normalized_edge_labels
+        ):
             self._merge_edge(
-                edge["source"]["labels"],
+                source_labels,
                 edge["source"]["properties"],
                 edge["type"],
-                edge["target"]["labels"],
+                target_labels,
                 edge["target"]["properties"],
                 edge["properties"],
             )
@@ -1382,8 +1469,7 @@ class NativeEngine:
         elif label == "CodeAnchor":
             match_key = "code_space, repo, fqn"
         else:
-            logger.warning(f"Unknown label for merge: {label}")
-            return
+            raise ValueError(f"Unsupported snapshot core label: {label}")
 
         # Build MERGE cypher (SET all properties)
         label_str = ":".join(labels)
@@ -1473,8 +1559,7 @@ class NativeEngine:
         elif label == "CodeAnchor":
             return f"{{code_space: ${prefix}code_space, repo: ${prefix}repo, fqn: ${prefix}fqn}}"
         else:
-            # Fallback: use code_space only
-            return f"{{code_space: ${prefix}code_space}}"
+            raise ValueError(f"Unsupported snapshot core label: {label}")
 
     # ── Internal indexing helpers ────────────────────────────────────
 

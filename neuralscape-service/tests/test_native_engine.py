@@ -1,5 +1,9 @@
 """Unit tests for NativeEngine (E2 native code-intel indexer)."""
 
+import copy
+import gzip
+import hashlib
+import json
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, Mock
@@ -8,6 +12,64 @@ import pytest
 
 from adapters.code_graph.engine import EngineCapabilityError, IndexReport
 from adapters.code_graph.native_engine import NativeEngine
+
+
+def _snapshot_artifact(snapshot, *, content_hash=None):
+    snapshot_json = json.dumps(snapshot, sort_keys=True)
+    envelope = {
+        "header": {
+            "format_version": "1.0",
+            "code_space": "code--user--repo",
+            "repo": "repo",
+            "symbol_count": sum(
+                "CodeSymbol" in node.get("labels", [])
+                for node in snapshot["nodes"]
+            ),
+            "edge_count": len(snapshot["edges"]),
+            "content_hash": content_hash
+            or hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest(),
+        },
+        "snapshot": snapshot,
+    }
+    return gzip.compress(
+        json.dumps(envelope, sort_keys=True).encode("utf-8"),
+        mtime=1,
+    )
+
+
+def _valid_multilabel_snapshot():
+    return {
+        "nodes": [
+            {
+                "labels": ["Searchable", "CodeSymbol", "Audited"],
+                "properties": {
+                    "code_space": "code--user--repo",
+                    "fqn": "mod.a",
+                    "tags": ["z", "a"],
+                },
+            }
+        ],
+        "edges": [
+            {
+                "type": "CALLS",
+                "properties": {},
+                "source": {
+                    "labels": ["Callable", "CodeSymbol"],
+                    "properties": {
+                        "code_space": "code--user--repo",
+                        "fqn": "mod.a",
+                    },
+                },
+                "target": {
+                    "labels": ["Indexed", "CodeSymbol"],
+                    "properties": {
+                        "code_space": "code--user--repo",
+                        "fqn": "mod.b",
+                    },
+                },
+            }
+        ],
+    }
 
 
 @pytest.fixture
@@ -445,14 +507,131 @@ def test_snapshot_export_canonicalizes_records_without_deduplicating(
     )
 
 
+def test_snapshot_export_canonicalizes_all_label_permutations(
+    mock_bridge,
+    mock_settings,
+):
+    """Neo4j label-set order cannot affect bytes, hashes, or primary type."""
+    from unittest.mock import patch
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user--repo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+    nodes = [
+        {
+            "labels": ["CodeSymbol", "Zulu", "Alpha"],
+            "props": {
+                "code_space": "code--user--repo",
+                "fqn": "mod.a",
+                "tags": ["z", "a"],
+            },
+        },
+        {
+            "labels": ["CodeAnchor", "Searchable", "Audited"],
+            "props": {
+                "code_space": "code--user--repo",
+                "repo": "repo",
+                "fqn": "mod.a",
+            },
+        },
+    ]
+    edges = [
+        {
+            "rel_type": "CALLS",
+            "props": {"evidence": ["second", "first"]},
+            "source_labels": ["CodeSymbol", "Zulu", "Alpha"],
+            "source_props": {
+                "code_space": "code--user--repo",
+                "fqn": "mod.a",
+            },
+            "target_labels": ["CodeSymbol", "Searchable", "Audited"],
+            "target_props": {
+                "code_space": "code--user--repo",
+                "fqn": "mod.b",
+            },
+        },
+        {
+            "rel_type": "ANCHORED",
+            "props": {},
+            "source_labels": ["CodeSymbol", "Callable", "Audited"],
+            "source_props": {
+                "code_space": "code--user--repo",
+                "fqn": "mod.a",
+            },
+            "target_labels": ["CodeAnchor", "Searchable", "Audited"],
+            "target_props": {
+                "code_space": "code--user--repo",
+                "repo": "repo",
+                "fqn": "mod.a",
+            },
+        },
+    ]
+    permuted_nodes = copy.deepcopy(nodes)
+    permuted_nodes[0]["labels"] = ["Zulu", "CodeSymbol", "Alpha"]
+    permuted_nodes[1]["labels"] = ["Searchable", "Audited", "CodeAnchor"]
+    permuted_edges = copy.deepcopy(edges)
+    permuted_edges[0]["source_labels"] = ["Alpha", "Zulu", "CodeSymbol"]
+    permuted_edges[0]["target_labels"] = ["Searchable", "CodeSymbol", "Audited"]
+    permuted_edges[1]["source_labels"] = ["Callable", "CodeSymbol", "Audited"]
+    permuted_edges[1]["target_labels"] = ["Audited", "Searchable", "CodeAnchor"]
+
+    def export(node_rows, edge_rows):
+        with patch.object(engine, "_run_cypher") as mock_cypher:
+            mock_cypher.side_effect = [node_rows, edge_rows]
+            return engine.export_snapshot()
+
+    first = export(nodes, edges)
+    second = export(permuted_nodes, permuted_edges)
+    assert first == second
+
+    envelope = json.loads(gzip.decompress(first))
+    snapshot = envelope["snapshot"]
+    snapshot_json = json.dumps(snapshot, sort_keys=True)
+    assert envelope["header"]["content_hash"] == hashlib.sha256(
+        snapshot_json.encode("utf-8")
+    ).hexdigest()
+    assert envelope["header"]["symbol_count"] == 1
+    assert envelope["header"]["edge_count"] == 2
+    symbol = next(
+        node for node in snapshot["nodes"] if "CodeSymbol" in node["labels"]
+    )
+    anchor = next(
+        node for node in snapshot["nodes"] if "CodeAnchor" in node["labels"]
+    )
+    assert symbol["labels"] == ["CodeSymbol", "Alpha", "Zulu"]
+    assert symbol["properties"]["tags"] == ["z", "a"]
+    assert anchor["labels"] == ["CodeAnchor", "Audited", "Searchable"]
+    calls = next(edge for edge in snapshot["edges"] if edge["type"] == "CALLS")
+    anchored = next(
+        edge for edge in snapshot["edges"] if edge["type"] == "ANCHORED"
+    )
+    assert calls["source"]["labels"] == ["CodeSymbol", "Alpha", "Zulu"]
+    assert calls["target"]["labels"] == [
+        "CodeSymbol",
+        "Audited",
+        "Searchable",
+    ]
+    assert calls["properties"]["evidence"] == ["second", "first"]
+    assert anchored["source"]["labels"] == [
+        "CodeSymbol",
+        "Audited",
+        "Callable",
+    ]
+    assert anchored["target"]["labels"] == [
+        "CodeAnchor",
+        "Audited",
+        "Searchable",
+    ]
+
+
 def test_import_snapshot_accepts_unsorted_version_one_artifact(
     mock_bridge,
     mock_settings,
 ):
     """Canonical exports do not invalidate historical version 1.0 snapshots."""
-    import gzip
-    import hashlib
-    import json
     from unittest.mock import patch
 
     engine = NativeEngine(
@@ -464,7 +643,7 @@ def test_import_snapshot_accepts_unsorted_version_one_artifact(
     snapshot = {
         "nodes": [
             {
-                "labels": ["CodeSymbol"],
+                "labels": ["Searchable", "CodeSymbol", "Audited"],
                 "properties": {
                     "code_space": "code--user--repo",
                     "fqn": "mod.z",
@@ -472,7 +651,7 @@ def test_import_snapshot_accepts_unsorted_version_one_artifact(
                 },
             },
             {
-                "labels": ["CodeRepo"],
+                "labels": ["Managed", "CodeRepo"],
                 "properties": {
                     "code_space": "code--user--repo",
                     "name": "repo",
@@ -480,11 +659,19 @@ def test_import_snapshot_accepts_unsorted_version_one_artifact(
                 },
             },
             {
-                "labels": ["CodeSymbol"],
+                "labels": ["Indexed", "CodeSymbol"],
                 "properties": {
                     "code_space": "code--user--repo",
                     "fqn": "mod.a",
                     "kind": "function",
+                },
+            },
+            {
+                "labels": ["Searchable", "CodeAnchor"],
+                "properties": {
+                    "code_space": "code--user--repo",
+                    "repo": "repo",
+                    "fqn": "mod.z",
                 },
             },
         ],
@@ -493,47 +680,184 @@ def test_import_snapshot_accepts_unsorted_version_one_artifact(
                 "type": "CALLS",
                 "properties": {},
                 "source": {
-                    "labels": ["CodeSymbol"],
+                    "labels": ["Callable", "CodeSymbol"],
                     "properties": {
                         "code_space": "code--user--repo",
                         "fqn": "mod.z",
                     },
                 },
                 "target": {
-                    "labels": ["CodeSymbol"],
+                    "labels": ["Indexed", "CodeSymbol"],
                     "properties": {
                         "code_space": "code--user--repo",
                         "fqn": "mod.a",
                     },
                 },
-            }
+            },
+            {
+                "type": "ANCHORED",
+                "properties": {},
+                "source": {
+                    "labels": ["Callable", "CodeSymbol"],
+                    "properties": {
+                        "code_space": "code--user--repo",
+                        "fqn": "mod.z",
+                    },
+                },
+                "target": {
+                    "labels": ["Searchable", "CodeAnchor"],
+                    "properties": {
+                        "code_space": "code--user--repo",
+                        "repo": "repo",
+                        "fqn": "mod.z",
+                    },
+                },
+            },
         ],
     }
-    snapshot_json = json.dumps(snapshot, sort_keys=True)
-    envelope = {
-        "header": {
-            "format_version": "1.0",
-            "code_space": "code--user--repo",
-            "repo": "repo",
-            "symbol_count": 2,
-            "edge_count": 1,
-            "content_hash": hashlib.sha256(
-                snapshot_json.encode("utf-8")
-            ).hexdigest(),
-        },
-        "snapshot": snapshot,
-    }
-    legacy_bytes = gzip.compress(
-        json.dumps(envelope, sort_keys=True).encode("utf-8"),
-        mtime=1,
-    )
+    legacy_bytes = _snapshot_artifact(snapshot)
 
     with patch.object(engine, "_run_cypher_with_retry") as mock_retry:
         engine.import_snapshot(legacy_bytes)
 
-    assert mock_retry.call_count == 4
-    assert any("CodeRepo" in str(call.args[0]) for call in mock_retry.call_args_list)
-    assert any("CALLS" in str(call.args[0]) for call in mock_retry.call_args_list)
+    assert mock_retry.call_count == 6
+    cypher = [str(call.args[0]) for call in mock_retry.call_args_list]
+    assert any("CodeRepo:Managed" in query for query in cypher)
+    assert any("CodeSymbol:Audited:Searchable" in query for query in cypher)
+    assert any("CodeSymbol:Indexed" in query for query in cypher)
+    assert any("CodeAnchor:Searchable" in query for query in cypher)
+    assert any(
+        "MATCH (s:CodeSymbol {code_space: $src_code_space, fqn: $src_fqn})"
+        in query
+        and "MATCH (t:CodeSymbol {code_space: $tgt_code_space, fqn: $tgt_fqn})"
+        in query
+        and "[r:CALLS]" in query
+        for query in cypher
+    )
+    assert any(
+        "MATCH (s:CodeSymbol {code_space: $src_code_space, fqn: $src_fqn})"
+        in query
+        and (
+            "MATCH (t:CodeAnchor {code_space: $tgt_code_space, "
+            "repo: $tgt_repo, fqn: $tgt_fqn})"
+        )
+        in query
+        and "[r:ANCHORED]" in query
+        for query in cypher
+    )
+
+
+@pytest.mark.parametrize(
+    ("location", "labels", "message"),
+    [
+        ("node", ["Searchable"], "expected exactly one core label"),
+        (
+            "node",
+            ["CodeFile", "CodeSymbol"],
+            "expected exactly one core label",
+        ),
+        ("node", ["CodeSymbol", "CodeSymbol"], "duplicate labels"),
+        ("source", ["Callable"], "expected exactly one core label"),
+        (
+            "source",
+            ["CodeSymbol", "CodeAnchor"],
+            "expected exactly one core label",
+        ),
+        ("source", ["CodeSymbol", "CodeSymbol"], "duplicate labels"),
+        ("target", ["Indexed"], "expected exactly one core label"),
+        (
+            "target",
+            ["CodeSymbol", "CodeAnchor"],
+            "expected exactly one core label",
+        ),
+        ("target", ["CodeSymbol", "CodeSymbol"], "duplicate labels"),
+    ],
+)
+def test_import_snapshot_rejects_ambiguous_labels_before_writes(
+    mock_bridge,
+    mock_settings,
+    location,
+    labels,
+    message,
+):
+    """Every label array is validated before the first database write."""
+    from unittest.mock import patch
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user--repo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+    snapshot = _valid_multilabel_snapshot()
+    if location == "node":
+        snapshot["nodes"][0]["labels"] = labels
+        path = r"node\[0\]\.labels"
+    else:
+        snapshot["edges"][0][location]["labels"] = labels
+        path = rf"edge\[0\]\.{location}\.labels"
+
+    with patch.object(engine, "_run_cypher_with_retry") as mock_retry:
+        with pytest.raises(ValueError, match=rf"{path}:.*{message}"):
+            engine.import_snapshot(_snapshot_artifact(snapshot))
+
+    mock_retry.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("labels", "message"),
+    [
+        ("CodeSymbol", "expected a list of strings"),
+        (["CodeSymbol", 7], "label 1 must be a string"),
+    ],
+)
+def test_import_snapshot_rejects_malformed_label_types_before_writes(
+    mock_bridge,
+    mock_settings,
+    labels,
+    message,
+):
+    from unittest.mock import patch
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user--repo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+    snapshot = _valid_multilabel_snapshot()
+    snapshot["nodes"][0]["labels"] = labels
+
+    with patch.object(engine, "_run_cypher_with_retry") as mock_retry:
+        with pytest.raises(ValueError, match=message):
+            engine.import_snapshot(_snapshot_artifact(snapshot))
+
+    mock_retry.assert_not_called()
+
+
+def test_import_snapshot_checks_hash_before_label_validation(
+    mock_bridge,
+    mock_settings,
+):
+    """A corrupt artifact cannot be reinterpreted by label normalization."""
+    from unittest.mock import patch
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user--repo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+    snapshot = _valid_multilabel_snapshot()
+    snapshot["nodes"][0]["labels"] = ["Searchable"]
+
+    with patch.object(engine, "_run_cypher_with_retry") as mock_retry:
+        with pytest.raises(ValueError, match="content_hash mismatch"):
+            engine.import_snapshot(
+                _snapshot_artifact(snapshot, content_hash="not-the-content-hash")
+            )
+
+    mock_retry.assert_not_called()
 
 
 def test_native_engine_parse_file(temp_repo, mock_bridge, mock_settings):
