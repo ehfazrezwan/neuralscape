@@ -686,6 +686,242 @@ def test_evaluator_rejects_cyclic_input_predictably() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "malformed_extra",
+    [[], (), "", 0, False, ["retained_unknown"]],
+)
+@pytest.mark.parametrize("location", ["principal", "nested_reference"])
+def test_evaluator_rejects_malformed_extra_storage(
+    malformed_extra: object,
+    location: str,
+) -> None:
+    resource_value = reference("memory-1")
+    principal_value = principal()
+    evaluation_value = PolicyEvaluationInput(
+        schema_version=VERSION,
+        action="read",
+        resource=resource_value,
+    )
+    if location == "principal":
+        object.__setattr__(
+            principal_value,
+            "__pydantic_extra__",
+            malformed_extra,
+        )
+    else:
+        object.__setattr__(
+            evaluation_value.resource,
+            "__pydantic_extra__",
+            malformed_extra,
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="contract input extra storage must be a mapping",
+    ):
+        evaluate_policy(
+            principal=principal_value,
+            evaluation=evaluation_value,
+            policy=policy(
+                statement("read-grant", "allow", "read", resource_value),
+            ),
+        )
+
+
+@pytest.mark.parametrize("extra_storage", [None, {}])
+def test_evaluator_accepts_valid_empty_extra_storage(
+    extra_storage: object,
+) -> None:
+    resource_value = reference("memory-1")
+    principal_value = principal()
+    object.__setattr__(
+        principal_value,
+        "__pydantic_extra__",
+        extra_storage,
+    )
+
+    decision = evaluate_policy(
+        principal=principal_value,
+        evaluation=PolicyEvaluationInput(
+            schema_version=VERSION,
+            action="read",
+            resource=resource_value,
+        ),
+        policy=policy(
+            statement("read-grant", "allow", "read", resource_value),
+        ),
+    )
+
+    assert (decision.outcome, decision.reason_code) == ("allow", "explicit_grant")
+
+
+@pytest.mark.parametrize(
+    ("location", "field_name"),
+    [
+        ("principal", "subject_id"),
+        ("nested_reference", "id"),
+    ],
+)
+def test_evaluator_rejects_required_field_moved_to_extra_storage(
+    location: str,
+    field_name: str,
+) -> None:
+    resource_value = reference("memory-1")
+    principal_value = principal()
+    evaluation_value = PolicyEvaluationInput(
+        schema_version=VERSION,
+        action="read",
+        resource=resource_value,
+    )
+    target = principal_value if location == "principal" else evaluation_value.resource
+    moved_value = target.__dict__.pop(field_name)
+    object.__setattr__(
+        target,
+        "__pydantic_extra__",
+        {field_name: moved_value},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="contract input contains duplicate stored fields",
+    ):
+        evaluate_policy(
+            principal=principal_value,
+            evaluation=evaluation_value,
+            policy=policy(
+                statement("read-grant", "allow", "read", resource_value),
+            ),
+        )
+
+
+def test_evaluator_still_rejects_required_field_absent_from_all_storage() -> None:
+    resource_value = reference("memory-1")
+    principal_value = principal()
+    principal_value.__dict__.pop("subject_id")
+
+    with pytest.raises(ValidationError):
+        evaluate_policy(
+            principal=principal_value,
+            evaluation=PolicyEvaluationInput(
+                schema_version=VERSION,
+                action="read",
+                resource=resource_value,
+            ),
+            policy=policy(
+                statement("read-grant", "allow", "read", resource_value),
+            ),
+        )
+
+
+def test_evaluator_retains_nonconflicting_unknown_extra_for_rejection() -> None:
+    resource_value = reference("memory-1")
+    principal_value = principal()
+    object.__setattr__(
+        principal_value,
+        "__pydantic_extra__",
+        {"future_constraint": "deny"},
+    )
+
+    with pytest.raises(ValidationError, match="future_constraint"):
+        evaluate_policy(
+            principal=principal_value,
+            evaluation=PolicyEvaluationInput(
+                schema_version=VERSION,
+                action="read",
+                resource=resource_value,
+            ),
+            policy=policy(
+                statement("read-grant", "allow", "read", resource_value),
+            ),
+        )
+
+
+@pytest.mark.parametrize("extra_subject_id", ["subject-a", "subject-b"])
+def test_evaluator_rejects_equal_or_conflicting_declared_extra_storage(
+    extra_subject_id: str,
+) -> None:
+    resource_value = reference("memory-1")
+    principal_value = principal()
+    object.__setattr__(
+        principal_value,
+        "__pydantic_extra__",
+        {"subject_id": extra_subject_id},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="contract input contains duplicate stored fields",
+    ):
+        evaluate_policy(
+            principal=principal_value,
+            evaluation=PolicyEvaluationInput(
+                schema_version=VERSION,
+                action="read",
+                resource=resource_value,
+            ),
+            policy=policy(
+                statement("read-grant", "allow", "read", resource_value),
+            ),
+        )
+
+
+def test_evaluator_preserves_missing_subclass_default_without_extra_override() -> None:
+    class ExtendedPrincipalContext(PrincipalContext):
+        audit_marker: str = "default-marker"
+
+    principal_value = ExtendedPrincipalContext.model_validate(
+        principal().model_dump(mode="python")
+    )
+    principal_value.__dict__.pop("audit_marker")
+    resource_value = reference("memory-1")
+
+    decision = evaluate_policy(
+        principal=principal_value,
+        evaluation=PolicyEvaluationInput(
+            schema_version=VERSION,
+            action="read",
+            resource=resource_value,
+        ),
+        policy=policy(
+            statement("read-grant", "allow", "read", resource_value),
+        ),
+    )
+
+    assert (decision.outcome, decision.reason_code) == ("allow", "explicit_grant")
+
+
+def test_evaluator_rejects_subclass_declared_default_moved_to_extra_storage() -> None:
+    class ExtendedPrincipalContext(PrincipalContext):
+        audit_marker: str = "default-marker"
+
+    principal_value = ExtendedPrincipalContext.model_validate(
+        principal().model_dump(mode="python")
+    )
+    principal_value.__dict__.pop("audit_marker")
+    object.__setattr__(
+        principal_value,
+        "__pydantic_extra__",
+        {"audit_marker": "override-marker"},
+    )
+    resource_value = reference("memory-1")
+
+    with pytest.raises(
+        ValueError,
+        match="contract input contains duplicate stored fields",
+    ):
+        evaluate_policy(
+            principal=principal_value,
+            evaluation=PolicyEvaluationInput(
+                schema_version=VERSION,
+                action="read",
+                resource=resource_value,
+            ),
+            policy=policy(
+                statement("read-grant", "allow", "read", resource_value),
+            ),
+        )
+
+
 @pytest.mark.parametrize("input_graph", ["principal", "evaluation", "policy"])
 def test_evaluator_revalidates_nested_references_in_every_input_graph(
     input_graph: str,
@@ -798,6 +1034,86 @@ def test_receiving_boundary_rejects_undeclared_decision_copy_field() -> None:
 def test_receiving_boundary_rejects_malformed_scalar_argument() -> None:
     with pytest.raises(ValidationError):
         validate_policy_decision("not-a-decision")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "malformed_extra",
+    [[], (), "", 0, False, ["retained_unknown"]],
+)
+def test_receiving_boundary_rejects_malformed_extra_storage(
+    malformed_extra: object,
+) -> None:
+    decision = PolicyDecision(**decision_payload())
+    object.__setattr__(decision, "__pydantic_extra__", malformed_extra)
+
+    with pytest.raises(
+        ValueError,
+        match="contract input extra storage must be a mapping",
+    ):
+        validate_policy_decision(decision)
+
+
+@pytest.mark.parametrize("extra_storage", [None, {}])
+def test_receiving_boundary_accepts_valid_empty_extra_storage(
+    extra_storage: object,
+) -> None:
+    decision = PolicyDecision(**decision_payload())
+    object.__setattr__(decision, "__pydantic_extra__", extra_storage)
+
+    received = validate_policy_decision(decision)
+
+    assert received.model_dump(mode="python") == decision.model_dump(mode="python")
+    assert received is not decision
+
+
+def test_receiving_boundary_rejects_required_field_moved_to_extra_storage() -> None:
+    decision = PolicyDecision(**decision_payload())
+    moved_value = decision.__dict__.pop("evaluated_subject_id")
+    object.__setattr__(
+        decision,
+        "__pydantic_extra__",
+        {"evaluated_subject_id": moved_value},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="contract input contains duplicate stored fields",
+    ):
+        validate_policy_decision(decision)
+
+
+def test_receiving_boundary_still_rejects_required_field_absent_from_all_storage() -> None:
+    decision = PolicyDecision(**decision_payload())
+    decision.__dict__.pop("evaluated_subject_id")
+
+    with pytest.raises(ValidationError):
+        validate_policy_decision(decision)
+
+
+def test_receiving_boundary_retains_nonconflicting_unknown_extra_for_rejection() -> None:
+    decision = PolicyDecision(**decision_payload())
+    object.__setattr__(
+        decision,
+        "__pydantic_extra__",
+        {"future_constraint": "deny"},
+    )
+
+    with pytest.raises(ValidationError, match="future_constraint"):
+        validate_policy_decision(decision)
+
+
+@pytest.mark.parametrize("extra_action", ["read", "delete"])
+def test_receiving_boundary_rejects_equal_or_conflicting_declared_extra_storage(
+    extra_action: str,
+) -> None:
+    decision = PolicyDecision(**decision_payload())
+    object.__setattr__(decision, "__pydantic_extra__", {"action": extra_action})
+
+    with pytest.raises(
+        ValueError,
+        match="contract input contains duplicate stored fields",
+    ):
+        validate_policy_decision(decision)
 
 
 def test_receiving_boundary_revalidates_nested_reference_copy() -> None:
