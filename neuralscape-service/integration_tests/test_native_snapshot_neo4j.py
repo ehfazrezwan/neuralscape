@@ -125,15 +125,19 @@ def _node_count(engine: NativeEngine) -> int:
 
 
 def test_database_receipt_uses_neo4j_5_default_database(live_engine):
-    rows = live_engine._run_cypher(
-        "CALL dbms.components() YIELD name, versions, edition "
-        "RETURN name, versions, edition, currentDatabase() AS database"
+    database_rows = live_engine._run_cypher(
+        "CALL db.info() YIELD name RETURN name"
     )
-    assert rows
-    assert rows[0]["database"] == "neo4j"
+    assert database_rows == [{"name": "neo4j"}]
+
+    component_rows = live_engine._run_cypher(
+        "CALL dbms.components() YIELD name, versions, edition "
+        "RETURN name, versions, edition"
+    )
+    assert component_rows
     assert any(
         str(version).startswith("5.")
-        for row in rows
+        for row in component_rows
         for version in row["versions"]
     )
 

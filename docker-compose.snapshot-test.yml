@@ -2,9 +2,9 @@ services:
   neo4j:
     image: neo4j:5-community
     environment:
-      NEO4J_AUTH: neo4j/${SNAPSHOT_NEO4J_PASSWORD:?set SNAPSHOT_NEO4J_PASSWORD}
-      NEO4J_initial_dbms_default__database: neo4j
-      SNAPSHOT_NEO4J_PASSWORD: ${SNAPSHOT_NEO4J_PASSWORD:?set SNAPSHOT_NEO4J_PASSWORD}
+      - NEO4J_AUTH
+      - NS_DB_PASSWORD
+      - NEO4J_initial_dbms_default__database=neo4j
     ports:
       - "127.0.0.1:7687:7687"
     volumes:
@@ -14,7 +14,7 @@ services:
         - CMD-SHELL
         - >-
           cypher-shell -a bolt://127.0.0.1:7687 -d neo4j -u neo4j
-          -p "$${SNAPSHOT_NEO4J_PASSWORD}" "RETURN 1"
+          -p "$${NS_DB_PASSWORD}" "RETURN 1"
       interval: 5s
       timeout: 5s
       retries: 20
