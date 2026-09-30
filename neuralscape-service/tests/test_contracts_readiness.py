@@ -89,6 +89,68 @@ class InverseItemsMapping(dict[object, object]):
         return ()
 
 
+class ObservedLengthMapping(Mapping[object, object]):
+    """Expose only a configured length, with counters for every observed view."""
+
+    def __init__(self, observed_length: int) -> None:
+        self.observed_length = observed_length
+        self.length_calls = 0
+        self.iteration_calls = 0
+        self.items_calls = 0
+        self.boolean_calls = 0
+
+    def __getitem__(self, key: object) -> object:
+        raise KeyError(key)
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        return iter(())
+
+    def __len__(self) -> int:
+        self.length_calls += 1
+        return self.observed_length
+
+    def items(self):
+        self.items_calls += 1
+        return ()
+
+
+class FalseBooleanLengthMapping(ObservedLengthMapping):
+    def __bool__(self) -> bool:
+        self.boolean_calls += 1
+        return False
+
+
+class TrueBooleanEmptyMapping(ObservedLengthMapping):
+    def __bool__(self) -> bool:
+        self.boolean_calls += 1
+        return True
+
+
+class DefaultItemsLengthProbe(Mapping[object, object]):
+    """Instrument the standard Mapping.items() view and its source mapping."""
+
+    def __init__(self) -> None:
+        self.length_calls = 0
+        self.iteration_calls = 0
+        self.items_calls = 0
+
+    def __getitem__(self, key: object) -> object:
+        raise KeyError(key)
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        return iter(())
+
+    def __len__(self) -> int:
+        self.length_calls += 1
+        return 0
+
+    def items(self):
+        self.items_calls += 1
+        return super().items()
+
+
 def observation(
     capability: str = "exact_reads",
     status: str = "healthy",
@@ -517,6 +579,86 @@ def test_readiness_boundaries_reject_iteration_visible_items_empty_extras(
             evaluate(item)
 
     assert extras.iteration_calls == 1
+    assert extras.items_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("boundary", "location"),
+    [
+        ("publication", "direct"),
+        ("publication", "nested"),
+        ("capability", "direct"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("case", "should_reject"),
+    [
+        ("length-one", True),
+        ("length-one-false-bool", True),
+        ("length-zero-true-bool", False),
+    ],
+)
+def test_readiness_boundaries_use_length_without_mapping_truthiness(
+    boundary: str,
+    location: str,
+    case: str,
+    should_reject: bool,
+) -> None:
+    if case == "length-one":
+        extras = ObservedLengthMapping(1)
+    elif case == "length-one-false-bool":
+        extras = FalseBooleanLengthMapping(1)
+    else:
+        extras = TrueBooleanEmptyMapping(0)
+
+    if boundary == "publication":
+        report = publication()
+        target = report if location == "direct" else report.capabilities[0]
+        object.__setattr__(target, "__pydantic_extra__", extras)
+
+        def validate_publication() -> object:
+            return validate_readiness_publication(
+                report,
+                expected_tenant_id="tenant-a",
+                current_placement_generation=12,
+            )
+
+        validate = validate_publication
+    else:
+        item = observation()
+        object.__setattr__(item, "__pydantic_extra__", extras)
+
+        def validate_capability() -> object:
+            return evaluate(item)
+
+        validate = validate_capability
+
+    if should_reject:
+        with pytest.raises(ValueError, match="undeclared fields"):
+            validate()
+    else:
+        validate()
+
+    assert extras.length_calls == 1
+    assert extras.iteration_calls == 1
+    assert extras.items_calls == 1
+    assert extras.boolean_calls == 0
+
+
+def test_publication_default_items_view_does_not_repeat_length_hint() -> None:
+    report = publication()
+    extras = DefaultItemsLengthProbe()
+    object.__setattr__(report, "__pydantic_extra__", extras)
+
+    result = validate_readiness_publication(
+        report,
+        expected_tenant_id="tenant-a",
+        current_placement_generation=12,
+    )
+
+    assert result.tenant_id == "tenant-a"
+    assert extras.length_calls == 1
+    assert extras.iteration_calls == 2
     assert extras.items_calls == 1
 
 

@@ -152,12 +152,19 @@ def _snapshot_closed_graph(
             if extras is not None and not isinstance(extras, Mapping):
                 raise ValueError("contract extra storage must be a mapping")
             if extras is None:
+                observed_extra_length = 0
                 iterated_extra_names = ()
                 extra_entries = ()
             else:
-                iterated_extra_names = tuple(extras)
-                extra_entries = tuple(extras.items())
-            if undeclared or iterated_extra_names or extra_entries:
+                observed_extra_length = len(extras)
+                iterated_extra_names = tuple(name for name in extras)
+                extra_entries = tuple(entry for entry in extras.items())
+            if (
+                undeclared
+                or observed_extra_length
+                or iterated_extra_names
+                or extra_entries
+            ):
                 raise ValueError("contract input contains undeclared fields")
             return {
                 name: _snapshot_closed_graph(field_value, active)
