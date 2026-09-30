@@ -1,6 +1,7 @@
 """Conformance tests for the shared candidate contract foundation."""
 
 import json
+from types import MappingProxyType
 from typing import get_args
 
 import pytest
@@ -12,6 +13,7 @@ from contracts_common import (
     OpaqueId,
     SafeCounter,
     VersionedContract,
+    snapshot_contract_graph,
 )
 from contracts_errors import (
     InternalErrorCode,
@@ -41,6 +43,98 @@ class ExampleContractGraph(ContractModel):
 
 class DerivedExampleContractGraph(ContractModel):
     item: DerivedNestedExampleContract
+
+
+@pytest.mark.parametrize("source", ["copy", "construct"])
+def test_snapshot_contract_graph_preserves_complete_stored_state(source: str) -> None:
+    if source == "copy":
+        value = ExampleContract(count=1).model_copy(
+            update={"unreviewed_state": "preserved"}
+        )
+    else:
+        value = ExampleContract.model_construct(count=1)
+        value.__dict__["unreviewed_state"] = "preserved"
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"count": 1, "unreviewed_state": "preserved"}
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ExampleContract.model_validate(snapshot, strict=True)
+
+
+def test_snapshot_contract_graph_preserves_nested_container_shapes() -> None:
+    nested = NestedExampleContract(identifier="item-1", count=2)
+    value = {
+        "models": [nested],
+        "tuple": ({"nested": nested},),
+    }
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {
+        "models": [{"identifier": "item-1", "count": 2}],
+        "tuple": (({"nested": {"identifier": "item-1", "count": 2}},)),
+    }
+    assert isinstance(snapshot, dict)
+    assert isinstance(snapshot["models"], list)
+    assert isinstance(snapshot["tuple"], tuple)
+    assert isinstance(snapshot["tuple"][0], dict)
+
+
+@pytest.mark.parametrize("extra", [None, MappingProxyType({})])
+def test_snapshot_contract_graph_accepts_normal_empty_extra_storage(
+    extra: object,
+) -> None:
+    value = ExampleContract(count=1)
+    object.__setattr__(value, "__pydantic_extra__", extra)
+
+    assert snapshot_contract_graph(value) == {"count": 1}
+
+
+@pytest.mark.parametrize("extra", [[], ["unreviewed"]], ids=["falsey", "truthy"])
+def test_snapshot_contract_graph_rejects_malformed_extra_storage(
+    extra: object,
+) -> None:
+    value = ExampleContract(count=1)
+    object.__setattr__(value, "__pydantic_extra__", extra)
+
+    with pytest.raises(ValueError, match="extra storage must be a mapping"):
+        snapshot_contract_graph(value)
+
+
+def test_snapshot_contract_graph_rejects_declared_extra_overlap() -> None:
+    value = ExampleContract(count=1)
+    object.__setattr__(value, "__pydantic_extra__", {"count": 2})
+
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(value)
+
+
+@pytest.mark.parametrize("container_type", [list, dict])
+def test_snapshot_contract_graph_rejects_cycles(container_type: type) -> None:
+    value: list[object] | dict[str, object] = container_type()
+    if isinstance(value, list):
+        value.append(value)
+    else:
+        value["self"] = value
+
+    with pytest.raises(ValueError, match="cyclic contract input"):
+        snapshot_contract_graph(value)
+
+
+def test_snapshot_contract_graph_allows_repeated_noncyclic_objects() -> None:
+    shared = [ExampleContract(count=1)]
+
+    assert snapshot_contract_graph([shared, shared]) == [
+        [{"count": 1}],
+        [{"count": 1}],
+    ]
+
+
+def test_snapshot_contract_graph_leaves_non_dict_mappings_unchanged() -> None:
+    value = MappingProxyType({"model": ExampleContract(count=1)})
+
+    assert snapshot_contract_graph(value) is value
 
 
 def test_contract_model_is_strict_and_rejects_unknown_fields() -> None:
