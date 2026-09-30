@@ -259,7 +259,11 @@ def _native_snapshot(value: object, active: set[int] | None = None) -> object:
                 for name, field_value in vars(value).items()
             }
             extras = getattr(value, "__pydantic_extra__", None)
-            if extras:
+            if extras is not None:
+                if not isinstance(extras, Mapping):
+                    raise ValueError("contract extra storage must be a mapping")
+                if set(fields).intersection(extras):
+                    raise ValueError("contract extra storage overlaps stored fields")
                 fields.update(
                     {
                         name: _native_snapshot(field_value, active)

@@ -3,6 +3,7 @@
 import copy
 import json
 from itertools import permutations
+from types import MappingProxyType
 
 import pytest
 from pydantic import ValidationError
@@ -409,6 +410,87 @@ def test_reconciliation_rejects_hidden_extra_from_unchecked_copy() -> None:
     invalid_event = event.model_copy(update={"usage": invalid_usage})
 
     assert _error_code([invalid_event]) == "invalid_event"
+
+
+@pytest.mark.parametrize(
+    "extra_storage",
+    [
+        pytest.param([], id="empty-list"),
+        pytest.param((), id="empty-tuple"),
+        pytest.param("", id="empty-string"),
+        pytest.param(0, id="zero"),
+        pytest.param(False, id="false"),
+        pytest.param(["hidden"], id="nonempty-list"),
+    ],
+)
+def test_reconciliation_rejects_malformed_event_extra_storage(
+    extra_storage: object,
+) -> None:
+    event = _event()
+    object.__setattr__(event, "__pydantic_extra__", extra_storage)
+
+    with pytest.raises(UsageReconciliationError) as caught:
+        reconcile_usage_events([event])
+
+    assert caught.value.code == "invalid_event"
+    assert str(caught.value) == (
+        "invalid_event: an input event failed contract validation"
+    )
+
+
+@pytest.mark.parametrize(
+    "extra_storage",
+    [None, {}, MappingProxyType({})],
+    ids=["none", "empty-dict", "empty-mapping"],
+)
+def test_reconciliation_accepts_absent_or_empty_mapping_extra_storage(
+    extra_storage: object,
+) -> None:
+    event = _event()
+    object.__setattr__(event, "__pydantic_extra__", extra_storage)
+
+    result = reconcile_usage_events([event])
+
+    assert result.streams[0].head_event_id == event.event_id
+    assert result.streams[0].total_tokens == 15
+
+
+@pytest.mark.parametrize(
+    "extra_storage",
+    [
+        pytest.param({"authority": True}, id="unknown-field"),
+        pytest.param({"event_id": "event-1"}, id="overlapping-field"),
+    ],
+)
+def test_reconciliation_rejects_mapping_event_extra_storage(
+    extra_storage: object,
+) -> None:
+    event = _event()
+    object.__setattr__(event, "__pydantic_extra__", extra_storage)
+
+    assert _error_code([event]) == "invalid_event"
+
+
+@pytest.mark.parametrize(
+    "extra_storage",
+    [
+        pytest.param([], id="malformed"),
+        pytest.param({"authority": True}, id="unknown-field"),
+        pytest.param({"value": 10}, id="overlapping-field"),
+    ],
+)
+def test_reconciliation_rejects_nested_quantity_extra_storage(
+    extra_storage: object,
+) -> None:
+    event = _event()
+    assert event.usage is not None
+    object.__setattr__(
+        event.usage.input_tokens,
+        "__pydantic_extra__",
+        extra_storage,
+    )
+
+    assert _error_code([event]) == "invalid_event"
 
 
 def test_reconciliation_rejects_cyclic_mutated_input_graph() -> None:
