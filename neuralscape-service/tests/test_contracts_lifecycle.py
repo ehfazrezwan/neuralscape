@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from itertools import permutations
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 import contracts_lifecycle as lifecycle_contracts
 from contracts_bodies import MEMORY_BODY_ADAPTER, OpaqueEnvelopeBody, PlaintextBody
@@ -31,6 +31,16 @@ from contracts_references import ReferenceHandle, SourceVersion
 
 
 NOW = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
+
+
+class DefaultedStoredModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    count: int = 7
+
+
+class ExtendedStoredModel(DefaultedStoredModel):
+    label: str
 
 
 def source(record_id: str, revision: int = 3, epoch: int = 7) -> SourceVersion:
@@ -88,11 +98,11 @@ def intent_with_requirements(
     return Intent.model_validate(values)
 
 
-def reference(reference_id: str) -> ReferenceHandle:
+def reference(reference_id: str, *, tenant_id: str = "tenant-1") -> ReferenceHandle:
     return ReferenceHandle(
         kind="artifact",
         id=reference_id,
-        tenant_id="tenant-1",
+        tenant_id=tenant_id,
         resolver="resolve_artifact",
     )
 
@@ -155,6 +165,15 @@ def receiving_graph_with_extra_target(
         "output_reference": applied.output_refs[0],
     }
     return command, (applied,), targets[target_name]
+
+
+def move_declared_field_to_extra(value: BaseModel, field_name: str) -> None:
+    stored_value = value.__dict__.pop(field_name)
+    object.__setattr__(
+        value,
+        "__pydantic_extra__",
+        {field_name: stored_value},
+    )
 
 
 def memory_record(**overrides: object) -> MemoryRecord:
@@ -740,18 +759,263 @@ def test_reference_set_match_handles_duplicates_inequality_and_order() -> None:
     )
 
 
+def test_intent_target_references_require_matching_tenant_on_construction() -> None:
+    same_tenant = reference("target")
+    other_tenant = reference("target", tenant_id="tenant-2")
+    direct_values = intent(ProcessingStage.CANONICAL).model_dump()
+
+    direct_values["target_refs"] = (same_tenant,)
+    assert Intent(**direct_values).target_refs == (same_tenant,)
+    direct_values["target_refs"] = (other_tenant,)
+    with pytest.raises(
+        ValidationError, match="target_refs must match intent tenant_id"
+    ):
+        Intent(**direct_values)
+
+    native_values = intent(ProcessingStage.CANONICAL).model_dump()
+    native_values["target_refs"] = (same_tenant.model_dump(),)
+    assert Intent.model_validate(native_values).target_refs == (same_tenant,)
+    native_values["target_refs"] = (other_tenant.model_dump(),)
+    with pytest.raises(
+        ValidationError, match="target_refs must match intent tenant_id"
+    ):
+        Intent.model_validate(native_values)
+
+    json_values = intent(ProcessingStage.CANONICAL).model_dump(mode="json")
+    json_values["target_refs"] = [same_tenant.model_dump(mode="json")]
+    assert Intent.model_validate_json(json.dumps(json_values)).target_refs == (
+        same_tenant,
+    )
+    json_values["target_refs"] = [other_tenant.model_dump(mode="json")]
+    with pytest.raises(
+        ValidationError, match="target_refs must match intent tenant_id"
+    ):
+        Intent.model_validate_json(json.dumps(json_values))
+
+
 @pytest.mark.parametrize(
-    ("field_name", "replacement"),
+    "other_tenant",
     [
-        ("kind", "memory"),
-        ("id", "other-reference"),
-        ("tenant_id", "other-tenant"),
-        ("resolver", "other-resolver"),
+        reference("target").model_copy(update={"tenant_id": "tenant-2"}),
+        ReferenceHandle.model_construct(
+            kind="artifact",
+            id="target",
+            tenant_id="tenant-2",
+            resolver="resolve_artifact",
+        ),
+    ],
+    ids=["copied", "constructed"],
+)
+def test_aggregate_revalidates_nested_target_reference_tenant(
+    other_tenant: ReferenceHandle,
+) -> None:
+    command = intent(ProcessingStage.CANONICAL).model_copy(
+        update={"target_refs": (other_tenant,)}
+    )
+
+    with pytest.raises(
+        ValidationError, match="target_refs must match intent tenant_id"
+    ):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=command,
+            receipts=(),
+        )
+
+
+def test_aggregate_checks_output_tenant_on_every_supplied_receipt() -> None:
+    other_tenant = reference("cross-tenant-output", tenant_id="tenant-2")
+    required_current = (
+        receipt(
+            ProcessingStage.GRAPH,
+            StageStatus.APPLIED,
+            outputs=(other_tenant,),
+        ),
+    )
+    required_historical_noncontrolling = (
+        receipt(
+            ProcessingStage.GRAPH,
+            StageStatus.APPLIED,
+            outputs=(other_tenant,),
+            attempt=1,
+        ),
+        receipt(
+            ProcessingStage.GRAPH,
+            StageStatus.APPLIED,
+            outputs=(reference("same-tenant-output"),),
+            attempt=2,
+        ),
+    )
+    nonrequired = (
+        receipt(
+            ProcessingStage.CANONICAL,
+            StageStatus.APPLIED,
+            effect_id="unrelated-effect",
+            sources=(source("unrelated-input"),),
+            outputs=(other_tenant,),
+        ),
+        receipt(ProcessingStage.GRAPH, StageStatus.PENDING),
+    )
+    nonapplied_historical_noncontrolling = (
+        receipt(
+            ProcessingStage.GRAPH,
+            StageStatus.FAILED,
+            sources=(),
+            outputs=(other_tenant,),
+            attempt=1,
+        ),
+        receipt(ProcessingStage.GRAPH, StageStatus.PENDING, attempt=2),
+    )
+
+    for supplied in (
+        required_current,
+        required_historical_noncontrolling,
+        nonrequired,
+        nonapplied_historical_noncontrolling,
+    ):
+        with pytest.raises(
+            ValueError,
+            match="stage receipt output_refs must match intent tenant_id",
+        ):
+            validate_required_stage_claim(
+                claimed_status=IntentStatus.APPLIED,
+                intent=intent(ProcessingStage.GRAPH),
+                receipts=supplied,
+            )
+
+
+def test_aggregate_accepts_same_tenant_outputs_in_every_receipt_position() -> None:
+    same_tenant = reference("same-tenant-output")
+    cases = (
+        (
+            IntentStatus.APPLIED,
+            (
+                receipt(
+                    ProcessingStage.GRAPH,
+                    StageStatus.APPLIED,
+                    outputs=(same_tenant,),
+                ),
+            ),
+        ),
+        (
+            IntentStatus.APPLIED,
+            (
+                receipt(
+                    ProcessingStage.GRAPH,
+                    StageStatus.APPLIED,
+                    outputs=(same_tenant,),
+                    attempt=1,
+                ),
+                receipt(
+                    ProcessingStage.GRAPH,
+                    StageStatus.APPLIED,
+                    outputs=(same_tenant,),
+                    attempt=2,
+                ),
+            ),
+        ),
+        (
+            IntentStatus.ACCEPTED,
+            (
+                receipt(
+                    ProcessingStage.CANONICAL,
+                    StageStatus.APPLIED,
+                    effect_id="unrelated-effect",
+                    sources=(source("unrelated-input"),),
+                    outputs=(same_tenant,),
+                ),
+                receipt(ProcessingStage.GRAPH, StageStatus.PENDING),
+            ),
+        ),
+        (
+            IntentStatus.PROCESSING,
+            (
+                receipt(
+                    ProcessingStage.GRAPH,
+                    StageStatus.FAILED,
+                    sources=(),
+                    outputs=(same_tenant,),
+                    attempt=1,
+                ),
+                receipt(ProcessingStage.GRAPH, StageStatus.PENDING, attempt=2),
+            ),
+        ),
+    )
+
+    for claim, supplied in cases:
+        validate_required_stage_claim(
+            claimed_status=claim,
+            intent=intent(ProcessingStage.GRAPH),
+            receipts=supplied,
+        )
+
+
+@pytest.mark.parametrize(
+    "other_tenant",
+    [
+        reference("output").model_copy(update={"tenant_id": "tenant-2"}),
+        ReferenceHandle.model_construct(
+            kind="artifact",
+            id="output",
+            tenant_id="tenant-2",
+            resolver="resolve_artifact",
+        ),
+    ],
+    ids=["copied", "constructed"],
+)
+def test_aggregate_revalidates_nested_output_reference_tenant(
+    other_tenant: ReferenceHandle,
+) -> None:
+    supplied = receipt(
+        ProcessingStage.GRAPH,
+        StageStatus.APPLIED,
+        outputs=(reference("output"),),
+    ).model_copy(update={"output_refs": (other_tenant,)})
+
+    with pytest.raises(
+        ValueError,
+        match="stage receipt output_refs must match intent tenant_id",
+    ):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED,
+            intent=intent(ProcessingStage.GRAPH),
+            receipts=(supplied,),
+        )
+
+
+def test_aggregate_rejects_json_received_cross_tenant_output() -> None:
+    values = receipt(
+        ProcessingStage.GRAPH,
+        StageStatus.APPLIED,
+        outputs=(reference("output"),),
+    ).model_dump(mode="json")
+    values["output_refs"][0]["tenant_id"] = "tenant-2"
+    supplied = StageReceipt.model_validate_json(json.dumps(values))
+
+    with pytest.raises(
+        ValueError,
+        match="stage receipt output_refs must match intent tenant_id",
+    ):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED,
+            intent=intent(ProcessingStage.GRAPH),
+            receipts=(supplied,),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "replacement", "expected_error"),
+    [
+        ("kind", "memory", "consistent result sets"),
+        ("id", "other-reference", "consistent result sets"),
+        ("tenant_id", "other-tenant", "output_refs must match intent tenant_id"),
+        ("resolver", "other-resolver", "consistent result sets"),
     ],
 )
 def test_reference_consensus_uses_every_identity_field(
     field_name: str,
     replacement: str,
+    expected_error: str,
 ) -> None:
     baseline = reference("graph-view")
     changed_values = baseline.model_dump()
@@ -772,7 +1036,7 @@ def test_reference_consensus_uses_every_identity_field(
     )
 
     for observed in permutations(receipts):
-        with pytest.raises(ValueError, match="consistent result sets"):
+        with pytest.raises(ValueError, match=expected_error):
             validate_required_stage_claim(
                 claimed_status=IntentStatus.APPLIED,
                 intent=intent(ProcessingStage.GRAPH),
@@ -1201,6 +1465,92 @@ def test_aggregate_boundary_accepts_absent_or_empty_dict_extra_storage(
         intent=command,
         receipts=receipts,
     )
+
+
+@pytest.mark.parametrize(
+    ("target_name", "field_name"),
+    [
+        ("intent", "id"),
+        ("requirement", "effect_id"),
+        ("source", "content_revision"),
+        ("receipt", "attempt"),
+        ("output_reference", "resolver"),
+    ],
+)
+def test_aggregate_boundary_rejects_declared_fields_moved_to_extra_storage(
+    target_name: str,
+    field_name: str,
+) -> None:
+    command, receipts, target = receiving_graph_with_extra_target(target_name)
+    assert isinstance(target, BaseModel)
+    move_declared_field_to_extra(target, field_name)
+
+    with pytest.raises(ValueError, match="conflicting stored contract field"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED,
+            intent=command,
+            receipts=receipts,
+        )
+
+
+@pytest.mark.parametrize("replacement", [4, 5], ids=["equal", "conflicting"])
+def test_source_boundary_rejects_stored_and_extra_declared_duplicates(
+    replacement: int,
+) -> None:
+    expected = source("memory-1", revision=4, epoch=9)
+    observed = source("memory-1", revision=4, epoch=9)
+    object.__setattr__(
+        observed,
+        "__pydantic_extra__",
+        {"content_revision": replacement},
+    )
+
+    with pytest.raises(ValueError, match="conflicting stored contract field"):
+        source_versions_match(expected, observed)
+
+
+def test_source_boundary_preserves_missing_and_unknown_extra_behavior() -> None:
+    expected = source("memory-1", revision=4, epoch=9)
+
+    missing = source("memory-1", revision=4, epoch=9)
+    missing.__dict__.pop("content_revision")
+    object.__setattr__(missing, "__pydantic_extra__", None)
+    with pytest.raises(ValidationError, match="content_revision"):
+        source_versions_match(expected, missing)
+
+    unknown = source("memory-1", revision=4, epoch=9)
+    object.__setattr__(
+        unknown,
+        "__pydantic_extra__",
+        {"undeclared_witness": True},
+    )
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        source_versions_match(expected, unknown)
+
+
+def test_native_graph_preserves_defaults_but_rejects_declared_extra_override() -> None:
+    absent_default = DefaultedStoredModel()
+    absent_default.__dict__.pop("count")
+    object.__setattr__(absent_default, "__pydantic_extra__", None)
+    reconstructed = DefaultedStoredModel.model_validate(
+        lifecycle_contracts._native_contract_graph(absent_default),
+        strict=True,
+    )
+    assert reconstructed.count == 7
+
+    moved_default = DefaultedStoredModel()
+    moved_default.__dict__.pop("count")
+    object.__setattr__(moved_default, "__pydantic_extra__", {"count": 9})
+    with pytest.raises(ValueError, match="conflicting stored contract field"):
+        lifecycle_contracts._native_contract_graph(moved_default)
+
+
+def test_native_graph_uses_concrete_subclass_declarations_for_extra_overlap() -> None:
+    extended = ExtendedStoredModel(label="retained")
+    move_declared_field_to_extra(extended, "label")
+
+    with pytest.raises(ValueError, match="conflicting stored contract field"):
+        lifecycle_contracts._native_contract_graph(extended)
 
 
 def test_aggregate_boundary_preserves_sequence_types_during_revalidation() -> None:
