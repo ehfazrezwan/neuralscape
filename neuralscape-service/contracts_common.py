@@ -53,12 +53,12 @@ class VersionedContract(ContractModel):
     schema_version: Literal["candidate-v1"]
 
 
-def _validation_alias_roots(model_type: type[BaseModel]) -> set[str]:
+def _validation_alias_owners(model_type: type[BaseModel]) -> dict[str, set[str]]:
     if model_type.model_config.get("validate_by_alias") is False:
-        return set()
+        return {}
 
-    roots: set[str] = set()
-    for field in model_type.model_fields.values():
+    owners: dict[str, set[str]] = {}
+    for field_name, field in model_type.model_fields.items():
         validation_alias = field.validation_alias
         choices = (
             validation_alias.choices
@@ -67,10 +67,10 @@ def _validation_alias_roots(model_type: type[BaseModel]) -> set[str]:
         )
         for choice in choices:
             if isinstance(choice, str):
-                roots.add(choice)
+                owners.setdefault(choice, set()).add(field_name)
             elif isinstance(choice, AliasPath):
-                roots.add(choice.path[0])
-    return roots
+                owners.setdefault(choice.path[0], set()).add(field_name)
+    return owners
 
 
 def snapshot_contract_graph(
@@ -94,9 +94,30 @@ def snapshot_contract_graph(
     active_containers.add(value_id)
     try:
         if isinstance(value, BaseModel):
+            model_type = type(value)
+            stored_entries = tuple(vars(value).items())
+            stored_names = {key for key, _ in stored_entries}
+            declared_names = set(model_type.model_fields)
+            alias_owners = _validation_alias_owners(model_type)
+            alias_roots = set(alias_owners)
+            unknown_stored_names = stored_names - declared_names
+            missing_owner_roots = {
+                root
+                for root in stored_names & alias_roots
+                if alias_owners[root] - stored_names
+            }
+            if unknown_stored_names & alias_roots:
+                raise ValueError(
+                    "contract input contains conflicting declared and extra fields"
+                )
+            if missing_owner_roots:
+                raise ValueError(
+                    "contract input contains stored validation alias roots "
+                    "with missing owning fields"
+                )
             fields = {
                 key: snapshot_contract_graph(item, active_containers)
-                for key, item in vars(value).items()
+                for key, item in stored_entries
             }
             extra = getattr(value, "__pydantic_extra__", None)
             if extra is not None:
@@ -104,11 +125,10 @@ def snapshot_contract_graph(
                     raise ValueError("contract extra storage must be a mapping")
                 extra_entries = tuple(extra.items())
                 extra_keys = {key for key, _ in extra_entries}
-                model_type = type(value)
                 reserved_names = (
                     fields.keys()
-                    | model_type.model_fields.keys()
-                    | _validation_alias_roots(model_type)
+                    | declared_names
+                    | alias_roots
                 )
                 if reserved_names & extra_keys:
                     raise ValueError(
