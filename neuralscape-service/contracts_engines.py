@@ -49,12 +49,19 @@ def _snapshot_native_value(
                 fields_set_value, (set, frozenset)
             ):
                 raise ValueError(f"malformed contract model at {location}")
-            if extras_value is not None and not isinstance(extras_value, dict):
+            if extras_value is not None and type(extras_value) is not dict:
                 raise ValueError(f"malformed contract extras at {location}")
             declared = set(type(value).model_fields)
             stored = set(storage)
             fields_set = set(fields_set_value)
-            extras = extras_value or {}
+            extras = {} if extras_value is None else extras_value
+            duplicated = set(extras) & (stored | declared)
+            if duplicated:
+                names = ", ".join(sorted(str(name) for name in duplicated))
+                raise ValueError(
+                    f"malformed contract extras at {location}: "
+                    f"duplicate field(s): {names}"
+                )
             undeclared = (stored | fields_set | set(extras)) - declared
             if undeclared:
                 names = ", ".join(sorted(str(name) for name in undeclared))
