@@ -262,7 +262,8 @@ def _native_snapshot(value: object, active: set[int] | None = None) -> object:
             if extras is not None:
                 if not isinstance(extras, Mapping):
                     raise ValueError("contract extra storage must be a mapping")
-                if set(fields).intersection(extras):
+                declared_fields = type(value).model_fields
+                if (set(fields) | set(declared_fields)).intersection(extras):
                     raise ValueError("contract extra storage overlaps stored fields")
                 fields.update(
                     {
