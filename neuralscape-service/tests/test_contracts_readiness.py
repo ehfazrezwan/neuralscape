@@ -270,6 +270,76 @@ def test_publication_rejects_retained_copied_extra_fields() -> None:
             )
 
 
+@pytest.mark.parametrize(
+    "malformed_extra",
+    [[], (), "", 0, False, ["unreviewed"]],
+    ids=["list", "tuple", "string", "zero", "false", "nonempty-list"],
+)
+def test_publication_rejects_each_malformed_extra_storage_representation(
+    malformed_extra: object,
+) -> None:
+    report = publication()
+    object.__setattr__(report, "__pydantic_extra__", malformed_extra)
+
+    with pytest.raises(ValueError, match="extra storage must be a mapping"):
+        validate_readiness_publication(
+            report,
+            expected_tenant_id="tenant-a",
+            current_placement_generation=12,
+        )
+
+
+@pytest.mark.parametrize("extra_storage", [None, {}], ids=["none", "empty-mapping"])
+def test_publication_accepts_absent_or_empty_mapping_extra_storage(
+    extra_storage: object,
+) -> None:
+    report = publication()
+    object.__setattr__(report, "__pydantic_extra__", extra_storage)
+
+    result = validate_readiness_publication(
+        report,
+        expected_tenant_id="tenant-a",
+        current_placement_generation=12,
+    )
+
+    assert result.tenant_id == "tenant-a"
+
+
+@pytest.mark.parametrize(
+    "stored_extra",
+    [{"process_healthy": True}, {"tenant_id": "tenant-a"}],
+    ids=["unknown", "declared-overlap"],
+)
+def test_publication_rejects_nonempty_mapping_extra_storage(
+    stored_extra: dict[str, object],
+) -> None:
+    report = publication()
+    object.__setattr__(report, "__pydantic_extra__", stored_extra)
+
+    with pytest.raises(ValueError, match="undeclared fields"):
+        validate_readiness_publication(
+            report,
+            expected_tenant_id="tenant-a",
+            current_placement_generation=12,
+        )
+
+
+def test_publication_rejects_malformed_nested_extra_storage() -> None:
+    report = publication()
+    object.__setattr__(
+        report.capabilities[0],
+        "__pydantic_extra__",
+        (),
+    )
+
+    with pytest.raises(ValueError, match="extra storage must be a mapping"):
+        validate_readiness_publication(
+            report,
+            expected_tenant_id="tenant-a",
+            current_placement_generation=12,
+        )
+
+
 def test_publication_rejects_cyclic_mutated_input_graph() -> None:
     report = publication()
     report.capabilities = (report,)  # type: ignore[assignment]

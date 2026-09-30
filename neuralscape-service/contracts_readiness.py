@@ -6,6 +6,7 @@ derived from process liveness, object construction, or another capability.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Literal
 
@@ -77,6 +78,8 @@ def _snapshot_closed_graph(
             declared = type(value).model_fields
             undeclared = stored.keys() - declared.keys()
             extras = getattr(value, "__pydantic_extra__", None)
+            if extras is not None and not isinstance(extras, Mapping):
+                raise ValueError("contract extra storage must be a mapping")
             if undeclared or extras:
                 raise ValueError("contract input contains undeclared fields")
             return {
