@@ -79,6 +79,20 @@ def _normalize_snapshot_labels(labels: object, *, location: str) -> list[str]:
     return [core_label, *auxiliary_labels]
 
 
+def _quote_cypher_identifier(identifier: object, *, location: str) -> str:
+    """Quote a snapshot-derived Cypher identifier without changing its value."""
+    if not isinstance(identifier, str):
+        raise ValueError(
+            f"Malformed snapshot identifier at {location}: expected a string"
+        )
+
+    # Cypher permits `` for a literal backtick and \uxxxx escapes inside quoted
+    # identifiers. Encode every input backslash first so a literal sequence such
+    # as \u0060 cannot be interpreted as a backtick by the Cypher parser.
+    escaped = identifier.replace("\\", "\\u005C").replace("`", "``")
+    return f"`{escaped}`"
+
+
 @dataclass
 class _Symbol:
     """Internal symbol representation for indexing."""
@@ -1407,19 +1421,25 @@ class NativeEngine:
             )
             for index, node in enumerate(snapshot["nodes"])
         ]
-        normalized_edge_labels = [
-            (
-                _normalize_snapshot_labels(
-                    edge["source"]["labels"],
-                    location=f"edge[{index}].source.labels",
-                ),
-                _normalize_snapshot_labels(
-                    edge["target"]["labels"],
-                    location=f"edge[{index}].target.labels",
-                ),
+        normalized_edge_labels = []
+        for index, edge in enumerate(snapshot["edges"]):
+            # Validate relationship identifiers during the same preflight so a
+            # malformed late edge cannot follow earlier database writes.
+            _quote_cypher_identifier(
+                edge["type"], location=f"edge[{index}].type"
             )
-            for index, edge in enumerate(snapshot["edges"])
-        ]
+            normalized_edge_labels.append(
+                (
+                    _normalize_snapshot_labels(
+                        edge["source"]["labels"],
+                        location=f"edge[{index}].source.labels",
+                    ),
+                    _normalize_snapshot_labels(
+                        edge["target"]["labels"],
+                        location=f"edge[{index}].target.labels",
+                    ),
+                )
+            )
 
         logger.info(
             "Importing snapshot: %d nodes, %d edges (code_space=%s)",
@@ -1461,34 +1481,42 @@ class NativeEngine:
         # Determine primary key based on label
         label = labels[0]  # First label is the primary type
         if label == "CodeRepo":
-            match_key = "code_space"
+            identity_keys = ("code_space",)
         elif label == "CodeFile":
-            match_key = "code_space, path"
+            identity_keys = ("code_space", "path")
         elif label == "CodeSymbol":
-            match_key = "code_space, fqn"
+            identity_keys = ("code_space", "fqn")
         elif label == "CodeAnchor":
-            match_key = "code_space, repo, fqn"
+            identity_keys = ("code_space", "repo", "fqn")
         else:
             raise ValueError(f"Unsupported snapshot core label: {label}")
 
-        # Build MERGE cypher (SET all properties)
-        label_str = ":".join(labels)
-        set_clauses = ", ".join(f"n.{k} = ${k}" for k in props.keys())
-        cypher = f"""
-        MERGE (n:{label_str} {{{match_key.replace(", ", ": $")}: ${match_key.replace(", ", ", ")}$}})
-        SET {set_clauses}
-        """
-        # Clean up the match clause to use actual keys
-        if label == "CodeRepo":
-            cypher = f"MERGE (n:{label_str} {{code_space: $code_space}}) SET {set_clauses}"
-        elif label == "CodeFile":
-            cypher = f"MERGE (n:{label_str} {{code_space: $code_space, path: $path}}) SET {set_clauses}"
-        elif label == "CodeSymbol":
-            cypher = f"MERGE (n:{label_str} {{code_space: $code_space, fqn: $fqn}}) SET {set_clauses}"
-        elif label == "CodeAnchor":
-            cypher = f"MERGE (n:{label_str} {{code_space: $code_space, repo: $repo, fqn: $fqn}}) SET {set_clauses}"
+        identity = {key: props[key] for key in identity_keys}
+        identity_pattern = ", ".join(
+            f"{key}: $identity.{key}" for key in identity_keys
+        )
+        core_identifier = _quote_cypher_identifier(
+            label, location="node core label"
+        )
+        cypher = (
+            f"MERGE (n:{core_identifier} {{{identity_pattern}}}) "
+            "SET n += $properties"
+        )
 
-        self._run_cypher_with_retry(cypher, **props)
+        # Auxiliary labels are additive metadata, not part of node identity.
+        # Apply them only after MERGE has resolved the core-labelled node.
+        if len(labels) > 1:
+            auxiliary_identifiers = "".join(
+                f":{_quote_cypher_identifier(auxiliary, location='node auxiliary label')}"
+                for auxiliary in labels[1:]
+            )
+            cypher += f" SET n{auxiliary_identifiers}"
+
+        self._run_cypher_with_retry(
+            cypher,
+            identity=identity,
+            properties=props,
+        )
 
     def _merge_edge(
         self,
@@ -1503,61 +1531,51 @@ class NativeEngine:
 
         Resolves source and target by their primary keys, then creates/updates the edge.
         """
-        # Build match predicates for source and target
+        # Build match predicates for source and target using isolated maps so
+        # overlapping endpoint and relationship keys cannot replace each other.
         src_label = source_labels[0]
         tgt_label = target_labels[0]
-
-        # Determine match keys
-        src_match = self._build_match_predicate(src_label, source_props)
-        tgt_match = self._build_match_predicate(tgt_label, target_props)
+        src_identifier = _quote_cypher_identifier(
+            src_label, location="edge source core label"
+        )
+        tgt_identifier = _quote_cypher_identifier(
+            tgt_label, location="edge target core label"
+        )
+        rel_identifier = _quote_cypher_identifier(
+            rel_type, location="edge relationship type"
+        )
 
         # Build edge SET clause
-        set_clause = (
-            ", ".join(f"r.{k} = ${k}" for k in edge_props.keys())
-            if edge_props
-            else ""
+        set_part = "SET r += $edge_properties" if edge_props else ""
+        src_match = self._build_match_predicate(src_label, "source")
+        tgt_match = self._build_match_predicate(tgt_label, "target")
+        cypher = f"""
+        MATCH (s:{src_identifier} {src_match})
+        MATCH (t:{tgt_identifier} {tgt_match})
+        MERGE (s)-[r:{rel_identifier}]->(t)
+        {set_part}
+        """
+
+        self._run_cypher_with_retry(
+            cypher,
+            source=source_props,
+            target=target_props,
+            edge_properties=edge_props,
         )
-        set_part = f"SET {set_clause}" if set_clause else ""
 
-        cypher = f"""
-        MATCH (s:{src_label} {src_match})
-        MATCH (t:{tgt_label} {tgt_match})
-        MERGE (s)-[r:{rel_type}]->(t)
-        {set_part}
-        """
-
-        # Merge all props (source, target, edge)
-        all_props = {**source_props, **target_props, **edge_props}
-        # Prefix source/target props to avoid collisions
-        params = {}
-        for k, v in source_props.items():
-            params[f"src_{k}"] = v
-        for k, v in target_props.items():
-            params[f"tgt_{k}"] = v
-        params.update(edge_props)
-
-        # Rebuild cypher with prefixed params
-        src_match_prefixed = self._build_match_predicate(src_label, source_props, prefix="src_")
-        tgt_match_prefixed = self._build_match_predicate(tgt_label, target_props, prefix="tgt_")
-        cypher = f"""
-        MATCH (s:{src_label} {src_match_prefixed})
-        MATCH (t:{tgt_label} {tgt_match_prefixed})
-        MERGE (s)-[r:{rel_type}]->(t)
-        {set_part}
-        """
-
-        self._run_cypher_with_retry(cypher, **params)
-
-    def _build_match_predicate(self, label: str, props: dict, prefix: str = "") -> str:
+    def _build_match_predicate(self, label: str, parameter: str) -> str:
         """Build a Cypher match predicate for a node by its primary key."""
         if label == "CodeRepo":
-            return f"{{code_space: ${prefix}code_space}}"
+            return f"{{code_space: ${parameter}.code_space}}"
         elif label == "CodeFile":
-            return f"{{code_space: ${prefix}code_space, path: ${prefix}path}}"
+            return f"{{code_space: ${parameter}.code_space, path: ${parameter}.path}}"
         elif label == "CodeSymbol":
-            return f"{{code_space: ${prefix}code_space, fqn: ${prefix}fqn}}"
+            return f"{{code_space: ${parameter}.code_space, fqn: ${parameter}.fqn}}"
         elif label == "CodeAnchor":
-            return f"{{code_space: ${prefix}code_space, repo: ${prefix}repo, fqn: ${prefix}fqn}}"
+            return (
+                f"{{code_space: ${parameter}.code_space, repo: ${parameter}.repo, "
+                f"fqn: ${parameter}.fqn}}"
+            )
         else:
             raise ValueError(f"Unsupported snapshot core label: {label}")
 

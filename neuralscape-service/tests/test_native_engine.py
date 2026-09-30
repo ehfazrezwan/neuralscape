@@ -722,29 +722,199 @@ def test_import_snapshot_accepts_unsorted_version_one_artifact(
 
     assert mock_retry.call_count == 6
     cypher = [str(call.args[0]) for call in mock_retry.call_args_list]
-    assert any("CodeRepo:Managed" in query for query in cypher)
-    assert any("CodeSymbol:Audited:Searchable" in query for query in cypher)
-    assert any("CodeSymbol:Indexed" in query for query in cypher)
-    assert any("CodeAnchor:Searchable" in query for query in cypher)
     assert any(
-        "MATCH (s:CodeSymbol {code_space: $src_code_space, fqn: $src_fqn})"
-        in query
-        and "MATCH (t:CodeSymbol {code_space: $tgt_code_space, fqn: $tgt_fqn})"
-        in query
-        and "[r:CALLS]" in query
+        "MERGE (n:`CodeRepo` {code_space: $identity.code_space})" in query
+        and "SET n:`Managed`" in query
         for query in cypher
     )
     assert any(
-        "MATCH (s:CodeSymbol {code_space: $src_code_space, fqn: $src_fqn})"
+        "MERGE (n:`CodeSymbol` {code_space: $identity.code_space, "
+        "fqn: $identity.fqn})" in query
+        and "SET n:`Audited`:`Searchable`" in query
+        for query in cypher
+    )
+    assert any("SET n:`Indexed`" in query for query in cypher)
+    assert any("SET n:`Searchable`" in query for query in cypher)
+    assert any(
+        "MATCH (s:`CodeSymbol` {code_space: $source.code_space, "
+        "fqn: $source.fqn})"
+        in query
+        and "MATCH (t:`CodeSymbol` {code_space: $target.code_space, "
+        "fqn: $target.fqn})"
+        in query
+        and "[r:`CALLS`]" in query
+        for query in cypher
+    )
+    assert any(
+        "MATCH (s:`CodeSymbol` {code_space: $source.code_space, "
+        "fqn: $source.fqn})"
         in query
         and (
-            "MATCH (t:CodeAnchor {code_space: $tgt_code_space, "
-            "repo: $tgt_repo, fqn: $tgt_fqn})"
+            "MATCH (t:`CodeAnchor` {code_space: $target.code_space, "
+            "repo: $target.repo, fqn: $target.fqn})"
         )
         in query
-        and "[r:ANCHORED]" in query
+        and "[r:`ANCHORED`]" in query
         for query in cypher
     )
+
+
+def test_merge_node_uses_only_core_identity_and_adds_auxiliary_labels(
+    mock_bridge,
+    mock_settings,
+):
+    """Auxiliary label sets cannot create distinct MERGE identities."""
+    from unittest.mock import patch
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user--repo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+    props = {
+        "code_space": "code--user--repo",
+        "fqn": "mod.a",
+        "kind": "function",
+    }
+    label_sets = [
+        ["CodeSymbol"],
+        ["CodeSymbol", "Audited"],
+        ["CodeSymbol", "Searchable"],
+        ["CodeSymbol", "Audited"],
+    ]
+
+    with patch.object(engine, "_run_cypher_with_retry") as mock_retry:
+        for labels in label_sets:
+            engine._merge_node(labels, props)
+
+    assert mock_retry.call_count == 4
+    merge_prefix = (
+        "MERGE (n:`CodeSymbol` {code_space: $identity.code_space, "
+        "fqn: $identity.fqn}) SET n += $properties"
+    )
+    queries = [call.args[0] for call in mock_retry.call_args_list]
+    assert all(query.startswith(merge_prefix) for query in queries)
+    assert all("MERGE (n:`CodeSymbol`:" not in query for query in queries)
+    assert queries[0] == merge_prefix
+    assert queries[1].endswith(" SET n:`Audited`")
+    assert queries[2].endswith(" SET n:`Searchable`")
+    assert queries[3] == queries[1]
+    for call in mock_retry.call_args_list:
+        assert call.kwargs == {
+            "identity": {
+                "code_space": "code--user--repo",
+                "fqn": "mod.a",
+            },
+            "properties": props,
+        }
+
+
+def test_snapshot_identifiers_and_node_properties_are_isolated(
+    mock_bridge,
+    mock_settings,
+):
+    """Special label text is quoted while property names and values stay data."""
+    from unittest.mock import patch
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user--repo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+    labels = [
+        "CodeSymbol",
+        "space label",
+        "punctuation:[]()",
+        "tick`) SET n.compromised = true //",
+        "雪 label",
+        r"\u0060literal",
+    ]
+    property_key = "odd key`) SET n.property_injected = true //"
+    property_value = "value`) DELETE n //"
+    props = {
+        "code_space": "code--user--repo",
+        "fqn": "mod.a",
+        property_key: property_value,
+    }
+
+    with patch.object(engine, "_run_cypher_with_retry") as mock_retry:
+        engine._merge_node(labels, props)
+
+    query = mock_retry.call_args.args[0]
+    assert "MERGE (n:`CodeSymbol`" in query
+    assert "MERGE (n:`CodeSymbol`:" not in query
+    assert "SET n:`space label`" in query
+    assert ":`punctuation:[]()`" in query
+    assert ":`tick``) SET n.compromised = true //`" in query
+    assert ":`雪 label`" in query
+    assert r":`\u005Cu0060literal`" in query
+    assert property_key not in query
+    assert property_value not in query
+    assert mock_retry.call_args.kwargs == {
+        "identity": {
+            "code_space": "code--user--repo",
+            "fqn": "mod.a",
+        },
+        "properties": props,
+    }
+
+
+def test_snapshot_edge_identifiers_and_parameter_namespaces_are_isolated(
+    mock_bridge,
+    mock_settings,
+):
+    """Relationship identifiers are quoted and all three maps remain separate."""
+    from unittest.mock import patch
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user--repo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+    source = {
+        "code_space": "source-space",
+        "fqn": "mod.source",
+        "shared": "source",
+    }
+    target = {
+        "code_space": "target-space",
+        "repo": "repo",
+        "fqn": "mod.target",
+        "shared": "target",
+    }
+    property_key = "source`) SET r.compromised = true //"
+    edge_properties = {
+        "shared": "edge",
+        "source": "not-the-source-map",
+        "target": "not-the-target-map",
+        property_key: "still data",
+    }
+    rel_type = r"TYPE` with space\u0060) DELETE r //"
+
+    with patch.object(engine, "_run_cypher_with_retry") as mock_retry:
+        engine._merge_edge(
+            ["CodeSymbol"],
+            source,
+            rel_type,
+            ["CodeAnchor"],
+            target,
+            edge_properties,
+        )
+
+    query = mock_retry.call_args.args[0]
+    assert "MATCH (s:`CodeSymbol`" in query
+    assert "MATCH (t:`CodeAnchor`" in query
+    assert r"[r:`TYPE`` with space\u005Cu0060) DELETE r //`]" in query
+    assert "SET r += $edge_properties" in query
+    assert property_key not in query
+    assert mock_retry.call_args.kwargs == {
+        "source": source,
+        "target": target,
+        "edge_properties": edge_properties,
+    }
 
 
 @pytest.mark.parametrize(
@@ -830,6 +1000,31 @@ def test_import_snapshot_rejects_malformed_label_types_before_writes(
 
     with patch.object(engine, "_run_cypher_with_retry") as mock_retry:
         with pytest.raises(ValueError, match=message):
+            engine.import_snapshot(_snapshot_artifact(snapshot))
+
+    mock_retry.assert_not_called()
+
+
+def test_import_snapshot_rejects_malformed_relationship_type_before_writes(
+    mock_bridge,
+    mock_settings,
+):
+    from unittest.mock import patch
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user--repo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+    snapshot = _valid_multilabel_snapshot()
+    snapshot["edges"][0]["type"] = ["CALLS"]
+
+    with patch.object(engine, "_run_cypher_with_retry") as mock_retry:
+        with pytest.raises(
+            ValueError,
+            match=r"edge\[0\]\.type: expected a string",
+        ):
             engine.import_snapshot(_snapshot_artifact(snapshot))
 
     mock_retry.assert_not_called()
@@ -967,7 +1162,7 @@ def test_import_snapshot_idempotent(mock_bridge, mock_settings):
 
     # Minimal fixture
     fixture_nodes = [
-        {"labels": ["CodeSymbol"], "props": {"code_space": "code--user--repo", "fqn": "mod.foo", "kind": "function", "file": "mod.py", "span": "1:5", "body_hash": "abc"}},
+        {"labels": ["Searchable", "CodeSymbol"], "props": {"code_space": "code--user--repo", "fqn": "mod.foo", "kind": "function", "file": "mod.py", "span": "1:5", "body_hash": "abc"}},
     ]
     fixture_edges = []
 
@@ -980,13 +1175,18 @@ def test_import_snapshot_idempotent(mock_bridge, mock_settings):
     with patch.object(engine, "_run_cypher_with_retry") as mock_retry:
         engine.import_snapshot(snapshot_bytes)
         first_call_count = mock_retry.call_count
+        first_calls = list(mock_retry.call_args_list)
 
         mock_retry.reset_mock()
         engine.import_snapshot(snapshot_bytes)
         second_call_count = mock_retry.call_count
 
-        # Same number of MERGE calls (idempotent)
+        # Re-import produces the exact same core-only MERGE and additive label SET.
         assert first_call_count == second_call_count
+        assert mock_retry.call_args_list == first_calls
+        assert "MERGE (n:`CodeSymbol`" in mock_retry.call_args.args[0]
+        assert "MERGE (n:`CodeSymbol`:" not in mock_retry.call_args.args[0]
+        assert "SET n:`Searchable`" in mock_retry.call_args.args[0]
 
 
 def test_detect_changes_snapshot_based(temp_repo, mock_bridge, mock_settings):
