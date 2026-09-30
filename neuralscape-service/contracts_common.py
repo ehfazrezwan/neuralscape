@@ -10,7 +10,14 @@ authority merely because a value validates.
 from collections.abc import Mapping
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import (
+    AliasChoices,
+    AliasPath,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+)
 
 
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
@@ -46,6 +53,23 @@ class VersionedContract(ContractModel):
     schema_version: Literal["candidate-v1"]
 
 
+def _validation_alias_roots(model_type: type[BaseModel]) -> set[str]:
+    roots: set[str] = set()
+    for field in model_type.model_fields.values():
+        validation_alias = field.validation_alias
+        choices = (
+            validation_alias.choices
+            if isinstance(validation_alias, AliasChoices)
+            else (validation_alias,)
+        )
+        for choice in choices:
+            if isinstance(choice, str):
+                roots.add(choice)
+            elif isinstance(choice, AliasPath):
+                roots.add(choice.path[0])
+    return roots
+
+
 def snapshot_contract_graph(
     value: object, active_containers: set[int] | None = None
 ) -> object:
@@ -75,8 +99,13 @@ def snapshot_contract_graph(
             if extra is not None:
                 if not isinstance(extra, Mapping):
                     raise ValueError("contract extra storage must be a mapping")
-                declared_fields = type(value).model_fields.keys()
-                if (fields.keys() | declared_fields) & extra.keys():
+                model_type = type(value)
+                reserved_names = (
+                    fields.keys()
+                    | model_type.model_fields.keys()
+                    | _validation_alias_roots(model_type)
+                )
+                if reserved_names & extra.keys():
                     raise ValueError(
                         "contract input contains conflicting declared and extra fields"
                     )

@@ -5,7 +5,7 @@ from types import MappingProxyType
 from typing import get_args
 
 import pytest
-from pydantic import TypeAdapter, ValidationError
+from pydantic import AliasChoices, AliasPath, Field, TypeAdapter, ValidationError
 
 from contracts_common import (
     ContractModel,
@@ -29,6 +29,42 @@ class ExampleContract(ContractModel):
 
 class DefaultedExampleContract(ContractModel):
     count: SafeCounter = 7
+
+
+class AliasedExampleContract(ContractModel):
+    count: SafeCounter = Field(alias="n")
+
+
+class ChoiceAliasedExampleContract(ContractModel):
+    count: SafeCounter = Field(
+        validation_alias=AliasChoices(
+            "n",
+            "number",
+            AliasPath("payload", "count"),
+        )
+    )
+
+
+class PathAliasedExampleContract(ContractModel):
+    count: SafeCounter = Field(validation_alias=AliasPath("payload", "count"))
+
+
+class SerializationAliasedExampleContract(ContractModel):
+    count: SafeCounter = Field(serialization_alias="n")
+
+
+class InheritedAliasExampleContract(ContractModel):
+    count: SafeCounter = Field(validation_alias=AliasChoices("n", "count"))
+
+
+class DerivedAliasedExampleContract(InheritedAliasExampleContract):
+    category: OpaqueId = Field(
+        validation_alias=AliasChoices(
+            "kind",
+            "category",
+            AliasPath("metadata", "category"),
+        )
+    )
 
 
 class NestedExampleContract(ContractModel):
@@ -186,6 +222,87 @@ def test_snapshot_contract_graph_preserves_nonconflicting_unknown_extra() -> Non
     assert snapshot == {"count": 1, "future_state": "preserved"}
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         ExampleContract.model_validate(snapshot, strict=True)
+
+
+@pytest.mark.parametrize(
+    ("value", "field_name", "extra"),
+    [
+        (AliasedExampleContract(n=1), "count", {"n": 9}),
+        (ChoiceAliasedExampleContract(n=1), "count", {"number": 9}),
+        (
+            ChoiceAliasedExampleContract(n=1),
+            "count",
+            {"payload": {"count": 9}},
+        ),
+        (
+            PathAliasedExampleContract(payload={"count": 1}),
+            "count",
+            {"payload": {"count": 9}},
+        ),
+    ],
+    ids=["alias", "choice-string", "choice-path", "path"],
+)
+def test_snapshot_contract_graph_rejects_declared_field_moved_to_validation_alias(
+    value: ContractModel,
+    field_name: str,
+    extra: dict[str, object],
+) -> None:
+    value.__dict__.pop(field_name)
+    object.__setattr__(value, "__pydantic_extra__", extra)
+
+    assert type(value).model_validate(
+        {**vars(value), **extra},
+        strict=True,
+    )
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(value)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "extra"),
+    [
+        ("count", {"n": 9}),
+        ("category", {"kind": "shadow"}),
+        ("category", {"metadata": {"category": "shadow"}}),
+    ],
+    ids=["inherited", "subclass-choice", "subclass-path"],
+)
+def test_snapshot_contract_graph_reserves_concrete_model_aliases(
+    field_name: str,
+    extra: dict[str, object],
+) -> None:
+    value = DerivedAliasedExampleContract(n=1, kind="derived")
+    value.__dict__.pop(field_name)
+    object.__setattr__(value, "__pydantic_extra__", extra)
+
+    assert type(value).model_validate(
+        {**vars(value), **extra},
+        strict=True,
+    )
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(value)
+
+
+def test_snapshot_contract_graph_preserves_stored_field_name_for_alias() -> None:
+    value = AliasedExampleContract(n=1)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"count": 1}
+    with pytest.raises(ValidationError, match="Field required"):
+        AliasedExampleContract.model_validate(snapshot, strict=True)
+
+
+def test_snapshot_contract_graph_does_not_reserve_serialization_only_alias() -> None:
+    value = SerializationAliasedExampleContract(count=1)
+    value.__dict__.pop("count")
+    object.__setattr__(value, "__pydantic_extra__", {"n": 9})
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"n": 9}
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        SerializationAliasedExampleContract.model_validate(snapshot, strict=True)
 
 
 @pytest.mark.parametrize("container_type", [list, dict])
