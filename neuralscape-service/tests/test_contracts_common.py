@@ -61,6 +61,71 @@ class AliasedExampleEnvelope(ContractModel):
     item: AliasedExampleContract
 
 
+class CrossStringAliasContract(ContractModel):
+    primary: SafeCounter = Field(alias="shadow")
+    shadow: SafeCounter
+
+
+class CrossPathAliasContract(ContractModel):
+    payload: dict[str, SafeCounter]
+    count: SafeCounter = Field(validation_alias=AliasPath("payload", "count"))
+
+
+class CrossChoiceAliasContract(ContractModel):
+    primary: SafeCounter = Field(
+        validation_alias=AliasChoices("primary", "shadow")
+    )
+    shadow: SafeCounter
+
+
+class CrossChoicePathAliasContract(ContractModel):
+    payload: dict[str, SafeCounter]
+    count: SafeCounter = Field(
+        validation_alias=AliasChoices(
+            "count",
+            AliasPath("payload", "count"),
+        )
+    )
+
+
+class CrossStringAliasEnvelope(ContractModel):
+    item: CrossStringAliasContract
+
+
+class CrossPathAliasEnvelope(ContractModel):
+    item: CrossPathAliasContract
+
+
+class CrossChoiceAliasEnvelope(ContractModel):
+    item: CrossChoiceAliasContract
+
+
+class CrossChoicePathAliasEnvelope(ContractModel):
+    item: CrossChoicePathAliasContract
+
+
+class CrossDefaultAliasContract(ContractModel):
+    primary: SafeCounter = Field(
+        default=7,
+        validation_alias=AliasChoices("primary", "shadow"),
+    )
+    shadow: SafeCounter = 11
+
+
+class CrossAliasBaseContract(ContractModel):
+    primary: SafeCounter = Field(
+        validation_alias=AliasChoices("primary", "shadow")
+    )
+    shadow: SafeCounter
+
+
+class CrossAliasDerivedContract(CrossAliasBaseContract):
+    category: OpaqueId = Field(
+        validation_alias=AliasChoices("category", "kind")
+    )
+    kind: OpaqueId
+
+
 class SerializationAliasedExampleContract(ContractModel):
     count: SafeCounter = Field(serialization_alias="n")
 
@@ -501,6 +566,176 @@ def test_snapshot_contract_graph_preserves_declared_active_alias_root() -> None:
         snapshot,
         strict=True,
     ) == value
+
+
+@pytest.mark.parametrize("replacement", [1, 9], ids=["equal", "conflicting"])
+@pytest.mark.parametrize(
+    ("value", "missing_field", "root_name", "receiver"),
+    [
+        (
+            CrossStringAliasContract(shadow=1),
+            "primary",
+            "shadow",
+            CrossStringAliasContract,
+        ),
+        (
+            CrossPathAliasContract(payload={"count": 1}),
+            "count",
+            "payload",
+            CrossPathAliasContract,
+        ),
+        (
+            CrossChoiceAliasContract(primary=1, shadow=1),
+            "primary",
+            "shadow",
+            CrossChoiceAliasContract,
+        ),
+        (
+            CrossChoicePathAliasContract(count=1, payload={"count": 1}),
+            "count",
+            "payload",
+            CrossChoicePathAliasContract,
+        ),
+    ],
+    ids=["string", "path", "choice-string", "choice-path"],
+)
+def test_snapshot_contract_graph_rejects_cross_field_alias_root(
+    value: ContractModel,
+    missing_field: str,
+    root_name: str,
+    receiver: type[ContractModel],
+    replacement: int,
+) -> None:
+    root_value: object = (
+        {"count": replacement} if root_name == "payload" else replacement
+    )
+    corrupted = value.model_copy(update={root_name: root_value})
+    corrupted.__dict__.pop(missing_field)
+    stored_snapshot = dict(vars(corrupted))
+
+    assert receiver.model_validate(stored_snapshot, strict=True)
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(corrupted)
+
+
+@pytest.mark.parametrize("replacement", [1, 9], ids=["equal", "conflicting"])
+@pytest.mark.parametrize(
+    ("value", "missing_field", "root_name", "receiver"),
+    [
+        (
+            CrossStringAliasContract(shadow=1),
+            "primary",
+            "shadow",
+            CrossStringAliasEnvelope,
+        ),
+        (
+            CrossPathAliasContract(payload={"count": 1}),
+            "count",
+            "payload",
+            CrossPathAliasEnvelope,
+        ),
+        (
+            CrossChoiceAliasContract(primary=1, shadow=1),
+            "primary",
+            "shadow",
+            CrossChoiceAliasEnvelope,
+        ),
+        (
+            CrossChoicePathAliasContract(count=1, payload={"count": 1}),
+            "count",
+            "payload",
+            CrossChoicePathAliasEnvelope,
+        ),
+    ],
+    ids=["string", "path", "choice-string", "choice-path"],
+)
+def test_snapshot_contract_graph_rejects_nested_cross_field_alias_root(
+    value: ContractModel,
+    missing_field: str,
+    root_name: str,
+    receiver: type[ContractModel],
+    replacement: int,
+) -> None:
+    root_value: object = (
+        {"count": replacement} if root_name == "payload" else replacement
+    )
+    corrupted = value.model_copy(update={root_name: root_value})
+    corrupted.__dict__.pop(missing_field)
+    stored_snapshot = {"item": dict(vars(corrupted))}
+
+    assert receiver.model_validate(stored_snapshot, strict=True)
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph({"item": corrupted})
+
+
+@pytest.mark.parametrize(
+    ("missing_field", "root_name", "root_value"),
+    [
+        ("primary", "shadow", 9),
+        ("category", "kind", "shadow-kind"),
+    ],
+    ids=["inherited", "concrete-subclass"],
+)
+def test_snapshot_contract_graph_rejects_inherited_cross_field_alias_root(
+    missing_field: str,
+    root_name: str,
+    root_value: object,
+) -> None:
+    value = CrossAliasDerivedContract(
+        primary=1,
+        shadow=1,
+        category="original-kind",
+        kind="original-kind",
+    ).model_copy(update={root_name: root_value})
+    value.__dict__.pop(missing_field)
+
+    assert CrossAliasDerivedContract.model_validate(dict(vars(value)), strict=True)
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        CrossChoiceAliasContract(primary=1, shadow=9),
+        CrossChoicePathAliasContract(count=1, payload={"count": 9}),
+        CrossAliasDerivedContract(
+            primary=1,
+            shadow=9,
+            category="category-value",
+            kind="kind-value",
+        ),
+    ],
+    ids=["choice-string", "choice-path", "inherited-subclass"],
+)
+def test_snapshot_contract_graph_preserves_populated_cross_field_models(
+    value: ContractModel,
+) -> None:
+    snapshot = snapshot_contract_graph(value)
+
+    assert type(value).model_validate(snapshot, strict=True) == value
+
+
+def test_snapshot_contract_graph_preserves_alias_only_populated_cross_field_model() -> None:
+    value = CrossStringAliasContract(shadow=3)
+
+    assert snapshot_contract_graph(value) == {
+        "primary": 3,
+        "shadow": 3,
+    }
+
+
+def test_snapshot_contract_graph_restores_absent_cross_field_defaults() -> None:
+    value = CrossDefaultAliasContract()
+    value.__dict__.pop("primary")
+    value.__dict__.pop("shadow")
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {}
+    assert CrossDefaultAliasContract.model_validate(snapshot, strict=True) == (
+        CrossDefaultAliasContract()
+    )
 
 
 @pytest.mark.parametrize("nested", [False, True], ids=["direct", "nested"])

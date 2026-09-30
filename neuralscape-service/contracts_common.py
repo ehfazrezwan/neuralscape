@@ -53,12 +53,12 @@ class VersionedContract(ContractModel):
     schema_version: Literal["candidate-v1"]
 
 
-def _validation_alias_roots(model_type: type[BaseModel]) -> set[str]:
+def _validation_alias_owners(model_type: type[BaseModel]) -> dict[str, set[str]]:
     if model_type.model_config.get("validate_by_alias") is False:
-        return set()
+        return {}
 
-    roots: set[str] = set()
-    for field in model_type.model_fields.values():
+    owners: dict[str, set[str]] = {}
+    for field_name, field in model_type.model_fields.items():
         validation_alias = field.validation_alias
         choices = (
             validation_alias.choices
@@ -67,10 +67,10 @@ def _validation_alias_roots(model_type: type[BaseModel]) -> set[str]:
         )
         for choice in choices:
             if isinstance(choice, str):
-                roots.add(choice)
+                owners.setdefault(choice, set()).add(field_name)
             elif isinstance(choice, AliasPath):
-                roots.add(choice.path[0])
-    return roots
+                owners.setdefault(choice.path[0], set()).add(field_name)
+    return owners
 
 
 def snapshot_contract_graph(
@@ -96,10 +96,17 @@ def snapshot_contract_graph(
         if isinstance(value, BaseModel):
             model_type = type(value)
             stored_entries = tuple(vars(value).items())
+            stored_names = {key for key, _ in stored_entries}
             declared_names = set(model_type.model_fields)
-            alias_roots = _validation_alias_roots(model_type)
-            unknown_stored_names = {key for key, _ in stored_entries} - declared_names
-            if unknown_stored_names & alias_roots:
+            alias_owners = _validation_alias_owners(model_type)
+            alias_roots = set(alias_owners)
+            unknown_stored_names = stored_names - declared_names
+            missing_owner_roots = {
+                root
+                for root in stored_names & alias_roots
+                if alias_owners[root] - stored_names
+            }
+            if unknown_stored_names & alias_roots or missing_owner_roots:
                 raise ValueError(
                     "contract input contains conflicting declared and extra fields"
                 )
