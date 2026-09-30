@@ -273,6 +273,269 @@ def test_native_engine_export_snapshot_implemented(mock_bridge, mock_settings):
     assert len(envelope["snapshot"]["edges"]) == 1
 
 
+def test_snapshot_export_canonicalizes_records_without_deduplicating(
+    mock_bridge,
+    mock_settings,
+):
+    """Equivalent query permutations produce one complete snapshot artifact."""
+    import gzip
+    import hashlib
+    import json
+    from collections import Counter
+    from unittest.mock import patch
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user--repo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+    repo = {
+        "labels": ["CodeRepo"],
+        "props": {
+            "code_space": "code--user--repo",
+            "name": "repo",
+            "path": "/repo",
+        },
+    }
+    symbol_a = {
+        "labels": ["CodeSymbol"],
+        "props": {
+            "code_space": "code--user--repo",
+            "fqn": "mod.a",
+            "kind": "function",
+            "tags": ["z", "a"],
+        },
+    }
+    symbol_a_equal = {
+        "props": {
+            "tags": ["z", "a"],
+            "kind": "function",
+            "fqn": "mod.a",
+            "code_space": "code--user--repo",
+        },
+        "labels": ["CodeSymbol"],
+    }
+    symbol_a_collision = {
+        "labels": ["CodeSymbol"],
+        "props": {
+            "code_space": "code--user--repo",
+            "fqn": "mod.a",
+            "kind": "class",
+            "tags": ["z", "a"],
+        },
+    }
+    symbol_b = {
+        "labels": ["CodeSymbol", "Searchable"],
+        "props": {
+            "code_space": "code--user--repo",
+            "fqn": "mod.b",
+            "kind": "function",
+        },
+    }
+    calls = {
+        "rel_type": "CALLS",
+        "props": {"source": "static", "weight": 1},
+        "source_labels": ["CodeSymbol"],
+        "source_props": {"code_space": "code--user--repo", "fqn": "mod.a"},
+        "target_labels": ["CodeSymbol", "Searchable"],
+        "target_props": {"code_space": "code--user--repo", "fqn": "mod.b"},
+    }
+    calls_equal = {
+        "target_props": {"fqn": "mod.b", "code_space": "code--user--repo"},
+        "target_labels": ["CodeSymbol", "Searchable"],
+        "source_props": {"fqn": "mod.a", "code_space": "code--user--repo"},
+        "source_labels": ["CodeSymbol"],
+        "props": {"weight": 1, "source": "static"},
+        "rel_type": "CALLS",
+    }
+    calls_collision = {
+        **calls,
+        "props": {"source": "dynamic", "weight": 2},
+    }
+    references = {
+        **calls,
+        "rel_type": "REFERENCES",
+        "props": {},
+    }
+    nodes = [repo, symbol_a, symbol_a_equal, symbol_a_collision, symbol_b]
+    edges = [calls, calls_equal, calls_collision, references]
+
+    def export(node_rows, edge_rows):
+        with patch.object(engine, "_run_cypher") as mock_cypher:
+            mock_cypher.side_effect = [node_rows, edge_rows]
+            return engine.export_snapshot()
+
+    first = export(nodes, edges)
+    second = export(
+        [symbol_a_equal, symbol_b, repo, symbol_a_collision, symbol_a],
+        [references, calls_equal, calls_collision, calls],
+    )
+    assert first == second
+
+    envelope = json.loads(gzip.decompress(first))
+    snapshot = envelope["snapshot"]
+    def canonical(value):
+        return json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    expected_nodes = [
+        {"labels": item["labels"], "properties": item["props"]}
+        for item in nodes
+    ]
+    expected_edges = [
+        {
+            "type": item["rel_type"],
+            "properties": item["props"],
+            "source": {
+                "labels": item["source_labels"],
+                "properties": item["source_props"],
+            },
+            "target": {
+                "labels": item["target_labels"],
+                "properties": item["target_props"],
+            },
+        }
+        for item in edges
+    ]
+    assert Counter(map(canonical, snapshot["nodes"])) == Counter(
+        map(canonical, expected_nodes)
+    )
+    assert Counter(map(canonical, snapshot["edges"])) == Counter(
+        map(canonical, expected_edges)
+    )
+    assert snapshot["nodes"] == sorted(snapshot["nodes"], key=canonical)
+    assert snapshot["edges"] == sorted(snapshot["edges"], key=canonical)
+    assert envelope["header"]["symbol_count"] == 4
+    assert envelope["header"]["edge_count"] == 4
+    snapshot_json = json.dumps(snapshot, sort_keys=True)
+    assert envelope["header"]["content_hash"] == hashlib.sha256(
+        snapshot_json.encode("utf-8")
+    ).hexdigest()
+
+    preserved = next(
+        item
+        for item in snapshot["nodes"]
+        if item["properties"].get("fqn") == "mod.b"
+    )
+    assert preserved["labels"] == ["CodeSymbol", "Searchable"]
+    duplicate = canonical(
+        {"labels": symbol_a["labels"], "properties": symbol_a["props"]}
+    )
+    assert Counter(map(canonical, snapshot["nodes"]))[duplicate] == 2
+    duplicate_edge = canonical(expected_edges[0])
+    assert Counter(map(canonical, snapshot["edges"]))[duplicate_edge] == 2
+    assert any(
+        item["properties"].get("fqn") == "mod.a"
+        and item["properties"].get("kind") == "class"
+        for item in snapshot["nodes"]
+    )
+    assert any(
+        item["type"] == "CALLS"
+        and item["properties"] == {"source": "dynamic", "weight": 2}
+        for item in snapshot["edges"]
+    )
+    assert any(
+        item["properties"].get("fqn") == "mod.a"
+        and item["properties"].get("tags") == ["z", "a"]
+        for item in snapshot["nodes"]
+    )
+
+
+def test_import_snapshot_accepts_unsorted_version_one_artifact(
+    mock_bridge,
+    mock_settings,
+):
+    """Canonical exports do not invalidate historical version 1.0 snapshots."""
+    import gzip
+    import hashlib
+    import json
+    from unittest.mock import patch
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user--repo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+    snapshot = {
+        "nodes": [
+            {
+                "labels": ["CodeSymbol"],
+                "properties": {
+                    "code_space": "code--user--repo",
+                    "fqn": "mod.z",
+                    "kind": "function",
+                },
+            },
+            {
+                "labels": ["CodeRepo"],
+                "properties": {
+                    "code_space": "code--user--repo",
+                    "name": "repo",
+                    "path": "/repo",
+                },
+            },
+            {
+                "labels": ["CodeSymbol"],
+                "properties": {
+                    "code_space": "code--user--repo",
+                    "fqn": "mod.a",
+                    "kind": "function",
+                },
+            },
+        ],
+        "edges": [
+            {
+                "type": "CALLS",
+                "properties": {},
+                "source": {
+                    "labels": ["CodeSymbol"],
+                    "properties": {
+                        "code_space": "code--user--repo",
+                        "fqn": "mod.z",
+                    },
+                },
+                "target": {
+                    "labels": ["CodeSymbol"],
+                    "properties": {
+                        "code_space": "code--user--repo",
+                        "fqn": "mod.a",
+                    },
+                },
+            }
+        ],
+    }
+    snapshot_json = json.dumps(snapshot, sort_keys=True)
+    envelope = {
+        "header": {
+            "format_version": "1.0",
+            "code_space": "code--user--repo",
+            "repo": "repo",
+            "symbol_count": 2,
+            "edge_count": 1,
+            "content_hash": hashlib.sha256(
+                snapshot_json.encode("utf-8")
+            ).hexdigest(),
+        },
+        "snapshot": snapshot,
+    }
+    legacy_bytes = gzip.compress(
+        json.dumps(envelope, sort_keys=True).encode("utf-8"),
+        mtime=1,
+    )
+
+    with patch.object(engine, "_run_cypher_with_retry") as mock_retry:
+        engine.import_snapshot(legacy_bytes)
+
+    assert mock_retry.call_count == 4
+    assert any("CodeRepo" in str(call.args[0]) for call in mock_retry.call_args_list)
+    assert any("CALLS" in str(call.args[0]) for call in mock_retry.call_args_list)
+
+
 def test_native_engine_parse_file(temp_repo, mock_bridge, mock_settings):
     """Test parsing a Python file with tree-sitter."""
     pytest.importorskip("tree_sitter_language_pack")

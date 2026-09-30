@@ -1243,22 +1243,29 @@ class NativeEngine:
         """
         edges = self._run_cypher(edges_cypher, code_space=self.code_space)
 
-        # Build snapshot payload
-        snapshot = {
-            "nodes": [
-                {"labels": n["labels"], "properties": n["props"]}
-                for n in nodes
-            ],
-            "edges": [
-                {
-                    "type": e["rel_type"],
-                    "properties": e["props"],
-                    "source": {"labels": e["source_labels"], "properties": e["source_props"]},
-                    "target": {"labels": e["target_labels"], "properties": e["target_props"]},
-                }
-                for e in edges
-            ],
-        }
+        # Build snapshot payload. Database result order is unspecified, so sort
+        # complete records to retain duplicates and deterministically break ties
+        # between records that share an identity but differ in other properties.
+        node_records = [
+            {"labels": n["labels"], "properties": n["props"]}
+            for n in nodes
+        ]
+        edge_records = [
+            {
+                "type": e["rel_type"],
+                "properties": e["props"],
+                "source": {"labels": e["source_labels"], "properties": e["source_props"]},
+                "target": {"labels": e["target_labels"], "properties": e["target_props"]},
+            }
+            for e in edges
+        ]
+
+        def canonical_record_key(record: dict) -> str:
+            return json.dumps(record, sort_keys=True, separators=(",", ":"))
+
+        node_records.sort(key=canonical_record_key)
+        edge_records.sort(key=canonical_record_key)
+        snapshot = {"nodes": node_records, "edges": edge_records}
 
         # Compute content hash
         snapshot_json = json.dumps(snapshot, sort_keys=True)
