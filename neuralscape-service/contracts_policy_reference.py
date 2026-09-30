@@ -28,6 +28,7 @@ def _complete_contract_input(value: object, active_ids: set[int]) -> object:
         active_ids.add(identity)
         try:
             stored_values = dict(value.__dict__)
+            declared_fields = type(value).model_fields
             extra_values = value.__pydantic_extra__
             if extra_values is not None:
                 if not isinstance(extra_values, Mapping):
@@ -35,7 +36,7 @@ def _complete_contract_input(value: object, active_ids: set[int]) -> object:
                         "contract input extra storage must be a mapping"
                     )
                 for key, item in extra_values.items():
-                    if key in stored_values:
+                    if key in stored_values or key in declared_fields:
                         raise ValueError(
                             "contract input contains duplicate stored fields"
                         )
@@ -44,7 +45,6 @@ def _complete_contract_input(value: object, active_ids: set[int]) -> object:
             # An unchecked copy normally stores its update in ``__dict__``.
             # Retain even an anomalous set-only field so closed-model validation
             # cannot silently erase evidence of unknown input semantics.
-            declared_fields = type(value).model_fields
             for field_name in value.__pydantic_fields_set__:
                 if (
                     field_name not in declared_fields
