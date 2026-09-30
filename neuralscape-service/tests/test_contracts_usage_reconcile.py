@@ -102,6 +102,16 @@ def _error_code(events: list[UsageEvent]) -> str:
     return caught.value.code
 
 
+def _assert_canonical_invalid_event(event: UsageEvent) -> None:
+    with pytest.raises(UsageReconciliationError) as caught:
+        reconcile_usage_events([event])
+
+    assert caught.value.code == "invalid_event"
+    assert str(caught.value) == (
+        "invalid_event: an input event failed contract validation"
+    )
+
+
 def _assert_result_payload_rejected(payload: dict[str, object]) -> None:
     with pytest.raises(ValidationError):
         UsageReconciliation.model_validate(payload)
@@ -469,6 +479,101 @@ def test_reconciliation_rejects_mapping_event_extra_storage(
     object.__setattr__(event, "__pydantic_extra__", extra_storage)
 
     assert _error_code([event]) == "invalid_event"
+
+
+@pytest.mark.parametrize(
+    ("target_name", "field_name"),
+    [
+        ("event", "event_id"),
+        ("quantity", "value"),
+        ("attribution", "producer"),
+    ],
+)
+def test_reconciliation_rejects_declared_field_moved_to_extra_storage(
+    target_name: str,
+    field_name: str,
+) -> None:
+    event = _event()
+    assert event.usage is not None
+    targets = {
+        "event": event,
+        "quantity": event.usage.input_tokens,
+        "attribution": event.attribution,
+    }
+    target = targets[target_name]
+    stored_value = target.__dict__.pop(field_name)
+    object.__setattr__(target, "__pydantic_extra__", {field_name: stored_value})
+
+    _assert_canonical_invalid_event(event)
+
+
+def test_reconciliation_rejects_constructed_missing_field_supplied_by_extras() -> None:
+    values = dict(_event().__dict__)
+    event_id = values.pop("event_id")
+    event = UsageEvent.model_construct(**values)
+    object.__setattr__(event, "__pydantic_extra__", {"event_id": event_id})
+
+    _assert_canonical_invalid_event(event)
+
+
+@pytest.mark.parametrize(
+    ("target_name", "field_name"),
+    [
+        ("event", "event_id"),
+        ("quantity", "value"),
+        ("attribution", "producer"),
+    ],
+)
+def test_reconciliation_rejects_missing_declared_field_without_extras(
+    target_name: str,
+    field_name: str,
+) -> None:
+    event = _event()
+    assert event.usage is not None
+    targets = {
+        "event": event,
+        "quantity": event.usage.input_tokens,
+        "attribution": event.attribution,
+    }
+    targets[target_name].__dict__.pop(field_name)
+
+    _assert_canonical_invalid_event(event)
+
+
+def test_snapshot_rejects_subclass_default_field_supplied_by_extras() -> None:
+    class DefaultedEventId(UsageEvent):
+        event_id: str = "default-event"
+
+    values = _event().model_dump()
+    values.pop("event_id")
+    event = DefaultedEventId.model_validate(values)
+    event.__dict__.pop("event_id")
+    object.__setattr__(
+        event,
+        "__pydantic_extra__",
+        {"event_id": "default-event"},
+    )
+
+    with pytest.raises(ValueError, match="extra storage overlaps stored fields"):
+        usage_reconcile_contracts._native_snapshot(event)
+    _assert_canonical_invalid_event(event)
+
+
+def test_snapshot_rejects_subclass_only_field_supplied_by_extras() -> None:
+    class ExtendedUsageEvent(UsageEvent):
+        audit_marker: str = "marker"
+
+    event = ExtendedUsageEvent.model_validate(_event().model_dump())
+    event.__dict__.pop("audit_marker")
+    object.__setattr__(
+        event,
+        "__pydantic_extra__",
+        {"audit_marker": "marker"},
+    )
+
+    with pytest.raises(ValueError, match="extra storage overlaps stored fields"):
+        usage_reconcile_contracts._native_snapshot(event)
+    _assert_canonical_invalid_event(event)
 
 
 @pytest.mark.parametrize(
