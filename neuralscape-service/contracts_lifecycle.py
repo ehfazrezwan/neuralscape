@@ -48,7 +48,7 @@ def _native_contract_graph(
                     for key, item in vars(value).items()
                 }
                 extra = getattr(value, "__pydantic_extra__", None)
-                if extra:
+                if extra is not None:
                     if not isinstance(extra, dict):
                         raise ValueError(
                             "malformed stored contract extras are not valid input"

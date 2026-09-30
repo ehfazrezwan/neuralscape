@@ -129,6 +129,33 @@ def receipt(
     )
 
 
+def receiving_graph_with_extra_target(
+    target_name: str,
+) -> tuple[Intent, tuple[StageReceipt, ...], object]:
+    committed = source("derived-1", revision=1, epoch=2)
+    command = intent_with_requirements(
+        requirement(
+            ProcessingStage.GRAPH,
+            committed_sources=(committed,),
+        )
+    )
+    output = reference("graph-view")
+    applied = receipt(
+        ProcessingStage.GRAPH,
+        StageStatus.APPLIED,
+        committed=(committed,),
+        outputs=(output,),
+    )
+    targets = {
+        "intent": command,
+        "requirement": command.stage_requirements[0],
+        "source": command.stage_requirements[0].committed_sources[0],
+        "receipt": applied,
+        "output_reference": applied.output_refs[0],
+    }
+    return command, (applied,), targets[target_name]
+
+
 def memory_record(**overrides: object) -> MemoryRecord:
     values: dict[str, object] = {
         "schema_version": "candidate-v1",
@@ -958,6 +985,53 @@ def test_aggregate_boundary_rejects_copy_injected_extra_fields() -> None:
             intent=command,
             receipts=(extra_nested_receipt,),
         )
+
+
+@pytest.mark.parametrize(
+    "target_name",
+    ["intent", "requirement", "source", "receipt", "output_reference"],
+)
+@pytest.mark.parametrize(
+    "malformed_extra",
+    [[], (), "", 0, False],
+    ids=["empty-list", "empty-tuple", "empty-string", "zero", "false"],
+)
+def test_aggregate_boundary_rejects_falsey_malformed_extra_storage(
+    target_name: str,
+    malformed_extra: object,
+) -> None:
+    command, receipts, target = receiving_graph_with_extra_target(target_name)
+    object.__setattr__(target, "__pydantic_extra__", malformed_extra)
+
+    with pytest.raises(ValueError, match="malformed stored contract extras"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED,
+            intent=command,
+            receipts=receipts,
+        )
+
+
+@pytest.mark.parametrize(
+    "target_name",
+    ["intent", "requirement", "source", "receipt", "output_reference"],
+)
+@pytest.mark.parametrize(
+    "valid_extra_storage",
+    [None, {}],
+    ids=["none", "empty-dict"],
+)
+def test_aggregate_boundary_accepts_absent_or_empty_dict_extra_storage(
+    target_name: str,
+    valid_extra_storage: object,
+) -> None:
+    command, receipts, target = receiving_graph_with_extra_target(target_name)
+    object.__setattr__(target, "__pydantic_extra__", valid_extra_storage)
+
+    validate_required_stage_claim(
+        claimed_status=IntentStatus.APPLIED,
+        intent=command,
+        receipts=receipts,
+    )
 
 
 def test_aggregate_boundary_preserves_sequence_types_during_revalidation() -> None:
