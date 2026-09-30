@@ -49,6 +49,10 @@ class CompatibleDefaultManifest(PortableManifest):
     defaulted_contract_field: str = "default"
 
 
+class CompatibleDefaultManifestFile(ManifestFile):
+    defaulted_contract_field: str = "default"
+
+
 class ExcludingFutureManifestFile(ManifestFile):
     future_contract_field: str = Field(exclude=True)
 
@@ -67,11 +71,14 @@ class SplitViewExtra(Mapping[str, str]):
         self._reported_keys = reported_keys
         self._reported_length = reported_length
         self._values = dict(entries)
+        self.iteration_calls = 0
+        self.item_calls = 0
 
     def __getitem__(self, key: str) -> str:
         return self._values[key]
 
     def __iter__(self) -> Iterator[str]:
+        self.iteration_calls += 1
         return iter(self._iteration_keys)
 
     def __len__(self) -> int:
@@ -81,12 +88,38 @@ class SplitViewExtra(Mapping[str, str]):
         return self._reported_keys
 
     def items(self) -> tuple[tuple[str, str], ...]:
+        self.item_calls += 1
         return self._entries
+
+
+class InverseItemsExtra(Mapping[str, str]):
+    def __init__(self, name: str, value: str) -> None:
+        self.name = name
+        self.value = value
+        self.iteration_calls = 0
+        self.item_calls = 0
+
+    def __getitem__(self, key: str) -> str:
+        if key == self.name:
+            return self.value
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        self.iteration_calls += 1
+        return iter((self.name,))
+
+    def __len__(self) -> int:
+        return 1
+
+    def items(self) -> tuple[tuple[str, str], ...]:
+        self.item_calls += 1
+        return ()
 
 
 class ChangingItemsExtra(Mapping[str, str]):
     def __init__(self) -> None:
         self.item_calls = 0
+        self.iteration_calls = 0
 
     def __getitem__(self, key: str) -> str:
         if key == "manifest_id":
@@ -94,6 +127,7 @@ class ChangingItemsExtra(Mapping[str, str]):
         raise KeyError(key)
 
     def __iter__(self) -> Iterator[str]:
+        self.iteration_calls += 1
         return iter(())
 
     def __len__(self) -> int:
@@ -926,11 +960,13 @@ def test_split_extra_views_cannot_overwrite_declared_fields(
     )
     object.__setattr__(node, "__pydantic_extra__", split_view)
 
-    with pytest.raises(
-        ValidationError,
-        match="contract model has conflicting stored and extra fields",
-    ):
+    with pytest.raises(ValidationError) as raised:
         validate_portable_manifest(manifest)
+    assert split_view.iteration_calls == 1
+    assert split_view.item_calls == 1
+    assert "contract model has conflicting stored and extra fields" in str(
+        raised.value
+    )
 
 
 def test_items_only_unknown_extra_is_not_silently_discarded() -> None:
@@ -941,6 +977,8 @@ def test_items_only_unknown_extra_is_not_silently_discarded() -> None:
     with pytest.raises(ValidationError, match="future_entry_semantics") as raised:
         validate_portable_manifest(manifest)
 
+    assert split_view.iteration_calls == 1
+    assert split_view.item_calls == 1
     assert raised.value.errors()[0]["type"] == "extra_forbidden"
 
 
@@ -952,6 +990,8 @@ def test_populated_falsey_extra_storage_is_not_silently_discarded() -> None:
 
     with pytest.raises(ValidationError, match="future_entry_semantics"):
         validate_portable_manifest(manifest)
+    assert falsey_populated.iteration_calls == 1
+    assert falsey_populated.item_calls == 1
 
 
 def test_extra_items_are_captured_once_for_validation_and_reconstruction() -> None:
@@ -962,6 +1002,7 @@ def test_extra_items_are_captured_once_for_validation_and_reconstruction() -> No
     revalidated = validate_portable_manifest(manifest)
 
     assert revalidated.manifest_id == "manifest-7"
+    assert changing.iteration_calls == 1
     assert changing.item_calls == 1
 
 
@@ -973,6 +1014,115 @@ def test_stable_empty_custom_extra_snapshot_remains_valid() -> None:
     revalidated = validate_portable_manifest(manifest)
 
     assert revalidated.files[0].path == manifest.files[0].path
+    assert stable_empty.iteration_calls == 1
+    assert stable_empty.item_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("location", "expected_location"),
+    [
+        ("manifest", ("future_entry_semantics",)),
+        ("file", ("files", 0, "future_entry_semantics")),
+    ],
+)
+def test_iteration_only_unknown_extra_is_not_silently_discarded(
+    location: str,
+    expected_location: tuple[object, ...],
+) -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    node = _model_at_location(manifest, location)
+    inverse = InverseItemsExtra("future_entry_semantics", "deny")
+    object.__setattr__(node, "__pydantic_extra__", inverse)
+
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+
+    assert inverse.iteration_calls == 1
+    assert inverse.item_calls == 1
+    errors = raised.value.errors()
+    assert len(errors) == 1
+    assert errors[0]["type"] == "extra_forbidden"
+    assert errors[0]["loc"] == expected_location
+    assert errors[0]["input"] is None
+
+
+@pytest.mark.parametrize(
+    ("location", "field_name", "shadow_value"),
+    [
+        ("manifest", "manifest_id", "shadow-manifest"),
+        ("file", "path", "canonical/shadow-records.jsonl"),
+    ],
+)
+def test_iteration_only_declared_conflict_is_rejected(
+    location: str,
+    field_name: str,
+    shadow_value: str,
+) -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    node = _model_at_location(manifest, location)
+    inverse = InverseItemsExtra(field_name, shadow_value)
+    object.__setattr__(node, "__pydantic_extra__", inverse)
+
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+
+    assert inverse.iteration_calls == 1
+    assert inverse.item_calls == 1
+    assert "contract model has conflicting stored and extra fields" in str(
+        raised.value
+    )
+
+
+@pytest.mark.parametrize("location", ["manifest", "file"])
+def test_iteration_only_subclass_default_moved_to_extra_is_rejected(
+    location: str,
+) -> None:
+    if location == "manifest":
+        manifest = CompatibleDefaultManifest.model_validate(valid_manifest())
+        node = manifest
+    else:
+        manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+        node = CompatibleDefaultManifestFile.model_validate(
+            manifest.files[0].model_dump()
+        )
+        manifest.files[0] = node
+    default_value = node.__dict__.pop("defaulted_contract_field")
+    inverse = InverseItemsExtra("defaulted_contract_field", default_value)
+    object.__setattr__(node, "__pydantic_extra__", inverse)
+
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+
+    assert inverse.iteration_calls == 1
+    assert inverse.item_calls == 1
+    assert "contract model has conflicting stored and extra fields" in str(
+        raised.value
+    )
+
+
+@pytest.mark.parametrize(
+    ("location", "field_name", "original_value"),
+    [
+        ("manifest", "manifest_id", "manifest-7"),
+        ("file", "path", "canonical/records.jsonl"),
+    ],
+)
+def test_iteration_only_required_field_moved_to_extra_remains_rejected(
+    location: str,
+    field_name: str,
+    original_value: str,
+) -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    node = _model_at_location(manifest, location)
+    assert node.__dict__.pop(field_name) == original_value
+    inverse = InverseItemsExtra(field_name, original_value)
+    object.__setattr__(node, "__pydantic_extra__", inverse)
+
+    with pytest.raises(ValidationError):
+        validate_portable_manifest(manifest)
+
+    assert inverse.iteration_calls == 1
+    assert inverse.item_calls == 1
 
 
 def test_compatible_nested_subclass_without_new_fields_remains_valid() -> None:

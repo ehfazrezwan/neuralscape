@@ -24,24 +24,28 @@ ScopeKind = Literal["tenant", "projects"]
 _WINDOWS_FORBIDDEN_COMPONENT_CHARACTERS = frozenset('<>:"|?*')
 
 
-def _validated_model_extra_storage(value: BaseModel) -> dict[Any, Any]:
-    """Capture well-formed, disjoint Pydantic extra entries for ``value``."""
+def _validated_model_extra_storage(
+    value: BaseModel,
+) -> tuple[dict[Any, Any], set[Any]]:
+    """Capture stable Pydantic extra entries and all observed names."""
 
     extra = value.__pydantic_extra__
     if extra is None:
-        return {}
+        return {}, set()
     if not isinstance(extra, Mapping):
         raise ValueError("contract model extra storage must be None or a mapping")
 
+    iterated_names = tuple(extra)
     captured = dict(tuple(extra.items()))
+    observed_names = set(iterated_names) | set(captured)
     declared_or_stored = set(type(value).model_fields) | set(value.__dict__)
-    overlap = declared_or_stored.intersection(captured)
+    overlap = declared_or_stored.intersection(observed_names)
     if overlap:
         names = ", ".join(sorted((repr(name) for name in overlap)))
         raise ValueError(
             f"contract model has conflicting stored and extra fields: {names}"
         )
-    return captured
+    return captured, observed_names
 
 
 def _reject_retained_unknown_fields(
@@ -73,10 +77,14 @@ def _reject_retained_unknown_fields(
         if isinstance(value, BaseModel):
             declared = type(value).model_fields
             stored = value.__dict__
-            pydantic_extra = _validated_model_extra_storage(value)
+            pydantic_extra, observed_extra_names = (
+                _validated_model_extra_storage(value)
+            )
             extra_inventory[identity] = pydantic_extra
             retained_names = (
-                set(stored) | set(value.model_fields_set) | set(pydantic_extra)
+                set(stored)
+                | set(value.model_fields_set)
+                | observed_extra_names
             )
 
             for name in sorted(retained_names - set(declared), key=repr):
