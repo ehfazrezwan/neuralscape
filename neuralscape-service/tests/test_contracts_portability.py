@@ -872,6 +872,39 @@ def test_custom_mapping_extra_storage_preserves_unknown_for_rejection() -> None:
     assert raised.value.errors()[0]["type"] == "extra_forbidden"
 
 
+def test_root_fields_set_only_unknown_is_controlled_extra_error() -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    manifest.__pydantic_fields_set__.add("phantom_only")
+
+    assert "phantom_only" not in manifest.__dict__
+    assert manifest.__pydantic_extra__ is None
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+
+    errors = raised.value.errors()
+    assert len(errors) == 1
+    assert errors[0]["type"] == "extra_forbidden"
+    assert errors[0]["loc"] == ("phantom_only",)
+    assert errors[0]["input"] is None
+
+
+def test_nested_fields_set_only_unknown_is_controlled_extra_error() -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    nested = manifest.files[0]
+    nested.__pydantic_fields_set__.add("phantom_only")
+
+    assert "phantom_only" not in nested.__dict__
+    assert nested.__pydantic_extra__ is None
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+
+    errors = raised.value.errors()
+    assert len(errors) == 1
+    assert errors[0]["type"] == "extra_forbidden"
+    assert errors[0]["loc"] == ("files", 0, "phantom_only")
+    assert errors[0]["input"] is None
+
+
 @pytest.mark.parametrize(
     ("location", "field_name", "shadow_value"),
     [

@@ -81,7 +81,7 @@ def _reject_retained_unknown_fields(
 
             for name in sorted(retained_names - set(declared), key=repr):
                 retained_value = (
-                    stored[name] if name in stored else pydantic_extra[name]
+                    stored[name] if name in stored else pydantic_extra.get(name)
                 )
                 error_location = name if isinstance(name, (str, int)) else repr(name)
                 errors.append(
