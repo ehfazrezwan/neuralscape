@@ -226,6 +226,8 @@ class Intent(VersionedContract):
 
     @model_validator(mode="after")
     def validate_stage_requirements(self) -> Intent:
+        if any(item.tenant_id != self.tenant_id for item in self.target_refs):
+            raise ValueError("target_refs must match intent tenant_id")
         _require_unique_source_ids(self.source_preconditions, "source_preconditions")
         if not self.stage_requirements:
             raise ValueError("stage_requirements must not be empty")
@@ -459,6 +461,11 @@ def validate_required_stage_claim(
     for receipt in receipts:
         if receipt.intent_id != intent.id:
             raise ValueError("stage receipt belongs to a different intent")
+        if any(
+            output_ref.tenant_id != intent.tenant_id
+            for output_ref in receipt.output_refs
+        ):
+            raise ValueError("stage receipt output_refs must match intent tenant_id")
         requirement = requirements.get(receipt.stage)
         if requirement is not None and receipt.effect_id != requirement.effect_id:
             raise ValueError("required-stage receipt must match its declared effect_id")

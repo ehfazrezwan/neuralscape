@@ -88,11 +88,11 @@ def intent_with_requirements(
     return Intent.model_validate(values)
 
 
-def reference(reference_id: str) -> ReferenceHandle:
+def reference(reference_id: str, *, tenant_id: str = "tenant-1") -> ReferenceHandle:
     return ReferenceHandle(
         kind="artifact",
         id=reference_id,
-        tenant_id="tenant-1",
+        tenant_id=tenant_id,
         resolver="resolve_artifact",
     )
 
@@ -740,18 +740,263 @@ def test_reference_set_match_handles_duplicates_inequality_and_order() -> None:
     )
 
 
+def test_intent_target_references_require_matching_tenant_on_construction() -> None:
+    same_tenant = reference("target")
+    other_tenant = reference("target", tenant_id="tenant-2")
+    direct_values = intent(ProcessingStage.CANONICAL).model_dump()
+
+    direct_values["target_refs"] = (same_tenant,)
+    assert Intent(**direct_values).target_refs == (same_tenant,)
+    direct_values["target_refs"] = (other_tenant,)
+    with pytest.raises(
+        ValidationError, match="target_refs must match intent tenant_id"
+    ):
+        Intent(**direct_values)
+
+    native_values = intent(ProcessingStage.CANONICAL).model_dump()
+    native_values["target_refs"] = (same_tenant.model_dump(),)
+    assert Intent.model_validate(native_values).target_refs == (same_tenant,)
+    native_values["target_refs"] = (other_tenant.model_dump(),)
+    with pytest.raises(
+        ValidationError, match="target_refs must match intent tenant_id"
+    ):
+        Intent.model_validate(native_values)
+
+    json_values = intent(ProcessingStage.CANONICAL).model_dump(mode="json")
+    json_values["target_refs"] = [same_tenant.model_dump(mode="json")]
+    assert Intent.model_validate_json(json.dumps(json_values)).target_refs == (
+        same_tenant,
+    )
+    json_values["target_refs"] = [other_tenant.model_dump(mode="json")]
+    with pytest.raises(
+        ValidationError, match="target_refs must match intent tenant_id"
+    ):
+        Intent.model_validate_json(json.dumps(json_values))
+
+
 @pytest.mark.parametrize(
-    ("field_name", "replacement"),
+    "other_tenant",
     [
-        ("kind", "memory"),
-        ("id", "other-reference"),
-        ("tenant_id", "other-tenant"),
-        ("resolver", "other-resolver"),
+        reference("target").model_copy(update={"tenant_id": "tenant-2"}),
+        ReferenceHandle.model_construct(
+            kind="artifact",
+            id="target",
+            tenant_id="tenant-2",
+            resolver="resolve_artifact",
+        ),
+    ],
+    ids=["copied", "constructed"],
+)
+def test_aggregate_revalidates_nested_target_reference_tenant(
+    other_tenant: ReferenceHandle,
+) -> None:
+    command = intent(ProcessingStage.CANONICAL).model_copy(
+        update={"target_refs": (other_tenant,)}
+    )
+
+    with pytest.raises(
+        ValidationError, match="target_refs must match intent tenant_id"
+    ):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=command,
+            receipts=(),
+        )
+
+
+def test_aggregate_checks_output_tenant_on_every_supplied_receipt() -> None:
+    other_tenant = reference("cross-tenant-output", tenant_id="tenant-2")
+    required_current = (
+        receipt(
+            ProcessingStage.GRAPH,
+            StageStatus.APPLIED,
+            outputs=(other_tenant,),
+        ),
+    )
+    required_historical_noncontrolling = (
+        receipt(
+            ProcessingStage.GRAPH,
+            StageStatus.APPLIED,
+            outputs=(other_tenant,),
+            attempt=1,
+        ),
+        receipt(
+            ProcessingStage.GRAPH,
+            StageStatus.APPLIED,
+            outputs=(reference("same-tenant-output"),),
+            attempt=2,
+        ),
+    )
+    nonrequired = (
+        receipt(
+            ProcessingStage.CANONICAL,
+            StageStatus.APPLIED,
+            effect_id="unrelated-effect",
+            sources=(source("unrelated-input"),),
+            outputs=(other_tenant,),
+        ),
+        receipt(ProcessingStage.GRAPH, StageStatus.PENDING),
+    )
+    nonapplied_historical_noncontrolling = (
+        receipt(
+            ProcessingStage.GRAPH,
+            StageStatus.FAILED,
+            sources=(),
+            outputs=(other_tenant,),
+            attempt=1,
+        ),
+        receipt(ProcessingStage.GRAPH, StageStatus.PENDING, attempt=2),
+    )
+
+    for supplied in (
+        required_current,
+        required_historical_noncontrolling,
+        nonrequired,
+        nonapplied_historical_noncontrolling,
+    ):
+        with pytest.raises(
+            ValueError,
+            match="stage receipt output_refs must match intent tenant_id",
+        ):
+            validate_required_stage_claim(
+                claimed_status=IntentStatus.APPLIED,
+                intent=intent(ProcessingStage.GRAPH),
+                receipts=supplied,
+            )
+
+
+def test_aggregate_accepts_same_tenant_outputs_in_every_receipt_position() -> None:
+    same_tenant = reference("same-tenant-output")
+    cases = (
+        (
+            IntentStatus.APPLIED,
+            (
+                receipt(
+                    ProcessingStage.GRAPH,
+                    StageStatus.APPLIED,
+                    outputs=(same_tenant,),
+                ),
+            ),
+        ),
+        (
+            IntentStatus.APPLIED,
+            (
+                receipt(
+                    ProcessingStage.GRAPH,
+                    StageStatus.APPLIED,
+                    outputs=(same_tenant,),
+                    attempt=1,
+                ),
+                receipt(
+                    ProcessingStage.GRAPH,
+                    StageStatus.APPLIED,
+                    outputs=(same_tenant,),
+                    attempt=2,
+                ),
+            ),
+        ),
+        (
+            IntentStatus.ACCEPTED,
+            (
+                receipt(
+                    ProcessingStage.CANONICAL,
+                    StageStatus.APPLIED,
+                    effect_id="unrelated-effect",
+                    sources=(source("unrelated-input"),),
+                    outputs=(same_tenant,),
+                ),
+                receipt(ProcessingStage.GRAPH, StageStatus.PENDING),
+            ),
+        ),
+        (
+            IntentStatus.PROCESSING,
+            (
+                receipt(
+                    ProcessingStage.GRAPH,
+                    StageStatus.FAILED,
+                    sources=(),
+                    outputs=(same_tenant,),
+                    attempt=1,
+                ),
+                receipt(ProcessingStage.GRAPH, StageStatus.PENDING, attempt=2),
+            ),
+        ),
+    )
+
+    for claim, supplied in cases:
+        validate_required_stage_claim(
+            claimed_status=claim,
+            intent=intent(ProcessingStage.GRAPH),
+            receipts=supplied,
+        )
+
+
+@pytest.mark.parametrize(
+    "other_tenant",
+    [
+        reference("output").model_copy(update={"tenant_id": "tenant-2"}),
+        ReferenceHandle.model_construct(
+            kind="artifact",
+            id="output",
+            tenant_id="tenant-2",
+            resolver="resolve_artifact",
+        ),
+    ],
+    ids=["copied", "constructed"],
+)
+def test_aggregate_revalidates_nested_output_reference_tenant(
+    other_tenant: ReferenceHandle,
+) -> None:
+    supplied = receipt(
+        ProcessingStage.GRAPH,
+        StageStatus.APPLIED,
+        outputs=(reference("output"),),
+    ).model_copy(update={"output_refs": (other_tenant,)})
+
+    with pytest.raises(
+        ValueError,
+        match="stage receipt output_refs must match intent tenant_id",
+    ):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED,
+            intent=intent(ProcessingStage.GRAPH),
+            receipts=(supplied,),
+        )
+
+
+def test_aggregate_rejects_json_received_cross_tenant_output() -> None:
+    values = receipt(
+        ProcessingStage.GRAPH,
+        StageStatus.APPLIED,
+        outputs=(reference("output"),),
+    ).model_dump(mode="json")
+    values["output_refs"][0]["tenant_id"] = "tenant-2"
+    supplied = StageReceipt.model_validate_json(json.dumps(values))
+
+    with pytest.raises(
+        ValueError,
+        match="stage receipt output_refs must match intent tenant_id",
+    ):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED,
+            intent=intent(ProcessingStage.GRAPH),
+            receipts=(supplied,),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "replacement", "expected_error"),
+    [
+        ("kind", "memory", "consistent result sets"),
+        ("id", "other-reference", "consistent result sets"),
+        ("tenant_id", "other-tenant", "output_refs must match intent tenant_id"),
+        ("resolver", "other-resolver", "consistent result sets"),
     ],
 )
 def test_reference_consensus_uses_every_identity_field(
     field_name: str,
     replacement: str,
+    expected_error: str,
 ) -> None:
     baseline = reference("graph-view")
     changed_values = baseline.model_dump()
@@ -772,7 +1017,7 @@ def test_reference_consensus_uses_every_identity_field(
     )
 
     for observed in permutations(receipts):
-        with pytest.raises(ValueError, match="consistent result sets"):
+        with pytest.raises(ValueError, match=expected_error):
             validate_required_stage_claim(
                 claimed_status=IntentStatus.APPLIED,
                 intent=intent(ProcessingStage.GRAPH),
