@@ -1,8 +1,10 @@
 """Behavioral and adversarial tests for portable manifest validation."""
 
+import json
 import sys
 from copy import deepcopy
 from pathlib import PureWindowsPath
+from types import MappingProxyType
 
 import pytest
 from pydantic import Field, ValidationError
@@ -40,6 +42,10 @@ class FutureEncryptionReference(EncryptionReference):
 
 class CompatibleManifestFile(ManifestFile):
     pass
+
+
+class CompatibleDefaultManifest(PortableManifest):
+    defaulted_contract_field: str = "default"
 
 
 class ExcludingFutureManifestFile(ManifestFile):
@@ -647,7 +653,15 @@ def _model_at_location(manifest: PortableManifest, location: str) -> object:
         return manifest
     if location == "file":
         return manifest.files[0]
+    if location == "replay_position":
+        return manifest.snapshot.replay_position
     return manifest.files[0].checksum
+
+
+def _manifest_from_origin(origin: str) -> PortableManifest:
+    if origin == "native":
+        return PortableManifest.model_validate(valid_manifest())
+    return PortableManifest.model_validate_json(json.dumps(valid_manifest()))
 
 
 @pytest.mark.parametrize("malformed_extra", [[], ["retained_unknown"]])
@@ -694,13 +708,111 @@ def test_rejects_overlap_between_stored_and_extra_state(
         validate_portable_manifest(manifest)
 
 
-def test_empty_mapping_extra_storage_remains_valid() -> None:
+@pytest.mark.parametrize("origin", ["native", "json"])
+@pytest.mark.parametrize(
+    ("location", "field_name", "conflicting_value"),
+    [
+        ("manifest", "manifest_id", "different-manifest"),
+        ("file", "path", "canonical/different-records.jsonl"),
+        ("replay_position", "position", "734"),
+    ],
+)
+@pytest.mark.parametrize("use_original_value", [True, False])
+def test_rejects_declared_field_moved_to_extra_storage(
+    origin: str,
+    location: str,
+    field_name: str,
+    conflicting_value: str,
+    use_original_value: bool,
+) -> None:
+    manifest = _manifest_from_origin(origin)
+    node = _model_at_location(manifest, location)
+    original_value = node.__dict__.pop(field_name)
+    extra_value = original_value if use_original_value else conflicting_value
+    object.__setattr__(node, "__pydantic_extra__", {field_name: extra_value})
+
+    with pytest.raises(
+        ValidationError,
+        match="contract model has conflicting stored and extra fields",
+    ):
+        validate_portable_manifest(manifest)
+
+
+@pytest.mark.parametrize(
+    ("location", "field_name"),
+    [
+        ("manifest", "manifest_id"),
+        ("file", "path"),
+        ("replay_position", "position"),
+    ],
+)
+def test_declared_required_field_absent_from_all_storage_remains_missing(
+    location: str,
+    field_name: str,
+) -> None:
     manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
-    object.__setattr__(manifest.files[0], "__pydantic_extra__", {})
+    node = _model_at_location(manifest, location)
+    node.__dict__.pop(field_name)
+    object.__setattr__(node, "__pydantic_extra__", None)
+
+    with pytest.raises(ValidationError, match=field_name):
+        validate_portable_manifest(manifest)
+
+
+def test_absent_defaulted_subclass_declaration_remains_valid() -> None:
+    manifest = CompatibleDefaultManifest.model_validate(valid_manifest())
+    manifest.__dict__.pop("defaulted_contract_field")
+
+    revalidated = validate_portable_manifest(manifest)
+
+    assert type(revalidated) is PortableManifest
+    assert revalidated.manifest_id == manifest.manifest_id
+
+
+def test_rejects_subclass_declared_field_moved_to_extra_storage() -> None:
+    manifest = CompatibleDefaultManifest.model_validate(valid_manifest())
+    default_value = manifest.__dict__.pop("defaulted_contract_field")
+    object.__setattr__(
+        manifest,
+        "__pydantic_extra__",
+        {"defaulted_contract_field": default_value},
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="contract model has conflicting stored and extra fields",
+    ):
+        validate_portable_manifest(manifest)
+
+
+@pytest.mark.parametrize(
+    "extra_storage",
+    [None, {}, MappingProxyType({})],
+    ids=["none", "empty-dict", "empty-custom-mapping"],
+)
+def test_none_and_empty_mapping_extra_storage_remain_valid(
+    extra_storage: object,
+) -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    object.__setattr__(manifest.files[0], "__pydantic_extra__", extra_storage)
 
     revalidated = validate_portable_manifest(manifest)
 
     assert revalidated.files[0].path == manifest.files[0].path
+
+
+def test_custom_mapping_extra_storage_preserves_unknown_for_rejection() -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    object.__setattr__(
+        manifest.files[0],
+        "__pydantic_extra__",
+        MappingProxyType({"future_entry_semantics": "deny"}),
+    )
+
+    with pytest.raises(ValidationError, match="future_entry_semantics") as raised:
+        validate_portable_manifest(manifest)
+
+    assert raised.value.errors()[0]["type"] == "extra_forbidden"
 
 
 def test_compatible_nested_subclass_without_new_fields_remains_valid() -> None:
