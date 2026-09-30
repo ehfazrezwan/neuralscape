@@ -1540,6 +1540,15 @@ class NativeEngine:
 
         Resolves source and target by their primary keys, then creates/updates the edge.
         """
+        # Enforce the same complete endpoint invariant for direct helper calls
+        # that import_snapshot establishes during its all-record preflight.
+        source_labels = _normalize_snapshot_labels(
+            source_labels, location="edge source labels"
+        )
+        target_labels = _normalize_snapshot_labels(
+            target_labels, location="edge target labels"
+        )
+
         # Build match predicates for source and target using isolated maps so
         # overlapping endpoint and relationship keys cannot replace each other.
         src_label = source_labels[0]
