@@ -317,7 +317,9 @@ def _snapshot_native(value: Any, *, path: str = "$", active: set[int] | None = N
             if extras is not None:
                 if not isinstance(extras, Mapping):
                     raise ValueError(f"malformed stored extras at {path}")
+                iterated_extra_names = tuple(extras)
                 extra_entries = tuple(extras.items())
+                undeclared.update(iterated_extra_names)
                 undeclared.update(key for key, _ in extra_entries)
             if undeclared:
                 names = ", ".join(sorted(repr(name) for name in undeclared))
