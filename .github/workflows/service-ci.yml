@@ -216,4 +216,5 @@ jobs:
           require_success changes "$CHANGES_RESULT"
           require_success subtree-prune-guard "$SUBTREE_RESULT"
           require_success host-tests "$HOST_RESULT"
+          require_success python310-contracts "$PYTHON310_RESULT"
           require_success container-gate "$CONTAINER_RESULT"
