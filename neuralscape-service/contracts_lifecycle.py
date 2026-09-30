@@ -585,8 +585,24 @@ def validate_required_stage_claim(
         if satisfied != required:
             raise ValueError("applied requires matching applied receipts for every required stage")
     elif claimed_status is IntentStatus.PARTIAL:
-        if not satisfied or not unsatisfied or partial_failures != unsatisfied:
-            raise ValueError("partial requires applied and terminal non-applied required stages")
+        mixed_terminal = (
+            bool(satisfied)
+            and bool(unsatisfied)
+            and partial_failures == unsatisfied
+        )
+        all_skipped = (
+            not satisfied
+            and bool(unsatisfied)
+            and all(
+                receipt is not None and receipt.status is StageStatus.SKIPPED
+                for receipt in unsatisfied_receipts.values()
+            )
+        )
+        if not (mixed_terminal or all_skipped):
+            raise ValueError(
+                "partial requires applied with terminal non-applied stages "
+                "or all required stages skipped"
+            )
     elif claimed_status is IntentStatus.FAILED:
         statuses = {
             stage: receipt.status

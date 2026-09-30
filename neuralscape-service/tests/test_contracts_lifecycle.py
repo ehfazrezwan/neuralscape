@@ -2292,6 +2292,11 @@ def test_latest_terminal_state_still_controls_unsatisfied_started_stage() -> Non
             (receipt(ProcessingStage.GRAPH, StageStatus.FAILED, sources=()),),
             IntentStatus.FAILED,
         ),
+        (
+            "skipped",
+            (receipt(ProcessingStage.GRAPH, StageStatus.SKIPPED, sources=()),),
+            IntentStatus.PARTIAL,
+        ),
     ],
 )
 def test_single_stage_aggregate_truth_table(
@@ -2422,6 +2427,22 @@ def test_matching_application_is_monotonic_across_later_attempt_states(
             IntentStatus.FAILED,
         ),
         (
+            "both_failed",
+            (
+                receipt(ProcessingStage.CANONICAL, StageStatus.FAILED, sources=()),
+                receipt(ProcessingStage.GRAPH, StageStatus.FAILED, sources=()),
+            ),
+            IntentStatus.FAILED,
+        ),
+        (
+            "both_skipped",
+            (
+                receipt(ProcessingStage.CANONICAL, StageStatus.SKIPPED, sources=()),
+                receipt(ProcessingStage.GRAPH, StageStatus.SKIPPED, sources=()),
+            ),
+            IntentStatus.PARTIAL,
+        ),
+        (
             "both_cancelled",
             (
                 receipt(ProcessingStage.CANONICAL, StageStatus.CANCELLED, sources=()),
@@ -2457,6 +2478,70 @@ def test_two_stage_aggregate_truth_table(
         command=intent(ProcessingStage.CANONICAL, ProcessingStage.GRAPH),
         receipts=receipts,
         expected=expected,
+    )
+
+
+@pytest.mark.parametrize(
+    "stages",
+    [
+        (ProcessingStage.GRAPH,),
+        (ProcessingStage.CANONICAL, ProcessingStage.GRAPH),
+    ],
+)
+def test_all_skipped_is_partial_after_json_receiving_boundary(
+    stages: tuple[ProcessingStage, ...],
+) -> None:
+    command = intent(*stages)
+    receipts = tuple(
+        receipt(stage, StageStatus.SKIPPED, sources=()) for stage in stages
+    )
+
+    received_command = Intent.model_validate_json(command.model_dump_json())
+    received_receipts = tuple(
+        StageReceipt.model_validate_json(item.model_dump_json()) for item in receipts
+    )
+
+    _assert_only_aggregate_claim(
+        command=received_command,
+        receipts=received_receipts,
+        expected=IntentStatus.PARTIAL,
+    )
+
+
+@pytest.mark.parametrize("boundary", ["copy", "construct"])
+@pytest.mark.parametrize(
+    "stages",
+    [
+        (ProcessingStage.GRAPH,),
+        (ProcessingStage.CANONICAL, ProcessingStage.GRAPH),
+    ],
+)
+def test_all_skipped_is_partial_after_unchecked_model_boundary(
+    boundary: str,
+    stages: tuple[ProcessingStage, ...],
+) -> None:
+    command = intent(*stages)
+    receipts = tuple(
+        receipt(stage, StageStatus.SKIPPED, sources=()) for stage in stages
+    )
+    if boundary == "copy":
+        unchecked_command = command.model_copy(
+            update={"stage_requirements": command.stage_requirements}
+        )
+        unchecked_receipts = tuple(
+            item.model_copy(update={"status": StageStatus.SKIPPED})
+            for item in receipts
+        )
+    else:
+        unchecked_command = Intent.model_construct(**vars(command))
+        unchecked_receipts = tuple(
+            StageReceipt.model_construct(**vars(item)) for item in receipts
+        )
+
+    _assert_only_aggregate_claim(
+        command=unchecked_command,
+        receipts=unchecked_receipts,
+        expected=IntentStatus.PARTIAL,
     )
 
 
