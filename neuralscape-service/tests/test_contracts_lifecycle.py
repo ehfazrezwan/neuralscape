@@ -1716,6 +1716,7 @@ def test_aggregate_boundary_dispatches_every_native_status() -> None:
 
 def test_legal_transitions_are_forward_only_and_terminal_states_stay_terminal() -> None:
     assert is_legal_intent_transition(IntentStatus.ACCEPTED, IntentStatus.PROCESSING)
+    assert is_legal_intent_transition(IntentStatus.ACCEPTED, IntentStatus.PARTIAL)
     assert is_legal_intent_transition(IntentStatus.PROCESSING, IntentStatus.PARTIAL)
     assert is_legal_intent_transition(IntentStatus.PROCESSING, IntentStatus.CANCELLED)
     assert is_legal_intent_transition(IntentStatus.PROCESSING, IntentStatus.SUPERSEDED)
@@ -2543,6 +2544,53 @@ def test_all_skipped_is_partial_after_unchecked_model_boundary(
         receipts=unchecked_receipts,
         expected=IntentStatus.PARTIAL,
     )
+
+
+@pytest.mark.parametrize(
+    "stages",
+    [
+        (ProcessingStage.GRAPH,),
+        (ProcessingStage.CANONICAL, ProcessingStage.GRAPH),
+    ],
+)
+def test_prestart_all_skipped_has_reachable_partial_transition(
+    stages: tuple[ProcessingStage, ...],
+) -> None:
+    receipts: list[StageReceipt] = []
+    for stage in stages:
+        values = receipt(stage, StageStatus.SKIPPED, sources=()).model_dump()
+        values["started_at"] = None
+        receipts.append(StageReceipt.model_validate(values))
+
+    assert is_legal_intent_transition(IntentStatus.ACCEPTED, IntentStatus.PARTIAL)
+    _assert_only_aggregate_claim(
+        command=intent(*stages),
+        receipts=tuple(receipts),
+        expected=IntentStatus.PARTIAL,
+    )
+
+
+@pytest.mark.parametrize(
+    "receipts",
+    [
+        (),
+        (receipt(ProcessingStage.GRAPH, StageStatus.PENDING),),
+        (receipt(ProcessingStage.GRAPH, StageStatus.PROCESSING),),
+        (receipt(ProcessingStage.GRAPH, StageStatus.FAILED, sources=()),),
+        (receipt(ProcessingStage.GRAPH, StageStatus.CANCELLED, sources=()),),
+        (receipt(ProcessingStage.GRAPH, StageStatus.SUPERSEDED, sources=()),),
+    ],
+)
+def test_accepted_to_partial_transition_does_not_replace_aggregate_evidence(
+    receipts: tuple[StageReceipt, ...],
+) -> None:
+    assert is_legal_intent_transition(IntentStatus.ACCEPTED, IntentStatus.PARTIAL)
+    with pytest.raises(ValueError, match="partial requires"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.PARTIAL,
+            intent=intent(ProcessingStage.GRAPH),
+            receipts=receipts,
+        )
 
 
 @pytest.mark.parametrize(

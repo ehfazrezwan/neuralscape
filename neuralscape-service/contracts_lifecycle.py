@@ -368,6 +368,7 @@ _LEGAL_INTENT_TRANSITIONS: dict[IntentStatus, frozenset[IntentStatus]] = {
     IntentStatus.ACCEPTED: frozenset(
         {
             IntentStatus.PROCESSING,
+            IntentStatus.PARTIAL,
             IntentStatus.FAILED,
             IntentStatus.CANCELLED,
             IntentStatus.SUPERSEDED,
