@@ -54,6 +54,9 @@ class VersionedContract(ContractModel):
 
 
 def _validation_alias_roots(model_type: type[BaseModel]) -> set[str]:
+    if model_type.model_config.get("validate_by_alias") is False:
+        return set()
+
     roots: set[str] = set()
     for field in model_type.model_fields.values():
         validation_alias = field.validation_alias
@@ -99,20 +102,22 @@ def snapshot_contract_graph(
             if extra is not None:
                 if not isinstance(extra, Mapping):
                     raise ValueError("contract extra storage must be a mapping")
+                extra_entries = tuple(extra.items())
+                extra_keys = {key for key, _ in extra_entries}
                 model_type = type(value)
                 reserved_names = (
                     fields.keys()
                     | model_type.model_fields.keys()
                     | _validation_alias_roots(model_type)
                 )
-                if reserved_names & extra.keys():
+                if reserved_names & extra_keys:
                     raise ValueError(
                         "contract input contains conflicting declared and extra fields"
                     )
                 fields.update(
                     {
                         key: snapshot_contract_graph(item, active_containers)
-                        for key, item in extra.items()
+                        for key, item in extra_entries
                     }
                 )
             return fields

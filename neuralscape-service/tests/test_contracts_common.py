@@ -1,11 +1,19 @@
 """Conformance tests for the shared candidate contract foundation."""
 
+from collections.abc import ItemsView, KeysView
 import json
 from types import MappingProxyType
 from typing import get_args
 
 import pytest
-from pydantic import AliasChoices, AliasPath, Field, TypeAdapter, ValidationError
+from pydantic import (
+    AliasChoices,
+    AliasPath,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    ValidationError,
+)
 
 from contracts_common import (
     ContractModel,
@@ -53,6 +61,12 @@ class SerializationAliasedExampleContract(ContractModel):
     count: SafeCounter = Field(serialization_alias="n")
 
 
+class NameOnlyAliasedExampleContract(ContractModel):
+    model_config = ConfigDict(validate_by_alias=False, validate_by_name=True)
+
+    count: SafeCounter = Field(alias="n")
+
+
 class InheritedAliasExampleContract(ContractModel):
     count: SafeCounter = Field(validation_alias=AliasChoices("n", "count"))
 
@@ -83,6 +97,24 @@ class ExampleContractGraph(ContractModel):
 
 class DerivedExampleContractGraph(ContractModel):
     item: DerivedNestedExampleContract
+
+
+class HiddenKeysExtra(dict[str, object]):
+    def keys(self) -> KeysView[str]:
+        return {}.keys()
+
+
+class SingleReadExtra(dict[str, object]):
+    item_reads = 0
+
+    def keys(self) -> KeysView[str]:
+        raise AssertionError("extra keys must come from captured entries")
+
+    def items(self) -> ItemsView[str, object]:
+        self.item_reads += 1
+        if self.item_reads > 1:
+            raise AssertionError("extra entries must be captured exactly once")
+        return super().items()
 
 
 @pytest.mark.parametrize("source", ["copy", "construct"])
@@ -213,9 +245,19 @@ def test_snapshot_contract_graph_rejects_duplicate_unknown_stored_name() -> None
         snapshot_contract_graph(value)
 
 
-def test_snapshot_contract_graph_preserves_nonconflicting_unknown_extra() -> None:
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"future_state": "preserved"},
+        MappingProxyType({"future_state": "preserved"}),
+    ],
+    ids=["dict", "mapping-proxy"],
+)
+def test_snapshot_contract_graph_preserves_nonconflicting_unknown_extra(
+    extra: object,
+) -> None:
     value = ExampleContract(count=1)
-    object.__setattr__(value, "__pydantic_extra__", {"future_state": "preserved"})
+    object.__setattr__(value, "__pydantic_extra__", extra)
 
     snapshot = snapshot_contract_graph(value)
 
@@ -303,6 +345,67 @@ def test_snapshot_contract_graph_does_not_reserve_serialization_only_alias() -> 
     assert snapshot == {"n": 9}
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         SerializationAliasedExampleContract.model_validate(snapshot, strict=True)
+
+
+def test_snapshot_contract_graph_does_not_reserve_disabled_validation_alias() -> None:
+    value = NameOnlyAliasedExampleContract(count=1)
+    value.__dict__.pop("count")
+    object.__setattr__(value, "__pydantic_extra__", {"n": 9})
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"n": 9}
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        NameOnlyAliasedExampleContract.model_validate(snapshot, strict=True)
+
+
+def test_snapshot_contract_graph_preserves_name_only_field_input() -> None:
+    value = NameOnlyAliasedExampleContract(count=1)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"count": 1}
+    assert NameOnlyAliasedExampleContract.model_validate(
+        snapshot,
+        strict=True,
+    ) == NameOnlyAliasedExampleContract(count=1)
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["direct", "nested"])
+def test_snapshot_contract_graph_rejects_key_hiding_alias_storage(
+    nested: bool,
+) -> None:
+    value = AliasedExampleContract(n=1)
+    value.__dict__.pop("count")
+    extra = HiddenKeysExtra({"n": 9})
+    object.__setattr__(value, "__pydantic_extra__", extra)
+    graph: object = {"item": value} if nested else value
+
+    assert list(extra.keys()) == []
+    assert list(extra.items()) == [("n", 9)]
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(graph)
+
+
+def test_snapshot_contract_graph_rejects_key_hiding_declared_name() -> None:
+    value = ExampleContract(count=1)
+    value.__dict__.pop("count")
+    object.__setattr__(value, "__pydantic_extra__", HiddenKeysExtra({"count": 9}))
+
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(value)
+
+
+def test_snapshot_contract_graph_captures_extra_entries_once() -> None:
+    value = ExampleContract(count=1)
+    extra = SingleReadExtra({"future_state": "preserved"})
+    object.__setattr__(value, "__pydantic_extra__", extra)
+
+    assert snapshot_contract_graph(value) == {
+        "count": 1,
+        "future_state": "preserved",
+    }
+    assert extra.item_reads == 1
 
 
 @pytest.mark.parametrize("container_type", [list, dict])
