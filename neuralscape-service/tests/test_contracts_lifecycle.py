@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from itertools import permutations
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 import contracts_lifecycle as lifecycle_contracts
 from contracts_bodies import MEMORY_BODY_ADAPTER, OpaqueEnvelopeBody, PlaintextBody
@@ -31,6 +31,16 @@ from contracts_references import ReferenceHandle, SourceVersion
 
 
 NOW = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
+
+
+class DefaultedStoredModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    count: int = 7
+
+
+class ExtendedStoredModel(DefaultedStoredModel):
+    label: str
 
 
 def source(record_id: str, revision: int = 3, epoch: int = 7) -> SourceVersion:
@@ -155,6 +165,15 @@ def receiving_graph_with_extra_target(
         "output_reference": applied.output_refs[0],
     }
     return command, (applied,), targets[target_name]
+
+
+def move_declared_field_to_extra(value: BaseModel, field_name: str) -> None:
+    stored_value = value.__dict__.pop(field_name)
+    object.__setattr__(
+        value,
+        "__pydantic_extra__",
+        {field_name: stored_value},
+    )
 
 
 def memory_record(**overrides: object) -> MemoryRecord:
@@ -1446,6 +1465,92 @@ def test_aggregate_boundary_accepts_absent_or_empty_dict_extra_storage(
         intent=command,
         receipts=receipts,
     )
+
+
+@pytest.mark.parametrize(
+    ("target_name", "field_name"),
+    [
+        ("intent", "id"),
+        ("requirement", "effect_id"),
+        ("source", "content_revision"),
+        ("receipt", "attempt"),
+        ("output_reference", "resolver"),
+    ],
+)
+def test_aggregate_boundary_rejects_declared_fields_moved_to_extra_storage(
+    target_name: str,
+    field_name: str,
+) -> None:
+    command, receipts, target = receiving_graph_with_extra_target(target_name)
+    assert isinstance(target, BaseModel)
+    move_declared_field_to_extra(target, field_name)
+
+    with pytest.raises(ValueError, match="conflicting stored contract field"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED,
+            intent=command,
+            receipts=receipts,
+        )
+
+
+@pytest.mark.parametrize("replacement", [4, 5], ids=["equal", "conflicting"])
+def test_source_boundary_rejects_stored_and_extra_declared_duplicates(
+    replacement: int,
+) -> None:
+    expected = source("memory-1", revision=4, epoch=9)
+    observed = source("memory-1", revision=4, epoch=9)
+    object.__setattr__(
+        observed,
+        "__pydantic_extra__",
+        {"content_revision": replacement},
+    )
+
+    with pytest.raises(ValueError, match="conflicting stored contract field"):
+        source_versions_match(expected, observed)
+
+
+def test_source_boundary_preserves_missing_and_unknown_extra_behavior() -> None:
+    expected = source("memory-1", revision=4, epoch=9)
+
+    missing = source("memory-1", revision=4, epoch=9)
+    missing.__dict__.pop("content_revision")
+    object.__setattr__(missing, "__pydantic_extra__", None)
+    with pytest.raises(ValidationError, match="content_revision"):
+        source_versions_match(expected, missing)
+
+    unknown = source("memory-1", revision=4, epoch=9)
+    object.__setattr__(
+        unknown,
+        "__pydantic_extra__",
+        {"undeclared_witness": True},
+    )
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        source_versions_match(expected, unknown)
+
+
+def test_native_graph_preserves_defaults_but_rejects_declared_extra_override() -> None:
+    absent_default = DefaultedStoredModel()
+    absent_default.__dict__.pop("count")
+    object.__setattr__(absent_default, "__pydantic_extra__", None)
+    reconstructed = DefaultedStoredModel.model_validate(
+        lifecycle_contracts._native_contract_graph(absent_default),
+        strict=True,
+    )
+    assert reconstructed.count == 7
+
+    moved_default = DefaultedStoredModel()
+    moved_default.__dict__.pop("count")
+    object.__setattr__(moved_default, "__pydantic_extra__", {"count": 9})
+    with pytest.raises(ValueError, match="conflicting stored contract field"):
+        lifecycle_contracts._native_contract_graph(moved_default)
+
+
+def test_native_graph_uses_concrete_subclass_declarations_for_extra_overlap() -> None:
+    extended = ExtendedStoredModel(label="retained")
+    move_declared_field_to_extra(extended, "label")
+
+    with pytest.raises(ValueError, match="conflicting stored contract field"):
+        lifecycle_contracts._native_contract_graph(extended)
 
 
 def test_aggregate_boundary_preserves_sequence_types_during_revalidation() -> None:

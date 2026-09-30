@@ -53,8 +53,9 @@ def _native_contract_graph(
                         raise ValueError(
                             "malformed stored contract extras are not valid input"
                         )
+                    declared_fields = type(value).model_fields
                     for key, item in extra.items():
-                        if key in fields:
+                        if key in fields or key in declared_fields:
                             raise ValueError(
                                 "conflicting stored contract field is not valid input"
                             )
