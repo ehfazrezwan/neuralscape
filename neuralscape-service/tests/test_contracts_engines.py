@@ -255,6 +255,81 @@ def test_capability_boundary_rejects_unknown_fields_wrong_containers_and_cycles(
         validate_capability_requirements(cyclic_manifest, (requirement(),))
 
 
+@pytest.mark.parametrize("extra_operation", ["retrieve", "shadow-operation"])
+def test_capability_boundary_rejects_declared_fields_duplicated_in_extras(
+    extra_operation,
+):
+    declared = manifest(state())
+    duplicated = requirement()
+    object.__setattr__(
+        duplicated,
+        "__pydantic_extra__",
+        {"operation": extra_operation},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"malformed contract extras.*duplicate field\(s\): operation",
+    ):
+        validate_capability_requirements(declared, (duplicated,))
+
+
+def test_capability_boundary_rejects_declared_extra_when_field_is_not_stored():
+    declared = manifest(state())
+    moved = requirement()
+    del moved.__dict__["operation"]
+    object.__setattr__(moved, "__pydantic_extra__", {"operation": "retrieve"})
+
+    with pytest.raises(
+        ValueError,
+        match=r"malformed contract extras.*duplicate field\(s\): operation",
+    ):
+        validate_capability_requirements(declared, (moved,))
+
+
+def test_capability_boundary_checks_defaulted_subclass_declarations_in_extras():
+    class ExtendedRequirement(CapabilityRequirement):
+        extension_mode: str = "strict"
+
+    declared = manifest(state())
+    values = requirement().model_dump()
+
+    normally_absent = ExtendedRequirement(**values)
+    del normally_absent.__dict__["extension_mode"]
+    assert validate_capability_requirements(declared, (normally_absent,)) == ()
+
+    moved_default = ExtendedRequirement(**values)
+    del moved_default.__dict__["extension_mode"]
+    object.__setattr__(
+        moved_default,
+        "__pydantic_extra__",
+        {"extension_mode": "shadow"},
+    )
+    with pytest.raises(
+        ValueError,
+        match=r"malformed contract extras.*duplicate field\(s\): extension_mode",
+    ):
+        validate_capability_requirements(declared, (moved_default,))
+
+
+@pytest.mark.parametrize("extras", [None, {}])
+def test_capability_boundary_preserves_absent_or_empty_extra_storage(extras):
+    declared = manifest(state())
+    valid_requirement = requirement()
+    object.__setattr__(valid_requirement, "__pydantic_extra__", extras)
+
+    assert validate_capability_requirements(declared, (valid_requirement,)) == ()
+
+
+def test_capability_boundary_still_rejects_nonconflicting_unknown_extras():
+    declared = manifest(state())
+    unknown = requirement()
+    object.__setattr__(unknown, "__pydantic_extra__", {"future_semantics": "deny"})
+
+    with pytest.raises(ValueError, match="undeclared contract field.*future_semantics"):
+        validate_capability_requirements(declared, (unknown,))
+
+
 @pytest.mark.parametrize("operation", ["", True, "x" * 257])
 def test_operation_lookup_validates_opaque_scalar(operation):
     with pytest.raises(ValidationError):

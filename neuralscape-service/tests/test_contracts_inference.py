@@ -1228,6 +1228,34 @@ def test_receiving_boundaries_reject_unknown_fields_constructed_values_and_cycle
         validate_generation_result(generation_request(), cyclic)
 
 
+@pytest.mark.parametrize("extra_value", ["span-1", "shadow-value"])
+@pytest.mark.parametrize("target_name", ["span", "nested_source_version"])
+def test_inference_boundary_rejects_declared_fields_duplicated_in_extras(
+    target_name,
+    extra_value,
+):
+    evidence = source_evidence()
+    span = SourceSpan(
+        span_id="span-1",
+        source_version=evidence.source_version,
+        start_utf8_byte=0,
+        end_utf8_byte=3,
+    )
+    if target_name == "span":
+        target = span
+        field_name = "span_id"
+    else:
+        target = span.source_version
+        field_name = "record_id"
+    object.__setattr__(target, "__pydantic_extra__", {field_name: extra_value})
+
+    with pytest.raises(
+        ValueError,
+        match=rf"malformed contract extras.*duplicate field\(s\): {field_name}",
+    ):
+        validate_source_span(evidence, span)
+
+
 def test_source_span_boundary_revalidates_mutated_inputs():
     evidence = source_evidence()
     span = SourceSpan(
