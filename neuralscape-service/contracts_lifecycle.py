@@ -500,8 +500,8 @@ def validate_required_stage_claim(
     for stage in _topological_stages(requirements):
         requirement = requirements[stage]
         stage_applications = applied_by_stage[stage]
+        expected_inputs = _expected_stage_inputs(intent, requirement, requirements)
         for receipt in stage_applications:
-            expected_inputs = _expected_stage_inputs(intent, requirement, requirements)
             if not _source_sets_match(expected_inputs, receipt.applied_sources):
                 raise ValueError(
                     "applied required-stage receipt must match calculated inputs"
@@ -652,17 +652,37 @@ def _reference_sets_match(
     expected: tuple[ReferenceHandle, ...],
     observed: tuple[ReferenceHandle, ...],
 ) -> bool:
-    return len(expected) == len(observed) and all(
-        any(item == candidate for candidate in observed) for item in expected
+    if len(expected) != len(observed):
+        return False
+    expected_keys = {_reference_identity_key(item) for item in expected}
+    observed_keys = {_reference_identity_key(item) for item in observed}
+    return (
+        len(expected_keys) == len(expected)
+        and len(observed_keys) == len(observed)
+        and expected_keys == observed_keys
     )
 
 
 def _require_unique_reference_handles(
     references: tuple[ReferenceHandle, ...], field: str
 ) -> None:
-    for index, reference in enumerate(references):
-        if any(reference == prior for prior in references[:index]):
+    seen: set[tuple[str, str, str, str]] = set()
+    for reference in references:
+        key = _reference_identity_key(reference)
+        if key in seen:
             raise ValueError(f"{field} must not contain duplicate handles")
+        seen.add(key)
+
+
+def _reference_identity_key(
+    reference: ReferenceHandle,
+) -> tuple[str, str, str, str]:
+    return (
+        reference.kind,
+        reference.id,
+        reference.tenant_id,
+        reference.resolver,
+    )
 
 
 def _topological_stages(

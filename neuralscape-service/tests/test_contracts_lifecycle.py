@@ -7,6 +7,7 @@ from itertools import permutations
 import pytest
 from pydantic import ValidationError
 
+import contracts_lifecycle as lifecycle_contracts
 from contracts_bodies import MEMORY_BODY_ADAPTER, OpaqueEnvelopeBody, PlaintextBody
 from contracts_lifecycle import (
     ApplicabilityScope,
@@ -723,6 +724,95 @@ def test_duplicate_output_handles_reject() -> None:
         StageReceipt.model_validate(values)
 
 
+def test_reference_set_match_handles_duplicates_inequality_and_order() -> None:
+    first = reference("graph-a")
+    second = reference("graph-b")
+
+    assert not lifecycle_contracts._reference_sets_match((first,), (second,))
+    assert lifecycle_contracts._reference_sets_match(
+        (first, second), (second, first)
+    )
+    assert not lifecycle_contracts._reference_sets_match(
+        (first, first), (first, second)
+    )
+    assert not lifecycle_contracts._reference_sets_match(
+        (first, second), (first, first)
+    )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "replacement"),
+    [
+        ("kind", "memory"),
+        ("id", "other-reference"),
+        ("tenant_id", "other-tenant"),
+        ("resolver", "other-resolver"),
+    ],
+)
+def test_reference_consensus_uses_every_identity_field(
+    field_name: str,
+    replacement: str,
+) -> None:
+    baseline = reference("graph-view")
+    changed_values = baseline.model_dump()
+    changed_values[field_name] = replacement
+    changed = ReferenceHandle.model_validate(changed_values)
+    receipts = (
+        receipt(
+            ProcessingStage.GRAPH,
+            StageStatus.APPLIED,
+            outputs=(baseline,),
+        ),
+        receipt(
+            ProcessingStage.GRAPH,
+            StageStatus.APPLIED,
+            outputs=(changed,),
+            attempt=2,
+        ),
+    )
+
+    for observed in permutations(receipts):
+        with pytest.raises(ValueError, match="consistent result sets"):
+            validate_required_stage_claim(
+                claimed_status=IntentStatus.APPLIED,
+                intent=intent(ProcessingStage.GRAPH),
+                receipts=observed,
+            )
+
+
+def test_reference_operations_are_linear_in_handle_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_identity_key = lifecycle_contracts._reference_identity_key
+    key_calls = 0
+
+    def counting_identity_key(
+        item: ReferenceHandle,
+    ) -> tuple[str, str, str, str]:
+        nonlocal key_calls
+        key_calls += 1
+        return original_identity_key(item)
+
+    monkeypatch.setattr(
+        lifecycle_contracts,
+        "_reference_identity_key",
+        counting_identity_key,
+    )
+
+    for size in (256, 512, 1024):
+        handles = tuple(reference(f"artifact-{index}") for index in range(size))
+
+        before_unique = key_calls
+        lifecycle_contracts._require_unique_reference_handles(handles, "output_refs")
+        assert key_calls - before_unique == size
+
+        before_match = key_calls
+        assert lifecycle_contracts._reference_sets_match(
+            handles, tuple(reversed(handles))
+        )
+        assert key_calls - before_match == 2 * size
+
+
 def test_historical_applications_require_cross_attempt_output_consensus() -> None:
     command = intent(ProcessingStage.GRAPH)
     receipts = (
@@ -767,6 +857,85 @@ def test_cross_attempt_result_consensus_ignores_tuple_order() -> None:
             ),
         ),
     )
+
+
+def test_expected_inputs_are_calculated_once_while_every_application_is_checked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_expected_inputs = lifecycle_contracts._expected_stage_inputs
+    original_source_sets_match = lifecycle_contracts._source_sets_match
+    calculated_inputs: list[tuple[SourceVersion, ...]] = []
+    input_comparisons = 0
+
+    def counting_expected_inputs(
+        command: Intent,
+        declared: StageEvidenceRequirement,
+        declared_by_stage: dict[ProcessingStage, StageEvidenceRequirement],
+    ) -> tuple[SourceVersion, ...]:
+        result = original_expected_inputs(command, declared, declared_by_stage)
+        calculated_inputs.append(result)
+        return result
+
+    def counting_source_sets_match(
+        expected: tuple[SourceVersion, ...],
+        observed: tuple[SourceVersion, ...],
+    ) -> bool:
+        nonlocal input_comparisons
+        if calculated_inputs and expected is calculated_inputs[0]:
+            input_comparisons += 1
+        return original_source_sets_match(expected, observed)
+
+    monkeypatch.setattr(
+        lifecycle_contracts,
+        "_expected_stage_inputs",
+        counting_expected_inputs,
+    )
+    monkeypatch.setattr(
+        lifecycle_contracts,
+        "_source_sets_match",
+        counting_source_sets_match,
+    )
+    receipt_count = 32
+
+    validate_required_stage_claim(
+        claimed_status=IntentStatus.APPLIED,
+        intent=intent(ProcessingStage.GRAPH),
+        receipts=tuple(
+            receipt(
+                ProcessingStage.GRAPH,
+                StageStatus.APPLIED,
+                attempt=index + 1,
+            )
+            for index in range(receipt_count)
+        ),
+    )
+
+    assert len(calculated_inputs) == 1
+    assert input_comparisons == receipt_count
+
+
+def test_aggregate_boundary_rejects_reference_subclass_extra_state() -> None:
+    class ReferenceWithExtra(ReferenceHandle):
+        marker: str
+
+    extended = ReferenceWithExtra(
+        kind="artifact",
+        id="graph-view",
+        tenant_id="tenant-1",
+        resolver="resolve_artifact",
+        marker="not-contract-state",
+    )
+    unchecked = receipt(
+        ProcessingStage.GRAPH,
+        StageStatus.APPLIED,
+    ).model_copy(update={"output_refs": (extended,)})
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED,
+            intent=intent(ProcessingStage.GRAPH),
+            receipts=(unchecked,),
+        )
 
 
 def test_aggregate_boundary_revalidates_nested_requirement_copy() -> None:
