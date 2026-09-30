@@ -102,30 +102,53 @@ class _SplitViewExtras(Mapping[str, object]):
 
     def __init__(self, entries: dict[str, object]) -> None:
         self._entries = entries
+        self.iteration_calls = 0
+        self.items_calls = 0
 
     def __getitem__(self, key: str) -> object:
         return self._entries[key]
 
     def __iter__(self) -> Iterator[str]:
+        self.iteration_calls += 1
         return iter(())
 
     def __len__(self) -> int:
         return 0
 
     def items(self) -> ItemsView[str, object]:
+        self.items_calls += 1
         return self._entries.items()
+
+
+class _InverseItemsExtras(dict[str, object]):
+    """Expose keys through iteration while hiding every items() pair."""
+
+    def __init__(self, entries: dict[str, object]) -> None:
+        super().__init__(entries)
+        self.iteration_calls = 0
+        self.items_calls = 0
+
+    def __iter__(self) -> Iterator[str]:
+        self.iteration_calls += 1
+        return super().__iter__()
+
+    def items(self) -> ItemsView[str, object]:
+        self.items_calls += 1
+        return {}.items()
 
 
 class _ChangingItemsExtras(Mapping[str, object]):
     """Return a different items view after the first captured snapshot."""
 
     def __init__(self) -> None:
+        self.iteration_calls = 0
         self.items_calls = 0
 
     def __getitem__(self, key: str) -> object:
         raise KeyError(key)
 
     def __iter__(self) -> Iterator[str]:
+        self.iteration_calls += 1
         return iter(())
 
     def __len__(self) -> int:
@@ -530,24 +553,30 @@ def test_reconciliation_rejects_mapping_event_extra_storage(
 
 def test_reconciliation_rejects_split_view_declared_extra_storage() -> None:
     event = _event(tenant_id="wrong-tenant")
+    extras = _SplitViewExtras({"tenant_id": "tenant-1"})
     object.__setattr__(
         event,
         "__pydantic_extra__",
-        _SplitViewExtras({"tenant_id": "tenant-1"}),
+        extras,
     )
 
     _assert_canonical_invalid_event(event)
+    assert extras.iteration_calls == 1
+    assert extras.items_calls == 1
 
 
 def test_reconciliation_retains_split_view_unknown_extra_for_rejection() -> None:
     event = _event()
+    extras = _SplitViewExtras({"authority": True})
     object.__setattr__(
         event,
         "__pydantic_extra__",
-        _SplitViewExtras({"authority": True}),
+        extras,
     )
 
     _assert_canonical_invalid_event(event)
+    assert extras.iteration_calls == 1
+    assert extras.items_calls == 1
 
 
 def test_reconciliation_uses_one_stable_extra_items_snapshot() -> None:
@@ -557,6 +586,7 @@ def test_reconciliation_uses_one_stable_extra_items_snapshot() -> None:
 
     result = reconcile_usage_events([event])
 
+    assert extras.iteration_calls == 1
     assert extras.items_calls == 1
     assert result.streams[0].tenant_id == "tenant-1"
 
@@ -574,15 +604,117 @@ def test_reconciliation_rejects_falsey_populated_extra_storage() -> None:
 
 def test_reconciliation_accepts_genuinely_empty_split_view_mapping() -> None:
     event = _event()
+    extras = _SplitViewExtras({})
     object.__setattr__(
         event,
         "__pydantic_extra__",
-        _SplitViewExtras({}),
+        extras,
     )
 
     result = reconcile_usage_events([event])
 
     assert result.streams[0].head_event_id == "event-1"
+    assert extras.iteration_calls == 1
+    assert extras.items_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("target_name", "field_name", "extra_value"),
+    [
+        ("event", "tenant_id", "shadow-tenant"),
+        ("attribution", "producer", "shadow-producer"),
+    ],
+)
+def test_reconciliation_rejects_inverse_items_declared_overlap(
+    target_name: str,
+    field_name: str,
+    extra_value: str,
+) -> None:
+    event = _event()
+    targets = {
+        "event": event,
+        "attribution": event.attribution,
+    }
+    extras = _InverseItemsExtras({field_name: extra_value})
+    object.__setattr__(targets[target_name], "__pydantic_extra__", extras)
+
+    _assert_canonical_invalid_event(event)
+    assert extras.iteration_calls == 1
+    assert extras.items_calls == 1
+
+
+@pytest.mark.parametrize("target_name", ["event", "attribution"])
+def test_reconciliation_rejects_inverse_items_moved_subclass_default(
+    target_name: str,
+) -> None:
+    class ExtendedUsageEvent(UsageEvent):
+        audit_marker: str = "marker"
+
+    class ExtendedAttribution(AttributionSnapshot):
+        audit_marker: str = "marker"
+
+    if target_name == "event":
+        event = ExtendedUsageEvent.model_validate(_event().model_dump(mode="python"))
+        target = event
+    else:
+        attribution = ExtendedAttribution.model_validate(
+            _attribution().model_dump(mode="python")
+        )
+        event = _event().model_copy(update={"attribution": attribution})
+        target = attribution
+    target.__dict__.pop("audit_marker")
+    extras = _InverseItemsExtras({"audit_marker": "override"})
+    object.__setattr__(target, "__pydantic_extra__", extras)
+
+    _assert_canonical_invalid_event(event)
+    assert extras.iteration_calls == 1
+    assert extras.items_calls == 1
+
+
+@pytest.mark.parametrize("target_name", ["event", "attribution"])
+def test_reconciliation_preserves_inverse_items_unknown_omission(
+    target_name: str,
+) -> None:
+    event = _event()
+    targets = {
+        "event": event,
+        "attribution": event.attribution,
+    }
+    extras = _InverseItemsExtras({"future_semantics": "omit"})
+    object.__setattr__(targets[target_name], "__pydantic_extra__", extras)
+
+    result = reconcile_usage_events([event])
+
+    assert result.streams[0].head_event_id == "event-1"
+    assert "future_semantics" not in result.model_dump_json()
+    assert extras.iteration_calls == 1
+    assert extras.items_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("target_name", "field_name"),
+    [
+        ("event", "event_id"),
+        ("attribution", "producer"),
+    ],
+)
+def test_reconciliation_preserves_inverse_items_required_missing_rejection(
+    target_name: str,
+    field_name: str,
+) -> None:
+    event = _event()
+    targets = {
+        "event": event,
+        "attribution": event.attribution,
+    }
+    target = targets[target_name]
+    stored_value = target.__dict__.pop(field_name)
+    extras = _InverseItemsExtras({field_name: stored_value})
+    object.__setattr__(target, "__pydantic_extra__", extras)
+
+    _assert_canonical_invalid_event(event)
+    assert extras.iteration_calls == 1
+    assert extras.items_calls == 1
 
 
 @pytest.mark.parametrize(
