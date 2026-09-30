@@ -7,6 +7,7 @@ the dedicated CI job. A missing or unreachable database is a test failure.
 from __future__ import annotations
 
 import asyncio
+import copy
 import gzip
 import hashlib
 import json
@@ -217,6 +218,7 @@ def test_core_only_identity_gains_auxiliary_label_union_without_duplicates(
 def test_arbitrary_identifiers_and_property_maps_round_trip_safely(live_engine):
     source_labels = [
         "CodeSymbol",
+        " ",
         " whitespace label ",
         "punctuation:[]()!?",
         "tick`) SET n.compromised = true //",
@@ -381,6 +383,44 @@ def test_non_string_relationship_type_rejects_before_writes(live_engine):
     assert _node_count(live_engine) == 0
 
 
+@pytest.mark.parametrize(
+    ("location", "message"),
+    [
+        ("node", r"node\[2\]\.labels: label 1 must not be empty"),
+        ("source", r"edge\[1\]\.source\.labels: label 1 must not be empty"),
+        ("target", r"edge\[1\]\.target\.labels: label 1 must not be empty"),
+        ("relationship", r"edge\[1\]\.type: must not be empty"),
+    ],
+)
+def test_late_empty_identifiers_reject_before_writes(
+    live_engine,
+    location,
+    message,
+):
+    snapshot = _preflight_snapshot(live_engine.code_space)
+    if location == "node":
+        snapshot["nodes"].append(
+            {
+                "labels": ["CodeSymbol", ""],
+                "properties": {
+                    "code_space": live_engine.code_space,
+                    "fqn": "pkg.invalid",
+                },
+            }
+        )
+    else:
+        invalid = copy.deepcopy(snapshot["edges"][0])
+        if location == "relationship":
+            invalid["type"] = ""
+        else:
+            invalid[location]["labels"] = ["CodeSymbol", ""]
+        snapshot["edges"].append(invalid)
+
+    with pytest.raises(ValueError, match=message):
+        live_engine.import_snapshot(_snapshot_artifact(snapshot))
+    assert _node_count(live_engine) == 0
+
+
 def test_malformed_late_labels_reject_before_writes(live_engine):
     snapshot = _preflight_snapshot(live_engine.code_space)
     snapshot["nodes"].append(
@@ -399,7 +439,7 @@ def test_malformed_late_labels_reject_before_writes(live_engine):
 
 def test_hash_rejection_precedes_database_writes(live_engine):
     snapshot = _preflight_snapshot(live_engine.code_space)
-    snapshot["nodes"][0]["labels"] = ["MalformedWithoutCore"]
+    snapshot["nodes"][0]["labels"] = ["CodeSymbol", ""]
     with pytest.raises(ValueError, match="content_hash mismatch"):
         live_engine.import_snapshot(
             _snapshot_artifact(snapshot, content_hash="not-the-content-hash")

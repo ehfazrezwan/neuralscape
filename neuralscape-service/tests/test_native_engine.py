@@ -11,7 +11,11 @@ from unittest.mock import MagicMock, Mock
 import pytest
 
 from adapters.code_graph.engine import EngineCapabilityError, IndexReport
-from adapters.code_graph.native_engine import NativeEngine
+from adapters.code_graph.native_engine import (
+    NativeEngine,
+    _normalize_snapshot_labels,
+    _quote_cypher_identifier,
+)
 
 
 def _snapshot_artifact(snapshot, *, content_hash=None):
@@ -917,6 +921,22 @@ def test_snapshot_edge_identifiers_and_parameter_namespaces_are_isolated(
     }
 
 
+def test_snapshot_identifier_helpers_reject_empty_but_preserve_whitespace():
+    with pytest.raises(ValueError, match="label 1 must not be empty"):
+        _normalize_snapshot_labels(
+            ["CodeSymbol", ""],
+            location="direct labels",
+        )
+    with pytest.raises(ValueError, match="direct identifier: must not be empty"):
+        _quote_cypher_identifier("", location="direct identifier")
+
+    assert _normalize_snapshot_labels(
+        [" ", "CodeSymbol"],
+        location="direct labels",
+    ) == ["CodeSymbol", " "]
+    assert _quote_cypher_identifier(" ", location="direct identifier") == "` `"
+
+
 @pytest.mark.parametrize(
     ("location", "labels", "message"),
     [
@@ -1030,6 +1050,49 @@ def test_import_snapshot_rejects_malformed_relationship_type_before_writes(
     mock_retry.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ("location", "message"),
+    [
+        ("node", r"node\[1\]\.labels: label 1 must not be empty"),
+        ("source", r"edge\[1\]\.source\.labels: label 1 must not be empty"),
+        ("target", r"edge\[1\]\.target\.labels: label 1 must not be empty"),
+        ("relationship", r"edge\[1\]\.type: must not be empty"),
+    ],
+)
+def test_import_snapshot_rejects_late_empty_identifiers_before_writes(
+    mock_bridge,
+    mock_settings,
+    location,
+    message,
+):
+    from unittest.mock import patch
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user--repo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+    snapshot = _valid_multilabel_snapshot()
+    if location == "node":
+        invalid = copy.deepcopy(snapshot["nodes"][0])
+        invalid["labels"] = ["CodeSymbol", ""]
+        snapshot["nodes"].append(invalid)
+    else:
+        invalid = copy.deepcopy(snapshot["edges"][0])
+        if location == "relationship":
+            invalid["type"] = ""
+        else:
+            invalid[location]["labels"] = ["CodeSymbol", ""]
+        snapshot["edges"].append(invalid)
+
+    with patch.object(engine, "_run_cypher_with_retry") as mock_retry:
+        with pytest.raises(ValueError, match=message):
+            engine.import_snapshot(_snapshot_artifact(snapshot))
+
+    mock_retry.assert_not_called()
+
+
 def test_import_snapshot_checks_hash_before_label_validation(
     mock_bridge,
     mock_settings,
@@ -1044,7 +1107,7 @@ def test_import_snapshot_checks_hash_before_label_validation(
         settings=mock_settings,
     )
     snapshot = _valid_multilabel_snapshot()
-    snapshot["nodes"][0]["labels"] = ["Searchable"]
+    snapshot["nodes"][0]["labels"] = ["CodeSymbol", ""]
 
     with patch.object(engine, "_run_cypher_with_retry") as mock_retry:
         with pytest.raises(ValueError, match="content_hash mismatch"):

@@ -54,6 +54,11 @@ def _normalize_snapshot_labels(labels: object, *, location: str) -> list[str]:
                 f"Malformed snapshot labels at {location}: "
                 f"label {index} must be a string"
             )
+        if not label:
+            raise ValueError(
+                f"Malformed snapshot labels at {location}: "
+                f"label {index} must not be empty"
+            )
 
     seen: set[str] = set()
     duplicates: list[str] = []
@@ -84,6 +89,10 @@ def _quote_cypher_identifier(identifier: object, *, location: str) -> str:
     if not isinstance(identifier, str):
         raise ValueError(
             f"Malformed snapshot identifier at {location}: expected a string"
+        )
+    if not identifier:
+        raise ValueError(
+            f"Malformed snapshot identifier at {location}: must not be empty"
         )
 
     # Cypher permits `` for a literal backtick and \uxxxx escapes inside quoted
