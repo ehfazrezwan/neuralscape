@@ -73,6 +73,14 @@ def _validation_alias_owners(model_type: type[BaseModel]) -> dict[str, set[str]]
     return owners
 
 
+def _mapping_entries(
+    value: Mapping[object, object],
+) -> tuple[tuple[object, object], ...]:
+    if issubclass(type(value), dict):
+        return tuple(dict.items(value))
+    return tuple(value.items())
+
+
 def snapshot_contract_graph(
     value: object, active_containers: set[int] | None = None
 ) -> object:
@@ -95,7 +103,7 @@ def snapshot_contract_graph(
     try:
         if isinstance(value, BaseModel):
             model_type = type(value)
-            stored_entries = tuple(vars(value).items())
+            stored_entries = _mapping_entries(vars(value))
             stored_names = {key for key, _ in stored_entries}
             declared_names = set(model_type.model_fields)
             alias_owners = _validation_alias_owners(model_type)
@@ -121,9 +129,9 @@ def snapshot_contract_graph(
             }
             extra = getattr(value, "__pydantic_extra__", None)
             if extra is not None:
-                if not isinstance(extra, Mapping):
+                if not issubclass(type(extra), Mapping):
                     raise ValueError("contract extra storage must be a mapping")
-                extra_entries = tuple(extra.items())
+                extra_entries = _mapping_entries(extra)
                 extra_keys = {key for key, _ in extra_entries}
                 reserved_names = (
                     fields.keys()
@@ -149,9 +157,10 @@ def snapshot_contract_graph(
             return [
                 snapshot_contract_graph(item, active_containers) for item in value
             ]
+        dict_entries = _mapping_entries(value)
         return {
             key: snapshot_contract_graph(item, active_containers)
-            for key, item in value.items()
+            for key, item in dict_entries
         }
     finally:
         active_containers.remove(value_id)

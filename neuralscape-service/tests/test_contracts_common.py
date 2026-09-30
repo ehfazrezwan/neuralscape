@@ -1,6 +1,6 @@
 """Conformance tests for the shared candidate contract foundation."""
 
-from collections.abc import ItemsView, KeysView
+from collections.abc import ItemsView, Iterator, KeysView, Mapping
 import json
 from types import MappingProxyType
 from typing import get_args
@@ -164,6 +164,14 @@ class ExampleContractGraph(ContractModel):
     by_name: dict[str, NestedExampleContract]
 
 
+class ExampleContractEnvelope(ContractModel):
+    item: ExampleContract
+
+
+class DictionaryEnvelope(ContractModel):
+    payload: dict[str, SafeCounter]
+
+
 class DerivedExampleContractGraph(ContractModel):
     item: DerivedNestedExampleContract
 
@@ -186,6 +194,72 @@ class SingleReadExtra(dict[str, object]):
         return super().items()
 
 
+class SingleReadMapping(Mapping[str, object]):
+    def __init__(self, entries: dict[str, object]) -> None:
+        self._entries = entries
+        self.item_reads = 0
+
+    def __getitem__(self, key: str) -> object:
+        return self._entries[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def items(self) -> ItemsView[str, object]:
+        self.item_reads += 1
+        if self.item_reads > 1:
+            raise AssertionError("mapping entries must be captured exactly once")
+        return self._entries.items()
+
+
+class DictClassSpoofingMapping(SingleReadMapping):
+    @property
+    def __class__(self) -> type[dict]:
+        return dict
+
+
+class ClassReadRejectingMapping(SingleReadMapping):
+    @property
+    def __class__(self) -> type[object]:
+        raise AssertionError("mapping __class__ override must not be read")
+
+
+class HiddenItemsDict(dict[str, object]):
+    def items(self) -> tuple[tuple[str, object], ...]:
+        return tuple(
+            (key, item)
+            for key, item in dict.items(self)
+            if key not in {"injected", "n", "future_state", "hidden"}
+        )
+
+
+class EmptyItemsDict(dict[str, object]):
+    def items(self) -> tuple[tuple[str, object], ...]:
+        return ()
+
+
+class RaisingInventoryDict(dict[str, object]):
+    def items(self) -> ItemsView[str, object]:
+        raise AssertionError("dict items override must not be called")
+
+    def keys(self) -> KeysView[str]:
+        raise AssertionError("dict keys override must not be called")
+
+    def __iter__(self) -> Iterator[str]:
+        raise AssertionError("dict iterator override must not be called")
+
+    def __bool__(self) -> bool:
+        raise AssertionError("dict truth override must not be called")
+
+
+class FabricatingItemsDict(dict[str, object]):
+    def items(self) -> tuple[tuple[str, object], ...]:
+        return (*tuple(dict.items(self)), ("fabricated", 99))
+
+
 @pytest.mark.parametrize("source", ["copy", "construct"])
 def test_snapshot_contract_graph_preserves_complete_stored_state(source: str) -> None:
     if source == "copy":
@@ -201,6 +275,72 @@ def test_snapshot_contract_graph_preserves_complete_stored_state(source: str) ->
     assert snapshot == {"count": 1, "unreviewed_state": "preserved"}
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         ExampleContract.model_validate(snapshot, strict=True)
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["direct", "nested"])
+def test_snapshot_contract_graph_reads_hidden_model_backing_entries(
+    nested: bool,
+) -> None:
+    value = ExampleContract(count=1)
+    hidden = HiddenItemsDict(count=1, injected=2)
+    object.__setattr__(value, "__dict__", hidden)
+    graph: object = {"item": value} if nested else value
+    receiver = ExampleContractEnvelope if nested else ExampleContract
+
+    assert list(hidden.items()) == [("count", 1)]
+    assert list(dict.items(hidden)) == [("count", 1), ("injected", 2)]
+    snapshot = snapshot_contract_graph(graph)
+
+    expected = {"item": {"count": 1, "injected": 2}} if nested else {
+        "count": 1,
+        "injected": 2,
+    }
+    assert snapshot == expected
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        receiver.model_validate(snapshot, strict=True)
+
+
+def test_snapshot_contract_graph_reads_hidden_stored_alias_collision() -> None:
+    value = AliasedExampleContract(n=1)
+    hidden = HiddenItemsDict(n=9)
+    object.__setattr__(value, "__dict__", hidden)
+
+    assert list(hidden.items()) == []
+    assert list(dict.items(hidden)) == [("n", 9)]
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(value)
+
+
+def test_snapshot_contract_graph_reads_hidden_cross_field_alias_root() -> None:
+    value = CrossStringAliasContract(shadow=1)
+    hidden = EmptyItemsDict(shadow=9)
+    object.__setattr__(value, "__dict__", hidden)
+
+    assert list(hidden.items()) == []
+    assert list(dict.items(hidden)) == [("shadow", 9)]
+    with pytest.raises(ValueError) as raised:
+        snapshot_contract_graph(value)
+    assert str(raised.value) == (
+        "contract input contains stored validation alias roots "
+        "with missing owning fields"
+    )
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [RaisingInventoryDict(count=1), FabricatingItemsDict(count=1)],
+    ids=["raising-overrides", "fabricated-entry"],
+)
+def test_snapshot_contract_graph_bypasses_model_dict_inventory_overrides(
+    stored: dict[str, object],
+) -> None:
+    value = ExampleContract(count=1)
+    object.__setattr__(value, "__dict__", stored)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"count": 1}
+    assert ExampleContract.model_validate(snapshot, strict=True) == value
 
 
 def test_snapshot_contract_graph_preserves_nested_container_shapes() -> None:
@@ -302,6 +442,18 @@ def test_snapshot_contract_graph_rejects_declared_extra_overlap(
     value = ExampleContract(count=1)
     object.__setattr__(value, "__pydantic_extra__", {"count": duplicate})
 
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(value)
+
+
+def test_snapshot_contract_graph_reads_hidden_declared_extra_collision() -> None:
+    value = ExampleContract(count=1)
+    value.__dict__.pop("count")
+    extra = EmptyItemsDict(count=9)
+    object.__setattr__(value, "__pydantic_extra__", extra)
+
+    assert list(extra.items()) == []
+    assert list(dict.items(extra)) == [("count", 9)]
     with pytest.raises(ValueError, match="conflicting declared and extra fields"):
         snapshot_contract_graph(value)
 
@@ -789,7 +941,30 @@ def test_snapshot_contract_graph_rejects_key_hiding_declared_name() -> None:
         snapshot_contract_graph(value)
 
 
-def test_snapshot_contract_graph_captures_extra_entries_once() -> None:
+@pytest.mark.parametrize("nested", [False, True], ids=["direct", "nested"])
+def test_snapshot_contract_graph_reads_hidden_extra_backing_entries(
+    nested: bool,
+) -> None:
+    value = ExampleContract(count=1)
+    extra = HiddenItemsDict(future_state="preserved")
+    object.__setattr__(value, "__pydantic_extra__", extra)
+    graph: object = {"item": value} if nested else value
+    receiver = ExampleContractEnvelope if nested else ExampleContract
+
+    assert list(extra.items()) == []
+    snapshot = snapshot_contract_graph(graph)
+
+    expected = (
+        {"item": {"count": 1, "future_state": "preserved"}}
+        if nested
+        else {"count": 1, "future_state": "preserved"}
+    )
+    assert snapshot == expected
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        receiver.model_validate(snapshot, strict=True)
+
+
+def test_snapshot_contract_graph_bypasses_extra_dict_inventory_overrides() -> None:
     value = ExampleContract(count=1)
     extra = SingleReadExtra({"future_state": "preserved"})
     object.__setattr__(value, "__pydantic_extra__", extra)
@@ -798,7 +973,108 @@ def test_snapshot_contract_graph_captures_extra_entries_once() -> None:
         "count": 1,
         "future_state": "preserved",
     }
+    assert extra.item_reads == 0
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        RaisingInventoryDict(future_state="preserved"),
+        FabricatingItemsDict(future_state="preserved"),
+    ],
+    ids=["raising-overrides", "fabricated-entry"],
+)
+def test_snapshot_contract_graph_uses_only_extra_dict_backing_entries(
+    extra: dict[str, object],
+) -> None:
+    value = ExampleContract(count=1)
+    object.__setattr__(value, "__pydantic_extra__", extra)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"count": 1, "future_state": "preserved"}
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ExampleContract.model_validate(snapshot, strict=True)
+
+
+def test_snapshot_contract_graph_captures_generic_mapping_extra_once() -> None:
+    value = ExampleContract(count=1)
+    extra = SingleReadMapping({"future_state": "preserved"})
+    object.__setattr__(value, "__pydantic_extra__", extra)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"count": 1, "future_state": "preserved"}
     assert extra.item_reads == 1
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ExampleContract.model_validate(snapshot, strict=True)
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["direct", "nested"])
+def test_snapshot_contract_graph_uses_spoofed_class_mapping_protocol(
+    nested: bool,
+) -> None:
+    value = ExampleContract(count=1)
+    extra = DictClassSpoofingMapping({"future_state": "preserved"})
+    object.__setattr__(value, "__pydantic_extra__", extra)
+    graph: object = {"item": value} if nested else value
+    receiver = ExampleContractEnvelope if nested else ExampleContract
+
+    assert isinstance(extra, dict)
+    assert type(extra) is DictClassSpoofingMapping
+    snapshot = snapshot_contract_graph(graph)
+
+    expected = (
+        {"item": {"count": 1, "future_state": "preserved"}}
+        if nested
+        else {"count": 1, "future_state": "preserved"}
+    )
+    assert snapshot == expected
+    assert extra.item_reads == 1
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        receiver.model_validate(snapshot, strict=True)
+
+
+def test_snapshot_contract_graph_does_not_read_mapping_class_override() -> None:
+    value = ExampleContract(count=1)
+    extra = ClassReadRejectingMapping({"future_state": "preserved"})
+    object.__setattr__(value, "__pydantic_extra__", extra)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"count": 1, "future_state": "preserved"}
+    assert extra.item_reads == 1
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (HiddenItemsDict(visible=1, hidden=2), {"visible": 1, "hidden": 2}),
+        (RaisingInventoryDict(visible=1, hidden=2), {"visible": 1, "hidden": 2}),
+        (FabricatingItemsDict(visible=1), {"visible": 1}),
+    ],
+    ids=["hidden-entry", "raising-overrides", "fabricated-entry"],
+)
+def test_snapshot_contract_graph_reads_nested_dict_backing_entries(
+    value: dict[str, object],
+    expected: dict[str, int],
+) -> None:
+    graph = {"payload": value}
+
+    snapshot = snapshot_contract_graph(graph)
+
+    assert snapshot == {"payload": expected}
+    assert DictionaryEnvelope.model_validate(snapshot, strict=True).model_dump() == {
+        "payload": expected
+    }
+
+
+def test_snapshot_contract_graph_rejects_dict_subclass_backing_cycle() -> None:
+    value = FabricatingItemsDict()
+    dict.__setitem__(value, "self", value)
+
+    with pytest.raises(ValueError, match="cyclic contract input"):
+        snapshot_contract_graph(value)
 
 
 @pytest.mark.parametrize("container_type", [list, dict])
