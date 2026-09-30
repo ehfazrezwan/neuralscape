@@ -33,7 +33,8 @@ def _validated_model_extra_storage(value: BaseModel) -> Mapping[Any, Any]:
     if not isinstance(extra, Mapping):
         raise ValueError("contract model extra storage must be None or a mapping")
 
-    overlap = set(value.__dict__).intersection(extra)
+    declared_or_stored = set(type(value).model_fields) | set(value.__dict__)
+    overlap = declared_or_stored.intersection(extra)
     if overlap:
         names = ", ".join(sorted((repr(name) for name in overlap)))
         raise ValueError(
