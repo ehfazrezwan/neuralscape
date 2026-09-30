@@ -29,7 +29,11 @@ def _complete_contract_input(value: object, active_ids: set[int]) -> object:
         try:
             stored_values = dict(value.__dict__)
             extra_values = value.__pydantic_extra__
-            if extra_values:
+            if extra_values is not None:
+                if not isinstance(extra_values, Mapping):
+                    raise ValueError(
+                        "contract input extra storage must be a mapping"
+                    )
                 for key, item in extra_values.items():
                     if key in stored_values:
                         raise ValueError(

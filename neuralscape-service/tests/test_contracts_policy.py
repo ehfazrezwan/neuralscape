@@ -686,6 +686,75 @@ def test_evaluator_rejects_cyclic_input_predictably() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "malformed_extra",
+    [[], (), "", 0, False, ["retained_unknown"]],
+)
+@pytest.mark.parametrize("location", ["principal", "nested_reference"])
+def test_evaluator_rejects_malformed_extra_storage(
+    malformed_extra: object,
+    location: str,
+) -> None:
+    resource_value = reference("memory-1")
+    principal_value = principal()
+    evaluation_value = PolicyEvaluationInput(
+        schema_version=VERSION,
+        action="read",
+        resource=resource_value,
+    )
+    if location == "principal":
+        object.__setattr__(
+            principal_value,
+            "__pydantic_extra__",
+            malformed_extra,
+        )
+    else:
+        object.__setattr__(
+            evaluation_value.resource,
+            "__pydantic_extra__",
+            malformed_extra,
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="contract input extra storage must be a mapping",
+    ):
+        evaluate_policy(
+            principal=principal_value,
+            evaluation=evaluation_value,
+            policy=policy(
+                statement("read-grant", "allow", "read", resource_value),
+            ),
+        )
+
+
+@pytest.mark.parametrize("extra_storage", [None, {}])
+def test_evaluator_accepts_valid_empty_extra_storage(
+    extra_storage: object,
+) -> None:
+    resource_value = reference("memory-1")
+    principal_value = principal()
+    object.__setattr__(
+        principal_value,
+        "__pydantic_extra__",
+        extra_storage,
+    )
+
+    decision = evaluate_policy(
+        principal=principal_value,
+        evaluation=PolicyEvaluationInput(
+            schema_version=VERSION,
+            action="read",
+            resource=resource_value,
+        ),
+        policy=policy(
+            statement("read-grant", "allow", "read", resource_value),
+        ),
+    )
+
+    assert (decision.outcome, decision.reason_code) == ("allow", "explicit_grant")
+
+
 @pytest.mark.parametrize("input_graph", ["principal", "evaluation", "policy"])
 def test_evaluator_revalidates_nested_references_in_every_input_graph(
     input_graph: str,
@@ -798,6 +867,36 @@ def test_receiving_boundary_rejects_undeclared_decision_copy_field() -> None:
 def test_receiving_boundary_rejects_malformed_scalar_argument() -> None:
     with pytest.raises(ValidationError):
         validate_policy_decision("not-a-decision")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "malformed_extra",
+    [[], (), "", 0, False, ["retained_unknown"]],
+)
+def test_receiving_boundary_rejects_malformed_extra_storage(
+    malformed_extra: object,
+) -> None:
+    decision = PolicyDecision(**decision_payload())
+    object.__setattr__(decision, "__pydantic_extra__", malformed_extra)
+
+    with pytest.raises(
+        ValueError,
+        match="contract input extra storage must be a mapping",
+    ):
+        validate_policy_decision(decision)
+
+
+@pytest.mark.parametrize("extra_storage", [None, {}])
+def test_receiving_boundary_accepts_valid_empty_extra_storage(
+    extra_storage: object,
+) -> None:
+    decision = PolicyDecision(**decision_payload())
+    object.__setattr__(decision, "__pydantic_extra__", extra_storage)
+
+    received = validate_policy_decision(decision)
+
+    assert received.model_dump(mode="python") == decision.model_dump(mode="python")
+    assert received is not decision
 
 
 def test_receiving_boundary_revalidates_nested_reference_copy() -> None:
