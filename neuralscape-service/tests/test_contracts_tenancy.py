@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from copy import deepcopy
+from types import MappingProxyType
 
 import pytest
 from pydantic import ValidationError
@@ -18,6 +20,135 @@ from contracts_tenancy import (
 
 
 VERSION = "candidate-v1"
+
+
+class InconsistentExtraMapping(Mapping[object, object]):
+    """Expose entries through items while hiding them from normal iteration."""
+
+    def __init__(self, entries: dict[object, object]) -> None:
+        self._entries = tuple(entries.items())
+
+    def __getitem__(self, key: object) -> object:
+        return dict(self._entries)[key]
+
+    def __iter__(self):
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+    def items(self):
+        return self._entries
+
+
+class ChangingItemsMapping(Mapping[object, object]):
+    """Return one entry snapshot first and a different one thereafter."""
+
+    def __init__(
+        self,
+        first: tuple[tuple[object, object], ...],
+        later: tuple[tuple[object, object], ...],
+    ) -> None:
+        self._first = first
+        self._later = later
+        self.calls = 0
+
+    def __getitem__(self, key: object) -> object:
+        raise KeyError(key)
+
+    def __iter__(self):
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+    def items(self):
+        self.calls += 1
+        return self._first if self.calls == 1 else self._later
+
+
+class FalseyEntries(dict[object, object]):
+    def __bool__(self) -> bool:
+        return False
+
+
+class InverseItemsMapping(dict[object, object]):
+    """Expose iterated keys while hiding every entry from items()."""
+
+    def __init__(self, entries: dict[object, object]) -> None:
+        super().__init__(entries)
+        self.iteration_calls = 0
+        self.items_calls = 0
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        return super().__iter__()
+
+    def items(self):
+        self.items_calls += 1
+        return ()
+
+
+class ObservedLengthMapping(Mapping[object, object]):
+    """Expose only a configured length, with counters for every observed view."""
+
+    def __init__(self, observed_length: int) -> None:
+        self.observed_length = observed_length
+        self.length_calls = 0
+        self.iteration_calls = 0
+        self.items_calls = 0
+        self.boolean_calls = 0
+
+    def __getitem__(self, key: object) -> object:
+        raise KeyError(key)
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        return iter(())
+
+    def __len__(self) -> int:
+        self.length_calls += 1
+        return self.observed_length
+
+    def items(self):
+        self.items_calls += 1
+        return ()
+
+
+class FalseBooleanLengthMapping(ObservedLengthMapping):
+    def __bool__(self) -> bool:
+        self.boolean_calls += 1
+        return False
+
+
+class TrueBooleanEmptyMapping(ObservedLengthMapping):
+    def __bool__(self) -> bool:
+        self.boolean_calls += 1
+        return True
+
+
+class DefaultItemsLengthProbe(Mapping[object, object]):
+    """Instrument the standard Mapping.items() view and its source mapping."""
+
+    def __init__(self) -> None:
+        self.length_calls = 0
+        self.iteration_calls = 0
+        self.items_calls = 0
+
+    def __getitem__(self, key: object) -> object:
+        raise KeyError(key)
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        return iter(())
+
+    def __len__(self) -> int:
+        self.length_calls += 1
+        return 0
+
+    def items(self):
+        self.items_calls += 1
+        return super().items()
 
 
 def manifest(
@@ -396,7 +527,11 @@ def test_transition_rejects_each_malformed_extra_storage_representation(
         validate_operation_transition(previous, current)
 
 
-@pytest.mark.parametrize("extra_storage", [None, {}], ids=["none", "empty-mapping"])
+@pytest.mark.parametrize(
+    "extra_storage",
+    [None, {}, MappingProxyType({})],
+    ids=["none", "empty-dict", "empty-custom-mapping"],
+)
 def test_transition_accepts_absent_or_empty_mapping_extra_storage(
     extra_storage: object,
 ) -> None:
@@ -423,6 +558,214 @@ def test_transition_rejects_nonempty_mapping_extra_storage(
 
     with pytest.raises(ValueError, match="undeclared fields"):
         validate_operation_transition(previous, current)
+
+
+@pytest.mark.parametrize("location", ["direct", "nested"])
+@pytest.mark.parametrize(
+    "extra_kind",
+    ["unknown", "declared"],
+    ids=["unknown", "declared"],
+)
+def test_transition_rejects_entries_hidden_from_mapping_iteration(
+    location: str,
+    extra_kind: str,
+) -> None:
+    previous = operation()
+    current = operation(observed_state="running")
+    target = current if location == "direct" else current.resource_manifests[0]
+    stored_extra = (
+        {"future_constraint": "reject"}
+        if extra_kind == "unknown"
+        else {"tenant_id": "tenant-a"}
+    )
+    object.__setattr__(
+        target,
+        "__pydantic_extra__",
+        InconsistentExtraMapping(stored_extra),
+    )
+
+    with pytest.raises(ValueError, match="undeclared fields"):
+        validate_operation_transition(previous, current)
+
+
+@pytest.mark.parametrize(
+    "stored_extra",
+    [{"future_constraint": "reject"}, {"tenant_id": "tenant-a"}],
+    ids=["unknown", "declared"],
+)
+def test_transition_rejects_populated_falsey_extra_storage(
+    stored_extra: dict[object, object],
+) -> None:
+    previous = operation(resource_manifests=[])
+    current = operation(observed_state="running", resource_manifests=[])
+    object.__setattr__(current, "__pydantic_extra__", FalseyEntries(stored_extra))
+
+    with pytest.raises(ValueError, match="undeclared fields"):
+        validate_operation_transition(previous, current)
+
+
+def test_transition_consumes_one_stable_extra_entry_snapshot() -> None:
+    previous = operation(resource_manifests=[])
+    current = operation(observed_state="running", resource_manifests=[])
+    populated_first = ChangingItemsMapping(
+        (("future_constraint", "reject"),),
+        (),
+    )
+    object.__setattr__(current, "__pydantic_extra__", populated_first)
+
+    with pytest.raises(ValueError, match="undeclared fields"):
+        validate_operation_transition(previous, current)
+    assert populated_first.calls == 1
+
+    current = operation(observed_state="running", resource_manifests=[])
+    empty_first = ChangingItemsMapping(
+        (),
+        (("future_constraint", "reject"),),
+    )
+    object.__setattr__(current, "__pydantic_extra__", empty_first)
+
+    result = validate_operation_transition(previous, current)
+
+    assert result.observed_state == "running"
+    assert empty_first.calls == 1
+
+
+@pytest.mark.parametrize("boundary", ["transition", "placement"])
+@pytest.mark.parametrize("location", ["direct", "nested"])
+def test_tenancy_boundaries_reject_iteration_visible_items_empty_extras(
+    boundary: str,
+    location: str,
+) -> None:
+    extras = InverseItemsMapping({"future_constraint": "reject"})
+    if boundary == "transition":
+        previous = operation()
+        candidate = operation(observed_state="running")
+        target = (
+            candidate
+            if location == "direct"
+            else candidate.resource_manifests[0]
+        )
+        object.__setattr__(target, "__pydantic_extra__", extras)
+
+        with pytest.raises(ValueError, match="undeclared fields"):
+            validate_operation_transition(previous, candidate)
+    else:
+        candidate = TenantPlacement.model_validate_json(
+            json.dumps(
+                {
+                    "schema_version": VERSION,
+                    "tenant_id": "tenant-a",
+                    "generation": 7,
+                    "resource_manifests": [manifest()],
+                }
+            )
+        )
+        target = (
+            candidate
+            if location == "direct"
+            else candidate.resource_manifests[0]
+        )
+        object.__setattr__(target, "__pydantic_extra__", extras)
+
+        with pytest.raises(ValueError, match="undeclared fields"):
+            validate_placement_publication(
+                candidate,
+                expected_tenant_id="tenant-a",
+                current_generation=7,
+            )
+
+    assert extras.iteration_calls == 1
+    assert extras.items_calls == 1
+
+
+@pytest.mark.parametrize("boundary", ["transition", "placement"])
+@pytest.mark.parametrize("location", ["direct", "nested"])
+@pytest.mark.parametrize(
+    ("case", "should_reject"),
+    [
+        ("length-one", True),
+        ("length-one-false-bool", True),
+        ("length-zero-true-bool", False),
+    ],
+)
+def test_tenancy_boundaries_use_length_without_mapping_truthiness(
+    boundary: str,
+    location: str,
+    case: str,
+    should_reject: bool,
+) -> None:
+    if case == "length-one":
+        extras = ObservedLengthMapping(1)
+    elif case == "length-one-false-bool":
+        extras = FalseBooleanLengthMapping(1)
+    else:
+        extras = TrueBooleanEmptyMapping(0)
+
+    if boundary == "transition":
+        previous = operation()
+        candidate = operation(observed_state="running")
+        target = (
+            candidate
+            if location == "direct"
+            else candidate.resource_manifests[0]
+        )
+        object.__setattr__(target, "__pydantic_extra__", extras)
+
+        def validate_transition() -> object:
+            return validate_operation_transition(previous, candidate)
+
+        validate = validate_transition
+    else:
+        candidate = TenantPlacement.model_validate_json(
+            json.dumps(
+                {
+                    "schema_version": VERSION,
+                    "tenant_id": "tenant-a",
+                    "generation": 7,
+                    "resource_manifests": [manifest()],
+                }
+            )
+        )
+        target = (
+            candidate
+            if location == "direct"
+            else candidate.resource_manifests[0]
+        )
+        object.__setattr__(target, "__pydantic_extra__", extras)
+
+        def validate_placement() -> object:
+            return validate_placement_publication(
+                candidate,
+                expected_tenant_id="tenant-a",
+                current_generation=7,
+            )
+
+        validate = validate_placement
+
+    if should_reject:
+        with pytest.raises(ValueError, match="undeclared fields"):
+            validate()
+    else:
+        validate()
+
+    assert extras.length_calls == 1
+    assert extras.iteration_calls == 1
+    assert extras.items_calls == 1
+    assert extras.boolean_calls == 0
+
+
+def test_transition_default_items_view_does_not_repeat_length_hint() -> None:
+    previous = operation(resource_manifests=[])
+    current = operation(observed_state="running", resource_manifests=[])
+    extras = DefaultItemsLengthProbe()
+    object.__setattr__(current, "__pydantic_extra__", extras)
+
+    result = validate_operation_transition(previous, current)
+
+    assert result.observed_state == "running"
+    assert extras.length_calls == 1
+    assert extras.iteration_calls == 2
+    assert extras.items_calls == 1
 
 
 def test_transition_rejects_malformed_nested_extra_storage() -> None:

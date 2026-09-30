@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
+from types import MappingProxyType
 
 import pytest
 from pydantic import ValidationError
@@ -18,6 +20,135 @@ from contracts_readiness import (
 
 VERSION = "candidate-v1"
 OBSERVED_AT = datetime(2026, 9, 28, 0, 0, tzinfo=timezone.utc)
+
+
+class InconsistentExtraMapping(Mapping[object, object]):
+    """Expose entries through items while hiding them from normal iteration."""
+
+    def __init__(self, entries: dict[object, object]) -> None:
+        self._entries = tuple(entries.items())
+
+    def __getitem__(self, key: object) -> object:
+        return dict(self._entries)[key]
+
+    def __iter__(self):
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+    def items(self):
+        return self._entries
+
+
+class ChangingItemsMapping(Mapping[object, object]):
+    """Return one entry snapshot first and a different one thereafter."""
+
+    def __init__(
+        self,
+        first: tuple[tuple[object, object], ...],
+        later: tuple[tuple[object, object], ...],
+    ) -> None:
+        self._first = first
+        self._later = later
+        self.calls = 0
+
+    def __getitem__(self, key: object) -> object:
+        raise KeyError(key)
+
+    def __iter__(self):
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+    def items(self):
+        self.calls += 1
+        return self._first if self.calls == 1 else self._later
+
+
+class FalseyEntries(dict[object, object]):
+    def __bool__(self) -> bool:
+        return False
+
+
+class InverseItemsMapping(dict[object, object]):
+    """Expose iterated keys while hiding every entry from items()."""
+
+    def __init__(self, entries: dict[object, object]) -> None:
+        super().__init__(entries)
+        self.iteration_calls = 0
+        self.items_calls = 0
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        return super().__iter__()
+
+    def items(self):
+        self.items_calls += 1
+        return ()
+
+
+class ObservedLengthMapping(Mapping[object, object]):
+    """Expose only a configured length, with counters for every observed view."""
+
+    def __init__(self, observed_length: int) -> None:
+        self.observed_length = observed_length
+        self.length_calls = 0
+        self.iteration_calls = 0
+        self.items_calls = 0
+        self.boolean_calls = 0
+
+    def __getitem__(self, key: object) -> object:
+        raise KeyError(key)
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        return iter(())
+
+    def __len__(self) -> int:
+        self.length_calls += 1
+        return self.observed_length
+
+    def items(self):
+        self.items_calls += 1
+        return ()
+
+
+class FalseBooleanLengthMapping(ObservedLengthMapping):
+    def __bool__(self) -> bool:
+        self.boolean_calls += 1
+        return False
+
+
+class TrueBooleanEmptyMapping(ObservedLengthMapping):
+    def __bool__(self) -> bool:
+        self.boolean_calls += 1
+        return True
+
+
+class DefaultItemsLengthProbe(Mapping[object, object]):
+    """Instrument the standard Mapping.items() view and its source mapping."""
+
+    def __init__(self) -> None:
+        self.length_calls = 0
+        self.iteration_calls = 0
+        self.items_calls = 0
+
+    def __getitem__(self, key: object) -> object:
+        raise KeyError(key)
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        return iter(())
+
+    def __len__(self) -> int:
+        self.length_calls += 1
+        return 0
+
+    def items(self):
+        self.items_calls += 1
+        return super().items()
 
 
 def observation(
@@ -289,7 +420,11 @@ def test_publication_rejects_each_malformed_extra_storage_representation(
         )
 
 
-@pytest.mark.parametrize("extra_storage", [None, {}], ids=["none", "empty-mapping"])
+@pytest.mark.parametrize(
+    "extra_storage",
+    [None, {}, MappingProxyType({})],
+    ids=["none", "empty-dict", "empty-custom-mapping"],
+)
 def test_publication_accepts_absent_or_empty_mapping_extra_storage(
     extra_storage: object,
 ) -> None:
@@ -322,6 +457,209 @@ def test_publication_rejects_nonempty_mapping_extra_storage(
             expected_tenant_id="tenant-a",
             current_placement_generation=12,
         )
+
+
+@pytest.mark.parametrize("location", ["direct", "nested"])
+@pytest.mark.parametrize(
+    "extra_kind",
+    ["unknown", "declared"],
+    ids=["unknown", "declared"],
+)
+def test_publication_rejects_entries_hidden_from_mapping_iteration(
+    location: str,
+    extra_kind: str,
+) -> None:
+    report = publication()
+    target = report if location == "direct" else report.capabilities[0]
+    declared_extra = (
+        {"tenant_id": "tenant-a"}
+        if location == "direct"
+        else {"status": "healthy"}
+    )
+    stored_extra = (
+        {"future_constraint": "reject"}
+        if extra_kind == "unknown"
+        else declared_extra
+    )
+    object.__setattr__(
+        target,
+        "__pydantic_extra__",
+        InconsistentExtraMapping(stored_extra),
+    )
+
+    with pytest.raises(ValueError, match="undeclared fields"):
+        validate_readiness_publication(
+            report,
+            expected_tenant_id="tenant-a",
+            current_placement_generation=12,
+        )
+
+
+@pytest.mark.parametrize(
+    "stored_extra",
+    [{"future_constraint": "reject"}, {"tenant_id": "tenant-a"}],
+    ids=["unknown", "declared"],
+)
+def test_publication_rejects_populated_falsey_extra_storage(
+    stored_extra: dict[object, object],
+) -> None:
+    report = publication()
+    object.__setattr__(report, "__pydantic_extra__", FalseyEntries(stored_extra))
+
+    with pytest.raises(ValueError, match="undeclared fields"):
+        validate_readiness_publication(
+            report,
+            expected_tenant_id="tenant-a",
+            current_placement_generation=12,
+        )
+
+
+def test_publication_consumes_one_stable_extra_entry_snapshot() -> None:
+    report = publication()
+    populated_first = ChangingItemsMapping(
+        (("future_constraint", "reject"),),
+        (),
+    )
+    object.__setattr__(report, "__pydantic_extra__", populated_first)
+
+    with pytest.raises(ValueError, match="undeclared fields"):
+        validate_readiness_publication(
+            report,
+            expected_tenant_id="tenant-a",
+            current_placement_generation=12,
+        )
+    assert populated_first.calls == 1
+
+    report = publication()
+    empty_first = ChangingItemsMapping(
+        (),
+        (("future_constraint", "reject"),),
+    )
+    object.__setattr__(report, "__pydantic_extra__", empty_first)
+
+    result = validate_readiness_publication(
+        report,
+        expected_tenant_id="tenant-a",
+        current_placement_generation=12,
+    )
+
+    assert result.tenant_id == "tenant-a"
+    assert empty_first.calls == 1
+
+
+@pytest.mark.parametrize(
+    ("boundary", "location"),
+    [
+        ("publication", "direct"),
+        ("publication", "nested"),
+        ("capability", "direct"),
+    ],
+)
+def test_readiness_boundaries_reject_iteration_visible_items_empty_extras(
+    boundary: str,
+    location: str,
+) -> None:
+    extras = InverseItemsMapping({"future_constraint": "reject"})
+    if boundary == "publication":
+        report = publication()
+        target = report if location == "direct" else report.capabilities[0]
+        object.__setattr__(target, "__pydantic_extra__", extras)
+
+        with pytest.raises(ValueError, match="undeclared fields"):
+            validate_readiness_publication(
+                report,
+                expected_tenant_id="tenant-a",
+                current_placement_generation=12,
+            )
+    else:
+        item = observation()
+        object.__setattr__(item, "__pydantic_extra__", extras)
+
+        with pytest.raises(ValueError, match="undeclared fields"):
+            evaluate(item)
+
+    assert extras.iteration_calls == 1
+    assert extras.items_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("boundary", "location"),
+    [
+        ("publication", "direct"),
+        ("publication", "nested"),
+        ("capability", "direct"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("case", "should_reject"),
+    [
+        ("length-one", True),
+        ("length-one-false-bool", True),
+        ("length-zero-true-bool", False),
+    ],
+)
+def test_readiness_boundaries_use_length_without_mapping_truthiness(
+    boundary: str,
+    location: str,
+    case: str,
+    should_reject: bool,
+) -> None:
+    if case == "length-one":
+        extras = ObservedLengthMapping(1)
+    elif case == "length-one-false-bool":
+        extras = FalseBooleanLengthMapping(1)
+    else:
+        extras = TrueBooleanEmptyMapping(0)
+
+    if boundary == "publication":
+        report = publication()
+        target = report if location == "direct" else report.capabilities[0]
+        object.__setattr__(target, "__pydantic_extra__", extras)
+
+        def validate_publication() -> object:
+            return validate_readiness_publication(
+                report,
+                expected_tenant_id="tenant-a",
+                current_placement_generation=12,
+            )
+
+        validate = validate_publication
+    else:
+        item = observation()
+        object.__setattr__(item, "__pydantic_extra__", extras)
+
+        def validate_capability() -> object:
+            return evaluate(item)
+
+        validate = validate_capability
+
+    if should_reject:
+        with pytest.raises(ValueError, match="undeclared fields"):
+            validate()
+    else:
+        validate()
+
+    assert extras.length_calls == 1
+    assert extras.iteration_calls == 1
+    assert extras.items_calls == 1
+    assert extras.boolean_calls == 0
+
+
+def test_publication_default_items_view_does_not_repeat_length_hint() -> None:
+    report = publication()
+    extras = DefaultItemsLengthProbe()
+    object.__setattr__(report, "__pydantic_extra__", extras)
+
+    result = validate_readiness_publication(
+        report,
+        expected_tenant_id="tenant-a",
+        current_placement_generation=12,
+    )
+
+    assert result.tenant_id == "tenant-a"
+    assert extras.length_calls == 1
+    assert extras.iteration_calls == 2
+    assert extras.items_calls == 1
 
 
 def test_publication_rejects_malformed_nested_extra_storage() -> None:
