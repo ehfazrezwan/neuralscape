@@ -197,10 +197,8 @@ jobs:
     env:
       SNAPSHOT_COMPOSE_FILE: docker-compose.snapshot-test.yml
       SNAPSHOT_COMPOSE_PROJECT: snapshot-${{ github.run_id }}-${{ github.run_attempt }}
-      SNAPSHOT_NEO4J_PASSWORD: snapshot-ci-${{ github.run_id }}-${{ github.run_attempt }}
       NEO4J_URI: neo4j://127.0.0.1:7687
       NEO4J_USER: neo4j
-      NEO4J_PASSWORD: snapshot-ci-${{ github.run_id }}-${{ github.run_attempt }}
       NEO4J_DATABASE: neo4j
     steps:
       - uses: actions/checkout@v4
@@ -217,6 +215,17 @@ jobs:
             echo "::error::checkout does not match the candidate SHA"
             exit 1
           fi
+      - name: Prepare disposable database credential
+        shell: bash
+        run: |
+          set -euo pipefail
+          credential=$(openssl rand -hex 32)
+          echo "::add-mask::$credential"
+          {
+            printf 'NEO4J_AUTH=neo4j/%s\n' "$credential"
+            printf 'NEO4J_PASSWORD=%s\n' "$credential"
+          } >> "$GITHUB_ENV"
+          unset credential
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
@@ -251,7 +260,7 @@ jobs:
               --project-name "$SNAPSHOT_COMPOSE_PROJECT" \
               --file "$SNAPSHOT_COMPOSE_FILE" \
               exec -T neo4j cypher-shell \
-                -d neo4j -u neo4j -p "$SNAPSHOT_NEO4J_PASSWORD" \
+                -d neo4j -u neo4j -p "$NEO4J_PASSWORD" \
                 "CALL dbms.components() YIELD name, versions, edition RETURN name, versions, edition"
           } | tee artifacts/snapshot-neo4j/runtime-evidence.txt
       - name: Run native snapshot database qualification
