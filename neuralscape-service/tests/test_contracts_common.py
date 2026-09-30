@@ -614,8 +614,12 @@ def test_snapshot_contract_graph_rejects_cross_field_alias_root(
     stored_snapshot = dict(vars(corrupted))
 
     assert receiver.model_validate(stored_snapshot, strict=True)
-    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+    with pytest.raises(ValueError) as raised:
         snapshot_contract_graph(corrupted)
+    assert str(raised.value) == (
+        "contract input contains stored validation alias roots "
+        "with missing owning fields"
+    )
 
 
 @pytest.mark.parametrize("replacement", [1, 9], ids=["equal", "conflicting"])
@@ -664,8 +668,12 @@ def test_snapshot_contract_graph_rejects_nested_cross_field_alias_root(
     stored_snapshot = {"item": dict(vars(corrupted))}
 
     assert receiver.model_validate(stored_snapshot, strict=True)
-    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+    with pytest.raises(ValueError) as raised:
         snapshot_contract_graph({"item": corrupted})
+    assert str(raised.value) == (
+        "contract input contains stored validation alias roots "
+        "with missing owning fields"
+    )
 
 
 @pytest.mark.parametrize(
@@ -690,8 +698,26 @@ def test_snapshot_contract_graph_rejects_inherited_cross_field_alias_root(
     value.__dict__.pop(missing_field)
 
     assert CrossAliasDerivedContract.model_validate(dict(vars(value)), strict=True)
-    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+    with pytest.raises(ValueError) as raised:
         snapshot_contract_graph(value)
+    assert str(raised.value) == (
+        "contract input contains stored validation alias roots "
+        "with missing owning fields"
+    )
+
+
+def test_snapshot_contract_graph_preserves_existing_alias_conflict_messages() -> None:
+    unknown_stored = AliasedExampleContract(n=1).model_copy(update={"n": 9})
+    unknown_stored.__dict__.pop("count")
+    extra_conflict = ExampleContract(count=1)
+    object.__setattr__(extra_conflict, "__pydantic_extra__", {"count": 2})
+
+    for value in (unknown_stored, extra_conflict):
+        with pytest.raises(ValueError) as raised:
+            snapshot_contract_graph(value)
+        assert str(raised.value) == (
+            "contract input contains conflicting declared and extra fields"
+        )
 
 
 @pytest.mark.parametrize(

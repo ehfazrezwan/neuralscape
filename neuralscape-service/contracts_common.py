@@ -106,9 +106,14 @@ def snapshot_contract_graph(
                 for root in stored_names & alias_roots
                 if alias_owners[root] - stored_names
             }
-            if unknown_stored_names & alias_roots or missing_owner_roots:
+            if unknown_stored_names & alias_roots:
                 raise ValueError(
                     "contract input contains conflicting declared and extra fields"
+                )
+            if missing_owner_roots:
+                raise ValueError(
+                    "contract input contains stored validation alias roots "
+                    "with missing owning fields"
                 )
             fields = {
                 key: snapshot_contract_graph(item, active_containers)
