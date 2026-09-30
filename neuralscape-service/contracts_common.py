@@ -75,7 +75,8 @@ def snapshot_contract_graph(
             if extra is not None:
                 if not isinstance(extra, Mapping):
                     raise ValueError("contract extra storage must be a mapping")
-                if fields.keys() & extra.keys():
+                declared_fields = type(value).model_fields.keys()
+                if (fields.keys() | declared_fields) & extra.keys():
                     raise ValueError(
                         "contract input contains conflicting declared and extra fields"
                     )

@@ -27,6 +27,10 @@ class ExampleContract(ContractModel):
     count: SafeCounter
 
 
+class DefaultedExampleContract(ContractModel):
+    count: SafeCounter = 7
+
+
 class NestedExampleContract(ContractModel):
     identifier: OpaqueId
     count: SafeCounter
@@ -102,12 +106,86 @@ def test_snapshot_contract_graph_rejects_malformed_extra_storage(
         snapshot_contract_graph(value)
 
 
-def test_snapshot_contract_graph_rejects_declared_extra_overlap() -> None:
+def test_snapshot_contract_graph_rejects_moved_required_field() -> None:
     value = ExampleContract(count=1)
-    object.__setattr__(value, "__pydantic_extra__", {"count": 2})
+    value.__dict__.pop("count")
+    object.__setattr__(value, "__pydantic_extra__", {"count": 1})
 
     with pytest.raises(ValueError, match="conflicting declared and extra fields"):
         snapshot_contract_graph(value)
+
+
+def test_snapshot_contract_graph_preserves_normal_missing_required_behavior() -> None:
+    value = ExampleContract(count=1)
+    value.__dict__.pop("count")
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {}
+    with pytest.raises(ValidationError, match="Field required"):
+        ExampleContract.model_validate(snapshot, strict=True)
+
+
+def test_snapshot_contract_graph_preserves_normal_missing_default_behavior() -> None:
+    value = DefaultedExampleContract()
+    value.__dict__.pop("count")
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {}
+    assert DefaultedExampleContract.model_validate(snapshot, strict=True).count == 7
+
+
+def test_snapshot_contract_graph_rejects_default_field_moved_to_extras() -> None:
+    value = DefaultedExampleContract()
+    value.__dict__.pop("count")
+    object.__setattr__(value, "__pydantic_extra__", {"count": 9})
+
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(value)
+
+
+def test_snapshot_contract_graph_rejects_subclass_field_moved_to_extras() -> None:
+    value = DerivedNestedExampleContract(
+        identifier="item-1",
+        count=1,
+        category="derived",
+    )
+    value.__dict__.pop("category")
+    object.__setattr__(value, "__pydantic_extra__", {"category": "derived"})
+
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(value)
+
+
+@pytest.mark.parametrize("duplicate", [1, 2], ids=["equal", "conflicting"])
+def test_snapshot_contract_graph_rejects_declared_extra_overlap(
+    duplicate: int,
+) -> None:
+    value = ExampleContract(count=1)
+    object.__setattr__(value, "__pydantic_extra__", {"count": duplicate})
+
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(value)
+
+
+def test_snapshot_contract_graph_rejects_duplicate_unknown_stored_name() -> None:
+    value = ExampleContract(count=1).model_copy(update={"future_state": "stored"})
+    object.__setattr__(value, "__pydantic_extra__", {"future_state": "extra"})
+
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(value)
+
+
+def test_snapshot_contract_graph_preserves_nonconflicting_unknown_extra() -> None:
+    value = ExampleContract(count=1)
+    object.__setattr__(value, "__pydantic_extra__", {"future_state": "preserved"})
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"count": 1, "future_state": "preserved"}
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ExampleContract.model_validate(snapshot, strict=True)
 
 
 @pytest.mark.parametrize("container_type", [list, dict])
