@@ -2,6 +2,7 @@
 
 import copy
 import json
+from collections.abc import ItemsView, Iterator, Mapping
 from itertools import permutations
 from types import MappingProxyType
 
@@ -94,6 +95,52 @@ def _event(**updates: object) -> UsageEvent:
     }
     values.update(updates)
     return UsageEvent(**values)
+
+
+class _SplitViewExtras(Mapping[str, object]):
+    """Expose entries through items while hiding them from iteration/truthiness."""
+
+    def __init__(self, entries: dict[str, object]) -> None:
+        self._entries = entries
+
+    def __getitem__(self, key: str) -> object:
+        return self._entries[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+    def items(self) -> ItemsView[str, object]:
+        return self._entries.items()
+
+
+class _ChangingItemsExtras(Mapping[str, object]):
+    """Return a different items view after the first captured snapshot."""
+
+    def __init__(self) -> None:
+        self.items_calls = 0
+
+    def __getitem__(self, key: str) -> object:
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+    def items(self) -> ItemsView[str, object]:
+        self.items_calls += 1
+        if self.items_calls == 1:
+            return {}.items()
+        return {"tenant_id": "shadow-tenant"}.items()
+
+
+class _FalseyPopulatedExtras(dict[str, object]):
+    def __bool__(self) -> bool:
+        return False
 
 
 def _error_code(events: list[UsageEvent]) -> str:
@@ -481,6 +528,63 @@ def test_reconciliation_rejects_mapping_event_extra_storage(
     assert _error_code([event]) == "invalid_event"
 
 
+def test_reconciliation_rejects_split_view_declared_extra_storage() -> None:
+    event = _event(tenant_id="wrong-tenant")
+    object.__setattr__(
+        event,
+        "__pydantic_extra__",
+        _SplitViewExtras({"tenant_id": "tenant-1"}),
+    )
+
+    _assert_canonical_invalid_event(event)
+
+
+def test_reconciliation_retains_split_view_unknown_extra_for_rejection() -> None:
+    event = _event()
+    object.__setattr__(
+        event,
+        "__pydantic_extra__",
+        _SplitViewExtras({"authority": True}),
+    )
+
+    _assert_canonical_invalid_event(event)
+
+
+def test_reconciliation_uses_one_stable_extra_items_snapshot() -> None:
+    event = _event()
+    extras = _ChangingItemsExtras()
+    object.__setattr__(event, "__pydantic_extra__", extras)
+
+    result = reconcile_usage_events([event])
+
+    assert extras.items_calls == 1
+    assert result.streams[0].tenant_id == "tenant-1"
+
+
+def test_reconciliation_rejects_falsey_populated_extra_storage() -> None:
+    event = _event()
+    object.__setattr__(
+        event,
+        "__pydantic_extra__",
+        _FalseyPopulatedExtras({"authority": True}),
+    )
+
+    _assert_canonical_invalid_event(event)
+
+
+def test_reconciliation_accepts_genuinely_empty_split_view_mapping() -> None:
+    event = _event()
+    object.__setattr__(
+        event,
+        "__pydantic_extra__",
+        _SplitViewExtras({}),
+    )
+
+    result = reconcile_usage_events([event])
+
+    assert result.streams[0].head_event_id == "event-1"
+
+
 @pytest.mark.parametrize(
     ("target_name", "field_name"),
     [
@@ -596,6 +700,18 @@ def test_reconciliation_rejects_nested_quantity_extra_storage(
     )
 
     assert _error_code([event]) == "invalid_event"
+
+
+def test_reconciliation_rejects_nested_split_view_declared_extra_storage() -> None:
+    event = _event()
+    assert event.usage is not None
+    object.__setattr__(
+        event.usage.input_tokens,
+        "__pydantic_extra__",
+        _SplitViewExtras({"value": 99}),
+    )
+
+    _assert_canonical_invalid_event(event)
 
 
 def test_reconciliation_rejects_cyclic_mutated_input_graph() -> None:
