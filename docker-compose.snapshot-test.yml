@@ -3,7 +3,7 @@ services:
     image: neo4j:5-community
     environment:
       - NEO4J_AUTH
-      - NEO4J_PASSWORD
+      - NS_DB_PASSWORD
       - NEO4J_initial_dbms_default__database=neo4j
     ports:
       - "127.0.0.1:7687:7687"
@@ -14,7 +14,7 @@ services:
         - CMD-SHELL
         - >-
           cypher-shell -a bolt://127.0.0.1:7687 -d neo4j -u neo4j
-          -p "$${NEO4J_PASSWORD}" "RETURN 1"
+          -p "$${NS_DB_PASSWORD}" "RETURN 1"
       interval: 5s
       timeout: 5s
       retries: 20

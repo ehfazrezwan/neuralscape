@@ -224,6 +224,7 @@ jobs:
           {
             printf 'NEO4J_AUTH=neo4j/%s\n' "$credential"
             printf 'NEO4J_PASSWORD=%s\n' "$credential"
+            printf 'NS_DB_PASSWORD=%s\n' "$credential"
           } >> "$GITHUB_ENV"
           unset credential
       - uses: astral-sh/setup-uv@v7
@@ -237,6 +238,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          : "${NEO4J_AUTH:?missing disposable database auth}"
+          : "${NEO4J_PASSWORD:?missing client database credential}"
+          : "${NS_DB_PASSWORD:?missing healthcheck database credential}"
           docker compose \
             --project-name "$SNAPSHOT_COMPOSE_PROJECT" \
             --file "$SNAPSHOT_COMPOSE_FILE" \
