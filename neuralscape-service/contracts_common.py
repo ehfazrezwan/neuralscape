@@ -94,9 +94,18 @@ def snapshot_contract_graph(
     active_containers.add(value_id)
     try:
         if isinstance(value, BaseModel):
+            model_type = type(value)
+            stored_entries = tuple(vars(value).items())
+            declared_names = set(model_type.model_fields)
+            alias_roots = _validation_alias_roots(model_type)
+            unknown_stored_names = {key for key, _ in stored_entries} - declared_names
+            if unknown_stored_names & alias_roots:
+                raise ValueError(
+                    "contract input contains conflicting declared and extra fields"
+                )
             fields = {
                 key: snapshot_contract_graph(item, active_containers)
-                for key, item in vars(value).items()
+                for key, item in stored_entries
             }
             extra = getattr(value, "__pydantic_extra__", None)
             if extra is not None:
@@ -104,11 +113,10 @@ def snapshot_contract_graph(
                     raise ValueError("contract extra storage must be a mapping")
                 extra_entries = tuple(extra.items())
                 extra_keys = {key for key, _ in extra_entries}
-                model_type = type(value)
                 reserved_names = (
                     fields.keys()
-                    | model_type.model_fields.keys()
-                    | _validation_alias_roots(model_type)
+                    | declared_names
+                    | alias_roots
                 )
                 if reserved_names & extra_keys:
                     raise ValueError(

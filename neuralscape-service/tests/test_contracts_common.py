@@ -57,6 +57,10 @@ class PathAliasedExampleContract(ContractModel):
     count: SafeCounter = Field(validation_alias=AliasPath("payload", "count"))
 
 
+class AliasedExampleEnvelope(ContractModel):
+    item: AliasedExampleContract
+
+
 class SerializationAliasedExampleContract(ContractModel):
     count: SafeCounter = Field(serialization_alias="n")
 
@@ -369,6 +373,134 @@ def test_snapshot_contract_graph_preserves_name_only_field_input() -> None:
         snapshot,
         strict=True,
     ) == NameOnlyAliasedExampleContract(count=1)
+
+
+@pytest.mark.parametrize(
+    ("value", "field_name", "stored_name", "stored_value"),
+    [
+        (AliasedExampleContract(n=1), "count", "n", 1),
+        (AliasedExampleContract(n=1), "count", "n", 9),
+        (ChoiceAliasedExampleContract(n=1), "count", "number", 9),
+        (
+            ChoiceAliasedExampleContract(n=1),
+            "count",
+            "payload",
+            {"count": 9},
+        ),
+        (
+            PathAliasedExampleContract(payload={"count": 1}),
+            "count",
+            "payload",
+            {"count": 9},
+        ),
+    ],
+    ids=[
+        "alias-equal",
+        "alias-conflicting",
+        "choice-string",
+        "choice-path",
+        "path",
+    ],
+)
+def test_snapshot_contract_graph_rejects_unknown_stored_validation_alias(
+    value: ContractModel,
+    field_name: str,
+    stored_name: str,
+    stored_value: object,
+) -> None:
+    corrupted = value.model_copy(update={stored_name: stored_value})
+    corrupted.__dict__.pop(field_name)
+    stored_snapshot = dict(vars(corrupted))
+
+    assert corrupted.__pydantic_extra__ is None
+    assert type(value).model_validate(stored_snapshot, strict=True)
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(corrupted)
+
+
+def test_snapshot_contract_graph_rejects_nested_unknown_stored_alias() -> None:
+    value = AliasedExampleContract(n=1).model_copy(update={"n": 9})
+    value.__dict__.pop("count")
+    stored_snapshot = {"item": dict(vars(value))}
+
+    assert (
+        AliasedExampleEnvelope.model_validate(
+            stored_snapshot,
+            strict=True,
+        ).item.count
+        == 9
+    )
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph({"item": value})
+
+
+def test_snapshot_contract_graph_reserves_complete_stored_alias_path_root() -> None:
+    value = PathAliasedExampleContract(payload={"count": 1}).model_copy(
+        update={"payload": {"other": 9}}
+    )
+    value.__dict__.pop("count")
+
+    with pytest.raises(ValidationError):
+        PathAliasedExampleContract.model_validate(dict(vars(value)), strict=True)
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(value)
+
+
+@pytest.mark.parametrize(
+    "model_type",
+    [NameOnlyAliasedExampleContract, SerializationAliasedExampleContract],
+    ids=["disabled-validation-alias", "serialization-only-alias"],
+)
+def test_snapshot_contract_graph_preserves_inactive_unknown_stored_alias(
+    model_type: type[ContractModel],
+) -> None:
+    value = model_type(count=1).model_copy(update={"n": 9})
+    value.__dict__.pop("count")
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"n": 9}
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        model_type.model_validate(snapshot, strict=True)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "stored_name", "stored_value"),
+    [
+        ("count", "n", 9),
+        ("category", "kind", "shadow"),
+        ("category", "metadata", {"category": "shadow"}),
+    ],
+    ids=["inherited", "subclass-choice", "subclass-path"],
+)
+def test_snapshot_contract_graph_rejects_concrete_model_stored_aliases(
+    field_name: str,
+    stored_name: str,
+    stored_value: object,
+) -> None:
+    value = DerivedAliasedExampleContract(n=1, kind="derived").model_copy(
+        update={stored_name: stored_value}
+    )
+    value.__dict__.pop(field_name)
+
+    assert DerivedAliasedExampleContract.model_validate(
+        dict(vars(value)),
+        strict=True,
+    )
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(value)
+
+
+def test_snapshot_contract_graph_preserves_declared_active_alias_root() -> None:
+    value = InheritedAliasExampleContract(n=3)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"count": 3}
+    assert InheritedAliasExampleContract.model_validate(
+        snapshot,
+        strict=True,
+    ) == value
 
 
 @pytest.mark.parametrize("nested", [False, True], ids=["direct", "nested"])
