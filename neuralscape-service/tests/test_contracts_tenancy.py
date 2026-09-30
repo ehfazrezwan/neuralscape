@@ -89,6 +89,68 @@ class InverseItemsMapping(dict[object, object]):
         return ()
 
 
+class ObservedLengthMapping(Mapping[object, object]):
+    """Expose only a configured length, with counters for every observed view."""
+
+    def __init__(self, observed_length: int) -> None:
+        self.observed_length = observed_length
+        self.length_calls = 0
+        self.iteration_calls = 0
+        self.items_calls = 0
+        self.boolean_calls = 0
+
+    def __getitem__(self, key: object) -> object:
+        raise KeyError(key)
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        return iter(())
+
+    def __len__(self) -> int:
+        self.length_calls += 1
+        return self.observed_length
+
+    def items(self):
+        self.items_calls += 1
+        return ()
+
+
+class FalseBooleanLengthMapping(ObservedLengthMapping):
+    def __bool__(self) -> bool:
+        self.boolean_calls += 1
+        return False
+
+
+class TrueBooleanEmptyMapping(ObservedLengthMapping):
+    def __bool__(self) -> bool:
+        self.boolean_calls += 1
+        return True
+
+
+class DefaultItemsLengthProbe(Mapping[object, object]):
+    """Instrument the standard Mapping.items() view and its source mapping."""
+
+    def __init__(self) -> None:
+        self.length_calls = 0
+        self.iteration_calls = 0
+        self.items_calls = 0
+
+    def __getitem__(self, key: object) -> object:
+        raise KeyError(key)
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        return iter(())
+
+    def __len__(self) -> int:
+        self.length_calls += 1
+        return 0
+
+    def items(self):
+        self.items_calls += 1
+        return super().items()
+
+
 def manifest(
     *, tenant_id: str = "tenant-a", generation: int = 7, manifest_id: str = "primary"
 ) -> dict[str, object]:
@@ -613,6 +675,96 @@ def test_tenancy_boundaries_reject_iteration_visible_items_empty_extras(
             )
 
     assert extras.iteration_calls == 1
+    assert extras.items_calls == 1
+
+
+@pytest.mark.parametrize("boundary", ["transition", "placement"])
+@pytest.mark.parametrize("location", ["direct", "nested"])
+@pytest.mark.parametrize(
+    ("case", "should_reject"),
+    [
+        ("length-one", True),
+        ("length-one-false-bool", True),
+        ("length-zero-true-bool", False),
+    ],
+)
+def test_tenancy_boundaries_use_length_without_mapping_truthiness(
+    boundary: str,
+    location: str,
+    case: str,
+    should_reject: bool,
+) -> None:
+    if case == "length-one":
+        extras = ObservedLengthMapping(1)
+    elif case == "length-one-false-bool":
+        extras = FalseBooleanLengthMapping(1)
+    else:
+        extras = TrueBooleanEmptyMapping(0)
+
+    if boundary == "transition":
+        previous = operation()
+        candidate = operation(observed_state="running")
+        target = (
+            candidate
+            if location == "direct"
+            else candidate.resource_manifests[0]
+        )
+        object.__setattr__(target, "__pydantic_extra__", extras)
+
+        def validate_transition() -> object:
+            return validate_operation_transition(previous, candidate)
+
+        validate = validate_transition
+    else:
+        candidate = TenantPlacement.model_validate_json(
+            json.dumps(
+                {
+                    "schema_version": VERSION,
+                    "tenant_id": "tenant-a",
+                    "generation": 7,
+                    "resource_manifests": [manifest()],
+                }
+            )
+        )
+        target = (
+            candidate
+            if location == "direct"
+            else candidate.resource_manifests[0]
+        )
+        object.__setattr__(target, "__pydantic_extra__", extras)
+
+        def validate_placement() -> object:
+            return validate_placement_publication(
+                candidate,
+                expected_tenant_id="tenant-a",
+                current_generation=7,
+            )
+
+        validate = validate_placement
+
+    if should_reject:
+        with pytest.raises(ValueError, match="undeclared fields"):
+            validate()
+    else:
+        validate()
+
+    assert extras.length_calls == 1
+    assert extras.iteration_calls == 1
+    assert extras.items_calls == 1
+    assert extras.boolean_calls == 0
+
+
+def test_transition_default_items_view_does_not_repeat_length_hint() -> None:
+    previous = operation(resource_manifests=[])
+    current = operation(observed_state="running", resource_manifests=[])
+    extras = DefaultItemsLengthProbe()
+    object.__setattr__(current, "__pydantic_extra__", extras)
+
+    result = validate_operation_transition(previous, current)
+
+    assert result.observed_state == "running"
+    assert extras.length_calls == 1
+    assert extras.iteration_calls == 2
     assert extras.items_calls == 1
 
 
