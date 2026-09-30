@@ -72,6 +72,23 @@ class FalseyEntries(dict[object, object]):
         return False
 
 
+class InverseItemsMapping(dict[object, object]):
+    """Expose iterated keys while hiding every entry from items()."""
+
+    def __init__(self, entries: dict[object, object]) -> None:
+        super().__init__(entries)
+        self.iteration_calls = 0
+        self.items_calls = 0
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        return super().__iter__()
+
+    def items(self):
+        self.items_calls += 1
+        return ()
+
+
 def manifest(
     *, tenant_id: str = "tenant-a", generation: int = 7, manifest_id: str = "primary"
 ) -> dict[str, object]:
@@ -549,6 +566,54 @@ def test_transition_consumes_one_stable_extra_entry_snapshot() -> None:
 
     assert result.observed_state == "running"
     assert empty_first.calls == 1
+
+
+@pytest.mark.parametrize("boundary", ["transition", "placement"])
+@pytest.mark.parametrize("location", ["direct", "nested"])
+def test_tenancy_boundaries_reject_iteration_visible_items_empty_extras(
+    boundary: str,
+    location: str,
+) -> None:
+    extras = InverseItemsMapping({"future_constraint": "reject"})
+    if boundary == "transition":
+        previous = operation()
+        candidate = operation(observed_state="running")
+        target = (
+            candidate
+            if location == "direct"
+            else candidate.resource_manifests[0]
+        )
+        object.__setattr__(target, "__pydantic_extra__", extras)
+
+        with pytest.raises(ValueError, match="undeclared fields"):
+            validate_operation_transition(previous, candidate)
+    else:
+        candidate = TenantPlacement.model_validate_json(
+            json.dumps(
+                {
+                    "schema_version": VERSION,
+                    "tenant_id": "tenant-a",
+                    "generation": 7,
+                    "resource_manifests": [manifest()],
+                }
+            )
+        )
+        target = (
+            candidate
+            if location == "direct"
+            else candidate.resource_manifests[0]
+        )
+        object.__setattr__(target, "__pydantic_extra__", extras)
+
+        with pytest.raises(ValueError, match="undeclared fields"):
+            validate_placement_publication(
+                candidate,
+                expected_tenant_id="tenant-a",
+                current_generation=7,
+            )
+
+    assert extras.iteration_calls == 1
+    assert extras.items_calls == 1
 
 
 def test_transition_rejects_malformed_nested_extra_storage() -> None:

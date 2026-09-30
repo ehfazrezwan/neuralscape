@@ -151,8 +151,13 @@ def _snapshot_closed_graph(
             extras = getattr(value, "__pydantic_extra__", None)
             if extras is not None and not isinstance(extras, Mapping):
                 raise ValueError("contract extra storage must be a mapping")
-            extra_entries = () if extras is None else tuple(extras.items())
-            if undeclared or extra_entries:
+            if extras is None:
+                iterated_extra_names = ()
+                extra_entries = ()
+            else:
+                iterated_extra_names = tuple(extras)
+                extra_entries = tuple(extras.items())
+            if undeclared or iterated_extra_names or extra_entries:
                 raise ValueError("contract input contains undeclared fields")
             return {
                 name: _snapshot_closed_graph(field_value, active)

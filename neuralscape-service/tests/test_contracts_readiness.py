@@ -72,6 +72,23 @@ class FalseyEntries(dict[object, object]):
         return False
 
 
+class InverseItemsMapping(dict[object, object]):
+    """Expose iterated keys while hiding every entry from items()."""
+
+    def __init__(self, entries: dict[object, object]) -> None:
+        super().__init__(entries)
+        self.iteration_calls = 0
+        self.items_calls = 0
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        return super().__iter__()
+
+    def items(self):
+        self.items_calls += 1
+        return ()
+
+
 def observation(
     capability: str = "exact_reads",
     status: str = "healthy",
@@ -466,6 +483,41 @@ def test_publication_consumes_one_stable_extra_entry_snapshot() -> None:
 
     assert result.tenant_id == "tenant-a"
     assert empty_first.calls == 1
+
+
+@pytest.mark.parametrize(
+    ("boundary", "location"),
+    [
+        ("publication", "direct"),
+        ("publication", "nested"),
+        ("capability", "direct"),
+    ],
+)
+def test_readiness_boundaries_reject_iteration_visible_items_empty_extras(
+    boundary: str,
+    location: str,
+) -> None:
+    extras = InverseItemsMapping({"future_constraint": "reject"})
+    if boundary == "publication":
+        report = publication()
+        target = report if location == "direct" else report.capabilities[0]
+        object.__setattr__(target, "__pydantic_extra__", extras)
+
+        with pytest.raises(ValueError, match="undeclared fields"):
+            validate_readiness_publication(
+                report,
+                expected_tenant_id="tenant-a",
+                current_placement_generation=12,
+            )
+    else:
+        item = observation()
+        object.__setattr__(item, "__pydantic_extra__", extras)
+
+        with pytest.raises(ValueError, match="undeclared fields"):
+            evaluate(item)
+
+    assert extras.iteration_calls == 1
+    assert extras.items_calls == 1
 
 
 def test_publication_rejects_malformed_nested_extra_storage() -> None:
