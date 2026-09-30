@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from copy import deepcopy
+from types import MappingProxyType
 
 import pytest
 from pydantic import ValidationError
@@ -18,6 +20,56 @@ from contracts_tenancy import (
 
 
 VERSION = "candidate-v1"
+
+
+class InconsistentExtraMapping(Mapping[object, object]):
+    """Expose entries through items while hiding them from normal iteration."""
+
+    def __init__(self, entries: dict[object, object]) -> None:
+        self._entries = tuple(entries.items())
+
+    def __getitem__(self, key: object) -> object:
+        return dict(self._entries)[key]
+
+    def __iter__(self):
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+    def items(self):
+        return self._entries
+
+
+class ChangingItemsMapping(Mapping[object, object]):
+    """Return one entry snapshot first and a different one thereafter."""
+
+    def __init__(
+        self,
+        first: tuple[tuple[object, object], ...],
+        later: tuple[tuple[object, object], ...],
+    ) -> None:
+        self._first = first
+        self._later = later
+        self.calls = 0
+
+    def __getitem__(self, key: object) -> object:
+        raise KeyError(key)
+
+    def __iter__(self):
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+    def items(self):
+        self.calls += 1
+        return self._first if self.calls == 1 else self._later
+
+
+class FalseyEntries(dict[object, object]):
+    def __bool__(self) -> bool:
+        return False
 
 
 def manifest(
@@ -396,7 +448,11 @@ def test_transition_rejects_each_malformed_extra_storage_representation(
         validate_operation_transition(previous, current)
 
 
-@pytest.mark.parametrize("extra_storage", [None, {}], ids=["none", "empty-mapping"])
+@pytest.mark.parametrize(
+    "extra_storage",
+    [None, {}, MappingProxyType({})],
+    ids=["none", "empty-dict", "empty-custom-mapping"],
+)
 def test_transition_accepts_absent_or_empty_mapping_extra_storage(
     extra_storage: object,
 ) -> None:
@@ -423,6 +479,76 @@ def test_transition_rejects_nonempty_mapping_extra_storage(
 
     with pytest.raises(ValueError, match="undeclared fields"):
         validate_operation_transition(previous, current)
+
+
+@pytest.mark.parametrize("location", ["direct", "nested"])
+@pytest.mark.parametrize(
+    "extra_kind",
+    ["unknown", "declared"],
+    ids=["unknown", "declared"],
+)
+def test_transition_rejects_entries_hidden_from_mapping_iteration(
+    location: str,
+    extra_kind: str,
+) -> None:
+    previous = operation()
+    current = operation(observed_state="running")
+    target = current if location == "direct" else current.resource_manifests[0]
+    stored_extra = (
+        {"future_constraint": "reject"}
+        if extra_kind == "unknown"
+        else {"tenant_id": "tenant-a"}
+    )
+    object.__setattr__(
+        target,
+        "__pydantic_extra__",
+        InconsistentExtraMapping(stored_extra),
+    )
+
+    with pytest.raises(ValueError, match="undeclared fields"):
+        validate_operation_transition(previous, current)
+
+
+@pytest.mark.parametrize(
+    "stored_extra",
+    [{"future_constraint": "reject"}, {"tenant_id": "tenant-a"}],
+    ids=["unknown", "declared"],
+)
+def test_transition_rejects_populated_falsey_extra_storage(
+    stored_extra: dict[object, object],
+) -> None:
+    previous = operation(resource_manifests=[])
+    current = operation(observed_state="running", resource_manifests=[])
+    object.__setattr__(current, "__pydantic_extra__", FalseyEntries(stored_extra))
+
+    with pytest.raises(ValueError, match="undeclared fields"):
+        validate_operation_transition(previous, current)
+
+
+def test_transition_consumes_one_stable_extra_entry_snapshot() -> None:
+    previous = operation(resource_manifests=[])
+    current = operation(observed_state="running", resource_manifests=[])
+    populated_first = ChangingItemsMapping(
+        (("future_constraint", "reject"),),
+        (),
+    )
+    object.__setattr__(current, "__pydantic_extra__", populated_first)
+
+    with pytest.raises(ValueError, match="undeclared fields"):
+        validate_operation_transition(previous, current)
+    assert populated_first.calls == 1
+
+    current = operation(observed_state="running", resource_manifests=[])
+    empty_first = ChangingItemsMapping(
+        (),
+        (("future_constraint", "reject"),),
+    )
+    object.__setattr__(current, "__pydantic_extra__", empty_first)
+
+    result = validate_operation_transition(previous, current)
+
+    assert result.observed_state == "running"
+    assert empty_first.calls == 1
 
 
 def test_transition_rejects_malformed_nested_extra_storage() -> None:
