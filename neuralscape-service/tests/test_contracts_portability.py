@@ -2,6 +2,7 @@
 
 import json
 import sys
+from collections.abc import Iterator, Mapping
 from copy import deepcopy
 from pathlib import PureWindowsPath
 from types import MappingProxyType
@@ -50,6 +51,62 @@ class CompatibleDefaultManifest(PortableManifest):
 
 class ExcludingFutureManifestFile(ManifestFile):
     future_contract_field: str = Field(exclude=True)
+
+
+class SplitViewExtra(Mapping[str, str]):
+    def __init__(
+        self,
+        entries: tuple[tuple[str, str], ...],
+        *,
+        iteration_keys: tuple[str, ...] = (),
+        reported_keys: tuple[str, ...] = (),
+        reported_length: int = 0,
+    ) -> None:
+        self._entries = entries
+        self._iteration_keys = iteration_keys
+        self._reported_keys = reported_keys
+        self._reported_length = reported_length
+        self._values = dict(entries)
+
+    def __getitem__(self, key: str) -> str:
+        return self._values[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._iteration_keys)
+
+    def __len__(self) -> int:
+        return self._reported_length
+
+    def keys(self) -> tuple[str, ...]:
+        return self._reported_keys
+
+    def items(self) -> tuple[tuple[str, str], ...]:
+        return self._entries
+
+
+class ChangingItemsExtra(Mapping[str, str]):
+    def __init__(self) -> None:
+        self.item_calls = 0
+
+    def __getitem__(self, key: str) -> str:
+        if key == "manifest_id":
+            return "shadow-manifest"
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+    def keys(self) -> tuple[str, ...]:
+        return ("manifest_id",)
+
+    def items(self) -> tuple[tuple[str, str], ...]:
+        self.item_calls += 1
+        if self.item_calls == 1:
+            return ()
+        return (("manifest_id", "shadow-manifest"),)
 
 
 def valid_manifest() -> dict:
@@ -813,6 +870,76 @@ def test_custom_mapping_extra_storage_preserves_unknown_for_rejection() -> None:
         validate_portable_manifest(manifest)
 
     assert raised.value.errors()[0]["type"] == "extra_forbidden"
+
+
+@pytest.mark.parametrize(
+    ("location", "field_name", "shadow_value"),
+    [
+        ("manifest", "manifest_id", "shadow-manifest"),
+        ("file", "path", "canonical/shadow-records.jsonl"),
+        ("replay_position", "position", "shadow-position"),
+    ],
+)
+def test_split_extra_views_cannot_overwrite_declared_fields(
+    location: str,
+    field_name: str,
+    shadow_value: str,
+) -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    node = _model_at_location(manifest, location)
+    split_view = SplitViewExtra(
+        ((field_name, shadow_value),),
+        reported_keys=(field_name,),
+    )
+    object.__setattr__(node, "__pydantic_extra__", split_view)
+
+    with pytest.raises(
+        ValidationError,
+        match="contract model has conflicting stored and extra fields",
+    ):
+        validate_portable_manifest(manifest)
+
+
+def test_items_only_unknown_extra_is_not_silently_discarded() -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    split_view = SplitViewExtra((("future_entry_semantics", "deny"),))
+    object.__setattr__(manifest, "__pydantic_extra__", split_view)
+
+    with pytest.raises(ValidationError, match="future_entry_semantics") as raised:
+        validate_portable_manifest(manifest)
+
+    assert raised.value.errors()[0]["type"] == "extra_forbidden"
+
+
+def test_populated_falsey_extra_storage_is_not_silently_discarded() -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    falsey_populated = SplitViewExtra((("future_entry_semantics", "deny"),))
+    assert not falsey_populated
+    object.__setattr__(manifest.files[0], "__pydantic_extra__", falsey_populated)
+
+    with pytest.raises(ValidationError, match="future_entry_semantics"):
+        validate_portable_manifest(manifest)
+
+
+def test_extra_items_are_captured_once_for_validation_and_reconstruction() -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    changing = ChangingItemsExtra()
+    object.__setattr__(manifest, "__pydantic_extra__", changing)
+
+    revalidated = validate_portable_manifest(manifest)
+
+    assert revalidated.manifest_id == "manifest-7"
+    assert changing.item_calls == 1
+
+
+def test_stable_empty_custom_extra_snapshot_remains_valid() -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    stable_empty = SplitViewExtra(())
+    object.__setattr__(manifest.files[0], "__pydantic_extra__", stable_empty)
+
+    revalidated = validate_portable_manifest(manifest)
+
+    assert revalidated.files[0].path == manifest.files[0].path
 
 
 def test_compatible_nested_subclass_without_new_fields_remains_valid() -> None:

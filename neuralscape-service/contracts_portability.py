@@ -24,8 +24,8 @@ ScopeKind = Literal["tenant", "projects"]
 _WINDOWS_FORBIDDEN_COMPONENT_CHARACTERS = frozenset('<>:"|?*')
 
 
-def _validated_model_extra_storage(value: BaseModel) -> Mapping[Any, Any]:
-    """Return well-formed, disjoint Pydantic extra storage for ``value``."""
+def _validated_model_extra_storage(value: BaseModel) -> dict[Any, Any]:
+    """Capture well-formed, disjoint Pydantic extra entries for ``value``."""
 
     extra = value.__pydantic_extra__
     if extra is None:
@@ -33,17 +33,20 @@ def _validated_model_extra_storage(value: BaseModel) -> Mapping[Any, Any]:
     if not isinstance(extra, Mapping):
         raise ValueError("contract model extra storage must be None or a mapping")
 
+    captured = dict(tuple(extra.items()))
     declared_or_stored = set(type(value).model_fields) | set(value.__dict__)
-    overlap = declared_or_stored.intersection(extra)
+    overlap = declared_or_stored.intersection(captured)
     if overlap:
         names = ", ".join(sorted((repr(name) for name in overlap)))
         raise ValueError(
             f"contract model has conflicting stored and extra fields: {names}"
         )
-    return extra
+    return captured
 
 
-def _reject_retained_unknown_fields(root: BaseModel) -> None:
+def _reject_retained_unknown_fields(
+    root: BaseModel,
+) -> dict[int, dict[Any, Any]]:
     """Reject undeclared state retained by unchecked Pydantic copies.
 
     ``model_copy(update=...)`` deliberately does not validate its update.  For
@@ -56,6 +59,7 @@ def _reject_retained_unknown_fields(root: BaseModel) -> None:
 
     errors: list[dict[str, Any]] = []
     visited: set[int] = set()
+    extra_inventory: dict[int, dict[Any, Any]] = {}
 
     def walk(value: Any, location: tuple[str | int, ...]) -> None:
         if not isinstance(value, (BaseModel, Mapping, list, tuple, set, frozenset)):
@@ -70,12 +74,15 @@ def _reject_retained_unknown_fields(root: BaseModel) -> None:
             declared = type(value).model_fields
             stored = value.__dict__
             pydantic_extra = _validated_model_extra_storage(value)
+            extra_inventory[identity] = pydantic_extra
             retained_names = (
                 set(stored) | set(value.model_fields_set) | set(pydantic_extra)
             )
 
             for name in sorted(retained_names - set(declared), key=repr):
-                retained_value = stored.get(name, pydantic_extra.get(name))
+                retained_value = (
+                    stored[name] if name in stored else pydantic_extra[name]
+                )
                 error_location = name if isinstance(name, (str, int)) else repr(name)
                 errors.append(
                     {
@@ -103,9 +110,13 @@ def _reject_retained_unknown_fields(root: BaseModel) -> None:
     walk(root, ())
     if errors:
         raise ValidationError.from_exception_data("PortableManifest", errors)
+    return extra_inventory
 
 
-def _reconstruct_retained_state(root: BaseModel) -> dict[str, Any]:
+def _reconstruct_retained_state(
+    root: BaseModel,
+    extra_inventory: Mapping[int, Mapping[Any, Any]],
+) -> dict[str, Any]:
     """Copy a model graph without invoking lossy Pydantic serialization.
 
     Pydantic serializes nested models according to their annotated field type
@@ -128,7 +139,13 @@ def _reconstruct_retained_state(root: BaseModel) -> dict[str, Any]:
         try:
             if isinstance(value, BaseModel):
                 stored = dict(value.__dict__)
-                stored.update(_validated_model_extra_storage(value))
+                try:
+                    captured_extra = extra_inventory[identity]
+                except KeyError as exc:
+                    raise ValueError(
+                        "contract model was not present in the validated graph"
+                    ) from exc
+                stored.update(captured_extra)
                 return {name: rebuild(item) for name, item in stored.items()}
 
             if isinstance(value, Mapping):
@@ -404,8 +421,8 @@ def validate_portable_manifest(
 
     if isinstance(document, PortableManifest):
         try:
-            _reject_retained_unknown_fields(document)
-            candidate = _reconstruct_retained_state(document)
+            extra_inventory = _reject_retained_unknown_fields(document)
+            candidate = _reconstruct_retained_state(document, extra_inventory)
         except ValidationError:
             raise
         except (TypeError, ValueError, RecursionError) as exc:
