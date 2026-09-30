@@ -76,7 +76,7 @@ def _validation_alias_owners(model_type: type[BaseModel]) -> dict[str, set[str]]
 def _mapping_entries(
     value: Mapping[object, object],
 ) -> tuple[tuple[object, object], ...]:
-    if isinstance(value, dict):
+    if issubclass(type(value), dict):
         return tuple(dict.items(value))
     return tuple(value.items())
 
@@ -129,7 +129,7 @@ def snapshot_contract_graph(
             }
             extra = getattr(value, "__pydantic_extra__", None)
             if extra is not None:
-                if not isinstance(extra, Mapping):
+                if not issubclass(type(extra), Mapping):
                     raise ValueError("contract extra storage must be a mapping")
                 extra_entries = _mapping_entries(extra)
                 extra_keys = {key for key, _ in extra_entries}

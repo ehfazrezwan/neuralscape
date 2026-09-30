@@ -215,6 +215,18 @@ class SingleReadMapping(Mapping[str, object]):
         return self._entries.items()
 
 
+class DictClassSpoofingMapping(SingleReadMapping):
+    @property
+    def __class__(self) -> type[dict]:
+        return dict
+
+
+class ClassReadRejectingMapping(SingleReadMapping):
+    @property
+    def __class__(self) -> type[object]:
+        raise AssertionError("mapping __class__ override must not be read")
+
+
 class HiddenItemsDict(dict[str, object]):
     def items(self) -> tuple[tuple[str, object], ...]:
         return tuple(
@@ -996,6 +1008,42 @@ def test_snapshot_contract_graph_captures_generic_mapping_extra_once() -> None:
     assert extra.item_reads == 1
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         ExampleContract.model_validate(snapshot, strict=True)
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["direct", "nested"])
+def test_snapshot_contract_graph_uses_spoofed_class_mapping_protocol(
+    nested: bool,
+) -> None:
+    value = ExampleContract(count=1)
+    extra = DictClassSpoofingMapping({"future_state": "preserved"})
+    object.__setattr__(value, "__pydantic_extra__", extra)
+    graph: object = {"item": value} if nested else value
+    receiver = ExampleContractEnvelope if nested else ExampleContract
+
+    assert isinstance(extra, dict)
+    assert type(extra) is DictClassSpoofingMapping
+    snapshot = snapshot_contract_graph(graph)
+
+    expected = (
+        {"item": {"count": 1, "future_state": "preserved"}}
+        if nested
+        else {"count": 1, "future_state": "preserved"}
+    )
+    assert snapshot == expected
+    assert extra.item_reads == 1
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        receiver.model_validate(snapshot, strict=True)
+
+
+def test_snapshot_contract_graph_does_not_read_mapping_class_override() -> None:
+    value = ExampleContract(count=1)
+    extra = ClassReadRejectingMapping({"future_state": "preserved"})
+    object.__setattr__(value, "__pydantic_extra__", extra)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"count": 1, "future_state": "preserved"}
+    assert extra.item_reads == 1
 
 
 @pytest.mark.parametrize(
