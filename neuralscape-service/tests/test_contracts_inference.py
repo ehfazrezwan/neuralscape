@@ -42,6 +42,16 @@ from contracts_references import ReferenceHandle, SourceVersion
 VERSION = "candidate-v1"
 
 
+class FalseyExtraDict(dict):
+    def __bool__(self):
+        return False
+
+
+class HiddenExtraKeysDict(dict):
+    def __iter__(self):
+        return iter(())
+
+
 def reference(identifier: str, resolver: str = "evidence") -> ReferenceHandle:
     return ReferenceHandle(
         kind="artifact",
@@ -1253,6 +1263,40 @@ def test_inference_boundary_rejects_declared_fields_duplicated_in_extras(
         ValueError,
         match=rf"malformed contract extras.*duplicate field\(s\): {field_name}",
     ):
+        validate_source_span(evidence, span)
+
+
+@pytest.mark.parametrize(
+    "extras_type",
+    [FalseyExtraDict, HiddenExtraKeysDict],
+    ids=["falsey-dict-subclass", "hidden-keys-dict-subclass"],
+)
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"record_id": "shadow-record"},
+        {"future_semantics": "deny"},
+    ],
+    ids=["declared-field", "unknown-field"],
+)
+def test_inference_boundary_rejects_nested_dict_subclass_extra_storage(
+    extras_type,
+    payload,
+):
+    evidence = source_evidence()
+    span = SourceSpan(
+        span_id="span-1",
+        source_version=evidence.source_version,
+        start_utf8_byte=0,
+        end_utf8_byte=3,
+    )
+    object.__setattr__(
+        span.source_version,
+        "__pydantic_extra__",
+        extras_type(payload),
+    )
+
+    with pytest.raises(ValueError, match="malformed contract extras"):
         validate_source_span(evidence, span)
 
 

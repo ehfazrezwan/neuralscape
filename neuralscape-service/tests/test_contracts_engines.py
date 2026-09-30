@@ -21,6 +21,16 @@ from contracts_references import ReferenceHandle
 VERSION = "candidate-v1"
 
 
+class FalseyExtraDict(dict):
+    def __bool__(self):
+        return False
+
+
+class HiddenExtraKeysDict(dict):
+    def __iter__(self):
+        return iter(())
+
+
 def reference(identifier: str) -> ReferenceHandle:
     return ReferenceHandle(
         kind="artifact",
@@ -328,6 +338,31 @@ def test_capability_boundary_still_rejects_nonconflicting_unknown_extras():
 
     with pytest.raises(ValueError, match="undeclared contract field.*future_semantics"):
         validate_capability_requirements(declared, (unknown,))
+
+
+@pytest.mark.parametrize(
+    "extras_type",
+    [FalseyExtraDict, HiddenExtraKeysDict],
+    ids=["falsey-dict-subclass", "hidden-keys-dict-subclass"],
+)
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"operation": "shadow-operation"},
+        {"future_semantics": "deny"},
+    ],
+    ids=["declared-field", "unknown-field"],
+)
+def test_capability_boundary_rejects_dict_subclass_extra_storage(
+    extras_type,
+    payload,
+):
+    declared = manifest(state())
+    malformed = requirement()
+    object.__setattr__(malformed, "__pydantic_extra__", extras_type(payload))
+
+    with pytest.raises(ValueError, match="malformed contract extras"):
+        validate_capability_requirements(declared, (malformed,))
 
 
 @pytest.mark.parametrize("operation", ["", True, "x" * 257])
