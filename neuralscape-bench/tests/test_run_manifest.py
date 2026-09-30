@@ -8,6 +8,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 
 import pydantic
 import pytest
@@ -203,6 +204,35 @@ def planned_manifest_with_extra_target(target_name: str) -> tuple[RunManifest, o
     return manifest, targets[target_name]
 
 
+class HiddenIterationExtras(dict[str, object]):
+    """Expose stored entries through items(), but not ordinary iteration."""
+
+    def __iter__(self):
+        return iter(())
+
+
+class FalseyPopulatedExtras(dict[str, object]):
+    def __bool__(self):
+        return False
+
+
+class ChangingItemsExtras(dict[str, object]):
+    """Return a different entry inventory if a receiver consumes it twice."""
+
+    def __init__(self):
+        super().__init__()
+        self.items_calls = 0
+
+    def __iter__(self):
+        return iter(())
+
+    def items(self):
+        self.items_calls += 1
+        if self.items_calls == 1:
+            return (("future_constraint", "first-view"),)
+        return (("run_id", "second-view"),)
+
+
 def test_planned_to_completed_round_trip_is_canonical_and_stable():
     manifest = completed_manifest()
 
@@ -242,8 +272,8 @@ def test_serializer_rejects_malformed_extra_storage(
 @pytest.mark.parametrize("target_name", ["manifest", "nested_resource"])
 @pytest.mark.parametrize(
     "valid_extras",
-    [None, {}],
-    ids=["none", "empty-dict"],
+    [None, {}, MappingProxyType({})],
+    ids=["none", "empty-dict", "empty-mapping"],
 )
 def test_serializer_accepts_absent_or_empty_mapping_extra_storage(
     target_name: str,
@@ -255,6 +285,67 @@ def test_serializer_accepts_absent_or_empty_mapping_extra_storage(
     assert serialize_run_manifest(manifest) == serialize_run_manifest(
         planned_manifest()
     )
+
+
+@pytest.mark.parametrize(
+    ("target_name", "extra_key", "extra_value"),
+    [
+        ("manifest", "future_constraint", "deny"),
+        ("manifest", "run_id", "run-001"),
+        ("manifest", "run_id", "shadow-run"),
+        ("nested_resource", "future_constraint", "deny"),
+        ("nested_resource", "scope", "api-container"),
+        ("nested_resource", "scope", "shadow-scope"),
+    ],
+    ids=[
+        "direct-unknown",
+        "direct-declared-equal",
+        "direct-declared-conflicting",
+        "nested-unknown",
+        "nested-declared-equal",
+        "nested-declared-conflicting",
+    ],
+)
+def test_serializer_rejects_nonempty_stable_extra_entry_snapshot(
+    target_name: str,
+    extra_key: str,
+    extra_value: str,
+):
+    manifest, target = planned_manifest_with_extra_target(target_name)
+    object.__setattr__(
+        target,
+        "__pydantic_extra__",
+        HiddenIterationExtras({extra_key: extra_value}),
+    )
+
+    with pytest.raises(ValueError, match="undeclared stored fields"):
+        serialize_run_manifest(manifest)
+
+
+@pytest.mark.parametrize("target_name", ["manifest", "nested_resource"])
+def test_serializer_rejects_falsey_populated_extra_storage(target_name: str):
+    manifest, target = planned_manifest_with_extra_target(target_name)
+    extras = FalseyPopulatedExtras({"future_constraint": "deny"})
+    assert not extras
+    assert tuple(extras.items())
+    object.__setattr__(target, "__pydantic_extra__", extras)
+
+    with pytest.raises(ValueError, match="undeclared stored fields"):
+        serialize_run_manifest(manifest)
+
+
+def test_serializer_consumes_one_stable_extra_entry_inventory():
+    manifest = planned_manifest()
+    extras = ChangingItemsExtras()
+    object.__setattr__(manifest, "__pydantic_extra__", extras)
+
+    with pytest.raises(
+        ValueError,
+        match="undeclared stored fields.*future_constraint",
+    ):
+        serialize_run_manifest(manifest)
+
+    assert extras.items_calls == 1
 
 
 def test_serializer_rejects_extra_storage_overlapping_declared_fields():
