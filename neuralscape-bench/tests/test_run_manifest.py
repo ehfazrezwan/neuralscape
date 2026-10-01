@@ -1442,6 +1442,101 @@ def test_finish_deeply_revalidates_unchecked_nested_models(resource, measurement
         )
 
 
+@pytest.mark.parametrize(
+    ("callback_source", "invalid_target", "expected_location"),
+    [
+        ("planned", "resource", ("resources", 0, "observed_value")),
+        ("planned", "measurement", ("measurements", 0, "time_unit")),
+        ("resource", "measurement", ("measurements", 0, "time_unit")),
+    ],
+)
+def test_finish_freezes_all_input_models_before_earlier_argument_callbacks(
+    callback_source: str,
+    invalid_target: str,
+    expected_location: tuple[object, ...],
+):
+    def inputs(invalid: bool):
+        resource = measured_memory()
+        measurement = timing()
+        if invalid_target == "resource":
+            if invalid:
+                resource = resource.model_copy(update={"observed_value": True})
+            target = resource
+            field_name = "observed_value"
+            repaired_value: object = 402_653_184
+        else:
+            if invalid:
+                measurement = measurement.model_copy(
+                    update={"time_unit": "fortnights"}
+                )
+            target = measurement
+            field_name = "time_unit"
+            repaired_value = "milliseconds"
+        return resource, measurement, target, field_name, repaired_value
+
+    def callback_inputs(invalid: bool):
+        planned = planned_manifest()
+        resource, measurement, target, field_name, repaired_value = inputs(invalid)
+        target_native = BASE_MODEL_DICT_DESCRIPTOR.__get__(
+            target, pydantic.BaseModel
+        )
+        callback_calls: list[str] = []
+
+        def repair_target() -> None:
+            callback_calls.append("called")
+            dict.__setitem__(target_native, field_name, repaired_value)
+
+        resources: tuple[ResourceReading, ...]
+        if callback_source == "planned":
+            planned_native = BASE_MODEL_DICT_DESCRIPTOR.__get__(
+                planned, pydantic.BaseModel
+            )
+            planned_native["concurrency"] = MutatingTuple(
+                planned_native["concurrency"],
+                repair_target,
+            )
+            resources = (resource,)
+        else:
+            resources = MutatingTuple((resource,), repair_target)
+
+        arguments = {
+            "planned": planned,
+            "state": RunState.COMPLETED,
+            "started_at": datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            "finished_at": datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            "resources": resources,
+            "measurements": (measurement,),
+        }
+        return arguments, callback_calls, target_native, field_name, repaired_value
+
+    ordinary_resource, ordinary_measurement, *_unused = inputs(True)
+    with pytest.raises(ValidationError) as ordinary_error:
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(ordinary_resource,),
+            measurements=(ordinary_measurement,),
+        )
+    assert ordinary_error.value.errors()[0]["loc"] == expected_location
+
+    invalid_callback = callback_inputs(True)
+    with pytest.raises(ValidationError) as callback_error:
+        finish_run(**invalid_callback[0])
+    assert callback_error.value.errors() == ordinary_error.value.errors()
+    assert invalid_callback[1] == ["called"]
+    assert dict.__getitem__(invalid_callback[2], invalid_callback[3]) == (
+        invalid_callback[4]
+    )
+
+    valid_callback = callback_inputs(False)
+    result = finish_run(**valid_callback[0])
+    assert result.state is RunState.COMPLETED
+    assert valid_callback[1] == ["called"]
+    assert dict.__getitem__(valid_callback[2], valid_callback[3]) == valid_callback[4]
+
+
 def test_finish_rejects_undeclared_planned_fields_and_returns_fresh_graph():
     with pytest.raises(ValueError, match="undeclared stored fields"):
         finish_run(

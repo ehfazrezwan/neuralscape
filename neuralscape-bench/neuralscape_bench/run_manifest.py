@@ -346,6 +346,16 @@ def _freeze_model_storage(
         _freeze_model_storage(item, frozen_models, visited)
 
 
+def _freeze_model_graphs(*values: Any) -> dict[int, _FrozenModelStorage]:
+    """Capture every supplied native model graph in one shared inventory."""
+
+    frozen_models: dict[int, _FrozenModelStorage] = {}
+    visited: set[int] = set()
+    for value in values:
+        _freeze_model_storage(value, frozen_models, visited)
+    return frozen_models
+
+
 def _snapshot_native(
     value: Any,
     *,
@@ -363,8 +373,7 @@ def _snapshot_native(
     """
 
     if _frozen_models is None:
-        _frozen_models = {}
-        _freeze_model_storage(value, _frozen_models, set())
+        _frozen_models = _freeze_model_graphs(value)
     if active is None:
         active = set()
 
@@ -446,12 +455,18 @@ def _snapshot_native(
             active.remove(identity)
 
 
-def _validated_manifest_snapshot(manifest: RunManifest) -> RunManifest:
+def _validated_manifest_snapshot(
+    manifest: RunManifest,
+    *,
+    _frozen_models: dict[int, _FrozenModelStorage] | None = None,
+) -> RunManifest:
     """Return a fresh, deeply validated manifest graph from native evidence."""
 
     if not isinstance(manifest, RunManifest):
         raise TypeError("manifest must be a RunManifest")
-    return RunManifest.model_validate(_snapshot_native(manifest))
+    return RunManifest.model_validate(
+        _snapshot_native(manifest, _frozen_models=_frozen_models)
+    )
 
 
 def finish_run(
@@ -465,17 +480,51 @@ def finish_run(
 ) -> RunManifest:
     """Finish a planned run without allowing its declared envelope to change."""
 
-    validated_planned = _validated_manifest_snapshot(planned)
+    frozen_models = _freeze_model_graphs(
+        planned,
+        state,
+        started_at,
+        finished_at,
+        resources,
+        measurements,
+    )
+    validated_planned = _validated_manifest_snapshot(
+        planned,
+        _frozen_models=frozen_models,
+    )
     if validated_planned.state is not RunState.PLANNED:
         raise ValueError("only a planned run can be finished")
 
-    candidate_data = _snapshot_native(validated_planned)
+    candidate_data = _snapshot_native(
+        validated_planned,
+        _frozen_models=frozen_models,
+    )
     candidate_data.update(
-        state=_snapshot_native(state, path="$.state"),
-        started_at=_snapshot_native(started_at, path="$.started_at"),
-        finished_at=_snapshot_native(finished_at, path="$.finished_at"),
-        resources=_snapshot_native(resources, path="$.resources"),
-        measurements=_snapshot_native(measurements, path="$.measurements"),
+        state=_snapshot_native(
+            state,
+            path="$.state",
+            _frozen_models=frozen_models,
+        ),
+        started_at=_snapshot_native(
+            started_at,
+            path="$.started_at",
+            _frozen_models=frozen_models,
+        ),
+        finished_at=_snapshot_native(
+            finished_at,
+            path="$.finished_at",
+            _frozen_models=frozen_models,
+        ),
+        resources=_snapshot_native(
+            resources,
+            path="$.resources",
+            _frozen_models=frozen_models,
+        ),
+        measurements=_snapshot_native(
+            measurements,
+            path="$.measurements",
+            _frozen_models=frozen_models,
+        ),
     )
     candidate = RunManifest.model_validate(candidate_data)
 
