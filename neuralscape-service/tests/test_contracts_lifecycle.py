@@ -72,6 +72,23 @@ class HiddenBackingDict(dict[str, object]):
         return {}.items()
 
 
+class SanitizingModelDict(dict[str, object]):
+    """Model storage whose public items view omits or rewrites native state."""
+
+    def __init__(
+        self,
+        backing: dict[str, object],
+        projected: dict[str, object],
+    ) -> None:
+        dict.__init__(self, backing)
+        self.projected = projected
+        self.view_calls = 0
+
+    def items(self):  # type: ignore[no-untyped-def]
+        self.view_calls += 1
+        return self.projected.items()
+
+
 class InverseViewDict(HiddenBackingDict):
     """An empty native dict whose overrides advertise nonexistent entries."""
 
@@ -1613,6 +1630,86 @@ def test_source_boundary_rejects_declared_overlap_hidden_in_native_backing() -> 
         source_versions_match(expected, observed)
 
     assert hidden.view_calls == 0
+
+
+@pytest.mark.parametrize("hidden_kind", ["unknown", "declared"])
+def test_source_boundary_uses_native_model_storage(
+    hidden_kind: str,
+) -> None:
+    expected = source("memory-1", revision=4, epoch=9)
+    observed = source("memory-1", revision=4, epoch=9)
+    projected = dict(observed.__dict__)
+    backing = dict(projected)
+    if hidden_kind == "unknown":
+        backing["undeclared_witness"] = True
+    else:
+        backing["content_revision"] = -1
+    hidden = SanitizingModelDict(backing, projected)
+    object.__setattr__(observed, "__dict__", hidden)
+
+    with pytest.raises(ValidationError) as raised:
+        source_versions_match(expected, observed)
+
+    assert hidden.view_calls == 0
+    if hidden_kind == "unknown":
+        assert raised.value.errors()[0]["type"] == "extra_forbidden"
+    else:
+        assert raised.value.errors()[0]["loc"] == ("content_revision",)
+
+
+@pytest.mark.parametrize("hidden_kind", ["unknown", "declared"])
+def test_aggregate_boundary_uses_native_nested_model_storage(
+    hidden_kind: str,
+) -> None:
+    command, receipts, target = receiving_graph_with_extra_target(
+        "output_reference"
+    )
+    assert isinstance(target, ReferenceHandle)
+    projected = dict(target.__dict__)
+    backing = dict(projected)
+    if hidden_kind == "unknown":
+        backing["undeclared_witness"] = True
+    else:
+        backing["tenant_id"] = ""
+    hidden = SanitizingModelDict(backing, projected)
+    object.__setattr__(target, "__dict__", hidden)
+
+    with pytest.raises(ValidationError) as raised:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED,
+            intent=command,
+            receipts=receipts,
+        )
+
+    assert hidden.view_calls == 0
+    if hidden_kind == "unknown":
+        assert raised.value.errors()[0]["type"] == "extra_forbidden"
+    else:
+        assert raised.value.errors()[0]["loc"][-1] == "tenant_id"
+
+
+def test_aggregate_boundary_snapshots_model_extras_before_nested_traversal() -> None:
+    command = intent(ProcessingStage.CANONICAL)
+    extras = {"undeclared_witness": True}
+    object.__setattr__(command, "__pydantic_extra__", extras)
+
+    class ClearingTuple(tuple[object, ...]):
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            extras.clear()
+            return super().__iter__()
+
+    command.__dict__["target_refs"] = ClearingTuple(command.target_refs)
+
+    with pytest.raises(ValidationError) as raised:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=command,
+            receipts=(),
+        )
+
+    assert extras == {}
+    assert raised.value.errors()[0]["type"] == "extra_forbidden"
+    assert raised.value.errors()[0]["loc"] == ("undeclared_witness",)
 
 
 @pytest.mark.parametrize(
