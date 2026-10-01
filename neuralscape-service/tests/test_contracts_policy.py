@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import gc
 import json
+import weakref
 from collections.abc import Iterator, Mapping
 from copy import deepcopy
 from types import MappingProxyType
@@ -19,7 +21,13 @@ from contracts_policy import (
     PolicyStatement,
     PrincipalContext,
 )
-from contracts_policy_reference import evaluate_policy, validate_policy_decision
+from contracts_policy_reference import (
+    _capture_model_inventory,
+    _complete_contract_input,
+    _freeze_reachable_model_inventories,
+    evaluate_policy,
+    validate_policy_decision,
+)
 from contracts_references import ReferenceHandle
 
 
@@ -2115,6 +2123,65 @@ def _assert_protocol_called_once(
     assert hook.items_calls == 1
     assert hook.iteration_calls == 0
     assert hook.getitem_calls == 0
+
+
+def test_model_inventory_retains_owner_only_for_cache_lifetime() -> None:
+    candidate = reference("memory-1")
+    candidate_reference = weakref.ref(candidate)
+    candidate_id = id(candidate)
+    inventories = {
+        candidate_id: _capture_model_inventory(candidate),
+    }
+
+    del candidate
+    gc.collect()
+    assert candidate_reference() is inventories[candidate_id].owner
+
+    inventories.clear()
+    gc.collect()
+    assert candidate_reference() is None
+
+
+@pytest.mark.parametrize("consumer", ["freeze", "completion"])
+@pytest.mark.parametrize("owner_matches", [False, True])
+def test_model_inventory_consumers_require_exact_owner_identity(
+    consumer: str,
+    owner_matches: bool,
+) -> None:
+    candidate = reference("memory-1")
+    owner = candidate if owner_matches else reference("memory-2")
+    inventories = {
+        id(candidate): _capture_model_inventory(owner),
+    }
+
+    if not owner_matches:
+        with pytest.raises(
+            ValueError,
+            match="contract input model inventory owner mismatch",
+        ):
+            if consumer == "freeze":
+                _freeze_reachable_model_inventories(
+                    candidate,
+                    inventories,
+                    set(),
+                )
+            else:
+                _complete_contract_input(candidate, set(), inventories)
+        return
+
+    if consumer == "freeze":
+        assert (
+            _freeze_reachable_model_inventories(
+                candidate,
+                inventories,
+                set(),
+            )
+            is None
+        )
+    else:
+        completed = _complete_contract_input(candidate, set(), inventories)
+        assert isinstance(completed, dict)
+        assert completed["id"] == "memory-1"
 
 
 @pytest.mark.parametrize("boundary", ["evaluator", "receiving"])
