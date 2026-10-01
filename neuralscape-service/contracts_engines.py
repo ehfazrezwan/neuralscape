@@ -37,6 +37,14 @@ class _FrozenModelState(NamedTuple):
     extra_items: tuple[tuple[Any, Any], ...]
 
 
+class _FrozenContainerState(NamedTuple):
+    """Callback-free entry edges for one exact native container."""
+
+    owner: Any
+    kind: str
+    entries: tuple[Any, ...]
+
+
 def _model_storage(descriptor: Any, value: BaseModel) -> Any:
     """Read a BaseModel-owned store without subclass attribute dispatch."""
 
@@ -57,6 +65,7 @@ def _native_set_members(value: set[Any] | frozenset[Any]) -> tuple[Any, ...]:
 def _freeze_native_model_graph(
     value: Any,
     frozen_models: dict[int, _FrozenModelState],
+    frozen_containers: dict[int, _FrozenContainerState],
     discovered: dict[int, Any],
 ) -> None:
     """Freeze models reachable through native container edges without callbacks."""
@@ -114,11 +123,32 @@ def _freeze_native_model_graph(
             frozen_models[identity] = frozen
             pending.extend(item for _, item in stored_items)
         elif isinstance(current, dict):
-            pending.extend(item for _, item in tuple(dict.items(current)))
+            native_items = tuple(dict.items(current))
+            if type(current) is dict:
+                frozen_containers[identity] = _FrozenContainerState(
+                    owner=current,
+                    kind="dict",
+                    entries=native_items,
+                )
+            pending.extend(item for _, item in native_items)
         elif isinstance(current, list):
-            pending.extend(tuple(list.__iter__(current)))
+            native_items = tuple(list.__iter__(current))
+            if type(current) is list:
+                frozen_containers[identity] = _FrozenContainerState(
+                    owner=current,
+                    kind="list",
+                    entries=native_items,
+                )
+            pending.extend(native_items)
         else:
-            pending.extend(tuple(tuple.__iter__(current)))
+            native_items = tuple(tuple.__iter__(current))
+            if type(current) is tuple:
+                frozen_containers[identity] = _FrozenContainerState(
+                    owner=current,
+                    kind="tuple",
+                    entries=native_items,
+                )
+            pending.extend(native_items)
 
 
 def _normalize_field_names(
@@ -172,6 +202,7 @@ def _snapshot_native_value(
     *,
     active: set[int],
     frozen_models: dict[int, _FrozenModelState],
+    frozen_containers: dict[int, _FrozenContainerState],
     discovered: dict[int, Any],
     depth: int,
     location: str,
@@ -184,7 +215,12 @@ def _snapshot_native_value(
     is_container = isinstance(value, (BaseModel, dict, list, tuple))
     identity = id(value)
     if is_container:
-        _freeze_native_model_graph(value, frozen_models, discovered)
+        _freeze_native_model_graph(
+            value,
+            frozen_models,
+            frozen_containers,
+            discovered,
+        )
         if identity in active:
             raise ValueError(f"cyclic contract graph at {location}")
         active.add(identity)
@@ -240,6 +276,7 @@ def _snapshot_native_value(
                     item,
                     active=active,
                     frozen_models=frozen_models,
+                    frozen_containers=frozen_containers,
                     discovered=discovered,
                     depth=depth + 1,
                     location=f"{location}.{name}",
@@ -247,40 +284,67 @@ def _snapshot_native_value(
                 for name, item in stored_values
             }
         if isinstance(value, dict):
+            frozen = frozen_containers.get(identity)
+            source_items = (
+                frozen.entries
+                if frozen is not None
+                and frozen.owner is value
+                and frozen.kind == "dict"
+                else value.items()
+            )
             return {
                 key: _snapshot_native_value(
                     item,
                     active=active,
                     frozen_models=frozen_models,
+                    frozen_containers=frozen_containers,
                     discovered=discovered,
                     depth=depth + 1,
                     location=f"{location}[key]",
                 )
-                for key, item in value.items()
+                for key, item in source_items
             }
         if isinstance(value, list):
+            frozen = frozen_containers.get(identity)
+            source_items = (
+                frozen.entries
+                if frozen is not None
+                and frozen.owner is value
+                and frozen.kind == "list"
+                else value
+            )
             return [
                 _snapshot_native_value(
                     item,
                     active=active,
                     frozen_models=frozen_models,
+                    frozen_containers=frozen_containers,
                     discovered=discovered,
                     depth=depth + 1,
                     location=f"{location}[{index}]",
                 )
-                for index, item in enumerate(value)
+                for index, item in enumerate(source_items)
             ]
         if isinstance(value, tuple):
+            frozen = frozen_containers.get(identity)
+            source_items = (
+                frozen.entries
+                if frozen is not None
+                and frozen.owner is value
+                and frozen.kind == "tuple"
+                else value
+            )
             return tuple(
                 _snapshot_native_value(
                     item,
                     active=active,
                     frozen_models=frozen_models,
+                    frozen_containers=frozen_containers,
                     discovered=discovered,
                     depth=depth + 1,
                     location=f"{location}[{index}]",
                 )
-                for index, item in enumerate(value)
+                for index, item in enumerate(source_items)
             )
         return value
     finally:
@@ -299,13 +363,20 @@ def _validated_contract_snapshot(
     if not isinstance(value, expected_type):
         raise TypeError(f"{label} must be a {expected_type.__name__}")
     frozen_models: dict[int, _FrozenModelState] = {}
+    frozen_containers: dict[int, _FrozenContainerState] = {}
     discovered: dict[int, Any] = {}
-    _freeze_native_model_graph(value, frozen_models, discovered)
+    _freeze_native_model_graph(
+        value,
+        frozen_models,
+        frozen_containers,
+        discovered,
+    )
     return _validated_contract_snapshot_from_frozen(
         value,
         expected_type,
         label=label,
         frozen_models=frozen_models,
+        frozen_containers=frozen_containers,
         discovered=discovered,
     )
 
@@ -316,6 +387,7 @@ def _validated_contract_snapshot_from_frozen(
     *,
     label: str,
     frozen_models: dict[int, _FrozenModelState],
+    frozen_containers: dict[int, _FrozenContainerState],
     discovered: dict[int, Any],
 ) -> _ContractT:
     """Validate using entry state already frozen for the enclosing boundary."""
@@ -327,6 +399,7 @@ def _validated_contract_snapshot_from_frozen(
             value,
             active=set(),
             frozen_models=frozen_models,
+            frozen_containers=frozen_containers,
             discovered=discovered,
             depth=0,
             location=label,
@@ -347,13 +420,20 @@ def _validated_contract_tuple(
     if not isinstance(values, tuple):
         raise TypeError(f"{label} must be a tuple")
     frozen_models: dict[int, _FrozenModelState] = {}
+    frozen_containers: dict[int, _FrozenContainerState] = {}
     discovered: dict[int, Any] = {}
-    _freeze_native_model_graph(values, frozen_models, discovered)
+    _freeze_native_model_graph(
+        values,
+        frozen_models,
+        frozen_containers,
+        discovered,
+    )
     return _validated_contract_tuple_from_frozen(
         values,
         expected_type,
         label=label,
         frozen_models=frozen_models,
+        frozen_containers=frozen_containers,
         discovered=discovered,
     )
 
@@ -364,6 +444,7 @@ def _validated_contract_tuple_from_frozen(
     *,
     label: str,
     frozen_models: dict[int, _FrozenModelState],
+    frozen_containers: dict[int, _FrozenContainerState],
     discovered: dict[int, Any],
 ) -> tuple[_ContractT, ...]:
     """Validate a tuple using entry state frozen for the enclosing boundary."""
@@ -376,6 +457,7 @@ def _validated_contract_tuple_from_frozen(
             expected_type,
             label=f"{label}[{index}]",
             frozen_models=frozen_models,
+            frozen_containers=frozen_containers,
             discovered=discovered,
         )
         for index, value in enumerate(values)
@@ -544,16 +626,28 @@ def validate_capability_requirements(
 
     requirements_is_tuple = isinstance(requirements, tuple)
     frozen_models: dict[int, _FrozenModelState] = {}
+    frozen_containers: dict[int, _FrozenContainerState] = {}
     discovered: dict[int, Any] = {}
-    _freeze_native_model_graph(manifest, frozen_models, discovered)
+    _freeze_native_model_graph(
+        manifest,
+        frozen_models,
+        frozen_containers,
+        discovered,
+    )
     if requirements_is_tuple:
-        _freeze_native_model_graph(requirements, frozen_models, discovered)
+        _freeze_native_model_graph(
+            requirements,
+            frozen_models,
+            frozen_containers,
+            discovered,
+        )
 
     manifest = _validated_contract_snapshot_from_frozen(
         manifest,
         CapabilityManifest,
         label="capability manifest",
         frozen_models=frozen_models,
+        frozen_containers=frozen_containers,
         discovered=discovered,
     )
     requirements = _validated_contract_tuple_from_frozen(
@@ -561,6 +655,7 @@ def validate_capability_requirements(
         CapabilityRequirement,
         label="capability requirements",
         frozen_models=frozen_models,
+        frozen_containers=frozen_containers,
         discovered=discovered,
     )
     states_by_operation = _operation_state_lookup(manifest)

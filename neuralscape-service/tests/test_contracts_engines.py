@@ -794,6 +794,215 @@ def test_capability_boundary_freezes_manifest_edge_before_earlier_callback():
     assert invalid.qualification.operation == "retrieve"
 
 
+@pytest.mark.parametrize("tuple_field", ["contract_schema_versions", "operations"])
+def test_capability_boundary_freezes_exact_reference_dict_before_manifest_callback(
+    tuple_field,
+):
+    ordinary_reference = reference("runtime-profile").model_dump(mode="python")
+    ordinary_reference["id"] = ""
+    ordinary = requirement().model_copy(
+        update={"qualification_profile_reference": ordinary_reference}
+    )
+    with pytest.raises(ValidationError) as caught:
+        validate_capability_requirements(manifest(state()), (ordinary,))
+    assert caught.value.errors(include_url=False)[0]["type"] == "string_too_short"
+    assert caught.value.errors(include_url=False)[0]["loc"] == (
+        "qualification_profile_reference",
+        "id",
+    )
+
+    invalid_reference = reference("runtime-profile").model_dump(mode="python")
+    invalid_reference["id"] = ""
+    invalid = requirement().model_copy(
+        update={"qualification_profile_reference": invalid_reference}
+    )
+
+    def repair_reference():
+        invalid_reference["id"] = "runtime-profile"
+
+    declared = manifest(state())
+    observed = ObservableTuple(
+        getattr(declared, tuple_field),
+        callback=repair_reference,
+    )
+    native = _MODEL_DICT_DESCRIPTOR.__get__(declared, BaseModel)
+    dict.__setitem__(native, tuple_field, observed)
+
+    with pytest.raises(ValidationError) as caught:
+        validate_capability_requirements(declared, (invalid,))
+    assert caught.value.errors(include_url=False)[0]["type"] == "string_too_short"
+    assert caught.value.errors(include_url=False)[0]["loc"] == (
+        "qualification_profile_reference",
+        "id",
+    )
+    assert observed.calls == 1
+    assert invalid_reference["id"] == "runtime-profile"
+
+    valid_reference = reference("runtime-profile").model_dump(mode="python")
+    valid = requirement().model_copy(
+        update={"qualification_profile_reference": valid_reference}
+    )
+    valid_manifest = manifest(state())
+    benign = ObservableTuple(
+        getattr(valid_manifest, tuple_field),
+        callback=lambda: valid_reference.__setitem__("id", "runtime-profile"),
+    )
+    valid_native = _MODEL_DICT_DESCRIPTOR.__get__(valid_manifest, BaseModel)
+    dict.__setitem__(valid_native, tuple_field, benign)
+
+    assert validate_capability_requirements(valid_manifest, (valid,)) == ()
+    assert benign.calls == 1
+
+
+def test_capability_boundary_freezes_exact_reference_dict_before_requirements_callback():
+    invalid_reference = reference("runtime-profile").model_dump(mode="python")
+    invalid_reference["id"] = ""
+    invalid = requirement().model_copy(
+        update={"qualification_profile_reference": invalid_reference}
+    )
+
+    requirements = ObservableTuple(
+        (invalid,),
+        callback=lambda: invalid_reference.__setitem__("id", "runtime-profile"),
+    )
+
+    with pytest.raises(ValidationError) as caught:
+        validate_capability_requirements(manifest(state()), requirements)
+    assert caught.value.errors(include_url=False)[0]["type"] == "string_too_short"
+    assert caught.value.errors(include_url=False)[0]["loc"] == (
+        "qualification_profile_reference",
+        "id",
+    )
+    assert requirements.calls == 1
+    assert invalid_reference["id"] == "runtime-profile"
+
+    valid_reference = reference("runtime-profile").model_dump(mode="python")
+    valid = requirement().model_copy(
+        update={"qualification_profile_reference": valid_reference}
+    )
+    control = ObservableTuple(
+        (valid,),
+        callback=lambda: valid_reference.__setitem__("id", "runtime-profile"),
+    )
+
+    assert validate_capability_requirements(manifest(state()), control) == ()
+    assert control.calls == 1
+
+
+@pytest.mark.parametrize("public_surface", ["requirements", "operation_state"])
+def test_capability_boundary_freezes_exact_qualification_dict_before_manifest_callback(
+    public_surface,
+):
+    ordinary_qualification = qualification(operation="export").model_dump(
+        mode="python"
+    )
+    ordinary_state = state().model_copy(
+        update={"qualification": ordinary_qualification}
+    )
+    ordinary_manifest = manifest(state()).model_copy(
+        update={"operations": (ordinary_state,)}
+    )
+    with pytest.raises(ValidationError) as caught:
+        if public_surface == "requirements":
+            validate_capability_requirements(
+                ordinary_manifest,
+                (requirement(),),
+            )
+        else:
+            ordinary_manifest.operation_state("retrieve")
+    assert caught.value.errors(include_url=False)[0]["type"] == "value_error"
+    assert caught.value.errors(include_url=False)[0]["loc"] == ("operations", 0)
+
+    invalid_qualification = qualification(operation="export").model_dump(
+        mode="python"
+    )
+    invalid_state = state().model_copy(
+        update={"qualification": invalid_qualification}
+    )
+    declared = manifest(state()).model_copy(
+        update={"operations": (invalid_state,)}
+    )
+    versions = ObservableTuple(
+        (VERSION,),
+        callback=lambda: invalid_qualification.__setitem__(
+            "operation",
+            "retrieve",
+        ),
+    )
+    native = _MODEL_DICT_DESCRIPTOR.__get__(declared, BaseModel)
+    dict.__setitem__(native, "contract_schema_versions", versions)
+
+    with pytest.raises(ValidationError) as caught:
+        if public_surface == "requirements":
+            validate_capability_requirements(declared, (requirement(),))
+        else:
+            declared.operation_state("retrieve")
+    assert caught.value.errors(include_url=False)[0]["type"] == "value_error"
+    assert caught.value.errors(include_url=False)[0]["loc"] == ("operations", 0)
+    assert versions.calls == 1
+    assert invalid_qualification["operation"] == "retrieve"
+
+    valid_qualification = qualification().model_dump(mode="python")
+    valid_state = state().model_copy(update={"qualification": valid_qualification})
+    valid_manifest = manifest(state()).model_copy(
+        update={"operations": (valid_state,)}
+    )
+    benign = ObservableTuple(
+        (VERSION,),
+        callback=lambda: valid_qualification.__setitem__(
+            "operation",
+            "retrieve",
+        ),
+    )
+    valid_native = _MODEL_DICT_DESCRIPTOR.__get__(valid_manifest, BaseModel)
+    dict.__setitem__(valid_native, "contract_schema_versions", benign)
+
+    if public_surface == "requirements":
+        assert validate_capability_requirements(
+            valid_manifest,
+            (requirement(),),
+        ) == ()
+    else:
+        assert valid_manifest.operation_state("retrieve") == state()
+    assert benign.calls == 1
+
+
+def test_capability_boundary_preserves_dict_subclass_public_view_authority():
+    class DivergentReference(dict):
+        def __init__(self, native, public):
+            super().__init__(native)
+            self.public = public
+            self.calls = 0
+
+        def items(self):
+            self.calls += 1
+            return self.public.items()
+
+    valid = reference("runtime-profile").model_dump(mode="python")
+    invalid = reference("runtime-profile").model_dump(mode="python")
+    invalid["id"] = ""
+
+    public_valid = DivergentReference(invalid, valid)
+    received = requirement().model_copy(
+        update={"qualification_profile_reference": public_valid}
+    )
+    assert validate_capability_requirements(manifest(state()), (received,)) == ()
+    assert public_valid.calls == 1
+
+    public_invalid = DivergentReference(valid, invalid)
+    received = requirement().model_copy(
+        update={"qualification_profile_reference": public_invalid}
+    )
+    with pytest.raises(ValidationError) as caught:
+        validate_capability_requirements(manifest(state()), (received,))
+    assert caught.value.errors(include_url=False)[0]["type"] == "string_too_short"
+    assert caught.value.errors(include_url=False)[0]["loc"] == (
+        "qualification_profile_reference",
+        "id",
+    )
+    assert public_invalid.calls == 1
+
+
 def test_capability_boundary_preserves_divergent_tuple_view_authority():
     invalid_backing = requirement().model_copy(
         update={"qualification_profile_version": None}
@@ -1060,6 +1269,7 @@ def test_requirement_validation_builds_one_index_from_one_manifest_snapshot(
         *,
         label,
         frozen_models,
+        frozen_containers,
         discovered,
     ):
         if expected_type is CapabilityManifest:
@@ -1069,6 +1279,7 @@ def test_requirement_validation_builds_one_index_from_one_manifest_snapshot(
             expected_type,
             label=label,
             frozen_models=frozen_models,
+            frozen_containers=frozen_containers,
             discovered=discovered,
         )
 
