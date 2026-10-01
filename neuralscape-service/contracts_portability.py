@@ -140,12 +140,9 @@ def _reject_retained_unknown_fields(
                 fields_set_storage,
                 extra_snapshot,
             )
-            for _, item in stored_entries:
-                discover(item)
-            captured_natively, extra = extra_snapshot
-            if captured_natively:
-                for key, item in extra:
-                    discover(key)
+            declared = value_type.model_fields
+            for name, item in stored_entries:
+                if name in declared:
                     discover(item)
             return
 
@@ -294,16 +291,25 @@ def _reconstruct_retained_state(
                 return {name: rebuild(item) for name, item in stored.items()}
 
             if type(value) is dict:
-                _, items = native_container_inventory[identity]
+                try:
+                    _, items = native_container_inventory[identity]
+                except KeyError as exc:
+                    raise ValueError(
+                        "contract container was not present in the validated graph"
+                    ) from exc
                 return {rebuild(key): rebuild(item) for key, item in items}
             if isinstance(value, Mapping):
                 return {rebuild(key): rebuild(item) for key, item in value.items()}
             value_type = type(value)
-            items = (
-                native_container_inventory[identity][1]
-                if value_type in (list, tuple, set, frozenset)
-                else value
-            )
+            if value_type in (list, tuple, set, frozenset):
+                try:
+                    items = native_container_inventory[identity][1]
+                except KeyError as exc:
+                    raise ValueError(
+                        "contract container was not present in the validated graph"
+                    ) from exc
+            else:
+                items = value
             if isinstance(value, list):
                 return [rebuild(item) for item in items]
             if isinstance(value, tuple):

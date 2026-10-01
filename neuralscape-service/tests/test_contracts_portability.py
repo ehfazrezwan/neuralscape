@@ -436,6 +436,28 @@ class DivergentFilesList(list[ManifestFile]):
         return iter(self.public_items)
 
 
+class LateExactContainerFilesList(list[ManifestFile]):
+    def __init__(
+        self,
+        public_items: tuple[ManifestFile, ...],
+        late_container_kind: str,
+    ) -> None:
+        list.__init__(self, public_items)
+        self.public_items = public_items
+        self.late_container_kind = late_container_kind
+        self.iteration_calls = 0
+
+    def __iter__(self) -> Iterator[object]:
+        self.iteration_calls += 1
+        if self.iteration_calls == 1:
+            return iter(self.public_items)
+        if self.late_container_kind == "dict":
+            late_container: object = self.public_items[0].model_dump(mode="python")
+        else:
+            late_container = [self.public_items[0]]
+        return iter((late_container, *self.public_items[1:]))
+
+
 class NoneReportingExtraManifest(PortableManifest):
     def __getattribute__(self, name: str) -> object:
         if name == "__pydantic_extra__":
@@ -1962,6 +1984,32 @@ def test_list_subclass_public_view_remains_authoritative(
     assert files.iteration_calls == 2
 
 
+@pytest.mark.parametrize("late_container_kind", ["dict", "list"])
+def test_list_subclass_cannot_introduce_unvalidated_exact_container(
+    late_container_kind: str,
+) -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    files = LateExactContainerFilesList(
+        tuple(manifest.files),
+        late_container_kind,
+    )
+    native_manifest = _PYDANTIC_DICT_DESCRIPTOR.__get__(manifest, BaseModel)
+    dict.__setitem__(native_manifest, "files", files)
+
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+
+    errors = raised.value.errors()
+    assert len(errors) == 1
+    assert errors[0]["type"] == "value_error"
+    assert errors[0]["loc"] == ()
+    assert isinstance(raised.value.__cause__, ValueError)
+    assert "contract container was not present in the validated graph" in str(
+        raised.value.__cause__
+    )
+    assert files.iteration_calls == 2
+
+
 @pytest.mark.parametrize("competing_error", ["overlap", "unknown", "cycle"])
 def test_frozen_nested_state_preserves_existing_error_priority(
     competing_error: str,
@@ -2616,6 +2664,34 @@ def test_deep_unchecked_native_container_is_a_controlled_validation_failure() ->
         validate_portable_manifest(corrupted)
 
     assert isinstance(raised.value.__cause__, RecursionError)
+
+
+@pytest.mark.parametrize("storage_kind", ["stored", "extra"])
+def test_deep_unknown_value_preserves_extra_forbidden_priority(
+    storage_kind: str,
+) -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    deeply_nested: object = "leaf"
+    for _ in range(sys.getrecursionlimit() + 100):
+        deeply_nested = [deeply_nested]
+
+    if storage_kind == "stored":
+        native_manifest = _PYDANTIC_DICT_DESCRIPTOR.__get__(manifest, BaseModel)
+        dict.__setitem__(native_manifest, "future_entry_semantics", deeply_nested)
+    else:
+        _PYDANTIC_EXTRA_SLOT.__set__(
+            manifest,
+            {"future_entry_semantics": deeply_nested},
+        )
+
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+
+    errors = raised.value.errors()
+    assert len(errors) == 1
+    assert errors[0]["type"] == "extra_forbidden"
+    assert errors[0]["loc"] == ("future_entry_semantics",)
+    assert errors[0]["input"] is deeply_nested
 
 
 def test_unknown_fields_and_missing_schema_version_are_rejected() -> None:
