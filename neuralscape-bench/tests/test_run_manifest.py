@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
@@ -216,30 +217,79 @@ class FalseyPopulatedExtras(dict[str, object]):
         return False
 
 
-class HiddenItemsExtras(dict[str, object]):
-    """Expose keys through iteration while hiding every items() pair."""
+class HiddenBackingExtras(dict[str, object]):
+    """Hide native dict backing through every overridable public view."""
 
     def __init__(self, values: dict[str, object]):
         super().__init__(values)
+        self.bool_calls = 0
+        self.class_calls = 0
+        self.len_calls = 0
         self.iteration_calls = 0
+        self.keys_calls = 0
         self.items_calls = 0
+
+    @property
+    def __class__(self):
+        self.class_calls += 1
+        return object
+
+    def __len__(self):
+        self.len_calls += 1
+        return 0
+
+    def __bool__(self):
+        self.bool_calls += 1
+        return False
 
     def __iter__(self):
         self.iteration_calls += 1
-        return super().__iter__()
+        return iter(())
+
+    def keys(self):
+        self.keys_calls += 1
+        return ()
 
     def items(self):
         self.items_calls += 1
         return ()
 
 
-class ChangingItemsExtras(dict[str, object]):
+class HiddenItemsExtras(Mapping[str, object]):
+    """Expose keys through iteration while hiding every items() pair."""
+
+    def __init__(self, values: dict[str, object]):
+        self.values = values
+        self.iteration_calls = 0
+        self.items_calls = 0
+
+    def __getitem__(self, key: str) -> object:
+        return self.values[key]
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        return iter(self.values)
+
+    def items(self):
+        self.items_calls += 1
+        return ()
+
+
+class ChangingItemsExtras(Mapping[str, object]):
     """Return a different entry inventory if a receiver consumes it twice."""
 
     def __init__(self):
-        super().__init__()
         self.iteration_calls = 0
         self.items_calls = 0
+
+    def __getitem__(self, key: str) -> object:
+        raise KeyError(key)
+
+    def __len__(self) -> int:
+        return 0
 
     def __iter__(self):
         self.iteration_calls += 1
@@ -351,6 +401,63 @@ def test_serializer_rejects_falsey_populated_extra_storage(target_name: str):
 
     with pytest.raises(ValueError, match="undeclared stored fields"):
         serialize_run_manifest(manifest)
+
+
+@pytest.mark.parametrize(
+    ("target_name", "extra_key", "extra_value"),
+    [
+        ("manifest", "future_constraint", "deny"),
+        ("manifest", "run_id", "run-001"),
+        ("manifest", "run_id", "shadow-run"),
+        ("nested_resource", "future_constraint", "deny"),
+        ("nested_resource", "scope", "api-container"),
+        ("nested_resource", "scope", "shadow-scope"),
+    ],
+    ids=[
+        "direct-unknown",
+        "direct-declared-equal",
+        "direct-declared-conflicting",
+        "nested-unknown",
+        "nested-declared-equal",
+        "nested-declared-conflicting",
+    ],
+)
+def test_serializer_rejects_hidden_native_dict_backing(
+    target_name: str,
+    extra_key: str,
+    extra_value: str,
+):
+    manifest, target = planned_manifest_with_extra_target(target_name)
+    extras = HiddenBackingExtras({extra_key: extra_value})
+    object.__setattr__(target, "__pydantic_extra__", extras)
+
+    with pytest.raises(ValueError, match="undeclared stored fields") as exc_info:
+        serialize_run_manifest(manifest)
+
+    assert repr(extra_key) in str(exc_info.value)
+    assert extras.bool_calls == 0
+    assert extras.class_calls == 0
+    assert extras.len_calls == 0
+    assert extras.iteration_calls == 0
+    assert extras.keys_calls == 0
+    assert extras.items_calls == 0
+
+
+@pytest.mark.parametrize("target_name", ["manifest", "nested_resource"])
+def test_serializer_accepts_empty_native_dict_subclass(target_name: str):
+    manifest, target = planned_manifest_with_extra_target(target_name)
+    extras = HiddenBackingExtras({})
+    object.__setattr__(target, "__pydantic_extra__", extras)
+
+    assert serialize_run_manifest(manifest) == serialize_run_manifest(
+        planned_manifest()
+    )
+    assert extras.bool_calls == 0
+    assert extras.class_calls == 0
+    assert extras.len_calls == 0
+    assert extras.iteration_calls == 0
+    assert extras.keys_calls == 0
+    assert extras.items_calls == 0
 
 
 @pytest.mark.parametrize(
