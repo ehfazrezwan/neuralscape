@@ -431,6 +431,30 @@ class _DivergentPublicMapping(Mapping[str, object]):
         return self.public_entries.items()
 
 
+class _TraversalItemsInput(dict[str, object]):
+    """Raise immediately or lazily from one public items traversal."""
+
+    def __init__(self, entries: dict[str, object], behavior: str) -> None:
+        super().__init__(entries)
+        self.behavior = behavior
+        self.items_calls = 0
+        self.iterator_entries = 0
+
+    def items(self) -> Iterator[tuple[str, object]]:
+        self.items_calls += 1
+        if self.behavior == "immediate":
+            raise RuntimeError("items immediate sentinel")
+
+        def iterate() -> Iterator[tuple[str, object]]:
+            first = next(iter(dict.items(self)))
+            self.iterator_entries += 1
+            yield first
+            if self.behavior == "lazy":
+                raise RuntimeError("items lazy sentinel")
+
+        return iterate()
+
+
 class _FalseyPopulatedExtras(dict[str, object]):
     def __bool__(self) -> bool:
         return False
@@ -1264,6 +1288,117 @@ def test_python_prefreeze_keeps_native_dict_and_public_mapping_authority() -> No
     public_invalid = _DivergentPublicMapping(valid_payload, invalid_payload)
     assert _validation_signature(ReconciledUsageStream, public_invalid) == expected
     assert public_invalid.items_calls == 1
+
+
+@pytest.mark.parametrize("behavior", ["immediate", "lazy"])
+@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+def test_python_result_root_dict_traversal_errors_remain_validation_errors(
+    behavior: str,
+    receiver_name: str,
+) -> None:
+    result = reconcile_usage_events([_event()])
+    if receiver_name == "stream":
+        receiver = ReconciledUsageStream
+        valid = result.streams[0]
+    else:
+        receiver = UsageReconciliation
+        valid = result
+
+    failing = _TraversalItemsInput(valid.model_dump(mode="python"), behavior)
+    assert _validation_signature(receiver, failing) == [
+        (
+            "mapping_type",
+            (),
+            (
+                "Input should be a valid mapping, error: RuntimeError: "
+                f"items {behavior} sentinel"
+            ),
+        )
+    ]
+    assert failing.items_calls == 1
+    assert failing.iterator_entries == (1 if behavior == "lazy" else 0)
+
+    control = _TraversalItemsInput(valid.model_dump(mode="python"), "valid")
+    assert receiver.model_validate(control) == valid
+    assert control.items_calls == 1
+    assert control.iterator_entries == 1
+
+
+@pytest.mark.parametrize("behavior", ["immediate", "lazy"])
+@pytest.mark.parametrize("entry", ["model_validate", "constructor"])
+@pytest.mark.parametrize(
+    ("target_name", "location"),
+    [
+        ("attribution", ("attribution",)),
+        ("usage", ("usage",)),
+        ("stream", ("streams", 0)),
+        ("ledger", ("ledgers", 0)),
+    ],
+)
+def test_python_nested_dict_traversal_errors_keep_category_and_location(
+    behavior: str,
+    entry: str,
+    target_name: str,
+    location: tuple[object, ...],
+) -> None:
+    result = reconcile_usage_events([_event()])
+    stream = result.streams[0]
+    if target_name == "attribution":
+        receiver = ReconciledUsageStream
+        expected = stream
+        field_name = "attribution"
+        child = stream.attribution
+        payload = stream.model_dump(mode="python")
+    elif target_name == "usage":
+        receiver = ReconciledUsageStream
+        expected = stream
+        field_name = "usage"
+        assert stream.usage is not None
+        child = stream.usage
+        payload = stream.model_dump(mode="python")
+    elif target_name == "stream":
+        receiver = UsageReconciliation
+        expected = result
+        field_name = "streams"
+        child = stream
+        payload = result.model_dump(mode="python")
+    else:
+        receiver = UsageReconciliation
+        expected = result
+        field_name = "ledgers"
+        child = result.ledgers[0]
+        payload = result.model_dump(mode="python")
+
+    failing = _TraversalItemsInput(child.model_dump(mode="python"), behavior)
+    control = _TraversalItemsInput(child.model_dump(mode="python"), "valid")
+    if target_name in {"stream", "ledger"}:
+        remaining = (
+            () if target_name == "stream" else result.ledgers[1:]
+        )
+        payload[field_name] = (failing, *remaining)
+    else:
+        payload[field_name] = failing
+
+    assert _python_validation_signature(receiver, payload, entry) == [
+        (
+            "mapping_type",
+            location,
+            (
+                "Input should be a valid mapping, error: RuntimeError: "
+                f"items {behavior} sentinel"
+            ),
+        )
+    ]
+    assert failing.items_calls == 1
+    assert failing.iterator_entries == (1 if behavior == "lazy" else 0)
+
+    if target_name in {"stream", "ledger"}:
+        payload[field_name] = (control, *remaining)
+    else:
+        payload[field_name] = control
+    assert _python_receive(receiver, payload, entry) == expected
+    assert control.items_calls == 1
+    assert control.iterator_entries == 1
 
 
 @pytest.mark.parametrize(

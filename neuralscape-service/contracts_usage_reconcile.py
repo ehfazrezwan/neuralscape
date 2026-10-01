@@ -56,6 +56,17 @@ LedgerCoverage = Literal["reported", "unreported"]
 LedgerMissingReason = Literal["no_events"]
 
 
+class _FailedNativeDictTraversal(dict[object, object]):
+    """Let Pydantic locate one failed native-dict mapping traversal."""
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__()
+        self.error = error
+
+    def items(self):
+        raise self.error
+
+
 class UsageReconciliationError(ValueError):
     """A deterministic validation failure in a supplied event set."""
 
@@ -442,7 +453,10 @@ def _native_snapshot(
             if frozen_dict is not None and frozen_dict[0] is value:
                 # Preserve the public traversal callback, but retain the native
                 # dict edges captured before that callback could replace them.
-                tuple(value.items())
+                try:
+                    tuple(value.items())
+                except Exception as exc:
+                    return _FailedNativeDictTraversal(exc)
                 source_items = frozen_dict[1]
             else:
                 source_items = value.items()
