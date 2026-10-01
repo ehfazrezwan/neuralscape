@@ -33,6 +33,8 @@ _SafeCounter = Annotated[
     int,
     Field(strict=True, ge=0, le=_MAX_SAFE_COUNTER),
 ]
+_BASE_MODEL_DICT_DESCRIPTOR = vars(BaseModel)["__dict__"]
+_BASE_MODEL_EXTRA_DESCRIPTOR = vars(BaseModel)["__pydantic_extra__"]
 
 
 class _ManifestContract(BaseModel):
@@ -311,11 +313,14 @@ def _snapshot_native(value: Any, *, path: str = "$", active: set[int] | None = N
     try:
         if isinstance(value, BaseModel):
             fields = type(value).model_fields
-            stored = object.__getattribute__(value, "__dict__")
+            stored = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
             stored_entries = tuple(dict.items(stored))
             stored_values = dict(stored_entries)
             undeclared = set(stored_values).difference(fields)
-            extras = object.__getattribute__(value, "__pydantic_extra__")
+            try:
+                extras = _BASE_MODEL_EXTRA_DESCRIPTOR.__get__(value, BaseModel)
+            except AttributeError:
+                extras = None
             if extras is not None:
                 if issubclass(type(extras), dict):
                     extra_entries = tuple(dict.items(extras))

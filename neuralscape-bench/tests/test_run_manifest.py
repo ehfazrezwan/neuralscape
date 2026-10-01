@@ -42,6 +42,8 @@ VERSION = "candidate-v1"
 SHA_A = "sha256:" + "a" * 64
 SHA_B = "sha256:" + "b" * 64
 SHA_C = "sha256:" + "c" * 64
+BASE_MODEL_DICT_DESCRIPTOR = vars(pydantic.BaseModel)["__dict__"]
+BASE_MODEL_EXTRA_DESCRIPTOR = vars(pydantic.BaseModel)["__pydantic_extra__"]
 
 
 def test_standalone_import_and_validation_without_product_modules(tmp_path):
@@ -391,6 +393,56 @@ class HiddenStorageViewManifest(RunManifest):
         return super().__getattribute__(name)
 
 
+class DescriptorMaskedRunManifest(RunManifest):
+    """Hide actual Pydantic storage behind subclass data descriptors."""
+
+    @property
+    def __dict__(self):
+        native = BASE_MODEL_DICT_DESCRIPTOR.__get__(self, pydantic.BaseModel)
+        return {
+            key: value
+            for key, value in dict.items(native)
+            if key != "future_constraint"
+        }
+
+    @__dict__.setter
+    def __dict__(self, value):
+        BASE_MODEL_DICT_DESCRIPTOR.__set__(self, value)
+
+    @property
+    def __pydantic_extra__(self):
+        return None
+
+    @__pydantic_extra__.setter
+    def __pydantic_extra__(self, value):
+        BASE_MODEL_EXTRA_DESCRIPTOR.__set__(self, value)
+
+
+class DescriptorMaskedResourceReading(ResourceReading):
+    """Nested counterpart to DescriptorMaskedRunManifest."""
+
+    @property
+    def __dict__(self):
+        native = BASE_MODEL_DICT_DESCRIPTOR.__get__(self, pydantic.BaseModel)
+        return {
+            key: value
+            for key, value in dict.items(native)
+            if key != "future_constraint"
+        }
+
+    @__dict__.setter
+    def __dict__(self, value):
+        BASE_MODEL_DICT_DESCRIPTOR.__set__(self, value)
+
+    @property
+    def __pydantic_extra__(self):
+        return None
+
+    @__pydantic_extra__.setter
+    def __pydantic_extra__(self, value):
+        BASE_MODEL_EXTRA_DESCRIPTOR.__set__(self, value)
+
+
 class MutatingTuple(tuple[object, ...]):
     """Apply one model-storage mutation when native tuple traversal starts."""
 
@@ -421,6 +473,118 @@ def receive_planned_manifest(boundary: str, manifest: RunManifest) -> RunManifes
         resources=(measured_memory(),),
         measurements=(timing(),),
     )
+
+
+def descriptor_masked_manifest(
+    target_name: str,
+) -> tuple[RunManifest, RunManifest | ResourceReading]:
+    if target_name == "manifest":
+        manifest = DescriptorMaskedRunManifest.model_validate(
+            planned_manifest().model_dump()
+        )
+        return manifest, manifest
+
+    resource = DescriptorMaskedResourceReading.model_validate(
+        pending_memory().model_dump()
+    )
+    manifest = planned_manifest().model_copy(update={"resources": (resource,)})
+    return manifest, resource
+
+
+def assert_received(boundary: str, manifest: RunManifest) -> None:
+    received = receive_planned_manifest(boundary, manifest)
+    expected_state = (
+        RunState.PLANNED if boundary == "serialize" else RunState.COMPLETED
+    )
+    assert received.state is expected_state
+
+
+@pytest.mark.parametrize("boundary", ["serialize", "finish"])
+@pytest.mark.parametrize(
+    ("target_name", "expected_path"),
+    [("manifest", "$"), ("nested_resource", "$.resources[0]")],
+)
+@pytest.mark.parametrize("storage_kind", ["stored", "extra"])
+def test_receivers_use_base_model_descriptors_for_native_storage(
+    boundary: str,
+    target_name: str,
+    expected_path: str,
+    storage_kind: str,
+):
+    manifest, target = descriptor_masked_manifest(target_name)
+
+    if storage_kind == "stored":
+        backing = BASE_MODEL_DICT_DESCRIPTOR.__get__(target, pydantic.BaseModel)
+        dict.__setitem__(backing, "future_constraint", "deny")
+        assert tuple(dict.items(backing))[-1] == ("future_constraint", "deny")
+        assert "future_constraint" not in target.__dict__
+    else:
+        BASE_MODEL_EXTRA_DESCRIPTOR.__set__(
+            target, {"future_constraint": "deny"}
+        )
+        backing = BASE_MODEL_EXTRA_DESCRIPTOR.__get__(target, pydantic.BaseModel)
+        assert tuple(dict.items(backing)) == (("future_constraint", "deny"),)
+        assert target.__pydantic_extra__ is None
+
+    with pytest.raises(ValueError) as exc_info:
+        receive_planned_manifest(boundary, manifest)
+
+    assert str(exc_info.value) == (
+        f"undeclared stored fields at {expected_path}: 'future_constraint'"
+    )
+
+
+@pytest.mark.parametrize("boundary", ["serialize", "finish"])
+@pytest.mark.parametrize(
+    ("target_name", "expected_path"),
+    [("manifest", "$"), ("nested_resource", "$.resources[0]")],
+)
+@pytest.mark.parametrize("native_state", ["valid", "unknown"])
+@pytest.mark.parametrize("extra_state", ["absent", "none", "empty", "populated"])
+def test_receivers_preserve_base_model_extra_storage_states(
+    boundary: str,
+    target_name: str,
+    expected_path: str,
+    native_state: str,
+    extra_state: str,
+):
+    manifest, target = descriptor_masked_manifest(target_name)
+    stored = BASE_MODEL_DICT_DESCRIPTOR.__get__(target, pydantic.BaseModel)
+    if native_state == "unknown":
+        dict.__setitem__(stored, "future_constraint", "stored")
+        assert ("future_constraint", "stored") in tuple(dict.items(stored))
+
+    if extra_state == "absent":
+        BASE_MODEL_EXTRA_DESCRIPTOR.__delete__(target)
+        with pytest.raises(AttributeError):
+            BASE_MODEL_EXTRA_DESCRIPTOR.__get__(target, pydantic.BaseModel)
+    else:
+        extras = {
+            "none": None,
+            "empty": {},
+            "populated": {"future_extra": "extra"},
+        }[extra_state]
+        BASE_MODEL_EXTRA_DESCRIPTOR.__set__(target, extras)
+        assert (
+            BASE_MODEL_EXTRA_DESCRIPTOR.__get__(target, pydantic.BaseModel)
+            is extras
+        )
+
+    rejected_names = []
+    if native_state == "unknown":
+        rejected_names.append("'future_constraint'")
+    if extra_state == "populated":
+        rejected_names.append("'future_extra'")
+
+    if rejected_names:
+        with pytest.raises(ValueError) as exc_info:
+            receive_planned_manifest(boundary, manifest)
+        assert str(exc_info.value) == (
+            f"undeclared stored fields at {expected_path}: "
+            + ", ".join(rejected_names)
+        )
+    else:
+        assert_received(boundary, manifest)
 
 
 @pytest.mark.parametrize("boundary", ["serialize", "finish"])
