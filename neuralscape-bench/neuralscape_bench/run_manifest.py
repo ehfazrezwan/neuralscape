@@ -44,6 +44,13 @@ _FrozenModelStorage = tuple[
 ]
 
 
+class _FrozenExtraInventory(NamedTuple):
+    owner: Mapping[Any, Any]
+    iterated_names: tuple[Any, ...]
+    item_entries: tuple[Any, ...]
+    failure: Exception | None
+
+
 class _FrozenPublicMapping(NamedTuple):
     owner: Mapping[Any, Any]
     entries: tuple[tuple[Any, Any], ...]
@@ -63,6 +70,10 @@ class _FrozenGraph(NamedTuple):
     native_containers: dict[int, tuple[object, tuple[Any, ...]]]
     replay_entries: dict[int, tuple[object, tuple[Any, ...]]]
     completed_traversals: dict[int, object]
+    extra_mapping_owners: dict[int, Mapping[Any, Any]]
+    extra_mapping_queue: list[Mapping[Any, Any]]
+    extra_mapping_cursor: list[int]
+    extra_inventories: dict[int, _FrozenExtraInventory]
     public_mapping_owners: dict[int, Mapping[Any, Any]]
     public_mapping_queue: list[Mapping[Any, Any]]
     public_mappings: dict[int, _FrozenPublicMapping]
@@ -342,6 +353,95 @@ def _retain_public_mapping(value: Any, frozen_graph: _FrozenGraph) -> bool:
     return True
 
 
+def _retain_extra_mapping(
+    value: Any,
+    frozen_graph: _FrozenGraph,
+) -> bool:
+    """Retain one supported non-dict model-extra mapping owner."""
+
+    if (
+        value is None
+        or issubclass(type(value), dict)
+        or not isinstance(value, Mapping)
+    ):
+        return False
+    identity = id(value)
+    owner = frozen_graph.extra_mapping_owners.get(identity)
+    if owner is value:
+        return False
+    frozen_graph.extra_mapping_owners[identity] = value
+    frozen_graph.extra_mapping_queue.append(value)
+    frozen_graph.extra_inventories.pop(identity, None)
+    return True
+
+
+def _inventory_extra_mapping(
+    value: Mapping[Any, Any],
+    frozen_graph: _FrozenGraph,
+) -> _FrozenExtraInventory:
+    """Retain one model-extra mapping's key and item views."""
+
+    identity = id(value)
+    frozen = frozen_graph.extra_inventories.get(identity)
+    if frozen is not None and frozen.owner is value:
+        return frozen
+
+    iterated_names: list[Any] = []
+    item_entries: list[Any] = []
+    failure: Exception | None = None
+    try:
+        name_iterator = iter(value)
+    except Exception as error:
+        failure = error
+    else:
+        while True:
+            try:
+                iterated_names.append(next(name_iterator))
+            except StopIteration:
+                break
+            except Exception as error:
+                failure = error
+                break
+
+    if failure is None:
+        try:
+            item_iterator = iter(value.items())
+        except Exception as error:
+            failure = error
+        else:
+            while True:
+                try:
+                    item_entries.append(next(item_iterator))
+                except StopIteration:
+                    break
+                except Exception as error:
+                    failure = error
+                    break
+
+    frozen = _FrozenExtraInventory(
+        owner=value,
+        iterated_names=tuple(iterated_names),
+        item_entries=tuple(item_entries),
+        failure=failure,
+    )
+    frozen_graph.extra_inventories[identity] = frozen
+    return frozen
+
+
+def _inventory_retained_extra_mappings(frozen_graph: _FrozenGraph) -> None:
+    """Observe each retained model-extra mapping before public traversal."""
+
+    while frozen_graph.extra_mapping_cursor[0] < len(
+        frozen_graph.extra_mapping_queue
+    ):
+        cursor = frozen_graph.extra_mapping_cursor[0]
+        owner = frozen_graph.extra_mapping_queue[cursor]
+        frozen_graph.extra_mapping_cursor[0] = cursor + 1
+        if frozen_graph.extra_mapping_owners.get(id(owner)) is not owner:
+            continue
+        _inventory_extra_mapping(owner, frozen_graph)
+
+
 def _freeze_model_storage(
     value: Any,
     frozen_graph: _FrozenGraph,
@@ -386,6 +486,7 @@ def _freeze_model_storage(
                 if extras is not None and issubclass(type(extras), dict)
                 else None
             )
+            _retain_extra_mapping(extras, frozen_graph)
             frozen_graph.models[identity] = (
                 current,
                 stored_entries,
@@ -467,6 +568,7 @@ def _protect_yielded_model_storage(
     frozen_replay = frozen_graph.replay_entries.get(identity)
     if frozen_replay is None or frozen_replay[0] is not value:
         _freeze_model_storage(value, frozen_graph, set())
+        _inventory_retained_extra_mappings(frozen_graph)
 
     completed_owner = frozen_graph.completed_traversals.get(identity)
     if completed_owner is value:
@@ -753,6 +855,10 @@ def _freeze_model_graphs(*values: Any) -> _FrozenGraph:
         native_containers={},
         replay_entries={},
         completed_traversals={},
+        extra_mapping_owners={},
+        extra_mapping_queue=[],
+        extra_mapping_cursor=[0],
+        extra_inventories={},
         public_mapping_owners={},
         public_mapping_queue=[],
         public_mappings={},
@@ -762,6 +868,7 @@ def _freeze_model_graphs(*values: Any) -> _FrozenGraph:
     visited: set[int] = set()
     for value in values:
         _freeze_model_storage(value, frozen_graph, visited)
+    _inventory_retained_extra_mappings(frozen_graph)
     _inventory_retained_public_mappings(frozen_graph)
     return frozen_graph
 
@@ -801,6 +908,7 @@ def _snapshot_native(
             frozen = _frozen_graph.models.get(identity)
             if frozen is None or frozen[0] is not value:
                 _freeze_model_storage(value, _frozen_graph, set())
+                _inventory_retained_extra_mappings(_frozen_graph)
                 _traverse_model_storage(value, _frozen_graph, set())
                 frozen = _frozen_graph.models[identity]
             _model, stored_entries, extras, native_extra_entries = frozen
@@ -813,8 +921,15 @@ def _snapshot_native(
                 else:
                     if not isinstance(extras, Mapping):
                         raise ValueError(f"malformed stored extras at {path}")
-                    iterated_extra_names = tuple(extras)
-                    extra_entries = tuple(extras.items())
+                    _retain_extra_mapping(extras, _frozen_graph)
+                    _inventory_retained_extra_mappings(_frozen_graph)
+                    extra_inventory = _frozen_graph.extra_inventories[
+                        id(extras)
+                    ]
+                    if extra_inventory.failure is not None:
+                        raise extra_inventory.failure
+                    iterated_extra_names = extra_inventory.iterated_names
+                    extra_entries = extra_inventory.item_entries
                 undeclared.update(iterated_extra_names)
                 undeclared.update(key for key, _ in extra_entries)
             if undeclared:
