@@ -3,7 +3,7 @@
 from collections.abc import ItemsView, Iterator, KeysView, Mapping
 import json
 from types import MappingProxyType
-from typing import get_args
+from typing import Callable, get_args
 
 import pytest
 from pydantic import (
@@ -34,6 +34,7 @@ from contracts_references import ReferenceHandle, ReferenceKind, SourceVersion
 
 _BASE_MODEL_DICT_DESCRIPTOR = vars(BaseModel)["__dict__"]
 _BASE_MODEL_EXTRA_DESCRIPTOR = vars(BaseModel)["__pydantic_extra__"]
+_BASE_MODEL_FIELDS_SET_DESCRIPTOR = vars(BaseModel)["__pydantic_fields_set__"]
 
 
 class ExampleContract(ContractModel):
@@ -177,6 +178,12 @@ class ExampleContractListEnvelope(ContractModel):
     items: list[ExampleContract]
 
 
+class NestedInventoryEnvelope(ContractModel):
+    tuple_trigger: tuple[int, ...]
+    list_trigger: list[int]
+    child: ExampleContract
+
+
 class DictionaryEnvelope(ContractModel):
     payload: dict[str, SafeCounter]
 
@@ -243,6 +250,28 @@ class DuplicateItemsMapping(Mapping[str, object]):
         if self.item_reads > 1:
             raise AssertionError("duplicate mapping items must be captured once")
         return self._entries
+
+
+class RepairingMapping(Mapping[str, object]):
+    def __init__(self, callback: Callable[[], None]) -> None:
+        self.callback = callback
+        self.item_reads = 0
+
+    def __getitem__(self, key: str) -> object:
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+    def items(self) -> tuple[tuple[str, object], ...]:
+        self.item_reads += 1
+        callback = self.callback
+        self.callback = lambda: None
+        callback()
+        return ()
 
 
 class DictClassSpoofingMapping(SingleReadMapping):
@@ -373,6 +402,234 @@ class RaisingInventoryDict(dict[str, object]):
 class FabricatingItemsDict(dict[str, object]):
     def items(self) -> tuple[tuple[str, object], ...]:
         return (*tuple(dict.items(self)), ("fabricated", 99))
+
+
+class RepairingTuple(tuple[int, ...]):
+    def __new__(
+        cls,
+        values: tuple[int, ...],
+        callback: Callable[[], None],
+    ) -> "RepairingTuple":
+        instance = tuple.__new__(cls, values)
+        instance.callback = callback
+        instance.iteration_calls = 0
+        return instance
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        self.iteration_calls += 1
+        callback = self.callback
+        self.callback = lambda: None
+        callback()
+        return tuple.__iter__(self)
+
+
+class RepairingList(list[int]):
+    def __init__(self, values: list[int], callback: Callable[[], None]) -> None:
+        list.__init__(self, values)
+        self.callback = callback
+        self.iteration_calls = 0
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        self.iteration_calls += 1
+        callback = self.callback
+        self.callback = lambda: None
+        callback()
+        return list.__iter__(self)
+
+
+class RepairingStoredName(str):
+    def __new__(
+        cls,
+        value: str,
+        callback: Callable[[], None],
+        hook: str,
+    ) -> "RepairingStoredName":
+        instance = str.__new__(cls, value)
+        instance.callback = callback
+        instance.hook = hook
+        instance.armed = False
+        instance.hash_calls = 0
+        instance.equality_calls = 0
+        return instance
+
+    def __hash__(self) -> int:
+        self.hash_calls += 1
+        if self.armed and self.hook == "hash":
+            self.armed = False
+            self.callback()
+        return str.__hash__(self)
+
+    def __eq__(self, other: object) -> bool:
+        self.equality_calls += 1
+        if self.armed and self.hook == "equality":
+            self.armed = False
+            self.callback()
+        return str.__eq__(self, other)
+
+
+def _invalid_nested_inventory_envelope() -> tuple[
+    NestedInventoryEnvelope,
+    ExampleContract,
+]:
+    child = ExampleContract(count=1).model_copy(update={"count": -1})
+    envelope = NestedInventoryEnvelope(
+        tuple_trigger=(),
+        list_trigger=[],
+        child=ExampleContract(count=1),
+    ).model_copy(update={"child": child})
+    return envelope, child
+
+
+@pytest.mark.parametrize("container_kind", ["tuple", "list"])
+def test_snapshot_contract_graph_freezes_later_model_before_container_hook(
+    container_kind: str,
+) -> None:
+    ordinary, _ = _invalid_nested_inventory_envelope()
+    ordinary_snapshot = snapshot_contract_graph(ordinary)
+    with pytest.raises(ValidationError) as ordinary_error:
+        NestedInventoryEnvelope.model_validate(ordinary_snapshot, strict=True)
+    assert ordinary_error.value.errors()[0]["type"] == "greater_than_equal"
+    assert ordinary_error.value.errors()[0]["loc"] == ("child", "count")
+    assert ordinary_error.value.errors()[0]["input"] == -1
+
+    value, child = _invalid_nested_inventory_envelope()
+    native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+
+    def repair_child() -> None:
+        child_native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(child, BaseModel)
+        dict.__setitem__(child_native, "count", 1)
+
+    if container_kind == "tuple":
+        trigger: RepairingTuple | RepairingList = RepairingTuple(
+            native["tuple_trigger"],
+            repair_child,
+        )
+        dict.__setitem__(native, "tuple_trigger", trigger)
+    else:
+        trigger = RepairingList(native["list_trigger"], repair_child)
+        dict.__setitem__(native, "list_trigger", trigger)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert trigger.iteration_calls == 1
+    assert child.count == 1
+    assert snapshot["child"]["count"] == -1
+    with pytest.raises(ValidationError) as repaired_error:
+        NestedInventoryEnvelope.model_validate(snapshot, strict=True)
+    assert repaired_error.value.errors() == ordinary_error.value.errors()
+
+
+def test_snapshot_contract_graph_freezes_later_model_before_mapping_hook() -> None:
+    ordinary, _ = _invalid_nested_inventory_envelope()
+    ordinary_snapshot = snapshot_contract_graph(ordinary)
+    with pytest.raises(ValidationError) as ordinary_error:
+        NestedInventoryEnvelope.model_validate(ordinary_snapshot, strict=True)
+
+    value, child = _invalid_nested_inventory_envelope()
+
+    def repair_child() -> None:
+        child_native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(child, BaseModel)
+        dict.__setitem__(child_native, "count", 1)
+
+    extras = RepairingMapping(repair_child)
+    _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(value, extras)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert extras.item_reads == 1
+    assert child.count == 1
+    assert snapshot["child"]["count"] == -1
+    with pytest.raises(ValidationError) as repaired_error:
+        NestedInventoryEnvelope.model_validate(snapshot, strict=True)
+    assert repaired_error.value.errors() == ordinary_error.value.errors()
+
+
+@pytest.mark.parametrize("hook", ["hash", "equality"])
+def test_snapshot_contract_graph_freezes_later_model_before_stored_name_hook(
+    hook: str,
+) -> None:
+    ordinary, _ = _invalid_nested_inventory_envelope()
+    ordinary_snapshot = snapshot_contract_graph(ordinary)
+    with pytest.raises(ValidationError) as ordinary_error:
+        NestedInventoryEnvelope.model_validate(ordinary_snapshot, strict=True)
+
+    value, child = _invalid_nested_inventory_envelope()
+    native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+
+    def repair_child() -> None:
+        child_native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(child, BaseModel)
+        dict.__setitem__(child_native, "count", 1)
+
+    stored_name = RepairingStoredName("tuple_trigger", repair_child, hook)
+    stored_value = dict.pop(native, "tuple_trigger")
+    dict.__setitem__(native, stored_name, stored_value)
+    stored_name.armed = True
+
+    snapshot = snapshot_contract_graph(value)
+
+    if hook == "hash":
+        assert stored_name.hash_calls > 0
+    else:
+        assert stored_name.equality_calls > 0
+    assert child.count == 1
+    assert snapshot["child"]["count"] == -1
+    with pytest.raises(ValidationError) as repaired_error:
+        NestedInventoryEnvelope.model_validate(snapshot, strict=True)
+    assert repaired_error.value.errors() == ordinary_error.value.errors()
+
+
+@pytest.mark.parametrize("hook", ["hash", "equality"])
+def test_snapshot_contract_graph_freezes_invalid_root_before_name_hook(
+    hook: str,
+) -> None:
+    value = ExampleContract(count=1).model_copy(update={"count": -1})
+    native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+
+    def repair_root() -> None:
+        dict.__setitem__(native, "count", 1)
+
+    stored_name = RepairingStoredName("count", repair_root, hook)
+    stored_value = dict.pop(native, "count")
+    dict.__setitem__(native, stored_name, stored_value)
+    stored_name.armed = True
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert value.count == 1
+    assert snapshot["count"] == -1
+    with pytest.raises(ValidationError) as raised:
+        ExampleContract.model_validate(snapshot, strict=True)
+    assert raised.value.errors()[0]["type"] == "greater_than_equal"
+    assert raised.value.errors()[0]["loc"] == ("count",)
+    assert raised.value.errors()[0]["input"] == -1
+
+
+@pytest.mark.parametrize("hook", ["hash", "equality"])
+def test_snapshot_contract_graph_preserves_valid_string_subclass_names(
+    hook: str,
+) -> None:
+    value = ExampleContract(count=1)
+    native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+    stored_name = RepairingStoredName("count", lambda: None, hook)
+    stored_value = dict.pop(native, "count")
+    dict.__setitem__(native, stored_name, stored_value)
+    stored_name.armed = True
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"count": 1}
+    assert ExampleContract.model_validate(snapshot, strict=True).count == 1
+
+
+def test_snapshot_contract_graph_preserves_no_fields_set_policy() -> None:
+    value = ExampleContract(count=1)
+    fields_set = _BASE_MODEL_FIELDS_SET_DESCRIPTOR.__get__(value, BaseModel)
+    set.add(fields_set, "future_constraint")
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"count": 1}
+    assert ExampleContract.model_validate(snapshot, strict=True).count == 1
 
 
 @pytest.mark.parametrize("source", ["copy", "construct"])
