@@ -146,6 +146,44 @@ class DictSpoofMapping(Mapping[object, object]):
         return False
 
 
+class HiddenModelStorage(dict[str, object]):
+    """Retain native model state while exposing a sanitized public view."""
+
+    def __init__(
+        self,
+        actual: dict[str, object],
+        visible: dict[str, object],
+    ) -> None:
+        dict.__init__(self, actual)
+        self._visible = tuple(visible.items())
+        self.keys_calls = 0
+        self.items_calls = 0
+
+    def keys(self):
+        self.keys_calls += 1
+        return dict(self._visible).keys()
+
+    def items(self):
+        self.items_calls += 1
+        return self._visible
+
+
+def replace_model_storage(
+    model: object,
+    *,
+    stored_name: str,
+    stored_value: object,
+) -> HiddenModelStorage:
+    visible = dict(
+        dict.items(object.__getattribute__(model, "__dict__"))
+    )
+    actual = dict(visible)
+    actual[stored_name] = stored_value
+    backing = HiddenModelStorage(actual, visible)
+    object.__setattr__(model, "__dict__", backing)
+    return backing
+
+
 class InverseItemsMapping(dict[object, object]):
     """Expose iterated keys while hiding every entry from items()."""
 
@@ -851,6 +889,67 @@ def test_readiness_boundaries_keep_spoofing_non_dict_on_mapping_path(
     assert extras.iteration_calls == 1
     assert extras.items_calls == 1
     assert extras.boolean_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("boundary", "location"),
+    [
+        ("publication", "direct"),
+        ("publication", "nested"),
+        ("capability", "direct"),
+    ],
+)
+@pytest.mark.parametrize(
+    "corruption",
+    ["hidden-unknown", "invalid-declared"],
+)
+def test_readiness_boundaries_use_frozen_native_model_storage(
+    boundary: str,
+    location: str,
+    corruption: str,
+) -> None:
+    if boundary == "publication":
+        candidate = publication()
+        target = candidate if location == "direct" else candidate.capabilities[0]
+
+        def validate() -> object:
+            return validate_readiness_publication(
+                candidate,
+                expected_tenant_id="tenant-a",
+                current_placement_generation=12,
+            )
+
+    else:
+        target = observation()
+
+        def validate() -> object:
+            return evaluate(target)
+
+    if corruption == "hidden-unknown":
+        stored_name = "hidden_unknown"
+        stored_value: object = "deny"
+    elif boundary == "publication" and location == "direct":
+        stored_name = "tenant_id"
+        stored_value = ""
+    else:
+        stored_name = "status"
+        stored_value = "not-a-status"
+    backing = replace_model_storage(
+        target,
+        stored_name=stored_name,
+        stored_value=stored_value,
+    )
+
+    if corruption == "hidden-unknown":
+        with pytest.raises(ValueError, match="undeclared fields"):
+            validate()
+    else:
+        with pytest.raises(ValidationError):
+            validate()
+
+    assert dict.__getitem__(backing, stored_name) == stored_value
+    assert backing.keys_calls == 0
+    assert backing.items_calls == 0
 
 
 @pytest.mark.parametrize(
