@@ -22,6 +22,7 @@ ChecksumAlgorithm = Literal["sha256"]
 EncryptionMode = Literal["plaintext_authorized_export", "encrypted"]
 ScopeKind = Literal["tenant", "projects"]
 _WINDOWS_FORBIDDEN_COMPONENT_CHARACTERS = frozenset('<>:"|?*')
+_PYDANTIC_EXTRA_SLOT = BaseModel.__dict__["__pydantic_extra__"]
 _ModelStorageEntries = tuple[tuple[Any, Any], ...]
 _ModelStorageSnapshot = tuple[_ModelStorageEntries, _ModelStorageEntries]
 _ModelStorageInventory = dict[int, _ModelStorageSnapshot]
@@ -33,7 +34,10 @@ def _validated_model_extra_storage(
 ) -> tuple[dict[Any, Any], set[Any]]:
     """Capture stable Pydantic extra entries and all observed names."""
 
-    extra = value.__pydantic_extra__
+    try:
+        extra = _PYDANTIC_EXTRA_SLOT.__get__(value, type(value))
+    except AttributeError:
+        extra = None
     if extra is None:
         return {}, set()
 

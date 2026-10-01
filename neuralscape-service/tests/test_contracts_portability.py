@@ -8,7 +8,7 @@ from pathlib import PureWindowsPath
 from types import MappingProxyType
 
 import pytest
-from pydantic import Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from contracts_portability import (
     ChecksumDescriptor,
@@ -19,6 +19,9 @@ from contracts_portability import (
     ProducerReference,
     validate_portable_manifest,
 )
+
+
+_PYDANTIC_EXTRA_SLOT = BaseModel.__dict__["__pydantic_extra__"]
 
 
 class FutureManifestFile(ManifestFile):
@@ -298,6 +301,27 @@ class RepairingProducer(dict[str, str]):
         native_stored = object.__getattribute__(self.owner, "__dict__")
         dict.__setitem__(native_stored, "manifest_id", "manifest-7")
         return dict.items(self)
+
+
+class NoneReportingExtraManifest(PortableManifest):
+    def __getattribute__(self, name: str) -> object:
+        if name == "__pydantic_extra__":
+            return None
+        return super().__getattribute__(name)
+
+
+class EmptyReportingExtraManifestFile(ManifestFile):
+    def __getattribute__(self, name: str) -> object:
+        if name == "__pydantic_extra__":
+            return {}
+        return super().__getattribute__(name)
+
+
+class PopulatedReportingExtraManifest(PortableManifest):
+    def __getattribute__(self, name: str) -> object:
+        if name == "__pydantic_extra__":
+            return {"reported_only": "deny"}
+        return super().__getattribute__(name)
 
 
 def valid_manifest() -> dict:
@@ -1047,6 +1071,61 @@ def test_none_and_empty_mapping_extra_storage_remain_valid(
     revalidated = validate_portable_manifest(manifest)
 
     assert revalidated.files[0].path == manifest.files[0].path
+
+
+def test_root_model_extra_override_cannot_hide_native_unknown() -> None:
+    manifest = NoneReportingExtraManifest.model_validate(valid_manifest())
+    native_extra = {"future_entry_semantics": "deny"}
+    _PYDANTIC_EXTRA_SLOT.__set__(manifest, native_extra)
+
+    assert manifest.__pydantic_extra__ is None
+    assert _PYDANTIC_EXTRA_SLOT.__get__(manifest, type(manifest)) is native_extra
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+
+    errors = raised.value.errors()
+    assert len(errors) == 1
+    assert errors[0]["type"] == "extra_forbidden"
+    assert errors[0]["loc"] == ("future_entry_semantics",)
+    assert errors[0]["input"] == "deny"
+
+
+def test_nested_model_extra_override_cannot_hide_native_mapping_unknown() -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    nested = EmptyReportingExtraManifestFile.model_validate(
+        manifest.files[0].model_dump()
+    )
+    native_extra = MappingProxyType({"future_entry_semantics": "deny"})
+    _PYDANTIC_EXTRA_SLOT.__set__(nested, native_extra)
+    manifest.files[0] = nested
+
+    assert nested.__pydantic_extra__ == {}
+    assert _PYDANTIC_EXTRA_SLOT.__get__(nested, type(nested)) is native_extra
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+
+    errors = raised.value.errors()
+    assert len(errors) == 1
+    assert errors[0]["type"] == "extra_forbidden"
+    assert errors[0]["loc"] == ("files", 0, "future_entry_semantics")
+    assert errors[0]["input"] == "deny"
+
+
+@pytest.mark.parametrize("native_state", ["none", "absent"])
+def test_reported_extra_does_not_replace_empty_native_storage(
+    native_state: str,
+) -> None:
+    manifest = PopulatedReportingExtraManifest.model_validate(valid_manifest())
+    if native_state == "none":
+        _PYDANTIC_EXTRA_SLOT.__set__(manifest, None)
+    else:
+        _PYDANTIC_EXTRA_SLOT.__delete__(manifest)
+
+    assert manifest.__pydantic_extra__ == {"reported_only": "deny"}
+    revalidated = validate_portable_manifest(manifest)
+
+    assert type(revalidated) is PortableManifest
+    assert revalidated.manifest_id == "manifest-7"
 
 
 def test_custom_mapping_extra_storage_preserves_unknown_for_rejection() -> None:
