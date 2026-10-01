@@ -143,10 +143,12 @@ _ALLOWED_OBSERVED_TRANSITIONS: dict[
 def _snapshot_closed_graph(value: object) -> object:
     """Copy a model/native graph without dropping stored undeclared fields."""
 
-    frozen: dict[int, tuple[str, object]] = {}
+    frozen_models: dict[int, tuple[object, bool, object]] = {}
+    frozen_containers: dict[int, object] = {}
+    discovered: set[int] = set()
 
     def freeze_native_graph(item: object) -> None:
-        """Capture native backing before any overridable protocol is invoked."""
+        """Discover model state and exact-container edges without callbacks."""
 
         item_type = type(item)
         if not (
@@ -158,8 +160,9 @@ def _snapshot_closed_graph(value: object) -> object:
             return
 
         identity = id(item)
-        if identity in frozen:
+        if identity in discovered:
             return
+        discovered.add(identity)
 
         if issubclass(item_type, BaseModel):
             stored_entries = tuple(
@@ -172,9 +175,10 @@ def _snapshot_closed_graph(value: object) -> object:
             else:
                 frozen_extras = extras
                 extras_are_native = False
-            frozen[identity] = (
-                "model",
-                (stored_entries, extras_are_native, frozen_extras),
+            frozen_models[identity] = (
+                stored_entries,
+                extras_are_native,
+                frozen_extras,
             )
             for _name, field_value in stored_entries:
                 freeze_native_graph(field_value)
@@ -182,17 +186,20 @@ def _snapshot_closed_graph(value: object) -> object:
 
         if issubclass(item_type, dict):
             entries = tuple(dict.items(item))
-            frozen[identity] = ("dict", entries)
+            if item_type is dict:
+                frozen_containers[identity] = entries
             for _key, field_value in entries:
                 freeze_native_graph(field_value)
             return
 
         if issubclass(item_type, list):
             items = tuple(list.__iter__(item))
-            frozen[identity] = ("list", items)
+            if item_type is list:
+                frozen_containers[identity] = items
         else:
             items = tuple(tuple.__iter__(item))
-            frozen[identity] = ("tuple", items)
+            if item_type is tuple:
+                frozen_containers[identity] = items
         for child in items:
             freeze_native_graph(child)
 
@@ -210,13 +217,16 @@ def _snapshot_closed_graph(value: object) -> object:
             return item
 
         identity = id(item)
+        if identity not in discovered:
+            freeze_native_graph(item)
         if identity in active:
             raise ValueError("contract input graph must be acyclic")
         active.add(identity)
         try:
-            kind, payload = frozen[identity]
-            if kind == "model":
-                stored_entries, extras_are_native, frozen_extras = payload
+            if isinstance(item, BaseModel):
+                stored_entries, extras_are_native, frozen_extras = frozen_models[
+                    identity
+                ]
                 declared = item_type.model_fields
                 if extras_are_native:
                     extra_entries = frozen_extras
@@ -249,14 +259,29 @@ def _snapshot_closed_graph(value: object) -> object:
                     name: rebuild(field_value)
                     for name, field_value in stored_entries
                 }
-            if kind == "dict":
+            if isinstance(item, dict):
+                entries = (
+                    frozen_containers[identity]
+                    if item_type is dict
+                    else item.items()
+                )
                 return {
                     key: rebuild(field_value)
-                    for key, field_value in payload
+                    for key, field_value in entries
                 }
-            if kind == "list":
-                return [rebuild(child) for child in payload]
-            return tuple(rebuild(child) for child in payload)
+            if isinstance(item, list):
+                items = (
+                    frozen_containers[identity]
+                    if item_type is list
+                    else item
+                )
+                return [rebuild(child) for child in items]
+            items = (
+                frozen_containers[identity]
+                if item_type is tuple
+                else item
+            )
+            return tuple(rebuild(child) for child in items)
         finally:
             active.remove(identity)
 

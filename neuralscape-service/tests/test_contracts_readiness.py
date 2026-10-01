@@ -229,6 +229,22 @@ class RepairingList(list):
         return list.__iter__(self)
 
 
+class DivergentTuple(tuple):
+    def __new__(
+        cls,
+        native_values: tuple[object, ...],
+        visible_values: tuple[object, ...],
+    ):
+        instance = super().__new__(cls, native_values)
+        instance.visible_values = visible_values
+        instance.calls = 0
+        return instance
+
+    def __iter__(self):
+        self.calls += 1
+        return iter(self.visible_values)
+
+
 class RepairingEmptyExtraMapping(Mapping[object, object]):
     def __init__(self, repair) -> None:
         self.repair = repair
@@ -1486,8 +1502,8 @@ def test_readiness_publication_freezes_tuple_before_traversal_hook() -> None:
     with pytest.raises(ValidationError):
         _validate_publication(candidate)
 
-    assert repairing.calls == 0
-    assert child.capability == ""
+    assert repairing.calls == 1
+    assert child.capability == "api_acceptance"
 
 
 def test_readiness_publication_freezes_nested_model_before_extra_mapping_hook() -> None:
@@ -1506,7 +1522,7 @@ def test_readiness_publication_freezes_nested_model_before_extra_mapping_hook() 
     assert child.capability == "api_acceptance"
 
 
-def test_readiness_publication_preserves_strict_list_rejection_without_hook() -> None:
+def test_readiness_publication_preserves_strict_list_rejection_with_hook() -> None:
     candidate = publication()
     child = candidate.capabilities[0]
     _set_native_field(child, "capability", "")
@@ -1520,8 +1536,8 @@ def test_readiness_publication_preserves_strict_list_rejection_without_hook() ->
         _validate_publication(candidate)
 
     assert any(error["type"] == "tuple_type" for error in exc_info.value.errors())
-    assert repairing.calls == 0
-    assert child.capability == ""
+    assert repairing.calls == 1
+    assert child.capability == "api_acceptance"
 
 
 def test_readiness_publication_leaves_fields_set_hook_inert() -> None:
@@ -1576,16 +1592,49 @@ def test_capability_receiver_retains_invalid_scalar_before_name_hook_repair() ->
 
 def test_readiness_publication_preserves_valid_tuple_subclass() -> None:
     candidate = publication()
+    calls: list[str] = []
     repairing = RepairingTuple(
         candidate.capabilities,
-        lambda: pytest.fail("native tuple discovery invoked subclass iteration"),
+        lambda: calls.append("iterated"),
     )
     _set_native_field(candidate, "capabilities", repairing)
 
     result = _validate_publication(candidate)
 
     assert result.capabilities[0].capability == "api_acceptance"
-    assert repairing.calls == 0
+    assert repairing.calls == 1
+    assert calls == ["iterated"]
+
+
+def test_readiness_publication_preserves_divergent_tuple_public_view() -> None:
+    candidate = publication()
+    visible = (observation("exact_reads", "healthy"),)
+    divergent = DivergentTuple(candidate.capabilities, visible)
+    _set_native_field(candidate, "capabilities", divergent)
+
+    result = _validate_publication(candidate)
+
+    assert result.capabilities == visible
+    assert divergent.calls == 1
+
+
+def test_readiness_publication_freezes_later_model_edge_before_name_callback() -> None:
+    candidate = publication()
+    original_edge = candidate.capabilities
+    child = original_edge[0]
+    _set_native_field(child, "capability", "")
+    replacement = (observation("exact_reads", "healthy"),)
+    name = _install_repairing_stored_name(
+        candidate,
+        lambda: _set_native_field(candidate, "capabilities", replacement),
+    )
+
+    with pytest.raises(ValidationError):
+        _validate_publication(candidate)
+
+    assert name.calls > 0
+    assert candidate.capabilities is replacement
+    assert original_edge[0].capability == ""
 
 
 def test_readiness_publication_preserves_benign_string_subclass_name() -> None:

@@ -229,6 +229,22 @@ class RepairingList(list):
         return list.__iter__(self)
 
 
+class DivergentTuple(tuple):
+    def __new__(
+        cls,
+        native_values: tuple[object, ...],
+        visible_values: tuple[object, ...],
+    ):
+        instance = super().__new__(cls, native_values)
+        instance.visible_values = visible_values
+        instance.calls = 0
+        return instance
+
+    def __iter__(self):
+        self.calls += 1
+        return iter(self.visible_values)
+
+
 class RepairingEmptyExtraMapping(Mapping[object, object]):
     def __init__(self, repair) -> None:
         self.repair = repair
@@ -1674,8 +1690,8 @@ def test_tenancy_boundaries_freeze_tuple_backing_before_traversal_hooks(
     with pytest.raises(ValidationError):
         invoke(candidate)
 
-    assert repairing.calls == 0
-    assert child.manifest_id == ""
+    assert repairing.calls == 1
+    assert child.manifest_id == "primary"
 
 
 @pytest.mark.parametrize("boundary", ["operation", "placement"])
@@ -1697,7 +1713,7 @@ def test_tenancy_boundaries_freeze_nested_models_before_extra_mapping_hooks(
 
 
 @pytest.mark.parametrize("boundary", ["operation", "placement"])
-def test_tenancy_boundaries_preserve_strict_list_rejection_without_hooks(
+def test_tenancy_boundaries_preserve_strict_list_rejection_with_public_hook(
     boundary: str,
 ) -> None:
     candidate, child, invoke = _tenancy_nested_boundary_case(boundary)
@@ -1712,8 +1728,8 @@ def test_tenancy_boundaries_preserve_strict_list_rejection_without_hooks(
         invoke(candidate)
 
     assert any(error["type"] == "tuple_type" for error in exc_info.value.errors())
-    assert repairing.calls == 0
-    assert child.manifest_id == ""
+    assert repairing.calls == 1
+    assert child.manifest_id == "primary"
 
 
 @pytest.mark.parametrize("boundary", ["operation", "placement"])
@@ -1757,16 +1773,72 @@ def test_tenancy_boundaries_retain_invalid_root_before_name_hook_repair(
 @pytest.mark.parametrize("boundary", ["operation", "placement"])
 def test_tenancy_boundaries_preserve_valid_tuple_subclasses(boundary: str) -> None:
     candidate, _child, invoke = _tenancy_nested_boundary_case(boundary)
+    calls: list[str] = []
     repairing = RepairingTuple(
         candidate.resource_manifests,
-        lambda: pytest.fail("native tuple discovery invoked subclass iteration"),
+        lambda: calls.append("iterated"),
     )
     _set_native_field(candidate, "resource_manifests", repairing)
 
     result = invoke(candidate)
 
     assert result.resource_manifests[0].manifest_id == "primary"
-    assert repairing.calls == 0
+    assert repairing.calls == 1
+    assert calls == ["iterated"]
+
+
+@pytest.mark.parametrize("boundary", ["operation", "placement"])
+def test_tenancy_boundaries_preserve_divergent_tuple_public_view(
+    boundary: str,
+) -> None:
+    candidate, _child, invoke = _tenancy_nested_boundary_case(boundary)
+    divergent = DivergentTuple(candidate.resource_manifests, ())
+    _set_native_field(candidate, "resource_manifests", divergent)
+
+    result = invoke(candidate)
+
+    assert result.resource_manifests == ()
+    assert divergent.calls == 1
+
+
+@pytest.mark.parametrize("boundary", ["operation", "placement"])
+def test_tenancy_boundaries_reject_cross_tenant_public_tuple_target(
+    boundary: str,
+) -> None:
+    candidate, _child, invoke = _tenancy_nested_boundary_case(boundary)
+    cross_tenant = ResourceManifestReference.model_validate(
+        manifest(tenant_id="tenant-b")
+    )
+    divergent = DivergentTuple(
+        candidate.resource_manifests,
+        (cross_tenant,),
+    )
+    _set_native_field(candidate, "resource_manifests", divergent)
+
+    with pytest.raises(ValidationError, match="tenant_id must match"):
+        invoke(candidate)
+
+    assert divergent.calls == 1
+
+
+@pytest.mark.parametrize("boundary", ["operation", "placement"])
+def test_tenancy_boundaries_freeze_later_model_edge_before_name_callback(
+    boundary: str,
+) -> None:
+    candidate, child, invoke = _tenancy_nested_boundary_case(boundary)
+    original_edge = candidate.resource_manifests
+    _set_native_field(child, "manifest_id", "")
+    name = _install_repairing_stored_name(
+        candidate,
+        lambda: _set_native_field(candidate, "resource_manifests", ()),
+    )
+
+    with pytest.raises(ValidationError):
+        invoke(candidate)
+
+    assert name.calls > 0
+    assert candidate.resource_manifests == ()
+    assert original_edge[0].manifest_id == ""
 
 
 @pytest.mark.parametrize("boundary", ["operation", "placement"])
