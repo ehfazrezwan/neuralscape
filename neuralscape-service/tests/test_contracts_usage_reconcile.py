@@ -222,11 +222,14 @@ class _DescriptorMaskedAttribution(AttributionSnapshot):
     @property
     def __dict__(self):
         native = _MODEL_DICT_DESCRIPTOR.__get__(self, BaseModel)
-        return {
+        visible = {
             name: value
             for name, value in dict.items(native)
             if name != "future_constraint"
         }
+        if visible.get("provider") == "":
+            visible["provider"] = "provider-1"
+        return visible
 
     @__dict__.setter
     def __dict__(self, value):
@@ -245,11 +248,14 @@ class _DescriptorMaskedReconciledUsageStream(ReconciledUsageStream):
     @property
     def __dict__(self):
         native = _MODEL_DICT_DESCRIPTOR.__get__(self, BaseModel)
-        return {
+        visible = {
             name: value
             for name, value in dict.items(native)
             if name != "future_constraint"
         }
+        if visible.get("known_token_subtotal") == 0:
+            visible["known_token_subtotal"] = 15
+        return visible
 
     @__dict__.setter
     def __dict__(self, value):
@@ -268,11 +274,66 @@ class _DescriptorMaskedUsageReconciliation(UsageReconciliation):
     @property
     def __dict__(self):
         native = _MODEL_DICT_DESCRIPTOR.__get__(self, BaseModel)
-        return {
+        visible = {
             name: value
             for name, value in dict.items(native)
             if name != "future_constraint"
         }
+        if visible.get("tenant_id") == "":
+            visible["tenant_id"] = "tenant-1"
+        return visible
+
+    @__dict__.setter
+    def __dict__(self, value):
+        _MODEL_DICT_DESCRIPTOR.__set__(self, value)
+
+    @property
+    def __pydantic_extra__(self):
+        return None
+
+    @__pydantic_extra__.setter
+    def __pydantic_extra__(self, value):
+        _MODEL_EXTRAS_DESCRIPTOR.__set__(self, value)
+
+
+class _DescriptorMaskedTokenUsage(TokenUsage):
+    @property
+    def __dict__(self):
+        native = _MODEL_DICT_DESCRIPTOR.__get__(self, BaseModel)
+        visible = {
+            name: value
+            for name, value in dict.items(native)
+            if name != "future_constraint"
+        }
+        if visible.get("measurement") == "future_measurement":
+            visible["measurement"] = "actual"
+        return visible
+
+    @__dict__.setter
+    def __dict__(self, value):
+        _MODEL_DICT_DESCRIPTOR.__set__(self, value)
+
+    @property
+    def __pydantic_extra__(self):
+        return None
+
+    @__pydantic_extra__.setter
+    def __pydantic_extra__(self, value):
+        _MODEL_EXTRAS_DESCRIPTOR.__set__(self, value)
+
+
+class _DescriptorMaskedReconciledLedger(ReconciledLedger):
+    @property
+    def __dict__(self):
+        native = _MODEL_DICT_DESCRIPTOR.__get__(self, BaseModel)
+        visible = {
+            name: value
+            for name, value in dict.items(native)
+            if name != "future_constraint"
+        }
+        if visible.get("coverage") == "future_coverage":
+            visible["coverage"] = "reported"
+        return visible
 
     @__dict__.setter
     def __dict__(self, value):
@@ -378,6 +439,29 @@ def _validation_signature(
 ) -> list[tuple[str, tuple[object, ...], str]]:
     with pytest.raises(ValidationError) as caught:
         receiver.model_validate(value)
+    return [
+        (error["type"], error["loc"], error["msg"])
+        for error in caught.value.errors(include_url=False)
+    ]
+
+
+def _python_receive(
+    receiver: type[BaseModel],
+    value: Mapping[str, object],
+    entry: str,
+) -> BaseModel:
+    if entry == "model_validate":
+        return receiver.model_validate(value)
+    return receiver(**value)
+
+
+def _python_validation_signature(
+    receiver: type[BaseModel],
+    value: Mapping[str, object],
+    entry: str,
+) -> list[tuple[str, tuple[object, ...], str]]:
+    with pytest.raises(ValidationError) as caught:
+        _python_receive(receiver, value, entry)
     return [
         (error["type"], error["loc"], error["msg"])
         for error in caught.value.errors(include_url=False)
@@ -655,6 +739,360 @@ def test_result_receivers_reject_descriptor_hidden_nested_storage_like_ordinary(
     ]
     assert _validation_signature(receiver, ordinary_parent) == expected
     assert _validation_signature(receiver, descriptor_parent) == expected
+
+
+@pytest.mark.parametrize("entry", ["model_validate", "constructor"])
+@pytest.mark.parametrize("root_kind", ["dict", "mapping-proxy"])
+@pytest.mark.parametrize("storage", ["stored", "extra"])
+@pytest.mark.parametrize(
+    ("target_name", "expected_location"),
+    [
+        ("attribution", ("attribution", "future_constraint")),
+        ("usage", ("usage", "future_constraint")),
+        ("stream", ("streams", 0, "future_constraint")),
+        ("ledger", ("ledgers", 0, "future_constraint")),
+    ],
+)
+def test_python_result_inputs_reject_nested_descriptor_unknowns_like_ordinary(
+    entry: str,
+    root_kind: str,
+    storage: str,
+    target_name: str,
+    expected_location: tuple[object, ...],
+) -> None:
+    result = reconcile_usage_events([_event()])
+    stream = result.streams[0]
+    if target_name == "attribution":
+        receiver = ReconciledUsageStream
+        ordinary_target = stream.attribution.model_copy()
+        descriptor_target = _DescriptorMaskedAttribution.model_validate(
+            stream.attribution.model_dump(mode="python")
+        )
+        ordinary_payload = stream.model_dump(mode="python")
+        descriptor_payload = stream.model_dump(mode="python")
+        ordinary_payload["attribution"] = ordinary_target
+        descriptor_payload["attribution"] = descriptor_target
+    elif target_name == "usage":
+        receiver = ReconciledUsageStream
+        assert stream.usage is not None
+        ordinary_target = stream.usage.model_copy()
+        descriptor_target = _DescriptorMaskedTokenUsage.model_validate(
+            stream.usage.model_dump(mode="python")
+        )
+        ordinary_payload = stream.model_dump(mode="python")
+        descriptor_payload = stream.model_dump(mode="python")
+        ordinary_payload["usage"] = ordinary_target
+        descriptor_payload["usage"] = descriptor_target
+    elif target_name == "stream":
+        receiver = UsageReconciliation
+        ordinary_target = stream.model_copy()
+        descriptor_target = _DescriptorMaskedReconciledUsageStream.model_validate(
+            stream.model_dump(mode="python")
+        )
+        ordinary_payload = result.model_dump(mode="python")
+        descriptor_payload = result.model_dump(mode="python")
+        ordinary_payload["streams"] = (ordinary_target,)
+        descriptor_payload["streams"] = (descriptor_target,)
+    else:
+        receiver = UsageReconciliation
+        ordinary_target = result.ledgers[0].model_copy()
+        descriptor_target = _DescriptorMaskedReconciledLedger.model_validate(
+            result.ledgers[0].model_dump(mode="python")
+        )
+        ordinary_payload = result.model_dump(mode="python")
+        descriptor_payload = result.model_dump(mode="python")
+        ordinary_payload["ledgers"] = (
+            ordinary_target,
+            *result.ledgers[1:],
+        )
+        descriptor_payload["ledgers"] = (
+            descriptor_target,
+            *result.ledgers[1:],
+        )
+
+    _set_native_unknown(ordinary_target, storage)
+    _set_native_unknown(descriptor_target, storage)
+    if storage == "stored":
+        assert "future_constraint" not in descriptor_target.__dict__
+    else:
+        assert descriptor_target.__pydantic_extra__ is None
+
+    if root_kind == "mapping-proxy":
+        ordinary_input = MappingProxyType(ordinary_payload)
+        descriptor_input = MappingProxyType(descriptor_payload)
+    else:
+        ordinary_input = ordinary_payload
+        descriptor_input = descriptor_payload
+    expected = [
+        (
+            "extra_forbidden",
+            expected_location,
+            "Extra inputs are not permitted",
+        )
+    ]
+    assert _python_validation_signature(receiver, ordinary_input, entry) == expected
+    assert _python_validation_signature(receiver, descriptor_input, entry) == expected
+
+
+@pytest.mark.parametrize("entry", ["model_validate", "constructor"])
+@pytest.mark.parametrize("root_kind", ["dict", "mapping-proxy"])
+@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+def test_python_result_inputs_accept_valid_nested_descriptor_controls(
+    entry: str,
+    root_kind: str,
+    receiver_name: str,
+) -> None:
+    result = reconcile_usage_events([_event()])
+    stream = result.streams[0]
+    if receiver_name == "stream":
+        receiver = ReconciledUsageStream
+        expected = stream
+        attribution = _DescriptorMaskedAttribution.model_validate(
+            stream.attribution.model_dump(mode="python")
+        )
+        assert stream.usage is not None
+        usage = _DescriptorMaskedTokenUsage.model_validate(
+            stream.usage.model_dump(mode="python")
+        )
+        payload = stream.model_dump(mode="python")
+        payload.update(attribution=attribution, usage=usage)
+    else:
+        receiver = UsageReconciliation
+        expected = result
+        nested_stream = _DescriptorMaskedReconciledUsageStream.model_validate(
+            stream.model_dump(mode="python")
+        )
+        ledger = _DescriptorMaskedReconciledLedger.model_validate(
+            result.ledgers[0].model_dump(mode="python")
+        )
+        payload = result.model_dump(mode="python")
+        payload["streams"] = (nested_stream,)
+        payload["ledgers"] = (ledger, *result.ledgers[1:])
+
+    received = _python_receive(
+        receiver,
+        MappingProxyType(payload) if root_kind == "mapping-proxy" else payload,
+        entry,
+    )
+
+    assert received == expected
+
+
+@pytest.mark.parametrize("entry", ["model_validate", "constructor"])
+@pytest.mark.parametrize(
+    ("target_name", "invalid_field", "invalid_value", "error_type", "location"),
+    [
+        (
+            "attribution",
+            "provider",
+            "",
+            "string_too_short",
+            ("attribution", "provider"),
+        ),
+        (
+            "usage",
+            "measurement",
+            "future_measurement",
+            "literal_error",
+            ("usage", "measurement"),
+        ),
+        (
+            "stream",
+            "known_token_subtotal",
+            0,
+            "value_error",
+            ("streams", 0),
+        ),
+        (
+            "ledger",
+            "coverage",
+            "future_coverage",
+            "literal_error",
+            ("ledgers", 0, "coverage"),
+        ),
+    ],
+)
+def test_python_result_inputs_reject_nested_descriptor_invalid_fields_like_ordinary(
+    entry: str,
+    target_name: str,
+    invalid_field: str,
+    invalid_value: object,
+    error_type: str,
+    location: tuple[object, ...],
+) -> None:
+    result = reconcile_usage_events([_event()])
+    stream = result.streams[0]
+    if target_name == "attribution":
+        receiver = ReconciledUsageStream
+        ordinary_target = stream.attribution.model_copy(
+            update={invalid_field: invalid_value}
+        )
+        descriptor_target = _DescriptorMaskedAttribution.model_validate(
+            stream.attribution.model_dump(mode="python")
+        )
+        ordinary_payload = stream.model_dump(mode="python")
+        descriptor_payload = stream.model_dump(mode="python")
+        ordinary_payload["attribution"] = ordinary_target
+        descriptor_payload["attribution"] = descriptor_target
+    elif target_name == "usage":
+        receiver = ReconciledUsageStream
+        assert stream.usage is not None
+        ordinary_target = stream.usage.model_copy(
+            update={invalid_field: invalid_value}
+        )
+        descriptor_target = _DescriptorMaskedTokenUsage.model_validate(
+            stream.usage.model_dump(mode="python")
+        )
+        ordinary_payload = stream.model_dump(mode="python")
+        descriptor_payload = stream.model_dump(mode="python")
+        ordinary_payload["usage"] = ordinary_target
+        descriptor_payload["usage"] = descriptor_target
+    elif target_name == "stream":
+        receiver = UsageReconciliation
+        ordinary_target = stream.model_copy(update={invalid_field: invalid_value})
+        descriptor_target = _DescriptorMaskedReconciledUsageStream.model_validate(
+            stream.model_dump(mode="python")
+        )
+        ordinary_payload = result.model_dump(mode="python")
+        descriptor_payload = result.model_dump(mode="python")
+        ordinary_payload["streams"] = (ordinary_target,)
+        descriptor_payload["streams"] = (descriptor_target,)
+    else:
+        receiver = UsageReconciliation
+        ordinary_target = result.ledgers[0].model_copy(
+            update={invalid_field: invalid_value}
+        )
+        descriptor_target = _DescriptorMaskedReconciledLedger.model_validate(
+            result.ledgers[0].model_dump(mode="python")
+        )
+        ordinary_payload = result.model_dump(mode="python")
+        descriptor_payload = result.model_dump(mode="python")
+        ordinary_payload["ledgers"] = (
+            ordinary_target,
+            *result.ledgers[1:],
+        )
+        descriptor_payload["ledgers"] = (
+            descriptor_target,
+            *result.ledgers[1:],
+        )
+
+    descriptor_backing = _MODEL_DICT_DESCRIPTOR.__get__(
+        descriptor_target,
+        BaseModel,
+    )
+    dict.__setitem__(descriptor_backing, invalid_field, invalid_value)
+    assert dict.__getitem__(descriptor_backing, invalid_field) == invalid_value
+    assert descriptor_target.__dict__[invalid_field] != invalid_value
+
+    ordinary_signature = _python_validation_signature(
+        receiver,
+        ordinary_payload,
+        entry,
+    )
+    descriptor_signature = _python_validation_signature(
+        receiver,
+        descriptor_payload,
+        entry,
+    )
+    assert descriptor_signature == ordinary_signature
+    assert descriptor_signature[0][:2] == (error_type, location)
+
+
+@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+def test_result_receivers_reject_descriptor_hidden_invalid_root(
+    receiver_name: str,
+) -> None:
+    result = reconcile_usage_events([_event()])
+    if receiver_name == "stream":
+        receiver = ReconciledUsageStream
+        ordinary = result.streams[0].model_copy(
+            update={"known_token_subtotal": 0}
+        )
+        descriptor = _DescriptorMaskedReconciledUsageStream.model_validate(
+            result.streams[0].model_dump(mode="python")
+        )
+        field_name = "known_token_subtotal"
+        invalid_value: object = 0
+        expected_type = "value_error"
+        expected_location: tuple[object, ...] = ()
+    else:
+        receiver = UsageReconciliation
+        ordinary = result.model_copy(update={"tenant_id": ""})
+        descriptor = _DescriptorMaskedUsageReconciliation.model_validate(
+            result.model_dump(mode="python")
+        )
+        field_name = "tenant_id"
+        invalid_value = ""
+        expected_type = "string_too_short"
+        expected_location = ("tenant_id",)
+
+    backing = _MODEL_DICT_DESCRIPTOR.__get__(descriptor, BaseModel)
+    dict.__setitem__(backing, field_name, invalid_value)
+    assert descriptor.__dict__[field_name] != invalid_value
+    ordinary_signature = _validation_signature(receiver, ordinary)
+    descriptor_signature = _validation_signature(receiver, descriptor)
+    assert descriptor_signature == ordinary_signature
+    assert descriptor_signature[0][:2] == (expected_type, expected_location)
+
+
+@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+def test_python_prefreeze_precedes_mapping_key_hooks(receiver_name: str) -> None:
+    result = reconcile_usage_events([_event()])
+
+    class RepairingFieldName(str):
+        def __new__(cls, value: str):
+            instance = super().__new__(cls, value)
+            instance.action = None
+            instance.calls = 0
+            return instance
+
+        def __hash__(self):
+            if self.action is not None:
+                self.calls += 1
+                action, self.action = self.action, None
+                action()
+            return super().__hash__()
+
+    if receiver_name == "stream":
+        receiver = ReconciledUsageStream
+        child = result.streams[0].attribution.model_copy(update={"provider": ""})
+        child_backing = _MODEL_DICT_DESCRIPTOR.__get__(child, BaseModel)
+        payload = result.streams[0].model_dump(mode="python")
+        payload["attribution"] = child
+        expected_location = ("attribution", "provider")
+        repair = lambda: dict.__setitem__(
+            child_backing,
+            "provider",
+            "provider-1",
+        )
+    else:
+        receiver = UsageReconciliation
+        child = result.streams[0].model_copy(
+            update={"known_token_subtotal": 0}
+        )
+        child_backing = _MODEL_DICT_DESCRIPTOR.__get__(child, BaseModel)
+        payload = result.model_dump(mode="python")
+        payload["streams"] = (child,)
+        expected_location = ("streams", 0)
+        repair = lambda: dict.__setitem__(
+            child_backing,
+            "known_token_subtotal",
+            15,
+        )
+
+    tenant_id = dict.pop(payload, "tenant_id")
+    key = RepairingFieldName("tenant_id")
+    dict.__setitem__(payload, key, tenant_id)
+    key.action = repair
+
+    signature = _python_validation_signature(receiver, payload, "model_validate")
+
+    assert key.calls == 1
+    assert signature[0][1] == expected_location
+    if receiver_name == "stream":
+        assert child_backing["provider"] == "provider-1"
+    else:
+        assert child_backing["known_token_subtotal"] == 15
 
 
 @pytest.mark.parametrize(

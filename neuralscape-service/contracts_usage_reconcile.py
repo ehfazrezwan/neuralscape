@@ -5,7 +5,8 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, GetCoreSchemaHandler, model_validator
+from pydantic_core import core_schema
 
 from contracts_common import ContractModel, OpaqueId, SafeCounter
 from contracts_usage import (
@@ -22,6 +23,12 @@ from contracts_usage import (
 _MAX_SAFE_COUNTER = 9_007_199_254_740_991
 _MODEL_DICT_DESCRIPTOR = BaseModel.__dict__["__dict__"]
 _MODEL_EXTRAS_DESCRIPTOR = BaseModel.__dict__["__pydantic_extra__"]
+_FrozenModelStorage = tuple[
+    BaseModel,
+    tuple[tuple[object, object], ...],
+    object,
+    tuple[tuple[object, object], ...] | None,
+]
 _LEDGER_ORDER: tuple[UsageLedger, ...] = (
     "service",
     "consuming_agent",
@@ -54,6 +61,10 @@ class UsageReconciliationError(ValueError):
         super().__init__(f"{code}: {detail}")
 
 
+def _snapshot_python_input(value: Any) -> Any:
+    return _native_snapshot(value)
+
+
 class ReconciledUsageStream(ContractModel):
     """The selected head of one attempt/ledger correction chain."""
 
@@ -78,29 +89,18 @@ class ReconciledUsageStream(ContractModel):
     incomplete_categories: tuple[str, ...]
 
     @classmethod
-    def model_validate(
+    def __get_pydantic_core_schema__(
         cls,
-        obj: Any,
-        *,
-        strict: bool | None = None,
-        extra: Literal["allow", "ignore", "forbid"] | None = None,
-        from_attributes: bool | None = None,
-        context: Any | None = None,
-        by_alias: bool | None = None,
-        by_name: bool | None = None,
-    ) -> "ReconciledUsageStream":
-        # Retained instances need snapshotting before Pydantic normalizes their
-        # nested models. Dict and JSON inputs keep Pydantic's native modes.
-        if isinstance(obj, cls):
-            obj = _native_snapshot(obj)
-        return super().model_validate(
-            obj,
-            strict=strict,
-            extra=extra,
-            from_attributes=from_attributes,
-            context=context,
-            by_alias=by_alias,
-            by_name=by_name,
+        source_type: Any,
+        handler: GetCoreSchemaHandler,
+    ) -> core_schema.CoreSchema:
+        schema = handler(source_type)
+        return core_schema.json_or_python_schema(
+            json_schema=schema,
+            python_schema=core_schema.no_info_before_validator_function(
+                _snapshot_python_input,
+                schema,
+            ),
         )
 
     @model_validator(mode="after")
@@ -194,29 +194,18 @@ class UsageReconciliation(ContractModel):
     ledgers: tuple[ReconciledLedger, ...]
 
     @classmethod
-    def model_validate(
+    def __get_pydantic_core_schema__(
         cls,
-        obj: Any,
-        *,
-        strict: bool | None = None,
-        extra: Literal["allow", "ignore", "forbid"] | None = None,
-        from_attributes: bool | None = None,
-        context: Any | None = None,
-        by_alias: bool | None = None,
-        by_name: bool | None = None,
-    ) -> "UsageReconciliation":
-        # Capture nested streams from retained results before field validation
-        # can normalize their concrete model storage.
-        if isinstance(obj, cls):
-            obj = _native_snapshot(obj)
-        return super().model_validate(
-            obj,
-            strict=strict,
-            extra=extra,
-            from_attributes=from_attributes,
-            context=context,
-            by_alias=by_alias,
-            by_name=by_name,
+        source_type: Any,
+        handler: GetCoreSchemaHandler,
+    ) -> core_schema.CoreSchema:
+        schema = handler(source_type)
+        return core_schema.json_or_python_schema(
+            json_schema=schema,
+            python_schema=core_schema.no_info_before_validator_function(
+                _snapshot_python_input,
+                schema,
+            ),
         )
 
     @model_validator(mode="after")
@@ -290,16 +279,86 @@ class UsageReconciliation(ContractModel):
         return self
 
 
-def _native_snapshot(value: object, active: set[int] | None = None) -> object:
+def _freeze_model_storage(
+    value: object,
+    frozen_models: dict[int, _FrozenModelStorage],
+    visited: set[int],
+) -> None:
+    """Capture reachable native model stores without public traversal hooks."""
+
+    value_type = type(value)
+    is_native_container = issubclass(
+        value_type,
+        (BaseModel, dict, list, tuple, set, frozenset),
+    )
+    if not is_native_container:
+        return
+
+    identity = id(value)
+    if identity in visited:
+        return
+    visited.add(identity)
+
+    if issubclass(value_type, BaseModel):
+        stored = _MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+        stored_items = tuple(dict.items(stored))
+        try:
+            extras = _MODEL_EXTRAS_DESCRIPTOR.__get__(value, BaseModel)
+        except AttributeError:
+            extras = None
+        native_extra_items = (
+            tuple(dict.items(extras))
+            if extras is not None and issubclass(type(extras), dict)
+            else None
+        )
+        frozen_models[identity] = (
+            value,
+            stored_items,
+            extras,
+            native_extra_items,
+        )
+        for _name, field_value in stored_items:
+            _freeze_model_storage(field_value, frozen_models, visited)
+        if native_extra_items is not None:
+            for _name, field_value in native_extra_items:
+                _freeze_model_storage(field_value, frozen_models, visited)
+        return
+
+    if issubclass(value_type, dict):
+        items = (item for _key, item in dict.items(value))
+    elif issubclass(value_type, list):
+        items = list.__iter__(value)
+    elif issubclass(value_type, tuple):
+        items = tuple.__iter__(value)
+    elif issubclass(value_type, set):
+        items = set.__iter__(value)
+    else:
+        items = frozenset.__iter__(value)
+    for item in items:
+        _freeze_model_storage(item, frozen_models, visited)
+
+
+def _native_snapshot(
+    value: object,
+    active: set[int] | None = None,
+    *,
+    _frozen_models: dict[int, _FrozenModelStorage] | None = None,
+) -> object:
     """Copy a nested native/model graph without trusting model construction.
 
     Reading ``__dict__`` deliberately retains unknown fields injected by
     unchecked model copies so the destination contract can reject them.
     """
 
+    if _frozen_models is None:
+        _frozen_models = {}
+        _freeze_model_storage(value, _frozen_models, set())
     if active is None:
         active = set()
-    if not isinstance(value, (BaseModel, dict, list, tuple, set, frozenset)):
+    if not isinstance(
+        value,
+        (BaseModel, Mapping, list, tuple, set, frozenset),
+    ):
         return value
 
     identity = id(value)
@@ -308,17 +367,15 @@ def _native_snapshot(value: object, active: set[int] | None = None) -> object:
     active.add(identity)
     try:
         if isinstance(value, BaseModel):
-            stored_values = _MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
-            stored_items = tuple(dict.items(stored_values))
-            try:
-                extras = _MODEL_EXTRAS_DESCRIPTOR.__get__(value, BaseModel)
-            except AttributeError:
-                extras = None
+            frozen = _frozen_models.get(identity)
+            if frozen is None or frozen[0] is not value:
+                _freeze_model_storage(value, _frozen_models, set())
+                frozen = _frozen_models[identity]
+            _model, stored_items, extras, native_extra_items = frozen
             extra_items: tuple[tuple[object, object], ...] = ()
             if extras is not None:
-                extras_type = type(extras)
-                if issubclass(extras_type, dict):
-                    extra_items = tuple(dict.items(extras))
+                if native_extra_items is not None:
+                    extra_items = native_extra_items
                     extra_names = {name for name, _ in extra_items}
                 else:
                     if not isinstance(extras, Mapping):
@@ -333,29 +390,53 @@ def _native_snapshot(value: object, active: set[int] | None = None) -> object:
                 if (stored_names | set(declared_fields)).intersection(extra_names):
                     raise ValueError("contract extra storage overlaps stored fields")
             fields = {
-                name: _native_snapshot(field_value, active)
+                name: _native_snapshot(
+                    field_value,
+                    active,
+                    _frozen_models=_frozen_models,
+                )
                 for name, field_value in stored_items
             }
             if extra_items:
                 fields.update(
-                    {
-                        name: _native_snapshot(field_value, active)
-                        for name, field_value in extra_items
-                    }
-                )
+                {
+                    name: _native_snapshot(
+                        field_value,
+                        active,
+                        _frozen_models=_frozen_models,
+                    )
+                    for name, field_value in extra_items
+                }
+            )
             return fields
-        if isinstance(value, dict):
+        if isinstance(value, Mapping):
             return {
-                key: _native_snapshot(field_value, active)
+                key: _native_snapshot(
+                    field_value,
+                    active,
+                    _frozen_models=_frozen_models,
+                )
                 for key, field_value in value.items()
             }
         if isinstance(value, list):
-            return [_native_snapshot(item, active) for item in value]
+            return [
+                _native_snapshot(item, active, _frozen_models=_frozen_models)
+                for item in value
+            ]
         if isinstance(value, tuple):
-            return tuple(_native_snapshot(item, active) for item in value)
+            return tuple(
+                _native_snapshot(item, active, _frozen_models=_frozen_models)
+                for item in value
+            )
         if isinstance(value, set):
-            return {_native_snapshot(item, active) for item in value}
-        return frozenset(_native_snapshot(item, active) for item in value)
+            return {
+                _native_snapshot(item, active, _frozen_models=_frozen_models)
+                for item in value
+            }
+        return frozenset(
+            _native_snapshot(item, active, _frozen_models=_frozen_models)
+            for item in value
+        )
     finally:
         active.remove(identity)
 
