@@ -642,6 +642,12 @@ def _error_code(events: list[UsageEvent]) -> str:
     return caught.value.code
 
 
+def _error_signature(events: tuple[UsageEvent, ...]) -> tuple[str, str]:
+    with pytest.raises(UsageReconciliationError) as caught:
+        reconcile_usage_events(events)
+    return caught.value.code, caught.value.detail
+
+
 def _assert_canonical_invalid_event(event: UsageEvent) -> None:
     with pytest.raises(UsageReconciliationError) as caught:
         reconcile_usage_events([event])
@@ -3343,6 +3349,64 @@ def test_correction_cycle_is_invalid() -> None:
     first = _event(event_id="a", predecessor_event_id="b")
     second = _event(event_id="b", predecessor_event_id="a")
     assert _error_code([first, second]) == "correction_cycle"
+
+
+def test_cycle_diagnostic_is_stable_across_event_permutations() -> None:
+    first = _event(event_id="a", predecessor_event_id="b")
+    second = _event(event_id="b", predecessor_event_id="a")
+
+    signatures = {
+        _error_signature(order) for order in permutations((first, second))
+    }
+
+    assert signatures == {
+        ("correction_cycle", "correction chain containing a is cyclic")
+    }
+
+
+def test_competing_graph_diagnostics_are_stable_across_event_permutations() -> None:
+    root = _event(
+        event_id="z-root",
+        status="pending",
+        attempt_outcome="in_progress",
+        usage=None,
+    )
+    cross_stream = _event(
+        event_id="a-cross",
+        predecessor_event_id="z-root",
+        task_id="task-2",
+    )
+    branch = _event(event_id="b-branch", predecessor_event_id="z-root")
+    unknown = _event(event_id="c-unknown", predecessor_event_id="not-present")
+
+    signatures = {
+        _error_signature(order)
+        for order in permutations((root, cross_stream, branch, unknown))
+    }
+
+    assert signatures == {
+        (
+            "cross_stream_correction",
+            "a-cross does not share its predecessor's stream identity",
+        )
+    }
+
+
+def test_valid_independent_stream_output_and_idempotence_are_permutation_stable(
+) -> None:
+    events = (
+        _event(event_id="z-event", attempt_id="attempt-3"),
+        _event(event_id="a-event", attempt_id="attempt-1"),
+        _event(event_id="m-event", attempt_id="attempt-2"),
+    )
+    expected = reconcile_usage_events(events)
+
+    results = [
+        reconcile_usage_events((*order, order[0]))
+        for order in permutations(events)
+    ]
+
+    assert all(result == expected for result in results)
 
 
 def test_cycle_validation_visits_each_event_once_for_long_valid_chain() -> None:

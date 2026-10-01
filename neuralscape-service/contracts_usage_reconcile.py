@@ -764,7 +764,7 @@ def _validate_no_correction_cycles(
     """Reject cycles while resolving every event at most once."""
 
     resolved: set[str] = set()
-    for start_id in by_id:
+    for start_id in sorted(by_id):
         if start_id in resolved:
             continue
 
@@ -774,7 +774,7 @@ def _validate_no_correction_cycles(
             if current_id in path:
                 raise UsageReconciliationError(
                     "correction_cycle",
-                    f"correction chain containing {current_id} cycles",
+                    f"correction chain containing {current_id} is cyclic",
                 )
             path.add(current_id)
             current_id = by_id[current_id].predecessor_event_id
@@ -815,9 +815,11 @@ def reconcile_usage_events(events: Iterable[UsageEvent]) -> UsageReconciliation:
             "mixed_tenants", "one reconciliation cannot combine tenant ledgers"
         )
 
+    ordered_events = tuple(by_id[event_id] for event_id in sorted(by_id))
+
     if any(
         event.predecessor_event_id is None and event.late_after_cancellation
-        for event in by_id.values()
+        for event in ordered_events
     ):
         raise UsageReconciliationError(
             "invalid_transition",
@@ -825,7 +827,7 @@ def reconcile_usage_events(events: Iterable[UsageEvent]) -> UsageReconciliation:
         )
 
     successor_by_id: dict[str, str] = {}
-    for event in by_id.values():
+    for event in ordered_events:
         predecessor_id = event.predecessor_event_id
         if predecessor_id is None:
             continue
@@ -847,7 +849,7 @@ def reconcile_usage_events(events: Iterable[UsageEvent]) -> UsageReconciliation:
     _validate_no_correction_cycles(by_id)
 
     roots_by_stream: dict[tuple[object, ...], list[UsageEvent]] = {}
-    for event in by_id.values():
+    for event in ordered_events:
         if event.predecessor_event_id is None:
             roots_by_stream.setdefault(_stream_key(event), []).append(event)
     for roots in roots_by_stream.values():
@@ -857,7 +859,9 @@ def reconcile_usage_events(events: Iterable[UsageEvent]) -> UsageReconciliation:
                 "one attempt/ledger/operation stream has multiple independent roots",
             )
 
-    heads = [event for event in by_id.values() if event.event_id not in successor_by_id]
+    heads = [
+        event for event in ordered_events if event.event_id not in successor_by_id
+    ]
     streams: list[ReconciledUsageStream] = []
     for event in heads:
         known, missing = _token_total(event.usage)
