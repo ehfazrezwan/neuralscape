@@ -38,7 +38,7 @@ _BASE_MODEL_EXTRA_DESCRIPTOR = vars(BaseModel)["__pydantic_extra__"]
 
 _FrozenModelStorage = tuple[
     BaseModel,
-    dict[Any, Any],
+    tuple[tuple[Any, Any], ...],
     Any,
     tuple[tuple[Any, Any], ...] | None,
 ]
@@ -316,7 +316,7 @@ def _freeze_model_storage(
 
     if issubclass(value_type, BaseModel):
         stored = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
-        stored_values = dict(dict.items(stored))
+        stored_entries = tuple(dict.items(stored))
         try:
             extras = _BASE_MODEL_EXTRA_DESCRIPTOR.__get__(value, BaseModel)
         except AttributeError:
@@ -328,15 +328,12 @@ def _freeze_model_storage(
         )
         frozen_models[identity] = (
             value,
-            stored_values,
+            stored_entries,
             extras,
             native_extra_entries,
         )
-        for field_name in value_type.model_fields:
-            if field_name in stored_values:
-                _freeze_model_storage(
-                    stored_values[field_name], frozen_models, visited
-                )
+        for _stored_name, stored_value in stored_entries:
+            _freeze_model_storage(stored_value, frozen_models, visited)
         return
 
     if issubclass(value_type, tuple):
@@ -385,7 +382,8 @@ def _snapshot_native(
             if frozen is None or frozen[0] is not value:
                 _freeze_model_storage(value, _frozen_models, set())
                 frozen = _frozen_models[identity]
-            _model, stored_values, extras, native_extra_entries = frozen
+            _model, stored_entries, extras, native_extra_entries = frozen
+            stored_values = dict(stored_entries)
             undeclared = set(stored_values).difference(fields)
             if extras is not None:
                 if native_extra_entries is not None:

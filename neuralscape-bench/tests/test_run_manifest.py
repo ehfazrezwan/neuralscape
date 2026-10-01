@@ -462,6 +462,27 @@ class MutatingTuple(tuple[object, ...]):
         return super().__iter__()
 
 
+class ArmedFieldName(str):
+    """Run one callback when a stored field name is next hashed."""
+
+    def __new__(cls, value: str):
+        instance = super().__new__(cls, value)
+        instance.action = None
+        instance.hash_calls = 0
+        return instance
+
+    def arm(self, action: Callable[[], None]) -> None:
+        self.action = action
+
+    def __hash__(self) -> int:
+        if self.action is not None:
+            action = self.action
+            self.action = None
+            self.hash_calls += 1
+            action()
+        return str.__hash__(self)
+
+
 def receive_planned_manifest(boundary: str, manifest: RunManifest) -> RunManifest:
     if boundary == "serialize":
         return validate_run_manifest_json(serialize_run_manifest(manifest))
@@ -753,6 +774,67 @@ def test_receivers_preserve_benign_string_subclass_field_names(boundary: str):
         if name == "run_id"
     )
     assert_received(boundary, manifest)
+
+
+@pytest.mark.parametrize("boundary", ["serialize", "finish"])
+@pytest.mark.parametrize(
+    ("invalid_target", "expected_location"),
+    [("nested", ("resources", 0)), ("root", ("state",))],
+)
+def test_receivers_freeze_models_before_stored_name_hash_callbacks(
+    boundary: str,
+    invalid_target: str,
+    expected_location: tuple[object, ...],
+):
+    assert_received(boundary, planned_manifest())
+
+    for armed in (False, True):
+        manifest = planned_manifest()
+        native = BASE_MODEL_DICT_DESCRIPTOR.__get__(
+            manifest, pydantic.BaseModel
+        )
+        if invalid_target == "nested":
+            invalid_resource = pending_memory().model_copy(
+                update={"observed_value": 1}
+            )
+            invalid_native = BASE_MODEL_DICT_DESCRIPTOR.__get__(
+                invalid_resource, pydantic.BaseModel
+            )
+            native["resources"] = (invalid_resource,)
+
+            def repair() -> None:
+                dict.__setitem__(invalid_native, "observed_value", None)
+
+            def repaired_value() -> object:
+                return dict.__getitem__(invalid_native, "observed_value")
+
+        else:
+            dict.__setitem__(native, "state", "invalid-state")
+
+            def repair() -> None:
+                dict.__setitem__(native, "state", RunState.PLANNED)
+
+            def repaired_value() -> object:
+                return dict.__getitem__(native, "state")
+
+        stored_name = None
+        if armed:
+            run_id = dict.pop(native, "run_id")
+            stored_name = ArmedFieldName("run_id")
+            dict.__setitem__(native, stored_name, run_id)
+            stored_name.arm(repair)
+
+        with pytest.raises(ValidationError) as exc_info:
+            receive_planned_manifest(boundary, manifest)
+
+        assert exc_info.value.errors()[0]["loc"] == expected_location
+        if armed:
+            assert stored_name is not None
+            assert stored_name.hash_calls == 1
+            expected_repaired = (
+                None if invalid_target == "nested" else RunState.PLANNED
+            )
+            assert repaired_value() == expected_repaired
 
 
 @pytest.mark.parametrize("boundary", ["serialize", "finish"])
