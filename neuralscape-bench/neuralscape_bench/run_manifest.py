@@ -604,14 +604,15 @@ def _inventory_public_sequence(
                 entries.append(item)
                 try:
                     _protect_yielded_model_storage(item, frozen_graph)
+                    public_shape_complete = _inventory_yielded_public_shape(
+                        item,
+                        frozen_graph,
+                        observing,
+                    )
                 except Exception as error:
                     failure = error
                     break
-                if not _inventory_yielded_public_shape(
-                    item,
-                    frozen_graph,
-                    observing,
-                ):
+                if not public_shape_complete:
                     break
     finally:
         observing.pop(identity, None)
@@ -700,14 +701,15 @@ def _inventory_public_mapping(
 
                 try:
                     _protect_yielded_model_storage(item, frozen_graph)
+                    public_shape_complete = _inventory_yielded_public_shape(
+                        item,
+                        frozen_graph,
+                        observing,
+                    )
                 except Exception as error:
                     failure = error
                     break
-                if not _inventory_yielded_public_shape(
-                    item,
-                    frozen_graph,
-                    observing,
-                ):
+                if not public_shape_complete:
                     break
     finally:
         observing.pop(identity, None)
