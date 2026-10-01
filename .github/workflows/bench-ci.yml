@@ -2,7 +2,7 @@ name: bench-ci
 
 on:
   pull_request:
-    branches: [codex/performance-baseline, "codex/performance-baseline-*", dev, main]
+    branches: [codex/performance-baseline, "codex/performance-baseline-*", "codex/performance-*", dev, main]
     paths:
       - "neuralscape-bench/**"
       - ".github/workflows/bench-ci.yml"
