@@ -106,6 +106,19 @@ class _RepairingStoredName(str):
         return super().__hash__()
 
 
+class _BenignExecutionLocation(str):
+    pass
+
+
+class _EndpointPretender:
+    def __init__(self) -> None:
+        self.equality_calls = 0
+
+    def __eq__(self, other: object) -> bool:
+        self.equality_calls += 1
+        return other == "endpoint"
+
+
 class _EmptyNativeRaisingViews(dict[str, object]):
     """Actually empty native storage whose overridden views must stay unused."""
 
@@ -284,6 +297,163 @@ def test_strict_local_accepts_only_local_primary_dispatch() -> None:
         )
         is None
     )
+
+
+@pytest.mark.parametrize(
+    "execution_location",
+    [None, True, 1, b"endpoint", [], {}, object(), "unknown_location"],
+    ids=[
+        "none",
+        "bool",
+        "integer",
+        "bytes",
+        "list",
+        "dict",
+        "object",
+        "unknown-string",
+    ],
+)
+def test_dispatch_rejects_invalid_execution_location_type_or_value(
+    execution_location: object,
+) -> None:
+    with pytest.raises(
+        PlaintextDispatchRejected,
+        match="execution location is invalid",
+    ) as raised:
+        validate_plaintext_dispatch(
+            _strict_local_policy(),
+            execution_location=execution_location,  # type: ignore[arg-type]
+            recipient_id=None,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=set(),
+            is_fallback=False,
+        )
+
+    assert isinstance(raised.value.__cause__, ValidationError)
+
+
+def test_dispatch_location_validation_does_not_use_caller_equality() -> None:
+    pretender = _EndpointPretender()
+
+    with pytest.raises(
+        PlaintextDispatchRejected,
+        match="execution location is invalid",
+    ):
+        validate_plaintext_dispatch(
+            _strict_local_policy(),
+            execution_location=pretender,  # type: ignore[arg-type]
+            recipient_id=None,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=set(),
+            is_fallback=False,
+        )
+
+    assert pretender.equality_calls == 0
+
+
+def test_dispatch_normalizes_benign_string_subclass_location() -> None:
+    assert (
+        validate_plaintext_dispatch(
+            _strict_local_policy(),
+            execution_location=_BenignExecutionLocation("endpoint"),
+            recipient_id=None,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=set(),
+            is_fallback=False,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "execution_location",
+    [
+        "endpoint",
+        "customer_worker",
+        "operator_worker",
+        "external_provider",
+        "attested_worker",
+    ],
+)
+def test_each_valid_execution_location_obeys_matching_policy(
+    execution_location: str,
+) -> None:
+    if execution_location == "endpoint":
+        policy = _strict_local_policy()
+        recipient_id = None
+        current_recipients: set[str] = set()
+    else:
+        policy = _external_policy(
+            allowed_execution_locations=(execution_location,),
+        )
+        recipient_id = "provider-a"
+        current_recipients = {"provider-a"}
+
+    assert (
+        validate_plaintext_dispatch(
+            policy,
+            execution_location=execution_location,  # type: ignore[arg-type]
+            recipient_id=recipient_id,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=current_recipients,
+            is_fallback=False,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("execution_location", "allowed_location"),
+    [
+        ("endpoint", "external_provider"),
+        ("customer_worker", "external_provider"),
+        ("operator_worker", "external_provider"),
+        ("external_provider", "customer_worker"),
+        ("attested_worker", "external_provider"),
+    ],
+)
+def test_each_valid_execution_location_still_requires_policy_allowance(
+    execution_location: str,
+    allowed_location: str,
+) -> None:
+    policy = _external_policy(
+        allowed_execution_locations=(allowed_location,),
+    )
+    recipient_id = None if execution_location == "endpoint" else "provider-a"
+
+    with pytest.raises(PlaintextDispatchRejected, match="location is not allowed"):
+        validate_plaintext_dispatch(
+            policy,
+            execution_location=execution_location,  # type: ignore[arg-type]
+            recipient_id=recipient_id,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids={"provider-a"},
+            is_fallback=False,
+        )
+
+
+def test_execution_location_validation_preserves_prior_diagnostic_order() -> None:
+    invalid_location = object()
+
+    with pytest.raises(PlaintextDispatchRejected, match="policy is not current"):
+        validate_plaintext_dispatch(
+            _strict_local_policy(),
+            execution_location=invalid_location,  # type: ignore[arg-type]
+            recipient_id=None,
+            current_policy_epoch=8,
+            currently_authorized_recipient_ids=set(),
+            is_fallback=False,
+        )
+
+    with pytest.raises(PlaintextDispatchRejected, match="fallback marker"):
+        validate_plaintext_dispatch(
+            _strict_local_policy(),
+            execution_location=invalid_location,  # type: ignore[arg-type]
+            recipient_id=None,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=set(),
+            is_fallback=0,  # type: ignore[arg-type]
+        )
 
 
 @pytest.mark.parametrize(

@@ -29,6 +29,7 @@ FallbackPolicy = Literal["deny", "within_approved_recipients"]
 _NON_ENDPOINT_LOCATIONS = frozenset(
     {"customer_worker", "operator_worker", "external_provider", "attested_worker"}
 )
+_EXECUTION_LOCATION_ADAPTER = TypeAdapter(ExecutionLocation)
 _OPAQUE_ID_ADAPTER = TypeAdapter(OpaqueId)
 _SAFE_COUNTER_ADAPTER = TypeAdapter(SafeCounter)
 _BASE_MODEL_DICT_DESCRIPTOR = vars(BaseModel)["__dict__"]
@@ -139,7 +140,9 @@ def validate_plaintext_dispatch(
     assurance.  Callers must explicitly classify every dispatch as primary or
     fallback; omission is not treated as a primary dispatch.  Recipient-only
     fallback must identify an approved, currently authorized non-endpoint
-    recipient.
+    recipient.  Execution-location string subclasses carrying a declared value
+    are normalized to that built-in string; non-string values are rejected
+    before policy comparisons.
     """
 
     try:
@@ -160,17 +163,24 @@ def validate_plaintext_dispatch(
         raise PlaintextDispatchRejected("processing policy is not current")
     if type(is_fallback) is not bool:
         raise PlaintextDispatchRejected("fallback marker must be a boolean")
-    if execution_location not in policy.allowed_execution_locations:
+    try:
+        checked_location = _EXECUTION_LOCATION_ADAPTER.validate_python(
+            execution_location, strict=True
+        )
+    except ValueError as exc:
+        raise PlaintextDispatchRejected("execution location is invalid") from exc
+
+    if checked_location not in policy.allowed_execution_locations:
         raise PlaintextDispatchRejected("execution location is not allowed")
     if is_fallback:
         if policy.fallback_policy == "deny":
             raise PlaintextDispatchRejected("fallback is denied")
-        if execution_location == "endpoint":
+        if checked_location == "endpoint":
             raise PlaintextDispatchRejected(
                 "recipient fallback requires a non-endpoint execution location"
             )
 
-    if execution_location == "endpoint":
+    if checked_location == "endpoint":
         if recipient_id is not None:
             raise PlaintextDispatchRejected(
                 "endpoint execution must not name a plaintext recipient"
