@@ -29,6 +29,10 @@ _FrozenModelStorage = tuple[
     object,
     tuple[tuple[object, object], ...] | None,
 ]
+_FrozenDictStorage = tuple[
+    dict[object, object],
+    tuple[tuple[object, object], ...],
+]
 _LEDGER_ORDER: tuple[UsageLedger, ...] = (
     "service",
     "consuming_agent",
@@ -282,6 +286,7 @@ class UsageReconciliation(ContractModel):
 def _freeze_model_storage(
     value: object,
     frozen_models: dict[int, _FrozenModelStorage],
+    frozen_dicts: dict[int, _FrozenDictStorage],
     visited: set[int],
 ) -> None:
     """Capture reachable native model stores without public traversal hooks."""
@@ -318,14 +323,26 @@ def _freeze_model_storage(
             native_extra_items,
         )
         for _name, field_value in stored_items:
-            _freeze_model_storage(field_value, frozen_models, visited)
+            _freeze_model_storage(
+                field_value,
+                frozen_models,
+                frozen_dicts,
+                visited,
+            )
         if native_extra_items is not None:
             for _name, field_value in native_extra_items:
-                _freeze_model_storage(field_value, frozen_models, visited)
+                _freeze_model_storage(
+                    field_value,
+                    frozen_models,
+                    frozen_dicts,
+                    visited,
+                )
         return
 
     if issubclass(value_type, dict):
-        items = (item for _key, item in dict.items(value))
+        native_items = tuple(dict.items(value))
+        frozen_dicts[identity] = (value, native_items)
+        items = (item for _key, item in native_items)
     elif issubclass(value_type, list):
         items = list.__iter__(value)
     elif issubclass(value_type, tuple):
@@ -335,7 +352,7 @@ def _freeze_model_storage(
     else:
         items = frozenset.__iter__(value)
     for item in items:
-        _freeze_model_storage(item, frozen_models, visited)
+        _freeze_model_storage(item, frozen_models, frozen_dicts, visited)
 
 
 def _native_snapshot(
@@ -343,6 +360,7 @@ def _native_snapshot(
     active: set[int] | None = None,
     *,
     _frozen_models: dict[int, _FrozenModelStorage] | None = None,
+    _frozen_dicts: dict[int, _FrozenDictStorage] | None = None,
 ) -> object:
     """Copy a nested native/model graph without trusting model construction.
 
@@ -350,9 +368,12 @@ def _native_snapshot(
     unchecked model copies so the destination contract can reject them.
     """
 
-    if _frozen_models is None:
-        _frozen_models = {}
-        _freeze_model_storage(value, _frozen_models, set())
+    if _frozen_models is None or _frozen_dicts is None:
+        if _frozen_models is None:
+            _frozen_models = {}
+        if _frozen_dicts is None:
+            _frozen_dicts = {}
+        _freeze_model_storage(value, _frozen_models, _frozen_dicts, set())
     if active is None:
         active = set()
     if not isinstance(
@@ -369,7 +390,12 @@ def _native_snapshot(
         if isinstance(value, BaseModel):
             frozen = _frozen_models.get(identity)
             if frozen is None or frozen[0] is not value:
-                _freeze_model_storage(value, _frozen_models, set())
+                _freeze_model_storage(
+                    value,
+                    _frozen_models,
+                    _frozen_dicts,
+                    set(),
+                )
                 frozen = _frozen_models[identity]
             _model, stored_items, extras, native_extra_items = frozen
             extra_items: tuple[tuple[object, object], ...] = ()
@@ -394,6 +420,7 @@ def _native_snapshot(
                     field_value,
                     active,
                     _frozen_models=_frozen_models,
+                    _frozen_dicts=_frozen_dicts,
                 )
                 for name, field_value in stored_items
             }
@@ -404,37 +431,67 @@ def _native_snapshot(
                         field_value,
                         active,
                         _frozen_models=_frozen_models,
+                        _frozen_dicts=_frozen_dicts,
                     )
                     for name, field_value in extra_items
                 }
             )
             return fields
         if isinstance(value, Mapping):
+            frozen_dict = _frozen_dicts.get(identity)
+            if frozen_dict is not None and frozen_dict[0] is value:
+                # Preserve the public traversal callback, but retain the native
+                # dict edges captured before that callback could replace them.
+                tuple(value.items())
+                source_items = frozen_dict[1]
+            else:
+                source_items = value.items()
             return {
                 key: _native_snapshot(
                     field_value,
                     active,
                     _frozen_models=_frozen_models,
+                    _frozen_dicts=_frozen_dicts,
                 )
-                for key, field_value in value.items()
+                for key, field_value in source_items
             }
         if isinstance(value, list):
             return [
-                _native_snapshot(item, active, _frozen_models=_frozen_models)
+                _native_snapshot(
+                    item,
+                    active,
+                    _frozen_models=_frozen_models,
+                    _frozen_dicts=_frozen_dicts,
+                )
                 for item in value
             ]
         if isinstance(value, tuple):
             return tuple(
-                _native_snapshot(item, active, _frozen_models=_frozen_models)
+                _native_snapshot(
+                    item,
+                    active,
+                    _frozen_models=_frozen_models,
+                    _frozen_dicts=_frozen_dicts,
+                )
                 for item in value
             )
         if isinstance(value, set):
             return {
-                _native_snapshot(item, active, _frozen_models=_frozen_models)
+                _native_snapshot(
+                    item,
+                    active,
+                    _frozen_models=_frozen_models,
+                    _frozen_dicts=_frozen_dicts,
+                )
                 for item in value
             }
         return frozenset(
-            _native_snapshot(item, active, _frozen_models=_frozen_models)
+            _native_snapshot(
+                item,
+                active,
+                _frozen_models=_frozen_models,
+                _frozen_dicts=_frozen_dicts,
+            )
             for item in value
         )
     finally:

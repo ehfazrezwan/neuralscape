@@ -2,7 +2,7 @@
 
 import copy
 import json
-from collections.abc import ItemsView, Iterator, KeysView, Mapping
+from collections.abc import Callable, ItemsView, Iterator, KeysView, Mapping
 from itertools import permutations
 from types import MappingProxyType
 
@@ -370,6 +370,65 @@ class _ChangingItemsExtras(Mapping[str, object]):
         if self.items_calls == 1:
             return {}.items()
         return {"tenant_id": "shadow-tenant"}.items()
+
+
+class _ReplacingItemsInput(dict[str, object]):
+    """Replace one native edge from the receiver's public items callback."""
+
+    def __init__(self, entries: dict[str, object]) -> None:
+        super().__init__(entries)
+        self.action: Callable[[], None] | None = None
+        self.items_calls = 0
+
+    def items(self) -> ItemsView[str, object]:
+        self.items_calls += 1
+        if self.action is not None:
+            action, self.action = self.action, None
+            action()
+        return super().items()
+
+
+class _DivergentItemsInput(dict[str, object]):
+    """Expose a public view that differs from authoritative native dict edges."""
+
+    def __init__(
+        self,
+        native_entries: dict[str, object],
+        public_entries: dict[str, object],
+    ) -> None:
+        super().__init__(native_entries)
+        self.public_entries = public_entries
+        self.items_calls = 0
+
+    def items(self) -> ItemsView[str, object]:
+        self.items_calls += 1
+        return self.public_entries.items()
+
+
+class _DivergentPublicMapping(Mapping[str, object]):
+    """Use the public items view for a non-dict Mapping input."""
+
+    def __init__(
+        self,
+        lookup_entries: dict[str, object],
+        public_entries: dict[str, object],
+    ) -> None:
+        self.lookup_entries = lookup_entries
+        self.public_entries = public_entries
+        self.items_calls = 0
+
+    def __getitem__(self, key: str) -> object:
+        return self.lookup_entries[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.lookup_entries)
+
+    def __len__(self) -> int:
+        return len(self.lookup_entries)
+
+    def items(self) -> ItemsView[str, object]:
+        self.items_calls += 1
+        return self.public_entries.items()
 
 
 class _FalseyPopulatedExtras(dict[str, object]):
@@ -1093,6 +1152,118 @@ def test_python_prefreeze_precedes_mapping_key_hooks(receiver_name: str) -> None
         assert child_backing["provider"] == "provider-1"
     else:
         assert child_backing["known_token_subtotal"] == 15
+
+
+@pytest.mark.parametrize(
+    ("target_name", "error_type", "location"),
+    [
+        ("attribution", "string_too_short", ("attribution", "provider")),
+        ("usage", "literal_error", ("usage", "measurement")),
+        ("stream", "value_error", ("streams", 0)),
+        ("ledger", "literal_error", ("ledgers", 0, "coverage")),
+    ],
+)
+def test_python_prefreeze_retains_native_dict_edges_before_items_callback(
+    target_name: str,
+    error_type: str,
+    location: tuple[object, ...],
+) -> None:
+    result = reconcile_usage_events([_event()])
+    stream = result.streams[0]
+    if target_name == "attribution":
+        receiver = ReconciledUsageStream
+        expected = stream
+        field_name = "attribution"
+        invalid_child = stream.attribution.model_copy(update={"provider": ""})
+        valid_child = stream.attribution.model_copy()
+        payload = stream.model_dump(mode="python")
+    elif target_name == "usage":
+        receiver = ReconciledUsageStream
+        expected = stream
+        field_name = "usage"
+        assert stream.usage is not None
+        invalid_child = stream.usage.model_copy(
+            update={"measurement": "future_measurement"}
+        )
+        valid_child = stream.usage.model_copy()
+        payload = stream.model_dump(mode="python")
+    elif target_name == "stream":
+        receiver = UsageReconciliation
+        expected = result
+        field_name = "streams"
+        invalid_child = (
+            stream.model_copy(update={"known_token_subtotal": 0}),
+        )
+        valid_child = (stream.model_copy(),)
+        payload = result.model_dump(mode="python")
+    else:
+        receiver = UsageReconciliation
+        expected = result
+        field_name = "ledgers"
+        invalid_child = (
+            result.ledgers[0].model_copy(update={"coverage": "future_coverage"}),
+            *result.ledgers[1:],
+        )
+        valid_child = (result.ledgers[0].model_copy(), *result.ledgers[1:])
+        payload = result.model_dump(mode="python")
+
+    ordinary = _ReplacingItemsInput(payload)
+    dict.__setitem__(ordinary, field_name, invalid_child)
+    ordinary_signature = _validation_signature(receiver, ordinary)
+
+    replacement = _ReplacingItemsInput(payload)
+    dict.__setitem__(replacement, field_name, invalid_child)
+    replacement.action = lambda: dict.__setitem__(
+        replacement,
+        field_name,
+        valid_child,
+    )
+    replacement_signature = _validation_signature(receiver, replacement)
+
+    valid = _ReplacingItemsInput(payload)
+    dict.__setitem__(valid, field_name, valid_child)
+    valid.action = lambda: dict.__setitem__(valid, field_name, valid_child)
+    received = receiver.model_validate(valid)
+
+    assert ordinary.items_calls == 1
+    assert replacement.items_calls == 1
+    assert valid.items_calls == 1
+    assert replacement_signature == ordinary_signature
+    assert replacement_signature[0][:2] == (error_type, location)
+    assert dict.__getitem__(replacement, field_name) is valid_child
+    assert received == expected
+
+
+def test_python_prefreeze_keeps_native_dict_and_public_mapping_authority() -> None:
+    stream = reconcile_usage_events([_event()]).streams[0]
+    valid_payload = stream.model_dump(mode="python")
+    invalid_payload = stream.model_dump(mode="python")
+    invalid_payload["attribution"] = stream.attribution.model_copy(
+        update={"provider": ""}
+    )
+    expected = [
+        (
+            "string_too_short",
+            ("attribution", "provider"),
+            "String should have at least 1 character",
+        )
+    ]
+
+    native_invalid = _DivergentItemsInput(invalid_payload, valid_payload)
+    assert _validation_signature(ReconciledUsageStream, native_invalid) == expected
+    assert native_invalid.items_calls == 1
+
+    native_valid = _DivergentItemsInput(valid_payload, invalid_payload)
+    assert ReconciledUsageStream.model_validate(native_valid) == stream
+    assert native_valid.items_calls == 1
+
+    public_valid = _DivergentPublicMapping(invalid_payload, valid_payload)
+    assert ReconciledUsageStream.model_validate(public_valid) == stream
+    assert public_valid.items_calls == 1
+
+    public_invalid = _DivergentPublicMapping(valid_payload, invalid_payload)
+    assert _validation_signature(ReconciledUsageStream, public_invalid) == expected
+    assert public_invalid.items_calls == 1
 
 
 @pytest.mark.parametrize(
