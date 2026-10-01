@@ -7,7 +7,7 @@ from itertools import permutations
 from types import MappingProxyType
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 import contracts_usage_reconcile as usage_reconcile_contracts
 from contracts_common import MAX_SAFE_INTEGER
@@ -19,6 +19,10 @@ from contracts_usage_reconcile import (
     UsageReconciliationError,
     reconcile_usage_events,
 )
+
+
+_MODEL_DICT_DESCRIPTOR = BaseModel.__dict__["__dict__"]
+_MODEL_EXTRAS_DESCRIPTOR = BaseModel.__dict__["__pydantic_extra__"]
 
 
 def _quantity(value: int | None, reason: str | None = None) -> TokenQuantity:
@@ -214,6 +218,75 @@ class _HidingStorageAttribution(AttributionSnapshot):
         return super().__getattribute__(name)
 
 
+class _DescriptorMaskedAttribution(AttributionSnapshot):
+    @property
+    def __dict__(self):
+        native = _MODEL_DICT_DESCRIPTOR.__get__(self, BaseModel)
+        return {
+            name: value
+            for name, value in dict.items(native)
+            if name != "future_constraint"
+        }
+
+    @__dict__.setter
+    def __dict__(self, value):
+        _MODEL_DICT_DESCRIPTOR.__set__(self, value)
+
+    @property
+    def __pydantic_extra__(self):
+        return None
+
+    @__pydantic_extra__.setter
+    def __pydantic_extra__(self, value):
+        _MODEL_EXTRAS_DESCRIPTOR.__set__(self, value)
+
+
+class _DescriptorMaskedReconciledUsageStream(ReconciledUsageStream):
+    @property
+    def __dict__(self):
+        native = _MODEL_DICT_DESCRIPTOR.__get__(self, BaseModel)
+        return {
+            name: value
+            for name, value in dict.items(native)
+            if name != "future_constraint"
+        }
+
+    @__dict__.setter
+    def __dict__(self, value):
+        _MODEL_DICT_DESCRIPTOR.__set__(self, value)
+
+    @property
+    def __pydantic_extra__(self):
+        return None
+
+    @__pydantic_extra__.setter
+    def __pydantic_extra__(self, value):
+        _MODEL_EXTRAS_DESCRIPTOR.__set__(self, value)
+
+
+class _DescriptorMaskedUsageReconciliation(UsageReconciliation):
+    @property
+    def __dict__(self):
+        native = _MODEL_DICT_DESCRIPTOR.__get__(self, BaseModel)
+        return {
+            name: value
+            for name, value in dict.items(native)
+            if name != "future_constraint"
+        }
+
+    @__dict__.setter
+    def __dict__(self, value):
+        _MODEL_DICT_DESCRIPTOR.__set__(self, value)
+
+    @property
+    def __pydantic_extra__(self):
+        return None
+
+    @__pydantic_extra__.setter
+    def __pydantic_extra__(self, value):
+        _MODEL_EXTRAS_DESCRIPTOR.__set__(self, value)
+
+
 class _ChangingItemsExtras(Mapping[str, object]):
     """Return a different items view after the first captured snapshot."""
 
@@ -288,6 +361,27 @@ def _assert_attribution_authority_rejected(value: object) -> None:
         (error["type"], error["loc"])
         for error in caught.value.errors(include_url=False)
     ] == [("extra_forbidden", ("attribution", "authority"))]
+
+
+def _set_native_unknown(target: BaseModel, storage: str) -> None:
+    if storage == "stored":
+        backing = _MODEL_DICT_DESCRIPTOR.__get__(target, BaseModel)
+        dict.__setitem__(backing, "future_constraint", "deny")
+    else:
+        backing = {"future_constraint": "deny"}
+        _MODEL_EXTRAS_DESCRIPTOR.__set__(target, backing)
+    assert dict.__getitem__(backing, "future_constraint") == "deny"
+
+
+def _validation_signature(
+    receiver: type[BaseModel], value: object
+) -> list[tuple[str, tuple[object, ...], str]]:
+    with pytest.raises(ValidationError) as caught:
+        receiver.model_validate(value)
+    return [
+        (error["type"], error["loc"], error["msg"])
+        for error in caught.value.errors(include_url=False)
+    ]
 
 
 def test_reconciles_three_ledgers_without_cross_ledger_relabelling() -> None:
@@ -472,6 +566,286 @@ def test_result_revalidation_rejects_hidden_extra_in_nested_copy() -> None:
 
     with pytest.raises(ValidationError):
         UsageReconciliation.model_validate(invalid_result)
+
+
+@pytest.mark.parametrize("storage", ["stored", "extra"])
+@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+def test_result_receivers_reject_descriptor_hidden_root_storage_like_ordinary(
+    storage: str,
+    receiver_name: str,
+) -> None:
+    result = reconcile_usage_events([_event()])
+    if receiver_name == "stream":
+        receiver = ReconciledUsageStream
+        ordinary = result.streams[0].model_copy()
+        descriptor = _DescriptorMaskedReconciledUsageStream.model_validate(
+            result.streams[0].model_dump(mode="python")
+        )
+    else:
+        receiver = UsageReconciliation
+        ordinary = result.model_copy()
+        descriptor = _DescriptorMaskedUsageReconciliation.model_validate(
+            result.model_dump(mode="python")
+        )
+
+    _set_native_unknown(ordinary, storage)
+    _set_native_unknown(descriptor, storage)
+    if storage == "stored":
+        assert "future_constraint" not in descriptor.__dict__
+    else:
+        assert descriptor.__pydantic_extra__ is None
+
+    expected = [
+        (
+            "extra_forbidden",
+            ("future_constraint",),
+            "Extra inputs are not permitted",
+        )
+    ]
+    assert _validation_signature(receiver, ordinary) == expected
+    assert _validation_signature(receiver, descriptor) == expected
+
+
+@pytest.mark.parametrize("storage", ["stored", "extra"])
+@pytest.mark.parametrize("target_name", ["attribution", "stream"])
+def test_result_receivers_reject_descriptor_hidden_nested_storage_like_ordinary(
+    storage: str,
+    target_name: str,
+) -> None:
+    result = reconcile_usage_events([_event()])
+    stream = result.streams[0]
+    if target_name == "attribution":
+        receiver = ReconciledUsageStream
+        ordinary_target = stream.attribution.model_copy()
+        descriptor_target = _DescriptorMaskedAttribution.model_validate(
+            stream.attribution.model_dump(mode="python")
+        )
+        expected_location = ("attribution", "future_constraint")
+        ordinary_parent = stream.model_copy(
+            update={"attribution": ordinary_target}
+        )
+        descriptor_parent = stream.model_copy(
+            update={"attribution": descriptor_target}
+        )
+    else:
+        receiver = UsageReconciliation
+        ordinary_target = stream.model_copy()
+        descriptor_target = _DescriptorMaskedReconciledUsageStream.model_validate(
+            stream.model_dump(mode="python")
+        )
+        expected_location = ("streams", 0, "future_constraint")
+        ordinary_parent = result.model_copy(update={"streams": (ordinary_target,)})
+        descriptor_parent = result.model_copy(
+            update={"streams": (descriptor_target,)}
+        )
+
+    _set_native_unknown(ordinary_target, storage)
+    _set_native_unknown(descriptor_target, storage)
+    if storage == "stored":
+        assert "future_constraint" not in descriptor_target.__dict__
+    else:
+        assert descriptor_target.__pydantic_extra__ is None
+
+    expected = [
+        (
+            "extra_forbidden",
+            expected_location,
+            "Extra inputs are not permitted",
+        )
+    ]
+    assert _validation_signature(receiver, ordinary_parent) == expected
+    assert _validation_signature(receiver, descriptor_parent) == expected
+
+
+@pytest.mark.parametrize(
+    "target_name",
+    ["stream", "attribution", "result", "nested_stream"],
+)
+def test_result_receivers_accept_valid_descriptor_subclass_controls(
+    target_name: str,
+) -> None:
+    result = reconcile_usage_events([_event()])
+    stream = result.streams[0]
+    if target_name == "stream":
+        value = _DescriptorMaskedReconciledUsageStream.model_validate(
+            stream.model_dump(mode="python")
+        )
+        received = ReconciledUsageStream.model_validate(value)
+        assert type(received) is ReconciledUsageStream
+        assert received == stream
+    elif target_name == "attribution":
+        attribution = _DescriptorMaskedAttribution.model_validate(
+            stream.attribution.model_dump(mode="python")
+        )
+        value = stream.model_copy(update={"attribution": attribution})
+        received = ReconciledUsageStream.model_validate(value)
+        assert type(received.attribution) is AttributionSnapshot
+        assert received == stream
+    elif target_name == "result":
+        value = _DescriptorMaskedUsageReconciliation.model_validate(
+            result.model_dump(mode="python")
+        )
+        received = UsageReconciliation.model_validate(value)
+        assert type(received) is UsageReconciliation
+        assert received == result
+    else:
+        nested = _DescriptorMaskedReconciledUsageStream.model_validate(
+            stream.model_dump(mode="python")
+        )
+        value = result.model_copy(update={"streams": (nested,)})
+        received = UsageReconciliation.model_validate(value)
+        assert type(received.streams[0]) is ReconciledUsageStream
+        assert received == result
+
+
+@pytest.mark.parametrize("construction", ["copy", "construct"])
+@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+def test_result_receivers_reject_unknown_from_unchecked_model_construction(
+    construction: str,
+    receiver_name: str,
+) -> None:
+    result = reconcile_usage_events([_event()])
+    valid = result.streams[0] if receiver_name == "stream" else result
+    receiver = (
+        ReconciledUsageStream
+        if receiver_name == "stream"
+        else UsageReconciliation
+    )
+    if construction == "copy":
+        invalid = valid.model_copy(update={"future_constraint": "deny"})
+    else:
+        stored = _MODEL_DICT_DESCRIPTOR.__get__(valid, BaseModel)
+        invalid = receiver.model_construct(**dict(dict.items(stored)))
+        invalid_stored = _MODEL_DICT_DESCRIPTOR.__get__(invalid, BaseModel)
+        dict.__setitem__(invalid_stored, "future_constraint", "deny")
+
+    assert _validation_signature(receiver, invalid) == [
+        (
+            "extra_forbidden",
+            ("future_constraint",),
+            "Extra inputs are not permitted",
+        )
+    ]
+
+
+@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+def test_result_receivers_preserve_dict_and_json_validation_paths(
+    receiver_name: str,
+) -> None:
+    result = reconcile_usage_events([_event()])
+    valid = result.streams[0] if receiver_name == "stream" else result
+    receiver = (
+        ReconciledUsageStream
+        if receiver_name == "stream"
+        else UsageReconciliation
+    )
+
+    assert receiver.model_validate(valid.model_dump(mode="python")) == valid
+    assert receiver.model_validate_json(valid.model_dump_json()) == valid
+
+
+@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+@pytest.mark.parametrize(
+    "extra_storage",
+    [
+        pytest.param("absent", id="absent"),
+        pytest.param(None, id="none"),
+        pytest.param({}, id="empty-dict"),
+        pytest.param(MappingProxyType({}), id="empty-mapping"),
+        pytest.param([], id="malformed"),
+    ],
+)
+def test_result_receivers_preserve_native_extra_storage_protocol(
+    receiver_name: str,
+    extra_storage: object,
+) -> None:
+    result = reconcile_usage_events([_event()])
+    valid = result.streams[0] if receiver_name == "stream" else result
+    receiver = (
+        ReconciledUsageStream
+        if receiver_name == "stream"
+        else UsageReconciliation
+    )
+    value = valid.model_copy()
+    if extra_storage == "absent":
+        _MODEL_EXTRAS_DESCRIPTOR.__delete__(value)
+        with pytest.raises(AttributeError):
+            _MODEL_EXTRAS_DESCRIPTOR.__get__(value, BaseModel)
+    else:
+        _MODEL_EXTRAS_DESCRIPTOR.__set__(value, extra_storage)
+
+    if isinstance(extra_storage, list):
+        with pytest.raises(
+            ValueError, match="contract extra storage must be a mapping"
+        ):
+            receiver.model_validate(value)
+    else:
+        assert receiver.model_validate(value) == valid
+
+
+def test_result_receivers_preserve_semantic_recomputation() -> None:
+    result = reconcile_usage_events([_event()])
+    invalid_stream = result.streams[0].model_copy(
+        update={"known_token_subtotal": 0}
+    )
+    with pytest.raises(
+        ValidationError, match="stream subtotal does not match token usage"
+    ):
+        ReconciledUsageStream.model_validate(invalid_stream)
+
+    invalid_ledger = result.ledgers[0].model_copy(
+        update={"known_token_subtotal": 999, "total_tokens": 999}
+    )
+    invalid_result = result.model_copy(
+        update={"ledgers": (invalid_ledger, *result.ledgers[1:])}
+    )
+    with pytest.raises(
+        ValidationError,
+        match="service ledger known_token_subtotal does not match streams",
+    ):
+        UsageReconciliation.model_validate(invalid_result)
+
+
+@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+def test_result_receivers_reject_native_cycles(receiver_name: str) -> None:
+    result = reconcile_usage_events([_event()])
+    if receiver_name == "stream":
+        value = result.streams[0].model_copy()
+        stored = _MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+        dict.__setitem__(stored, "attribution", value)
+        receiver = ReconciledUsageStream
+    else:
+        value = result.model_copy()
+        stored = _MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+        dict.__setitem__(stored, "streams", (value,))
+        receiver = UsageReconciliation
+
+    with pytest.raises(ValueError, match="cyclic input graph"):
+        receiver.model_validate(value)
+
+
+def test_result_snapshot_freezes_root_extras_before_nested_traversal() -> None:
+    result = reconcile_usage_events([_event()]).model_copy()
+    extras = {"future_constraint": "deny"}
+    _MODEL_EXTRAS_DESCRIPTOR.__set__(result, extras)
+
+    class ClearingTuple(tuple):
+        def __iter__(self):
+            dict.clear(extras)
+            return super().__iter__()
+
+    stored = _MODEL_DICT_DESCRIPTOR.__get__(result, BaseModel)
+    dict.__setitem__(stored, "streams", ClearingTuple(result.streams))
+
+    assert tuple(dict.items(extras)) == (("future_constraint", "deny"),)
+    assert _validation_signature(UsageReconciliation, result) == [
+        (
+            "extra_forbidden",
+            ("future_constraint",),
+            "Extra inputs are not permitted",
+        )
+    ]
+    assert tuple(dict.items(extras)) == ()
 
 
 def test_stream_rejects_existing_attribution_with_hidden_extra() -> None:

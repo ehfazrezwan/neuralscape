@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
@@ -76,6 +76,32 @@ class ReconciledUsageStream(ContractModel):
     known_token_subtotal: SafeCounter
     total_tokens: SafeCounter | None
     incomplete_categories: tuple[str, ...]
+
+    @classmethod
+    def model_validate(
+        cls,
+        obj: Any,
+        *,
+        strict: bool | None = None,
+        extra: Literal["allow", "ignore", "forbid"] | None = None,
+        from_attributes: bool | None = None,
+        context: Any | None = None,
+        by_alias: bool | None = None,
+        by_name: bool | None = None,
+    ) -> "ReconciledUsageStream":
+        # Retained instances need snapshotting before Pydantic normalizes their
+        # nested models. Dict and JSON inputs keep Pydantic's native modes.
+        if isinstance(obj, cls):
+            obj = _native_snapshot(obj)
+        return super().model_validate(
+            obj,
+            strict=strict,
+            extra=extra,
+            from_attributes=from_attributes,
+            context=context,
+            by_alias=by_alias,
+            by_name=by_name,
+        )
 
     @model_validator(mode="after")
     def validate_usage_summary(self) -> "ReconciledUsageStream":
@@ -166,6 +192,32 @@ class UsageReconciliation(ContractModel):
     tenant_id: OpaqueId
     streams: tuple[ReconciledUsageStream, ...]
     ledgers: tuple[ReconciledLedger, ...]
+
+    @classmethod
+    def model_validate(
+        cls,
+        obj: Any,
+        *,
+        strict: bool | None = None,
+        extra: Literal["allow", "ignore", "forbid"] | None = None,
+        from_attributes: bool | None = None,
+        context: Any | None = None,
+        by_alias: bool | None = None,
+        by_name: bool | None = None,
+    ) -> "UsageReconciliation":
+        # Capture nested streams from retained results before field validation
+        # can normalize their concrete model storage.
+        if isinstance(obj, cls):
+            obj = _native_snapshot(obj)
+        return super().model_validate(
+            obj,
+            strict=strict,
+            extra=extra,
+            from_attributes=from_attributes,
+            context=context,
+            by_alias=by_alias,
+            by_name=by_name,
+        )
 
     @model_validator(mode="after")
     def validate_result_graph(self) -> "UsageReconciliation":
