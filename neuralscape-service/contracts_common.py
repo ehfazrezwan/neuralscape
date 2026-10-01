@@ -22,6 +22,9 @@ from pydantic import (
 
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
 
+_BASE_MODEL_DICT_DESCRIPTOR = vars(BaseModel)["__dict__"]
+_BASE_MODEL_EXTRA_DESCRIPTOR = vars(BaseModel)["__pydantic_extra__"]
+
 
 OpaqueId = Annotated[
     str,
@@ -107,7 +110,7 @@ def snapshot_contract_graph(
             model_type = value_type
             # Freeze both model-owned inventories without consulting instance
             # attribute or dict-view overrides, before visiting any values.
-            stored = object.__getattribute__(value, "__dict__")
+            stored = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
             stored_entries = _mapping_entries(stored, type(stored))
             stored_names = {key for key, _ in stored_entries}
             declared_names = set(model_type.model_fields)
@@ -129,7 +132,7 @@ def snapshot_contract_graph(
                     "with missing owning fields"
                 )
             try:
-                extra = object.__getattribute__(value, "__pydantic_extra__")
+                extra = _BASE_MODEL_EXTRA_DESCRIPTOR.__get__(value, BaseModel)
             except AttributeError:
                 extra = None
             extra_entries: tuple[tuple[object, object], ...] = ()
