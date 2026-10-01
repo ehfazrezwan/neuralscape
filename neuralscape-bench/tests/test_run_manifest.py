@@ -35,7 +35,12 @@ from neuralscape_bench.run_manifest import (
     serialize_run_manifest,
     validate_run_manifest_json,
 )
-from neuralscape_bench.run_manifest import _snapshot_native
+from neuralscape_bench.run_manifest import (
+    _freeze_model_graphs,
+    _protect_yielded_model_storage,
+    _snapshot_native,
+    _traverse_model_storage,
+)
 
 
 VERSION = "candidate-v1"
@@ -462,6 +467,143 @@ class MutatingTuple(tuple[object, ...]):
         return super().__iter__()
 
 
+class PublicViewTuple(tuple[object, ...]):
+    """Expose a distinct, authoritative public tuple view exactly once."""
+
+    def __new__(
+        cls,
+        values: tuple[object, ...],
+        public_values: tuple[object, ...],
+        action: Callable[[], None] | None = None,
+    ):
+        instance = super().__new__(cls, values)
+        instance.public_values = public_values
+        instance.action = action
+        instance.iteration_calls = 0
+        return instance
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        if self.action is not None:
+            self.action()
+        return iter(self.public_values)
+
+
+class PublicResourceWithDeepNativeBacking(dict[str, object]):
+    """Expose a valid resource while retaining a deep native-only graph."""
+
+    def __init__(self, depth: int):
+        hidden: dict[str, object] = {"leaf": "value"}
+        for index in range(depth):
+            hidden = {f"level-{index}": hidden}
+        super().__init__(hidden=hidden)
+        self.public_values = measured_memory().model_dump(mode="python")
+        self.items_calls = 0
+
+    def __getitem__(self, key: str) -> object:
+        return self.public_values[key]
+
+    def __len__(self) -> int:
+        return len(self.public_values)
+
+    def __iter__(self):
+        return iter(self.public_values)
+
+    def items(self):
+        self.items_calls += 1
+        return self.public_values.items()
+
+
+class YieldRepairMapping(Mapping[str, object]):
+    """Repair the first yielded child when the next pair is requested."""
+
+    def __init__(
+        self,
+        values: dict[str, object],
+        action: Callable[[], None],
+    ):
+        self.values = values
+        self.action = action
+        self.items_calls = 0
+        self.callback_calls = 0
+        self.events: list[str] = []
+
+    def __getitem__(self, key: str) -> object:
+        return self.values[key]
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+    def __iter__(self):
+        return iter(self.values)
+
+    def items(self):
+        self.items_calls += 1
+        self.events.append("items")
+
+        def generate():
+            self.events.append("yield:exclusions")
+            yield "exclusions", self.values["exclusions"]
+            self.events.append("callback")
+            self.callback_calls += 1
+            self.action()
+            for key, value in self.values.items():
+                if key != "exclusions":
+                    self.events.append(f"yield:{key}")
+                    yield key, value
+
+        return generate()
+
+
+class LazyProvenanceMapping(Mapping[str, object]):
+    """Expose provenance before the remaining measurement fields."""
+
+    def __init__(self, values: dict[str, object]):
+        self.values = values
+        self.items_calls = 0
+
+    def __getitem__(self, key: str) -> object:
+        return self.values[key]
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+    def __iter__(self):
+        return iter(self.values)
+
+    def items(self):
+        self.items_calls += 1
+
+        def generate():
+            yield "provenance", self.values["provenance"]
+            for key, value in self.values.items():
+                if key != "provenance":
+                    yield key, value
+
+        return generate()
+
+
+class ArmedFieldName(str):
+    """Run one callback when a stored field name is next hashed."""
+
+    def __new__(cls, value: str):
+        instance = super().__new__(cls, value)
+        instance.action = None
+        instance.hash_calls = 0
+        return instance
+
+    def arm(self, action: Callable[[], None]) -> None:
+        self.action = action
+
+    def __hash__(self) -> int:
+        if self.action is not None:
+            action = self.action
+            self.action = None
+            self.hash_calls += 1
+            action()
+        return str.__hash__(self)
+
+
 def receive_planned_manifest(boundary: str, manifest: RunManifest) -> RunManifest:
     if boundary == "serialize":
         return validate_run_manifest_json(serialize_run_manifest(manifest))
@@ -497,6 +639,141 @@ def assert_received(boundary: str, manifest: RunManifest) -> None:
         RunState.PLANNED if boundary == "serialize" else RunState.COMPLETED
     )
     assert received.state is expected_state
+
+
+def test_replay_inventory_retains_first_entries_and_strong_owners():
+    class ReplayDict(dict[str, object]):
+        pass
+
+    class ReplayList(list[object]):
+        pass
+
+    class ReplayTuple(tuple[object, ...]):
+        pass
+
+    dict_child: dict[str, object] = {}
+    list_child: dict[str, object] = {}
+    tuple_child: dict[str, object] = {}
+    dict_parent = ReplayDict(child=dict_child)
+    list_parent = ReplayList((list_child,))
+    tuple_parent = ReplayTuple((tuple_child,))
+    manifest = planned_manifest()
+
+    frozen = _freeze_model_graphs(
+        manifest,
+        dict_parent,
+        list_parent,
+        tuple_parent,
+    )
+
+    assert frozen.replay_entries[id(manifest)][0] is manifest
+    assert manifest.build in frozen.replay_entries[id(manifest)][1]
+    assert frozen.replay_entries[id(dict_parent)] == (
+        dict_parent,
+        (dict_child,),
+    )
+    assert frozen.replay_entries[id(list_parent)] == (
+        list_parent,
+        (list_child,),
+    )
+    assert frozen.replay_entries[id(tuple_parent)] == (
+        tuple_parent,
+        (tuple_child,),
+    )
+
+    dict_parent.clear()
+    list_parent.clear()
+    visited: set[int] = set()
+    _traverse_model_storage(dict_parent, frozen, visited)
+    _traverse_model_storage(list_parent, frozen, visited)
+    _traverse_model_storage(tuple_parent, frozen, visited)
+    _traverse_model_storage(manifest, frozen, visited)
+
+    assert id(dict_child) in visited
+    assert id(list_child) in visited
+    assert id(tuple_child) in visited
+    assert id(manifest.build) in visited
+    assert frozen.replay_entries[id(dict_parent)][1] == (dict_child,)
+    assert frozen.replay_entries[id(list_parent)][1] == (list_child,)
+
+
+def test_yielded_child_guard_traverses_captured_storage_then_reuses_completion():
+    class ReplayDict(dict[str, object]):
+        pass
+
+    child: dict[str, object] = {}
+    value = ReplayDict(child=child)
+    frozen = _freeze_model_graphs(value)
+
+    assert frozen.replay_entries[id(value)][0] is value
+    assert id(value) not in frozen.completed_traversals
+    assert _protect_yielded_model_storage(value, frozen) is True
+    assert frozen.completed_traversals[id(value)] is value
+    assert frozen.completed_traversals[id(child)] is child
+
+    value.clear()
+    assert _protect_yielded_model_storage(value, frozen) is False
+    assert frozen.replay_entries[id(value)] == (value, (child,))
+
+    visited: set[int] = set()
+    _traverse_model_storage(value, frozen, visited)
+    assert id(child) in visited
+    assert _protect_yielded_model_storage("ordinary scalar", frozen) is False
+
+
+def test_yielded_child_guard_rejects_wrong_capture_and_completion_owners():
+    class ReplayDict(dict[str, object]):
+        pass
+
+    child: dict[str, object] = {}
+    value = ReplayDict(child=child)
+    impostor = ReplayDict()
+    frozen = _freeze_model_graphs(value)
+    frozen.completed_traversals[id(value)] = impostor
+
+    assert _protect_yielded_model_storage(value, frozen) is True
+    assert frozen.completed_traversals[id(value)] is value
+
+    replacement = ReplayDict(child=child)
+    replacement_graph = _freeze_model_graphs(())
+    replacement_graph.replay_entries[id(replacement)] = (impostor, ())
+    replacement_graph.completed_traversals[id(replacement)] = replacement
+
+    assert _protect_yielded_model_storage(replacement, replacement_graph) is True
+    owner, entries = replacement_graph.replay_entries[id(replacement)]
+    assert owner is replacement
+    assert entries == (child,)
+    assert replacement_graph.completed_traversals[id(replacement)] is replacement
+
+
+def test_failed_yielded_child_traversal_is_not_marked_complete():
+    deep: list[object] = []
+    for _index in range(sys.getrecursionlimit() + 100):
+        deep = [deep]
+    alias: dict[str, object] = {}
+    value: list[object] = [alias, deep, alias]
+    frozen = _freeze_model_graphs(value)
+
+    with pytest.raises(RecursionError, match="maximum recursion depth exceeded"):
+        _protect_yielded_model_storage(value, frozen)
+
+    assert frozen.completed_traversals == {}
+
+
+def test_successful_alias_and_cycle_traversals_record_exact_owners():
+    child: dict[str, object] = {}
+    aliased: list[object] = [child, child]
+    cycle: list[object] = []
+    cycle.append(cycle)
+    frozen = _freeze_model_graphs(aliased, cycle)
+
+    assert _protect_yielded_model_storage(aliased, frozen) is True
+    assert frozen.completed_traversals[id(aliased)] is aliased
+    assert frozen.completed_traversals[id(child)] is child
+    assert _protect_yielded_model_storage(cycle, frozen) is True
+    assert frozen.completed_traversals[id(cycle)] is cycle
+    assert _protect_yielded_model_storage(aliased, frozen) is False
+    assert _protect_yielded_model_storage(cycle, frozen) is False
 
 
 @pytest.mark.parametrize("boundary", ["serialize", "finish"])
@@ -687,6 +964,133 @@ def test_receivers_reject_initial_invalid_value_changed_during_traversal(
 
     assert native["measurements"] == ()
     assert isinstance(invalid_measurements, list)
+
+
+@pytest.mark.parametrize("boundary", ["serialize", "finish"])
+def test_receivers_freeze_nested_models_before_overridable_traversal(
+    boundary: str,
+):
+    manifest = planned_manifest()
+    invalid_resource = pending_memory().model_copy(
+        update={"observed_value": 1}
+    )
+    invalid_native = BASE_MODEL_DICT_DESCRIPTOR.__get__(
+        invalid_resource, pydantic.BaseModel
+    )
+    manifest_native = BASE_MODEL_DICT_DESCRIPTOR.__get__(
+        manifest, pydantic.BaseModel
+    )
+    original_concurrency = manifest_native["concurrency"]
+    manifest_native["resources"] = (invalid_resource,)
+    manifest_native["concurrency"] = MutatingTuple(
+        original_concurrency,
+        lambda: dict.__setitem__(invalid_native, "observed_value", None),
+    )
+
+    with pytest.raises(ValidationError) as exc_info:
+        receive_planned_manifest(boundary, manifest)
+
+    assert invalid_native["observed_value"] is None
+    assert exc_info.value.errors()[0]["loc"] == ("resources", 0)
+    assert "observed_value is valid only for a measured resource" in str(
+        exc_info.value
+    )
+
+
+@pytest.mark.parametrize("boundary", ["serialize", "finish"])
+def test_receivers_preserve_valid_overridable_tuple_traversal(boundary: str):
+    manifest = planned_manifest()
+    native = BASE_MODEL_DICT_DESCRIPTOR.__get__(manifest, pydantic.BaseModel)
+    original_concurrency = native["concurrency"]
+    calls: list[str] = []
+    native["concurrency"] = MutatingTuple(
+        original_concurrency,
+        lambda: calls.append("iterated"),
+    )
+
+    assert_received(boundary, manifest)
+
+    assert calls == ["iterated"]
+
+
+@pytest.mark.parametrize("boundary", ["serialize", "finish"])
+def test_receivers_preserve_benign_string_subclass_field_names(boundary: str):
+    class FieldName(str):
+        pass
+
+    manifest = planned_manifest()
+    native = BASE_MODEL_DICT_DESCRIPTOR.__get__(manifest, pydantic.BaseModel)
+    run_id = dict.pop(native, "run_id")
+    stored_name = FieldName("run_id")
+    dict.__setitem__(native, stored_name, run_id)
+
+    assert any(
+        type(name) is FieldName
+        for name, _field_value in dict.items(native)
+        if name == "run_id"
+    )
+    assert_received(boundary, manifest)
+
+
+@pytest.mark.parametrize("boundary", ["serialize", "finish"])
+@pytest.mark.parametrize(
+    ("invalid_target", "expected_location"),
+    [("nested", ("resources", 0)), ("root", ("state",))],
+)
+def test_receivers_freeze_models_before_stored_name_hash_callbacks(
+    boundary: str,
+    invalid_target: str,
+    expected_location: tuple[object, ...],
+):
+    assert_received(boundary, planned_manifest())
+
+    for armed in (False, True):
+        manifest = planned_manifest()
+        native = BASE_MODEL_DICT_DESCRIPTOR.__get__(
+            manifest, pydantic.BaseModel
+        )
+        if invalid_target == "nested":
+            invalid_resource = pending_memory().model_copy(
+                update={"observed_value": 1}
+            )
+            invalid_native = BASE_MODEL_DICT_DESCRIPTOR.__get__(
+                invalid_resource, pydantic.BaseModel
+            )
+            native["resources"] = (invalid_resource,)
+
+            def repair() -> None:
+                dict.__setitem__(invalid_native, "observed_value", None)
+
+            def repaired_value() -> object:
+                return dict.__getitem__(invalid_native, "observed_value")
+
+        else:
+            dict.__setitem__(native, "state", "invalid-state")
+
+            def repair() -> None:
+                dict.__setitem__(native, "state", RunState.PLANNED)
+
+            def repaired_value() -> object:
+                return dict.__getitem__(native, "state")
+
+        stored_name = None
+        if armed:
+            run_id = dict.pop(native, "run_id")
+            stored_name = ArmedFieldName("run_id")
+            dict.__setitem__(native, stored_name, run_id)
+            stored_name.arm(repair)
+
+        with pytest.raises(ValidationError) as exc_info:
+            receive_planned_manifest(boundary, manifest)
+
+        assert exc_info.value.errors()[0]["loc"] == expected_location
+        if armed:
+            assert stored_name is not None
+            assert stored_name.hash_calls == 1
+            expected_repaired = (
+                None if invalid_target == "nested" else RunState.PLANNED
+            )
+            assert repaired_value() == expected_repaired
 
 
 @pytest.mark.parametrize("boundary", ["serialize", "finish"])
@@ -1292,6 +1696,581 @@ def test_finish_deeply_revalidates_unchecked_nested_models(resource, measurement
             resources=(resource,),
             measurements=(measurement,),
         )
+
+
+@pytest.mark.parametrize(
+    ("callback_source", "invalid_target", "expected_location"),
+    [
+        ("planned", "resource", ("resources", 0, "observed_value")),
+        ("planned", "measurement", ("measurements", 0, "time_unit")),
+        ("resource", "measurement", ("measurements", 0, "time_unit")),
+    ],
+)
+def test_finish_freezes_all_input_models_before_earlier_argument_callbacks(
+    callback_source: str,
+    invalid_target: str,
+    expected_location: tuple[object, ...],
+):
+    def inputs(invalid: bool):
+        resource = measured_memory()
+        measurement = timing()
+        if invalid_target == "resource":
+            if invalid:
+                resource = resource.model_copy(update={"observed_value": True})
+            target = resource
+            field_name = "observed_value"
+            repaired_value: object = 402_653_184
+        else:
+            if invalid:
+                measurement = measurement.model_copy(
+                    update={"time_unit": "fortnights"}
+                )
+            target = measurement
+            field_name = "time_unit"
+            repaired_value = "milliseconds"
+        return resource, measurement, target, field_name, repaired_value
+
+    def callback_inputs(invalid: bool):
+        planned = planned_manifest()
+        resource, measurement, target, field_name, repaired_value = inputs(invalid)
+        target_native = BASE_MODEL_DICT_DESCRIPTOR.__get__(
+            target, pydantic.BaseModel
+        )
+        callback_calls: list[str] = []
+
+        def repair_target() -> None:
+            callback_calls.append("called")
+            dict.__setitem__(target_native, field_name, repaired_value)
+
+        resources: tuple[ResourceReading, ...]
+        if callback_source == "planned":
+            planned_native = BASE_MODEL_DICT_DESCRIPTOR.__get__(
+                planned, pydantic.BaseModel
+            )
+            planned_native["concurrency"] = MutatingTuple(
+                planned_native["concurrency"],
+                repair_target,
+            )
+            resources = (resource,)
+        else:
+            resources = MutatingTuple((resource,), repair_target)
+
+        arguments = {
+            "planned": planned,
+            "state": RunState.COMPLETED,
+            "started_at": datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            "finished_at": datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            "resources": resources,
+            "measurements": (measurement,),
+        }
+        return arguments, callback_calls, target_native, field_name, repaired_value
+
+    ordinary_resource, ordinary_measurement, *_unused = inputs(True)
+    with pytest.raises(ValidationError) as ordinary_error:
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(ordinary_resource,),
+            measurements=(ordinary_measurement,),
+        )
+    assert ordinary_error.value.errors()[0]["loc"] == expected_location
+
+    invalid_callback = callback_inputs(True)
+    with pytest.raises(ValidationError) as callback_error:
+        finish_run(**invalid_callback[0])
+    assert callback_error.value.errors() == ordinary_error.value.errors()
+    assert invalid_callback[1] == ["called"]
+    assert dict.__getitem__(invalid_callback[2], invalid_callback[3]) == (
+        invalid_callback[4]
+    )
+
+    valid_callback = callback_inputs(False)
+    result = finish_run(**valid_callback[0])
+    assert result.state is RunState.COMPLETED
+    assert valid_callback[1] == ["called"]
+    assert dict.__getitem__(valid_callback[2], valid_callback[3]) == valid_callback[4]
+
+
+@pytest.mark.parametrize("callback_source", ["planned", "resources"])
+def test_finish_freezes_plain_resource_dict_before_callbacks(
+    callback_source: str,
+):
+    def resource_data(invalid: bool) -> dict[str, object]:
+        data = measured_memory().model_dump(mode="python")
+        if invalid:
+            data["observed_value"] = True
+        return data
+
+    ordinary_invalid = resource_data(True)
+    with pytest.raises(ValidationError) as ordinary_error:
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(ordinary_invalid,),
+            measurements=(timing(),),
+        )
+    assert ordinary_error.value.errors()[0]["loc"] == (
+        "resources",
+        0,
+        "observed_value",
+    )
+
+    def callback_arguments(invalid: bool):
+        planned = planned_manifest()
+        resource = resource_data(invalid)
+        callback_calls: list[str] = []
+
+        def repair_resource() -> None:
+            callback_calls.append("called")
+            dict.__setitem__(resource, "observed_value", 402_653_184)
+
+        if callback_source == "planned":
+            native = BASE_MODEL_DICT_DESCRIPTOR.__get__(
+                planned,
+                pydantic.BaseModel,
+            )
+            native["concurrency"] = MutatingTuple(
+                native["concurrency"],
+                repair_resource,
+            )
+            resources = (resource,)
+        else:
+            resources = MutatingTuple((resource,), repair_resource)
+        return planned, resources, resource, callback_calls
+
+    attacked = callback_arguments(True)
+    with pytest.raises(ValidationError) as callback_error:
+        finish_run(
+            attacked[0],
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=attacked[1],
+            measurements=(timing(),),
+        )
+    assert callback_error.value.errors() == ordinary_error.value.errors()
+    assert attacked[2]["observed_value"] == 402_653_184
+    assert attacked[3] == ["called"]
+
+    valid = callback_arguments(False)
+    result = finish_run(
+        valid[0],
+        state=RunState.COMPLETED,
+        started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+        resources=valid[1],
+        measurements=(timing(),),
+    )
+    assert result.resources[0].observed_value == 402_653_184
+    assert valid[3] == ["called"]
+
+
+def test_finish_preserves_authoritative_public_resource_tuple_view():
+    invalid_native = measured_memory().model_dump(mode="python")
+    invalid_native["observed_value"] = True
+    visible = measured_memory(value=123)
+    resources = PublicViewTuple((invalid_native,), (visible,))
+
+    result = finish_run(
+        planned_manifest(),
+        state=RunState.COMPLETED,
+        started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+        resources=resources,
+        measurements=(timing(),),
+    )
+
+    assert result.resources[0].observed_value == 123
+    assert resources.iteration_calls == 1
+
+
+def test_finish_preserves_deep_later_native_failure_for_valid_planned():
+    shallow = PublicResourceWithDeepNativeBacking(2)
+    result = finish_run(
+        planned_manifest(),
+        state=RunState.COMPLETED,
+        started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+        resources=(shallow,),
+        measurements=(timing(),),
+    )
+    assert result.resources[0] == measured_memory()
+    assert shallow.items_calls == 1
+
+    deep = PublicResourceWithDeepNativeBacking(sys.getrecursionlimit() + 600)
+    with pytest.raises(RecursionError, match="maximum recursion depth exceeded"):
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(deep,),
+            measurements=(timing(),),
+        )
+    assert deep.items_calls == 0
+
+
+def test_finish_validates_planned_before_deep_later_native_failure():
+    invalid_planned = planned_manifest()
+    invalid_concurrency = invalid_planned.concurrency[0].model_copy(
+        update={"value": True}
+    )
+    invalid_planned = invalid_planned.model_copy(
+        update={"concurrency": (invalid_concurrency,)}
+    )
+    deep_for_invalid = PublicResourceWithDeepNativeBacking(
+        sys.getrecursionlimit() + 600
+    )
+    with pytest.raises(ValidationError) as invalid_error:
+        finish_run(
+            invalid_planned,
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(deep_for_invalid,),
+            measurements=(timing(),),
+        )
+    assert invalid_error.value.errors()[0]["type"] == "int_type"
+    assert invalid_error.value.errors()[0]["loc"] == (
+        "concurrency",
+        0,
+        "value",
+    )
+    assert deep_for_invalid.items_calls == 0
+
+    deep_for_nonplanned = PublicResourceWithDeepNativeBacking(
+        sys.getrecursionlimit() + 600
+    )
+    with pytest.raises(
+        ValueError,
+        match="only a planned run can be finished",
+    ):
+        finish_run(
+            completed_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(deep_for_nonplanned,),
+            measurements=(timing(),),
+        )
+    assert deep_for_nonplanned.items_calls == 0
+
+
+def test_finish_snapshots_public_mapping_child_before_requesting_next_pair():
+    def finish_with(measurements):
+        return finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=measurements,
+        )
+
+    def mapping_input(*, invalid: bool, name: str):
+        measurement = timing()
+        child = measurement.exclusions[0]
+        if invalid:
+            child = child.model_copy(update={"count": True})
+        values = measurement.model_dump(mode="python")
+        values["name"] = name
+        values["exclusions"] = (child,)
+        native = BASE_MODEL_DICT_DESCRIPTOR.__get__(child, pydantic.BaseModel)
+        mapping = YieldRepairMapping(
+            values,
+            lambda: dict.__setitem__(native, "count", 2),
+        )
+        return mapping, child, native
+
+    ordinary_measurement = timing()
+    ordinary_invalid = ordinary_measurement.model_dump(mode="python")
+    ordinary_invalid["exclusions"] = (
+        ordinary_measurement.exclusions[0].model_copy(update={"count": True}),
+    )
+    with pytest.raises(ValidationError) as ordinary_error:
+        finish_with((ordinary_invalid,))
+    assert ordinary_error.value.errors()[0]["loc"] == (
+        "measurements",
+        0,
+        "exclusions",
+        0,
+        "count",
+    )
+
+    attacked, _child, attacked_native = mapping_input(
+        invalid=True,
+        name="public-invalid",
+    )
+    with pytest.raises(ValidationError) as callback_error:
+        finish_with((attacked,))
+    assert callback_error.value.errors() == ordinary_error.value.errors()
+    assert attacked.items_calls == 1
+    assert attacked.callback_calls == 1
+    assert attacked.events[:3] == [
+        "items",
+        "yield:exclusions",
+        "callback",
+    ]
+    assert dict.__getitem__(attacked_native, "count") == 2
+
+    valid, _child, valid_native = mapping_input(
+        invalid=False,
+        name="public-valid",
+    )
+    result = finish_with((valid,))
+    assert result.state is RunState.COMPLETED
+    assert valid.items_calls == 1
+    assert valid.callback_calls == 1
+    assert valid.events[:3] == [
+        "items",
+        "yield:exclusions",
+        "callback",
+    ]
+    assert dict.__getitem__(valid_native, "count") == 2
+
+    shared, shared_child, shared_native = mapping_input(
+        invalid=True,
+        name="shared-second",
+    )
+    first = timing().model_dump(mode="python")
+    first["name"] = "shared-first"
+    first["exclusions"] = (shared_child,)
+    with pytest.raises(ValidationError) as shared_error:
+        finish_with((first, shared))
+    assert shared_error.value.errors()[0] == ordinary_error.value.errors()[0]
+    assert shared.items_calls == 1
+    assert shared.callback_calls == 1
+    assert dict.__getitem__(shared_native, "count") == 2
+
+
+def test_finish_replays_new_exact_dict_before_snapshotting_its_entries():
+    unexpected_callbacks: list[str] = []
+
+    def reject_callback() -> None:
+        unexpected_callbacks.append("called")
+        raise RuntimeError("callback ran before native traversal")
+
+    trigger = PublicViewTuple((), (), action=reject_callback)
+    deep: dict[str, object] = {"leaf": "value"}
+    for index in range(sys.getrecursionlimit() + 600):
+        deep = {f"level-{index}": deep}
+    provenance = {"trigger": trigger}
+    provenance.update(timing().provenance.model_dump(mode="python"))
+    provenance["deep"] = deep
+    values = timing().model_dump(mode="python")
+    values["provenance"] = provenance
+    measurement = LazyProvenanceMapping(values)
+
+    with pytest.raises(RecursionError, match="maximum recursion depth exceeded"):
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(measurement,),
+        )
+
+    assert measurement.items_calls == 1
+    assert trigger.iteration_calls == 0
+    assert unexpected_callbacks == []
+
+
+def test_finish_preserves_new_exact_dict_shallow_and_valid_controls():
+    shallow_callbacks: list[str] = []
+    trigger = PublicViewTuple(
+        (),
+        (),
+        action=lambda: shallow_callbacks.append("called"),
+    )
+    shallow = {"leaf": "value"}
+    for index in range(2):
+        shallow = {f"level-{index}": shallow}
+    provenance = {"trigger": trigger}
+    provenance.update(timing().provenance.model_dump(mode="python"))
+    provenance["deep"] = shallow
+    invalid_values = timing().model_dump(mode="python")
+    invalid_values["provenance"] = provenance
+    invalid = LazyProvenanceMapping(invalid_values)
+
+    with pytest.raises(ValidationError) as invalid_error:
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(invalid,),
+        )
+    assert invalid_error.value.errors()[0]["type"] == "extra_forbidden"
+    assert invalid_error.value.errors()[0]["loc"] == (
+        "measurements",
+        0,
+        "provenance",
+        "trigger",
+    )
+    assert invalid.items_calls == 1
+    assert trigger.iteration_calls == 1
+    assert shallow_callbacks == ["called"]
+
+    key_callbacks: list[str] = []
+    collector_key = ArmedFieldName("collector")
+    valid_provenance = {
+        collector_key: "benchmark-driver",
+        "schema_version": VERSION,
+        "collector_version": "1.0.0",
+        "clock": "monotonic",
+        "placement": "separate-driver-process",
+    }
+    collector_key.arm(lambda: key_callbacks.append("called"))
+    valid_values = timing().model_dump(mode="python")
+    valid_values["provenance"] = valid_provenance
+    valid = LazyProvenanceMapping(valid_values)
+
+    result = finish_run(
+        planned_manifest(),
+        state=RunState.COMPLETED,
+        started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+        resources=(measured_memory(),),
+        measurements=(valid,),
+    )
+    assert result.state is RunState.COMPLETED
+    assert valid.items_calls == 1
+    assert collector_key.hash_calls == 1
+    assert key_callbacks == ["called"]
+
+
+def test_finish_preserves_lazy_exact_dict_priority_and_shared_capture():
+    def deep_measurement():
+        callbacks: list[str] = []
+        trigger = PublicViewTuple(
+            (),
+            (),
+            action=lambda: callbacks.append("called"),
+        )
+        deep: dict[str, object] = {"leaf": "value"}
+        for index in range(sys.getrecursionlimit() + 600):
+            deep = {f"level-{index}": deep}
+        provenance = {"trigger": trigger}
+        provenance.update(timing().provenance.model_dump(mode="python"))
+        provenance["deep"] = deep
+        values = timing().model_dump(mode="python")
+        values["provenance"] = provenance
+        return LazyProvenanceMapping(values), trigger, callbacks, provenance
+
+    invalid_planned = planned_manifest()
+    invalid_concurrency = invalid_planned.concurrency[0].model_copy(
+        update={"value": True}
+    )
+    invalid_planned = invalid_planned.model_copy(
+        update={"concurrency": (invalid_concurrency,)}
+    )
+    invalid, invalid_trigger, invalid_callbacks, _provenance = deep_measurement()
+    with pytest.raises(ValidationError) as invalid_error:
+        finish_run(
+            invalid_planned,
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(invalid,),
+        )
+    assert invalid_error.value.errors()[0]["loc"] == (
+        "concurrency",
+        0,
+        "value",
+    )
+    assert invalid.items_calls == 0
+    assert invalid_trigger.iteration_calls == 0
+    assert invalid_callbacks == []
+
+    nonplanned, nonplanned_trigger, nonplanned_callbacks, _ = deep_measurement()
+    with pytest.raises(
+        ValueError,
+        match="only a planned run can be finished",
+    ):
+        finish_run(
+            completed_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(nonplanned,),
+        )
+    assert nonplanned.items_calls == 0
+    assert nonplanned_trigger.iteration_calls == 0
+    assert nonplanned_callbacks == []
+
+    public, shared_trigger, shared_callbacks, shared_provenance = (
+        deep_measurement()
+    )
+    native = timing().model_dump(mode="python")
+    native["provenance"] = shared_provenance
+    measurements = PublicViewTuple((native,), (public,))
+    with pytest.raises(RecursionError, match="maximum recursion depth exceeded"):
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=measurements,
+        )
+    assert measurements.iteration_calls == 0
+    assert public.items_calls == 0
+    assert shared_trigger.iteration_calls == 0
+    assert shared_callbacks == []
+
+
+def test_public_only_parent_cannot_refreeze_native_exposed_plain_child():
+    native_measurement = timing().model_dump(mode="python")
+    visible_measurement = timing().model_dump(mode="python")
+    shared_provenance = native_measurement["provenance"]
+    assert isinstance(shared_provenance, dict)
+    shared_provenance["clock"] = "wall_clock"
+    visible_measurement["provenance"] = shared_provenance
+
+    ordinary_measurement = timing().model_dump(mode="python")
+    ordinary_provenance = ordinary_measurement["provenance"]
+    assert isinstance(ordinary_provenance, dict)
+    ordinary_provenance["clock"] = "wall_clock"
+    with pytest.raises(ValidationError) as ordinary_error:
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(ordinary_measurement,),
+        )
+
+    measurements = PublicViewTuple(
+        (native_measurement,),
+        (visible_measurement,),
+        action=lambda: dict.__setitem__(
+            shared_provenance,
+            "clock",
+            "monotonic",
+        ),
+    )
+    with pytest.raises(ValidationError) as callback_error:
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=measurements,
+        )
+
+    assert callback_error.value.errors() == ordinary_error.value.errors()
+    assert shared_provenance["clock"] == "monotonic"
+    assert measurements.iteration_calls == 1
 
 
 def test_finish_rejects_undeclared_planned_fields_and_returns_fresh_graph():
