@@ -2,13 +2,13 @@
 
 import json
 import sys
-from collections.abc import Iterator, Mapping
+from collections.abc import ItemsView, Iterator, Mapping
 from copy import deepcopy
 from pathlib import PureWindowsPath
 from types import MappingProxyType
 
 import pytest
-from pydantic import Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from contracts_portability import (
     ChecksumDescriptor,
@@ -19,6 +19,11 @@ from contracts_portability import (
     ProducerReference,
     validate_portable_manifest,
 )
+
+
+_PYDANTIC_DICT_DESCRIPTOR = BaseModel.__dict__["__dict__"]
+_PYDANTIC_EXTRA_SLOT = BaseModel.__dict__["__pydantic_extra__"]
+_PYDANTIC_FIELDS_SET_SLOT = BaseModel.__dict__["__pydantic_fields_set__"]
 
 
 class FutureManifestFile(ManifestFile):
@@ -228,6 +233,173 @@ class ChangingItemsExtra(Mapping[str, str]):
         if self.item_calls == 1:
             return ()
         return (("manifest_id", "shadow-manifest"),)
+
+
+class HiddenModelBacking(dict[str, object]):
+    def __init__(
+        self,
+        entries: tuple[tuple[str, object], ...],
+        *,
+        hidden_name: str | None = None,
+    ) -> None:
+        dict.__init__(self, entries)
+        self.hidden_name = hidden_name
+        self.iteration_calls = 0
+        self.key_calls = 0
+        self.item_calls = 0
+        self.value_calls = 0
+        self.length_calls = 0
+
+    def __iter__(self) -> Iterator[str]:
+        self.iteration_calls += 1
+        return (
+            key for key in dict.__iter__(self) if key != self.hidden_name
+        )
+
+    def keys(self) -> tuple[str, ...]:
+        self.key_calls += 1
+        return tuple(self)
+
+    def items(self) -> tuple[tuple[str, object], ...]:
+        self.item_calls += 1
+        return tuple(
+            (key, dict.__getitem__(self, key)) for key in self
+        )
+
+    def values(self) -> tuple[object, ...]:
+        self.value_calls += 1
+        return tuple(dict.__getitem__(self, key) for key in self)
+
+    def __len__(self) -> int:
+        self.length_calls += 1
+        hidden_count = int(
+            self.hidden_name is not None
+            and dict.__contains__(self, self.hidden_name)
+        )
+        return dict.__len__(self) - hidden_count
+
+    def overridden_view_calls(self) -> tuple[int, ...]:
+        return (
+            self.iteration_calls,
+            self.key_calls,
+            self.item_calls,
+            self.value_calls,
+            self.length_calls,
+        )
+
+
+class RepairingProducer(dict[str, str]):
+    def __init__(self, owner: PortableManifest) -> None:
+        dict.__init__(
+            self,
+            implementation="reference-exporter",
+            version="1.4.2",
+        )
+        self.owner = owner
+        self.item_calls = 0
+
+    def items(self) -> ItemsView[str, str]:
+        self.item_calls += 1
+        native_stored = object.__getattribute__(self.owner, "__dict__")
+        dict.__setitem__(native_stored, "manifest_id", "manifest-7")
+        return dict.items(self)
+
+
+class NoneReportingExtraManifest(PortableManifest):
+    def __getattribute__(self, name: str) -> object:
+        if name == "__pydantic_extra__":
+            return None
+        return super().__getattribute__(name)
+
+
+class EmptyReportingExtraManifestFile(ManifestFile):
+    def __getattribute__(self, name: str) -> object:
+        if name == "__pydantic_extra__":
+            return {}
+        return super().__getattribute__(name)
+
+
+class PopulatedReportingExtraManifest(PortableManifest):
+    def __getattribute__(self, name: str) -> object:
+        if name == "__pydantic_extra__":
+            return {"reported_only": "deny"}
+        return super().__getattribute__(name)
+
+
+class HidingFieldsSetManifest(PortableManifest):
+    def __getattribute__(self, name: str) -> object:
+        if name == "model_fields_set":
+            return set(type(self).model_fields)
+        return super().__getattribute__(name)
+
+
+class HidingFieldsSetManifestFile(ManifestFile):
+    def __getattribute__(self, name: str) -> object:
+        if name == "model_fields_set":
+            return set(type(self).model_fields)
+        return super().__getattribute__(name)
+
+
+class HiddenFieldsSetBacking(set[str]):
+    def __init__(self, values: set[str]) -> None:
+        set.__init__(self, values)
+        self.iteration_calls = 0
+        self.length_calls = 0
+        self.contains_calls = 0
+
+    def __iter__(self) -> Iterator[str]:
+        self.iteration_calls += 1
+        return (
+            name for name in set.__iter__(self) if name != "phantom_only"
+        )
+
+    def __len__(self) -> int:
+        self.length_calls += 1
+        hidden_count = int(set.__contains__(self, "phantom_only"))
+        return set.__len__(self) - hidden_count
+
+    def __contains__(self, name: object) -> bool:
+        self.contains_calls += 1
+        if name == "phantom_only":
+            return False
+        return set.__contains__(self, name)
+
+    def overridden_view_calls(self) -> tuple[int, int, int]:
+        return (
+            self.iteration_calls,
+            self.length_calls,
+            self.contains_calls,
+        )
+
+
+class DescriptorMaskedManifest(PortableManifest):
+    @property
+    def __dict__(self) -> dict[str, object]:
+        native_stored = _PYDANTIC_DICT_DESCRIPTOR.__get__(self, BaseModel)
+        return {
+            name: value
+            for name, value in dict.items(native_stored)
+            if name != "future_entry_semantics"
+        }
+
+    @__dict__.setter
+    def __dict__(self, value: dict[str, object]) -> None:
+        _PYDANTIC_DICT_DESCRIPTOR.__set__(self, value)
+
+
+class DescriptorMaskedManifestFile(ManifestFile):
+    @property
+    def __dict__(self) -> dict[str, object]:
+        native_stored = _PYDANTIC_DICT_DESCRIPTOR.__get__(self, BaseModel)
+        return {
+            name: value
+            for name, value in dict.items(native_stored)
+            if name != "future_entry_semantics"
+        }
+
+    @__dict__.setter
+    def __dict__(self, value: dict[str, object]) -> None:
+        _PYDANTIC_DICT_DESCRIPTOR.__set__(self, value)
 
 
 def valid_manifest() -> dict:
@@ -979,6 +1151,61 @@ def test_none_and_empty_mapping_extra_storage_remain_valid(
     assert revalidated.files[0].path == manifest.files[0].path
 
 
+def test_root_model_extra_override_cannot_hide_native_unknown() -> None:
+    manifest = NoneReportingExtraManifest.model_validate(valid_manifest())
+    native_extra = {"future_entry_semantics": "deny"}
+    _PYDANTIC_EXTRA_SLOT.__set__(manifest, native_extra)
+
+    assert manifest.__pydantic_extra__ is None
+    assert _PYDANTIC_EXTRA_SLOT.__get__(manifest, type(manifest)) is native_extra
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+
+    errors = raised.value.errors()
+    assert len(errors) == 1
+    assert errors[0]["type"] == "extra_forbidden"
+    assert errors[0]["loc"] == ("future_entry_semantics",)
+    assert errors[0]["input"] == "deny"
+
+
+def test_nested_model_extra_override_cannot_hide_native_mapping_unknown() -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    nested = EmptyReportingExtraManifestFile.model_validate(
+        manifest.files[0].model_dump()
+    )
+    native_extra = MappingProxyType({"future_entry_semantics": "deny"})
+    _PYDANTIC_EXTRA_SLOT.__set__(nested, native_extra)
+    manifest.files[0] = nested
+
+    assert nested.__pydantic_extra__ == {}
+    assert _PYDANTIC_EXTRA_SLOT.__get__(nested, type(nested)) is native_extra
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+
+    errors = raised.value.errors()
+    assert len(errors) == 1
+    assert errors[0]["type"] == "extra_forbidden"
+    assert errors[0]["loc"] == ("files", 0, "future_entry_semantics")
+    assert errors[0]["input"] == "deny"
+
+
+@pytest.mark.parametrize("native_state", ["none", "absent"])
+def test_reported_extra_does_not_replace_empty_native_storage(
+    native_state: str,
+) -> None:
+    manifest = PopulatedReportingExtraManifest.model_validate(valid_manifest())
+    if native_state == "none":
+        _PYDANTIC_EXTRA_SLOT.__set__(manifest, None)
+    else:
+        _PYDANTIC_EXTRA_SLOT.__delete__(manifest)
+
+    assert manifest.__pydantic_extra__ == {"reported_only": "deny"}
+    revalidated = validate_portable_manifest(manifest)
+
+    assert type(revalidated) is PortableManifest
+    assert revalidated.manifest_id == "manifest-7"
+
+
 def test_custom_mapping_extra_storage_preserves_unknown_for_rejection() -> None:
     manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
     object.__setattr__(
@@ -1024,6 +1251,238 @@ def test_nested_fields_set_only_unknown_is_controlled_extra_error() -> None:
     assert errors[0]["type"] == "extra_forbidden"
     assert errors[0]["loc"] == ("files", 0, "phantom_only")
     assert errors[0]["input"] is None
+
+
+def test_model_fields_set_override_cannot_hide_root_unknown() -> None:
+    ordinary = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    ordinary_fields_set = _PYDANTIC_FIELDS_SET_SLOT.__get__(
+        ordinary, type(ordinary)
+    )
+    ordinary_fields_set.add("phantom_only")
+
+    hidden = HidingFieldsSetManifest.model_validate(valid_manifest())
+    hidden_fields_set = HiddenFieldsSetBacking(
+        set.copy(_PYDANTIC_FIELDS_SET_SLOT.__get__(hidden, type(hidden)))
+    )
+    set.add(hidden_fields_set, "phantom_only")
+    _PYDANTIC_FIELDS_SET_SLOT.__set__(hidden, hidden_fields_set)
+
+    assert "phantom_only" in ordinary.model_fields_set
+    assert set.__contains__(hidden_fields_set, "phantom_only")
+    assert "phantom_only" not in hidden.model_fields_set
+
+    observed_errors = []
+    for model in (ordinary, hidden):
+        with pytest.raises(ValidationError) as raised:
+            validate_portable_manifest(model)
+        observed_errors.append(raised.value.errors())
+
+    assert observed_errors[0] == observed_errors[1]
+    assert len(observed_errors[0]) == 1
+    assert observed_errors[0][0]["type"] == "extra_forbidden"
+    assert observed_errors[0][0]["loc"] == ("phantom_only",)
+    assert observed_errors[0][0]["input"] is None
+    assert hidden_fields_set.overridden_view_calls() == (0, 0, 0)
+
+
+def test_model_fields_set_override_cannot_hide_nested_unknown() -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    nested = HidingFieldsSetManifestFile.model_validate(
+        manifest.files[0].model_dump()
+    )
+    native_fields_set = _PYDANTIC_FIELDS_SET_SLOT.__get__(nested, type(nested))
+    native_fields_set.add("phantom_only")
+    manifest.files[0] = nested
+
+    assert "phantom_only" not in nested.model_fields_set
+    assert set.__contains__(native_fields_set, "phantom_only")
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+
+    errors = raised.value.errors()
+    assert len(errors) == 1
+    assert errors[0]["type"] == "extra_forbidden"
+    assert errors[0]["loc"] == ("files", 0, "phantom_only")
+    assert errors[0]["input"] is None
+
+
+@pytest.mark.parametrize("representation", ["frozenset", "tuple", "list"])
+@pytest.mark.parametrize("with_unknown", [False, True])
+def test_fields_set_iterable_storage_preserves_prior_behavior(
+    representation: str,
+    with_unknown: bool,
+) -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    native_fields_set = set.copy(
+        _PYDANTIC_FIELDS_SET_SLOT.__get__(manifest, type(manifest))
+    )
+    if with_unknown:
+        native_fields_set.add("phantom_only")
+    if representation == "frozenset":
+        replacement = frozenset(native_fields_set)
+    elif representation == "tuple":
+        replacement = tuple(native_fields_set)
+    else:
+        replacement = list(native_fields_set)
+    _PYDANTIC_FIELDS_SET_SLOT.__set__(manifest, replacement)
+
+    if with_unknown:
+        with pytest.raises(ValidationError) as raised:
+            validate_portable_manifest(manifest)
+        errors = raised.value.errors()
+        assert len(errors) == 1
+        assert errors[0]["type"] == "extra_forbidden"
+        assert errors[0]["loc"] == ("phantom_only",)
+        assert errors[0]["input"] is None
+    else:
+        revalidated = validate_portable_manifest(manifest)
+        assert revalidated.manifest_id == "manifest-7"
+
+
+def test_model_dict_descriptor_cannot_hide_root_unknown() -> None:
+    ordinary = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    masked = DescriptorMaskedManifest.model_validate(valid_manifest())
+
+    observed_errors = []
+    for model in (ordinary, masked):
+        native_stored = _PYDANTIC_DICT_DESCRIPTOR.__get__(model, BaseModel)
+        dict.__setitem__(native_stored, "future_entry_semantics", "deny")
+        assert dict.__getitem__(native_stored, "future_entry_semantics") == "deny"
+        if model is masked:
+            assert "future_entry_semantics" not in model.__dict__
+        with pytest.raises(ValidationError) as raised:
+            validate_portable_manifest(model)
+        observed_errors.append(raised.value.errors())
+
+    assert observed_errors[0] == observed_errors[1]
+    assert len(observed_errors[0]) == 1
+    assert observed_errors[0][0]["type"] == "extra_forbidden"
+    assert observed_errors[0][0]["loc"] == ("future_entry_semantics",)
+    assert observed_errors[0][0]["input"] == "deny"
+
+
+def test_model_dict_descriptor_cannot_hide_nested_unknown() -> None:
+    ordinary_manifest = validate_portable_manifest(valid_manifest()).model_copy(
+        deep=True
+    )
+    masked_manifest = validate_portable_manifest(valid_manifest()).model_copy(
+        deep=True
+    )
+    nested = DescriptorMaskedManifestFile.model_validate(
+        masked_manifest.files[0].model_dump()
+    )
+    masked_manifest.files[0] = nested
+
+    observed_errors = []
+    for manifest in (ordinary_manifest, masked_manifest):
+        node = manifest.files[0]
+        native_stored = _PYDANTIC_DICT_DESCRIPTOR.__get__(node, BaseModel)
+        dict.__setitem__(native_stored, "future_entry_semantics", "deny")
+        assert dict.__getitem__(native_stored, "future_entry_semantics") == "deny"
+        if node is nested:
+            assert "future_entry_semantics" not in node.__dict__
+        with pytest.raises(ValidationError) as raised:
+            validate_portable_manifest(manifest)
+        observed_errors.append(raised.value.errors())
+
+    assert observed_errors[0] == observed_errors[1]
+    assert len(observed_errors[0]) == 1
+    assert observed_errors[0][0]["type"] == "extra_forbidden"
+    assert observed_errors[0][0]["loc"] == (
+        "files",
+        0,
+        "future_entry_semantics",
+    )
+    assert observed_errors[0][0]["input"] == "deny"
+
+
+@pytest.mark.parametrize("location", ["manifest", "file"])
+def test_model_dict_descriptor_without_unknown_remains_valid(
+    location: str,
+) -> None:
+    if location == "manifest":
+        manifest = DescriptorMaskedManifest.model_validate(valid_manifest())
+    else:
+        manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+        manifest.files[0] = DescriptorMaskedManifestFile.model_validate(
+            manifest.files[0].model_dump()
+        )
+
+    revalidated = validate_portable_manifest(manifest)
+
+    assert type(revalidated) is PortableManifest
+    assert revalidated.files[0].path == "canonical/records.jsonl"
+
+
+@pytest.mark.parametrize(
+    ("location", "expected_location"),
+    [
+        ("manifest", ("hidden_unknown",)),
+        ("file", ("files", 0, "hidden_unknown")),
+    ],
+)
+def test_hidden_native_model_backing_unknown_is_not_discarded(
+    location: str,
+    expected_location: tuple[object, ...],
+) -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    node = _model_at_location(manifest, location)
+    native_stored = object.__getattribute__(node, "__dict__")
+    hidden = HiddenModelBacking(
+        tuple(dict.items(native_stored)),
+        hidden_name="hidden_unknown",
+    )
+    dict.__setitem__(hidden, "hidden_unknown", "deny")
+    object.__setattr__(node, "__dict__", hidden)
+
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+
+    assert hidden.overridden_view_calls() == (0, 0, 0, 0, 0)
+    errors = raised.value.errors()
+    assert len(errors) == 1
+    assert errors[0]["type"] == "extra_forbidden"
+    assert errors[0]["loc"] == expected_location
+    assert errors[0]["input"] == "deny"
+
+
+def test_native_model_backing_subclass_without_hidden_state_remains_valid() -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    native_stored = object.__getattribute__(manifest.files[0], "__dict__")
+    backing = HiddenModelBacking(tuple(dict.items(native_stored)))
+    object.__setattr__(manifest.files[0], "__dict__", backing)
+
+    revalidated = validate_portable_manifest(manifest)
+
+    assert revalidated.files[0].path == manifest.files[0].path
+    assert backing.overridden_view_calls() == (0, 0, 0, 0, 0)
+
+
+def test_nested_mapping_cannot_repair_initially_invalid_model_storage() -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    native_stored = object.__getattribute__(manifest, "__dict__")
+    dict.__setitem__(native_stored, "manifest_id", "")
+    repairing_producer = RepairingProducer(manifest)
+    dict.__setitem__(native_stored, "producer", repairing_producer)
+
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+
+    assert raised.value.errors()[0]["loc"] == ("manifest_id",)
+    assert repairing_producer.item_calls == 2
+
+
+def test_nested_mapping_with_initially_valid_model_storage_remains_valid() -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    repairing_producer = RepairingProducer(manifest)
+    native_stored = object.__getattribute__(manifest, "__dict__")
+    dict.__setitem__(native_stored, "producer", repairing_producer)
+
+    revalidated = validate_portable_manifest(manifest)
+
+    assert revalidated.manifest_id == "manifest-7"
+    assert revalidated.producer.implementation == "reference-exporter"
+    assert repairing_producer.item_calls == 2
 
 
 @pytest.mark.parametrize(

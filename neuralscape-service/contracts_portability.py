@@ -22,14 +22,24 @@ ChecksumAlgorithm = Literal["sha256"]
 EncryptionMode = Literal["plaintext_authorized_export", "encrypted"]
 ScopeKind = Literal["tenant", "projects"]
 _WINDOWS_FORBIDDEN_COMPONENT_CHARACTERS = frozenset('<>:"|?*')
+_PYDANTIC_DICT_DESCRIPTOR = BaseModel.__dict__["__dict__"]
+_PYDANTIC_EXTRA_SLOT = BaseModel.__dict__["__pydantic_extra__"]
+_PYDANTIC_FIELDS_SET_SLOT = BaseModel.__dict__["__pydantic_fields_set__"]
+_ModelStorageEntries = tuple[tuple[Any, Any], ...]
+_ModelStorageSnapshot = tuple[_ModelStorageEntries, _ModelStorageEntries]
+_ModelStorageInventory = dict[int, _ModelStorageSnapshot]
 
 
 def _validated_model_extra_storage(
     value: BaseModel,
+    stored_names: set[Any],
 ) -> tuple[dict[Any, Any], set[Any]]:
     """Capture stable Pydantic extra entries and all observed names."""
 
-    extra = value.__pydantic_extra__
+    try:
+        extra = _PYDANTIC_EXTRA_SLOT.__get__(value, type(value))
+    except AttributeError:
+        extra = None
     if extra is None:
         return {}, set()
 
@@ -44,7 +54,7 @@ def _validated_model_extra_storage(
         iterated_names = tuple(extra)
         captured = dict(tuple(extra.items()))
         observed_names = set(iterated_names) | set(captured)
-    declared_or_stored = set(type(value).model_fields) | set(value.__dict__)
+    declared_or_stored = set(type(value).model_fields) | stored_names
     overlap = declared_or_stored.intersection(observed_names)
     if overlap:
         names = ", ".join(sorted((repr(name) for name in overlap)))
@@ -56,7 +66,7 @@ def _validated_model_extra_storage(
 
 def _reject_retained_unknown_fields(
     root: BaseModel,
-) -> dict[int, dict[Any, Any]]:
+) -> _ModelStorageInventory:
     """Reject undeclared state retained by unchecked Pydantic copies.
 
     ``model_copy(update=...)`` deliberately does not validate its update.  For
@@ -69,7 +79,7 @@ def _reject_retained_unknown_fields(
 
     errors: list[dict[str, Any]] = []
     visited: set[int] = set()
-    extra_inventory: dict[int, dict[Any, Any]] = {}
+    model_inventory: _ModelStorageInventory = {}
 
     def walk(value: Any, location: tuple[str | int, ...]) -> None:
         if not isinstance(value, (BaseModel, Mapping, list, tuple, set, frozenset)):
@@ -82,14 +92,26 @@ def _reject_retained_unknown_fields(
 
         if isinstance(value, BaseModel):
             declared = type(value).model_fields
-            stored = value.__dict__
-            pydantic_extra, observed_extra_names = (
-                _validated_model_extra_storage(value)
+            native_stored = _PYDANTIC_DICT_DESCRIPTOR.__get__(value, BaseModel)
+            stored_entries = tuple(dict.items(native_stored))
+            stored = dict(stored_entries)
+            native_fields_set = _PYDANTIC_FIELDS_SET_SLOT.__get__(
+                value, type(value)
             )
-            extra_inventory[identity] = pydantic_extra
+            if issubclass(type(native_fields_set), set):
+                fields_set = set.copy(native_fields_set)
+            else:
+                fields_set = set(native_fields_set)
+            pydantic_extra, observed_extra_names = (
+                _validated_model_extra_storage(value, set(stored))
+            )
+            model_inventory[identity] = (
+                stored_entries,
+                tuple(dict.items(pydantic_extra)),
+            )
             retained_names = (
                 set(stored)
-                | set(value.model_fields_set)
+                | fields_set
                 | observed_extra_names
             )
 
@@ -124,12 +146,12 @@ def _reject_retained_unknown_fields(
     walk(root, ())
     if errors:
         raise ValidationError.from_exception_data("PortableManifest", errors)
-    return extra_inventory
+    return model_inventory
 
 
 def _reconstruct_retained_state(
     root: BaseModel,
-    extra_inventory: Mapping[int, Mapping[Any, Any]],
+    model_inventory: Mapping[int, _ModelStorageSnapshot],
 ) -> dict[str, Any]:
     """Copy a model graph without invoking lossy Pydantic serialization.
 
@@ -152,14 +174,14 @@ def _reconstruct_retained_state(
         active.add(identity)
         try:
             if isinstance(value, BaseModel):
-                stored = dict(value.__dict__)
                 try:
-                    captured_extra = extra_inventory[identity]
+                    stored_entries, extra_entries = model_inventory[identity]
                 except KeyError as exc:
                     raise ValueError(
                         "contract model was not present in the validated graph"
                     ) from exc
-                stored.update(captured_extra)
+                stored = dict(stored_entries)
+                stored.update(extra_entries)
                 return {name: rebuild(item) for name, item in stored.items()}
 
             if isinstance(value, Mapping):
@@ -435,8 +457,8 @@ def validate_portable_manifest(
 
     if isinstance(document, PortableManifest):
         try:
-            extra_inventory = _reject_retained_unknown_fields(document)
-            candidate = _reconstruct_retained_state(document, extra_inventory)
+            model_inventory = _reject_retained_unknown_fields(document)
+            candidate = _reconstruct_retained_state(document, model_inventory)
         except ValidationError:
             raise
         except (TypeError, ValueError, RecursionError) as exc:
