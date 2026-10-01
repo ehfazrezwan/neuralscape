@@ -43,9 +43,10 @@ def _complete_contract_input(value: object, active_ids: set[int]) -> object:
             raise ValueError("cyclic contract input is not supported")
         active_ids.add(identity)
         try:
-            stored_values = dict(value.__dict__)
+            stored_storage = object.__getattribute__(value, "__dict__")
+            stored_values = dict(_mapping_items(stored_storage))
             declared_fields = type(value).model_fields
-            extra_values = value.__pydantic_extra__
+            extra_values = object.__getattribute__(value, "__pydantic_extra__")
             if extra_values is not None:
                 if not (
                     _is_native_dict(extra_values)

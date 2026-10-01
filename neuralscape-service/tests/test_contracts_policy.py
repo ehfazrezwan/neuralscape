@@ -117,6 +117,29 @@ class _ChangingItemsExtras(Mapping[str, object]):
         return {"future_constraint": "deny"}.items()
 
 
+class _HiddenStoredViewDecision(PolicyDecision):
+    """Hide real stored state from instance-level ``__dict__`` access."""
+
+    def __getattribute__(self, name: str) -> object:
+        if name == "__dict__":
+            native = object.__getattribute__(self, "__dict__")
+            visible = dict(dict.items(native))
+            visible.pop("future_constraint", None)
+            if visible.get("action") == "future-action":
+                visible["action"] = "read"
+            return visible
+        return object.__getattribute__(self, name)
+
+
+class _HiddenExtraViewDecision(PolicyDecision):
+    """Hide real Pydantic extra storage from instance-level access."""
+
+    def __getattribute__(self, name: str) -> object:
+        if name == "__pydantic_extra__":
+            return {}
+        return object.__getattribute__(self, name)
+
+
 def reference(
     resource_id: str,
     *,
@@ -1506,6 +1529,73 @@ def test_receiving_boundary_retains_nonconflicting_unknown_extra_for_rejection()
         "__pydantic_extra__",
         {"future_constraint": "deny"},
     )
+
+    with pytest.raises(ValidationError, match="future_constraint"):
+        validate_policy_decision(decision)
+
+
+@pytest.mark.parametrize(
+    "decision_type",
+    [PolicyDecision, _HiddenStoredViewDecision],
+    ids=["ordinary", "overridden-dict-view"],
+)
+def test_receiving_boundary_reads_native_stored_unknown_state(
+    decision_type: type[PolicyDecision],
+) -> None:
+    decision = decision_type(**decision_payload())
+    native_storage = object.__getattribute__(decision, "__dict__")
+    dict.__setitem__(native_storage, "future_constraint", "deny")
+
+    assert ("future_constraint", "deny") in tuple(dict.items(native_storage))
+    if decision_type is _HiddenStoredViewDecision:
+        assert "future_constraint" not in decision.__dict__
+
+    with pytest.raises(ValidationError, match="future_constraint"):
+        validate_policy_decision(decision)
+
+
+@pytest.mark.parametrize(
+    "decision_type",
+    [PolicyDecision, _HiddenStoredViewDecision],
+    ids=["ordinary", "overridden-dict-view"],
+)
+def test_receiving_boundary_reads_native_invalid_declared_state(
+    decision_type: type[PolicyDecision],
+) -> None:
+    decision = decision_type(**decision_payload())
+    native_storage = object.__getattribute__(decision, "__dict__")
+    dict.__setitem__(native_storage, "action", "future-action")
+
+    assert dict.__getitem__(native_storage, "action") == "future-action"
+    if decision_type is _HiddenStoredViewDecision:
+        assert decision.__dict__["action"] == "read"
+
+    with pytest.raises(
+        ValidationError,
+        match="allow decisions require a supported action",
+    ):
+        validate_policy_decision(decision)
+
+
+@pytest.mark.parametrize(
+    "decision_type",
+    [PolicyDecision, _HiddenExtraViewDecision],
+    ids=["ordinary", "overridden-extra-view"],
+)
+def test_receiving_boundary_reads_native_unknown_extra_storage(
+    decision_type: type[PolicyDecision],
+) -> None:
+    decision = decision_type(**decision_payload())
+    object.__setattr__(
+        decision,
+        "__pydantic_extra__",
+        {"future_constraint": "deny"},
+    )
+    native_extra = object.__getattribute__(decision, "__pydantic_extra__")
+
+    assert tuple(dict.items(native_extra)) == (("future_constraint", "deny"),)
+    if decision_type is _HiddenExtraViewDecision:
+        assert decision.__pydantic_extra__ == {}
 
     with pytest.raises(ValidationError, match="future_constraint"):
         validate_policy_decision(decision)
