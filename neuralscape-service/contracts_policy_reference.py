@@ -67,7 +67,7 @@ def _normalize_model_names(names: tuple[object, ...]) -> tuple[str, ...]:
     normalized: list[str] = []
     seen: set[str] = set()
     for candidate in names:
-        if not isinstance(candidate, str):
+        if not issubclass(type(candidate), str):
             raise ValueError("contract input model field names must be strings")
         name = str.__str__(candidate)
         if name in seen:
@@ -136,7 +136,7 @@ def _freeze_reachable_model_inventories(
 ) -> None:
     """Freeze natively reachable models before callback-bearing traversal."""
 
-    if isinstance(value, BaseModel):
+    if issubclass(type(value), BaseModel):
         identity = id(value)
         if identity in inventories:
             return
@@ -171,7 +171,7 @@ def _freeze_reachable_model_inventories(
             )
         return
 
-    if isinstance(value, list):
+    if issubclass(type(value), list):
         identity = id(value)
         if identity in visited_containers:
             return
@@ -184,7 +184,7 @@ def _freeze_reachable_model_inventories(
             )
         return
 
-    if isinstance(value, tuple):
+    if issubclass(type(value), tuple):
         identity = id(value)
         if identity in visited_containers:
             return
@@ -210,7 +210,7 @@ def _complete_contract_input(
 ) -> object:
     """Copy a native input graph without normalizing away invalid data."""
 
-    if isinstance(value, BaseModel):
+    if issubclass(type(value), BaseModel):
         identity = id(value)
         if identity in active_ids:
             raise ValueError("cyclic contract input is not supported")
@@ -233,7 +233,7 @@ def _complete_contract_input(
             if extra_values is not None:
                 if not (
                     _is_native_dict(extra_values)
-                    or isinstance(extra_values, Mapping)
+                    or issubclass(type(extra_values), Mapping)
                 ):
                     raise ValueError(
                         "contract input extra storage must be a mapping"
@@ -276,7 +276,7 @@ def _complete_contract_input(
         finally:
             active_ids.remove(identity)
 
-    if isinstance(value, Mapping):
+    if issubclass(type(value), Mapping):
         identity = id(value)
         if identity in active_ids:
             raise ValueError("cyclic contract input is not supported")
@@ -290,7 +290,7 @@ def _complete_contract_input(
         finally:
             active_ids.remove(identity)
 
-    if isinstance(value, list):
+    if issubclass(type(value), list):
         identity = id(value)
         if identity in active_ids:
             raise ValueError("cyclic contract input is not supported")
@@ -303,7 +303,7 @@ def _complete_contract_input(
         finally:
             active_ids.remove(identity)
 
-    if isinstance(value, tuple):
+    if issubclass(type(value), tuple):
         identity = id(value)
         if identity in active_ids:
             raise ValueError("cyclic contract input is not supported")

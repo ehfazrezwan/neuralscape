@@ -220,6 +220,21 @@ class _NestedRepairingFieldName(str):
         return str.__str__(self)
 
 
+class _NestedRepairingClassView:
+    """Repair a nested model if instance-sensitive classification is used."""
+
+    def __init__(self, target: BaseModel) -> None:
+        self.target = target
+        self.class_calls = 0
+
+    @property
+    def __class__(self):  # type: ignore[override]
+        self.class_calls += 1
+        native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(self.target, BaseModel)
+        dict.__setitem__(native, "id", "memory-1")
+        return object
+
+
 class _RepairingFieldsIterable:
     """Legacy fields-set iterable that can repair a referenced model."""
 
@@ -1898,6 +1913,18 @@ def _install_model_name_subclass(
     storage_name: str,
 ) -> _NestedRepairingFieldName:
     name = _NestedRepairingFieldName("resource", nested)
+    _replace_model_owned_name(model, name, storage_name)
+    name.armed = True
+    name.hash_calls = 0
+    name.equality_calls = 0
+    return name
+
+
+def _replace_model_owned_name(
+    model: BaseModel,
+    name: object,
+    storage_name: str,
+) -> None:
     if storage_name == "stored":
         storage = _BASE_MODEL_DICT_DESCRIPTOR.__get__(model, BaseModel)
         item = dict.__getitem__(storage, "resource")
@@ -1907,10 +1934,6 @@ def _install_model_name_subclass(
         fields_set = _BASE_MODEL_FIELDS_SET_DESCRIPTOR.__get__(model, BaseModel)
         set.discard(fields_set, "resource")
         set.add(fields_set, name)
-    name.armed = True
-    name.hash_calls = 0
-    name.equality_calls = 0
-    return name
 
 
 @pytest.mark.parametrize("boundary", ["evaluator", "receiving"])
@@ -1967,6 +1990,79 @@ def test_policy_boundaries_accept_benign_string_subclass_model_names(
     assert result.outcome == "allow"
     assert benign_name.hash_calls == 0
     assert benign_name.equality_calls == 0
+
+
+@pytest.mark.parametrize("boundary", ["evaluator", "receiving"])
+@pytest.mark.parametrize("storage_name", ["stored", "fields-set"])
+def test_policy_boundaries_classify_malformed_model_names_concretely(
+    boundary: str,
+    storage_name: str,
+) -> None:
+    ordinary, ordinary_nested, ordinary_invoke = _nested_model_name_case(
+        boundary,
+        invalid=True,
+    )
+    _replace_model_owned_name(ordinary, object(), storage_name)
+    with pytest.raises(ValueError) as ordinary_error:
+        ordinary_invoke(ordinary)
+
+    attacked, attacked_nested, attacked_invoke = _nested_model_name_case(
+        boundary,
+        invalid=True,
+    )
+    hostile_name = _NestedRepairingClassView(attacked_nested)
+    _replace_model_owned_name(attacked, hostile_name, storage_name)
+    with pytest.raises(ValueError) as attacked_error:
+        attacked_invoke(attacked)
+
+    assert str(attacked_error.value) == str(ordinary_error.value)
+    assert str(attacked_error.value) == (
+        "contract input model field names must be strings"
+    )
+    assert ordinary_nested.id == ""
+    assert attacked_nested.id == ""
+    assert hostile_name.class_calls == 0
+
+
+@pytest.mark.parametrize("boundary", ["evaluator", "receiving"])
+def test_policy_boundaries_classify_graph_values_concretely(
+    boundary: str,
+) -> None:
+    ordinary, ordinary_nested, ordinary_invoke = _nested_model_name_case(
+        boundary,
+        invalid=True,
+    )
+    ordinary_storage = _BASE_MODEL_DICT_DESCRIPTOR.__get__(ordinary, BaseModel)
+    dict.__setitem__(ordinary_storage, "action", object())
+    with pytest.raises(ValidationError) as ordinary_error:
+        ordinary_invoke(ordinary)
+
+    attacked, attacked_nested, attacked_invoke = _nested_model_name_case(
+        boundary,
+        invalid=True,
+    )
+    hostile_value = _NestedRepairingClassView(attacked_nested)
+    attacked_storage = _BASE_MODEL_DICT_DESCRIPTOR.__get__(attacked, BaseModel)
+    dict.__setitem__(attacked_storage, "action", hostile_value)
+    with pytest.raises(ValidationError) as attacked_error:
+        attacked_invoke(attacked)
+
+    ordinary_diagnostics = [
+        (error["loc"], error["type"])
+        for error in ordinary_error.value.errors()
+    ]
+    attacked_diagnostics = [
+        (error["loc"], error["type"])
+        for error in attacked_error.value.errors()
+    ]
+    assert attacked_diagnostics == ordinary_diagnostics
+    assert ordinary_diagnostics == [
+        (("action",), "string_type"),
+        (("resource", "id"), "string_too_short"),
+    ]
+    assert ordinary_nested.id == ""
+    assert attacked_nested.id == ""
+    assert hostile_value.class_calls == 0
 
 
 def _install_repairing_protocol(
