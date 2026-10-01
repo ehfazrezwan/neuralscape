@@ -52,29 +52,29 @@ def _native_contract_graph(
                     extra = None
                 if extra is None:
                     extra_entries: tuple[tuple[object, object], ...] = ()
+                    malformed_extra = False
                 else:
                     extra_type = type(extra)
-                    if not issubclass(extra_type, dict):
-                        raise ValueError(
-                            "malformed stored contract extras are not valid input"
-                        )
-                    extra_entries = tuple(dict.items(extra))
+                    malformed_extra = not issubclass(extra_type, dict)
+                    extra_entries = (
+                        () if malformed_extra else tuple(dict.items(extra))
+                    )
 
                 stored_names = {key for key, _ in stored_entries}
                 declared_fields = value_type.model_fields
-                if any(
-                    key in stored_names or key in declared_fields
-                    for key, _ in extra_entries
-                ):
-                    raise ValueError(
-                        "conflicting stored contract field is not valid input"
-                    )
-
                 fields = {
                     key: _native_contract_graph(item, active_containers)
                     for key, item in stored_entries
                 }
+                if malformed_extra:
+                    raise ValueError(
+                        "malformed stored contract extras are not valid input"
+                    )
                 for key, item in extra_entries:
+                    if key in stored_names or key in declared_fields:
+                        raise ValueError(
+                            "conflicting stored contract field is not valid input"
+                        )
                     fields[key] = _native_contract_graph(item, active_containers)
                 return fields
             if issubclass(value_type, dict):

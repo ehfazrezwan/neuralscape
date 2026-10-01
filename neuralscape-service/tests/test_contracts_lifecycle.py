@@ -1854,6 +1854,45 @@ def test_aggregate_boundary_rejects_cyclic_graph_predictably() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "extra_storage",
+    [[], {"id": "shadow-intent"}],
+    ids=["malformed-extras", "declared-overlap"],
+)
+def test_aggregate_boundary_preserves_parent_cycle_priority_over_extra_defects(
+    extra_storage: object,
+) -> None:
+    command = intent(ProcessingStage.CANONICAL)
+    command.__dict__["target_refs"] = (command,)
+    object.__setattr__(command, "__pydantic_extra__", extra_storage)
+
+    with pytest.raises(ValueError, match="cyclic contract graph"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=command,
+            receipts=(),
+        )
+
+
+def test_aggregate_boundary_preserves_parent_extra_entry_error_order() -> None:
+    command = intent(ProcessingStage.CANONICAL)
+    object.__setattr__(
+        command,
+        "__pydantic_extra__",
+        {
+            "earlier_cycle": command,
+            "id": "later-overlap",
+        },
+    )
+
+    with pytest.raises(ValueError, match="cyclic contract graph"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=command,
+            receipts=(),
+        )
+
+
 def test_aggregate_boundary_rejects_non_tuple_receipt_collection() -> None:
     with pytest.raises(TypeError, match="receipts must be a tuple"):
         validate_required_stage_claim(
