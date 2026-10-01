@@ -32,13 +32,15 @@ def _validated_model_extra_storage(
     extra = value.__pydantic_extra__
     if extra is None:
         return {}, set()
-    if not isinstance(extra, Mapping):
-        raise ValueError("contract model extra storage must be None or a mapping")
 
-    if isinstance(extra, dict):
+    if issubclass(type(extra), dict):
         captured = dict(tuple(dict.items(extra)))
         observed_names = set(captured)
     else:
+        if not isinstance(extra, Mapping):
+            raise ValueError(
+                "contract model extra storage must be None or a mapping"
+            )
         iterated_names = tuple(extra)
         captured = dict(tuple(extra.items()))
         observed_names = set(iterated_names) | set(captured)

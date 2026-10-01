@@ -165,6 +165,44 @@ class InheritedHiddenBackingExtra(HiddenBackingExtra):
     pass
 
 
+class RaisingClassHiddenBackingExtra(HiddenBackingExtra):
+    def __init__(self, entries: dict[str, str]) -> None:
+        super().__init__(entries)
+        self.class_calls = 0
+
+    @property
+    def __class__(self) -> type[dict]:
+        self.class_calls += 1
+        raise RuntimeError("__class__ must not be read")
+
+
+class SpoofedDictClassMapping(Mapping[str, str]):
+    def __init__(self, entries: dict[str, str]) -> None:
+        self._entries = entries
+        self.class_calls = 0
+        self.iteration_calls = 0
+        self.item_calls = 0
+
+    @property
+    def __class__(self) -> type[dict]:
+        self.class_calls += 1
+        return dict
+
+    def __getitem__(self, key: str) -> str:
+        return self._entries[key]
+
+    def __iter__(self) -> Iterator[str]:
+        self.iteration_calls += 1
+        return iter(self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def items(self) -> tuple[tuple[str, str], ...]:
+        self.item_calls += 1
+        return tuple(self._entries.items())
+
+
 class ChangingItemsExtra(Mapping[str, str]):
     def __init__(self) -> None:
         self.item_calls = 0
@@ -1145,6 +1183,100 @@ def test_empty_hidden_native_dict_subclass_remains_valid() -> None:
 
     assert revalidated.files[0].path == manifest.files[0].path
     assert hidden.overridden_view_calls() == (0, 0, 0, 0, 0, 0)
+
+
+def _assert_concrete_extra_dispatch_counts(
+    extra: RaisingClassHiddenBackingExtra | SpoofedDictClassMapping,
+) -> None:
+    assert extra.class_calls == 0
+    if type(extra) is RaisingClassHiddenBackingExtra:
+        assert extra.overridden_view_calls() == (0, 0, 0, 0, 0, 0)
+    else:
+        assert extra.iteration_calls == 1
+        assert extra.item_calls == 1
+
+
+@pytest.mark.parametrize(
+    "extra_type",
+    [RaisingClassHiddenBackingExtra, SpoofedDictClassMapping],
+)
+def test_concrete_extra_dispatch_preserves_empty_storage(
+    extra_type: type[RaisingClassHiddenBackingExtra]
+    | type[SpoofedDictClassMapping],
+) -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    extra = extra_type({})
+    object.__setattr__(manifest, "__pydantic_extra__", extra)
+
+    revalidated = validate_portable_manifest(manifest)
+
+    assert revalidated.manifest_id == manifest.manifest_id
+    _assert_concrete_extra_dispatch_counts(extra)
+
+
+@pytest.mark.parametrize(
+    ("location", "expected_location"),
+    [
+        ("manifest", ("future_entry_semantics",)),
+        ("file", ("files", 0, "future_entry_semantics")),
+    ],
+)
+@pytest.mark.parametrize(
+    "extra_type",
+    [RaisingClassHiddenBackingExtra, SpoofedDictClassMapping],
+)
+def test_concrete_extra_dispatch_rejects_unknown_storage(
+    location: str,
+    expected_location: tuple[object, ...],
+    extra_type: type[RaisingClassHiddenBackingExtra]
+    | type[SpoofedDictClassMapping],
+) -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    node = _model_at_location(manifest, location)
+    extra = extra_type({"future_entry_semantics": "deny"})
+    object.__setattr__(node, "__pydantic_extra__", extra)
+
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+
+    _assert_concrete_extra_dispatch_counts(extra)
+    errors = raised.value.errors()
+    assert len(errors) == 1
+    assert errors[0]["type"] == "extra_forbidden"
+    assert errors[0]["loc"] == expected_location
+    assert errors[0]["input"] == "deny"
+
+
+@pytest.mark.parametrize(
+    ("location", "field_name", "shadow_value"),
+    [
+        ("manifest", "manifest_id", "shadow-manifest"),
+        ("file", "path", "canonical/shadow-records.jsonl"),
+    ],
+)
+@pytest.mark.parametrize(
+    "extra_type",
+    [RaisingClassHiddenBackingExtra, SpoofedDictClassMapping],
+)
+def test_concrete_extra_dispatch_rejects_declared_overlap(
+    location: str,
+    field_name: str,
+    shadow_value: str,
+    extra_type: type[RaisingClassHiddenBackingExtra]
+    | type[SpoofedDictClassMapping],
+) -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    node = _model_at_location(manifest, location)
+    extra = extra_type({field_name: shadow_value})
+    object.__setattr__(node, "__pydantic_extra__", extra)
+
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+
+    _assert_concrete_extra_dispatch_counts(extra)
+    assert "contract model has conflicting stored and extra fields" in str(
+        raised.value
+    )
 
 
 @pytest.mark.parametrize(
