@@ -37,6 +37,102 @@ from adapters.code_graph.engine import (
 
 logger = logging.getLogger(__name__)
 
+_SNAPSHOT_IDENTITY_KEYS = {
+    "CodeRepo": ("code_space",),
+    "CodeFile": ("code_space", "path"),
+    "CodeSymbol": ("code_space", "fqn"),
+    "CodeAnchor": ("code_space", "repo", "fqn"),
+}
+_SNAPSHOT_CORE_LABELS = frozenset(_SNAPSHOT_IDENTITY_KEYS)
+
+
+def _normalize_snapshot_labels(labels: object, *, location: str) -> list[str]:
+    """Return one core label followed by deterministically sorted auxiliaries."""
+    if not isinstance(labels, list):
+        raise ValueError(
+            f"Malformed snapshot labels at {location}: expected a list of strings"
+        )
+    for index, label in enumerate(labels):
+        if not isinstance(label, str):
+            raise ValueError(
+                f"Malformed snapshot labels at {location}: "
+                f"label {index} must be a string"
+            )
+        if not label:
+            raise ValueError(
+                f"Malformed snapshot labels at {location}: "
+                f"label {index} must not be empty"
+            )
+
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for label in labels:
+        if label in seen and label not in duplicates:
+            duplicates.append(label)
+        seen.add(label)
+    if duplicates:
+        raise ValueError(
+            f"Malformed snapshot labels at {location}: "
+            f"duplicate labels {duplicates!r}"
+        )
+
+    core_labels = [label for label in labels if label in _SNAPSHOT_CORE_LABELS]
+    if len(core_labels) != 1:
+        raise ValueError(
+            f"Malformed snapshot labels at {location}: expected exactly one core "
+            f"label, found {core_labels!r}"
+        )
+
+    core_label = core_labels[0]
+    auxiliary_labels = sorted(label for label in labels if label != core_label)
+    return [core_label, *auxiliary_labels]
+
+
+def _quote_cypher_identifier(identifier: object, *, location: str) -> str:
+    """Quote a snapshot-derived Cypher identifier without changing its value."""
+    if not isinstance(identifier, str):
+        raise ValueError(
+            f"Malformed snapshot identifier at {location}: expected a string"
+        )
+    if not identifier:
+        raise ValueError(
+            f"Malformed snapshot identifier at {location}: must not be empty"
+        )
+
+    # Cypher permits `` for a literal backtick and \uxxxx escapes inside quoted
+    # identifiers. Encode every input backslash first so a literal sequence such
+    # as \u0060 cannot be interpreted as a backtick by the Cypher parser.
+    escaped = identifier.replace("\\", "\\u005C").replace("`", "``")
+    return f"`{escaped}`"
+
+
+def _validate_snapshot_properties(
+    properties: object,
+    *,
+    location: str,
+    core_label: str | None = None,
+) -> dict[str, Any]:
+    """Validate a snapshot property map and any core identity it carries."""
+    if not isinstance(properties, dict):
+        raise ValueError(
+            f"Malformed snapshot properties at {location}: expected a property map"
+        )
+
+    if core_label is not None:
+        for key in _SNAPSHOT_IDENTITY_KEYS[core_label]:
+            if key not in properties:
+                raise ValueError(
+                    f"Malformed snapshot properties at {location}: "
+                    f"missing required identity key {key!r}"
+                )
+            if properties[key] is None:
+                raise ValueError(
+                    f"Malformed snapshot properties at {location}: "
+                    f"identity key {key!r} must not be null"
+                )
+
+    return properties
+
 
 @dataclass
 class _Symbol:
@@ -1246,19 +1342,38 @@ class NativeEngine:
         # Build snapshot payload. Database result order is unspecified, so sort
         # complete records to retain duplicates and deterministically break ties
         # between records that share an identity but differ in other properties.
-        node_records = [
-            {"labels": n["labels"], "properties": n["props"]}
-            for n in nodes
-        ]
-        edge_records = [
-            {
-                "type": e["rel_type"],
-                "properties": e["props"],
-                "source": {"labels": e["source_labels"], "properties": e["source_props"]},
-                "target": {"labels": e["target_labels"], "properties": e["target_props"]},
-            }
-            for e in edges
-        ]
+        node_records = []
+        for index, node in enumerate(nodes):
+            node_records.append(
+                {
+                    "labels": _normalize_snapshot_labels(
+                        node["labels"], location=f"node[{index}].labels"
+                    ),
+                    "properties": node["props"],
+                }
+            )
+        edge_records = []
+        for index, edge in enumerate(edges):
+            edge_records.append(
+                {
+                    "type": edge["rel_type"],
+                    "properties": edge["props"],
+                    "source": {
+                        "labels": _normalize_snapshot_labels(
+                            edge["source_labels"],
+                            location=f"edge[{index}].source.labels",
+                        ),
+                        "properties": edge["source_props"],
+                    },
+                    "target": {
+                        "labels": _normalize_snapshot_labels(
+                            edge["target_labels"],
+                            location=f"edge[{index}].target.labels",
+                        ),
+                        "properties": edge["target_props"],
+                    },
+                }
+            )
 
         def canonical_record_key(record: dict) -> str:
             return json.dumps(record, sort_keys=True, separators=(",", ":"))
@@ -1338,6 +1453,52 @@ class NativeEngine:
                 f"(expected {header['content_hash']}, got {computed_hash})"
             )
 
+        # Validate every record and normalize every label array before issuing any
+        # writes. Hash verification intentionally uses the original representation
+        # so historical format-1.0 artifacts remain valid regardless of auxiliary-
+        # label position.
+        normalized_node_labels = []
+        for index, node in enumerate(snapshot["nodes"]):
+            labels = _normalize_snapshot_labels(
+                node["labels"], location=f"node[{index}].labels"
+            )
+            _validate_snapshot_properties(
+                node["properties"],
+                location=f"node[{index}].properties",
+                core_label=labels[0],
+            )
+            normalized_node_labels.append(labels)
+
+        normalized_edge_labels = []
+        for index, edge in enumerate(snapshot["edges"]):
+            # Validate relationship identifiers during the same preflight so a
+            # malformed late edge cannot follow earlier database writes.
+            _quote_cypher_identifier(
+                edge["type"], location=f"edge[{index}].type"
+            )
+            _validate_snapshot_properties(
+                edge["properties"], location=f"edge[{index}].properties"
+            )
+            source_labels = _normalize_snapshot_labels(
+                edge["source"]["labels"],
+                location=f"edge[{index}].source.labels",
+            )
+            _validate_snapshot_properties(
+                edge["source"]["properties"],
+                location=f"edge[{index}].source.properties",
+                core_label=source_labels[0],
+            )
+            target_labels = _normalize_snapshot_labels(
+                edge["target"]["labels"],
+                location=f"edge[{index}].target.labels",
+            )
+            _validate_snapshot_properties(
+                edge["target"]["properties"],
+                location=f"edge[{index}].target.properties",
+                core_label=target_labels[0],
+            )
+            normalized_edge_labels.append((source_labels, target_labels))
+
         logger.info(
             "Importing snapshot: %d nodes, %d edges (code_space=%s)",
             len(snapshot["nodes"]), len(snapshot["edges"]), header["code_space"]
@@ -1348,18 +1509,22 @@ class NativeEngine:
         node_order = ["CodeRepo", "CodeFile", "CodeSymbol", "CodeAnchor"]
         for label_filter in node_order:
             nodes_to_merge = [
-                n for n in snapshot["nodes"] if label_filter in n["labels"]
+                (node, labels)
+                for node, labels in zip(snapshot["nodes"], normalized_node_labels)
+                if labels[0] == label_filter
             ]
-            for node in nodes_to_merge:
-                self._merge_node(node["labels"], node["properties"])
+            for node, labels in nodes_to_merge:
+                self._merge_node(labels, node["properties"])
 
         # MERGE edges
-        for edge in snapshot["edges"]:
+        for edge, (source_labels, target_labels) in zip(
+            snapshot["edges"], normalized_edge_labels
+        ):
             self._merge_edge(
-                edge["source"]["labels"],
+                source_labels,
                 edge["source"]["properties"],
                 edge["type"],
-                edge["target"]["labels"],
+                target_labels,
                 edge["target"]["properties"],
                 edge["properties"],
             )
@@ -1373,36 +1538,37 @@ class NativeEngine:
         """
         # Determine primary key based on label
         label = labels[0]  # First label is the primary type
-        if label == "CodeRepo":
-            match_key = "code_space"
-        elif label == "CodeFile":
-            match_key = "code_space, path"
-        elif label == "CodeSymbol":
-            match_key = "code_space, fqn"
-        elif label == "CodeAnchor":
-            match_key = "code_space, repo, fqn"
-        else:
-            logger.warning(f"Unknown label for merge: {label}")
-            return
+        try:
+            identity_keys = _SNAPSHOT_IDENTITY_KEYS[label]
+        except KeyError:
+            raise ValueError(f"Unsupported snapshot core label: {label}") from None
 
-        # Build MERGE cypher (SET all properties)
-        label_str = ":".join(labels)
-        set_clauses = ", ".join(f"n.{k} = ${k}" for k in props.keys())
-        cypher = f"""
-        MERGE (n:{label_str} {{{match_key.replace(", ", ": $")}: ${match_key.replace(", ", ", ")}$}})
-        SET {set_clauses}
-        """
-        # Clean up the match clause to use actual keys
-        if label == "CodeRepo":
-            cypher = f"MERGE (n:{label_str} {{code_space: $code_space}}) SET {set_clauses}"
-        elif label == "CodeFile":
-            cypher = f"MERGE (n:{label_str} {{code_space: $code_space, path: $path}}) SET {set_clauses}"
-        elif label == "CodeSymbol":
-            cypher = f"MERGE (n:{label_str} {{code_space: $code_space, fqn: $fqn}}) SET {set_clauses}"
-        elif label == "CodeAnchor":
-            cypher = f"MERGE (n:{label_str} {{code_space: $code_space, repo: $repo, fqn: $fqn}}) SET {set_clauses}"
+        identity = {key: props[key] for key in identity_keys}
+        identity_pattern = ", ".join(
+            f"{key}: $identity.{key}" for key in identity_keys
+        )
+        core_identifier = _quote_cypher_identifier(
+            label, location="node core label"
+        )
+        cypher = (
+            f"MERGE (n:{core_identifier} {{{identity_pattern}}}) "
+            "SET n += $properties"
+        )
 
-        self._run_cypher_with_retry(cypher, **props)
+        # Auxiliary labels are additive metadata, not part of node identity.
+        # Apply them only after MERGE has resolved the core-labelled node.
+        if len(labels) > 1:
+            auxiliary_identifiers = "".join(
+                f":{_quote_cypher_identifier(auxiliary, location='node auxiliary label')}"
+                for auxiliary in labels[1:]
+            )
+            cypher += f" SET n{auxiliary_identifiers}"
+
+        self._run_cypher_with_retry(
+            cypher,
+            identity=identity,
+            properties=props,
+        )
 
     def _merge_edge(
         self,
@@ -1417,64 +1583,62 @@ class NativeEngine:
 
         Resolves source and target by their primary keys, then creates/updates the edge.
         """
-        # Build match predicates for source and target
+        # Enforce the same complete endpoint invariant for direct helper calls
+        # that import_snapshot establishes during its all-record preflight.
+        source_labels = _normalize_snapshot_labels(
+            source_labels, location="edge source labels"
+        )
+        target_labels = _normalize_snapshot_labels(
+            target_labels, location="edge target labels"
+        )
+
+        # Build match predicates for source and target using isolated maps so
+        # overlapping endpoint and relationship keys cannot replace each other.
         src_label = source_labels[0]
         tgt_label = target_labels[0]
-
-        # Determine match keys
-        src_match = self._build_match_predicate(src_label, source_props)
-        tgt_match = self._build_match_predicate(tgt_label, target_props)
+        src_identifier = _quote_cypher_identifier(
+            src_label, location="edge source core label"
+        )
+        tgt_identifier = _quote_cypher_identifier(
+            tgt_label, location="edge target core label"
+        )
+        rel_identifier = _quote_cypher_identifier(
+            rel_type, location="edge relationship type"
+        )
 
         # Build edge SET clause
-        set_clause = (
-            ", ".join(f"r.{k} = ${k}" for k in edge_props.keys())
-            if edge_props
-            else ""
+        set_part = "SET r += $edge_properties" if edge_props else ""
+        src_match = self._build_match_predicate(src_label, "source")
+        tgt_match = self._build_match_predicate(tgt_label, "target")
+        cypher = f"""
+        MATCH (s:{src_identifier} {src_match})
+        MATCH (t:{tgt_identifier} {tgt_match})
+        MERGE (s)-[r:{rel_identifier}]->(t)
+        {set_part}
+        """
+
+        self._run_cypher_with_retry(
+            cypher,
+            source=source_props,
+            target=target_props,
+            edge_properties=edge_props,
         )
-        set_part = f"SET {set_clause}" if set_clause else ""
 
-        cypher = f"""
-        MATCH (s:{src_label} {src_match})
-        MATCH (t:{tgt_label} {tgt_match})
-        MERGE (s)-[r:{rel_type}]->(t)
-        {set_part}
-        """
-
-        # Merge all props (source, target, edge)
-        all_props = {**source_props, **target_props, **edge_props}
-        # Prefix source/target props to avoid collisions
-        params = {}
-        for k, v in source_props.items():
-            params[f"src_{k}"] = v
-        for k, v in target_props.items():
-            params[f"tgt_{k}"] = v
-        params.update(edge_props)
-
-        # Rebuild cypher with prefixed params
-        src_match_prefixed = self._build_match_predicate(src_label, source_props, prefix="src_")
-        tgt_match_prefixed = self._build_match_predicate(tgt_label, target_props, prefix="tgt_")
-        cypher = f"""
-        MATCH (s:{src_label} {src_match_prefixed})
-        MATCH (t:{tgt_label} {tgt_match_prefixed})
-        MERGE (s)-[r:{rel_type}]->(t)
-        {set_part}
-        """
-
-        self._run_cypher_with_retry(cypher, **params)
-
-    def _build_match_predicate(self, label: str, props: dict, prefix: str = "") -> str:
+    def _build_match_predicate(self, label: str, parameter: str) -> str:
         """Build a Cypher match predicate for a node by its primary key."""
         if label == "CodeRepo":
-            return f"{{code_space: ${prefix}code_space}}"
+            return f"{{code_space: ${parameter}.code_space}}"
         elif label == "CodeFile":
-            return f"{{code_space: ${prefix}code_space, path: ${prefix}path}}"
+            return f"{{code_space: ${parameter}.code_space, path: ${parameter}.path}}"
         elif label == "CodeSymbol":
-            return f"{{code_space: ${prefix}code_space, fqn: ${prefix}fqn}}"
+            return f"{{code_space: ${parameter}.code_space, fqn: ${parameter}.fqn}}"
         elif label == "CodeAnchor":
-            return f"{{code_space: ${prefix}code_space, repo: ${prefix}repo, fqn: ${prefix}fqn}}"
+            return (
+                f"{{code_space: ${parameter}.code_space, repo: ${parameter}.repo, "
+                f"fqn: ${parameter}.fqn}}"
+            )
         else:
-            # Fallback: use code_space only
-            return f"{{code_space: ${prefix}code_space}}"
+            raise ValueError(f"Unsupported snapshot core label: {label}")
 
     # ── Internal indexing helpers ────────────────────────────────────
 
