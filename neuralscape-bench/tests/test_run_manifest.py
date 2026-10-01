@@ -550,6 +550,34 @@ class YieldRepairMapping(Mapping[str, object]):
         return generate()
 
 
+class LazyProvenanceMapping(Mapping[str, object]):
+    """Expose provenance before the remaining measurement fields."""
+
+    def __init__(self, values: dict[str, object]):
+        self.values = values
+        self.items_calls = 0
+
+    def __getitem__(self, key: str) -> object:
+        return self.values[key]
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+    def __iter__(self):
+        return iter(self.values)
+
+    def items(self):
+        self.items_calls += 1
+
+        def generate():
+            yield "provenance", self.values["provenance"]
+            for key, value in self.values.items():
+                if key != "provenance":
+                    yield key, value
+
+        return generate()
+
+
 class ArmedFieldName(str):
     """Run one callback when a stored field name is next hashed."""
 
@@ -1877,6 +1905,186 @@ def test_finish_snapshots_public_mapping_child_before_requesting_next_pair():
     assert shared.items_calls == 1
     assert shared.callback_calls == 1
     assert dict.__getitem__(shared_native, "count") == 2
+
+
+def test_finish_replays_new_exact_dict_before_snapshotting_its_entries():
+    unexpected_callbacks: list[str] = []
+
+    def reject_callback() -> None:
+        unexpected_callbacks.append("called")
+        raise RuntimeError("callback ran before native traversal")
+
+    trigger = PublicViewTuple((), (), action=reject_callback)
+    deep: dict[str, object] = {"leaf": "value"}
+    for index in range(sys.getrecursionlimit() + 600):
+        deep = {f"level-{index}": deep}
+    provenance = {"trigger": trigger}
+    provenance.update(timing().provenance.model_dump(mode="python"))
+    provenance["deep"] = deep
+    values = timing().model_dump(mode="python")
+    values["provenance"] = provenance
+    measurement = LazyProvenanceMapping(values)
+
+    with pytest.raises(RecursionError, match="maximum recursion depth exceeded"):
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(measurement,),
+        )
+
+    assert measurement.items_calls == 1
+    assert trigger.iteration_calls == 0
+    assert unexpected_callbacks == []
+
+
+def test_finish_preserves_new_exact_dict_shallow_and_valid_controls():
+    shallow_callbacks: list[str] = []
+    trigger = PublicViewTuple(
+        (),
+        (),
+        action=lambda: shallow_callbacks.append("called"),
+    )
+    shallow = {"leaf": "value"}
+    for index in range(2):
+        shallow = {f"level-{index}": shallow}
+    provenance = {"trigger": trigger}
+    provenance.update(timing().provenance.model_dump(mode="python"))
+    provenance["deep"] = shallow
+    invalid_values = timing().model_dump(mode="python")
+    invalid_values["provenance"] = provenance
+    invalid = LazyProvenanceMapping(invalid_values)
+
+    with pytest.raises(ValidationError) as invalid_error:
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(invalid,),
+        )
+    assert invalid_error.value.errors()[0]["type"] == "extra_forbidden"
+    assert invalid_error.value.errors()[0]["loc"] == (
+        "measurements",
+        0,
+        "provenance",
+        "trigger",
+    )
+    assert invalid.items_calls == 1
+    assert trigger.iteration_calls == 1
+    assert shallow_callbacks == ["called"]
+
+    key_callbacks: list[str] = []
+    collector_key = ArmedFieldName("collector")
+    valid_provenance = {
+        collector_key: "benchmark-driver",
+        "schema_version": VERSION,
+        "collector_version": "1.0.0",
+        "clock": "monotonic",
+        "placement": "separate-driver-process",
+    }
+    collector_key.arm(lambda: key_callbacks.append("called"))
+    valid_values = timing().model_dump(mode="python")
+    valid_values["provenance"] = valid_provenance
+    valid = LazyProvenanceMapping(valid_values)
+
+    result = finish_run(
+        planned_manifest(),
+        state=RunState.COMPLETED,
+        started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+        resources=(measured_memory(),),
+        measurements=(valid,),
+    )
+    assert result.state is RunState.COMPLETED
+    assert valid.items_calls == 1
+    assert collector_key.hash_calls == 1
+    assert key_callbacks == ["called"]
+
+
+def test_finish_preserves_lazy_exact_dict_priority_and_shared_capture():
+    def deep_measurement():
+        callbacks: list[str] = []
+        trigger = PublicViewTuple(
+            (),
+            (),
+            action=lambda: callbacks.append("called"),
+        )
+        deep: dict[str, object] = {"leaf": "value"}
+        for index in range(sys.getrecursionlimit() + 600):
+            deep = {f"level-{index}": deep}
+        provenance = {"trigger": trigger}
+        provenance.update(timing().provenance.model_dump(mode="python"))
+        provenance["deep"] = deep
+        values = timing().model_dump(mode="python")
+        values["provenance"] = provenance
+        return LazyProvenanceMapping(values), trigger, callbacks, provenance
+
+    invalid_planned = planned_manifest()
+    invalid_concurrency = invalid_planned.concurrency[0].model_copy(
+        update={"value": True}
+    )
+    invalid_planned = invalid_planned.model_copy(
+        update={"concurrency": (invalid_concurrency,)}
+    )
+    invalid, invalid_trigger, invalid_callbacks, _provenance = deep_measurement()
+    with pytest.raises(ValidationError) as invalid_error:
+        finish_run(
+            invalid_planned,
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(invalid,),
+        )
+    assert invalid_error.value.errors()[0]["loc"] == (
+        "concurrency",
+        0,
+        "value",
+    )
+    assert invalid.items_calls == 0
+    assert invalid_trigger.iteration_calls == 0
+    assert invalid_callbacks == []
+
+    nonplanned, nonplanned_trigger, nonplanned_callbacks, _ = deep_measurement()
+    with pytest.raises(
+        ValueError,
+        match="only a planned run can be finished",
+    ):
+        finish_run(
+            completed_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(nonplanned,),
+        )
+    assert nonplanned.items_calls == 0
+    assert nonplanned_trigger.iteration_calls == 0
+    assert nonplanned_callbacks == []
+
+    public, shared_trigger, shared_callbacks, shared_provenance = (
+        deep_measurement()
+    )
+    native = timing().model_dump(mode="python")
+    native["provenance"] = shared_provenance
+    measurements = PublicViewTuple((native,), (public,))
+    with pytest.raises(RecursionError, match="maximum recursion depth exceeded"):
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=measurements,
+        )
+    assert measurements.iteration_calls == 0
+    assert public.items_calls == 0
+    assert shared_trigger.iteration_calls == 0
+    assert shared_callbacks == []
 
 
 def test_public_only_parent_cannot_refreeze_native_exposed_plain_child():
