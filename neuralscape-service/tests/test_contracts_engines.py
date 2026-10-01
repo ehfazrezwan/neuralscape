@@ -44,6 +44,23 @@ class HiddenFrozenSet(frozenset):
         return iter(())
 
 
+class ObservableTuple(tuple):
+    def __new__(cls, values, *, callback=None, view=None):
+        instance = super().__new__(cls, values)
+        instance.callback = callback
+        instance.view = view
+        instance.calls = 0
+        return instance
+
+    def __iter__(self):
+        self.calls += 1
+        if self.callback is not None:
+            self.callback()
+        if self.view is not None:
+            return iter(self.view)
+        return tuple.__iter__(self)
+
+
 _MODEL_DICT_DESCRIPTOR = BaseModel.__dict__["__dict__"]
 _MODEL_FIELDS_SET_DESCRIPTOR = BaseModel.__dict__["__pydantic_fields_set__"]
 _MODEL_EXTRAS_DESCRIPTOR = BaseModel.__dict__["__pydantic_extra__"]
@@ -635,6 +652,122 @@ def test_capability_boundary_preserves_valid_child_mutation_control():
     valid.qualification_profile_reference.parent = valid
 
     assert validate_capability_requirements(manifest(state()), (valid,)) == ()
+
+
+@pytest.mark.parametrize("tuple_field", ["contract_schema_versions", "operations"])
+@pytest.mark.parametrize("public_surface", ["requirements", "operation_state"])
+def test_capability_boundary_freezes_manifest_children_before_tuple_callbacks(
+    tuple_field,
+    public_surface,
+):
+    invalid = state().model_copy(update={"supported": False})
+
+    def repair_child():
+        native = _MODEL_DICT_DESCRIPTOR.__get__(invalid, BaseModel)
+        dict.__setitem__(native, "supported", True)
+
+    declared = manifest(state()).model_copy(update={"operations": (invalid,)})
+    if tuple_field == "contract_schema_versions":
+        observed = ObservableTuple((VERSION,), callback=repair_child)
+        declared = declared.model_copy(
+            update={"contract_schema_versions": observed}
+        )
+    else:
+        observed = ObservableTuple((invalid,), callback=repair_child)
+        declared = declared.model_copy(update={"operations": observed})
+
+    with pytest.raises(ValidationError, match="cannot be configured"):
+        if public_surface == "requirements":
+            validate_capability_requirements(declared, (requirement(),))
+        else:
+            declared.operation_state("retrieve")
+
+    assert observed.calls == 1
+    assert invalid.supported is True
+
+
+def test_capability_boundary_freezes_requirements_before_tuple_callback():
+    invalid = requirement().model_copy(
+        update={"qualification_profile_version": None}
+    )
+
+    def repair_child():
+        native = _MODEL_DICT_DESCRIPTOR.__get__(invalid, BaseModel)
+        dict.__setitem__(native, "qualification_profile_version", "profile-v1")
+
+    requirements = ObservableTuple(
+        (requirement(operation="export"), invalid),
+        callback=repair_child,
+    )
+
+    with pytest.raises(ValidationError, match="are paired"):
+        validate_capability_requirements(manifest(state()), requirements)
+
+    assert requirements.calls == 1
+    assert invalid.qualification_profile_version == "profile-v1"
+
+
+def test_capability_boundary_freezes_manifest_edge_before_earlier_callback():
+    invalid = state().model_copy(
+        update={"qualification": qualification(operation="export")}
+    )
+    declared = manifest(state()).model_copy(update={"operations": (invalid,)})
+
+    def replace_edge():
+        native = _MODEL_DICT_DESCRIPTOR.__get__(invalid, BaseModel)
+        dict.__setitem__(native, "qualification", qualification())
+
+    versions = ObservableTuple((VERSION,), callback=replace_edge)
+    native = _MODEL_DICT_DESCRIPTOR.__get__(declared, BaseModel)
+    dict.__setitem__(native, "contract_schema_versions", versions)
+
+    with pytest.raises(ValidationError, match="operation must match"):
+        validate_capability_requirements(declared, (requirement(),))
+
+    assert versions.calls == 1
+    assert invalid.qualification.operation == "retrieve"
+
+
+def test_capability_boundary_preserves_divergent_tuple_view_authority():
+    invalid_backing = requirement().model_copy(
+        update={"qualification_profile_version": None}
+    )
+    requirements = ObservableTuple(
+        (invalid_backing,),
+        view=(requirement(),),
+    )
+
+    assert validate_capability_requirements(manifest(state()), requirements) == ()
+    assert requirements.calls == 1
+
+    hidden_cross_tenant = requirement().model_copy(
+        update={
+            "qualification_profile_reference": reference(
+                "runtime-profile"
+            ).model_copy(update={"tenant_id": "tenant-2"})
+        }
+    )
+    requirements = ObservableTuple(
+        (requirement(),),
+        view=(hidden_cross_tenant,),
+    )
+
+    violations = validate_capability_requirements(manifest(state()), requirements)
+
+    assert [(item.operation, item.fact) for item in violations] == [
+        ("retrieve", "qualification_profile")
+    ]
+    assert requirements.calls == 1
+
+
+def test_manifest_preserves_divergent_operations_tuple_view_authority():
+    invalid_backing = state().model_copy(update={"supported": False})
+    visible = state(operation="export", qualification=qualification("export"))
+    operations = ObservableTuple((invalid_backing,), view=(visible,))
+    declared = manifest(state()).model_copy(update={"operations": operations})
+
+    assert declared.operation_state("export") == visible
+    assert operations.calls == 1
 
 
 def test_capability_boundary_preserves_missing_extra_storage():

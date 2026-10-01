@@ -8,7 +8,7 @@ reviewable but are not themselves proof that the referenced evidence is valid.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, TypeVar
+from typing import Any, NamedTuple, TypeVar
 
 from pydantic import BaseModel, TypeAdapter, model_validator
 
@@ -23,6 +23,18 @@ _MODEL_DICT_DESCRIPTOR = BaseModel.__dict__["__dict__"]
 _MODEL_FIELDS_SET_DESCRIPTOR = BaseModel.__dict__["__pydantic_fields_set__"]
 _MODEL_EXTRAS_DESCRIPTOR = BaseModel.__dict__["__pydantic_extra__"]
 _MISSING_MODEL_STORAGE = object()
+
+
+class _FrozenModelState(NamedTuple):
+    """Callback-free entry state for one natively reachable model."""
+
+    owner: BaseModel
+    storage_is_dict: bool
+    stored_items: tuple[tuple[Any, Any], ...]
+    fields_set_is_set: bool
+    fields_set_members: tuple[Any, ...]
+    extras_state: str
+    extra_items: tuple[tuple[Any, Any], ...]
 
 
 def _model_storage(descriptor: Any, value: BaseModel) -> Any:
@@ -40,6 +52,73 @@ def _native_set_members(value: set[Any] | frozenset[Any]) -> tuple[Any, ...]:
     if isinstance(value, set):
         return tuple(set.__iter__(value))
     return tuple(frozenset.__iter__(value))
+
+
+def _freeze_native_model_graph(
+    value: Any,
+    frozen_models: dict[int, _FrozenModelState],
+    discovered: dict[int, Any],
+) -> None:
+    """Freeze models reachable through native container edges without callbacks."""
+
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if not isinstance(current, (BaseModel, dict, list, tuple)):
+            continue
+        identity = id(current)
+        if identity in discovered and discovered[identity] is current:
+            continue
+        discovered[identity] = current
+
+        if isinstance(current, BaseModel):
+            frozen = frozen_models.get(identity)
+            if frozen is not None and frozen.owner is current:
+                continue
+
+            storage = _model_storage(_MODEL_DICT_DESCRIPTOR, current)
+            fields_set_value = _model_storage(
+                _MODEL_FIELDS_SET_DESCRIPTOR,
+                current,
+            )
+            extras_value = _model_storage(_MODEL_EXTRAS_DESCRIPTOR, current)
+            storage_is_dict = isinstance(storage, dict)
+            fields_set_is_set = isinstance(fields_set_value, (set, frozenset))
+            stored_items = (
+                tuple(dict.items(storage)) if storage_is_dict else ()
+            )
+            fields_set_members = (
+                _native_set_members(fields_set_value) if fields_set_is_set else ()
+            )
+            if extras_value is _MISSING_MODEL_STORAGE:
+                extras_state = "missing"
+                extra_items: tuple[tuple[Any, Any], ...] = ()
+            elif extras_value is None:
+                extras_state = "none"
+                extra_items = ()
+            elif type(extras_value) is dict:
+                extras_state = "dict"
+                extra_items = tuple(dict.items(extras_value))
+            else:
+                extras_state = "malformed"
+                extra_items = ()
+            frozen = _FrozenModelState(
+                owner=current,
+                storage_is_dict=storage_is_dict,
+                stored_items=stored_items,
+                fields_set_is_set=fields_set_is_set,
+                fields_set_members=fields_set_members,
+                extras_state=extras_state,
+                extra_items=extra_items,
+            )
+            frozen_models[identity] = frozen
+            pending.extend(item for _, item in stored_items)
+        elif isinstance(current, dict):
+            pending.extend(item for _, item in tuple(dict.items(current)))
+        elif isinstance(current, list):
+            pending.extend(tuple(list.__iter__(current)))
+        else:
+            pending.extend(tuple(tuple.__iter__(current)))
 
 
 def _normalize_field_names(
@@ -92,6 +171,8 @@ def _snapshot_native_value(
     value: Any,
     *,
     active: set[int],
+    frozen_models: dict[int, _FrozenModelState],
+    discovered: dict[int, Any],
     depth: int,
     location: str,
 ) -> Any:
@@ -103,40 +184,30 @@ def _snapshot_native_value(
     is_container = isinstance(value, (BaseModel, dict, list, tuple))
     identity = id(value)
     if is_container:
+        _freeze_native_model_graph(value, frozen_models, discovered)
         if identity in active:
             raise ValueError(f"cyclic contract graph at {location}")
         active.add(identity)
 
     try:
         if isinstance(value, BaseModel):
-            storage = _model_storage(_MODEL_DICT_DESCRIPTOR, value)
-            fields_set_value = _model_storage(_MODEL_FIELDS_SET_DESCRIPTOR, value)
-            extras_value = _model_storage(_MODEL_EXTRAS_DESCRIPTOR, value)
-            if not isinstance(storage, dict) or not isinstance(
-                fields_set_value, (set, frozenset)
-            ):
+            frozen = frozen_models[identity]
+            if not frozen.storage_is_dict or not frozen.fields_set_is_set:
                 raise ValueError(f"malformed contract model at {location}")
-            if extras_value is _MISSING_MODEL_STORAGE:
-                extras_value = None
-            if extras_value is not None and type(extras_value) is not dict:
+            if frozen.extras_state == "malformed":
                 raise ValueError(f"malformed contract extras at {location}")
-            native_stored_items = tuple(dict.items(storage))
-            native_fields_set = _native_set_members(fields_set_value)
-            native_extra_items = (
-                () if extras_value is None else tuple(dict.items(extras_value))
-            )
             stored_items = _normalize_field_items(
-                native_stored_items,
+                frozen.stored_items,
                 location=location,
                 storage_kind="model",
             )
             fields_set_names = _normalize_field_names(
-                native_fields_set,
+                frozen.fields_set_members,
                 location=location,
                 storage_kind="model",
             )
             extra_items = _normalize_field_items(
-                native_extra_items,
+                frozen.extra_items,
                 location=location,
                 storage_kind="extras",
             )
@@ -168,6 +239,8 @@ def _snapshot_native_value(
                 name: _snapshot_native_value(
                     item,
                     active=active,
+                    frozen_models=frozen_models,
+                    discovered=discovered,
                     depth=depth + 1,
                     location=f"{location}.{name}",
                 )
@@ -178,6 +251,8 @@ def _snapshot_native_value(
                 key: _snapshot_native_value(
                     item,
                     active=active,
+                    frozen_models=frozen_models,
+                    discovered=discovered,
                     depth=depth + 1,
                     location=f"{location}[key]",
                 )
@@ -188,6 +263,8 @@ def _snapshot_native_value(
                 _snapshot_native_value(
                     item,
                     active=active,
+                    frozen_models=frozen_models,
+                    discovered=discovered,
                     depth=depth + 1,
                     location=f"{location}[{index}]",
                 )
@@ -198,6 +275,8 @@ def _snapshot_native_value(
                 _snapshot_native_value(
                     item,
                     active=active,
+                    frozen_models=frozen_models,
+                    discovered=discovered,
                     depth=depth + 1,
                     location=f"{location}[{index}]",
                 )
@@ -219,10 +298,36 @@ def _validated_contract_snapshot(
 
     if not isinstance(value, expected_type):
         raise TypeError(f"{label} must be a {expected_type.__name__}")
+    frozen_models: dict[int, _FrozenModelState] = {}
+    discovered: dict[int, Any] = {}
+    _freeze_native_model_graph(value, frozen_models, discovered)
+    return _validated_contract_snapshot_from_frozen(
+        value,
+        expected_type,
+        label=label,
+        frozen_models=frozen_models,
+        discovered=discovered,
+    )
+
+
+def _validated_contract_snapshot_from_frozen(
+    value: Any,
+    expected_type: type[_ContractT],
+    *,
+    label: str,
+    frozen_models: dict[int, _FrozenModelState],
+    discovered: dict[int, Any],
+) -> _ContractT:
+    """Validate using entry state already frozen for the enclosing boundary."""
+
+    if not isinstance(value, expected_type):
+        raise TypeError(f"{label} must be a {expected_type.__name__}")
     try:
         native = _snapshot_native_value(
             value,
             active=set(),
+            frozen_models=frozen_models,
+            discovered=discovered,
             depth=0,
             location=label,
         )
@@ -241,11 +346,16 @@ def _validated_contract_tuple(
 
     if not isinstance(values, tuple):
         raise TypeError(f"{label} must be a tuple")
+    frozen_models: dict[int, _FrozenModelState] = {}
+    discovered: dict[int, Any] = {}
+    _freeze_native_model_graph(values, frozen_models, discovered)
     return tuple(
-        _validated_contract_snapshot(
+        _validated_contract_snapshot_from_frozen(
             value,
             expected_type,
             label=f"{label}[{index}]",
+            frozen_models=frozen_models,
+            discovered=discovered,
         )
         for index, value in enumerate(values)
     )
