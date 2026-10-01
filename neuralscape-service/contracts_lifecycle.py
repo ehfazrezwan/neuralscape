@@ -773,7 +773,7 @@ def validate_required_stage_claim(
     receipt_inventory: dict[int, _CapturedGraph] = {}
     receipt_capture_errors: dict[int, Exception] = {}
     for receipt in tuple.__iter__(receipts):
-        if not isinstance(receipt, StageReceipt):
+        if not issubclass(type(receipt), StageReceipt):
             continue
         identity = id(receipt)
         if identity in receipt_inventory or identity in receipt_capture_errors:

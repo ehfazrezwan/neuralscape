@@ -203,6 +203,21 @@ class DivergentTuple(tuple[object, ...]):
         return iter(self.public_items)
 
 
+class RepairingReceiptClassView:
+    """Repair a later receipt if native classification reads ``__class__``."""
+
+    def __init__(self, target: StageReceipt) -> None:
+        self.target = target
+        self.class_reads = 0
+
+    @property
+    def __class__(self):  # type: ignore[override]
+        self.class_reads += 1
+        native = BASE_MODEL_DICT_DESCRIPTOR.__get__(self.target, BaseModel)
+        dict.__setitem__(native, "attempt", 1)
+        return object
+
+
 def descriptor_masked_copy(value: BaseModel) -> BaseModel:
     """Return a concrete subtype whose properties hide model-owned storage."""
 
@@ -2325,6 +2340,80 @@ def test_aggregate_boundary_preserves_receipt_tuple_subclass_public_view(
             )
 
     assert divergent.iteration_calls == 1
+
+
+def test_aggregate_boundary_classifies_native_receipts_concretely() -> None:
+    class ReceiptSubtype(StageReceipt):
+        pass
+
+    command = intent(ProcessingStage.CANONICAL)
+    ordinary = receipt(
+        ProcessingStage.CANONICAL,
+        StageStatus.PENDING,
+    ).model_copy(update={"attempt": 0})
+    ordinary_native = BASE_MODEL_DICT_DESCRIPTOR.__get__(ordinary, BaseModel)
+    assert dict.__getitem__(ordinary_native, "attempt") == 0
+    with pytest.raises(ValidationError) as ordinary_error:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=command,
+            receipts=(ordinary,),
+        )
+    assert dict.__getitem__(ordinary_native, "attempt") == 0
+
+    invalid = ReceiptSubtype.model_validate(
+        receipt(
+            ProcessingStage.CANONICAL,
+            StageStatus.PENDING,
+        ).model_dump(mode="python")
+    ).model_copy(update={"attempt": 0})
+    invalid_native = BASE_MODEL_DICT_DESCRIPTOR.__get__(invalid, BaseModel)
+    hidden_invalid = RepairingReceiptClassView(invalid)
+    divergent_invalid = DivergentTuple(
+        (hidden_invalid, invalid),
+        (invalid,),
+    )
+    assert dict.__getitem__(invalid_native, "attempt") == 0
+    with pytest.raises(ValidationError) as divergent_error:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=command,
+            receipts=divergent_invalid,
+        )
+
+    ordinary_diagnostics = [
+        (error["loc"], error["type"], error["msg"], error["input"])
+        for error in ordinary_error.value.errors(include_url=False)
+    ]
+    divergent_diagnostics = [
+        (error["loc"], error["type"], error["msg"], error["input"])
+        for error in divergent_error.value.errors(include_url=False)
+    ]
+    assert divergent_diagnostics == ordinary_diagnostics
+    assert dict.__getitem__(invalid_native, "attempt") == 0
+    assert hidden_invalid.class_reads == 0
+    assert divergent_invalid.iteration_calls == 1
+
+    valid = ReceiptSubtype.model_validate(
+        receipt(
+            ProcessingStage.CANONICAL,
+            StageStatus.PENDING,
+        ).model_dump(mode="python")
+    )
+    valid_native = BASE_MODEL_DICT_DESCRIPTOR.__get__(valid, BaseModel)
+    hidden_valid = RepairingReceiptClassView(valid)
+    divergent_valid = DivergentTuple((hidden_valid, valid), (valid,))
+    assert dict.__getitem__(valid_native, "attempt") == 1
+
+    validate_required_stage_claim(
+        claimed_status=IntentStatus.ACCEPTED,
+        intent=command,
+        receipts=divergent_valid,
+    )
+
+    assert dict.__getitem__(valid_native, "attempt") == 1
+    assert hidden_valid.class_reads == 0
+    assert divergent_valid.iteration_calls == 1
 
 
 def test_aggregate_boundary_snapshots_model_extras_before_nested_traversal() -> None:
