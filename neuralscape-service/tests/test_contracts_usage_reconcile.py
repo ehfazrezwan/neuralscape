@@ -1,7 +1,9 @@
 """Adversarial correction and aggregation tests for usage reconciliation."""
 
 import copy
+import gc
 import json
+import weakref
 from collections.abc import Callable, ItemsView, Iterator, KeysView, Mapping
 from itertools import permutations
 from types import MappingProxyType
@@ -726,9 +728,38 @@ def _python_validation_signature(
 
 
 def test_public_mapping_entry_validator_accepts_ordinary_entries() -> None:
-    entries = (("first", object()), ["second", object()])
+    class LifetimeMarker:
+        pass
 
-    assert usage_reconcile_contracts._validate_public_mapping_entries(entries) is None
+    key = LifetimeMarker()
+    value = LifetimeMarker()
+    pair = (key, value)
+    entries = iter((pair,))
+    key_ref = weakref.ref(key)
+    value_ref = weakref.ref(value)
+
+    validated = usage_reconcile_contracts._validate_public_mapping_entries(entries)
+
+    assert isinstance(
+        validated,
+        usage_reconcile_contracts._ValidatedPublicMappingEntries,
+    )
+    assert validated.entries is entries
+    assert validated.iterator is entries
+    assert validated.retained_keys == {key: None}
+    assert validated.final_pair is pair
+    assert validated.final_key is key
+    assert validated.final_value is value
+
+    del entries, key, pair, value
+    gc.collect()
+    assert key_ref() is not None
+    assert value_ref() is not None
+
+    del validated
+    gc.collect()
+    assert key_ref() is None
+    assert value_ref() is None
 
 
 @pytest.mark.parametrize(
