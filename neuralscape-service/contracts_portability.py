@@ -34,6 +34,12 @@ _ModelDiscoverySnapshot = tuple[
     Any,
     _ModelExtraSnapshot,
 ]
+_NativeContainerSnapshot = tuple[type, tuple[Any, ...]]
+_NativeContainerInventory = dict[int, _NativeContainerSnapshot]
+_RetainedStateInventory = tuple[
+    _ModelStorageInventory,
+    _NativeContainerInventory,
+]
 _MISSING_FIELDS_SET = object()
 
 
@@ -82,17 +88,19 @@ def _validated_model_extra_storage(
 
 def _reject_retained_unknown_fields(
     root: BaseModel,
-) -> _ModelStorageInventory:
+) -> _RetainedStateInventory:
     """Reject undeclared state retained by unchecked Pydantic copies.
 
     ``model_copy(update=...)`` deliberately does not validate its update.  For
     models configured with ``extra="forbid"``, an undeclared update can remain
     in ``__dict__``/``model_fields_set`` while ``model_dump()`` silently omits
     it.  First discover model-owned state through native container backing so
-    every reachable model inventory is frozen before callback-bearing legacy
-    protocols run.  Then validate and walk those snapshots so the receiving
-    boundary cannot accept a later sanitized subset.  Object identity, rather
-    than value equality, makes shared and cyclic containers safe to inspect.
+    every reachable model inventory and exact built-in container edge is
+    frozen before callback-bearing legacy protocols run.  Container subclasses
+    retain their public traversal authority.  Then validate and walk those
+    snapshots so the receiving boundary cannot accept a later sanitized
+    subset.  Object identity, rather than value equality, makes shared and
+    cyclic containers safe to inspect.
     """
 
     errors: list[dict[str, Any]] = []
@@ -100,6 +108,7 @@ def _reject_retained_unknown_fields(
     discovered: set[int] = set()
     discovery_inventory: dict[int, _ModelDiscoverySnapshot] = {}
     model_inventory: _ModelStorageInventory = {}
+    native_container_inventory: _NativeContainerInventory = {}
 
     def discover(value: Any) -> None:
         value_type = type(value)
@@ -141,7 +150,10 @@ def _reject_retained_unknown_fields(
             return
 
         if issubclass(value_type, dict):
-            for key, item in tuple(dict.items(value)):
+            items = tuple(dict.items(value))
+            if value_type is dict:
+                native_container_inventory[identity] = (dict, items)
+            for key, item in items:
                 discover(key)
                 discover(item)
             return
@@ -153,6 +165,8 @@ def _reject_retained_unknown_fields(
             items = tuple(set.__iter__(value))
         else:
             items = tuple(frozenset.__iter__(value))
+        if value_type in (list, tuple, set, frozenset):
+            native_container_inventory[identity] = (value_type, items)
         for item in items:
             discover(item)
 
@@ -164,10 +178,10 @@ def _reject_retained_unknown_fields(
         if identity in visited:
             return
         visited.add(identity)
+        if identity not in discovered:
+            discover(value)
 
         if isinstance(value, BaseModel):
-            if identity not in discovery_inventory:
-                discover(value)
             declared = type(value).model_fields
             stored_entries, fields_set_storage, extra_snapshot = (
                 discovery_inventory[identity]
@@ -213,6 +227,14 @@ def _reject_retained_unknown_fields(
                     walk(stored[name], (*location, name))
             return
 
+        if type(value) is dict:
+            _, items = native_container_inventory[identity]
+            for index, (key, item) in enumerate(items):
+                walk(key, (*location, "<key>", index))
+                item_location = key if isinstance(key, (str, int)) else index
+                walk(item, (*location, item_location))
+            return
+
         if isinstance(value, Mapping):
             for index, (key, item) in enumerate(value.items()):
                 walk(key, (*location, "<key>", index))
@@ -220,19 +242,24 @@ def _reject_retained_unknown_fields(
                 walk(item, (*location, item_location))
             return
 
-        for index, item in enumerate(value):
+        items = (
+            native_container_inventory[identity][1]
+            if type(value) in (list, tuple, set, frozenset)
+            else value
+        )
+        for index, item in enumerate(items):
             walk(item, (*location, index))
 
     discover(root)
     walk(root, ())
     if errors:
         raise ValidationError.from_exception_data("PortableManifest", errors)
-    return model_inventory
+    return model_inventory, native_container_inventory
 
 
 def _reconstruct_retained_state(
     root: BaseModel,
-    model_inventory: Mapping[int, _ModelStorageSnapshot],
+    retained_state_inventory: _RetainedStateInventory,
 ) -> dict[str, Any]:
     """Copy a model graph without invoking lossy Pydantic serialization.
 
@@ -243,6 +270,7 @@ def _reconstruct_retained_state(
     receiving boundary cannot turn an invalid tuple or set into a valid list.
     """
 
+    model_inventory, native_container_inventory = retained_state_inventory
     active: set[int] = set()
 
     def rebuild(value: Any) -> Any:
@@ -265,15 +293,24 @@ def _reconstruct_retained_state(
                 stored.update(extra_entries)
                 return {name: rebuild(item) for name, item in stored.items()}
 
+            if type(value) is dict:
+                _, items = native_container_inventory[identity]
+                return {rebuild(key): rebuild(item) for key, item in items}
             if isinstance(value, Mapping):
                 return {rebuild(key): rebuild(item) for key, item in value.items()}
+            value_type = type(value)
+            items = (
+                native_container_inventory[identity][1]
+                if value_type in (list, tuple, set, frozenset)
+                else value
+            )
             if isinstance(value, list):
-                return [rebuild(item) for item in value]
+                return [rebuild(item) for item in items]
             if isinstance(value, tuple):
-                return tuple(rebuild(item) for item in value)
+                return tuple(rebuild(item) for item in items)
             if isinstance(value, set):
-                return {rebuild(item) for item in value}
-            return frozenset(rebuild(item) for item in value)
+                return {rebuild(item) for item in items}
+            return frozenset(rebuild(item) for item in items)
         finally:
             active.remove(identity)
 
