@@ -8,7 +8,7 @@ from copy import deepcopy
 from types import MappingProxyType
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from contracts_policy import (
     AccessPolicy,
@@ -138,6 +138,44 @@ class _HiddenExtraViewDecision(PolicyDecision):
         if name == "__pydantic_extra__":
             return {}
         return object.__getattribute__(self, name)
+
+
+class _HiddenFieldsSetViewDecision(PolicyDecision):
+    """Hide real set-only state from instance-level fields-set access."""
+
+    def __getattribute__(self, name: str) -> object:
+        if name == "__pydantic_fields_set__":
+            return set(type(self).model_fields)
+        return object.__getattribute__(self, name)
+
+
+class _HiddenFieldsSetViewReference(ReferenceHandle):
+    """Nested contract hiding its real set-only state from instance access."""
+
+    def __getattribute__(self, name: str) -> object:
+        if name == "__pydantic_fields_set__":
+            return set(type(self).model_fields)
+        return object.__getattribute__(self, name)
+
+
+class _HiddenIterationFieldsSet(set[str]):
+    """A real set whose overridable views conceal its native backing."""
+
+    def __init__(self, values: set[str]) -> None:
+        set.__init__(self, values)
+        self.view_calls = 0
+
+    def __bool__(self) -> bool:
+        self.view_calls += 1
+        return False
+
+    def __len__(self) -> int:
+        self.view_calls += 1
+        return 0
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        self.view_calls += 1
+        return iter(())
 
 
 def reference(
@@ -1599,6 +1637,64 @@ def test_receiving_boundary_reads_native_unknown_extra_storage(
 
     with pytest.raises(ValidationError, match="future_constraint"):
         validate_policy_decision(decision)
+
+
+@pytest.mark.parametrize("location", ["decision", "nested-reference"])
+@pytest.mark.parametrize(
+    "storage_kind",
+    ["ordinary", "model-override", "native-set-subclass"],
+)
+def test_receiving_boundary_reads_native_unknown_fields_set_storage(
+    location: str,
+    storage_kind: str,
+) -> None:
+    if location == "decision":
+        decision_type = (
+            _HiddenFieldsSetViewDecision
+            if storage_kind == "model-override"
+            else PolicyDecision
+        )
+        decision = decision_type(**decision_payload())
+        target: BaseModel = decision
+        expected_location = ("future_constraint",)
+    else:
+        decision = PolicyDecision(**decision_payload())
+        reference_type = (
+            _HiddenFieldsSetViewReference
+            if storage_kind == "model-override"
+            else ReferenceHandle
+        )
+        target = reference_type(**decision.resource.model_dump(mode="python"))
+        decision.__dict__["resource"] = target
+        expected_location = ("resource", "future_constraint")
+
+    native_fields_set = object.__getattribute__(
+        target,
+        "__pydantic_fields_set__",
+    )
+    if storage_kind == "native-set-subclass":
+        native_fields_set = _HiddenIterationFieldsSet(set(native_fields_set))
+        object.__setattr__(
+            target,
+            "__pydantic_fields_set__",
+            native_fields_set,
+        )
+    set.add(native_fields_set, "future_constraint")
+
+    assert "future_constraint" in tuple(set.__iter__(native_fields_set))
+    assert "future_constraint" not in object.__getattribute__(target, "__dict__")
+    assert object.__getattribute__(target, "__pydantic_extra__") is None
+    if storage_kind == "model-override":
+        assert "future_constraint" not in target.__pydantic_fields_set__
+
+    with pytest.raises(ValidationError) as raised:
+        validate_policy_decision(decision)
+
+    assert raised.value.errors()[0]["type"] == "extra_forbidden"
+    assert raised.value.errors()[0]["loc"] == expected_location
+    assert raised.value.errors()[0]["input"] is None
+    if storage_kind == "native-set-subclass":
+        assert native_fields_set.view_calls == 0
 
 
 @pytest.mark.parametrize("extra_action", ["read", "delete"])

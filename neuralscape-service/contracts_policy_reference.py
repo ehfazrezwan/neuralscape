@@ -34,6 +34,14 @@ def _mapping_items(
     return tuple(value.items())
 
 
+def _fields_set_names(value: object) -> tuple[object, ...]:
+    """Capture native set backing without changing other iterable fallbacks."""
+
+    if issubclass(type(value), set):
+        return tuple(set.__iter__(value))
+    return tuple(value)  # type: ignore[arg-type]
+
+
 def _complete_contract_input(value: object, active_ids: set[int]) -> object:
     """Copy a native input graph without normalizing away invalid data."""
 
@@ -66,7 +74,12 @@ def _complete_contract_input(value: object, active_ids: set[int]) -> object:
             # An unchecked copy normally stores its update in ``__dict__``.
             # Retain even an anomalous set-only field so closed-model validation
             # cannot silently erase evidence of unknown input semantics.
-            for field_name in value.__pydantic_fields_set__:
+            fields_set_storage = object.__getattribute__(
+                value,
+                "__pydantic_fields_set__",
+            )
+            fields_set_names = _fields_set_names(fields_set_storage)
+            for field_name in fields_set_names:
                 if (
                     field_name not in declared_fields
                     and field_name not in stored_values
