@@ -179,6 +179,10 @@ jobs:
           cache-to: type=gha,mode=max
       - name: Run suite inside the packaged image
         run: docker run --rm ns-gate:ci
+      - name: Verify test image contains snapshot integration test
+        run: >-
+          docker run --rm --entrypoint /bin/sh ns-gate:ci
+          -ec 'test -f /app/neuralscape-service/integration_tests/test_native_snapshot_neo4j.py'
       - name: Build runtime image
         uses: docker/build-push-action@v7
         with:
@@ -188,6 +192,10 @@ jobs:
           load: true
           tags: ns-gate-rt:ci
           cache-from: type=gha
+      - name: Verify runtime image contains snapshot integration test
+        run: >-
+          docker run --rm --entrypoint /bin/sh ns-gate-rt:ci
+          -ec 'test -f /app/neuralscape-service/integration_tests/test_native_snapshot_neo4j.py'
 
   native-snapshot-neo4j:
     runs-on: ubuntu-latest
