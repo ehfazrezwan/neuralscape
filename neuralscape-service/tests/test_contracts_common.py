@@ -227,6 +227,47 @@ class ClassReadRejectingMapping(SingleReadMapping):
         raise AssertionError("mapping __class__ override must not be read")
 
 
+class ClassReadCountingMapping(SingleReadMapping):
+    def __init__(self, entries: dict[str, object]) -> None:
+        super().__init__(entries)
+        self.class_reads = 0
+
+    @property
+    def __class__(self) -> type[dict]:
+        self.class_reads += 1
+        return dict
+
+
+class ClassReadRejectingContract(ExampleContract):
+    @property
+    def __class__(self) -> type[object]:
+        raise AssertionError("model __class__ override must not be read")
+
+
+class ClassReadRejectingTuple(tuple):
+    @property
+    def __class__(self) -> type[object]:
+        raise AssertionError("tuple __class__ override must not be read")
+
+
+class ClassReadRejectingList(list):
+    @property
+    def __class__(self) -> type[object]:
+        raise AssertionError("list __class__ override must not be read")
+
+
+class ClassReadRejectingDict(dict[str, object]):
+    @property
+    def __class__(self) -> type[object]:
+        raise AssertionError("dict __class__ override must not be read")
+
+
+class ModelClassSpoofingDict(dict[str, object]):
+    @property
+    def __class__(self) -> type[ExampleContract]:
+        return ExampleContract
+
+
 class HiddenItemsDict(dict[str, object]):
     def items(self) -> tuple[tuple[str, object], ...]:
         return tuple(
@@ -1044,6 +1085,74 @@ def test_snapshot_contract_graph_does_not_read_mapping_class_override() -> None:
 
     assert snapshot == {"count": 1, "future_state": "preserved"}
     assert extra.item_reads == 1
+
+
+@pytest.mark.parametrize(
+    "mapping_type",
+    [ClassReadRejectingMapping, ClassReadCountingMapping],
+    ids=["raising-class", "counted-class"],
+)
+@pytest.mark.parametrize("location", ["direct", "list", "dict"])
+def test_snapshot_contract_graph_leaves_adversarial_non_dict_mapping_unchanged(
+    mapping_type: type[SingleReadMapping],
+    location: str,
+) -> None:
+    value = mapping_type({"future_state": "preserved"})
+    graph: object
+    if location == "direct":
+        graph = value
+    elif location == "list":
+        graph = [value]
+    else:
+        graph = {"item": value}
+
+    snapshot = snapshot_contract_graph(graph)
+
+    retained = (
+        snapshot
+        if location == "direct"
+        else snapshot[0]
+        if location == "list"
+        else snapshot["item"]
+    )
+    assert retained is value
+    assert value.item_reads == 0
+    if type(value) is ClassReadCountingMapping:
+        assert value.class_reads == 0
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["direct", "nested"])
+def test_snapshot_contract_graph_dispatches_model_spoofing_dict_as_dict(
+    nested: bool,
+) -> None:
+    value = ModelClassSpoofingDict(count=1)
+    graph: object = {"item": value} if nested else value
+
+    assert isinstance(value, ContractModel)
+    snapshot = snapshot_contract_graph(graph)
+
+    expected = {"item": {"count": 1}} if nested else {"count": 1}
+    assert snapshot == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (ClassReadRejectingContract(count=1), {"count": 1}),
+        (ClassReadRejectingTuple((ExampleContract(count=1),)), ({"count": 1},)),
+        (ClassReadRejectingList([ExampleContract(count=1)]), [{"count": 1}]),
+        (
+            ClassReadRejectingDict(item=ExampleContract(count=1)),
+            {"item": {"count": 1}},
+        ),
+    ],
+    ids=["model-subclass", "tuple-subclass", "list-subclass", "dict-subclass"],
+)
+def test_snapshot_contract_graph_dispatches_concrete_container_subclasses(
+    value: object,
+    expected: object,
+) -> None:
+    assert snapshot_contract_graph(value) == expected
 
 
 @pytest.mark.parametrize(
