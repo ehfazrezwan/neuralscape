@@ -37,9 +37,13 @@ from adapters.code_graph.engine import (
 
 logger = logging.getLogger(__name__)
 
-_SNAPSHOT_CORE_LABELS = frozenset(
-    {"CodeRepo", "CodeFile", "CodeSymbol", "CodeAnchor"}
-)
+_SNAPSHOT_IDENTITY_KEYS = {
+    "CodeRepo": ("code_space",),
+    "CodeFile": ("code_space", "path"),
+    "CodeSymbol": ("code_space", "fqn"),
+    "CodeAnchor": ("code_space", "repo", "fqn"),
+}
+_SNAPSHOT_CORE_LABELS = frozenset(_SNAPSHOT_IDENTITY_KEYS)
 
 
 def _normalize_snapshot_labels(labels: object, *, location: str) -> list[str]:
@@ -100,6 +104,34 @@ def _quote_cypher_identifier(identifier: object, *, location: str) -> str:
     # as \u0060 cannot be interpreted as a backtick by the Cypher parser.
     escaped = identifier.replace("\\", "\\u005C").replace("`", "``")
     return f"`{escaped}`"
+
+
+def _validate_snapshot_properties(
+    properties: object,
+    *,
+    location: str,
+    core_label: str | None = None,
+) -> dict[str, Any]:
+    """Validate a snapshot property map and any core identity it carries."""
+    if not isinstance(properties, dict):
+        raise ValueError(
+            f"Malformed snapshot properties at {location}: expected a property map"
+        )
+
+    if core_label is not None:
+        for key in _SNAPSHOT_IDENTITY_KEYS[core_label]:
+            if key not in properties:
+                raise ValueError(
+                    f"Malformed snapshot properties at {location}: "
+                    f"missing required identity key {key!r}"
+                )
+            if properties[key] is None:
+                raise ValueError(
+                    f"Malformed snapshot properties at {location}: "
+                    f"identity key {key!r} must not be null"
+                )
+
+    return properties
 
 
 @dataclass
@@ -1421,15 +1453,22 @@ class NativeEngine:
                 f"(expected {header['content_hash']}, got {computed_hash})"
             )
 
-        # Validate and normalize every label array before issuing any writes. Hash
-        # verification intentionally uses the original representation so historical
-        # format-1.0 artifacts remain valid regardless of auxiliary-label position.
-        normalized_node_labels = [
-            _normalize_snapshot_labels(
+        # Validate every record and normalize every label array before issuing any
+        # writes. Hash verification intentionally uses the original representation
+        # so historical format-1.0 artifacts remain valid regardless of auxiliary-
+        # label position.
+        normalized_node_labels = []
+        for index, node in enumerate(snapshot["nodes"]):
+            labels = _normalize_snapshot_labels(
                 node["labels"], location=f"node[{index}].labels"
             )
-            for index, node in enumerate(snapshot["nodes"])
-        ]
+            _validate_snapshot_properties(
+                node["properties"],
+                location=f"node[{index}].properties",
+                core_label=labels[0],
+            )
+            normalized_node_labels.append(labels)
+
         normalized_edge_labels = []
         for index, edge in enumerate(snapshot["edges"]):
             # Validate relationship identifiers during the same preflight so a
@@ -1437,18 +1476,28 @@ class NativeEngine:
             _quote_cypher_identifier(
                 edge["type"], location=f"edge[{index}].type"
             )
-            normalized_edge_labels.append(
-                (
-                    _normalize_snapshot_labels(
-                        edge["source"]["labels"],
-                        location=f"edge[{index}].source.labels",
-                    ),
-                    _normalize_snapshot_labels(
-                        edge["target"]["labels"],
-                        location=f"edge[{index}].target.labels",
-                    ),
-                )
+            _validate_snapshot_properties(
+                edge["properties"], location=f"edge[{index}].properties"
             )
+            source_labels = _normalize_snapshot_labels(
+                edge["source"]["labels"],
+                location=f"edge[{index}].source.labels",
+            )
+            _validate_snapshot_properties(
+                edge["source"]["properties"],
+                location=f"edge[{index}].source.properties",
+                core_label=source_labels[0],
+            )
+            target_labels = _normalize_snapshot_labels(
+                edge["target"]["labels"],
+                location=f"edge[{index}].target.labels",
+            )
+            _validate_snapshot_properties(
+                edge["target"]["properties"],
+                location=f"edge[{index}].target.properties",
+                core_label=target_labels[0],
+            )
+            normalized_edge_labels.append((source_labels, target_labels))
 
         logger.info(
             "Importing snapshot: %d nodes, %d edges (code_space=%s)",
@@ -1489,16 +1538,10 @@ class NativeEngine:
         """
         # Determine primary key based on label
         label = labels[0]  # First label is the primary type
-        if label == "CodeRepo":
-            identity_keys = ("code_space",)
-        elif label == "CodeFile":
-            identity_keys = ("code_space", "path")
-        elif label == "CodeSymbol":
-            identity_keys = ("code_space", "fqn")
-        elif label == "CodeAnchor":
-            identity_keys = ("code_space", "repo", "fqn")
-        else:
-            raise ValueError(f"Unsupported snapshot core label: {label}")
+        try:
+            identity_keys = _SNAPSHOT_IDENTITY_KEYS[label]
+        except KeyError:
+            raise ValueError(f"Unsupported snapshot core label: {label}") from None
 
         identity = {key: props[key] for key in identity_keys}
         identity_pattern = ", ".join(

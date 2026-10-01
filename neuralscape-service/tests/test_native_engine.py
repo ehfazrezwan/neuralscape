@@ -76,6 +76,29 @@ def _valid_multilabel_snapshot():
     }
 
 
+_CORE_IDENTITY_FIELDS = [
+    ("CodeRepo", "code_space"),
+    ("CodeFile", "code_space"),
+    ("CodeFile", "path"),
+    ("CodeSymbol", "code_space"),
+    ("CodeSymbol", "fqn"),
+    ("CodeAnchor", "code_space"),
+    ("CodeAnchor", "repo"),
+    ("CodeAnchor", "fqn"),
+]
+
+
+def _core_identity_properties(core_label):
+    properties = {"code_space": "code--user--repo"}
+    if core_label == "CodeFile":
+        properties["path"] = "src/module.py"
+    elif core_label == "CodeSymbol":
+        properties["fqn"] = "mod.symbol"
+    elif core_label == "CodeAnchor":
+        properties.update({"repo": "repo", "fqn": "mod.symbol"})
+    return properties
+
+
 @pytest.fixture
 def mock_bridge():
     """Mock Graphiti bridge with a fake Neo4j driver."""
@@ -663,6 +686,14 @@ def test_import_snapshot_accepts_unsorted_version_one_artifact(
                 },
             },
             {
+                "labels": ["Tracked", "CodeFile"],
+                "properties": {
+                    "code_space": "code--user--repo",
+                    "path": "src/mod.py",
+                    "language": "python",
+                },
+            },
+            {
                 "labels": ["Indexed", "CodeSymbol"],
                 "properties": {
                     "code_space": "code--user--repo",
@@ -724,11 +755,17 @@ def test_import_snapshot_accepts_unsorted_version_one_artifact(
     with patch.object(engine, "_run_cypher_with_retry") as mock_retry:
         engine.import_snapshot(legacy_bytes)
 
-    assert mock_retry.call_count == 6
+    assert mock_retry.call_count == 7
     cypher = [str(call.args[0]) for call in mock_retry.call_args_list]
     assert any(
         "MERGE (n:`CodeRepo` {code_space: $identity.code_space})" in query
         and "SET n:`Managed`" in query
+        for query in cypher
+    )
+    assert any(
+        "MERGE (n:`CodeFile` {code_space: $identity.code_space, "
+        "path: $identity.path})" in query
+        and "SET n:`Tracked`" in query
         for query in cypher
     )
     assert any(
@@ -1177,6 +1214,99 @@ def test_import_snapshot_rejects_late_empty_identifiers_before_writes(
 
     with patch.object(engine, "_run_cypher_with_retry") as mock_retry:
         with pytest.raises(ValueError, match=message):
+            engine.import_snapshot(_snapshot_artifact(snapshot))
+
+    mock_retry.assert_not_called()
+
+
+@pytest.mark.parametrize("location", ["node", "source", "target"])
+@pytest.mark.parametrize(("core_label", "identity_key"), _CORE_IDENTITY_FIELDS)
+@pytest.mark.parametrize("malformation", ["missing", "null"])
+def test_import_snapshot_rejects_late_invalid_core_identity_before_writes(
+    mock_bridge,
+    mock_settings,
+    location,
+    core_label,
+    identity_key,
+    malformation,
+):
+    """Every required node or endpoint identity is checked before any merge."""
+    from unittest.mock import patch
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user--repo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+    snapshot = _valid_multilabel_snapshot()
+    properties = _core_identity_properties(core_label)
+    if malformation == "missing":
+        properties.pop(identity_key)
+        reason = rf"missing required identity key '{identity_key}'"
+    else:
+        properties[identity_key] = None
+        reason = rf"identity key '{identity_key}' must not be null"
+
+    if location == "node":
+        snapshot["nodes"].append(
+            {
+                "labels": ["Late record", core_label],
+                "properties": properties,
+            }
+        )
+        path = r"node\[1\]\.properties"
+    else:
+        invalid = copy.deepcopy(snapshot["edges"][0])
+        invalid[location] = {
+            "labels": ["Late endpoint", core_label],
+            "properties": properties,
+        }
+        snapshot["edges"].append(invalid)
+        path = rf"edge\[1\]\.{location}\.properties"
+
+    with patch.object(engine, "_run_cypher_with_retry") as mock_retry:
+        with pytest.raises(ValueError, match=rf"{path}: {reason}"):
+            engine.import_snapshot(_snapshot_artifact(snapshot))
+
+    mock_retry.assert_not_called()
+
+
+@pytest.mark.parametrize("location", ["node", "source", "target", "edge"])
+def test_import_snapshot_rejects_late_non_map_properties_before_writes(
+    mock_bridge,
+    mock_settings,
+    location,
+):
+    from unittest.mock import patch
+
+    engine = NativeEngine(
+        repo_path="/tmp/test",
+        code_space="code--user--repo",
+        bridge=mock_bridge,
+        settings=mock_settings,
+    )
+    snapshot = _valid_multilabel_snapshot()
+    if location == "node":
+        snapshot["nodes"].append(
+            {"labels": ["CodeFile"], "properties": ["not", "a", "map"]}
+        )
+        path = r"node\[1\]\.properties"
+    else:
+        invalid = copy.deepcopy(snapshot["edges"][0])
+        if location == "edge":
+            invalid["properties"] = ["not", "a", "map"]
+            path = r"edge\[1\]\.properties"
+        else:
+            invalid[location]["properties"] = ["not", "a", "map"]
+            path = rf"edge\[1\]\.{location}\.properties"
+        snapshot["edges"].append(invalid)
+
+    with patch.object(engine, "_run_cypher_with_retry") as mock_retry:
+        with pytest.raises(
+            ValueError,
+            match=rf"{path}: expected a property map",
+        ):
             engine.import_snapshot(_snapshot_artifact(snapshot))
 
     mock_retry.assert_not_called()
