@@ -1,7 +1,9 @@
 """Adversarial correction and aggregation tests for usage reconciliation."""
 
 import copy
+import gc
 import json
+import weakref
 from collections.abc import Callable, ItemsView, Iterator, KeysView, Mapping
 from itertools import permutations
 from types import MappingProxyType
@@ -723,6 +725,319 @@ def _python_validation_signature(
         (error["type"], error["loc"], error["msg"])
         for error in caught.value.errors(include_url=False)
     ]
+
+
+def test_public_mapping_entry_validator_accepts_ordinary_entries() -> None:
+    class LifetimeMarker:
+        pass
+
+    class LifetimePair:
+        def __init__(self, key: object, value: object) -> None:
+            self.key = key
+            self.value = value
+
+        def __iter__(self):
+            return iter((self.key, self.value))
+
+    first_key = LifetimeMarker()
+    first_value = LifetimeMarker()
+    second_key = LifetimeMarker()
+    second_value = LifetimeMarker()
+    first_pair = LifetimePair(first_key, first_value)
+    second_pair = LifetimePair(second_key, second_value)
+    entries = (pair for pair in (first_pair, second_pair))
+    lifetime_refs = tuple(
+        weakref.ref(item)
+        for item in (
+            entries,
+            first_pair,
+            first_key,
+            first_value,
+            second_pair,
+            second_key,
+            second_value,
+        )
+    )
+
+    validated = usage_reconcile_contracts._validate_public_mapping_entries(entries)
+
+    assert isinstance(
+        validated,
+        usage_reconcile_contracts._ValidatedPublicMappingEntries,
+    )
+    assert validated.entries is entries
+    assert validated.iterator is entries
+    assert validated.retained_keys == {first_key: None, second_key: None}
+    assert validated.retained_entries == (
+        (first_pair, first_key, first_value),
+        (second_pair, second_key, second_value),
+    )
+
+    del (
+        entries,
+        first_pair,
+        first_key,
+        first_value,
+        second_pair,
+        second_key,
+        second_value,
+    )
+    gc.collect()
+    assert all(reference() is not None for reference in lifetime_refs)
+
+    del validated
+    gc.collect()
+    assert all(reference() is None for reference in lifetime_refs)
+
+
+@pytest.mark.parametrize(
+    ("entries", "error_type", "error_message"),
+    [
+        (
+            [("only-item",)],
+            ValueError,
+            "not enough values to unpack (expected 2, got 1)",
+        ),
+        (
+            [["key", "value", "extra"]],
+            ValueError,
+            "too many values to unpack (expected 2)",
+        ),
+        (
+            [([], "value")],
+            TypeError,
+            "unhashable type: 'list'",
+        ),
+    ],
+)
+def test_public_mapping_entry_validator_translates_ordinary_invalid_entries(
+    entries: list[object],
+    error_type: type[Exception],
+    error_message: str,
+) -> None:
+    failed = usage_reconcile_contracts._validate_public_mapping_entries(entries)
+
+    assert isinstance(failed, usage_reconcile_contracts._FailedNativeDictTraversal)
+    assert isinstance(failed.error, error_type)
+    assert str(failed.error) == error_message
+
+
+def test_native_dict_snapshot_calls_public_entry_validator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {"field": "value"}
+    observed_entries: list[tuple[tuple[str, object], ...]] = []
+    validate_entries = usage_reconcile_contracts._validate_public_mapping_entries
+
+    def observe(entries: object):
+        captured = tuple(entries)
+        observed_entries.append(captured)
+        return validate_entries(captured)
+
+    monkeypatch.setattr(
+        usage_reconcile_contracts,
+        "_validate_public_mapping_entries",
+        observe,
+    )
+
+    assert usage_reconcile_contracts._native_snapshot(payload) == payload
+    assert observed_entries == [(("field", "value"),)]
+
+
+def test_native_dict_snapshot_retains_validation_owner_through_nested_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class LifetimeMarker:
+        pass
+
+    nested = {"leaf": "value"}
+    payload = {"nested": nested}
+    validate_entries = usage_reconcile_contracts._validate_public_mapping_entries
+    snapshot = usage_reconcile_contracts._native_snapshot
+    lifetime_refs: list[tuple[Callable[[], object | None], ...]] = []
+    observed_liveness: list[tuple[bool, ...]] = []
+    validation_calls = 0
+
+    def retain_synthetic_owner(entries: object):
+        nonlocal validation_calls
+        validation_calls += 1
+        validated = validate_entries(entries)
+        if validation_calls != 1:
+            return validated
+        assert isinstance(
+            validated,
+            usage_reconcile_contracts._ValidatedPublicMappingEntries,
+        )
+
+        first_pair = LifetimeMarker()
+        first_key = LifetimeMarker()
+        first_value = LifetimeMarker()
+        second_pair = LifetimeMarker()
+        second_key = LifetimeMarker()
+        second_value = LifetimeMarker()
+        iterator = (item for item in ())
+        lifetime_refs.append(
+            tuple(
+                weakref.ref(item)
+                for item in (
+                    iterator,
+                    first_pair,
+                    first_key,
+                    first_value,
+                    second_pair,
+                    second_key,
+                    second_value,
+                )
+            )
+        )
+        return usage_reconcile_contracts._ValidatedPublicMappingEntries(
+            entries=(first_pair, second_pair),
+            iterator=iterator,
+            retained_keys={first_key: None, second_key: None},
+            retained_entries=(
+                (first_pair, first_key, first_value),
+                (second_pair, second_key, second_value),
+            ),
+        )
+
+    def observe_nested_projection(value, *args, **kwargs):
+        if value is nested:
+            observed_liveness.append(
+                tuple(reference() is not None for reference in lifetime_refs[0])
+            )
+        return snapshot(value, *args, **kwargs)
+
+    monkeypatch.setattr(
+        usage_reconcile_contracts,
+        "_validate_public_mapping_entries",
+        retain_synthetic_owner,
+    )
+    monkeypatch.setattr(
+        usage_reconcile_contracts,
+        "_native_snapshot",
+        observe_nested_projection,
+    )
+
+    assert usage_reconcile_contracts._native_snapshot(payload) == payload
+    assert validation_calls == 2
+    assert observed_liveness == [(True, True, True, True, True, True, True)]
+
+    gc.collect()
+    assert all(reference() is None for reference in lifetime_refs[0])
+
+
+def test_native_dict_snapshot_propagates_public_entry_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {"field": "value"}
+    ledger = reconcile_usage_events([_event()]).ledgers[0]
+    ledger_payload = ledger.model_dump(mode="python")
+    failure = usage_reconcile_contracts._FailedNativeDictTraversal(
+        ValueError("public entry sentinel")
+    )
+    observed_entries: list[tuple[tuple[str, object], ...]] = []
+
+    def fail(entries: object):
+        observed_entries.append(tuple(entries))
+        return failure
+
+    monkeypatch.setattr(
+        usage_reconcile_contracts,
+        "_validate_public_mapping_entries",
+        fail,
+    )
+
+    assert usage_reconcile_contracts._native_snapshot(payload) is failure
+    assert observed_entries == [(("field", "value"),)]
+
+    observed_entries.clear()
+    assert _validation_signature(ReconciledLedger, ledger_payload) == [
+        (
+            "mapping_type",
+            (),
+            (
+                "Input should be a valid mapping, error: ValueError: "
+                "public entry sentinel"
+            ),
+        )
+    ]
+    assert observed_entries == [tuple(ledger_payload.items())]
+
+
+def test_reconciled_ledger_python_before_schema_is_present_and_invoked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schema = ReconciledLedger.__pydantic_core_schema__
+    assert schema["type"] == "json-or-python"
+    python_schema = schema["python_schema"]
+    assert python_schema["type"] == "function-before"
+    assert (
+        python_schema["function"]["function"]
+        is usage_reconcile_contracts._snapshot_python_input
+    )
+
+    ledger = reconcile_usage_events([_event()]).ledgers[0]
+    payload = ledger.model_dump(mode="python")
+    snapshot = usage_reconcile_contracts._native_snapshot
+    observed_inputs: list[object] = []
+    depth = 0
+
+    def observe(value, *args, **kwargs):
+        nonlocal depth
+        if depth == 0:
+            observed_inputs.append(value)
+        depth += 1
+        try:
+            return snapshot(value, *args, **kwargs)
+        finally:
+            depth -= 1
+
+    monkeypatch.setattr(usage_reconcile_contracts, "_native_snapshot", observe)
+
+    assert ReconciledLedger.model_validate(payload) == ledger
+    assert observed_inputs == [payload]
+
+    observed_inputs.clear()
+    assert ReconciledLedger.model_validate_json(ledger.model_dump_json()) == ledger
+    assert observed_inputs == []
+
+    invalid_payload = {**payload, "coverage": "future_coverage"}
+    assert _validation_signature(ReconciledLedger, invalid_payload) == [
+        (
+            "literal_error",
+            ("coverage",),
+            "Input should be 'reported' or 'unreported'",
+        )
+    ]
+    assert observed_inputs == [invalid_payload]
+
+
+def test_reconciled_ledger_validates_returned_python_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = reconcile_usage_events([_event()]).ledgers[0]
+    payload = ledger.model_dump(mode="python")
+    returned_snapshot = {**payload, "coverage": "future_coverage"}
+    observed_inputs: list[object] = []
+
+    def replace(value, *args, **kwargs):
+        observed_inputs.append(value)
+        return returned_snapshot
+
+    monkeypatch.setattr(usage_reconcile_contracts, "_native_snapshot", replace)
+
+    assert _validation_signature(ReconciledLedger, payload) == [
+        (
+            "literal_error",
+            ("coverage",),
+            "Input should be 'reported' or 'unreported'",
+        )
+    ]
+    assert observed_inputs == [payload]
+
+    observed_inputs.clear()
+    assert ReconciledLedger.model_validate_json(ledger.model_dump_json()) == ledger
+    assert observed_inputs == []
 
 
 def test_reconciles_three_ledgers_without_cross_ledger_relabelling() -> None:
@@ -2185,19 +2500,25 @@ def test_result_receivers_reject_unknown_from_unchecked_model_construction(
     ]
 
 
-@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+@pytest.mark.parametrize("receiver_name", ["stream", "ledger", "result"])
 def test_result_receivers_preserve_dict_and_json_validation_paths(
     receiver_name: str,
 ) -> None:
     result = reconcile_usage_events([_event()])
-    valid = result.streams[0] if receiver_name == "stream" else result
-    receiver = (
-        ReconciledUsageStream
-        if receiver_name == "stream"
-        else UsageReconciliation
-    )
+    if receiver_name == "stream":
+        valid = result.streams[0]
+        receiver = ReconciledUsageStream
+    elif receiver_name == "ledger":
+        valid = result.ledgers[0]
+        receiver = ReconciledLedger
+    else:
+        valid = result
+        receiver = UsageReconciliation
 
-    assert receiver.model_validate(valid.model_dump(mode="python")) == valid
+    payload = valid.model_dump(mode="python")
+    assert receiver.model_validate(payload) == valid
+    assert receiver.model_validate(MappingProxyType(payload)) == valid
+    assert receiver(**payload) == valid
     assert receiver.model_validate_json(valid.model_dump_json()) == valid
 
 

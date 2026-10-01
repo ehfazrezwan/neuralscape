@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, GetCoreSchemaHandler, model_validator
@@ -69,6 +70,49 @@ class _FailedNativeDictTraversal(dict[object, object]):
 
     def items(self):
         raise self.error
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidatedPublicMappingEntries:
+    entries: Iterable[object]
+    iterator: Iterator[object]
+    retained_keys: dict[object, None]
+    retained_entries: tuple[tuple[object, object, object], ...]
+
+
+def _validate_public_mapping_entries(
+    entries: Iterable[object],
+) -> _FailedNativeDictTraversal | _ValidatedPublicMappingEntries:
+    """Validate public mapping entry shape and key insertion only."""
+
+    try:
+        source_iterator = iter(entries)
+    except Exception as exc:
+        return _FailedNativeDictTraversal(exc)
+    public_entries: dict[object, None] = {}
+    retained_entries: list[tuple[object, object, object]] = []
+    while True:
+        try:
+            pair = next(source_iterator)
+        except StopIteration:
+            break
+        except Exception as exc:
+            return _FailedNativeDictTraversal(exc)
+        try:
+            key, public_value = pair
+        except Exception as exc:
+            return _FailedNativeDictTraversal(exc)
+        try:
+            public_entries[key] = None
+        except Exception as exc:
+            return _FailedNativeDictTraversal(exc)
+        retained_entries.append((pair, key, public_value))
+    return _ValidatedPublicMappingEntries(
+        entries=entries,
+        iterator=source_iterator,
+        retained_keys=public_entries,
+        retained_entries=tuple(retained_entries),
+    )
 
 
 class UsageReconciliationError(ValueError):
@@ -181,6 +225,21 @@ class ReconciledLedger(ContractModel):
     known_token_subtotal: SafeCounter
     total_tokens: SafeCounter | None
     incomplete_attempt_ids: tuple[OpaqueId, ...]
+
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls,
+        source_type: Any,
+        handler: GetCoreSchemaHandler,
+    ) -> core_schema.CoreSchema:
+        schema = handler(source_type)
+        return core_schema.json_or_python_schema(
+            json_schema=schema,
+            python_schema=core_schema.no_info_before_validator_function(
+                _snapshot_python_input,
+                schema,
+            ),
+        )
 
     @model_validator(mode="after")
     def validate_coverage(self) -> "ReconciledLedger":
@@ -494,9 +553,14 @@ def _native_snapshot(
                 # Preserve the public traversal callback, but retain the native
                 # dict edges captured before that callback could replace them.
                 try:
-                    tuple(value.items())
+                    public_items = value.items()
                 except Exception as exc:
                     return _FailedNativeDictTraversal(exc)
+                validated_entries = _validate_public_mapping_entries(public_items)
+                if isinstance(validated_entries, _FailedNativeDictTraversal):
+                    return validated_entries
+                # Keep the iterator, retained keys, and all entry components
+                # in caller scope until authoritative projection is complete.
                 source_items = frozen_dict[1]
             else:
                 try:
@@ -540,6 +604,7 @@ def _native_snapshot(
                     projected[key] = projected_value
                 except Exception as exc:
                     return _FailedNativeDictTraversal(exc)
+            del validated_entries
             return projected
         if isinstance(value, list):
             return [
