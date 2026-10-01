@@ -20,6 +20,8 @@ from contracts_usage import (
 
 
 _MAX_SAFE_COUNTER = 9_007_199_254_740_991
+_MODEL_DICT_DESCRIPTOR = BaseModel.__dict__["__dict__"]
+_MODEL_EXTRAS_DESCRIPTOR = BaseModel.__dict__["__pydantic_extra__"]
 _LEDGER_ORDER: tuple[UsageLedger, ...] = (
     "service",
     "consuming_agent",
@@ -254,10 +256,10 @@ def _native_snapshot(value: object, active: set[int] | None = None) -> object:
     active.add(identity)
     try:
         if isinstance(value, BaseModel):
-            stored_values = object.__getattribute__(value, "__dict__")
+            stored_values = _MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
             stored_items = tuple(dict.items(stored_values))
             try:
-                extras = object.__getattribute__(value, "__pydantic_extra__")
+                extras = _MODEL_EXTRAS_DESCRIPTOR.__get__(value, BaseModel)
             except AttributeError:
                 extras = None
             extra_items: tuple[tuple[object, object], ...] = ()

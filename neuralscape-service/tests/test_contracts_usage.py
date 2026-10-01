@@ -1,9 +1,60 @@
 """Field and state semantics for the candidate usage contract."""
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from contracts_usage import AttributionSnapshot, TokenQuantity, TokenUsage, UsageEvent
+from contracts_usage_reconcile import UsageReconciliationError, reconcile_usage_events
+
+
+_MODEL_DICT_DESCRIPTOR = BaseModel.__dict__["__dict__"]
+_MODEL_EXTRAS_DESCRIPTOR = BaseModel.__dict__["__pydantic_extra__"]
+
+
+class _DescriptorMaskedUsageEvent(UsageEvent):
+    @property
+    def __dict__(self):
+        native = _MODEL_DICT_DESCRIPTOR.__get__(self, BaseModel)
+        return {
+            name: value
+            for name, value in dict.items(native)
+            if name != "future_constraint"
+        }
+
+    @__dict__.setter
+    def __dict__(self, value):
+        _MODEL_DICT_DESCRIPTOR.__set__(self, value)
+
+    @property
+    def __pydantic_extra__(self):
+        return None
+
+    @__pydantic_extra__.setter
+    def __pydantic_extra__(self, value):
+        _MODEL_EXTRAS_DESCRIPTOR.__set__(self, value)
+
+
+class _DescriptorMaskedAttribution(AttributionSnapshot):
+    @property
+    def __dict__(self):
+        native = _MODEL_DICT_DESCRIPTOR.__get__(self, BaseModel)
+        return {
+            name: value
+            for name, value in dict.items(native)
+            if name != "future_constraint"
+        }
+
+    @__dict__.setter
+    def __dict__(self, value):
+        _MODEL_DICT_DESCRIPTOR.__set__(self, value)
+
+    @property
+    def __pydantic_extra__(self):
+        return None
+
+    @__pydantic_extra__.setter
+    def __pydantic_extra__(self, value):
+        _MODEL_EXTRAS_DESCRIPTOR.__set__(self, value)
 
 
 def _known(value: int) -> TokenQuantity:
@@ -170,3 +221,78 @@ def test_ledgers_are_closed_and_cannot_be_relabelled() -> None:
     assert _event(ledger="evaluation").ledger == "evaluation"
     with pytest.raises(ValidationError):
         _event(ledger="customer")
+
+
+def _reconciliation_error(event: UsageEvent) -> tuple[str, str]:
+    with pytest.raises(UsageReconciliationError) as caught:
+        reconcile_usage_events([event])
+    return caught.value.code, str(caught.value)
+
+
+@pytest.mark.parametrize("target_name", ["event", "attribution"])
+@pytest.mark.parametrize("storage_name", ["stored", "extras"])
+def test_reconciliation_rejects_property_hidden_model_storage_like_ordinary_input(
+    target_name: str,
+    storage_name: str,
+) -> None:
+    ordinary_event = _event()
+    if target_name == "event":
+        ordinary_target = ordinary_event
+        property_event: UsageEvent = _DescriptorMaskedUsageEvent.model_validate(
+            _event().model_dump(mode="python")
+        )
+        property_target = property_event
+    else:
+        ordinary_target = ordinary_event.attribution
+        property_target = _DescriptorMaskedAttribution.model_validate(
+            _attribution().model_dump(mode="python")
+        )
+        property_event = _event().model_copy(
+            update={"attribution": property_target}
+        )
+
+    if storage_name == "stored":
+        ordinary_backing = _MODEL_DICT_DESCRIPTOR.__get__(
+            ordinary_target, BaseModel
+        )
+        property_backing = _MODEL_DICT_DESCRIPTOR.__get__(
+            property_target, BaseModel
+        )
+        dict.__setitem__(ordinary_backing, "future_constraint", "deny")
+        dict.__setitem__(property_backing, "future_constraint", "deny")
+        assert "future_constraint" not in property_target.__dict__
+    else:
+        ordinary_backing = {"future_constraint": "deny"}
+        property_backing = {"future_constraint": "deny"}
+        _MODEL_EXTRAS_DESCRIPTOR.__set__(ordinary_target, ordinary_backing)
+        _MODEL_EXTRAS_DESCRIPTOR.__set__(property_target, property_backing)
+        assert property_target.__pydantic_extra__ is None
+
+    assert dict.__getitem__(ordinary_backing, "future_constraint") == "deny"
+    assert dict.__getitem__(property_backing, "future_constraint") == "deny"
+    expected = (
+        "invalid_event",
+        "invalid_event: an input event failed contract validation",
+    )
+    assert _reconciliation_error(ordinary_event) == expected
+    assert _reconciliation_error(property_event) == expected
+
+
+@pytest.mark.parametrize("target_name", ["event", "attribution"])
+def test_reconciliation_accepts_valid_property_storage_controls(
+    target_name: str,
+) -> None:
+    if target_name == "event":
+        event: UsageEvent = _DescriptorMaskedUsageEvent.model_validate(
+            _event().model_dump(mode="python")
+        )
+    else:
+        attribution = _DescriptorMaskedAttribution.model_validate(
+            _attribution().model_dump(mode="python")
+        )
+        event = _event().model_copy(update={"attribution": attribution})
+
+    result = reconcile_usage_events([event])
+
+    assert result.streams[0].head_event_id == "event-1"
+    assert result.streams[0].total_tokens == 130
