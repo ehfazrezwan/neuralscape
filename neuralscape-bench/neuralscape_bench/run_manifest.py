@@ -47,6 +47,7 @@ _FrozenModelStorage = tuple[
 class _FrozenGraph(NamedTuple):
     models: dict[int, _FrozenModelStorage]
     native_containers: dict[int, tuple[object, tuple[Any, ...]]]
+    replay_entries: dict[int, tuple[object, tuple[Any, ...]]]
 
 
 class _ManifestContract(BaseModel):
@@ -324,6 +325,10 @@ def _freeze_model_storage(
             continue
         visited.add(identity)
 
+        existing_replay = frozen_graph.replay_entries.get(identity)
+        if existing_replay is not None and existing_replay[0] is current:
+            continue
+
         if issubclass(value_type, BaseModel):
             existing_model = frozen_graph.models.get(identity)
             if existing_model is not None and existing_model[0] is current:
@@ -367,10 +372,15 @@ def _freeze_model_storage(
                     current,
                     dict_entries if value_type is dict else entries,
                 )
+        frozen_graph.replay_entries[identity] = (current, entries)
         pending.extend(reversed(entries))
 
 
-def _traverse_model_storage(value: Any, visited: set[int]) -> None:
+def _traverse_model_storage(
+    value: Any,
+    frozen_graph: _FrozenGraph,
+    visited: set[int],
+) -> None:
     """Retain historical native-recursion failures at validation order."""
 
     value_type = type(value)
@@ -383,23 +393,23 @@ def _traverse_model_storage(value: Any, visited: set[int]) -> None:
         return
     visited.add(identity)
 
-    if issubclass(value_type, BaseModel):
-        stored = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
-        entries = tuple(item for _name, item in dict.items(stored))
-    elif issubclass(value_type, tuple):
-        entries = tuple(tuple.__iter__(value))
-    elif issubclass(value_type, list):
-        entries = tuple(list.__iter__(value))
-    else:
-        entries = tuple(item for _key, item in dict.items(value))
+    frozen_replay = frozen_graph.replay_entries.get(identity)
+    if frozen_replay is None or frozen_replay[0] is not value:
+        _freeze_model_storage(value, frozen_graph, set())
+        frozen_replay = frozen_graph.replay_entries[identity]
+    _owner, entries = frozen_replay
     for item in entries:
-        _traverse_model_storage(item, visited)
+        _traverse_model_storage(item, frozen_graph, visited)
 
 
 def _freeze_model_graphs(*values: Any) -> _FrozenGraph:
     """Capture every supplied native graph in one shared inventory."""
 
-    frozen_graph = _FrozenGraph(models={}, native_containers={})
+    frozen_graph = _FrozenGraph(
+        models={},
+        native_containers={},
+        replay_entries={},
+    )
     visited: set[int] = set()
     for value in values:
         _freeze_model_storage(value, frozen_graph, visited)
@@ -424,7 +434,7 @@ def _snapshot_native(
 
     if _frozen_graph is None:
         _frozen_graph = _freeze_model_graphs(value)
-        _traverse_model_storage(value, set())
+        _traverse_model_storage(value, _frozen_graph, set())
     if active is None:
         active = set()
 
@@ -441,7 +451,7 @@ def _snapshot_native(
             frozen = _frozen_graph.models.get(identity)
             if frozen is None or frozen[0] is not value:
                 _freeze_model_storage(value, _frozen_graph, set())
-                _traverse_model_storage(value, set())
+                _traverse_model_storage(value, _frozen_graph, set())
                 frozen = _frozen_graph.models[identity]
             _model, stored_entries, extras, native_extra_entries = frozen
             stored_values = dict(stored_entries)
@@ -476,7 +486,7 @@ def _snapshot_native(
                 frozen_container = _frozen_graph.native_containers.get(identity)
                 if frozen_container is None or frozen_container[0] is not value:
                     _freeze_model_storage(value, _frozen_graph, set())
-                    _traverse_model_storage(value, set())
+                    _traverse_model_storage(value, _frozen_graph, set())
                     frozen_container = _frozen_graph.native_containers[identity]
                 mapping_items = frozen_container[1]
             else:
@@ -495,7 +505,7 @@ def _snapshot_native(
                 frozen_container = _frozen_graph.native_containers.get(identity)
                 if frozen_container is None or frozen_container[0] is not value:
                     _freeze_model_storage(value, _frozen_graph, set())
-                    _traverse_model_storage(value, set())
+                    _traverse_model_storage(value, _frozen_graph, set())
                     frozen_container = _frozen_graph.native_containers[identity]
                 tuple_items = frozen_container[1]
             else:
@@ -514,7 +524,7 @@ def _snapshot_native(
                 frozen_container = _frozen_graph.native_containers.get(identity)
                 if frozen_container is None or frozen_container[0] is not value:
                     _freeze_model_storage(value, _frozen_graph, set())
-                    _traverse_model_storage(value, set())
+                    _traverse_model_storage(value, _frozen_graph, set())
                     frozen_container = _frozen_graph.native_containers[identity]
                 list_items = frozen_container[1]
             else:
@@ -567,7 +577,7 @@ def finish_run(
         resources,
         measurements,
     )
-    _traverse_model_storage(planned, set())
+    _traverse_model_storage(planned, frozen_graph, set())
     validated_planned = _validated_manifest_snapshot(
         planned,
         _frozen_graph=frozen_graph,
@@ -575,36 +585,36 @@ def finish_run(
     if validated_planned.state is not RunState.PLANNED:
         raise ValueError("only a planned run can be finished")
 
-    _traverse_model_storage(validated_planned, set())
+    _traverse_model_storage(validated_planned, frozen_graph, set())
     candidate_data = _snapshot_native(
         validated_planned,
         _frozen_graph=frozen_graph,
     )
-    _traverse_model_storage(state, set())
+    _traverse_model_storage(state, frozen_graph, set())
     frozen_state = _snapshot_native(
         state,
         path="$.state",
         _frozen_graph=frozen_graph,
     )
-    _traverse_model_storage(started_at, set())
+    _traverse_model_storage(started_at, frozen_graph, set())
     frozen_started_at = _snapshot_native(
         started_at,
         path="$.started_at",
         _frozen_graph=frozen_graph,
     )
-    _traverse_model_storage(finished_at, set())
+    _traverse_model_storage(finished_at, frozen_graph, set())
     frozen_finished_at = _snapshot_native(
         finished_at,
         path="$.finished_at",
         _frozen_graph=frozen_graph,
     )
-    _traverse_model_storage(resources, set())
+    _traverse_model_storage(resources, frozen_graph, set())
     frozen_resources = _snapshot_native(
         resources,
         path="$.resources",
         _frozen_graph=frozen_graph,
     )
-    _traverse_model_storage(measurements, set())
+    _traverse_model_storage(measurements, frozen_graph, set())
     frozen_measurements = _snapshot_native(
         measurements,
         path="$.measurements",

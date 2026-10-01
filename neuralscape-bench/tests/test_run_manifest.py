@@ -35,7 +35,11 @@ from neuralscape_bench.run_manifest import (
     serialize_run_manifest,
     validate_run_manifest_json,
 )
-from neuralscape_bench.run_manifest import _snapshot_native
+from neuralscape_bench.run_manifest import (
+    _freeze_model_graphs,
+    _snapshot_native,
+    _traverse_model_storage,
+)
 
 
 VERSION = "candidate-v1"
@@ -634,6 +638,82 @@ def assert_received(boundary: str, manifest: RunManifest) -> None:
         RunState.PLANNED if boundary == "serialize" else RunState.COMPLETED
     )
     assert received.state is expected_state
+
+
+def test_replay_inventory_retains_first_entries_and_strong_owners():
+    class ReplayDict(dict[str, object]):
+        pass
+
+    class ReplayList(list[object]):
+        pass
+
+    class ReplayTuple(tuple[object, ...]):
+        pass
+
+    dict_child: dict[str, object] = {}
+    list_child: dict[str, object] = {}
+    tuple_child: dict[str, object] = {}
+    dict_parent = ReplayDict(child=dict_child)
+    list_parent = ReplayList((list_child,))
+    tuple_parent = ReplayTuple((tuple_child,))
+    manifest = planned_manifest()
+
+    frozen = _freeze_model_graphs(
+        manifest,
+        dict_parent,
+        list_parent,
+        tuple_parent,
+    )
+
+    assert frozen.replay_entries[id(manifest)][0] is manifest
+    assert manifest.build in frozen.replay_entries[id(manifest)][1]
+    assert frozen.replay_entries[id(dict_parent)] == (
+        dict_parent,
+        (dict_child,),
+    )
+    assert frozen.replay_entries[id(list_parent)] == (
+        list_parent,
+        (list_child,),
+    )
+    assert frozen.replay_entries[id(tuple_parent)] == (
+        tuple_parent,
+        (tuple_child,),
+    )
+
+    dict_parent.clear()
+    list_parent.clear()
+    visited: set[int] = set()
+    _traverse_model_storage(dict_parent, frozen, visited)
+    _traverse_model_storage(list_parent, frozen, visited)
+    _traverse_model_storage(tuple_parent, frozen, visited)
+    _traverse_model_storage(manifest, frozen, visited)
+
+    assert id(dict_child) in visited
+    assert id(list_child) in visited
+    assert id(tuple_child) in visited
+    assert id(manifest.build) in visited
+    assert frozen.replay_entries[id(dict_parent)][1] == (dict_child,)
+    assert frozen.replay_entries[id(list_parent)][1] == (list_child,)
+
+
+def test_replay_inventory_captures_a_genuinely_missing_supported_object_once():
+    class ReplayDict(dict[str, object]):
+        pass
+
+    frozen = _freeze_model_graphs(())
+    child: dict[str, object] = {}
+    value = ReplayDict(child=child)
+
+    first_visited: set[int] = set()
+    _traverse_model_storage(value, frozen, first_visited)
+    assert frozen.replay_entries[id(value)] == (value, (child,))
+    assert id(child) in first_visited
+
+    value.clear()
+    second_visited: set[int] = set()
+    _traverse_model_storage(value, frozen, second_visited)
+    assert frozen.replay_entries[id(value)] == (value, (child,))
+    assert id(child) in second_visited
 
 
 @pytest.mark.parametrize("boundary", ["serialize", "finish"])
