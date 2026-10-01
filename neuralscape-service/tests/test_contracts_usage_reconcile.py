@@ -731,12 +731,33 @@ def test_public_mapping_entry_validator_accepts_ordinary_entries() -> None:
     class LifetimeMarker:
         pass
 
-    key = LifetimeMarker()
-    value = LifetimeMarker()
-    pair = (key, value)
-    entries = iter((pair,))
-    key_ref = weakref.ref(key)
-    value_ref = weakref.ref(value)
+    class LifetimePair:
+        def __init__(self, key: object, value: object) -> None:
+            self.key = key
+            self.value = value
+
+        def __iter__(self):
+            return iter((self.key, self.value))
+
+    first_key = LifetimeMarker()
+    first_value = LifetimeMarker()
+    second_key = LifetimeMarker()
+    second_value = LifetimeMarker()
+    first_pair = LifetimePair(first_key, first_value)
+    second_pair = LifetimePair(second_key, second_value)
+    entries = (pair for pair in (first_pair, second_pair))
+    lifetime_refs = tuple(
+        weakref.ref(item)
+        for item in (
+            entries,
+            first_pair,
+            first_key,
+            first_value,
+            second_pair,
+            second_key,
+            second_value,
+        )
+    )
 
     validated = usage_reconcile_contracts._validate_public_mapping_entries(entries)
 
@@ -746,20 +767,27 @@ def test_public_mapping_entry_validator_accepts_ordinary_entries() -> None:
     )
     assert validated.entries is entries
     assert validated.iterator is entries
-    assert validated.retained_keys == {key: None}
-    assert validated.final_pair is pair
-    assert validated.final_key is key
-    assert validated.final_value is value
+    assert validated.retained_keys == {first_key: None, second_key: None}
+    assert validated.retained_entries == (
+        (first_pair, first_key, first_value),
+        (second_pair, second_key, second_value),
+    )
 
-    del entries, key, pair, value
+    del (
+        entries,
+        first_pair,
+        first_key,
+        first_value,
+        second_pair,
+        second_key,
+        second_value,
+    )
     gc.collect()
-    assert key_ref() is not None
-    assert value_ref() is not None
+    assert all(reference() is not None for reference in lifetime_refs)
 
     del validated
     gc.collect()
-    assert key_ref() is None
-    assert value_ref() is None
+    assert all(reference() is None for reference in lifetime_refs)
 
 
 @pytest.mark.parametrize(
@@ -841,20 +869,35 @@ def test_native_dict_snapshot_retains_validation_owner_through_nested_projection
             usage_reconcile_contracts._ValidatedPublicMappingEntries,
         )
 
-        key = LifetimeMarker()
-        value = LifetimeMarker()
-        pair = (key, value)
+        first_pair = LifetimeMarker()
+        first_key = LifetimeMarker()
+        first_value = LifetimeMarker()
+        second_pair = LifetimeMarker()
+        second_key = LifetimeMarker()
+        second_value = LifetimeMarker()
         iterator = (item for item in ())
         lifetime_refs.append(
-            (weakref.ref(iterator), weakref.ref(key), weakref.ref(value))
+            tuple(
+                weakref.ref(item)
+                for item in (
+                    iterator,
+                    first_pair,
+                    first_key,
+                    first_value,
+                    second_pair,
+                    second_key,
+                    second_value,
+                )
+            )
         )
         return usage_reconcile_contracts._ValidatedPublicMappingEntries(
-            entries=(pair,),
+            entries=(first_pair, second_pair),
             iterator=iterator,
-            retained_keys={key: None},
-            final_pair=pair,
-            final_key=key,
-            final_value=value,
+            retained_keys={first_key: None, second_key: None},
+            retained_entries=(
+                (first_pair, first_key, first_value),
+                (second_pair, second_key, second_value),
+            ),
         )
 
     def observe_nested_projection(value, *args, **kwargs):
@@ -877,7 +920,7 @@ def test_native_dict_snapshot_retains_validation_owner_through_nested_projection
 
     assert usage_reconcile_contracts._native_snapshot(payload) == payload
     assert validation_calls == 2
-    assert observed_liveness == [(True, True, True)]
+    assert observed_liveness == [(True, True, True, True, True, True, True)]
 
     gc.collect()
     assert all(reference() is None for reference in lifetime_refs[0])
