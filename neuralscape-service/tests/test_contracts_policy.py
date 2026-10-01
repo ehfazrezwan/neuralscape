@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import gc
 import json
+import weakref
+from collections.abc import Iterator, Mapping
 from copy import deepcopy
+from types import MappingProxyType
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from contracts_policy import (
     AccessPolicy,
@@ -17,11 +21,368 @@ from contracts_policy import (
     PolicyStatement,
     PrincipalContext,
 )
-from contracts_policy_reference import evaluate_policy, validate_policy_decision
+from contracts_policy_reference import (
+    _CapturedFailure,
+    _capture_model_inventory,
+    _complete_contract_input,
+    _freeze_mapping_entries,
+    _freeze_mapping_inventories,
+    _freeze_reachable_model_inventories,
+    evaluate_policy,
+    validate_policy_decision,
+)
 from contracts_references import ReferenceHandle
 
 
 VERSION = "candidate-v1"
+_BASE_MODEL_DICT_DESCRIPTOR = vars(BaseModel)["__dict__"]
+_BASE_MODEL_EXTRA_DESCRIPTOR = vars(BaseModel)["__pydantic_extra__"]
+_BASE_MODEL_FIELDS_SET_DESCRIPTOR = vars(BaseModel)["__pydantic_fields_set__"]
+
+
+class _HiddenBackingExtras(dict[str, object]):
+    """A native dict whose overridable public views conceal its backing."""
+
+    def __init__(self, entries: dict[str, object]) -> None:
+        super().__init__(entries)
+        self.view_calls = 0
+
+    def __bool__(self) -> bool:
+        self.view_calls += 1
+        return False
+
+    def __len__(self) -> int:
+        self.view_calls += 1
+        return 0
+
+    def __iter__(self) -> Iterator[str]:
+        self.view_calls += 1
+        return iter(())
+
+    def keys(self):
+        self.view_calls += 1
+        return {}.keys()
+
+    def items(self):
+        self.view_calls += 1
+        return {}.items()
+
+
+class _RaisingClassExtras(_HiddenBackingExtras):
+    """A native dict whose instance-level class view must not be consulted."""
+
+    @property
+    def __class__(self):
+        raise RuntimeError("instance __class__ consulted")
+
+
+class _InverseViewExtras(Mapping[str, object]):
+    """Expose names through iteration while keeping the items inventory empty."""
+
+    def __init__(self, entries: dict[str, object]) -> None:
+        self._entries = entries
+        self.iteration_calls = 0
+        self.items_calls = 0
+        self.getitem_calls = 0
+
+    def __getitem__(self, key: str) -> object:
+        self.getitem_calls += 1
+        return self._entries[key]
+
+    def __iter__(self) -> Iterator[str]:
+        self.iteration_calls += 1
+        return iter(self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def items(self):
+        self.items_calls += 1
+        return {}.items()
+
+
+class _DictSpoofingExtras(_InverseViewExtras):
+    """A non-dict mapping whose instance-level class view claims dict."""
+
+    @property
+    def __class__(self):
+        return dict
+
+
+class _ChangingItemsExtras(Mapping[str, object]):
+    """Reveal an unknown item only if a consumer requests a second inventory."""
+
+    def __init__(self) -> None:
+        self.items_calls = 0
+
+    def __getitem__(self, key: str) -> object:
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+    def items(self):
+        self.items_calls += 1
+        if self.items_calls == 1:
+            return {}.items()
+        return {"future_constraint": "deny"}.items()
+
+
+class _HiddenStoredViewDecision(PolicyDecision):
+    """Hide real stored state from instance-level ``__dict__`` access."""
+
+    def __getattribute__(self, name: str) -> object:
+        if name == "__dict__":
+            native = object.__getattribute__(self, "__dict__")
+            visible = dict(dict.items(native))
+            visible.pop("future_constraint", None)
+            if visible.get("action") == "future-action":
+                visible["action"] = "read"
+            return visible
+        return object.__getattribute__(self, name)
+
+
+class _HiddenExtraViewDecision(PolicyDecision):
+    """Hide real Pydantic extra storage from instance-level access."""
+
+    def __getattribute__(self, name: str) -> object:
+        if name == "__pydantic_extra__":
+            return {}
+        return object.__getattribute__(self, name)
+
+
+class _HiddenFieldsSetViewDecision(PolicyDecision):
+    """Hide real set-only state from instance-level fields-set access."""
+
+    def __getattribute__(self, name: str) -> object:
+        if name == "__pydantic_fields_set__":
+            return set(type(self).model_fields)
+        return object.__getattribute__(self, name)
+
+
+class _HiddenFieldsSetViewReference(ReferenceHandle):
+    """Nested contract hiding its real set-only state from instance access."""
+
+    def __getattribute__(self, name: str) -> object:
+        if name == "__pydantic_fields_set__":
+            return set(type(self).model_fields)
+        return object.__getattribute__(self, name)
+
+
+class _HiddenIterationFieldsSet(set[str]):
+    """A real set whose overridable views conceal its native backing."""
+
+    def __init__(self, values: set[str]) -> None:
+        set.__init__(self, values)
+        self.view_calls = 0
+
+    def __bool__(self) -> bool:
+        self.view_calls += 1
+        return False
+
+    def __len__(self) -> int:
+        self.view_calls += 1
+        return 0
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        self.view_calls += 1
+        return iter(())
+
+
+class _NestedRepairingFieldName(str):
+    """Repair a nested model if model-owned name hashing is dispatched."""
+
+    def __new__(
+        cls,
+        value: str,
+        target: BaseModel | None,
+    ) -> "_NestedRepairingFieldName":
+        instance = super().__new__(cls, value)
+        instance.target = target
+        instance.armed = False
+        instance.hash_calls = 0
+        instance.equality_calls = 0
+        return instance
+
+    def _repair_or_reject_callback(self) -> None:
+        if self.target is None:
+            raise AssertionError("benign model-owned name callback was invoked")
+        native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(self.target, BaseModel)
+        dict.__setitem__(native, "id", "memory-1")
+
+    def __hash__(self) -> int:
+        if self.armed:
+            self.hash_calls += 1
+            self._repair_or_reject_callback()
+        return str.__hash__(self)
+
+    def __eq__(self, other: object) -> bool:
+        if self.armed:
+            self.equality_calls += 1
+            self._repair_or_reject_callback()
+        return str.__eq__(self, other)
+
+    def __str__(self) -> str:
+        if self.armed:
+            raise AssertionError("model-owned name used subclass string hook")
+        return str.__str__(self)
+
+
+class _NestedRepairingClassView:
+    """Repair a nested model if instance-sensitive classification is used."""
+
+    def __init__(self, target: BaseModel) -> None:
+        self.target = target
+        self.class_calls = 0
+
+    @property
+    def __class__(self):  # type: ignore[override]
+        self.class_calls += 1
+        native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(self.target, BaseModel)
+        dict.__setitem__(native, "id", "memory-1")
+        return object
+
+
+class _RepairingFieldsIterable:
+    """Legacy fields-set iterable that can repair a referenced model."""
+
+    def __init__(
+        self,
+        names: tuple[str, ...],
+        target: BaseModel | None,
+    ) -> None:
+        self.names = names
+        self.target = target
+        self.iteration_calls = 0
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        self.iteration_calls += 1
+        if self.target is not None:
+            native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(self.target, BaseModel)
+            dict.__setitem__(native, "id", "memory-1")
+        return iter(self.names)
+
+
+class _LengthAwareFieldsIterable:
+    """Legacy fields-set iterable whose length view is not authoritative."""
+
+    def __init__(
+        self,
+        names: tuple[str, ...],
+        *,
+        raise_on_length: bool,
+    ) -> None:
+        self.names = names
+        self.raise_on_length = raise_on_length
+        self.iteration_calls = 0
+        self.length_calls = 0
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        self.iteration_calls += 1
+        return iter(self.names)
+
+    def __len__(self) -> int:
+        self.length_calls += 1
+        if self.raise_on_length:
+            raise RuntimeError("legacy fields-set length callback ran")
+        return len(self.names)
+
+
+class _RepairingEmptyExtras(Mapping[str, object]):
+    """Supported empty Mapping whose items authority can repair a model."""
+
+    def __init__(self, target: BaseModel | None) -> None:
+        self.target = target
+        self.items_calls = 0
+        self.iteration_calls = 0
+        self.getitem_calls = 0
+
+    def __getitem__(self, key: str) -> object:
+        self.getitem_calls += 1
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        self.iteration_calls += 1
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+    def items(self):  # type: ignore[no-untyped-def]
+        self.items_calls += 1
+        if self.target is not None:
+            native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(self.target, BaseModel)
+            dict.__setitem__(native, "id", "memory-1")
+        return {}.items()
+
+
+class _StoredDescriptorDecision(PolicyDecision):
+    @property
+    def __dict__(self):  # type: ignore[override]
+        native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(self, BaseModel)
+        visible = dict(dict.items(native))
+        visible.pop("future_constraint", None)
+        return visible
+
+    @__dict__.setter
+    def __dict__(self, value):  # type: ignore[no-untyped-def]
+        _BASE_MODEL_DICT_DESCRIPTOR.__set__(self, value)
+
+
+class _ExtraDescriptorDecision(PolicyDecision):
+    @property
+    def __pydantic_extra__(self):  # type: ignore[override]
+        return {}
+
+    @__pydantic_extra__.setter
+    def __pydantic_extra__(self, value):  # type: ignore[no-untyped-def]
+        _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(self, value)
+
+
+class _FieldsSetDescriptorDecision(PolicyDecision):
+    @property
+    def __pydantic_fields_set__(self):  # type: ignore[override]
+        return set(type(self).model_fields)
+
+    @__pydantic_fields_set__.setter
+    def __pydantic_fields_set__(self, value):  # type: ignore[no-untyped-def]
+        _BASE_MODEL_FIELDS_SET_DESCRIPTOR.__set__(self, value)
+
+
+class _StoredDescriptorReference(ReferenceHandle):
+    @property
+    def __dict__(self):  # type: ignore[override]
+        native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(self, BaseModel)
+        visible = dict(dict.items(native))
+        visible.pop("future_constraint", None)
+        return visible
+
+    @__dict__.setter
+    def __dict__(self, value):  # type: ignore[no-untyped-def]
+        _BASE_MODEL_DICT_DESCRIPTOR.__set__(self, value)
+
+
+class _ExtraDescriptorReference(ReferenceHandle):
+    @property
+    def __pydantic_extra__(self):  # type: ignore[override]
+        return {}
+
+    @__pydantic_extra__.setter
+    def __pydantic_extra__(self, value):  # type: ignore[no-untyped-def]
+        _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(self, value)
+
+
+class _FieldsSetDescriptorReference(ReferenceHandle):
+    @property
+    def __pydantic_fields_set__(self):  # type: ignore[override]
+        return set(type(self).model_fields)
+
+    @__pydantic_fields_set__.setter
+    def __pydantic_fields_set__(self, value):  # type: ignore[no-untyped-def]
+        _BASE_MODEL_FIELDS_SET_DESCRIPTOR.__set__(self, value)
 
 
 def reference(
@@ -728,7 +1089,7 @@ def test_evaluator_rejects_malformed_extra_storage(
         )
 
 
-@pytest.mark.parametrize("extra_storage", [None, {}])
+@pytest.mark.parametrize("extra_storage", [None, {}, MappingProxyType({})])
 def test_evaluator_accepts_valid_empty_extra_storage(
     extra_storage: object,
 ) -> None:
@@ -753,6 +1114,322 @@ def test_evaluator_accepts_valid_empty_extra_storage(
     )
 
     assert (decision.outcome, decision.reason_code) == ("allow", "explicit_grant")
+
+
+@pytest.mark.parametrize(
+    ("boundary", "location"),
+    [
+        ("evaluator", "direct"),
+        ("evaluator", "nested"),
+        ("receiving", "direct"),
+        ("receiving", "nested"),
+    ],
+)
+def test_policy_boundaries_reject_hidden_native_dict_unknown_extra(
+    boundary: str,
+    location: str,
+) -> None:
+    extras = _HiddenBackingExtras({"future_constraint": "deny"})
+
+    if boundary == "evaluator":
+        resource_value = reference("memory-1")
+        principal_value = principal()
+        evaluation_value = PolicyEvaluationInput(
+            schema_version=VERSION,
+            action="read",
+            resource=resource_value,
+        )
+        target = principal_value if location == "direct" else evaluation_value.resource
+        object.__setattr__(target, "__pydantic_extra__", extras)
+
+        with pytest.raises(ValidationError, match="future_constraint"):
+            evaluate_policy(
+                principal=principal_value,
+                evaluation=evaluation_value,
+                policy=policy(
+                    statement(
+                        "read-grant",
+                        "allow",
+                        "read",
+                        reference("memory-1"),
+                    ),
+                ),
+            )
+    else:
+        decision = PolicyDecision(**decision_payload())
+        target = decision if location == "direct" else decision.resource
+        object.__setattr__(target, "__pydantic_extra__", extras)
+
+        with pytest.raises(ValidationError, match="future_constraint"):
+            validate_policy_decision(decision)
+
+    assert extras.view_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("boundary", "location"),
+    [
+        ("evaluator", "direct"),
+        ("evaluator", "nested"),
+        ("receiving", "direct"),
+        ("receiving", "nested"),
+    ],
+)
+def test_policy_boundaries_use_concrete_type_for_native_dict_extra(
+    boundary: str,
+    location: str,
+) -> None:
+    extras = _RaisingClassExtras({"future_constraint": "deny"})
+
+    if boundary == "evaluator":
+        resource_value = reference("memory-1")
+        principal_value = principal()
+        evaluation_value = PolicyEvaluationInput(
+            schema_version=VERSION,
+            action="read",
+            resource=resource_value,
+        )
+        target = principal_value if location == "direct" else evaluation_value.resource
+        object.__setattr__(target, "__pydantic_extra__", extras)
+
+        with pytest.raises(ValidationError, match="future_constraint"):
+            evaluate_policy(
+                principal=principal_value,
+                evaluation=evaluation_value,
+                policy=policy(
+                    statement(
+                        "read-grant",
+                        "allow",
+                        "read",
+                        reference("memory-1"),
+                    ),
+                ),
+            )
+    else:
+        decision = PolicyDecision(**decision_payload())
+        target = decision if location == "direct" else decision.resource
+        object.__setattr__(target, "__pydantic_extra__", extras)
+
+        with pytest.raises(ValidationError, match="future_constraint"):
+            validate_policy_decision(decision)
+
+    assert extras.view_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("boundary", "location"),
+    [
+        ("evaluator", "direct"),
+        ("evaluator", "nested"),
+        ("receiving", "direct"),
+        ("receiving", "nested"),
+    ],
+)
+def test_policy_boundaries_do_not_trust_spoofed_dict_class(
+    boundary: str,
+    location: str,
+) -> None:
+    extras = _DictSpoofingExtras({"future_constraint": "deny"})
+
+    if boundary == "evaluator":
+        resource_value = reference("memory-1")
+        principal_value = principal()
+        evaluation_value = PolicyEvaluationInput(
+            schema_version=VERSION,
+            action="read",
+            resource=resource_value,
+        )
+        target = principal_value if location == "direct" else evaluation_value.resource
+        object.__setattr__(target, "__pydantic_extra__", extras)
+        received = evaluate_policy(
+            principal=principal_value,
+            evaluation=evaluation_value,
+            policy=policy(
+                statement(
+                    "read-grant",
+                    "allow",
+                    "read",
+                    reference("memory-1"),
+                ),
+            ),
+        )
+        assert (received.outcome, received.reason_code) == (
+            "allow",
+            "explicit_grant",
+        )
+    else:
+        decision = PolicyDecision(**decision_payload())
+        target = decision if location == "direct" else decision.resource
+        object.__setattr__(target, "__pydantic_extra__", extras)
+        received = validate_policy_decision(decision)
+        assert received.model_dump(mode="python") == decision_payload()
+
+    assert extras.items_calls == 1
+    assert extras.iteration_calls == 0
+    assert extras.getitem_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("boundary", "location", "field_name", "extra_value"),
+    [
+        ("evaluator", "direct", "subject_id", "shadow-subject"),
+        ("evaluator", "nested", "id", "shadow-memory"),
+        ("receiving", "direct", "action", "delete"),
+        ("receiving", "nested", "id", "shadow-memory"),
+    ],
+)
+def test_policy_boundaries_reject_hidden_native_dict_declared_overlap(
+    boundary: str,
+    location: str,
+    field_name: str,
+    extra_value: str,
+) -> None:
+    extras = _HiddenBackingExtras({field_name: extra_value})
+
+    if boundary == "evaluator":
+        resource_value = reference("memory-1")
+        principal_value = principal()
+        evaluation_value = PolicyEvaluationInput(
+            schema_version=VERSION,
+            action="read",
+            resource=resource_value,
+        )
+        target = principal_value if location == "direct" else evaluation_value.resource
+        object.__setattr__(target, "__pydantic_extra__", extras)
+
+        with pytest.raises(
+            ValueError,
+            match="contract input contains duplicate stored fields",
+        ):
+            evaluate_policy(
+                principal=principal_value,
+                evaluation=evaluation_value,
+                policy=policy(
+                    statement(
+                        "read-grant",
+                        "allow",
+                        "read",
+                        reference("memory-1"),
+                    ),
+                ),
+            )
+    else:
+        decision = PolicyDecision(**decision_payload())
+        target = decision if location == "direct" else decision.resource
+        object.__setattr__(target, "__pydantic_extra__", extras)
+
+        with pytest.raises(
+            ValueError,
+            match="contract input contains duplicate stored fields",
+        ):
+            validate_policy_decision(decision)
+
+    assert extras.view_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("boundary", "location"),
+    [
+        ("evaluator", "direct"),
+        ("evaluator", "nested"),
+        ("receiving", "direct"),
+        ("receiving", "nested"),
+    ],
+)
+def test_policy_boundaries_preserve_non_dict_inverse_items_authority(
+    boundary: str,
+    location: str,
+) -> None:
+    extras = _InverseViewExtras({"future_constraint": "deny"})
+
+    if boundary == "evaluator":
+        resource_value = reference("memory-1")
+        principal_value = principal()
+        evaluation_value = PolicyEvaluationInput(
+            schema_version=VERSION,
+            action="read",
+            resource=resource_value,
+        )
+        target = principal_value if location == "direct" else evaluation_value.resource
+        object.__setattr__(target, "__pydantic_extra__", extras)
+        received = evaluate_policy(
+            principal=principal_value,
+            evaluation=evaluation_value,
+            policy=policy(
+                statement(
+                    "read-grant",
+                    "allow",
+                    "read",
+                    reference("memory-1"),
+                ),
+            ),
+        )
+        assert (received.outcome, received.reason_code) == (
+            "allow",
+            "explicit_grant",
+        )
+    else:
+        decision = PolicyDecision(**decision_payload())
+        target = decision if location == "direct" else decision.resource
+        object.__setattr__(target, "__pydantic_extra__", extras)
+        received = validate_policy_decision(decision)
+        assert received.model_dump(mode="python") == decision_payload()
+
+    assert extras.items_calls == 1
+    assert extras.iteration_calls == 0
+    assert extras.getitem_calls == 0
+
+
+@pytest.mark.parametrize("boundary", ["evaluator", "receiving"])
+def test_policy_boundaries_capture_non_dict_items_inventory_once(
+    boundary: str,
+) -> None:
+    extras = _ChangingItemsExtras()
+
+    if boundary == "evaluator":
+        resource_value = reference("memory-1")
+        principal_value = principal()
+        object.__setattr__(principal_value, "__pydantic_extra__", extras)
+        received = evaluate(
+            principal_value,
+            "read",
+            resource_value,
+            policy(statement("read-grant", "allow", "read", resource_value)),
+        )
+        assert received.outcome == "allow"
+    else:
+        decision = PolicyDecision(**decision_payload())
+        object.__setattr__(decision, "__pydantic_extra__", extras)
+        received = validate_policy_decision(decision)
+        assert received.model_dump(mode="python") == decision_payload()
+
+    assert extras.items_calls == 1
+
+
+@pytest.mark.parametrize("boundary", ["evaluator", "receiving"])
+def test_policy_boundaries_accept_genuinely_empty_native_dict_subclass(
+    boundary: str,
+) -> None:
+    extras = _HiddenBackingExtras({})
+
+    if boundary == "evaluator":
+        resource_value = reference("memory-1")
+        principal_value = principal()
+        object.__setattr__(principal_value, "__pydantic_extra__", extras)
+        received = evaluate(
+            principal_value,
+            "read",
+            resource_value,
+            policy(statement("read-grant", "allow", "read", resource_value)),
+        )
+        assert received.outcome == "allow"
+    else:
+        decision = PolicyDecision(**decision_payload())
+        object.__setattr__(decision, "__pydantic_extra__", extras)
+        received = validate_policy_decision(decision)
+        assert received.model_dump(mode="python") == decision_payload()
+
+    assert extras.view_calls == 0
 
 
 @pytest.mark.parametrize(
@@ -1053,7 +1730,7 @@ def test_receiving_boundary_rejects_malformed_extra_storage(
         validate_policy_decision(decision)
 
 
-@pytest.mark.parametrize("extra_storage", [None, {}])
+@pytest.mark.parametrize("extra_storage", [None, {}, MappingProxyType({})])
 def test_receiving_boundary_accepts_valid_empty_extra_storage(
     extra_storage: object,
 ) -> None:
@@ -1100,6 +1777,755 @@ def test_receiving_boundary_retains_nonconflicting_unknown_extra_for_rejection()
 
     with pytest.raises(ValidationError, match="future_constraint"):
         validate_policy_decision(decision)
+
+
+@pytest.mark.parametrize(
+    "decision_type",
+    [PolicyDecision, _HiddenStoredViewDecision],
+    ids=["ordinary", "overridden-dict-view"],
+)
+def test_receiving_boundary_reads_native_stored_unknown_state(
+    decision_type: type[PolicyDecision],
+) -> None:
+    decision = decision_type(**decision_payload())
+    native_storage = object.__getattribute__(decision, "__dict__")
+    dict.__setitem__(native_storage, "future_constraint", "deny")
+
+    assert ("future_constraint", "deny") in tuple(dict.items(native_storage))
+    if decision_type is _HiddenStoredViewDecision:
+        assert "future_constraint" not in decision.__dict__
+
+    with pytest.raises(ValidationError, match="future_constraint"):
+        validate_policy_decision(decision)
+
+
+@pytest.mark.parametrize(
+    "decision_type",
+    [PolicyDecision, _HiddenStoredViewDecision],
+    ids=["ordinary", "overridden-dict-view"],
+)
+def test_receiving_boundary_reads_native_invalid_declared_state(
+    decision_type: type[PolicyDecision],
+) -> None:
+    decision = decision_type(**decision_payload())
+    native_storage = object.__getattribute__(decision, "__dict__")
+    dict.__setitem__(native_storage, "action", "future-action")
+
+    assert dict.__getitem__(native_storage, "action") == "future-action"
+    if decision_type is _HiddenStoredViewDecision:
+        assert decision.__dict__["action"] == "read"
+
+    with pytest.raises(
+        ValidationError,
+        match="allow decisions require a supported action",
+    ):
+        validate_policy_decision(decision)
+
+
+@pytest.mark.parametrize(
+    "decision_type",
+    [PolicyDecision, _HiddenExtraViewDecision],
+    ids=["ordinary", "overridden-extra-view"],
+)
+def test_receiving_boundary_reads_native_unknown_extra_storage(
+    decision_type: type[PolicyDecision],
+) -> None:
+    decision = decision_type(**decision_payload())
+    object.__setattr__(
+        decision,
+        "__pydantic_extra__",
+        {"future_constraint": "deny"},
+    )
+    native_extra = object.__getattribute__(decision, "__pydantic_extra__")
+
+    assert tuple(dict.items(native_extra)) == (("future_constraint", "deny"),)
+    if decision_type is _HiddenExtraViewDecision:
+        assert decision.__pydantic_extra__ == {}
+
+    with pytest.raises(ValidationError, match="future_constraint"):
+        validate_policy_decision(decision)
+
+
+@pytest.mark.parametrize("location", ["decision", "nested-reference"])
+@pytest.mark.parametrize(
+    "storage_kind",
+    ["ordinary", "model-override", "native-set-subclass"],
+)
+def test_receiving_boundary_reads_native_unknown_fields_set_storage(
+    location: str,
+    storage_kind: str,
+) -> None:
+    if location == "decision":
+        decision_type = (
+            _HiddenFieldsSetViewDecision
+            if storage_kind == "model-override"
+            else PolicyDecision
+        )
+        decision = decision_type(**decision_payload())
+        target: BaseModel = decision
+        expected_location = ("future_constraint",)
+    else:
+        decision = PolicyDecision(**decision_payload())
+        reference_type = (
+            _HiddenFieldsSetViewReference
+            if storage_kind == "model-override"
+            else ReferenceHandle
+        )
+        target = reference_type(**decision.resource.model_dump(mode="python"))
+        decision.__dict__["resource"] = target
+        expected_location = ("resource", "future_constraint")
+
+    native_fields_set = object.__getattribute__(
+        target,
+        "__pydantic_fields_set__",
+    )
+    if storage_kind == "native-set-subclass":
+        native_fields_set = _HiddenIterationFieldsSet(set(native_fields_set))
+        object.__setattr__(
+            target,
+            "__pydantic_fields_set__",
+            native_fields_set,
+        )
+    set.add(native_fields_set, "future_constraint")
+
+    assert "future_constraint" in tuple(set.__iter__(native_fields_set))
+    assert "future_constraint" not in object.__getattribute__(target, "__dict__")
+    assert object.__getattribute__(target, "__pydantic_extra__") is None
+    if storage_kind == "model-override":
+        assert "future_constraint" not in target.__pydantic_fields_set__
+
+    with pytest.raises(ValidationError) as raised:
+        validate_policy_decision(decision)
+
+    assert raised.value.errors()[0]["type"] == "extra_forbidden"
+    assert raised.value.errors()[0]["loc"] == expected_location
+    assert raised.value.errors()[0]["input"] is None
+    if storage_kind == "native-set-subclass":
+        assert native_fields_set.view_calls == 0
+
+
+def _nested_model_name_case(
+    boundary: str,
+    *,
+    invalid: bool,
+):  # type: ignore[no-untyped-def]
+    resource_value = reference("memory-1")
+    nested = (
+        resource_value.model_copy(update={"id": ""})
+        if invalid
+        else resource_value
+    )
+    if boundary == "evaluator":
+        candidate = PolicyEvaluationInput(
+            schema_version=VERSION,
+            action="read",
+            resource=resource_value,
+        ).model_copy(update={"resource": nested})
+        policy_value = policy(
+            statement("read-grant", "allow", "read", resource_value)
+        )
+
+        def invoke(value):  # type: ignore[no-untyped-def]
+            return evaluate_policy(
+                principal=principal(),
+                evaluation=value,
+                policy=policy_value,
+            )
+
+    else:
+        candidate = PolicyDecision(**decision_payload()).model_copy(
+            update={"resource": nested}
+        )
+
+        def invoke(value):  # type: ignore[no-untyped-def]
+            return validate_policy_decision(value)
+
+    return candidate, nested, invoke
+
+
+def _install_model_name_subclass(
+    model: BaseModel,
+    nested: BaseModel | None,
+    storage_name: str,
+) -> _NestedRepairingFieldName:
+    name = _NestedRepairingFieldName("resource", nested)
+    _replace_model_owned_name(model, name, storage_name)
+    name.armed = True
+    name.hash_calls = 0
+    name.equality_calls = 0
+    return name
+
+
+def _replace_model_owned_name(
+    model: BaseModel,
+    name: object,
+    storage_name: str,
+) -> None:
+    if storage_name == "stored":
+        storage = _BASE_MODEL_DICT_DESCRIPTOR.__get__(model, BaseModel)
+        item = dict.__getitem__(storage, "resource")
+        dict.__delitem__(storage, "resource")
+        dict.__setitem__(storage, name, item)
+    else:
+        fields_set = _BASE_MODEL_FIELDS_SET_DESCRIPTOR.__get__(model, BaseModel)
+        set.discard(fields_set, "resource")
+        set.add(fields_set, name)
+
+
+@pytest.mark.parametrize("boundary", ["evaluator", "receiving"])
+@pytest.mark.parametrize("storage_name", ["stored", "fields-set"])
+def test_policy_boundaries_snapshot_nested_models_before_name_hashing(
+    boundary: str,
+    storage_name: str,
+) -> None:
+    ordinary, ordinary_nested, ordinary_invoke = _nested_model_name_case(
+        boundary,
+        invalid=True,
+    )
+    with pytest.raises(ValidationError) as ordinary_error:
+        ordinary_invoke(ordinary)
+
+    attacked, attacked_nested, attacked_invoke = _nested_model_name_case(
+        boundary,
+        invalid=True,
+    )
+    hostile_name = _install_model_name_subclass(
+        attacked,
+        attacked_nested,
+        storage_name,
+    )
+    with pytest.raises(ValidationError) as attacked_error:
+        attacked_invoke(attacked)
+
+    ordinary_diagnostics = [
+        (error["loc"], error["type"])
+        for error in ordinary_error.value.errors()
+    ]
+    attacked_diagnostics = [
+        (error["loc"], error["type"])
+        for error in attacked_error.value.errors()
+    ]
+    assert attacked_diagnostics == ordinary_diagnostics
+    assert ordinary_nested.id == ""
+    assert attacked_nested.id == ""
+    assert hostile_name.hash_calls == 0
+    assert hostile_name.equality_calls == 0
+
+
+@pytest.mark.parametrize("boundary", ["evaluator", "receiving"])
+@pytest.mark.parametrize("storage_name", ["stored", "fields-set"])
+def test_policy_boundaries_accept_benign_string_subclass_model_names(
+    boundary: str,
+    storage_name: str,
+) -> None:
+    candidate, _, invoke = _nested_model_name_case(boundary, invalid=False)
+    benign_name = _install_model_name_subclass(candidate, None, storage_name)
+
+    result = invoke(candidate)
+
+    assert result.outcome == "allow"
+    assert benign_name.hash_calls == 0
+    assert benign_name.equality_calls == 0
+
+
+@pytest.mark.parametrize("boundary", ["evaluator", "receiving"])
+@pytest.mark.parametrize("storage_name", ["stored", "fields-set"])
+def test_policy_boundaries_classify_malformed_model_names_concretely(
+    boundary: str,
+    storage_name: str,
+) -> None:
+    ordinary, ordinary_nested, ordinary_invoke = _nested_model_name_case(
+        boundary,
+        invalid=True,
+    )
+    _replace_model_owned_name(ordinary, object(), storage_name)
+    with pytest.raises(ValueError) as ordinary_error:
+        ordinary_invoke(ordinary)
+
+    attacked, attacked_nested, attacked_invoke = _nested_model_name_case(
+        boundary,
+        invalid=True,
+    )
+    hostile_name = _NestedRepairingClassView(attacked_nested)
+    _replace_model_owned_name(attacked, hostile_name, storage_name)
+    with pytest.raises(ValueError) as attacked_error:
+        attacked_invoke(attacked)
+
+    assert str(attacked_error.value) == str(ordinary_error.value)
+    assert str(attacked_error.value) == (
+        "contract input model field names must be strings"
+    )
+    assert ordinary_nested.id == ""
+    assert attacked_nested.id == ""
+    assert hostile_name.class_calls == 0
+
+
+@pytest.mark.parametrize("boundary", ["evaluator", "receiving"])
+def test_policy_boundaries_classify_graph_values_concretely(
+    boundary: str,
+) -> None:
+    ordinary, ordinary_nested, ordinary_invoke = _nested_model_name_case(
+        boundary,
+        invalid=True,
+    )
+    ordinary_storage = _BASE_MODEL_DICT_DESCRIPTOR.__get__(ordinary, BaseModel)
+    dict.__setitem__(ordinary_storage, "action", object())
+    with pytest.raises(ValidationError) as ordinary_error:
+        ordinary_invoke(ordinary)
+
+    attacked, attacked_nested, attacked_invoke = _nested_model_name_case(
+        boundary,
+        invalid=True,
+    )
+    hostile_value = _NestedRepairingClassView(attacked_nested)
+    attacked_storage = _BASE_MODEL_DICT_DESCRIPTOR.__get__(attacked, BaseModel)
+    dict.__setitem__(attacked_storage, "action", hostile_value)
+    with pytest.raises(ValidationError) as attacked_error:
+        attacked_invoke(attacked)
+
+    ordinary_diagnostics = [
+        (error["loc"], error["type"])
+        for error in ordinary_error.value.errors()
+    ]
+    attacked_diagnostics = [
+        (error["loc"], error["type"])
+        for error in attacked_error.value.errors()
+    ]
+    assert attacked_diagnostics == ordinary_diagnostics
+    assert ordinary_diagnostics == [
+        (("action",), "string_type"),
+        (("resource", "id"), "string_too_short"),
+    ]
+    assert ordinary_nested.id == ""
+    assert attacked_nested.id == ""
+    assert hostile_value.class_calls == 0
+
+
+def _install_repairing_protocol(
+    model: BaseModel,
+    target: BaseModel | None,
+    protocol: str,
+) -> _RepairingFieldsIterable | _RepairingEmptyExtras:
+    if protocol == "fields-iterable":
+        hook = _RepairingFieldsIterable(tuple(type(model).model_fields), target)
+        _BASE_MODEL_FIELDS_SET_DESCRIPTOR.__set__(model, hook)
+        assert _BASE_MODEL_FIELDS_SET_DESCRIPTOR.__get__(model, BaseModel) is hook
+        return hook
+    hook = _RepairingEmptyExtras(target)
+    _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(model, hook)
+    assert _BASE_MODEL_EXTRA_DESCRIPTOR.__get__(model, BaseModel) is hook
+    return hook
+
+
+def _assert_protocol_called_once(
+    hook: _RepairingFieldsIterable | _RepairingEmptyExtras,
+) -> None:
+    if type(hook) is _RepairingFieldsIterable:
+        assert hook.iteration_calls == 1
+        return
+    assert hook.items_calls == 1
+    assert hook.iteration_calls == 0
+    assert hook.getitem_calls == 0
+
+
+def test_model_inventory_retains_owner_only_for_cache_lifetime() -> None:
+    candidate = reference("memory-1")
+    candidate_reference = weakref.ref(candidate)
+    candidate_id = id(candidate)
+    inventories = {
+        candidate_id: _capture_model_inventory(candidate),
+    }
+
+    del candidate
+    gc.collect()
+    assert candidate_reference() is inventories[candidate_id].owner
+
+    inventories.clear()
+    gc.collect()
+    assert candidate_reference() is None
+
+
+@pytest.mark.parametrize("consumer", ["freeze", "completion"])
+@pytest.mark.parametrize("owner_matches", [False, True])
+def test_model_inventory_consumers_require_exact_owner_identity(
+    consumer: str,
+    owner_matches: bool,
+) -> None:
+    candidate = reference("memory-1")
+    owner = candidate if owner_matches else reference("memory-2")
+    inventories = {
+        id(candidate): _capture_model_inventory(owner),
+    }
+
+    if not owner_matches:
+        with pytest.raises(
+            ValueError,
+            match="contract input model inventory owner mismatch",
+        ):
+            if consumer == "freeze":
+                _freeze_reachable_model_inventories(
+                    candidate,
+                    inventories,
+                    set(),
+                )
+            else:
+                _complete_contract_input(candidate, set(), inventories)
+        return
+
+    if consumer == "freeze":
+        assert (
+            _freeze_reachable_model_inventories(
+                candidate,
+                inventories,
+                set(),
+            )
+            is None
+        )
+    else:
+        completed = _complete_contract_input(candidate, set(), inventories)
+        assert isinstance(completed, dict)
+        assert completed["id"] == "memory-1"
+
+
+def test_mapping_inventory_retains_owner_entries_and_exposed_models() -> None:
+    original = reference("memory-1")
+    backing = {"resource": original}
+    candidate = MappingProxyType(backing)
+    model_inventories = {}
+    mapping_owners = {}
+    mapping_inventories = {}
+    visited_containers: set[int] = set()
+
+    _freeze_reachable_model_inventories(
+        candidate,
+        model_inventories,
+        visited_containers,
+        mapping_owners,
+    )
+    assert mapping_owners[id(candidate)] is candidate
+
+    _freeze_mapping_inventories(
+        mapping_owners,
+        mapping_inventories,
+        model_inventories,
+        visited_containers,
+    )
+    retained = mapping_inventories[id(candidate)]
+    assert retained.owner is candidate
+    assert id(original) in model_inventories
+
+    backing["resource"] = reference("memory-2")
+    completed = _complete_contract_input(
+        candidate,
+        set(),
+        model_inventories,
+        mapping_inventories,
+    )
+
+    assert completed == {
+        "resource": original.model_dump(mode="python"),
+    }
+
+
+def test_model_extra_mapping_reuses_inventory_after_direct_edit() -> None:
+    backing: dict[str, object] = {}
+    extras = MappingProxyType(backing)
+    candidate = PolicyDecision(**decision_payload())
+    object.__setattr__(candidate, "__pydantic_extra__", extras)
+    model_inventories = {}
+    mapping_owners = {}
+    mapping_inventories = {}
+    visited_containers: set[int] = set()
+
+    _freeze_reachable_model_inventories(
+        candidate,
+        model_inventories,
+        visited_containers,
+        mapping_owners,
+    )
+    _freeze_mapping_inventories(
+        mapping_owners,
+        mapping_inventories,
+        model_inventories,
+        visited_containers,
+    )
+    assert mapping_inventories[id(extras)].owner is extras
+
+    backing["future_constraint"] = "deny"
+    completed = _complete_contract_input(
+        candidate,
+        set(),
+        model_inventories,
+        mapping_inventories,
+    )
+
+    assert PolicyDecision.model_validate(completed).model_dump(mode="python") == (
+        decision_payload()
+    )
+
+
+def test_mapping_inventory_consumer_requires_exact_owner_identity() -> None:
+    candidate = MappingProxyType({"resource": reference("memory-1")})
+    other = MappingProxyType({"resource": reference("memory-2")})
+    other_owners = {id(other): other}
+    mapping_inventories = {}
+    _freeze_mapping_inventories(other_owners, mapping_inventories, {}, set())
+    mismatched_inventories = {
+        id(candidate): mapping_inventories[id(other)],
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="contract input mapping inventory owner mismatch",
+    ):
+        _complete_contract_input(
+            candidate,
+            set(),
+            {},
+            mismatched_inventories,
+        )
+
+
+def test_mapping_entries_stop_at_first_terminal_pair_failure() -> None:
+    retained = reference("memory-1")
+    unreachable = reference("memory-2")
+    model_inventories = {}
+
+    entries = _freeze_mapping_entries(
+        (
+            ("resource", retained),
+            ("terminal",),
+            ("unreachable", unreachable),
+        ),
+        {},
+        model_inventories,
+        set(),
+    )
+
+    assert entries[0] == ("resource", retained)
+    assert type(entries[1]) is _CapturedFailure
+    assert isinstance(entries[1].error, ValueError)
+    assert len(entries) == 2
+    assert id(retained) in model_inventories
+    assert id(unreachable) not in model_inventories
+
+
+@pytest.mark.parametrize("boundary", ["evaluator", "receiving"])
+@pytest.mark.parametrize("raise_on_length", [False, True])
+def test_legacy_fields_set_fallback_uses_iteration_without_length_hint(
+    boundary: str,
+    raise_on_length: bool,
+) -> None:
+    candidate, _, invoke = _nested_model_name_case(boundary, invalid=False)
+    fields = _LengthAwareFieldsIterable(
+        tuple(type(candidate).model_fields),
+        raise_on_length=raise_on_length,
+    )
+    _BASE_MODEL_FIELDS_SET_DESCRIPTOR.__set__(candidate, fields)
+
+    result = invoke(candidate)
+
+    assert result.outcome == "allow"
+    assert fields.iteration_calls == 1
+    assert fields.length_calls == 0
+
+
+@pytest.mark.parametrize("boundary", ["evaluator", "receiving"])
+@pytest.mark.parametrize("protocol", ["fields-iterable", "extra-mapping"])
+@pytest.mark.parametrize("location", ["root", "nested"])
+def test_policy_boundaries_freeze_models_before_supported_callbacks(
+    boundary: str,
+    protocol: str,
+    location: str,
+) -> None:
+    ordinary, ordinary_nested, ordinary_invoke = _nested_model_name_case(
+        boundary,
+        invalid=True,
+    )
+    with pytest.raises(ValidationError) as ordinary_error:
+        ordinary_invoke(ordinary)
+
+    attacked, attacked_nested, attacked_invoke = _nested_model_name_case(
+        boundary,
+        invalid=True,
+    )
+    callback_owner = attacked if location == "root" else attacked_nested
+    hook = _install_repairing_protocol(
+        callback_owner,
+        attacked_nested,
+        protocol,
+    )
+    native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(attacked_nested, BaseModel)
+    assert dict.__getitem__(native, "id") == ""
+
+    with pytest.raises(ValidationError) as attacked_error:
+        attacked_invoke(attacked)
+
+    ordinary_diagnostics = [
+        (error["loc"], error["type"])
+        for error in ordinary_error.value.errors()
+    ]
+    attacked_diagnostics = [
+        (error["loc"], error["type"])
+        for error in attacked_error.value.errors()
+    ]
+    assert attacked_diagnostics == ordinary_diagnostics
+    assert ordinary_nested.id == ""
+    assert dict.__getitem__(native, "id") == "memory-1"
+    _assert_protocol_called_once(hook)
+
+
+@pytest.mark.parametrize("boundary", ["evaluator", "receiving"])
+@pytest.mark.parametrize("protocol", ["fields-iterable", "extra-mapping"])
+@pytest.mark.parametrize("location", ["root", "nested"])
+def test_policy_boundaries_preserve_valid_supported_callback_controls(
+    boundary: str,
+    protocol: str,
+    location: str,
+) -> None:
+    candidate, nested, invoke = _nested_model_name_case(boundary, invalid=False)
+    callback_owner = candidate if location == "root" else nested
+    hook = _install_repairing_protocol(callback_owner, nested, protocol)
+
+    result = invoke(candidate)
+
+    assert result.outcome == "allow"
+    assert result.resource.id == "memory-1"
+    assert nested.id == "memory-1"
+    _assert_protocol_called_once(hook)
+
+
+@pytest.mark.parametrize("protocol", ["fields-iterable", "extra-mapping"])
+def test_evaluator_freezes_all_input_graphs_before_supported_callbacks(
+    protocol: str,
+) -> None:
+    evaluation, nested, _ = _nested_model_name_case("evaluator", invalid=True)
+    principal_value = principal()
+    hook = _install_repairing_protocol(principal_value, nested, protocol)
+    native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(nested, BaseModel)
+    assert dict.__getitem__(native, "id") == ""
+
+    with pytest.raises(ValidationError) as raised:
+        evaluate_policy(
+            principal=principal_value,
+            evaluation=evaluation,
+            policy=policy(
+                statement("read-grant", "allow", "read", reference("memory-1"))
+            ),
+        )
+
+    assert raised.value.errors()[0]["loc"] == ("resource", "id")
+    assert raised.value.errors()[0]["type"] == "string_too_short"
+    assert dict.__getitem__(native, "id") == "memory-1"
+    _assert_protocol_called_once(hook)
+
+
+def test_prefreeze_preserves_overlap_before_nested_storage_failure() -> None:
+    nested = reference("memory-1")
+    _BASE_MODEL_FIELDS_SET_DESCRIPTOR.__delete__(nested)
+    decision = PolicyDecision(**decision_payload()).model_copy(
+        update={"resource": nested}
+    )
+    _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(decision, {"action": "delete"})
+
+    with pytest.raises(
+        ValueError,
+        match="contract input contains duplicate stored fields",
+    ):
+        validate_policy_decision(decision)
+
+
+@pytest.mark.parametrize("location", ["decision", "nested-reference"])
+@pytest.mark.parametrize("storage_name", ["stored", "extra", "fields-set"])
+def test_receiving_boundary_bypasses_subclass_storage_descriptors(
+    location: str,
+    storage_name: str,
+) -> None:
+    decision_types = {
+        "stored": _StoredDescriptorDecision,
+        "extra": _ExtraDescriptorDecision,
+        "fields-set": _FieldsSetDescriptorDecision,
+    }
+    reference_types = {
+        "stored": _StoredDescriptorReference,
+        "extra": _ExtraDescriptorReference,
+        "fields-set": _FieldsSetDescriptorReference,
+    }
+    if location == "decision":
+        decision = decision_types[storage_name](**decision_payload())
+        target: BaseModel = decision
+        expected_location = ("future_constraint",)
+    else:
+        decision = PolicyDecision(**decision_payload())
+        target = reference_types[storage_name](
+            **decision.resource.model_dump(mode="python")
+        )
+        decision.__dict__["resource"] = target
+        expected_location = ("resource", "future_constraint")
+
+    normal = validate_policy_decision(decision)
+    assert normal.action == "read"
+
+    if storage_name == "stored":
+        native_storage = _BASE_MODEL_DICT_DESCRIPTOR.__get__(target, BaseModel)
+        dict.__setitem__(native_storage, "future_constraint", "deny")
+        assert ("future_constraint", "deny") in tuple(
+            dict.items(native_storage)
+        )
+        assert "future_constraint" not in target.__dict__
+        expected_input: object = "deny"
+    elif storage_name == "extra":
+        _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(
+            target,
+            {"future_constraint": "deny"},
+        )
+        native_storage = _BASE_MODEL_EXTRA_DESCRIPTOR.__get__(target, BaseModel)
+        assert tuple(dict.items(native_storage)) == (
+            ("future_constraint", "deny"),
+        )
+        assert target.__pydantic_extra__ == {}
+        expected_input = "deny"
+    else:
+        native_storage = _BASE_MODEL_FIELDS_SET_DESCRIPTOR.__get__(
+            target,
+            BaseModel,
+        )
+        set.add(native_storage, "future_constraint")
+        assert "future_constraint" in tuple(set.__iter__(native_storage))
+        assert "future_constraint" not in target.__pydantic_fields_set__
+        expected_input = None
+
+    with pytest.raises(ValidationError) as raised:
+        validate_policy_decision(decision)
+
+    assert raised.value.errors()[0]["type"] == "extra_forbidden"
+    assert raised.value.errors()[0]["loc"] == expected_location
+    assert raised.value.errors()[0]["input"] == expected_input
+
+
+@pytest.mark.parametrize("location", ["decision", "nested-reference"])
+def test_receiving_boundary_descriptor_snapshot_preserves_missing_subclass_default(
+    location: str,
+) -> None:
+    if location == "decision":
+        class DefaultedDecision(_StoredDescriptorDecision):
+            audit_marker: str = "default-marker"
+
+        decision = DefaultedDecision(**decision_payload())
+        native_storage = _BASE_MODEL_DICT_DESCRIPTOR.__get__(decision, BaseModel)
+    else:
+        class DefaultedReference(_StoredDescriptorReference):
+            audit_marker: str = "default-marker"
+
+        decision = PolicyDecision(**decision_payload())
+        target = DefaultedReference(**decision.resource.model_dump(mode="python"))
+        decision.__dict__["resource"] = target
+        native_storage = _BASE_MODEL_DICT_DESCRIPTOR.__get__(target, BaseModel)
+    dict.pop(native_storage, "audit_marker", None)
+
+    received = validate_policy_decision(decision)
+
+    assert received.action == "read"
 
 
 @pytest.mark.parametrize("extra_action", ["read", "delete"])
