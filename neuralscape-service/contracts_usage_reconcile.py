@@ -71,6 +71,34 @@ class _FailedNativeDictTraversal(dict[object, object]):
         raise self.error
 
 
+def _validate_public_mapping_entries(
+    entries: Iterable[object],
+) -> _FailedNativeDictTraversal | None:
+    """Validate public mapping entry shape and key insertion only."""
+
+    try:
+        source_iterator = iter(entries)
+    except Exception as exc:
+        return _FailedNativeDictTraversal(exc)
+    public_entries: dict[object, None] = {}
+    while True:
+        try:
+            pair = next(source_iterator)
+        except StopIteration:
+            break
+        except Exception as exc:
+            return _FailedNativeDictTraversal(exc)
+        try:
+            key, _public_value = pair
+        except Exception as exc:
+            return _FailedNativeDictTraversal(exc)
+        try:
+            public_entries[key] = None
+        except Exception as exc:
+            return _FailedNativeDictTraversal(exc)
+    return None
+
+
 class UsageReconciliationError(ValueError):
     """A deterministic validation failure in a supplied event set."""
 
@@ -509,25 +537,12 @@ def _native_snapshot(
                 # Preserve the public traversal callback, but retain the native
                 # dict edges captured before that callback could replace them.
                 try:
-                    source_iterator = iter(value.items())
+                    public_items = value.items()
                 except Exception as exc:
                     return _FailedNativeDictTraversal(exc)
-                public_entries: dict[object, None] = {}
-                while True:
-                    try:
-                        pair = next(source_iterator)
-                    except StopIteration:
-                        break
-                    except Exception as exc:
-                        return _FailedNativeDictTraversal(exc)
-                    try:
-                        key, _public_value = pair
-                    except Exception as exc:
-                        return _FailedNativeDictTraversal(exc)
-                    try:
-                        public_entries[key] = None
-                    except Exception as exc:
-                        return _FailedNativeDictTraversal(exc)
+                failed_traversal = _validate_public_mapping_entries(public_items)
+                if failed_traversal is not None:
+                    return failed_traversal
                 source_items = frozen_dict[1]
             else:
                 try:

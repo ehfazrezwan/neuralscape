@@ -725,6 +725,114 @@ def _python_validation_signature(
     ]
 
 
+def test_public_mapping_entry_validator_accepts_ordinary_entries() -> None:
+    entries = (("first", object()), ["second", object()])
+
+    assert usage_reconcile_contracts._validate_public_mapping_entries(entries) is None
+
+
+@pytest.mark.parametrize(
+    ("entries", "error_type", "error_message"),
+    [
+        (
+            [("only-item",)],
+            ValueError,
+            "not enough values to unpack (expected 2, got 1)",
+        ),
+        (
+            [["key", "value", "extra"]],
+            ValueError,
+            "too many values to unpack (expected 2)",
+        ),
+        (
+            [([], "value")],
+            TypeError,
+            "unhashable type: 'list'",
+        ),
+    ],
+)
+def test_public_mapping_entry_validator_translates_ordinary_invalid_entries(
+    entries: list[object],
+    error_type: type[Exception],
+    error_message: str,
+) -> None:
+    failed = usage_reconcile_contracts._validate_public_mapping_entries(entries)
+
+    assert isinstance(failed, usage_reconcile_contracts._FailedNativeDictTraversal)
+    assert isinstance(failed.error, error_type)
+    assert str(failed.error) == error_message
+
+
+def test_native_dict_snapshot_calls_public_entry_validator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {"field": "value"}
+    observed_entries: list[tuple[tuple[str, object], ...]] = []
+    validate_entries = usage_reconcile_contracts._validate_public_mapping_entries
+
+    def observe(entries: object):
+        captured = tuple(entries)
+        observed_entries.append(captured)
+        return validate_entries(captured)
+
+    monkeypatch.setattr(
+        usage_reconcile_contracts,
+        "_validate_public_mapping_entries",
+        observe,
+    )
+
+    assert usage_reconcile_contracts._native_snapshot(payload) == payload
+    assert observed_entries == [(("field", "value"),)]
+
+
+def test_reconciled_ledger_python_before_schema_is_present_and_invoked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schema = ReconciledLedger.__pydantic_core_schema__
+    assert schema["type"] == "json-or-python"
+    python_schema = schema["python_schema"]
+    assert python_schema["type"] == "function-before"
+    assert (
+        python_schema["function"]["function"]
+        is usage_reconcile_contracts._snapshot_python_input
+    )
+
+    ledger = reconcile_usage_events([_event()]).ledgers[0]
+    payload = ledger.model_dump(mode="python")
+    snapshot = usage_reconcile_contracts._native_snapshot
+    observed_inputs: list[object] = []
+    depth = 0
+
+    def observe(value, *args, **kwargs):
+        nonlocal depth
+        if depth == 0:
+            observed_inputs.append(value)
+        depth += 1
+        try:
+            return snapshot(value, *args, **kwargs)
+        finally:
+            depth -= 1
+
+    monkeypatch.setattr(usage_reconcile_contracts, "_native_snapshot", observe)
+
+    assert ReconciledLedger.model_validate(payload) == ledger
+    assert observed_inputs == [payload]
+
+    observed_inputs.clear()
+    assert ReconciledLedger.model_validate_json(ledger.model_dump_json()) == ledger
+    assert observed_inputs == []
+
+    invalid_payload = {**payload, "coverage": "future_coverage"}
+    assert _validation_signature(ReconciledLedger, invalid_payload) == [
+        (
+            "literal_error",
+            ("coverage",),
+            "Input should be 'reported' or 'unreported'",
+        )
+    ]
+    assert observed_inputs == [invalid_payload]
+
+
 def test_reconciles_three_ledgers_without_cross_ledger_relabelling() -> None:
     service = _event()
     agent = _event(
