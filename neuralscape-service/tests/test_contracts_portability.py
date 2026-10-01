@@ -305,6 +305,137 @@ class RepairingProducer(dict[str, str]):
         return dict.items(self)
 
 
+class RepairingFieldsSetIterable:
+    def __init__(
+        self,
+        names: tuple[str, ...],
+        target: BaseModel,
+        field_name: str,
+        replacement: str,
+    ) -> None:
+        self.names = names
+        self.target = target
+        self.field_name = field_name
+        self.replacement = replacement
+        self.iteration_calls = 0
+
+    def __iter__(self) -> Iterator[str]:
+        self.iteration_calls += 1
+        native_stored = _PYDANTIC_DICT_DESCRIPTOR.__get__(
+            self.target, BaseModel
+        )
+        dict.__setitem__(native_stored, self.field_name, self.replacement)
+        return iter(self.names)
+
+
+class RepairingProducerMapping(Mapping[str, str]):
+    def __init__(
+        self,
+        target: BaseModel,
+        field_name: str,
+        replacement: str,
+    ) -> None:
+        self.entries = {
+            "implementation": "reference-exporter",
+            "version": "1.4.2",
+        }
+        self.target = target
+        self.field_name = field_name
+        self.replacement = replacement
+        self.item_calls = 0
+
+    def __getitem__(self, key: str) -> str:
+        return self.entries[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.entries)
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def items(self) -> tuple[tuple[str, str], ...]:
+        self.item_calls += 1
+        native_stored = _PYDANTIC_DICT_DESCRIPTOR.__get__(
+            self.target, BaseModel
+        )
+        dict.__setitem__(native_stored, self.field_name, self.replacement)
+        return tuple(self.entries.items())
+
+
+class ReplacingFilesFieldsSetIterable:
+    def __init__(
+        self,
+        names: tuple[str, ...],
+        files: list[ManifestFile],
+        replacement: ManifestFile | None,
+    ) -> None:
+        self.names = names
+        self.files = files
+        self.replacement = replacement
+        self.iteration_calls = 0
+        self.mutated = False
+
+    def __iter__(self) -> Iterator[str]:
+        self.iteration_calls += 1
+        if not self.mutated:
+            if self.replacement is None:
+                list.__delitem__(self.files, 0)
+            else:
+                list.__setitem__(self.files, 0, self.replacement)
+            self.mutated = True
+        return iter(self.names)
+
+
+class ReplacingFilesProducerMapping(Mapping[str, str]):
+    def __init__(
+        self,
+        files: list[ManifestFile],
+        replacement: ManifestFile | None,
+    ) -> None:
+        self.entries = {
+            "implementation": "reference-exporter",
+            "version": "1.4.2",
+        }
+        self.files = files
+        self.replacement = replacement
+        self.item_calls = 0
+        self.mutated = False
+
+    def __getitem__(self, key: str) -> str:
+        return self.entries[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.entries)
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def items(self) -> tuple[tuple[str, str], ...]:
+        self.item_calls += 1
+        if not self.mutated:
+            if self.replacement is None:
+                list.__delitem__(self.files, 0)
+            else:
+                list.__setitem__(self.files, 0, self.replacement)
+            self.mutated = True
+        return tuple(self.entries.items())
+
+
+class DivergentFilesList(list[ManifestFile]):
+    def __init__(
+        self,
+        native_items: tuple[ManifestFile, ...],
+        public_items: tuple[ManifestFile, ...],
+    ) -> None:
+        list.__init__(self, native_items)
+        self.public_items = public_items
+        self.iteration_calls = 0
+
+    def __iter__(self) -> Iterator[ManifestFile]:
+        self.iteration_calls += 1
+        return iter(self.public_items)
+
+
 class NoneReportingExtraManifest(PortableManifest):
     def __getattribute__(self, name: str) -> object:
         if name == "__pydantic_extra__":
@@ -374,6 +505,55 @@ class HiddenFieldsSetBacking(set[str]):
 
 class BenignFieldName(str):
     pass
+
+
+class RepairingFieldName(str):
+    def __new__(
+        cls,
+        value: str,
+        target: BaseModel,
+        field_name: str,
+        replacement: str,
+    ) -> "RepairingFieldName":
+        instance = super().__new__(cls, value)
+        instance.target = target
+        instance.field_name = field_name
+        instance.replacement = replacement
+        instance.hash_calls = 0
+        return instance
+
+    def __hash__(self) -> int:
+        self.hash_calls += 1
+        native_stored = _PYDANTIC_DICT_DESCRIPTOR.__get__(
+            self.target, BaseModel
+        )
+        dict.__setitem__(native_stored, self.field_name, self.replacement)
+        return str.__hash__(self)
+
+
+class ReplacingFilesFieldName(str):
+    def __new__(
+        cls,
+        value: str,
+        files: list[ManifestFile],
+        replacement: ManifestFile | None,
+    ) -> "ReplacingFilesFieldName":
+        instance = super().__new__(cls, value)
+        instance.files = files
+        instance.replacement = replacement
+        instance.hash_calls = 0
+        instance.mutated = False
+        return instance
+
+    def __hash__(self) -> int:
+        self.hash_calls += 1
+        if not self.mutated:
+            if self.replacement is None:
+                list.__delitem__(self.files, 0)
+            else:
+                list.__setitem__(self.files, 0, self.replacement)
+            self.mutated = True
+        return str.__hash__(self)
 
 
 class DescriptorMaskedManifest(PortableManifest):
@@ -1557,6 +1737,273 @@ def test_nested_mapping_with_initially_valid_model_storage_remains_valid() -> No
     assert revalidated.manifest_id == "manifest-7"
     assert revalidated.producer.implementation == "reference-exporter"
     assert repairing_producer.item_calls == 2
+
+
+@pytest.mark.parametrize(
+    ("location", "field_name", "expected_location"),
+    [
+        ("manifest", "manifest_id", ("manifest_id",)),
+        ("file", "path", ("files", 0, "path")),
+    ],
+)
+def test_ordinary_initially_invalid_model_storage_remains_rejected(
+    location: str,
+    field_name: str,
+    expected_location: tuple[object, ...],
+) -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    target = _model_at_location(manifest, location)
+    native_stored = _PYDANTIC_DICT_DESCRIPTOR.__get__(target, BaseModel)
+    dict.__setitem__(native_stored, field_name, "")
+
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+
+    assert raised.value.errors()[0]["loc"] == expected_location
+
+
+@pytest.mark.parametrize("hook_kind", ["fields-set", "mapping"])
+@pytest.mark.parametrize(
+    ("location", "field_name", "valid_value", "expected_location"),
+    [
+        ("manifest", "manifest_id", "manifest-7", ("manifest_id",)),
+        ("file", "path", "canonical/records.jsonl", ("files", 0, "path")),
+    ],
+)
+@pytest.mark.parametrize("initially_valid", [False, True])
+def test_supported_hook_cannot_repair_frozen_model_storage(
+    hook_kind: str,
+    location: str,
+    field_name: str,
+    valid_value: str,
+    expected_location: tuple[object, ...],
+    initially_valid: bool,
+) -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    target = _model_at_location(manifest, location)
+    native_target = _PYDANTIC_DICT_DESCRIPTOR.__get__(target, BaseModel)
+    if not initially_valid:
+        dict.__setitem__(native_target, field_name, "")
+
+    if hook_kind == "fields-set":
+        native_fields_set = _PYDANTIC_FIELDS_SET_SLOT.__get__(
+            manifest, type(manifest)
+        )
+        hook = RepairingFieldsSetIterable(
+            tuple(set.__iter__(native_fields_set)),
+            target,
+            field_name,
+            valid_value,
+        )
+        _PYDANTIC_FIELDS_SET_SLOT.__set__(manifest, hook)
+    else:
+        hook = RepairingProducerMapping(target, field_name, valid_value)
+        native_manifest = _PYDANTIC_DICT_DESCRIPTOR.__get__(manifest, BaseModel)
+        dict.__setitem__(native_manifest, "producer", hook)
+
+    if initially_valid:
+        revalidated = validate_portable_manifest(manifest)
+        assert revalidated.manifest_id == "manifest-7"
+    else:
+        with pytest.raises(ValidationError) as raised:
+            validate_portable_manifest(manifest)
+        assert raised.value.errors()[0]["loc"] == expected_location
+
+    assert dict.__getitem__(native_target, field_name) == valid_value
+    if hook_kind == "fields-set":
+        assert hook.iteration_calls == 1
+    else:
+        assert hook.item_calls == 2
+
+
+@pytest.mark.parametrize(
+    ("location", "field_name", "valid_value", "expected_location"),
+    [
+        ("manifest", "manifest_id", "manifest-7", ("manifest_id",)),
+        ("file", "path", "canonical/records.jsonl", ("files", 0, "path")),
+    ],
+)
+@pytest.mark.parametrize("initially_valid", [False, True])
+def test_benign_field_name_hash_cannot_repair_frozen_model_storage(
+    location: str,
+    field_name: str,
+    valid_value: str,
+    expected_location: tuple[object, ...],
+    initially_valid: bool,
+) -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    target = _model_at_location(manifest, location)
+    native_target = _PYDANTIC_DICT_DESCRIPTOR.__get__(target, BaseModel)
+    if not initially_valid:
+        dict.__setitem__(native_target, field_name, "")
+
+    native_fields_set = _PYDANTIC_FIELDS_SET_SLOT.__get__(
+        manifest, type(manifest)
+    )
+    field_names = [
+        name for name in set.__iter__(native_fields_set) if name != "manifest_id"
+    ]
+    repairing_name = RepairingFieldName(
+        "manifest_id",
+        target,
+        field_name,
+        valid_value,
+    )
+    field_names.append(repairing_name)
+    _PYDANTIC_FIELDS_SET_SLOT.__set__(manifest, field_names)
+
+    if initially_valid:
+        revalidated = validate_portable_manifest(manifest)
+        assert revalidated.manifest_id == "manifest-7"
+    else:
+        with pytest.raises(ValidationError) as raised:
+            validate_portable_manifest(manifest)
+        assert raised.value.errors()[0]["loc"] == expected_location
+
+    assert repairing_name.hash_calls >= 1
+    assert dict.__getitem__(native_target, field_name) == valid_value
+
+
+@pytest.mark.parametrize("hook_kind", ["fields-set", "mapping", "stored-key"])
+@pytest.mark.parametrize("edge_action", ["replace", "remove"])
+@pytest.mark.parametrize("initially_valid", [False, True])
+def test_supported_hook_cannot_change_frozen_native_list_edge(
+    hook_kind: str,
+    edge_action: str,
+    initially_valid: bool,
+) -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    files = manifest.files
+    valid_file = files[0]
+    invalid_file = valid_file.model_copy(update={"path": ""})
+    original = valid_file if initially_valid else invalid_file
+    replacement = (
+        invalid_file if initially_valid else valid_file
+    )
+    if edge_action == "remove":
+        replacement = None
+    list.__setitem__(files, 0, original)
+
+    if hook_kind == "fields-set":
+        native_fields_set = _PYDANTIC_FIELDS_SET_SLOT.__get__(
+            manifest, type(manifest)
+        )
+        hook = ReplacingFilesFieldsSetIterable(
+            tuple(set.__iter__(native_fields_set)),
+            files,
+            replacement,
+        )
+        _PYDANTIC_FIELDS_SET_SLOT.__set__(manifest, hook)
+    elif hook_kind == "mapping":
+        hook = ReplacingFilesProducerMapping(files, replacement)
+        native_manifest = _PYDANTIC_DICT_DESCRIPTOR.__get__(manifest, BaseModel)
+        dict.__setitem__(native_manifest, "producer", hook)
+    else:
+        native_fields_set = _PYDANTIC_FIELDS_SET_SLOT.__get__(
+            manifest, type(manifest)
+        )
+        field_names = [
+            name
+            for name in set.__iter__(native_fields_set)
+            if name != "manifest_id"
+        ]
+        hook = ReplacingFilesFieldName("manifest_id", files, replacement)
+        field_names.append(hook)
+        _PYDANTIC_FIELDS_SET_SLOT.__set__(manifest, field_names)
+
+    if initially_valid:
+        revalidated = validate_portable_manifest(manifest)
+        assert revalidated.files[0].path == "canonical/records.jsonl"
+    else:
+        with pytest.raises(ValidationError) as raised:
+            validate_portable_manifest(manifest)
+        assert raised.value.errors()[0]["type"] == "string_too_short"
+        assert raised.value.errors()[0]["loc"] == ("files", 0, "path")
+
+    if replacement is None:
+        assert len(files) == 1
+        assert list.__getitem__(files, 0).path == "crypto/envelope.bin"
+    else:
+        assert list.__getitem__(files, 0) is replacement
+    if hook_kind == "fields-set":
+        assert hook.iteration_calls == 1
+    elif hook_kind == "mapping":
+        assert hook.item_calls == 2
+    else:
+        assert hook.hash_calls >= 1
+
+
+@pytest.mark.parametrize("invalid_view", ["native", "public"])
+def test_list_subclass_public_view_remains_authoritative(
+    invalid_view: str,
+) -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    valid_file = manifest.files[0]
+    invalid_file = valid_file.model_copy(update={"path": "../hidden.jsonl"})
+    if invalid_view == "native":
+        native_first, public_first = invalid_file, valid_file
+    else:
+        native_first, public_first = valid_file, invalid_file
+    files = DivergentFilesList(
+        (native_first, manifest.files[1]),
+        (public_first, manifest.files[1]),
+    )
+    native_manifest = _PYDANTIC_DICT_DESCRIPTOR.__get__(manifest, BaseModel)
+    dict.__setitem__(native_manifest, "files", files)
+
+    if invalid_view == "native":
+        revalidated = validate_portable_manifest(manifest)
+        assert revalidated.files[0].path == "canonical/records.jsonl"
+    else:
+        with pytest.raises(ValidationError) as raised:
+            validate_portable_manifest(manifest)
+        assert raised.value.errors()[0]["loc"] == ("files", 0, "path")
+
+    assert files.iteration_calls == 2
+
+
+@pytest.mark.parametrize("competing_error", ["overlap", "unknown", "cycle"])
+def test_frozen_nested_state_preserves_existing_error_priority(
+    competing_error: str,
+) -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    nested = manifest.files[0]
+    native_nested = _PYDANTIC_DICT_DESCRIPTOR.__get__(nested, BaseModel)
+    dict.__setitem__(native_nested, "path", "")
+    native_fields_set = _PYDANTIC_FIELDS_SET_SLOT.__get__(
+        manifest, type(manifest)
+    )
+    repair = RepairingFieldsSetIterable(
+        tuple(set.__iter__(native_fields_set)),
+        nested,
+        "path",
+        "canonical/records.jsonl",
+    )
+    _PYDANTIC_FIELDS_SET_SLOT.__set__(manifest, repair)
+
+    if competing_error == "overlap":
+        _PYDANTIC_EXTRA_SLOT.__set__(manifest, {"manifest_id": "shadow"})
+        expected = "contract model has conflicting stored and extra fields"
+    elif competing_error == "unknown":
+        native_manifest = _PYDANTIC_DICT_DESCRIPTOR.__get__(manifest, BaseModel)
+        dict.__setitem__(native_manifest, "future_entry_semantics", "deny")
+        expected = "future_entry_semantics"
+    else:
+        cyclic_capabilities: list[object] = []
+        cyclic_capabilities.append(cyclic_capabilities)
+        native_manifest = _PYDANTIC_DICT_DESCRIPTOR.__get__(manifest, BaseModel)
+        dict.__setitem__(
+            native_manifest,
+            "included_capabilities",
+            cyclic_capabilities,
+        )
+        expected = "contract input graph must be acyclic"
+
+    with pytest.raises(ValidationError, match=expected):
+        validate_portable_manifest(manifest)
+
+    assert repair.iteration_calls == 1
+    assert dict.__getitem__(native_nested, "path") == "canonical/records.jsonl"
 
 
 @pytest.mark.parametrize(
