@@ -462,6 +462,28 @@ class MutatingTuple(tuple[object, ...]):
         return super().__iter__()
 
 
+class PublicViewTuple(tuple[object, ...]):
+    """Expose a distinct, authoritative public tuple view exactly once."""
+
+    def __new__(
+        cls,
+        values: tuple[object, ...],
+        public_values: tuple[object, ...],
+        action: Callable[[], None] | None = None,
+    ):
+        instance = super().__new__(cls, values)
+        instance.public_values = public_values
+        instance.action = action
+        instance.iteration_calls = 0
+        return instance
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        if self.action is not None:
+            self.action()
+        return iter(self.public_values)
+
+
 class ArmedFieldName(str):
     """Run one callback when a stored field name is next hashed."""
 
@@ -1535,6 +1557,147 @@ def test_finish_freezes_all_input_models_before_earlier_argument_callbacks(
     assert result.state is RunState.COMPLETED
     assert valid_callback[1] == ["called"]
     assert dict.__getitem__(valid_callback[2], valid_callback[3]) == valid_callback[4]
+
+
+@pytest.mark.parametrize("callback_source", ["planned", "resources"])
+def test_finish_freezes_plain_resource_dict_before_callbacks(
+    callback_source: str,
+):
+    def resource_data(invalid: bool) -> dict[str, object]:
+        data = measured_memory().model_dump(mode="python")
+        if invalid:
+            data["observed_value"] = True
+        return data
+
+    ordinary_invalid = resource_data(True)
+    with pytest.raises(ValidationError) as ordinary_error:
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(ordinary_invalid,),
+            measurements=(timing(),),
+        )
+    assert ordinary_error.value.errors()[0]["loc"] == (
+        "resources",
+        0,
+        "observed_value",
+    )
+
+    def callback_arguments(invalid: bool):
+        planned = planned_manifest()
+        resource = resource_data(invalid)
+        callback_calls: list[str] = []
+
+        def repair_resource() -> None:
+            callback_calls.append("called")
+            dict.__setitem__(resource, "observed_value", 402_653_184)
+
+        if callback_source == "planned":
+            native = BASE_MODEL_DICT_DESCRIPTOR.__get__(
+                planned,
+                pydantic.BaseModel,
+            )
+            native["concurrency"] = MutatingTuple(
+                native["concurrency"],
+                repair_resource,
+            )
+            resources = (resource,)
+        else:
+            resources = MutatingTuple((resource,), repair_resource)
+        return planned, resources, resource, callback_calls
+
+    attacked = callback_arguments(True)
+    with pytest.raises(ValidationError) as callback_error:
+        finish_run(
+            attacked[0],
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=attacked[1],
+            measurements=(timing(),),
+        )
+    assert callback_error.value.errors() == ordinary_error.value.errors()
+    assert attacked[2]["observed_value"] == 402_653_184
+    assert attacked[3] == ["called"]
+
+    valid = callback_arguments(False)
+    result = finish_run(
+        valid[0],
+        state=RunState.COMPLETED,
+        started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+        resources=valid[1],
+        measurements=(timing(),),
+    )
+    assert result.resources[0].observed_value == 402_653_184
+    assert valid[3] == ["called"]
+
+
+def test_finish_preserves_authoritative_public_resource_tuple_view():
+    invalid_native = measured_memory().model_dump(mode="python")
+    invalid_native["observed_value"] = True
+    visible = measured_memory(value=123)
+    resources = PublicViewTuple((invalid_native,), (visible,))
+
+    result = finish_run(
+        planned_manifest(),
+        state=RunState.COMPLETED,
+        started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+        resources=resources,
+        measurements=(timing(),),
+    )
+
+    assert result.resources[0].observed_value == 123
+    assert resources.iteration_calls == 1
+
+
+def test_public_only_parent_cannot_refreeze_native_exposed_plain_child():
+    native_measurement = timing().model_dump(mode="python")
+    visible_measurement = timing().model_dump(mode="python")
+    shared_provenance = native_measurement["provenance"]
+    assert isinstance(shared_provenance, dict)
+    shared_provenance["clock"] = "wall_clock"
+    visible_measurement["provenance"] = shared_provenance
+
+    ordinary_measurement = timing().model_dump(mode="python")
+    ordinary_provenance = ordinary_measurement["provenance"]
+    assert isinstance(ordinary_provenance, dict)
+    ordinary_provenance["clock"] = "wall_clock"
+    with pytest.raises(ValidationError) as ordinary_error:
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(ordinary_measurement,),
+        )
+
+    measurements = PublicViewTuple(
+        (native_measurement,),
+        (visible_measurement,),
+        action=lambda: dict.__setitem__(
+            shared_provenance,
+            "clock",
+            "monotonic",
+        ),
+    )
+    with pytest.raises(ValidationError) as callback_error:
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=measurements,
+        )
+
+    assert callback_error.value.errors() == ordinary_error.value.errors()
+    assert shared_provenance["clock"] == "monotonic"
+    assert measurements.iteration_calls == 1
 
 
 def test_finish_rejects_undeclared_planned_fields_and_returns_fresh_graph():
