@@ -1,7 +1,10 @@
 """Tests for the plaintext/opaque body boundary."""
 
+from collections.abc import Iterator, Mapping
+from typing import ClassVar
+
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from contracts_common import VersionedContract
 from contracts_bodies import (
@@ -13,10 +16,257 @@ from contracts_bodies import (
 )
 
 
+_BASE_MODEL_DICT_DESCRIPTOR = vars(BaseModel)["__dict__"]
+_BASE_MODEL_EXTRA_DESCRIPTOR = vars(BaseModel)["__pydantic_extra__"]
+
+
 class VersionedBodyOwner(VersionedContract):
     """Synthetic enclosing record that owns its nested body's version."""
 
     body: MemoryBody
+
+
+class _HiddenBackingDict(dict[str, object]):
+    def __init__(self, values: dict[str, object]) -> None:
+        super().__init__(values)
+        self.view_calls = 0
+
+    def __len__(self) -> int:
+        self.view_calls += 1
+        return 0
+
+    def __bool__(self) -> bool:
+        self.view_calls += 1
+        return False
+
+    def __iter__(self) -> Iterator[str]:
+        self.view_calls += 1
+        return iter(())
+
+    def keys(self):
+        self.view_calls += 1
+        return {}.keys()
+
+    def items(self):
+        self.view_calls += 1
+        return {}.items()
+
+
+class _IterationVisibleItemsEmptyMapping(Mapping[str, object]):
+    def __init__(self) -> None:
+        self.items_calls = 0
+
+    def __getitem__(self, key: str) -> object:
+        if key == "future_constraint":
+            return "deny"
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(("future_constraint",))
+
+    def __len__(self) -> int:
+        return 1
+
+    def items(self):
+        self.items_calls += 1
+        return {}.items()
+
+
+class _SpoofedDictMapping(_IterationVisibleItemsEmptyMapping):
+    def __init__(self) -> None:
+        super().__init__()
+        self.class_reads = 0
+
+    @property
+    def __class__(self):
+        self.class_reads += 1
+        return dict
+
+
+class _RaisingClassHiddenDict(_HiddenBackingDict):
+    def __init__(self, values: dict[str, object]) -> None:
+        super().__init__(values)
+        self.class_reads = 0
+
+    @property
+    def __class__(self):
+        self.class_reads += 1
+        raise AssertionError("__class__ must not be read")
+
+
+class _RepairingStoredName(str):
+    """A stored key whose hash callback repairs a later live model value."""
+
+    def __new__(cls, value: str, repair):
+        instance = super().__new__(cls, value)
+        instance.repair = repair
+        instance.armed = False
+        instance.hash_calls = 0
+        return instance
+
+    def __hash__(self) -> int:
+        if self.armed:
+            self.hash_calls += 1
+            self.repair()
+        return super().__hash__()
+
+
+class _EmptyNativeRaisingViews(dict[str, object]):
+    """Actually empty native storage whose overridden views must stay unused."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.view_calls = 0
+
+    def _called(self):
+        self.view_calls += 1
+        raise AssertionError("overridden dict view must not be read")
+
+    def __len__(self) -> int:
+        return self._called()
+
+    def __bool__(self) -> bool:
+        return self._called()
+
+    def __iter__(self) -> Iterator[str]:
+        return self._called()
+
+    def __getitem__(self, key: str) -> object:
+        return self._called()
+
+    def keys(self):
+        return self._called()
+
+    def items(self):
+        return self._called()
+
+
+class _EmptyNativeFabricatedViews(dict[str, object]):
+    """Actually empty native storage with fabricated nonempty public views."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.view_calls = 0
+
+    def __len__(self) -> int:
+        self.view_calls += 1
+        return 1
+
+    def __bool__(self) -> bool:
+        self.view_calls += 1
+        return True
+
+    def __iter__(self) -> Iterator[str]:
+        self.view_calls += 1
+        return iter(("fabricated_unknown",))
+
+    def __getitem__(self, key: str) -> object:
+        self.view_calls += 1
+        if key == "fabricated_unknown":
+            return True
+        raise KeyError(key)
+
+    def keys(self):
+        self.view_calls += 1
+        return {"fabricated_unknown": True}.keys()
+
+    def items(self):
+        self.view_calls += 1
+        return {"fabricated_unknown": True}.items()
+
+
+class _AttributeHidingPlaintextBody(PlaintextBody):
+    text_reads: ClassVar[int] = 0
+
+    def __getattribute__(self, name: str):
+        if name == "text":
+            type(self).text_reads += 1
+            return "secret"
+        return super().__getattribute__(name)
+
+
+class _DescriptorMaskedPlaintextBody(PlaintextBody):
+    @property
+    def __dict__(self):
+        native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(self, BaseModel)
+        return {
+            name: value
+            for name, value in dict.items(native)
+            if name != "future_constraint"
+        }
+
+    @__dict__.setter
+    def __dict__(self, value):
+        _BASE_MODEL_DICT_DESCRIPTOR.__set__(self, value)
+
+    @property
+    def __pydantic_extra__(self):
+        return None
+
+    @__pydantic_extra__.setter
+    def __pydantic_extra__(self, value):
+        _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(self, value)
+
+
+class _DescriptorMaskedOpaqueBody(OpaqueEnvelopeBody):
+    @property
+    def __dict__(self):
+        native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(self, BaseModel)
+        return {
+            name: value
+            for name, value in dict.items(native)
+            if name != "future_constraint"
+        }
+
+    @__dict__.setter
+    def __dict__(self, value):
+        _BASE_MODEL_DICT_DESCRIPTOR.__set__(self, value)
+
+    @property
+    def __pydantic_extra__(self):
+        return None
+
+    @__pydantic_extra__.setter
+    def __pydantic_extra__(self, value):
+        _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(self, value)
+
+
+def _replace_model_backing(
+    body: MemoryBody,
+    changes: dict[str, object],
+) -> _HiddenBackingDict:
+    stored = dict(
+        dict.items(object.__getattribute__(body, "__dict__"))
+    )
+    for name, value in changes.items():
+        dict.__setitem__(stored, name, value)
+    hidden = _HiddenBackingDict(stored)
+    object.__setattr__(body, "__dict__", hidden)
+    return hidden
+
+
+def _arm_first_stored_name_repair(
+    body: MemoryBody,
+    *,
+    field: str,
+    repaired_value: object,
+) -> _RepairingStoredName:
+    stored = _BASE_MODEL_DICT_DESCRIPTOR.__get__(body, BaseModel)
+    entries = tuple(dict.items(stored))
+    dict.clear(stored)
+    name = _RepairingStoredName(
+        entries[0][0],
+        lambda: dict.__setitem__(stored, field, repaired_value),
+    )
+    for index, (key, value) in enumerate(entries):
+        dict.__setitem__(stored, name if index == 0 else key, value)
+    name.armed = True
+    return name
+
+
+def _attach_extra_storage(body: MemoryBody, storage: object) -> MemoryBody:
+    object.__setattr__(body, "__pydantic_extra__", storage)
+    return body
 
 
 def test_plaintext_body_preserves_exact_text() -> None:
@@ -78,6 +328,410 @@ def test_parser_revalidates_unchecked_body_copy() -> None:
 
     with pytest.raises(ValidationError):
         parse_memory_body(unchecked)
+
+
+@pytest.mark.parametrize(
+    ("valid", "invalid_field", "invalid_value", "repaired_value"),
+    [
+        (
+            PlaintextBody(kind="plaintext", text="secret"),
+            "text",
+            "",
+            "repaired",
+        ),
+        (
+            OpaqueEnvelopeBody(kind="opaque_envelope", envelope_id="env-1"),
+            "envelope_id",
+            "",
+            "repaired",
+        ),
+    ],
+    ids=["plaintext", "opaque-envelope"],
+)
+def test_parser_captures_all_stored_pairs_before_name_hashing(
+    valid: MemoryBody,
+    invalid_field: str,
+    invalid_value: object,
+    repaired_value: object,
+) -> None:
+    assert parse_memory_body(valid).kind == valid.kind
+
+    ordinary = valid.model_copy(update={invalid_field: invalid_value})
+    with pytest.raises(ValidationError) as ordinary_exc:
+        parse_memory_body(ordinary)
+
+    hooked = valid.model_copy(update={invalid_field: invalid_value})
+    name = _arm_first_stored_name_repair(
+        hooked,
+        field=invalid_field,
+        repaired_value=repaired_value,
+    )
+    with pytest.raises(ValidationError) as hooked_exc:
+        parse_memory_body(hooked)
+
+    ordinary_errors = [
+        (error["loc"], error["type"]) for error in ordinary_exc.value.errors()
+    ]
+    hooked_errors = [
+        (error["loc"], error["type"]) for error in hooked_exc.value.errors()
+    ]
+    assert ordinary_errors == hooked_errors
+    assert any(error_type == "string_too_short" for _, error_type in hooked_errors)
+    assert name.hash_calls == 1
+    assert dict.__getitem__(
+        _BASE_MODEL_DICT_DESCRIPTOR.__get__(hooked, BaseModel),
+        invalid_field,
+    ) == repaired_value
+
+
+@pytest.mark.parametrize(
+    ("body", "backing"),
+    [
+        (
+            PlaintextBody(kind="plaintext", text="secret"),
+            {"future_constraint": "deny"},
+        ),
+        (
+            PlaintextBody(kind="plaintext", text="secret"),
+            {"text": "replacement"},
+        ),
+        (
+            OpaqueEnvelopeBody(kind="opaque_envelope", envelope_id="env-1"),
+            {"future_constraint": "deny"},
+        ),
+        (
+            OpaqueEnvelopeBody(kind="opaque_envelope", envelope_id="env-1"),
+            {"envelope_id": "replacement"},
+        ),
+    ],
+)
+def test_parser_rejects_hidden_native_dict_backing(
+    body: MemoryBody,
+    backing: dict[str, object],
+) -> None:
+    hidden = _HiddenBackingDict(backing)
+    _attach_extra_storage(body, hidden)
+
+    with pytest.raises(ValidationError, match="extra"):
+        parse_memory_body(body)
+
+    assert hidden.view_calls == 0
+
+
+@pytest.mark.parametrize(
+    "extra_storage",
+    [None, {}],
+    ids=["none-extras", "empty-dict-extras"],
+)
+def test_parser_projects_hidden_native_model_backing(
+    extra_storage: object,
+) -> None:
+    body = PlaintextBody(kind="plaintext", text="secret")
+    hidden = _replace_model_backing(body, {"hidden_unknown": "deny"})
+    _attach_extra_storage(body, extra_storage)
+
+    with pytest.raises(ValidationError) as exc:
+        parse_memory_body(body)
+
+    assert any(
+        error["loc"][-1] == "hidden_unknown" for error in exc.value.errors()
+    )
+    assert hidden.view_calls == 0
+
+
+@pytest.mark.parametrize(
+    "extra_storage",
+    [None, {}],
+    ids=["none-extras", "empty-dict-extras"],
+)
+def test_parser_native_model_backing_ignores_attribute_override(
+    extra_storage: object,
+) -> None:
+    body = _AttributeHidingPlaintextBody(kind="plaintext", text="secret")
+    _AttributeHidingPlaintextBody.text_reads = 0
+    hidden = _replace_model_backing(body, {"text": ""})
+    _attach_extra_storage(body, extra_storage)
+
+    with pytest.raises(ValidationError) as exc:
+        parse_memory_body(body)
+
+    assert any(error["loc"][-1] == "text" for error in exc.value.errors())
+    assert _AttributeHidingPlaintextBody.text_reads == 0
+    assert hidden.view_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("ordinary_type", "masked_type", "values"),
+    [
+        (
+            PlaintextBody,
+            _DescriptorMaskedPlaintextBody,
+            {"kind": "plaintext", "text": "secret"},
+        ),
+        (
+            OpaqueEnvelopeBody,
+            _DescriptorMaskedOpaqueBody,
+            {"kind": "opaque_envelope", "envelope_id": "env-1"},
+        ),
+    ],
+    ids=["plaintext", "opaque-envelope"],
+)
+@pytest.mark.parametrize("inventory", ["stored", "extra"])
+def test_parser_uses_base_model_storage_descriptors(
+    ordinary_type: type[PlaintextBody | OpaqueEnvelopeBody],
+    masked_type: type[PlaintextBody | OpaqueEnvelopeBody],
+    values: dict[str, str],
+    inventory: str,
+) -> None:
+    bodies = [ordinary_type(**values), masked_type(**values)]
+    hidden_stores: list[_HiddenBackingDict] = []
+    for body in bodies:
+        if inventory == "stored":
+            stored = dict(
+                dict.items(_BASE_MODEL_DICT_DESCRIPTOR.__get__(body, BaseModel))
+            )
+            stored["future_constraint"] = "deny"
+            hidden = _HiddenBackingDict(stored)
+            _BASE_MODEL_DICT_DESCRIPTOR.__set__(body, hidden)
+        else:
+            hidden = _HiddenBackingDict({"future_constraint": "deny"})
+            _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(body, hidden)
+        hidden_stores.append(hidden)
+
+    diagnostics = []
+    for body in bodies:
+        with pytest.raises(ValidationError) as exc:
+            parse_memory_body(body)
+        diagnostics.append(
+            [(error["loc"], error["type"]) for error in exc.value.errors()]
+        )
+
+    assert diagnostics[0] == diagnostics[1]
+    assert all(hidden.view_calls == 0 for hidden in hidden_stores)
+
+
+@pytest.mark.parametrize(
+    ("body_type", "values"),
+    [
+        (PlaintextBody, {"kind": "plaintext", "text": "secret"}),
+        (
+            OpaqueEnvelopeBody,
+            {"kind": "opaque_envelope", "envelope_id": "env-1"},
+        ),
+    ],
+    ids=["plaintext", "opaque-envelope"],
+)
+@pytest.mark.parametrize("inventory", ["stored", "extra"])
+def test_enclosing_contract_uses_actual_nested_validation_boundary(
+    body_type: type[PlaintextBody | OpaqueEnvelopeBody],
+    values: dict[str, str],
+    inventory: str,
+) -> None:
+    valid = VersionedBodyOwner.model_validate(
+        {
+            "schema_version": "candidate-v1",
+            "body": body_type(**values),
+        }
+    )
+    assert valid.body.kind == values["kind"]
+
+    body = body_type(**values)
+    if inventory == "stored":
+        stored = dict(
+            dict.items(_BASE_MODEL_DICT_DESCRIPTOR.__get__(body, BaseModel))
+        )
+        stored["future_constraint"] = "deny"
+        _BASE_MODEL_DICT_DESCRIPTOR.__set__(body, stored)
+    else:
+        _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(
+            body,
+            {"future_constraint": "deny"},
+        )
+
+    with pytest.raises(ValidationError) as exc:
+        VersionedBodyOwner.model_validate(
+            {
+                "schema_version": "candidate-v1",
+                "body": body,
+            }
+        )
+
+    assert any(
+        error["loc"][0] == "body"
+        and error["loc"][-1] == "future_constraint"
+        and error["type"] == "extra_forbidden"
+        for error in exc.value.errors()
+    )
+
+
+@pytest.mark.parametrize(
+    ("body_type", "values"),
+    [
+        (
+            _DescriptorMaskedPlaintextBody,
+            {"kind": "plaintext", "text": "secret"},
+        ),
+        (
+            _DescriptorMaskedOpaqueBody,
+            {"kind": "opaque_envelope", "envelope_id": "env-1"},
+        ),
+    ],
+    ids=["plaintext", "opaque-envelope"],
+)
+def test_parser_descriptor_masked_valid_and_absent_extra_controls(
+    body_type: type[PlaintextBody | OpaqueEnvelopeBody],
+    values: dict[str, str],
+) -> None:
+    valid = body_type(**values)
+    assert parse_memory_body(valid).kind == values["kind"]
+
+    _BASE_MODEL_EXTRA_DESCRIPTOR.__delete__(valid)
+    with pytest.raises(AttributeError, match="__pydantic_extra__"):
+        parse_memory_body(valid)
+
+
+def test_parser_extra_storage_controls_preserve_existing_behavior() -> None:
+    empty = _attach_extra_storage(
+        PlaintextBody(kind="plaintext", text="secret"),
+        {},
+    )
+    parsed = parse_memory_body(empty)
+    assert isinstance(parsed, PlaintextBody)
+    assert parsed.text == "secret"
+
+    ordinary = _attach_extra_storage(
+        PlaintextBody(kind="plaintext", text="secret"),
+        {"future_constraint": "deny"},
+    )
+    with pytest.raises(ValidationError, match="extra"):
+        parse_memory_body(ordinary)
+
+    inverse = _IterationVisibleItemsEmptyMapping()
+    inverted = _attach_extra_storage(
+        PlaintextBody(kind="plaintext", text="secret"),
+        inverse,
+    )
+    with pytest.raises(ValidationError):
+        parse_memory_body(inverted)
+    assert inverse.items_calls == 0
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        PlaintextBody(kind="plaintext", text="secret"),
+        OpaqueEnvelopeBody(kind="opaque_envelope", envelope_id="env-1"),
+    ],
+    ids=["plaintext", "opaque-envelope"],
+)
+@pytest.mark.parametrize(
+    "extra_type",
+    [_EmptyNativeRaisingViews, _EmptyNativeFabricatedViews],
+    ids=["raising-views", "fabricated-views"],
+)
+def test_parser_accepts_empty_native_backing_without_overridden_views(
+    body: MemoryBody,
+    extra_type: type[_EmptyNativeRaisingViews | _EmptyNativeFabricatedViews],
+) -> None:
+    extras = extra_type()
+    _attach_extra_storage(body, extras)
+
+    parsed = parse_memory_body(body)
+
+    assert parsed.kind == body.kind
+    assert tuple(dict.items(extras)) == ()
+    assert extras.view_calls == 0
+
+
+def test_parser_empty_native_projection_preserves_injected_unknown_field() -> None:
+    body = PlaintextBody(kind="plaintext", text="secret")
+    object.__setattr__(body, "injected_unknown", "deny")
+    extras = _EmptyNativeRaisingViews()
+    _attach_extra_storage(body, extras)
+
+    with pytest.raises(ValidationError) as exc:
+        parse_memory_body(body)
+
+    assert any(
+        error["loc"][-1] == "injected_unknown" for error in exc.value.errors()
+    )
+    assert extras.view_calls == 0
+
+
+def test_parser_empty_native_projection_preserves_subclass_field() -> None:
+    class SpecializedPlaintextBody(PlaintextBody):
+        declared_note: str
+
+    body = SpecializedPlaintextBody(
+        kind="plaintext",
+        text="secret",
+        declared_note="subclass-only",
+    )
+    extras = _EmptyNativeRaisingViews()
+    _attach_extra_storage(body, extras)
+
+    with pytest.raises(ValidationError) as exc:
+        parse_memory_body(body)
+
+    assert any(error["loc"][-1] == "declared_note" for error in exc.value.errors())
+    assert extras.view_calls == 0
+
+
+def test_parser_empty_native_projection_preserves_missing_fields() -> None:
+    body = PlaintextBody.model_construct(kind="plaintext")
+    extras = _EmptyNativeRaisingViews()
+    _attach_extra_storage(body, extras)
+
+    with pytest.raises(ValidationError) as exc:
+        parse_memory_body(body)
+
+    assert any(error["loc"][-1] == "text" for error in exc.value.errors())
+    assert extras.view_calls == 0
+
+
+def test_parser_uses_concrete_extra_storage_type() -> None:
+    spoofed = _SpoofedDictMapping()
+    spoofed_body = _attach_extra_storage(
+        PlaintextBody(kind="plaintext", text="secret"),
+        spoofed,
+    )
+    with pytest.raises(ValidationError):
+        parse_memory_body(spoofed_body)
+    assert spoofed.class_reads == 1
+
+    hidden = _RaisingClassHiddenDict({"future_constraint": "deny"})
+    hidden_body = _attach_extra_storage(
+        PlaintextBody(kind="plaintext", text="secret"),
+        hidden,
+    )
+    with pytest.raises(ValidationError, match="extra"):
+        parse_memory_body(hidden_body)
+    assert hidden.class_reads == 0
+    assert hidden.view_calls == 0
+
+
+def test_parser_malformed_construct_with_hidden_backing_is_canonical() -> None:
+    malformed = PlaintextBody.model_construct(kind="plaintext")
+    _attach_extra_storage(malformed, {"future_constraint": "deny"})
+
+    with pytest.raises(ValidationError) as exc:
+        parse_memory_body(malformed)
+
+    assert any(error["loc"][-1] == "text" for error in exc.value.errors())
+
+
+def test_parser_declared_subclass_field_remains_invalid_at_union_boundary() -> None:
+    class SpecializedPlaintextBody(PlaintextBody):
+        declared_note: str
+
+    body = SpecializedPlaintextBody(
+        kind="plaintext",
+        text="secret",
+        declared_note="subclass-only",
+    )
+
+    with pytest.raises(ValidationError, match="extra"):
+        parse_memory_body(body)
 
 
 @pytest.mark.parametrize(
