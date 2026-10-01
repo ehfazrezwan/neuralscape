@@ -379,6 +379,17 @@ def _preflight_snapshot(code_space: str) -> dict:
     }
 
 
+def _core_identity_properties(core_label: str, code_space: str) -> dict:
+    properties = {"code_space": code_space}
+    if core_label == "CodeFile":
+        properties["path"] = "src/late.py"
+    elif core_label == "CodeSymbol":
+        properties["fqn"] = "pkg.late"
+    elif core_label == "CodeAnchor":
+        properties.update({"repo": "snapshot-ci", "fqn": "pkg.late"})
+    return properties
+
+
 def test_non_string_relationship_type_rejects_before_writes(live_engine):
     snapshot = _preflight_snapshot(live_engine.code_space)
     snapshot["edges"][0]["type"] = ["CALLS"]
@@ -421,6 +432,78 @@ def test_late_empty_identifiers_reject_before_writes(
         snapshot["edges"].append(invalid)
 
     with pytest.raises(ValueError, match=message):
+        live_engine.import_snapshot(_snapshot_artifact(snapshot))
+    assert _node_count(live_engine) == 0
+
+
+@pytest.mark.parametrize(
+    ("core_label", "identity_key"),
+    [
+        ("CodeRepo", "code_space"),
+        ("CodeFile", "path"),
+        ("CodeSymbol", "fqn"),
+        ("CodeAnchor", "repo"),
+    ],
+)
+@pytest.mark.parametrize("location", ["node", "source", "target"])
+@pytest.mark.parametrize("malformation", ["missing", "null"])
+def test_late_invalid_core_identity_rejects_before_writes(
+    live_engine,
+    core_label,
+    identity_key,
+    location,
+    malformation,
+):
+    snapshot = _preflight_snapshot(live_engine.code_space)
+    properties = _core_identity_properties(core_label, live_engine.code_space)
+    if malformation == "missing":
+        properties.pop(identity_key)
+        reason = rf"missing required identity key '{identity_key}'"
+    else:
+        properties[identity_key] = None
+        reason = rf"identity key '{identity_key}' must not be null"
+
+    if location == "node":
+        snapshot["nodes"].append(
+            {"labels": ["Late record", core_label], "properties": properties}
+        )
+        path = r"node\[2\]\.properties"
+    else:
+        invalid = copy.deepcopy(snapshot["edges"][0])
+        invalid[location] = {
+            "labels": ["Late endpoint", core_label],
+            "properties": properties,
+        }
+        snapshot["edges"].append(invalid)
+        path = rf"edge\[1\]\.{location}\.properties"
+
+    with pytest.raises(ValueError, match=rf"{path}: {reason}"):
+        live_engine.import_snapshot(_snapshot_artifact(snapshot))
+    assert _node_count(live_engine) == 0
+
+
+@pytest.mark.parametrize("location", ["node", "source", "target", "edge"])
+def test_late_non_map_properties_reject_before_writes(live_engine, location):
+    snapshot = _preflight_snapshot(live_engine.code_space)
+    if location == "node":
+        snapshot["nodes"].append(
+            {"labels": ["CodeFile"], "properties": ["not", "a", "map"]}
+        )
+        path = r"node\[2\]\.properties"
+    else:
+        invalid = copy.deepcopy(snapshot["edges"][0])
+        if location == "edge":
+            invalid["properties"] = ["not", "a", "map"]
+            path = r"edge\[1\]\.properties"
+        else:
+            invalid[location]["properties"] = ["not", "a", "map"]
+            path = rf"edge\[1\]\.{location}\.properties"
+        snapshot["edges"].append(invalid)
+
+    with pytest.raises(
+        ValueError,
+        match=rf"{path}: expected a property map",
+    ):
         live_engine.import_snapshot(_snapshot_artifact(snapshot))
     assert _node_count(live_engine) == 0
 
