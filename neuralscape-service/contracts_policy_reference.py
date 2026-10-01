@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import NamedTuple
+from collections.abc import Iterable, Mapping
+from typing import NamedTuple, cast
 
 from pydantic import BaseModel
 
@@ -58,7 +58,7 @@ def _fields_set_names(value: object) -> tuple[object, ...]:
 
     if issubclass(type(value), set):
         return tuple(set.__iter__(value))
-    return tuple(value)  # type: ignore[arg-type]
+    return tuple(item for item in cast(Iterable[object], value))
 
 
 def _normalize_model_names(names: tuple[object, ...]) -> tuple[str, ...]:
