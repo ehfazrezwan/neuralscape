@@ -122,6 +122,20 @@ def _snapshot_model_extra_storage(value: BaseModel) -> _ModelExtraSnapshot:
     return False, extra
 
 
+def _model_discovery_values(
+    model_type: type[BaseModel],
+    stored_entries: _ModelStorageEntries,
+) -> tuple[Any, ...]:
+    """Select stored values needing callback-free graph discovery."""
+
+    declared_names = model_type.model_fields
+    return tuple(
+        item
+        for name, item in reversed(stored_entries)
+        if type(name) is not str or name in declared_names
+    )
+
+
 def _validated_model_extra_storage(
     extra_snapshot: _ModelExtraSnapshot,
     stored_names: set[Any],
@@ -211,11 +225,11 @@ def _reject_retained_unknown_fields(
                     fields_set_storage,
                     extra_snapshot,
                 )
-                # Later hash-based model validation is the sole authority for
-                # whether a stored name is declared.  Freeze every candidate
-                # edge now without invoking that overridable protocol.
+                # Exact strings can be classified from the class field mapping
+                # without invoking a user-defined name protocol.  Other names
+                # remain conservative candidates for later hash authority.
                 pending.extend(
-                    item for _, item in reversed(stored_entries)
+                    _model_discovery_values(value_type, stored_entries)
                 )
                 continue
 

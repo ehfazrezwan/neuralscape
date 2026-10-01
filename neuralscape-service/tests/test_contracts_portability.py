@@ -19,6 +19,7 @@ from contracts_portability import (
     ManifestFile,
     PortableManifest,
     ProducerReference,
+    _model_discovery_values,
     _validated_model_discovery_snapshot,
     _validated_model_storage,
     _validated_native_container_items,
@@ -2223,6 +2224,22 @@ def test_native_container_inventory_requires_exact_owner_identity(
 
     inventory[id(candidate)] = (candidate, type(candidate), items)
     assert _validated_native_container_items(candidate, inventory) is items
+
+
+def test_model_discovery_queues_only_declared_exact_string_values() -> None:
+    schema_version = object()
+    files = object()
+    future_semantics = object()
+    stored_entries = (
+        ("schema_version", schema_version),
+        ("future_entry_semantics", future_semantics),
+        ("files", files),
+    )
+
+    queued = _model_discovery_values(PortableManifest, stored_entries)
+
+    assert queued == (files, schema_version)
+    assert all(item is not future_semantics for item in queued)
 
 
 @pytest.mark.parametrize("inventory_kind", ["discovery", "validated"])
