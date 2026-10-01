@@ -36,8 +36,8 @@ from neuralscape_bench.run_manifest import (
     validate_run_manifest_json,
 )
 from neuralscape_bench.run_manifest import (
-    _capture_missing_model_storage,
     _freeze_model_graphs,
+    _protect_yielded_model_storage,
     _snapshot_native,
     _traverse_model_storage,
 )
@@ -697,29 +697,83 @@ def test_replay_inventory_retains_first_entries_and_strong_owners():
     assert frozen.replay_entries[id(list_parent)][1] == (list_child,)
 
 
-def test_yielded_child_guard_captures_owned_storage_once_and_reuses_it():
+def test_yielded_child_guard_traverses_captured_storage_then_reuses_completion():
     class ReplayDict(dict[str, object]):
         pass
 
-    frozen = _freeze_model_graphs(())
     child: dict[str, object] = {}
     value = ReplayDict(child=child)
-    impostor = ReplayDict()
-    frozen.replay_entries[id(value)] = (impostor, ())
+    frozen = _freeze_model_graphs(value)
 
-    assert _capture_missing_model_storage(value, frozen) is True
-    owner, entries = frozen.replay_entries[id(value)]
-    assert owner is value
-    assert entries == (child,)
+    assert frozen.replay_entries[id(value)][0] is value
+    assert id(value) not in frozen.completed_traversals
+    assert _protect_yielded_model_storage(value, frozen) is True
+    assert frozen.completed_traversals[id(value)] is value
+    assert frozen.completed_traversals[id(child)] is child
 
     value.clear()
-    assert _capture_missing_model_storage(value, frozen) is False
+    assert _protect_yielded_model_storage(value, frozen) is False
     assert frozen.replay_entries[id(value)] == (value, (child,))
 
     visited: set[int] = set()
     _traverse_model_storage(value, frozen, visited)
     assert id(child) in visited
-    assert _capture_missing_model_storage("ordinary scalar", frozen) is False
+    assert _protect_yielded_model_storage("ordinary scalar", frozen) is False
+
+
+def test_yielded_child_guard_rejects_wrong_capture_and_completion_owners():
+    class ReplayDict(dict[str, object]):
+        pass
+
+    child: dict[str, object] = {}
+    value = ReplayDict(child=child)
+    impostor = ReplayDict()
+    frozen = _freeze_model_graphs(value)
+    frozen.completed_traversals[id(value)] = impostor
+
+    assert _protect_yielded_model_storage(value, frozen) is True
+    assert frozen.completed_traversals[id(value)] is value
+
+    replacement = ReplayDict(child=child)
+    replacement_graph = _freeze_model_graphs(())
+    replacement_graph.replay_entries[id(replacement)] = (impostor, ())
+    replacement_graph.completed_traversals[id(replacement)] = replacement
+
+    assert _protect_yielded_model_storage(replacement, replacement_graph) is True
+    owner, entries = replacement_graph.replay_entries[id(replacement)]
+    assert owner is replacement
+    assert entries == (child,)
+    assert replacement_graph.completed_traversals[id(replacement)] is replacement
+
+
+def test_failed_yielded_child_traversal_is_not_marked_complete():
+    deep: list[object] = []
+    for _index in range(sys.getrecursionlimit() + 100):
+        deep = [deep]
+    alias: dict[str, object] = {}
+    value: list[object] = [alias, deep, alias]
+    frozen = _freeze_model_graphs(value)
+
+    with pytest.raises(RecursionError, match="maximum recursion depth exceeded"):
+        _protect_yielded_model_storage(value, frozen)
+
+    assert frozen.completed_traversals == {}
+
+
+def test_successful_alias_and_cycle_traversals_record_exact_owners():
+    child: dict[str, object] = {}
+    aliased: list[object] = [child, child]
+    cycle: list[object] = []
+    cycle.append(cycle)
+    frozen = _freeze_model_graphs(aliased, cycle)
+
+    assert _protect_yielded_model_storage(aliased, frozen) is True
+    assert frozen.completed_traversals[id(aliased)] is aliased
+    assert frozen.completed_traversals[id(child)] is child
+    assert _protect_yielded_model_storage(cycle, frozen) is True
+    assert frozen.completed_traversals[id(cycle)] is cycle
+    assert _protect_yielded_model_storage(aliased, frozen) is False
+    assert _protect_yielded_model_storage(cycle, frozen) is False
 
 
 @pytest.mark.parametrize("boundary", ["serialize", "finish"])
