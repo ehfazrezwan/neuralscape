@@ -28,23 +28,39 @@ _PYDANTIC_FIELDS_SET_SLOT = BaseModel.__dict__["__pydantic_fields_set__"]
 _ModelStorageEntries = tuple[tuple[Any, Any], ...]
 _ModelStorageSnapshot = tuple[_ModelStorageEntries, _ModelStorageEntries]
 _ModelStorageInventory = dict[int, _ModelStorageSnapshot]
+_ModelExtraSnapshot = tuple[bool, Any]
+_ModelDiscoverySnapshot = tuple[
+    _ModelStorageEntries,
+    Any,
+    _ModelExtraSnapshot,
+]
+_MISSING_FIELDS_SET = object()
 
 
-def _validated_model_extra_storage(
-    value: BaseModel,
-    stored_names: set[Any],
-) -> tuple[dict[Any, Any], set[Any]]:
-    """Capture stable Pydantic extra entries and all observed names."""
+def _snapshot_model_extra_storage(value: BaseModel) -> _ModelExtraSnapshot:
+    """Capture native dict extras without invoking public mapping views."""
 
     try:
         extra = _PYDANTIC_EXTRA_SLOT.__get__(value, type(value))
     except AttributeError:
         extra = None
     if extra is None:
-        return {}, set()
-
+        return True, ()
     if issubclass(type(extra), dict):
-        captured = dict(tuple(dict.items(extra)))
+        return True, tuple(dict.items(extra))
+    return False, extra
+
+
+def _validated_model_extra_storage(
+    extra_snapshot: _ModelExtraSnapshot,
+    stored_names: set[Any],
+    declared_names: set[Any],
+) -> tuple[dict[Any, Any], set[Any]]:
+    """Capture stable Pydantic extra entries and all observed names."""
+
+    captured_natively, extra = extra_snapshot
+    if captured_natively:
+        captured = dict(extra)
         observed_names = set(captured)
     else:
         if not isinstance(extra, Mapping):
@@ -54,7 +70,7 @@ def _validated_model_extra_storage(
         iterated_names = tuple(extra)
         captured = dict(tuple(extra.items()))
         observed_names = set(iterated_names) | set(captured)
-    declared_or_stored = set(type(value).model_fields) | stored_names
+    declared_or_stored = declared_names | stored_names
     overlap = declared_or_stored.intersection(observed_names)
     if overlap:
         names = ", ".join(sorted((repr(name) for name in overlap)))
@@ -72,14 +88,73 @@ def _reject_retained_unknown_fields(
     ``model_copy(update=...)`` deliberately does not validate its update.  For
     models configured with ``extra="forbid"``, an undeclared update can remain
     in ``__dict__``/``model_fields_set`` while ``model_dump()`` silently omits
-    it.  Walk the native object graph before dumping so the receiving boundary
-    cannot accept that sanitized subset.  Object identity, rather than value
-    equality, makes shared and cyclic containers safe to inspect.
+    it.  First discover model-owned state through native container backing so
+    every reachable model inventory is frozen before callback-bearing legacy
+    protocols run.  Then validate and walk those snapshots so the receiving
+    boundary cannot accept a later sanitized subset.  Object identity, rather
+    than value equality, makes shared and cyclic containers safe to inspect.
     """
 
     errors: list[dict[str, Any]] = []
     visited: set[int] = set()
+    discovered: set[int] = set()
+    discovery_inventory: dict[int, _ModelDiscoverySnapshot] = {}
     model_inventory: _ModelStorageInventory = {}
+
+    def discover(value: Any) -> None:
+        value_type = type(value)
+        if not issubclass(
+            value_type,
+            (BaseModel, dict, list, tuple, set, frozenset),
+        ):
+            return
+
+        identity = id(value)
+        if identity in discovered:
+            return
+        discovered.add(identity)
+
+        if issubclass(value_type, BaseModel):
+            native_stored = _PYDANTIC_DICT_DESCRIPTOR.__get__(value, BaseModel)
+            stored_entries = tuple(dict.items(native_stored))
+            try:
+                fields_set_storage = _PYDANTIC_FIELDS_SET_SLOT.__get__(
+                    value, value_type
+                )
+            except AttributeError:
+                fields_set_storage = _MISSING_FIELDS_SET
+            if issubclass(type(fields_set_storage), set):
+                fields_set_storage = set.copy(fields_set_storage)
+            extra_snapshot = _snapshot_model_extra_storage(value)
+            discovery_inventory[identity] = (
+                stored_entries,
+                fields_set_storage,
+                extra_snapshot,
+            )
+            for _, item in stored_entries:
+                discover(item)
+            captured_natively, extra = extra_snapshot
+            if captured_natively:
+                for key, item in extra:
+                    discover(key)
+                    discover(item)
+            return
+
+        if issubclass(value_type, dict):
+            for key, item in tuple(dict.items(value)):
+                discover(key)
+                discover(item)
+            return
+        if issubclass(value_type, list):
+            items = tuple(list.__iter__(value))
+        elif issubclass(value_type, tuple):
+            items = tuple(tuple.__iter__(value))
+        elif issubclass(value_type, set):
+            items = tuple(set.__iter__(value))
+        else:
+            items = tuple(frozenset.__iter__(value))
+        for item in items:
+            discover(item)
 
     def walk(value: Any, location: tuple[str | int, ...]) -> None:
         if not isinstance(value, (BaseModel, Mapping, list, tuple, set, frozenset)):
@@ -91,24 +166,24 @@ def _reject_retained_unknown_fields(
         visited.add(identity)
 
         if isinstance(value, BaseModel):
+            if identity not in discovery_inventory:
+                discover(value)
             declared = type(value).model_fields
-            native_stored = _PYDANTIC_DICT_DESCRIPTOR.__get__(value, BaseModel)
-            stored_entries = tuple(dict.items(native_stored))
+            stored_entries, fields_set_storage, extra_snapshot = (
+                discovery_inventory[identity]
+            )
             stored = dict(stored_entries)
-            try:
-                native_fields_set = _PYDANTIC_FIELDS_SET_SLOT.__get__(
-                    value, type(value)
-                )
-            except AttributeError as exc:
+            if fields_set_storage is _MISSING_FIELDS_SET:
                 raise ValueError(
                     "contract model fields-set storage is missing"
-                ) from exc
-            if issubclass(type(native_fields_set), set):
-                fields_set = set.copy(native_fields_set)
-            else:
-                fields_set = set(native_fields_set)
+                )
+            fields_set = set(fields_set_storage)
             pydantic_extra, observed_extra_names = (
-                _validated_model_extra_storage(value, set(stored))
+                _validated_model_extra_storage(
+                    extra_snapshot,
+                    set(stored),
+                    set(declared),
+                )
             )
             model_inventory[identity] = (
                 stored_entries,
@@ -148,6 +223,7 @@ def _reject_retained_unknown_fields(
         for index, item in enumerate(value):
             walk(item, (*location, index))
 
+    discover(root)
     walk(root, ())
     if errors:
         raise ValidationError.from_exception_data("PortableManifest", errors)
