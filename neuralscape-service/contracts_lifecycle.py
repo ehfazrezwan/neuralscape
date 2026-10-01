@@ -44,25 +44,38 @@ def _native_contract_graph(
         active_containers.add(identity)
         try:
             if issubclass(value_type, BaseModel):
-                fields = {
-                    key: _native_contract_graph(item, active_containers)
-                    for key, item in vars(value).items()
-                }
-                extra = getattr(value, "__pydantic_extra__", None)
-                if extra is not None:
+                stored = object.__getattribute__(value, "__dict__")
+                stored_entries = tuple(dict.items(stored))
+                try:
+                    extra = object.__getattribute__(value, "__pydantic_extra__")
+                except AttributeError:
+                    extra = None
+                if extra is None:
+                    extra_entries: tuple[tuple[object, object], ...] = ()
+                else:
                     extra_type = type(extra)
                     if not issubclass(extra_type, dict):
                         raise ValueError(
                             "malformed stored contract extras are not valid input"
                         )
                     extra_entries = tuple(dict.items(extra))
-                    declared_fields = type(value).model_fields
-                    for key, item in extra_entries:
-                        if key in fields or key in declared_fields:
-                            raise ValueError(
-                                "conflicting stored contract field is not valid input"
-                            )
-                        fields[key] = _native_contract_graph(item, active_containers)
+
+                stored_names = {key for key, _ in stored_entries}
+                declared_fields = value_type.model_fields
+                if any(
+                    key in stored_names or key in declared_fields
+                    for key, _ in extra_entries
+                ):
+                    raise ValueError(
+                        "conflicting stored contract field is not valid input"
+                    )
+
+                fields = {
+                    key: _native_contract_graph(item, active_containers)
+                    for key, item in stored_entries
+                }
+                for key, item in extra_entries:
+                    fields[key] = _native_contract_graph(item, active_containers)
                 return fields
             if issubclass(value_type, dict):
                 entries = tuple(dict.items(value))
