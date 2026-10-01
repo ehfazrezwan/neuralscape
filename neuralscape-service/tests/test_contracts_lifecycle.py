@@ -1,6 +1,8 @@
 """Positive and adversarial tests for inert lifecycle contracts."""
 
+import gc
 import json
+import weakref
 from collections.abc import Iterator, Mapping
 from datetime import datetime, timedelta, timezone
 from itertools import permutations
@@ -125,6 +127,124 @@ class InverseViewMapping(Mapping[str, object]):
 
 BASE_MODEL_DICT_DESCRIPTOR = vars(BaseModel)["__dict__"]
 BASE_MODEL_EXTRA_DESCRIPTOR = vars(BaseModel)["__pydantic_extra__"]
+
+
+class NestedRepairingTuple(tuple[object, ...]):
+    """Mutate a later model if tuple subclass traversal is dispatched."""
+
+    target: BaseModel | None = None
+    field_name = "content_revision"
+    replacement: object = 1
+    iteration_calls = 0
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        type(self).iteration_calls += 1
+        if self.target is not None:
+            native = BASE_MODEL_DICT_DESCRIPTOR.__get__(self.target, BaseModel)
+            dict.__setitem__(native, self.field_name, self.replacement)
+        return tuple.__iter__(self)
+
+
+class NestedRepairingName(str):
+    """Mutate a later model if model-owned name callbacks are dispatched."""
+
+    def __new__(
+        cls,
+        value: str,
+        target: BaseModel | None,
+        field_name: str = "content_revision",
+        replacement: object = 1,
+    ) -> "NestedRepairingName":
+        instance = super().__new__(cls, value)
+        instance.target = target
+        instance.field_name = field_name
+        instance.replacement = replacement
+        instance.armed = False
+        instance.hash_calls = 0
+        instance.equality_calls = 0
+        return instance
+
+    def _repair_or_reject_callback(self) -> None:
+        if self.target is not None:
+            native = BASE_MODEL_DICT_DESCRIPTOR.__get__(self.target, BaseModel)
+            dict.__setitem__(native, self.field_name, self.replacement)
+
+    def __hash__(self) -> int:
+        if self.armed:
+            self.hash_calls += 1
+            self._repair_or_reject_callback()
+        return str.__hash__(self)
+
+    def __eq__(self, other: object) -> bool:
+        if self.armed:
+            self.equality_calls += 1
+            self._repair_or_reject_callback()
+        return str.__eq__(self, other)
+
+    def __str__(self) -> str:
+        if self.armed:
+            raise AssertionError("string-subclass __str__ was invoked")
+        return str.__str__(self)
+
+
+class DivergentTuple(tuple[object, ...]):
+    """Expose a configured public view distinct from native tuple backing."""
+
+    def __new__(
+        cls,
+        native_items: tuple[object, ...],
+        public_items: tuple[object, ...],
+    ) -> "DivergentTuple":
+        instance = super().__new__(cls, native_items)
+        instance.public_items = public_items
+        instance.iteration_calls = 0
+        return instance
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        self.iteration_calls += 1
+        return iter(self.public_items)
+
+
+class RepairingReceiptClassView:
+    """Repair a later receipt if native classification reads ``__class__``."""
+
+    def __init__(self, target: StageReceipt) -> None:
+        self.target = target
+        self.class_reads = 0
+
+    @property
+    def __class__(self):  # type: ignore[override]
+        self.class_reads += 1
+        native = BASE_MODEL_DICT_DESCRIPTOR.__get__(self.target, BaseModel)
+        dict.__setitem__(native, "attempt", 1)
+        return object
+
+
+class ReleasingReceiptTuple(tuple[object, ...]):
+    """Release a native nested receipt before exposing the public receipt."""
+
+    def __new__(
+        cls,
+        hidden: object,
+        carrier: StageReceipt,
+        public_receipt: StageReceipt,
+    ) -> "ReleasingReceiptTuple":
+        instance = super().__new__(cls, (hidden, carrier))
+        instance.carrier = carrier
+        instance.public_receipt = public_receipt
+        native = BASE_MODEL_DICT_DESCRIPTOR.__get__(carrier, BaseModel)
+        nested = dict.__getitem__(native, "error")
+        instance.nested_ref = weakref.ref(nested)
+        instance.iteration_calls = 0
+        instance.nested_alive_after_release = False
+        return instance
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        self.iteration_calls += 1
+        native = BASE_MODEL_DICT_DESCRIPTOR.__get__(self.carrier, BaseModel)
+        dict.__setitem__(native, "error", None)
+        self.nested_alive_after_release = self.nested_ref() is not None
+        return iter((self.public_receipt,))
 
 
 def descriptor_masked_copy(value: BaseModel) -> BaseModel:
@@ -306,6 +426,47 @@ def move_declared_field_to_extra(value: BaseModel, field_name: str) -> None:
         "__pydantic_extra__",
         {field_name: stored_value},
     )
+
+
+def install_repairing_stored_name(
+    model: BaseModel,
+    stored_name: str,
+    target: BaseModel | None,
+    *,
+    field_name: str = "content_revision",
+    replacement: object = 1,
+) -> NestedRepairingName:
+    storage = BASE_MODEL_DICT_DESCRIPTOR.__get__(model, BaseModel)
+    item = dict.__getitem__(storage, stored_name)
+    dict.__delitem__(storage, stored_name)
+    name = NestedRepairingName(
+        stored_name,
+        target,
+        field_name,
+        replacement,
+    )
+    dict.__setitem__(storage, name, item)
+    name.armed = True
+    name.hash_calls = 0
+    name.equality_calls = 0
+    return name
+
+
+def install_repairing_target_refs(
+    command: Intent,
+    target: BaseModel | None,
+    *,
+    field_name: str = "content_revision",
+    replacement: object = 1,
+) -> NestedRepairingTuple:
+    trigger = NestedRepairingTuple(command.target_refs)
+    trigger.target = target
+    trigger.field_name = field_name
+    trigger.replacement = replacement
+    storage = BASE_MODEL_DICT_DESCRIPTOR.__get__(command, BaseModel)
+    dict.__setitem__(storage, "target_refs", trigger)
+    NestedRepairingTuple.iteration_calls = 0
+    return trigger
 
 
 def memory_record(**overrides: object) -> MemoryRecord:
@@ -1824,15 +1985,562 @@ def test_aggregate_boundary_uses_native_nested_model_storage(
         assert raised.value.errors()[0]["loc"][-1] == "tenant_id"
 
 
+def _intent_with_invalid_nested_source() -> tuple[Intent, SourceVersion]:
+    command = intent(ProcessingStage.CANONICAL)
+    invalid_source = command.source_preconditions[0].model_copy(
+        update={"content_revision": -1}
+    )
+    return (
+        command.model_copy(update={"source_preconditions": (invalid_source,)}),
+        invalid_source,
+    )
+
+
+@pytest.mark.parametrize("trigger_kind", ["tuple", "stored-name"])
+def test_aggregate_boundary_freezes_later_nested_model_before_earlier_hook(
+    trigger_kind: str,
+) -> None:
+    ordinary, ordinary_source = _intent_with_invalid_nested_source()
+    with pytest.raises(ValidationError) as ordinary_error:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=ordinary,
+            receipts=(),
+        )
+
+    attacked, attacked_source = _intent_with_invalid_nested_source()
+    NestedRepairingTuple.iteration_calls = 0
+    if trigger_kind == "tuple":
+        install_repairing_target_refs(attacked, attacked_source)
+        hostile_name = None
+    else:
+        hostile_name = install_repairing_stored_name(
+            attacked,
+            "id",
+            attacked_source,
+        )
+    with pytest.raises(ValidationError) as attacked_error:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=attacked,
+            receipts=(),
+        )
+
+    ordinary_diagnostics = [
+        (error["loc"], error["type"], error["input"])
+        for error in ordinary_error.value.errors()
+    ]
+    attacked_diagnostics = [
+        (error["loc"], error["type"], error["input"])
+        for error in attacked_error.value.errors()
+    ]
+    assert attacked_diagnostics == ordinary_diagnostics
+    assert ordinary_source.content_revision == -1
+    assert attacked_source.content_revision == 1
+    assert NestedRepairingTuple.iteration_calls == (1 if trigger_kind == "tuple" else 0)
+    if hostile_name is not None:
+        assert hostile_name.hash_calls == 2
+        assert hostile_name.equality_calls == 1
+
+
+@pytest.mark.parametrize("trigger_kind", ["tuple", "stored-name"])
+def test_aggregate_boundary_preserves_invalid_root_before_earlier_hook(
+    trigger_kind: str,
+) -> None:
+    ordinary = intent(ProcessingStage.CANONICAL).model_copy(
+        update={"request_digest": ""}
+    )
+    with pytest.raises(ValidationError) as ordinary_error:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=ordinary,
+            receipts=(),
+        )
+
+    attacked = intent(ProcessingStage.CANONICAL).model_copy(
+        update={"request_digest": ""}
+    )
+    NestedRepairingTuple.iteration_calls = 0
+    if trigger_kind == "tuple":
+        install_repairing_target_refs(
+            attacked,
+            attacked,
+            field_name="request_digest",
+            replacement="sha256:repaired",
+        )
+        hostile_name = None
+    else:
+        hostile_name = install_repairing_stored_name(
+            attacked,
+            "id",
+            attacked,
+            field_name="request_digest",
+            replacement="sha256:repaired",
+        )
+    with pytest.raises(ValidationError) as attacked_error:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=attacked,
+            receipts=(),
+        )
+
+    ordinary_diagnostics = [
+        (error["loc"], error["type"], error["input"])
+        for error in ordinary_error.value.errors()
+    ]
+    attacked_diagnostics = [
+        (error["loc"], error["type"], error["input"])
+        for error in attacked_error.value.errors()
+    ]
+    assert attacked_diagnostics == ordinary_diagnostics
+    assert attacked.request_digest == "sha256:repaired"
+    assert NestedRepairingTuple.iteration_calls == (1 if trigger_kind == "tuple" else 0)
+    if hostile_name is not None:
+        assert hostile_name.hash_calls == 2
+        assert hostile_name.equality_calls == 1
+
+
+@pytest.mark.parametrize("trigger_kind", ["tuple", "stored-name"])
+def test_aggregate_boundary_accepts_benign_supported_subclasses(
+    trigger_kind: str,
+) -> None:
+    command = intent(ProcessingStage.CANONICAL)
+    NestedRepairingTuple.iteration_calls = 0
+    if trigger_kind == "tuple":
+        install_repairing_target_refs(command, None)
+        benign_name = None
+    else:
+        benign_name = install_repairing_stored_name(command, "id", None)
+
+    validate_required_stage_claim(
+        claimed_status=IntentStatus.ACCEPTED,
+        intent=command,
+        receipts=(),
+    )
+
+    assert NestedRepairingTuple.iteration_calls == (1 if trigger_kind == "tuple" else 0)
+    if benign_name is not None:
+        assert benign_name.hash_calls == 2
+        assert benign_name.equality_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("native_targets", "public_targets", "accepted"),
+    [
+        ((), (reference("public-same-tenant"),), True),
+        ((), (reference("public-cross-tenant", tenant_id="tenant-2"),), False),
+        (
+            (reference("native-cross-tenant", tenant_id="tenant-2"),),
+            (reference("public-same-tenant"),),
+            True,
+        ),
+    ],
+    ids=[
+        "public-only-valid-target",
+        "public-only-cross-tenant-target",
+        "valid-public-view-hides-native-cross-tenant-target",
+    ],
+)
+def test_aggregate_boundary_preserves_tuple_subclass_public_target_view(
+    native_targets: tuple[object, ...],
+    public_targets: tuple[object, ...],
+    accepted: bool,
+) -> None:
+    command = intent(ProcessingStage.CANONICAL)
+    divergent = DivergentTuple(native_targets, public_targets)
+    dict.__setitem__(
+        BASE_MODEL_DICT_DESCRIPTOR.__get__(command, BaseModel),
+        "target_refs",
+        divergent,
+    )
+
+    if accepted:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=command,
+            receipts=(),
+        )
+    else:
+        with pytest.raises(
+            ValidationError,
+            match="target_refs must match intent tenant_id",
+        ):
+            validate_required_stage_claim(
+                claimed_status=IntentStatus.ACCEPTED,
+                intent=command,
+                receipts=(),
+            )
+
+    assert divergent.iteration_calls == 1
+
+
+def test_aggregate_boundary_freezes_replaced_later_native_edge() -> None:
+    ordinary, _ordinary_source = _intent_with_invalid_nested_source()
+    with pytest.raises(ValidationError) as ordinary_error:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=ordinary,
+            receipts=(),
+        )
+
+    attacked, _attacked_source = _intent_with_invalid_nested_source()
+    install_repairing_target_refs(
+        attacked,
+        attacked,
+        field_name="source_preconditions",
+        replacement=(),
+    )
+    with pytest.raises(ValidationError) as attacked_error:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=attacked,
+            receipts=(),
+        )
+
+    assert attacked_error.value.errors(include_url=False) == (
+        ordinary_error.value.errors(include_url=False)
+    )
+    assert attacked.source_preconditions == ()
+    assert NestedRepairingTuple.iteration_calls == 1
+
+
+def test_source_boundary_scalar_invalidity_remains_frozen_before_name_hook() -> None:
+    expected = source("memory-1")
+    ordinary = source("memory-1").model_copy(update={"content_revision": -1})
+    with pytest.raises(ValidationError) as ordinary_error:
+        source_versions_match(expected, ordinary)
+
+    attacked = source("memory-1").model_copy(update={"content_revision": -1})
+    hostile_name = install_repairing_stored_name(
+        attacked,
+        "record_id",
+        attacked,
+    )
+    with pytest.raises(ValidationError) as attacked_error:
+        source_versions_match(expected, attacked)
+
+    ordinary_diagnostics = [
+        (error["loc"], error["type"], error["input"])
+        for error in ordinary_error.value.errors()
+    ]
+    attacked_diagnostics = [
+        (error["loc"], error["type"], error["input"])
+        for error in attacked_error.value.errors()
+    ]
+    assert attacked_diagnostics == ordinary_diagnostics
+    assert attacked.content_revision == 1
+    assert hostile_name.hash_calls == 2
+    assert hostile_name.equality_calls == 1
+
+
+def test_source_boundary_captures_observed_before_expected_name_hook() -> None:
+    ordinary_expected = source("memory-1")
+    ordinary_observed = source("memory-1").model_copy(
+        update={"content_revision": -1}
+    )
+    with pytest.raises(ValidationError) as ordinary_error:
+        source_versions_match(ordinary_expected, ordinary_observed)
+
+    attacked_expected = source("memory-1")
+    attacked_observed = source("memory-1").model_copy(
+        update={"content_revision": -1}
+    )
+    hostile_name = install_repairing_stored_name(
+        attacked_expected,
+        "record_id",
+        attacked_observed,
+        replacement=3,
+    )
+    with pytest.raises(ValidationError) as attacked_error:
+        source_versions_match(attacked_expected, attacked_observed)
+
+    assert attacked_error.value.errors(include_url=False) == (
+        ordinary_error.value.errors(include_url=False)
+    )
+    assert attacked_observed.content_revision == 3
+    assert hostile_name.hash_calls == 2
+    assert hostile_name.equality_calls == 1
+
+
+def test_source_boundary_preserves_expected_error_before_observed_type() -> None:
+    invalid_expected = source("memory-1").model_copy(
+        update={"content_revision": -1}
+    )
+
+    with pytest.raises(ValidationError) as raised:
+        source_versions_match(invalid_expected, object())  # type: ignore[arg-type]
+
+    assert raised.value.errors()[0]["loc"] == ("content_revision",)
+    assert raised.value.errors()[0]["type"] == "greater_than_equal"
+
+
+def test_aggregate_boundary_captures_receipt_before_intent_tuple_hook() -> None:
+    command = intent(ProcessingStage.CANONICAL)
+    ordinary_receipt = receipt(
+        ProcessingStage.CANONICAL,
+        StageStatus.PENDING,
+    ).model_copy(update={"attempt": 0})
+    with pytest.raises(ValidationError) as ordinary_error:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=command,
+            receipts=(ordinary_receipt,),
+        )
+
+    attacked_command = intent(ProcessingStage.CANONICAL)
+    attacked_receipt = receipt(
+        ProcessingStage.CANONICAL,
+        StageStatus.PENDING,
+    ).model_copy(update={"attempt": 0})
+    install_repairing_target_refs(
+        attacked_command,
+        attacked_receipt,
+        field_name="attempt",
+        replacement=1,
+    )
+    with pytest.raises(ValidationError) as attacked_error:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=attacked_command,
+            receipts=(attacked_receipt,),
+        )
+
+    ordinary_diagnostics = [
+        (error["loc"], error["type"], error["msg"], error["input"])
+        for error in ordinary_error.value.errors(include_url=False)
+    ]
+    attacked_diagnostics = [
+        (error["loc"], error["type"], error["msg"], error["input"])
+        for error in attacked_error.value.errors(include_url=False)
+    ]
+    assert attacked_diagnostics == ordinary_diagnostics
+    assert attacked_receipt.attempt == 1
+    assert NestedRepairingTuple.iteration_calls == 1
+
+
+def test_aggregate_boundary_preserves_intent_error_before_receipt_error() -> None:
+    invalid_intent = intent(ProcessingStage.CANONICAL).model_copy(
+        update={"request_digest": ""}
+    )
+    invalid_receipt = receipt(
+        ProcessingStage.CANONICAL,
+        StageStatus.PENDING,
+    ).model_copy(update={"attempt": 0})
+
+    with pytest.raises(ValidationError) as raised:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=invalid_intent,
+            receipts=(invalid_receipt,),
+        )
+
+    assert raised.value.errors()[0]["loc"] == ("request_digest",)
+    assert raised.value.errors()[0]["type"] == "string_too_short"
+
+
+@pytest.mark.parametrize("invalid_view", ["native", "public"])
+def test_aggregate_boundary_preserves_receipt_tuple_subclass_public_view(
+    invalid_view: str,
+) -> None:
+    command = intent(ProcessingStage.CANONICAL)
+    valid_receipt = receipt(
+        ProcessingStage.CANONICAL,
+        StageStatus.PENDING,
+    )
+    invalid_receipt = valid_receipt.model_copy(update={"attempt": 0})
+    if invalid_view == "native":
+        native_receipt, public_receipt = invalid_receipt, valid_receipt
+    else:
+        native_receipt, public_receipt = valid_receipt, invalid_receipt
+    divergent = DivergentTuple((native_receipt,), (public_receipt,))
+
+    if invalid_view == "native":
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=command,
+            receipts=divergent,
+        )
+    else:
+        with pytest.raises(ValidationError, match="attempt must be at least 1"):
+            validate_required_stage_claim(
+                claimed_status=IntentStatus.ACCEPTED,
+                intent=command,
+                receipts=divergent,
+            )
+
+    assert divergent.iteration_calls == 1
+
+
+def test_aggregate_boundary_classifies_native_receipts_concretely() -> None:
+    class ReceiptSubtype(StageReceipt):
+        pass
+
+    command = intent(ProcessingStage.CANONICAL)
+    ordinary = receipt(
+        ProcessingStage.CANONICAL,
+        StageStatus.PENDING,
+    ).model_copy(update={"attempt": 0})
+    ordinary_native = BASE_MODEL_DICT_DESCRIPTOR.__get__(ordinary, BaseModel)
+    assert dict.__getitem__(ordinary_native, "attempt") == 0
+    with pytest.raises(ValidationError) as ordinary_error:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=command,
+            receipts=(ordinary,),
+        )
+    assert dict.__getitem__(ordinary_native, "attempt") == 0
+
+    invalid = ReceiptSubtype.model_validate(
+        receipt(
+            ProcessingStage.CANONICAL,
+            StageStatus.PENDING,
+        ).model_dump(mode="python")
+    ).model_copy(update={"attempt": 0})
+    invalid_native = BASE_MODEL_DICT_DESCRIPTOR.__get__(invalid, BaseModel)
+    hidden_invalid = RepairingReceiptClassView(invalid)
+    divergent_invalid = DivergentTuple(
+        (hidden_invalid, invalid),
+        (invalid,),
+    )
+    assert dict.__getitem__(invalid_native, "attempt") == 0
+    with pytest.raises(ValidationError) as divergent_error:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=command,
+            receipts=divergent_invalid,
+        )
+
+    ordinary_diagnostics = [
+        (error["loc"], error["type"], error["msg"], error["input"])
+        for error in ordinary_error.value.errors(include_url=False)
+    ]
+    divergent_diagnostics = [
+        (error["loc"], error["type"], error["msg"], error["input"])
+        for error in divergent_error.value.errors(include_url=False)
+    ]
+    assert divergent_diagnostics == ordinary_diagnostics
+    assert dict.__getitem__(invalid_native, "attempt") == 0
+    assert hidden_invalid.class_reads == 0
+    assert divergent_invalid.iteration_calls == 1
+
+    valid = ReceiptSubtype.model_validate(
+        receipt(
+            ProcessingStage.CANONICAL,
+            StageStatus.PENDING,
+        ).model_dump(mode="python")
+    )
+    valid_native = BASE_MODEL_DICT_DESCRIPTOR.__get__(valid, BaseModel)
+    hidden_valid = RepairingReceiptClassView(valid)
+    divergent_valid = DivergentTuple((hidden_valid, valid), (valid,))
+    assert dict.__getitem__(valid_native, "attempt") == 1
+
+    validate_required_stage_claim(
+        claimed_status=IntentStatus.ACCEPTED,
+        intent=command,
+        receipts=divergent_valid,
+    )
+
+    assert dict.__getitem__(valid_native, "attempt") == 1
+    assert hidden_valid.class_reads == 0
+    assert divergent_valid.iteration_calls == 1
+
+
+def test_aggregate_boundary_owns_native_receipts_released_by_public_view() -> None:
+    command = intent(ProcessingStage.CANONICAL)
+    ordinary_invalid = receipt(
+        ProcessingStage.CANONICAL,
+        StageStatus.PENDING,
+    ).model_copy(update={"attempt": 0})
+    with pytest.raises(ValidationError) as ordinary_error:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=command,
+            receipts=(ordinary_invalid,),
+        )
+
+    stale_valid = receipt(
+        ProcessingStage.CANONICAL,
+        StageStatus.PENDING,
+    )
+    carrier_for_invalid = receipt(
+        ProcessingStage.CANONICAL,
+        StageStatus.PENDING,
+    ).model_copy(update={"error": stale_valid})
+    public_invalid = receipt(
+        ProcessingStage.CANONICAL,
+        StageStatus.PENDING,
+    ).model_copy(update={"attempt": 0})
+    hidden_invalid = RepairingReceiptClassView(public_invalid)
+    divergent_invalid = ReleasingReceiptTuple(
+        hidden_invalid,
+        carrier_for_invalid,
+        public_invalid,
+    )
+    del stale_valid
+
+    with pytest.raises(ValidationError) as divergent_error:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=command,
+            receipts=divergent_invalid,
+        )
+
+    ordinary_diagnostics = [
+        (error["loc"], error["type"], error["msg"], error["input"])
+        for error in ordinary_error.value.errors(include_url=False)
+    ]
+    divergent_diagnostics = [
+        (error["loc"], error["type"], error["msg"], error["input"])
+        for error in divergent_error.value.errors(include_url=False)
+    ]
+    assert divergent_diagnostics == ordinary_diagnostics
+    assert divergent_invalid.nested_alive_after_release
+    assert divergent_invalid.iteration_calls == 1
+    assert hidden_invalid.class_reads == 0
+
+    stale_invalid = receipt(
+        ProcessingStage.CANONICAL,
+        StageStatus.PENDING,
+    ).model_copy(update={"attempt": 0})
+    carrier_for_valid = receipt(
+        ProcessingStage.CANONICAL,
+        StageStatus.PENDING,
+    ).model_copy(update={"error": stale_invalid})
+    public_valid = receipt(
+        ProcessingStage.CANONICAL,
+        StageStatus.PENDING,
+    )
+    hidden_valid = RepairingReceiptClassView(public_valid)
+    divergent_valid = ReleasingReceiptTuple(
+        hidden_valid,
+        carrier_for_valid,
+        public_valid,
+    )
+    del stale_invalid
+
+    validate_required_stage_claim(
+        claimed_status=IntentStatus.ACCEPTED,
+        intent=command,
+        receipts=divergent_valid,
+    )
+
+    assert divergent_valid.nested_alive_after_release
+    assert divergent_valid.iteration_calls == 1
+    assert hidden_valid.class_reads == 0
+
+
 def test_aggregate_boundary_snapshots_model_extras_before_nested_traversal() -> None:
     command = intent(ProcessingStage.CANONICAL)
     extras = {"undeclared_witness": True}
     object.__setattr__(command, "__pydantic_extra__", extras)
 
     class ClearingTuple(tuple[object, ...]):
+        iteration_calls = 0
+
         def __iter__(self):  # type: ignore[no-untyped-def]
+            type(self).iteration_calls += 1
             extras.clear()
-            return super().__iter__()
+            return tuple.__iter__(self)
 
     command.__dict__["target_refs"] = ClearingTuple(command.target_refs)
 
@@ -1844,6 +2552,7 @@ def test_aggregate_boundary_snapshots_model_extras_before_nested_traversal() -> 
         )
 
     assert extras == {}
+    assert ClearingTuple.iteration_calls == 1
     assert raised.value.errors()[0]["type"] == "extra_forbidden"
     assert raised.value.errors()[0]["loc"] == ("undeclared_witness",)
 
@@ -1919,13 +2628,87 @@ def test_source_boundary_preserves_non_dict_mapping_rejection() -> None:
         source_versions_match(expected, observed)
 
 
+def test_identity_cache_owns_model_and_dict_sources_until_snapshot_release() -> None:
+    def assert_snapshot_owner(value: object) -> None:
+        source_ref = weakref.ref(value)
+        snapshot = lifecycle_contracts._capture_contract_graph(value)
+        del value
+        gc.collect()
+        assert source_ref() is not None
+
+        del snapshot
+        gc.collect()
+        assert source_ref() is None
+
+    assert_snapshot_owner(source("owned-model"))
+    assert_snapshot_owner(HiddenBackingDict({"owned": True}))
+
+
+def test_native_capture_rejects_foreign_identity_cache_entry() -> None:
+    stale = source("stale-model")
+    stale_capture, _ = lifecycle_contracts._capture_contract_graph(stale)
+    current = source("current-model")
+    inventory = {id(current): stale_capture}
+
+    captured = lifecycle_contracts._capture_native_contract_graph(
+        current,
+        captured_by_identity=inventory,
+    )
+    materialized = lifecycle_contracts._materialize_contract_graph(
+        (captured, inventory)
+    )
+
+    assert captured.source is current
+    assert inventory[id(current)] is captured
+    assert materialized["record_id"] == "current-model"
+
+
+def test_public_materialization_rejects_foreign_identity_cache_entry() -> None:
+    stale = source("stale-public-model")
+    stale_capture, _ = lifecycle_contracts._capture_contract_graph(stale)
+    current = source("current-public-model")
+    public_view = DivergentTuple((), (current,))
+    captured, inventory = lifecycle_contracts._capture_contract_graph(public_view)
+    inventory[id(current)] = stale_capture
+
+    materialized = lifecycle_contracts._materialize_contract_graph(
+        (captured, inventory)
+    )
+
+    assert materialized[0]["record_id"] == "current-public-model"
+    assert public_view.iteration_calls == 1
+
+
+def test_receipt_inventory_rejects_foreign_identity_cache_entry() -> None:
+    stale = receipt(
+        ProcessingStage.CANONICAL,
+        StageStatus.PENDING,
+    )
+    stale_capture, _ = lifecycle_contracts._capture_contract_graph(stale)
+    current = stale.model_copy(update={"attempt": 0})
+    inventory = {id(current): stale_capture}
+
+    with pytest.raises(ValidationError) as raised:
+        lifecycle_contracts._revalidated_inventory_model(
+            StageReceipt,
+            current,
+            inventory,
+        )
+
+    assert raised.value.errors()[0]["type"] == "value_error"
+    assert raised.value.errors()[0]["input"]["attempt"] == 0
+
+
 def test_native_graph_captures_dict_backing_before_nested_traversal() -> None:
     parent = HiddenBackingDict()
 
     class MutatingList(list[object]):
+        iteration_calls = 0
+
         def __iter__(self):  # type: ignore[no-untyped-def]
+            type(self).iteration_calls += 1
             dict.__setitem__(parent, "late", "not-in-captured-inventory")
-            return super().__iter__()
+            return list.__iter__(self)
 
     child = MutatingList(["retained"])
     dict.__setitem__(parent, "payload", child)
@@ -1934,7 +2717,58 @@ def test_native_graph_captures_dict_backing_before_nested_traversal() -> None:
         "payload": ["retained"]
     }
     assert dict.__getitem__(parent, "late") == "not-in-captured-inventory"
+    assert MutatingList.iteration_calls == 1
     assert parent.view_calls == 0
+
+
+def test_native_graph_freezes_plain_list_edges_before_earlier_callback() -> None:
+    later = ["retained"]
+
+    class ClearingTuple(tuple[object, ...]):
+        iteration_calls = 0
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            type(self).iteration_calls += 1
+            later.clear()
+            return tuple.__iter__(self)
+
+    parent = {
+        "earlier": ClearingTuple(("trigger",)),
+        "later": later,
+    }
+
+    assert lifecycle_contracts._native_contract_graph(parent) == {
+        "earlier": ("trigger",),
+        "later": ["retained"],
+    }
+    assert later == []
+    assert ClearingTuple.iteration_calls == 1
+
+
+def test_native_graph_preserves_subclass_cycle_public_views() -> None:
+    class HidingCycleList(list[object]):
+        iteration_calls = 0
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            type(self).iteration_calls += 1
+            return iter(())
+
+    hidden = HidingCycleList()
+    list.append(hidden, hidden)
+    assert lifecycle_contracts._native_contract_graph(hidden) == []
+    assert HidingCycleList.iteration_calls == 1
+
+    class ExposingCycleList(list[object]):
+        iteration_calls = 0
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            type(self).iteration_calls += 1
+            return iter((self,))
+
+    exposed = ExposingCycleList()
+    with pytest.raises(ValueError, match="cyclic contract graph"):
+        lifecycle_contracts._native_contract_graph(exposed)
+    assert ExposingCycleList.iteration_calls == 1
 
 
 def test_native_graph_preserves_defaults_but_rejects_declared_extra_override() -> None:
@@ -2037,6 +2871,18 @@ def test_aggregate_boundary_rejects_non_tuple_receipt_collection() -> None:
             receipts=[  # type: ignore[arg-type]
                 receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
             ],
+        )
+
+
+def test_aggregate_boundary_preserves_strict_receipt_item_type() -> None:
+    unsupported: dict[str, object] = {}
+    unsupported["cycle"] = unsupported
+
+    with pytest.raises(TypeError, match="value must be a StageReceipt"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=intent(ProcessingStage.CANONICAL),
+            receipts=(unsupported,),  # type: ignore[arg-type]
         )
 
 
