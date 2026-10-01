@@ -506,9 +506,13 @@ def _native_snapshot(
                 projected: dict[object, object] = {}
                 while True:
                     try:
-                        key, field_value = next(source_iterator)
+                        pair = next(source_iterator)
                     except StopIteration:
                         break
+                    except Exception as exc:
+                        return _FailedNativeDictTraversal(exc)
+                    try:
+                        key, field_value = pair
                     except Exception as exc:
                         return _FailedNativeDictTraversal(exc)
                     projected[key] = _native_snapshot(

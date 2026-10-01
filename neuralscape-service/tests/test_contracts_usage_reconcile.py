@@ -574,6 +574,61 @@ class _TraversalPublicItemsIterator:
         return entry
 
 
+class _StopIterationUnpackPair:
+    def __init__(self) -> None:
+        self.iteration_calls = 0
+
+    def __iter__(self) -> Iterator[object]:
+        self.iteration_calls += 1
+        raise StopIteration("pair unpack sentinel")
+
+
+class _LateMalformedPairMapping(Mapping[str, object]):
+    """Yield a malformed pair after every otherwise valid public entry."""
+
+    def __init__(self, entries: dict[str, object], malformed_pair: object) -> None:
+        self.entries = entries
+        self.malformed_pair = malformed_pair
+        self.items_calls = 0
+        self.iterator_calls = 0
+        self.iterator_entries = 0
+
+    def __getitem__(self, key: str) -> object:
+        return self.entries[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.entries)
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def items(self) -> Iterator[object]:
+        self.items_calls += 1
+        return _LateMalformedPairIterator(self)
+
+
+class _LateMalformedPairIterator:
+    def __init__(self, owner: _LateMalformedPairMapping) -> None:
+        self.owner = owner
+        self.entries: tuple[object, ...] = (
+            *tuple(dict.items(owner.entries)),
+            owner.malformed_pair,
+        )
+        self.index = 0
+
+    def __iter__(self) -> "_LateMalformedPairIterator":
+        self.owner.iterator_calls += 1
+        return self
+
+    def __next__(self) -> object:
+        if self.index == len(self.entries):
+            raise StopIteration
+        entry = self.entries[self.index]
+        self.index += 1
+        self.owner.iterator_entries += 1
+        return entry
+
+
 class _FalseyPopulatedExtras(dict[str, object]):
     def __bool__(self) -> bool:
         return False
@@ -1834,6 +1889,83 @@ def test_python_public_mapping_does_not_remap_recursive_cycle_error(
     assert value.items_calls == 1
     assert value.iterator_calls == 1
     assert value.iterator_entries == expected_entries
+
+
+@pytest.mark.parametrize(
+    ("pair_kind", "error_detail"),
+    [
+        ("stop-iteration", "StopIteration: pair unpack sentinel"),
+        (
+            "one-item",
+            "ValueError: not enough values to unpack (expected 2, got 1)",
+        ),
+        ("three-item", "ValueError: too many values to unpack (expected 2)"),
+    ],
+)
+@pytest.mark.parametrize("placement", ["root", "nested"])
+@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+def test_python_public_mapping_late_malformed_pair_is_located(
+    pair_kind: str,
+    error_detail: str,
+    placement: str,
+    receiver_name: str,
+) -> None:
+    result = reconcile_usage_events([_event()])
+    stream = result.streams[0]
+    if receiver_name == "stream":
+        receiver = ReconciledUsageStream
+        valid = stream
+        if placement == "root":
+            outer_payload: dict[str, object] | None = None
+            entries = stream.model_dump(mode="python")
+            location: tuple[object, ...] = ()
+        else:
+            outer_payload = stream.model_dump(mode="python")
+            entries = stream.attribution.model_dump(mode="python")
+            location = ("attribution",)
+    else:
+        receiver = UsageReconciliation
+        valid = result
+        if placement == "root":
+            outer_payload = None
+            entries = result.model_dump(mode="python")
+            location = ()
+        else:
+            outer_payload = result.model_dump(mode="python")
+            entries = stream.model_dump(mode="python")
+            location = ("streams", 0)
+
+    if pair_kind == "stop-iteration":
+        malformed_pair: object = _StopIterationUnpackPair()
+    elif pair_kind == "one-item":
+        malformed_pair = ("only-item",)
+    else:
+        malformed_pair = ("key", "value", "extra")
+    failing = _LateMalformedPairMapping(entries, malformed_pair)
+    if placement == "root":
+        value: object = failing
+    else:
+        assert outer_payload is not None
+        if receiver_name == "stream":
+            outer_payload["attribution"] = failing
+        else:
+            outer_payload["streams"] = (failing,)
+        value = outer_payload
+
+    assert _validation_signature(receiver, value) == [
+        (
+            "mapping_type",
+            location,
+            f"Input should be a valid mapping, error: {error_detail}",
+        )
+    ]
+    assert failing.items_calls == 1
+    assert failing.iterator_calls == 1
+    assert failing.iterator_entries == len(entries) + 1
+    if isinstance(malformed_pair, _StopIterationUnpackPair):
+        assert malformed_pair.iteration_calls == 1
+
+    assert receiver.model_validate(valid.model_dump(mode="python")) == valid
 
 
 @pytest.mark.parametrize(
