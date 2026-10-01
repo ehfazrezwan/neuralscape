@@ -774,7 +774,7 @@ def _validate_no_correction_cycles(
             if current_id in path:
                 raise UsageReconciliationError(
                     "correction_cycle",
-                    f"correction chain containing {current_id} cycles",
+                    f"correction chain containing {current_id} is cyclic",
                 )
             path.add(current_id)
             current_id = by_id[current_id].predecessor_event_id
