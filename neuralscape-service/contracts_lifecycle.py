@@ -7,6 +7,7 @@ projection.  Callers must establish those runtime properties separately.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum
 from typing import Annotated, Literal, TypeVar
 
@@ -29,11 +30,48 @@ _BASE_MODEL_DICT_DESCRIPTOR = vars(BaseModel)["__dict__"]
 _BASE_MODEL_EXTRA_DESCRIPTOR = vars(BaseModel)["__pydantic_extra__"]
 
 
-def _native_contract_graph(
+class _CapturedGraph:
+    """Opaque native graph captured before reconstruction callbacks."""
+
+
+@dataclass(frozen=True, slots=True)
+class _CapturedLeaf(_CapturedGraph):
+    value: object
+
+
+@dataclass(frozen=True, slots=True)
+class _CapturedCycle(_CapturedGraph):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class _CapturedModel(_CapturedGraph):
+    model_type: type[BaseModel]
+    stored_entries: tuple[tuple[object, _CapturedGraph], ...]
+    extra_entries: tuple[tuple[object, _CapturedGraph], ...]
+    malformed_extra: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _CapturedDict(_CapturedGraph):
+    entries: tuple[tuple[object, _CapturedGraph], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _CapturedList(_CapturedGraph):
+    items: tuple[_CapturedGraph, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _CapturedTuple(_CapturedGraph):
+    items: tuple[_CapturedGraph, ...]
+
+
+def _capture_native_contract_graph(
     value: object,
     active_containers: set[int] | None = None,
-) -> object:
-    """Materialize stored fields without dropping extras or hiding cycles."""
+) -> _CapturedGraph:
+    """Freeze supported native backing without invoking public protocols."""
 
     value_type = type(value)
     if active_containers is None:
@@ -42,7 +80,7 @@ def _native_contract_graph(
     if issubclass(value_type, (BaseModel, dict, list, tuple)):
         identity = id(value)
         if identity in active_containers:
-            raise ValueError("cyclic contract graph is not valid input")
+            return _CapturedCycle()
         active_containers.add(identity)
         try:
             if issubclass(value_type, BaseModel):
@@ -61,41 +99,109 @@ def _native_contract_graph(
                     extra_entries = (
                         () if malformed_extra else tuple(dict.items(extra))
                     )
-
-                stored_names = {key for key, _ in stored_entries}
-                declared_fields = value_type.model_fields
-                fields = {
-                    key: _native_contract_graph(item, active_containers)
-                    for key, item in stored_entries
-                }
-                if malformed_extra:
-                    raise ValueError(
-                        "malformed stored contract extras are not valid input"
-                    )
-                for key, item in extra_entries:
-                    if key in stored_names or key in declared_fields:
-                        raise ValueError(
-                            "conflicting stored contract field is not valid input"
+                return _CapturedModel(
+                    model_type=value_type,
+                    stored_entries=tuple(
+                        (
+                            key,
+                            _capture_native_contract_graph(item, active_containers),
                         )
-                    fields[key] = _native_contract_graph(item, active_containers)
-                return fields
+                        for key, item in stored_entries
+                    ),
+                    extra_entries=tuple(
+                        (
+                            key,
+                            _capture_native_contract_graph(item, active_containers),
+                        )
+                        for key, item in extra_entries
+                    ),
+                    malformed_extra=malformed_extra,
+                )
             if issubclass(value_type, dict):
                 entries = tuple(dict.items(value))
-                return {
-                    key: _native_contract_graph(item, active_containers)
-                    for key, item in entries
-                }
+                return _CapturedDict(
+                    tuple(
+                        (
+                            key,
+                            _capture_native_contract_graph(item, active_containers),
+                        )
+                        for key, item in entries
+                    )
+                )
             if issubclass(value_type, list):
-                return [
-                    _native_contract_graph(item, active_containers)
-                    for item in value
-                ]
-            return tuple(
-                _native_contract_graph(item, active_containers) for item in value
+                native_items = tuple(list.__iter__(value))
+                return _CapturedList(
+                    tuple(
+                        _capture_native_contract_graph(item, active_containers)
+                        for item in native_items
+                    )
+                )
+            native_items = tuple(tuple.__iter__(value))
+            return _CapturedTuple(
+                tuple(
+                    _capture_native_contract_graph(item, active_containers)
+                    for item in native_items
+                )
             )
         finally:
             active_containers.remove(identity)
+    return _CapturedLeaf(value)
+
+
+def _model_field_name(value: object) -> object:
+    """Normalize benign string subclasses without invoking their hooks."""
+
+    if issubclass(type(value), str):
+        return str.__str__(value)
     return value
+
+
+def _materialize_captured_graph(value: _CapturedGraph) -> object:
+    """Reconstruct one frozen graph with established diagnostic ordering."""
+
+    if isinstance(value, _CapturedCycle):
+        raise ValueError("cyclic contract graph is not valid input")
+    if isinstance(value, _CapturedLeaf):
+        return value.value
+    if isinstance(value, _CapturedModel):
+        stored_entries = tuple(
+            (_model_field_name(key), item)
+            for key, item in value.stored_entries
+        )
+        stored_names = {key for key, _ in stored_entries}
+        declared_fields = value.model_type.model_fields
+        fields = {
+            key: _materialize_captured_graph(item)
+            for key, item in stored_entries
+        }
+        if value.malformed_extra:
+            raise ValueError("malformed stored contract extras are not valid input")
+        for raw_key, item in value.extra_entries:
+            key = _model_field_name(raw_key)
+            if key in stored_names or key in declared_fields:
+                raise ValueError(
+                    "conflicting stored contract field is not valid input"
+                )
+            fields[key] = _materialize_captured_graph(item)
+        return fields
+    if isinstance(value, _CapturedDict):
+        return {
+            key: _materialize_captured_graph(item)
+            for key, item in value.entries
+        }
+    if isinstance(value, _CapturedList):
+        return [_materialize_captured_graph(item) for item in value.items]
+    return tuple(_materialize_captured_graph(item) for item in value.items)
+
+
+def _native_contract_graph(
+    value: object,
+    active_containers: set[int] | None = None,
+) -> object:
+    """Materialize stored fields without dropping extras or hiding cycles."""
+
+    captured = _capture_native_contract_graph(value, active_containers)
+    return _materialize_captured_graph(captured)
 
 
 def _revalidated_model(model_type: type[_ModelT], value: object) -> _ModelT:

@@ -127,6 +127,66 @@ BASE_MODEL_DICT_DESCRIPTOR = vars(BaseModel)["__dict__"]
 BASE_MODEL_EXTRA_DESCRIPTOR = vars(BaseModel)["__pydantic_extra__"]
 
 
+class NestedRepairingTuple(tuple[object, ...]):
+    """Mutate a later model if tuple subclass traversal is dispatched."""
+
+    target: BaseModel | None = None
+    field_name = "content_revision"
+    replacement: object = 1
+    iteration_calls = 0
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        type(self).iteration_calls += 1
+        if self.target is None:
+            raise AssertionError("benign tuple subclass iterator was invoked")
+        native = BASE_MODEL_DICT_DESCRIPTOR.__get__(self.target, BaseModel)
+        dict.__setitem__(native, self.field_name, self.replacement)
+        return tuple.__iter__(self)
+
+
+class NestedRepairingName(str):
+    """Mutate a later model if model-owned name callbacks are dispatched."""
+
+    def __new__(
+        cls,
+        value: str,
+        target: BaseModel | None,
+        field_name: str = "content_revision",
+        replacement: object = 1,
+    ) -> "NestedRepairingName":
+        instance = super().__new__(cls, value)
+        instance.target = target
+        instance.field_name = field_name
+        instance.replacement = replacement
+        instance.armed = False
+        instance.hash_calls = 0
+        instance.equality_calls = 0
+        return instance
+
+    def _repair_or_reject_callback(self) -> None:
+        if self.target is None:
+            raise AssertionError("benign string-subclass callback was invoked")
+        native = BASE_MODEL_DICT_DESCRIPTOR.__get__(self.target, BaseModel)
+        dict.__setitem__(native, self.field_name, self.replacement)
+
+    def __hash__(self) -> int:
+        if self.armed:
+            self.hash_calls += 1
+            self._repair_or_reject_callback()
+        return str.__hash__(self)
+
+    def __eq__(self, other: object) -> bool:
+        if self.armed:
+            self.equality_calls += 1
+            self._repair_or_reject_callback()
+        return str.__eq__(self, other)
+
+    def __str__(self) -> str:
+        if self.armed:
+            raise AssertionError("string-subclass __str__ was invoked")
+        return str.__str__(self)
+
+
 def descriptor_masked_copy(value: BaseModel) -> BaseModel:
     """Return a concrete subtype whose properties hide model-owned storage."""
 
@@ -306,6 +366,47 @@ def move_declared_field_to_extra(value: BaseModel, field_name: str) -> None:
         "__pydantic_extra__",
         {field_name: stored_value},
     )
+
+
+def install_repairing_stored_name(
+    model: BaseModel,
+    stored_name: str,
+    target: BaseModel | None,
+    *,
+    field_name: str = "content_revision",
+    replacement: object = 1,
+) -> NestedRepairingName:
+    storage = BASE_MODEL_DICT_DESCRIPTOR.__get__(model, BaseModel)
+    item = dict.__getitem__(storage, stored_name)
+    dict.__delitem__(storage, stored_name)
+    name = NestedRepairingName(
+        stored_name,
+        target,
+        field_name,
+        replacement,
+    )
+    dict.__setitem__(storage, name, item)
+    name.armed = True
+    name.hash_calls = 0
+    name.equality_calls = 0
+    return name
+
+
+def install_repairing_target_refs(
+    command: Intent,
+    target: BaseModel | None,
+    *,
+    field_name: str = "content_revision",
+    replacement: object = 1,
+) -> NestedRepairingTuple:
+    trigger = NestedRepairingTuple(command.target_refs)
+    trigger.target = target
+    trigger.field_name = field_name
+    trigger.replacement = replacement
+    storage = BASE_MODEL_DICT_DESCRIPTOR.__get__(command, BaseModel)
+    dict.__setitem__(storage, "target_refs", trigger)
+    NestedRepairingTuple.iteration_calls = 0
+    return trigger
 
 
 def memory_record(**overrides: object) -> MemoryRecord:
@@ -1824,15 +1925,183 @@ def test_aggregate_boundary_uses_native_nested_model_storage(
         assert raised.value.errors()[0]["loc"][-1] == "tenant_id"
 
 
+def _intent_with_invalid_nested_source() -> tuple[Intent, SourceVersion]:
+    command = intent(ProcessingStage.CANONICAL)
+    invalid_source = command.source_preconditions[0].model_copy(
+        update={"content_revision": -1}
+    )
+    return (
+        command.model_copy(update={"source_preconditions": (invalid_source,)}),
+        invalid_source,
+    )
+
+
+@pytest.mark.parametrize("trigger_kind", ["tuple", "stored-name"])
+def test_aggregate_boundary_freezes_later_nested_model_before_earlier_hook(
+    trigger_kind: str,
+) -> None:
+    ordinary, ordinary_source = _intent_with_invalid_nested_source()
+    with pytest.raises(ValidationError) as ordinary_error:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=ordinary,
+            receipts=(),
+        )
+
+    attacked, attacked_source = _intent_with_invalid_nested_source()
+    if trigger_kind == "tuple":
+        install_repairing_target_refs(attacked, attacked_source)
+        hostile_name = None
+    else:
+        hostile_name = install_repairing_stored_name(
+            attacked,
+            "id",
+            attacked_source,
+        )
+    with pytest.raises(ValidationError) as attacked_error:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=attacked,
+            receipts=(),
+        )
+
+    ordinary_diagnostics = [
+        (error["loc"], error["type"], error["input"])
+        for error in ordinary_error.value.errors()
+    ]
+    attacked_diagnostics = [
+        (error["loc"], error["type"], error["input"])
+        for error in attacked_error.value.errors()
+    ]
+    assert attacked_diagnostics == ordinary_diagnostics
+    assert ordinary_source.content_revision == -1
+    assert attacked_source.content_revision == -1
+    assert NestedRepairingTuple.iteration_calls == 0
+    if hostile_name is not None:
+        assert hostile_name.hash_calls == 0
+        assert hostile_name.equality_calls == 0
+
+
+@pytest.mark.parametrize("trigger_kind", ["tuple", "stored-name"])
+def test_aggregate_boundary_preserves_invalid_root_before_earlier_hook(
+    trigger_kind: str,
+) -> None:
+    ordinary = intent(ProcessingStage.CANONICAL).model_copy(
+        update={"request_digest": ""}
+    )
+    with pytest.raises(ValidationError) as ordinary_error:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=ordinary,
+            receipts=(),
+        )
+
+    attacked = intent(ProcessingStage.CANONICAL).model_copy(
+        update={"request_digest": ""}
+    )
+    if trigger_kind == "tuple":
+        install_repairing_target_refs(
+            attacked,
+            attacked,
+            field_name="request_digest",
+            replacement="sha256:repaired",
+        )
+        hostile_name = None
+    else:
+        hostile_name = install_repairing_stored_name(
+            attacked,
+            "id",
+            attacked,
+            field_name="request_digest",
+            replacement="sha256:repaired",
+        )
+    with pytest.raises(ValidationError) as attacked_error:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=attacked,
+            receipts=(),
+        )
+
+    ordinary_diagnostics = [
+        (error["loc"], error["type"], error["input"])
+        for error in ordinary_error.value.errors()
+    ]
+    attacked_diagnostics = [
+        (error["loc"], error["type"], error["input"])
+        for error in attacked_error.value.errors()
+    ]
+    assert attacked_diagnostics == ordinary_diagnostics
+    assert attacked.request_digest == ""
+    assert NestedRepairingTuple.iteration_calls == 0
+    if hostile_name is not None:
+        assert hostile_name.hash_calls == 0
+        assert hostile_name.equality_calls == 0
+
+
+@pytest.mark.parametrize("trigger_kind", ["tuple", "stored-name"])
+def test_aggregate_boundary_accepts_benign_supported_subclasses(
+    trigger_kind: str,
+) -> None:
+    command = intent(ProcessingStage.CANONICAL)
+    if trigger_kind == "tuple":
+        install_repairing_target_refs(command, None)
+        benign_name = None
+    else:
+        benign_name = install_repairing_stored_name(command, "id", None)
+
+    validate_required_stage_claim(
+        claimed_status=IntentStatus.ACCEPTED,
+        intent=command,
+        receipts=(),
+    )
+
+    assert NestedRepairingTuple.iteration_calls == 0
+    if benign_name is not None:
+        assert benign_name.hash_calls == 0
+        assert benign_name.equality_calls == 0
+
+
+def test_source_boundary_scalar_invalidity_remains_frozen_before_name_hook() -> None:
+    expected = source("memory-1")
+    ordinary = source("memory-1").model_copy(update={"content_revision": -1})
+    with pytest.raises(ValidationError) as ordinary_error:
+        source_versions_match(expected, ordinary)
+
+    attacked = source("memory-1").model_copy(update={"content_revision": -1})
+    hostile_name = install_repairing_stored_name(
+        attacked,
+        "record_id",
+        attacked,
+    )
+    with pytest.raises(ValidationError) as attacked_error:
+        source_versions_match(expected, attacked)
+
+    ordinary_diagnostics = [
+        (error["loc"], error["type"], error["input"])
+        for error in ordinary_error.value.errors()
+    ]
+    attacked_diagnostics = [
+        (error["loc"], error["type"], error["input"])
+        for error in attacked_error.value.errors()
+    ]
+    assert attacked_diagnostics == ordinary_diagnostics
+    assert attacked.content_revision == -1
+    assert hostile_name.hash_calls == 0
+    assert hostile_name.equality_calls == 0
+
+
 def test_aggregate_boundary_snapshots_model_extras_before_nested_traversal() -> None:
     command = intent(ProcessingStage.CANONICAL)
     extras = {"undeclared_witness": True}
     object.__setattr__(command, "__pydantic_extra__", extras)
 
     class ClearingTuple(tuple[object, ...]):
+        iteration_calls = 0
+
         def __iter__(self):  # type: ignore[no-untyped-def]
+            type(self).iteration_calls += 1
             extras.clear()
-            return super().__iter__()
+            return tuple.__iter__(self)
 
     command.__dict__["target_refs"] = ClearingTuple(command.target_refs)
 
@@ -1843,7 +2112,8 @@ def test_aggregate_boundary_snapshots_model_extras_before_nested_traversal() -> 
             receipts=(),
         )
 
-    assert extras == {}
+    assert extras == {"undeclared_witness": True}
+    assert ClearingTuple.iteration_calls == 0
     assert raised.value.errors()[0]["type"] == "extra_forbidden"
     assert raised.value.errors()[0]["loc"] == ("undeclared_witness",)
 
@@ -1919,13 +2189,16 @@ def test_source_boundary_preserves_non_dict_mapping_rejection() -> None:
         source_versions_match(expected, observed)
 
 
-def test_native_graph_captures_dict_backing_before_nested_traversal() -> None:
+def test_native_graph_uses_native_list_backing_during_deep_capture() -> None:
     parent = HiddenBackingDict()
 
     class MutatingList(list[object]):
+        iteration_calls = 0
+
         def __iter__(self):  # type: ignore[no-untyped-def]
+            type(self).iteration_calls += 1
             dict.__setitem__(parent, "late", "not-in-captured-inventory")
-            return super().__iter__()
+            return list.__iter__(self)
 
     child = MutatingList(["retained"])
     dict.__setitem__(parent, "payload", child)
@@ -1933,7 +2206,8 @@ def test_native_graph_captures_dict_backing_before_nested_traversal() -> None:
     assert lifecycle_contracts._native_contract_graph(parent) == {
         "payload": ["retained"]
     }
-    assert dict.__getitem__(parent, "late") == "not-in-captured-inventory"
+    assert "late" not in tuple(dict.keys(parent))
+    assert MutatingList.iteration_calls == 0
     assert parent.view_calls == 0
 
 
