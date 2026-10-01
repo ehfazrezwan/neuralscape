@@ -9,6 +9,7 @@ import pytest
 from pydantic import (
     AliasChoices,
     AliasPath,
+    BaseModel,
     ConfigDict,
     Field,
     TypeAdapter,
@@ -29,6 +30,10 @@ from contracts_errors import (
     public_error_for,
 )
 from contracts_references import ReferenceHandle, ReferenceKind, SourceVersion
+
+
+_BASE_MODEL_DICT_DESCRIPTOR = vars(BaseModel)["__dict__"]
+_BASE_MODEL_EXTRA_DESCRIPTOR = vars(BaseModel)["__pydantic_extra__"]
 
 
 class ExampleContract(ContractModel):
@@ -312,6 +317,31 @@ class ModelExtraViewHidingExampleContract(ExampleContract):
         return super().__getattribute__(name)
 
 
+class ModelDictDescriptorHidingExampleContract(ExampleContract):
+    @property
+    def __dict__(self):  # type: ignore[override]
+        native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(self, BaseModel)
+        return {
+            key: item
+            for key, item in dict.items(native)
+            if key != "future_state"
+        }
+
+    @__dict__.setter
+    def __dict__(self, value):  # type: ignore[no-untyped-def]
+        _BASE_MODEL_DICT_DESCRIPTOR.__set__(self, value)
+
+
+class ModelExtraDescriptorHidingExampleContract(ExampleContract):
+    @property
+    def __pydantic_extra__(self):  # type: ignore[override]
+        return None
+
+    @__pydantic_extra__.setter
+    def __pydantic_extra__(self, value):  # type: ignore[no-untyped-def]
+        _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(self, value)
+
+
 class HiddenItemsDict(dict[str, object]):
     def items(self) -> tuple[tuple[str, object], ...]:
         return tuple(
@@ -481,6 +511,78 @@ def test_snapshot_contract_graph_uses_native_model_extra_storage(
     assert snapshot == expected
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         receiver.model_validate(snapshot, strict=True)
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["direct", "nested"])
+@pytest.mark.parametrize("storage", ["stored", "extra"])
+def test_snapshot_contract_graph_bypasses_model_storage_descriptors(
+    nested: bool,
+    storage: str,
+) -> None:
+    descriptor_type = (
+        ModelDictDescriptorHidingExampleContract
+        if storage == "stored"
+        else ModelExtraDescriptorHidingExampleContract
+    )
+    ordinary = ExampleContract(count=1)
+    descriptor = descriptor_type(count=1)
+    ordinary_graph: object = {"item": ordinary} if nested else ordinary
+    descriptor_graph: object = {"item": descriptor} if nested else descriptor
+    receiver = ExampleContractEnvelope if nested else ExampleContract
+    valid_snapshot = {"item": {"count": 1}} if nested else {"count": 1}
+
+    assert snapshot_contract_graph(ordinary_graph) == valid_snapshot
+    assert snapshot_contract_graph(descriptor_graph) == valid_snapshot
+    receiver.model_validate(valid_snapshot, strict=True)
+
+    if storage == "stored":
+        ordinary_backing = _BASE_MODEL_DICT_DESCRIPTOR.__get__(
+            ordinary,
+            BaseModel,
+        )
+        descriptor_backing = _BASE_MODEL_DICT_DESCRIPTOR.__get__(
+            descriptor,
+            BaseModel,
+        )
+        dict.__setitem__(ordinary_backing, "future_state", "preserved")
+        dict.__setitem__(descriptor_backing, "future_state", "preserved")
+        assert tuple(dict.items(descriptor_backing)) == (
+            ("count", 1),
+            ("future_state", "preserved"),
+        )
+        assert "future_state" not in descriptor.__dict__
+    else:
+        _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(
+            ordinary,
+            {"future_state": "preserved"},
+        )
+        _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(
+            descriptor,
+            {"future_state": "preserved"},
+        )
+        descriptor_backing = _BASE_MODEL_EXTRA_DESCRIPTOR.__get__(
+            descriptor,
+            BaseModel,
+        )
+        assert tuple(dict.items(descriptor_backing)) == (
+            ("future_state", "preserved"),
+        )
+        assert descriptor.__pydantic_extra__ is None
+
+    expected_snapshot = (
+        {"item": {"count": 1, "future_state": "preserved"}}
+        if nested
+        else {"count": 1, "future_state": "preserved"}
+    )
+    ordinary_snapshot = snapshot_contract_graph(ordinary_graph)
+    descriptor_snapshot = snapshot_contract_graph(descriptor_graph)
+
+    assert descriptor_snapshot == ordinary_snapshot == expected_snapshot
+    with pytest.raises(ValidationError) as ordinary_error:
+        receiver.model_validate(ordinary_snapshot, strict=True)
+    with pytest.raises(ValidationError) as descriptor_error:
+        receiver.model_validate(descriptor_snapshot, strict=True)
+    assert descriptor_error.value.errors() == ordinary_error.value.errors()
 
 
 def test_snapshot_contract_graph_freezes_extras_before_nested_removal() -> None:
