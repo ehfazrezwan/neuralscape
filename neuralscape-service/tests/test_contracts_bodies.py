@@ -94,6 +94,23 @@ class _RaisingClassHiddenDict(_HiddenBackingDict):
         raise AssertionError("__class__ must not be read")
 
 
+class _RepairingStoredName(str):
+    """A stored key whose hash callback repairs a later live model value."""
+
+    def __new__(cls, value: str, repair):
+        instance = super().__new__(cls, value)
+        instance.repair = repair
+        instance.armed = False
+        instance.hash_calls = 0
+        return instance
+
+    def __hash__(self) -> int:
+        if self.armed:
+            self.hash_calls += 1
+            self.repair()
+        return super().__hash__()
+
+
 class _EmptyNativeRaisingViews(dict[str, object]):
     """Actually empty native storage whose overridden views must stay unused."""
 
@@ -228,6 +245,25 @@ def _replace_model_backing(
     return hidden
 
 
+def _arm_first_stored_name_repair(
+    body: MemoryBody,
+    *,
+    field: str,
+    repaired_value: object,
+) -> _RepairingStoredName:
+    stored = _BASE_MODEL_DICT_DESCRIPTOR.__get__(body, BaseModel)
+    entries = tuple(dict.items(stored))
+    dict.clear(stored)
+    name = _RepairingStoredName(
+        entries[0][0],
+        lambda: dict.__setitem__(stored, field, repaired_value),
+    )
+    for index, (key, value) in enumerate(entries):
+        dict.__setitem__(stored, name if index == 0 else key, value)
+    name.armed = True
+    return name
+
+
 def _attach_extra_storage(body: MemoryBody, storage: object) -> MemoryBody:
     object.__setattr__(body, "__pydantic_extra__", storage)
     return body
@@ -292,6 +328,60 @@ def test_parser_revalidates_unchecked_body_copy() -> None:
 
     with pytest.raises(ValidationError):
         parse_memory_body(unchecked)
+
+
+@pytest.mark.parametrize(
+    ("valid", "invalid_field", "invalid_value", "repaired_value"),
+    [
+        (
+            PlaintextBody(kind="plaintext", text="secret"),
+            "text",
+            "",
+            "repaired",
+        ),
+        (
+            OpaqueEnvelopeBody(kind="opaque_envelope", envelope_id="env-1"),
+            "envelope_id",
+            "",
+            "repaired",
+        ),
+    ],
+    ids=["plaintext", "opaque-envelope"],
+)
+def test_parser_captures_all_stored_pairs_before_name_hashing(
+    valid: MemoryBody,
+    invalid_field: str,
+    invalid_value: object,
+    repaired_value: object,
+) -> None:
+    assert parse_memory_body(valid).kind == valid.kind
+
+    ordinary = valid.model_copy(update={invalid_field: invalid_value})
+    with pytest.raises(ValidationError) as ordinary_exc:
+        parse_memory_body(ordinary)
+
+    hooked = valid.model_copy(update={invalid_field: invalid_value})
+    name = _arm_first_stored_name_repair(
+        hooked,
+        field=invalid_field,
+        repaired_value=repaired_value,
+    )
+    with pytest.raises(ValidationError) as hooked_exc:
+        parse_memory_body(hooked)
+
+    ordinary_errors = [
+        (error["loc"], error["type"]) for error in ordinary_exc.value.errors()
+    ]
+    hooked_errors = [
+        (error["loc"], error["type"]) for error in hooked_exc.value.errors()
+    ]
+    assert ordinary_errors == hooked_errors
+    assert any(error_type == "string_too_short" for _, error_type in hooked_errors)
+    assert name.hash_calls == 1
+    assert dict.__getitem__(
+        _BASE_MODEL_DICT_DESCRIPTOR.__get__(hooked, BaseModel),
+        invalid_field,
+    ) == repaired_value
 
 
 @pytest.mark.parametrize(
@@ -387,13 +477,11 @@ def test_parser_native_model_backing_ignores_attribute_override(
     ids=["plaintext", "opaque-envelope"],
 )
 @pytest.mark.parametrize("inventory", ["stored", "extra"])
-@pytest.mark.parametrize("nested", [False, True], ids=["direct", "nested"])
 def test_parser_uses_base_model_storage_descriptors(
     ordinary_type: type[PlaintextBody | OpaqueEnvelopeBody],
     masked_type: type[PlaintextBody | OpaqueEnvelopeBody],
     values: dict[str, str],
     inventory: str,
-    nested: bool,
 ) -> None:
     bodies = [ordinary_type(**values), masked_type(**values)]
     hidden_stores: list[_HiddenBackingDict] = []
@@ -412,22 +500,68 @@ def test_parser_uses_base_model_storage_descriptors(
 
     diagnostics = []
     for body in bodies:
-        candidate = (
-            VersionedBodyOwner.model_construct(
-                schema_version="candidate-v1",
-                body=body,
-            ).body
-            if nested
-            else body
-        )
         with pytest.raises(ValidationError) as exc:
-            parse_memory_body(candidate)
+            parse_memory_body(body)
         diagnostics.append(
             [(error["loc"], error["type"]) for error in exc.value.errors()]
         )
 
     assert diagnostics[0] == diagnostics[1]
     assert all(hidden.view_calls == 0 for hidden in hidden_stores)
+
+
+@pytest.mark.parametrize(
+    ("body_type", "values"),
+    [
+        (PlaintextBody, {"kind": "plaintext", "text": "secret"}),
+        (
+            OpaqueEnvelopeBody,
+            {"kind": "opaque_envelope", "envelope_id": "env-1"},
+        ),
+    ],
+    ids=["plaintext", "opaque-envelope"],
+)
+@pytest.mark.parametrize("inventory", ["stored", "extra"])
+def test_enclosing_contract_uses_actual_nested_validation_boundary(
+    body_type: type[PlaintextBody | OpaqueEnvelopeBody],
+    values: dict[str, str],
+    inventory: str,
+) -> None:
+    valid = VersionedBodyOwner.model_validate(
+        {
+            "schema_version": "candidate-v1",
+            "body": body_type(**values),
+        }
+    )
+    assert valid.body.kind == values["kind"]
+
+    body = body_type(**values)
+    if inventory == "stored":
+        stored = dict(
+            dict.items(_BASE_MODEL_DICT_DESCRIPTOR.__get__(body, BaseModel))
+        )
+        stored["future_constraint"] = "deny"
+        _BASE_MODEL_DICT_DESCRIPTOR.__set__(body, stored)
+    else:
+        _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(
+            body,
+            {"future_constraint": "deny"},
+        )
+
+    with pytest.raises(ValidationError) as exc:
+        VersionedBodyOwner.model_validate(
+            {
+                "schema_version": "candidate-v1",
+                "body": body,
+            }
+        )
+
+    assert any(
+        error["loc"][0] == "body"
+        and error["loc"][-1] == "future_constraint"
+        and error["type"] == "extra_forbidden"
+        for error in exc.value.errors()
+    )
 
 
 @pytest.mark.parametrize(
