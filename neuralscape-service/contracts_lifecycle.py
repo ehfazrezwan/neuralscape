@@ -25,6 +25,8 @@ from contracts_references import ReferenceHandle, SourceVersion
 
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
+_BASE_MODEL_DICT_DESCRIPTOR = vars(BaseModel)["__dict__"]
+_BASE_MODEL_EXTRA_DESCRIPTOR = vars(BaseModel)["__pydantic_extra__"]
 
 
 def _native_contract_graph(
@@ -44,10 +46,10 @@ def _native_contract_graph(
         active_containers.add(identity)
         try:
             if issubclass(value_type, BaseModel):
-                stored = object.__getattribute__(value, "__dict__")
+                stored = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
                 stored_entries = tuple(dict.items(stored))
                 try:
-                    extra = object.__getattribute__(value, "__pydantic_extra__")
+                    extra = _BASE_MODEL_EXTRA_DESCRIPTOR.__get__(value, BaseModel)
                 except AttributeError:
                     extra = None
                 if extra is None:

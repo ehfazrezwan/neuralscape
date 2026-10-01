@@ -123,6 +123,58 @@ class InverseViewMapping(Mapping[str, object]):
         return {}.items()
 
 
+BASE_MODEL_DICT_DESCRIPTOR = vars(BaseModel)["__dict__"]
+BASE_MODEL_EXTRA_DESCRIPTOR = vars(BaseModel)["__pydantic_extra__"]
+
+
+def descriptor_masked_copy(value: BaseModel) -> BaseModel:
+    """Return a concrete subtype whose properties hide model-owned storage."""
+
+    model_type = type(value)
+
+    def get_dict(self):  # type: ignore[no-untyped-def]
+        native = BASE_MODEL_DICT_DESCRIPTOR.__get__(self, BaseModel)
+        return {
+            key: item
+            for key, item in dict.items(native)
+            if key != "undeclared_witness"
+        }
+
+    def set_dict(self, stored):  # type: ignore[no-untyped-def]
+        BASE_MODEL_DICT_DESCRIPTOR.__set__(self, stored)
+
+    def get_extra(self):  # type: ignore[no-untyped-def]
+        return None
+
+    def set_extra(self, extra):  # type: ignore[no-untyped-def]
+        BASE_MODEL_EXTRA_DESCRIPTOR.__set__(self, extra)
+
+    masked_type = type(
+        f"DescriptorMasked{model_type.__name__}",
+        (model_type,),
+        {
+            "__dict__": property(get_dict, set_dict),
+            "__pydantic_extra__": property(get_extra, set_extra),
+        },
+    )
+    native = BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+    return masked_type.model_validate(dict(dict.items(native)), strict=True)
+
+
+def inject_native_unknown(value: BaseModel, storage: str) -> None:
+    if storage == "stored":
+        native = BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+        dict.__setitem__(native, "undeclared_witness", True)
+        assert ("undeclared_witness", True) in tuple(dict.items(native))
+    else:
+        BASE_MODEL_EXTRA_DESCRIPTOR.__set__(
+            value,
+            {"undeclared_witness": True},
+        )
+        native = BASE_MODEL_EXTRA_DESCRIPTOR.__get__(value, BaseModel)
+        assert tuple(dict.items(native)) == (("undeclared_witness", True),)
+
+
 def source(record_id: str, revision: int = 3, epoch: int = 7) -> SourceVersion:
     return SourceVersion(
         record_id=record_id,
@@ -1606,6 +1658,90 @@ def test_source_boundary_preserves_missing_and_unknown_extra_behavior() -> None:
     )
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         source_versions_match(expected, unknown)
+
+
+@pytest.mark.parametrize("storage", ["stored", "extra"])
+def test_source_boundary_bypasses_subclass_storage_descriptors(
+    storage: str,
+) -> None:
+    expected = source("memory-1", revision=4, epoch=9)
+    valid_masked = descriptor_masked_copy(expected)
+    assert source_versions_match(expected, valid_masked)
+
+    ordinary = source("memory-1", revision=4, epoch=9)
+    masked = descriptor_masked_copy(ordinary)
+    inject_native_unknown(ordinary, storage)
+    inject_native_unknown(masked, storage)
+
+    with pytest.raises(ValidationError) as ordinary_error:
+        source_versions_match(expected, ordinary)
+    with pytest.raises(ValidationError) as masked_error:
+        source_versions_match(expected, masked)
+
+    assert masked_error.value.errors(include_url=False) == (
+        ordinary_error.value.errors(include_url=False)
+    )
+    assert masked_error.value.errors()[0]["type"] == "extra_forbidden"
+
+
+def test_source_boundary_preserves_actually_absent_extra_storage() -> None:
+    expected = source("memory-1", revision=4, epoch=9)
+    observed = source("memory-1", revision=4, epoch=9)
+    BASE_MODEL_EXTRA_DESCRIPTOR.__delete__(observed)
+
+    with pytest.raises(AttributeError):
+        BASE_MODEL_EXTRA_DESCRIPTOR.__get__(observed, BaseModel)
+    assert source_versions_match(expected, observed)
+
+
+@pytest.mark.parametrize("storage", ["stored", "extra"])
+@pytest.mark.parametrize("location", ["direct", "nested"])
+def test_aggregate_boundary_bypasses_subclass_storage_descriptors(
+    storage: str,
+    location: str,
+) -> None:
+    def case(masked: bool, corrupt: bool):
+        command, receipts, target = receiving_graph_with_extra_target(
+            "intent" if location == "direct" else "output_reference"
+        )
+        assert isinstance(target, BaseModel)
+        replacement = descriptor_masked_copy(target) if masked else target
+        if corrupt:
+            inject_native_unknown(replacement, storage)
+        if location == "direct":
+            command = replacement
+        else:
+            receipts = (
+                receipts[0].model_copy(update={"output_refs": (replacement,)}),
+            )
+        return command, receipts
+
+    valid_command, valid_receipts = case(masked=True, corrupt=False)
+    validate_required_stage_claim(
+        claimed_status=IntentStatus.APPLIED,
+        intent=valid_command,  # type: ignore[arg-type]
+        receipts=valid_receipts,
+    )
+
+    ordinary_command, ordinary_receipts = case(masked=False, corrupt=True)
+    masked_command, masked_receipts = case(masked=True, corrupt=True)
+    with pytest.raises(ValidationError) as ordinary_error:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED,
+            intent=ordinary_command,  # type: ignore[arg-type]
+            receipts=ordinary_receipts,
+        )
+    with pytest.raises(ValidationError) as masked_error:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED,
+            intent=masked_command,  # type: ignore[arg-type]
+            receipts=masked_receipts,
+        )
+
+    assert masked_error.value.errors(include_url=False) == (
+        ordinary_error.value.errors(include_url=False)
+    )
+    assert masked_error.value.errors()[0]["type"] == "extra_forbidden"
 
 
 def test_source_boundary_rejects_unknown_hidden_native_backing() -> None:
