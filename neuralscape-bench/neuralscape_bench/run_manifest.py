@@ -326,7 +326,11 @@ class RunManifest(_ManifestContract):
 def _retain_public_mapping(value: Any, frozen_graph: _FrozenGraph) -> bool:
     """Retain a strong owner for a supported nonexact public mapping."""
 
-    if type(value) is dict or not isinstance(value, Mapping):
+    if (
+        isinstance(value, BaseModel)
+        or type(value) is dict
+        or not isinstance(value, Mapping)
+    ):
         return False
     identity = id(value)
     owner = frozen_graph.public_mapping_owners.get(identity)
@@ -492,7 +496,12 @@ def _inventory_reachable_public_mappings(
             continue
         visited[identity] = authoritative
 
-        if type(current) is not dict and isinstance(current, Mapping):
+        is_model = isinstance(current, BaseModel)
+        if (
+            not is_model
+            and type(current) is not dict
+            and isinstance(current, Mapping)
+        ):
             _retain_public_mapping(current, frozen_graph)
             active_owner = observing.get(identity)
             if active_owner is current:
@@ -505,7 +514,8 @@ def _inventory_reachable_public_mappings(
             ) and authoritative:
                 return False
         elif (
-            authoritative
+            not is_model
+            and authoritative
             and type(current) not in (tuple, list)
             and isinstance(current, (tuple, list))
         ):
@@ -623,17 +633,20 @@ def _inventory_yielded_public_shape(
     """Protect one yielded value's authoritative public shape."""
 
     identity = id(value)
-    if type(value) is not dict and isinstance(value, Mapping):
-        if observing.get(identity) is value:
-            return False
-        _retain_public_mapping(value, frozen_graph)
-        if not _inventory_public_mapping(value, frozen_graph, observing):
-            return False
-    elif type(value) not in (tuple, list) and isinstance(value, (tuple, list)):
-        if observing.get(identity) is value:
-            return False
-        if not _inventory_public_sequence(value, frozen_graph, observing):
-            return False
+    if not isinstance(value, BaseModel):
+        if type(value) is not dict and isinstance(value, Mapping):
+            if observing.get(identity) is value:
+                return False
+            _retain_public_mapping(value, frozen_graph)
+            if not _inventory_public_mapping(value, frozen_graph, observing):
+                return False
+        elif type(value) not in (tuple, list) and isinstance(
+            value, (tuple, list)
+        ):
+            if observing.get(identity) is value:
+                return False
+            if not _inventory_public_sequence(value, frozen_graph, observing):
+                return False
 
     return _inventory_reachable_public_mappings(
         value,

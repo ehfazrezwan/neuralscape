@@ -664,6 +664,41 @@ class InventoryMapping(Mapping[object, object]):
         return generate()
 
 
+def dual_interface_timing(
+    provenance: Mapping[object, object],
+) -> tuple[TimingMeasurement, dict[str, int]]:
+    """Build a model whose Mapping view must not outrank model storage."""
+
+    calls = {"getitem": 0, "iter": 0, "len": 0, "items": 0}
+
+    class DualInterfaceTimingMeasurement(
+        TimingMeasurement, Mapping[str, object]
+    ):
+        def __getitem__(self, key: str) -> object:
+            calls["getitem"] += 1
+            return getattr(self, key)
+
+        def __iter__(self):
+            calls["iter"] += 1
+            return iter(type(self).model_fields)
+
+        def __len__(self) -> int:
+            calls["len"] += 1
+            return len(type(self).model_fields)
+
+        def items(self):
+            calls["items"] += 1
+            return (
+                (name, getattr(self, name))
+                for name in type(self).model_fields
+            )
+
+    measurement = DualInterfaceTimingMeasurement.model_validate(
+        timing().model_dump(mode="python")
+    ).model_copy(update={"provenance": provenance})
+    return measurement, calls
+
+
 class PublicItemsDict(dict[object, object]):
     """Keep native dict backing distinct from its public items authority."""
 
@@ -1080,6 +1115,55 @@ def test_model_reachable_public_mappings_validate_from_one_inventory():
     assert received.resources[0] == measured_memory()
     assert received.measurements[0] == timing()
     assert measurement.items_calls == 1
+
+
+def test_dual_interface_model_prefers_storage_and_inventories_mapping_child():
+    events: list[str] = []
+    expected = timing()
+    provenance = InventoryMapping(
+        tuple(expected.provenance.model_dump(mode="python").items()),
+        name="provenance",
+        events=events,
+    )
+    measurement, mapping_calls = dual_interface_timing(provenance)
+    manifest = completed_manifest().model_copy(
+        update={"measurements": (measurement,)}
+    )
+
+    received = validate_run_manifest_json(serialize_run_manifest(manifest))
+
+    assert received.measurements[0] == expected
+    assert mapping_calls == {"getitem": 0, "iter": 0, "len": 0, "items": 0}
+    assert provenance.items_calls == 1
+
+
+def test_parent_yielded_dual_interface_model_keeps_model_precedence():
+    events: list[str] = []
+    expected = timing()
+    provenance = InventoryMapping(
+        tuple(expected.provenance.model_dump(mode="python").items()),
+        name="provenance",
+        events=events,
+    )
+    measurement, mapping_calls = dual_interface_timing(provenance)
+    parent = InventoryMapping(
+        (("measurement", measurement), ("tail", 1)),
+        name="parent",
+        events=events,
+    )
+
+    frozen = _freeze_model_graphs(parent)
+    snapshot = _snapshot_native(parent, _frozen_graph=frozen)
+
+    assert snapshot["measurement"]["provenance"] == (
+        expected.provenance.model_dump(mode="python")
+    )
+    assert snapshot["tail"] == 1
+    assert mapping_calls == {"getitem": 0, "iter": 0, "len": 0, "items": 0}
+    assert id(measurement) not in frozen.public_mapping_owners
+    assert frozen.public_mapping_owners[id(provenance)] is provenance
+    assert provenance.items_calls == 1
+    assert events.index("provenance:items") < events.index("parent:yield:1")
 
 
 def test_dict_subclass_uses_public_inventory_but_exact_dict_uses_native_entries():
