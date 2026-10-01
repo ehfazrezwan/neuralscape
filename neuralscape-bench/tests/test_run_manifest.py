@@ -484,6 +484,100 @@ class PublicViewTuple(tuple[object, ...]):
         return iter(self.public_values)
 
 
+class PublicResourceWithDeepNativeBacking(dict[str, object]):
+    """Expose a valid resource while retaining a deep native-only graph."""
+
+    def __init__(self, depth: int):
+        hidden: dict[str, object] = {"leaf": "value"}
+        for index in range(depth):
+            hidden = {f"level-{index}": hidden}
+        super().__init__(hidden=hidden)
+        self.public_values = measured_memory().model_dump(mode="python")
+        self.items_calls = 0
+
+    def __getitem__(self, key: str) -> object:
+        return self.public_values[key]
+
+    def __len__(self) -> int:
+        return len(self.public_values)
+
+    def __iter__(self):
+        return iter(self.public_values)
+
+    def items(self):
+        self.items_calls += 1
+        return self.public_values.items()
+
+
+class YieldRepairMapping(Mapping[str, object]):
+    """Repair the first yielded child when the next pair is requested."""
+
+    def __init__(
+        self,
+        values: dict[str, object],
+        action: Callable[[], None],
+    ):
+        self.values = values
+        self.action = action
+        self.items_calls = 0
+        self.callback_calls = 0
+        self.events: list[str] = []
+
+    def __getitem__(self, key: str) -> object:
+        return self.values[key]
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+    def __iter__(self):
+        return iter(self.values)
+
+    def items(self):
+        self.items_calls += 1
+        self.events.append("items")
+
+        def generate():
+            self.events.append("yield:exclusions")
+            yield "exclusions", self.values["exclusions"]
+            self.events.append("callback")
+            self.callback_calls += 1
+            self.action()
+            for key, value in self.values.items():
+                if key != "exclusions":
+                    self.events.append(f"yield:{key}")
+                    yield key, value
+
+        return generate()
+
+
+class LazyProvenanceMapping(Mapping[str, object]):
+    """Expose provenance before the remaining measurement fields."""
+
+    def __init__(self, values: dict[str, object]):
+        self.values = values
+        self.items_calls = 0
+
+    def __getitem__(self, key: str) -> object:
+        return self.values[key]
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+    def __iter__(self):
+        return iter(self.values)
+
+    def items(self):
+        self.items_calls += 1
+
+        def generate():
+            yield "provenance", self.values["provenance"]
+            for key, value in self.values.items():
+                if key != "provenance":
+                    yield key, value
+
+        return generate()
+
+
 class ArmedFieldName(str):
     """Run one callback when a stored field name is next hashed."""
 
@@ -1652,6 +1746,345 @@ def test_finish_preserves_authoritative_public_resource_tuple_view():
 
     assert result.resources[0].observed_value == 123
     assert resources.iteration_calls == 1
+
+
+def test_finish_preserves_deep_later_native_failure_for_valid_planned():
+    shallow = PublicResourceWithDeepNativeBacking(2)
+    result = finish_run(
+        planned_manifest(),
+        state=RunState.COMPLETED,
+        started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+        resources=(shallow,),
+        measurements=(timing(),),
+    )
+    assert result.resources[0] == measured_memory()
+    assert shallow.items_calls == 1
+
+    deep = PublicResourceWithDeepNativeBacking(sys.getrecursionlimit() + 600)
+    with pytest.raises(RecursionError, match="maximum recursion depth exceeded"):
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(deep,),
+            measurements=(timing(),),
+        )
+    assert deep.items_calls == 0
+
+
+def test_finish_validates_planned_before_deep_later_native_failure():
+    invalid_planned = planned_manifest()
+    invalid_concurrency = invalid_planned.concurrency[0].model_copy(
+        update={"value": True}
+    )
+    invalid_planned = invalid_planned.model_copy(
+        update={"concurrency": (invalid_concurrency,)}
+    )
+    deep_for_invalid = PublicResourceWithDeepNativeBacking(
+        sys.getrecursionlimit() + 600
+    )
+    with pytest.raises(ValidationError) as invalid_error:
+        finish_run(
+            invalid_planned,
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(deep_for_invalid,),
+            measurements=(timing(),),
+        )
+    assert invalid_error.value.errors()[0]["type"] == "int_type"
+    assert invalid_error.value.errors()[0]["loc"] == (
+        "concurrency",
+        0,
+        "value",
+    )
+    assert deep_for_invalid.items_calls == 0
+
+    deep_for_nonplanned = PublicResourceWithDeepNativeBacking(
+        sys.getrecursionlimit() + 600
+    )
+    with pytest.raises(
+        ValueError,
+        match="only a planned run can be finished",
+    ):
+        finish_run(
+            completed_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(deep_for_nonplanned,),
+            measurements=(timing(),),
+        )
+    assert deep_for_nonplanned.items_calls == 0
+
+
+def test_finish_snapshots_public_mapping_child_before_requesting_next_pair():
+    def finish_with(measurements):
+        return finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=measurements,
+        )
+
+    def mapping_input(*, invalid: bool, name: str):
+        measurement = timing()
+        child = measurement.exclusions[0]
+        if invalid:
+            child = child.model_copy(update={"count": True})
+        values = measurement.model_dump(mode="python")
+        values["name"] = name
+        values["exclusions"] = (child,)
+        native = BASE_MODEL_DICT_DESCRIPTOR.__get__(child, pydantic.BaseModel)
+        mapping = YieldRepairMapping(
+            values,
+            lambda: dict.__setitem__(native, "count", 2),
+        )
+        return mapping, child, native
+
+    ordinary_measurement = timing()
+    ordinary_invalid = ordinary_measurement.model_dump(mode="python")
+    ordinary_invalid["exclusions"] = (
+        ordinary_measurement.exclusions[0].model_copy(update={"count": True}),
+    )
+    with pytest.raises(ValidationError) as ordinary_error:
+        finish_with((ordinary_invalid,))
+    assert ordinary_error.value.errors()[0]["loc"] == (
+        "measurements",
+        0,
+        "exclusions",
+        0,
+        "count",
+    )
+
+    attacked, _child, attacked_native = mapping_input(
+        invalid=True,
+        name="public-invalid",
+    )
+    with pytest.raises(ValidationError) as callback_error:
+        finish_with((attacked,))
+    assert callback_error.value.errors() == ordinary_error.value.errors()
+    assert attacked.items_calls == 1
+    assert attacked.callback_calls == 1
+    assert attacked.events[:3] == [
+        "items",
+        "yield:exclusions",
+        "callback",
+    ]
+    assert dict.__getitem__(attacked_native, "count") == 2
+
+    valid, _child, valid_native = mapping_input(
+        invalid=False,
+        name="public-valid",
+    )
+    result = finish_with((valid,))
+    assert result.state is RunState.COMPLETED
+    assert valid.items_calls == 1
+    assert valid.callback_calls == 1
+    assert valid.events[:3] == [
+        "items",
+        "yield:exclusions",
+        "callback",
+    ]
+    assert dict.__getitem__(valid_native, "count") == 2
+
+    shared, shared_child, shared_native = mapping_input(
+        invalid=True,
+        name="shared-second",
+    )
+    first = timing().model_dump(mode="python")
+    first["name"] = "shared-first"
+    first["exclusions"] = (shared_child,)
+    with pytest.raises(ValidationError) as shared_error:
+        finish_with((first, shared))
+    assert shared_error.value.errors()[0] == ordinary_error.value.errors()[0]
+    assert shared.items_calls == 1
+    assert shared.callback_calls == 1
+    assert dict.__getitem__(shared_native, "count") == 2
+
+
+def test_finish_replays_new_exact_dict_before_snapshotting_its_entries():
+    unexpected_callbacks: list[str] = []
+
+    def reject_callback() -> None:
+        unexpected_callbacks.append("called")
+        raise RuntimeError("callback ran before native traversal")
+
+    trigger = PublicViewTuple((), (), action=reject_callback)
+    deep: dict[str, object] = {"leaf": "value"}
+    for index in range(sys.getrecursionlimit() + 600):
+        deep = {f"level-{index}": deep}
+    provenance = {"trigger": trigger}
+    provenance.update(timing().provenance.model_dump(mode="python"))
+    provenance["deep"] = deep
+    values = timing().model_dump(mode="python")
+    values["provenance"] = provenance
+    measurement = LazyProvenanceMapping(values)
+
+    with pytest.raises(RecursionError, match="maximum recursion depth exceeded"):
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(measurement,),
+        )
+
+    assert measurement.items_calls == 1
+    assert trigger.iteration_calls == 0
+    assert unexpected_callbacks == []
+
+
+def test_finish_preserves_new_exact_dict_shallow_and_valid_controls():
+    shallow_callbacks: list[str] = []
+    trigger = PublicViewTuple(
+        (),
+        (),
+        action=lambda: shallow_callbacks.append("called"),
+    )
+    shallow = {"leaf": "value"}
+    for index in range(2):
+        shallow = {f"level-{index}": shallow}
+    provenance = {"trigger": trigger}
+    provenance.update(timing().provenance.model_dump(mode="python"))
+    provenance["deep"] = shallow
+    invalid_values = timing().model_dump(mode="python")
+    invalid_values["provenance"] = provenance
+    invalid = LazyProvenanceMapping(invalid_values)
+
+    with pytest.raises(ValidationError) as invalid_error:
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(invalid,),
+        )
+    assert invalid_error.value.errors()[0]["type"] == "extra_forbidden"
+    assert invalid_error.value.errors()[0]["loc"] == (
+        "measurements",
+        0,
+        "provenance",
+        "trigger",
+    )
+    assert invalid.items_calls == 1
+    assert trigger.iteration_calls == 1
+    assert shallow_callbacks == ["called"]
+
+    key_callbacks: list[str] = []
+    collector_key = ArmedFieldName("collector")
+    valid_provenance = {
+        collector_key: "benchmark-driver",
+        "schema_version": VERSION,
+        "collector_version": "1.0.0",
+        "clock": "monotonic",
+        "placement": "separate-driver-process",
+    }
+    collector_key.arm(lambda: key_callbacks.append("called"))
+    valid_values = timing().model_dump(mode="python")
+    valid_values["provenance"] = valid_provenance
+    valid = LazyProvenanceMapping(valid_values)
+
+    result = finish_run(
+        planned_manifest(),
+        state=RunState.COMPLETED,
+        started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+        resources=(measured_memory(),),
+        measurements=(valid,),
+    )
+    assert result.state is RunState.COMPLETED
+    assert valid.items_calls == 1
+    assert collector_key.hash_calls == 1
+    assert key_callbacks == ["called"]
+
+
+def test_finish_preserves_lazy_exact_dict_priority_and_shared_capture():
+    def deep_measurement():
+        callbacks: list[str] = []
+        trigger = PublicViewTuple(
+            (),
+            (),
+            action=lambda: callbacks.append("called"),
+        )
+        deep: dict[str, object] = {"leaf": "value"}
+        for index in range(sys.getrecursionlimit() + 600):
+            deep = {f"level-{index}": deep}
+        provenance = {"trigger": trigger}
+        provenance.update(timing().provenance.model_dump(mode="python"))
+        provenance["deep"] = deep
+        values = timing().model_dump(mode="python")
+        values["provenance"] = provenance
+        return LazyProvenanceMapping(values), trigger, callbacks, provenance
+
+    invalid_planned = planned_manifest()
+    invalid_concurrency = invalid_planned.concurrency[0].model_copy(
+        update={"value": True}
+    )
+    invalid_planned = invalid_planned.model_copy(
+        update={"concurrency": (invalid_concurrency,)}
+    )
+    invalid, invalid_trigger, invalid_callbacks, _provenance = deep_measurement()
+    with pytest.raises(ValidationError) as invalid_error:
+        finish_run(
+            invalid_planned,
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(invalid,),
+        )
+    assert invalid_error.value.errors()[0]["loc"] == (
+        "concurrency",
+        0,
+        "value",
+    )
+    assert invalid.items_calls == 0
+    assert invalid_trigger.iteration_calls == 0
+    assert invalid_callbacks == []
+
+    nonplanned, nonplanned_trigger, nonplanned_callbacks, _ = deep_measurement()
+    with pytest.raises(
+        ValueError,
+        match="only a planned run can be finished",
+    ):
+        finish_run(
+            completed_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(nonplanned,),
+        )
+    assert nonplanned.items_calls == 0
+    assert nonplanned_trigger.iteration_calls == 0
+    assert nonplanned_callbacks == []
+
+    public, shared_trigger, shared_callbacks, shared_provenance = (
+        deep_measurement()
+    )
+    native = timing().model_dump(mode="python")
+    native["provenance"] = shared_provenance
+    measurements = PublicViewTuple((native,), (public,))
+    with pytest.raises(RecursionError, match="maximum recursion depth exceeded"):
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=measurements,
+        )
+    assert measurements.iteration_calls == 0
+    assert public.items_calls == 0
+    assert shared_trigger.iteration_calls == 0
+    assert shared_callbacks == []
 
 
 def test_public_only_parent_cannot_refreeze_native_exposed_plain_child():
