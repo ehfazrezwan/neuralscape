@@ -33,40 +33,44 @@ def _native_contract_graph(
 ) -> object:
     """Materialize stored fields without dropping extras or hiding cycles."""
 
+    value_type = type(value)
     if active_containers is None:
         active_containers = set()
 
-    if isinstance(value, (BaseModel, dict, list, tuple)):
+    if issubclass(value_type, (BaseModel, dict, list, tuple)):
         identity = id(value)
         if identity in active_containers:
             raise ValueError("cyclic contract graph is not valid input")
         active_containers.add(identity)
         try:
-            if isinstance(value, BaseModel):
+            if issubclass(value_type, BaseModel):
                 fields = {
                     key: _native_contract_graph(item, active_containers)
                     for key, item in vars(value).items()
                 }
                 extra = getattr(value, "__pydantic_extra__", None)
                 if extra is not None:
-                    if not isinstance(extra, dict):
+                    extra_type = type(extra)
+                    if not issubclass(extra_type, dict):
                         raise ValueError(
                             "malformed stored contract extras are not valid input"
                         )
+                    extra_entries = tuple(dict.items(extra))
                     declared_fields = type(value).model_fields
-                    for key, item in extra.items():
+                    for key, item in extra_entries:
                         if key in fields or key in declared_fields:
                             raise ValueError(
                                 "conflicting stored contract field is not valid input"
                             )
                         fields[key] = _native_contract_graph(item, active_containers)
                 return fields
-            if isinstance(value, dict):
+            if issubclass(value_type, dict):
+                entries = tuple(dict.items(value))
                 return {
                     key: _native_contract_graph(item, active_containers)
-                    for key, item in value.items()
+                    for key, item in entries
                 }
-            if isinstance(value, list):
+            if issubclass(value_type, list):
                 return [
                     _native_contract_graph(item, active_containers)
                     for item in value
