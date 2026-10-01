@@ -1,6 +1,8 @@
 """Positive and adversarial tests for inert lifecycle contracts."""
 
+import gc
 import json
+import weakref
 from collections.abc import Iterator, Mapping
 from datetime import datetime, timedelta, timezone
 from itertools import permutations
@@ -216,6 +218,33 @@ class RepairingReceiptClassView:
         native = BASE_MODEL_DICT_DESCRIPTOR.__get__(self.target, BaseModel)
         dict.__setitem__(native, "attempt", 1)
         return object
+
+
+class ReleasingReceiptTuple(tuple[object, ...]):
+    """Release a native nested receipt before exposing the public receipt."""
+
+    def __new__(
+        cls,
+        hidden: object,
+        carrier: StageReceipt,
+        public_receipt: StageReceipt,
+    ) -> "ReleasingReceiptTuple":
+        instance = super().__new__(cls, (hidden, carrier))
+        instance.carrier = carrier
+        instance.public_receipt = public_receipt
+        native = BASE_MODEL_DICT_DESCRIPTOR.__get__(carrier, BaseModel)
+        nested = dict.__getitem__(native, "error")
+        instance.nested_ref = weakref.ref(nested)
+        instance.iteration_calls = 0
+        instance.nested_alive_after_release = False
+        return instance
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        self.iteration_calls += 1
+        native = BASE_MODEL_DICT_DESCRIPTOR.__get__(self.carrier, BaseModel)
+        dict.__setitem__(native, "error", None)
+        self.nested_alive_after_release = self.nested_ref() is not None
+        return iter((self.public_receipt,))
 
 
 def descriptor_masked_copy(value: BaseModel) -> BaseModel:
@@ -2416,6 +2445,90 @@ def test_aggregate_boundary_classifies_native_receipts_concretely() -> None:
     assert divergent_valid.iteration_calls == 1
 
 
+def test_aggregate_boundary_owns_native_receipts_released_by_public_view() -> None:
+    command = intent(ProcessingStage.CANONICAL)
+    ordinary_invalid = receipt(
+        ProcessingStage.CANONICAL,
+        StageStatus.PENDING,
+    ).model_copy(update={"attempt": 0})
+    with pytest.raises(ValidationError) as ordinary_error:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=command,
+            receipts=(ordinary_invalid,),
+        )
+
+    stale_valid = receipt(
+        ProcessingStage.CANONICAL,
+        StageStatus.PENDING,
+    )
+    carrier_for_invalid = receipt(
+        ProcessingStage.CANONICAL,
+        StageStatus.PENDING,
+    ).model_copy(update={"error": stale_valid})
+    public_invalid = receipt(
+        ProcessingStage.CANONICAL,
+        StageStatus.PENDING,
+    ).model_copy(update={"attempt": 0})
+    hidden_invalid = RepairingReceiptClassView(public_invalid)
+    divergent_invalid = ReleasingReceiptTuple(
+        hidden_invalid,
+        carrier_for_invalid,
+        public_invalid,
+    )
+    del stale_valid
+
+    with pytest.raises(ValidationError) as divergent_error:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=command,
+            receipts=divergent_invalid,
+        )
+
+    ordinary_diagnostics = [
+        (error["loc"], error["type"], error["msg"], error["input"])
+        for error in ordinary_error.value.errors(include_url=False)
+    ]
+    divergent_diagnostics = [
+        (error["loc"], error["type"], error["msg"], error["input"])
+        for error in divergent_error.value.errors(include_url=False)
+    ]
+    assert divergent_diagnostics == ordinary_diagnostics
+    assert divergent_invalid.nested_alive_after_release
+    assert divergent_invalid.iteration_calls == 1
+    assert hidden_invalid.class_reads == 0
+
+    stale_invalid = receipt(
+        ProcessingStage.CANONICAL,
+        StageStatus.PENDING,
+    ).model_copy(update={"attempt": 0})
+    carrier_for_valid = receipt(
+        ProcessingStage.CANONICAL,
+        StageStatus.PENDING,
+    ).model_copy(update={"error": stale_invalid})
+    public_valid = receipt(
+        ProcessingStage.CANONICAL,
+        StageStatus.PENDING,
+    )
+    hidden_valid = RepairingReceiptClassView(public_valid)
+    divergent_valid = ReleasingReceiptTuple(
+        hidden_valid,
+        carrier_for_valid,
+        public_valid,
+    )
+    del stale_invalid
+
+    validate_required_stage_claim(
+        claimed_status=IntentStatus.ACCEPTED,
+        intent=command,
+        receipts=divergent_valid,
+    )
+
+    assert divergent_valid.nested_alive_after_release
+    assert divergent_valid.iteration_calls == 1
+    assert hidden_valid.class_reads == 0
+
+
 def test_aggregate_boundary_snapshots_model_extras_before_nested_traversal() -> None:
     command = intent(ProcessingStage.CANONICAL)
     extras = {"undeclared_witness": True}
@@ -2513,6 +2626,77 @@ def test_source_boundary_preserves_non_dict_mapping_rejection() -> None:
 
     with pytest.raises(ValueError, match="malformed stored contract extras"):
         source_versions_match(expected, observed)
+
+
+def test_identity_cache_owns_model_and_dict_sources_until_snapshot_release() -> None:
+    def assert_snapshot_owner(value: object) -> None:
+        source_ref = weakref.ref(value)
+        snapshot = lifecycle_contracts._capture_contract_graph(value)
+        del value
+        gc.collect()
+        assert source_ref() is not None
+
+        del snapshot
+        gc.collect()
+        assert source_ref() is None
+
+    assert_snapshot_owner(source("owned-model"))
+    assert_snapshot_owner(HiddenBackingDict({"owned": True}))
+
+
+def test_native_capture_rejects_foreign_identity_cache_entry() -> None:
+    stale = source("stale-model")
+    stale_capture, _ = lifecycle_contracts._capture_contract_graph(stale)
+    current = source("current-model")
+    inventory = {id(current): stale_capture}
+
+    captured = lifecycle_contracts._capture_native_contract_graph(
+        current,
+        captured_by_identity=inventory,
+    )
+    materialized = lifecycle_contracts._materialize_contract_graph(
+        (captured, inventory)
+    )
+
+    assert captured.source is current
+    assert inventory[id(current)] is captured
+    assert materialized["record_id"] == "current-model"
+
+
+def test_public_materialization_rejects_foreign_identity_cache_entry() -> None:
+    stale = source("stale-public-model")
+    stale_capture, _ = lifecycle_contracts._capture_contract_graph(stale)
+    current = source("current-public-model")
+    public_view = DivergentTuple((), (current,))
+    captured, inventory = lifecycle_contracts._capture_contract_graph(public_view)
+    inventory[id(current)] = stale_capture
+
+    materialized = lifecycle_contracts._materialize_contract_graph(
+        (captured, inventory)
+    )
+
+    assert materialized[0]["record_id"] == "current-public-model"
+    assert public_view.iteration_calls == 1
+
+
+def test_receipt_inventory_rejects_foreign_identity_cache_entry() -> None:
+    stale = receipt(
+        ProcessingStage.CANONICAL,
+        StageStatus.PENDING,
+    )
+    stale_capture, _ = lifecycle_contracts._capture_contract_graph(stale)
+    current = stale.model_copy(update={"attempt": 0})
+    inventory = {id(current): stale_capture}
+
+    with pytest.raises(ValidationError) as raised:
+        lifecycle_contracts._revalidated_inventory_model(
+            StageReceipt,
+            current,
+            inventory,
+        )
+
+    assert raised.value.errors()[0]["type"] == "value_error"
+    assert raised.value.errors()[0]["input"]["attempt"] == 0
 
 
 def test_native_graph_captures_dict_backing_before_nested_traversal() -> None:
