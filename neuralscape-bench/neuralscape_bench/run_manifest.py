@@ -51,14 +51,23 @@ class _FrozenPublicMapping(NamedTuple):
     complete: bool
 
 
+class _FrozenPublicSequence(NamedTuple):
+    owner: object
+    entries: tuple[Any, ...]
+    failure: Exception | None
+    complete: bool
+
+
 class _FrozenGraph(NamedTuple):
     models: dict[int, _FrozenModelStorage]
     native_containers: dict[int, tuple[object, tuple[Any, ...]]]
     replay_entries: dict[int, tuple[object, tuple[Any, ...]]]
     completed_traversals: dict[int, object]
     public_mapping_owners: dict[int, Mapping[Any, Any]]
+    public_mapping_queue: list[Mapping[Any, Any]]
     public_mappings: dict[int, _FrozenPublicMapping]
-    completed_mapping_discoveries: dict[int, object]
+    completed_mapping_discoveries: dict[int, tuple[object, bool]]
+    public_sequences: dict[int, _FrozenPublicSequence]
 
 
 class _ManifestContract(BaseModel):
@@ -324,6 +333,7 @@ def _retain_public_mapping(value: Any, frozen_graph: _FrozenGraph) -> bool:
     if owner is value:
         return False
     frozen_graph.public_mapping_owners[identity] = value
+    frozen_graph.public_mapping_queue.append(value)
     frozen_graph.public_mappings.pop(identity, None)
     return True
 
@@ -465,32 +475,58 @@ def _protect_yielded_model_storage(
 def _inventory_reachable_public_mappings(
     value: Any,
     frozen_graph: _FrozenGraph,
-    observing: dict[int, Mapping[Any, Any]],
+    observing: dict[int, object],
 ) -> bool:
     """Inventory public mappings reachable through retained native storage."""
 
-    pending = [value]
-    visited: set[int] = set()
-    discovered: dict[int, object] = {}
+    pending = [(value, True)]
+    visited: dict[int, bool] = {}
+    discovered: dict[int, tuple[object, bool]] = {}
     while pending:
-        current = pending.pop()
+        current, authoritative = pending.pop()
         identity = id(current)
-        if identity in visited:
+        previous_authority = visited.get(identity)
+        if identity in visited and (
+            previous_authority is True or not authoritative
+        ):
             continue
-        visited.add(identity)
+        visited[identity] = authoritative
 
         if type(current) is not dict and isinstance(current, Mapping):
             _retain_public_mapping(current, frozen_graph)
             active_owner = observing.get(identity)
             if active_owner is current:
+                if authoritative:
+                    return False
+            elif not _inventory_public_mapping(
+                current,
+                frozen_graph,
+                observing,
+            ) and authoritative:
                 return False
-            if not _inventory_public_mapping(current, frozen_graph, observing):
+        elif (
+            authoritative
+            and type(current) not in (tuple, list)
+            and isinstance(current, (tuple, list))
+        ):
+            active_owner = observing.get(identity)
+            if active_owner is current:
+                return False
+            if not _inventory_public_sequence(
+                current,
+                frozen_graph,
+                observing,
+            ):
                 return False
 
-        discovered_owner = frozen_graph.completed_mapping_discoveries.get(
+        prior_discovery = frozen_graph.completed_mapping_discoveries.get(
             identity
         )
-        if discovered_owner is current:
+        if (
+            prior_discovery is not None
+            and prior_discovery[0] is current
+            and (prior_discovery[1] or not authoritative)
+        ):
             continue
 
         value_type = type(current)
@@ -501,16 +537,115 @@ def _inventory_reachable_public_mappings(
             _freeze_model_storage(current, frozen_graph, set())
             frozen_replay = frozen_graph.replay_entries[identity]
         _owner, entries = frozen_replay
-        discovered[identity] = current
-        pending.extend(reversed(entries))
-    frozen_graph.completed_mapping_discoveries.update(discovered)
+        local_authority = issubclass(value_type, BaseModel) or value_type in (
+            dict,
+            list,
+            tuple,
+        )
+        child_authority = authoritative and local_authority
+        prior = discovered.get(identity)
+        discovered[identity] = (
+            current,
+            child_authority or (prior is not None and prior[1]),
+        )
+        pending.extend(
+            (item, child_authority) for item in reversed(entries)
+        )
+    for identity, discovery in discovered.items():
+        prior = frozen_graph.completed_mapping_discoveries.get(identity)
+        if prior is None or prior[0] is not discovery[0] or discovery[1]:
+            frozen_graph.completed_mapping_discoveries[identity] = discovery
     return True
+
+
+def _inventory_public_sequence(
+    value: tuple[Any, ...] | list[Any],
+    frozen_graph: _FrozenGraph,
+    observing: dict[int, object],
+) -> bool:
+    """Retain one yielded sequence subclass's authoritative public view."""
+
+    identity = id(value)
+    frozen = frozen_graph.public_sequences.get(identity)
+    if frozen is not None and frozen.owner is value:
+        return frozen.complete
+    if observing.get(identity) is value:
+        return False
+
+    observing[identity] = value
+    entries: list[Any] = []
+    failure: Exception | None = None
+    complete = False
+    try:
+        try:
+            iterator = iter(value)
+        except Exception as error:
+            failure = error
+        else:
+            while True:
+                try:
+                    item = next(iterator)
+                except StopIteration:
+                    complete = True
+                    break
+                except Exception as error:
+                    failure = error
+                    break
+                entries.append(item)
+                try:
+                    _protect_yielded_model_storage(item, frozen_graph)
+                except Exception as error:
+                    failure = error
+                    break
+                if not _inventory_yielded_public_shape(
+                    item,
+                    frozen_graph,
+                    observing,
+                ):
+                    break
+    finally:
+        observing.pop(identity, None)
+
+    frozen_graph.public_sequences[identity] = _FrozenPublicSequence(
+        owner=value,
+        entries=tuple(entries),
+        failure=failure,
+        complete=complete,
+    )
+    return complete
+
+
+def _inventory_yielded_public_shape(
+    value: Any,
+    frozen_graph: _FrozenGraph,
+    observing: dict[int, object],
+) -> bool:
+    """Protect one yielded value's authoritative public shape."""
+
+    identity = id(value)
+    if type(value) is not dict and isinstance(value, Mapping):
+        if observing.get(identity) is value:
+            return False
+        _retain_public_mapping(value, frozen_graph)
+        if not _inventory_public_mapping(value, frozen_graph, observing):
+            return False
+    elif type(value) not in (tuple, list) and isinstance(value, (tuple, list)):
+        if observing.get(identity) is value:
+            return False
+        if not _inventory_public_sequence(value, frozen_graph, observing):
+            return False
+
+    return _inventory_reachable_public_mappings(
+        value,
+        frozen_graph,
+        observing,
+    )
 
 
 def _inventory_public_mapping(
     value: Mapping[Any, Any],
     frozen_graph: _FrozenGraph,
-    observing: dict[int, Mapping[Any, Any]],
+    observing: dict[int, object],
 ) -> bool:
     """Observe one public mapping stream without performing key operations."""
 
@@ -555,7 +690,7 @@ def _inventory_public_mapping(
                 except Exception as error:
                     failure = error
                     break
-                if not _inventory_reachable_public_mappings(
+                if not _inventory_yielded_public_shape(
                     item,
                     frozen_graph,
                     observing,
@@ -576,21 +711,17 @@ def _inventory_public_mapping(
 def _inventory_retained_public_mappings(frozen_graph: _FrozenGraph) -> None:
     """Observe retained public mappings in deterministic discovery order."""
 
-    observing: dict[int, Mapping[Any, Any]] = {}
-    while True:
-        pending_owner = next(
-            (
-                owner
-                for identity, owner in frozen_graph.public_mapping_owners.items()
-                if (
-                    identity not in frozen_graph.public_mappings
-                    or frozen_graph.public_mappings[identity].owner is not owner
-                )
-            ),
-            None,
-        )
-        if pending_owner is None:
-            return
+    observing: dict[int, object] = {}
+    cursor = 0
+    while cursor < len(frozen_graph.public_mapping_queue):
+        pending_owner = frozen_graph.public_mapping_queue[cursor]
+        cursor += 1
+        identity = id(pending_owner)
+        if frozen_graph.public_mapping_owners.get(identity) is not pending_owner:
+            continue
+        frozen = frozen_graph.public_mappings.get(identity)
+        if frozen is not None and frozen.owner is pending_owner:
+            continue
         if not _inventory_public_mapping(
             pending_owner,
             frozen_graph,
@@ -608,8 +739,10 @@ def _freeze_model_graphs(*values: Any) -> _FrozenGraph:
         replay_entries={},
         completed_traversals={},
         public_mapping_owners={},
+        public_mapping_queue=[],
         public_mappings={},
         completed_mapping_discoveries={},
+        public_sequences={},
     )
     visited: set[int] = set()
     for value in values:
@@ -731,6 +864,27 @@ def _snapshot_native(
                     frozen_container = _frozen_graph.native_containers[identity]
                 tuple_items = frozen_container[1]
             else:
+                frozen_sequence = _frozen_graph.public_sequences.get(identity)
+                if (
+                    frozen_sequence is not None
+                    and frozen_sequence.owner is value
+                ):
+                    projected = tuple(
+                        _snapshot_native(
+                            item,
+                            path=f"{path}[{index}]",
+                            active=active,
+                            _frozen_graph=_frozen_graph,
+                        )
+                        for index, item in enumerate(frozen_sequence.entries)
+                    )
+                    if frozen_sequence.failure is not None:
+                        raise frozen_sequence.failure
+                    if not frozen_sequence.complete:
+                        raise ValueError(
+                            f"incomplete public sequence inventory at {path}"
+                        )
+                    return projected
                 tuple_items = value
             return tuple(
                 _snapshot_native(
@@ -750,6 +904,27 @@ def _snapshot_native(
                     frozen_container = _frozen_graph.native_containers[identity]
                 list_items = frozen_container[1]
             else:
+                frozen_sequence = _frozen_graph.public_sequences.get(identity)
+                if (
+                    frozen_sequence is not None
+                    and frozen_sequence.owner is value
+                ):
+                    projected = [
+                        _snapshot_native(
+                            item,
+                            path=f"{path}[{index}]",
+                            active=active,
+                            _frozen_graph=_frozen_graph,
+                        )
+                        for index, item in enumerate(frozen_sequence.entries)
+                    ]
+                    if frozen_sequence.failure is not None:
+                        raise frozen_sequence.failure
+                    if not frozen_sequence.complete:
+                        raise ValueError(
+                            f"incomplete public sequence inventory at {path}"
+                        )
+                    return projected
                 list_items = value
             return [
                 _snapshot_native(

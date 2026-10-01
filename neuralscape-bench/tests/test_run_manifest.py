@@ -489,6 +489,46 @@ class PublicViewTuple(tuple[object, ...]):
         return iter(self.public_values)
 
 
+class EventPublicTuple(tuple[object, ...]):
+    """Expose a passive public tuple view and record observation order."""
+
+    def __new__(
+        cls,
+        values: tuple[object, ...],
+        public_values: tuple[object, ...],
+        events: list[str],
+        name: str,
+    ):
+        instance = super().__new__(cls, values)
+        instance.public_values = public_values
+        instance.events = events
+        instance.name = name
+        instance.iteration_calls = 0
+        return instance
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        self.events.append(f"{self.name}:iter")
+        return iter(self.public_values)
+
+
+class PublicViewList(list[object]):
+    """Keep hidden native list backing distinct from a passive public view."""
+
+    def __init__(
+        self,
+        values: list[object],
+        public_values: list[object],
+    ):
+        super().__init__(values)
+        self.public_values = public_values
+        self.iteration_calls = 0
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        return iter(self.public_values)
+
+
 class PublicResourceWithDeepNativeBacking(dict[str, object]):
     """Expose a valid resource while retaining a deep native-only graph."""
 
@@ -895,6 +935,7 @@ def test_public_mapping_inventory_replays_one_recursive_alias_projection():
     assert events.index("inner:items") < events.index("outer:yield:1")
     assert frozen.public_mapping_owners[id(outer)] is outer
     assert frozen.public_mappings[id(outer)].owner is outer
+    assert frozen.public_mapping_queue == [proxy, outer, inner]
 
     assert _snapshot_native(value, _frozen_graph=frozen) == {
         "proxy": {"outer": {"inner": {"leaf": 1}, "tail": 2}},
@@ -902,6 +943,121 @@ def test_public_mapping_inventory_replays_one_recursive_alias_projection():
     }
     assert outer.items_calls == 1
     assert inner.items_calls == 1
+
+
+def test_public_mapping_queue_visits_each_retained_owner_once():
+    mappings = tuple(
+        InventoryMapping((), name=f"mapping-{index}") for index in range(32)
+    )
+
+    frozen = _freeze_model_graphs(mappings)
+
+    assert frozen.public_mapping_queue == list(mappings)
+    assert len(frozen.public_mapping_owners) == len(mappings)
+    assert len(frozen.public_mappings) == len(mappings)
+    assert sum(mapping.items_calls for mapping in mappings) == len(mappings)
+
+
+def test_hidden_native_alias_does_not_create_a_public_mapping_cycle():
+    mapping = InventoryMapping(())
+    child = PublicViewList([mapping], ["public-value"])
+    mapping.pairs = (("child", child),)
+
+    frozen = _freeze_model_graphs(mapping)
+
+    assert frozen.public_mappings[id(mapping)].complete is True
+    assert frozen.public_sequences[id(child)].complete is True
+    assert _snapshot_native(mapping, _frozen_graph=frozen) == {
+        "child": ["public-value"]
+    }
+    assert mapping.items_calls == 1
+    assert child.iteration_calls == 1
+
+
+@pytest.mark.parametrize("invalid", [False, True], ids=["valid", "invalid"])
+def test_mapping_inventory_observes_yielded_public_tuple_before_parent_advance(
+    invalid: bool,
+):
+    events: list[str] = []
+    exclusion = timing().exclusions[0]
+    if invalid:
+        exclusion = exclusion.model_copy(update={"count": True})
+    public_exclusions = EventPublicTuple(
+        (),
+        (exclusion,),
+        events,
+        "exclusions",
+    )
+    values = timing().model_dump(mode="python")
+    values["exclusions"] = public_exclusions
+    ordered_pairs = (("exclusions", public_exclusions),) + tuple(
+        (key, item) for key, item in values.items() if key != "exclusions"
+    )
+    measurement = InventoryMapping(
+        ordered_pairs,
+        name="measurement",
+        events=events,
+    )
+
+    if invalid:
+        with pytest.raises(ValidationError) as exc_info:
+            finish_run(
+                planned_manifest(),
+                state=RunState.COMPLETED,
+                started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+                finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+                resources=(measured_memory(),),
+                measurements=(measurement,),
+            )
+        assert exc_info.value.errors()[0]["loc"] == (
+            "measurements",
+            0,
+            "exclusions",
+            0,
+            "count",
+        )
+    else:
+        result = finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(measurement,),
+        )
+        assert result.state is RunState.COMPLETED
+
+    assert events.index("exclusions:iter") < events.index(
+        "measurement:yield:1"
+    )
+    assert measurement.items_calls == 1
+    assert public_exclusions.iteration_calls == 1
+
+
+def test_mapping_inventory_completes_nested_public_tuple_before_parent_advance():
+    events: list[str] = []
+    public_exclusions = EventPublicTuple(
+        (),
+        timing().exclusions,
+        events,
+        "nested-exclusions",
+    )
+    measurement = timing().model_copy(
+        update={"exclusions": public_exclusions}
+    )
+    mapping = InventoryMapping(
+        (("measurement", measurement), ("tail", 1)),
+        name="parent",
+        events=events,
+    )
+
+    frozen = _freeze_model_graphs(mapping)
+
+    assert events.index("nested-exclusions:iter") < events.index(
+        "parent:yield:1"
+    )
+    assert _snapshot_native(mapping, _frozen_graph=frozen)["tail"] == 1
+    assert public_exclusions.iteration_calls == 1
 
 
 def test_model_reachable_public_mappings_validate_from_one_inventory():
