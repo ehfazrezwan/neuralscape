@@ -155,6 +155,12 @@ def _snapshot_closed_graph(
                 observed_extra_length = 0
                 iterated_extra_names = ()
                 extra_entries = ()
+            elif isinstance(extras, dict):
+                extra_entries = tuple(entry for entry in dict.items(extras))
+                observed_extra_length = len(extra_entries)
+                iterated_extra_names = tuple(
+                    name for name, _field_value in extra_entries
+                )
             else:
                 observed_extra_length = len(extras)
                 iterated_extra_names = tuple(name for name in extras)

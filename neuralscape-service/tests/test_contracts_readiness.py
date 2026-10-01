@@ -72,6 +72,38 @@ class FalseyEntries(dict[object, object]):
         return False
 
 
+class HiddenNativeBacking(dict[object, object]):
+    """Hide native dict storage from every overridable mapping view."""
+
+    def __init__(self, entries: dict[object, object]) -> None:
+        dict.__init__(self, entries)
+        self.length_calls = 0
+        self.iteration_calls = 0
+        self.keys_calls = 0
+        self.items_calls = 0
+        self.boolean_calls = 0
+
+    def __len__(self) -> int:
+        self.length_calls += 1
+        return 0
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        return iter(())
+
+    def keys(self):
+        self.keys_calls += 1
+        return ()
+
+    def items(self):
+        self.items_calls += 1
+        return ()
+
+    def __bool__(self) -> bool:
+        self.boolean_calls += 1
+        return False
+
+
 class InverseItemsMapping(dict[object, object]):
     """Expose iterated keys while hiding every entry from items()."""
 
@@ -578,8 +610,83 @@ def test_readiness_boundaries_reject_iteration_visible_items_empty_extras(
         with pytest.raises(ValueError, match="undeclared fields"):
             evaluate(item)
 
-    assert extras.iteration_calls == 1
-    assert extras.items_calls == 1
+    assert extras.iteration_calls == 0
+    assert extras.items_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("boundary", "location"),
+    [
+        ("publication", "direct"),
+        ("publication", "nested"),
+        ("capability", "direct"),
+    ],
+)
+@pytest.mark.parametrize(
+    "extra_kind",
+    ["unknown", "declared"],
+    ids=["unknown", "declared-overlap"],
+)
+def test_readiness_boundaries_reject_hidden_native_dict_backing(
+    boundary: str,
+    location: str,
+    extra_kind: str,
+) -> None:
+    if boundary == "publication":
+        candidate = publication()
+        target = candidate if location == "direct" else candidate.capabilities[0]
+        declared_name = "tenant_id" if location == "direct" else "status"
+
+        def validate() -> object:
+            return validate_readiness_publication(
+                candidate,
+                expected_tenant_id="tenant-a",
+                current_placement_generation=12,
+            )
+
+    else:
+        target = observation()
+        declared_name = "status"
+
+        def validate() -> object:
+            return evaluate(target)
+
+    name = "future_constraint" if extra_kind == "unknown" else declared_name
+    extras = HiddenNativeBacking({name: "reject"})
+    object.__setattr__(target, "__pydantic_extra__", extras)
+
+    with pytest.raises(ValueError, match="undeclared fields"):
+        validate()
+
+    assert tuple(dict.items(extras)) == ((name, "reject"),)
+    assert (
+        extras.length_calls,
+        extras.iteration_calls,
+        extras.keys_calls,
+        extras.items_calls,
+        extras.boolean_calls,
+    ) == (0, 0, 0, 0, 0)
+
+
+def test_publication_accepts_empty_native_dict_subclass_backing() -> None:
+    candidate = publication()
+    extras = HiddenNativeBacking({})
+    object.__setattr__(candidate, "__pydantic_extra__", extras)
+
+    result = validate_readiness_publication(
+        candidate,
+        expected_tenant_id="tenant-a",
+        current_placement_generation=12,
+    )
+
+    assert result.tenant_id == "tenant-a"
+    assert (
+        extras.length_calls,
+        extras.iteration_calls,
+        extras.keys_calls,
+        extras.items_calls,
+        extras.boolean_calls,
+    ) == (0, 0, 0, 0, 0)
 
 
 @pytest.mark.parametrize(
