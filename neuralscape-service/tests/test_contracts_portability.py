@@ -2,7 +2,7 @@
 
 import json
 import sys
-from collections.abc import Iterator, Mapping
+from collections.abc import ItemsView, Iterator, Mapping
 from copy import deepcopy
 from pathlib import PureWindowsPath
 from types import MappingProxyType
@@ -228,6 +228,76 @@ class ChangingItemsExtra(Mapping[str, str]):
         if self.item_calls == 1:
             return ()
         return (("manifest_id", "shadow-manifest"),)
+
+
+class HiddenModelBacking(dict[str, object]):
+    def __init__(
+        self,
+        entries: tuple[tuple[str, object], ...],
+        *,
+        hidden_name: str | None = None,
+    ) -> None:
+        dict.__init__(self, entries)
+        self.hidden_name = hidden_name
+        self.iteration_calls = 0
+        self.key_calls = 0
+        self.item_calls = 0
+        self.value_calls = 0
+        self.length_calls = 0
+
+    def __iter__(self) -> Iterator[str]:
+        self.iteration_calls += 1
+        return (
+            key for key in dict.__iter__(self) if key != self.hidden_name
+        )
+
+    def keys(self) -> tuple[str, ...]:
+        self.key_calls += 1
+        return tuple(self)
+
+    def items(self) -> tuple[tuple[str, object], ...]:
+        self.item_calls += 1
+        return tuple(
+            (key, dict.__getitem__(self, key)) for key in self
+        )
+
+    def values(self) -> tuple[object, ...]:
+        self.value_calls += 1
+        return tuple(dict.__getitem__(self, key) for key in self)
+
+    def __len__(self) -> int:
+        self.length_calls += 1
+        hidden_count = int(
+            self.hidden_name is not None
+            and dict.__contains__(self, self.hidden_name)
+        )
+        return dict.__len__(self) - hidden_count
+
+    def overridden_view_calls(self) -> tuple[int, ...]:
+        return (
+            self.iteration_calls,
+            self.key_calls,
+            self.item_calls,
+            self.value_calls,
+            self.length_calls,
+        )
+
+
+class RepairingProducer(dict[str, str]):
+    def __init__(self, owner: PortableManifest) -> None:
+        dict.__init__(
+            self,
+            implementation="reference-exporter",
+            version="1.4.2",
+        )
+        self.owner = owner
+        self.item_calls = 0
+
+    def items(self) -> ItemsView[str, str]:
+        self.item_calls += 1
+        native_stored = object.__getattribute__(self.owner, "__dict__")
+        dict.__setitem__(native_stored, "manifest_id", "manifest-7")
+        return dict.items(self)
 
 
 def valid_manifest() -> dict:
@@ -1024,6 +1094,77 @@ def test_nested_fields_set_only_unknown_is_controlled_extra_error() -> None:
     assert errors[0]["type"] == "extra_forbidden"
     assert errors[0]["loc"] == ("files", 0, "phantom_only")
     assert errors[0]["input"] is None
+
+
+@pytest.mark.parametrize(
+    ("location", "expected_location"),
+    [
+        ("manifest", ("hidden_unknown",)),
+        ("file", ("files", 0, "hidden_unknown")),
+    ],
+)
+def test_hidden_native_model_backing_unknown_is_not_discarded(
+    location: str,
+    expected_location: tuple[object, ...],
+) -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    node = _model_at_location(manifest, location)
+    native_stored = object.__getattribute__(node, "__dict__")
+    hidden = HiddenModelBacking(
+        tuple(dict.items(native_stored)),
+        hidden_name="hidden_unknown",
+    )
+    dict.__setitem__(hidden, "hidden_unknown", "deny")
+    object.__setattr__(node, "__dict__", hidden)
+
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+
+    assert hidden.overridden_view_calls() == (0, 0, 0, 0, 0)
+    errors = raised.value.errors()
+    assert len(errors) == 1
+    assert errors[0]["type"] == "extra_forbidden"
+    assert errors[0]["loc"] == expected_location
+    assert errors[0]["input"] == "deny"
+
+
+def test_native_model_backing_subclass_without_hidden_state_remains_valid() -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    native_stored = object.__getattribute__(manifest.files[0], "__dict__")
+    backing = HiddenModelBacking(tuple(dict.items(native_stored)))
+    object.__setattr__(manifest.files[0], "__dict__", backing)
+
+    revalidated = validate_portable_manifest(manifest)
+
+    assert revalidated.files[0].path == manifest.files[0].path
+    assert backing.overridden_view_calls() == (0, 0, 0, 0, 0)
+
+
+def test_nested_mapping_cannot_repair_initially_invalid_model_storage() -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    native_stored = object.__getattribute__(manifest, "__dict__")
+    dict.__setitem__(native_stored, "manifest_id", "")
+    repairing_producer = RepairingProducer(manifest)
+    dict.__setitem__(native_stored, "producer", repairing_producer)
+
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+
+    assert raised.value.errors()[0]["loc"] == ("manifest_id",)
+    assert repairing_producer.item_calls == 2
+
+
+def test_nested_mapping_with_initially_valid_model_storage_remains_valid() -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    repairing_producer = RepairingProducer(manifest)
+    native_stored = object.__getattribute__(manifest, "__dict__")
+    dict.__setitem__(native_stored, "producer", repairing_producer)
+
+    revalidated = validate_portable_manifest(manifest)
+
+    assert revalidated.manifest_id == "manifest-7"
+    assert revalidated.producer.implementation == "reference-exporter"
+    assert repairing_producer.item_calls == 2
 
 
 @pytest.mark.parametrize(
