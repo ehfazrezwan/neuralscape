@@ -523,6 +523,57 @@ class _TraversalItemsInput(dict[str, object]):
         return iterate()
 
 
+class _TraversalPublicMapping(Mapping[str, object]):
+    """Fail at one precise stage of a non-dict public items traversal."""
+
+    def __init__(self, entries: dict[str, object], behavior: str) -> None:
+        self.entries = entries
+        self.behavior = behavior
+        self.items_calls = 0
+        self.iterator_calls = 0
+        self.iterator_entries = 0
+
+    def __getitem__(self, key: str) -> object:
+        return self.entries[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.entries)
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def items(self) -> Iterator[tuple[str, object]]:
+        self.items_calls += 1
+        if self.behavior == "items":
+            raise RuntimeError("public mapping items sentinel")
+        return _TraversalPublicItemsIterator(self)
+
+
+class _TraversalPublicItemsIterator:
+    def __init__(self, owner: _TraversalPublicMapping) -> None:
+        self.owner = owner
+        self.entries = tuple(dict.items(owner.entries))
+        self.index = 0
+
+    def __iter__(self) -> "_TraversalPublicItemsIterator":
+        self.owner.iterator_calls += 1
+        if self.owner.behavior == "iter":
+            raise RuntimeError("public mapping iter sentinel")
+        return self
+
+    def __next__(self) -> tuple[str, object]:
+        if self.owner.behavior == "next" and self.index == 0:
+            raise RuntimeError("public mapping next sentinel")
+        if self.owner.behavior == "lazy" and self.index == 1:
+            raise RuntimeError("public mapping lazy sentinel")
+        if self.index == len(self.entries):
+            raise StopIteration
+        entry = self.entries[self.index]
+        self.index += 1
+        self.owner.iterator_entries += 1
+        return entry
+
+
 class _FalseyPopulatedExtras(dict[str, object]):
     def __bool__(self) -> bool:
         return False
@@ -1651,6 +1702,138 @@ def test_python_nested_dict_traversal_errors_keep_category_and_location(
     assert _python_receive(receiver, payload, entry) == expected
     assert control.items_calls == 1
     assert control.iterator_entries == 1
+
+
+@pytest.mark.parametrize(
+    ("behavior", "expected_iterator_calls", "expected_entries"),
+    [
+        ("items", 0, 0),
+        ("iter", 1, 0),
+        ("next", 1, 0),
+        ("lazy", 1, 1),
+    ],
+)
+@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+def test_python_result_root_public_mapping_traversal_errors_are_located(
+    behavior: str,
+    expected_iterator_calls: int,
+    expected_entries: int,
+    receiver_name: str,
+) -> None:
+    result = reconcile_usage_events([_event()])
+    if receiver_name == "stream":
+        receiver = ReconciledUsageStream
+        valid = result.streams[0]
+    else:
+        receiver = UsageReconciliation
+        valid = result
+
+    payload = valid.model_dump(mode="python")
+    failing = _TraversalPublicMapping(payload, behavior)
+    assert _validation_signature(receiver, failing) == [
+        (
+            "mapping_type",
+            (),
+            (
+                "Input should be a valid mapping, error: RuntimeError: "
+                f"public mapping {behavior} sentinel"
+            ),
+        )
+    ]
+    assert failing.items_calls == 1
+    assert failing.iterator_calls == expected_iterator_calls
+    assert failing.iterator_entries == expected_entries
+
+    control = _TraversalPublicMapping(payload, "valid")
+    assert receiver.model_validate(control) == valid
+    assert control.items_calls == 1
+    assert control.iterator_calls == 1
+    assert control.iterator_entries == len(payload)
+
+
+@pytest.mark.parametrize(
+    ("behavior", "expected_iterator_calls", "expected_entries"),
+    [
+        ("items", 0, 0),
+        ("iter", 1, 0),
+        ("next", 1, 0),
+        ("lazy", 1, 1),
+    ],
+)
+@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+def test_python_nested_public_mapping_traversal_errors_keep_location(
+    behavior: str,
+    expected_iterator_calls: int,
+    expected_entries: int,
+    receiver_name: str,
+) -> None:
+    result = reconcile_usage_events([_event()])
+    stream = result.streams[0]
+    if receiver_name == "stream":
+        receiver = ReconciledUsageStream
+        expected = stream
+        payload = stream.model_dump(mode="python")
+        field_name = "attribution"
+        child = stream.attribution
+        location = ("attribution",)
+    else:
+        receiver = UsageReconciliation
+        expected = result
+        payload = result.model_dump(mode="python")
+        field_name = "streams"
+        child = stream
+        location = ("streams", 0)
+
+    failing = _TraversalPublicMapping(child.model_dump(mode="python"), behavior)
+    payload[field_name] = failing if receiver_name == "stream" else (failing,)
+    assert _validation_signature(receiver, payload) == [
+        (
+            "mapping_type",
+            location,
+            (
+                "Input should be a valid mapping, error: RuntimeError: "
+                f"public mapping {behavior} sentinel"
+            ),
+        )
+    ]
+    assert failing.items_calls == 1
+    assert failing.iterator_calls == expected_iterator_calls
+    assert failing.iterator_entries == expected_entries
+
+    control = _TraversalPublicMapping(child.model_dump(mode="python"), "valid")
+    payload[field_name] = control if receiver_name == "stream" else (control,)
+    assert receiver.model_validate(payload) == expected
+    assert control.items_calls == 1
+    assert control.iterator_calls == 1
+    assert control.iterator_entries == len(child.model_dump(mode="python"))
+
+
+@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+def test_python_public_mapping_does_not_remap_recursive_cycle_error(
+    receiver_name: str,
+) -> None:
+    result = reconcile_usage_events([_event()])
+    stream = result.streams[0]
+    cycle: list[object] = []
+    cycle.append(cycle)
+    if receiver_name == "stream":
+        receiver = ReconciledUsageStream
+        payload = stream.model_dump(mode="python")
+        field_name = "attribution"
+    else:
+        receiver = UsageReconciliation
+        payload = result.model_dump(mode="python")
+        field_name = "streams"
+    payload[field_name] = cycle if receiver_name == "stream" else (cycle,)
+    expected_entries = tuple(payload).index(field_name) + 1
+    value = _TraversalPublicMapping(payload, "valid")
+
+    assert _validation_signature(receiver, value) == [
+        ("value_error", (), "Value error, cyclic input graph")
+    ]
+    assert value.items_calls == 1
+    assert value.iterator_calls == 1
+    assert value.iterator_entries == expected_entries
 
 
 @pytest.mark.parametrize(

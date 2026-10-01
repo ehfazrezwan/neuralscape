@@ -499,7 +499,26 @@ def _native_snapshot(
                     return _FailedNativeDictTraversal(exc)
                 source_items = frozen_dict[1]
             else:
-                source_items = value.items()
+                try:
+                    source_iterator = iter(value.items())
+                except Exception as exc:
+                    return _FailedNativeDictTraversal(exc)
+                projected: dict[object, object] = {}
+                while True:
+                    try:
+                        key, field_value = next(source_iterator)
+                    except StopIteration:
+                        break
+                    except Exception as exc:
+                        return _FailedNativeDictTraversal(exc)
+                    projected[key] = _native_snapshot(
+                        field_value,
+                        active,
+                        _frozen_models=_frozen_models,
+                        _frozen_dicts=_frozen_dicts,
+                        _frozen_tuples=_frozen_tuples,
+                    )
+                return projected
             return {
                 key: _native_snapshot(
                     field_value,
