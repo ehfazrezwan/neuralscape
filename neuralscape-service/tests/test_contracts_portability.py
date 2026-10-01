@@ -22,6 +22,7 @@ from contracts_portability import (
 
 
 _PYDANTIC_EXTRA_SLOT = BaseModel.__dict__["__pydantic_extra__"]
+_PYDANTIC_FIELDS_SET_SLOT = BaseModel.__dict__["__pydantic_fields_set__"]
 
 
 class FutureManifestFile(ManifestFile):
@@ -322,6 +323,52 @@ class PopulatedReportingExtraManifest(PortableManifest):
         if name == "__pydantic_extra__":
             return {"reported_only": "deny"}
         return super().__getattribute__(name)
+
+
+class HidingFieldsSetManifest(PortableManifest):
+    def __getattribute__(self, name: str) -> object:
+        if name == "model_fields_set":
+            return set(type(self).model_fields)
+        return super().__getattribute__(name)
+
+
+class HidingFieldsSetManifestFile(ManifestFile):
+    def __getattribute__(self, name: str) -> object:
+        if name == "model_fields_set":
+            return set(type(self).model_fields)
+        return super().__getattribute__(name)
+
+
+class HiddenFieldsSetBacking(set[str]):
+    def __init__(self, values: set[str]) -> None:
+        set.__init__(self, values)
+        self.iteration_calls = 0
+        self.length_calls = 0
+        self.contains_calls = 0
+
+    def __iter__(self) -> Iterator[str]:
+        self.iteration_calls += 1
+        return (
+            name for name in set.__iter__(self) if name != "phantom_only"
+        )
+
+    def __len__(self) -> int:
+        self.length_calls += 1
+        hidden_count = int(set.__contains__(self, "phantom_only"))
+        return set.__len__(self) - hidden_count
+
+    def __contains__(self, name: object) -> bool:
+        self.contains_calls += 1
+        if name == "phantom_only":
+            return False
+        return set.__contains__(self, name)
+
+    def overridden_view_calls(self) -> tuple[int, int, int]:
+        return (
+            self.iteration_calls,
+            self.length_calls,
+            self.contains_calls,
+        )
 
 
 def valid_manifest() -> dict:
@@ -1165,6 +1212,59 @@ def test_nested_fields_set_only_unknown_is_controlled_extra_error() -> None:
 
     assert "phantom_only" not in nested.__dict__
     assert nested.__pydantic_extra__ is None
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+
+    errors = raised.value.errors()
+    assert len(errors) == 1
+    assert errors[0]["type"] == "extra_forbidden"
+    assert errors[0]["loc"] == ("files", 0, "phantom_only")
+    assert errors[0]["input"] is None
+
+
+def test_model_fields_set_override_cannot_hide_root_unknown() -> None:
+    ordinary = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    ordinary_fields_set = _PYDANTIC_FIELDS_SET_SLOT.__get__(
+        ordinary, type(ordinary)
+    )
+    ordinary_fields_set.add("phantom_only")
+
+    hidden = HidingFieldsSetManifest.model_validate(valid_manifest())
+    hidden_fields_set = HiddenFieldsSetBacking(
+        set.copy(_PYDANTIC_FIELDS_SET_SLOT.__get__(hidden, type(hidden)))
+    )
+    set.add(hidden_fields_set, "phantom_only")
+    _PYDANTIC_FIELDS_SET_SLOT.__set__(hidden, hidden_fields_set)
+
+    assert "phantom_only" in ordinary.model_fields_set
+    assert set.__contains__(hidden_fields_set, "phantom_only")
+    assert "phantom_only" not in hidden.model_fields_set
+
+    observed_errors = []
+    for model in (ordinary, hidden):
+        with pytest.raises(ValidationError) as raised:
+            validate_portable_manifest(model)
+        observed_errors.append(raised.value.errors())
+
+    assert observed_errors[0] == observed_errors[1]
+    assert len(observed_errors[0]) == 1
+    assert observed_errors[0][0]["type"] == "extra_forbidden"
+    assert observed_errors[0][0]["loc"] == ("phantom_only",)
+    assert observed_errors[0][0]["input"] is None
+    assert hidden_fields_set.overridden_view_calls() == (0, 0, 0)
+
+
+def test_model_fields_set_override_cannot_hide_nested_unknown() -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    nested = HidingFieldsSetManifestFile.model_validate(
+        manifest.files[0].model_dump()
+    )
+    native_fields_set = _PYDANTIC_FIELDS_SET_SLOT.__get__(nested, type(nested))
+    native_fields_set.add("phantom_only")
+    manifest.files[0] = nested
+
+    assert "phantom_only" not in nested.model_fields_set
+    assert set.__contains__(native_fields_set, "phantom_only")
     with pytest.raises(ValidationError) as raised:
         validate_portable_manifest(manifest)
 

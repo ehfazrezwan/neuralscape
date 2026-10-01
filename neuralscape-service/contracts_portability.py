@@ -23,6 +23,7 @@ EncryptionMode = Literal["plaintext_authorized_export", "encrypted"]
 ScopeKind = Literal["tenant", "projects"]
 _WINDOWS_FORBIDDEN_COMPONENT_CHARACTERS = frozenset('<>:"|?*')
 _PYDANTIC_EXTRA_SLOT = BaseModel.__dict__["__pydantic_extra__"]
+_PYDANTIC_FIELDS_SET_SLOT = BaseModel.__dict__["__pydantic_fields_set__"]
 _ModelStorageEntries = tuple[tuple[Any, Any], ...]
 _ModelStorageSnapshot = tuple[_ModelStorageEntries, _ModelStorageEntries]
 _ModelStorageInventory = dict[int, _ModelStorageSnapshot]
@@ -93,6 +94,10 @@ def _reject_retained_unknown_fields(
             native_stored = object.__getattribute__(value, "__dict__")
             stored_entries = tuple(dict.items(native_stored))
             stored = dict(stored_entries)
+            native_fields_set = _PYDANTIC_FIELDS_SET_SLOT.__get__(
+                value, type(value)
+            )
+            fields_set = set.copy(native_fields_set)
             pydantic_extra, observed_extra_names = (
                 _validated_model_extra_storage(value, set(stored))
             )
@@ -102,7 +107,7 @@ def _reject_retained_unknown_fields(
             )
             retained_names = (
                 set(stored)
-                | set(value.model_fields_set)
+                | fields_set
                 | observed_extra_names
             )
 
