@@ -29,6 +29,7 @@ class _CapturedFailure(NamedTuple):
 
 
 class _ModelInventory(NamedTuple):
+    owner: BaseModel
     stored_storage: object
     stored_items: tuple[tuple[object, object], ...] | None
     extra_storage: object
@@ -120,6 +121,7 @@ def _capture_model_inventory(value: BaseModel) -> _ModelInventory:
         else None
     )
     return _ModelInventory(
+        value,
         stored_storage,
         stored_items,
         extra_storage,
@@ -127,6 +129,18 @@ def _capture_model_inventory(value: BaseModel) -> _ModelInventory:
         fields_set_storage,
         fields_set_names,
     )
+
+
+def _validated_model_inventory(
+    value: BaseModel,
+    inventories: dict[int, _ModelInventory],
+) -> _ModelInventory | None:
+    """Return only an inventory owned by this exact model instance."""
+
+    inventory = inventories.get(id(value))
+    if inventory is not None and inventory.owner is not value:
+        raise ValueError("contract input model inventory owner mismatch")
+    return inventory
 
 
 def _freeze_reachable_model_inventories(
@@ -138,7 +152,7 @@ def _freeze_reachable_model_inventories(
 
     if issubclass(type(value), BaseModel):
         identity = id(value)
-        if identity in inventories:
+        if _validated_model_inventory(value, inventories) is not None:
             return
         inventory = _capture_model_inventory(value)
         inventories[identity] = inventory
@@ -216,10 +230,12 @@ def _complete_contract_input(
             raise ValueError("cyclic contract input is not supported")
         active_ids.add(identity)
         try:
-            inventory = inventories.get(identity)
+            inventory = _validated_model_inventory(value, inventories)
             if inventory is None:
                 _freeze_reachable_model_inventories(value, inventories, set())
-                inventory = inventories[identity]
+                inventory = _validated_model_inventory(value, inventories)
+                if inventory is None:
+                    raise ValueError("contract input model inventory is missing")
             stored_storage = _raise_captured_failure(inventory.stored_storage)
             native_stored_items = (
                 inventory.stored_items
