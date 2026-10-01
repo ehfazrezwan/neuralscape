@@ -1,6 +1,7 @@
 """Tests for processing-policy and plaintext-recipient boundaries."""
 
 from collections.abc import Iterator, Mapping
+from typing import ClassVar
 
 import pytest
 from pydantic import ValidationError
@@ -146,6 +147,30 @@ class _EmptyNativeFabricatedViews(dict[str, object]):
     def items(self):
         self.view_calls += 1
         return {"fabricated_unknown": True}.items()
+
+
+class _AttributeHidingPolicy(ProcessingPolicy):
+    mode_reads: ClassVar[int] = 0
+
+    def __getattribute__(self, name: str):
+        if name == "mode":
+            type(self).mode_reads += 1
+            return "strict_local"
+        return super().__getattribute__(name)
+
+
+def _replace_model_backing(
+    policy: ProcessingPolicy,
+    changes: dict[str, object],
+) -> _HiddenBackingDict:
+    stored = dict(
+        dict.items(object.__getattribute__(policy, "__dict__"))
+    )
+    for name, value in changes.items():
+        dict.__setitem__(stored, name, value)
+    hidden = _HiddenBackingDict(stored)
+    object.__setattr__(policy, "__dict__", hidden)
+    return hidden
 
 
 def _attach_extra_storage(
@@ -322,6 +347,72 @@ def test_dispatch_rejects_hidden_native_dict_backing(
             is_fallback=False,
         )
 
+    assert hidden.view_calls == 0
+
+
+@pytest.mark.parametrize(
+    "extra_storage",
+    [None, {}],
+    ids=["none-extras", "empty-dict-extras"],
+)
+def test_dispatch_projects_hidden_native_model_backing(
+    extra_storage: object,
+) -> None:
+    policy = _strict_local_policy()
+    hidden = _replace_model_backing(policy, {"hidden_unknown": "deny"})
+    _attach_extra_storage(policy, extra_storage)
+
+    with pytest.raises(PlaintextDispatchRejected, match="policy is invalid") as exc:
+        validate_plaintext_dispatch(
+            policy,
+            execution_location="endpoint",
+            recipient_id=None,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=set(),
+            is_fallback=False,
+        )
+
+    assert isinstance(exc.value.__cause__, ValidationError)
+    assert any(
+        error["loc"] == ("hidden_unknown",)
+        for error in exc.value.__cause__.errors()
+    )
+    assert hidden.view_calls == 0
+
+
+@pytest.mark.parametrize(
+    "extra_storage",
+    [None, {}],
+    ids=["none-extras", "empty-dict-extras"],
+)
+def test_dispatch_native_model_backing_ignores_attribute_override(
+    extra_storage: object,
+) -> None:
+    policy = _AttributeHidingPolicy(
+        schema_version="candidate-v1",
+        mode="strict_local",
+        allowed_execution_locations=("endpoint",),
+        approved_recipient_ids=(),
+        fallback_policy="deny",
+        policy_epoch=7,
+    )
+    _AttributeHidingPolicy.mode_reads = 0
+    hidden = _replace_model_backing(policy, {"mode": "invalid"})
+    _attach_extra_storage(policy, extra_storage)
+
+    with pytest.raises(PlaintextDispatchRejected, match="policy is invalid") as exc:
+        validate_plaintext_dispatch(
+            policy,
+            execution_location="endpoint",
+            recipient_id=None,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=set(),
+            is_fallback=False,
+        )
+
+    assert isinstance(exc.value.__cause__, ValidationError)
+    assert any(error["loc"] == ("mode",) for error in exc.value.__cause__.errors())
+    assert _AttributeHidingPolicy.mode_reads == 0
     assert hidden.view_calls == 0
 
 

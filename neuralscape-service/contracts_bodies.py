@@ -54,13 +54,15 @@ def _with_native_dict_extra_backing(value: object) -> object:
     if not issubclass(value_type, BaseModel):
         return value
     extras = object.__getattribute__(value, "__pydantic_extra__")
-    extras_type = type(extras)
-    if not issubclass(extras_type, dict):
+    if extras is None:
+        captured = ()
+    elif issubclass(type(extras), dict):
+        # Bypass every overridable view on a dict subclass and capture its
+        # actual backing exactly once.
+        captured = tuple(dict.items(extras))
+    else:
         return value
 
-    # Bypass every overridable view on a dict subclass and capture its actual
-    # backing exactly once. Non-dict mappings retain Pydantic's existing path.
-    captured = tuple(dict.items(extras))
     projected = dict(
         dict.items(object.__getattribute__(value, "__dict__"))
     )

@@ -1,6 +1,7 @@
 """Tests for the plaintext/opaque body boundary."""
 
 from collections.abc import Iterator, Mapping
+from typing import ClassVar
 
 import pytest
 from pydantic import ValidationError
@@ -153,6 +154,30 @@ class _EmptyNativeFabricatedViews(dict[str, object]):
         return {"fabricated_unknown": True}.items()
 
 
+class _AttributeHidingPlaintextBody(PlaintextBody):
+    text_reads: ClassVar[int] = 0
+
+    def __getattribute__(self, name: str):
+        if name == "text":
+            type(self).text_reads += 1
+            return "secret"
+        return super().__getattribute__(name)
+
+
+def _replace_model_backing(
+    body: MemoryBody,
+    changes: dict[str, object],
+) -> _HiddenBackingDict:
+    stored = dict(
+        dict.items(object.__getattribute__(body, "__dict__"))
+    )
+    for name, value in changes.items():
+        dict.__setitem__(stored, name, value)
+    hidden = _HiddenBackingDict(stored)
+    object.__setattr__(body, "__dict__", hidden)
+    return hidden
+
+
 def _attach_extra_storage(body: MemoryBody, storage: object) -> MemoryBody:
     object.__setattr__(body, "__pydantic_extra__", storage)
     return body
@@ -250,6 +275,48 @@ def test_parser_rejects_hidden_native_dict_backing(
     with pytest.raises(ValidationError, match="extra"):
         parse_memory_body(body)
 
+    assert hidden.view_calls == 0
+
+
+@pytest.mark.parametrize(
+    "extra_storage",
+    [None, {}],
+    ids=["none-extras", "empty-dict-extras"],
+)
+def test_parser_projects_hidden_native_model_backing(
+    extra_storage: object,
+) -> None:
+    body = PlaintextBody(kind="plaintext", text="secret")
+    hidden = _replace_model_backing(body, {"hidden_unknown": "deny"})
+    _attach_extra_storage(body, extra_storage)
+
+    with pytest.raises(ValidationError) as exc:
+        parse_memory_body(body)
+
+    assert any(
+        error["loc"][-1] == "hidden_unknown" for error in exc.value.errors()
+    )
+    assert hidden.view_calls == 0
+
+
+@pytest.mark.parametrize(
+    "extra_storage",
+    [None, {}],
+    ids=["none-extras", "empty-dict-extras"],
+)
+def test_parser_native_model_backing_ignores_attribute_override(
+    extra_storage: object,
+) -> None:
+    body = _AttributeHidingPlaintextBody(kind="plaintext", text="secret")
+    _AttributeHidingPlaintextBody.text_reads = 0
+    hidden = _replace_model_backing(body, {"text": ""})
+    _attach_extra_storage(body, extra_storage)
+
+    with pytest.raises(ValidationError) as exc:
+        parse_memory_body(body)
+
+    assert any(error["loc"][-1] == "text" for error in exc.value.errors())
+    assert _AttributeHidingPlaintextBody.text_reads == 0
     assert hidden.view_calls == 0
 
 
