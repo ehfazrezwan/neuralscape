@@ -36,6 +36,7 @@ from neuralscape_bench.run_manifest import (
     validate_run_manifest_json,
 )
 from neuralscape_bench.run_manifest import (
+    _capture_missing_model_storage,
     _freeze_model_graphs,
     _snapshot_native,
     _traverse_model_storage,
@@ -696,24 +697,29 @@ def test_replay_inventory_retains_first_entries_and_strong_owners():
     assert frozen.replay_entries[id(list_parent)][1] == (list_child,)
 
 
-def test_replay_inventory_captures_a_genuinely_missing_supported_object_once():
+def test_yielded_child_guard_captures_owned_storage_once_and_reuses_it():
     class ReplayDict(dict[str, object]):
         pass
 
     frozen = _freeze_model_graphs(())
     child: dict[str, object] = {}
     value = ReplayDict(child=child)
+    impostor = ReplayDict()
+    frozen.replay_entries[id(value)] = (impostor, ())
 
-    first_visited: set[int] = set()
-    _traverse_model_storage(value, frozen, first_visited)
-    assert frozen.replay_entries[id(value)] == (value, (child,))
-    assert id(child) in first_visited
+    assert _capture_missing_model_storage(value, frozen) is True
+    owner, entries = frozen.replay_entries[id(value)]
+    assert owner is value
+    assert entries == (child,)
 
     value.clear()
-    second_visited: set[int] = set()
-    _traverse_model_storage(value, frozen, second_visited)
+    assert _capture_missing_model_storage(value, frozen) is False
     assert frozen.replay_entries[id(value)] == (value, (child,))
-    assert id(child) in second_visited
+
+    visited: set[int] = set()
+    _traverse_model_storage(value, frozen, visited)
+    assert id(child) in visited
+    assert _capture_missing_model_storage("ordinary scalar", frozen) is False
 
 
 @pytest.mark.parametrize("boundary", ["serialize", "finish"])
