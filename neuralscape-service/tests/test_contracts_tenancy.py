@@ -560,6 +560,69 @@ def test_valid_operation_progress_is_accepted() -> None:
 
 
 @pytest.mark.parametrize(
+    ("callback_kind", "expected_calls"),
+    [("stored-name", 2), ("tuple", 1)],
+)
+def test_transition_freezes_current_before_previous_callbacks(
+    callback_kind: str,
+    expected_calls: int,
+) -> None:
+    def invalid_current() -> tuple[TenantOperationState, ResourceManifestReference]:
+        current = operation(observed_state="running")
+        child = current.resource_manifests[0]
+        _set_native_field(child, "manifest_id", "")
+        return current, child
+
+    def install_callback(
+        previous: TenantOperationState,
+        repair,
+    ) -> RepairingName | RepairingTuple:
+        if callback_kind == "stored-name":
+            return _install_repairing_stored_name(previous, repair)
+        repairing = RepairingTuple(previous.resource_manifests, repair)
+        _set_native_field(previous, "resource_manifests", repairing)
+        return repairing
+
+    ordinary_current, _ordinary_child = invalid_current()
+    with pytest.raises(ValidationError) as ordinary_error:
+        validate_operation_transition(operation(), ordinary_current)
+    assert ordinary_error.value.errors()[0]["type"] == "string_too_short"
+    assert ordinary_error.value.errors()[0]["loc"] == (
+        "resource_manifests",
+        0,
+        "manifest_id",
+    )
+
+    attacked_current, attacked_child = invalid_current()
+    previous = operation()
+    callback = install_callback(
+        previous,
+        lambda: _set_native_field(attacked_child, "manifest_id", "primary"),
+    )
+
+    with pytest.raises(ValidationError) as callback_error:
+        validate_operation_transition(previous, attacked_current)
+
+    assert callback_error.value.errors() == ordinary_error.value.errors()
+    assert callback.calls == expected_calls
+    assert attacked_child.manifest_id == "primary"
+
+    valid_current = operation(observed_state="running")
+    valid_child = valid_current.resource_manifests[0]
+    valid_previous = operation()
+    valid_callback = install_callback(
+        valid_previous,
+        lambda: _set_native_field(valid_child, "manifest_id", "primary"),
+    )
+
+    result = validate_operation_transition(valid_previous, valid_current)
+
+    assert result == valid_current
+    assert valid_callback.calls == expected_calls
+    assert valid_child.manifest_id == "primary"
+
+
+@pytest.mark.parametrize(
     ("previous", "current"),
     [
         ("pending", "succeeded"),

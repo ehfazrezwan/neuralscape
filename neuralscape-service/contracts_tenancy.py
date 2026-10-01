@@ -6,7 +6,7 @@ allocate resources, grant authority, or select a shared-plane or cell topology.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Literal
 
 from pydantic import BaseModel, TypeAdapter, model_validator
@@ -140,8 +140,11 @@ _ALLOWED_OBSERVED_TRANSITIONS: dict[
 }
 
 
-def _snapshot_closed_graph(value: object) -> object:
-    """Copy a model/native graph without dropping stored undeclared fields."""
+def _closed_graph_snapshot_session() -> tuple[
+    Callable[[object], None],
+    Callable[[object], object],
+]:
+    """Return native capture and public rebuild phases sharing one inventory."""
 
     frozen_models: dict[int, tuple[object, bool, object]] = {}
     frozen_containers: dict[int, object] = {}
@@ -203,7 +206,6 @@ def _snapshot_closed_graph(value: object) -> object:
         for child in items:
             freeze_native_graph(child)
 
-    freeze_native_graph(value)
     active: set[int] = set()
 
     def rebuild(item: object) -> object:
@@ -285,15 +287,30 @@ def _snapshot_closed_graph(value: object) -> object:
         finally:
             active.remove(identity)
 
+    return freeze_native_graph, rebuild
+
+
+def _snapshot_closed_graph(value: object) -> object:
+    """Copy a model/native graph without dropping stored undeclared fields."""
+
+    freeze_native_graph, rebuild = _closed_graph_snapshot_session()
+    freeze_native_graph(value)
     return rebuild(value)
 
 
 def _validated_operation_snapshot(
     operation: TenantOperationState,
+    *,
+    rebuild: Callable[[object], object] | None = None,
 ) -> TenantOperationState:
     if not isinstance(operation, TenantOperationState):
         raise TypeError("operation must be a TenantOperationState")
-    return TenantOperationState.model_validate(_snapshot_closed_graph(operation))
+    snapshot = (
+        _snapshot_closed_graph(operation)
+        if rebuild is None
+        else rebuild(operation)
+    )
+    return TenantOperationState.model_validate(snapshot)
 
 
 def _validated_placement_snapshot(placement: TenantPlacement) -> TenantPlacement:
@@ -307,8 +324,11 @@ def validate_operation_transition(
 ) -> TenantOperationState:
     """Reject identity changes, generation rollback, and invalid progress changes."""
 
-    previous = _validated_operation_snapshot(previous)
-    current = _validated_operation_snapshot(current)
+    freeze_native_graph, rebuild = _closed_graph_snapshot_session()
+    freeze_native_graph(previous)
+    freeze_native_graph(current)
+    previous = _validated_operation_snapshot(previous, rebuild=rebuild)
+    current = _validated_operation_snapshot(current, rebuild=rebuild)
 
     immutable_fields = ("tenant_id", "operation_id", "operation", "desired_state")
     for field_name in immutable_fields:
