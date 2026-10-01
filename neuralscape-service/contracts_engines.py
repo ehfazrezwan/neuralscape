@@ -349,6 +349,27 @@ def _validated_contract_tuple(
     frozen_models: dict[int, _FrozenModelState] = {}
     discovered: dict[int, Any] = {}
     _freeze_native_model_graph(values, frozen_models, discovered)
+    return _validated_contract_tuple_from_frozen(
+        values,
+        expected_type,
+        label=label,
+        frozen_models=frozen_models,
+        discovered=discovered,
+    )
+
+
+def _validated_contract_tuple_from_frozen(
+    values: Any,
+    expected_type: type[_ContractT],
+    *,
+    label: str,
+    frozen_models: dict[int, _FrozenModelState],
+    discovered: dict[int, Any],
+) -> tuple[_ContractT, ...]:
+    """Validate a tuple using entry state frozen for the enclosing boundary."""
+
+    if not isinstance(values, tuple):
+        raise TypeError(f"{label} must be a tuple")
     return tuple(
         _validated_contract_snapshot_from_frozen(
             value,
@@ -518,15 +539,29 @@ def validate_capability_requirements(
     resolve and evaluate the referenced qualification evidence.
     """
 
-    manifest = _validated_contract_snapshot(
+    if not isinstance(manifest, CapabilityManifest):
+        raise TypeError("capability manifest must be a CapabilityManifest")
+
+    requirements_is_tuple = isinstance(requirements, tuple)
+    frozen_models: dict[int, _FrozenModelState] = {}
+    discovered: dict[int, Any] = {}
+    _freeze_native_model_graph(manifest, frozen_models, discovered)
+    if requirements_is_tuple:
+        _freeze_native_model_graph(requirements, frozen_models, discovered)
+
+    manifest = _validated_contract_snapshot_from_frozen(
         manifest,
         CapabilityManifest,
         label="capability manifest",
+        frozen_models=frozen_models,
+        discovered=discovered,
     )
-    requirements = _validated_contract_tuple(
+    requirements = _validated_contract_tuple_from_frozen(
         requirements,
         CapabilityRequirement,
         label="capability requirements",
+        frozen_models=frozen_models,
+        discovered=discovered,
     )
     states_by_operation = _operation_state_lookup(manifest)
 

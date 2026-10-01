@@ -707,6 +707,72 @@ def test_capability_boundary_freezes_requirements_before_tuple_callback():
     assert invalid.qualification_profile_version == "profile-v1"
 
 
+@pytest.mark.parametrize("tuple_field", ["contract_schema_versions", "operations"])
+def test_capability_boundary_freezes_requirements_before_manifest_callbacks(
+    tuple_field,
+):
+    ordinary = requirement().model_copy(
+        update={"qualification_profile_version": None}
+    )
+    with pytest.raises(ValidationError, match="are paired"):
+        validate_capability_requirements(manifest(state()), (ordinary,))
+
+    invalid = requirement().model_copy(
+        update={"qualification_profile_version": None}
+    )
+
+    def repair_requirement():
+        native = _MODEL_DICT_DESCRIPTOR.__get__(invalid, BaseModel)
+        dict.__setitem__(
+            native,
+            "qualification_profile_version",
+            "profile-v1",
+        )
+
+    declared = manifest(state())
+    observed = ObservableTuple(
+        getattr(declared, tuple_field),
+        callback=repair_requirement,
+    )
+    native = _MODEL_DICT_DESCRIPTOR.__get__(declared, BaseModel)
+    dict.__setitem__(native, tuple_field, observed)
+
+    with pytest.raises(ValidationError, match="are paired"):
+        validate_capability_requirements(declared, (invalid,))
+
+    assert observed.calls == 1
+    assert invalid.qualification_profile_version == "profile-v1"
+
+    callbacks = []
+    valid_manifest = manifest(state())
+    benign = ObservableTuple(
+        getattr(valid_manifest, tuple_field),
+        callback=lambda: callbacks.append(tuple_field),
+    )
+    valid_native = _MODEL_DICT_DESCRIPTOR.__get__(valid_manifest, BaseModel)
+    dict.__setitem__(valid_native, tuple_field, benign)
+
+    assert validate_capability_requirements(
+        valid_manifest,
+        (requirement(),),
+    ) == ()
+    assert benign.calls == 1
+    assert callbacks == [tuple_field]
+
+
+def test_capability_boundary_preserves_sibling_type_error_priority():
+    invalid_state = state().model_copy(update={"supported": False})
+    invalid_manifest = manifest(state()).model_copy(
+        update={"operations": (invalid_state,)}
+    )
+
+    with pytest.raises(ValidationError, match="cannot be configured"):
+        validate_capability_requirements(invalid_manifest, [])
+
+    with pytest.raises(TypeError, match="capability requirements must be a tuple"):
+        validate_capability_requirements(manifest(state()), [])
+
+
 def test_capability_boundary_freezes_manifest_edge_before_earlier_callback():
     invalid = state().model_copy(
         update={"qualification": qualification(operation="export")}
@@ -985,13 +1051,26 @@ def test_requirement_validation_builds_one_index_from_one_manifest_snapshot(
         ),
     )
     counts = {"manifest_snapshots": 0, "operation_indexes": 0}
-    original_snapshot = contracts_engines._validated_contract_snapshot
+    original_snapshot = contracts_engines._validated_contract_snapshot_from_frozen
     original_lookup = contracts_engines._operation_state_lookup
 
-    def counted_snapshot(value, expected_type, *, label):
+    def counted_snapshot(
+        value,
+        expected_type,
+        *,
+        label,
+        frozen_models,
+        discovered,
+    ):
         if expected_type is CapabilityManifest:
             counts["manifest_snapshots"] += 1
-        return original_snapshot(value, expected_type, label=label)
+        return original_snapshot(
+            value,
+            expected_type,
+            label=label,
+            frozen_models=frozen_models,
+            discovered=discovered,
+        )
 
     def counted_lookup(value):
         counts["operation_indexes"] += 1
@@ -999,7 +1078,7 @@ def test_requirement_validation_builds_one_index_from_one_manifest_snapshot(
 
     monkeypatch.setattr(
         contracts_engines,
-        "_validated_contract_snapshot",
+        "_validated_contract_snapshot_from_frozen",
         counted_snapshot,
     )
     monkeypatch.setattr(contracts_engines, "_operation_state_lookup", counted_lookup)
