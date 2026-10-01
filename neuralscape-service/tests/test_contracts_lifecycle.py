@@ -1,6 +1,7 @@
 """Positive and adversarial tests for inert lifecycle contracts."""
 
 import json
+from collections.abc import Iterator, Mapping
 from datetime import datetime, timedelta, timezone
 from itertools import permutations
 
@@ -41,6 +42,68 @@ class DefaultedStoredModel(BaseModel):
 
 class ExtendedStoredModel(DefaultedStoredModel):
     label: str
+
+
+class HiddenBackingDict(dict[str, object]):
+    """A real dict whose overridable views conceal its native backing."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.view_calls = 0
+
+    def __bool__(self) -> bool:
+        self.view_calls += 1
+        return False
+
+    def __len__(self) -> int:
+        self.view_calls += 1
+        return 0
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        self.view_calls += 1
+        return iter(())
+
+    def keys(self):  # type: ignore[no-untyped-def]
+        self.view_calls += 1
+        return {}.keys()
+
+    def items(self):  # type: ignore[no-untyped-def]
+        self.view_calls += 1
+        return {}.items()
+
+
+class InverseViewDict(HiddenBackingDict):
+    """An empty native dict whose overrides advertise nonexistent entries."""
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        self.view_calls += 1
+        return iter(("undeclared_witness",))
+
+    def keys(self):  # type: ignore[no-untyped-def]
+        self.view_calls += 1
+        return {"undeclared_witness": True}.keys()
+
+    def items(self):  # type: ignore[no-untyped-def]
+        self.view_calls += 1
+        return {"undeclared_witness": True}.items()
+
+
+class InverseViewMapping(Mapping[str, object]):
+    """A non-dict mapping whose iteration and items inventories disagree."""
+
+    def __getitem__(self, key: str) -> object:
+        if key == "undeclared_witness":
+            return True
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(("undeclared_witness",))
+
+    def __len__(self) -> int:
+        return 1
+
+    def items(self):  # type: ignore[no-untyped-def]
+        return {}.items()
 
 
 def source(record_id: str, revision: int = 3, epoch: int = 7) -> SourceVersion:
@@ -1526,6 +1589,119 @@ def test_source_boundary_preserves_missing_and_unknown_extra_behavior() -> None:
     )
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         source_versions_match(expected, unknown)
+
+
+def test_source_boundary_rejects_unknown_hidden_native_backing() -> None:
+    expected = source("memory-1", revision=4, epoch=9)
+    observed = source("memory-1", revision=4, epoch=9)
+    hidden = HiddenBackingDict({"undeclared_witness": True})
+    object.__setattr__(observed, "__pydantic_extra__", hidden)
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        source_versions_match(expected, observed)
+
+    assert hidden.view_calls == 0
+
+
+def test_source_boundary_rejects_declared_overlap_hidden_in_native_backing() -> None:
+    expected = source("memory-1", revision=4, epoch=9)
+    observed = source("memory-1", revision=4, epoch=9)
+    hidden = HiddenBackingDict({"content_revision": 5})
+    object.__setattr__(observed, "__pydantic_extra__", hidden)
+
+    with pytest.raises(ValueError, match="conflicting stored contract field"):
+        source_versions_match(expected, observed)
+
+    assert hidden.view_calls == 0
+
+
+@pytest.mark.parametrize(
+    "target_name",
+    ["intent", "requirement", "source", "receipt", "output_reference"],
+)
+def test_aggregate_boundary_rejects_unknown_hidden_native_backing(
+    target_name: str,
+) -> None:
+    command, receipts, target = receiving_graph_with_extra_target(target_name)
+    hidden = HiddenBackingDict({"undeclared_witness": True})
+    object.__setattr__(target, "__pydantic_extra__", hidden)
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED,
+            intent=command,
+            receipts=receipts,
+        )
+
+    assert hidden.view_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("target_name", "field_name"),
+    [
+        ("intent", "id"),
+        ("requirement", "effect_id"),
+        ("source", "content_revision"),
+        ("receipt", "attempt"),
+        ("output_reference", "resolver"),
+    ],
+)
+def test_aggregate_boundary_rejects_declared_overlap_hidden_in_native_backing(
+    target_name: str,
+    field_name: str,
+) -> None:
+    command, receipts, target = receiving_graph_with_extra_target(target_name)
+    hidden = HiddenBackingDict({field_name: object()})
+    object.__setattr__(target, "__pydantic_extra__", hidden)
+
+    with pytest.raises(ValueError, match="conflicting stored contract field"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.APPLIED,
+            intent=command,
+            receipts=receipts,
+        )
+
+    assert hidden.view_calls == 0
+
+
+@pytest.mark.parametrize("extra_type", [HiddenBackingDict, InverseViewDict])
+def test_source_boundary_uses_empty_native_backing_as_authoritative(
+    extra_type: type[HiddenBackingDict],
+) -> None:
+    expected = source("memory-1", revision=4, epoch=9)
+    observed = source("memory-1", revision=4, epoch=9)
+    extra = extra_type()
+    object.__setattr__(observed, "__pydantic_extra__", extra)
+
+    assert source_versions_match(expected, observed)
+    assert extra.view_calls == 0
+
+
+def test_source_boundary_preserves_non_dict_mapping_rejection() -> None:
+    expected = source("memory-1", revision=4, epoch=9)
+    observed = source("memory-1", revision=4, epoch=9)
+    object.__setattr__(observed, "__pydantic_extra__", InverseViewMapping())
+
+    with pytest.raises(ValueError, match="malformed stored contract extras"):
+        source_versions_match(expected, observed)
+
+
+def test_native_graph_captures_dict_backing_before_nested_traversal() -> None:
+    parent = HiddenBackingDict()
+
+    class MutatingList(list[object]):
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            dict.__setitem__(parent, "late", "not-in-captured-inventory")
+            return super().__iter__()
+
+    child = MutatingList(["retained"])
+    dict.__setitem__(parent, "payload", child)
+
+    assert lifecycle_contracts._native_contract_graph(parent) == {
+        "payload": ["retained"]
+    }
+    assert dict.__getitem__(parent, "late") == "not-in-captured-inventory"
+    assert parent.view_calls == 0
 
 
 def test_native_graph_preserves_defaults_but_rejects_declared_extra_override() -> None:
