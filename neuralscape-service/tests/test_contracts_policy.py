@@ -24,6 +24,9 @@ from contracts_references import ReferenceHandle
 
 
 VERSION = "candidate-v1"
+_BASE_MODEL_DICT_DESCRIPTOR = vars(BaseModel)["__dict__"]
+_BASE_MODEL_EXTRA_DESCRIPTOR = vars(BaseModel)["__pydantic_extra__"]
+_BASE_MODEL_FIELDS_SET_DESCRIPTOR = vars(BaseModel)["__pydantic_fields_set__"]
 
 
 class _HiddenBackingExtras(dict[str, object]):
@@ -176,6 +179,72 @@ class _HiddenIterationFieldsSet(set[str]):
     def __iter__(self):  # type: ignore[no-untyped-def]
         self.view_calls += 1
         return iter(())
+
+
+class _StoredDescriptorDecision(PolicyDecision):
+    @property
+    def __dict__(self):  # type: ignore[override]
+        native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(self, BaseModel)
+        visible = dict(dict.items(native))
+        visible.pop("future_constraint", None)
+        return visible
+
+    @__dict__.setter
+    def __dict__(self, value):  # type: ignore[no-untyped-def]
+        _BASE_MODEL_DICT_DESCRIPTOR.__set__(self, value)
+
+
+class _ExtraDescriptorDecision(PolicyDecision):
+    @property
+    def __pydantic_extra__(self):  # type: ignore[override]
+        return {}
+
+    @__pydantic_extra__.setter
+    def __pydantic_extra__(self, value):  # type: ignore[no-untyped-def]
+        _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(self, value)
+
+
+class _FieldsSetDescriptorDecision(PolicyDecision):
+    @property
+    def __pydantic_fields_set__(self):  # type: ignore[override]
+        return set(type(self).model_fields)
+
+    @__pydantic_fields_set__.setter
+    def __pydantic_fields_set__(self, value):  # type: ignore[no-untyped-def]
+        _BASE_MODEL_FIELDS_SET_DESCRIPTOR.__set__(self, value)
+
+
+class _StoredDescriptorReference(ReferenceHandle):
+    @property
+    def __dict__(self):  # type: ignore[override]
+        native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(self, BaseModel)
+        visible = dict(dict.items(native))
+        visible.pop("future_constraint", None)
+        return visible
+
+    @__dict__.setter
+    def __dict__(self, value):  # type: ignore[no-untyped-def]
+        _BASE_MODEL_DICT_DESCRIPTOR.__set__(self, value)
+
+
+class _ExtraDescriptorReference(ReferenceHandle):
+    @property
+    def __pydantic_extra__(self):  # type: ignore[override]
+        return {}
+
+    @__pydantic_extra__.setter
+    def __pydantic_extra__(self, value):  # type: ignore[no-untyped-def]
+        _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(self, value)
+
+
+class _FieldsSetDescriptorReference(ReferenceHandle):
+    @property
+    def __pydantic_fields_set__(self):  # type: ignore[override]
+        return set(type(self).model_fields)
+
+    @__pydantic_fields_set__.setter
+    def __pydantic_fields_set__(self, value):  # type: ignore[no-untyped-def]
+        _BASE_MODEL_FIELDS_SET_DESCRIPTOR.__set__(self, value)
 
 
 def reference(
@@ -1695,6 +1764,99 @@ def test_receiving_boundary_reads_native_unknown_fields_set_storage(
     assert raised.value.errors()[0]["input"] is None
     if storage_kind == "native-set-subclass":
         assert native_fields_set.view_calls == 0
+
+
+@pytest.mark.parametrize("location", ["decision", "nested-reference"])
+@pytest.mark.parametrize("storage_name", ["stored", "extra", "fields-set"])
+def test_receiving_boundary_bypasses_subclass_storage_descriptors(
+    location: str,
+    storage_name: str,
+) -> None:
+    decision_types = {
+        "stored": _StoredDescriptorDecision,
+        "extra": _ExtraDescriptorDecision,
+        "fields-set": _FieldsSetDescriptorDecision,
+    }
+    reference_types = {
+        "stored": _StoredDescriptorReference,
+        "extra": _ExtraDescriptorReference,
+        "fields-set": _FieldsSetDescriptorReference,
+    }
+    if location == "decision":
+        decision = decision_types[storage_name](**decision_payload())
+        target: BaseModel = decision
+        expected_location = ("future_constraint",)
+    else:
+        decision = PolicyDecision(**decision_payload())
+        target = reference_types[storage_name](
+            **decision.resource.model_dump(mode="python")
+        )
+        decision.__dict__["resource"] = target
+        expected_location = ("resource", "future_constraint")
+
+    normal = validate_policy_decision(decision)
+    assert normal.action == "read"
+
+    if storage_name == "stored":
+        native_storage = _BASE_MODEL_DICT_DESCRIPTOR.__get__(target, BaseModel)
+        dict.__setitem__(native_storage, "future_constraint", "deny")
+        assert ("future_constraint", "deny") in tuple(
+            dict.items(native_storage)
+        )
+        assert "future_constraint" not in target.__dict__
+        expected_input: object = "deny"
+    elif storage_name == "extra":
+        _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(
+            target,
+            {"future_constraint": "deny"},
+        )
+        native_storage = _BASE_MODEL_EXTRA_DESCRIPTOR.__get__(target, BaseModel)
+        assert tuple(dict.items(native_storage)) == (
+            ("future_constraint", "deny"),
+        )
+        assert target.__pydantic_extra__ == {}
+        expected_input = "deny"
+    else:
+        native_storage = _BASE_MODEL_FIELDS_SET_DESCRIPTOR.__get__(
+            target,
+            BaseModel,
+        )
+        set.add(native_storage, "future_constraint")
+        assert "future_constraint" in tuple(set.__iter__(native_storage))
+        assert "future_constraint" not in target.__pydantic_fields_set__
+        expected_input = None
+
+    with pytest.raises(ValidationError) as raised:
+        validate_policy_decision(decision)
+
+    assert raised.value.errors()[0]["type"] == "extra_forbidden"
+    assert raised.value.errors()[0]["loc"] == expected_location
+    assert raised.value.errors()[0]["input"] == expected_input
+
+
+@pytest.mark.parametrize("location", ["decision", "nested-reference"])
+def test_receiving_boundary_descriptor_snapshot_preserves_missing_subclass_default(
+    location: str,
+) -> None:
+    if location == "decision":
+        class DefaultedDecision(_StoredDescriptorDecision):
+            audit_marker: str = "default-marker"
+
+        decision = DefaultedDecision(**decision_payload())
+        native_storage = _BASE_MODEL_DICT_DESCRIPTOR.__get__(decision, BaseModel)
+    else:
+        class DefaultedReference(_StoredDescriptorReference):
+            audit_marker: str = "default-marker"
+
+        decision = PolicyDecision(**decision_payload())
+        target = DefaultedReference(**decision.resource.model_dump(mode="python"))
+        decision.__dict__["resource"] = target
+        native_storage = _BASE_MODEL_DICT_DESCRIPTOR.__get__(target, BaseModel)
+    dict.pop(native_storage, "audit_marker", None)
+
+    received = validate_policy_decision(decision)
+
+    assert received.action == "read"
 
 
 @pytest.mark.parametrize("extra_action", ["read", "delete"])
