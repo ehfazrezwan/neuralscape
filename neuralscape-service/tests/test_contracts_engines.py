@@ -49,6 +49,83 @@ _MODEL_FIELDS_SET_DESCRIPTOR = BaseModel.__dict__["__pydantic_fields_set__"]
 _MODEL_EXTRAS_DESCRIPTOR = BaseModel.__dict__["__pydantic_extra__"]
 
 
+class HookedFieldName(str):
+    def __new__(cls, value):
+        instance = super().__new__(cls, value)
+        instance.events = []
+        instance.armed = False
+        instance.target = None
+        instance.field_name = None
+        instance.replacement = None
+        return instance
+
+    def arm(self, target=None, field_name=None, replacement=None):
+        self.events.clear()
+        self.target = target
+        self.field_name = field_name
+        self.replacement = replacement
+        self.armed = True
+
+    def _hook(self, name):
+        if self.armed:
+            self.events.append(name)
+            if self.target is not None:
+                native = _MODEL_DICT_DESCRIPTOR.__get__(self.target, BaseModel)
+                dict.__setitem__(native, self.field_name, self.replacement)
+
+    def __hash__(self):
+        self._hook("hash")
+        return str.__hash__(self)
+
+    def __eq__(self, other):
+        self._hook("eq")
+        return str.__eq__(self, other)
+
+    def __str__(self):
+        self._hook("str")
+        return str.__str__(self)
+
+
+class DistinctFieldName(HookedFieldName):
+    def __hash__(self):
+        self._hook("hash")
+        return object.__hash__(self)
+
+    def __eq__(self, other):
+        self._hook("eq")
+        return self is other
+
+
+class NonStringFieldName:
+    def __init__(self):
+        self.events = []
+        self.armed = False
+
+    def arm(self):
+        self.events.clear()
+        self.armed = True
+
+    def _hook(self, name):
+        if self.armed:
+            self.events.append(name)
+
+    def __hash__(self):
+        self._hook("hash")
+        return object.__hash__(self)
+
+    def __eq__(self, other):
+        self._hook("eq")
+        return self is other
+
+    def __str__(self):
+        self._hook("str")
+        return "non-string-field"
+
+    def __repr__(self):
+        self._hook("repr")
+        return "NonStringFieldName()"
+
+
 def reference(identifier: str) -> ReferenceHandle:
     return ReferenceHandle(
         kind="artifact",
@@ -565,6 +642,164 @@ def test_capability_boundary_preserves_missing_extra_storage():
     _MODEL_EXTRAS_DESCRIPTOR.__delete__(valid)
 
     assert validate_capability_requirements(manifest(state()), (valid,)) == ()
+
+
+def _replace_stored_name(value, original_name, replacement):
+    native = _MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+    item = dict.pop(native, original_name)
+    dict.__setitem__(native, replacement, item)
+
+
+def _replace_fields_set_name(value, original_name, replacement):
+    native = _MODEL_FIELDS_SET_DESCRIPTOR.__get__(value, BaseModel)
+    members = set(set.__iter__(native))
+    members.remove(original_name)
+    set.add(members, replacement)
+    _MODEL_FIELDS_SET_DESCRIPTOR.__set__(value, members)
+
+
+@pytest.mark.parametrize("inventory", ["stored", "fields_set"])
+@pytest.mark.parametrize("target_name", ["direct", "nested"])
+def test_capability_boundary_captures_values_before_field_name_hooks(
+    inventory,
+    target_name,
+):
+    if target_name == "direct":
+        target = requirement().model_copy(
+            update={"qualification_profile_version": None}
+        )
+        received = target
+        name = "operation"
+        invalid_field = "qualification_profile_version"
+        replacement = "profile-v1"
+        message = "are paired"
+    else:
+        target = reference("runtime-profile").model_copy(update={"id": ""})
+        received = requirement().model_copy(
+            update={"qualification_profile_reference": target}
+        )
+        name = "kind"
+        invalid_field = "id"
+        replacement = "runtime-profile"
+        message = "at least 1 character"
+
+    hooked_name = HookedFieldName(name)
+    if inventory == "stored":
+        _replace_stored_name(target, name, hooked_name)
+    else:
+        _replace_fields_set_name(target, name, hooked_name)
+    hooked_name.arm(target, invalid_field, replacement)
+
+    with pytest.raises(ValidationError, match=message):
+        validate_capability_requirements(manifest(state()), (received,))
+
+    native = _MODEL_DICT_DESCRIPTOR.__get__(target, BaseModel)
+    assert dict.__getitem__(native, invalid_field) in (None, "")
+    assert hooked_name.events == []
+
+
+@pytest.mark.parametrize("inventory", ["stored", "fields_set"])
+@pytest.mark.parametrize("target_name", ["direct", "nested"])
+def test_capability_boundary_preserves_benign_string_subclass_names(
+    inventory,
+    target_name,
+):
+    if target_name == "direct":
+        target = requirement()
+        received = target
+        name = "operation"
+    else:
+        target = reference("runtime-profile")
+        received = requirement().model_copy(
+            update={"qualification_profile_reference": target}
+        )
+        name = "kind"
+    hooked_name = HookedFieldName(name)
+    if inventory == "stored":
+        _replace_stored_name(target, name, hooked_name)
+    else:
+        _replace_fields_set_name(target, name, hooked_name)
+    hooked_name.arm()
+
+    assert validate_capability_requirements(manifest(state()), (received,)) == ()
+    assert hooked_name.events == []
+
+
+@pytest.mark.parametrize("target_name", ["direct", "nested"])
+def test_capability_boundary_normalizes_extra_string_subclass_without_hooks(
+    target_name,
+):
+    if target_name == "direct":
+        target = requirement()
+        received = target
+    else:
+        target = reference("runtime-profile")
+        received = requirement().model_copy(
+            update={"qualification_profile_reference": target}
+        )
+    hooked_name = HookedFieldName("future_semantics")
+    extras = {}
+    dict.__setitem__(extras, hooked_name, "deny")
+    _MODEL_EXTRAS_DESCRIPTOR.__set__(target, extras)
+    hooked_name.arm()
+
+    with pytest.raises(ValueError, match="undeclared contract field.*future_semantics"):
+        validate_capability_requirements(manifest(state()), (received,))
+
+    assert hooked_name.events == []
+
+
+@pytest.mark.parametrize("inventory", ["stored", "fields_set", "extras"])
+def test_capability_boundary_rejects_normalized_field_name_collisions(inventory):
+    invalid = requirement()
+    if inventory == "extras":
+        exact_name = "future_semantics"
+        hooked_name = DistinctFieldName(exact_name)
+        extras = {exact_name: "first"}
+        dict.__setitem__(extras, hooked_name, "second")
+        _MODEL_EXTRAS_DESCRIPTOR.__set__(invalid, extras)
+        message = "malformed contract extras.*collide after normalization"
+    else:
+        exact_name = "operation"
+        hooked_name = DistinctFieldName(exact_name)
+        if inventory == "stored":
+            native = _MODEL_DICT_DESCRIPTOR.__get__(invalid, BaseModel)
+            dict.__setitem__(native, hooked_name, "retrieve")
+        else:
+            native = _MODEL_FIELDS_SET_DESCRIPTOR.__get__(invalid, BaseModel)
+            set.add(native, hooked_name)
+        message = "malformed contract model.*collide after normalization"
+    hooked_name.arm()
+
+    with pytest.raises(ValueError, match=message):
+        validate_capability_requirements(manifest(state()), (invalid,))
+
+    assert hooked_name.events == []
+
+
+@pytest.mark.parametrize("inventory", ["stored", "fields_set", "extras"])
+def test_capability_boundary_rejects_nonstring_field_names_without_hooks(inventory):
+    invalid = requirement()
+    hostile_name = NonStringFieldName()
+    if inventory == "stored":
+        native = _MODEL_DICT_DESCRIPTOR.__get__(invalid, BaseModel)
+        dict.__setitem__(native, hostile_name, "deny")
+        message = "malformed contract model.*field names must be strings"
+    elif inventory == "fields_set":
+        native = _MODEL_FIELDS_SET_DESCRIPTOR.__get__(invalid, BaseModel)
+        set.add(native, hostile_name)
+        message = "malformed contract model.*field names must be strings"
+    else:
+        extras = {}
+        dict.__setitem__(extras, hostile_name, "deny")
+        _MODEL_EXTRAS_DESCRIPTOR.__set__(invalid, extras)
+        message = "malformed contract extras.*field names must be strings"
+    hostile_name.arm()
+
+    with pytest.raises(ValueError, match=message):
+        validate_capability_requirements(manifest(state()), (invalid,))
+
+    assert hostile_name.events == []
 
 
 @pytest.mark.parametrize(

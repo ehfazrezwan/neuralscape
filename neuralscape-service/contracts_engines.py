@@ -34,12 +34,58 @@ def _model_storage(descriptor: Any, value: BaseModel) -> Any:
         return _MISSING_MODEL_STORAGE
 
 
-def _native_set_copy(value: set[Any] | frozenset[Any]) -> set[Any]:
-    """Copy the concrete set backing without subclass iteration hooks."""
+def _native_set_members(value: set[Any] | frozenset[Any]) -> tuple[Any, ...]:
+    """Capture concrete set members without subclass iteration hooks."""
 
     if isinstance(value, set):
-        return set(set.__iter__(value))
-    return set(frozenset.__iter__(value))
+        return tuple(set.__iter__(value))
+    return tuple(frozenset.__iter__(value))
+
+
+def _normalize_field_names(
+    names: tuple[Any, ...],
+    *,
+    location: str,
+    storage_kind: str,
+) -> tuple[str, ...]:
+    """Normalize string-subclass names without invoking their hooks."""
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for candidate in names:
+        if not isinstance(candidate, str):
+            raise ValueError(
+                f"malformed contract {storage_kind} at {location}: "
+                "field names must be strings"
+            )
+        name = str.__str__(candidate)
+        if name in seen:
+            raise ValueError(
+                f"malformed contract {storage_kind} at {location}: "
+                "field names collide after normalization"
+            )
+        seen.add(name)
+        normalized.append(name)
+    return tuple(normalized)
+
+
+def _normalize_field_items(
+    items: tuple[tuple[Any, Any], ...],
+    *,
+    location: str,
+    storage_kind: str,
+) -> tuple[tuple[str, Any], ...]:
+    """Attach normalized names to values captured from native storage."""
+
+    names = _normalize_field_names(
+        tuple(name for name, _ in items),
+        location=location,
+        storage_kind=storage_kind,
+    )
+    return tuple(
+        (name, item)
+        for name, (_, item) in zip(names, items)
+    )
 
 
 def _snapshot_native_value(
@@ -74,27 +120,49 @@ def _snapshot_native_value(
                 extras_value = None
             if extras_value is not None and type(extras_value) is not dict:
                 raise ValueError(f"malformed contract extras at {location}")
-            declared = set(type(value).model_fields)
-            stored = set(dict.keys(storage))
-            fields_set = _native_set_copy(fields_set_value)
-            extras = {} if extras_value is None else extras_value
-            duplicated = set(extras) & (stored | declared)
+            native_stored_items = tuple(dict.items(storage))
+            native_fields_set = _native_set_members(fields_set_value)
+            native_extra_items = (
+                () if extras_value is None else tuple(dict.items(extras_value))
+            )
+            stored_items = _normalize_field_items(
+                native_stored_items,
+                location=location,
+                storage_kind="model",
+            )
+            fields_set_names = _normalize_field_names(
+                native_fields_set,
+                location=location,
+                storage_kind="model",
+            )
+            extra_items = _normalize_field_items(
+                native_extra_items,
+                location=location,
+                storage_kind="extras",
+            )
+            declared_names = tuple(type(value).model_fields)
+            declared = set(declared_names)
+            stored = {name for name, _ in stored_items}
+            fields_set = set(fields_set_names)
+            extras = {name for name, _ in extra_items}
+            duplicated = extras & (stored | declared)
             if duplicated:
-                names = ", ".join(sorted(str(name) for name in duplicated))
+                names = ", ".join(sorted(duplicated))
                 raise ValueError(
                     f"malformed contract extras at {location}: "
                     f"duplicate field(s): {names}"
                 )
-            undeclared = (stored | fields_set | set(extras)) - declared
+            undeclared = (stored | fields_set | extras) - declared
             if undeclared:
-                names = ", ".join(sorted(str(name) for name in undeclared))
+                names = ", ".join(sorted(undeclared))
                 raise ValueError(
                     f"undeclared contract field(s) at {location}: {names}"
                 )
+            stored_by_name = dict(stored_items)
             stored_values = tuple(
-                (name, dict.__getitem__(storage, name))
-                for name in type(value).model_fields
-                if dict.__contains__(storage, name)
+                (name, stored_by_name[name])
+                for name in declared_names
+                if name in stored_by_name
             )
             return {
                 name: _snapshot_native_value(
