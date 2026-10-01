@@ -3360,7 +3360,7 @@ def test_cycle_diagnostic_is_stable_across_event_permutations() -> None:
     }
 
     assert signatures == {
-        ("correction_cycle", "correction chain containing a cycles")
+        ("correction_cycle", "correction chain containing a is cyclic")
     }
 
 
