@@ -26,21 +26,86 @@ _PYDANTIC_DICT_DESCRIPTOR = BaseModel.__dict__["__dict__"]
 _PYDANTIC_EXTRA_SLOT = BaseModel.__dict__["__pydantic_extra__"]
 _PYDANTIC_FIELDS_SET_SLOT = BaseModel.__dict__["__pydantic_fields_set__"]
 _ModelStorageEntries = tuple[tuple[Any, Any], ...]
-_ModelStorageSnapshot = tuple[_ModelStorageEntries, _ModelStorageEntries]
+_ModelStorageSnapshot = tuple[
+    BaseModel,
+    _ModelStorageEntries,
+    _ModelStorageEntries,
+]
 _ModelStorageInventory = dict[int, _ModelStorageSnapshot]
 _ModelExtraSnapshot = tuple[bool, Any]
 _ModelDiscoverySnapshot = tuple[
+    BaseModel,
     _ModelStorageEntries,
     Any,
     _ModelExtraSnapshot,
 ]
-_NativeContainerSnapshot = tuple[type, tuple[Any, ...]]
+_ModelDiscoveryInventory = dict[int, _ModelDiscoverySnapshot]
+_NativeContainerSnapshot = tuple[Any, type, tuple[Any, ...]]
 _NativeContainerInventory = dict[int, _NativeContainerSnapshot]
 _RetainedStateInventory = tuple[
     _ModelStorageInventory,
     _NativeContainerInventory,
 ]
 _MISSING_FIELDS_SET = object()
+
+
+def _validated_model_discovery_snapshot(
+    value: BaseModel,
+    inventory: _ModelDiscoveryInventory,
+) -> tuple[_ModelStorageEntries, Any, _ModelExtraSnapshot]:
+    """Return the discovery snapshot belonging to this model instance."""
+
+    try:
+        owner, stored_entries, fields_set_storage, extra_snapshot = inventory[
+            id(value)
+        ]
+    except KeyError as exc:
+        raise ValueError(
+            "contract model was not present in the validated graph"
+        ) from exc
+    if owner is not value:
+        raise ValueError(
+            "contract model was not present in the validated graph"
+        )
+    return stored_entries, fields_set_storage, extra_snapshot
+
+
+def _validated_model_storage(
+    value: BaseModel,
+    inventory: _ModelStorageInventory,
+) -> tuple[_ModelStorageEntries, _ModelStorageEntries]:
+    """Return the validated storage belonging to this model instance."""
+
+    try:
+        owner, stored_entries, extra_entries = inventory[id(value)]
+    except KeyError as exc:
+        raise ValueError(
+            "contract model was not present in the validated graph"
+        ) from exc
+    if owner is not value:
+        raise ValueError(
+            "contract model was not present in the validated graph"
+        )
+    return stored_entries, extra_entries
+
+
+def _validated_native_container_items(
+    value: Any,
+    inventory: _NativeContainerInventory,
+) -> tuple[Any, ...]:
+    """Return the snapshot belonging to this exact container instance."""
+
+    try:
+        owner, value_type, items = inventory[id(value)]
+    except KeyError as exc:
+        raise ValueError(
+            "contract container was not present in the validated graph"
+        ) from exc
+    if owner is not value or value_type is not type(value):
+        raise ValueError(
+            "contract container was not present in the validated graph"
+        )
+    return items
 
 
 def _snapshot_model_extra_storage(value: BaseModel) -> _ModelExtraSnapshot:
@@ -55,6 +120,20 @@ def _snapshot_model_extra_storage(value: BaseModel) -> _ModelExtraSnapshot:
     if issubclass(type(extra), dict):
         return True, tuple(dict.items(extra))
     return False, extra
+
+
+def _model_discovery_values(
+    model_type: type[BaseModel],
+    stored_entries: _ModelStorageEntries,
+) -> tuple[Any, ...]:
+    """Select stored values needing callback-free graph discovery."""
+
+    declared_names = model_type.model_fields
+    return tuple(
+        item
+        for name, item in reversed(stored_entries)
+        if type(name) is not str or name in declared_names
+    )
 
 
 def _validated_model_extra_storage(
@@ -106,69 +185,81 @@ def _reject_retained_unknown_fields(
     errors: list[dict[str, Any]] = []
     visited: set[int] = set()
     discovered: set[int] = set()
-    discovery_inventory: dict[int, _ModelDiscoverySnapshot] = {}
+    discovery_inventory: _ModelDiscoveryInventory = {}
     model_inventory: _ModelStorageInventory = {}
     native_container_inventory: _NativeContainerInventory = {}
 
     def discover(value: Any) -> None:
-        value_type = type(value)
-        if not issubclass(
-            value_type,
-            (BaseModel, dict, list, tuple, set, frozenset),
-        ):
-            return
+        pending = [value]
+        while pending:
+            current = pending.pop()
+            value_type = type(current)
+            if not issubclass(
+                value_type,
+                (BaseModel, dict, list, tuple, set, frozenset),
+            ):
+                continue
 
-        identity = id(value)
-        if identity in discovered:
-            return
-        discovered.add(identity)
+            identity = id(current)
+            if identity in discovered:
+                continue
+            discovered.add(identity)
 
-        if issubclass(value_type, BaseModel):
-            native_stored = _PYDANTIC_DICT_DESCRIPTOR.__get__(value, BaseModel)
-            stored_entries = tuple(dict.items(native_stored))
-            try:
-                fields_set_storage = _PYDANTIC_FIELDS_SET_SLOT.__get__(
-                    value, value_type
+            if issubclass(value_type, BaseModel):
+                native_stored = _PYDANTIC_DICT_DESCRIPTOR.__get__(
+                    current, BaseModel
                 )
-            except AttributeError:
-                fields_set_storage = _MISSING_FIELDS_SET
-            if issubclass(type(fields_set_storage), set):
-                fields_set_storage = set.copy(fields_set_storage)
-            extra_snapshot = _snapshot_model_extra_storage(value)
-            discovery_inventory[identity] = (
-                stored_entries,
-                fields_set_storage,
-                extra_snapshot,
-            )
-            for _, item in stored_entries:
-                discover(item)
-            captured_natively, extra = extra_snapshot
-            if captured_natively:
-                for key, item in extra:
-                    discover(key)
-                    discover(item)
-            return
+                stored_entries = tuple(dict.items(native_stored))
+                try:
+                    fields_set_storage = _PYDANTIC_FIELDS_SET_SLOT.__get__(
+                        current, value_type
+                    )
+                except AttributeError:
+                    fields_set_storage = _MISSING_FIELDS_SET
+                if issubclass(type(fields_set_storage), set):
+                    fields_set_storage = set.copy(fields_set_storage)
+                extra_snapshot = _snapshot_model_extra_storage(current)
+                discovery_inventory[identity] = (
+                    current,
+                    stored_entries,
+                    fields_set_storage,
+                    extra_snapshot,
+                )
+                # Exact strings can be classified from the class field mapping
+                # without invoking a user-defined name protocol.  Other names
+                # remain conservative candidates for later hash authority.
+                pending.extend(
+                    _model_discovery_values(value_type, stored_entries)
+                )
+                continue
 
-        if issubclass(value_type, dict):
-            items = tuple(dict.items(value))
-            if value_type is dict:
-                native_container_inventory[identity] = (dict, items)
-            for key, item in items:
-                discover(key)
-                discover(item)
-            return
-        if issubclass(value_type, list):
-            items = tuple(list.__iter__(value))
-        elif issubclass(value_type, tuple):
-            items = tuple(tuple.__iter__(value))
-        elif issubclass(value_type, set):
-            items = tuple(set.__iter__(value))
-        else:
-            items = tuple(frozenset.__iter__(value))
-        if value_type in (list, tuple, set, frozenset):
-            native_container_inventory[identity] = (value_type, items)
-        for item in items:
-            discover(item)
+            if issubclass(value_type, dict):
+                items = tuple(dict.items(current))
+                if value_type is dict:
+                    native_container_inventory[identity] = (
+                        current,
+                        dict,
+                        items,
+                    )
+                for key, item in reversed(items):
+                    pending.append(item)
+                    pending.append(key)
+                continue
+            if issubclass(value_type, list):
+                items = tuple(list.__iter__(current))
+            elif issubclass(value_type, tuple):
+                items = tuple(tuple.__iter__(current))
+            elif issubclass(value_type, set):
+                items = tuple(set.__iter__(current))
+            else:
+                items = tuple(frozenset.__iter__(current))
+            if value_type in (list, tuple, set, frozenset):
+                native_container_inventory[identity] = (
+                    current,
+                    value_type,
+                    items,
+                )
+            pending.extend(reversed(items))
 
     def walk(value: Any, location: tuple[str | int, ...]) -> None:
         if not isinstance(value, (BaseModel, Mapping, list, tuple, set, frozenset)):
@@ -184,7 +275,9 @@ def _reject_retained_unknown_fields(
         if isinstance(value, BaseModel):
             declared = type(value).model_fields
             stored_entries, fields_set_storage, extra_snapshot = (
-                discovery_inventory[identity]
+                _validated_model_discovery_snapshot(
+                    value, discovery_inventory
+                )
             )
             stored = dict(stored_entries)
             if fields_set_storage is _MISSING_FIELDS_SET:
@@ -200,6 +293,7 @@ def _reject_retained_unknown_fields(
                 )
             )
             model_inventory[identity] = (
+                value,
                 stored_entries,
                 tuple(dict.items(pydantic_extra)),
             )
@@ -228,7 +322,9 @@ def _reject_retained_unknown_fields(
             return
 
         if type(value) is dict:
-            _, items = native_container_inventory[identity]
+            items = _validated_native_container_items(
+                value, native_container_inventory
+            )
             for index, (key, item) in enumerate(items):
                 walk(key, (*location, "<key>", index))
                 item_location = key if isinstance(key, (str, int)) else index
@@ -243,7 +339,7 @@ def _reject_retained_unknown_fields(
             return
 
         items = (
-            native_container_inventory[identity][1]
+            _validated_native_container_items(value, native_container_inventory)
             if type(value) in (list, tuple, set, frozenset)
             else value
         )
@@ -283,27 +379,27 @@ def _reconstruct_retained_state(
         active.add(identity)
         try:
             if isinstance(value, BaseModel):
-                try:
-                    stored_entries, extra_entries = model_inventory[identity]
-                except KeyError as exc:
-                    raise ValueError(
-                        "contract model was not present in the validated graph"
-                    ) from exc
+                stored_entries, extra_entries = _validated_model_storage(
+                    value, model_inventory
+                )
                 stored = dict(stored_entries)
                 stored.update(extra_entries)
                 return {name: rebuild(item) for name, item in stored.items()}
 
             if type(value) is dict:
-                _, items = native_container_inventory[identity]
+                items = _validated_native_container_items(
+                    value, native_container_inventory
+                )
                 return {rebuild(key): rebuild(item) for key, item in items}
             if isinstance(value, Mapping):
                 return {rebuild(key): rebuild(item) for key, item in value.items()}
             value_type = type(value)
-            items = (
-                native_container_inventory[identity][1]
-                if value_type in (list, tuple, set, frozenset)
-                else value
-            )
+            if value_type in (list, tuple, set, frozenset):
+                items = _validated_native_container_items(
+                    value, native_container_inventory
+                )
+            else:
+                items = value
             if isinstance(value, list):
                 return [rebuild(item) for item in items]
             if isinstance(value, tuple):
