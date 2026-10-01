@@ -18,6 +18,11 @@ from contracts_policy import (
 from contracts_references import ReferenceHandle
 
 
+_BASE_MODEL_DICT_DESCRIPTOR = vars(BaseModel)["__dict__"]
+_BASE_MODEL_EXTRA_DESCRIPTOR = vars(BaseModel)["__pydantic_extra__"]
+_BASE_MODEL_FIELDS_SET_DESCRIPTOR = vars(BaseModel)["__pydantic_fields_set__"]
+
+
 def _is_native_dict(value: object) -> bool:
     """Recognize dict storage without consulting an instance-level class view."""
 
@@ -34,6 +39,14 @@ def _mapping_items(
     return tuple(value.items())
 
 
+def _fields_set_names(value: object) -> tuple[object, ...]:
+    """Capture native set backing without changing other iterable fallbacks."""
+
+    if issubclass(type(value), set):
+        return tuple(set.__iter__(value))
+    return tuple(value)  # type: ignore[arg-type]
+
+
 def _complete_contract_input(value: object, active_ids: set[int]) -> object:
     """Copy a native input graph without normalizing away invalid data."""
 
@@ -43,10 +56,10 @@ def _complete_contract_input(value: object, active_ids: set[int]) -> object:
             raise ValueError("cyclic contract input is not supported")
         active_ids.add(identity)
         try:
-            stored_storage = object.__getattribute__(value, "__dict__")
+            stored_storage = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
             stored_values = dict(_mapping_items(stored_storage))
             declared_fields = type(value).model_fields
-            extra_values = object.__getattribute__(value, "__pydantic_extra__")
+            extra_values = _BASE_MODEL_EXTRA_DESCRIPTOR.__get__(value, BaseModel)
             if extra_values is not None:
                 if not (
                     _is_native_dict(extra_values)
@@ -66,7 +79,12 @@ def _complete_contract_input(value: object, active_ids: set[int]) -> object:
             # An unchecked copy normally stores its update in ``__dict__``.
             # Retain even an anomalous set-only field so closed-model validation
             # cannot silently erase evidence of unknown input semantics.
-            for field_name in value.__pydantic_fields_set__:
+            fields_set_storage = _BASE_MODEL_FIELDS_SET_DESCRIPTOR.__get__(
+                value,
+                BaseModel,
+            )
+            fields_set_names = _fields_set_names(fields_set_storage)
+            for field_name in fields_set_names:
                 if (
                     field_name not in declared_fields
                     and field_name not in stored_values
