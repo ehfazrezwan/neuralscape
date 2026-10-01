@@ -146,6 +146,8 @@ def snapshot_contract_graph(
                     raise ValueError(
                         "contract input contains conflicting declared and extra fields"
                     )
+                if len(extra_keys) != len(extra_entries):
+                    raise ValueError("contract extra storage contains duplicate keys")
                 fields.update(
                     {
                         key: snapshot_contract_graph(item, active_containers)

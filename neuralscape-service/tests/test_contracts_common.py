@@ -215,6 +215,27 @@ class SingleReadMapping(Mapping[str, object]):
         return self._entries.items()
 
 
+class DuplicateItemsMapping(Mapping[str, object]):
+    def __init__(self, entries: tuple[tuple[str, object], ...]) -> None:
+        self._entries = entries
+        self.item_reads = 0
+
+    def __getitem__(self, key: str) -> object:
+        raise AssertionError("duplicate mapping getitem must not be called")
+
+    def __iter__(self) -> Iterator[str]:
+        raise AssertionError("duplicate mapping iterator must not be called")
+
+    def __len__(self) -> int:
+        raise AssertionError("duplicate mapping len must not be called")
+
+    def items(self) -> tuple[tuple[str, object], ...]:
+        self.item_reads += 1
+        if self.item_reads > 1:
+            raise AssertionError("duplicate mapping items must be captured once")
+        return self._entries
+
+
 class DictClassSpoofingMapping(SingleReadMapping):
     @property
     def __class__(self) -> type[dict]:
@@ -1049,6 +1070,53 @@ def test_snapshot_contract_graph_captures_generic_mapping_extra_once() -> None:
     assert extra.item_reads == 1
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         ExampleContract.model_validate(snapshot, strict=True)
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["direct", "nested"])
+@pytest.mark.parametrize("second_value", [1, 2], ids=["equal", "different"])
+def test_snapshot_contract_graph_rejects_duplicate_custom_extra_keys(
+    nested: bool,
+    second_value: int,
+) -> None:
+    value = ExampleContract(count=1)
+    extra = DuplicateItemsMapping(
+        (("future_state", 1), ("future_state", second_value))
+    )
+    object.__setattr__(value, "__pydantic_extra__", extra)
+    graph: object = {"item": value} if nested else value
+
+    with pytest.raises(ValueError) as raised:
+        snapshot_contract_graph(graph)
+
+    assert str(raised.value) == "contract extra storage contains duplicate keys"
+    assert extra.item_reads == 1
+
+
+def test_snapshot_contract_graph_preserves_unique_custom_extra_inventory() -> None:
+    value = ExampleContract(count=1)
+    extra = DuplicateItemsMapping((("future_state", "preserved"),))
+    object.__setattr__(value, "__pydantic_extra__", extra)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"count": 1, "future_state": "preserved"}
+    assert extra.item_reads == 1
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ExampleContract.model_validate(snapshot, strict=True)
+
+
+def test_snapshot_contract_graph_preserves_collision_priority_for_duplicate_extra() -> None:
+    value = ExampleContract(count=1)
+    extra = DuplicateItemsMapping((("count", 1), ("count", 2)))
+    object.__setattr__(value, "__pydantic_extra__", extra)
+
+    with pytest.raises(ValueError) as raised:
+        snapshot_contract_graph(value)
+
+    assert str(raised.value) == (
+        "contract input contains conflicting declared and extra fields"
+    )
+    assert extra.item_reads == 1
 
 
 @pytest.mark.parametrize("nested", [False, True], ids=["direct", "nested"])
