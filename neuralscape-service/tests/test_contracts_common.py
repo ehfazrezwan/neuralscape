@@ -14,6 +14,7 @@ from pydantic import (
     Field,
     TypeAdapter,
     ValidationError,
+    model_validator,
 )
 
 from contracts_common import (
@@ -182,6 +183,22 @@ class NestedInventoryEnvelope(ContractModel):
     tuple_trigger: tuple[int, ...]
     list_trigger: list[int]
     child: ExampleContract
+
+
+class NativeEdgeEnvelope(ContractModel):
+    trigger: tuple[int, ...]
+    children: list[ExampleContract]
+
+
+class TenantTargetEnvelope(ContractModel):
+    tenant_id: OpaqueId
+    target_refs: tuple[ReferenceHandle, ...]
+
+    @model_validator(mode="after")
+    def validate_target_tenants(self) -> "TenantTargetEnvelope":
+        if any(item.tenant_id != self.tenant_id for item in self.target_refs):
+            raise ValueError("target_refs must match tenant_id")
+        return self
 
 
 class DictionaryEnvelope(ContractModel):
@@ -437,6 +454,37 @@ class RepairingList(list[int]):
         return list.__iter__(self)
 
 
+class DivergentTuple(tuple[object, ...]):
+    def __new__(
+        cls,
+        native_values: tuple[object, ...],
+        public_values: tuple[object, ...],
+    ) -> "DivergentTuple":
+        instance = tuple.__new__(cls, native_values)
+        instance.public_values = public_values
+        instance.iteration_calls = 0
+        return instance
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        self.iteration_calls += 1
+        return iter(self.public_values)
+
+
+class DivergentList(list[object]):
+    def __init__(
+        self,
+        native_values: list[object],
+        public_values: list[object],
+    ) -> None:
+        list.__init__(self, native_values)
+        self.public_values = public_values
+        self.iteration_calls = 0
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        self.iteration_calls += 1
+        return iter(self.public_values)
+
+
 class RepairingStoredName(str):
     def __new__(
         cls,
@@ -517,6 +565,88 @@ def test_snapshot_contract_graph_freezes_later_model_before_container_hook(
     with pytest.raises(ValidationError) as repaired_error:
         NestedInventoryEnvelope.model_validate(snapshot, strict=True)
     assert repaired_error.value.errors() == ordinary_error.value.errors()
+
+
+@pytest.mark.parametrize("container_kind", ["tuple", "list"])
+def test_snapshot_contract_graph_preserves_sequence_subclass_public_view(
+    container_kind: str,
+) -> None:
+    if container_kind == "tuple":
+        value: DivergentTuple | DivergentList = DivergentTuple((1,), (2,))
+        expected: tuple[int, ...] | list[int] = (2,)
+        adapter = TypeAdapter(tuple[int, ...])
+    else:
+        value = DivergentList([1], [2])
+        expected = [2]
+        adapter = TypeAdapter(list[int])
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == expected
+    assert type(snapshot) is type(expected)
+    assert value.iteration_calls == 1
+    assert adapter.validate_python(snapshot, strict=True) == expected
+
+
+def test_snapshot_contract_graph_exposes_hidden_cross_tenant_target() -> None:
+    cross_tenant = ReferenceHandle(
+        kind="artifact",
+        id="artifact-1",
+        tenant_id="tenant-2",
+        resolver="resolve_artifact",
+    )
+    target_refs = DivergentTuple((), (cross_tenant,))
+    value = TenantTargetEnvelope(tenant_id="tenant-1", target_refs=())
+    native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+    dict.__setitem__(native, "target_refs", target_refs)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot["target_refs"] == (
+        {
+            "kind": "artifact",
+            "id": "artifact-1",
+            "tenant_id": "tenant-2",
+            "resolver": "resolve_artifact",
+        },
+    )
+    assert target_refs.iteration_calls == 1
+    with pytest.raises(ValidationError, match="target_refs must match tenant_id"):
+        TenantTargetEnvelope.model_validate(snapshot, strict=True)
+
+
+@pytest.mark.parametrize("mutation", ["replace", "remove"])
+def test_snapshot_contract_graph_freezes_plain_list_edges_before_earlier_hook(
+    mutation: str,
+) -> None:
+    invalid_child = ExampleContract(count=1).model_copy(update={"count": -1})
+    children = [invalid_child]
+
+    def mutate_edge() -> None:
+        if mutation == "replace":
+            list.__setitem__(children, 0, ExampleContract(count=1))
+        else:
+            list.clear(children)
+
+    trigger = RepairingTuple((), mutate_edge)
+    value = NativeEdgeEnvelope(trigger=(), children=[ExampleContract(count=1)])
+    native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+    dict.__setitem__(native, "trigger", trigger)
+    dict.__setitem__(native, "children", children)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert trigger.iteration_calls == 1
+    assert snapshot["children"] == [{"count": -1}]
+    if mutation == "replace":
+        assert children[0].count == 1
+    else:
+        assert children == []
+    with pytest.raises(ValidationError) as raised:
+        NativeEdgeEnvelope.model_validate(snapshot, strict=True)
+    assert raised.value.errors()[0]["type"] == "greater_than_equal"
+    assert raised.value.errors()[0]["loc"] == ("children", 0, "count")
+    assert raised.value.errors()[0]["input"] == -1
 
 
 def test_snapshot_contract_graph_freezes_later_model_before_mapping_hook() -> None:

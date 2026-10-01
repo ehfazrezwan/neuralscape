@@ -178,7 +178,7 @@ def _snapshot_captured_graph(
     active_containers: set[int],
     inventory: _GraphInventory,
 ) -> object:
-    """Reconstruct one graph exclusively from its captured native backing."""
+    """Reconstruct one graph after its reachable native backing is frozen."""
 
     value_type = type(value)
     if not issubclass(value_type, (BaseModel, tuple, list, dict)):
@@ -253,17 +253,21 @@ def _snapshot_captured_graph(
             return fields
 
         if issubclass(value_type, tuple):
-            items = inventory.sequences[value_id]
-            if value_type is not tuple:
-                tuple(iter(value))
+            items = (
+                inventory.sequences[value_id]
+                if value_type is tuple
+                else tuple(iter(value))
+            )
             return tuple(
                 _snapshot_captured_graph(item, active_containers, inventory)
                 for item in items
             )
         if issubclass(value_type, list):
-            items = inventory.sequences[value_id]
-            if value_type is not list:
-                tuple(iter(value))
+            items = (
+                inventory.sequences[value_id]
+                if value_type is list
+                else tuple(iter(value))
+            )
             return [
                 _snapshot_captured_graph(item, active_containers, inventory)
                 for item in items
