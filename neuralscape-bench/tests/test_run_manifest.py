@@ -312,6 +312,77 @@ class ChangingItemsExtras(Mapping[str, object]):
         return (("run_id", "second-view"),)
 
 
+class StableFrozenExtras(Mapping[str, object]):
+    """Expose stable, separately counted key and item inventories."""
+
+    def __init__(
+        self,
+        iterated_names: tuple[str, ...],
+        item_entries: tuple[tuple[str, object], ...],
+        events: list[str] | None = None,
+    ):
+        self.iterated_names = iterated_names
+        self.item_entries = item_entries
+        self.values = dict(item_entries)
+        self.events = events if events is not None else []
+        self.iteration_calls = 0
+        self.items_calls = 0
+
+    def __getitem__(self, key: str) -> object:
+        return self.values[key]
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        self.events.append("extras:iter")
+        return iter(self.iterated_names)
+
+    def items(self):
+        self.items_calls += 1
+        self.events.append("extras:items")
+        return iter(self.item_entries)
+
+
+class TerminalFrozenExtras(Mapping[str, object]):
+    """Yield one stable prefix before one ordinary terminal exception."""
+
+    def __init__(self, failure_stage: str):
+        self.failure_stage = failure_stage
+        self.error = RuntimeError("ordinary model-extra inventory failed")
+        self.iteration_calls = 0
+        self.items_calls = 0
+
+    def __getitem__(self, key: str) -> object:
+        raise KeyError(key)
+
+    def __len__(self) -> int:
+        return 0
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        if self.failure_stage == "keys":
+            error = self.error
+
+            def generate():
+                yield "future_constraint"
+                raise error
+
+            return generate()
+        return iter(())
+
+    def items(self):
+        self.items_calls += 1
+        error = self.error
+
+        def generate():
+            yield "future_constraint", "deny"
+            raise error
+
+        return generate()
+
+
 class DictEqualitySpoof:
     """Compare equal to dict if candidate-MRO membership consults it."""
 
@@ -2034,6 +2105,146 @@ def test_planned_to_completed_round_trip_is_canonical_and_stable():
     assert serialize_run_manifest(reparsed) == first
     assert first.startswith(b'{"build":')
     assert b'"observed_value":402653184' in first
+
+
+@pytest.mark.parametrize("target_name", ["manifest", "nested_resource"])
+@pytest.mark.parametrize(
+    "inventory_source",
+    [
+        "empty",
+        "key-undeclared",
+        "key-declared",
+        "item-undeclared",
+        "item-declared",
+    ],
+)
+def test_frozen_extra_inventory_replays_key_item_union_once(
+    target_name: str,
+    inventory_source: str,
+):
+    manifest, target = planned_manifest_with_extra_target(target_name)
+    declared_name = "run_id" if target_name == "manifest" else "scope"
+    extra_name = (
+        declared_name
+        if inventory_source in ("key-declared", "item-declared")
+        else "future_constraint"
+    )
+    iterated_names = (
+        (extra_name,) if inventory_source.startswith("key-") else ()
+    )
+    item_entries = (
+        ((extra_name, "deny"),)
+        if inventory_source.startswith("item-")
+        else ()
+    )
+    extras = StableFrozenExtras(iterated_names, item_entries)
+    BASE_MODEL_EXTRA_DESCRIPTOR.__set__(target, extras)
+
+    frozen = _freeze_model_graphs(manifest)
+
+    assert extras.iteration_calls == 1
+    assert extras.items_calls == 1
+    if inventory_source == "empty":
+        snapshot = _snapshot_native(manifest, _frozen_graph=frozen)
+        assert snapshot["run_id"] == manifest.run_id
+    else:
+        with pytest.raises(
+            ValueError,
+            match="undeclared stored fields",
+        ) as exc_info:
+            _snapshot_native(manifest, _frozen_graph=frozen)
+        assert repr(extra_name) in str(exc_info.value)
+    assert extras.iteration_calls == 1
+    assert extras.items_calls == 1
+
+
+def test_frozen_extra_inventory_reuses_one_owner_across_model_aliases():
+    manifest = planned_manifest()
+    resource = manifest.resources[0]
+    extras = StableFrozenExtras((), ())
+    BASE_MODEL_EXTRA_DESCRIPTOR.__set__(manifest, extras)
+    BASE_MODEL_EXTRA_DESCRIPTOR.__set__(resource, extras)
+
+    frozen = _freeze_model_graphs(manifest)
+    snapshot = _snapshot_native(manifest, _frozen_graph=frozen)
+
+    assert snapshot["run_id"] == manifest.run_id
+    assert extras.iteration_calls == 1
+    assert extras.items_calls == 1
+
+
+def test_frozen_extra_inventory_precedes_public_mapping_observation():
+    events: list[str] = []
+    extras = StableFrozenExtras((), (), events)
+    public_resource = InventoryMapping(
+        tuple(pending_memory().model_dump(mode="python").items()),
+        name="resource",
+        events=events,
+    )
+    manifest = planned_manifest().model_copy(
+        update={"resources": (public_resource,)}
+    )
+    BASE_MODEL_EXTRA_DESCRIPTOR.__set__(manifest, extras)
+
+    frozen = _freeze_model_graphs(manifest)
+    snapshot = _snapshot_native(manifest, _frozen_graph=frozen)
+
+    assert events.index("extras:iter") < events.index("resource:items")
+    assert events.index("extras:items") < events.index("resource:items")
+    assert snapshot["resources"][0] == pending_memory().model_dump(
+        mode="python"
+    )
+    assert extras.iteration_calls == 1
+    assert extras.items_calls == 1
+    assert public_resource.items_calls == 1
+
+
+@pytest.mark.parametrize("failure_stage", ["keys", "items"])
+def test_frozen_extra_inventory_failure_preserves_finish_error_order(
+    failure_stage: str,
+):
+    extras = TerminalFrozenExtras(failure_stage)
+    resource = measured_memory()
+    BASE_MODEL_EXTRA_DESCRIPTOR.__set__(resource, extras)
+    invalid_planned = planned_manifest()
+    invalid_concurrency = invalid_planned.concurrency[0].model_copy(
+        update={"value": True}
+    )
+    invalid_planned = invalid_planned.model_copy(
+        update={"concurrency": (invalid_concurrency,)}
+    )
+
+    with pytest.raises(ValidationError) as invalid_error:
+        finish_run(
+            invalid_planned,
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(resource,),
+            measurements=(timing(),),
+        )
+
+    assert invalid_error.value.errors()[0]["loc"] == (
+        "concurrency",
+        0,
+        "value",
+    )
+    assert extras.iteration_calls == 1
+    assert extras.items_calls == (0 if failure_stage == "keys" else 1)
+
+    with pytest.raises(RuntimeError) as reached_error:
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(resource,),
+            measurements=(timing(),),
+        )
+
+    assert reached_error.value is extras.error
+    assert extras.iteration_calls == 2
+    assert extras.items_calls == (0 if failure_stage == "keys" else 2)
 
 
 @pytest.mark.parametrize("target_name", ["manifest", "nested_resource"])
