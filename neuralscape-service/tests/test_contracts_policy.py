@@ -22,8 +22,10 @@ from contracts_policy import (
     PrincipalContext,
 )
 from contracts_policy_reference import (
+    _CapturedFailure,
     _capture_model_inventory,
     _complete_contract_input,
+    _freeze_mapping_entries,
     _freeze_mapping_inventories,
     _freeze_reachable_model_inventories,
     evaluate_policy,
@@ -2282,6 +2284,30 @@ def test_mapping_inventory_consumer_requires_exact_owner_identity() -> None:
             {},
             mismatched_inventories,
         )
+
+
+def test_mapping_entries_stop_at_first_terminal_pair_failure() -> None:
+    retained = reference("memory-1")
+    unreachable = reference("memory-2")
+    model_inventories = {}
+
+    entries = _freeze_mapping_entries(
+        (
+            ("resource", retained),
+            ("terminal",),
+            ("unreachable", unreachable),
+        ),
+        {},
+        model_inventories,
+        set(),
+    )
+
+    assert entries[0] == ("resource", retained)
+    assert type(entries[1]) is _CapturedFailure
+    assert isinstance(entries[1].error, ValueError)
+    assert len(entries) == 2
+    assert id(retained) in model_inventories
+    assert id(unreachable) not in model_inventories
 
 
 @pytest.mark.parametrize("boundary", ["evaluator", "receiving"])

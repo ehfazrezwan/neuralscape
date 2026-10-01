@@ -291,25 +291,40 @@ def _freeze_mapping_inventories(
                 )
                 continue
 
-            entries: list[_MappingEntry | _CapturedFailure] = []
-            for raw_entry in raw_entries:
-                try:
-                    key, item = raw_entry  # type: ignore[misc]
-                except Exception as error:
-                    entries.append(_CapturedFailure(error))
-                    continue
-                entry = _MappingEntry(key, item)
-                entries.append(entry)
-                _freeze_reachable_model_inventories(
-                    item,
-                    model_inventories,
-                    visited_containers,
-                    owners,
-                )
             mapping_inventories[id(owner)] = _MappingInventory(
                 owner,
-                tuple(entries),
+                _freeze_mapping_entries(
+                    raw_entries,
+                    owners,
+                    model_inventories,
+                    visited_containers,
+                ),
             )
+
+
+def _freeze_mapping_entries(
+    raw_entries: tuple[object, ...],
+    owners: dict[int, Mapping[object, object]],
+    model_inventories: dict[int, _ModelInventory],
+    visited_containers: set[int],
+) -> tuple[_MappingEntry | _CapturedFailure, ...]:
+    """Retain the successful prefix and first terminal pair failure."""
+
+    entries: list[_MappingEntry | _CapturedFailure] = []
+    for raw_entry in raw_entries:
+        try:
+            key, item = raw_entry  # type: ignore[misc]
+        except Exception as error:
+            entries.append(_CapturedFailure(error))
+            break
+        entries.append(_MappingEntry(key, item))
+        _freeze_reachable_model_inventories(
+            item,
+            model_inventories,
+            visited_containers,
+            owners,
+        )
+    return tuple(entries)
 
 
 def _raise_captured_failure(value: object) -> object:
