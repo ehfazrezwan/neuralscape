@@ -48,6 +48,7 @@ class _FrozenGraph(NamedTuple):
     models: dict[int, _FrozenModelStorage]
     native_containers: dict[int, tuple[object, tuple[Any, ...]]]
     replay_entries: dict[int, tuple[object, tuple[Any, ...]]]
+    completed_traversals: dict[int, object]
 
 
 class _ManifestContract(BaseModel):
@@ -328,6 +329,7 @@ def _freeze_model_storage(
         existing_replay = frozen_graph.replay_entries.get(identity)
         if existing_replay is not None and existing_replay[0] is current:
             continue
+        frozen_graph.completed_traversals.pop(identity, None)
 
         if issubclass(value_type, BaseModel):
             existing_model = frozen_graph.models.get(identity)
@@ -383,23 +385,55 @@ def _traverse_model_storage(
 ) -> None:
     """Retain historical native-recursion failures at validation order."""
 
+    traversed: dict[int, object] = {}
+
+    def visit(current: Any) -> None:
+        value_type = type(current)
+        is_native_container = issubclass(
+            value_type, (BaseModel, tuple, list, dict)
+        )
+        if not is_native_container:
+            return
+
+        identity = id(current)
+        if identity in visited:
+            return
+        visited.add(identity)
+
+        frozen_replay = frozen_graph.replay_entries.get(identity)
+        if frozen_replay is None or frozen_replay[0] is not current:
+            _freeze_model_storage(current, frozen_graph, set())
+            frozen_replay = frozen_graph.replay_entries[identity]
+        owner, entries = frozen_replay
+        traversed[identity] = owner
+        for item in entries:
+            visit(item)
+
+    visit(value)
+    frozen_graph.completed_traversals.update(traversed)
+
+
+def _protect_yielded_model_storage(
+    value: Any,
+    frozen_graph: _FrozenGraph,
+) -> bool:
+    """Capture and successfully traverse yielded supported storage once."""
+
     value_type = type(value)
-    is_native_container = issubclass(value_type, (BaseModel, tuple, list, dict))
-    if not is_native_container:
-        return
+    if not issubclass(value_type, (BaseModel, tuple, list, dict)):
+        return False
 
     identity = id(value)
-    if identity in visited:
-        return
-    visited.add(identity)
-
     frozen_replay = frozen_graph.replay_entries.get(identity)
     if frozen_replay is None or frozen_replay[0] is not value:
         _freeze_model_storage(value, frozen_graph, set())
-        frozen_replay = frozen_graph.replay_entries[identity]
-    _owner, entries = frozen_replay
-    for item in entries:
-        _traverse_model_storage(item, frozen_graph, visited)
+
+    completed_owner = frozen_graph.completed_traversals.get(identity)
+    if completed_owner is value:
+        return False
+
+    _traverse_model_storage(value, frozen_graph, set())
+    return True
 
 
 def _freeze_model_graphs(*values: Any) -> _FrozenGraph:
@@ -409,6 +443,7 @@ def _freeze_model_graphs(*values: Any) -> _FrozenGraph:
         models={},
         native_containers={},
         replay_entries={},
+        completed_traversals={},
     )
     visited: set[int] = set()
     for value in values:
@@ -489,17 +524,27 @@ def _snapshot_native(
                     _traverse_model_storage(value, _frozen_graph, set())
                     frozen_container = _frozen_graph.native_containers[identity]
                 mapping_items = frozen_container[1]
-            else:
-                mapping_items = value.items()
-            return {
-                key: _snapshot_native(
+                return {
+                    key: _snapshot_native(
+                        item,
+                        path=f"{path}[{key!r}]",
+                        active=active,
+                        _frozen_graph=_frozen_graph,
+                    )
+                    for key, item in mapping_items
+                }
+
+            projected: dict[Any, Any] = {}
+            for key, item in value.items():
+                _protect_yielded_model_storage(item, _frozen_graph)
+                item_path = f"{path}[{key!r}]"
+                projected[key] = _snapshot_native(
                     item,
-                    path=f"{path}[{key!r}]",
+                    path=item_path,
                     active=active,
                     _frozen_graph=_frozen_graph,
                 )
-                for key, item in mapping_items
-            }
+            return projected
         if isinstance(value, tuple):
             if type(value) is tuple:
                 frozen_container = _frozen_graph.native_containers.get(identity)
