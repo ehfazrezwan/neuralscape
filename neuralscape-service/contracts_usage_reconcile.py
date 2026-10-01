@@ -254,11 +254,13 @@ def _native_snapshot(value: object, active: set[int] | None = None) -> object:
     active.add(identity)
     try:
         if isinstance(value, BaseModel):
-            fields = {
-                name: _native_snapshot(field_value, active)
-                for name, field_value in vars(value).items()
-            }
-            extras = getattr(value, "__pydantic_extra__", None)
+            stored_values = object.__getattribute__(value, "__dict__")
+            stored_items = tuple(dict.items(stored_values))
+            try:
+                extras = object.__getattribute__(value, "__pydantic_extra__")
+            except AttributeError:
+                extras = None
+            extra_items: tuple[tuple[object, object], ...] = ()
             if extras is not None:
                 extras_type = type(extras)
                 if issubclass(extras_type, dict):
@@ -273,8 +275,14 @@ def _native_snapshot(value: object, active: set[int] | None = None) -> object:
                         name for name, _ in extra_items
                     }
                 declared_fields = type(value).model_fields
-                if (set(fields) | set(declared_fields)).intersection(extra_names):
+                stored_names = {name for name, _ in stored_items}
+                if (stored_names | set(declared_fields)).intersection(extra_names):
                     raise ValueError("contract extra storage overlaps stored fields")
+            fields = {
+                name: _native_snapshot(field_value, active)
+                for name, field_value in stored_items
+            }
+            if extra_items:
                 fields.update(
                     {
                         name: _native_snapshot(field_value, active)

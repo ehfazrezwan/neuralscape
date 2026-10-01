@@ -190,6 +190,30 @@ class _HiddenBackingExtras(dict[str, object]):
         raise AssertionError("extra truthiness must not be read")
 
 
+class _HidingStorageUsageEvent(UsageEvent):
+    def __getattribute__(self, name: str) -> object:
+        if name == "__dict__":
+            backing = object.__getattribute__(self, "__dict__")
+            return {
+                key: item
+                for key, item in dict.items(backing)
+                if key != "future_constraint"
+            }
+        return super().__getattribute__(name)
+
+
+class _HidingStorageAttribution(AttributionSnapshot):
+    def __getattribute__(self, name: str) -> object:
+        if name == "__dict__":
+            backing = object.__getattribute__(self, "__dict__")
+            return {
+                key: item
+                for key, item in dict.items(backing)
+                if key != "future_constraint"
+            }
+        return super().__getattribute__(name)
+
+
 class _ChangingItemsExtras(Mapping[str, object]):
     """Return a different items view after the first captured snapshot."""
 
@@ -550,6 +574,72 @@ def test_reconciliation_rejects_hidden_extra_from_unchecked_copy() -> None:
     invalid_event = event.model_copy(update={"usage": invalid_usage})
 
     assert _error_code([invalid_event]) == "invalid_event"
+
+
+@pytest.mark.parametrize("target_name", ["event", "attribution"])
+def test_reconciliation_reads_native_model_storage_without_instance_dispatch(
+    target_name: str,
+) -> None:
+    if target_name == "event":
+        event: UsageEvent = _HidingStorageUsageEvent.model_validate(
+            _event().model_dump(mode="python")
+        )
+        target = event
+    else:
+        attribution = _HidingStorageAttribution.model_validate(
+            _attribution().model_dump(mode="python")
+        )
+        event = _event().model_copy(update={"attribution": attribution})
+        target = attribution
+    native_storage = object.__getattribute__(target, "__dict__")
+    dict.__setitem__(native_storage, "future_constraint", "deny")
+
+    assert ("future_constraint", "deny") in tuple(dict.items(native_storage))
+    assert "future_constraint" not in target.__dict__
+    _assert_canonical_invalid_event(event)
+
+
+def test_reconciliation_freezes_parent_extras_before_child_traversal() -> None:
+    parent_extras: dict[str, object] = {"future_constraint": "deny"}
+
+    class ClearingRecipients(tuple):
+        def __iter__(self) -> Iterator[object]:
+            dict.clear(parent_extras)
+            return super().__iter__()
+
+    class MutatingAttribution(AttributionSnapshot):
+        pass
+
+    attribution = MutatingAttribution.model_validate(
+        _attribution().model_dump(mode="python")
+    )
+    attribution_storage = object.__getattribute__(attribution, "__dict__")
+    dict.__setitem__(
+        attribution_storage,
+        "recipients",
+        ClearingRecipients(("provider-1",)),
+    )
+    event = _event().model_copy(update={"attribution": attribution})
+    object.__setattr__(event, "__pydantic_extra__", parent_extras)
+
+    assert tuple(dict.items(parent_extras)) == (("future_constraint", "deny"),)
+    _assert_canonical_invalid_event(event)
+    assert tuple(dict.items(parent_extras)) == ()
+
+    result = reconcile_usage_events([event])
+    assert result.streams[0].head_event_id == "event-1"
+    assert result.streams[0].total_tokens == 15
+
+
+def test_reconciliation_accepts_valid_model_storage_subclass() -> None:
+    event = _HidingStorageUsageEvent.model_validate(
+        _event().model_dump(mode="python")
+    )
+
+    result = reconcile_usage_events([event])
+
+    assert result.streams[0].head_event_id == "event-1"
+    assert result.streams[0].total_tokens == 15
 
 
 @pytest.mark.parametrize(
