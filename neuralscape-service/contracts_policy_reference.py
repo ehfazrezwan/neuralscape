@@ -18,13 +18,18 @@ from contracts_policy import (
 from contracts_references import ReferenceHandle
 
 
+def _is_native_dict(value: object) -> bool:
+    """Recognize dict storage without consulting an instance-level class view."""
+
+    return issubclass(type(value), dict)
+
+
 def _mapping_items(
     value: Mapping[object, object],
 ) -> tuple[tuple[object, object], ...]:
     """Capture one mapping inventory without trusting native-dict overrides."""
 
-    value_type = type(value)
-    if issubclass(value_type, dict):
+    if _is_native_dict(value):
         return tuple(dict.items(value))
     return tuple(value.items())
 
@@ -42,7 +47,10 @@ def _complete_contract_input(value: object, active_ids: set[int]) -> object:
             declared_fields = type(value).model_fields
             extra_values = value.__pydantic_extra__
             if extra_values is not None:
-                if not isinstance(extra_values, Mapping):
+                if not (
+                    _is_native_dict(extra_values)
+                    or isinstance(extra_values, Mapping)
+                ):
                     raise ValueError(
                         "contract input extra storage must be a mapping"
                     )

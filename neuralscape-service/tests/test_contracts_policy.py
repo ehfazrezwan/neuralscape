@@ -54,6 +54,14 @@ class _HiddenBackingExtras(dict[str, object]):
         return {}.items()
 
 
+class _RaisingClassExtras(_HiddenBackingExtras):
+    """A native dict whose instance-level class view must not be consulted."""
+
+    @property
+    def __class__(self):
+        raise RuntimeError("instance __class__ consulted")
+
+
 class _InverseViewExtras(Mapping[str, object]):
     """Expose names through iteration while keeping the items inventory empty."""
 
@@ -77,6 +85,14 @@ class _InverseViewExtras(Mapping[str, object]):
     def items(self):
         self.items_calls += 1
         return {}.items()
+
+
+class _DictSpoofingExtras(_InverseViewExtras):
+    """A non-dict mapping whose instance-level class view claims dict."""
+
+    @property
+    def __class__(self):
+        return dict
 
 
 class _ChangingItemsExtras(Mapping[str, object]):
@@ -880,6 +896,109 @@ def test_policy_boundaries_reject_hidden_native_dict_unknown_extra(
             validate_policy_decision(decision)
 
     assert extras.view_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("boundary", "location"),
+    [
+        ("evaluator", "direct"),
+        ("evaluator", "nested"),
+        ("receiving", "direct"),
+        ("receiving", "nested"),
+    ],
+)
+def test_policy_boundaries_use_concrete_type_for_native_dict_extra(
+    boundary: str,
+    location: str,
+) -> None:
+    extras = _RaisingClassExtras({"future_constraint": "deny"})
+
+    if boundary == "evaluator":
+        resource_value = reference("memory-1")
+        principal_value = principal()
+        evaluation_value = PolicyEvaluationInput(
+            schema_version=VERSION,
+            action="read",
+            resource=resource_value,
+        )
+        target = principal_value if location == "direct" else evaluation_value.resource
+        object.__setattr__(target, "__pydantic_extra__", extras)
+
+        with pytest.raises(ValidationError, match="future_constraint"):
+            evaluate_policy(
+                principal=principal_value,
+                evaluation=evaluation_value,
+                policy=policy(
+                    statement(
+                        "read-grant",
+                        "allow",
+                        "read",
+                        reference("memory-1"),
+                    ),
+                ),
+            )
+    else:
+        decision = PolicyDecision(**decision_payload())
+        target = decision if location == "direct" else decision.resource
+        object.__setattr__(target, "__pydantic_extra__", extras)
+
+        with pytest.raises(ValidationError, match="future_constraint"):
+            validate_policy_decision(decision)
+
+    assert extras.view_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("boundary", "location"),
+    [
+        ("evaluator", "direct"),
+        ("evaluator", "nested"),
+        ("receiving", "direct"),
+        ("receiving", "nested"),
+    ],
+)
+def test_policy_boundaries_do_not_trust_spoofed_dict_class(
+    boundary: str,
+    location: str,
+) -> None:
+    extras = _DictSpoofingExtras({"future_constraint": "deny"})
+
+    if boundary == "evaluator":
+        resource_value = reference("memory-1")
+        principal_value = principal()
+        evaluation_value = PolicyEvaluationInput(
+            schema_version=VERSION,
+            action="read",
+            resource=resource_value,
+        )
+        target = principal_value if location == "direct" else evaluation_value.resource
+        object.__setattr__(target, "__pydantic_extra__", extras)
+        received = evaluate_policy(
+            principal=principal_value,
+            evaluation=evaluation_value,
+            policy=policy(
+                statement(
+                    "read-grant",
+                    "allow",
+                    "read",
+                    reference("memory-1"),
+                ),
+            ),
+        )
+        assert (received.outcome, received.reason_code) == (
+            "allow",
+            "explicit_grant",
+        )
+    else:
+        decision = PolicyDecision(**decision_payload())
+        target = decision if location == "direct" else decision.resource
+        object.__setattr__(target, "__pydantic_extra__", extras)
+        received = validate_policy_decision(decision)
+        assert received.model_dump(mode="python") == decision_payload()
+
+    assert extras.items_calls == 1
+    assert extras.iteration_calls == 0
+    assert extras.getitem_calls == 0
 
 
 @pytest.mark.parametrize(
