@@ -1,7 +1,9 @@
 """Behavioral and adversarial tests for portable manifest validation."""
 
+import gc
 import json
 import sys
+import weakref
 from collections.abc import ItemsView, Iterator, Mapping
 from copy import deepcopy
 from pathlib import PureWindowsPath
@@ -17,6 +19,8 @@ from contracts_portability import (
     ManifestFile,
     PortableManifest,
     ProducerReference,
+    _validated_model_discovery_snapshot,
+    _validated_model_storage,
     _validated_native_container_items,
     validate_portable_manifest,
 )
@@ -476,6 +480,46 @@ class TransientExactContainerFilesList(list[ManifestFile]):
             transient["path"] = ""
             self.second_id = id(transient)
         return iter((transient, *self.public_items[1:]))
+
+
+class TransientModelFilesList(list[ManifestFile]):
+    def __init__(
+        self,
+        public_items: tuple[ManifestFile, ...],
+        replacement_path: str,
+    ) -> None:
+        list.__init__(self, public_items)
+        self.public_items = public_items
+        self.replacement_path = replacement_path
+        self.iteration_calls = 0
+        self.first_reference: weakref.ReferenceType[ManifestFile] | None = None
+        self.first_id: int | None = None
+        self.second_id: int | None = None
+        self.first_live_during_walk: bool | None = None
+        self.first_live_during_rebuild: bool | None = None
+
+    def __iter__(self) -> Iterator[ManifestFile]:
+        self.iteration_calls += 1
+        if self.iteration_calls == 1:
+            transient = self.public_items[0].model_copy(deep=True)
+            self.first_reference = weakref.ref(transient)
+            self.first_id = id(transient)
+            yield transient
+            del transient
+            yield self.public_items[1]
+            gc.collect()
+            self.first_live_during_walk = self.first_reference() is not None
+            return
+
+        gc.collect()
+        self.first_live_during_rebuild = self.first_reference() is not None
+        replacement = self.public_items[0].model_copy(
+            deep=True,
+            update={"path": self.replacement_path},
+        )
+        self.second_id = id(replacement)
+        yield replacement
+        yield self.public_items[1]
 
 
 class NoneReportingExtraManifest(PortableManifest):
@@ -2179,6 +2223,111 @@ def test_native_container_inventory_requires_exact_owner_identity(
 
     inventory[id(candidate)] = (candidate, type(candidate), items)
     assert _validated_native_container_items(candidate, inventory) is items
+
+
+@pytest.mark.parametrize("inventory_kind", ["discovery", "validated"])
+def test_model_inventories_require_exact_owner_identity(
+    inventory_kind: str,
+) -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    owner = manifest.files[0]
+    candidate = owner.model_copy(deep=True)
+    stored_entries = tuple(dict.items(owner.__dict__))
+
+    if inventory_kind == "discovery":
+        fields_set_storage = set(owner.model_fields_set)
+        extra_snapshot = (True, ())
+        inventory = {
+            id(candidate): (
+                owner,
+                stored_entries,
+                fields_set_storage,
+                extra_snapshot,
+            )
+        }
+        with pytest.raises(
+            ValueError,
+            match="contract model was not present in the validated graph",
+        ):
+            _validated_model_discovery_snapshot(candidate, inventory)
+
+        inventory[id(candidate)] = (
+            candidate,
+            stored_entries,
+            fields_set_storage,
+            extra_snapshot,
+        )
+        assert _validated_model_discovery_snapshot(candidate, inventory) == (
+            stored_entries,
+            fields_set_storage,
+            extra_snapshot,
+        )
+    else:
+        extra_entries: tuple[tuple[object, object], ...] = ()
+        inventory = {
+            id(candidate): (owner, stored_entries, extra_entries)
+        }
+        with pytest.raises(
+            ValueError,
+            match="contract model was not present in the validated graph",
+        ):
+            _validated_model_storage(candidate, inventory)
+
+        inventory[id(candidate)] = (
+            candidate,
+            stored_entries,
+            extra_entries,
+        )
+        assert _validated_model_storage(candidate, inventory) == (
+            stored_entries,
+            extra_entries,
+        )
+
+    candidate_reference = weakref.ref(candidate)
+    del candidate
+    gc.collect()
+    assert candidate_reference() is not None
+    inventory.clear()
+    gc.collect()
+    assert candidate_reference() is None
+
+
+@pytest.mark.parametrize(
+    "replacement_path",
+    ["", "canonical/records.jsonl"],
+)
+def test_transient_model_owner_survives_validation_and_reconstruction(
+    replacement_path: str,
+) -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    files = TransientModelFilesList(tuple(manifest.files), replacement_path)
+    native_manifest = _PYDANTIC_DICT_DESCRIPTOR.__get__(manifest, BaseModel)
+    dict.__setitem__(native_manifest, "files", files)
+
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+
+    errors = raised.value.errors()
+    assert len(errors) == 1
+    assert errors[0]["type"] == "value_error"
+    assert errors[0]["loc"] == ()
+    assert isinstance(raised.value.__cause__, ValueError)
+    assert "contract model was not present in the validated graph" in str(
+        raised.value.__cause__
+    )
+    assert files.iteration_calls == 2
+    assert files.first_reference is not None
+    assert files.first_live_during_walk is True
+    assert files.first_live_during_rebuild is True
+    assert files.first_id is not None
+    assert files.second_id is not None
+    assert files.first_id != files.second_id
+
+    first_reference = files.first_reference
+    del errors
+    del raised
+    gc.collect()
+    assert first_reference() is None
 
 
 @pytest.mark.parametrize("competing_error", ["overlap", "unknown", "cycle"])

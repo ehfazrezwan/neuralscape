@@ -26,14 +26,20 @@ _PYDANTIC_DICT_DESCRIPTOR = BaseModel.__dict__["__dict__"]
 _PYDANTIC_EXTRA_SLOT = BaseModel.__dict__["__pydantic_extra__"]
 _PYDANTIC_FIELDS_SET_SLOT = BaseModel.__dict__["__pydantic_fields_set__"]
 _ModelStorageEntries = tuple[tuple[Any, Any], ...]
-_ModelStorageSnapshot = tuple[_ModelStorageEntries, _ModelStorageEntries]
+_ModelStorageSnapshot = tuple[
+    BaseModel,
+    _ModelStorageEntries,
+    _ModelStorageEntries,
+]
 _ModelStorageInventory = dict[int, _ModelStorageSnapshot]
 _ModelExtraSnapshot = tuple[bool, Any]
 _ModelDiscoverySnapshot = tuple[
+    BaseModel,
     _ModelStorageEntries,
     Any,
     _ModelExtraSnapshot,
 ]
+_ModelDiscoveryInventory = dict[int, _ModelDiscoverySnapshot]
 _NativeContainerSnapshot = tuple[Any, type, tuple[Any, ...]]
 _NativeContainerInventory = dict[int, _NativeContainerSnapshot]
 _RetainedStateInventory = tuple[
@@ -41,6 +47,46 @@ _RetainedStateInventory = tuple[
     _NativeContainerInventory,
 ]
 _MISSING_FIELDS_SET = object()
+
+
+def _validated_model_discovery_snapshot(
+    value: BaseModel,
+    inventory: _ModelDiscoveryInventory,
+) -> tuple[_ModelStorageEntries, Any, _ModelExtraSnapshot]:
+    """Return the discovery snapshot belonging to this model instance."""
+
+    try:
+        owner, stored_entries, fields_set_storage, extra_snapshot = inventory[
+            id(value)
+        ]
+    except KeyError as exc:
+        raise ValueError(
+            "contract model was not present in the validated graph"
+        ) from exc
+    if owner is not value:
+        raise ValueError(
+            "contract model was not present in the validated graph"
+        )
+    return stored_entries, fields_set_storage, extra_snapshot
+
+
+def _validated_model_storage(
+    value: BaseModel,
+    inventory: _ModelStorageInventory,
+) -> tuple[_ModelStorageEntries, _ModelStorageEntries]:
+    """Return the validated storage belonging to this model instance."""
+
+    try:
+        owner, stored_entries, extra_entries = inventory[id(value)]
+    except KeyError as exc:
+        raise ValueError(
+            "contract model was not present in the validated graph"
+        ) from exc
+    if owner is not value:
+        raise ValueError(
+            "contract model was not present in the validated graph"
+        )
+    return stored_entries, extra_entries
 
 
 def _validated_native_container_items(
@@ -125,7 +171,7 @@ def _reject_retained_unknown_fields(
     errors: list[dict[str, Any]] = []
     visited: set[int] = set()
     discovered: set[int] = set()
-    discovery_inventory: dict[int, _ModelDiscoverySnapshot] = {}
+    discovery_inventory: _ModelDiscoveryInventory = {}
     model_inventory: _ModelStorageInventory = {}
     native_container_inventory: _NativeContainerInventory = {}
 
@@ -160,6 +206,7 @@ def _reject_retained_unknown_fields(
                     fields_set_storage = set.copy(fields_set_storage)
                 extra_snapshot = _snapshot_model_extra_storage(current)
                 discovery_inventory[identity] = (
+                    current,
                     stored_entries,
                     fields_set_storage,
                     extra_snapshot,
@@ -214,7 +261,9 @@ def _reject_retained_unknown_fields(
         if isinstance(value, BaseModel):
             declared = type(value).model_fields
             stored_entries, fields_set_storage, extra_snapshot = (
-                discovery_inventory[identity]
+                _validated_model_discovery_snapshot(
+                    value, discovery_inventory
+                )
             )
             stored = dict(stored_entries)
             if fields_set_storage is _MISSING_FIELDS_SET:
@@ -230,6 +279,7 @@ def _reject_retained_unknown_fields(
                 )
             )
             model_inventory[identity] = (
+                value,
                 stored_entries,
                 tuple(dict.items(pydantic_extra)),
             )
@@ -315,12 +365,9 @@ def _reconstruct_retained_state(
         active.add(identity)
         try:
             if isinstance(value, BaseModel):
-                try:
-                    stored_entries, extra_entries = model_inventory[identity]
-                except KeyError as exc:
-                    raise ValueError(
-                        "contract model was not present in the validated graph"
-                    ) from exc
+                stored_entries, extra_entries = _validated_model_storage(
+                    value, model_inventory
+                )
                 stored = dict(stored_entries)
                 stored.update(extra_entries)
                 return {name: rebuild(item) for name, item in stored.items()}
