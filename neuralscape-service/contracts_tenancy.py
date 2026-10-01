@@ -335,15 +335,11 @@ def validate_operation_transition(
         previous_capture_error = error
 
     current_capture_error: Exception | None = None
-    if isinstance(current, TenantOperationState):
+    if issubclass(type(current), TenantOperationState):
         try:
             freeze_native_graph(current)
         except Exception as error:
             current_capture_error = error
-    else:
-        current_capture_error = TypeError(
-            "operation must be a TenantOperationState"
-        )
 
     if previous_capture_error is not None:
         raise previous_capture_error

@@ -696,6 +696,46 @@ def test_transition_does_not_capture_unsupported_current_before_its_turn() -> No
     assert callback_calls == []
 
 
+def test_transition_defers_unsupported_current_classification() -> None:
+    class RaisingClass:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        @property
+        def __class__(self):
+            self.calls += 1
+            raise RuntimeError("classification trap")
+
+    ordinary_previous = operation()
+    _set_native_field(
+        ordinary_previous.resource_manifests[0],
+        "manifest_id",
+        "",
+    )
+    with pytest.raises(ValidationError) as ordinary_error:
+        validate_operation_transition(
+            ordinary_previous,
+            operation(observed_state="running"),
+        )
+
+    invalid_previous = operation()
+    _set_native_field(
+        invalid_previous.resource_manifests[0],
+        "manifest_id",
+        "",
+    )
+    invalid_current = RaisingClass()
+    with pytest.raises(ValidationError) as competing_error:
+        validate_operation_transition(invalid_previous, invalid_current)
+    assert competing_error.value.errors() == ordinary_error.value.errors()
+    assert invalid_current.calls == 0
+
+    valid_current = RaisingClass()
+    with pytest.raises(RuntimeError, match="classification trap"):
+        validate_operation_transition(operation(), valid_current)
+    assert valid_current.calls == 1
+
+
 @pytest.mark.parametrize(
     ("previous", "current"),
     [
