@@ -47,13 +47,16 @@ MemoryBody = Annotated[
 MEMORY_BODY_ADAPTER: TypeAdapter[MemoryBody] = TypeAdapter(MemoryBody)
 """Reusable validator and JSON-schema adapter for :data:`MemoryBody`."""
 
+_BASE_MODEL_DICT_DESCRIPTOR = vars(BaseModel)["__dict__"]
+_BASE_MODEL_EXTRA_DESCRIPTOR = vars(BaseModel)["__pydantic_extra__"]
+
 
 def _with_native_dict_extra_backing(value: object) -> object:
     """Project a model with native dict extra storage for closed revalidation."""
     value_type = type(value)
     if not issubclass(value_type, BaseModel):
         return value
-    extras = object.__getattribute__(value, "__pydantic_extra__")
+    extras = _BASE_MODEL_EXTRA_DESCRIPTOR.__get__(value, BaseModel)
     if extras is None:
         captured = ()
     elif issubclass(type(extras), dict):
@@ -64,7 +67,7 @@ def _with_native_dict_extra_backing(value: object) -> object:
         return value
 
     projected = dict(
-        dict.items(object.__getattribute__(value, "__dict__"))
+        dict.items(_BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel))
     )
     if captured:
         projected["native_extra_backing"] = dict(captured)
