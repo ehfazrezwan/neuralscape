@@ -40,6 +40,16 @@ _DESIRED_STATE_BY_OPERATION: dict[TenantOperationKind, TenantDesiredState] = {
 
 _OPAQUE_ID_ADAPTER = TypeAdapter(OpaqueId)
 _SAFE_COUNTER_ADAPTER = TypeAdapter(SafeCounter)
+_PYDANTIC_EXTRA_DESCRIPTOR = BaseModel.__dict__["__pydantic_extra__"]
+
+
+def _model_extra_storage(value: BaseModel) -> object:
+    """Read Pydantic-owned extra storage without model instance dispatch."""
+
+    try:
+        return _PYDANTIC_EXTRA_DESCRIPTOR.__get__(value, type(value))
+    except AttributeError:
+        return None
 
 
 class ResourceManifestReference(VersionedContract):
@@ -149,7 +159,7 @@ def _snapshot_closed_graph(
                 dict.items(object.__getattribute__(value, "__dict__"))
             )
             declared = type(value).model_fields
-            extras = getattr(value, "__pydantic_extra__", None)
+            extras = _model_extra_storage(value)
             if extras is None:
                 observed_extra_length = 0
                 iterated_extra_names = ()

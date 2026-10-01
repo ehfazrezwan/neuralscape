@@ -8,7 +8,7 @@ from copy import deepcopy
 from types import MappingProxyType
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from contracts_tenancy import (
     ResourceManifestReference,
@@ -182,6 +182,41 @@ def replace_model_storage(
     backing = HiddenModelStorage(actual, visible)
     object.__setattr__(model, "__dict__", backing)
     return backing
+
+
+PYDANTIC_EXTRA_DESCRIPTOR = BaseModel.__dict__["__pydantic_extra__"]
+
+
+def model_with_hidden_extra(
+    model: BaseModel,
+    *,
+    reported_view: str,
+) -> tuple[BaseModel, list[str]]:
+    calls: list[str] = []
+    target = model
+    if reported_view != "ordinary":
+        reported = None if reported_view == "none" else {}
+        model_type = type(model)
+
+        def masked_getattribute(self, name: str):
+            if name == "__pydantic_extra__":
+                calls.append(name)
+                return reported
+            return super(masked_type, self).__getattribute__(name)
+
+        masked_type = type(
+            f"Masked{model_type.__name__}",
+            (model_type,),
+            {"__getattribute__": masked_getattribute},
+        )
+        target = masked_type.model_validate(
+            dict(dict.items(object.__getattribute__(model, "__dict__")))
+        )
+    PYDANTIC_EXTRA_DESCRIPTOR.__set__(
+        target,
+        {"hidden_unknown": "deny"},
+    )
+    return target, calls
 
 
 class InverseItemsMapping(dict[object, object]):
@@ -1085,6 +1120,75 @@ def test_tenancy_boundaries_use_frozen_native_model_storage(
     assert dict.__getitem__(backing, stored_name) == stored_value
     assert backing.keys_calls == 0
     assert backing.items_calls == 0
+
+
+@pytest.mark.parametrize("boundary", ["transition", "placement"])
+@pytest.mark.parametrize("location", ["direct", "nested"])
+@pytest.mark.parametrize("reported_view", ["ordinary", "none", "empty"])
+def test_tenancy_boundaries_read_model_owned_extra_storage(
+    boundary: str,
+    location: str,
+    reported_view: str,
+) -> None:
+    if boundary == "transition":
+        previous = operation()
+        candidate = operation(observed_state="running")
+        if location == "direct":
+            target, calls = model_with_hidden_extra(
+                candidate,
+                reported_view=reported_view,
+            )
+            candidate = target
+        else:
+            target, calls = model_with_hidden_extra(
+                candidate.resource_manifests[0],
+                reported_view=reported_view,
+            )
+            candidate = candidate.model_copy(
+                update={"resource_manifests": (target,)}
+            )
+
+        def validate() -> object:
+            return validate_operation_transition(previous, candidate)
+
+    else:
+        candidate = TenantPlacement.model_validate_json(
+            json.dumps(
+                {
+                    "schema_version": VERSION,
+                    "tenant_id": "tenant-a",
+                    "generation": 7,
+                    "resource_manifests": [manifest()],
+                }
+            )
+        )
+        if location == "direct":
+            target, calls = model_with_hidden_extra(
+                candidate,
+                reported_view=reported_view,
+            )
+            candidate = target
+        else:
+            target, calls = model_with_hidden_extra(
+                candidate.resource_manifests[0],
+                reported_view=reported_view,
+            )
+            candidate = candidate.model_copy(
+                update={"resource_manifests": (target,)}
+            )
+
+        def validate() -> object:
+            return validate_placement_publication(
+                candidate,
+                expected_tenant_id="tenant-a",
+                current_generation=7,
+            )
+
+    actual_extras = PYDANTIC_EXTRA_DESCRIPTOR.__get__(target, type(target))
+    assert dict.__getitem__(actual_extras, "hidden_unknown") == "deny"
+    with pytest.raises(ValueError, match="undeclared fields"):
+        validate()
+    assert calls == []
 
 
 @pytest.mark.parametrize("boundary", ["transition", "placement"])
