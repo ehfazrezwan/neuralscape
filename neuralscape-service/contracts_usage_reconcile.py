@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, GetCoreSchemaHandler, model_validator
@@ -71,9 +72,19 @@ class _FailedNativeDictTraversal(dict[object, object]):
         raise self.error
 
 
+@dataclass(frozen=True, slots=True)
+class _ValidatedPublicMappingEntries:
+    entries: Iterable[object]
+    iterator: Iterator[object]
+    retained_keys: dict[object, None]
+    final_pair: object | None
+    final_key: object | None
+    final_value: object | None
+
+
 def _validate_public_mapping_entries(
     entries: Iterable[object],
-) -> _FailedNativeDictTraversal | None:
+) -> _FailedNativeDictTraversal | _ValidatedPublicMappingEntries:
     """Validate public mapping entry shape and key insertion only."""
 
     try:
@@ -81,6 +92,9 @@ def _validate_public_mapping_entries(
     except Exception as exc:
         return _FailedNativeDictTraversal(exc)
     public_entries: dict[object, None] = {}
+    pair: object | None = None
+    key: object | None = None
+    public_value: object | None = None
     while True:
         try:
             pair = next(source_iterator)
@@ -89,14 +103,21 @@ def _validate_public_mapping_entries(
         except Exception as exc:
             return _FailedNativeDictTraversal(exc)
         try:
-            key, _public_value = pair
+            key, public_value = pair
         except Exception as exc:
             return _FailedNativeDictTraversal(exc)
         try:
             public_entries[key] = None
         except Exception as exc:
             return _FailedNativeDictTraversal(exc)
-    return None
+    return _ValidatedPublicMappingEntries(
+        entries=entries,
+        iterator=source_iterator,
+        retained_keys=public_entries,
+        final_pair=pair,
+        final_key=key,
+        final_value=public_value,
+    )
 
 
 class UsageReconciliationError(ValueError):
@@ -540,9 +561,11 @@ def _native_snapshot(
                     public_items = value.items()
                 except Exception as exc:
                     return _FailedNativeDictTraversal(exc)
-                failed_traversal = _validate_public_mapping_entries(public_items)
-                if failed_traversal is not None:
-                    return failed_traversal
+                validated_entries = _validate_public_mapping_entries(public_items)
+                if isinstance(validated_entries, _FailedNativeDictTraversal):
+                    return validated_entries
+                # Keep the iterator, retained keys, and final entry components
+                # in caller scope until authoritative projection is complete.
                 source_items = frozen_dict[1]
             else:
                 try:
@@ -586,6 +609,7 @@ def _native_snapshot(
                     projected[key] = projected_value
                 except Exception as exc:
                     return _FailedNativeDictTraversal(exc)
+            del validated_entries
             return projected
         if isinstance(value, list):
             return [

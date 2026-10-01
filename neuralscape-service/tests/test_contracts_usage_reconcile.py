@@ -1,7 +1,9 @@
 """Adversarial correction and aggregation tests for usage reconciliation."""
 
 import copy
+import gc
 import json
+import weakref
 from collections.abc import Callable, ItemsView, Iterator, KeysView, Mapping
 from itertools import permutations
 from types import MappingProxyType
@@ -726,9 +728,38 @@ def _python_validation_signature(
 
 
 def test_public_mapping_entry_validator_accepts_ordinary_entries() -> None:
-    entries = (("first", object()), ["second", object()])
+    class LifetimeMarker:
+        pass
 
-    assert usage_reconcile_contracts._validate_public_mapping_entries(entries) is None
+    key = LifetimeMarker()
+    value = LifetimeMarker()
+    pair = (key, value)
+    entries = iter((pair,))
+    key_ref = weakref.ref(key)
+    value_ref = weakref.ref(value)
+
+    validated = usage_reconcile_contracts._validate_public_mapping_entries(entries)
+
+    assert isinstance(
+        validated,
+        usage_reconcile_contracts._ValidatedPublicMappingEntries,
+    )
+    assert validated.entries is entries
+    assert validated.iterator is entries
+    assert validated.retained_keys == {key: None}
+    assert validated.final_pair is pair
+    assert validated.final_key is key
+    assert validated.final_value is value
+
+    del entries, key, pair, value
+    gc.collect()
+    assert key_ref() is not None
+    assert value_ref() is not None
+
+    del validated
+    gc.collect()
+    assert key_ref() is None
+    assert value_ref() is None
 
 
 @pytest.mark.parametrize(
@@ -783,6 +814,73 @@ def test_native_dict_snapshot_calls_public_entry_validator(
 
     assert usage_reconcile_contracts._native_snapshot(payload) == payload
     assert observed_entries == [(("field", "value"),)]
+
+
+def test_native_dict_snapshot_retains_validation_owner_through_nested_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class LifetimeMarker:
+        pass
+
+    nested = {"leaf": "value"}
+    payload = {"nested": nested}
+    validate_entries = usage_reconcile_contracts._validate_public_mapping_entries
+    snapshot = usage_reconcile_contracts._native_snapshot
+    lifetime_refs: list[tuple[Callable[[], object | None], ...]] = []
+    observed_liveness: list[tuple[bool, ...]] = []
+    validation_calls = 0
+
+    def retain_synthetic_owner(entries: object):
+        nonlocal validation_calls
+        validation_calls += 1
+        validated = validate_entries(entries)
+        if validation_calls != 1:
+            return validated
+        assert isinstance(
+            validated,
+            usage_reconcile_contracts._ValidatedPublicMappingEntries,
+        )
+
+        key = LifetimeMarker()
+        value = LifetimeMarker()
+        pair = (key, value)
+        iterator = (item for item in ())
+        lifetime_refs.append(
+            (weakref.ref(iterator), weakref.ref(key), weakref.ref(value))
+        )
+        return usage_reconcile_contracts._ValidatedPublicMappingEntries(
+            entries=(pair,),
+            iterator=iterator,
+            retained_keys={key: None},
+            final_pair=pair,
+            final_key=key,
+            final_value=value,
+        )
+
+    def observe_nested_projection(value, *args, **kwargs):
+        if value is nested:
+            observed_liveness.append(
+                tuple(reference() is not None for reference in lifetime_refs[0])
+            )
+        return snapshot(value, *args, **kwargs)
+
+    monkeypatch.setattr(
+        usage_reconcile_contracts,
+        "_validate_public_mapping_entries",
+        retain_synthetic_owner,
+    )
+    monkeypatch.setattr(
+        usage_reconcile_contracts,
+        "_native_snapshot",
+        observe_nested_projection,
+    )
+
+    assert usage_reconcile_contracts._native_snapshot(payload) == payload
+    assert validation_calls == 2
+    assert observed_liveness == [(True, True, True)]
+
+    gc.collect()
+    assert all(reference() is None for reference in lifetime_refs[0])
 
 
 def test_native_dict_snapshot_propagates_public_entry_failure(
