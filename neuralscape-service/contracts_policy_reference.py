@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from typing import NamedTuple
 
 from pydantic import BaseModel
 
@@ -21,6 +22,19 @@ from contracts_references import ReferenceHandle
 _BASE_MODEL_DICT_DESCRIPTOR = vars(BaseModel)["__dict__"]
 _BASE_MODEL_EXTRA_DESCRIPTOR = vars(BaseModel)["__pydantic_extra__"]
 _BASE_MODEL_FIELDS_SET_DESCRIPTOR = vars(BaseModel)["__pydantic_fields_set__"]
+
+
+class _CapturedFailure(NamedTuple):
+    error: Exception
+
+
+class _ModelInventory(NamedTuple):
+    stored_storage: object
+    stored_items: tuple[tuple[object, object], ...] | None
+    extra_storage: object
+    extra_items: tuple[tuple[object, object], ...] | None
+    fields_set_storage: object
+    fields_set_names: tuple[object, ...] | None
 
 
 def _is_native_dict(value: object) -> bool:
@@ -72,7 +86,128 @@ def _normalize_model_items(
     return tuple((name, item) for name, (_, item) in zip(names, items))
 
 
-def _complete_contract_input(value: object, active_ids: set[int]) -> object:
+def _capture_model_store(descriptor: object, value: BaseModel) -> object:
+    """Capture a model-owned slot while deferring its existing error order."""
+
+    try:
+        return descriptor.__get__(value, BaseModel)  # type: ignore[attr-defined]
+    except Exception as error:
+        return _CapturedFailure(error)
+
+
+def _capture_model_inventory(value: BaseModel) -> _ModelInventory:
+    """Capture native inventories without invoking supported fallback protocols."""
+
+    stored_storage = _capture_model_store(_BASE_MODEL_DICT_DESCRIPTOR, value)
+    stored_items = (
+        tuple(dict.items(stored_storage))
+        if _is_native_dict(stored_storage)
+        else None
+    )
+    extra_storage = _capture_model_store(_BASE_MODEL_EXTRA_DESCRIPTOR, value)
+    extra_items = (
+        tuple(dict.items(extra_storage))
+        if _is_native_dict(extra_storage)
+        else (() if extra_storage is None else None)
+    )
+    fields_set_storage = _capture_model_store(
+        _BASE_MODEL_FIELDS_SET_DESCRIPTOR,
+        value,
+    )
+    fields_set_names = (
+        tuple(set.__iter__(fields_set_storage))
+        if issubclass(type(fields_set_storage), set)
+        else None
+    )
+    return _ModelInventory(
+        stored_storage,
+        stored_items,
+        extra_storage,
+        extra_items,
+        fields_set_storage,
+        fields_set_names,
+    )
+
+
+def _freeze_reachable_model_inventories(
+    value: object,
+    inventories: dict[int, _ModelInventory],
+    visited_containers: set[int],
+) -> None:
+    """Freeze natively reachable models before callback-bearing traversal."""
+
+    if isinstance(value, BaseModel):
+        identity = id(value)
+        if identity in inventories:
+            return
+        inventory = _capture_model_inventory(value)
+        inventories[identity] = inventory
+        if inventory.stored_items is not None:
+            for _, item in inventory.stored_items:
+                _freeze_reachable_model_inventories(
+                    item,
+                    inventories,
+                    visited_containers,
+                )
+        if inventory.extra_items is not None:
+            for _, item in inventory.extra_items:
+                _freeze_reachable_model_inventories(
+                    item,
+                    inventories,
+                    visited_containers,
+                )
+        return
+
+    if _is_native_dict(value):
+        identity = id(value)
+        if identity in visited_containers:
+            return
+        visited_containers.add(identity)
+        for _, item in dict.items(value):
+            _freeze_reachable_model_inventories(
+                item,
+                inventories,
+                visited_containers,
+            )
+        return
+
+    if isinstance(value, list):
+        identity = id(value)
+        if identity in visited_containers:
+            return
+        visited_containers.add(identity)
+        for item in list.__iter__(value):
+            _freeze_reachable_model_inventories(
+                item,
+                inventories,
+                visited_containers,
+            )
+        return
+
+    if isinstance(value, tuple):
+        identity = id(value)
+        if identity in visited_containers:
+            return
+        visited_containers.add(identity)
+        for item in tuple.__iter__(value):
+            _freeze_reachable_model_inventories(
+                item,
+                inventories,
+                visited_containers,
+            )
+
+
+def _raise_captured_failure(value: object) -> object:
+    if type(value) is _CapturedFailure:
+        raise value.error
+    return value
+
+
+def _complete_contract_input(
+    value: object,
+    active_ids: set[int],
+    inventories: dict[int, _ModelInventory],
+) -> object:
     """Copy a native input graph without normalizing away invalid data."""
 
     if isinstance(value, BaseModel):
@@ -81,11 +216,20 @@ def _complete_contract_input(value: object, active_ids: set[int]) -> object:
             raise ValueError("cyclic contract input is not supported")
         active_ids.add(identity)
         try:
-            stored_storage = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
-            stored_items = _normalize_model_items(_mapping_items(stored_storage))
+            inventory = inventories.get(identity)
+            if inventory is None:
+                _freeze_reachable_model_inventories(value, inventories, set())
+                inventory = inventories[identity]
+            stored_storage = _raise_captured_failure(inventory.stored_storage)
+            native_stored_items = (
+                inventory.stored_items
+                if inventory.stored_items is not None
+                else _mapping_items(stored_storage)  # type: ignore[arg-type]
+            )
+            stored_items = _normalize_model_items(native_stored_items)
             stored_values = dict(stored_items)
             declared_fields = type(value).model_fields
-            extra_values = _BASE_MODEL_EXTRA_DESCRIPTOR.__get__(value, BaseModel)
+            extra_values = _raise_captured_failure(inventory.extra_storage)
             if extra_values is not None:
                 if not (
                     _is_native_dict(extra_values)
@@ -94,7 +238,12 @@ def _complete_contract_input(value: object, active_ids: set[int]) -> object:
                     raise ValueError(
                         "contract input extra storage must be a mapping"
                     )
-                extra_items = _normalize_model_items(_mapping_items(extra_values))
+                native_extra_items = (
+                    inventory.extra_items
+                    if inventory.extra_items is not None
+                    else _mapping_items(extra_values)  # type: ignore[arg-type]
+                )
+                extra_items = _normalize_model_items(native_extra_items)
                 for key, item in extra_items:
                     if key in stored_values or key in declared_fields:
                         raise ValueError(
@@ -105,12 +254,13 @@ def _complete_contract_input(value: object, active_ids: set[int]) -> object:
             # An unchecked copy normally stores its update in ``__dict__``.
             # Retain even an anomalous set-only field so closed-model validation
             # cannot silently erase evidence of unknown input semantics.
-            fields_set_storage = _BASE_MODEL_FIELDS_SET_DESCRIPTOR.__get__(
-                value,
-                BaseModel,
+            fields_set_storage = _raise_captured_failure(
+                inventory.fields_set_storage
             )
             fields_set_names = _normalize_model_names(
-                _fields_set_names(fields_set_storage)
+                inventory.fields_set_names
+                if inventory.fields_set_names is not None
+                else _fields_set_names(fields_set_storage)
             )
             for field_name in fields_set_names:
                 if (
@@ -120,7 +270,7 @@ def _complete_contract_input(value: object, active_ids: set[int]) -> object:
                     stored_values[field_name] = None
 
             return {
-                key: _complete_contract_input(item, active_ids)
+                key: _complete_contract_input(item, active_ids, inventories)
                 for key, item in stored_values.items()
             }
         finally:
@@ -134,7 +284,7 @@ def _complete_contract_input(value: object, active_ids: set[int]) -> object:
         try:
             # Keys are deliberately not stringified or otherwise normalized.
             return {
-                key: _complete_contract_input(item, active_ids)
+                key: _complete_contract_input(item, active_ids, inventories)
                 for key, item in _mapping_items(value)
             }
         finally:
@@ -146,7 +296,10 @@ def _complete_contract_input(value: object, active_ids: set[int]) -> object:
             raise ValueError("cyclic contract input is not supported")
         active_ids.add(identity)
         try:
-            return [_complete_contract_input(item, active_ids) for item in value]
+            return [
+                _complete_contract_input(item, active_ids, inventories)
+                for item in value
+            ]
         finally:
             active_ids.remove(identity)
 
@@ -156,27 +309,41 @@ def _complete_contract_input(value: object, active_ids: set[int]) -> object:
             raise ValueError("cyclic contract input is not supported")
         active_ids.add(identity)
         try:
-            return tuple(_complete_contract_input(item, active_ids) for item in value)
+            return tuple(
+                _complete_contract_input(item, active_ids, inventories)
+                for item in value
+            )
         finally:
             active_ids.remove(identity)
 
     return value
 
 
-def _validated_principal_snapshot(principal: PrincipalContext) -> PrincipalContext:
-    return PrincipalContext.model_validate(_complete_contract_input(principal, set()))
+def _validated_principal_snapshot(
+    principal: PrincipalContext,
+    inventories: dict[int, _ModelInventory],
+) -> PrincipalContext:
+    return PrincipalContext.model_validate(
+        _complete_contract_input(principal, set(), inventories)
+    )
 
 
 def _validated_evaluation_snapshot(
     evaluation: PolicyEvaluationInput,
+    inventories: dict[int, _ModelInventory],
 ) -> PolicyEvaluationInput:
     return PolicyEvaluationInput.model_validate(
-        _complete_contract_input(evaluation, set())
+        _complete_contract_input(evaluation, set(), inventories)
     )
 
 
-def _validated_policy_snapshot(policy: AccessPolicy) -> AccessPolicy:
-    return AccessPolicy.model_validate(_complete_contract_input(policy, set()))
+def _validated_policy_snapshot(
+    policy: AccessPolicy,
+    inventories: dict[int, _ModelInventory],
+) -> AccessPolicy:
+    return AccessPolicy.model_validate(
+        _complete_contract_input(policy, set(), inventories)
+    )
 
 
 def _decision(
@@ -217,9 +384,17 @@ def evaluate_policy(
     existence.
     """
 
-    principal = _validated_principal_snapshot(principal)
-    evaluation = _validated_evaluation_snapshot(evaluation)
-    policy = _validated_policy_snapshot(policy)
+    inventories: dict[int, _ModelInventory] = {}
+    visited_containers: set[int] = set()
+    for value in (principal, evaluation, policy):
+        _freeze_reachable_model_inventories(
+            value,
+            inventories,
+            visited_containers,
+        )
+    principal = _validated_principal_snapshot(principal, inventories)
+    evaluation = _validated_evaluation_snapshot(evaluation, inventories)
+    policy = _validated_policy_snapshot(policy, inventories)
 
     action = evaluation.action
     resource = evaluation.resource
@@ -312,7 +487,11 @@ def validate_policy_decision(decision: PolicyDecision) -> PolicyDecision:
     Validation does not prove that the decision came from an authority.
     """
 
-    return PolicyDecision.model_validate(_complete_contract_input(decision, set()))
+    inventories: dict[int, _ModelInventory] = {}
+    _freeze_reachable_model_inventories(decision, inventories, set())
+    return PolicyDecision.model_validate(
+        _complete_contract_input(decision, set(), inventories)
+    )
 
 
 __all__ = ["evaluate_policy", "validate_policy_decision"]

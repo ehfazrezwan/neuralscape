@@ -220,6 +220,54 @@ class _NestedRepairingFieldName(str):
         return str.__str__(self)
 
 
+class _RepairingFieldsIterable:
+    """Legacy fields-set iterable that can repair a referenced model."""
+
+    def __init__(
+        self,
+        names: tuple[str, ...],
+        target: BaseModel | None,
+    ) -> None:
+        self.names = names
+        self.target = target
+        self.iteration_calls = 0
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        self.iteration_calls += 1
+        if self.target is not None:
+            native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(self.target, BaseModel)
+            dict.__setitem__(native, "id", "memory-1")
+        return iter(self.names)
+
+
+class _RepairingEmptyExtras(Mapping[str, object]):
+    """Supported empty Mapping whose items authority can repair a model."""
+
+    def __init__(self, target: BaseModel | None) -> None:
+        self.target = target
+        self.items_calls = 0
+        self.iteration_calls = 0
+        self.getitem_calls = 0
+
+    def __getitem__(self, key: str) -> object:
+        self.getitem_calls += 1
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        self.iteration_calls += 1
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+    def items(self):  # type: ignore[no-untyped-def]
+        self.items_calls += 1
+        if self.target is not None:
+            native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(self.target, BaseModel)
+            dict.__setitem__(native, "id", "memory-1")
+        return {}.items()
+
+
 class _StoredDescriptorDecision(PolicyDecision):
     @property
     def __dict__(self):  # type: ignore[override]
@@ -1919,6 +1967,138 @@ def test_policy_boundaries_accept_benign_string_subclass_model_names(
     assert result.outcome == "allow"
     assert benign_name.hash_calls == 0
     assert benign_name.equality_calls == 0
+
+
+def _install_repairing_protocol(
+    model: BaseModel,
+    target: BaseModel | None,
+    protocol: str,
+) -> _RepairingFieldsIterable | _RepairingEmptyExtras:
+    if protocol == "fields-iterable":
+        hook = _RepairingFieldsIterable(tuple(type(model).model_fields), target)
+        _BASE_MODEL_FIELDS_SET_DESCRIPTOR.__set__(model, hook)
+        assert _BASE_MODEL_FIELDS_SET_DESCRIPTOR.__get__(model, BaseModel) is hook
+        return hook
+    hook = _RepairingEmptyExtras(target)
+    _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(model, hook)
+    assert _BASE_MODEL_EXTRA_DESCRIPTOR.__get__(model, BaseModel) is hook
+    return hook
+
+
+def _assert_protocol_called_once(
+    hook: _RepairingFieldsIterable | _RepairingEmptyExtras,
+) -> None:
+    if type(hook) is _RepairingFieldsIterable:
+        assert hook.iteration_calls == 1
+        return
+    assert hook.items_calls == 1
+    assert hook.iteration_calls == 0
+    assert hook.getitem_calls == 0
+
+
+@pytest.mark.parametrize("boundary", ["evaluator", "receiving"])
+@pytest.mark.parametrize("protocol", ["fields-iterable", "extra-mapping"])
+@pytest.mark.parametrize("location", ["root", "nested"])
+def test_policy_boundaries_freeze_models_before_supported_callbacks(
+    boundary: str,
+    protocol: str,
+    location: str,
+) -> None:
+    ordinary, ordinary_nested, ordinary_invoke = _nested_model_name_case(
+        boundary,
+        invalid=True,
+    )
+    with pytest.raises(ValidationError) as ordinary_error:
+        ordinary_invoke(ordinary)
+
+    attacked, attacked_nested, attacked_invoke = _nested_model_name_case(
+        boundary,
+        invalid=True,
+    )
+    callback_owner = attacked if location == "root" else attacked_nested
+    hook = _install_repairing_protocol(
+        callback_owner,
+        attacked_nested,
+        protocol,
+    )
+    native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(attacked_nested, BaseModel)
+    assert dict.__getitem__(native, "id") == ""
+
+    with pytest.raises(ValidationError) as attacked_error:
+        attacked_invoke(attacked)
+
+    ordinary_diagnostics = [
+        (error["loc"], error["type"])
+        for error in ordinary_error.value.errors()
+    ]
+    attacked_diagnostics = [
+        (error["loc"], error["type"])
+        for error in attacked_error.value.errors()
+    ]
+    assert attacked_diagnostics == ordinary_diagnostics
+    assert ordinary_nested.id == ""
+    assert dict.__getitem__(native, "id") == "memory-1"
+    _assert_protocol_called_once(hook)
+
+
+@pytest.mark.parametrize("boundary", ["evaluator", "receiving"])
+@pytest.mark.parametrize("protocol", ["fields-iterable", "extra-mapping"])
+@pytest.mark.parametrize("location", ["root", "nested"])
+def test_policy_boundaries_preserve_valid_supported_callback_controls(
+    boundary: str,
+    protocol: str,
+    location: str,
+) -> None:
+    candidate, nested, invoke = _nested_model_name_case(boundary, invalid=False)
+    callback_owner = candidate if location == "root" else nested
+    hook = _install_repairing_protocol(callback_owner, nested, protocol)
+
+    result = invoke(candidate)
+
+    assert result.outcome == "allow"
+    assert result.resource.id == "memory-1"
+    assert nested.id == "memory-1"
+    _assert_protocol_called_once(hook)
+
+
+@pytest.mark.parametrize("protocol", ["fields-iterable", "extra-mapping"])
+def test_evaluator_freezes_all_input_graphs_before_supported_callbacks(
+    protocol: str,
+) -> None:
+    evaluation, nested, _ = _nested_model_name_case("evaluator", invalid=True)
+    principal_value = principal()
+    hook = _install_repairing_protocol(principal_value, nested, protocol)
+    native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(nested, BaseModel)
+    assert dict.__getitem__(native, "id") == ""
+
+    with pytest.raises(ValidationError) as raised:
+        evaluate_policy(
+            principal=principal_value,
+            evaluation=evaluation,
+            policy=policy(
+                statement("read-grant", "allow", "read", reference("memory-1"))
+            ),
+        )
+
+    assert raised.value.errors()[0]["loc"] == ("resource", "id")
+    assert raised.value.errors()[0]["type"] == "string_too_short"
+    assert dict.__getitem__(native, "id") == "memory-1"
+    _assert_protocol_called_once(hook)
+
+
+def test_prefreeze_preserves_overlap_before_nested_storage_failure() -> None:
+    nested = reference("memory-1")
+    _BASE_MODEL_FIELDS_SET_DESCRIPTOR.__delete__(nested)
+    decision = PolicyDecision(**decision_payload()).model_copy(
+        update={"resource": nested}
+    )
+    _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(decision, {"action": "delete"})
+
+    with pytest.raises(
+        ValueError,
+        match="contract input contains duplicate stored fields",
+    ):
+        validate_policy_decision(decision)
 
 
 @pytest.mark.parametrize("location", ["decision", "nested-reference"])
