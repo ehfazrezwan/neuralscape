@@ -4,13 +4,17 @@ from collections.abc import Iterator, Mapping
 from typing import ClassVar
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from contracts_processing import (
     PlaintextDispatchRejected,
     ProcessingPolicy,
     validate_plaintext_dispatch,
 )
+
+
+_BASE_MODEL_DICT_DESCRIPTOR = vars(BaseModel)["__dict__"]
+_BASE_MODEL_EXTRA_DESCRIPTOR = vars(BaseModel)["__pydantic_extra__"]
 
 
 class _HiddenBackingDict(dict[str, object]):
@@ -157,6 +161,29 @@ class _AttributeHidingPolicy(ProcessingPolicy):
             type(self).mode_reads += 1
             return "strict_local"
         return super().__getattribute__(name)
+
+
+class _DescriptorMaskedPolicy(ProcessingPolicy):
+    @property
+    def __dict__(self):
+        native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(self, BaseModel)
+        return {
+            name: value
+            for name, value in dict.items(native)
+            if name != "future_constraint"
+        }
+
+    @__dict__.setter
+    def __dict__(self, value):
+        _BASE_MODEL_DICT_DESCRIPTOR.__set__(self, value)
+
+    @property
+    def __pydantic_extra__(self):
+        return None
+
+    @__pydantic_extra__.setter
+    def __pydantic_extra__(self, value):
+        _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(self, value)
 
 
 def _replace_model_backing(
@@ -414,6 +441,89 @@ def test_dispatch_native_model_backing_ignores_attribute_override(
     assert any(error["loc"] == ("mode",) for error in exc.value.__cause__.errors())
     assert _AttributeHidingPolicy.mode_reads == 0
     assert hidden.view_calls == 0
+
+
+@pytest.mark.parametrize("inventory", ["stored", "extra"])
+def test_dispatch_uses_base_model_storage_descriptors(
+    inventory: str,
+) -> None:
+    ordinary = _strict_local_policy()
+    masked = _DescriptorMaskedPolicy(
+        schema_version="candidate-v1",
+        mode="strict_local",
+        allowed_execution_locations=("endpoint",),
+        approved_recipient_ids=(),
+        fallback_policy="deny",
+        policy_epoch=7,
+    )
+    hidden_stores: list[_HiddenBackingDict] = []
+    for policy in (ordinary, masked):
+        if inventory == "stored":
+            stored = dict(
+                dict.items(_BASE_MODEL_DICT_DESCRIPTOR.__get__(policy, BaseModel))
+            )
+            stored["future_constraint"] = "deny"
+            hidden = _HiddenBackingDict(stored)
+            _BASE_MODEL_DICT_DESCRIPTOR.__set__(policy, hidden)
+        else:
+            hidden = _HiddenBackingDict({"future_constraint": "deny"})
+            _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(policy, hidden)
+        hidden_stores.append(hidden)
+
+    diagnostics = []
+    for policy in (ordinary, masked):
+        with pytest.raises(
+            PlaintextDispatchRejected,
+            match="policy is invalid",
+        ) as exc:
+            validate_plaintext_dispatch(
+                policy,
+                execution_location="endpoint",
+                recipient_id=None,
+                current_policy_epoch=7,
+                currently_authorized_recipient_ids=set(),
+                is_fallback=False,
+            )
+        assert isinstance(exc.value.__cause__, ValidationError)
+        diagnostics.append(
+            [
+                (error["loc"], error["type"])
+                for error in exc.value.__cause__.errors()
+            ]
+        )
+
+    assert diagnostics[0] == diagnostics[1]
+    assert all(hidden.view_calls == 0 for hidden in hidden_stores)
+
+
+def test_dispatch_descriptor_masked_valid_and_absent_extra_controls() -> None:
+    valid = _DescriptorMaskedPolicy(
+        schema_version="candidate-v1",
+        mode="strict_local",
+        allowed_execution_locations=("endpoint",),
+        approved_recipient_ids=(),
+        fallback_policy="deny",
+        policy_epoch=7,
+    )
+    validate_plaintext_dispatch(
+        valid,
+        execution_location="endpoint",
+        recipient_id=None,
+        current_policy_epoch=7,
+        currently_authorized_recipient_ids=set(),
+        is_fallback=False,
+    )
+
+    _BASE_MODEL_EXTRA_DESCRIPTOR.__delete__(valid)
+    with pytest.raises(AttributeError, match="__pydantic_extra__"):
+        validate_plaintext_dispatch(
+            valid,
+            execution_location="endpoint",
+            recipient_id=None,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=set(),
+            is_fallback=False,
+        )
 
 
 def test_dispatch_extra_storage_controls_preserve_existing_behavior() -> None:

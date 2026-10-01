@@ -4,7 +4,7 @@ from collections.abc import Iterator, Mapping
 from typing import ClassVar
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from contracts_common import VersionedContract
 from contracts_bodies import (
@@ -14,6 +14,10 @@ from contracts_bodies import (
     PlaintextBody,
     parse_memory_body,
 )
+
+
+_BASE_MODEL_DICT_DESCRIPTOR = vars(BaseModel)["__dict__"]
+_BASE_MODEL_EXTRA_DESCRIPTOR = vars(BaseModel)["__pydantic_extra__"]
 
 
 class VersionedBodyOwner(VersionedContract):
@@ -162,6 +166,52 @@ class _AttributeHidingPlaintextBody(PlaintextBody):
             type(self).text_reads += 1
             return "secret"
         return super().__getattribute__(name)
+
+
+class _DescriptorMaskedPlaintextBody(PlaintextBody):
+    @property
+    def __dict__(self):
+        native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(self, BaseModel)
+        return {
+            name: value
+            for name, value in dict.items(native)
+            if name != "future_constraint"
+        }
+
+    @__dict__.setter
+    def __dict__(self, value):
+        _BASE_MODEL_DICT_DESCRIPTOR.__set__(self, value)
+
+    @property
+    def __pydantic_extra__(self):
+        return None
+
+    @__pydantic_extra__.setter
+    def __pydantic_extra__(self, value):
+        _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(self, value)
+
+
+class _DescriptorMaskedOpaqueBody(OpaqueEnvelopeBody):
+    @property
+    def __dict__(self):
+        native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(self, BaseModel)
+        return {
+            name: value
+            for name, value in dict.items(native)
+            if name != "future_constraint"
+        }
+
+    @__dict__.setter
+    def __dict__(self, value):
+        _BASE_MODEL_DICT_DESCRIPTOR.__set__(self, value)
+
+    @property
+    def __pydantic_extra__(self):
+        return None
+
+    @__pydantic_extra__.setter
+    def __pydantic_extra__(self, value):
+        _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(self, value)
 
 
 def _replace_model_backing(
@@ -318,6 +368,92 @@ def test_parser_native_model_backing_ignores_attribute_override(
     assert any(error["loc"][-1] == "text" for error in exc.value.errors())
     assert _AttributeHidingPlaintextBody.text_reads == 0
     assert hidden.view_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("ordinary_type", "masked_type", "values"),
+    [
+        (
+            PlaintextBody,
+            _DescriptorMaskedPlaintextBody,
+            {"kind": "plaintext", "text": "secret"},
+        ),
+        (
+            OpaqueEnvelopeBody,
+            _DescriptorMaskedOpaqueBody,
+            {"kind": "opaque_envelope", "envelope_id": "env-1"},
+        ),
+    ],
+    ids=["plaintext", "opaque-envelope"],
+)
+@pytest.mark.parametrize("inventory", ["stored", "extra"])
+@pytest.mark.parametrize("nested", [False, True], ids=["direct", "nested"])
+def test_parser_uses_base_model_storage_descriptors(
+    ordinary_type: type[PlaintextBody | OpaqueEnvelopeBody],
+    masked_type: type[PlaintextBody | OpaqueEnvelopeBody],
+    values: dict[str, str],
+    inventory: str,
+    nested: bool,
+) -> None:
+    bodies = [ordinary_type(**values), masked_type(**values)]
+    hidden_stores: list[_HiddenBackingDict] = []
+    for body in bodies:
+        if inventory == "stored":
+            stored = dict(
+                dict.items(_BASE_MODEL_DICT_DESCRIPTOR.__get__(body, BaseModel))
+            )
+            stored["future_constraint"] = "deny"
+            hidden = _HiddenBackingDict(stored)
+            _BASE_MODEL_DICT_DESCRIPTOR.__set__(body, hidden)
+        else:
+            hidden = _HiddenBackingDict({"future_constraint": "deny"})
+            _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(body, hidden)
+        hidden_stores.append(hidden)
+
+    diagnostics = []
+    for body in bodies:
+        candidate = (
+            VersionedBodyOwner.model_construct(
+                schema_version="candidate-v1",
+                body=body,
+            ).body
+            if nested
+            else body
+        )
+        with pytest.raises(ValidationError) as exc:
+            parse_memory_body(candidate)
+        diagnostics.append(
+            [(error["loc"], error["type"]) for error in exc.value.errors()]
+        )
+
+    assert diagnostics[0] == diagnostics[1]
+    assert all(hidden.view_calls == 0 for hidden in hidden_stores)
+
+
+@pytest.mark.parametrize(
+    ("body_type", "values"),
+    [
+        (
+            _DescriptorMaskedPlaintextBody,
+            {"kind": "plaintext", "text": "secret"},
+        ),
+        (
+            _DescriptorMaskedOpaqueBody,
+            {"kind": "opaque_envelope", "envelope_id": "env-1"},
+        ),
+    ],
+    ids=["plaintext", "opaque-envelope"],
+)
+def test_parser_descriptor_masked_valid_and_absent_extra_controls(
+    body_type: type[PlaintextBody | OpaqueEnvelopeBody],
+    values: dict[str, str],
+) -> None:
+    valid = body_type(**values)
+    assert parse_memory_body(valid).kind == values["kind"]
+
+    _BASE_MODEL_EXTRA_DESCRIPTOR.__delete__(valid)
+    with pytest.raises(AttributeError, match="__pydantic_extra__"):
+        parse_memory_body(valid)
 
 
 def test_parser_extra_storage_controls_preserve_existing_behavior() -> None:
