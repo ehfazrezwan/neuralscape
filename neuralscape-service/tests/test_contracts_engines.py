@@ -44,9 +44,141 @@ class HiddenFrozenSet(frozenset):
         return iter(())
 
 
+class ObservableTuple(tuple):
+    def __new__(cls, values, *, callback=None, view=None):
+        instance = super().__new__(cls, values)
+        instance.callback = callback
+        instance.view = view
+        instance.calls = 0
+        return instance
+
+    def __iter__(self):
+        self.calls += 1
+        if self.callback is not None:
+            self.callback()
+        if self.view is not None:
+            return iter(self.view)
+        return tuple.__iter__(self)
+
+
+class ClassViewString(str):
+    def __new__(cls, value, *, callback=None, error=None):
+        instance = super().__new__(cls, value)
+        instance.callback = callback
+        instance.error = error
+        instance.class_calls = 0
+        instance.callback_ran = False
+        return instance
+
+    @property
+    def __class__(self):  # type: ignore[override]
+        self.class_calls += 1
+        if not self.callback_ran:
+            self.callback_ran = True
+            if self.callback is not None:
+                self.callback()
+        if self.error is not None:
+            raise self.error
+        return str
+
+
+class ClassViewFrozenSet(frozenset):
+    def __new__(cls, values, *, callback):
+        instance = super().__new__(cls, values)
+        instance.callback = callback
+        instance.class_calls = 0
+        instance.callback_ran = False
+        return instance
+
+    @property
+    def __class__(self):  # type: ignore[override]
+        self.class_calls += 1
+        if not self.callback_ran:
+            self.callback_ran = True
+            self.callback()
+        return frozenset
+
+
 _MODEL_DICT_DESCRIPTOR = BaseModel.__dict__["__dict__"]
 _MODEL_FIELDS_SET_DESCRIPTOR = BaseModel.__dict__["__pydantic_fields_set__"]
 _MODEL_EXTRAS_DESCRIPTOR = BaseModel.__dict__["__pydantic_extra__"]
+
+
+class HookedFieldName(str):
+    def __new__(cls, value):
+        instance = super().__new__(cls, value)
+        instance.events = []
+        instance.armed = False
+        instance.target = None
+        instance.field_name = None
+        instance.replacement = None
+        return instance
+
+    def arm(self, target=None, field_name=None, replacement=None):
+        self.events.clear()
+        self.target = target
+        self.field_name = field_name
+        self.replacement = replacement
+        self.armed = True
+
+    def _hook(self, name):
+        if self.armed:
+            self.events.append(name)
+            if self.target is not None:
+                native = _MODEL_DICT_DESCRIPTOR.__get__(self.target, BaseModel)
+                dict.__setitem__(native, self.field_name, self.replacement)
+
+    def __hash__(self):
+        self._hook("hash")
+        return str.__hash__(self)
+
+    def __eq__(self, other):
+        self._hook("eq")
+        return str.__eq__(self, other)
+
+    def __str__(self):
+        self._hook("str")
+        return str.__str__(self)
+
+
+class DistinctFieldName(HookedFieldName):
+    def __hash__(self):
+        self._hook("hash")
+        return object.__hash__(self)
+
+    def __eq__(self, other):
+        self._hook("eq")
+        return self is other
+
+
+class NonStringFieldName:
+    def __init__(self):
+        self.events = []
+        self.armed = False
+
+    def arm(self):
+        self.events.clear()
+        self.armed = True
+
+    def _hook(self, name):
+        if self.armed:
+            self.events.append(name)
+
+    def __hash__(self):
+        self._hook("hash")
+        return object.__hash__(self)
+
+    def __eq__(self, other):
+        self._hook("eq")
+        return self is other
+
+    def __str__(self):
+        self._hook("str")
+        return "non-string-field"
+
+    def __repr__(self):
+        self._hook("repr")
+        return "NonStringFieldName()"
 
 
 def reference(identifier: str) -> ReferenceHandle:
@@ -560,11 +692,709 @@ def test_capability_boundary_preserves_valid_child_mutation_control():
     assert validate_capability_requirements(manifest(state()), (valid,)) == ()
 
 
+@pytest.mark.parametrize("tuple_field", ["contract_schema_versions", "operations"])
+@pytest.mark.parametrize("public_surface", ["requirements", "operation_state"])
+def test_capability_boundary_freezes_manifest_children_before_tuple_callbacks(
+    tuple_field,
+    public_surface,
+):
+    invalid = state().model_copy(update={"supported": False})
+
+    def repair_child():
+        native = _MODEL_DICT_DESCRIPTOR.__get__(invalid, BaseModel)
+        dict.__setitem__(native, "supported", True)
+
+    declared = manifest(state()).model_copy(update={"operations": (invalid,)})
+    if tuple_field == "contract_schema_versions":
+        observed = ObservableTuple((VERSION,), callback=repair_child)
+        declared = declared.model_copy(
+            update={"contract_schema_versions": observed}
+        )
+    else:
+        observed = ObservableTuple((invalid,), callback=repair_child)
+        declared = declared.model_copy(update={"operations": observed})
+
+    with pytest.raises(ValidationError, match="cannot be configured"):
+        if public_surface == "requirements":
+            validate_capability_requirements(declared, (requirement(),))
+        else:
+            declared.operation_state("retrieve")
+
+    assert observed.calls == 1
+    assert invalid.supported is True
+
+
+def test_capability_boundary_freezes_requirements_before_tuple_callback():
+    invalid = requirement().model_copy(
+        update={"qualification_profile_version": None}
+    )
+
+    def repair_child():
+        native = _MODEL_DICT_DESCRIPTOR.__get__(invalid, BaseModel)
+        dict.__setitem__(native, "qualification_profile_version", "profile-v1")
+
+    requirements = ObservableTuple(
+        (requirement(operation="export"), invalid),
+        callback=repair_child,
+    )
+
+    with pytest.raises(ValidationError, match="are paired"):
+        validate_capability_requirements(manifest(state()), requirements)
+
+    assert requirements.calls == 1
+    assert invalid.qualification_profile_version == "profile-v1"
+
+
+@pytest.mark.parametrize("tuple_field", ["contract_schema_versions", "operations"])
+def test_capability_boundary_freezes_requirements_before_manifest_callbacks(
+    tuple_field,
+):
+    ordinary = requirement().model_copy(
+        update={"qualification_profile_version": None}
+    )
+    with pytest.raises(ValidationError, match="are paired"):
+        validate_capability_requirements(manifest(state()), (ordinary,))
+
+    invalid = requirement().model_copy(
+        update={"qualification_profile_version": None}
+    )
+
+    def repair_requirement():
+        native = _MODEL_DICT_DESCRIPTOR.__get__(invalid, BaseModel)
+        dict.__setitem__(
+            native,
+            "qualification_profile_version",
+            "profile-v1",
+        )
+
+    declared = manifest(state())
+    observed = ObservableTuple(
+        getattr(declared, tuple_field),
+        callback=repair_requirement,
+    )
+    native = _MODEL_DICT_DESCRIPTOR.__get__(declared, BaseModel)
+    dict.__setitem__(native, tuple_field, observed)
+
+    with pytest.raises(ValidationError, match="are paired"):
+        validate_capability_requirements(declared, (invalid,))
+
+    assert observed.calls == 1
+    assert invalid.qualification_profile_version == "profile-v1"
+
+    callbacks = []
+    valid_manifest = manifest(state())
+    benign = ObservableTuple(
+        getattr(valid_manifest, tuple_field),
+        callback=lambda: callbacks.append(tuple_field),
+    )
+    valid_native = _MODEL_DICT_DESCRIPTOR.__get__(valid_manifest, BaseModel)
+    dict.__setitem__(valid_native, tuple_field, benign)
+
+    assert validate_capability_requirements(
+        valid_manifest,
+        (requirement(),),
+    ) == ()
+    assert benign.calls == 1
+    assert callbacks == [tuple_field]
+
+
+def test_capability_boundary_preserves_sibling_type_error_priority():
+    invalid_state = state().model_copy(update={"supported": False})
+    invalid_manifest = manifest(state()).model_copy(
+        update={"operations": (invalid_state,)}
+    )
+
+    with pytest.raises(ValidationError, match="cannot be configured"):
+        validate_capability_requirements(invalid_manifest, [])
+
+    with pytest.raises(TypeError, match="capability requirements must be a tuple"):
+        validate_capability_requirements(manifest(state()), [])
+
+
+def _set_native_model_field(model, name, value):
+    native = _MODEL_DICT_DESCRIPTOR.__get__(model, BaseModel)
+    dict.__setitem__(native, name, value)
+
+
+@pytest.mark.parametrize("public_surface", ["requirements", "operation_state"])
+@pytest.mark.parametrize(
+    "case",
+    ["ordinary-invalid", "hooked-invalid", "hooked-valid"],
+)
+def test_capability_boundary_uses_concrete_graph_classification(
+    public_surface,
+    case,
+):
+    first = state()
+    if case != "hooked-valid":
+        _set_native_model_field(first, "supported", False)
+    later = state(operation="export", qualification=qualification("export"))
+    hook = None
+    if case != "ordinary-invalid":
+        callback = (
+            lambda: _set_native_model_field(first, "supported", True)
+            if case == "hooked-invalid"
+            else None
+        )
+        hook = ClassViewString("export", callback=callback)
+        _set_native_model_field(later, "operation", hook)
+    declared = manifest(state(), later).model_copy(
+        update={"operations": (first, later)}
+    )
+
+    if case == "hooked-valid":
+        if public_surface == "requirements":
+            assert validate_capability_requirements(
+                declared,
+                (requirement(),),
+            ) == ()
+        else:
+            assert declared.operation_state("retrieve") == state()
+    else:
+        with pytest.raises(ValidationError) as raised:
+            if public_surface == "requirements":
+                validate_capability_requirements(declared, (requirement(),))
+            else:
+                declared.operation_state("retrieve")
+        error = raised.value.errors(include_url=False)[0]
+        assert error["type"] == "value_error"
+        assert error["loc"] == ("operations", 0)
+        assert "unsupported operation cannot be configured" in error["msg"]
+
+    if hook is not None:
+        assert hook.class_calls == 0
+    assert first.supported is (case == "hooked-valid")
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["ordinary-invalid", "hooked-invalid", "hooked-valid"],
+)
+def test_capability_boundary_uses_concrete_requirement_classification(case):
+    first = requirement()
+    if case != "hooked-valid":
+        _set_native_model_field(first, "qualification_profile_version", None)
+    later = requirement(operation="export")
+    hook = None
+    if case != "ordinary-invalid":
+        callback = (
+            lambda: _set_native_model_field(
+                first,
+                "qualification_profile_version",
+                "profile-v1",
+            )
+            if case == "hooked-invalid"
+            else None
+        )
+        hook = ClassViewString("export", callback=callback)
+        _set_native_model_field(later, "operation", hook)
+    declared = manifest(
+        state(),
+        state(operation="export", qualification=qualification("export")),
+    )
+
+    if case == "hooked-valid":
+        assert validate_capability_requirements(declared, (first, later)) == ()
+    else:
+        with pytest.raises(ValidationError) as raised:
+            validate_capability_requirements(declared, (first, later))
+        error = raised.value.errors(include_url=False)[0]
+        assert error["type"] == "value_error"
+        assert error["loc"] == ()
+        assert "qualification profile reference and version are paired" in error[
+            "msg"
+        ]
+
+    if hook is not None:
+        assert hook.class_calls == 0
+    expected_version = "profile-v1" if case == "hooked-valid" else None
+    assert first.qualification_profile_version == expected_version
+
+
+@pytest.mark.parametrize("initially_valid", [False, True])
+def test_capability_boundary_classifies_frozenset_storage_concretely(
+    initially_valid,
+):
+    child = state()
+    if not initially_valid:
+        _set_native_model_field(child, "supported", False)
+    declared = manifest(state()).model_copy(update={"operations": (child,)})
+    fields_set = ClassViewFrozenSet(
+        frozenset(type(declared).model_fields),
+        callback=lambda: _set_native_model_field(child, "supported", True),
+    )
+    _MODEL_FIELDS_SET_DESCRIPTOR.__set__(declared, fields_set)
+
+    if initially_valid:
+        assert validate_capability_requirements(
+            declared,
+            (requirement(),),
+        ) == ()
+    else:
+        with pytest.raises(ValidationError) as raised:
+            validate_capability_requirements(declared, (requirement(),))
+        error = raised.value.errors(include_url=False)[0]
+        assert error["type"] == "value_error"
+        assert error["loc"] == ("operations", 0)
+
+    assert fields_set.class_calls == 0
+    assert child.supported is initially_valid
+
+
+def test_invalid_manifest_precedes_later_requirement_class_view():
+    invalid = state().model_copy(update={"supported": False})
+    declared = manifest(state()).model_copy(update={"operations": (invalid,)})
+    hostile_operation = ClassViewString(
+        "retrieve",
+        error=RuntimeError("requirements class-view callback ran"),
+    )
+    received = requirement()
+    _set_native_model_field(received, "operation", hostile_operation)
+
+    with pytest.raises(ValidationError) as raised:
+        validate_capability_requirements(declared, (received,))
+
+    error = raised.value.errors(include_url=False)[0]
+    assert error["type"] == "value_error"
+    assert error["loc"] == ("operations", 0)
+    assert hostile_operation.class_calls == 0
+
+
+def test_capability_boundary_freezes_manifest_edge_before_earlier_callback():
+    invalid = state().model_copy(
+        update={"qualification": qualification(operation="export")}
+    )
+    declared = manifest(state()).model_copy(update={"operations": (invalid,)})
+
+    def replace_edge():
+        native = _MODEL_DICT_DESCRIPTOR.__get__(invalid, BaseModel)
+        dict.__setitem__(native, "qualification", qualification())
+
+    versions = ObservableTuple((VERSION,), callback=replace_edge)
+    native = _MODEL_DICT_DESCRIPTOR.__get__(declared, BaseModel)
+    dict.__setitem__(native, "contract_schema_versions", versions)
+
+    with pytest.raises(ValidationError, match="operation must match"):
+        validate_capability_requirements(declared, (requirement(),))
+
+    assert versions.calls == 1
+    assert invalid.qualification.operation == "retrieve"
+
+
+@pytest.mark.parametrize("tuple_field", ["contract_schema_versions", "operations"])
+def test_capability_boundary_freezes_exact_reference_dict_before_manifest_callback(
+    tuple_field,
+):
+    ordinary_reference = reference("runtime-profile").model_dump(mode="python")
+    ordinary_reference["id"] = ""
+    ordinary = requirement().model_copy(
+        update={"qualification_profile_reference": ordinary_reference}
+    )
+    with pytest.raises(ValidationError) as caught:
+        validate_capability_requirements(manifest(state()), (ordinary,))
+    assert caught.value.errors(include_url=False)[0]["type"] == "string_too_short"
+    assert caught.value.errors(include_url=False)[0]["loc"] == (
+        "qualification_profile_reference",
+        "id",
+    )
+
+    invalid_reference = reference("runtime-profile").model_dump(mode="python")
+    invalid_reference["id"] = ""
+    invalid = requirement().model_copy(
+        update={"qualification_profile_reference": invalid_reference}
+    )
+
+    def repair_reference():
+        invalid_reference["id"] = "runtime-profile"
+
+    declared = manifest(state())
+    observed = ObservableTuple(
+        getattr(declared, tuple_field),
+        callback=repair_reference,
+    )
+    native = _MODEL_DICT_DESCRIPTOR.__get__(declared, BaseModel)
+    dict.__setitem__(native, tuple_field, observed)
+
+    with pytest.raises(ValidationError) as caught:
+        validate_capability_requirements(declared, (invalid,))
+    assert caught.value.errors(include_url=False)[0]["type"] == "string_too_short"
+    assert caught.value.errors(include_url=False)[0]["loc"] == (
+        "qualification_profile_reference",
+        "id",
+    )
+    assert observed.calls == 1
+    assert invalid_reference["id"] == "runtime-profile"
+
+    valid_reference = reference("runtime-profile").model_dump(mode="python")
+    valid = requirement().model_copy(
+        update={"qualification_profile_reference": valid_reference}
+    )
+    valid_manifest = manifest(state())
+    benign = ObservableTuple(
+        getattr(valid_manifest, tuple_field),
+        callback=lambda: valid_reference.__setitem__("id", "runtime-profile"),
+    )
+    valid_native = _MODEL_DICT_DESCRIPTOR.__get__(valid_manifest, BaseModel)
+    dict.__setitem__(valid_native, tuple_field, benign)
+
+    assert validate_capability_requirements(valid_manifest, (valid,)) == ()
+    assert benign.calls == 1
+
+
+def test_capability_boundary_freezes_exact_reference_dict_before_requirements_callback():
+    invalid_reference = reference("runtime-profile").model_dump(mode="python")
+    invalid_reference["id"] = ""
+    invalid = requirement().model_copy(
+        update={"qualification_profile_reference": invalid_reference}
+    )
+
+    requirements = ObservableTuple(
+        (invalid,),
+        callback=lambda: invalid_reference.__setitem__("id", "runtime-profile"),
+    )
+
+    with pytest.raises(ValidationError) as caught:
+        validate_capability_requirements(manifest(state()), requirements)
+    assert caught.value.errors(include_url=False)[0]["type"] == "string_too_short"
+    assert caught.value.errors(include_url=False)[0]["loc"] == (
+        "qualification_profile_reference",
+        "id",
+    )
+    assert requirements.calls == 1
+    assert invalid_reference["id"] == "runtime-profile"
+
+    valid_reference = reference("runtime-profile").model_dump(mode="python")
+    valid = requirement().model_copy(
+        update={"qualification_profile_reference": valid_reference}
+    )
+    control = ObservableTuple(
+        (valid,),
+        callback=lambda: valid_reference.__setitem__("id", "runtime-profile"),
+    )
+
+    assert validate_capability_requirements(manifest(state()), control) == ()
+    assert control.calls == 1
+
+
+@pytest.mark.parametrize("public_surface", ["requirements", "operation_state"])
+def test_capability_boundary_freezes_exact_qualification_dict_before_manifest_callback(
+    public_surface,
+):
+    ordinary_qualification = qualification(operation="export").model_dump(
+        mode="python"
+    )
+    ordinary_state = state().model_copy(
+        update={"qualification": ordinary_qualification}
+    )
+    ordinary_manifest = manifest(state()).model_copy(
+        update={"operations": (ordinary_state,)}
+    )
+    with pytest.raises(ValidationError) as caught:
+        if public_surface == "requirements":
+            validate_capability_requirements(
+                ordinary_manifest,
+                (requirement(),),
+            )
+        else:
+            ordinary_manifest.operation_state("retrieve")
+    assert caught.value.errors(include_url=False)[0]["type"] == "value_error"
+    assert caught.value.errors(include_url=False)[0]["loc"] == ("operations", 0)
+
+    invalid_qualification = qualification(operation="export").model_dump(
+        mode="python"
+    )
+    invalid_state = state().model_copy(
+        update={"qualification": invalid_qualification}
+    )
+    declared = manifest(state()).model_copy(
+        update={"operations": (invalid_state,)}
+    )
+    versions = ObservableTuple(
+        (VERSION,),
+        callback=lambda: invalid_qualification.__setitem__(
+            "operation",
+            "retrieve",
+        ),
+    )
+    native = _MODEL_DICT_DESCRIPTOR.__get__(declared, BaseModel)
+    dict.__setitem__(native, "contract_schema_versions", versions)
+
+    with pytest.raises(ValidationError) as caught:
+        if public_surface == "requirements":
+            validate_capability_requirements(declared, (requirement(),))
+        else:
+            declared.operation_state("retrieve")
+    assert caught.value.errors(include_url=False)[0]["type"] == "value_error"
+    assert caught.value.errors(include_url=False)[0]["loc"] == ("operations", 0)
+    assert versions.calls == 1
+    assert invalid_qualification["operation"] == "retrieve"
+
+    valid_qualification = qualification().model_dump(mode="python")
+    valid_state = state().model_copy(update={"qualification": valid_qualification})
+    valid_manifest = manifest(state()).model_copy(
+        update={"operations": (valid_state,)}
+    )
+    benign = ObservableTuple(
+        (VERSION,),
+        callback=lambda: valid_qualification.__setitem__(
+            "operation",
+            "retrieve",
+        ),
+    )
+    valid_native = _MODEL_DICT_DESCRIPTOR.__get__(valid_manifest, BaseModel)
+    dict.__setitem__(valid_native, "contract_schema_versions", benign)
+
+    if public_surface == "requirements":
+        assert validate_capability_requirements(
+            valid_manifest,
+            (requirement(),),
+        ) == ()
+    else:
+        assert valid_manifest.operation_state("retrieve") == state()
+    assert benign.calls == 1
+
+
+def test_capability_boundary_preserves_dict_subclass_public_view_authority():
+    class DivergentReference(dict):
+        def __init__(self, native, public):
+            super().__init__(native)
+            self.public = public
+            self.calls = 0
+
+        def items(self):
+            self.calls += 1
+            return self.public.items()
+
+    valid = reference("runtime-profile").model_dump(mode="python")
+    invalid = reference("runtime-profile").model_dump(mode="python")
+    invalid["id"] = ""
+
+    public_valid = DivergentReference(invalid, valid)
+    received = requirement().model_copy(
+        update={"qualification_profile_reference": public_valid}
+    )
+    assert validate_capability_requirements(manifest(state()), (received,)) == ()
+    assert public_valid.calls == 1
+
+    public_invalid = DivergentReference(valid, invalid)
+    received = requirement().model_copy(
+        update={"qualification_profile_reference": public_invalid}
+    )
+    with pytest.raises(ValidationError) as caught:
+        validate_capability_requirements(manifest(state()), (received,))
+    assert caught.value.errors(include_url=False)[0]["type"] == "string_too_short"
+    assert caught.value.errors(include_url=False)[0]["loc"] == (
+        "qualification_profile_reference",
+        "id",
+    )
+    assert public_invalid.calls == 1
+
+
+def test_capability_boundary_preserves_divergent_tuple_view_authority():
+    invalid_backing = requirement().model_copy(
+        update={"qualification_profile_version": None}
+    )
+    requirements = ObservableTuple(
+        (invalid_backing,),
+        view=(requirement(),),
+    )
+
+    assert validate_capability_requirements(manifest(state()), requirements) == ()
+    assert requirements.calls == 1
+
+    hidden_cross_tenant = requirement().model_copy(
+        update={
+            "qualification_profile_reference": reference(
+                "runtime-profile"
+            ).model_copy(update={"tenant_id": "tenant-2"})
+        }
+    )
+    requirements = ObservableTuple(
+        (requirement(),),
+        view=(hidden_cross_tenant,),
+    )
+
+    violations = validate_capability_requirements(manifest(state()), requirements)
+
+    assert [(item.operation, item.fact) for item in violations] == [
+        ("retrieve", "qualification_profile")
+    ]
+    assert requirements.calls == 1
+
+
+def test_manifest_preserves_divergent_operations_tuple_view_authority():
+    invalid_backing = state().model_copy(update={"supported": False})
+    visible = state(operation="export", qualification=qualification("export"))
+    operations = ObservableTuple((invalid_backing,), view=(visible,))
+    declared = manifest(state()).model_copy(update={"operations": operations})
+
+    assert declared.operation_state("export") == visible
+    assert operations.calls == 1
+
+
 def test_capability_boundary_preserves_missing_extra_storage():
     valid = requirement()
     _MODEL_EXTRAS_DESCRIPTOR.__delete__(valid)
 
     assert validate_capability_requirements(manifest(state()), (valid,)) == ()
+
+
+def _replace_stored_name(value, original_name, replacement):
+    native = _MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+    item = dict.pop(native, original_name)
+    dict.__setitem__(native, replacement, item)
+
+
+def _replace_fields_set_name(value, original_name, replacement):
+    native = _MODEL_FIELDS_SET_DESCRIPTOR.__get__(value, BaseModel)
+    members = set(set.__iter__(native))
+    members.remove(original_name)
+    set.add(members, replacement)
+    _MODEL_FIELDS_SET_DESCRIPTOR.__set__(value, members)
+
+
+@pytest.mark.parametrize("inventory", ["stored", "fields_set"])
+@pytest.mark.parametrize("target_name", ["direct", "nested"])
+def test_capability_boundary_captures_values_before_field_name_hooks(
+    inventory,
+    target_name,
+):
+    if target_name == "direct":
+        target = requirement().model_copy(
+            update={"qualification_profile_version": None}
+        )
+        received = target
+        name = "operation"
+        invalid_field = "qualification_profile_version"
+        replacement = "profile-v1"
+        message = "are paired"
+    else:
+        target = reference("runtime-profile").model_copy(update={"id": ""})
+        received = requirement().model_copy(
+            update={"qualification_profile_reference": target}
+        )
+        name = "kind"
+        invalid_field = "id"
+        replacement = "runtime-profile"
+        message = "at least 1 character"
+
+    hooked_name = HookedFieldName(name)
+    if inventory == "stored":
+        _replace_stored_name(target, name, hooked_name)
+    else:
+        _replace_fields_set_name(target, name, hooked_name)
+    hooked_name.arm(target, invalid_field, replacement)
+
+    with pytest.raises(ValidationError, match=message):
+        validate_capability_requirements(manifest(state()), (received,))
+
+    native = _MODEL_DICT_DESCRIPTOR.__get__(target, BaseModel)
+    assert dict.__getitem__(native, invalid_field) in (None, "")
+    assert hooked_name.events == []
+
+
+@pytest.mark.parametrize("inventory", ["stored", "fields_set"])
+@pytest.mark.parametrize("target_name", ["direct", "nested"])
+def test_capability_boundary_preserves_benign_string_subclass_names(
+    inventory,
+    target_name,
+):
+    if target_name == "direct":
+        target = requirement()
+        received = target
+        name = "operation"
+    else:
+        target = reference("runtime-profile")
+        received = requirement().model_copy(
+            update={"qualification_profile_reference": target}
+        )
+        name = "kind"
+    hooked_name = HookedFieldName(name)
+    if inventory == "stored":
+        _replace_stored_name(target, name, hooked_name)
+    else:
+        _replace_fields_set_name(target, name, hooked_name)
+    hooked_name.arm()
+
+    assert validate_capability_requirements(manifest(state()), (received,)) == ()
+    assert hooked_name.events == []
+
+
+@pytest.mark.parametrize("target_name", ["direct", "nested"])
+def test_capability_boundary_normalizes_extra_string_subclass_without_hooks(
+    target_name,
+):
+    if target_name == "direct":
+        target = requirement()
+        received = target
+    else:
+        target = reference("runtime-profile")
+        received = requirement().model_copy(
+            update={"qualification_profile_reference": target}
+        )
+    hooked_name = HookedFieldName("future_semantics")
+    extras = {}
+    dict.__setitem__(extras, hooked_name, "deny")
+    _MODEL_EXTRAS_DESCRIPTOR.__set__(target, extras)
+    hooked_name.arm()
+
+    with pytest.raises(ValueError, match="undeclared contract field.*future_semantics"):
+        validate_capability_requirements(manifest(state()), (received,))
+
+    assert hooked_name.events == []
+
+
+@pytest.mark.parametrize("inventory", ["stored", "fields_set", "extras"])
+def test_capability_boundary_rejects_normalized_field_name_collisions(inventory):
+    invalid = requirement()
+    if inventory == "extras":
+        exact_name = "future_semantics"
+        hooked_name = DistinctFieldName(exact_name)
+        extras = {exact_name: "first"}
+        dict.__setitem__(extras, hooked_name, "second")
+        _MODEL_EXTRAS_DESCRIPTOR.__set__(invalid, extras)
+        message = "malformed contract extras.*collide after normalization"
+    else:
+        exact_name = "operation"
+        hooked_name = DistinctFieldName(exact_name)
+        if inventory == "stored":
+            native = _MODEL_DICT_DESCRIPTOR.__get__(invalid, BaseModel)
+            dict.__setitem__(native, hooked_name, "retrieve")
+        else:
+            native = _MODEL_FIELDS_SET_DESCRIPTOR.__get__(invalid, BaseModel)
+            set.add(native, hooked_name)
+        message = "malformed contract model.*collide after normalization"
+    hooked_name.arm()
+
+    with pytest.raises(ValueError, match=message):
+        validate_capability_requirements(manifest(state()), (invalid,))
+
+    assert hooked_name.events == []
+
+
+@pytest.mark.parametrize("inventory", ["stored", "fields_set", "extras"])
+def test_capability_boundary_rejects_nonstring_field_names_without_hooks(inventory):
+    invalid = requirement()
+    hostile_name = NonStringFieldName()
+    if inventory == "stored":
+        native = _MODEL_DICT_DESCRIPTOR.__get__(invalid, BaseModel)
+        dict.__setitem__(native, hostile_name, "deny")
+        message = "malformed contract model.*field names must be strings"
+    elif inventory == "fields_set":
+        native = _MODEL_FIELDS_SET_DESCRIPTOR.__get__(invalid, BaseModel)
+        set.add(native, hostile_name)
+        message = "malformed contract model.*field names must be strings"
+    else:
+        extras = {}
+        dict.__setitem__(extras, hostile_name, "deny")
+        _MODEL_EXTRAS_DESCRIPTOR.__set__(invalid, extras)
+        message = "malformed contract extras.*field names must be strings"
+    hostile_name.arm()
+
+    with pytest.raises(ValueError, match=message):
+        validate_capability_requirements(manifest(state()), (invalid,))
+
+    assert hostile_name.events == []
 
 
 @pytest.mark.parametrize(
@@ -617,13 +1447,28 @@ def test_requirement_validation_builds_one_index_from_one_manifest_snapshot(
         ),
     )
     counts = {"manifest_snapshots": 0, "operation_indexes": 0}
-    original_snapshot = contracts_engines._validated_contract_snapshot
+    original_snapshot = contracts_engines._validated_contract_snapshot_from_frozen
     original_lookup = contracts_engines._operation_state_lookup
 
-    def counted_snapshot(value, expected_type, *, label):
+    def counted_snapshot(
+        value,
+        expected_type,
+        *,
+        label,
+        frozen_models,
+        frozen_containers,
+        discovered,
+    ):
         if expected_type is CapabilityManifest:
             counts["manifest_snapshots"] += 1
-        return original_snapshot(value, expected_type, label=label)
+        return original_snapshot(
+            value,
+            expected_type,
+            label=label,
+            frozen_models=frozen_models,
+            frozen_containers=frozen_containers,
+            discovered=discovered,
+        )
 
     def counted_lookup(value):
         counts["operation_indexes"] += 1
@@ -631,7 +1476,7 @@ def test_requirement_validation_builds_one_index_from_one_manifest_snapshot(
 
     monkeypatch.setattr(
         contracts_engines,
-        "_validated_contract_snapshot",
+        "_validated_contract_snapshot_from_frozen",
         counted_snapshot,
     )
     monkeypatch.setattr(contracts_engines, "_operation_state_lookup", counted_lookup)

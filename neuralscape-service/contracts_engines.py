@@ -8,7 +8,7 @@ reviewable but are not themselves proof that the referenced evidence is valid.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, TypeVar
+from typing import Any, NamedTuple, TypeVar
 
 from pydantic import BaseModel, TypeAdapter, model_validator
 
@@ -25,6 +25,26 @@ _MODEL_EXTRAS_DESCRIPTOR = BaseModel.__dict__["__pydantic_extra__"]
 _MISSING_MODEL_STORAGE = object()
 
 
+class _FrozenModelState(NamedTuple):
+    """Callback-free entry state for one natively reachable model."""
+
+    owner: BaseModel
+    storage_is_dict: bool
+    stored_items: tuple[tuple[Any, Any], ...]
+    fields_set_is_set: bool
+    fields_set_members: tuple[Any, ...]
+    extras_state: str
+    extra_items: tuple[tuple[Any, Any], ...]
+
+
+class _FrozenContainerState(NamedTuple):
+    """Callback-free entry edges for one exact native container."""
+
+    owner: Any
+    kind: str
+    entries: tuple[Any, ...]
+
+
 def _model_storage(descriptor: Any, value: BaseModel) -> Any:
     """Read a BaseModel-owned store without subclass attribute dispatch."""
 
@@ -34,18 +54,160 @@ def _model_storage(descriptor: Any, value: BaseModel) -> Any:
         return _MISSING_MODEL_STORAGE
 
 
-def _native_set_copy(value: set[Any] | frozenset[Any]) -> set[Any]:
-    """Copy the concrete set backing without subclass iteration hooks."""
+def _native_set_members(value: set[Any] | frozenset[Any]) -> tuple[Any, ...]:
+    """Capture concrete set members without subclass iteration hooks."""
 
-    if isinstance(value, set):
-        return set(set.__iter__(value))
-    return set(frozenset.__iter__(value))
+    if issubclass(type(value), set):
+        return tuple(set.__iter__(value))
+    return tuple(frozenset.__iter__(value))
+
+
+def _freeze_native_model_graph(
+    value: Any,
+    frozen_models: dict[int, _FrozenModelState],
+    frozen_containers: dict[int, _FrozenContainerState],
+    discovered: dict[int, Any],
+) -> None:
+    """Freeze models reachable through native container edges without callbacks."""
+
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        current_type = type(current)
+        if not issubclass(current_type, (BaseModel, dict, list, tuple)):
+            continue
+        identity = id(current)
+        if identity in discovered and discovered[identity] is current:
+            continue
+        discovered[identity] = current
+
+        if issubclass(current_type, BaseModel):
+            frozen = frozen_models.get(identity)
+            if frozen is not None and frozen.owner is current:
+                continue
+
+            storage = _model_storage(_MODEL_DICT_DESCRIPTOR, current)
+            fields_set_value = _model_storage(
+                _MODEL_FIELDS_SET_DESCRIPTOR,
+                current,
+            )
+            extras_value = _model_storage(_MODEL_EXTRAS_DESCRIPTOR, current)
+            storage_is_dict = issubclass(type(storage), dict)
+            fields_set_is_set = issubclass(
+                type(fields_set_value),
+                (set, frozenset),
+            )
+            stored_items = (
+                tuple(dict.items(storage)) if storage_is_dict else ()
+            )
+            fields_set_members = (
+                _native_set_members(fields_set_value) if fields_set_is_set else ()
+            )
+            if extras_value is _MISSING_MODEL_STORAGE:
+                extras_state = "missing"
+                extra_items: tuple[tuple[Any, Any], ...] = ()
+            elif extras_value is None:
+                extras_state = "none"
+                extra_items = ()
+            elif type(extras_value) is dict:
+                extras_state = "dict"
+                extra_items = tuple(dict.items(extras_value))
+            else:
+                extras_state = "malformed"
+                extra_items = ()
+            frozen = _FrozenModelState(
+                owner=current,
+                storage_is_dict=storage_is_dict,
+                stored_items=stored_items,
+                fields_set_is_set=fields_set_is_set,
+                fields_set_members=fields_set_members,
+                extras_state=extras_state,
+                extra_items=extra_items,
+            )
+            frozen_models[identity] = frozen
+            pending.extend(item for _, item in stored_items)
+        elif issubclass(current_type, dict):
+            native_items = tuple(dict.items(current))
+            if type(current) is dict:
+                frozen_containers[identity] = _FrozenContainerState(
+                    owner=current,
+                    kind="dict",
+                    entries=native_items,
+                )
+            pending.extend(item for _, item in native_items)
+        elif issubclass(current_type, list):
+            native_items = tuple(list.__iter__(current))
+            if type(current) is list:
+                frozen_containers[identity] = _FrozenContainerState(
+                    owner=current,
+                    kind="list",
+                    entries=native_items,
+                )
+            pending.extend(native_items)
+        else:
+            native_items = tuple(tuple.__iter__(current))
+            if type(current) is tuple:
+                frozen_containers[identity] = _FrozenContainerState(
+                    owner=current,
+                    kind="tuple",
+                    entries=native_items,
+                )
+            pending.extend(native_items)
+
+
+def _normalize_field_names(
+    names: tuple[Any, ...],
+    *,
+    location: str,
+    storage_kind: str,
+) -> tuple[str, ...]:
+    """Normalize string-subclass names without invoking their hooks."""
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for candidate in names:
+        if not issubclass(type(candidate), str):
+            raise ValueError(
+                f"malformed contract {storage_kind} at {location}: "
+                "field names must be strings"
+            )
+        name = str.__str__(candidate)
+        if name in seen:
+            raise ValueError(
+                f"malformed contract {storage_kind} at {location}: "
+                "field names collide after normalization"
+            )
+        seen.add(name)
+        normalized.append(name)
+    return tuple(normalized)
+
+
+def _normalize_field_items(
+    items: tuple[tuple[Any, Any], ...],
+    *,
+    location: str,
+    storage_kind: str,
+) -> tuple[tuple[str, Any], ...]:
+    """Attach normalized names to values captured from native storage."""
+
+    names = _normalize_field_names(
+        tuple(name for name, _ in items),
+        location=location,
+        storage_kind=storage_kind,
+    )
+    return tuple(
+        (name, item)
+        for name, (_, item) in zip(names, items)
+    )
 
 
 def _snapshot_native_value(
     value: Any,
     *,
     active: set[int],
+    frozen_models: dict[int, _FrozenModelState],
+    frozen_containers: dict[int, _FrozenContainerState],
+    discovered: dict[int, Any],
     depth: int,
     location: str,
 ) -> Any:
@@ -54,86 +216,140 @@ def _snapshot_native_value(
     if depth > _MAX_SNAPSHOT_DEPTH:
         raise ValueError(f"contract graph nesting exceeds the limit at {location}")
 
-    is_container = isinstance(value, (BaseModel, dict, list, tuple))
+    value_type = type(value)
+    is_container = issubclass(value_type, (BaseModel, dict, list, tuple))
     identity = id(value)
     if is_container:
+        _freeze_native_model_graph(
+            value,
+            frozen_models,
+            frozen_containers,
+            discovered,
+        )
         if identity in active:
             raise ValueError(f"cyclic contract graph at {location}")
         active.add(identity)
 
     try:
-        if isinstance(value, BaseModel):
-            storage = _model_storage(_MODEL_DICT_DESCRIPTOR, value)
-            fields_set_value = _model_storage(_MODEL_FIELDS_SET_DESCRIPTOR, value)
-            extras_value = _model_storage(_MODEL_EXTRAS_DESCRIPTOR, value)
-            if not isinstance(storage, dict) or not isinstance(
-                fields_set_value, (set, frozenset)
-            ):
+        if issubclass(value_type, BaseModel):
+            frozen = frozen_models[identity]
+            if not frozen.storage_is_dict or not frozen.fields_set_is_set:
                 raise ValueError(f"malformed contract model at {location}")
-            if extras_value is _MISSING_MODEL_STORAGE:
-                extras_value = None
-            if extras_value is not None and type(extras_value) is not dict:
+            if frozen.extras_state == "malformed":
                 raise ValueError(f"malformed contract extras at {location}")
-            declared = set(type(value).model_fields)
-            stored = set(dict.keys(storage))
-            fields_set = _native_set_copy(fields_set_value)
-            extras = {} if extras_value is None else extras_value
-            duplicated = set(extras) & (stored | declared)
+            stored_items = _normalize_field_items(
+                frozen.stored_items,
+                location=location,
+                storage_kind="model",
+            )
+            fields_set_names = _normalize_field_names(
+                frozen.fields_set_members,
+                location=location,
+                storage_kind="model",
+            )
+            extra_items = _normalize_field_items(
+                frozen.extra_items,
+                location=location,
+                storage_kind="extras",
+            )
+            declared_names = tuple(type(value).model_fields)
+            declared = set(declared_names)
+            stored = {name for name, _ in stored_items}
+            fields_set = set(fields_set_names)
+            extras = {name for name, _ in extra_items}
+            duplicated = extras & (stored | declared)
             if duplicated:
-                names = ", ".join(sorted(str(name) for name in duplicated))
+                names = ", ".join(sorted(duplicated))
                 raise ValueError(
                     f"malformed contract extras at {location}: "
                     f"duplicate field(s): {names}"
                 )
-            undeclared = (stored | fields_set | set(extras)) - declared
+            undeclared = (stored | fields_set | extras) - declared
             if undeclared:
-                names = ", ".join(sorted(str(name) for name in undeclared))
+                names = ", ".join(sorted(undeclared))
                 raise ValueError(
                     f"undeclared contract field(s) at {location}: {names}"
                 )
+            stored_by_name = dict(stored_items)
             stored_values = tuple(
-                (name, dict.__getitem__(storage, name))
-                for name in type(value).model_fields
-                if dict.__contains__(storage, name)
+                (name, stored_by_name[name])
+                for name in declared_names
+                if name in stored_by_name
             )
             return {
                 name: _snapshot_native_value(
                     item,
                     active=active,
+                    frozen_models=frozen_models,
+                    frozen_containers=frozen_containers,
+                    discovered=discovered,
                     depth=depth + 1,
                     location=f"{location}.{name}",
                 )
                 for name, item in stored_values
             }
-        if isinstance(value, dict):
+        if issubclass(value_type, dict):
+            frozen = frozen_containers.get(identity)
+            source_items = (
+                frozen.entries
+                if frozen is not None
+                and frozen.owner is value
+                and frozen.kind == "dict"
+                else value.items()
+            )
             return {
                 key: _snapshot_native_value(
                     item,
                     active=active,
+                    frozen_models=frozen_models,
+                    frozen_containers=frozen_containers,
+                    discovered=discovered,
                     depth=depth + 1,
                     location=f"{location}[key]",
                 )
-                for key, item in value.items()
+                for key, item in source_items
             }
-        if isinstance(value, list):
+        if issubclass(value_type, list):
+            frozen = frozen_containers.get(identity)
+            source_items = (
+                frozen.entries
+                if frozen is not None
+                and frozen.owner is value
+                and frozen.kind == "list"
+                else value
+            )
             return [
                 _snapshot_native_value(
                     item,
                     active=active,
+                    frozen_models=frozen_models,
+                    frozen_containers=frozen_containers,
+                    discovered=discovered,
                     depth=depth + 1,
                     location=f"{location}[{index}]",
                 )
-                for index, item in enumerate(value)
+                for index, item in enumerate(source_items)
             ]
-        if isinstance(value, tuple):
+        if issubclass(value_type, tuple):
+            frozen = frozen_containers.get(identity)
+            source_items = (
+                frozen.entries
+                if frozen is not None
+                and frozen.owner is value
+                and frozen.kind == "tuple"
+                else value
+            )
             return tuple(
                 _snapshot_native_value(
                     item,
                     active=active,
+                    frozen_models=frozen_models,
+                    frozen_containers=frozen_containers,
+                    discovered=discovered,
                     depth=depth + 1,
                     location=f"{location}[{index}]",
                 )
-                for index, item in enumerate(value)
+                for index, item in enumerate(source_items)
             )
         return value
     finally:
@@ -149,12 +365,47 @@ def _validated_contract_snapshot(
 ) -> _ContractT:
     """Return a fresh, fully validated closed-contract snapshot."""
 
-    if not isinstance(value, expected_type):
+    if not issubclass(type(value), expected_type):
+        raise TypeError(f"{label} must be a {expected_type.__name__}")
+    frozen_models: dict[int, _FrozenModelState] = {}
+    frozen_containers: dict[int, _FrozenContainerState] = {}
+    discovered: dict[int, Any] = {}
+    _freeze_native_model_graph(
+        value,
+        frozen_models,
+        frozen_containers,
+        discovered,
+    )
+    return _validated_contract_snapshot_from_frozen(
+        value,
+        expected_type,
+        label=label,
+        frozen_models=frozen_models,
+        frozen_containers=frozen_containers,
+        discovered=discovered,
+    )
+
+
+def _validated_contract_snapshot_from_frozen(
+    value: Any,
+    expected_type: type[_ContractT],
+    *,
+    label: str,
+    frozen_models: dict[int, _FrozenModelState],
+    frozen_containers: dict[int, _FrozenContainerState],
+    discovered: dict[int, Any],
+) -> _ContractT:
+    """Validate using entry state already frozen for the enclosing boundary."""
+
+    if not issubclass(type(value), expected_type):
         raise TypeError(f"{label} must be a {expected_type.__name__}")
     try:
         native = _snapshot_native_value(
             value,
             active=set(),
+            frozen_models=frozen_models,
+            frozen_containers=frozen_containers,
+            discovered=discovered,
             depth=0,
             location=label,
         )
@@ -171,13 +422,48 @@ def _validated_contract_tuple(
 ) -> tuple[_ContractT, ...]:
     """Validate a tuple argument without normalizing another container type."""
 
-    if not isinstance(values, tuple):
+    if not issubclass(type(values), tuple):
+        raise TypeError(f"{label} must be a tuple")
+    frozen_models: dict[int, _FrozenModelState] = {}
+    frozen_containers: dict[int, _FrozenContainerState] = {}
+    discovered: dict[int, Any] = {}
+    _freeze_native_model_graph(
+        values,
+        frozen_models,
+        frozen_containers,
+        discovered,
+    )
+    return _validated_contract_tuple_from_frozen(
+        values,
+        expected_type,
+        label=label,
+        frozen_models=frozen_models,
+        frozen_containers=frozen_containers,
+        discovered=discovered,
+    )
+
+
+def _validated_contract_tuple_from_frozen(
+    values: Any,
+    expected_type: type[_ContractT],
+    *,
+    label: str,
+    frozen_models: dict[int, _FrozenModelState],
+    frozen_containers: dict[int, _FrozenContainerState],
+    discovered: dict[int, Any],
+) -> tuple[_ContractT, ...]:
+    """Validate a tuple using entry state frozen for the enclosing boundary."""
+
+    if not issubclass(type(values), tuple):
         raise TypeError(f"{label} must be a tuple")
     return tuple(
-        _validated_contract_snapshot(
+        _validated_contract_snapshot_from_frozen(
             value,
             expected_type,
             label=f"{label}[{index}]",
+            frozen_models=frozen_models,
+            frozen_containers=frozen_containers,
+            discovered=discovered,
         )
         for index, value in enumerate(values)
     )
@@ -340,15 +626,42 @@ def validate_capability_requirements(
     resolve and evaluate the referenced qualification evidence.
     """
 
-    manifest = _validated_contract_snapshot(
+    if not issubclass(type(manifest), CapabilityManifest):
+        raise TypeError("capability manifest must be a CapabilityManifest")
+
+    requirements_is_tuple = issubclass(type(requirements), tuple)
+    frozen_models: dict[int, _FrozenModelState] = {}
+    frozen_containers: dict[int, _FrozenContainerState] = {}
+    discovered: dict[int, Any] = {}
+    _freeze_native_model_graph(
+        manifest,
+        frozen_models,
+        frozen_containers,
+        discovered,
+    )
+    if requirements_is_tuple:
+        _freeze_native_model_graph(
+            requirements,
+            frozen_models,
+            frozen_containers,
+            discovered,
+        )
+
+    manifest = _validated_contract_snapshot_from_frozen(
         manifest,
         CapabilityManifest,
         label="capability manifest",
+        frozen_models=frozen_models,
+        frozen_containers=frozen_containers,
+        discovered=discovered,
     )
-    requirements = _validated_contract_tuple(
+    requirements = _validated_contract_tuple_from_frozen(
         requirements,
         CapabilityRequirement,
         label="capability requirements",
+        frozen_models=frozen_models,
+        frozen_containers=frozen_containers,
+        discovered=discovered,
     )
     states_by_operation = _operation_state_lookup(manifest)
 
