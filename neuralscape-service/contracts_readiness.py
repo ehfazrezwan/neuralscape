@@ -28,6 +28,7 @@ CapabilityStatus = Literal[
 _AWARE_DATETIME_ADAPTER = TypeAdapter(AwareDatetime)
 _OPAQUE_ID_ADAPTER = TypeAdapter(OpaqueId)
 _SAFE_COUNTER_ADAPTER = TypeAdapter(SafeCounter)
+_PYDANTIC_DICT_DESCRIPTOR = BaseModel.__dict__["__dict__"]
 _PYDANTIC_EXTRA_DESCRIPTOR = BaseModel.__dict__["__pydantic_extra__"]
 
 
@@ -85,7 +86,7 @@ def _snapshot_closed_graph(
     try:
         if isinstance(value, BaseModel):
             stored_entries = tuple(
-                dict.items(object.__getattribute__(value, "__dict__"))
+                dict.items(_PYDANTIC_DICT_DESCRIPTOR.__get__(value, BaseModel))
             )
             declared = type(value).model_fields
             extras = _model_extra_storage(value)
