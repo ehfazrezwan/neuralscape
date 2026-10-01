@@ -89,6 +89,70 @@ class _RaisingClassHiddenDict(_HiddenBackingDict):
         raise AssertionError("__class__ must not be read")
 
 
+class _EmptyNativeRaisingViews(dict[str, object]):
+    """Actually empty native storage whose overridden views must stay unused."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.view_calls = 0
+
+    def _called(self):
+        self.view_calls += 1
+        raise AssertionError("overridden dict view must not be read")
+
+    def __len__(self) -> int:
+        return self._called()
+
+    def __bool__(self) -> bool:
+        return self._called()
+
+    def __iter__(self) -> Iterator[str]:
+        return self._called()
+
+    def __getitem__(self, key: str) -> object:
+        return self._called()
+
+    def keys(self):
+        return self._called()
+
+    def items(self):
+        return self._called()
+
+
+class _EmptyNativeFabricatedViews(dict[str, object]):
+    """Actually empty native storage with fabricated nonempty public views."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.view_calls = 0
+
+    def __len__(self) -> int:
+        self.view_calls += 1
+        return 1
+
+    def __bool__(self) -> bool:
+        self.view_calls += 1
+        return True
+
+    def __iter__(self) -> Iterator[str]:
+        self.view_calls += 1
+        return iter(("fabricated_unknown",))
+
+    def __getitem__(self, key: str) -> object:
+        self.view_calls += 1
+        if key == "fabricated_unknown":
+            return True
+        raise KeyError(key)
+
+    def keys(self):
+        self.view_calls += 1
+        return {"fabricated_unknown": True}.keys()
+
+    def items(self):
+        self.view_calls += 1
+        return {"fabricated_unknown": True}.items()
+
+
 def _attach_extra_storage(body: MemoryBody, storage: object) -> MemoryBody:
     object.__setattr__(body, "__pydantic_extra__", storage)
     return body
@@ -213,6 +277,79 @@ def test_parser_extra_storage_controls_preserve_existing_behavior() -> None:
     with pytest.raises(ValidationError):
         parse_memory_body(inverted)
     assert inverse.items_calls == 0
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        PlaintextBody(kind="plaintext", text="secret"),
+        OpaqueEnvelopeBody(kind="opaque_envelope", envelope_id="env-1"),
+    ],
+    ids=["plaintext", "opaque-envelope"],
+)
+@pytest.mark.parametrize(
+    "extra_type",
+    [_EmptyNativeRaisingViews, _EmptyNativeFabricatedViews],
+    ids=["raising-views", "fabricated-views"],
+)
+def test_parser_accepts_empty_native_backing_without_overridden_views(
+    body: MemoryBody,
+    extra_type: type[_EmptyNativeRaisingViews | _EmptyNativeFabricatedViews],
+) -> None:
+    extras = extra_type()
+    _attach_extra_storage(body, extras)
+
+    parsed = parse_memory_body(body)
+
+    assert parsed.kind == body.kind
+    assert tuple(dict.items(extras)) == ()
+    assert extras.view_calls == 0
+
+
+def test_parser_empty_native_projection_preserves_injected_unknown_field() -> None:
+    body = PlaintextBody(kind="plaintext", text="secret")
+    object.__setattr__(body, "injected_unknown", "deny")
+    extras = _EmptyNativeRaisingViews()
+    _attach_extra_storage(body, extras)
+
+    with pytest.raises(ValidationError) as exc:
+        parse_memory_body(body)
+
+    assert any(
+        error["loc"][-1] == "injected_unknown" for error in exc.value.errors()
+    )
+    assert extras.view_calls == 0
+
+
+def test_parser_empty_native_projection_preserves_subclass_field() -> None:
+    class SpecializedPlaintextBody(PlaintextBody):
+        declared_note: str
+
+    body = SpecializedPlaintextBody(
+        kind="plaintext",
+        text="secret",
+        declared_note="subclass-only",
+    )
+    extras = _EmptyNativeRaisingViews()
+    _attach_extra_storage(body, extras)
+
+    with pytest.raises(ValidationError) as exc:
+        parse_memory_body(body)
+
+    assert any(error["loc"][-1] == "declared_note" for error in exc.value.errors())
+    assert extras.view_calls == 0
+
+
+def test_parser_empty_native_projection_preserves_missing_fields() -> None:
+    body = PlaintextBody.model_construct(kind="plaintext")
+    extras = _EmptyNativeRaisingViews()
+    _attach_extra_storage(body, extras)
+
+    with pytest.raises(ValidationError) as exc:
+        parse_memory_body(body)
+
+    assert any(error["loc"][-1] == "text" for error in exc.value.errors())
+    assert extras.view_calls == 0
 
 
 def test_parser_uses_concrete_extra_storage_type() -> None:

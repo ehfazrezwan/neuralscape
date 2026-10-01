@@ -48,11 +48,8 @@ MEMORY_BODY_ADAPTER: TypeAdapter[MemoryBody] = TypeAdapter(MemoryBody)
 """Reusable validator and JSON-schema adapter for :data:`MemoryBody`."""
 
 
-def _with_native_dict_extra_backing(
-    value: object,
-    field_names: tuple[str, ...],
-) -> object:
-    """Expose nonempty native dict extra storage to closed revalidation."""
+def _with_native_dict_extra_backing(value: object) -> object:
+    """Project a model with native dict extra storage for closed revalidation."""
     value_type = type(value)
     if not issubclass(value_type, BaseModel):
         return value
@@ -64,18 +61,11 @@ def _with_native_dict_extra_backing(
     # Bypass every overridable view on a dict subclass and capture its actual
     # backing exactly once. Non-dict mappings retain Pydantic's existing path.
     captured = tuple(dict.items(extras))
-    if not captured:
-        return value
-
-    model_backing = dict(
+    projected = dict(
         dict.items(object.__getattribute__(value, "__dict__"))
     )
-    projected = {
-        name: model_backing[name]
-        for name in field_names
-        if name in model_backing
-    }
-    projected["native_extra_backing"] = dict(captured)
+    if captured:
+        projected["native_extra_backing"] = dict(captured)
     return projected
 
 
@@ -88,12 +78,9 @@ def parse_memory_body(value: object) -> MemoryBody:
 
     value_type = type(value)
     if issubclass(value_type, PlaintextBody):
-        value = _with_native_dict_extra_backing(value, ("kind", "text"))
+        value = _with_native_dict_extra_backing(value)
     elif issubclass(value_type, OpaqueEnvelopeBody):
-        value = _with_native_dict_extra_backing(
-            value,
-            ("kind", "envelope_id"),
-        )
+        value = _with_native_dict_extra_backing(value)
     return MEMORY_BODY_ADAPTER.validate_python(value)
 
 

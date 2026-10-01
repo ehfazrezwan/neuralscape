@@ -84,6 +84,70 @@ class _RaisingClassHiddenDict(_HiddenBackingDict):
         raise AssertionError("__class__ must not be read")
 
 
+class _EmptyNativeRaisingViews(dict[str, object]):
+    """Actually empty native storage whose overridden views must stay unused."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.view_calls = 0
+
+    def _called(self):
+        self.view_calls += 1
+        raise AssertionError("overridden dict view must not be read")
+
+    def __len__(self) -> int:
+        return self._called()
+
+    def __bool__(self) -> bool:
+        return self._called()
+
+    def __iter__(self) -> Iterator[str]:
+        return self._called()
+
+    def __getitem__(self, key: str) -> object:
+        return self._called()
+
+    def keys(self):
+        return self._called()
+
+    def items(self):
+        return self._called()
+
+
+class _EmptyNativeFabricatedViews(dict[str, object]):
+    """Actually empty native storage with fabricated nonempty public views."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.view_calls = 0
+
+    def __len__(self) -> int:
+        self.view_calls += 1
+        return 1
+
+    def __bool__(self) -> bool:
+        self.view_calls += 1
+        return True
+
+    def __iter__(self) -> Iterator[str]:
+        self.view_calls += 1
+        return iter(("fabricated_unknown",))
+
+    def __getitem__(self, key: str) -> object:
+        self.view_calls += 1
+        if key == "fabricated_unknown":
+            return True
+        raise KeyError(key)
+
+    def keys(self):
+        self.view_calls += 1
+        return {"fabricated_unknown": True}.keys()
+
+    def items(self):
+        self.view_calls += 1
+        return {"fabricated_unknown": True}.items()
+
+
 def _attach_extra_storage(
     policy: ProcessingPolicy,
     storage: object,
@@ -298,6 +362,112 @@ def test_dispatch_extra_storage_controls_preserve_existing_behavior() -> None:
             is_fallback=False,
         )
     assert inverse.items_calls == 0
+
+
+@pytest.mark.parametrize(
+    "extra_type",
+    [_EmptyNativeRaisingViews, _EmptyNativeFabricatedViews],
+    ids=["raising-views", "fabricated-views"],
+)
+def test_dispatch_accepts_empty_native_backing_without_overridden_views(
+    extra_type: type[_EmptyNativeRaisingViews | _EmptyNativeFabricatedViews],
+) -> None:
+    extras = extra_type()
+    policy = _attach_extra_storage(_strict_local_policy(), extras)
+
+    validate_plaintext_dispatch(
+        policy,
+        execution_location="endpoint",
+        recipient_id=None,
+        current_policy_epoch=7,
+        currently_authorized_recipient_ids=set(),
+        is_fallback=False,
+    )
+
+    assert tuple(dict.items(extras)) == ()
+    assert extras.view_calls == 0
+
+
+def test_dispatch_empty_native_projection_preserves_injected_unknown_field() -> None:
+    policy = _strict_local_policy()
+    object.__setattr__(policy, "injected_unknown", "deny")
+    extras = _EmptyNativeRaisingViews()
+    _attach_extra_storage(policy, extras)
+
+    with pytest.raises(PlaintextDispatchRejected, match="policy is invalid") as exc:
+        validate_plaintext_dispatch(
+            policy,
+            execution_location="endpoint",
+            recipient_id=None,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=set(),
+            is_fallback=False,
+        )
+
+    assert isinstance(exc.value.__cause__, ValidationError)
+    assert any(
+        error["loc"] == ("injected_unknown",)
+        for error in exc.value.__cause__.errors()
+    )
+    assert extras.view_calls == 0
+
+
+def test_dispatch_empty_native_projection_preserves_subclass_field() -> None:
+    class SpecializedPolicy(ProcessingPolicy):
+        declared_note: str
+
+    policy = SpecializedPolicy(
+        schema_version="candidate-v1",
+        mode="strict_local",
+        allowed_execution_locations=("endpoint",),
+        approved_recipient_ids=(),
+        fallback_policy="deny",
+        policy_epoch=7,
+        declared_note="subclass-only",
+    )
+    extras = _EmptyNativeRaisingViews()
+    _attach_extra_storage(policy, extras)
+
+    with pytest.raises(PlaintextDispatchRejected, match="policy is invalid") as exc:
+        validate_plaintext_dispatch(
+            policy,
+            execution_location="endpoint",
+            recipient_id=None,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=set(),
+            is_fallback=False,
+        )
+
+    assert isinstance(exc.value.__cause__, ValidationError)
+    assert any(
+        error["loc"] == ("declared_note",)
+        for error in exc.value.__cause__.errors()
+    )
+    assert extras.view_calls == 0
+
+
+def test_dispatch_empty_native_projection_preserves_missing_fields() -> None:
+    policy = ProcessingPolicy.model_construct(schema_version="candidate-v1")
+    extras = _EmptyNativeRaisingViews()
+    _attach_extra_storage(policy, extras)
+
+    with pytest.raises(PlaintextDispatchRejected, match="policy is invalid") as exc:
+        validate_plaintext_dispatch(
+            policy,
+            execution_location="endpoint",
+            recipient_id=None,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=set(),
+            is_fallback=False,
+        )
+
+    assert isinstance(exc.value.__cause__, ValidationError)
+    missing_locations = {
+        error["loc"] for error in exc.value.__cause__.errors()
+    }
+    assert ("mode",) in missing_locations
+    assert ("policy_epoch",) in missing_locations
+    assert extras.view_calls == 0
 
 
 def test_dispatch_uses_concrete_extra_storage_type() -> None:
