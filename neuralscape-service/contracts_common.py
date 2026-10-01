@@ -8,6 +8,7 @@ authority merely because a value validates.
 """
 
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Annotated, Literal
 
 from pydantic import (
@@ -85,33 +86,115 @@ def _mapping_entries(
     return tuple(value.items())
 
 
-def snapshot_contract_graph(
-    value: object, active_containers: set[int] | None = None
-) -> object:
-    """Reconstruct stored contract graphs while rejecting structural defects.
+@dataclass
+class _ModelInventory:
+    model_type: type[BaseModel]
+    stored_entries: tuple[tuple[object, object], ...]
+    extra: object | None
+    extra_entries: tuple[tuple[object, object], ...] | None = None
+    malformed_extra: bool = False
 
-    Malformed extra storage, declared/extra overlap, and cycles are rejected.
-    This is neither schema validation nor authorization: callers must strictly
-    reconstruct the intended target model before trusting the result.
-    """
+
+@dataclass
+class _GraphInventory:
+    models: dict[int, _ModelInventory] = field(default_factory=dict)
+    sequences: dict[int, tuple[object, ...]] = field(default_factory=dict)
+    dictionaries: dict[int, tuple[tuple[object, object], ...]] = field(
+        default_factory=dict
+    )
+    visited: set[int] = field(default_factory=set)
+
+
+def _capture_native_graph(value: object, inventory: _GraphInventory) -> None:
+    """Freeze supported native backing without invoking public protocols."""
+
+    value_type = type(value)
+    if not issubclass(value_type, (BaseModel, tuple, list, dict)):
+        return
+
+    value_id = id(value)
+    if value_id in inventory.visited:
+        return
+    inventory.visited.add(value_id)
+
+    if issubclass(value_type, BaseModel):
+        stored = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+        stored_entries = tuple(dict.items(stored))
+        try:
+            extra = _BASE_MODEL_EXTRA_DESCRIPTOR.__get__(value, BaseModel)
+        except AttributeError:
+            extra = None
+        model_inventory = _ModelInventory(
+            model_type=value_type,
+            stored_entries=stored_entries,
+            extra=extra,
+        )
+        inventory.models[value_id] = model_inventory
+
+        # Capture every model reachable through native stored backing before
+        # classifying extras or hashing any stored name.
+        for _, item in stored_entries:
+            _capture_native_graph(item, inventory)
+
+        if extra is None:
+            model_inventory.extra_entries = ()
+            return
+        extra_type = type(extra)
+        if issubclass(extra_type, dict):
+            extra_entries = tuple(dict.items(extra))
+            model_inventory.extra_entries = extra_entries
+            for _, item in extra_entries:
+                _capture_native_graph(item, inventory)
+        elif not issubclass(extra_type, Mapping):
+            model_inventory.extra_entries = ()
+            model_inventory.malformed_extra = True
+        # A non-dict Mapping retains its established public items protocol.
+        # Its inventory is captured later, after all natively reachable model
+        # backing has already been frozen.
+        return
+
+    if issubclass(value_type, tuple):
+        items = tuple(tuple.__iter__(value))
+        inventory.sequences[value_id] = items
+        for item in items:
+            _capture_native_graph(item, inventory)
+        return
+
+    if issubclass(value_type, list):
+        items = tuple(list.__iter__(value))
+        inventory.sequences[value_id] = items
+        for item in items:
+            _capture_native_graph(item, inventory)
+        return
+
+    entries = tuple(dict.items(value))
+    inventory.dictionaries[value_id] = entries
+    for _, item in entries:
+        _capture_native_graph(item, inventory)
+
+
+def _snapshot_captured_graph(
+    value: object,
+    active_containers: set[int],
+    inventory: _GraphInventory,
+) -> object:
+    """Reconstruct one graph after its reachable native backing is frozen."""
 
     value_type = type(value)
     if not issubclass(value_type, (BaseModel, tuple, list, dict)):
         return value
 
-    if active_containers is None:
-        active_containers = set()
     value_id = id(value)
+    if value_id not in inventory.visited:
+        _capture_native_graph(value, inventory)
     if value_id in active_containers:
         raise ValueError("cyclic contract input is not supported")
     active_containers.add(value_id)
     try:
         if issubclass(value_type, BaseModel):
-            model_type = value_type
-            # Freeze both model-owned inventories without consulting instance
-            # attribute or dict-view overrides, before visiting any values.
-            stored = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
-            stored_entries = _mapping_entries(stored, type(stored))
+            captured = inventory.models[value_id]
+            model_type = captured.model_type
+            stored_entries = captured.stored_entries
             stored_names = {key for key, _ in stored_entries}
             declared_names = set(model_type.model_fields)
             alias_owners = _validation_alias_owners(model_type)
@@ -131,26 +214,24 @@ def snapshot_contract_graph(
                     "contract input contains stored validation alias roots "
                     "with missing owning fields"
                 )
-            try:
-                extra = _BASE_MODEL_EXTRA_DESCRIPTOR.__get__(value, BaseModel)
-            except AttributeError:
-                extra = None
-            extra_entries: tuple[tuple[object, object], ...] = ()
-            malformed_extra = False
-            if extra is not None:
-                extra_type = type(extra)
-                if not issubclass(extra_type, Mapping):
-                    malformed_extra = True
-                else:
-                    extra_entries = _mapping_entries(extra, extra_type)
+
+            extra_entries = captured.extra_entries
+            if extra_entries is None:
+                extra_entries = _mapping_entries(
+                    captured.extra,  # type: ignore[arg-type]
+                    type(captured.extra),
+                )
+                captured.extra_entries = extra_entries
+                for _, item in extra_entries:
+                    _capture_native_graph(item, inventory)
 
             fields = {
-                key: snapshot_contract_graph(item, active_containers)
+                key: _snapshot_captured_graph(item, active_containers, inventory)
                 for key, item in stored_entries
             }
-            if malformed_extra:
+            if captured.malformed_extra:
                 raise ValueError("contract extra storage must be a mapping")
-            if extra is not None:
+            if captured.extra is not None:
                 extra_keys = {key for key, _ in extra_entries}
                 reserved_names = stored_names | declared_names | alias_roots
                 if reserved_names & extra_keys:
@@ -161,26 +242,60 @@ def snapshot_contract_graph(
                     raise ValueError("contract extra storage contains duplicate keys")
             fields.update(
                 {
-                    key: snapshot_contract_graph(item, active_containers)
+                    key: _snapshot_captured_graph(
+                        item,
+                        active_containers,
+                        inventory,
+                    )
                     for key, item in extra_entries
                 }
             )
             return fields
+
         if issubclass(value_type, tuple):
+            items = (
+                inventory.sequences[value_id]
+                if value_type is tuple
+                else tuple(iter(value))
+            )
             return tuple(
-                snapshot_contract_graph(item, active_containers) for item in value
+                _snapshot_captured_graph(item, active_containers, inventory)
+                for item in items
             )
         if issubclass(value_type, list):
+            items = (
+                inventory.sequences[value_id]
+                if value_type is list
+                else tuple(iter(value))
+            )
             return [
-                snapshot_contract_graph(item, active_containers) for item in value
+                _snapshot_captured_graph(item, active_containers, inventory)
+                for item in items
             ]
-        dict_entries = _mapping_entries(value, value_type)
+        entries = inventory.dictionaries[value_id]
         return {
-            key: snapshot_contract_graph(item, active_containers)
-            for key, item in dict_entries
+            key: _snapshot_captured_graph(item, active_containers, inventory)
+            for key, item in entries
         }
     finally:
         active_containers.remove(value_id)
+
+
+def snapshot_contract_graph(
+    value: object, active_containers: set[int] | None = None
+) -> object:
+    """Reconstruct stored contract graphs while rejecting structural defects.
+
+    Malformed extra storage, declared/extra overlap, and cycles are rejected.
+    This is neither schema validation nor authorization: callers must strictly
+    reconstruct the intended target model before trusting the result.
+    """
+
+    if active_containers is None:
+        active_containers = set()
+    inventory = _GraphInventory()
+    _capture_native_graph(value, inventory)
+    return _snapshot_captured_graph(value, active_containers, inventory)
 
 
 __all__ = [
