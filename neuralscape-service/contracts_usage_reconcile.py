@@ -182,6 +182,21 @@ class ReconciledLedger(ContractModel):
     total_tokens: SafeCounter | None
     incomplete_attempt_ids: tuple[OpaqueId, ...]
 
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls,
+        source_type: Any,
+        handler: GetCoreSchemaHandler,
+    ) -> core_schema.CoreSchema:
+        schema = handler(source_type)
+        return core_schema.json_or_python_schema(
+            json_schema=schema,
+            python_schema=core_schema.no_info_before_validator_function(
+                _snapshot_python_input,
+                schema,
+            ),
+        )
+
     @model_validator(mode="after")
     def validate_coverage(self) -> "ReconciledLedger":
         if self.coverage == "unreported":
@@ -494,9 +509,25 @@ def _native_snapshot(
                 # Preserve the public traversal callback, but retain the native
                 # dict edges captured before that callback could replace them.
                 try:
-                    tuple(value.items())
+                    source_iterator = iter(value.items())
                 except Exception as exc:
                     return _FailedNativeDictTraversal(exc)
+                public_entries: dict[object, None] = {}
+                while True:
+                    try:
+                        pair = next(source_iterator)
+                    except StopIteration:
+                        break
+                    except Exception as exc:
+                        return _FailedNativeDictTraversal(exc)
+                    try:
+                        key, _public_value = pair
+                    except Exception as exc:
+                        return _FailedNativeDictTraversal(exc)
+                    try:
+                        public_entries[key] = None
+                    except Exception as exc:
+                        return _FailedNativeDictTraversal(exc)
                 source_items = frozen_dict[1]
             else:
                 try:

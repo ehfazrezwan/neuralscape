@@ -2185,19 +2185,25 @@ def test_result_receivers_reject_unknown_from_unchecked_model_construction(
     ]
 
 
-@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+@pytest.mark.parametrize("receiver_name", ["stream", "ledger", "result"])
 def test_result_receivers_preserve_dict_and_json_validation_paths(
     receiver_name: str,
 ) -> None:
     result = reconcile_usage_events([_event()])
-    valid = result.streams[0] if receiver_name == "stream" else result
-    receiver = (
-        ReconciledUsageStream
-        if receiver_name == "stream"
-        else UsageReconciliation
-    )
+    if receiver_name == "stream":
+        valid = result.streams[0]
+        receiver = ReconciledUsageStream
+    elif receiver_name == "ledger":
+        valid = result.ledgers[0]
+        receiver = ReconciledLedger
+    else:
+        valid = result
+        receiver = UsageReconciliation
 
-    assert receiver.model_validate(valid.model_dump(mode="python")) == valid
+    payload = valid.model_dump(mode="python")
+    assert receiver.model_validate(payload) == valid
+    assert receiver.model_validate(MappingProxyType(payload)) == valid
+    assert receiver(**payload) == valid
     assert receiver.model_validate_json(valid.model_dump_json()) == valid
 
 
