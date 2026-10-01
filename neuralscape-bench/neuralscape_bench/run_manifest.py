@@ -12,7 +12,7 @@ import json
 from collections.abc import Mapping
 from datetime import datetime
 from enum import Enum
-from typing import Annotated, Any, Literal, Self
+from typing import Annotated, Any, Literal, NamedTuple, Self
 
 from pydantic import (
     BaseModel,
@@ -42,6 +42,11 @@ _FrozenModelStorage = tuple[
     Any,
     tuple[tuple[Any, Any], ...] | None,
 ]
+
+
+class _FrozenGraph(NamedTuple):
+    models: dict[int, _FrozenModelStorage]
+    native_containers: dict[int, tuple[object, tuple[Any, ...]]]
 
 
 class _ManifestContract(BaseModel):
@@ -299,10 +304,10 @@ class RunManifest(_ManifestContract):
 
 def _freeze_model_storage(
     value: Any,
-    frozen_models: dict[int, _FrozenModelStorage],
+    frozen_graph: _FrozenGraph,
     visited: set[int],
 ) -> None:
-    """Capture nested model storage before overridable graph traversal."""
+    """Capture native graph entries before overridable graph traversal."""
 
     value_type = type(value)
     is_native_container = issubclass(value_type, (BaseModel, tuple, list, dict))
@@ -315,6 +320,9 @@ def _freeze_model_storage(
     visited.add(identity)
 
     if issubclass(value_type, BaseModel):
+        existing_model = frozen_graph.models.get(identity)
+        if existing_model is not None and existing_model[0] is value:
+            return
         stored = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
         stored_entries = tuple(dict.items(stored))
         try:
@@ -326,34 +334,48 @@ def _freeze_model_storage(
             if extras is not None and issubclass(type(extras), dict)
             else None
         )
-        frozen_models[identity] = (
+        frozen_graph.models[identity] = (
             value,
             stored_entries,
             extras,
             native_extra_entries,
         )
         for _stored_name, stored_value in stored_entries:
-            _freeze_model_storage(stored_value, frozen_models, visited)
+            _freeze_model_storage(stored_value, frozen_graph, visited)
+        return
+
+    existing_container = frozen_graph.native_containers.get(identity)
+    if (
+        value_type in (dict, list, tuple)
+        and existing_container is not None
+        and existing_container[0] is value
+    ):
         return
 
     if issubclass(value_type, tuple):
-        items = tuple.__iter__(value)
+        entries = tuple(tuple.__iter__(value))
     elif issubclass(value_type, list):
-        items = list.__iter__(value)
+        entries = tuple(list.__iter__(value))
     else:
-        items = (item for _key, item in dict.items(value))
-    for item in items:
-        _freeze_model_storage(item, frozen_models, visited)
+        dict_entries = tuple(dict.items(value))
+        entries = tuple(item for _key, item in dict_entries)
+    if value_type in (dict, list, tuple):
+        frozen_graph.native_containers[identity] = (
+            value,
+            dict_entries if value_type is dict else entries,
+        )
+    for item in entries:
+        _freeze_model_storage(item, frozen_graph, visited)
 
 
-def _freeze_model_graphs(*values: Any) -> dict[int, _FrozenModelStorage]:
-    """Capture every supplied native model graph in one shared inventory."""
+def _freeze_model_graphs(*values: Any) -> _FrozenGraph:
+    """Capture every supplied native graph in one shared inventory."""
 
-    frozen_models: dict[int, _FrozenModelStorage] = {}
+    frozen_graph = _FrozenGraph(models={}, native_containers={})
     visited: set[int] = set()
     for value in values:
-        _freeze_model_storage(value, frozen_models, visited)
-    return frozen_models
+        _freeze_model_storage(value, frozen_graph, visited)
+    return frozen_graph
 
 
 def _snapshot_native(
@@ -361,7 +383,7 @@ def _snapshot_native(
     *,
     path: str = "$",
     active: set[int] | None = None,
-    _frozen_models: dict[int, _FrozenModelStorage] | None = None,
+    _frozen_graph: _FrozenGraph | None = None,
 ) -> Any:
     """Copy native input without coercion while enforcing closed model storage.
 
@@ -372,8 +394,8 @@ def _snapshot_native(
     caller's actual structure instead of a normalized substitute.
     """
 
-    if _frozen_models is None:
-        _frozen_models = _freeze_model_graphs(value)
+    if _frozen_graph is None:
+        _frozen_graph = _freeze_model_graphs(value)
     if active is None:
         active = set()
 
@@ -387,10 +409,10 @@ def _snapshot_native(
     try:
         if isinstance(value, BaseModel):
             fields = type(value).model_fields
-            frozen = _frozen_models.get(identity)
+            frozen = _frozen_graph.models.get(identity)
             if frozen is None or frozen[0] is not value:
-                _freeze_model_storage(value, _frozen_models, set())
-                frozen = _frozen_models[identity]
+                _freeze_model_storage(value, _frozen_graph, set())
+                frozen = _frozen_graph.models[identity]
             _model, stored_entries, extras, native_extra_entries = frozen
             stored_values = dict(stored_entries)
             undeclared = set(stored_values).difference(fields)
@@ -413,41 +435,65 @@ def _snapshot_native(
                     stored_values[name],
                     path=f"{path}.{name}",
                     active=active,
-                    _frozen_models=_frozen_models,
+                    _frozen_graph=_frozen_graph,
                 )
                 for name in fields
                 if name in stored_values
             }
 
         if isinstance(value, Mapping):
+            if type(value) is dict:
+                frozen_container = _frozen_graph.native_containers.get(identity)
+                if frozen_container is None or frozen_container[0] is not value:
+                    _freeze_model_storage(value, _frozen_graph, set())
+                    frozen_container = _frozen_graph.native_containers[identity]
+                mapping_items = frozen_container[1]
+            else:
+                mapping_items = tuple(value.items())
             return {
                 key: _snapshot_native(
                     item,
                     path=f"{path}[{key!r}]",
                     active=active,
-                    _frozen_models=_frozen_models,
+                    _frozen_graph=_frozen_graph,
                 )
-                for key, item in value.items()
+                for key, item in mapping_items
             }
         if isinstance(value, tuple):
+            if type(value) is tuple:
+                frozen_container = _frozen_graph.native_containers.get(identity)
+                if frozen_container is None or frozen_container[0] is not value:
+                    _freeze_model_storage(value, _frozen_graph, set())
+                    frozen_container = _frozen_graph.native_containers[identity]
+                tuple_items = frozen_container[1]
+            else:
+                tuple_items = value
             return tuple(
                 _snapshot_native(
                     item,
                     path=f"{path}[{index}]",
                     active=active,
-                    _frozen_models=_frozen_models,
+                    _frozen_graph=_frozen_graph,
                 )
-                for index, item in enumerate(value)
+                for index, item in enumerate(tuple_items)
             )
         if isinstance(value, list):
+            if type(value) is list:
+                frozen_container = _frozen_graph.native_containers.get(identity)
+                if frozen_container is None or frozen_container[0] is not value:
+                    _freeze_model_storage(value, _frozen_graph, set())
+                    frozen_container = _frozen_graph.native_containers[identity]
+                list_items = frozen_container[1]
+            else:
+                list_items = value
             return [
                 _snapshot_native(
                     item,
                     path=f"{path}[{index}]",
                     active=active,
-                    _frozen_models=_frozen_models,
+                    _frozen_graph=_frozen_graph,
                 )
-                for index, item in enumerate(value)
+                for index, item in enumerate(list_items)
             ]
         return value
     finally:
@@ -458,14 +504,14 @@ def _snapshot_native(
 def _validated_manifest_snapshot(
     manifest: RunManifest,
     *,
-    _frozen_models: dict[int, _FrozenModelStorage] | None = None,
+    _frozen_graph: _FrozenGraph | None = None,
 ) -> RunManifest:
     """Return a fresh, deeply validated manifest graph from native evidence."""
 
     if not isinstance(manifest, RunManifest):
         raise TypeError("manifest must be a RunManifest")
     return RunManifest.model_validate(
-        _snapshot_native(manifest, _frozen_models=_frozen_models)
+        _snapshot_native(manifest, _frozen_graph=_frozen_graph)
     )
 
 
@@ -480,7 +526,7 @@ def finish_run(
 ) -> RunManifest:
     """Finish a planned run without allowing its declared envelope to change."""
 
-    frozen_models = _freeze_model_graphs(
+    frozen_graph = _freeze_model_graphs(
         planned,
         state,
         started_at,
@@ -490,40 +536,40 @@ def finish_run(
     )
     validated_planned = _validated_manifest_snapshot(
         planned,
-        _frozen_models=frozen_models,
+        _frozen_graph=frozen_graph,
     )
     if validated_planned.state is not RunState.PLANNED:
         raise ValueError("only a planned run can be finished")
 
     candidate_data = _snapshot_native(
         validated_planned,
-        _frozen_models=frozen_models,
+        _frozen_graph=frozen_graph,
     )
     candidate_data.update(
         state=_snapshot_native(
             state,
             path="$.state",
-            _frozen_models=frozen_models,
+            _frozen_graph=frozen_graph,
         ),
         started_at=_snapshot_native(
             started_at,
             path="$.started_at",
-            _frozen_models=frozen_models,
+            _frozen_graph=frozen_graph,
         ),
         finished_at=_snapshot_native(
             finished_at,
             path="$.finished_at",
-            _frozen_models=frozen_models,
+            _frozen_graph=frozen_graph,
         ),
         resources=_snapshot_native(
             resources,
             path="$.resources",
-            _frozen_models=frozen_models,
+            _frozen_graph=frozen_graph,
         ),
         measurements=_snapshot_native(
             measurements,
             path="$.measurements",
-            _frozen_models=frozen_models,
+            _frozen_graph=frozen_graph,
         ),
     )
     candidate = RunManifest.model_validate(candidate_data)
