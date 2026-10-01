@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
-from typing import Literal
+from collections.abc import Iterable, Iterator, Mapping
+from dataclasses import dataclass
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, GetCoreSchemaHandler, model_validator
+from pydantic_core import core_schema
 
 from contracts_common import ContractModel, OpaqueId, SafeCounter
 from contracts_usage import (
@@ -20,6 +22,22 @@ from contracts_usage import (
 
 
 _MAX_SAFE_COUNTER = 9_007_199_254_740_991
+_MODEL_DICT_DESCRIPTOR = BaseModel.__dict__["__dict__"]
+_MODEL_EXTRAS_DESCRIPTOR = BaseModel.__dict__["__pydantic_extra__"]
+_FrozenModelStorage = tuple[
+    BaseModel,
+    tuple[tuple[object, object], ...],
+    object,
+    tuple[tuple[object, object], ...] | None,
+]
+_FrozenDictStorage = tuple[
+    dict[object, object],
+    tuple[tuple[object, object], ...],
+]
+_FrozenTupleStorage = tuple[
+    tuple[object, ...],
+    tuple[object, ...],
+]
 _LEDGER_ORDER: tuple[UsageLedger, ...] = (
     "service",
     "consuming_agent",
@@ -43,6 +61,60 @@ LedgerCoverage = Literal["reported", "unreported"]
 LedgerMissingReason = Literal["no_events"]
 
 
+class _FailedNativeDictTraversal(dict[object, object]):
+    """Let Pydantic locate one failed native-dict mapping traversal."""
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__()
+        self.error = error
+
+    def items(self):
+        raise self.error
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidatedPublicMappingEntries:
+    entries: Iterable[object]
+    iterator: Iterator[object]
+    retained_keys: dict[object, None]
+    retained_entries: tuple[tuple[object, object, object], ...]
+
+
+def _validate_public_mapping_entries(
+    entries: Iterable[object],
+) -> _FailedNativeDictTraversal | _ValidatedPublicMappingEntries:
+    """Validate public mapping entry shape and key insertion only."""
+
+    try:
+        source_iterator = iter(entries)
+    except Exception as exc:
+        return _FailedNativeDictTraversal(exc)
+    public_entries: dict[object, None] = {}
+    retained_entries: list[tuple[object, object, object]] = []
+    while True:
+        try:
+            pair = next(source_iterator)
+        except StopIteration:
+            break
+        except Exception as exc:
+            return _FailedNativeDictTraversal(exc)
+        try:
+            key, public_value = pair
+        except Exception as exc:
+            return _FailedNativeDictTraversal(exc)
+        try:
+            public_entries[key] = None
+        except Exception as exc:
+            return _FailedNativeDictTraversal(exc)
+        retained_entries.append((pair, key, public_value))
+    return _ValidatedPublicMappingEntries(
+        entries=entries,
+        iterator=source_iterator,
+        retained_keys=public_entries,
+        retained_entries=tuple(retained_entries),
+    )
+
+
 class UsageReconciliationError(ValueError):
     """A deterministic validation failure in a supplied event set."""
 
@@ -50,6 +122,10 @@ class UsageReconciliationError(ValueError):
         self.code = code
         self.detail = detail
         super().__init__(f"{code}: {detail}")
+
+
+def _snapshot_python_input(value: Any) -> Any:
+    return _native_snapshot(value)
 
 
 class ReconciledUsageStream(ContractModel):
@@ -74,6 +150,21 @@ class ReconciledUsageStream(ContractModel):
     known_token_subtotal: SafeCounter
     total_tokens: SafeCounter | None
     incomplete_categories: tuple[str, ...]
+
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls,
+        source_type: Any,
+        handler: GetCoreSchemaHandler,
+    ) -> core_schema.CoreSchema:
+        schema = handler(source_type)
+        return core_schema.json_or_python_schema(
+            json_schema=schema,
+            python_schema=core_schema.no_info_before_validator_function(
+                _snapshot_python_input,
+                schema,
+            ),
+        )
 
     @model_validator(mode="after")
     def validate_usage_summary(self) -> "ReconciledUsageStream":
@@ -135,6 +226,21 @@ class ReconciledLedger(ContractModel):
     total_tokens: SafeCounter | None
     incomplete_attempt_ids: tuple[OpaqueId, ...]
 
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls,
+        source_type: Any,
+        handler: GetCoreSchemaHandler,
+    ) -> core_schema.CoreSchema:
+        schema = handler(source_type)
+        return core_schema.json_or_python_schema(
+            json_schema=schema,
+            python_schema=core_schema.no_info_before_validator_function(
+                _snapshot_python_input,
+                schema,
+            ),
+        )
+
     @model_validator(mode="after")
     def validate_coverage(self) -> "ReconciledLedger":
         if self.coverage == "unreported":
@@ -164,6 +270,21 @@ class UsageReconciliation(ContractModel):
     tenant_id: OpaqueId
     streams: tuple[ReconciledUsageStream, ...]
     ledgers: tuple[ReconciledLedger, ...]
+
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls,
+        source_type: Any,
+        handler: GetCoreSchemaHandler,
+    ) -> core_schema.CoreSchema:
+        schema = handler(source_type)
+        return core_schema.json_or_python_schema(
+            json_schema=schema,
+            python_schema=core_schema.no_info_before_validator_function(
+                _snapshot_python_input,
+                schema,
+            ),
+        )
 
     @model_validator(mode="after")
     def validate_result_graph(self) -> "UsageReconciliation":
@@ -236,16 +357,136 @@ class UsageReconciliation(ContractModel):
         return self
 
 
-def _native_snapshot(value: object, active: set[int] | None = None) -> object:
+def _freeze_model_storage(
+    value: object,
+    frozen_models: dict[int, _FrozenModelStorage],
+    frozen_dicts: dict[int, _FrozenDictStorage],
+    frozen_tuples: dict[int, _FrozenTupleStorage],
+    visited: set[int],
+) -> None:
+    """Capture reachable native model stores without public traversal hooks."""
+
+    value_type = type(value)
+    is_native_container = issubclass(
+        value_type,
+        (BaseModel, dict, list, tuple, set, frozenset),
+    )
+    if not is_native_container:
+        return
+
+    identity = id(value)
+    if identity in visited:
+        return
+    visited.add(identity)
+
+    if issubclass(value_type, BaseModel):
+        frozen_model = frozen_models.get(identity)
+        if frozen_model is not None and frozen_model[0] is value:
+            return
+        stored = _MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+        stored_items = tuple(dict.items(stored))
+        try:
+            extras = _MODEL_EXTRAS_DESCRIPTOR.__get__(value, BaseModel)
+        except AttributeError:
+            extras = None
+        native_extra_items = (
+            tuple(dict.items(extras))
+            if extras is not None and issubclass(type(extras), dict)
+            else None
+        )
+        frozen_models[identity] = (
+            value,
+            stored_items,
+            extras,
+            native_extra_items,
+        )
+        for _name, field_value in stored_items:
+            _freeze_model_storage(
+                field_value,
+                frozen_models,
+                frozen_dicts,
+                frozen_tuples,
+                visited,
+            )
+        if native_extra_items is not None:
+            for _name, field_value in native_extra_items:
+                _freeze_model_storage(
+                    field_value,
+                    frozen_models,
+                    frozen_dicts,
+                    frozen_tuples,
+                    visited,
+                )
+        return
+
+    if issubclass(value_type, dict):
+        frozen_dict = frozen_dicts.get(identity)
+        if frozen_dict is not None and frozen_dict[0] is value:
+            return
+        native_items = tuple(dict.items(value))
+        frozen_dicts[identity] = (value, native_items)
+        items = (item for _key, item in native_items)
+    elif issubclass(value_type, list):
+        items = list.__iter__(value)
+    elif issubclass(value_type, tuple):
+        frozen_tuple = frozen_tuples.get(identity)
+        if frozen_tuple is not None and frozen_tuple[0] is value:
+            return
+        native_items = tuple(tuple.__iter__(value))
+        frozen_tuples[identity] = (value, native_items)
+        items = iter(native_items)
+    elif issubclass(value_type, set):
+        items = set.__iter__(value)
+    else:
+        items = frozenset.__iter__(value)
+    for item in items:
+        _freeze_model_storage(
+            item,
+            frozen_models,
+            frozen_dicts,
+            frozen_tuples,
+            visited,
+        )
+
+
+def _native_snapshot(
+    value: object,
+    active: set[int] | None = None,
+    *,
+    _frozen_models: dict[int, _FrozenModelStorage] | None = None,
+    _frozen_dicts: dict[int, _FrozenDictStorage] | None = None,
+    _frozen_tuples: dict[int, _FrozenTupleStorage] | None = None,
+) -> object:
     """Copy a nested native/model graph without trusting model construction.
 
     Reading ``__dict__`` deliberately retains unknown fields injected by
     unchecked model copies so the destination contract can reject them.
     """
 
+    if (
+        _frozen_models is None
+        or _frozen_dicts is None
+        or _frozen_tuples is None
+    ):
+        if _frozen_models is None:
+            _frozen_models = {}
+        if _frozen_dicts is None:
+            _frozen_dicts = {}
+        if _frozen_tuples is None:
+            _frozen_tuples = {}
+        _freeze_model_storage(
+            value,
+            _frozen_models,
+            _frozen_dicts,
+            _frozen_tuples,
+            set(),
+        )
     if active is None:
         active = set()
-    if not isinstance(value, (BaseModel, dict, list, tuple, set, frozenset)):
+    if not isinstance(
+        value,
+        (BaseModel, Mapping, list, tuple, set, frozenset),
+    ):
         return value
 
     identity = id(value)
@@ -254,41 +495,170 @@ def _native_snapshot(value: object, active: set[int] | None = None) -> object:
     active.add(identity)
     try:
         if isinstance(value, BaseModel):
-            fields = {
-                name: _native_snapshot(field_value, active)
-                for name, field_value in vars(value).items()
-            }
-            extras = getattr(value, "__pydantic_extra__", None)
-            if extras is not None:
-                if not isinstance(extras, Mapping):
-                    raise ValueError("contract extra storage must be a mapping")
-                iterated_extra_names = tuple(extras)
-                extra_items = tuple(extras.items())
-                extra_names = set(iterated_extra_names) | {
-                    name for name, _ in extra_items
-                }
-                declared_fields = type(value).model_fields
-                if (set(fields) | set(declared_fields)).intersection(extra_names):
-                    raise ValueError("contract extra storage overlaps stored fields")
-                fields.update(
-                    {
-                        name: _native_snapshot(field_value, active)
-                        for name, field_value in extra_items
-                    }
+            frozen = _frozen_models.get(identity)
+            if frozen is None or frozen[0] is not value:
+                _freeze_model_storage(
+                    value,
+                    _frozen_models,
+                    _frozen_dicts,
+                    _frozen_tuples,
+                    set(),
                 )
-            return fields
-        if isinstance(value, dict):
-            return {
-                key: _native_snapshot(field_value, active)
-                for key, field_value in value.items()
+                frozen = _frozen_models[identity]
+            _model, stored_items, extras, native_extra_items = frozen
+            extra_items: tuple[tuple[object, object], ...] = ()
+            if extras is not None:
+                if native_extra_items is not None:
+                    extra_items = native_extra_items
+                    extra_names = {name for name, _ in extra_items}
+                else:
+                    if not isinstance(extras, Mapping):
+                        raise ValueError("contract extra storage must be a mapping")
+                    iterated_extra_names = tuple(extras)
+                    extra_items = tuple(extras.items())
+                    extra_names = set(iterated_extra_names) | {
+                        name for name, _ in extra_items
+                    }
+                declared_fields = type(value).model_fields
+                stored_names = {name for name, _ in stored_items}
+                if (stored_names | set(declared_fields)).intersection(extra_names):
+                    raise ValueError("contract extra storage overlaps stored fields")
+            fields = {
+                name: _native_snapshot(
+                    field_value,
+                    active,
+                    _frozen_models=_frozen_models,
+                    _frozen_dicts=_frozen_dicts,
+                    _frozen_tuples=_frozen_tuples,
+                )
+                for name, field_value in stored_items
             }
+            if extra_items:
+                fields.update(
+                {
+                    name: _native_snapshot(
+                        field_value,
+                        active,
+                        _frozen_models=_frozen_models,
+                        _frozen_dicts=_frozen_dicts,
+                        _frozen_tuples=_frozen_tuples,
+                    )
+                    for name, field_value in extra_items
+                }
+            )
+            return fields
+        if isinstance(value, Mapping):
+            frozen_dict = _frozen_dicts.get(identity)
+            if frozen_dict is not None and frozen_dict[0] is value:
+                # Preserve the public traversal callback, but retain the native
+                # dict edges captured before that callback could replace them.
+                try:
+                    public_items = value.items()
+                except Exception as exc:
+                    return _FailedNativeDictTraversal(exc)
+                validated_entries = _validate_public_mapping_entries(public_items)
+                if isinstance(validated_entries, _FailedNativeDictTraversal):
+                    return validated_entries
+                # Keep the iterator, retained keys, and all entry components
+                # in caller scope until authoritative projection is complete.
+                source_items = frozen_dict[1]
+            else:
+                try:
+                    source_iterator = iter(value.items())
+                except Exception as exc:
+                    return _FailedNativeDictTraversal(exc)
+                projected: dict[object, object] = {}
+                while True:
+                    try:
+                        pair = next(source_iterator)
+                    except StopIteration:
+                        break
+                    except Exception as exc:
+                        return _FailedNativeDictTraversal(exc)
+                    try:
+                        key, field_value = pair
+                    except Exception as exc:
+                        return _FailedNativeDictTraversal(exc)
+                    projected_value = _native_snapshot(
+                        field_value,
+                        active,
+                        _frozen_models=_frozen_models,
+                        _frozen_dicts=_frozen_dicts,
+                        _frozen_tuples=_frozen_tuples,
+                    )
+                    try:
+                        projected[key] = projected_value
+                    except Exception as exc:
+                        return _FailedNativeDictTraversal(exc)
+                return projected
+            projected = {}
+            for key, field_value in source_items:
+                projected_value = _native_snapshot(
+                    field_value,
+                    active,
+                    _frozen_models=_frozen_models,
+                    _frozen_dicts=_frozen_dicts,
+                    _frozen_tuples=_frozen_tuples,
+                )
+                try:
+                    projected[key] = projected_value
+                except Exception as exc:
+                    return _FailedNativeDictTraversal(exc)
+            del validated_entries
+            return projected
         if isinstance(value, list):
-            return [_native_snapshot(item, active) for item in value]
+            return [
+                _native_snapshot(
+                    item,
+                    active,
+                    _frozen_models=_frozen_models,
+                    _frozen_dicts=_frozen_dicts,
+                    _frozen_tuples=_frozen_tuples,
+                )
+                for item in value
+            ]
         if isinstance(value, tuple):
-            return tuple(_native_snapshot(item, active) for item in value)
+            frozen_tuple = _frozen_tuples.get(identity)
+            if frozen_tuple is None or frozen_tuple[0] is not value:
+                _freeze_model_storage(
+                    value,
+                    _frozen_models,
+                    _frozen_dicts,
+                    _frozen_tuples,
+                    set(),
+                )
+                frozen_tuple = _frozen_tuples[identity]
+            return tuple(
+                _native_snapshot(
+                    item,
+                    active,
+                    _frozen_models=_frozen_models,
+                    _frozen_dicts=_frozen_dicts,
+                    _frozen_tuples=_frozen_tuples,
+                )
+                for item in frozen_tuple[1]
+            )
         if isinstance(value, set):
-            return {_native_snapshot(item, active) for item in value}
-        return frozenset(_native_snapshot(item, active) for item in value)
+            return {
+                _native_snapshot(
+                    item,
+                    active,
+                    _frozen_models=_frozen_models,
+                    _frozen_dicts=_frozen_dicts,
+                    _frozen_tuples=_frozen_tuples,
+                )
+                for item in value
+            }
+        return frozenset(
+            _native_snapshot(
+                item,
+                active,
+                _frozen_models=_frozen_models,
+                _frozen_dicts=_frozen_dicts,
+                _frozen_tuples=_frozen_tuples,
+            )
+            for item in value
+        )
     finally:
         active.remove(identity)
 
