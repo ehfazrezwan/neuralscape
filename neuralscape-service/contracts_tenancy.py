@@ -324,10 +324,32 @@ def validate_operation_transition(
 ) -> TenantOperationState:
     """Reject identity changes, generation rollback, and invalid progress changes."""
 
+    if not isinstance(previous, TenantOperationState):
+        raise TypeError("operation must be a TenantOperationState")
+
     freeze_native_graph, rebuild = _closed_graph_snapshot_session()
-    freeze_native_graph(previous)
-    freeze_native_graph(current)
+    previous_capture_error: Exception | None = None
+    try:
+        freeze_native_graph(previous)
+    except Exception as error:
+        previous_capture_error = error
+
+    current_capture_error: Exception | None = None
+    if isinstance(current, TenantOperationState):
+        try:
+            freeze_native_graph(current)
+        except Exception as error:
+            current_capture_error = error
+    else:
+        current_capture_error = TypeError(
+            "operation must be a TenantOperationState"
+        )
+
+    if previous_capture_error is not None:
+        raise previous_capture_error
     previous = _validated_operation_snapshot(previous, rebuild=rebuild)
+    if current_capture_error is not None:
+        raise current_capture_error
     current = _validated_operation_snapshot(current, rebuild=rebuild)
 
     immutable_fields = ("tenant_id", "operation_id", "operation", "desired_state")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from collections.abc import Mapping
 from copy import deepcopy
 from types import MappingProxyType
@@ -620,6 +621,79 @@ def test_transition_freezes_current_before_previous_callbacks(
     assert result == valid_current
     assert valid_callback.calls == expected_calls
     assert valid_child.manifest_id == "primary"
+
+
+def _operation_with_too_deep_manifest_graph() -> TenantOperationState:
+    nested: list[object] = []
+    for _ in range(sys.getrecursionlimit() + 100):
+        nested = [nested]
+    return operation(observed_state="running").model_copy(
+        update={"resource_manifests": nested}
+    )
+
+
+def test_transition_preserves_previous_error_before_current_capture_failure() -> None:
+    ordinary_previous = operation()
+    _set_native_field(
+        ordinary_previous.resource_manifests[0],
+        "manifest_id",
+        "",
+    )
+    with pytest.raises(ValidationError) as ordinary_error:
+        validate_operation_transition(
+            ordinary_previous,
+            operation(observed_state="running"),
+        )
+
+    competing_previous = operation()
+    _set_native_field(
+        competing_previous.resource_manifests[0],
+        "manifest_id",
+        "",
+    )
+    with pytest.raises(ValidationError) as competing_error:
+        validate_operation_transition(
+            competing_previous,
+            _operation_with_too_deep_manifest_graph(),
+        )
+
+    assert competing_error.value.errors() == ordinary_error.value.errors()
+    with pytest.raises(RecursionError, match="maximum recursion depth exceeded"):
+        validate_operation_transition(
+            operation(),
+            _operation_with_too_deep_manifest_graph(),
+        )
+
+
+def test_transition_does_not_capture_unsupported_current_before_its_turn() -> None:
+    nested: list[object] = []
+    for _ in range(sys.getrecursionlimit() + 100):
+        nested = [nested]
+    callback_calls: list[str] = []
+    unsupported = RepairingTuple(
+        (nested,),
+        lambda: callback_calls.append("called"),
+    )
+
+    invalid_previous = operation()
+    _set_native_field(
+        invalid_previous.resource_manifests[0],
+        "manifest_id",
+        "",
+    )
+    with pytest.raises(ValidationError) as previous_error:
+        validate_operation_transition(invalid_previous, unsupported)
+    assert previous_error.value.errors()[0]["type"] == "string_too_short"
+    assert unsupported.calls == 0
+    assert callback_calls == []
+
+    with pytest.raises(
+        TypeError,
+        match="operation must be a TenantOperationState",
+    ):
+        validate_operation_transition(operation(), unsupported)
+    assert unsupported.calls == 0
+    assert callback_calls == []
 
 
 @pytest.mark.parametrize(
