@@ -583,6 +583,107 @@ class LazyProvenanceMapping(Mapping[str, object]):
         return generate()
 
 
+class InventoryMapping(Mapping[object, object]):
+    """Expose a benign, counted public pair stream for inventory tests."""
+
+    def __init__(
+        self,
+        pairs: tuple[tuple[object, ...], ...],
+        *,
+        name: str = "mapping",
+        events: list[str] | None = None,
+    ):
+        self.pairs = pairs
+        self.name = name
+        self.events = events if events is not None else []
+        self.items_calls = 0
+        self.yielded_indexes: list[int] = []
+
+    def __getitem__(self, key: object) -> object:
+        for pair in self.pairs:
+            if len(pair) == 2 and pair[0] == key:
+                return pair[1]
+        raise KeyError(key)
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def __iter__(self):
+        return (pair[0] for pair in self.pairs if pair)
+
+    def items(self):
+        self.items_calls += 1
+        self.events.append(f"{self.name}:items")
+
+        def generate():
+            for index, pair in enumerate(self.pairs):
+                self.yielded_indexes.append(index)
+                self.events.append(f"{self.name}:yield:{index}")
+                yield pair
+
+        return generate()
+
+
+class PublicItemsDict(dict[object, object]):
+    """Keep native dict backing distinct from its public items authority."""
+
+    def __init__(
+        self,
+        native: dict[object, object],
+        public_pairs: tuple[tuple[object, object], ...],
+    ):
+        super().__init__(native)
+        self.public_pairs = public_pairs
+        self.items_calls = 0
+
+    def items(self):
+        self.items_calls += 1
+        return iter(self.public_pairs)
+
+
+class FailingItemsMapping(Mapping[object, object]):
+    def __init__(self):
+        self.items_calls = 0
+
+    def __getitem__(self, key: object) -> object:
+        raise KeyError(key)
+
+    def __len__(self) -> int:
+        return 0
+
+    def __iter__(self):
+        return iter(())
+
+    def items(self):
+        self.items_calls += 1
+        raise RuntimeError("ordinary public mapping observation failed")
+
+
+class FailingIteratorMapping(Mapping[object, object]):
+    def __init__(self):
+        self.items_calls = 0
+        self.yielded = 0
+
+    def __getitem__(self, key: object) -> object:
+        raise KeyError(key)
+
+    def __len__(self) -> int:
+        return 0
+
+    def __iter__(self):
+        return iter(())
+
+    def items(self):
+        self.items_calls += 1
+
+        def generate():
+            self.yielded += 1
+            yield "prefix", 1
+            raise RuntimeError("ordinary public mapping iterator failed")
+
+        return generate()
+
+
 class ArmedFieldName(str):
     """Run one callback when a stored field name is next hashed."""
 
@@ -774,6 +875,188 @@ def test_successful_alias_and_cycle_traversals_record_exact_owners():
     assert frozen.completed_traversals[id(cycle)] is cycle
     assert _protect_yielded_model_storage(aliased, frozen) is False
     assert _protect_yielded_model_storage(cycle, frozen) is False
+
+
+def test_public_mapping_inventory_replays_one_recursive_alias_projection():
+    events: list[str] = []
+    inner = InventoryMapping((("leaf", 1),), name="inner", events=events)
+    outer = InventoryMapping(
+        (("inner", inner), ("tail", 2)),
+        name="outer",
+        events=events,
+    )
+    proxy = MappingProxyType({"outer": outer})
+    value = {"proxy": proxy, "alias": outer}
+
+    frozen = _freeze_model_graphs(value)
+
+    assert outer.items_calls == 1
+    assert inner.items_calls == 1
+    assert events.index("inner:items") < events.index("outer:yield:1")
+    assert frozen.public_mapping_owners[id(outer)] is outer
+    assert frozen.public_mappings[id(outer)].owner is outer
+
+    assert _snapshot_native(value, _frozen_graph=frozen) == {
+        "proxy": {"outer": {"inner": {"leaf": 1}, "tail": 2}},
+        "alias": {"inner": {"leaf": 1}, "tail": 2},
+    }
+    assert outer.items_calls == 1
+    assert inner.items_calls == 1
+
+
+def test_model_reachable_public_mappings_validate_from_one_inventory():
+    resource = MappingProxyType(measured_memory().model_dump(mode="python"))
+    measurement = InventoryMapping(
+        tuple(
+            (key, item)
+            for key, item in timing().model_dump(mode="python").items()
+        )
+    )
+    manifest = completed_manifest().model_copy(
+        update={
+            "resources": (resource,),
+            "measurements": (measurement,),
+        }
+    )
+
+    received = validate_run_manifest_json(serialize_run_manifest(manifest))
+
+    assert received.resources[0] == measured_memory()
+    assert received.measurements[0] == timing()
+    assert measurement.items_calls == 1
+
+
+def test_dict_subclass_uses_public_inventory_but_exact_dict_uses_native_entries():
+    public = PublicItemsDict(
+        {"native": "backing"},
+        (("public", "projection"),),
+    )
+    exact = {"native": "authority"}
+    value = {"public": public, "exact": exact}
+
+    frozen = _freeze_model_graphs(value)
+
+    assert frozen.replay_entries[id(public)] == (public, ("backing",))
+    assert frozen.public_mappings[id(public)].entries == (
+        ("public", "projection"),
+    )
+    assert id(exact) not in frozen.public_mapping_owners
+    assert _snapshot_native(value, _frozen_graph=frozen) == {
+        "public": {"public": "projection"},
+        "exact": {"native": "authority"},
+    }
+    assert public.items_calls == 1
+
+
+def test_public_mapping_inventory_defers_malformed_pair_and_cycle_diagnostics():
+    malformed = InventoryMapping(
+        (("prefix", 1), ("malformed",), ("unreached", 3)),
+    )
+    malformed_graph = _freeze_model_graphs(malformed)
+
+    assert malformed.items_calls == 1
+    assert malformed.yielded_indexes == [0, 1]
+    assert malformed_graph.public_mappings[id(malformed)].entries == (
+        ("prefix", 1),
+    )
+    with pytest.raises(ValueError, match="not enough values to unpack"):
+        _snapshot_native(malformed, _frozen_graph=malformed_graph)
+
+    terminal = FailingIteratorMapping()
+    terminal_graph = _freeze_model_graphs(terminal)
+
+    assert terminal.items_calls == 1
+    assert terminal.yielded == 1
+    assert terminal_graph.public_mappings[id(terminal)].entries == (
+        ("prefix", 1),
+    )
+    with pytest.raises(RuntimeError, match="public mapping iterator failed"):
+        _snapshot_native(terminal, _frozen_graph=terminal_graph)
+
+    unhashable_key: list[object] = []
+    deferred_key = InventoryMapping(((unhashable_key, 1),))
+    deferred_key_graph = _freeze_model_graphs(deferred_key)
+
+    assert deferred_key.items_calls == 1
+    with pytest.raises(TypeError, match="unhashable type"):
+        _snapshot_native(deferred_key, _frozen_graph=deferred_key_graph)
+
+    cycle = InventoryMapping(())
+    cycle.pairs = (("self", cycle), ("unreached", 2))
+    cycle_graph = _freeze_model_graphs(cycle)
+
+    assert cycle.items_calls == 1
+    assert cycle.yielded_indexes == [0]
+    assert cycle_graph.public_mappings[id(cycle)].complete is False
+    with pytest.raises(ValueError, match="cyclic native input"):
+        _snapshot_native(cycle, _frozen_graph=cycle_graph)
+
+
+def test_public_mapping_observation_failure_stays_deferred_to_receiver_order():
+    invalid_planned = planned_manifest()
+    invalid_concurrency = invalid_planned.concurrency[0].model_copy(
+        update={"value": True}
+    )
+    invalid_planned = invalid_planned.model_copy(
+        update={"concurrency": (invalid_concurrency,)}
+    )
+    invalid_mapping = FailingItemsMapping()
+
+    with pytest.raises(ValidationError) as invalid_error:
+        finish_run(
+            invalid_planned,
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(invalid_mapping,),
+        )
+    assert invalid_error.value.errors()[0]["loc"] == (
+        "concurrency",
+        0,
+        "value",
+    )
+    assert invalid_mapping.items_calls == 1
+
+    nonplanned_mapping = FailingItemsMapping()
+    with pytest.raises(ValueError, match="only a planned run can be finished"):
+        finish_run(
+            completed_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(nonplanned_mapping,),
+        )
+    assert nonplanned_mapping.items_calls == 1
+
+    reached_mapping = FailingItemsMapping()
+    with pytest.raises(
+        RuntimeError,
+        match="ordinary public mapping observation failed",
+    ):
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(reached_mapping,),
+        )
+    assert reached_mapping.items_calls == 1
+
+
+def test_public_only_tuple_mapping_keeps_lazy_first_observation():
+    mapping = InventoryMapping((("value", 1),))
+    parent = PublicViewTuple((), (mapping,))
+
+    frozen = _freeze_model_graphs(parent)
+
+    assert mapping.items_calls == 0
+    assert id(mapping) not in frozen.public_mapping_owners
+    assert _snapshot_native(parent, _frozen_graph=frozen) == ({"value": 1},)
+    assert parent.iteration_calls == 1
+    assert mapping.items_calls == 1
 
 
 @pytest.mark.parametrize("boundary", ["serialize", "finish"])
@@ -1911,7 +2194,7 @@ def test_finish_preserves_deep_later_native_failure_for_valid_planned():
             resources=(deep,),
             measurements=(timing(),),
         )
-    assert deep.items_calls == 0
+    assert deep.items_calls == 1
 
 
 def test_finish_validates_planned_before_deep_later_native_failure():
@@ -1940,7 +2223,7 @@ def test_finish_validates_planned_before_deep_later_native_failure():
         0,
         "value",
     )
-    assert deep_for_invalid.items_calls == 0
+    assert deep_for_invalid.items_calls == 1
 
     deep_for_nonplanned = PublicResourceWithDeepNativeBacking(
         sys.getrecursionlimit() + 600
@@ -1957,7 +2240,7 @@ def test_finish_validates_planned_before_deep_later_native_failure():
             resources=(deep_for_nonplanned,),
             measurements=(timing(),),
         )
-    assert deep_for_nonplanned.items_calls == 0
+    assert deep_for_nonplanned.items_calls == 1
 
 
 def test_finish_snapshots_public_mapping_child_before_requesting_next_pair():
@@ -2185,7 +2468,7 @@ def test_finish_preserves_lazy_exact_dict_priority_and_shared_capture():
         0,
         "value",
     )
-    assert invalid.items_calls == 0
+    assert invalid.items_calls == 1
     assert invalid_trigger.iteration_calls == 0
     assert invalid_callbacks == []
 
@@ -2202,7 +2485,7 @@ def test_finish_preserves_lazy_exact_dict_priority_and_shared_capture():
             resources=(measured_memory(),),
             measurements=(nonplanned,),
         )
-    assert nonplanned.items_calls == 0
+    assert nonplanned.items_calls == 1
     assert nonplanned_trigger.iteration_calls == 0
     assert nonplanned_callbacks == []
 

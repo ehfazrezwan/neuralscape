@@ -44,11 +44,21 @@ _FrozenModelStorage = tuple[
 ]
 
 
+class _FrozenPublicMapping(NamedTuple):
+    owner: Mapping[Any, Any]
+    entries: tuple[tuple[Any, Any], ...]
+    failure: Exception | None
+    complete: bool
+
+
 class _FrozenGraph(NamedTuple):
     models: dict[int, _FrozenModelStorage]
     native_containers: dict[int, tuple[object, tuple[Any, ...]]]
     replay_entries: dict[int, tuple[object, tuple[Any, ...]]]
     completed_traversals: dict[int, object]
+    public_mapping_owners: dict[int, Mapping[Any, Any]]
+    public_mappings: dict[int, _FrozenPublicMapping]
+    completed_mapping_discoveries: dict[int, object]
 
 
 class _ManifestContract(BaseModel):
@@ -304,6 +314,20 @@ class RunManifest(_ManifestContract):
         return self
 
 
+def _retain_public_mapping(value: Any, frozen_graph: _FrozenGraph) -> bool:
+    """Retain a strong owner for a supported nonexact public mapping."""
+
+    if type(value) is dict or not isinstance(value, Mapping):
+        return False
+    identity = id(value)
+    owner = frozen_graph.public_mapping_owners.get(identity)
+    if owner is value:
+        return False
+    frozen_graph.public_mapping_owners[identity] = value
+    frozen_graph.public_mappings.pop(identity, None)
+    return True
+
+
 def _freeze_model_storage(
     value: Any,
     frozen_graph: _FrozenGraph,
@@ -314,6 +338,7 @@ def _freeze_model_storage(
     pending = [value]
     while pending:
         current = pending.pop()
+        _retain_public_mapping(current, frozen_graph)
         value_type = type(current)
         is_native_container = issubclass(
             value_type, (BaseModel, tuple, list, dict)
@@ -330,6 +355,7 @@ def _freeze_model_storage(
         if existing_replay is not None and existing_replay[0] is current:
             continue
         frozen_graph.completed_traversals.pop(identity, None)
+        frozen_graph.completed_mapping_discoveries.pop(identity, None)
 
         if issubclass(value_type, BaseModel):
             existing_model = frozen_graph.models.get(identity)
@@ -436,6 +462,143 @@ def _protect_yielded_model_storage(
     return True
 
 
+def _inventory_reachable_public_mappings(
+    value: Any,
+    frozen_graph: _FrozenGraph,
+    observing: dict[int, Mapping[Any, Any]],
+) -> bool:
+    """Inventory public mappings reachable through retained native storage."""
+
+    pending = [value]
+    visited: set[int] = set()
+    discovered: dict[int, object] = {}
+    while pending:
+        current = pending.pop()
+        identity = id(current)
+        if identity in visited:
+            continue
+        visited.add(identity)
+
+        if type(current) is not dict and isinstance(current, Mapping):
+            _retain_public_mapping(current, frozen_graph)
+            active_owner = observing.get(identity)
+            if active_owner is current:
+                return False
+            if not _inventory_public_mapping(current, frozen_graph, observing):
+                return False
+
+        discovered_owner = frozen_graph.completed_mapping_discoveries.get(
+            identity
+        )
+        if discovered_owner is current:
+            continue
+
+        value_type = type(current)
+        if not issubclass(value_type, (BaseModel, tuple, list, dict)):
+            continue
+        frozen_replay = frozen_graph.replay_entries.get(identity)
+        if frozen_replay is None or frozen_replay[0] is not current:
+            _freeze_model_storage(current, frozen_graph, set())
+            frozen_replay = frozen_graph.replay_entries[identity]
+        _owner, entries = frozen_replay
+        discovered[identity] = current
+        pending.extend(reversed(entries))
+    frozen_graph.completed_mapping_discoveries.update(discovered)
+    return True
+
+
+def _inventory_public_mapping(
+    value: Mapping[Any, Any],
+    frozen_graph: _FrozenGraph,
+    observing: dict[int, Mapping[Any, Any]],
+) -> bool:
+    """Observe one public mapping stream without performing key operations."""
+
+    identity = id(value)
+    frozen = frozen_graph.public_mappings.get(identity)
+    if frozen is not None and frozen.owner is value:
+        return frozen.complete
+
+    active_owner = observing.get(identity)
+    if active_owner is value:
+        return False
+    observing[identity] = value
+    entries: list[tuple[Any, Any]] = []
+    failure: Exception | None = None
+    complete = False
+    try:
+        try:
+            mapping_items = value.items()
+            iterator = iter(mapping_items)
+        except Exception as error:
+            failure = error
+        else:
+            while True:
+                try:
+                    pair = next(iterator)
+                except StopIteration:
+                    complete = True
+                    break
+                except Exception as error:
+                    failure = error
+                    break
+
+                try:
+                    key, item = pair
+                except Exception as error:
+                    failure = error
+                    break
+                entries.append((key, item))
+
+                try:
+                    _protect_yielded_model_storage(item, frozen_graph)
+                except Exception as error:
+                    failure = error
+                    break
+                if not _inventory_reachable_public_mappings(
+                    item,
+                    frozen_graph,
+                    observing,
+                ):
+                    break
+    finally:
+        observing.pop(identity, None)
+
+    frozen_graph.public_mappings[identity] = _FrozenPublicMapping(
+        owner=value,
+        entries=tuple(entries),
+        failure=failure,
+        complete=complete,
+    )
+    return complete
+
+
+def _inventory_retained_public_mappings(frozen_graph: _FrozenGraph) -> None:
+    """Observe retained public mappings in deterministic discovery order."""
+
+    observing: dict[int, Mapping[Any, Any]] = {}
+    while True:
+        pending_owner = next(
+            (
+                owner
+                for identity, owner in frozen_graph.public_mapping_owners.items()
+                if (
+                    identity not in frozen_graph.public_mappings
+                    or frozen_graph.public_mappings[identity].owner is not owner
+                )
+            ),
+            None,
+        )
+        if pending_owner is None:
+            return
+        if not _inventory_public_mapping(
+            pending_owner,
+            frozen_graph,
+            observing,
+        ):
+            return
+
+
 def _freeze_model_graphs(*values: Any) -> _FrozenGraph:
     """Capture every supplied native graph in one shared inventory."""
 
@@ -444,10 +607,14 @@ def _freeze_model_graphs(*values: Any) -> _FrozenGraph:
         native_containers={},
         replay_entries={},
         completed_traversals={},
+        public_mapping_owners={},
+        public_mappings={},
+        completed_mapping_discoveries={},
     )
     visited: set[int] = set()
     for value in values:
         _freeze_model_storage(value, frozen_graph, visited)
+    _inventory_retained_public_mappings(frozen_graph)
     return frozen_graph
 
 
@@ -534,8 +701,14 @@ def _snapshot_native(
                     for key, item in mapping_items
                 }
 
+            _retain_public_mapping(value, _frozen_graph)
+            frozen_mapping = _frozen_graph.public_mappings.get(identity)
+            if frozen_mapping is None or frozen_mapping.owner is not value:
+                _inventory_public_mapping(value, _frozen_graph, {})
+                frozen_mapping = _frozen_graph.public_mappings[identity]
+
             projected: dict[Any, Any] = {}
-            for key, item in value.items():
+            for key, item in frozen_mapping.entries:
                 _protect_yielded_model_storage(item, _frozen_graph)
                 item_path = f"{path}[{key!r}]"
                 projected[key] = _snapshot_native(
@@ -544,6 +717,10 @@ def _snapshot_native(
                     active=active,
                     _frozen_graph=_frozen_graph,
                 )
+            if frozen_mapping.failure is not None:
+                raise frozen_mapping.failure
+            if not frozen_mapping.complete:
+                raise ValueError(f"incomplete public mapping inventory at {path}")
             return projected
         if isinstance(value, tuple):
             if type(value) is tuple:
