@@ -105,7 +105,9 @@ def snapshot_contract_graph(
     try:
         if issubclass(value_type, BaseModel):
             model_type = value_type
-            stored = vars(value)
+            # Freeze both model-owned inventories without consulting instance
+            # attribute or dict-view overrides, before visiting any values.
+            stored = object.__getattribute__(value, "__dict__")
             stored_entries = _mapping_entries(stored, type(stored))
             stored_names = {key for key, _ in stored_entries}
             declared_names = set(model_type.model_fields)
@@ -126,34 +128,34 @@ def snapshot_contract_graph(
                     "contract input contains stored validation alias roots "
                     "with missing owning fields"
                 )
-            fields = {
-                key: snapshot_contract_graph(item, active_containers)
-                for key, item in stored_entries
-            }
-            extra = getattr(value, "__pydantic_extra__", None)
+            try:
+                extra = object.__getattribute__(value, "__pydantic_extra__")
+            except AttributeError:
+                extra = None
+            extra_entries: tuple[tuple[object, object], ...] = ()
             if extra is not None:
                 extra_type = type(extra)
                 if not issubclass(extra_type, Mapping):
                     raise ValueError("contract extra storage must be a mapping")
                 extra_entries = _mapping_entries(extra, extra_type)
                 extra_keys = {key for key, _ in extra_entries}
-                reserved_names = (
-                    fields.keys()
-                    | declared_names
-                    | alias_roots
-                )
+                reserved_names = stored_names | declared_names | alias_roots
                 if reserved_names & extra_keys:
                     raise ValueError(
                         "contract input contains conflicting declared and extra fields"
                     )
                 if len(extra_keys) != len(extra_entries):
                     raise ValueError("contract extra storage contains duplicate keys")
-                fields.update(
-                    {
-                        key: snapshot_contract_graph(item, active_containers)
-                        for key, item in extra_entries
-                    }
-                )
+            fields = {
+                key: snapshot_contract_graph(item, active_containers)
+                for key, item in stored_entries
+            }
+            fields.update(
+                {
+                    key: snapshot_contract_graph(item, active_containers)
+                    for key, item in extra_entries
+                }
+            )
             return fields
         if issubclass(value_type, tuple):
             return tuple(

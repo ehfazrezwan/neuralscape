@@ -168,6 +168,10 @@ class ExampleContractEnvelope(ContractModel):
     item: ExampleContract
 
 
+class ExampleContractListEnvelope(ContractModel):
+    items: list[ExampleContract]
+
+
 class DictionaryEnvelope(ContractModel):
     payload: dict[str, SafeCounter]
 
@@ -289,6 +293,25 @@ class ModelClassSpoofingDict(dict[str, object]):
         return ExampleContract
 
 
+class ModelDictViewHidingExampleContract(ExampleContract):
+    def __getattribute__(self, name: str) -> object:
+        if name == "__dict__":
+            native = object.__getattribute__(self, "__dict__")
+            return {
+                key: item
+                for key, item in dict.items(native)
+                if key != "future_state"
+            }
+        return super().__getattribute__(name)
+
+
+class ModelExtraViewHidingExampleContract(ExampleContract):
+    def __getattribute__(self, name: str) -> object:
+        if name == "__pydantic_extra__":
+            return {}
+        return super().__getattribute__(name)
+
+
 class HiddenItemsDict(dict[str, object]):
     def items(self) -> tuple[tuple[str, object], ...]:
         return tuple(
@@ -403,6 +426,135 @@ def test_snapshot_contract_graph_bypasses_model_dict_inventory_overrides(
 
     assert snapshot == {"count": 1}
     assert ExampleContract.model_validate(snapshot, strict=True) == value
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["direct", "nested"])
+def test_snapshot_contract_graph_uses_native_model_storage(
+    nested: bool,
+) -> None:
+    value = ModelDictViewHidingExampleContract(count=1)
+    native = RaisingInventoryDict(count=1, future_state="preserved")
+    object.__setattr__(value, "__dict__", native)
+    graph: object = {"item": value} if nested else value
+    receiver = ExampleContractEnvelope if nested else ExampleContract
+
+    assert value.__dict__ == {"count": 1}
+    assert dict(dict.items(object.__getattribute__(value, "__dict__"))) == {
+        "count": 1,
+        "future_state": "preserved",
+    }
+
+    snapshot = snapshot_contract_graph(graph)
+
+    expected = (
+        {"item": {"count": 1, "future_state": "preserved"}}
+        if nested
+        else {"count": 1, "future_state": "preserved"}
+    )
+    assert snapshot == expected
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        receiver.model_validate(snapshot, strict=True)
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["direct", "nested"])
+def test_snapshot_contract_graph_uses_native_model_extra_storage(
+    nested: bool,
+) -> None:
+    value = ModelExtraViewHidingExampleContract(count=1)
+    native = RaisingInventoryDict(future_state="preserved")
+    object.__setattr__(value, "__pydantic_extra__", native)
+    graph: object = {"item": value} if nested else value
+    receiver = ExampleContractEnvelope if nested else ExampleContract
+
+    assert value.__pydantic_extra__ == {}
+    assert dict(
+        dict.items(object.__getattribute__(value, "__pydantic_extra__"))
+    ) == {"future_state": "preserved"}
+
+    snapshot = snapshot_contract_graph(graph)
+
+    expected = (
+        {"item": {"count": 1, "future_state": "preserved"}}
+        if nested
+        else {"count": 1, "future_state": "preserved"}
+    )
+    assert snapshot == expected
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        receiver.model_validate(snapshot, strict=True)
+
+
+def test_snapshot_contract_graph_freezes_extras_before_nested_removal() -> None:
+    ordinary = ExampleContractListEnvelope(items=[ExampleContract(count=1)])
+    object.__setattr__(
+        ordinary,
+        "__pydantic_extra__",
+        {"future_state": "preserved"},
+    )
+    ordinary_snapshot = snapshot_contract_graph(ordinary)
+
+    parent: list[ExampleContractListEnvelope | None] = [None]
+
+    class RemovingList(list[ExampleContract]):
+        def __iter__(self) -> Iterator[ExampleContract]:
+            if parent[0] is not None:
+                extras = object.__getattribute__(
+                    parent[0],
+                    "__pydantic_extra__",
+                )
+                dict.clear(extras)
+            return super().__iter__()
+
+    value = ExampleContractListEnvelope(items=[ExampleContract(count=1)])
+    object.__setattr__(value, "items", RemovingList([ExampleContract(count=1)]))
+    object.__setattr__(
+        value,
+        "__pydantic_extra__",
+        {"future_state": "preserved"},
+    )
+    parent[0] = value
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == ordinary_snapshot == {
+        "items": [{"count": 1}],
+        "future_state": "preserved",
+    }
+    assert object.__getattribute__(value, "__pydantic_extra__") == {}
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ExampleContractListEnvelope.model_validate(snapshot, strict=True)
+
+
+def test_snapshot_contract_graph_freezes_extras_before_nested_addition() -> None:
+    ordinary = ExampleContractListEnvelope(items=[ExampleContract(count=1)])
+    ordinary_snapshot = snapshot_contract_graph(ordinary)
+
+    parent: list[ExampleContractListEnvelope | None] = [None]
+
+    class AddingList(list[ExampleContract]):
+        def __iter__(self) -> Iterator[ExampleContract]:
+            if parent[0] is not None:
+                extras = object.__getattribute__(
+                    parent[0],
+                    "__pydantic_extra__",
+                )
+                dict.__setitem__(extras, "late_state", "not_in_snapshot")
+            return super().__iter__()
+
+    value = ExampleContractListEnvelope(items=[ExampleContract(count=1)])
+    object.__setattr__(value, "items", AddingList([ExampleContract(count=1)]))
+    object.__setattr__(value, "__pydantic_extra__", {})
+    parent[0] = value
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == ordinary_snapshot == {"items": [{"count": 1}]}
+    assert object.__getattribute__(value, "__pydantic_extra__") == {
+        "late_state": "not_in_snapshot"
+    }
+    assert (
+        ExampleContractListEnvelope.model_validate(snapshot, strict=True).items[0].count
+        == 1
+    )
 
 
 def test_snapshot_contract_graph_preserves_nested_container_shapes() -> None:
