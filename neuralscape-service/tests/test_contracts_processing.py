@@ -1,5 +1,7 @@
 """Tests for processing-policy and plaintext-recipient boundaries."""
 
+from collections.abc import Iterator, Mapping
+
 import pytest
 from pydantic import ValidationError
 
@@ -8,6 +10,64 @@ from contracts_processing import (
     ProcessingPolicy,
     validate_plaintext_dispatch,
 )
+
+
+class _HiddenBackingDict(dict[str, object]):
+    """A real dict backing whose overridable views all claim to be empty."""
+
+    def __init__(self, values: dict[str, object]) -> None:
+        super().__init__(values)
+        self.view_calls = 0
+
+    def __len__(self) -> int:
+        self.view_calls += 1
+        return 0
+
+    def __bool__(self) -> bool:
+        self.view_calls += 1
+        return False
+
+    def __iter__(self) -> Iterator[str]:
+        self.view_calls += 1
+        return iter(())
+
+    def keys(self):
+        self.view_calls += 1
+        return {}.keys()
+
+    def items(self):
+        self.view_calls += 1
+        return {}.items()
+
+
+class _IterationVisibleItemsEmptyMapping(Mapping[str, object]):
+    """Non-dict control retaining the existing iteration-authoritative path."""
+
+    def __init__(self) -> None:
+        self.items_calls = 0
+
+    def __getitem__(self, key: str) -> object:
+        if key == "future_constraint":
+            return "deny"
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(("future_constraint",))
+
+    def __len__(self) -> int:
+        return 1
+
+    def items(self):
+        self.items_calls += 1
+        return {}.items()
+
+
+def _attach_extra_storage(
+    policy: ProcessingPolicy,
+    storage: object,
+) -> ProcessingPolicy:
+    object.__setattr__(policy, "__pydantic_extra__", storage)
+    return policy
 
 
 def _strict_local_policy(**changes: object) -> ProcessingPolicy:
@@ -149,6 +209,96 @@ def test_dispatch_revalidates_unchecked_strict_local_copy() -> None:
             recipient_id="provider-a",
             current_policy_epoch=7,
             currently_authorized_recipient_ids={"provider-a"},
+            is_fallback=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "backing",
+    [
+        {"future_constraint": "deny"},
+        {"mode": "operator_trusted"},
+    ],
+)
+def test_dispatch_rejects_hidden_native_dict_backing(
+    backing: dict[str, object],
+) -> None:
+    hidden = _HiddenBackingDict(backing)
+    policy = _attach_extra_storage(_strict_local_policy(), hidden)
+
+    with pytest.raises(PlaintextDispatchRejected, match="policy is invalid"):
+        validate_plaintext_dispatch(
+            policy,
+            execution_location="endpoint",
+            recipient_id=None,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=set(),
+            is_fallback=False,
+        )
+
+    assert hidden.view_calls == 0
+
+
+def test_dispatch_extra_storage_controls_preserve_existing_behavior() -> None:
+    empty = _attach_extra_storage(_strict_local_policy(), {})
+    validate_plaintext_dispatch(
+        empty,
+        execution_location="endpoint",
+        recipient_id=None,
+        current_policy_epoch=7,
+        currently_authorized_recipient_ids=set(),
+        is_fallback=False,
+    )
+
+    ordinary = _attach_extra_storage(
+        _strict_local_policy(),
+        {"future_constraint": "deny"},
+    )
+    with pytest.raises(PlaintextDispatchRejected, match="policy is invalid"):
+        validate_plaintext_dispatch(
+            ordinary,
+            execution_location="endpoint",
+            recipient_id=None,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=set(),
+            is_fallback=False,
+        )
+
+    inverse = _IterationVisibleItemsEmptyMapping()
+    inverted = _attach_extra_storage(_strict_local_policy(), inverse)
+    with pytest.raises(PlaintextDispatchRejected, match="policy is invalid"):
+        validate_plaintext_dispatch(
+            inverted,
+            execution_location="endpoint",
+            recipient_id=None,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=set(),
+            is_fallback=False,
+        )
+    assert inverse.items_calls == 0
+
+
+def test_dispatch_declared_subclass_field_remains_invalid_at_base_boundary() -> None:
+    class SpecializedPolicy(ProcessingPolicy):
+        declared_note: str
+
+    policy = SpecializedPolicy(
+        schema_version="candidate-v1",
+        mode="strict_local",
+        allowed_execution_locations=("endpoint",),
+        approved_recipient_ids=(),
+        fallback_policy="deny",
+        policy_epoch=7,
+        declared_note="subclass-only",
+    )
+
+    with pytest.raises(PlaintextDispatchRejected, match="policy is invalid"):
+        validate_plaintext_dispatch(
+            policy,
+            execution_location="endpoint",
+            recipient_id=None,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=set(),
             is_fallback=False,
         )
 

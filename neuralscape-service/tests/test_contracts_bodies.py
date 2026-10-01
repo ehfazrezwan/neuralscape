@@ -1,5 +1,7 @@
 """Tests for the plaintext/opaque body boundary."""
 
+from collections.abc import Iterator, Mapping
+
 import pytest
 from pydantic import ValidationError
 
@@ -17,6 +19,57 @@ class VersionedBodyOwner(VersionedContract):
     """Synthetic enclosing record that owns its nested body's version."""
 
     body: MemoryBody
+
+
+class _HiddenBackingDict(dict[str, object]):
+    def __init__(self, values: dict[str, object]) -> None:
+        super().__init__(values)
+        self.view_calls = 0
+
+    def __len__(self) -> int:
+        self.view_calls += 1
+        return 0
+
+    def __bool__(self) -> bool:
+        self.view_calls += 1
+        return False
+
+    def __iter__(self) -> Iterator[str]:
+        self.view_calls += 1
+        return iter(())
+
+    def keys(self):
+        self.view_calls += 1
+        return {}.keys()
+
+    def items(self):
+        self.view_calls += 1
+        return {}.items()
+
+
+class _IterationVisibleItemsEmptyMapping(Mapping[str, object]):
+    def __init__(self) -> None:
+        self.items_calls = 0
+
+    def __getitem__(self, key: str) -> object:
+        if key == "future_constraint":
+            return "deny"
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(("future_constraint",))
+
+    def __len__(self) -> int:
+        return 1
+
+    def items(self):
+        self.items_calls += 1
+        return {}.items()
+
+
+def _attach_extra_storage(body: MemoryBody, storage: object) -> MemoryBody:
+    object.__setattr__(body, "__pydantic_extra__", storage)
+    return body
 
 
 def test_plaintext_body_preserves_exact_text() -> None:
@@ -78,6 +131,80 @@ def test_parser_revalidates_unchecked_body_copy() -> None:
 
     with pytest.raises(ValidationError):
         parse_memory_body(unchecked)
+
+
+@pytest.mark.parametrize(
+    ("body", "backing"),
+    [
+        (
+            PlaintextBody(kind="plaintext", text="secret"),
+            {"future_constraint": "deny"},
+        ),
+        (
+            PlaintextBody(kind="plaintext", text="secret"),
+            {"text": "replacement"},
+        ),
+        (
+            OpaqueEnvelopeBody(kind="opaque_envelope", envelope_id="env-1"),
+            {"future_constraint": "deny"},
+        ),
+        (
+            OpaqueEnvelopeBody(kind="opaque_envelope", envelope_id="env-1"),
+            {"envelope_id": "replacement"},
+        ),
+    ],
+)
+def test_parser_rejects_hidden_native_dict_backing(
+    body: MemoryBody,
+    backing: dict[str, object],
+) -> None:
+    hidden = _HiddenBackingDict(backing)
+    _attach_extra_storage(body, hidden)
+
+    with pytest.raises(ValidationError, match="extra"):
+        parse_memory_body(body)
+
+    assert hidden.view_calls == 0
+
+
+def test_parser_extra_storage_controls_preserve_existing_behavior() -> None:
+    empty = _attach_extra_storage(
+        PlaintextBody(kind="plaintext", text="secret"),
+        {},
+    )
+    parsed = parse_memory_body(empty)
+    assert isinstance(parsed, PlaintextBody)
+    assert parsed.text == "secret"
+
+    ordinary = _attach_extra_storage(
+        PlaintextBody(kind="plaintext", text="secret"),
+        {"future_constraint": "deny"},
+    )
+    with pytest.raises(ValidationError, match="extra"):
+        parse_memory_body(ordinary)
+
+    inverse = _IterationVisibleItemsEmptyMapping()
+    inverted = _attach_extra_storage(
+        PlaintextBody(kind="plaintext", text="secret"),
+        inverse,
+    )
+    with pytest.raises(ValidationError):
+        parse_memory_body(inverted)
+    assert inverse.items_calls == 0
+
+
+def test_parser_declared_subclass_field_remains_invalid_at_union_boundary() -> None:
+    class SpecializedPlaintextBody(PlaintextBody):
+        declared_note: str
+
+    body = SpecializedPlaintextBody(
+        kind="plaintext",
+        text="secret",
+        declared_note="subclass-only",
+    )
+
+    with pytest.raises(ValidationError, match="extra"):
+        parse_memory_body(body)
 
 
 @pytest.mark.parametrize(

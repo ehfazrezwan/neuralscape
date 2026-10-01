@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Collection
 from typing import Literal
 
-from pydantic import ConfigDict, TypeAdapter, model_validator
+from pydantic import BaseModel, ConfigDict, TypeAdapter, model_validator
 
 from contracts_common import OpaqueId, SafeCounter, VersionedContract
 
@@ -31,6 +31,39 @@ _NON_ENDPOINT_LOCATIONS = frozenset(
 )
 _OPAQUE_ID_ADAPTER = TypeAdapter(OpaqueId)
 _SAFE_COUNTER_ADAPTER = TypeAdapter(SafeCounter)
+_PROCESSING_POLICY_FIELDS = (
+    "schema_version",
+    "mode",
+    "allowed_execution_locations",
+    "approved_recipient_ids",
+    "fallback_policy",
+    "policy_epoch",
+)
+
+
+def _with_native_dict_extra_backing(
+    value: object,
+    field_names: tuple[str, ...],
+) -> object:
+    """Expose nonempty native dict extra storage to closed revalidation."""
+    if not isinstance(value, BaseModel):
+        return value
+    extras = object.__getattribute__(value, "__pydantic_extra__")
+    if not isinstance(extras, dict):
+        return value
+
+    # A dict subclass may lie through len/iteration/keys/items/truthiness.
+    # Snapshot its concrete backing exactly once with the built-in operation.
+    captured = tuple(dict.items(extras))
+    if not captured:
+        return value
+
+    projected = {
+        name: object.__getattribute__(value, name)
+        for name in field_names
+    }
+    projected["native_extra_backing"] = dict(captured)
+    return projected
 
 
 class ProcessingPolicy(VersionedContract):
@@ -115,7 +148,9 @@ def validate_plaintext_dispatch(
     """
 
     try:
-        policy = ProcessingPolicy.model_validate(policy)
+        policy = ProcessingPolicy.model_validate(
+            _with_native_dict_extra_backing(policy, _PROCESSING_POLICY_FIELDS)
+        )
     except (TypeError, ValueError) as exc:
         raise PlaintextDispatchRejected("processing policy is invalid") from exc
 
