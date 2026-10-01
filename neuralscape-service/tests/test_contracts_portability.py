@@ -372,6 +372,10 @@ class HiddenFieldsSetBacking(set[str]):
         )
 
 
+class BenignFieldName(str):
+    pass
+
+
 class DescriptorMaskedManifest(PortableManifest):
     @property
     def __dict__(self) -> dict[str, object]:
@@ -1337,6 +1341,76 @@ def test_fields_set_iterable_storage_preserves_prior_behavior(
     else:
         revalidated = validate_portable_manifest(manifest)
         assert revalidated.manifest_id == "manifest-7"
+
+
+@pytest.mark.parametrize("location", ["manifest", "file"])
+def test_fields_set_storage_states_use_controlled_public_results(
+    location: str,
+) -> None:
+    intact = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    assert validate_portable_manifest(intact).manifest_id == "manifest-7"
+
+    missing = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    missing_target = _model_at_location(missing, location)
+    _PYDANTIC_FIELDS_SET_SLOT.__delete__(missing_target)
+    with pytest.raises(ValidationError) as missing_error:
+        validate_portable_manifest(missing)
+    missing_errors = missing_error.value.errors(include_url=False)
+    assert len(missing_errors) == 1
+    assert missing_errors[0]["type"] == "value_error"
+    assert missing_errors[0]["loc"] == ()
+    assert "contract model fields-set storage is missing" in missing_errors[0][
+        "msg"
+    ]
+
+    malformed = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    malformed_target = _model_at_location(malformed, location)
+    _PYDANTIC_FIELDS_SET_SLOT.__set__(malformed_target, 0)
+    with pytest.raises(ValidationError) as malformed_error:
+        validate_portable_manifest(malformed)
+    malformed_errors = malformed_error.value.errors(include_url=False)
+    assert len(malformed_errors) == 1
+    assert malformed_errors[0]["type"] == "value_error"
+    assert malformed_errors[0]["loc"] == ()
+    assert "'int' object is not iterable" in malformed_errors[0]["msg"]
+
+
+@pytest.mark.parametrize("location", ["manifest", "file"])
+def test_missing_fields_set_precedes_malformed_extra_storage(
+    location: str,
+) -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    target = _model_at_location(manifest, location)
+    _PYDANTIC_FIELDS_SET_SLOT.__delete__(target)
+    _PYDANTIC_EXTRA_SLOT.__set__(target, [])
+
+    with pytest.raises(
+        ValidationError,
+        match="contract model fields-set storage is missing",
+    ):
+        validate_portable_manifest(manifest)
+
+
+@pytest.mark.parametrize(
+    ("location", "field_name"),
+    [("manifest", "manifest_id"), ("file", "path")],
+)
+def test_benign_string_subclass_field_names_remain_valid(
+    location: str,
+    field_name: str,
+) -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    target = _model_at_location(manifest, location)
+    native_fields_set = set.copy(
+        _PYDANTIC_FIELDS_SET_SLOT.__get__(target, type(target))
+    )
+    native_fields_set.remove(field_name)
+    native_fields_set.add(BenignFieldName(field_name))
+    _PYDANTIC_FIELDS_SET_SLOT.__set__(target, native_fields_set)
+
+    revalidated = validate_portable_manifest(manifest)
+
+    assert revalidated.manifest_id == "manifest-7"
 
 
 def test_model_dict_descriptor_cannot_hide_root_unknown() -> None:

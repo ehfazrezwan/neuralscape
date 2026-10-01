@@ -95,9 +95,14 @@ def _reject_retained_unknown_fields(
             native_stored = _PYDANTIC_DICT_DESCRIPTOR.__get__(value, BaseModel)
             stored_entries = tuple(dict.items(native_stored))
             stored = dict(stored_entries)
-            native_fields_set = _PYDANTIC_FIELDS_SET_SLOT.__get__(
-                value, type(value)
-            )
+            try:
+                native_fields_set = _PYDANTIC_FIELDS_SET_SLOT.__get__(
+                    value, type(value)
+                )
+            except AttributeError as exc:
+                raise ValueError(
+                    "contract model fields-set storage is missing"
+                ) from exc
             if issubclass(type(native_fields_set), set):
                 fields_set = set.copy(native_fields_set)
             else:
