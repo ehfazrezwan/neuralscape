@@ -17,6 +17,7 @@ import pydantic
 import pytest
 from pydantic import ValidationError
 
+import neuralscape_bench.run_manifest as run_manifest_module
 from neuralscape_bench.run_manifest import (
     BuildIdentity,
     CacheCondition,
@@ -489,6 +490,139 @@ class PublicViewTuple(tuple[object, ...]):
         return iter(self.public_values)
 
 
+class EventPublicTuple(tuple[object, ...]):
+    """Expose a passive public tuple view and record observation order."""
+
+    def __new__(
+        cls,
+        values: tuple[object, ...],
+        public_values: tuple[object, ...],
+        events: list[str],
+        name: str,
+    ):
+        instance = super().__new__(cls, values)
+        instance.public_values = public_values
+        instance.events = events
+        instance.name = name
+        instance.iteration_calls = 0
+        return instance
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        self.events.append(f"{self.name}:iter")
+        return iter(self.public_values)
+
+
+class IteratorAcquisitionErrorTuple(tuple[object, ...]):
+    """Raise one stable ordinary error while acquiring the public iterator."""
+
+    def __new__(cls, _prefix: object):
+        instance = super().__new__(cls, ())
+        instance.iteration_calls = 0
+        instance.error = RuntimeError(
+            "ordinary public sequence iterator acquisition failed"
+        )
+        return instance
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        raise self.error
+
+
+class IteratorAdvancementErrorTuple(tuple[object, ...]):
+    """Yield one public value, then raise one stable ordinary error."""
+
+    def __new__(cls, prefix: object):
+        instance = super().__new__(cls, ())
+        instance.prefix = prefix
+        instance.iteration_calls = 0
+        instance.advancement_calls = 0
+        instance.error = RuntimeError(
+            "ordinary public sequence iterator advancement failed"
+        )
+        return instance
+
+    def __iter__(self):
+        self.iteration_calls += 1
+
+        def generate():
+            self.advancement_calls += 1
+            yield self.prefix
+            self.advancement_calls += 1
+            raise self.error
+
+        return generate()
+
+
+class IteratorAcquisitionErrorList(list[object]):
+    """Raise one stable ordinary error while acquiring the public iterator."""
+
+    def __init__(self, _prefix: object):
+        super().__init__()
+        self.iteration_calls = 0
+        self.error = RuntimeError(
+            "ordinary public list iterator acquisition failed"
+        )
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        raise self.error
+
+
+class IteratorAdvancementErrorList(list[object]):
+    """Yield one public value, then raise one stable ordinary error."""
+
+    def __init__(self, prefix: object):
+        super().__init__()
+        self.prefix = prefix
+        self.iteration_calls = 0
+        self.advancement_calls = 0
+        self.error = RuntimeError(
+            "ordinary public list iterator advancement failed"
+        )
+
+    def __iter__(self):
+        self.iteration_calls += 1
+
+        def generate():
+            self.advancement_calls += 1
+            yield self.prefix
+            self.advancement_calls += 1
+            raise self.error
+
+        return generate()
+
+
+class PassiveProjectionKey(str):
+    """Count ordinary hashing when a retained mapping prefix is projected."""
+
+    def __new__(cls, value: str):
+        instance = super().__new__(cls, value)
+        instance.hash_calls = 0
+        return instance
+
+    def __hash__(self) -> int:
+        self.hash_calls += 1
+        return str.__hash__(self)
+
+
+class PublicViewList(list[object]):
+    """Keep hidden native list backing distinct from a passive public view."""
+
+    def __init__(
+        self,
+        values: list[object],
+        public_values: list[object],
+    ):
+        super().__init__(values)
+        self.public_values = public_values
+        self.iteration_calls = 0
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        return iter(self.public_values)
+
+
 class PublicResourceWithDeepNativeBacking(dict[str, object]):
     """Expose a valid resource while retaining a deep native-only graph."""
 
@@ -579,6 +713,142 @@ class LazyProvenanceMapping(Mapping[str, object]):
             for key, value in self.values.items():
                 if key != "provenance":
                     yield key, value
+
+        return generate()
+
+
+class InventoryMapping(Mapping[object, object]):
+    """Expose a benign, counted public pair stream for inventory tests."""
+
+    def __init__(
+        self,
+        pairs: tuple[tuple[object, ...], ...],
+        *,
+        name: str = "mapping",
+        events: list[str] | None = None,
+    ):
+        self.pairs = pairs
+        self.name = name
+        self.events = events if events is not None else []
+        self.items_calls = 0
+        self.yielded_indexes: list[int] = []
+
+    def __getitem__(self, key: object) -> object:
+        for pair in self.pairs:
+            if len(pair) == 2 and pair[0] == key:
+                return pair[1]
+        raise KeyError(key)
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def __iter__(self):
+        return (pair[0] for pair in self.pairs if pair)
+
+    def items(self):
+        self.items_calls += 1
+        self.events.append(f"{self.name}:items")
+
+        def generate():
+            for index, pair in enumerate(self.pairs):
+                self.yielded_indexes.append(index)
+                self.events.append(f"{self.name}:yield:{index}")
+                yield pair
+
+        return generate()
+
+
+def dual_interface_timing(
+    provenance: Mapping[object, object],
+) -> tuple[TimingMeasurement, dict[str, int]]:
+    """Build a model whose Mapping view must not outrank model storage."""
+
+    calls = {"getitem": 0, "iter": 0, "len": 0, "items": 0}
+
+    class DualInterfaceTimingMeasurement(
+        TimingMeasurement, Mapping[str, object]
+    ):
+        def __getitem__(self, key: str) -> object:
+            calls["getitem"] += 1
+            return getattr(self, key)
+
+        def __iter__(self):
+            calls["iter"] += 1
+            return iter(type(self).model_fields)
+
+        def __len__(self) -> int:
+            calls["len"] += 1
+            return len(type(self).model_fields)
+
+        def items(self):
+            calls["items"] += 1
+            return (
+                (name, getattr(self, name))
+                for name in type(self).model_fields
+            )
+
+    measurement = DualInterfaceTimingMeasurement.model_validate(
+        timing().model_dump(mode="python")
+    ).model_copy(update={"provenance": provenance})
+    return measurement, calls
+
+
+class PublicItemsDict(dict[object, object]):
+    """Keep native dict backing distinct from its public items authority."""
+
+    def __init__(
+        self,
+        native: dict[object, object],
+        public_pairs: tuple[tuple[object, object], ...],
+    ):
+        super().__init__(native)
+        self.public_pairs = public_pairs
+        self.items_calls = 0
+
+    def items(self):
+        self.items_calls += 1
+        return iter(self.public_pairs)
+
+
+class FailingItemsMapping(Mapping[object, object]):
+    def __init__(self):
+        self.items_calls = 0
+
+    def __getitem__(self, key: object) -> object:
+        raise KeyError(key)
+
+    def __len__(self) -> int:
+        return 0
+
+    def __iter__(self):
+        return iter(())
+
+    def items(self):
+        self.items_calls += 1
+        raise RuntimeError("ordinary public mapping observation failed")
+
+
+class FailingIteratorMapping(Mapping[object, object]):
+    def __init__(self):
+        self.items_calls = 0
+        self.yielded = 0
+
+    def __getitem__(self, key: object) -> object:
+        raise KeyError(key)
+
+    def __len__(self) -> int:
+        return 0
+
+    def __iter__(self):
+        return iter(())
+
+    def items(self):
+        self.items_calls += 1
+
+        def generate():
+            self.yielded += 1
+            yield "prefix", 1
+            raise RuntimeError("ordinary public mapping iterator failed")
 
         return generate()
 
@@ -774,6 +1044,646 @@ def test_successful_alias_and_cycle_traversals_record_exact_owners():
     assert frozen.completed_traversals[id(cycle)] is cycle
     assert _protect_yielded_model_storage(aliased, frozen) is False
     assert _protect_yielded_model_storage(cycle, frozen) is False
+
+
+def test_public_mapping_inventory_replays_one_recursive_alias_projection():
+    events: list[str] = []
+    inner = InventoryMapping((("leaf", 1),), name="inner", events=events)
+    outer = InventoryMapping(
+        (("inner", inner), ("tail", 2)),
+        name="outer",
+        events=events,
+    )
+    proxy = MappingProxyType({"outer": outer})
+    value = {"proxy": proxy, "alias": outer}
+
+    frozen = _freeze_model_graphs(value)
+
+    assert outer.items_calls == 1
+    assert inner.items_calls == 1
+    assert events.index("inner:items") < events.index("outer:yield:1")
+    assert frozen.public_mapping_owners[id(outer)] is outer
+    assert frozen.public_mappings[id(outer)].owner is outer
+    assert frozen.public_mapping_queue == [proxy, outer, inner]
+
+    assert _snapshot_native(value, _frozen_graph=frozen) == {
+        "proxy": {"outer": {"inner": {"leaf": 1}, "tail": 2}},
+        "alias": {"inner": {"leaf": 1}, "tail": 2},
+    }
+    assert outer.items_calls == 1
+    assert inner.items_calls == 1
+
+
+def test_public_mapping_queue_visits_each_retained_owner_once():
+    mappings = tuple(
+        InventoryMapping((), name=f"mapping-{index}") for index in range(32)
+    )
+
+    frozen = _freeze_model_graphs(mappings)
+
+    assert frozen.public_mapping_queue == list(mappings)
+    assert len(frozen.public_mapping_owners) == len(mappings)
+    assert len(frozen.public_mappings) == len(mappings)
+    assert sum(mapping.items_calls for mapping in mappings) == len(mappings)
+
+
+def test_hidden_native_alias_does_not_create_a_public_mapping_cycle():
+    mapping = InventoryMapping(())
+    child = PublicViewList([mapping], ["public-value"])
+    mapping.pairs = (("child", child),)
+
+    frozen = _freeze_model_graphs(mapping)
+
+    assert frozen.public_mappings[id(mapping)].complete is True
+    assert frozen.public_sequences[id(child)].complete is True
+    assert _snapshot_native(mapping, _frozen_graph=frozen) == {
+        "child": ["public-value"]
+    }
+    assert mapping.items_calls == 1
+    assert child.iteration_calls == 1
+
+
+@pytest.mark.parametrize("invalid", [False, True], ids=["valid", "invalid"])
+def test_mapping_inventory_observes_yielded_public_tuple_before_parent_advance(
+    invalid: bool,
+):
+    events: list[str] = []
+    exclusion = timing().exclusions[0]
+    if invalid:
+        exclusion = exclusion.model_copy(update={"count": True})
+    public_exclusions = EventPublicTuple(
+        (),
+        (exclusion,),
+        events,
+        "exclusions",
+    )
+    values = timing().model_dump(mode="python")
+    values["exclusions"] = public_exclusions
+    ordered_pairs = (("exclusions", public_exclusions),) + tuple(
+        (key, item) for key, item in values.items() if key != "exclusions"
+    )
+    measurement = InventoryMapping(
+        ordered_pairs,
+        name="measurement",
+        events=events,
+    )
+
+    if invalid:
+        with pytest.raises(ValidationError) as exc_info:
+            finish_run(
+                planned_manifest(),
+                state=RunState.COMPLETED,
+                started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+                finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+                resources=(measured_memory(),),
+                measurements=(measurement,),
+            )
+        assert exc_info.value.errors()[0]["loc"] == (
+            "measurements",
+            0,
+            "exclusions",
+            0,
+            "count",
+        )
+    else:
+        result = finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(measurement,),
+        )
+        assert result.state is RunState.COMPLETED
+
+    assert events.index("exclusions:iter") < events.index(
+        "measurement:yield:1"
+    )
+    assert measurement.items_calls == 1
+    assert public_exclusions.iteration_calls == 1
+
+
+def test_mapping_inventory_completes_nested_public_tuple_before_parent_advance():
+    events: list[str] = []
+    public_exclusions = EventPublicTuple(
+        (),
+        timing().exclusions,
+        events,
+        "nested-exclusions",
+    )
+    measurement = timing().model_copy(
+        update={"exclusions": public_exclusions}
+    )
+    mapping = InventoryMapping(
+        (("measurement", measurement), ("tail", 1)),
+        name="parent",
+        events=events,
+    )
+
+    frozen = _freeze_model_graphs(mapping)
+
+    assert events.index("nested-exclusions:iter") < events.index(
+        "parent:yield:1"
+    )
+    assert _snapshot_native(mapping, _frozen_graph=frozen)["tail"] == 1
+    assert public_exclusions.iteration_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("sequence_type", "retains_prefix", "expected_advancement_calls"),
+    [
+        (IteratorAcquisitionErrorTuple, False, 0),
+        (IteratorAdvancementErrorTuple, True, 2),
+        (IteratorAcquisitionErrorList, False, 0),
+        (IteratorAdvancementErrorList, True, 2),
+    ],
+    ids=[
+        "tuple-iterator-acquisition",
+        "tuple-iterator-advancement",
+        "list-iterator-acquisition",
+        "list-iterator-advancement",
+    ],
+)
+def test_public_sequence_iterator_failure_is_retained_and_replayed_once(
+    sequence_type,
+    retains_prefix: bool,
+    expected_advancement_calls: int,
+):
+    projection_key = PassiveProjectionKey("projected")
+    prefix = InventoryMapping(((projection_key, "prefix-value"),))
+    sequence = sequence_type(prefix)
+    primary = InventoryMapping((("sequence", sequence),), name="primary")
+    alias = InventoryMapping((("sequence", sequence),), name="alias")
+
+    frozen = _freeze_model_graphs(primary, alias)
+
+    retained = frozen.public_sequences[id(sequence)]
+    assert retained.owner is sequence
+    assert retained.entries == ((prefix,) if retains_prefix else ())
+    assert retained.failure is sequence.error
+    assert retained.complete is False
+    assert sequence.iteration_calls == 1
+    assert getattr(sequence, "advancement_calls", 0) == (
+        expected_advancement_calls
+    )
+    assert primary.items_calls == 1
+    assert alias.items_calls == 0
+    assert prefix.items_calls == (1 if retains_prefix else 0)
+    assert projection_key.hash_calls == 0
+    assert _snapshot_native(
+        {"safe": "value"}, _frozen_graph=frozen
+    ) == {"safe": "value"}
+    assert projection_key.hash_calls == 0
+
+    with pytest.raises(RuntimeError) as alias_error:
+        _snapshot_native(alias, _frozen_graph=frozen)
+    assert projection_key.hash_calls == (1 if retains_prefix else 0)
+    with pytest.raises(RuntimeError) as primary_error:
+        _snapshot_native(primary, _frozen_graph=frozen)
+
+    assert alias_error.value is sequence.error
+    assert primary_error.value is sequence.error
+    assert sequence.iteration_calls == 1
+    assert getattr(sequence, "advancement_calls", 0) == (
+        expected_advancement_calls
+    )
+    assert primary.items_calls == 1
+    assert alias.items_calls == 1
+    assert prefix.items_calls == (1 if retains_prefix else 0)
+    assert projection_key.hash_calls == (2 if retains_prefix else 0)
+
+
+@pytest.mark.parametrize(
+    "sequence_type",
+    [
+        IteratorAcquisitionErrorTuple,
+        IteratorAdvancementErrorTuple,
+        IteratorAcquisitionErrorList,
+        IteratorAdvancementErrorList,
+    ],
+    ids=[
+        "tuple-iterator-acquisition",
+        "tuple-iterator-advancement",
+        "list-iterator-acquisition",
+        "list-iterator-advancement",
+    ],
+)
+def test_public_sequence_iterator_failure_preserves_receiver_error_order(
+    sequence_type,
+):
+    def measurement_with(sequence):
+        values = timing().model_dump(mode="python")
+        values["exclusions"] = sequence
+        return InventoryMapping(tuple(values.items()))
+
+    invalid_planned = planned_manifest()
+    invalid_concurrency = invalid_planned.concurrency[0].model_copy(
+        update={"value": True}
+    )
+    invalid_planned = invalid_planned.model_copy(
+        update={"concurrency": (invalid_concurrency,)}
+    )
+    deferred_sequence = sequence_type(timing().exclusions[0])
+    deferred_measurement = measurement_with(deferred_sequence)
+
+    with pytest.raises(ValidationError) as invalid_error:
+        finish_run(
+            invalid_planned,
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(deferred_measurement,),
+        )
+
+    assert invalid_error.value.errors()[0]["loc"] == (
+        "concurrency",
+        0,
+        "value",
+    )
+    assert deferred_sequence.iteration_calls == 1
+    assert deferred_measurement.items_calls == 1
+
+    reached_sequence = sequence_type(timing().exclusions[0])
+    reached_measurement = measurement_with(reached_sequence)
+    with pytest.raises(RuntimeError) as reached_error:
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(reached_measurement,),
+        )
+
+    assert reached_error.value is reached_sequence.error
+    assert reached_sequence.iteration_calls == 1
+    assert reached_measurement.items_calls == 1
+
+
+@pytest.mark.parametrize("boundary", ["mapping", "sequence"])
+def test_recursive_public_shape_failure_is_deferred_and_replayed_once(
+    boundary: str,
+    monkeypatch,
+):
+    sentinel = object()
+    failure = RuntimeError("ordinary recursive public-shape helper failed")
+    failure_calls = 0
+    original = run_manifest_module._inventory_yielded_public_shape
+
+    def inject_failure(value, frozen_graph, observing):
+        nonlocal failure_calls
+        if value is sentinel:
+            failure_calls += 1
+            raise failure
+        return original(value, frozen_graph, observing)
+
+    monkeypatch.setattr(
+        run_manifest_module,
+        "_inventory_yielded_public_shape",
+        inject_failure,
+    )
+    projection_key = PassiveProjectionKey("projected")
+    prefix = InventoryMapping(((projection_key, "prefix-value"),))
+    if boundary == "mapping":
+        failing_child = InventoryMapping(
+            (("prefix", prefix), ("terminal", sentinel)),
+            name="failing-child",
+        )
+    else:
+        failing_child = EventPublicTuple(
+            (),
+            (prefix, sentinel),
+            [],
+            "failing-child",
+        )
+    primary = InventoryMapping((("child", failing_child),), name="primary")
+    alias = InventoryMapping((("child", failing_child),), name="alias")
+
+    frozen = _freeze_model_graphs(primary, alias)
+
+    if boundary == "mapping":
+        retained = frozen.public_mappings[id(failing_child)]
+        assert failing_child.items_calls == 1
+    else:
+        retained = frozen.public_sequences[id(failing_child)]
+        assert failing_child.iteration_calls == 1
+    assert retained.owner is failing_child
+    assert retained.entries == (
+        (("prefix", prefix), ("terminal", sentinel))
+        if boundary == "mapping"
+        else (prefix, sentinel)
+    )
+    assert retained.failure is failure
+    assert retained.complete is False
+    assert failure_calls == 1
+    assert prefix.items_calls == 1
+    assert projection_key.hash_calls == 0
+    assert primary.items_calls == 1
+    assert alias.items_calls == 0
+    assert _snapshot_native(
+        {"safe": "value"}, _frozen_graph=frozen
+    ) == {"safe": "value"}
+
+    with pytest.raises(RuntimeError) as alias_error:
+        _snapshot_native(alias, _frozen_graph=frozen)
+    assert projection_key.hash_calls == 1
+    with pytest.raises(RuntimeError) as primary_error:
+        _snapshot_native(primary, _frozen_graph=frozen)
+
+    assert alias_error.value is failure
+    assert primary_error.value is failure
+    assert failure_calls == 1
+    assert prefix.items_calls == 1
+    assert projection_key.hash_calls == 2
+    assert primary.items_calls == 1
+    assert alias.items_calls == 1
+    if boundary == "mapping":
+        assert failing_child.items_calls == 1
+    else:
+        assert failing_child.iteration_calls == 1
+
+
+@pytest.mark.parametrize("boundary", ["mapping", "sequence"])
+def test_recursive_public_shape_failure_preserves_receiver_error_order(
+    boundary: str,
+    monkeypatch,
+):
+    sentinel = object()
+    failure = RuntimeError("ordinary recursive public-shape helper failed")
+    failure_calls = 0
+    original = run_manifest_module._inventory_yielded_public_shape
+
+    def inject_failure(value, frozen_graph, observing):
+        nonlocal failure_calls
+        if value is sentinel:
+            failure_calls += 1
+            raise failure
+        return original(value, frozen_graph, observing)
+
+    monkeypatch.setattr(
+        run_manifest_module,
+        "_inventory_yielded_public_shape",
+        inject_failure,
+    )
+    prefix = InventoryMapping((("prefix", "value"),))
+    if boundary == "mapping":
+        failing_child = InventoryMapping(
+            (("prefix", prefix), ("terminal", sentinel))
+        )
+    else:
+        failing_child = PublicViewList([], [prefix, sentinel])
+    values = timing().model_dump(mode="python")
+    values["exclusions"] = failing_child
+    measurement = InventoryMapping(tuple(values.items()))
+    invalid_planned = planned_manifest()
+    invalid_concurrency = invalid_planned.concurrency[0].model_copy(
+        update={"value": True}
+    )
+    invalid_planned = invalid_planned.model_copy(
+        update={"concurrency": (invalid_concurrency,)}
+    )
+
+    with pytest.raises(ValidationError) as invalid_error:
+        finish_run(
+            invalid_planned,
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(measurement,),
+        )
+
+    assert invalid_error.value.errors()[0]["loc"] == (
+        "concurrency",
+        0,
+        "value",
+    )
+    assert failure_calls == 1
+    assert measurement.items_calls == 1
+
+    with pytest.raises(RuntimeError) as reached_error:
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(measurement,),
+        )
+
+    assert reached_error.value is failure
+    assert failure_calls == 2
+    assert measurement.items_calls == 2
+    assert prefix.items_calls == 2
+    if boundary == "mapping":
+        assert failing_child.items_calls == 2
+    else:
+        assert failing_child.iteration_calls == 2
+
+
+def test_model_reachable_public_mappings_validate_from_one_inventory():
+    resource = MappingProxyType(measured_memory().model_dump(mode="python"))
+    measurement = InventoryMapping(
+        tuple(
+            (key, item)
+            for key, item in timing().model_dump(mode="python").items()
+        )
+    )
+    manifest = completed_manifest().model_copy(
+        update={
+            "resources": (resource,),
+            "measurements": (measurement,),
+        }
+    )
+
+    received = validate_run_manifest_json(serialize_run_manifest(manifest))
+
+    assert received.resources[0] == measured_memory()
+    assert received.measurements[0] == timing()
+    assert measurement.items_calls == 1
+
+
+def test_dual_interface_model_prefers_storage_and_inventories_mapping_child():
+    events: list[str] = []
+    expected = timing()
+    provenance = InventoryMapping(
+        tuple(expected.provenance.model_dump(mode="python").items()),
+        name="provenance",
+        events=events,
+    )
+    measurement, mapping_calls = dual_interface_timing(provenance)
+    manifest = completed_manifest().model_copy(
+        update={"measurements": (measurement,)}
+    )
+
+    received = validate_run_manifest_json(serialize_run_manifest(manifest))
+
+    assert received.measurements[0] == expected
+    assert mapping_calls == {"getitem": 0, "iter": 0, "len": 0, "items": 0}
+    assert provenance.items_calls == 1
+
+
+def test_parent_yielded_dual_interface_model_keeps_model_precedence():
+    events: list[str] = []
+    expected = timing()
+    provenance = InventoryMapping(
+        tuple(expected.provenance.model_dump(mode="python").items()),
+        name="provenance",
+        events=events,
+    )
+    measurement, mapping_calls = dual_interface_timing(provenance)
+    parent = InventoryMapping(
+        (("measurement", measurement), ("tail", 1)),
+        name="parent",
+        events=events,
+    )
+
+    frozen = _freeze_model_graphs(parent)
+    snapshot = _snapshot_native(parent, _frozen_graph=frozen)
+
+    assert snapshot["measurement"]["provenance"] == (
+        expected.provenance.model_dump(mode="python")
+    )
+    assert snapshot["tail"] == 1
+    assert mapping_calls == {"getitem": 0, "iter": 0, "len": 0, "items": 0}
+    assert id(measurement) not in frozen.public_mapping_owners
+    assert frozen.public_mapping_owners[id(provenance)] is provenance
+    assert provenance.items_calls == 1
+    assert events.index("provenance:items") < events.index("parent:yield:1")
+
+
+def test_dict_subclass_uses_public_inventory_but_exact_dict_uses_native_entries():
+    public = PublicItemsDict(
+        {"native": "backing"},
+        (("public", "projection"),),
+    )
+    exact = {"native": "authority"}
+    value = {"public": public, "exact": exact}
+
+    frozen = _freeze_model_graphs(value)
+
+    assert frozen.replay_entries[id(public)] == (public, ("backing",))
+    assert frozen.public_mappings[id(public)].entries == (
+        ("public", "projection"),
+    )
+    assert id(exact) not in frozen.public_mapping_owners
+    assert _snapshot_native(value, _frozen_graph=frozen) == {
+        "public": {"public": "projection"},
+        "exact": {"native": "authority"},
+    }
+    assert public.items_calls == 1
+
+
+def test_public_mapping_inventory_defers_malformed_pair_and_cycle_diagnostics():
+    malformed = InventoryMapping(
+        (("prefix", 1), ("malformed",), ("unreached", 3)),
+    )
+    malformed_graph = _freeze_model_graphs(malformed)
+
+    assert malformed.items_calls == 1
+    assert malformed.yielded_indexes == [0, 1]
+    assert malformed_graph.public_mappings[id(malformed)].entries == (
+        ("prefix", 1),
+    )
+    with pytest.raises(ValueError, match="not enough values to unpack"):
+        _snapshot_native(malformed, _frozen_graph=malformed_graph)
+
+    terminal = FailingIteratorMapping()
+    terminal_graph = _freeze_model_graphs(terminal)
+
+    assert terminal.items_calls == 1
+    assert terminal.yielded == 1
+    assert terminal_graph.public_mappings[id(terminal)].entries == (
+        ("prefix", 1),
+    )
+    with pytest.raises(RuntimeError, match="public mapping iterator failed"):
+        _snapshot_native(terminal, _frozen_graph=terminal_graph)
+
+    unhashable_key: list[object] = []
+    deferred_key = InventoryMapping(((unhashable_key, 1),))
+    deferred_key_graph = _freeze_model_graphs(deferred_key)
+
+    assert deferred_key.items_calls == 1
+    with pytest.raises(TypeError, match="unhashable type"):
+        _snapshot_native(deferred_key, _frozen_graph=deferred_key_graph)
+
+    cycle = InventoryMapping(())
+    cycle.pairs = (("self", cycle), ("unreached", 2))
+    cycle_graph = _freeze_model_graphs(cycle)
+
+    assert cycle.items_calls == 1
+    assert cycle.yielded_indexes == [0]
+    assert cycle_graph.public_mappings[id(cycle)].complete is False
+    with pytest.raises(ValueError, match="cyclic native input"):
+        _snapshot_native(cycle, _frozen_graph=cycle_graph)
+
+
+def test_public_mapping_observation_failure_stays_deferred_to_receiver_order():
+    invalid_planned = planned_manifest()
+    invalid_concurrency = invalid_planned.concurrency[0].model_copy(
+        update={"value": True}
+    )
+    invalid_planned = invalid_planned.model_copy(
+        update={"concurrency": (invalid_concurrency,)}
+    )
+    invalid_mapping = FailingItemsMapping()
+
+    with pytest.raises(ValidationError) as invalid_error:
+        finish_run(
+            invalid_planned,
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(invalid_mapping,),
+        )
+    assert invalid_error.value.errors()[0]["loc"] == (
+        "concurrency",
+        0,
+        "value",
+    )
+    assert invalid_mapping.items_calls == 1
+
+    nonplanned_mapping = FailingItemsMapping()
+    with pytest.raises(ValueError, match="only a planned run can be finished"):
+        finish_run(
+            completed_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(nonplanned_mapping,),
+        )
+    assert nonplanned_mapping.items_calls == 1
+
+    reached_mapping = FailingItemsMapping()
+    with pytest.raises(
+        RuntimeError,
+        match="ordinary public mapping observation failed",
+    ):
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(reached_mapping,),
+        )
+    assert reached_mapping.items_calls == 1
+
+
+def test_public_only_tuple_mapping_keeps_lazy_first_observation():
+    mapping = InventoryMapping((("value", 1),))
+    parent = PublicViewTuple((), (mapping,))
+
+    frozen = _freeze_model_graphs(parent)
+
+    assert mapping.items_calls == 0
+    assert id(mapping) not in frozen.public_mapping_owners
+    assert _snapshot_native(parent, _frozen_graph=frozen) == ({"value": 1},)
+    assert parent.iteration_calls == 1
+    assert mapping.items_calls == 1
 
 
 @pytest.mark.parametrize("boundary", ["serialize", "finish"])
@@ -1911,7 +2821,7 @@ def test_finish_preserves_deep_later_native_failure_for_valid_planned():
             resources=(deep,),
             measurements=(timing(),),
         )
-    assert deep.items_calls == 0
+    assert deep.items_calls == 1
 
 
 def test_finish_validates_planned_before_deep_later_native_failure():
@@ -1940,7 +2850,7 @@ def test_finish_validates_planned_before_deep_later_native_failure():
         0,
         "value",
     )
-    assert deep_for_invalid.items_calls == 0
+    assert deep_for_invalid.items_calls == 1
 
     deep_for_nonplanned = PublicResourceWithDeepNativeBacking(
         sys.getrecursionlimit() + 600
@@ -1957,7 +2867,7 @@ def test_finish_validates_planned_before_deep_later_native_failure():
             resources=(deep_for_nonplanned,),
             measurements=(timing(),),
         )
-    assert deep_for_nonplanned.items_calls == 0
+    assert deep_for_nonplanned.items_calls == 1
 
 
 def test_finish_snapshots_public_mapping_child_before_requesting_next_pair():
@@ -2185,7 +3095,7 @@ def test_finish_preserves_lazy_exact_dict_priority_and_shared_capture():
         0,
         "value",
     )
-    assert invalid.items_calls == 0
+    assert invalid.items_calls == 1
     assert invalid_trigger.iteration_calls == 0
     assert invalid_callbacks == []
 
@@ -2202,7 +3112,7 @@ def test_finish_preserves_lazy_exact_dict_priority_and_shared_capture():
             resources=(measured_memory(),),
             measurements=(nonplanned,),
         )
-    assert nonplanned.items_calls == 0
+    assert nonplanned.items_calls == 1
     assert nonplanned_trigger.iteration_calls == 0
     assert nonplanned_callbacks == []
 
