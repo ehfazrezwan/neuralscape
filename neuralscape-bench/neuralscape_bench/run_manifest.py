@@ -476,6 +476,7 @@ def _snapshot_native(
                 frozen_container = _frozen_graph.native_containers.get(identity)
                 if frozen_container is None or frozen_container[0] is not value:
                     _freeze_model_storage(value, _frozen_graph, set())
+                    _traverse_model_storage(value, set())
                     frozen_container = _frozen_graph.native_containers[identity]
                 mapping_items = frozen_container[1]
             else:
