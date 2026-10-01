@@ -4,7 +4,7 @@ from enum import Enum
 
 import contracts_engines
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from contracts_engines import (
     CapabilityHealth,
@@ -29,6 +29,24 @@ class FalseyExtraDict(dict):
 class HiddenExtraKeysDict(dict):
     def __iter__(self):
         return iter(())
+
+    def keys(self):
+        return {}.keys()
+
+
+class HiddenSet(set):
+    def __iter__(self):
+        return iter(())
+
+
+class HiddenFrozenSet(frozenset):
+    def __iter__(self):
+        return iter(())
+
+
+_MODEL_DICT_DESCRIPTOR = BaseModel.__dict__["__dict__"]
+_MODEL_FIELDS_SET_DESCRIPTOR = BaseModel.__dict__["__pydantic_fields_set__"]
+_MODEL_EXTRAS_DESCRIPTOR = BaseModel.__dict__["__pydantic_extra__"]
 
 
 def reference(identifier: str) -> ReferenceHandle:
@@ -338,6 +356,215 @@ def test_capability_boundary_still_rejects_nonconflicting_unknown_extras():
 
     with pytest.raises(ValueError, match="undeclared contract field.*future_semantics"):
         validate_capability_requirements(declared, (unknown,))
+
+
+def test_capability_boundary_reads_model_storage_past_getattribute_override():
+    class HiddenRequirement(CapabilityRequirement):
+        def __getattribute__(self, name):
+            if name == "__dict__":
+                native = _MODEL_DICT_DESCRIPTOR.__get__(self, BaseModel)
+                return {
+                    key: item
+                    for key, item in dict.items(native)
+                    if key != "future_semantics"
+                }
+            return object.__getattribute__(self, name)
+
+    declared = manifest(state())
+    hidden = HiddenRequirement(**requirement().model_dump())
+    native = _MODEL_DICT_DESCRIPTOR.__get__(hidden, BaseModel)
+    dict.__setitem__(native, "future_semantics", "deny")
+
+    assert "future_semantics" not in hidden.__dict__
+    with pytest.raises(ValueError, match="undeclared contract field.*future_semantics"):
+        validate_capability_requirements(declared, (hidden,))
+
+
+@pytest.mark.parametrize("location", ["stored", "fields_set", "extras"])
+def test_capability_boundary_reads_model_storage_past_subclass_properties(location):
+    class PropertyHiddenRequirement(CapabilityRequirement):
+        @property
+        def __dict__(self):
+            return {}
+
+        @__dict__.setter
+        def __dict__(self, value):
+            _MODEL_DICT_DESCRIPTOR.__set__(self, value)
+
+        @property
+        def __pydantic_fields_set__(self):
+            return set()
+
+        @__pydantic_fields_set__.setter
+        def __pydantic_fields_set__(self, value):
+            _MODEL_FIELDS_SET_DESCRIPTOR.__set__(self, value)
+
+        @property
+        def __pydantic_extra__(self):
+            return None
+
+        @__pydantic_extra__.setter
+        def __pydantic_extra__(self, value):
+            _MODEL_EXTRAS_DESCRIPTOR.__set__(self, value)
+
+    declared = manifest(state())
+    hidden = PropertyHiddenRequirement(**requirement().model_dump())
+    if location == "stored":
+        native = _MODEL_DICT_DESCRIPTOR.__get__(hidden, BaseModel)
+        dict.__setitem__(native, "future_semantics", "deny")
+    elif location == "fields_set":
+        native = set(_MODEL_FIELDS_SET_DESCRIPTOR.__get__(hidden, BaseModel))
+        native.add("future_semantics")
+        _MODEL_FIELDS_SET_DESCRIPTOR.__set__(hidden, native)
+    else:
+        _MODEL_EXTRAS_DESCRIPTOR.__set__(hidden, {"future_semantics": "deny"})
+
+    with pytest.raises(ValueError, match="undeclared contract field.*future_semantics"):
+        validate_capability_requirements(declared, (hidden,))
+
+
+def test_capability_boundary_reads_nested_model_storage_past_property():
+    class PropertyHiddenReference(ReferenceHandle):
+        @property
+        def __dict__(self):
+            native = _MODEL_DICT_DESCRIPTOR.__get__(self, BaseModel)
+            return {
+                key: item
+                for key, item in dict.items(native)
+                if key != "future_semantics"
+            }
+
+        @__dict__.setter
+        def __dict__(self, value):
+            _MODEL_DICT_DESCRIPTOR.__set__(self, value)
+
+    hidden_reference = PropertyHiddenReference(
+        **reference("runtime-profile").model_dump()
+    )
+    native = _MODEL_DICT_DESCRIPTOR.__get__(hidden_reference, BaseModel)
+    dict.__setitem__(native, "future_semantics", "deny")
+    nested = requirement().model_copy(
+        update={"qualification_profile_reference": hidden_reference}
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"undeclared contract field.*capability requirements\[0\]"
+        r"\.qualification_profile_reference.*future_semantics",
+    ):
+        validate_capability_requirements(manifest(state()), (nested,))
+
+
+@pytest.mark.parametrize("fields_type", [HiddenSet, HiddenFrozenSet])
+def test_capability_boundary_reads_native_field_set_backing(fields_type):
+    declared = manifest(state())
+    hidden = requirement()
+    fields = set(_MODEL_FIELDS_SET_DESCRIPTOR.__get__(hidden, BaseModel))
+    fields.add("future_semantics")
+    _MODEL_FIELDS_SET_DESCRIPTOR.__set__(hidden, fields_type(fields))
+
+    with pytest.raises(ValueError, match="undeclared contract field.*future_semantics"):
+        validate_capability_requirements(declared, (hidden,))
+
+
+def test_capability_boundary_reads_native_dict_subclass_backing():
+    declared = manifest(state())
+    hidden = requirement()
+    native = _MODEL_DICT_DESCRIPTOR.__get__(hidden, BaseModel)
+    replacement = HiddenExtraKeysDict(dict(dict.items(native)))
+    dict.__setitem__(replacement, "future_semantics", "deny")
+    _MODEL_DICT_DESCRIPTOR.__set__(hidden, replacement)
+
+    with pytest.raises(ValueError, match="undeclared contract field.*future_semantics"):
+        validate_capability_requirements(declared, (hidden,))
+
+
+def test_capability_boundary_preserves_valid_hidden_backing_controls():
+    class HiddenValidRequirement(CapabilityRequirement):
+        @property
+        def __dict__(self):
+            return {}
+
+        @__dict__.setter
+        def __dict__(self, value):
+            _MODEL_DICT_DESCRIPTOR.__set__(self, value)
+
+        @property
+        def __pydantic_fields_set__(self):
+            return set()
+
+        @__pydantic_fields_set__.setter
+        def __pydantic_fields_set__(self, value):
+            _MODEL_FIELDS_SET_DESCRIPTOR.__set__(self, value)
+
+        @property
+        def __pydantic_extra__(self):
+            return None
+
+        @__pydantic_extra__.setter
+        def __pydantic_extra__(self, value):
+            _MODEL_EXTRAS_DESCRIPTOR.__set__(self, value)
+
+    valid = HiddenValidRequirement(**requirement().model_dump())
+    native = _MODEL_DICT_DESCRIPTOR.__get__(valid, BaseModel)
+    _MODEL_DICT_DESCRIPTOR.__set__(valid, HiddenExtraKeysDict(dict(dict.items(native))))
+    native_fields = _MODEL_FIELDS_SET_DESCRIPTOR.__get__(valid, BaseModel)
+    _MODEL_FIELDS_SET_DESCRIPTOR.__set__(valid, HiddenSet(native_fields))
+
+    assert validate_capability_requirements(manifest(state()), (valid,)) == ()
+
+
+def test_capability_boundary_freezes_parent_values_before_child_recursion():
+    class RepairingReference(dict):
+        parent = None
+
+        def items(self):
+            native = _MODEL_DICT_DESCRIPTOR.__get__(self.parent, BaseModel)
+            dict.__setitem__(native, "qualification_profile_version", "profile-v1")
+            return dict.items(self)
+
+    invalid = requirement().model_copy(
+        update={
+            "qualification_profile_reference": RepairingReference(
+                reference("runtime-profile").model_dump()
+            ),
+            "qualification_profile_version": None,
+        }
+    )
+    invalid.qualification_profile_reference.parent = invalid
+
+    with pytest.raises(ValidationError, match="are paired"):
+        validate_capability_requirements(manifest(state()), (invalid,))
+
+    assert invalid.qualification_profile_version == "profile-v1"
+
+
+def test_capability_boundary_preserves_valid_child_mutation_control():
+    class MutatingValidReference(dict):
+        parent = None
+
+        def items(self):
+            native = _MODEL_DICT_DESCRIPTOR.__get__(self.parent, BaseModel)
+            dict.__setitem__(native, "qualification_profile_version", "profile-v1")
+            return dict.items(self)
+
+    valid = requirement().model_copy(
+        update={
+            "qualification_profile_reference": MutatingValidReference(
+                reference("runtime-profile").model_dump()
+            )
+        }
+    )
+    valid.qualification_profile_reference.parent = valid
+
+    assert validate_capability_requirements(manifest(state()), (valid,)) == ()
+
+
+def test_capability_boundary_preserves_missing_extra_storage():
+    valid = requirement()
+    _MODEL_EXTRAS_DESCRIPTOR.__delete__(valid)
+
+    assert validate_capability_requirements(manifest(state()), (valid,)) == ()
 
 
 @pytest.mark.parametrize(
