@@ -47,6 +47,7 @@ class _CapturedCycle(_CapturedGraph):
 @dataclass(frozen=True, slots=True)
 class _CapturedModel(_CapturedGraph):
     identity: int
+    source: BaseModel
     model_type: type[BaseModel]
     stored_entries: tuple[tuple[object, _CapturedGraph], ...]
     extra_entries: tuple[tuple[object, _CapturedGraph], ...]
@@ -56,6 +57,7 @@ class _CapturedModel(_CapturedGraph):
 @dataclass(frozen=True, slots=True)
 class _CapturedDict(_CapturedGraph):
     identity: int
+    source: dict[object, object]
     entries: tuple[tuple[object, _CapturedGraph], ...]
 
 
@@ -79,6 +81,21 @@ _CapturedGraphSnapshot = tuple[
 ]
 
 
+def _cached_identity_capture(
+    value: object,
+    captured_by_identity: dict[int, _CapturedGraph],
+) -> _CapturedGraph | None:
+    """Return a cache hit only when it owns the exact source object."""
+
+    captured = captured_by_identity.get(id(value))
+    if isinstance(
+        captured,
+        (_CapturedModel, _CapturedDict, _CapturedList, _CapturedTuple),
+    ) and captured.source is value:
+        return captured
+    return None
+
+
 def _capture_native_contract_graph(
     value: object,
     active_containers: set[int] | None = None,
@@ -96,8 +113,9 @@ def _capture_native_contract_graph(
         identity = id(value)
         if identity in active_containers:
             return _CapturedCycle()
-        if identity in captured_by_identity:
-            return captured_by_identity[identity]
+        cached = _cached_identity_capture(value, captured_by_identity)
+        if cached is not None:
+            return cached
         active_containers.add(identity)
         try:
             if issubclass(value_type, BaseModel):
@@ -118,6 +136,7 @@ def _capture_native_contract_graph(
                     )
                 captured: _CapturedGraph = _CapturedModel(
                     identity=identity,
+                    source=value,
                     model_type=value_type,
                     stored_entries=tuple(
                         (
@@ -147,6 +166,7 @@ def _capture_native_contract_graph(
                 entries = tuple(dict.items(value))
                 captured = _CapturedDict(
                     identity=identity,
+                    source=value,
                     entries=tuple(
                         (
                             key,
@@ -251,7 +271,7 @@ def _materialize_captured_graph(
         def public_item(item: object) -> _CapturedGraph:
             item_type = type(item)
             if issubclass(item_type, (BaseModel, dict, list, tuple)):
-                frozen = captured_by_identity.get(id(item))
+                frozen = _cached_identity_capture(item, captured_by_identity)
                 if frozen is not None:
                     return frozen
                 return _capture_native_contract_graph(
@@ -349,7 +369,7 @@ def _revalidated_inventory_model(
 
     if not isinstance(value, model_type):
         raise TypeError(f"value must be a {model_type.__name__}")
-    captured = captured_by_identity.get(id(value))
+    captured = _cached_identity_capture(value, captured_by_identity)
     if captured is None:
         captured = _capture_native_contract_graph(
             value,
