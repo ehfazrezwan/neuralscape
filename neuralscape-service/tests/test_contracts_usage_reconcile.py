@@ -785,6 +785,44 @@ def test_native_dict_snapshot_calls_public_entry_validator(
     assert observed_entries == [(("field", "value"),)]
 
 
+def test_native_dict_snapshot_propagates_public_entry_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {"field": "value"}
+    ledger = reconcile_usage_events([_event()]).ledgers[0]
+    ledger_payload = ledger.model_dump(mode="python")
+    failure = usage_reconcile_contracts._FailedNativeDictTraversal(
+        ValueError("public entry sentinel")
+    )
+    observed_entries: list[tuple[tuple[str, object], ...]] = []
+
+    def fail(entries: object):
+        observed_entries.append(tuple(entries))
+        return failure
+
+    monkeypatch.setattr(
+        usage_reconcile_contracts,
+        "_validate_public_mapping_entries",
+        fail,
+    )
+
+    assert usage_reconcile_contracts._native_snapshot(payload) is failure
+    assert observed_entries == [(("field", "value"),)]
+
+    observed_entries.clear()
+    assert _validation_signature(ReconciledLedger, ledger_payload) == [
+        (
+            "mapping_type",
+            (),
+            (
+                "Input should be a valid mapping, error: ValueError: "
+                "public entry sentinel"
+            ),
+        )
+    ]
+    assert observed_entries == [tuple(ledger_payload.items())]
+
+
 def test_reconciled_ledger_python_before_schema_is_present_and_invoked(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -831,6 +869,34 @@ def test_reconciled_ledger_python_before_schema_is_present_and_invoked(
         )
     ]
     assert observed_inputs == [invalid_payload]
+
+
+def test_reconciled_ledger_validates_returned_python_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = reconcile_usage_events([_event()]).ledgers[0]
+    payload = ledger.model_dump(mode="python")
+    returned_snapshot = {**payload, "coverage": "future_coverage"}
+    observed_inputs: list[object] = []
+
+    def replace(value, *args, **kwargs):
+        observed_inputs.append(value)
+        return returned_snapshot
+
+    monkeypatch.setattr(usage_reconcile_contracts, "_native_snapshot", replace)
+
+    assert _validation_signature(ReconciledLedger, payload) == [
+        (
+            "literal_error",
+            ("coverage",),
+            "Input should be 'reported' or 'unreported'",
+        )
+    ]
+    assert observed_inputs == [payload]
+
+    observed_inputs.clear()
+    assert ReconciledLedger.model_validate_json(ledger.model_dump_json()) == ledger
+    assert observed_inputs == []
 
 
 def test_reconciles_three_ledgers_without_cross_ledger_relabelling() -> None:
