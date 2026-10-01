@@ -54,6 +54,11 @@ def _normalize_snapshot_labels(labels: object, *, location: str) -> list[str]:
                 f"Malformed snapshot labels at {location}: "
                 f"label {index} must be a string"
             )
+        if not label:
+            raise ValueError(
+                f"Malformed snapshot labels at {location}: "
+                f"label {index} must not be empty"
+            )
 
     seen: set[str] = set()
     duplicates: list[str] = []
@@ -84,6 +89,10 @@ def _quote_cypher_identifier(identifier: object, *, location: str) -> str:
     if not isinstance(identifier, str):
         raise ValueError(
             f"Malformed snapshot identifier at {location}: expected a string"
+        )
+    if not identifier:
+        raise ValueError(
+            f"Malformed snapshot identifier at {location}: must not be empty"
         )
 
     # Cypher permits `` for a literal backtick and \uxxxx escapes inside quoted
@@ -1531,6 +1540,15 @@ class NativeEngine:
 
         Resolves source and target by their primary keys, then creates/updates the edge.
         """
+        # Enforce the same complete endpoint invariant for direct helper calls
+        # that import_snapshot establishes during its all-record preflight.
+        source_labels = _normalize_snapshot_labels(
+            source_labels, location="edge source labels"
+        )
+        target_labels = _normalize_snapshot_labels(
+            target_labels, location="edge target labels"
+        )
+
         # Build match predicates for source and target using isolated maps so
         # overlapping endpoint and relationship keys cannot replace each other.
         src_label = source_labels[0]
