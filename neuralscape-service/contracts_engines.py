@@ -19,6 +19,27 @@ from contracts_references import ReferenceHandle
 _ContractT = TypeVar("_ContractT", bound=BaseModel)
 _MAX_SNAPSHOT_DEPTH = 256
 _OPAQUE_ID_ADAPTER = TypeAdapter(OpaqueId)
+_MODEL_DICT_DESCRIPTOR = BaseModel.__dict__["__dict__"]
+_MODEL_FIELDS_SET_DESCRIPTOR = BaseModel.__dict__["__pydantic_fields_set__"]
+_MODEL_EXTRAS_DESCRIPTOR = BaseModel.__dict__["__pydantic_extra__"]
+_MISSING_MODEL_STORAGE = object()
+
+
+def _model_storage(descriptor: Any, value: BaseModel) -> Any:
+    """Read a BaseModel-owned store without subclass attribute dispatch."""
+
+    try:
+        return descriptor.__get__(value, BaseModel)
+    except AttributeError:
+        return _MISSING_MODEL_STORAGE
+
+
+def _native_set_copy(value: set[Any] | frozenset[Any]) -> set[Any]:
+    """Copy the concrete set backing without subclass iteration hooks."""
+
+    if isinstance(value, set):
+        return set(set.__iter__(value))
+    return set(frozenset.__iter__(value))
 
 
 def _snapshot_native_value(
@@ -42,18 +63,20 @@ def _snapshot_native_value(
 
     try:
         if isinstance(value, BaseModel):
-            storage = getattr(value, "__dict__", None)
-            fields_set_value = getattr(value, "__pydantic_fields_set__", None)
-            extras_value = getattr(value, "__pydantic_extra__", None)
+            storage = _model_storage(_MODEL_DICT_DESCRIPTOR, value)
+            fields_set_value = _model_storage(_MODEL_FIELDS_SET_DESCRIPTOR, value)
+            extras_value = _model_storage(_MODEL_EXTRAS_DESCRIPTOR, value)
             if not isinstance(storage, dict) or not isinstance(
                 fields_set_value, (set, frozenset)
             ):
                 raise ValueError(f"malformed contract model at {location}")
+            if extras_value is _MISSING_MODEL_STORAGE:
+                extras_value = None
             if extras_value is not None and type(extras_value) is not dict:
                 raise ValueError(f"malformed contract extras at {location}")
             declared = set(type(value).model_fields)
-            stored = set(storage)
-            fields_set = set(fields_set_value)
+            stored = set(dict.keys(storage))
+            fields_set = _native_set_copy(fields_set_value)
             extras = {} if extras_value is None else extras_value
             duplicated = set(extras) & (stored | declared)
             if duplicated:
@@ -68,15 +91,19 @@ def _snapshot_native_value(
                 raise ValueError(
                     f"undeclared contract field(s) at {location}: {names}"
                 )
+            stored_values = tuple(
+                (name, dict.__getitem__(storage, name))
+                for name in type(value).model_fields
+                if dict.__contains__(storage, name)
+            )
             return {
                 name: _snapshot_native_value(
-                    storage[name],
+                    item,
                     active=active,
                     depth=depth + 1,
                     location=f"{location}.{name}",
                 )
-                for name in type(value).model_fields
-                if name in storage
+                for name, item in stored_values
             }
         if isinstance(value, dict):
             return {
