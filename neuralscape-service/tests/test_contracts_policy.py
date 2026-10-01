@@ -255,6 +255,31 @@ class _RepairingFieldsIterable:
         return iter(self.names)
 
 
+class _LengthAwareFieldsIterable:
+    """Legacy fields-set iterable whose length view is not authoritative."""
+
+    def __init__(
+        self,
+        names: tuple[str, ...],
+        *,
+        raise_on_length: bool,
+    ) -> None:
+        self.names = names
+        self.raise_on_length = raise_on_length
+        self.iteration_calls = 0
+        self.length_calls = 0
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        self.iteration_calls += 1
+        return iter(self.names)
+
+    def __len__(self) -> int:
+        self.length_calls += 1
+        if self.raise_on_length:
+            raise RuntimeError("legacy fields-set length callback ran")
+        return len(self.names)
+
+
 class _RepairingEmptyExtras(Mapping[str, object]):
     """Supported empty Mapping whose items authority can repair a model."""
 
@@ -2090,6 +2115,26 @@ def _assert_protocol_called_once(
     assert hook.items_calls == 1
     assert hook.iteration_calls == 0
     assert hook.getitem_calls == 0
+
+
+@pytest.mark.parametrize("boundary", ["evaluator", "receiving"])
+@pytest.mark.parametrize("raise_on_length", [False, True])
+def test_legacy_fields_set_fallback_uses_iteration_without_length_hint(
+    boundary: str,
+    raise_on_length: bool,
+) -> None:
+    candidate, _, invoke = _nested_model_name_case(boundary, invalid=False)
+    fields = _LengthAwareFieldsIterable(
+        tuple(type(candidate).model_fields),
+        raise_on_length=raise_on_length,
+    )
+    _BASE_MODEL_FIELDS_SET_DESCRIPTOR.__set__(candidate, fields)
+
+    result = invoke(candidate)
+
+    assert result.outcome == "allow"
+    assert fields.iteration_calls == 1
+    assert fields.length_calls == 0
 
 
 @pytest.mark.parametrize("boundary", ["evaluator", "receiving"])
