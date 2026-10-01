@@ -24,6 +24,7 @@ from contracts_policy import (
 from contracts_policy_reference import (
     _capture_model_inventory,
     _complete_contract_input,
+    _freeze_mapping_inventories,
     _freeze_reachable_model_inventories,
     evaluate_policy,
     validate_policy_decision,
@@ -2182,6 +2183,105 @@ def test_model_inventory_consumers_require_exact_owner_identity(
         completed = _complete_contract_input(candidate, set(), inventories)
         assert isinstance(completed, dict)
         assert completed["id"] == "memory-1"
+
+
+def test_mapping_inventory_retains_owner_entries_and_exposed_models() -> None:
+    original = reference("memory-1")
+    backing = {"resource": original}
+    candidate = MappingProxyType(backing)
+    model_inventories = {}
+    mapping_owners = {}
+    mapping_inventories = {}
+    visited_containers: set[int] = set()
+
+    _freeze_reachable_model_inventories(
+        candidate,
+        model_inventories,
+        visited_containers,
+        mapping_owners,
+    )
+    assert mapping_owners[id(candidate)] is candidate
+
+    _freeze_mapping_inventories(
+        mapping_owners,
+        mapping_inventories,
+        model_inventories,
+        visited_containers,
+    )
+    retained = mapping_inventories[id(candidate)]
+    assert retained.owner is candidate
+    assert id(original) in model_inventories
+
+    backing["resource"] = reference("memory-2")
+    completed = _complete_contract_input(
+        candidate,
+        set(),
+        model_inventories,
+        mapping_inventories,
+    )
+
+    assert completed == {
+        "resource": original.model_dump(mode="python"),
+    }
+
+
+def test_model_extra_mapping_reuses_inventory_after_direct_edit() -> None:
+    backing: dict[str, object] = {}
+    extras = MappingProxyType(backing)
+    candidate = PolicyDecision(**decision_payload())
+    object.__setattr__(candidate, "__pydantic_extra__", extras)
+    model_inventories = {}
+    mapping_owners = {}
+    mapping_inventories = {}
+    visited_containers: set[int] = set()
+
+    _freeze_reachable_model_inventories(
+        candidate,
+        model_inventories,
+        visited_containers,
+        mapping_owners,
+    )
+    _freeze_mapping_inventories(
+        mapping_owners,
+        mapping_inventories,
+        model_inventories,
+        visited_containers,
+    )
+    assert mapping_inventories[id(extras)].owner is extras
+
+    backing["future_constraint"] = "deny"
+    completed = _complete_contract_input(
+        candidate,
+        set(),
+        model_inventories,
+        mapping_inventories,
+    )
+
+    assert PolicyDecision.model_validate(completed).model_dump(mode="python") == (
+        decision_payload()
+    )
+
+
+def test_mapping_inventory_consumer_requires_exact_owner_identity() -> None:
+    candidate = MappingProxyType({"resource": reference("memory-1")})
+    other = MappingProxyType({"resource": reference("memory-2")})
+    other_owners = {id(other): other}
+    mapping_inventories = {}
+    _freeze_mapping_inventories(other_owners, mapping_inventories, {}, set())
+    mismatched_inventories = {
+        id(candidate): mapping_inventories[id(other)],
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="contract input mapping inventory owner mismatch",
+    ):
+        _complete_contract_input(
+            candidate,
+            set(),
+            {},
+            mismatched_inventories,
+        )
 
 
 @pytest.mark.parametrize("boundary", ["evaluator", "receiving"])

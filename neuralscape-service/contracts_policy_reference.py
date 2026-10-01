@@ -38,6 +38,16 @@ class _ModelInventory(NamedTuple):
     fields_set_names: tuple[object, ...] | None
 
 
+class _MappingEntry(NamedTuple):
+    key: object
+    value: object
+
+
+class _MappingInventory(NamedTuple):
+    owner: Mapping[object, object]
+    entries: tuple[_MappingEntry | _CapturedFailure, ...] | _CapturedFailure
+
+
 def _is_native_dict(value: object) -> bool:
     """Recognize dict storage without consulting an instance-level class view."""
 
@@ -143,12 +153,41 @@ def _validated_model_inventory(
     return inventory
 
 
+def _retain_mapping_owner(
+    value: Mapping[object, object],
+    owners: dict[int, Mapping[object, object]],
+) -> None:
+    """Retain and authenticate a mapping reached without public callbacks."""
+
+    identity = id(value)
+    owner = owners.get(identity)
+    if owner is not None and owner is not value:
+        raise ValueError("contract input mapping owner mismatch")
+    owners[identity] = value
+
+
+def _validated_mapping_inventory(
+    value: Mapping[object, object],
+    inventories: dict[int, _MappingInventory],
+) -> _MappingInventory | None:
+    """Return only an inventory owned by this exact mapping instance."""
+
+    inventory = inventories.get(id(value))
+    if inventory is not None and inventory.owner is not value:
+        raise ValueError("contract input mapping inventory owner mismatch")
+    return inventory
+
+
 def _freeze_reachable_model_inventories(
     value: object,
     inventories: dict[int, _ModelInventory],
     visited_containers: set[int],
+    mapping_owners: dict[int, Mapping[object, object]] | None = None,
 ) -> None:
     """Freeze natively reachable models before callback-bearing traversal."""
+
+    if mapping_owners is None:
+        mapping_owners = {}
 
     if issubclass(type(value), BaseModel):
         identity = id(value)
@@ -162,14 +201,20 @@ def _freeze_reachable_model_inventories(
                     item,
                     inventories,
                     visited_containers,
+                    mapping_owners,
                 )
+        elif issubclass(type(inventory.stored_storage), Mapping):
+            _retain_mapping_owner(inventory.stored_storage, mapping_owners)
         if inventory.extra_items is not None:
             for _, item in inventory.extra_items:
                 _freeze_reachable_model_inventories(
                     item,
                     inventories,
                     visited_containers,
+                    mapping_owners,
                 )
+        elif issubclass(type(inventory.extra_storage), Mapping):
+            _retain_mapping_owner(inventory.extra_storage, mapping_owners)
         return
 
     if _is_native_dict(value):
@@ -182,7 +227,12 @@ def _freeze_reachable_model_inventories(
                 item,
                 inventories,
                 visited_containers,
+                mapping_owners,
             )
+        return
+
+    if issubclass(type(value), Mapping):
+        _retain_mapping_owner(value, mapping_owners)
         return
 
     if issubclass(type(value), list):
@@ -195,6 +245,7 @@ def _freeze_reachable_model_inventories(
                 item,
                 inventories,
                 visited_containers,
+                mapping_owners,
             )
         return
 
@@ -208,6 +259,56 @@ def _freeze_reachable_model_inventories(
                 item,
                 inventories,
                 visited_containers,
+                mapping_owners,
+            )
+        return
+
+
+def _freeze_mapping_inventories(
+    owners: dict[int, Mapping[object, object]],
+    mapping_inventories: dict[int, _MappingInventory],
+    model_inventories: dict[int, _ModelInventory],
+    visited_containers: set[int],
+) -> None:
+    """Observe each retained public mapping inventory exactly once."""
+
+    while True:
+        pending = tuple(
+            owner
+            for owner in owners.values()
+            if _validated_mapping_inventory(owner, mapping_inventories) is None
+        )
+        if not pending:
+            return
+
+        for owner in pending:
+            try:
+                raw_entries: tuple[object, ...] = _mapping_items(owner)
+            except Exception as error:
+                mapping_inventories[id(owner)] = _MappingInventory(
+                    owner,
+                    _CapturedFailure(error),
+                )
+                continue
+
+            entries: list[_MappingEntry | _CapturedFailure] = []
+            for raw_entry in raw_entries:
+                try:
+                    key, item = raw_entry  # type: ignore[misc]
+                except Exception as error:
+                    entries.append(_CapturedFailure(error))
+                    continue
+                entry = _MappingEntry(key, item)
+                entries.append(entry)
+                _freeze_reachable_model_inventories(
+                    item,
+                    model_inventories,
+                    visited_containers,
+                    owners,
+                )
+            mapping_inventories[id(owner)] = _MappingInventory(
+                owner,
+                tuple(entries),
             )
 
 
@@ -217,12 +318,60 @@ def _raise_captured_failure(value: object) -> object:
     return value
 
 
+def _retained_mapping_entries(
+    value: Mapping[object, object],
+    mapping_inventories: dict[int, _MappingInventory],
+    model_inventories: dict[int, _ModelInventory],
+) -> tuple[_MappingEntry | _CapturedFailure, ...]:
+    """Return one authenticated public inventory, capturing it if newly seen."""
+
+    inventory = _validated_mapping_inventory(value, mapping_inventories)
+    if inventory is None:
+        owners: dict[int, Mapping[object, object]] = {}
+        _retain_mapping_owner(value, owners)
+        _freeze_mapping_inventories(
+            owners,
+            mapping_inventories,
+            model_inventories,
+            set(),
+        )
+        inventory = _validated_mapping_inventory(value, mapping_inventories)
+        if inventory is None:
+            raise ValueError("contract input mapping inventory is missing")
+    return cast(
+        tuple[_MappingEntry | _CapturedFailure, ...],
+        _raise_captured_failure(inventory.entries),
+    )
+
+
+def _retained_mapping_items(
+    value: Mapping[object, object],
+    mapping_inventories: dict[int, _MappingInventory],
+    model_inventories: dict[int, _ModelInventory],
+) -> tuple[tuple[object, object], ...]:
+    """Rebuild model-owned items while retaining per-entry error priority."""
+
+    items: list[tuple[object, object]] = []
+    for entry in _retained_mapping_entries(
+        value,
+        mapping_inventories,
+        model_inventories,
+    ):
+        retained = cast(_MappingEntry, _raise_captured_failure(entry))
+        items.append((retained.key, retained.value))
+    return tuple(items)
+
+
 def _complete_contract_input(
     value: object,
     active_ids: set[int],
     inventories: dict[int, _ModelInventory],
+    mapping_inventories: dict[int, _MappingInventory] | None = None,
 ) -> object:
     """Copy a native input graph without normalizing away invalid data."""
+
+    if mapping_inventories is None:
+        mapping_inventories = {}
 
     if issubclass(type(value), BaseModel):
         identity = id(value)
@@ -240,7 +389,11 @@ def _complete_contract_input(
             native_stored_items = (
                 inventory.stored_items
                 if inventory.stored_items is not None
-                else _mapping_items(stored_storage)  # type: ignore[arg-type]
+                else _retained_mapping_items(
+                    stored_storage,  # type: ignore[arg-type]
+                    mapping_inventories,
+                    inventories,
+                )
             )
             stored_items = _normalize_model_items(native_stored_items)
             stored_values = dict(stored_items)
@@ -257,7 +410,11 @@ def _complete_contract_input(
                 native_extra_items = (
                     inventory.extra_items
                     if inventory.extra_items is not None
-                    else _mapping_items(extra_values)  # type: ignore[arg-type]
+                    else _retained_mapping_items(
+                        extra_values,  # type: ignore[arg-type]
+                        mapping_inventories,
+                        inventories,
+                    )
                 )
                 extra_items = _normalize_model_items(native_extra_items)
                 for key, item in extra_items:
@@ -286,7 +443,12 @@ def _complete_contract_input(
                     stored_values[field_name] = None
 
             return {
-                key: _complete_contract_input(item, active_ids, inventories)
+                key: _complete_contract_input(
+                    item,
+                    active_ids,
+                    inventories,
+                    mapping_inventories,
+                )
                 for key, item in stored_values.items()
             }
         finally:
@@ -299,10 +461,30 @@ def _complete_contract_input(
         active_ids.add(identity)
         try:
             # Keys are deliberately not stringified or otherwise normalized.
-            return {
-                key: _complete_contract_input(item, active_ids, inventories)
-                for key, item in _mapping_items(value)
-            }
+            if _is_native_dict(value):
+                entries = tuple(
+                    _MappingEntry(key, item)
+                    for key, item in _mapping_items(value)
+                )
+            else:
+                entries = _retained_mapping_entries(
+                    value,
+                    mapping_inventories,
+                    inventories,
+                )
+            completed: dict[object, object] = {}
+            for entry in entries:
+                retained = cast(
+                    _MappingEntry,
+                    _raise_captured_failure(entry),
+                )
+                completed[retained.key] = _complete_contract_input(
+                    retained.value,
+                    active_ids,
+                    inventories,
+                    mapping_inventories,
+                )
+            return completed
         finally:
             active_ids.remove(identity)
 
@@ -313,7 +495,12 @@ def _complete_contract_input(
         active_ids.add(identity)
         try:
             return [
-                _complete_contract_input(item, active_ids, inventories)
+                _complete_contract_input(
+                    item,
+                    active_ids,
+                    inventories,
+                    mapping_inventories,
+                )
                 for item in value
             ]
         finally:
@@ -326,7 +513,12 @@ def _complete_contract_input(
         active_ids.add(identity)
         try:
             return tuple(
-                _complete_contract_input(item, active_ids, inventories)
+                _complete_contract_input(
+                    item,
+                    active_ids,
+                    inventories,
+                    mapping_inventories,
+                )
                 for item in value
             )
         finally:
@@ -338,27 +530,45 @@ def _complete_contract_input(
 def _validated_principal_snapshot(
     principal: PrincipalContext,
     inventories: dict[int, _ModelInventory],
+    mapping_inventories: dict[int, _MappingInventory],
 ) -> PrincipalContext:
     return PrincipalContext.model_validate(
-        _complete_contract_input(principal, set(), inventories)
+        _complete_contract_input(
+            principal,
+            set(),
+            inventories,
+            mapping_inventories,
+        )
     )
 
 
 def _validated_evaluation_snapshot(
     evaluation: PolicyEvaluationInput,
     inventories: dict[int, _ModelInventory],
+    mapping_inventories: dict[int, _MappingInventory],
 ) -> PolicyEvaluationInput:
     return PolicyEvaluationInput.model_validate(
-        _complete_contract_input(evaluation, set(), inventories)
+        _complete_contract_input(
+            evaluation,
+            set(),
+            inventories,
+            mapping_inventories,
+        )
     )
 
 
 def _validated_policy_snapshot(
     policy: AccessPolicy,
     inventories: dict[int, _ModelInventory],
+    mapping_inventories: dict[int, _MappingInventory],
 ) -> AccessPolicy:
     return AccessPolicy.model_validate(
-        _complete_contract_input(policy, set(), inventories)
+        _complete_contract_input(
+            policy,
+            set(),
+            inventories,
+            mapping_inventories,
+        )
     )
 
 
@@ -401,16 +611,37 @@ def evaluate_policy(
     """
 
     inventories: dict[int, _ModelInventory] = {}
+    mapping_owners: dict[int, Mapping[object, object]] = {}
+    mapping_inventories: dict[int, _MappingInventory] = {}
     visited_containers: set[int] = set()
     for value in (principal, evaluation, policy):
         _freeze_reachable_model_inventories(
             value,
             inventories,
             visited_containers,
+            mapping_owners,
         )
-    principal = _validated_principal_snapshot(principal, inventories)
-    evaluation = _validated_evaluation_snapshot(evaluation, inventories)
-    policy = _validated_policy_snapshot(policy, inventories)
+    _freeze_mapping_inventories(
+        mapping_owners,
+        mapping_inventories,
+        inventories,
+        visited_containers,
+    )
+    principal = _validated_principal_snapshot(
+        principal,
+        inventories,
+        mapping_inventories,
+    )
+    evaluation = _validated_evaluation_snapshot(
+        evaluation,
+        inventories,
+        mapping_inventories,
+    )
+    policy = _validated_policy_snapshot(
+        policy,
+        inventories,
+        mapping_inventories,
+    )
 
     action = evaluation.action
     resource = evaluation.resource
@@ -504,9 +735,28 @@ def validate_policy_decision(decision: PolicyDecision) -> PolicyDecision:
     """
 
     inventories: dict[int, _ModelInventory] = {}
-    _freeze_reachable_model_inventories(decision, inventories, set())
+    mapping_owners: dict[int, Mapping[object, object]] = {}
+    mapping_inventories: dict[int, _MappingInventory] = {}
+    visited_containers: set[int] = set()
+    _freeze_reachable_model_inventories(
+        decision,
+        inventories,
+        visited_containers,
+        mapping_owners,
+    )
+    _freeze_mapping_inventories(
+        mapping_owners,
+        mapping_inventories,
+        inventories,
+        visited_containers,
+    )
     return PolicyDecision.model_validate(
-        _complete_contract_input(decision, set(), inventories)
+        _complete_contract_input(
+            decision,
+            set(),
+            inventories,
+            mapping_inventories,
+        )
     )
 
 
