@@ -1,15 +1,20 @@
 """Tests for processing-policy and plaintext-recipient boundaries."""
 
 from collections.abc import Iterator, Mapping
+from typing import ClassVar
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from contracts_processing import (
     PlaintextDispatchRejected,
     ProcessingPolicy,
     validate_plaintext_dispatch,
 )
+
+
+_BASE_MODEL_DICT_DESCRIPTOR = vars(BaseModel)["__dict__"]
+_BASE_MODEL_EXTRA_DESCRIPTOR = vars(BaseModel)["__pydantic_extra__"]
 
 
 class _HiddenBackingDict(dict[str, object]):
@@ -82,6 +87,153 @@ class _RaisingClassHiddenDict(_HiddenBackingDict):
     def __class__(self):
         self.class_reads += 1
         raise AssertionError("__class__ must not be read")
+
+
+class _RepairingStoredName(str):
+    """A stored key whose hash callback repairs a later live model value."""
+
+    def __new__(cls, value: str, repair):
+        instance = super().__new__(cls, value)
+        instance.repair = repair
+        instance.armed = False
+        instance.hash_calls = 0
+        return instance
+
+    def __hash__(self) -> int:
+        if self.armed:
+            self.hash_calls += 1
+            self.repair()
+        return super().__hash__()
+
+
+class _EmptyNativeRaisingViews(dict[str, object]):
+    """Actually empty native storage whose overridden views must stay unused."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.view_calls = 0
+
+    def _called(self):
+        self.view_calls += 1
+        raise AssertionError("overridden dict view must not be read")
+
+    def __len__(self) -> int:
+        return self._called()
+
+    def __bool__(self) -> bool:
+        return self._called()
+
+    def __iter__(self) -> Iterator[str]:
+        return self._called()
+
+    def __getitem__(self, key: str) -> object:
+        return self._called()
+
+    def keys(self):
+        return self._called()
+
+    def items(self):
+        return self._called()
+
+
+class _EmptyNativeFabricatedViews(dict[str, object]):
+    """Actually empty native storage with fabricated nonempty public views."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.view_calls = 0
+
+    def __len__(self) -> int:
+        self.view_calls += 1
+        return 1
+
+    def __bool__(self) -> bool:
+        self.view_calls += 1
+        return True
+
+    def __iter__(self) -> Iterator[str]:
+        self.view_calls += 1
+        return iter(("fabricated_unknown",))
+
+    def __getitem__(self, key: str) -> object:
+        self.view_calls += 1
+        if key == "fabricated_unknown":
+            return True
+        raise KeyError(key)
+
+    def keys(self):
+        self.view_calls += 1
+        return {"fabricated_unknown": True}.keys()
+
+    def items(self):
+        self.view_calls += 1
+        return {"fabricated_unknown": True}.items()
+
+
+class _AttributeHidingPolicy(ProcessingPolicy):
+    mode_reads: ClassVar[int] = 0
+
+    def __getattribute__(self, name: str):
+        if name == "mode":
+            type(self).mode_reads += 1
+            return "strict_local"
+        return super().__getattribute__(name)
+
+
+class _DescriptorMaskedPolicy(ProcessingPolicy):
+    @property
+    def __dict__(self):
+        native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(self, BaseModel)
+        return {
+            name: value
+            for name, value in dict.items(native)
+            if name != "future_constraint"
+        }
+
+    @__dict__.setter
+    def __dict__(self, value):
+        _BASE_MODEL_DICT_DESCRIPTOR.__set__(self, value)
+
+    @property
+    def __pydantic_extra__(self):
+        return None
+
+    @__pydantic_extra__.setter
+    def __pydantic_extra__(self, value):
+        _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(self, value)
+
+
+def _replace_model_backing(
+    policy: ProcessingPolicy,
+    changes: dict[str, object],
+) -> _HiddenBackingDict:
+    stored = dict(
+        dict.items(object.__getattribute__(policy, "__dict__"))
+    )
+    for name, value in changes.items():
+        dict.__setitem__(stored, name, value)
+    hidden = _HiddenBackingDict(stored)
+    object.__setattr__(policy, "__dict__", hidden)
+    return hidden
+
+
+def _arm_first_stored_name_repair(
+    policy: ProcessingPolicy,
+    *,
+    field: str,
+    repaired_value: object,
+) -> _RepairingStoredName:
+    stored = _BASE_MODEL_DICT_DESCRIPTOR.__get__(policy, BaseModel)
+    entries = tuple(dict.items(stored))
+    dict.clear(stored)
+    name = _RepairingStoredName(
+        entries[0][0],
+        lambda: dict.__setitem__(stored, field, repaired_value),
+    )
+    for index, (key, value) in enumerate(entries):
+        dict.__setitem__(stored, name if index == 0 else key, value)
+    name.armed = True
+    return name
 
 
 def _attach_extra_storage(
@@ -235,6 +387,64 @@ def test_dispatch_revalidates_unchecked_strict_local_copy() -> None:
         )
 
 
+def test_dispatch_captures_all_stored_pairs_before_name_hashing() -> None:
+    valid = _strict_local_policy()
+    validate_plaintext_dispatch(
+        valid,
+        execution_location="endpoint",
+        recipient_id=None,
+        current_policy_epoch=7,
+        currently_authorized_recipient_ids=set(),
+        is_fallback=False,
+    )
+
+    ordinary = valid.model_copy(update={"policy_epoch": -1})
+    with pytest.raises(PlaintextDispatchRejected) as ordinary_exc:
+        validate_plaintext_dispatch(
+            ordinary,
+            execution_location="endpoint",
+            recipient_id=None,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=set(),
+            is_fallback=False,
+        )
+
+    hooked = valid.model_copy(update={"policy_epoch": -1})
+    name = _arm_first_stored_name_repair(
+        hooked,
+        field="policy_epoch",
+        repaired_value=7,
+    )
+    with pytest.raises(PlaintextDispatchRejected) as hooked_exc:
+        validate_plaintext_dispatch(
+            hooked,
+            execution_location="endpoint",
+            recipient_id=None,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=set(),
+            is_fallback=False,
+        )
+
+    assert isinstance(ordinary_exc.value.__cause__, ValidationError)
+    assert isinstance(hooked_exc.value.__cause__, ValidationError)
+    ordinary_errors = [
+        (error["loc"], error["type"])
+        for error in ordinary_exc.value.__cause__.errors()
+    ]
+    hooked_errors = [
+        (error["loc"], error["type"])
+        for error in hooked_exc.value.__cause__.errors()
+    ]
+    assert ordinary_errors == hooked_errors == [
+        (("policy_epoch",), "greater_than_equal")
+    ]
+    assert name.hash_calls == 1
+    assert dict.__getitem__(
+        _BASE_MODEL_DICT_DESCRIPTOR.__get__(hooked, BaseModel),
+        "policy_epoch",
+    ) == 7
+
+
 @pytest.mark.parametrize(
     "backing",
     [
@@ -259,6 +469,155 @@ def test_dispatch_rejects_hidden_native_dict_backing(
         )
 
     assert hidden.view_calls == 0
+
+
+@pytest.mark.parametrize(
+    "extra_storage",
+    [None, {}],
+    ids=["none-extras", "empty-dict-extras"],
+)
+def test_dispatch_projects_hidden_native_model_backing(
+    extra_storage: object,
+) -> None:
+    policy = _strict_local_policy()
+    hidden = _replace_model_backing(policy, {"hidden_unknown": "deny"})
+    _attach_extra_storage(policy, extra_storage)
+
+    with pytest.raises(PlaintextDispatchRejected, match="policy is invalid") as exc:
+        validate_plaintext_dispatch(
+            policy,
+            execution_location="endpoint",
+            recipient_id=None,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=set(),
+            is_fallback=False,
+        )
+
+    assert isinstance(exc.value.__cause__, ValidationError)
+    assert any(
+        error["loc"] == ("hidden_unknown",)
+        for error in exc.value.__cause__.errors()
+    )
+    assert hidden.view_calls == 0
+
+
+@pytest.mark.parametrize(
+    "extra_storage",
+    [None, {}],
+    ids=["none-extras", "empty-dict-extras"],
+)
+def test_dispatch_native_model_backing_ignores_attribute_override(
+    extra_storage: object,
+) -> None:
+    policy = _AttributeHidingPolicy(
+        schema_version="candidate-v1",
+        mode="strict_local",
+        allowed_execution_locations=("endpoint",),
+        approved_recipient_ids=(),
+        fallback_policy="deny",
+        policy_epoch=7,
+    )
+    _AttributeHidingPolicy.mode_reads = 0
+    hidden = _replace_model_backing(policy, {"mode": "invalid"})
+    _attach_extra_storage(policy, extra_storage)
+
+    with pytest.raises(PlaintextDispatchRejected, match="policy is invalid") as exc:
+        validate_plaintext_dispatch(
+            policy,
+            execution_location="endpoint",
+            recipient_id=None,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=set(),
+            is_fallback=False,
+        )
+
+    assert isinstance(exc.value.__cause__, ValidationError)
+    assert any(error["loc"] == ("mode",) for error in exc.value.__cause__.errors())
+    assert _AttributeHidingPolicy.mode_reads == 0
+    assert hidden.view_calls == 0
+
+
+@pytest.mark.parametrize("inventory", ["stored", "extra"])
+def test_dispatch_uses_base_model_storage_descriptors(
+    inventory: str,
+) -> None:
+    ordinary = _strict_local_policy()
+    masked = _DescriptorMaskedPolicy(
+        schema_version="candidate-v1",
+        mode="strict_local",
+        allowed_execution_locations=("endpoint",),
+        approved_recipient_ids=(),
+        fallback_policy="deny",
+        policy_epoch=7,
+    )
+    hidden_stores: list[_HiddenBackingDict] = []
+    for policy in (ordinary, masked):
+        if inventory == "stored":
+            stored = dict(
+                dict.items(_BASE_MODEL_DICT_DESCRIPTOR.__get__(policy, BaseModel))
+            )
+            stored["future_constraint"] = "deny"
+            hidden = _HiddenBackingDict(stored)
+            _BASE_MODEL_DICT_DESCRIPTOR.__set__(policy, hidden)
+        else:
+            hidden = _HiddenBackingDict({"future_constraint": "deny"})
+            _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(policy, hidden)
+        hidden_stores.append(hidden)
+
+    diagnostics = []
+    for policy in (ordinary, masked):
+        with pytest.raises(
+            PlaintextDispatchRejected,
+            match="policy is invalid",
+        ) as exc:
+            validate_plaintext_dispatch(
+                policy,
+                execution_location="endpoint",
+                recipient_id=None,
+                current_policy_epoch=7,
+                currently_authorized_recipient_ids=set(),
+                is_fallback=False,
+            )
+        assert isinstance(exc.value.__cause__, ValidationError)
+        diagnostics.append(
+            [
+                (error["loc"], error["type"])
+                for error in exc.value.__cause__.errors()
+            ]
+        )
+
+    assert diagnostics[0] == diagnostics[1]
+    assert all(hidden.view_calls == 0 for hidden in hidden_stores)
+
+
+def test_dispatch_descriptor_masked_valid_and_absent_extra_controls() -> None:
+    valid = _DescriptorMaskedPolicy(
+        schema_version="candidate-v1",
+        mode="strict_local",
+        allowed_execution_locations=("endpoint",),
+        approved_recipient_ids=(),
+        fallback_policy="deny",
+        policy_epoch=7,
+    )
+    validate_plaintext_dispatch(
+        valid,
+        execution_location="endpoint",
+        recipient_id=None,
+        current_policy_epoch=7,
+        currently_authorized_recipient_ids=set(),
+        is_fallback=False,
+    )
+
+    _BASE_MODEL_EXTRA_DESCRIPTOR.__delete__(valid)
+    with pytest.raises(AttributeError, match="__pydantic_extra__"):
+        validate_plaintext_dispatch(
+            valid,
+            execution_location="endpoint",
+            recipient_id=None,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=set(),
+            is_fallback=False,
+        )
 
 
 def test_dispatch_extra_storage_controls_preserve_existing_behavior() -> None:
@@ -298,6 +657,112 @@ def test_dispatch_extra_storage_controls_preserve_existing_behavior() -> None:
             is_fallback=False,
         )
     assert inverse.items_calls == 0
+
+
+@pytest.mark.parametrize(
+    "extra_type",
+    [_EmptyNativeRaisingViews, _EmptyNativeFabricatedViews],
+    ids=["raising-views", "fabricated-views"],
+)
+def test_dispatch_accepts_empty_native_backing_without_overridden_views(
+    extra_type: type[_EmptyNativeRaisingViews | _EmptyNativeFabricatedViews],
+) -> None:
+    extras = extra_type()
+    policy = _attach_extra_storage(_strict_local_policy(), extras)
+
+    validate_plaintext_dispatch(
+        policy,
+        execution_location="endpoint",
+        recipient_id=None,
+        current_policy_epoch=7,
+        currently_authorized_recipient_ids=set(),
+        is_fallback=False,
+    )
+
+    assert tuple(dict.items(extras)) == ()
+    assert extras.view_calls == 0
+
+
+def test_dispatch_empty_native_projection_preserves_injected_unknown_field() -> None:
+    policy = _strict_local_policy()
+    object.__setattr__(policy, "injected_unknown", "deny")
+    extras = _EmptyNativeRaisingViews()
+    _attach_extra_storage(policy, extras)
+
+    with pytest.raises(PlaintextDispatchRejected, match="policy is invalid") as exc:
+        validate_plaintext_dispatch(
+            policy,
+            execution_location="endpoint",
+            recipient_id=None,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=set(),
+            is_fallback=False,
+        )
+
+    assert isinstance(exc.value.__cause__, ValidationError)
+    assert any(
+        error["loc"] == ("injected_unknown",)
+        for error in exc.value.__cause__.errors()
+    )
+    assert extras.view_calls == 0
+
+
+def test_dispatch_empty_native_projection_preserves_subclass_field() -> None:
+    class SpecializedPolicy(ProcessingPolicy):
+        declared_note: str
+
+    policy = SpecializedPolicy(
+        schema_version="candidate-v1",
+        mode="strict_local",
+        allowed_execution_locations=("endpoint",),
+        approved_recipient_ids=(),
+        fallback_policy="deny",
+        policy_epoch=7,
+        declared_note="subclass-only",
+    )
+    extras = _EmptyNativeRaisingViews()
+    _attach_extra_storage(policy, extras)
+
+    with pytest.raises(PlaintextDispatchRejected, match="policy is invalid") as exc:
+        validate_plaintext_dispatch(
+            policy,
+            execution_location="endpoint",
+            recipient_id=None,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=set(),
+            is_fallback=False,
+        )
+
+    assert isinstance(exc.value.__cause__, ValidationError)
+    assert any(
+        error["loc"] == ("declared_note",)
+        for error in exc.value.__cause__.errors()
+    )
+    assert extras.view_calls == 0
+
+
+def test_dispatch_empty_native_projection_preserves_missing_fields() -> None:
+    policy = ProcessingPolicy.model_construct(schema_version="candidate-v1")
+    extras = _EmptyNativeRaisingViews()
+    _attach_extra_storage(policy, extras)
+
+    with pytest.raises(PlaintextDispatchRejected, match="policy is invalid") as exc:
+        validate_plaintext_dispatch(
+            policy,
+            execution_location="endpoint",
+            recipient_id=None,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=set(),
+            is_fallback=False,
+        )
+
+    assert isinstance(exc.value.__cause__, ValidationError)
+    missing_locations = {
+        error["loc"] for error in exc.value.__cause__.errors()
+    }
+    assert ("mode",) in missing_locations
+    assert ("policy_epoch",) in missing_locations
+    assert extras.view_calls == 0
 
 
 def test_dispatch_uses_concrete_extra_storage_type() -> None:
