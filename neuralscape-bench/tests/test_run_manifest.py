@@ -512,6 +512,99 @@ class EventPublicTuple(tuple[object, ...]):
         return iter(self.public_values)
 
 
+class IteratorAcquisitionErrorTuple(tuple[object, ...]):
+    """Raise one stable ordinary error while acquiring the public iterator."""
+
+    def __new__(cls, _prefix: object):
+        instance = super().__new__(cls, ())
+        instance.iteration_calls = 0
+        instance.error = RuntimeError(
+            "ordinary public sequence iterator acquisition failed"
+        )
+        return instance
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        raise self.error
+
+
+class IteratorAdvancementErrorTuple(tuple[object, ...]):
+    """Yield one public value, then raise one stable ordinary error."""
+
+    def __new__(cls, prefix: object):
+        instance = super().__new__(cls, ())
+        instance.prefix = prefix
+        instance.iteration_calls = 0
+        instance.advancement_calls = 0
+        instance.error = RuntimeError(
+            "ordinary public sequence iterator advancement failed"
+        )
+        return instance
+
+    def __iter__(self):
+        self.iteration_calls += 1
+
+        def generate():
+            self.advancement_calls += 1
+            yield self.prefix
+            self.advancement_calls += 1
+            raise self.error
+
+        return generate()
+
+
+class IteratorAcquisitionErrorList(list[object]):
+    """Raise one stable ordinary error while acquiring the public iterator."""
+
+    def __init__(self, _prefix: object):
+        super().__init__()
+        self.iteration_calls = 0
+        self.error = RuntimeError(
+            "ordinary public list iterator acquisition failed"
+        )
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        raise self.error
+
+
+class IteratorAdvancementErrorList(list[object]):
+    """Yield one public value, then raise one stable ordinary error."""
+
+    def __init__(self, prefix: object):
+        super().__init__()
+        self.prefix = prefix
+        self.iteration_calls = 0
+        self.advancement_calls = 0
+        self.error = RuntimeError(
+            "ordinary public list iterator advancement failed"
+        )
+
+    def __iter__(self):
+        self.iteration_calls += 1
+
+        def generate():
+            self.advancement_calls += 1
+            yield self.prefix
+            self.advancement_calls += 1
+            raise self.error
+
+        return generate()
+
+
+class PassiveProjectionKey(str):
+    """Count ordinary hashing when a retained mapping prefix is projected."""
+
+    def __new__(cls, value: str):
+        instance = super().__new__(cls, value)
+        instance.hash_calls = 0
+        return instance
+
+    def __hash__(self) -> int:
+        self.hash_calls += 1
+        return str.__hash__(self)
+
+
 class PublicViewList(list[object]):
     """Keep hidden native list backing distinct from a passive public view."""
 
@@ -1093,6 +1186,138 @@ def test_mapping_inventory_completes_nested_public_tuple_before_parent_advance()
     )
     assert _snapshot_native(mapping, _frozen_graph=frozen)["tail"] == 1
     assert public_exclusions.iteration_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("sequence_type", "retains_prefix", "expected_advancement_calls"),
+    [
+        (IteratorAcquisitionErrorTuple, False, 0),
+        (IteratorAdvancementErrorTuple, True, 2),
+        (IteratorAcquisitionErrorList, False, 0),
+        (IteratorAdvancementErrorList, True, 2),
+    ],
+    ids=[
+        "tuple-iterator-acquisition",
+        "tuple-iterator-advancement",
+        "list-iterator-acquisition",
+        "list-iterator-advancement",
+    ],
+)
+def test_public_sequence_iterator_failure_is_retained_and_replayed_once(
+    sequence_type,
+    retains_prefix: bool,
+    expected_advancement_calls: int,
+):
+    projection_key = PassiveProjectionKey("projected")
+    prefix = InventoryMapping(((projection_key, "prefix-value"),))
+    sequence = sequence_type(prefix)
+    primary = InventoryMapping((("sequence", sequence),), name="primary")
+    alias = InventoryMapping((("sequence", sequence),), name="alias")
+
+    frozen = _freeze_model_graphs(primary, alias)
+
+    retained = frozen.public_sequences[id(sequence)]
+    assert retained.owner is sequence
+    assert retained.entries == ((prefix,) if retains_prefix else ())
+    assert retained.failure is sequence.error
+    assert retained.complete is False
+    assert sequence.iteration_calls == 1
+    assert getattr(sequence, "advancement_calls", 0) == (
+        expected_advancement_calls
+    )
+    assert primary.items_calls == 1
+    assert alias.items_calls == 0
+    assert prefix.items_calls == (1 if retains_prefix else 0)
+    assert projection_key.hash_calls == 0
+    assert _snapshot_native(
+        {"safe": "value"}, _frozen_graph=frozen
+    ) == {"safe": "value"}
+    assert projection_key.hash_calls == 0
+
+    with pytest.raises(RuntimeError) as alias_error:
+        _snapshot_native(alias, _frozen_graph=frozen)
+    assert projection_key.hash_calls == (1 if retains_prefix else 0)
+    with pytest.raises(RuntimeError) as primary_error:
+        _snapshot_native(primary, _frozen_graph=frozen)
+
+    assert alias_error.value is sequence.error
+    assert primary_error.value is sequence.error
+    assert sequence.iteration_calls == 1
+    assert getattr(sequence, "advancement_calls", 0) == (
+        expected_advancement_calls
+    )
+    assert primary.items_calls == 1
+    assert alias.items_calls == 1
+    assert prefix.items_calls == (1 if retains_prefix else 0)
+    assert projection_key.hash_calls == (2 if retains_prefix else 0)
+
+
+@pytest.mark.parametrize(
+    "sequence_type",
+    [
+        IteratorAcquisitionErrorTuple,
+        IteratorAdvancementErrorTuple,
+        IteratorAcquisitionErrorList,
+        IteratorAdvancementErrorList,
+    ],
+    ids=[
+        "tuple-iterator-acquisition",
+        "tuple-iterator-advancement",
+        "list-iterator-acquisition",
+        "list-iterator-advancement",
+    ],
+)
+def test_public_sequence_iterator_failure_preserves_receiver_error_order(
+    sequence_type,
+):
+    def measurement_with(sequence):
+        values = timing().model_dump(mode="python")
+        values["exclusions"] = sequence
+        return InventoryMapping(tuple(values.items()))
+
+    invalid_planned = planned_manifest()
+    invalid_concurrency = invalid_planned.concurrency[0].model_copy(
+        update={"value": True}
+    )
+    invalid_planned = invalid_planned.model_copy(
+        update={"concurrency": (invalid_concurrency,)}
+    )
+    deferred_sequence = sequence_type(timing().exclusions[0])
+    deferred_measurement = measurement_with(deferred_sequence)
+
+    with pytest.raises(ValidationError) as invalid_error:
+        finish_run(
+            invalid_planned,
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(deferred_measurement,),
+        )
+
+    assert invalid_error.value.errors()[0]["loc"] == (
+        "concurrency",
+        0,
+        "value",
+    )
+    assert deferred_sequence.iteration_calls == 1
+    assert deferred_measurement.items_calls == 1
+
+    reached_sequence = sequence_type(timing().exclusions[0])
+    reached_measurement = measurement_with(reached_sequence)
+    with pytest.raises(RuntimeError) as reached_error:
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(reached_measurement,),
+        )
+
+    assert reached_error.value is reached_sequence.error
+    assert reached_sequence.iteration_calls == 1
+    assert reached_measurement.items_calls == 1
 
 
 def test_model_reachable_public_mappings_validate_from_one_inventory():
