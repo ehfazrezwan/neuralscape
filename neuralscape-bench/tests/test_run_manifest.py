@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+from abc import ABCMeta
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -302,6 +303,63 @@ class ChangingItemsExtras(Mapping[str, object]):
         return (("run_id", "second-view"),)
 
 
+class DictEqualitySpoof:
+    """Compare equal to dict if candidate-MRO membership consults it."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def __eq__(self, other: object) -> bool:
+        self.calls += 1
+        return other is dict
+
+
+DICT_EQUALITY_SPOOF = DictEqualitySpoof()
+
+
+class MroSpoofMeta(ABCMeta):
+    def __getattribute__(cls, name: str):
+        if name == "__mro__":
+            return (dict,)
+        return super().__getattribute__(name)
+
+
+class EqualitySpoofMeta(ABCMeta):
+    def __getattribute__(cls, name: str):
+        if name == "__mro__":
+            return (DICT_EQUALITY_SPOOF,)
+        return super().__getattribute__(name)
+
+
+class MetaclassSpoofExtras(Mapping[str, object]):
+    def __init__(self, values: dict[str, object]):
+        self.values = values
+        self.iteration_calls = 0
+        self.items_calls = 0
+
+    def __getitem__(self, key: str) -> object:
+        return self.values[key]
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        return iter(self.values)
+
+    def items(self):
+        self.items_calls += 1
+        return tuple(self.values.items())
+
+
+class MroSpoofExtras(MetaclassSpoofExtras, metaclass=MroSpoofMeta):
+    pass
+
+
+class EqualitySpoofExtras(MetaclassSpoofExtras, metaclass=EqualitySpoofMeta):
+    pass
+
+
 def test_planned_to_completed_round_trip_is_canonical_and_stable():
     manifest = completed_manifest()
 
@@ -458,6 +516,37 @@ def test_serializer_accepts_empty_native_dict_subclass(target_name: str):
     assert extras.iteration_calls == 0
     assert extras.keys_calls == 0
     assert extras.items_calls == 0
+
+
+@pytest.mark.parametrize("target_name", ["manifest", "nested_resource"])
+@pytest.mark.parametrize(
+    "extra_type",
+    [MroSpoofExtras, EqualitySpoofExtras],
+    ids=["spoofed-mro", "spoofed-mro-equality"],
+)
+@pytest.mark.parametrize("populated", [False, True], ids=["empty", "unknown"])
+def test_serializer_keeps_metaclass_spoofs_on_non_dict_mapping_path(
+    target_name: str,
+    extra_type: type[MetaclassSpoofExtras],
+    populated: bool,
+):
+    manifest, target = planned_manifest_with_extra_target(target_name)
+    values = {"future_constraint": "deny"} if populated else {}
+    extras = extra_type(values)
+    object.__setattr__(target, "__pydantic_extra__", extras)
+    DICT_EQUALITY_SPOOF.calls = 0
+
+    if populated:
+        with pytest.raises(ValueError, match="undeclared stored fields"):
+            serialize_run_manifest(manifest)
+    else:
+        assert serialize_run_manifest(manifest) == serialize_run_manifest(
+            planned_manifest()
+        )
+
+    assert extras.iteration_calls == 1
+    assert extras.items_calls == 1
+    assert DICT_EQUALITY_SPOOF.calls == 0
 
 
 @pytest.mark.parametrize(

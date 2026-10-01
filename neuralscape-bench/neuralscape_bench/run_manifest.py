@@ -315,7 +315,7 @@ def _snapshot_native(value: Any, *, path: str = "$", active: set[int] | None = N
             undeclared = set(stored).difference(fields)
             extras = getattr(value, "__pydantic_extra__", None)
             if extras is not None:
-                if dict in type(extras).__mro__:
+                if issubclass(type(extras), dict):
                     extra_entries = tuple(dict.items(extras))
                     iterated_extra_names = tuple(key for key, _ in extra_entries)
                 else:
