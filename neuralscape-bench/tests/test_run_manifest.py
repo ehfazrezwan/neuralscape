@@ -17,6 +17,7 @@ import pydantic
 import pytest
 from pydantic import ValidationError
 
+import neuralscape_bench.run_manifest as run_manifest_module
 from neuralscape_bench.run_manifest import (
     BuildIdentity,
     CacheCondition,
@@ -1318,6 +1319,167 @@ def test_public_sequence_iterator_failure_preserves_receiver_error_order(
     assert reached_error.value is reached_sequence.error
     assert reached_sequence.iteration_calls == 1
     assert reached_measurement.items_calls == 1
+
+
+@pytest.mark.parametrize("boundary", ["mapping", "sequence"])
+def test_recursive_public_shape_failure_is_deferred_and_replayed_once(
+    boundary: str,
+    monkeypatch,
+):
+    sentinel = object()
+    failure = RuntimeError("ordinary recursive public-shape helper failed")
+    failure_calls = 0
+    original = run_manifest_module._inventory_yielded_public_shape
+
+    def inject_failure(value, frozen_graph, observing):
+        nonlocal failure_calls
+        if value is sentinel:
+            failure_calls += 1
+            raise failure
+        return original(value, frozen_graph, observing)
+
+    monkeypatch.setattr(
+        run_manifest_module,
+        "_inventory_yielded_public_shape",
+        inject_failure,
+    )
+    projection_key = PassiveProjectionKey("projected")
+    prefix = InventoryMapping(((projection_key, "prefix-value"),))
+    if boundary == "mapping":
+        failing_child = InventoryMapping(
+            (("prefix", prefix), ("terminal", sentinel)),
+            name="failing-child",
+        )
+    else:
+        failing_child = EventPublicTuple(
+            (),
+            (prefix, sentinel),
+            [],
+            "failing-child",
+        )
+    primary = InventoryMapping((("child", failing_child),), name="primary")
+    alias = InventoryMapping((("child", failing_child),), name="alias")
+
+    frozen = _freeze_model_graphs(primary, alias)
+
+    if boundary == "mapping":
+        retained = frozen.public_mappings[id(failing_child)]
+        assert failing_child.items_calls == 1
+    else:
+        retained = frozen.public_sequences[id(failing_child)]
+        assert failing_child.iteration_calls == 1
+    assert retained.owner is failing_child
+    assert retained.entries == (
+        (("prefix", prefix), ("terminal", sentinel))
+        if boundary == "mapping"
+        else (prefix, sentinel)
+    )
+    assert retained.failure is failure
+    assert retained.complete is False
+    assert failure_calls == 1
+    assert prefix.items_calls == 1
+    assert projection_key.hash_calls == 0
+    assert primary.items_calls == 1
+    assert alias.items_calls == 0
+    assert _snapshot_native(
+        {"safe": "value"}, _frozen_graph=frozen
+    ) == {"safe": "value"}
+
+    with pytest.raises(RuntimeError) as alias_error:
+        _snapshot_native(alias, _frozen_graph=frozen)
+    assert projection_key.hash_calls == 1
+    with pytest.raises(RuntimeError) as primary_error:
+        _snapshot_native(primary, _frozen_graph=frozen)
+
+    assert alias_error.value is failure
+    assert primary_error.value is failure
+    assert failure_calls == 1
+    assert prefix.items_calls == 1
+    assert projection_key.hash_calls == 2
+    assert primary.items_calls == 1
+    assert alias.items_calls == 1
+    if boundary == "mapping":
+        assert failing_child.items_calls == 1
+    else:
+        assert failing_child.iteration_calls == 1
+
+
+@pytest.mark.parametrize("boundary", ["mapping", "sequence"])
+def test_recursive_public_shape_failure_preserves_receiver_error_order(
+    boundary: str,
+    monkeypatch,
+):
+    sentinel = object()
+    failure = RuntimeError("ordinary recursive public-shape helper failed")
+    failure_calls = 0
+    original = run_manifest_module._inventory_yielded_public_shape
+
+    def inject_failure(value, frozen_graph, observing):
+        nonlocal failure_calls
+        if value is sentinel:
+            failure_calls += 1
+            raise failure
+        return original(value, frozen_graph, observing)
+
+    monkeypatch.setattr(
+        run_manifest_module,
+        "_inventory_yielded_public_shape",
+        inject_failure,
+    )
+    prefix = InventoryMapping((("prefix", "value"),))
+    if boundary == "mapping":
+        failing_child = InventoryMapping(
+            (("prefix", prefix), ("terminal", sentinel))
+        )
+    else:
+        failing_child = PublicViewList([], [prefix, sentinel])
+    values = timing().model_dump(mode="python")
+    values["exclusions"] = failing_child
+    measurement = InventoryMapping(tuple(values.items()))
+    invalid_planned = planned_manifest()
+    invalid_concurrency = invalid_planned.concurrency[0].model_copy(
+        update={"value": True}
+    )
+    invalid_planned = invalid_planned.model_copy(
+        update={"concurrency": (invalid_concurrency,)}
+    )
+
+    with pytest.raises(ValidationError) as invalid_error:
+        finish_run(
+            invalid_planned,
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(measurement,),
+        )
+
+    assert invalid_error.value.errors()[0]["loc"] == (
+        "concurrency",
+        0,
+        "value",
+    )
+    assert failure_calls == 1
+    assert measurement.items_calls == 1
+
+    with pytest.raises(RuntimeError) as reached_error:
+        finish_run(
+            planned_manifest(),
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(measured_memory(),),
+            measurements=(measurement,),
+        )
+
+    assert reached_error.value is failure
+    assert failure_calls == 2
+    assert measurement.items_calls == 2
+    assert prefix.items_calls == 2
+    if boundary == "mapping":
+        assert failing_child.items_calls == 2
+    else:
+        assert failing_child.iteration_calls == 2
 
 
 def test_model_reachable_public_mappings_validate_from_one_inventory():
