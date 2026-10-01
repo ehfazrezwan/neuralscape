@@ -46,6 +46,7 @@ class _CapturedCycle(_CapturedGraph):
 
 @dataclass(frozen=True, slots=True)
 class _CapturedModel(_CapturedGraph):
+    identity: int
     model_type: type[BaseModel]
     stored_entries: tuple[tuple[object, _CapturedGraph], ...]
     extra_entries: tuple[tuple[object, _CapturedGraph], ...]
@@ -54,33 +55,43 @@ class _CapturedModel(_CapturedGraph):
 
 @dataclass(frozen=True, slots=True)
 class _CapturedDict(_CapturedGraph):
+    identity: int
     entries: tuple[tuple[object, _CapturedGraph], ...]
 
 
 @dataclass(frozen=True, slots=True)
 class _CapturedList(_CapturedGraph):
+    identity: int
+    source: list[object]
     items: tuple[_CapturedGraph, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class _CapturedTuple(_CapturedGraph):
+    identity: int
+    source: tuple[object, ...]
     items: tuple[_CapturedGraph, ...]
 
 
 def _capture_native_contract_graph(
     value: object,
     active_containers: set[int] | None = None,
+    captured_by_identity: dict[int, _CapturedGraph] | None = None,
 ) -> _CapturedGraph:
     """Freeze supported native backing without invoking public protocols."""
 
     value_type = type(value)
     if active_containers is None:
         active_containers = set()
+    if captured_by_identity is None:
+        captured_by_identity = {}
 
     if issubclass(value_type, (BaseModel, dict, list, tuple)):
         identity = id(value)
         if identity in active_containers:
             return _CapturedCycle()
+        if identity in captured_by_identity:
+            return captured_by_identity[identity]
         active_containers.add(identity)
         try:
             if issubclass(value_type, BaseModel):
@@ -99,99 +110,175 @@ def _capture_native_contract_graph(
                     extra_entries = (
                         () if malformed_extra else tuple(dict.items(extra))
                     )
-                return _CapturedModel(
+                captured: _CapturedGraph = _CapturedModel(
+                    identity=identity,
                     model_type=value_type,
                     stored_entries=tuple(
                         (
                             key,
-                            _capture_native_contract_graph(item, active_containers),
+                            _capture_native_contract_graph(
+                                item,
+                                active_containers,
+                                captured_by_identity,
+                            ),
                         )
                         for key, item in stored_entries
                     ),
                     extra_entries=tuple(
                         (
                             key,
-                            _capture_native_contract_graph(item, active_containers),
+                            _capture_native_contract_graph(
+                                item,
+                                active_containers,
+                                captured_by_identity,
+                            ),
                         )
                         for key, item in extra_entries
                     ),
                     malformed_extra=malformed_extra,
                 )
-            if issubclass(value_type, dict):
+            elif issubclass(value_type, dict):
                 entries = tuple(dict.items(value))
-                return _CapturedDict(
-                    tuple(
+                captured = _CapturedDict(
+                    identity=identity,
+                    entries=tuple(
                         (
                             key,
-                            _capture_native_contract_graph(item, active_containers),
+                            _capture_native_contract_graph(
+                                item,
+                                active_containers,
+                                captured_by_identity,
+                            ),
                         )
                         for key, item in entries
-                    )
+                    ),
                 )
-            if issubclass(value_type, list):
+            elif issubclass(value_type, list):
                 native_items = tuple(list.__iter__(value))
-                return _CapturedList(
-                    tuple(
-                        _capture_native_contract_graph(item, active_containers)
+                captured = _CapturedList(
+                    identity=identity,
+                    source=value,
+                    items=tuple(
+                        _capture_native_contract_graph(
+                            item,
+                            active_containers,
+                            captured_by_identity,
+                        )
                         for item in native_items
-                    )
+                    ),
                 )
-            native_items = tuple(tuple.__iter__(value))
-            return _CapturedTuple(
-                tuple(
-                    _capture_native_contract_graph(item, active_containers)
-                    for item in native_items
+            else:
+                native_items = tuple(tuple.__iter__(value))
+                captured = _CapturedTuple(
+                    identity=identity,
+                    source=value,
+                    items=tuple(
+                        _capture_native_contract_graph(
+                            item,
+                            active_containers,
+                            captured_by_identity,
+                        )
+                        for item in native_items
+                    ),
                 )
-            )
+            captured_by_identity[identity] = captured
+            return captured
         finally:
             active_containers.remove(identity)
     return _CapturedLeaf(value)
 
 
-def _model_field_name(value: object) -> object:
-    """Normalize benign string subclasses without invoking their hooks."""
-
-    if issubclass(type(value), str):
-        return str.__str__(value)
-    return value
-
-
-def _materialize_captured_graph(value: _CapturedGraph) -> object:
+def _materialize_captured_graph(
+    value: _CapturedGraph,
+    captured_by_identity: dict[int, _CapturedGraph],
+    active_containers: set[int] | None = None,
+) -> object:
     """Reconstruct one frozen graph with established diagnostic ordering."""
 
+    if active_containers is None:
+        active_containers = set()
     if isinstance(value, _CapturedCycle):
         raise ValueError("cyclic contract graph is not valid input")
     if isinstance(value, _CapturedLeaf):
         return value.value
-    if isinstance(value, _CapturedModel):
-        stored_entries = tuple(
-            (_model_field_name(key), item)
-            for key, item in value.stored_entries
-        )
-        stored_names = {key for key, _ in stored_entries}
-        declared_fields = value.model_type.model_fields
-        fields = {
-            key: _materialize_captured_graph(item)
-            for key, item in stored_entries
-        }
-        if value.malformed_extra:
-            raise ValueError("malformed stored contract extras are not valid input")
-        for raw_key, item in value.extra_entries:
-            key = _model_field_name(raw_key)
-            if key in stored_names or key in declared_fields:
-                raise ValueError(
-                    "conflicting stored contract field is not valid input"
+    identity = value.identity
+    if identity in active_containers:
+        raise ValueError("cyclic contract graph is not valid input")
+    active_containers.add(identity)
+    try:
+        if isinstance(value, _CapturedModel):
+            stored_names = {key for key, _ in value.stored_entries}
+            declared_fields = value.model_type.model_fields
+            fields = {
+                key: _materialize_captured_graph(
+                    item,
+                    captured_by_identity,
+                    active_containers,
                 )
-            fields[key] = _materialize_captured_graph(item)
-        return fields
-    if isinstance(value, _CapturedDict):
-        return {
-            key: _materialize_captured_graph(item)
-            for key, item in value.entries
-        }
-    if isinstance(value, _CapturedList):
-        return [_materialize_captured_graph(item) for item in value.items]
-    return tuple(_materialize_captured_graph(item) for item in value.items)
+                for key, item in value.stored_entries
+            }
+            if value.malformed_extra:
+                raise ValueError(
+                    "malformed stored contract extras are not valid input"
+                )
+            for key, item in value.extra_entries:
+                if key in stored_names or key in declared_fields:
+                    raise ValueError(
+                        "conflicting stored contract field is not valid input"
+                    )
+                fields[key] = _materialize_captured_graph(
+                    item,
+                    captured_by_identity,
+                    active_containers,
+                )
+            return fields
+        if isinstance(value, _CapturedDict):
+            return {
+                key: _materialize_captured_graph(
+                    item,
+                    captured_by_identity,
+                    active_containers,
+                )
+                for key, item in value.entries
+            }
+
+        def public_item(item: object) -> _CapturedGraph:
+            item_type = type(item)
+            if issubclass(item_type, (BaseModel, dict, list, tuple)):
+                frozen = captured_by_identity.get(id(item))
+                if frozen is not None:
+                    return frozen
+                return _capture_native_contract_graph(
+                    item,
+                    captured_by_identity=captured_by_identity,
+                )
+            return _CapturedLeaf(item)
+
+        if isinstance(value, _CapturedList):
+            items = value.items if type(value.source) is list else (
+                public_item(item) for item in value.source
+            )
+            return [
+                _materialize_captured_graph(
+                    item,
+                    captured_by_identity,
+                    active_containers,
+                )
+                for item in items
+            ]
+        items = value.items if type(value.source) is tuple else (
+            public_item(item) for item in value.source
+        )
+        return tuple(
+            _materialize_captured_graph(
+                item,
+                captured_by_identity,
+                active_containers,
+            )
+            for item in items
+        )
+    finally:
+        active_containers.remove(identity)
 
 
 def _native_contract_graph(
@@ -200,8 +287,13 @@ def _native_contract_graph(
 ) -> object:
     """Materialize stored fields without dropping extras or hiding cycles."""
 
-    captured = _capture_native_contract_graph(value, active_containers)
-    return _materialize_captured_graph(captured)
+    captured_by_identity: dict[int, _CapturedGraph] = {}
+    captured = _capture_native_contract_graph(
+        value,
+        active_containers,
+        captured_by_identity,
+    )
+    return _materialize_captured_graph(captured, captured_by_identity)
 
 
 def _revalidated_model(model_type: type[_ModelT], value: object) -> _ModelT:

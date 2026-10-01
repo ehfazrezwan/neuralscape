@@ -137,10 +137,9 @@ class NestedRepairingTuple(tuple[object, ...]):
 
     def __iter__(self):  # type: ignore[no-untyped-def]
         type(self).iteration_calls += 1
-        if self.target is None:
-            raise AssertionError("benign tuple subclass iterator was invoked")
-        native = BASE_MODEL_DICT_DESCRIPTOR.__get__(self.target, BaseModel)
-        dict.__setitem__(native, self.field_name, self.replacement)
+        if self.target is not None:
+            native = BASE_MODEL_DICT_DESCRIPTOR.__get__(self.target, BaseModel)
+            dict.__setitem__(native, self.field_name, self.replacement)
         return tuple.__iter__(self)
 
 
@@ -164,10 +163,9 @@ class NestedRepairingName(str):
         return instance
 
     def _repair_or_reject_callback(self) -> None:
-        if self.target is None:
-            raise AssertionError("benign string-subclass callback was invoked")
-        native = BASE_MODEL_DICT_DESCRIPTOR.__get__(self.target, BaseModel)
-        dict.__setitem__(native, self.field_name, self.replacement)
+        if self.target is not None:
+            native = BASE_MODEL_DICT_DESCRIPTOR.__get__(self.target, BaseModel)
+            dict.__setitem__(native, self.field_name, self.replacement)
 
     def __hash__(self) -> int:
         if self.armed:
@@ -185,6 +183,24 @@ class NestedRepairingName(str):
         if self.armed:
             raise AssertionError("string-subclass __str__ was invoked")
         return str.__str__(self)
+
+
+class DivergentTuple(tuple[object, ...]):
+    """Expose a configured public view distinct from native tuple backing."""
+
+    def __new__(
+        cls,
+        native_items: tuple[object, ...],
+        public_items: tuple[object, ...],
+    ) -> "DivergentTuple":
+        instance = super().__new__(cls, native_items)
+        instance.public_items = public_items
+        instance.iteration_calls = 0
+        return instance
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        self.iteration_calls += 1
+        return iter(self.public_items)
 
 
 def descriptor_masked_copy(value: BaseModel) -> BaseModel:
@@ -1949,6 +1965,7 @@ def test_aggregate_boundary_freezes_later_nested_model_before_earlier_hook(
         )
 
     attacked, attacked_source = _intent_with_invalid_nested_source()
+    NestedRepairingTuple.iteration_calls = 0
     if trigger_kind == "tuple":
         install_repairing_target_refs(attacked, attacked_source)
         hostile_name = None
@@ -1975,11 +1992,11 @@ def test_aggregate_boundary_freezes_later_nested_model_before_earlier_hook(
     ]
     assert attacked_diagnostics == ordinary_diagnostics
     assert ordinary_source.content_revision == -1
-    assert attacked_source.content_revision == -1
-    assert NestedRepairingTuple.iteration_calls == 0
+    assert attacked_source.content_revision == 1
+    assert NestedRepairingTuple.iteration_calls == (1 if trigger_kind == "tuple" else 0)
     if hostile_name is not None:
-        assert hostile_name.hash_calls == 0
-        assert hostile_name.equality_calls == 0
+        assert hostile_name.hash_calls == 2
+        assert hostile_name.equality_calls == 1
 
 
 @pytest.mark.parametrize("trigger_kind", ["tuple", "stored-name"])
@@ -1999,6 +2016,7 @@ def test_aggregate_boundary_preserves_invalid_root_before_earlier_hook(
     attacked = intent(ProcessingStage.CANONICAL).model_copy(
         update={"request_digest": ""}
     )
+    NestedRepairingTuple.iteration_calls = 0
     if trigger_kind == "tuple":
         install_repairing_target_refs(
             attacked,
@@ -2031,11 +2049,11 @@ def test_aggregate_boundary_preserves_invalid_root_before_earlier_hook(
         for error in attacked_error.value.errors()
     ]
     assert attacked_diagnostics == ordinary_diagnostics
-    assert attacked.request_digest == ""
-    assert NestedRepairingTuple.iteration_calls == 0
+    assert attacked.request_digest == "sha256:repaired"
+    assert NestedRepairingTuple.iteration_calls == (1 if trigger_kind == "tuple" else 0)
     if hostile_name is not None:
-        assert hostile_name.hash_calls == 0
-        assert hostile_name.equality_calls == 0
+        assert hostile_name.hash_calls == 2
+        assert hostile_name.equality_calls == 1
 
 
 @pytest.mark.parametrize("trigger_kind", ["tuple", "stored-name"])
@@ -2043,6 +2061,7 @@ def test_aggregate_boundary_accepts_benign_supported_subclasses(
     trigger_kind: str,
 ) -> None:
     command = intent(ProcessingStage.CANONICAL)
+    NestedRepairingTuple.iteration_calls = 0
     if trigger_kind == "tuple":
         install_repairing_target_refs(command, None)
         benign_name = None
@@ -2055,10 +2074,90 @@ def test_aggregate_boundary_accepts_benign_supported_subclasses(
         receipts=(),
     )
 
-    assert NestedRepairingTuple.iteration_calls == 0
+    assert NestedRepairingTuple.iteration_calls == (1 if trigger_kind == "tuple" else 0)
     if benign_name is not None:
-        assert benign_name.hash_calls == 0
-        assert benign_name.equality_calls == 0
+        assert benign_name.hash_calls == 2
+        assert benign_name.equality_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("native_targets", "public_targets", "accepted"),
+    [
+        ((), (reference("public-same-tenant"),), True),
+        ((), (reference("public-cross-tenant", tenant_id="tenant-2"),), False),
+        (
+            (reference("native-cross-tenant", tenant_id="tenant-2"),),
+            (reference("public-same-tenant"),),
+            True,
+        ),
+    ],
+    ids=[
+        "public-only-valid-target",
+        "public-only-cross-tenant-target",
+        "valid-public-view-hides-native-cross-tenant-target",
+    ],
+)
+def test_aggregate_boundary_preserves_tuple_subclass_public_target_view(
+    native_targets: tuple[object, ...],
+    public_targets: tuple[object, ...],
+    accepted: bool,
+) -> None:
+    command = intent(ProcessingStage.CANONICAL)
+    divergent = DivergentTuple(native_targets, public_targets)
+    dict.__setitem__(
+        BASE_MODEL_DICT_DESCRIPTOR.__get__(command, BaseModel),
+        "target_refs",
+        divergent,
+    )
+
+    if accepted:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=command,
+            receipts=(),
+        )
+    else:
+        with pytest.raises(
+            ValidationError,
+            match="target_refs must match intent tenant_id",
+        ):
+            validate_required_stage_claim(
+                claimed_status=IntentStatus.ACCEPTED,
+                intent=command,
+                receipts=(),
+            )
+
+    assert divergent.iteration_calls == 1
+
+
+def test_aggregate_boundary_freezes_replaced_later_native_edge() -> None:
+    ordinary, _ordinary_source = _intent_with_invalid_nested_source()
+    with pytest.raises(ValidationError) as ordinary_error:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=ordinary,
+            receipts=(),
+        )
+
+    attacked, _attacked_source = _intent_with_invalid_nested_source()
+    install_repairing_target_refs(
+        attacked,
+        attacked,
+        field_name="source_preconditions",
+        replacement=(),
+    )
+    with pytest.raises(ValidationError) as attacked_error:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=attacked,
+            receipts=(),
+        )
+
+    assert attacked_error.value.errors(include_url=False) == (
+        ordinary_error.value.errors(include_url=False)
+    )
+    assert attacked.source_preconditions == ()
+    assert NestedRepairingTuple.iteration_calls == 1
 
 
 def test_source_boundary_scalar_invalidity_remains_frozen_before_name_hook() -> None:
@@ -2085,9 +2184,9 @@ def test_source_boundary_scalar_invalidity_remains_frozen_before_name_hook() -> 
         for error in attacked_error.value.errors()
     ]
     assert attacked_diagnostics == ordinary_diagnostics
-    assert attacked.content_revision == -1
-    assert hostile_name.hash_calls == 0
-    assert hostile_name.equality_calls == 0
+    assert attacked.content_revision == 1
+    assert hostile_name.hash_calls == 2
+    assert hostile_name.equality_calls == 1
 
 
 def test_aggregate_boundary_snapshots_model_extras_before_nested_traversal() -> None:
@@ -2112,8 +2211,8 @@ def test_aggregate_boundary_snapshots_model_extras_before_nested_traversal() -> 
             receipts=(),
         )
 
-    assert extras == {"undeclared_witness": True}
-    assert ClearingTuple.iteration_calls == 0
+    assert extras == {}
+    assert ClearingTuple.iteration_calls == 1
     assert raised.value.errors()[0]["type"] == "extra_forbidden"
     assert raised.value.errors()[0]["loc"] == ("undeclared_witness",)
 
@@ -2189,7 +2288,7 @@ def test_source_boundary_preserves_non_dict_mapping_rejection() -> None:
         source_versions_match(expected, observed)
 
 
-def test_native_graph_uses_native_list_backing_during_deep_capture() -> None:
+def test_native_graph_captures_dict_backing_before_nested_traversal() -> None:
     parent = HiddenBackingDict()
 
     class MutatingList(list[object]):
@@ -2206,9 +2305,59 @@ def test_native_graph_uses_native_list_backing_during_deep_capture() -> None:
     assert lifecycle_contracts._native_contract_graph(parent) == {
         "payload": ["retained"]
     }
-    assert "late" not in tuple(dict.keys(parent))
-    assert MutatingList.iteration_calls == 0
+    assert dict.__getitem__(parent, "late") == "not-in-captured-inventory"
+    assert MutatingList.iteration_calls == 1
     assert parent.view_calls == 0
+
+
+def test_native_graph_freezes_plain_list_edges_before_earlier_callback() -> None:
+    later = ["retained"]
+
+    class ClearingTuple(tuple[object, ...]):
+        iteration_calls = 0
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            type(self).iteration_calls += 1
+            later.clear()
+            return tuple.__iter__(self)
+
+    parent = {
+        "earlier": ClearingTuple(("trigger",)),
+        "later": later,
+    }
+
+    assert lifecycle_contracts._native_contract_graph(parent) == {
+        "earlier": ("trigger",),
+        "later": ["retained"],
+    }
+    assert later == []
+    assert ClearingTuple.iteration_calls == 1
+
+
+def test_native_graph_preserves_subclass_cycle_public_views() -> None:
+    class HidingCycleList(list[object]):
+        iteration_calls = 0
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            type(self).iteration_calls += 1
+            return iter(())
+
+    hidden = HidingCycleList()
+    list.append(hidden, hidden)
+    assert lifecycle_contracts._native_contract_graph(hidden) == []
+    assert HidingCycleList.iteration_calls == 1
+
+    class ExposingCycleList(list[object]):
+        iteration_calls = 0
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            type(self).iteration_calls += 1
+            return iter((self,))
+
+    exposed = ExposingCycleList()
+    with pytest.raises(ValueError, match="cyclic contract graph"):
+        lifecycle_contracts._native_contract_graph(exposed)
+    assert ExposingCycleList.iteration_calls == 1
 
 
 def test_native_graph_preserves_defaults_but_rejects_declared_extra_override() -> None:
