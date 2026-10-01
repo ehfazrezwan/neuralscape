@@ -104,6 +104,48 @@ class HiddenNativeBacking(dict[object, object]):
         return False
 
 
+class ClassTrapNativeBacking(HiddenNativeBacking):
+    @property
+    def __class__(self):
+        raise AssertionError("native dict dispatch must not inspect __class__")
+
+
+class DictSpoofMapping(Mapping[object, object]):
+    """A non-dict mapping whose dynamic class view claims to be dict."""
+
+    def __init__(self, entries: dict[object, object]) -> None:
+        self._entries = tuple(entries.items())
+        self.class_calls = 0
+        self.length_calls = 0
+        self.iteration_calls = 0
+        self.items_calls = 0
+        self.boolean_calls = 0
+
+    @property
+    def __class__(self):
+        self.class_calls += 1
+        return dict
+
+    def __getitem__(self, key: object) -> object:
+        return dict(self._entries)[key]
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        return (name for name, _field_value in self._entries)
+
+    def __len__(self) -> int:
+        self.length_calls += 1
+        return len(self._entries)
+
+    def items(self):
+        self.items_calls += 1
+        return self._entries
+
+    def __bool__(self) -> bool:
+        self.boolean_calls += 1
+        return False
+
+
 class InverseItemsMapping(dict[object, object]):
     """Expose iterated keys while hiding every entry from items()."""
 
@@ -793,6 +835,144 @@ def test_transition_accepts_empty_native_dict_subclass_backing() -> None:
         extras.items_calls,
         extras.boolean_calls,
     ) == (0, 0, 0, 0, 0)
+
+
+@pytest.mark.parametrize("boundary", ["transition", "placement"])
+@pytest.mark.parametrize("location", ["direct", "nested"])
+@pytest.mark.parametrize(
+    ("extra_kind", "should_reject"),
+    [("empty", False), ("unknown", True), ("declared", True)],
+)
+def test_tenancy_boundaries_dispatch_native_dict_before_mapping_abc(
+    boundary: str,
+    location: str,
+    extra_kind: str,
+    should_reject: bool,
+) -> None:
+    if boundary == "transition":
+        previous = operation()
+        candidate = operation(observed_state="running")
+        target = (
+            candidate
+            if location == "direct"
+            else candidate.resource_manifests[0]
+        )
+
+        def validate() -> object:
+            return validate_operation_transition(previous, candidate)
+
+    else:
+        candidate = TenantPlacement.model_validate_json(
+            json.dumps(
+                {
+                    "schema_version": VERSION,
+                    "tenant_id": "tenant-a",
+                    "generation": 7,
+                    "resource_manifests": [manifest()],
+                }
+            )
+        )
+        target = (
+            candidate
+            if location == "direct"
+            else candidate.resource_manifests[0]
+        )
+
+        def validate() -> object:
+            return validate_placement_publication(
+                candidate,
+                expected_tenant_id="tenant-a",
+                current_generation=7,
+            )
+
+    stored = {
+        "unknown": {"future_constraint": "reject"},
+        "declared": {"tenant_id": "tenant-a"},
+    }.get(extra_kind, {})
+    extras = ClassTrapNativeBacking(stored)
+    object.__setattr__(target, "__pydantic_extra__", extras)
+
+    if should_reject:
+        with pytest.raises(ValueError, match="undeclared fields"):
+            validate()
+    else:
+        validate()
+
+    assert (
+        extras.length_calls,
+        extras.iteration_calls,
+        extras.keys_calls,
+        extras.items_calls,
+        extras.boolean_calls,
+    ) == (0, 0, 0, 0, 0)
+
+
+@pytest.mark.parametrize("boundary", ["transition", "placement"])
+@pytest.mark.parametrize("location", ["direct", "nested"])
+@pytest.mark.parametrize(
+    ("extra_kind", "should_reject"),
+    [("empty", False), ("unknown", True), ("declared", True)],
+)
+def test_tenancy_boundaries_keep_spoofing_non_dict_on_mapping_path(
+    boundary: str,
+    location: str,
+    extra_kind: str,
+    should_reject: bool,
+) -> None:
+    if boundary == "transition":
+        previous = operation()
+        candidate = operation(observed_state="running")
+        target = (
+            candidate
+            if location == "direct"
+            else candidate.resource_manifests[0]
+        )
+
+        def validate() -> object:
+            return validate_operation_transition(previous, candidate)
+
+    else:
+        candidate = TenantPlacement.model_validate_json(
+            json.dumps(
+                {
+                    "schema_version": VERSION,
+                    "tenant_id": "tenant-a",
+                    "generation": 7,
+                    "resource_manifests": [manifest()],
+                }
+            )
+        )
+        target = (
+            candidate
+            if location == "direct"
+            else candidate.resource_manifests[0]
+        )
+
+        def validate() -> object:
+            return validate_placement_publication(
+                candidate,
+                expected_tenant_id="tenant-a",
+                current_generation=7,
+            )
+
+    stored = {
+        "unknown": {"future_constraint": "reject"},
+        "declared": {"tenant_id": "tenant-a"},
+    }.get(extra_kind, {})
+    extras = DictSpoofMapping(stored)
+    object.__setattr__(target, "__pydantic_extra__", extras)
+
+    if should_reject:
+        with pytest.raises(ValueError, match="undeclared fields"):
+            validate()
+    else:
+        validate()
+
+    assert extras.class_calls == 1
+    assert extras.length_calls == 1
+    assert extras.iteration_calls == 1
+    assert extras.items_calls == 1
+    assert extras.boolean_calls == 0
 
 
 @pytest.mark.parametrize("boundary", ["transition", "placement"])
