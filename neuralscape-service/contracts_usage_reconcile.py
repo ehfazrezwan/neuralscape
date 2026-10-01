@@ -321,6 +321,9 @@ def _freeze_model_storage(
     visited.add(identity)
 
     if issubclass(value_type, BaseModel):
+        frozen_model = frozen_models.get(identity)
+        if frozen_model is not None and frozen_model[0] is value:
+            return
         stored = _MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
         stored_items = tuple(dict.items(stored))
         try:
@@ -358,12 +361,18 @@ def _freeze_model_storage(
         return
 
     if issubclass(value_type, dict):
+        frozen_dict = frozen_dicts.get(identity)
+        if frozen_dict is not None and frozen_dict[0] is value:
+            return
         native_items = tuple(dict.items(value))
         frozen_dicts[identity] = (value, native_items)
         items = (item for _key, item in native_items)
     elif issubclass(value_type, list):
         items = list.__iter__(value)
     elif issubclass(value_type, tuple):
+        frozen_tuple = frozen_tuples.get(identity)
+        if frozen_tuple is not None and frozen_tuple[0] is value:
+            return
         native_items = tuple(tuple.__iter__(value))
         frozen_tuples[identity] = (value, native_items)
         items = iter(native_items)

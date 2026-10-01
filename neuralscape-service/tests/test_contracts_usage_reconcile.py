@@ -431,6 +431,56 @@ class _DivergentPublicMapping(Mapping[str, object]):
         return self.public_entries.items()
 
 
+class _AdjacentItemsMapping(Mapping[str, object]):
+    """Yield one field twice with a callback between adjacent values."""
+
+    def __init__(
+        self,
+        entries: dict[str, object],
+        target: str,
+        first: object,
+        second: object,
+        *,
+        repeat: bool,
+        action: Callable[[], None] | None = None,
+    ) -> None:
+        self.entries = entries
+        self.target = target
+        self.first = first
+        self.second = second
+        self.repeat = repeat
+        self.action = action
+        self.items_calls = 0
+        self.action_calls = 0
+
+    def __getitem__(self, key: str) -> object:
+        return self.entries[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.entries)
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def items(self) -> Iterator[tuple[str, object]]:
+        self.items_calls += 1
+
+        def iterate() -> Iterator[tuple[str, object]]:
+            for key, value in self.entries.items():
+                if key != self.target:
+                    yield key, value
+                    continue
+                yield key, self.first
+                if self.action is not None:
+                    self.action_calls += 1
+                    action, self.action = self.action, None
+                    action()
+                if self.repeat:
+                    yield key, self.second
+
+        return iterate()
+
+
 class _DivergentTuple(tuple):
     """Expose a public iteration view distinct from native tuple storage."""
 
@@ -1306,6 +1356,107 @@ def test_python_prefreeze_keeps_native_dict_and_public_mapping_authority() -> No
     public_invalid = _DivergentPublicMapping(valid_payload, invalid_payload)
     assert _validation_signature(ReconciledUsageStream, public_invalid) == expected
     assert public_invalid.items_calls == 1
+
+
+@pytest.mark.parametrize("receiver_name", ["result", "stream"])
+def test_python_public_mapping_keeps_first_observed_shared_descendant(
+    receiver_name: str,
+) -> None:
+    def run_case(
+        case: str,
+    ) -> tuple[
+        _AdjacentItemsMapping,
+        BaseModel | list[tuple[str, tuple[object, ...], str]],
+    ]:
+        result = reconcile_usage_events([_event()])
+        stream = result.streams[0]
+        if receiver_name == "result":
+            receiver = UsageReconciliation
+            expected: BaseModel = result
+            payload = result.model_dump(mode="python")
+            target = "streams"
+            valid_parent: object = tuple([stream.model_copy()])
+            shared = stream.model_copy(update={"known_token_subtotal": 0})
+            first_parent: object = tuple([shared])
+            second_parent: object = (
+                first_parent if case == "same-parent" else tuple([shared])
+            )
+            shared_backing = _MODEL_DICT_DESCRIPTOR.__get__(shared, BaseModel)
+
+            def repair() -> None:
+                dict.__setitem__(shared_backing, "known_token_subtotal", 15)
+
+        else:
+            receiver = ReconciledUsageStream
+            expected = stream
+            payload = stream.model_dump(mode="python")
+            target = "usage"
+            assert stream.usage is not None
+            valid_usage = stream.usage.model_copy()
+            valid_parent = valid_usage
+            shared = valid_usage.input_tokens.model_copy(update={"value": -1})
+            first_parent = valid_usage.model_copy(
+                update={"input_tokens": shared}
+            )
+            second_parent = (
+                first_parent
+                if case == "same-parent"
+                else valid_usage.model_copy(update={"input_tokens": shared})
+            )
+            shared_backing = _MODEL_DICT_DESCRIPTOR.__get__(shared, BaseModel)
+
+            def repair() -> None:
+                dict.__setitem__(shared_backing, "value", 10)
+
+        if case == "valid":
+            first = valid_parent
+            second = valid_parent
+            repeat = False
+            action = None
+        elif case == "ordinary-invalid":
+            first = first_parent
+            second = first_parent
+            repeat = False
+            action = None
+        else:
+            first = first_parent
+            second = second_parent
+            repeat = True
+            action = repair
+        value = _AdjacentItemsMapping(
+            payload,
+            target,
+            first,
+            second,
+            repeat=repeat,
+            action=action,
+        )
+        if case == "valid":
+            outcome: BaseModel | list[tuple[str, tuple[object, ...], str]] = (
+                receiver.model_validate(value)
+            )
+        else:
+            outcome = _validation_signature(receiver, value)
+        assert value.items_calls == 1
+        assert value.action_calls == (1 if action is not None else 0)
+        if case == "valid":
+            assert outcome == expected
+        return value, outcome
+
+    _valid_mapping, _valid_outcome = run_case("valid")
+    _ordinary_mapping, ordinary = run_case("ordinary-invalid")
+    _same_mapping, same_parent = run_case("same-parent")
+    _distinct_mapping, distinct_parent = run_case("distinct-parent")
+
+    assert same_parent == ordinary
+    assert distinct_parent == ordinary
+    if receiver_name == "result":
+        assert ordinary[0][:2] == ("value_error", ("streams", 0))
+    else:
+        assert ordinary[0][:2] == (
+            "greater_than_equal",
+            ("usage", "input_tokens", "value"),
+        )
 
 
 def test_python_prefreeze_retains_native_root_tuple_edges_without_iteration() -> None:
