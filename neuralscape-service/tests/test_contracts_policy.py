@@ -181,6 +181,45 @@ class _HiddenIterationFieldsSet(set[str]):
         return iter(())
 
 
+class _NestedRepairingFieldName(str):
+    """Repair a nested model if model-owned name hashing is dispatched."""
+
+    def __new__(
+        cls,
+        value: str,
+        target: BaseModel | None,
+    ) -> "_NestedRepairingFieldName":
+        instance = super().__new__(cls, value)
+        instance.target = target
+        instance.armed = False
+        instance.hash_calls = 0
+        instance.equality_calls = 0
+        return instance
+
+    def _repair_or_reject_callback(self) -> None:
+        if self.target is None:
+            raise AssertionError("benign model-owned name callback was invoked")
+        native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(self.target, BaseModel)
+        dict.__setitem__(native, "id", "memory-1")
+
+    def __hash__(self) -> int:
+        if self.armed:
+            self.hash_calls += 1
+            self._repair_or_reject_callback()
+        return str.__hash__(self)
+
+    def __eq__(self, other: object) -> bool:
+        if self.armed:
+            self.equality_calls += 1
+            self._repair_or_reject_callback()
+        return str.__eq__(self, other)
+
+    def __str__(self) -> str:
+        if self.armed:
+            raise AssertionError("model-owned name used subclass string hook")
+        return str.__str__(self)
+
+
 class _StoredDescriptorDecision(PolicyDecision):
     @property
     def __dict__(self):  # type: ignore[override]
@@ -1764,6 +1803,122 @@ def test_receiving_boundary_reads_native_unknown_fields_set_storage(
     assert raised.value.errors()[0]["input"] is None
     if storage_kind == "native-set-subclass":
         assert native_fields_set.view_calls == 0
+
+
+def _nested_model_name_case(
+    boundary: str,
+    *,
+    invalid: bool,
+):  # type: ignore[no-untyped-def]
+    resource_value = reference("memory-1")
+    nested = (
+        resource_value.model_copy(update={"id": ""})
+        if invalid
+        else resource_value
+    )
+    if boundary == "evaluator":
+        candidate = PolicyEvaluationInput(
+            schema_version=VERSION,
+            action="read",
+            resource=resource_value,
+        ).model_copy(update={"resource": nested})
+        policy_value = policy(
+            statement("read-grant", "allow", "read", resource_value)
+        )
+
+        def invoke(value):  # type: ignore[no-untyped-def]
+            return evaluate_policy(
+                principal=principal(),
+                evaluation=value,
+                policy=policy_value,
+            )
+
+    else:
+        candidate = PolicyDecision(**decision_payload()).model_copy(
+            update={"resource": nested}
+        )
+
+        def invoke(value):  # type: ignore[no-untyped-def]
+            return validate_policy_decision(value)
+
+    return candidate, nested, invoke
+
+
+def _install_model_name_subclass(
+    model: BaseModel,
+    nested: BaseModel | None,
+    storage_name: str,
+) -> _NestedRepairingFieldName:
+    name = _NestedRepairingFieldName("resource", nested)
+    if storage_name == "stored":
+        storage = _BASE_MODEL_DICT_DESCRIPTOR.__get__(model, BaseModel)
+        item = dict.__getitem__(storage, "resource")
+        dict.__delitem__(storage, "resource")
+        dict.__setitem__(storage, name, item)
+    else:
+        fields_set = _BASE_MODEL_FIELDS_SET_DESCRIPTOR.__get__(model, BaseModel)
+        set.discard(fields_set, "resource")
+        set.add(fields_set, name)
+    name.armed = True
+    name.hash_calls = 0
+    name.equality_calls = 0
+    return name
+
+
+@pytest.mark.parametrize("boundary", ["evaluator", "receiving"])
+@pytest.mark.parametrize("storage_name", ["stored", "fields-set"])
+def test_policy_boundaries_snapshot_nested_models_before_name_hashing(
+    boundary: str,
+    storage_name: str,
+) -> None:
+    ordinary, ordinary_nested, ordinary_invoke = _nested_model_name_case(
+        boundary,
+        invalid=True,
+    )
+    with pytest.raises(ValidationError) as ordinary_error:
+        ordinary_invoke(ordinary)
+
+    attacked, attacked_nested, attacked_invoke = _nested_model_name_case(
+        boundary,
+        invalid=True,
+    )
+    hostile_name = _install_model_name_subclass(
+        attacked,
+        attacked_nested,
+        storage_name,
+    )
+    with pytest.raises(ValidationError) as attacked_error:
+        attacked_invoke(attacked)
+
+    ordinary_diagnostics = [
+        (error["loc"], error["type"])
+        for error in ordinary_error.value.errors()
+    ]
+    attacked_diagnostics = [
+        (error["loc"], error["type"])
+        for error in attacked_error.value.errors()
+    ]
+    assert attacked_diagnostics == ordinary_diagnostics
+    assert ordinary_nested.id == ""
+    assert attacked_nested.id == ""
+    assert hostile_name.hash_calls == 0
+    assert hostile_name.equality_calls == 0
+
+
+@pytest.mark.parametrize("boundary", ["evaluator", "receiving"])
+@pytest.mark.parametrize("storage_name", ["stored", "fields-set"])
+def test_policy_boundaries_accept_benign_string_subclass_model_names(
+    boundary: str,
+    storage_name: str,
+) -> None:
+    candidate, _, invoke = _nested_model_name_case(boundary, invalid=False)
+    benign_name = _install_model_name_subclass(candidate, None, storage_name)
+
+    result = invoke(candidate)
+
+    assert result.outcome == "allow"
+    assert benign_name.hash_calls == 0
+    assert benign_name.equality_calls == 0
 
 
 @pytest.mark.parametrize("location", ["decision", "nested-reference"])

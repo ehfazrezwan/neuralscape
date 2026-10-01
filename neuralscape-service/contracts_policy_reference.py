@@ -47,6 +47,31 @@ def _fields_set_names(value: object) -> tuple[object, ...]:
     return tuple(value)  # type: ignore[arg-type]
 
 
+def _normalize_model_names(names: tuple[object, ...]) -> tuple[str, ...]:
+    """Normalize model-owned string names without invoking subclass hooks."""
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for candidate in names:
+        if not isinstance(candidate, str):
+            raise ValueError("contract input model field names must be strings")
+        name = str.__str__(candidate)
+        if name in seen:
+            raise ValueError("contract input contains colliding model field names")
+        seen.add(name)
+        normalized.append(name)
+    return tuple(normalized)
+
+
+def _normalize_model_items(
+    items: tuple[tuple[object, object], ...],
+) -> tuple[tuple[str, object], ...]:
+    """Pair native model values with callback-free normalized names."""
+
+    names = _normalize_model_names(tuple(name for name, _ in items))
+    return tuple((name, item) for name, (_, item) in zip(names, items))
+
+
 def _complete_contract_input(value: object, active_ids: set[int]) -> object:
     """Copy a native input graph without normalizing away invalid data."""
 
@@ -57,7 +82,8 @@ def _complete_contract_input(value: object, active_ids: set[int]) -> object:
         active_ids.add(identity)
         try:
             stored_storage = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
-            stored_values = dict(_mapping_items(stored_storage))
+            stored_items = _normalize_model_items(_mapping_items(stored_storage))
+            stored_values = dict(stored_items)
             declared_fields = type(value).model_fields
             extra_values = _BASE_MODEL_EXTRA_DESCRIPTOR.__get__(value, BaseModel)
             if extra_values is not None:
@@ -68,7 +94,7 @@ def _complete_contract_input(value: object, active_ids: set[int]) -> object:
                     raise ValueError(
                         "contract input extra storage must be a mapping"
                     )
-                extra_items = _mapping_items(extra_values)
+                extra_items = _normalize_model_items(_mapping_items(extra_values))
                 for key, item in extra_items:
                     if key in stored_values or key in declared_fields:
                         raise ValueError(
@@ -83,7 +109,9 @@ def _complete_contract_input(value: object, active_ids: set[int]) -> object:
                 value,
                 BaseModel,
             )
-            fields_set_names = _fields_set_names(fields_set_storage)
+            fields_set_names = _normalize_model_names(
+                _fields_set_names(fields_set_storage)
+            )
             for field_name in fields_set_names:
                 if (
                     field_name not in declared_fields
