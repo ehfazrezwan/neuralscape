@@ -40,6 +40,17 @@ _DESIRED_STATE_BY_OPERATION: dict[TenantOperationKind, TenantDesiredState] = {
 
 _OPAQUE_ID_ADAPTER = TypeAdapter(OpaqueId)
 _SAFE_COUNTER_ADAPTER = TypeAdapter(SafeCounter)
+_PYDANTIC_DICT_DESCRIPTOR = BaseModel.__dict__["__dict__"]
+_PYDANTIC_EXTRA_DESCRIPTOR = BaseModel.__dict__["__pydantic_extra__"]
+
+
+def _model_extra_storage(value: BaseModel) -> object:
+    """Read Pydantic-owned extra storage without model instance dispatch."""
+
+    try:
+        return _PYDANTIC_EXTRA_DESCRIPTOR.__get__(value, type(value))
+    except AttributeError:
+        return None
 
 
 class ResourceManifestReference(VersionedContract):
@@ -145,10 +156,11 @@ def _snapshot_closed_graph(
     active.add(identity)
     try:
         if isinstance(value, BaseModel):
-            stored = vars(value)
+            stored_entries = tuple(
+                dict.items(_PYDANTIC_DICT_DESCRIPTOR.__get__(value, BaseModel))
+            )
             declared = type(value).model_fields
-            undeclared = stored.keys() - declared.keys()
-            extras = getattr(value, "__pydantic_extra__", None)
+            extras = _model_extra_storage(value)
             if extras is None:
                 observed_extra_length = 0
                 iterated_extra_names = ()
@@ -165,6 +177,8 @@ def _snapshot_closed_graph(
                 observed_extra_length = len(extras)
                 iterated_extra_names = tuple(name for name in extras)
                 extra_entries = tuple(entry for entry in extras.items())
+            stored_names = {name for name, _field_value in stored_entries}
+            undeclared = stored_names - declared.keys()
             if (
                 undeclared
                 or observed_extra_length
@@ -174,7 +188,7 @@ def _snapshot_closed_graph(
                 raise ValueError("contract input contains undeclared fields")
             return {
                 name: _snapshot_closed_graph(field_value, active)
-                for name, field_value in stored.items()
+                for name, field_value in stored_entries
             }
         if isinstance(value, dict):
             return {

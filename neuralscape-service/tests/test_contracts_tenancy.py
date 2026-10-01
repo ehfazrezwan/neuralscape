@@ -8,7 +8,7 @@ from copy import deepcopy
 from types import MappingProxyType
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from contracts_tenancy import (
     ResourceManifestReference,
@@ -144,6 +144,122 @@ class DictSpoofMapping(Mapping[object, object]):
     def __bool__(self) -> bool:
         self.boolean_calls += 1
         return False
+
+
+class HiddenModelStorage(dict[str, object]):
+    """Retain native model state while exposing a sanitized public view."""
+
+    def __init__(
+        self,
+        actual: dict[str, object],
+        visible: dict[str, object],
+    ) -> None:
+        dict.__init__(self, actual)
+        self._visible = tuple(visible.items())
+        self.keys_calls = 0
+        self.items_calls = 0
+
+    def keys(self):
+        self.keys_calls += 1
+        return dict(self._visible).keys()
+
+    def items(self):
+        self.items_calls += 1
+        return self._visible
+
+
+def replace_model_storage(
+    model: object,
+    *,
+    stored_name: str,
+    stored_value: object,
+) -> HiddenModelStorage:
+    visible = dict(
+        dict.items(object.__getattribute__(model, "__dict__"))
+    )
+    actual = dict(visible)
+    actual[stored_name] = stored_value
+    backing = HiddenModelStorage(actual, visible)
+    object.__setattr__(model, "__dict__", backing)
+    return backing
+
+
+PYDANTIC_DICT_DESCRIPTOR = BaseModel.__dict__["__dict__"]
+PYDANTIC_EXTRA_DESCRIPTOR = BaseModel.__dict__["__pydantic_extra__"]
+
+
+def model_with_hidden_extra(
+    model: BaseModel,
+    *,
+    reported_view: str,
+) -> tuple[BaseModel, list[str]]:
+    calls: list[str] = []
+    target = model
+    if reported_view != "ordinary":
+        reported = None if reported_view == "none" else {}
+        model_type = type(model)
+
+        def masked_getattribute(self, name: str):
+            if name == "__pydantic_extra__":
+                calls.append(name)
+                return reported
+            return super(masked_type, self).__getattribute__(name)
+
+        masked_type = type(
+            f"Masked{model_type.__name__}",
+            (model_type,),
+            {"__getattribute__": masked_getattribute},
+        )
+        target = masked_type.model_validate(
+            dict(dict.items(object.__getattribute__(model, "__dict__")))
+        )
+    PYDANTIC_EXTRA_DESCRIPTOR.__set__(
+        target,
+        {"hidden_unknown": "deny"},
+    )
+    return target, calls
+
+
+def model_with_descriptor_storage(
+    model: BaseModel,
+    *,
+    representation: str,
+    include_unknown: bool,
+) -> tuple[BaseModel, list[str]]:
+    calls: list[str] = []
+    target = model
+    if representation == "property":
+        model_type = type(model)
+
+        def stored_getter(self):
+            calls.append("__dict__")
+            native = PYDANTIC_DICT_DESCRIPTOR.__get__(self, BaseModel)
+            return {
+                name: field_value
+                for name, field_value in dict.items(native)
+                if name != "hidden_unknown"
+            }
+
+        def stored_setter(self, value):
+            PYDANTIC_DICT_DESCRIPTOR.__set__(self, value)
+
+        masked_type = type(
+            f"Descriptor{model_type.__name__}",
+            (model_type,),
+            {"__dict__": property(stored_getter, stored_setter)},
+        )
+        target = masked_type.model_validate(
+            dict(
+                dict.items(
+                    PYDANTIC_DICT_DESCRIPTOR.__get__(model, BaseModel)
+                )
+            )
+        )
+    native = PYDANTIC_DICT_DESCRIPTOR.__get__(target, BaseModel)
+    if include_unknown:
+        dict.__setitem__(native, "hidden_unknown", "deny")
+    calls.clear()
+    return target, calls
 
 
 class InverseItemsMapping(dict[object, object]):
@@ -973,6 +1089,227 @@ def test_tenancy_boundaries_keep_spoofing_non_dict_on_mapping_path(
     assert extras.iteration_calls == 1
     assert extras.items_calls == 1
     assert extras.boolean_calls == 0
+
+
+@pytest.mark.parametrize("boundary", ["transition", "placement"])
+@pytest.mark.parametrize("location", ["direct", "nested"])
+@pytest.mark.parametrize(
+    "corruption",
+    ["hidden-unknown", "invalid-declared"],
+)
+def test_tenancy_boundaries_use_frozen_native_model_storage(
+    boundary: str,
+    location: str,
+    corruption: str,
+) -> None:
+    if boundary == "transition":
+        previous = operation()
+        candidate = operation(observed_state="running")
+        target = (
+            candidate
+            if location == "direct"
+            else candidate.resource_manifests[0]
+        )
+
+        def validate() -> object:
+            return validate_operation_transition(previous, candidate)
+
+    else:
+        candidate = TenantPlacement.model_validate_json(
+            json.dumps(
+                {
+                    "schema_version": VERSION,
+                    "tenant_id": "tenant-a",
+                    "generation": 7,
+                    "resource_manifests": [manifest()],
+                }
+            )
+        )
+        target = (
+            candidate
+            if location == "direct"
+            else candidate.resource_manifests[0]
+        )
+
+        def validate() -> object:
+            return validate_placement_publication(
+                candidate,
+                expected_tenant_id="tenant-a",
+                current_generation=7,
+            )
+
+    if corruption == "hidden-unknown":
+        stored_name = "hidden_unknown"
+        stored_value: object = "deny"
+    elif location == "direct":
+        stored_name = "tenant_id"
+        stored_value = ""
+    else:
+        stored_name = "manifest_revision"
+        stored_value = -1
+    backing = replace_model_storage(
+        target,
+        stored_name=stored_name,
+        stored_value=stored_value,
+    )
+
+    if corruption == "hidden-unknown":
+        with pytest.raises(ValueError, match="undeclared fields"):
+            validate()
+    else:
+        with pytest.raises(ValidationError):
+            validate()
+
+    assert dict.__getitem__(backing, stored_name) == stored_value
+    assert backing.keys_calls == 0
+    assert backing.items_calls == 0
+
+
+@pytest.mark.parametrize("boundary", ["transition", "placement"])
+@pytest.mark.parametrize("location", ["direct", "nested"])
+@pytest.mark.parametrize("reported_view", ["ordinary", "none", "empty"])
+def test_tenancy_boundaries_read_model_owned_extra_storage(
+    boundary: str,
+    location: str,
+    reported_view: str,
+) -> None:
+    if boundary == "transition":
+        previous = operation()
+        candidate = operation(observed_state="running")
+        if location == "direct":
+            target, calls = model_with_hidden_extra(
+                candidate,
+                reported_view=reported_view,
+            )
+            candidate = target
+        else:
+            target, calls = model_with_hidden_extra(
+                candidate.resource_manifests[0],
+                reported_view=reported_view,
+            )
+            candidate = candidate.model_copy(
+                update={"resource_manifests": (target,)}
+            )
+
+        def validate() -> object:
+            return validate_operation_transition(previous, candidate)
+
+    else:
+        candidate = TenantPlacement.model_validate_json(
+            json.dumps(
+                {
+                    "schema_version": VERSION,
+                    "tenant_id": "tenant-a",
+                    "generation": 7,
+                    "resource_manifests": [manifest()],
+                }
+            )
+        )
+        if location == "direct":
+            target, calls = model_with_hidden_extra(
+                candidate,
+                reported_view=reported_view,
+            )
+            candidate = target
+        else:
+            target, calls = model_with_hidden_extra(
+                candidate.resource_manifests[0],
+                reported_view=reported_view,
+            )
+            candidate = candidate.model_copy(
+                update={"resource_manifests": (target,)}
+            )
+
+        def validate() -> object:
+            return validate_placement_publication(
+                candidate,
+                expected_tenant_id="tenant-a",
+                current_generation=7,
+            )
+
+    actual_extras = PYDANTIC_EXTRA_DESCRIPTOR.__get__(target, type(target))
+    assert dict.__getitem__(actual_extras, "hidden_unknown") == "deny"
+    with pytest.raises(ValueError, match="undeclared fields"):
+        validate()
+    assert calls == []
+
+
+@pytest.mark.parametrize("boundary", ["transition", "placement"])
+@pytest.mark.parametrize("location", ["direct", "nested"])
+@pytest.mark.parametrize("representation", ["ordinary", "property"])
+@pytest.mark.parametrize("include_unknown", [False, True], ids=["valid", "unknown"])
+def test_tenancy_boundaries_read_base_model_dict_descriptor(
+    boundary: str,
+    location: str,
+    representation: str,
+    include_unknown: bool,
+) -> None:
+    if boundary == "transition":
+        previous = operation()
+        candidate = operation(observed_state="running")
+        if location == "direct":
+            target, calls = model_with_descriptor_storage(
+                candidate,
+                representation=representation,
+                include_unknown=include_unknown,
+            )
+            candidate = target
+        else:
+            target, calls = model_with_descriptor_storage(
+                candidate.resource_manifests[0],
+                representation=representation,
+                include_unknown=include_unknown,
+            )
+            candidate = candidate.model_copy(
+                update={"resource_manifests": (target,)}
+            )
+
+        def validate() -> object:
+            return validate_operation_transition(previous, candidate)
+
+    else:
+        candidate = TenantPlacement.model_validate_json(
+            json.dumps(
+                {
+                    "schema_version": VERSION,
+                    "tenant_id": "tenant-a",
+                    "generation": 7,
+                    "resource_manifests": [manifest()],
+                }
+            )
+        )
+        if location == "direct":
+            target, calls = model_with_descriptor_storage(
+                candidate,
+                representation=representation,
+                include_unknown=include_unknown,
+            )
+            candidate = target
+        else:
+            target, calls = model_with_descriptor_storage(
+                candidate.resource_manifests[0],
+                representation=representation,
+                include_unknown=include_unknown,
+            )
+            candidate = candidate.model_copy(
+                update={"resource_manifests": (target,)}
+            )
+
+        def validate() -> object:
+            return validate_placement_publication(
+                candidate,
+                expected_tenant_id="tenant-a",
+                current_generation=7,
+            )
+
+    native = PYDANTIC_DICT_DESCRIPTOR.__get__(target, BaseModel)
+    assert dict.__contains__(native, "hidden_unknown") is include_unknown
+    if include_unknown:
+        with pytest.raises(ValueError, match="undeclared fields"):
+            validate()
+    else:
+        validate()
+    assert calls == []
 
 
 @pytest.mark.parametrize("boundary", ["transition", "placement"])
