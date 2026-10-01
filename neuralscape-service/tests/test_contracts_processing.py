@@ -89,6 +89,23 @@ class _RaisingClassHiddenDict(_HiddenBackingDict):
         raise AssertionError("__class__ must not be read")
 
 
+class _RepairingStoredName(str):
+    """A stored key whose hash callback repairs a later live model value."""
+
+    def __new__(cls, value: str, repair):
+        instance = super().__new__(cls, value)
+        instance.repair = repair
+        instance.armed = False
+        instance.hash_calls = 0
+        return instance
+
+    def __hash__(self) -> int:
+        if self.armed:
+            self.hash_calls += 1
+            self.repair()
+        return super().__hash__()
+
+
 class _EmptyNativeRaisingViews(dict[str, object]):
     """Actually empty native storage whose overridden views must stay unused."""
 
@@ -198,6 +215,25 @@ def _replace_model_backing(
     hidden = _HiddenBackingDict(stored)
     object.__setattr__(policy, "__dict__", hidden)
     return hidden
+
+
+def _arm_first_stored_name_repair(
+    policy: ProcessingPolicy,
+    *,
+    field: str,
+    repaired_value: object,
+) -> _RepairingStoredName:
+    stored = _BASE_MODEL_DICT_DESCRIPTOR.__get__(policy, BaseModel)
+    entries = tuple(dict.items(stored))
+    dict.clear(stored)
+    name = _RepairingStoredName(
+        entries[0][0],
+        lambda: dict.__setitem__(stored, field, repaired_value),
+    )
+    for index, (key, value) in enumerate(entries):
+        dict.__setitem__(stored, name if index == 0 else key, value)
+    name.armed = True
+    return name
 
 
 def _attach_extra_storage(
@@ -349,6 +385,64 @@ def test_dispatch_revalidates_unchecked_strict_local_copy() -> None:
             currently_authorized_recipient_ids={"provider-a"},
             is_fallback=False,
         )
+
+
+def test_dispatch_captures_all_stored_pairs_before_name_hashing() -> None:
+    valid = _strict_local_policy()
+    validate_plaintext_dispatch(
+        valid,
+        execution_location="endpoint",
+        recipient_id=None,
+        current_policy_epoch=7,
+        currently_authorized_recipient_ids=set(),
+        is_fallback=False,
+    )
+
+    ordinary = valid.model_copy(update={"policy_epoch": -1})
+    with pytest.raises(PlaintextDispatchRejected) as ordinary_exc:
+        validate_plaintext_dispatch(
+            ordinary,
+            execution_location="endpoint",
+            recipient_id=None,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=set(),
+            is_fallback=False,
+        )
+
+    hooked = valid.model_copy(update={"policy_epoch": -1})
+    name = _arm_first_stored_name_repair(
+        hooked,
+        field="policy_epoch",
+        repaired_value=7,
+    )
+    with pytest.raises(PlaintextDispatchRejected) as hooked_exc:
+        validate_plaintext_dispatch(
+            hooked,
+            execution_location="endpoint",
+            recipient_id=None,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=set(),
+            is_fallback=False,
+        )
+
+    assert isinstance(ordinary_exc.value.__cause__, ValidationError)
+    assert isinstance(hooked_exc.value.__cause__, ValidationError)
+    ordinary_errors = [
+        (error["loc"], error["type"])
+        for error in ordinary_exc.value.__cause__.errors()
+    ]
+    hooked_errors = [
+        (error["loc"], error["type"])
+        for error in hooked_exc.value.__cause__.errors()
+    ]
+    assert ordinary_errors == hooked_errors == [
+        (("policy_epoch",), "greater_than_equal")
+    ]
+    assert name.hash_calls == 1
+    assert dict.__getitem__(
+        _BASE_MODEL_DICT_DESCRIPTOR.__get__(hooked, BaseModel),
+        "policy_epoch",
+    ) == 7
 
 
 @pytest.mark.parametrize(

@@ -66,9 +66,12 @@ def _with_native_dict_extra_backing(value: object) -> object:
     else:
         return value
 
-    projected = dict(
+    # Detach every pair before projected-dict hashing can run a hostile stored
+    # name callback that repairs a later value in the live model backing.
+    stored = tuple(
         dict.items(_BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel))
     )
+    projected = dict(stored)
     if captured:
         projected["native_extra_backing"] = dict(captured)
     return projected
