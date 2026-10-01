@@ -515,24 +515,32 @@ def _native_snapshot(
                         key, field_value = pair
                     except Exception as exc:
                         return _FailedNativeDictTraversal(exc)
-                    projected[key] = _native_snapshot(
+                    projected_value = _native_snapshot(
                         field_value,
                         active,
                         _frozen_models=_frozen_models,
                         _frozen_dicts=_frozen_dicts,
                         _frozen_tuples=_frozen_tuples,
                     )
+                    try:
+                        projected[key] = projected_value
+                    except Exception as exc:
+                        return _FailedNativeDictTraversal(exc)
                 return projected
-            return {
-                key: _native_snapshot(
+            projected = {}
+            for key, field_value in source_items:
+                projected_value = _native_snapshot(
                     field_value,
                     active,
                     _frozen_models=_frozen_models,
                     _frozen_dicts=_frozen_dicts,
                     _frozen_tuples=_frozen_tuples,
                 )
-                for key, field_value in source_items
-            }
+                try:
+                    projected[key] = projected_value
+                except Exception as exc:
+                    return _FailedNativeDictTraversal(exc)
+            return projected
         if isinstance(value, list):
             return [
                 _native_snapshot(

@@ -1968,6 +1968,152 @@ def test_python_public_mapping_late_malformed_pair_is_located(
     assert receiver.model_validate(valid.model_dump(mode="python")) == valid
 
 
+@pytest.mark.parametrize("placement", ["root", "nested"])
+@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+def test_python_public_mapping_unhashable_key_is_located(
+    placement: str,
+    receiver_name: str,
+) -> None:
+    result = reconcile_usage_events([_event()])
+    stream = result.streams[0]
+    if receiver_name == "stream":
+        receiver = ReconciledUsageStream
+        valid = stream
+        if placement == "root":
+            outer_payload: dict[str, object] | None = None
+            entries = stream.model_dump(mode="python")
+            location: tuple[object, ...] = ()
+        else:
+            outer_payload = stream.model_dump(mode="python")
+            entries = stream.attribution.model_dump(mode="python")
+            location = ("attribution",)
+    else:
+        receiver = UsageReconciliation
+        valid = result
+        if placement == "root":
+            outer_payload = None
+            entries = result.model_dump(mode="python")
+            location = ()
+        else:
+            outer_payload = result.model_dump(mode="python")
+            entries = stream.model_dump(mode="python")
+            location = ("streams", 0)
+
+    failing = _LateMalformedPairMapping(entries, ([], "ignored"))
+    control = _TraversalPublicMapping(entries, "valid")
+    if placement == "root":
+        failing_value: object = failing
+        control_value: object = control
+    else:
+        assert outer_payload is not None
+        failing_payload = dict(outer_payload)
+        control_payload = dict(outer_payload)
+        if receiver_name == "stream":
+            failing_payload["attribution"] = failing
+            control_payload["attribution"] = control
+        else:
+            failing_payload["streams"] = (failing,)
+            control_payload["streams"] = (control,)
+        failing_value = failing_payload
+        control_value = control_payload
+
+    assert _validation_signature(receiver, failing_value) == [
+        (
+            "mapping_type",
+            location,
+            (
+                "Input should be a valid mapping, error: TypeError: "
+                "unhashable type: 'list'"
+            ),
+        )
+    ]
+    assert failing.items_calls == 1
+    assert failing.iterator_calls == 1
+    assert failing.iterator_entries == len(entries) + 1
+
+    assert receiver.model_validate(control_value) == valid
+    assert control.items_calls == 1
+    assert control.iterator_calls == 1
+    assert control.iterator_entries == len(entries)
+
+
+@pytest.mark.parametrize("placement", ["root", "nested"])
+@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+def test_frozen_native_dict_projection_unhashable_key_is_located(
+    placement: str,
+    receiver_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = reconcile_usage_events([_event()])
+    stream = result.streams[0]
+    if receiver_name == "stream":
+        receiver = ReconciledUsageStream
+        valid = stream
+        failing_value = stream.model_dump(mode="python")
+        target = (
+            failing_value
+            if placement == "root"
+            else failing_value["attribution"]
+        )
+        location: tuple[object, ...] = (
+            () if placement == "root" else ("attribution",)
+        )
+    else:
+        receiver = UsageReconciliation
+        valid = result
+        failing_value = result.model_dump(mode="python")
+        target = (
+            failing_value
+            if placement == "root"
+            else failing_value["streams"][0]
+        )
+        location = () if placement == "root" else ("streams", 0)
+
+    assert type(target) is dict
+    original_freeze = usage_reconcile_contracts._freeze_model_storage
+    injected_targets: list[dict[object, object]] = []
+
+    def inject_unhashable_frozen_key(
+        value,
+        frozen_models,
+        frozen_dicts,
+        frozen_tuples,
+        visited,
+    ) -> None:
+        original_freeze(
+            value,
+            frozen_models,
+            frozen_dicts,
+            frozen_tuples,
+            visited,
+        )
+        if value is target:
+            injected_targets.append(value)
+            frozen_dicts[id(value)] = (value, (([], "ignored"),))
+
+    monkeypatch.setattr(
+        usage_reconcile_contracts,
+        "_freeze_model_storage",
+        inject_unhashable_frozen_key,
+    )
+
+    assert _validation_signature(receiver, failing_value) == [
+        (
+            "mapping_type",
+            location,
+            (
+                "Input should be a valid mapping, error: TypeError: "
+                "unhashable type: 'list'"
+            ),
+        )
+    ]
+    assert injected_targets == [target]
+
+    control = valid.model_dump(mode="python")
+    assert receiver.model_validate(control) == valid
+    assert injected_targets == [target]
+
+
 @pytest.mark.parametrize(
     "target_name",
     ["stream", "attribution", "result", "nested_stream"],
