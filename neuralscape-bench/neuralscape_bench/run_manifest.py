@@ -311,9 +311,11 @@ def _snapshot_native(value: Any, *, path: str = "$", active: set[int] | None = N
     try:
         if isinstance(value, BaseModel):
             fields = type(value).model_fields
-            stored = vars(value)
-            undeclared = set(stored).difference(fields)
-            extras = getattr(value, "__pydantic_extra__", None)
+            stored = object.__getattribute__(value, "__dict__")
+            stored_entries = tuple(dict.items(stored))
+            stored_values = dict(stored_entries)
+            undeclared = set(stored_values).difference(fields)
+            extras = object.__getattribute__(value, "__pydantic_extra__")
             if extras is not None:
                 if issubclass(type(extras), dict):
                     extra_entries = tuple(dict.items(extras))
@@ -329,9 +331,11 @@ def _snapshot_native(value: Any, *, path: str = "$", active: set[int] | None = N
                 names = ", ".join(sorted(repr(name) for name in undeclared))
                 raise ValueError(f"undeclared stored fields at {path}: {names}")
             return {
-                name: _snapshot_native(stored[name], path=f"{path}.{name}", active=active)
+                name: _snapshot_native(
+                    stored_values[name], path=f"{path}.{name}", active=active
+                )
                 for name in fields
-                if name in stored
+                if name in stored_values
             }
 
         if isinstance(value, Mapping):

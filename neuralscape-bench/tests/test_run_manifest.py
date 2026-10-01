@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
+from typing import Callable
 
 import pydantic
 import pytest
@@ -358,6 +359,191 @@ class MroSpoofExtras(MetaclassSpoofExtras, metaclass=MroSpoofMeta):
 
 class EqualitySpoofExtras(MetaclassSpoofExtras, metaclass=EqualitySpoofMeta):
     pass
+
+
+class HiddenModelBacking(dict[str, object]):
+    """Retain native entries while hiding them from overridable iteration."""
+
+    def __init__(self, values: dict[str, object]):
+        super().__init__(values)
+        self.iteration_calls = 0
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        return (
+            key for key in dict.keys(self) if key != "future_constraint"
+        )
+
+
+class HiddenStorageViewManifest(RunManifest):
+    """Hide native stored and extra entries from instance-dispatched views."""
+
+    def __getattribute__(self, name: str):
+        if name == "__dict__":
+            native = object.__getattribute__(self, "__dict__")
+            return {
+                key: value
+                for key, value in dict.items(native)
+                if key != "future_constraint"
+            }
+        if name == "__pydantic_extra__":
+            return None
+        return super().__getattribute__(name)
+
+
+class MutatingTuple(tuple[object, ...]):
+    """Apply one model-storage mutation when native tuple traversal starts."""
+
+    def __new__(
+        cls,
+        values: tuple[object, ...],
+        action: Callable[[], None],
+    ):
+        instance = super().__new__(cls, values)
+        instance.action = action
+        return instance
+
+    def __iter__(self):
+        action = self.action
+        self.action = lambda: None
+        action()
+        return super().__iter__()
+
+
+def receive_planned_manifest(boundary: str, manifest: RunManifest) -> RunManifest:
+    if boundary == "serialize":
+        return validate_run_manifest_json(serialize_run_manifest(manifest))
+    return finish_run(
+        manifest,
+        state=RunState.COMPLETED,
+        started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+        resources=(measured_memory(),),
+        measurements=(timing(),),
+    )
+
+
+@pytest.mark.parametrize("boundary", ["serialize", "finish"])
+@pytest.mark.parametrize(
+    "storage_kind",
+    ["ordinary", "native-dict-subclass", "model-stored-view", "model-extra-view"],
+)
+def test_receivers_reject_unknown_native_model_storage(
+    boundary: str,
+    storage_kind: str,
+):
+    valid = receive_planned_manifest(boundary, planned_manifest())
+    assert valid.state is (
+        RunState.PLANNED if boundary == "serialize" else RunState.COMPLETED
+    )
+
+    if storage_kind.startswith("model-"):
+        manifest = HiddenStorageViewManifest.model_validate(
+            planned_manifest().model_dump()
+        )
+    else:
+        manifest = planned_manifest()
+
+    native = object.__getattribute__(manifest, "__dict__")
+    hidden_backing = None
+    if storage_kind == "native-dict-subclass":
+        hidden_backing = HiddenModelBacking(dict(dict.items(native)))
+        dict.__setitem__(hidden_backing, "future_constraint", "deny")
+        object.__setattr__(manifest, "__dict__", hidden_backing)
+        native = object.__getattribute__(manifest, "__dict__")
+    elif storage_kind == "model-extra-view":
+        object.__setattr__(
+            manifest,
+            "__pydantic_extra__",
+            {"future_constraint": "deny"},
+        )
+        native_extras = object.__getattribute__(manifest, "__pydantic_extra__")
+        assert tuple(dict.items(native_extras)) == (("future_constraint", "deny"),)
+    else:
+        dict.__setitem__(native, "future_constraint", "deny")
+
+    if storage_kind != "model-extra-view":
+        assert ("future_constraint", "deny") in tuple(dict.items(native))
+
+    with pytest.raises(ValueError, match="undeclared stored fields.*future_constraint"):
+        receive_planned_manifest(boundary, manifest)
+
+    if hidden_backing is not None:
+        assert hidden_backing.iteration_calls == 0
+
+
+@pytest.mark.parametrize("boundary", ["serialize", "finish"])
+def test_receivers_snapshot_declared_values_before_nested_traversal(boundary: str):
+    manifest = planned_manifest()
+    native = object.__getattribute__(manifest, "__dict__")
+    original_resources = native["resources"]
+    original_measurements = native["measurements"]
+    replacement_measurements = (timing(),)
+    dict.__setitem__(
+        native,
+        "resources",
+        MutatingTuple(
+            original_resources,
+            lambda: dict.__setitem__(
+                native, "measurements", replacement_measurements
+            ),
+        ),
+    )
+
+    received = receive_planned_manifest(boundary, manifest)
+
+    assert native["measurements"] is replacement_measurements
+    assert original_measurements == ()
+    if boundary == "serialize":
+        assert received.measurements == original_measurements
+    else:
+        assert received.measurements == (timing(),)
+
+
+@pytest.mark.parametrize("boundary", ["serialize", "finish"])
+def test_receivers_reject_initial_invalid_value_changed_during_traversal(
+    boundary: str,
+):
+    manifest = planned_manifest()
+    native = object.__getattribute__(manifest, "__dict__")
+    original_resources = native["resources"]
+    invalid_measurements = [timing()]
+    dict.__setitem__(native, "measurements", invalid_measurements)
+    dict.__setitem__(
+        native,
+        "resources",
+        MutatingTuple(
+            original_resources,
+            lambda: dict.__setitem__(native, "measurements", ()),
+        ),
+    )
+
+    with pytest.raises(ValidationError):
+        receive_planned_manifest(boundary, manifest)
+
+    assert native["measurements"] == ()
+    assert isinstance(invalid_measurements, list)
+
+
+@pytest.mark.parametrize("boundary", ["serialize", "finish"])
+def test_receivers_do_not_retroactively_include_late_unknowns(boundary: str):
+    manifest = planned_manifest()
+    native = object.__getattribute__(manifest, "__dict__")
+    original_resources = native["resources"]
+    dict.__setitem__(
+        native,
+        "resources",
+        MutatingTuple(
+            original_resources,
+            lambda: dict.__setitem__(native, "late_unknown", "deny"),
+        ),
+    )
+
+    received = receive_planned_manifest(boundary, manifest)
+
+    assert ("late_unknown", "deny") in tuple(dict.items(native))
+    received_native = object.__getattribute__(received, "__dict__")
+    assert "late_unknown" not in received_native
 
 
 def test_planned_to_completed_round_trip_is_canonical_and_stable():
