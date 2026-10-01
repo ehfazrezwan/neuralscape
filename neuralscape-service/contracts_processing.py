@@ -46,10 +46,12 @@ def _with_native_dict_extra_backing(
     field_names: tuple[str, ...],
 ) -> object:
     """Expose nonempty native dict extra storage to closed revalidation."""
-    if not isinstance(value, BaseModel):
+    value_type = type(value)
+    if not issubclass(value_type, BaseModel):
         return value
     extras = object.__getattribute__(value, "__pydantic_extra__")
-    if not isinstance(extras, dict):
+    extras_type = type(extras)
+    if not issubclass(extras_type, dict):
         return value
 
     # A dict subclass may lie through len/iteration/keys/items/truthiness.
@@ -58,9 +60,13 @@ def _with_native_dict_extra_backing(
     if not captured:
         return value
 
+    model_backing = dict(
+        dict.items(object.__getattribute__(value, "__dict__"))
+    )
     projected = {
-        name: object.__getattribute__(value, name)
+        name: model_backing[name]
         for name in field_names
+        if name in model_backing
     }
     projected["native_extra_backing"] = dict(captured)
     return projected

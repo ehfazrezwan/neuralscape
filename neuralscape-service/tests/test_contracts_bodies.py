@@ -67,6 +67,28 @@ class _IterationVisibleItemsEmptyMapping(Mapping[str, object]):
         return {}.items()
 
 
+class _SpoofedDictMapping(_IterationVisibleItemsEmptyMapping):
+    def __init__(self) -> None:
+        super().__init__()
+        self.class_reads = 0
+
+    @property
+    def __class__(self):
+        self.class_reads += 1
+        return dict
+
+
+class _RaisingClassHiddenDict(_HiddenBackingDict):
+    def __init__(self, values: dict[str, object]) -> None:
+        super().__init__(values)
+        self.class_reads = 0
+
+    @property
+    def __class__(self):
+        self.class_reads += 1
+        raise AssertionError("__class__ must not be read")
+
+
 def _attach_extra_storage(body: MemoryBody, storage: object) -> MemoryBody:
     object.__setattr__(body, "__pydantic_extra__", storage)
     return body
@@ -191,6 +213,37 @@ def test_parser_extra_storage_controls_preserve_existing_behavior() -> None:
     with pytest.raises(ValidationError):
         parse_memory_body(inverted)
     assert inverse.items_calls == 0
+
+
+def test_parser_uses_concrete_extra_storage_type() -> None:
+    spoofed = _SpoofedDictMapping()
+    spoofed_body = _attach_extra_storage(
+        PlaintextBody(kind="plaintext", text="secret"),
+        spoofed,
+    )
+    with pytest.raises(ValidationError):
+        parse_memory_body(spoofed_body)
+    assert spoofed.class_reads == 1
+
+    hidden = _RaisingClassHiddenDict({"future_constraint": "deny"})
+    hidden_body = _attach_extra_storage(
+        PlaintextBody(kind="plaintext", text="secret"),
+        hidden,
+    )
+    with pytest.raises(ValidationError, match="extra"):
+        parse_memory_body(hidden_body)
+    assert hidden.class_reads == 0
+    assert hidden.view_calls == 0
+
+
+def test_parser_malformed_construct_with_hidden_backing_is_canonical() -> None:
+    malformed = PlaintextBody.model_construct(kind="plaintext")
+    _attach_extra_storage(malformed, {"future_constraint": "deny"})
+
+    with pytest.raises(ValidationError) as exc:
+        parse_memory_body(malformed)
+
+    assert any(error["loc"][-1] == "text" for error in exc.value.errors())
 
 
 def test_parser_declared_subclass_field_remains_invalid_at_union_boundary() -> None:

@@ -62,6 +62,28 @@ class _IterationVisibleItemsEmptyMapping(Mapping[str, object]):
         return {}.items()
 
 
+class _SpoofedDictMapping(_IterationVisibleItemsEmptyMapping):
+    def __init__(self) -> None:
+        super().__init__()
+        self.class_reads = 0
+
+    @property
+    def __class__(self):
+        self.class_reads += 1
+        return dict
+
+
+class _RaisingClassHiddenDict(_HiddenBackingDict):
+    def __init__(self, values: dict[str, object]) -> None:
+        super().__init__(values)
+        self.class_reads = 0
+
+    @property
+    def __class__(self):
+        self.class_reads += 1
+        raise AssertionError("__class__ must not be read")
+
+
 def _attach_extra_storage(
     policy: ProcessingPolicy,
     storage: object,
@@ -276,6 +298,57 @@ def test_dispatch_extra_storage_controls_preserve_existing_behavior() -> None:
             is_fallback=False,
         )
     assert inverse.items_calls == 0
+
+
+def test_dispatch_uses_concrete_extra_storage_type() -> None:
+    spoofed = _SpoofedDictMapping()
+    spoofed_policy = _attach_extra_storage(_strict_local_policy(), spoofed)
+    with pytest.raises(
+        PlaintextDispatchRejected,
+        match="policy is invalid",
+    ) as exc:
+        validate_plaintext_dispatch(
+            spoofed_policy,
+            execution_location="endpoint",
+            recipient_id=None,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=set(),
+            is_fallback=False,
+        )
+    assert isinstance(exc.value.__cause__, ValidationError)
+    assert spoofed.class_reads == 1
+
+    hidden = _RaisingClassHiddenDict({"future_constraint": "deny"})
+    hidden_policy = _attach_extra_storage(_strict_local_policy(), hidden)
+    with pytest.raises(PlaintextDispatchRejected, match="policy is invalid"):
+        validate_plaintext_dispatch(
+            hidden_policy,
+            execution_location="endpoint",
+            recipient_id=None,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=set(),
+            is_fallback=False,
+        )
+    assert hidden.class_reads == 0
+    assert hidden.view_calls == 0
+
+
+def test_dispatch_malformed_construct_with_hidden_backing_is_canonical() -> None:
+    malformed = ProcessingPolicy.model_construct(schema_version="candidate-v1")
+    _attach_extra_storage(malformed, {"future_constraint": "deny"})
+
+    with pytest.raises(PlaintextDispatchRejected, match="policy is invalid") as exc:
+        validate_plaintext_dispatch(
+            malformed,
+            execution_location="endpoint",
+            recipient_id=None,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=set(),
+            is_fallback=False,
+        )
+
+    assert isinstance(exc.value.__cause__, ValidationError)
+    assert any(error["loc"] == ("mode",) for error in exc.value.__cause__.errors())
 
 
 def test_dispatch_declared_subclass_field_remains_invalid_at_base_boundary() -> None:
