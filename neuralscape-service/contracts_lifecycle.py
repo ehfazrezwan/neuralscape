@@ -73,6 +73,12 @@ class _CapturedTuple(_CapturedGraph):
     items: tuple[_CapturedGraph, ...]
 
 
+_CapturedGraphSnapshot = tuple[
+    _CapturedGraph,
+    dict[int, _CapturedGraph],
+]
+
+
 def _capture_native_contract_graph(
     value: object,
     active_containers: set[int] | None = None,
@@ -287,23 +293,80 @@ def _native_contract_graph(
 ) -> object:
     """Materialize stored fields without dropping extras or hiding cycles."""
 
+    captured = _capture_contract_graph(value, active_containers)
+    return _materialize_contract_graph(captured)
+
+
+def _capture_contract_graph(
+    value: object,
+    active_containers: set[int] | None = None,
+) -> _CapturedGraphSnapshot:
+    """Capture one graph without running its public reconstruction views."""
+
     captured_by_identity: dict[int, _CapturedGraph] = {}
     captured = _capture_native_contract_graph(
         value,
         active_containers,
         captured_by_identity,
     )
-    return _materialize_captured_graph(captured, captured_by_identity)
+    return captured, captured_by_identity
+
+
+def _materialize_contract_graph(
+    captured: _CapturedGraphSnapshot,
+) -> object:
+    """Materialize one previously captured graph through established views."""
+
+    root, captured_by_identity = captured
+    return _materialize_captured_graph(root, captured_by_identity)
+
+
+def _captured_model(
+    model_type: type[_ModelT],
+    value: object,
+) -> _CapturedGraphSnapshot:
+    if not isinstance(value, model_type):
+        raise TypeError(f"value must be a {model_type.__name__}")
+    return _capture_contract_graph(value)
+
+
+def _revalidated_captured_model(
+    model_type: type[_ModelT],
+    captured: _CapturedGraphSnapshot,
+) -> _ModelT:
+    return model_type.model_validate(
+        _materialize_contract_graph(captured),
+        strict=True,
+    )
+
+
+def _revalidated_inventory_model(
+    model_type: type[_ModelT],
+    value: object,
+    captured_by_identity: dict[int, _CapturedGraph],
+) -> _ModelT:
+    """Validate a public-view item, reusing entry-time state when available."""
+
+    if not isinstance(value, model_type):
+        raise TypeError(f"value must be a {model_type.__name__}")
+    captured = captured_by_identity.get(id(value))
+    if captured is None:
+        captured = _capture_native_contract_graph(
+            value,
+            captured_by_identity=captured_by_identity,
+        )
+    return _revalidated_captured_model(
+        model_type,
+        (captured, captured_by_identity),
+    )
 
 
 def _revalidated_model(model_type: type[_ModelT], value: object) -> _ModelT:
     """Strictly reconstruct one expected model from its complete stored graph."""
 
-    if not isinstance(value, model_type):
-        raise TypeError(f"value must be a {model_type.__name__}")
-    return model_type.model_validate(
-        _native_contract_graph(value),
-        strict=True,
+    return _revalidated_captured_model(
+        model_type,
+        _captured_model(model_type, value),
     )
 
 
@@ -628,8 +691,35 @@ def source_versions_match(
 ) -> bool:
     """Require exact equality after deep validation of both version witnesses."""
 
-    expected = _revalidated_model(SourceVersion, expected)
-    observed = _revalidated_model(SourceVersion, observed)
+    if not isinstance(expected, SourceVersion):
+        raise TypeError("value must be a SourceVersion")
+    try:
+        captured_expected = _capture_contract_graph(expected)
+        expected_capture_error: Exception | None = None
+    except Exception as exc:
+        captured_expected = None
+        expected_capture_error = exc
+
+    if isinstance(observed, SourceVersion):
+        try:
+            captured_observed = _capture_contract_graph(observed)
+            observed_capture_error: Exception | None = None
+        except Exception as exc:
+            captured_observed = None
+            observed_capture_error = exc
+    else:
+        captured_observed = None
+        observed_capture_error = TypeError("value must be a SourceVersion")
+
+    if expected_capture_error is not None:
+        raise expected_capture_error
+    assert captured_expected is not None
+    expected = _revalidated_captured_model(SourceVersion, captured_expected)
+
+    if observed_capture_error is not None:
+        raise observed_capture_error
+    assert captured_observed is not None
+    observed = _revalidated_captured_model(SourceVersion, captured_observed)
 
     return (
         expected.record_id == observed.record_id
@@ -671,8 +761,50 @@ def validate_required_stage_claim(
     if not isinstance(receipts, tuple):
         raise TypeError("receipts must be a tuple")
 
-    intent = _revalidated_model(Intent, intent)
-    receipts = tuple(_revalidated_model(StageReceipt, receipt) for receipt in receipts)
+    if not isinstance(intent, Intent):
+        raise TypeError("value must be a Intent")
+    try:
+        captured_intent = _capture_contract_graph(intent)
+        intent_capture_error: Exception | None = None
+    except Exception as exc:
+        captured_intent = None
+        intent_capture_error = exc
+
+    receipt_inventory: dict[int, _CapturedGraph] = {}
+    receipt_capture_errors: dict[int, Exception] = {}
+    for receipt in tuple.__iter__(receipts):
+        if not isinstance(receipt, StageReceipt):
+            continue
+        identity = id(receipt)
+        if identity in receipt_inventory or identity in receipt_capture_errors:
+            continue
+        try:
+            _capture_native_contract_graph(
+                receipt,
+                captured_by_identity=receipt_inventory,
+            )
+        except Exception as exc:
+            receipt_capture_errors[identity] = exc
+
+    if intent_capture_error is not None:
+        raise intent_capture_error
+    assert captured_intent is not None
+    intent = _revalidated_captured_model(Intent, captured_intent)
+
+    def revalidate_receipt(receipt: object) -> StageReceipt:
+        capture_error = receipt_capture_errors.get(id(receipt))
+        if capture_error is not None and isinstance(receipt, StageReceipt):
+            raise capture_error
+        return _revalidated_inventory_model(
+            StageReceipt,
+            receipt,
+            receipt_inventory,
+        )
+
+    receipts = tuple(
+        revalidate_receipt(receipt)
+        for receipt in receipts
+    )
 
     requirements = {item.stage: item for item in intent.stage_requirements}
     required = set(requirements)

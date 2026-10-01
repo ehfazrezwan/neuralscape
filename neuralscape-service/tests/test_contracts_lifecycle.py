@@ -2189,6 +2189,144 @@ def test_source_boundary_scalar_invalidity_remains_frozen_before_name_hook() -> 
     assert hostile_name.equality_calls == 1
 
 
+def test_source_boundary_captures_observed_before_expected_name_hook() -> None:
+    ordinary_expected = source("memory-1")
+    ordinary_observed = source("memory-1").model_copy(
+        update={"content_revision": -1}
+    )
+    with pytest.raises(ValidationError) as ordinary_error:
+        source_versions_match(ordinary_expected, ordinary_observed)
+
+    attacked_expected = source("memory-1")
+    attacked_observed = source("memory-1").model_copy(
+        update={"content_revision": -1}
+    )
+    hostile_name = install_repairing_stored_name(
+        attacked_expected,
+        "record_id",
+        attacked_observed,
+        replacement=3,
+    )
+    with pytest.raises(ValidationError) as attacked_error:
+        source_versions_match(attacked_expected, attacked_observed)
+
+    assert attacked_error.value.errors(include_url=False) == (
+        ordinary_error.value.errors(include_url=False)
+    )
+    assert attacked_observed.content_revision == 3
+    assert hostile_name.hash_calls == 2
+    assert hostile_name.equality_calls == 1
+
+
+def test_source_boundary_preserves_expected_error_before_observed_type() -> None:
+    invalid_expected = source("memory-1").model_copy(
+        update={"content_revision": -1}
+    )
+
+    with pytest.raises(ValidationError) as raised:
+        source_versions_match(invalid_expected, object())  # type: ignore[arg-type]
+
+    assert raised.value.errors()[0]["loc"] == ("content_revision",)
+    assert raised.value.errors()[0]["type"] == "greater_than_equal"
+
+
+def test_aggregate_boundary_captures_receipt_before_intent_tuple_hook() -> None:
+    command = intent(ProcessingStage.CANONICAL)
+    ordinary_receipt = receipt(
+        ProcessingStage.CANONICAL,
+        StageStatus.PENDING,
+    ).model_copy(update={"attempt": 0})
+    with pytest.raises(ValidationError) as ordinary_error:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=command,
+            receipts=(ordinary_receipt,),
+        )
+
+    attacked_command = intent(ProcessingStage.CANONICAL)
+    attacked_receipt = receipt(
+        ProcessingStage.CANONICAL,
+        StageStatus.PENDING,
+    ).model_copy(update={"attempt": 0})
+    install_repairing_target_refs(
+        attacked_command,
+        attacked_receipt,
+        field_name="attempt",
+        replacement=1,
+    )
+    with pytest.raises(ValidationError) as attacked_error:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=attacked_command,
+            receipts=(attacked_receipt,),
+        )
+
+    ordinary_diagnostics = [
+        (error["loc"], error["type"], error["msg"], error["input"])
+        for error in ordinary_error.value.errors(include_url=False)
+    ]
+    attacked_diagnostics = [
+        (error["loc"], error["type"], error["msg"], error["input"])
+        for error in attacked_error.value.errors(include_url=False)
+    ]
+    assert attacked_diagnostics == ordinary_diagnostics
+    assert attacked_receipt.attempt == 1
+    assert NestedRepairingTuple.iteration_calls == 1
+
+
+def test_aggregate_boundary_preserves_intent_error_before_receipt_error() -> None:
+    invalid_intent = intent(ProcessingStage.CANONICAL).model_copy(
+        update={"request_digest": ""}
+    )
+    invalid_receipt = receipt(
+        ProcessingStage.CANONICAL,
+        StageStatus.PENDING,
+    ).model_copy(update={"attempt": 0})
+
+    with pytest.raises(ValidationError) as raised:
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=invalid_intent,
+            receipts=(invalid_receipt,),
+        )
+
+    assert raised.value.errors()[0]["loc"] == ("request_digest",)
+    assert raised.value.errors()[0]["type"] == "string_too_short"
+
+
+@pytest.mark.parametrize("invalid_view", ["native", "public"])
+def test_aggregate_boundary_preserves_receipt_tuple_subclass_public_view(
+    invalid_view: str,
+) -> None:
+    command = intent(ProcessingStage.CANONICAL)
+    valid_receipt = receipt(
+        ProcessingStage.CANONICAL,
+        StageStatus.PENDING,
+    )
+    invalid_receipt = valid_receipt.model_copy(update={"attempt": 0})
+    if invalid_view == "native":
+        native_receipt, public_receipt = invalid_receipt, valid_receipt
+    else:
+        native_receipt, public_receipt = valid_receipt, invalid_receipt
+    divergent = DivergentTuple((native_receipt,), (public_receipt,))
+
+    if invalid_view == "native":
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=command,
+            receipts=divergent,
+        )
+    else:
+        with pytest.raises(ValidationError, match="attempt must be at least 1"):
+            validate_required_stage_claim(
+                claimed_status=IntentStatus.ACCEPTED,
+                intent=command,
+                receipts=divergent,
+            )
+
+    assert divergent.iteration_calls == 1
+
+
 def test_aggregate_boundary_snapshots_model_extras_before_nested_traversal() -> None:
     command = intent(ProcessingStage.CANONICAL)
     extras = {"undeclared_witness": True}
@@ -2460,6 +2598,18 @@ def test_aggregate_boundary_rejects_non_tuple_receipt_collection() -> None:
             receipts=[  # type: ignore[arg-type]
                 receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
             ],
+        )
+
+
+def test_aggregate_boundary_preserves_strict_receipt_item_type() -> None:
+    unsupported: dict[str, object] = {}
+    unsupported["cycle"] = unsupported
+
+    with pytest.raises(TypeError, match="value must be a StageReceipt"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.ACCEPTED,
+            intent=intent(ProcessingStage.CANONICAL),
+            receipts=(unsupported,),  # type: ignore[arg-type]
         )
 
 
