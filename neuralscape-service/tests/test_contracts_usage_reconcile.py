@@ -2,12 +2,12 @@
 
 import copy
 import json
-from collections.abc import ItemsView, Iterator, KeysView, Mapping
+from collections.abc import Callable, ItemsView, Iterator, KeysView, Mapping
 from itertools import permutations
 from types import MappingProxyType
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 import contracts_usage_reconcile as usage_reconcile_contracts
 from contracts_common import MAX_SAFE_INTEGER
@@ -19,6 +19,10 @@ from contracts_usage_reconcile import (
     UsageReconciliationError,
     reconcile_usage_events,
 )
+
+
+_MODEL_DICT_DESCRIPTOR = BaseModel.__dict__["__dict__"]
+_MODEL_EXTRAS_DESCRIPTOR = BaseModel.__dict__["__pydantic_extra__"]
 
 
 def _quantity(value: int | None, reason: str | None = None) -> TokenQuantity:
@@ -214,6 +218,136 @@ class _HidingStorageAttribution(AttributionSnapshot):
         return super().__getattribute__(name)
 
 
+class _DescriptorMaskedAttribution(AttributionSnapshot):
+    @property
+    def __dict__(self):
+        native = _MODEL_DICT_DESCRIPTOR.__get__(self, BaseModel)
+        visible = {
+            name: value
+            for name, value in dict.items(native)
+            if name != "future_constraint"
+        }
+        if visible.get("provider") == "":
+            visible["provider"] = "provider-1"
+        return visible
+
+    @__dict__.setter
+    def __dict__(self, value):
+        _MODEL_DICT_DESCRIPTOR.__set__(self, value)
+
+    @property
+    def __pydantic_extra__(self):
+        return None
+
+    @__pydantic_extra__.setter
+    def __pydantic_extra__(self, value):
+        _MODEL_EXTRAS_DESCRIPTOR.__set__(self, value)
+
+
+class _DescriptorMaskedReconciledUsageStream(ReconciledUsageStream):
+    @property
+    def __dict__(self):
+        native = _MODEL_DICT_DESCRIPTOR.__get__(self, BaseModel)
+        visible = {
+            name: value
+            for name, value in dict.items(native)
+            if name != "future_constraint"
+        }
+        if visible.get("known_token_subtotal") == 0:
+            visible["known_token_subtotal"] = 15
+        return visible
+
+    @__dict__.setter
+    def __dict__(self, value):
+        _MODEL_DICT_DESCRIPTOR.__set__(self, value)
+
+    @property
+    def __pydantic_extra__(self):
+        return None
+
+    @__pydantic_extra__.setter
+    def __pydantic_extra__(self, value):
+        _MODEL_EXTRAS_DESCRIPTOR.__set__(self, value)
+
+
+class _DescriptorMaskedUsageReconciliation(UsageReconciliation):
+    @property
+    def __dict__(self):
+        native = _MODEL_DICT_DESCRIPTOR.__get__(self, BaseModel)
+        visible = {
+            name: value
+            for name, value in dict.items(native)
+            if name != "future_constraint"
+        }
+        if visible.get("tenant_id") == "":
+            visible["tenant_id"] = "tenant-1"
+        return visible
+
+    @__dict__.setter
+    def __dict__(self, value):
+        _MODEL_DICT_DESCRIPTOR.__set__(self, value)
+
+    @property
+    def __pydantic_extra__(self):
+        return None
+
+    @__pydantic_extra__.setter
+    def __pydantic_extra__(self, value):
+        _MODEL_EXTRAS_DESCRIPTOR.__set__(self, value)
+
+
+class _DescriptorMaskedTokenUsage(TokenUsage):
+    @property
+    def __dict__(self):
+        native = _MODEL_DICT_DESCRIPTOR.__get__(self, BaseModel)
+        visible = {
+            name: value
+            for name, value in dict.items(native)
+            if name != "future_constraint"
+        }
+        if visible.get("measurement") == "future_measurement":
+            visible["measurement"] = "actual"
+        return visible
+
+    @__dict__.setter
+    def __dict__(self, value):
+        _MODEL_DICT_DESCRIPTOR.__set__(self, value)
+
+    @property
+    def __pydantic_extra__(self):
+        return None
+
+    @__pydantic_extra__.setter
+    def __pydantic_extra__(self, value):
+        _MODEL_EXTRAS_DESCRIPTOR.__set__(self, value)
+
+
+class _DescriptorMaskedReconciledLedger(ReconciledLedger):
+    @property
+    def __dict__(self):
+        native = _MODEL_DICT_DESCRIPTOR.__get__(self, BaseModel)
+        visible = {
+            name: value
+            for name, value in dict.items(native)
+            if name != "future_constraint"
+        }
+        if visible.get("coverage") == "future_coverage":
+            visible["coverage"] = "reported"
+        return visible
+
+    @__dict__.setter
+    def __dict__(self, value):
+        _MODEL_DICT_DESCRIPTOR.__set__(self, value)
+
+    @property
+    def __pydantic_extra__(self):
+        return None
+
+    @__pydantic_extra__.setter
+    def __pydantic_extra__(self, value):
+        _MODEL_EXTRAS_DESCRIPTOR.__set__(self, value)
+
+
 class _ChangingItemsExtras(Mapping[str, object]):
     """Return a different items view after the first captured snapshot."""
 
@@ -236,6 +370,263 @@ class _ChangingItemsExtras(Mapping[str, object]):
         if self.items_calls == 1:
             return {}.items()
         return {"tenant_id": "shadow-tenant"}.items()
+
+
+class _ReplacingItemsInput(dict[str, object]):
+    """Replace one native edge from the receiver's public items callback."""
+
+    def __init__(self, entries: dict[str, object]) -> None:
+        super().__init__(entries)
+        self.action: Callable[[], None] | None = None
+        self.items_calls = 0
+
+    def items(self) -> ItemsView[str, object]:
+        self.items_calls += 1
+        if self.action is not None:
+            action, self.action = self.action, None
+            action()
+        return super().items()
+
+
+class _DivergentItemsInput(dict[str, object]):
+    """Expose a public view that differs from authoritative native dict edges."""
+
+    def __init__(
+        self,
+        native_entries: dict[str, object],
+        public_entries: dict[str, object],
+    ) -> None:
+        super().__init__(native_entries)
+        self.public_entries = public_entries
+        self.items_calls = 0
+
+    def items(self) -> ItemsView[str, object]:
+        self.items_calls += 1
+        return self.public_entries.items()
+
+
+class _DivergentPublicMapping(Mapping[str, object]):
+    """Use the public items view for a non-dict Mapping input."""
+
+    def __init__(
+        self,
+        lookup_entries: dict[str, object],
+        public_entries: dict[str, object],
+    ) -> None:
+        self.lookup_entries = lookup_entries
+        self.public_entries = public_entries
+        self.items_calls = 0
+
+    def __getitem__(self, key: str) -> object:
+        return self.lookup_entries[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.lookup_entries)
+
+    def __len__(self) -> int:
+        return len(self.lookup_entries)
+
+    def items(self) -> ItemsView[str, object]:
+        self.items_calls += 1
+        return self.public_entries.items()
+
+
+class _AdjacentItemsMapping(Mapping[str, object]):
+    """Yield one field twice with a callback between adjacent values."""
+
+    def __init__(
+        self,
+        entries: dict[str, object],
+        target: str,
+        first: object,
+        second: object,
+        *,
+        repeat: bool,
+        action: Callable[[], None] | None = None,
+    ) -> None:
+        self.entries = entries
+        self.target = target
+        self.first = first
+        self.second = second
+        self.repeat = repeat
+        self.action = action
+        self.items_calls = 0
+        self.action_calls = 0
+
+    def __getitem__(self, key: str) -> object:
+        return self.entries[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.entries)
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def items(self) -> Iterator[tuple[str, object]]:
+        self.items_calls += 1
+
+        def iterate() -> Iterator[tuple[str, object]]:
+            for key, value in self.entries.items():
+                if key != self.target:
+                    yield key, value
+                    continue
+                yield key, self.first
+                if self.action is not None:
+                    self.action_calls += 1
+                    action, self.action = self.action, None
+                    action()
+                if self.repeat:
+                    yield key, self.second
+
+        return iterate()
+
+
+class _DivergentTuple(tuple):
+    """Expose a public iteration view distinct from native tuple storage."""
+
+    def __new__(
+        cls,
+        native_entries: tuple[object, ...],
+        public_entries: tuple[object, ...],
+    ):
+        instance = super().__new__(cls, native_entries)
+        instance.public_entries = public_entries
+        instance.iteration_calls = 0
+        return instance
+
+    def __iter__(self) -> Iterator[object]:
+        self.iteration_calls += 1
+        return iter(self.public_entries)
+
+
+class _TraversalItemsInput(dict[str, object]):
+    """Raise immediately or lazily from one public items traversal."""
+
+    def __init__(self, entries: dict[str, object], behavior: str) -> None:
+        super().__init__(entries)
+        self.behavior = behavior
+        self.items_calls = 0
+        self.iterator_entries = 0
+
+    def items(self) -> Iterator[tuple[str, object]]:
+        self.items_calls += 1
+        if self.behavior == "immediate":
+            raise RuntimeError("items immediate sentinel")
+
+        def iterate() -> Iterator[tuple[str, object]]:
+            first = next(iter(dict.items(self)))
+            self.iterator_entries += 1
+            yield first
+            if self.behavior == "lazy":
+                raise RuntimeError("items lazy sentinel")
+
+        return iterate()
+
+
+class _TraversalPublicMapping(Mapping[str, object]):
+    """Fail at one precise stage of a non-dict public items traversal."""
+
+    def __init__(self, entries: dict[str, object], behavior: str) -> None:
+        self.entries = entries
+        self.behavior = behavior
+        self.items_calls = 0
+        self.iterator_calls = 0
+        self.iterator_entries = 0
+
+    def __getitem__(self, key: str) -> object:
+        return self.entries[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.entries)
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def items(self) -> Iterator[tuple[str, object]]:
+        self.items_calls += 1
+        if self.behavior == "items":
+            raise RuntimeError("public mapping items sentinel")
+        return _TraversalPublicItemsIterator(self)
+
+
+class _TraversalPublicItemsIterator:
+    def __init__(self, owner: _TraversalPublicMapping) -> None:
+        self.owner = owner
+        self.entries = tuple(dict.items(owner.entries))
+        self.index = 0
+
+    def __iter__(self) -> "_TraversalPublicItemsIterator":
+        self.owner.iterator_calls += 1
+        if self.owner.behavior == "iter":
+            raise RuntimeError("public mapping iter sentinel")
+        return self
+
+    def __next__(self) -> tuple[str, object]:
+        if self.owner.behavior == "next" and self.index == 0:
+            raise RuntimeError("public mapping next sentinel")
+        if self.owner.behavior == "lazy" and self.index == 1:
+            raise RuntimeError("public mapping lazy sentinel")
+        if self.index == len(self.entries):
+            raise StopIteration
+        entry = self.entries[self.index]
+        self.index += 1
+        self.owner.iterator_entries += 1
+        return entry
+
+
+class _StopIterationUnpackPair:
+    def __init__(self) -> None:
+        self.iteration_calls = 0
+
+    def __iter__(self) -> Iterator[object]:
+        self.iteration_calls += 1
+        raise StopIteration("pair unpack sentinel")
+
+
+class _LateMalformedPairMapping(Mapping[str, object]):
+    """Yield a malformed pair after every otherwise valid public entry."""
+
+    def __init__(self, entries: dict[str, object], malformed_pair: object) -> None:
+        self.entries = entries
+        self.malformed_pair = malformed_pair
+        self.items_calls = 0
+        self.iterator_calls = 0
+        self.iterator_entries = 0
+
+    def __getitem__(self, key: str) -> object:
+        return self.entries[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.entries)
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def items(self) -> Iterator[object]:
+        self.items_calls += 1
+        return _LateMalformedPairIterator(self)
+
+
+class _LateMalformedPairIterator:
+    def __init__(self, owner: _LateMalformedPairMapping) -> None:
+        self.owner = owner
+        self.entries: tuple[object, ...] = (
+            *tuple(dict.items(owner.entries)),
+            owner.malformed_pair,
+        )
+        self.index = 0
+
+    def __iter__(self) -> "_LateMalformedPairIterator":
+        self.owner.iterator_calls += 1
+        return self
+
+    def __next__(self) -> object:
+        if self.index == len(self.entries):
+            raise StopIteration
+        entry = self.entries[self.index]
+        self.index += 1
+        self.owner.iterator_entries += 1
+        return entry
 
 
 class _FalseyPopulatedExtras(dict[str, object]):
@@ -288,6 +679,50 @@ def _assert_attribution_authority_rejected(value: object) -> None:
         (error["type"], error["loc"])
         for error in caught.value.errors(include_url=False)
     ] == [("extra_forbidden", ("attribution", "authority"))]
+
+
+def _set_native_unknown(target: BaseModel, storage: str) -> None:
+    if storage == "stored":
+        backing = _MODEL_DICT_DESCRIPTOR.__get__(target, BaseModel)
+        dict.__setitem__(backing, "future_constraint", "deny")
+    else:
+        backing = {"future_constraint": "deny"}
+        _MODEL_EXTRAS_DESCRIPTOR.__set__(target, backing)
+    assert dict.__getitem__(backing, "future_constraint") == "deny"
+
+
+def _validation_signature(
+    receiver: type[BaseModel], value: object
+) -> list[tuple[str, tuple[object, ...], str]]:
+    with pytest.raises(ValidationError) as caught:
+        receiver.model_validate(value)
+    return [
+        (error["type"], error["loc"], error["msg"])
+        for error in caught.value.errors(include_url=False)
+    ]
+
+
+def _python_receive(
+    receiver: type[BaseModel],
+    value: Mapping[str, object],
+    entry: str,
+) -> BaseModel:
+    if entry == "model_validate":
+        return receiver.model_validate(value)
+    return receiver(**value)
+
+
+def _python_validation_signature(
+    receiver: type[BaseModel],
+    value: Mapping[str, object],
+    entry: str,
+) -> list[tuple[str, tuple[object, ...], str]]:
+    with pytest.raises(ValidationError) as caught:
+        _python_receive(receiver, value, entry)
+    return [
+        (error["type"], error["loc"], error["msg"])
+        for error in caught.value.errors(include_url=False)
+    ]
 
 
 def test_reconciles_three_ledgers_without_cross_ledger_relabelling() -> None:
@@ -474,6 +909,1406 @@ def test_result_revalidation_rejects_hidden_extra_in_nested_copy() -> None:
         UsageReconciliation.model_validate(invalid_result)
 
 
+@pytest.mark.parametrize("storage", ["stored", "extra"])
+@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+def test_result_receivers_reject_descriptor_hidden_root_storage_like_ordinary(
+    storage: str,
+    receiver_name: str,
+) -> None:
+    result = reconcile_usage_events([_event()])
+    if receiver_name == "stream":
+        receiver = ReconciledUsageStream
+        ordinary = result.streams[0].model_copy()
+        descriptor = _DescriptorMaskedReconciledUsageStream.model_validate(
+            result.streams[0].model_dump(mode="python")
+        )
+    else:
+        receiver = UsageReconciliation
+        ordinary = result.model_copy()
+        descriptor = _DescriptorMaskedUsageReconciliation.model_validate(
+            result.model_dump(mode="python")
+        )
+
+    _set_native_unknown(ordinary, storage)
+    _set_native_unknown(descriptor, storage)
+    if storage == "stored":
+        assert "future_constraint" not in descriptor.__dict__
+    else:
+        assert descriptor.__pydantic_extra__ is None
+
+    expected = [
+        (
+            "extra_forbidden",
+            ("future_constraint",),
+            "Extra inputs are not permitted",
+        )
+    ]
+    assert _validation_signature(receiver, ordinary) == expected
+    assert _validation_signature(receiver, descriptor) == expected
+
+
+@pytest.mark.parametrize("storage", ["stored", "extra"])
+@pytest.mark.parametrize("target_name", ["attribution", "stream"])
+def test_result_receivers_reject_descriptor_hidden_nested_storage_like_ordinary(
+    storage: str,
+    target_name: str,
+) -> None:
+    result = reconcile_usage_events([_event()])
+    stream = result.streams[0]
+    if target_name == "attribution":
+        receiver = ReconciledUsageStream
+        ordinary_target = stream.attribution.model_copy()
+        descriptor_target = _DescriptorMaskedAttribution.model_validate(
+            stream.attribution.model_dump(mode="python")
+        )
+        expected_location = ("attribution", "future_constraint")
+        ordinary_parent = stream.model_copy(
+            update={"attribution": ordinary_target}
+        )
+        descriptor_parent = stream.model_copy(
+            update={"attribution": descriptor_target}
+        )
+    else:
+        receiver = UsageReconciliation
+        ordinary_target = stream.model_copy()
+        descriptor_target = _DescriptorMaskedReconciledUsageStream.model_validate(
+            stream.model_dump(mode="python")
+        )
+        expected_location = ("streams", 0, "future_constraint")
+        ordinary_parent = result.model_copy(update={"streams": (ordinary_target,)})
+        descriptor_parent = result.model_copy(
+            update={"streams": (descriptor_target,)}
+        )
+
+    _set_native_unknown(ordinary_target, storage)
+    _set_native_unknown(descriptor_target, storage)
+    if storage == "stored":
+        assert "future_constraint" not in descriptor_target.__dict__
+    else:
+        assert descriptor_target.__pydantic_extra__ is None
+
+    expected = [
+        (
+            "extra_forbidden",
+            expected_location,
+            "Extra inputs are not permitted",
+        )
+    ]
+    assert _validation_signature(receiver, ordinary_parent) == expected
+    assert _validation_signature(receiver, descriptor_parent) == expected
+
+
+@pytest.mark.parametrize("entry", ["model_validate", "constructor"])
+@pytest.mark.parametrize("root_kind", ["dict", "mapping-proxy"])
+@pytest.mark.parametrize("storage", ["stored", "extra"])
+@pytest.mark.parametrize(
+    ("target_name", "expected_location"),
+    [
+        ("attribution", ("attribution", "future_constraint")),
+        ("usage", ("usage", "future_constraint")),
+        ("stream", ("streams", 0, "future_constraint")),
+        ("ledger", ("ledgers", 0, "future_constraint")),
+    ],
+)
+def test_python_result_inputs_reject_nested_descriptor_unknowns_like_ordinary(
+    entry: str,
+    root_kind: str,
+    storage: str,
+    target_name: str,
+    expected_location: tuple[object, ...],
+) -> None:
+    result = reconcile_usage_events([_event()])
+    stream = result.streams[0]
+    if target_name == "attribution":
+        receiver = ReconciledUsageStream
+        ordinary_target = stream.attribution.model_copy()
+        descriptor_target = _DescriptorMaskedAttribution.model_validate(
+            stream.attribution.model_dump(mode="python")
+        )
+        ordinary_payload = stream.model_dump(mode="python")
+        descriptor_payload = stream.model_dump(mode="python")
+        ordinary_payload["attribution"] = ordinary_target
+        descriptor_payload["attribution"] = descriptor_target
+    elif target_name == "usage":
+        receiver = ReconciledUsageStream
+        assert stream.usage is not None
+        ordinary_target = stream.usage.model_copy()
+        descriptor_target = _DescriptorMaskedTokenUsage.model_validate(
+            stream.usage.model_dump(mode="python")
+        )
+        ordinary_payload = stream.model_dump(mode="python")
+        descriptor_payload = stream.model_dump(mode="python")
+        ordinary_payload["usage"] = ordinary_target
+        descriptor_payload["usage"] = descriptor_target
+    elif target_name == "stream":
+        receiver = UsageReconciliation
+        ordinary_target = stream.model_copy()
+        descriptor_target = _DescriptorMaskedReconciledUsageStream.model_validate(
+            stream.model_dump(mode="python")
+        )
+        ordinary_payload = result.model_dump(mode="python")
+        descriptor_payload = result.model_dump(mode="python")
+        ordinary_payload["streams"] = (ordinary_target,)
+        descriptor_payload["streams"] = (descriptor_target,)
+    else:
+        receiver = UsageReconciliation
+        ordinary_target = result.ledgers[0].model_copy()
+        descriptor_target = _DescriptorMaskedReconciledLedger.model_validate(
+            result.ledgers[0].model_dump(mode="python")
+        )
+        ordinary_payload = result.model_dump(mode="python")
+        descriptor_payload = result.model_dump(mode="python")
+        ordinary_payload["ledgers"] = (
+            ordinary_target,
+            *result.ledgers[1:],
+        )
+        descriptor_payload["ledgers"] = (
+            descriptor_target,
+            *result.ledgers[1:],
+        )
+
+    _set_native_unknown(ordinary_target, storage)
+    _set_native_unknown(descriptor_target, storage)
+    if storage == "stored":
+        assert "future_constraint" not in descriptor_target.__dict__
+    else:
+        assert descriptor_target.__pydantic_extra__ is None
+
+    if root_kind == "mapping-proxy":
+        ordinary_input = MappingProxyType(ordinary_payload)
+        descriptor_input = MappingProxyType(descriptor_payload)
+    else:
+        ordinary_input = ordinary_payload
+        descriptor_input = descriptor_payload
+    expected = [
+        (
+            "extra_forbidden",
+            expected_location,
+            "Extra inputs are not permitted",
+        )
+    ]
+    assert _python_validation_signature(receiver, ordinary_input, entry) == expected
+    assert _python_validation_signature(receiver, descriptor_input, entry) == expected
+
+
+@pytest.mark.parametrize("entry", ["model_validate", "constructor"])
+@pytest.mark.parametrize("root_kind", ["dict", "mapping-proxy"])
+@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+def test_python_result_inputs_accept_valid_nested_descriptor_controls(
+    entry: str,
+    root_kind: str,
+    receiver_name: str,
+) -> None:
+    result = reconcile_usage_events([_event()])
+    stream = result.streams[0]
+    if receiver_name == "stream":
+        receiver = ReconciledUsageStream
+        expected = stream
+        attribution = _DescriptorMaskedAttribution.model_validate(
+            stream.attribution.model_dump(mode="python")
+        )
+        assert stream.usage is not None
+        usage = _DescriptorMaskedTokenUsage.model_validate(
+            stream.usage.model_dump(mode="python")
+        )
+        payload = stream.model_dump(mode="python")
+        payload.update(attribution=attribution, usage=usage)
+    else:
+        receiver = UsageReconciliation
+        expected = result
+        nested_stream = _DescriptorMaskedReconciledUsageStream.model_validate(
+            stream.model_dump(mode="python")
+        )
+        ledger = _DescriptorMaskedReconciledLedger.model_validate(
+            result.ledgers[0].model_dump(mode="python")
+        )
+        payload = result.model_dump(mode="python")
+        payload["streams"] = (nested_stream,)
+        payload["ledgers"] = (ledger, *result.ledgers[1:])
+
+    received = _python_receive(
+        receiver,
+        MappingProxyType(payload) if root_kind == "mapping-proxy" else payload,
+        entry,
+    )
+
+    assert received == expected
+
+
+@pytest.mark.parametrize("entry", ["model_validate", "constructor"])
+@pytest.mark.parametrize(
+    ("target_name", "invalid_field", "invalid_value", "error_type", "location"),
+    [
+        (
+            "attribution",
+            "provider",
+            "",
+            "string_too_short",
+            ("attribution", "provider"),
+        ),
+        (
+            "usage",
+            "measurement",
+            "future_measurement",
+            "literal_error",
+            ("usage", "measurement"),
+        ),
+        (
+            "stream",
+            "known_token_subtotal",
+            0,
+            "value_error",
+            ("streams", 0),
+        ),
+        (
+            "ledger",
+            "coverage",
+            "future_coverage",
+            "literal_error",
+            ("ledgers", 0, "coverage"),
+        ),
+    ],
+)
+def test_python_result_inputs_reject_nested_descriptor_invalid_fields_like_ordinary(
+    entry: str,
+    target_name: str,
+    invalid_field: str,
+    invalid_value: object,
+    error_type: str,
+    location: tuple[object, ...],
+) -> None:
+    result = reconcile_usage_events([_event()])
+    stream = result.streams[0]
+    if target_name == "attribution":
+        receiver = ReconciledUsageStream
+        ordinary_target = stream.attribution.model_copy(
+            update={invalid_field: invalid_value}
+        )
+        descriptor_target = _DescriptorMaskedAttribution.model_validate(
+            stream.attribution.model_dump(mode="python")
+        )
+        ordinary_payload = stream.model_dump(mode="python")
+        descriptor_payload = stream.model_dump(mode="python")
+        ordinary_payload["attribution"] = ordinary_target
+        descriptor_payload["attribution"] = descriptor_target
+    elif target_name == "usage":
+        receiver = ReconciledUsageStream
+        assert stream.usage is not None
+        ordinary_target = stream.usage.model_copy(
+            update={invalid_field: invalid_value}
+        )
+        descriptor_target = _DescriptorMaskedTokenUsage.model_validate(
+            stream.usage.model_dump(mode="python")
+        )
+        ordinary_payload = stream.model_dump(mode="python")
+        descriptor_payload = stream.model_dump(mode="python")
+        ordinary_payload["usage"] = ordinary_target
+        descriptor_payload["usage"] = descriptor_target
+    elif target_name == "stream":
+        receiver = UsageReconciliation
+        ordinary_target = stream.model_copy(update={invalid_field: invalid_value})
+        descriptor_target = _DescriptorMaskedReconciledUsageStream.model_validate(
+            stream.model_dump(mode="python")
+        )
+        ordinary_payload = result.model_dump(mode="python")
+        descriptor_payload = result.model_dump(mode="python")
+        ordinary_payload["streams"] = (ordinary_target,)
+        descriptor_payload["streams"] = (descriptor_target,)
+    else:
+        receiver = UsageReconciliation
+        ordinary_target = result.ledgers[0].model_copy(
+            update={invalid_field: invalid_value}
+        )
+        descriptor_target = _DescriptorMaskedReconciledLedger.model_validate(
+            result.ledgers[0].model_dump(mode="python")
+        )
+        ordinary_payload = result.model_dump(mode="python")
+        descriptor_payload = result.model_dump(mode="python")
+        ordinary_payload["ledgers"] = (
+            ordinary_target,
+            *result.ledgers[1:],
+        )
+        descriptor_payload["ledgers"] = (
+            descriptor_target,
+            *result.ledgers[1:],
+        )
+
+    descriptor_backing = _MODEL_DICT_DESCRIPTOR.__get__(
+        descriptor_target,
+        BaseModel,
+    )
+    dict.__setitem__(descriptor_backing, invalid_field, invalid_value)
+    assert dict.__getitem__(descriptor_backing, invalid_field) == invalid_value
+    assert descriptor_target.__dict__[invalid_field] != invalid_value
+
+    ordinary_signature = _python_validation_signature(
+        receiver,
+        ordinary_payload,
+        entry,
+    )
+    descriptor_signature = _python_validation_signature(
+        receiver,
+        descriptor_payload,
+        entry,
+    )
+    assert descriptor_signature == ordinary_signature
+    assert descriptor_signature[0][:2] == (error_type, location)
+
+
+@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+def test_result_receivers_reject_descriptor_hidden_invalid_root(
+    receiver_name: str,
+) -> None:
+    result = reconcile_usage_events([_event()])
+    if receiver_name == "stream":
+        receiver = ReconciledUsageStream
+        ordinary = result.streams[0].model_copy(
+            update={"known_token_subtotal": 0}
+        )
+        descriptor = _DescriptorMaskedReconciledUsageStream.model_validate(
+            result.streams[0].model_dump(mode="python")
+        )
+        field_name = "known_token_subtotal"
+        invalid_value: object = 0
+        expected_type = "value_error"
+        expected_location: tuple[object, ...] = ()
+    else:
+        receiver = UsageReconciliation
+        ordinary = result.model_copy(update={"tenant_id": ""})
+        descriptor = _DescriptorMaskedUsageReconciliation.model_validate(
+            result.model_dump(mode="python")
+        )
+        field_name = "tenant_id"
+        invalid_value = ""
+        expected_type = "string_too_short"
+        expected_location = ("tenant_id",)
+
+    backing = _MODEL_DICT_DESCRIPTOR.__get__(descriptor, BaseModel)
+    dict.__setitem__(backing, field_name, invalid_value)
+    assert descriptor.__dict__[field_name] != invalid_value
+    ordinary_signature = _validation_signature(receiver, ordinary)
+    descriptor_signature = _validation_signature(receiver, descriptor)
+    assert descriptor_signature == ordinary_signature
+    assert descriptor_signature[0][:2] == (expected_type, expected_location)
+
+
+@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+def test_python_prefreeze_precedes_mapping_key_hooks(receiver_name: str) -> None:
+    result = reconcile_usage_events([_event()])
+
+    class RepairingFieldName(str):
+        def __new__(cls, value: str):
+            instance = super().__new__(cls, value)
+            instance.action = None
+            instance.calls = 0
+            return instance
+
+        def __hash__(self):
+            if self.action is not None:
+                self.calls += 1
+                action, self.action = self.action, None
+                action()
+            return super().__hash__()
+
+    if receiver_name == "stream":
+        receiver = ReconciledUsageStream
+        child = result.streams[0].attribution.model_copy(update={"provider": ""})
+        child_backing = _MODEL_DICT_DESCRIPTOR.__get__(child, BaseModel)
+        payload = result.streams[0].model_dump(mode="python")
+        payload["attribution"] = child
+        expected_location = ("attribution", "provider")
+        repair = lambda: dict.__setitem__(
+            child_backing,
+            "provider",
+            "provider-1",
+        )
+    else:
+        receiver = UsageReconciliation
+        child = result.streams[0].model_copy(
+            update={"known_token_subtotal": 0}
+        )
+        child_backing = _MODEL_DICT_DESCRIPTOR.__get__(child, BaseModel)
+        payload = result.model_dump(mode="python")
+        payload["streams"] = (child,)
+        expected_location = ("streams", 0)
+        repair = lambda: dict.__setitem__(
+            child_backing,
+            "known_token_subtotal",
+            15,
+        )
+
+    tenant_id = dict.pop(payload, "tenant_id")
+    key = RepairingFieldName("tenant_id")
+    dict.__setitem__(payload, key, tenant_id)
+    key.action = repair
+
+    signature = _python_validation_signature(receiver, payload, "model_validate")
+
+    assert key.calls == 1
+    assert signature[0][1] == expected_location
+    if receiver_name == "stream":
+        assert child_backing["provider"] == "provider-1"
+    else:
+        assert child_backing["known_token_subtotal"] == 15
+
+
+@pytest.mark.parametrize(
+    ("target_name", "error_type", "location"),
+    [
+        ("attribution", "string_too_short", ("attribution", "provider")),
+        ("usage", "literal_error", ("usage", "measurement")),
+        ("stream", "value_error", ("streams", 0)),
+        ("ledger", "literal_error", ("ledgers", 0, "coverage")),
+    ],
+)
+def test_python_prefreeze_retains_native_dict_edges_before_items_callback(
+    target_name: str,
+    error_type: str,
+    location: tuple[object, ...],
+) -> None:
+    result = reconcile_usage_events([_event()])
+    stream = result.streams[0]
+    if target_name == "attribution":
+        receiver = ReconciledUsageStream
+        expected = stream
+        field_name = "attribution"
+        invalid_child = stream.attribution.model_copy(update={"provider": ""})
+        valid_child = stream.attribution.model_copy()
+        payload = stream.model_dump(mode="python")
+    elif target_name == "usage":
+        receiver = ReconciledUsageStream
+        expected = stream
+        field_name = "usage"
+        assert stream.usage is not None
+        invalid_child = stream.usage.model_copy(
+            update={"measurement": "future_measurement"}
+        )
+        valid_child = stream.usage.model_copy()
+        payload = stream.model_dump(mode="python")
+    elif target_name == "stream":
+        receiver = UsageReconciliation
+        expected = result
+        field_name = "streams"
+        invalid_child = (
+            stream.model_copy(update={"known_token_subtotal": 0}),
+        )
+        valid_child = (stream.model_copy(),)
+        payload = result.model_dump(mode="python")
+    else:
+        receiver = UsageReconciliation
+        expected = result
+        field_name = "ledgers"
+        invalid_child = (
+            result.ledgers[0].model_copy(update={"coverage": "future_coverage"}),
+            *result.ledgers[1:],
+        )
+        valid_child = (result.ledgers[0].model_copy(), *result.ledgers[1:])
+        payload = result.model_dump(mode="python")
+
+    ordinary = _ReplacingItemsInput(payload)
+    dict.__setitem__(ordinary, field_name, invalid_child)
+    ordinary_signature = _validation_signature(receiver, ordinary)
+
+    replacement = _ReplacingItemsInput(payload)
+    dict.__setitem__(replacement, field_name, invalid_child)
+    replacement.action = lambda: dict.__setitem__(
+        replacement,
+        field_name,
+        valid_child,
+    )
+    replacement_signature = _validation_signature(receiver, replacement)
+
+    valid = _ReplacingItemsInput(payload)
+    dict.__setitem__(valid, field_name, valid_child)
+    valid.action = lambda: dict.__setitem__(valid, field_name, valid_child)
+    received = receiver.model_validate(valid)
+
+    assert ordinary.items_calls == 1
+    assert replacement.items_calls == 1
+    assert valid.items_calls == 1
+    assert replacement_signature == ordinary_signature
+    assert replacement_signature[0][:2] == (error_type, location)
+    assert dict.__getitem__(replacement, field_name) is valid_child
+    assert received == expected
+
+
+def test_python_prefreeze_keeps_native_dict_and_public_mapping_authority() -> None:
+    stream = reconcile_usage_events([_event()]).streams[0]
+    valid_payload = stream.model_dump(mode="python")
+    invalid_payload = stream.model_dump(mode="python")
+    invalid_payload["attribution"] = stream.attribution.model_copy(
+        update={"provider": ""}
+    )
+    expected = [
+        (
+            "string_too_short",
+            ("attribution", "provider"),
+            "String should have at least 1 character",
+        )
+    ]
+
+    native_invalid = _DivergentItemsInput(invalid_payload, valid_payload)
+    assert _validation_signature(ReconciledUsageStream, native_invalid) == expected
+    assert native_invalid.items_calls == 1
+
+    native_valid = _DivergentItemsInput(valid_payload, invalid_payload)
+    assert ReconciledUsageStream.model_validate(native_valid) == stream
+    assert native_valid.items_calls == 1
+
+    public_valid = _DivergentPublicMapping(invalid_payload, valid_payload)
+    assert ReconciledUsageStream.model_validate(public_valid) == stream
+    assert public_valid.items_calls == 1
+
+    public_invalid = _DivergentPublicMapping(valid_payload, invalid_payload)
+    assert _validation_signature(ReconciledUsageStream, public_invalid) == expected
+    assert public_invalid.items_calls == 1
+
+
+@pytest.mark.parametrize("receiver_name", ["result", "stream"])
+def test_python_public_mapping_keeps_first_observed_shared_descendant(
+    receiver_name: str,
+) -> None:
+    def run_case(
+        case: str,
+    ) -> tuple[
+        _AdjacentItemsMapping,
+        BaseModel | list[tuple[str, tuple[object, ...], str]],
+    ]:
+        result = reconcile_usage_events([_event()])
+        stream = result.streams[0]
+        if receiver_name == "result":
+            receiver = UsageReconciliation
+            expected: BaseModel = result
+            payload = result.model_dump(mode="python")
+            target = "streams"
+            valid_parent: object = tuple([stream.model_copy()])
+            shared = stream.model_copy(update={"known_token_subtotal": 0})
+            first_parent: object = tuple([shared])
+            second_parent: object = (
+                first_parent if case == "same-parent" else tuple([shared])
+            )
+            shared_backing = _MODEL_DICT_DESCRIPTOR.__get__(shared, BaseModel)
+
+            def repair() -> None:
+                dict.__setitem__(shared_backing, "known_token_subtotal", 15)
+
+        else:
+            receiver = ReconciledUsageStream
+            expected = stream
+            payload = stream.model_dump(mode="python")
+            target = "usage"
+            assert stream.usage is not None
+            valid_usage = stream.usage.model_copy()
+            valid_parent = valid_usage
+            shared = valid_usage.input_tokens.model_copy(update={"value": -1})
+            first_parent = valid_usage.model_copy(
+                update={"input_tokens": shared}
+            )
+            second_parent = (
+                first_parent
+                if case == "same-parent"
+                else valid_usage.model_copy(update={"input_tokens": shared})
+            )
+            shared_backing = _MODEL_DICT_DESCRIPTOR.__get__(shared, BaseModel)
+
+            def repair() -> None:
+                dict.__setitem__(shared_backing, "value", 10)
+
+        if case == "valid":
+            first = valid_parent
+            second = valid_parent
+            repeat = False
+            action = None
+        elif case == "ordinary-invalid":
+            first = first_parent
+            second = first_parent
+            repeat = False
+            action = None
+        else:
+            first = first_parent
+            second = second_parent
+            repeat = True
+            action = repair
+        value = _AdjacentItemsMapping(
+            payload,
+            target,
+            first,
+            second,
+            repeat=repeat,
+            action=action,
+        )
+        if case == "valid":
+            outcome: BaseModel | list[tuple[str, tuple[object, ...], str]] = (
+                receiver.model_validate(value)
+            )
+        else:
+            outcome = _validation_signature(receiver, value)
+        assert value.items_calls == 1
+        assert value.action_calls == (1 if action is not None else 0)
+        if case == "valid":
+            assert outcome == expected
+        return value, outcome
+
+    _valid_mapping, _valid_outcome = run_case("valid")
+    _ordinary_mapping, ordinary = run_case("ordinary-invalid")
+    _same_mapping, same_parent = run_case("same-parent")
+    _distinct_mapping, distinct_parent = run_case("distinct-parent")
+
+    assert same_parent == ordinary
+    assert distinct_parent == ordinary
+    if receiver_name == "result":
+        assert ordinary[0][:2] == ("value_error", ("streams", 0))
+    else:
+        assert ordinary[0][:2] == (
+            "greater_than_equal",
+            ("usage", "input_tokens", "value"),
+        )
+
+
+def test_python_prefreeze_retains_native_root_tuple_edges_without_iteration() -> None:
+    result = reconcile_usage_events([_event()])
+    valid_stream = result.streams[0].model_copy()
+    invalid_stream = result.streams[0].model_copy(
+        update={"known_token_subtotal": 0}
+    )
+    payload = result.model_dump(mode="python")
+
+    ordinary_payload = dict(payload)
+    ordinary_payload["streams"] = (invalid_stream,)
+    ordinary_signature = _validation_signature(
+        UsageReconciliation,
+        ordinary_payload,
+    )
+
+    divergent = _DivergentTuple((invalid_stream,), (valid_stream,))
+    divergent_payload = dict(payload)
+    divergent_payload["streams"] = divergent
+    divergent_signature = _validation_signature(
+        UsageReconciliation,
+        divergent_payload,
+    )
+
+    control = _DivergentTuple((valid_stream,), (invalid_stream,))
+    control_payload = dict(payload)
+    control_payload["streams"] = control
+    received = UsageReconciliation.model_validate(control_payload)
+
+    assert divergent_signature == ordinary_signature
+    assert divergent_signature[0][:2] == ("value_error", ("streams", 0))
+    assert divergent.iteration_calls == 0
+    assert control.iteration_calls == 0
+    assert received == result
+
+
+def test_python_prefreeze_retains_nested_native_tuple_edges_without_iteration() -> None:
+    stream = reconcile_usage_events([_event()]).streams[0]
+
+    ordinary_attribution = stream.attribution.model_copy()
+    ordinary_backing = _MODEL_DICT_DESCRIPTOR.__get__(
+        ordinary_attribution,
+        BaseModel,
+    )
+    dict.__setitem__(ordinary_backing, "recipients", ("",))
+    ordinary_payload = stream.model_dump(mode="python")
+    ordinary_payload["attribution"] = ordinary_attribution
+    ordinary_signature = _validation_signature(
+        ReconciledUsageStream,
+        ordinary_payload,
+    )
+
+    divergent = _DivergentTuple(("",), ("provider-1",))
+    divergent_attribution = stream.attribution.model_copy()
+    divergent_backing = _MODEL_DICT_DESCRIPTOR.__get__(
+        divergent_attribution,
+        BaseModel,
+    )
+    dict.__setitem__(divergent_backing, "recipients", divergent)
+    divergent_payload = stream.model_dump(mode="python")
+    divergent_payload["attribution"] = divergent_attribution
+    divergent_signature = _validation_signature(
+        ReconciledUsageStream,
+        divergent_payload,
+    )
+
+    control = _DivergentTuple(("provider-1",), ("",))
+    control_attribution = stream.attribution.model_copy()
+    control_backing = _MODEL_DICT_DESCRIPTOR.__get__(control_attribution, BaseModel)
+    dict.__setitem__(control_backing, "recipients", control)
+    control_payload = stream.model_dump(mode="python")
+    control_payload["attribution"] = control_attribution
+    received = ReconciledUsageStream.model_validate(control_payload)
+
+    assert divergent_signature == ordinary_signature
+    assert divergent_signature[0][:2] == (
+        "string_too_short",
+        ("attribution", "recipients", 0),
+    )
+    assert divergent.iteration_calls == 0
+    assert control.iteration_calls == 0
+    assert received == stream
+
+
+@pytest.mark.parametrize("behavior", ["immediate", "lazy"])
+@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+def test_python_result_root_dict_traversal_errors_remain_validation_errors(
+    behavior: str,
+    receiver_name: str,
+) -> None:
+    result = reconcile_usage_events([_event()])
+    if receiver_name == "stream":
+        receiver = ReconciledUsageStream
+        valid = result.streams[0]
+    else:
+        receiver = UsageReconciliation
+        valid = result
+
+    failing = _TraversalItemsInput(valid.model_dump(mode="python"), behavior)
+    assert _validation_signature(receiver, failing) == [
+        (
+            "mapping_type",
+            (),
+            (
+                "Input should be a valid mapping, error: RuntimeError: "
+                f"items {behavior} sentinel"
+            ),
+        )
+    ]
+    assert failing.items_calls == 1
+    assert failing.iterator_entries == (1 if behavior == "lazy" else 0)
+
+    control = _TraversalItemsInput(valid.model_dump(mode="python"), "valid")
+    assert receiver.model_validate(control) == valid
+    assert control.items_calls == 1
+    assert control.iterator_entries == 1
+
+
+@pytest.mark.parametrize("behavior", ["immediate", "lazy"])
+@pytest.mark.parametrize("entry", ["model_validate", "constructor"])
+@pytest.mark.parametrize(
+    ("target_name", "location"),
+    [
+        ("attribution", ("attribution",)),
+        ("usage", ("usage",)),
+        ("stream", ("streams", 0)),
+        ("ledger", ("ledgers", 0)),
+    ],
+)
+def test_python_nested_dict_traversal_errors_keep_category_and_location(
+    behavior: str,
+    entry: str,
+    target_name: str,
+    location: tuple[object, ...],
+) -> None:
+    result = reconcile_usage_events([_event()])
+    stream = result.streams[0]
+    if target_name == "attribution":
+        receiver = ReconciledUsageStream
+        expected = stream
+        field_name = "attribution"
+        child = stream.attribution
+        payload = stream.model_dump(mode="python")
+    elif target_name == "usage":
+        receiver = ReconciledUsageStream
+        expected = stream
+        field_name = "usage"
+        assert stream.usage is not None
+        child = stream.usage
+        payload = stream.model_dump(mode="python")
+    elif target_name == "stream":
+        receiver = UsageReconciliation
+        expected = result
+        field_name = "streams"
+        child = stream
+        payload = result.model_dump(mode="python")
+    else:
+        receiver = UsageReconciliation
+        expected = result
+        field_name = "ledgers"
+        child = result.ledgers[0]
+        payload = result.model_dump(mode="python")
+
+    failing = _TraversalItemsInput(child.model_dump(mode="python"), behavior)
+    control = _TraversalItemsInput(child.model_dump(mode="python"), "valid")
+    if target_name in {"stream", "ledger"}:
+        remaining = (
+            () if target_name == "stream" else result.ledgers[1:]
+        )
+        payload[field_name] = (failing, *remaining)
+    else:
+        payload[field_name] = failing
+
+    assert _python_validation_signature(receiver, payload, entry) == [
+        (
+            "mapping_type",
+            location,
+            (
+                "Input should be a valid mapping, error: RuntimeError: "
+                f"items {behavior} sentinel"
+            ),
+        )
+    ]
+    assert failing.items_calls == 1
+    assert failing.iterator_entries == (1 if behavior == "lazy" else 0)
+
+    if target_name in {"stream", "ledger"}:
+        payload[field_name] = (control, *remaining)
+    else:
+        payload[field_name] = control
+    assert _python_receive(receiver, payload, entry) == expected
+    assert control.items_calls == 1
+    assert control.iterator_entries == 1
+
+
+@pytest.mark.parametrize(
+    ("behavior", "expected_iterator_calls", "expected_entries"),
+    [
+        ("items", 0, 0),
+        ("iter", 1, 0),
+        ("next", 1, 0),
+        ("lazy", 1, 1),
+    ],
+)
+@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+def test_python_result_root_public_mapping_traversal_errors_are_located(
+    behavior: str,
+    expected_iterator_calls: int,
+    expected_entries: int,
+    receiver_name: str,
+) -> None:
+    result = reconcile_usage_events([_event()])
+    if receiver_name == "stream":
+        receiver = ReconciledUsageStream
+        valid = result.streams[0]
+    else:
+        receiver = UsageReconciliation
+        valid = result
+
+    payload = valid.model_dump(mode="python")
+    failing = _TraversalPublicMapping(payload, behavior)
+    assert _validation_signature(receiver, failing) == [
+        (
+            "mapping_type",
+            (),
+            (
+                "Input should be a valid mapping, error: RuntimeError: "
+                f"public mapping {behavior} sentinel"
+            ),
+        )
+    ]
+    assert failing.items_calls == 1
+    assert failing.iterator_calls == expected_iterator_calls
+    assert failing.iterator_entries == expected_entries
+
+    control = _TraversalPublicMapping(payload, "valid")
+    assert receiver.model_validate(control) == valid
+    assert control.items_calls == 1
+    assert control.iterator_calls == 1
+    assert control.iterator_entries == len(payload)
+
+
+@pytest.mark.parametrize(
+    ("behavior", "expected_iterator_calls", "expected_entries"),
+    [
+        ("items", 0, 0),
+        ("iter", 1, 0),
+        ("next", 1, 0),
+        ("lazy", 1, 1),
+    ],
+)
+@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+def test_python_nested_public_mapping_traversal_errors_keep_location(
+    behavior: str,
+    expected_iterator_calls: int,
+    expected_entries: int,
+    receiver_name: str,
+) -> None:
+    result = reconcile_usage_events([_event()])
+    stream = result.streams[0]
+    if receiver_name == "stream":
+        receiver = ReconciledUsageStream
+        expected = stream
+        payload = stream.model_dump(mode="python")
+        field_name = "attribution"
+        child = stream.attribution
+        location = ("attribution",)
+    else:
+        receiver = UsageReconciliation
+        expected = result
+        payload = result.model_dump(mode="python")
+        field_name = "streams"
+        child = stream
+        location = ("streams", 0)
+
+    failing = _TraversalPublicMapping(child.model_dump(mode="python"), behavior)
+    payload[field_name] = failing if receiver_name == "stream" else (failing,)
+    assert _validation_signature(receiver, payload) == [
+        (
+            "mapping_type",
+            location,
+            (
+                "Input should be a valid mapping, error: RuntimeError: "
+                f"public mapping {behavior} sentinel"
+            ),
+        )
+    ]
+    assert failing.items_calls == 1
+    assert failing.iterator_calls == expected_iterator_calls
+    assert failing.iterator_entries == expected_entries
+
+    control = _TraversalPublicMapping(child.model_dump(mode="python"), "valid")
+    payload[field_name] = control if receiver_name == "stream" else (control,)
+    assert receiver.model_validate(payload) == expected
+    assert control.items_calls == 1
+    assert control.iterator_calls == 1
+    assert control.iterator_entries == len(child.model_dump(mode="python"))
+
+
+@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+def test_python_public_mapping_does_not_remap_recursive_cycle_error(
+    receiver_name: str,
+) -> None:
+    result = reconcile_usage_events([_event()])
+    stream = result.streams[0]
+    cycle: list[object] = []
+    cycle.append(cycle)
+    if receiver_name == "stream":
+        receiver = ReconciledUsageStream
+        payload = stream.model_dump(mode="python")
+        field_name = "attribution"
+    else:
+        receiver = UsageReconciliation
+        payload = result.model_dump(mode="python")
+        field_name = "streams"
+    payload[field_name] = cycle if receiver_name == "stream" else (cycle,)
+    expected_entries = tuple(payload).index(field_name) + 1
+    value = _TraversalPublicMapping(payload, "valid")
+
+    assert _validation_signature(receiver, value) == [
+        ("value_error", (), "Value error, cyclic input graph")
+    ]
+    assert value.items_calls == 1
+    assert value.iterator_calls == 1
+    assert value.iterator_entries == expected_entries
+
+
+@pytest.mark.parametrize(
+    ("pair_kind", "error_detail"),
+    [
+        ("stop-iteration", "StopIteration: pair unpack sentinel"),
+        (
+            "one-item",
+            "ValueError: not enough values to unpack (expected 2, got 1)",
+        ),
+        ("three-item", "ValueError: too many values to unpack (expected 2)"),
+    ],
+)
+@pytest.mark.parametrize("placement", ["root", "nested"])
+@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+def test_python_public_mapping_late_malformed_pair_is_located(
+    pair_kind: str,
+    error_detail: str,
+    placement: str,
+    receiver_name: str,
+) -> None:
+    result = reconcile_usage_events([_event()])
+    stream = result.streams[0]
+    if receiver_name == "stream":
+        receiver = ReconciledUsageStream
+        valid = stream
+        if placement == "root":
+            outer_payload: dict[str, object] | None = None
+            entries = stream.model_dump(mode="python")
+            location: tuple[object, ...] = ()
+        else:
+            outer_payload = stream.model_dump(mode="python")
+            entries = stream.attribution.model_dump(mode="python")
+            location = ("attribution",)
+    else:
+        receiver = UsageReconciliation
+        valid = result
+        if placement == "root":
+            outer_payload = None
+            entries = result.model_dump(mode="python")
+            location = ()
+        else:
+            outer_payload = result.model_dump(mode="python")
+            entries = stream.model_dump(mode="python")
+            location = ("streams", 0)
+
+    if pair_kind == "stop-iteration":
+        malformed_pair: object = _StopIterationUnpackPair()
+    elif pair_kind == "one-item":
+        malformed_pair = ("only-item",)
+    else:
+        malformed_pair = ("key", "value", "extra")
+    failing = _LateMalformedPairMapping(entries, malformed_pair)
+    if placement == "root":
+        value: object = failing
+    else:
+        assert outer_payload is not None
+        if receiver_name == "stream":
+            outer_payload["attribution"] = failing
+        else:
+            outer_payload["streams"] = (failing,)
+        value = outer_payload
+
+    assert _validation_signature(receiver, value) == [
+        (
+            "mapping_type",
+            location,
+            f"Input should be a valid mapping, error: {error_detail}",
+        )
+    ]
+    assert failing.items_calls == 1
+    assert failing.iterator_calls == 1
+    assert failing.iterator_entries == len(entries) + 1
+    if isinstance(malformed_pair, _StopIterationUnpackPair):
+        assert malformed_pair.iteration_calls == 1
+
+    assert receiver.model_validate(valid.model_dump(mode="python")) == valid
+
+
+@pytest.mark.parametrize("placement", ["root", "nested"])
+@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+def test_python_public_mapping_unhashable_key_is_located(
+    placement: str,
+    receiver_name: str,
+) -> None:
+    result = reconcile_usage_events([_event()])
+    stream = result.streams[0]
+    if receiver_name == "stream":
+        receiver = ReconciledUsageStream
+        valid = stream
+        if placement == "root":
+            outer_payload: dict[str, object] | None = None
+            entries = stream.model_dump(mode="python")
+            location: tuple[object, ...] = ()
+        else:
+            outer_payload = stream.model_dump(mode="python")
+            entries = stream.attribution.model_dump(mode="python")
+            location = ("attribution",)
+    else:
+        receiver = UsageReconciliation
+        valid = result
+        if placement == "root":
+            outer_payload = None
+            entries = result.model_dump(mode="python")
+            location = ()
+        else:
+            outer_payload = result.model_dump(mode="python")
+            entries = stream.model_dump(mode="python")
+            location = ("streams", 0)
+
+    failing = _LateMalformedPairMapping(entries, ([], "ignored"))
+    control = _TraversalPublicMapping(entries, "valid")
+    if placement == "root":
+        failing_value: object = failing
+        control_value: object = control
+    else:
+        assert outer_payload is not None
+        failing_payload = dict(outer_payload)
+        control_payload = dict(outer_payload)
+        if receiver_name == "stream":
+            failing_payload["attribution"] = failing
+            control_payload["attribution"] = control
+        else:
+            failing_payload["streams"] = (failing,)
+            control_payload["streams"] = (control,)
+        failing_value = failing_payload
+        control_value = control_payload
+
+    assert _validation_signature(receiver, failing_value) == [
+        (
+            "mapping_type",
+            location,
+            (
+                "Input should be a valid mapping, error: TypeError: "
+                "unhashable type: 'list'"
+            ),
+        )
+    ]
+    assert failing.items_calls == 1
+    assert failing.iterator_calls == 1
+    assert failing.iterator_entries == len(entries) + 1
+
+    assert receiver.model_validate(control_value) == valid
+    assert control.items_calls == 1
+    assert control.iterator_calls == 1
+    assert control.iterator_entries == len(entries)
+
+
+@pytest.mark.parametrize("placement", ["root", "nested"])
+@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+def test_frozen_native_dict_projection_unhashable_key_is_located(
+    placement: str,
+    receiver_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = reconcile_usage_events([_event()])
+    stream = result.streams[0]
+    if receiver_name == "stream":
+        receiver = ReconciledUsageStream
+        valid = stream
+        failing_value = stream.model_dump(mode="python")
+        target = (
+            failing_value
+            if placement == "root"
+            else failing_value["attribution"]
+        )
+        location: tuple[object, ...] = (
+            () if placement == "root" else ("attribution",)
+        )
+    else:
+        receiver = UsageReconciliation
+        valid = result
+        failing_value = result.model_dump(mode="python")
+        target = (
+            failing_value
+            if placement == "root"
+            else failing_value["streams"][0]
+        )
+        location = () if placement == "root" else ("streams", 0)
+
+    assert type(target) is dict
+    original_freeze = usage_reconcile_contracts._freeze_model_storage
+    injected_targets: list[dict[object, object]] = []
+
+    def inject_unhashable_frozen_key(
+        value,
+        frozen_models,
+        frozen_dicts,
+        frozen_tuples,
+        visited,
+    ) -> None:
+        original_freeze(
+            value,
+            frozen_models,
+            frozen_dicts,
+            frozen_tuples,
+            visited,
+        )
+        if value is target:
+            injected_targets.append(value)
+            frozen_dicts[id(value)] = (value, (([], "ignored"),))
+
+    monkeypatch.setattr(
+        usage_reconcile_contracts,
+        "_freeze_model_storage",
+        inject_unhashable_frozen_key,
+    )
+
+    assert _validation_signature(receiver, failing_value) == [
+        (
+            "mapping_type",
+            location,
+            (
+                "Input should be a valid mapping, error: TypeError: "
+                "unhashable type: 'list'"
+            ),
+        )
+    ]
+    assert injected_targets == [target]
+
+    control = valid.model_dump(mode="python")
+    assert receiver.model_validate(control) == valid
+    assert injected_targets == [target]
+
+
+@pytest.mark.parametrize(
+    "target_name",
+    ["stream", "attribution", "result", "nested_stream"],
+)
+def test_result_receivers_accept_valid_descriptor_subclass_controls(
+    target_name: str,
+) -> None:
+    result = reconcile_usage_events([_event()])
+    stream = result.streams[0]
+    if target_name == "stream":
+        value = _DescriptorMaskedReconciledUsageStream.model_validate(
+            stream.model_dump(mode="python")
+        )
+        received = ReconciledUsageStream.model_validate(value)
+        assert type(received) is ReconciledUsageStream
+        assert received == stream
+    elif target_name == "attribution":
+        attribution = _DescriptorMaskedAttribution.model_validate(
+            stream.attribution.model_dump(mode="python")
+        )
+        value = stream.model_copy(update={"attribution": attribution})
+        received = ReconciledUsageStream.model_validate(value)
+        assert type(received.attribution) is AttributionSnapshot
+        assert received == stream
+    elif target_name == "result":
+        value = _DescriptorMaskedUsageReconciliation.model_validate(
+            result.model_dump(mode="python")
+        )
+        received = UsageReconciliation.model_validate(value)
+        assert type(received) is UsageReconciliation
+        assert received == result
+    else:
+        nested = _DescriptorMaskedReconciledUsageStream.model_validate(
+            stream.model_dump(mode="python")
+        )
+        value = result.model_copy(update={"streams": (nested,)})
+        received = UsageReconciliation.model_validate(value)
+        assert type(received.streams[0]) is ReconciledUsageStream
+        assert received == result
+
+
+@pytest.mark.parametrize("construction", ["copy", "construct"])
+@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+def test_result_receivers_reject_unknown_from_unchecked_model_construction(
+    construction: str,
+    receiver_name: str,
+) -> None:
+    result = reconcile_usage_events([_event()])
+    valid = result.streams[0] if receiver_name == "stream" else result
+    receiver = (
+        ReconciledUsageStream
+        if receiver_name == "stream"
+        else UsageReconciliation
+    )
+    if construction == "copy":
+        invalid = valid.model_copy(update={"future_constraint": "deny"})
+    else:
+        stored = _MODEL_DICT_DESCRIPTOR.__get__(valid, BaseModel)
+        invalid = receiver.model_construct(**dict(dict.items(stored)))
+        invalid_stored = _MODEL_DICT_DESCRIPTOR.__get__(invalid, BaseModel)
+        dict.__setitem__(invalid_stored, "future_constraint", "deny")
+
+    assert _validation_signature(receiver, invalid) == [
+        (
+            "extra_forbidden",
+            ("future_constraint",),
+            "Extra inputs are not permitted",
+        )
+    ]
+
+
+@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+def test_result_receivers_preserve_dict_and_json_validation_paths(
+    receiver_name: str,
+) -> None:
+    result = reconcile_usage_events([_event()])
+    valid = result.streams[0] if receiver_name == "stream" else result
+    receiver = (
+        ReconciledUsageStream
+        if receiver_name == "stream"
+        else UsageReconciliation
+    )
+
+    assert receiver.model_validate(valid.model_dump(mode="python")) == valid
+    assert receiver.model_validate_json(valid.model_dump_json()) == valid
+
+
+@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+@pytest.mark.parametrize(
+    "extra_storage",
+    [
+        pytest.param("absent", id="absent"),
+        pytest.param(None, id="none"),
+        pytest.param({}, id="empty-dict"),
+        pytest.param(MappingProxyType({}), id="empty-mapping"),
+        pytest.param([], id="malformed"),
+    ],
+)
+def test_result_receivers_preserve_native_extra_storage_protocol(
+    receiver_name: str,
+    extra_storage: object,
+) -> None:
+    result = reconcile_usage_events([_event()])
+    valid = result.streams[0] if receiver_name == "stream" else result
+    receiver = (
+        ReconciledUsageStream
+        if receiver_name == "stream"
+        else UsageReconciliation
+    )
+    value = valid.model_copy()
+    if extra_storage == "absent":
+        _MODEL_EXTRAS_DESCRIPTOR.__delete__(value)
+        with pytest.raises(AttributeError):
+            _MODEL_EXTRAS_DESCRIPTOR.__get__(value, BaseModel)
+    else:
+        _MODEL_EXTRAS_DESCRIPTOR.__set__(value, extra_storage)
+
+    if isinstance(extra_storage, list):
+        with pytest.raises(
+            ValueError, match="contract extra storage must be a mapping"
+        ):
+            receiver.model_validate(value)
+    else:
+        assert receiver.model_validate(value) == valid
+
+
+def test_result_receivers_preserve_semantic_recomputation() -> None:
+    result = reconcile_usage_events([_event()])
+    invalid_stream = result.streams[0].model_copy(
+        update={"known_token_subtotal": 0}
+    )
+    with pytest.raises(
+        ValidationError, match="stream subtotal does not match token usage"
+    ):
+        ReconciledUsageStream.model_validate(invalid_stream)
+
+    invalid_ledger = result.ledgers[0].model_copy(
+        update={"known_token_subtotal": 999, "total_tokens": 999}
+    )
+    invalid_result = result.model_copy(
+        update={"ledgers": (invalid_ledger, *result.ledgers[1:])}
+    )
+    with pytest.raises(
+        ValidationError,
+        match="service ledger known_token_subtotal does not match streams",
+    ):
+        UsageReconciliation.model_validate(invalid_result)
+
+
+@pytest.mark.parametrize("receiver_name", ["stream", "result"])
+def test_result_receivers_reject_native_cycles(receiver_name: str) -> None:
+    result = reconcile_usage_events([_event()])
+    if receiver_name == "stream":
+        value = result.streams[0].model_copy()
+        stored = _MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+        dict.__setitem__(stored, "attribution", value)
+        receiver = ReconciledUsageStream
+    else:
+        value = result.model_copy()
+        stored = _MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+        dict.__setitem__(stored, "streams", (value,))
+        receiver = UsageReconciliation
+
+    with pytest.raises(ValueError, match="cyclic input graph"):
+        receiver.model_validate(value)
+
+
+def test_result_snapshot_freezes_root_extras_before_nested_traversal() -> None:
+    result = reconcile_usage_events([_event()]).model_copy()
+    extras = {"future_constraint": "deny"}
+    _MODEL_EXTRAS_DESCRIPTOR.__set__(result, extras)
+
+    class ClearingTuple(tuple):
+        def __iter__(self):
+            self.iteration_calls += 1
+            dict.clear(extras)
+            return super().__iter__()
+
+    streams = ClearingTuple(result.streams)
+    streams.iteration_calls = 0
+    stored = _MODEL_DICT_DESCRIPTOR.__get__(result, BaseModel)
+    dict.__setitem__(stored, "streams", streams)
+
+    assert tuple(dict.items(extras)) == (("future_constraint", "deny"),)
+    assert _validation_signature(UsageReconciliation, result) == [
+        (
+            "extra_forbidden",
+            ("future_constraint",),
+            "Extra inputs are not permitted",
+        )
+    ]
+    assert streams.iteration_calls == 0
+    assert tuple(dict.items(extras)) == (("future_constraint", "deny"),)
+
+
 def test_stream_rejects_existing_attribution_with_hidden_extra() -> None:
     stream = reconcile_usage_events([_event()]).streams[0]
     invalid_attribution = stream.attribution.model_copy(
@@ -604,6 +2439,7 @@ def test_reconciliation_freezes_parent_extras_before_child_traversal() -> None:
 
     class ClearingRecipients(tuple):
         def __iter__(self) -> Iterator[object]:
+            self.iteration_calls += 1
             dict.clear(parent_extras)
             return super().__iter__()
 
@@ -614,18 +2450,18 @@ def test_reconciliation_freezes_parent_extras_before_child_traversal() -> None:
         _attribution().model_dump(mode="python")
     )
     attribution_storage = object.__getattribute__(attribution, "__dict__")
-    dict.__setitem__(
-        attribution_storage,
-        "recipients",
-        ClearingRecipients(("provider-1",)),
-    )
+    recipients = ClearingRecipients(("provider-1",))
+    recipients.iteration_calls = 0
+    dict.__setitem__(attribution_storage, "recipients", recipients)
     event = _event().model_copy(update={"attribution": attribution})
     object.__setattr__(event, "__pydantic_extra__", parent_extras)
 
     assert tuple(dict.items(parent_extras)) == (("future_constraint", "deny"),)
     _assert_canonical_invalid_event(event)
-    assert tuple(dict.items(parent_extras)) == ()
+    assert recipients.iteration_calls == 0
+    assert tuple(dict.items(parent_extras)) == (("future_constraint", "deny"),)
 
+    dict.clear(parent_extras)
     result = reconcile_usage_events([event])
     assert result.streams[0].head_event_id == "event-1"
     assert result.streams[0].total_tokens == 15
