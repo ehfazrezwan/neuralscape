@@ -149,12 +149,18 @@ def _snapshot_closed_graph(
             declared = type(value).model_fields
             undeclared = stored.keys() - declared.keys()
             extras = getattr(value, "__pydantic_extra__", None)
-            if extras is not None and not isinstance(extras, Mapping):
-                raise ValueError("contract extra storage must be a mapping")
             if extras is None:
                 observed_extra_length = 0
                 iterated_extra_names = ()
                 extra_entries = ()
+            elif issubclass(type(extras), dict):
+                extra_entries = tuple(entry for entry in dict.items(extras))
+                observed_extra_length = len(extra_entries)
+                iterated_extra_names = tuple(
+                    name for name, _field_value in extra_entries
+                )
+            elif not isinstance(extras, Mapping):
+                raise ValueError("contract extra storage must be a mapping")
             else:
                 observed_extra_length = len(extras)
                 iterated_extra_names = tuple(name for name in extras)
