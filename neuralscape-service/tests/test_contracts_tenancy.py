@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from collections.abc import Mapping
 from copy import deepcopy
 from types import MappingProxyType
@@ -186,6 +187,88 @@ def replace_model_storage(
 
 PYDANTIC_DICT_DESCRIPTOR = BaseModel.__dict__["__dict__"]
 PYDANTIC_EXTRA_DESCRIPTOR = BaseModel.__dict__["__pydantic_extra__"]
+PYDANTIC_FIELDS_SET_DESCRIPTOR = BaseModel.__dict__["__pydantic_fields_set__"]
+
+
+class RepairingName(str):
+    def __new__(cls, value: str, repair):
+        instance = super().__new__(cls, value)
+        instance.repair = repair
+        instance.armed = False
+        instance.calls = 0
+        return instance
+
+    def __hash__(self) -> int:
+        if self.armed:
+            self.calls += 1
+            self.repair()
+        return str.__hash__(self)
+
+
+class RepairingTuple(tuple):
+    def __new__(cls, values: tuple[object, ...], repair):
+        instance = super().__new__(cls, values)
+        instance.repair = repair
+        instance.calls = 0
+        return instance
+
+    def __iter__(self):
+        self.calls += 1
+        self.repair()
+        return tuple.__iter__(self)
+
+
+class RepairingList(list):
+    def __init__(self, values: tuple[object, ...], repair) -> None:
+        super().__init__(values)
+        self.repair = repair
+        self.calls = 0
+
+    def __iter__(self):
+        self.calls += 1
+        self.repair()
+        return list.__iter__(self)
+
+
+class DivergentTuple(tuple):
+    def __new__(
+        cls,
+        native_values: tuple[object, ...],
+        visible_values: tuple[object, ...],
+    ):
+        instance = super().__new__(cls, native_values)
+        instance.visible_values = visible_values
+        instance.calls = 0
+        return instance
+
+    def __iter__(self):
+        self.calls += 1
+        return iter(self.visible_values)
+
+
+class RepairingEmptyExtraMapping(Mapping[object, object]):
+    def __init__(self, repair) -> None:
+        self.repair = repair
+        self.calls = 0
+
+    def _run(self) -> None:
+        self.calls += 1
+        self.repair()
+
+    def __getitem__(self, key: object) -> object:
+        raise KeyError(key)
+
+    def __iter__(self):
+        self._run()
+        return iter(())
+
+    def __len__(self) -> int:
+        self._run()
+        return 0
+
+    def items(self):
+        self._run()
+        return ()
 
 
 def model_with_hidden_extra(
@@ -475,6 +558,182 @@ def test_valid_operation_progress_is_accepted() -> None:
     assert running_result is not running
     assert succeeded_result == succeeded
     assert succeeded_result is not succeeded
+
+
+@pytest.mark.parametrize(
+    ("callback_kind", "expected_calls"),
+    [("stored-name", 2), ("tuple", 1)],
+)
+def test_transition_freezes_current_before_previous_callbacks(
+    callback_kind: str,
+    expected_calls: int,
+) -> None:
+    def invalid_current() -> tuple[TenantOperationState, ResourceManifestReference]:
+        current = operation(observed_state="running")
+        child = current.resource_manifests[0]
+        _set_native_field(child, "manifest_id", "")
+        return current, child
+
+    def install_callback(
+        previous: TenantOperationState,
+        repair,
+    ) -> RepairingName | RepairingTuple:
+        if callback_kind == "stored-name":
+            return _install_repairing_stored_name(previous, repair)
+        repairing = RepairingTuple(previous.resource_manifests, repair)
+        _set_native_field(previous, "resource_manifests", repairing)
+        return repairing
+
+    ordinary_current, _ordinary_child = invalid_current()
+    with pytest.raises(ValidationError) as ordinary_error:
+        validate_operation_transition(operation(), ordinary_current)
+    assert ordinary_error.value.errors()[0]["type"] == "string_too_short"
+    assert ordinary_error.value.errors()[0]["loc"] == (
+        "resource_manifests",
+        0,
+        "manifest_id",
+    )
+
+    attacked_current, attacked_child = invalid_current()
+    previous = operation()
+    callback = install_callback(
+        previous,
+        lambda: _set_native_field(attacked_child, "manifest_id", "primary"),
+    )
+
+    with pytest.raises(ValidationError) as callback_error:
+        validate_operation_transition(previous, attacked_current)
+
+    assert callback_error.value.errors() == ordinary_error.value.errors()
+    assert callback.calls == expected_calls
+    assert attacked_child.manifest_id == "primary"
+
+    valid_current = operation(observed_state="running")
+    valid_child = valid_current.resource_manifests[0]
+    valid_previous = operation()
+    valid_callback = install_callback(
+        valid_previous,
+        lambda: _set_native_field(valid_child, "manifest_id", "primary"),
+    )
+
+    result = validate_operation_transition(valid_previous, valid_current)
+
+    assert result == valid_current
+    assert valid_callback.calls == expected_calls
+    assert valid_child.manifest_id == "primary"
+
+
+def _operation_with_too_deep_manifest_graph() -> TenantOperationState:
+    nested: list[object] = []
+    for _ in range(sys.getrecursionlimit() + 100):
+        nested = [nested]
+    return operation(observed_state="running").model_copy(
+        update={"resource_manifests": nested}
+    )
+
+
+def test_transition_preserves_previous_error_before_current_capture_failure() -> None:
+    ordinary_previous = operation()
+    _set_native_field(
+        ordinary_previous.resource_manifests[0],
+        "manifest_id",
+        "",
+    )
+    with pytest.raises(ValidationError) as ordinary_error:
+        validate_operation_transition(
+            ordinary_previous,
+            operation(observed_state="running"),
+        )
+
+    competing_previous = operation()
+    _set_native_field(
+        competing_previous.resource_manifests[0],
+        "manifest_id",
+        "",
+    )
+    with pytest.raises(ValidationError) as competing_error:
+        validate_operation_transition(
+            competing_previous,
+            _operation_with_too_deep_manifest_graph(),
+        )
+
+    assert competing_error.value.errors() == ordinary_error.value.errors()
+    with pytest.raises(RecursionError, match="maximum recursion depth exceeded"):
+        validate_operation_transition(
+            operation(),
+            _operation_with_too_deep_manifest_graph(),
+        )
+
+
+def test_transition_does_not_capture_unsupported_current_before_its_turn() -> None:
+    nested: list[object] = []
+    for _ in range(sys.getrecursionlimit() + 100):
+        nested = [nested]
+    callback_calls: list[str] = []
+    unsupported = RepairingTuple(
+        (nested,),
+        lambda: callback_calls.append("called"),
+    )
+
+    invalid_previous = operation()
+    _set_native_field(
+        invalid_previous.resource_manifests[0],
+        "manifest_id",
+        "",
+    )
+    with pytest.raises(ValidationError) as previous_error:
+        validate_operation_transition(invalid_previous, unsupported)
+    assert previous_error.value.errors()[0]["type"] == "string_too_short"
+    assert unsupported.calls == 0
+    assert callback_calls == []
+
+    with pytest.raises(
+        TypeError,
+        match="operation must be a TenantOperationState",
+    ):
+        validate_operation_transition(operation(), unsupported)
+    assert unsupported.calls == 0
+    assert callback_calls == []
+
+
+def test_transition_defers_unsupported_current_classification() -> None:
+    class RaisingClass:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        @property
+        def __class__(self):
+            self.calls += 1
+            raise RuntimeError("classification trap")
+
+    ordinary_previous = operation()
+    _set_native_field(
+        ordinary_previous.resource_manifests[0],
+        "manifest_id",
+        "",
+    )
+    with pytest.raises(ValidationError) as ordinary_error:
+        validate_operation_transition(
+            ordinary_previous,
+            operation(observed_state="running"),
+        )
+
+    invalid_previous = operation()
+    _set_native_field(
+        invalid_previous.resource_manifests[0],
+        "manifest_id",
+        "",
+    )
+    invalid_current = RaisingClass()
+    with pytest.raises(ValidationError) as competing_error:
+        validate_operation_transition(invalid_previous, invalid_current)
+    assert competing_error.value.errors() == ordinary_error.value.errors()
+    assert invalid_current.calls == 0
+
+    valid_current = RaisingClass()
+    with pytest.raises(RuntimeError, match="classification trap"):
+        validate_operation_transition(operation(), valid_current)
+    assert valid_current.calls == 1
 
 
 @pytest.mark.parametrize(
@@ -1520,3 +1779,271 @@ def test_generation_uses_safe_counter_bounds(invalid_generation: object) -> None
             placement_generation=invalid_generation,
             resource_manifests=[],
         )
+
+
+def _tenancy_nested_boundary_case(boundary: str):
+    if boundary == "operation":
+        previous = operation(observed_state="pending")
+        candidate = operation(observed_state="running")
+
+        def invoke(value):
+            return validate_operation_transition(previous, value)
+
+    else:
+        candidate = TenantPlacement.model_validate(
+            {
+                "schema_version": VERSION,
+                "tenant_id": "tenant-a",
+                "generation": 7,
+                "resource_manifests": (manifest(),),
+            }
+        )
+
+        def invoke(value):
+            return validate_placement_publication(
+                value,
+                expected_tenant_id="tenant-a",
+                current_generation=7,
+            )
+
+    return candidate, candidate.resource_manifests[0], invoke
+
+
+def _set_native_field(model: BaseModel, name: str, value: object) -> None:
+    native = PYDANTIC_DICT_DESCRIPTOR.__get__(model, BaseModel)
+    dict.__setitem__(native, name, value)
+
+
+def _install_repairing_stored_name(
+    model: BaseModel, repair
+) -> RepairingName:
+    native = PYDANTIC_DICT_DESCRIPTOR.__get__(model, BaseModel)
+    stored_value = dict.__getitem__(native, "schema_version")
+    dict.__delitem__(native, "schema_version")
+    name = RepairingName("schema_version", repair)
+    dict.__setitem__(native, name, stored_value)
+    name.calls = 0
+    name.armed = True
+    return name
+
+
+@pytest.mark.parametrize("boundary", ["operation", "placement"])
+def test_tenancy_boundaries_freeze_nested_models_before_stored_name_hooks(
+    boundary: str,
+) -> None:
+    ordinary, ordinary_child, ordinary_invoke = _tenancy_nested_boundary_case(
+        boundary
+    )
+    _set_native_field(ordinary_child, "manifest_id", "")
+    with pytest.raises(ValidationError):
+        ordinary_invoke(ordinary)
+
+    candidate, child, invoke = _tenancy_nested_boundary_case(boundary)
+    _set_native_field(child, "manifest_id", "")
+    name = _install_repairing_stored_name(
+        candidate,
+        lambda: _set_native_field(child, "manifest_id", "primary"),
+    )
+
+    with pytest.raises(ValidationError):
+        invoke(candidate)
+
+    assert name.calls > 0
+    assert child.manifest_id == "primary"
+
+
+@pytest.mark.parametrize("boundary", ["operation", "placement"])
+def test_tenancy_boundaries_freeze_tuple_backing_before_traversal_hooks(
+    boundary: str,
+) -> None:
+    candidate, child, invoke = _tenancy_nested_boundary_case(boundary)
+    _set_native_field(child, "manifest_id", "")
+    repairing = RepairingTuple(
+        candidate.resource_manifests,
+        lambda: _set_native_field(child, "manifest_id", "primary"),
+    )
+    _set_native_field(candidate, "resource_manifests", repairing)
+
+    with pytest.raises(ValidationError):
+        invoke(candidate)
+
+    assert repairing.calls == 1
+    assert child.manifest_id == "primary"
+
+
+@pytest.mark.parametrize("boundary", ["operation", "placement"])
+def test_tenancy_boundaries_freeze_nested_models_before_extra_mapping_hooks(
+    boundary: str,
+) -> None:
+    candidate, child, invoke = _tenancy_nested_boundary_case(boundary)
+    _set_native_field(child, "manifest_id", "")
+    extras = RepairingEmptyExtraMapping(
+        lambda: _set_native_field(child, "manifest_id", "primary")
+    )
+    PYDANTIC_EXTRA_DESCRIPTOR.__set__(candidate, extras)
+
+    with pytest.raises(ValidationError):
+        invoke(candidate)
+
+    assert extras.calls == 3
+    assert child.manifest_id == "primary"
+
+
+@pytest.mark.parametrize("boundary", ["operation", "placement"])
+def test_tenancy_boundaries_preserve_strict_list_rejection_with_public_hook(
+    boundary: str,
+) -> None:
+    candidate, child, invoke = _tenancy_nested_boundary_case(boundary)
+    _set_native_field(child, "manifest_id", "")
+    repairing = RepairingList(
+        candidate.resource_manifests,
+        lambda: _set_native_field(child, "manifest_id", "primary"),
+    )
+    _set_native_field(candidate, "resource_manifests", repairing)
+
+    with pytest.raises(ValidationError) as exc_info:
+        invoke(candidate)
+
+    assert any(error["type"] == "tuple_type" for error in exc_info.value.errors())
+    assert repairing.calls == 1
+    assert child.manifest_id == "primary"
+
+
+@pytest.mark.parametrize("boundary", ["operation", "placement"])
+def test_tenancy_boundaries_leave_fields_set_hooks_inert(boundary: str) -> None:
+    candidate, child, invoke = _tenancy_nested_boundary_case(boundary)
+    _set_native_field(child, "manifest_id", "")
+    name = RepairingName(
+        "manifest_id",
+        lambda: _set_native_field(child, "manifest_id", "primary"),
+    )
+    fields_set = PYDANTIC_FIELDS_SET_DESCRIPTOR.__get__(candidate, type(candidate))
+    set.add(fields_set, name)
+    name.calls = 0
+    name.armed = True
+
+    with pytest.raises(ValidationError):
+        invoke(candidate)
+
+    assert name.calls == 0
+    assert child.manifest_id == ""
+
+
+@pytest.mark.parametrize("boundary", ["operation", "placement"])
+def test_tenancy_boundaries_retain_invalid_root_before_name_hook_repair(
+    boundary: str,
+) -> None:
+    candidate, _child, invoke = _tenancy_nested_boundary_case(boundary)
+    _set_native_field(candidate, "tenant_id", "")
+    name = _install_repairing_stored_name(
+        candidate,
+        lambda: _set_native_field(candidate, "tenant_id", "tenant-a"),
+    )
+
+    with pytest.raises(ValidationError):
+        invoke(candidate)
+
+    assert name.calls > 0
+    assert candidate.tenant_id == "tenant-a"
+
+
+@pytest.mark.parametrize("boundary", ["operation", "placement"])
+def test_tenancy_boundaries_preserve_valid_tuple_subclasses(boundary: str) -> None:
+    candidate, _child, invoke = _tenancy_nested_boundary_case(boundary)
+    calls: list[str] = []
+    repairing = RepairingTuple(
+        candidate.resource_manifests,
+        lambda: calls.append("iterated"),
+    )
+    _set_native_field(candidate, "resource_manifests", repairing)
+
+    result = invoke(candidate)
+
+    assert result.resource_manifests[0].manifest_id == "primary"
+    assert repairing.calls == 1
+    assert calls == ["iterated"]
+
+
+@pytest.mark.parametrize("boundary", ["operation", "placement"])
+def test_tenancy_boundaries_preserve_divergent_tuple_public_view(
+    boundary: str,
+) -> None:
+    candidate, _child, invoke = _tenancy_nested_boundary_case(boundary)
+    divergent = DivergentTuple(candidate.resource_manifests, ())
+    _set_native_field(candidate, "resource_manifests", divergent)
+
+    result = invoke(candidate)
+
+    assert result.resource_manifests == ()
+    assert divergent.calls == 1
+
+
+@pytest.mark.parametrize("boundary", ["operation", "placement"])
+def test_tenancy_boundaries_reject_cross_tenant_public_tuple_target(
+    boundary: str,
+) -> None:
+    candidate, _child, invoke = _tenancy_nested_boundary_case(boundary)
+    cross_tenant = ResourceManifestReference.model_validate(
+        manifest(tenant_id="tenant-b")
+    )
+    divergent = DivergentTuple(
+        candidate.resource_manifests,
+        (cross_tenant,),
+    )
+    _set_native_field(candidate, "resource_manifests", divergent)
+
+    with pytest.raises(ValidationError, match="tenant_id must match"):
+        invoke(candidate)
+
+    assert divergent.calls == 1
+
+
+@pytest.mark.parametrize("boundary", ["operation", "placement"])
+def test_tenancy_boundaries_freeze_later_model_edge_before_name_callback(
+    boundary: str,
+) -> None:
+    candidate, child, invoke = _tenancy_nested_boundary_case(boundary)
+    original_edge = candidate.resource_manifests
+    _set_native_field(child, "manifest_id", "")
+    name = _install_repairing_stored_name(
+        candidate,
+        lambda: _set_native_field(candidate, "resource_manifests", ()),
+    )
+
+    with pytest.raises(ValidationError):
+        invoke(candidate)
+
+    assert name.calls > 0
+    assert candidate.resource_manifests == ()
+    assert original_edge[0].manifest_id == ""
+
+
+@pytest.mark.parametrize("boundary", ["operation", "placement"])
+def test_tenancy_boundaries_preserve_benign_string_subclass_names(
+    boundary: str,
+) -> None:
+    candidate, _child, invoke = _tenancy_nested_boundary_case(boundary)
+    name = _install_repairing_stored_name(candidate, lambda: None)
+
+    result = invoke(candidate)
+
+    assert result.tenant_id == "tenant-a"
+    assert name.calls > 0
+
+
+@pytest.mark.parametrize("boundary", ["operation", "placement"])
+def test_tenancy_boundaries_preserve_absent_fields_set_policy(boundary: str) -> None:
+    candidate, child, invoke = _tenancy_nested_boundary_case(boundary)
+    PYDANTIC_FIELDS_SET_DESCRIPTOR.__delete__(candidate)
+    PYDANTIC_FIELDS_SET_DESCRIPTOR.__delete__(child)
+
+    assert invoke(candidate).tenant_id == "tenant-a"
+
+
+@pytest.mark.parametrize("boundary", ["operation", "placement"])
+def test_tenancy_boundaries_accept_truly_absent_extra_storage(boundary: str) -> None:
+    candidate, child, invoke = _tenancy_nested_boundary_case(boundary)
+    PYDANTIC_EXTRA_DESCRIPTOR.__delete__(candidate)
+    PYDANTIC_EXTRA_DESCRIPTOR.__delete__(child)
+
+    assert invoke(candidate).tenant_id == "tenant-a"
