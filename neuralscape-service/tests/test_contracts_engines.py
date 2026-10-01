@@ -61,6 +61,44 @@ class ObservableTuple(tuple):
         return tuple.__iter__(self)
 
 
+class ClassViewString(str):
+    def __new__(cls, value, *, callback=None, error=None):
+        instance = super().__new__(cls, value)
+        instance.callback = callback
+        instance.error = error
+        instance.class_calls = 0
+        instance.callback_ran = False
+        return instance
+
+    @property
+    def __class__(self):  # type: ignore[override]
+        self.class_calls += 1
+        if not self.callback_ran:
+            self.callback_ran = True
+            if self.callback is not None:
+                self.callback()
+        if self.error is not None:
+            raise self.error
+        return str
+
+
+class ClassViewFrozenSet(frozenset):
+    def __new__(cls, values, *, callback):
+        instance = super().__new__(cls, values)
+        instance.callback = callback
+        instance.class_calls = 0
+        instance.callback_ran = False
+        return instance
+
+    @property
+    def __class__(self):  # type: ignore[override]
+        self.class_calls += 1
+        if not self.callback_ran:
+            self.callback_ran = True
+            self.callback()
+        return frozenset
+
+
 _MODEL_DICT_DESCRIPTOR = BaseModel.__dict__["__dict__"]
 _MODEL_FIELDS_SET_DESCRIPTOR = BaseModel.__dict__["__pydantic_fields_set__"]
 _MODEL_EXTRAS_DESCRIPTOR = BaseModel.__dict__["__pydantic_extra__"]
@@ -771,6 +809,155 @@ def test_capability_boundary_preserves_sibling_type_error_priority():
 
     with pytest.raises(TypeError, match="capability requirements must be a tuple"):
         validate_capability_requirements(manifest(state()), [])
+
+
+def _set_native_model_field(model, name, value):
+    native = _MODEL_DICT_DESCRIPTOR.__get__(model, BaseModel)
+    dict.__setitem__(native, name, value)
+
+
+@pytest.mark.parametrize("public_surface", ["requirements", "operation_state"])
+@pytest.mark.parametrize(
+    "case",
+    ["ordinary-invalid", "hooked-invalid", "hooked-valid"],
+)
+def test_capability_boundary_uses_concrete_graph_classification(
+    public_surface,
+    case,
+):
+    first = state()
+    if case != "hooked-valid":
+        _set_native_model_field(first, "supported", False)
+    later = state(operation="export", qualification=qualification("export"))
+    hook = None
+    if case != "ordinary-invalid":
+        callback = (
+            lambda: _set_native_model_field(first, "supported", True)
+            if case == "hooked-invalid"
+            else None
+        )
+        hook = ClassViewString("export", callback=callback)
+        _set_native_model_field(later, "operation", hook)
+    declared = manifest(state(), later).model_copy(
+        update={"operations": (first, later)}
+    )
+
+    if case == "hooked-valid":
+        if public_surface == "requirements":
+            assert validate_capability_requirements(
+                declared,
+                (requirement(),),
+            ) == ()
+        else:
+            assert declared.operation_state("retrieve") == state()
+    else:
+        with pytest.raises(ValidationError) as raised:
+            if public_surface == "requirements":
+                validate_capability_requirements(declared, (requirement(),))
+            else:
+                declared.operation_state("retrieve")
+        error = raised.value.errors(include_url=False)[0]
+        assert error["type"] == "value_error"
+        assert error["loc"] == ("operations", 0)
+        assert "unsupported operation cannot be configured" in error["msg"]
+
+    if hook is not None:
+        assert hook.class_calls == 0
+    assert first.supported is (case == "hooked-valid")
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["ordinary-invalid", "hooked-invalid", "hooked-valid"],
+)
+def test_capability_boundary_uses_concrete_requirement_classification(case):
+    first = requirement()
+    if case != "hooked-valid":
+        _set_native_model_field(first, "qualification_profile_version", None)
+    later = requirement(operation="export")
+    hook = None
+    if case != "ordinary-invalid":
+        callback = (
+            lambda: _set_native_model_field(
+                first,
+                "qualification_profile_version",
+                "profile-v1",
+            )
+            if case == "hooked-invalid"
+            else None
+        )
+        hook = ClassViewString("export", callback=callback)
+        _set_native_model_field(later, "operation", hook)
+    declared = manifest(
+        state(),
+        state(operation="export", qualification=qualification("export")),
+    )
+
+    if case == "hooked-valid":
+        assert validate_capability_requirements(declared, (first, later)) == ()
+    else:
+        with pytest.raises(ValidationError) as raised:
+            validate_capability_requirements(declared, (first, later))
+        error = raised.value.errors(include_url=False)[0]
+        assert error["type"] == "value_error"
+        assert error["loc"] == ()
+        assert "qualification profile reference and version are paired" in error[
+            "msg"
+        ]
+
+    if hook is not None:
+        assert hook.class_calls == 0
+    expected_version = "profile-v1" if case == "hooked-valid" else None
+    assert first.qualification_profile_version == expected_version
+
+
+@pytest.mark.parametrize("initially_valid", [False, True])
+def test_capability_boundary_classifies_frozenset_storage_concretely(
+    initially_valid,
+):
+    child = state()
+    if not initially_valid:
+        _set_native_model_field(child, "supported", False)
+    declared = manifest(state()).model_copy(update={"operations": (child,)})
+    fields_set = ClassViewFrozenSet(
+        frozenset(type(declared).model_fields),
+        callback=lambda: _set_native_model_field(child, "supported", True),
+    )
+    _MODEL_FIELDS_SET_DESCRIPTOR.__set__(declared, fields_set)
+
+    if initially_valid:
+        assert validate_capability_requirements(
+            declared,
+            (requirement(),),
+        ) == ()
+    else:
+        with pytest.raises(ValidationError) as raised:
+            validate_capability_requirements(declared, (requirement(),))
+        error = raised.value.errors(include_url=False)[0]
+        assert error["type"] == "value_error"
+        assert error["loc"] == ("operations", 0)
+
+    assert fields_set.class_calls == 0
+    assert child.supported is initially_valid
+
+
+def test_invalid_manifest_precedes_later_requirement_class_view():
+    invalid = state().model_copy(update={"supported": False})
+    declared = manifest(state()).model_copy(update={"operations": (invalid,)})
+    hostile_operation = ClassViewString(
+        "retrieve",
+        error=RuntimeError("requirements class-view callback ran"),
+    )
+    received = requirement()
+    _set_native_model_field(received, "operation", hostile_operation)
+
+    with pytest.raises(ValidationError) as raised:
+        validate_capability_requirements(declared, (received,))
+
+    error = raised.value.errors(include_url=False)[0]
+    assert error["type"] == "value_error"
+    assert error["loc"] == ("operations", 0)
+    assert hostile_operation.class_calls == 0
 
 
 def test_capability_boundary_freezes_manifest_edge_before_earlier_callback():
