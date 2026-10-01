@@ -77,9 +77,7 @@ class _ValidatedPublicMappingEntries:
     entries: Iterable[object]
     iterator: Iterator[object]
     retained_keys: dict[object, None]
-    final_pair: object | None
-    final_key: object | None
-    final_value: object | None
+    retained_entries: tuple[tuple[object, object, object], ...]
 
 
 def _validate_public_mapping_entries(
@@ -92,9 +90,7 @@ def _validate_public_mapping_entries(
     except Exception as exc:
         return _FailedNativeDictTraversal(exc)
     public_entries: dict[object, None] = {}
-    pair: object | None = None
-    key: object | None = None
-    public_value: object | None = None
+    retained_entries: list[tuple[object, object, object]] = []
     while True:
         try:
             pair = next(source_iterator)
@@ -110,13 +106,12 @@ def _validate_public_mapping_entries(
             public_entries[key] = None
         except Exception as exc:
             return _FailedNativeDictTraversal(exc)
+        retained_entries.append((pair, key, public_value))
     return _ValidatedPublicMappingEntries(
         entries=entries,
         iterator=source_iterator,
         retained_keys=public_entries,
-        final_pair=pair,
-        final_key=key,
-        final_value=public_value,
+        retained_entries=tuple(retained_entries),
     )
 
 
@@ -564,7 +559,7 @@ def _native_snapshot(
                 validated_entries = _validate_public_mapping_entries(public_items)
                 if isinstance(validated_entries, _FailedNativeDictTraversal):
                     return validated_entries
-                # Keep the iterator, retained keys, and final entry components
+                # Keep the iterator, retained keys, and all entry components
                 # in caller scope until authoritative projection is complete.
                 source_items = frozen_dict[1]
             else:
