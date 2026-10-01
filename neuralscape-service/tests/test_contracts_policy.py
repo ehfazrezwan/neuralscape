@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator, Mapping
 from copy import deepcopy
+from types import MappingProxyType
 
 import pytest
 from pydantic import ValidationError
@@ -22,6 +24,81 @@ from contracts_references import ReferenceHandle
 
 
 VERSION = "candidate-v1"
+
+
+class _HiddenBackingExtras(dict[str, object]):
+    """A native dict whose overridable public views conceal its backing."""
+
+    def __init__(self, entries: dict[str, object]) -> None:
+        super().__init__(entries)
+        self.view_calls = 0
+
+    def __bool__(self) -> bool:
+        self.view_calls += 1
+        return False
+
+    def __len__(self) -> int:
+        self.view_calls += 1
+        return 0
+
+    def __iter__(self) -> Iterator[str]:
+        self.view_calls += 1
+        return iter(())
+
+    def keys(self):
+        self.view_calls += 1
+        return {}.keys()
+
+    def items(self):
+        self.view_calls += 1
+        return {}.items()
+
+
+class _InverseViewExtras(Mapping[str, object]):
+    """Expose names through iteration while keeping the items inventory empty."""
+
+    def __init__(self, entries: dict[str, object]) -> None:
+        self._entries = entries
+        self.iteration_calls = 0
+        self.items_calls = 0
+        self.getitem_calls = 0
+
+    def __getitem__(self, key: str) -> object:
+        self.getitem_calls += 1
+        return self._entries[key]
+
+    def __iter__(self) -> Iterator[str]:
+        self.iteration_calls += 1
+        return iter(self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def items(self):
+        self.items_calls += 1
+        return {}.items()
+
+
+class _ChangingItemsExtras(Mapping[str, object]):
+    """Reveal an unknown item only if a consumer requests a second inventory."""
+
+    def __init__(self) -> None:
+        self.items_calls = 0
+
+    def __getitem__(self, key: str) -> object:
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+    def items(self):
+        self.items_calls += 1
+        if self.items_calls == 1:
+            return {}.items()
+        return {"future_constraint": "deny"}.items()
 
 
 def reference(
@@ -728,7 +805,7 @@ def test_evaluator_rejects_malformed_extra_storage(
         )
 
 
-@pytest.mark.parametrize("extra_storage", [None, {}])
+@pytest.mark.parametrize("extra_storage", [None, {}, MappingProxyType({})])
 def test_evaluator_accepts_valid_empty_extra_storage(
     extra_storage: object,
 ) -> None:
@@ -753,6 +830,219 @@ def test_evaluator_accepts_valid_empty_extra_storage(
     )
 
     assert (decision.outcome, decision.reason_code) == ("allow", "explicit_grant")
+
+
+@pytest.mark.parametrize(
+    ("boundary", "location"),
+    [
+        ("evaluator", "direct"),
+        ("evaluator", "nested"),
+        ("receiving", "direct"),
+        ("receiving", "nested"),
+    ],
+)
+def test_policy_boundaries_reject_hidden_native_dict_unknown_extra(
+    boundary: str,
+    location: str,
+) -> None:
+    extras = _HiddenBackingExtras({"future_constraint": "deny"})
+
+    if boundary == "evaluator":
+        resource_value = reference("memory-1")
+        principal_value = principal()
+        evaluation_value = PolicyEvaluationInput(
+            schema_version=VERSION,
+            action="read",
+            resource=resource_value,
+        )
+        target = principal_value if location == "direct" else evaluation_value.resource
+        object.__setattr__(target, "__pydantic_extra__", extras)
+
+        with pytest.raises(ValidationError, match="future_constraint"):
+            evaluate_policy(
+                principal=principal_value,
+                evaluation=evaluation_value,
+                policy=policy(
+                    statement(
+                        "read-grant",
+                        "allow",
+                        "read",
+                        reference("memory-1"),
+                    ),
+                ),
+            )
+    else:
+        decision = PolicyDecision(**decision_payload())
+        target = decision if location == "direct" else decision.resource
+        object.__setattr__(target, "__pydantic_extra__", extras)
+
+        with pytest.raises(ValidationError, match="future_constraint"):
+            validate_policy_decision(decision)
+
+    assert extras.view_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("boundary", "location", "field_name", "extra_value"),
+    [
+        ("evaluator", "direct", "subject_id", "shadow-subject"),
+        ("evaluator", "nested", "id", "shadow-memory"),
+        ("receiving", "direct", "action", "delete"),
+        ("receiving", "nested", "id", "shadow-memory"),
+    ],
+)
+def test_policy_boundaries_reject_hidden_native_dict_declared_overlap(
+    boundary: str,
+    location: str,
+    field_name: str,
+    extra_value: str,
+) -> None:
+    extras = _HiddenBackingExtras({field_name: extra_value})
+
+    if boundary == "evaluator":
+        resource_value = reference("memory-1")
+        principal_value = principal()
+        evaluation_value = PolicyEvaluationInput(
+            schema_version=VERSION,
+            action="read",
+            resource=resource_value,
+        )
+        target = principal_value if location == "direct" else evaluation_value.resource
+        object.__setattr__(target, "__pydantic_extra__", extras)
+
+        with pytest.raises(
+            ValueError,
+            match="contract input contains duplicate stored fields",
+        ):
+            evaluate_policy(
+                principal=principal_value,
+                evaluation=evaluation_value,
+                policy=policy(
+                    statement(
+                        "read-grant",
+                        "allow",
+                        "read",
+                        reference("memory-1"),
+                    ),
+                ),
+            )
+    else:
+        decision = PolicyDecision(**decision_payload())
+        target = decision if location == "direct" else decision.resource
+        object.__setattr__(target, "__pydantic_extra__", extras)
+
+        with pytest.raises(
+            ValueError,
+            match="contract input contains duplicate stored fields",
+        ):
+            validate_policy_decision(decision)
+
+    assert extras.view_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("boundary", "location"),
+    [
+        ("evaluator", "direct"),
+        ("evaluator", "nested"),
+        ("receiving", "direct"),
+        ("receiving", "nested"),
+    ],
+)
+def test_policy_boundaries_preserve_non_dict_inverse_items_authority(
+    boundary: str,
+    location: str,
+) -> None:
+    extras = _InverseViewExtras({"future_constraint": "deny"})
+
+    if boundary == "evaluator":
+        resource_value = reference("memory-1")
+        principal_value = principal()
+        evaluation_value = PolicyEvaluationInput(
+            schema_version=VERSION,
+            action="read",
+            resource=resource_value,
+        )
+        target = principal_value if location == "direct" else evaluation_value.resource
+        object.__setattr__(target, "__pydantic_extra__", extras)
+        received = evaluate_policy(
+            principal=principal_value,
+            evaluation=evaluation_value,
+            policy=policy(
+                statement(
+                    "read-grant",
+                    "allow",
+                    "read",
+                    reference("memory-1"),
+                ),
+            ),
+        )
+        assert (received.outcome, received.reason_code) == (
+            "allow",
+            "explicit_grant",
+        )
+    else:
+        decision = PolicyDecision(**decision_payload())
+        target = decision if location == "direct" else decision.resource
+        object.__setattr__(target, "__pydantic_extra__", extras)
+        received = validate_policy_decision(decision)
+        assert received.model_dump(mode="python") == decision_payload()
+
+    assert extras.items_calls == 1
+    assert extras.iteration_calls == 0
+    assert extras.getitem_calls == 0
+
+
+@pytest.mark.parametrize("boundary", ["evaluator", "receiving"])
+def test_policy_boundaries_capture_non_dict_items_inventory_once(
+    boundary: str,
+) -> None:
+    extras = _ChangingItemsExtras()
+
+    if boundary == "evaluator":
+        resource_value = reference("memory-1")
+        principal_value = principal()
+        object.__setattr__(principal_value, "__pydantic_extra__", extras)
+        received = evaluate(
+            principal_value,
+            "read",
+            resource_value,
+            policy(statement("read-grant", "allow", "read", resource_value)),
+        )
+        assert received.outcome == "allow"
+    else:
+        decision = PolicyDecision(**decision_payload())
+        object.__setattr__(decision, "__pydantic_extra__", extras)
+        received = validate_policy_decision(decision)
+        assert received.model_dump(mode="python") == decision_payload()
+
+    assert extras.items_calls == 1
+
+
+@pytest.mark.parametrize("boundary", ["evaluator", "receiving"])
+def test_policy_boundaries_accept_genuinely_empty_native_dict_subclass(
+    boundary: str,
+) -> None:
+    extras = _HiddenBackingExtras({})
+
+    if boundary == "evaluator":
+        resource_value = reference("memory-1")
+        principal_value = principal()
+        object.__setattr__(principal_value, "__pydantic_extra__", extras)
+        received = evaluate(
+            principal_value,
+            "read",
+            resource_value,
+            policy(statement("read-grant", "allow", "read", resource_value)),
+        )
+        assert received.outcome == "allow"
+    else:
+        decision = PolicyDecision(**decision_payload())
+        object.__setattr__(decision, "__pydantic_extra__", extras)
+        received = validate_policy_decision(decision)
+        assert received.model_dump(mode="python") == decision_payload()
+
+    assert extras.view_calls == 0
 
 
 @pytest.mark.parametrize(
@@ -1053,7 +1343,7 @@ def test_receiving_boundary_rejects_malformed_extra_storage(
         validate_policy_decision(decision)
 
 
-@pytest.mark.parametrize("extra_storage", [None, {}])
+@pytest.mark.parametrize("extra_storage", [None, {}, MappingProxyType({})])
 def test_receiving_boundary_accepts_valid_empty_extra_storage(
     extra_storage: object,
 ) -> None:

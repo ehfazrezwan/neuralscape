@@ -18,6 +18,17 @@ from contracts_policy import (
 from contracts_references import ReferenceHandle
 
 
+def _mapping_items(
+    value: Mapping[object, object],
+) -> tuple[tuple[object, object], ...]:
+    """Capture one mapping inventory without trusting native-dict overrides."""
+
+    value_type = type(value)
+    if issubclass(value_type, dict):
+        return tuple(dict.items(value))
+    return tuple(value.items())
+
+
 def _complete_contract_input(value: object, active_ids: set[int]) -> object:
     """Copy a native input graph without normalizing away invalid data."""
 
@@ -35,7 +46,8 @@ def _complete_contract_input(value: object, active_ids: set[int]) -> object:
                     raise ValueError(
                         "contract input extra storage must be a mapping"
                     )
-                for key, item in extra_values.items():
+                extra_items = _mapping_items(extra_values)
+                for key, item in extra_items:
                     if key in stored_values or key in declared_fields:
                         raise ValueError(
                             "contract input contains duplicate stored fields"
@@ -68,7 +80,7 @@ def _complete_contract_input(value: object, active_ids: set[int]) -> object:
             # Keys are deliberately not stringified or otherwise normalized.
             return {
                 key: _complete_contract_input(item, active_ids)
-                for key, item in value.items()
+                for key, item in _mapping_items(value)
             }
         finally:
             active_ids.remove(identity)
