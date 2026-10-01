@@ -578,6 +578,32 @@ class ReplacingFilesFieldName(str):
         return str.__hash__(self)
 
 
+class ReplacingFilesStoredName(str):
+    def __new__(
+        cls,
+        value: str,
+        files: list[ManifestFile],
+        replacement: ManifestFile | None,
+    ) -> "ReplacingFilesStoredName":
+        instance = super().__new__(cls, value)
+        instance.files = files
+        instance.replacement = replacement
+        instance.armed = False
+        instance.hash_calls = 0
+        instance.mutated = False
+        return instance
+
+    def __hash__(self) -> int:
+        self.hash_calls += 1
+        if self.armed and not self.mutated:
+            if self.replacement is None:
+                list.__delitem__(self.files, 0)
+            else:
+                list.__setitem__(self.files, 0, self.replacement)
+            self.mutated = True
+        return str.__hash__(self)
+
+
 class DescriptorMaskedManifest(PortableManifest):
     @property
     def __dict__(self) -> dict[str, object]:
@@ -1953,6 +1979,55 @@ def test_supported_hook_cannot_change_frozen_native_list_edge(
         assert hook.item_calls == 2
     else:
         assert hook.hash_calls >= 1
+
+
+@pytest.mark.parametrize(
+    "edge_case",
+    ["invalid-repaired", "valid-corrupted", "valid-removed"],
+)
+def test_stored_name_callback_cannot_change_frozen_native_list_edge(
+    edge_case: str,
+) -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    files = manifest.files
+    valid_file = list.__getitem__(files, 0)
+    invalid_file = valid_file.model_copy(update={"path": ""})
+    if edge_case == "invalid-repaired":
+        original, replacement = invalid_file, valid_file
+    elif edge_case == "valid-corrupted":
+        original, replacement = valid_file, invalid_file
+    else:
+        original, replacement = valid_file, None
+    list.__setitem__(files, 0, original)
+
+    hook = ReplacingFilesStoredName("schema_version", files, replacement)
+    native_manifest = _PYDANTIC_DICT_DESCRIPTOR.__get__(manifest, BaseModel)
+    stored_entries = tuple(dict.items(native_manifest))
+    dict.clear(native_manifest)
+    for name, item in stored_entries:
+        dict.__setitem__(
+            native_manifest,
+            hook if name == "schema_version" else name,
+            item,
+        )
+    hook.armed = True
+
+    if edge_case == "invalid-repaired":
+        with pytest.raises(ValidationError) as raised:
+            validate_portable_manifest(manifest)
+        assert raised.value.errors()[0]["type"] == "string_too_short"
+        assert raised.value.errors()[0]["loc"] == ("files", 0, "path")
+    else:
+        revalidated = validate_portable_manifest(manifest)
+        assert len(revalidated.files) == 2
+        assert revalidated.files[0].path == "canonical/records.jsonl"
+
+    if edge_case == "valid-removed":
+        assert len(files) == 1
+        assert list.__getitem__(files, 0).path == "crypto/envelope.bin"
+    else:
+        assert list.__getitem__(files, 0) is replacement
+    assert hook.hash_calls == 4
 
 
 @pytest.mark.parametrize("invalid_view", ["native", "public"])

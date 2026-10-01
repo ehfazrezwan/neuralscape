@@ -43,6 +43,20 @@ _RetainedStateInventory = tuple[
 _MISSING_FIELDS_SET = object()
 
 
+def _is_declared_model_field_name(
+    candidate: object,
+    declared_names: tuple[str, ...],
+) -> bool:
+    """Compare real string names without invoking overridable protocols."""
+
+    if not issubclass(type(candidate), str):
+        return False
+    return any(
+        str.__eq__(candidate, declared_name) is True
+        for declared_name in declared_names
+    )
+
+
 def _snapshot_model_extra_storage(value: BaseModel) -> _ModelExtraSnapshot:
     """Capture native dict extras without invoking public mapping views."""
 
@@ -140,9 +154,9 @@ def _reject_retained_unknown_fields(
                 fields_set_storage,
                 extra_snapshot,
             )
-            declared = value_type.model_fields
+            declared_names = tuple(value_type.model_fields)
             for name, item in stored_entries:
-                if name in declared:
+                if _is_declared_model_field_name(name, declared_names):
                     discover(item)
             return
 
