@@ -36,6 +36,13 @@ _SafeCounter = Annotated[
 _BASE_MODEL_DICT_DESCRIPTOR = vars(BaseModel)["__dict__"]
 _BASE_MODEL_EXTRA_DESCRIPTOR = vars(BaseModel)["__pydantic_extra__"]
 
+_FrozenModelStorage = tuple[
+    BaseModel,
+    dict[Any, Any],
+    Any,
+    tuple[tuple[Any, Any], ...] | None,
+]
+
 
 class _ManifestContract(BaseModel):
     """Strict, immutable base local to the standalone benchmark package."""
@@ -290,7 +297,65 @@ class RunManifest(_ManifestContract):
         return self
 
 
-def _snapshot_native(value: Any, *, path: str = "$", active: set[int] | None = None) -> Any:
+def _freeze_model_storage(
+    value: Any,
+    frozen_models: dict[int, _FrozenModelStorage],
+    visited: set[int],
+) -> None:
+    """Capture nested model storage before overridable graph traversal."""
+
+    value_type = type(value)
+    is_native_container = issubclass(value_type, (BaseModel, tuple, list, dict))
+    if not is_native_container:
+        return
+
+    identity = id(value)
+    if identity in visited:
+        return
+    visited.add(identity)
+
+    if issubclass(value_type, BaseModel):
+        stored = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+        stored_values = dict(dict.items(stored))
+        try:
+            extras = _BASE_MODEL_EXTRA_DESCRIPTOR.__get__(value, BaseModel)
+        except AttributeError:
+            extras = None
+        native_extra_entries = (
+            tuple(dict.items(extras))
+            if extras is not None and issubclass(type(extras), dict)
+            else None
+        )
+        frozen_models[identity] = (
+            value,
+            stored_values,
+            extras,
+            native_extra_entries,
+        )
+        for field_name in value_type.model_fields:
+            if field_name in stored_values:
+                _freeze_model_storage(
+                    stored_values[field_name], frozen_models, visited
+                )
+        return
+
+    if issubclass(value_type, tuple):
+        items = tuple.__iter__(value)
+    elif issubclass(value_type, list):
+        items = list.__iter__(value)
+    else:
+        items = (item for _key, item in dict.items(value))
+    for item in items:
+        _freeze_model_storage(item, frozen_models, visited)
+
+
+def _snapshot_native(
+    value: Any,
+    *,
+    path: str = "$",
+    active: set[int] | None = None,
+    _frozen_models: dict[int, _FrozenModelStorage] | None = None,
+) -> Any:
     """Copy native input without coercion while enforcing closed model storage.
 
     Pydantic's unchecked construction and copy APIs can create model instances
@@ -300,6 +365,9 @@ def _snapshot_native(value: Any, *, path: str = "$", active: set[int] | None = N
     caller's actual structure instead of a normalized substitute.
     """
 
+    if _frozen_models is None:
+        _frozen_models = {}
+        _freeze_model_storage(value, _frozen_models, set())
     if active is None:
         active = set()
 
@@ -313,17 +381,15 @@ def _snapshot_native(value: Any, *, path: str = "$", active: set[int] | None = N
     try:
         if isinstance(value, BaseModel):
             fields = type(value).model_fields
-            stored = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
-            stored_entries = tuple(dict.items(stored))
-            stored_values = dict(stored_entries)
+            frozen = _frozen_models.get(identity)
+            if frozen is None or frozen[0] is not value:
+                _freeze_model_storage(value, _frozen_models, set())
+                frozen = _frozen_models[identity]
+            _model, stored_values, extras, native_extra_entries = frozen
             undeclared = set(stored_values).difference(fields)
-            try:
-                extras = _BASE_MODEL_EXTRA_DESCRIPTOR.__get__(value, BaseModel)
-            except AttributeError:
-                extras = None
             if extras is not None:
-                if issubclass(type(extras), dict):
-                    extra_entries = tuple(dict.items(extras))
+                if native_extra_entries is not None:
+                    extra_entries = native_extra_entries
                     iterated_extra_names = tuple(key for key, _ in extra_entries)
                 else:
                     if not isinstance(extras, Mapping):
@@ -337,7 +403,10 @@ def _snapshot_native(value: Any, *, path: str = "$", active: set[int] | None = N
                 raise ValueError(f"undeclared stored fields at {path}: {names}")
             return {
                 name: _snapshot_native(
-                    stored_values[name], path=f"{path}.{name}", active=active
+                    stored_values[name],
+                    path=f"{path}.{name}",
+                    active=active,
+                    _frozen_models=_frozen_models,
                 )
                 for name in fields
                 if name in stored_values
@@ -345,17 +414,32 @@ def _snapshot_native(value: Any, *, path: str = "$", active: set[int] | None = N
 
         if isinstance(value, Mapping):
             return {
-                key: _snapshot_native(item, path=f"{path}[{key!r}]", active=active)
+                key: _snapshot_native(
+                    item,
+                    path=f"{path}[{key!r}]",
+                    active=active,
+                    _frozen_models=_frozen_models,
+                )
                 for key, item in value.items()
             }
         if isinstance(value, tuple):
             return tuple(
-                _snapshot_native(item, path=f"{path}[{index}]", active=active)
+                _snapshot_native(
+                    item,
+                    path=f"{path}[{index}]",
+                    active=active,
+                    _frozen_models=_frozen_models,
+                )
                 for index, item in enumerate(value)
             )
         if isinstance(value, list):
             return [
-                _snapshot_native(item, path=f"{path}[{index}]", active=active)
+                _snapshot_native(
+                    item,
+                    path=f"{path}[{index}]",
+                    active=active,
+                    _frozen_models=_frozen_models,
+                )
                 for index, item in enumerate(value)
             ]
         return value

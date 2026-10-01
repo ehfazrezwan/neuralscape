@@ -690,6 +690,72 @@ def test_receivers_reject_initial_invalid_value_changed_during_traversal(
 
 
 @pytest.mark.parametrize("boundary", ["serialize", "finish"])
+def test_receivers_freeze_nested_models_before_overridable_traversal(
+    boundary: str,
+):
+    manifest = planned_manifest()
+    invalid_resource = pending_memory().model_copy(
+        update={"observed_value": 1}
+    )
+    invalid_native = BASE_MODEL_DICT_DESCRIPTOR.__get__(
+        invalid_resource, pydantic.BaseModel
+    )
+    manifest_native = BASE_MODEL_DICT_DESCRIPTOR.__get__(
+        manifest, pydantic.BaseModel
+    )
+    original_concurrency = manifest_native["concurrency"]
+    manifest_native["resources"] = (invalid_resource,)
+    manifest_native["concurrency"] = MutatingTuple(
+        original_concurrency,
+        lambda: dict.__setitem__(invalid_native, "observed_value", None),
+    )
+
+    with pytest.raises(ValidationError) as exc_info:
+        receive_planned_manifest(boundary, manifest)
+
+    assert invalid_native["observed_value"] is None
+    assert exc_info.value.errors()[0]["loc"] == ("resources", 0)
+    assert "observed_value is valid only for a measured resource" in str(
+        exc_info.value
+    )
+
+
+@pytest.mark.parametrize("boundary", ["serialize", "finish"])
+def test_receivers_preserve_valid_overridable_tuple_traversal(boundary: str):
+    manifest = planned_manifest()
+    native = BASE_MODEL_DICT_DESCRIPTOR.__get__(manifest, pydantic.BaseModel)
+    original_concurrency = native["concurrency"]
+    calls: list[str] = []
+    native["concurrency"] = MutatingTuple(
+        original_concurrency,
+        lambda: calls.append("iterated"),
+    )
+
+    assert_received(boundary, manifest)
+
+    assert calls == ["iterated"]
+
+
+@pytest.mark.parametrize("boundary", ["serialize", "finish"])
+def test_receivers_preserve_benign_string_subclass_field_names(boundary: str):
+    class FieldName(str):
+        pass
+
+    manifest = planned_manifest()
+    native = BASE_MODEL_DICT_DESCRIPTOR.__get__(manifest, pydantic.BaseModel)
+    run_id = dict.pop(native, "run_id")
+    stored_name = FieldName("run_id")
+    dict.__setitem__(native, stored_name, run_id)
+
+    assert any(
+        type(name) is FieldName
+        for name, _field_value in dict.items(native)
+        if name == "run_id"
+    )
+    assert_received(boundary, manifest)
+
+
+@pytest.mark.parametrize("boundary", ["serialize", "finish"])
 def test_receivers_do_not_retroactively_include_late_unknowns(boundary: str):
     manifest = planned_manifest()
     native = object.__getattribute__(manifest, "__dict__")
