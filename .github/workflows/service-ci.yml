@@ -6,12 +6,11 @@ name: service-ci
 # 2026-07-05 memory/ package incident (PR #136 → #138) is the origin story.
 #
 # Trigger shape: runs on EVERY PR so the jobs can be marked as required
-# checks; the `changes` job path-filters internally and non-service PRs get
-# "skipped" jobs, which GitHub treats as passing for required checks.
+# checks. The `changes` job retains its existing status context and diagnostic
+# output, but never skips the mandatory host, container, runtime, or guard jobs.
 
 on:
   pull_request:
-    branches: [dev, main]
   push:
     branches: [dev, main]
     paths:
@@ -26,6 +25,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Retained for status-context compatibility and change diagnostics. Its
+  # output is deliberately not used to condition any mandatory job.
   changes:
     runs-on: ubuntu-latest
     outputs:
@@ -51,8 +52,6 @@ jobs:
   # security tab with alerts for code we never install — one past sync left
   # 31 stale alerts to triage away. Fail fast at PR time instead.
   subtree-prune-guard:
-    needs: changes
-    if: needs.changes.outputs.service == 'true' || github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -74,8 +73,6 @@ jobs:
           echo "subtrees clean"
 
   host-tests:
-    needs: changes
-    if: needs.changes.outputs.service == 'true' || github.event_name == 'push'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -102,8 +99,6 @@ jobs:
         run: uv run pytest tests/ --ignore=tests/test_async_pipeline.py -q
 
   container-gate:
-    needs: changes
-    if: needs.changes.outputs.service == 'true' || github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -131,3 +126,31 @@ jobs:
           load: true
           tags: ns-gate-rt:ci
           cache-from: type=gha
+
+  service-gate:
+    if: ${{ always() }}
+    needs: [changes, subtree-prune-guard, host-tests, container-gate]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every service qualification job
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          SUBTREE_RESULT: ${{ needs.subtree-prune-guard.result }}
+          HOST_RESULT: ${{ needs.host-tests.result }}
+          CONTAINER_RESULT: ${{ needs.container-gate.result }}
+        run: |
+          set -eu
+
+          require_success() {
+            check_name=$1
+            result=$2
+            if [ "$result" != "success" ]; then
+              echo "::error::$check_name result '$result'; expected 'success'"
+              exit 1
+            fi
+          }
+
+          require_success changes "$CHANGES_RESULT"
+          require_success subtree-prune-guard "$SUBTREE_RESULT"
+          require_success host-tests "$HOST_RESULT"
+          require_success container-gate "$CONTAINER_RESULT"
