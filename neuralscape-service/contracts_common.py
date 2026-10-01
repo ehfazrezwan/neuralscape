@@ -75,8 +75,9 @@ def _validation_alias_owners(model_type: type[BaseModel]) -> dict[str, set[str]]
 
 def _mapping_entries(
     value: Mapping[object, object],
+    value_type: type[object],
 ) -> tuple[tuple[object, object], ...]:
-    if issubclass(type(value), dict):
+    if issubclass(value_type, dict):
         return tuple(dict.items(value))
     return tuple(value.items())
 
@@ -91,7 +92,8 @@ def snapshot_contract_graph(
     reconstruct the intended target model before trusting the result.
     """
 
-    if not isinstance(value, (BaseModel, tuple, list, dict)):
+    value_type = type(value)
+    if not issubclass(value_type, (BaseModel, tuple, list, dict)):
         return value
 
     if active_containers is None:
@@ -101,9 +103,10 @@ def snapshot_contract_graph(
         raise ValueError("cyclic contract input is not supported")
     active_containers.add(value_id)
     try:
-        if isinstance(value, BaseModel):
-            model_type = type(value)
-            stored_entries = _mapping_entries(vars(value))
+        if issubclass(value_type, BaseModel):
+            model_type = value_type
+            stored = vars(value)
+            stored_entries = _mapping_entries(stored, type(stored))
             stored_names = {key for key, _ in stored_entries}
             declared_names = set(model_type.model_fields)
             alias_owners = _validation_alias_owners(model_type)
@@ -129,9 +132,10 @@ def snapshot_contract_graph(
             }
             extra = getattr(value, "__pydantic_extra__", None)
             if extra is not None:
-                if not issubclass(type(extra), Mapping):
+                extra_type = type(extra)
+                if not issubclass(extra_type, Mapping):
                     raise ValueError("contract extra storage must be a mapping")
-                extra_entries = _mapping_entries(extra)
+                extra_entries = _mapping_entries(extra, extra_type)
                 extra_keys = {key for key, _ in extra_entries}
                 reserved_names = (
                     fields.keys()
@@ -149,15 +153,15 @@ def snapshot_contract_graph(
                     }
                 )
             return fields
-        if isinstance(value, tuple):
+        if issubclass(value_type, tuple):
             return tuple(
                 snapshot_contract_graph(item, active_containers) for item in value
             )
-        if isinstance(value, list):
+        if issubclass(value_type, list):
             return [
                 snapshot_contract_graph(item, active_containers) for item in value
             ]
-        dict_entries = _mapping_entries(value)
+        dict_entries = _mapping_entries(value, value_type)
         return {
             key: snapshot_contract_graph(item, active_containers)
             for key, item in dict_entries
