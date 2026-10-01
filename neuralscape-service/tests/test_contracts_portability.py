@@ -21,6 +21,7 @@ from contracts_portability import (
 )
 
 
+_PYDANTIC_DICT_DESCRIPTOR = BaseModel.__dict__["__dict__"]
 _PYDANTIC_EXTRA_SLOT = BaseModel.__dict__["__pydantic_extra__"]
 _PYDANTIC_FIELDS_SET_SLOT = BaseModel.__dict__["__pydantic_fields_set__"]
 
@@ -369,6 +370,36 @@ class HiddenFieldsSetBacking(set[str]):
             self.length_calls,
             self.contains_calls,
         )
+
+
+class DescriptorMaskedManifest(PortableManifest):
+    @property
+    def __dict__(self) -> dict[str, object]:
+        native_stored = _PYDANTIC_DICT_DESCRIPTOR.__get__(self, BaseModel)
+        return {
+            name: value
+            for name, value in dict.items(native_stored)
+            if name != "future_entry_semantics"
+        }
+
+    @__dict__.setter
+    def __dict__(self, value: dict[str, object]) -> None:
+        _PYDANTIC_DICT_DESCRIPTOR.__set__(self, value)
+
+
+class DescriptorMaskedManifestFile(ManifestFile):
+    @property
+    def __dict__(self) -> dict[str, object]:
+        native_stored = _PYDANTIC_DICT_DESCRIPTOR.__get__(self, BaseModel)
+        return {
+            name: value
+            for name, value in dict.items(native_stored)
+            if name != "future_entry_semantics"
+        }
+
+    @__dict__.setter
+    def __dict__(self, value: dict[str, object]) -> None:
+        _PYDANTIC_DICT_DESCRIPTOR.__set__(self, value)
 
 
 def valid_manifest() -> dict:
@@ -1273,6 +1304,114 @@ def test_model_fields_set_override_cannot_hide_nested_unknown() -> None:
     assert errors[0]["type"] == "extra_forbidden"
     assert errors[0]["loc"] == ("files", 0, "phantom_only")
     assert errors[0]["input"] is None
+
+
+@pytest.mark.parametrize("representation", ["frozenset", "tuple", "list"])
+@pytest.mark.parametrize("with_unknown", [False, True])
+def test_fields_set_iterable_storage_preserves_prior_behavior(
+    representation: str,
+    with_unknown: bool,
+) -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    native_fields_set = set.copy(
+        _PYDANTIC_FIELDS_SET_SLOT.__get__(manifest, type(manifest))
+    )
+    if with_unknown:
+        native_fields_set.add("phantom_only")
+    if representation == "frozenset":
+        replacement = frozenset(native_fields_set)
+    elif representation == "tuple":
+        replacement = tuple(native_fields_set)
+    else:
+        replacement = list(native_fields_set)
+    _PYDANTIC_FIELDS_SET_SLOT.__set__(manifest, replacement)
+
+    if with_unknown:
+        with pytest.raises(ValidationError) as raised:
+            validate_portable_manifest(manifest)
+        errors = raised.value.errors()
+        assert len(errors) == 1
+        assert errors[0]["type"] == "extra_forbidden"
+        assert errors[0]["loc"] == ("phantom_only",)
+        assert errors[0]["input"] is None
+    else:
+        revalidated = validate_portable_manifest(manifest)
+        assert revalidated.manifest_id == "manifest-7"
+
+
+def test_model_dict_descriptor_cannot_hide_root_unknown() -> None:
+    ordinary = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    masked = DescriptorMaskedManifest.model_validate(valid_manifest())
+
+    observed_errors = []
+    for model in (ordinary, masked):
+        native_stored = _PYDANTIC_DICT_DESCRIPTOR.__get__(model, BaseModel)
+        dict.__setitem__(native_stored, "future_entry_semantics", "deny")
+        assert dict.__getitem__(native_stored, "future_entry_semantics") == "deny"
+        if model is masked:
+            assert "future_entry_semantics" not in model.__dict__
+        with pytest.raises(ValidationError) as raised:
+            validate_portable_manifest(model)
+        observed_errors.append(raised.value.errors())
+
+    assert observed_errors[0] == observed_errors[1]
+    assert len(observed_errors[0]) == 1
+    assert observed_errors[0][0]["type"] == "extra_forbidden"
+    assert observed_errors[0][0]["loc"] == ("future_entry_semantics",)
+    assert observed_errors[0][0]["input"] == "deny"
+
+
+def test_model_dict_descriptor_cannot_hide_nested_unknown() -> None:
+    ordinary_manifest = validate_portable_manifest(valid_manifest()).model_copy(
+        deep=True
+    )
+    masked_manifest = validate_portable_manifest(valid_manifest()).model_copy(
+        deep=True
+    )
+    nested = DescriptorMaskedManifestFile.model_validate(
+        masked_manifest.files[0].model_dump()
+    )
+    masked_manifest.files[0] = nested
+
+    observed_errors = []
+    for manifest in (ordinary_manifest, masked_manifest):
+        node = manifest.files[0]
+        native_stored = _PYDANTIC_DICT_DESCRIPTOR.__get__(node, BaseModel)
+        dict.__setitem__(native_stored, "future_entry_semantics", "deny")
+        assert dict.__getitem__(native_stored, "future_entry_semantics") == "deny"
+        if node is nested:
+            assert "future_entry_semantics" not in node.__dict__
+        with pytest.raises(ValidationError) as raised:
+            validate_portable_manifest(manifest)
+        observed_errors.append(raised.value.errors())
+
+    assert observed_errors[0] == observed_errors[1]
+    assert len(observed_errors[0]) == 1
+    assert observed_errors[0][0]["type"] == "extra_forbidden"
+    assert observed_errors[0][0]["loc"] == (
+        "files",
+        0,
+        "future_entry_semantics",
+    )
+    assert observed_errors[0][0]["input"] == "deny"
+
+
+@pytest.mark.parametrize("location", ["manifest", "file"])
+def test_model_dict_descriptor_without_unknown_remains_valid(
+    location: str,
+) -> None:
+    if location == "manifest":
+        manifest = DescriptorMaskedManifest.model_validate(valid_manifest())
+    else:
+        manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+        manifest.files[0] = DescriptorMaskedManifestFile.model_validate(
+            manifest.files[0].model_dump()
+        )
+
+    revalidated = validate_portable_manifest(manifest)
+
+    assert type(revalidated) is PortableManifest
+    assert revalidated.files[0].path == "canonical/records.jsonl"
 
 
 @pytest.mark.parametrize(

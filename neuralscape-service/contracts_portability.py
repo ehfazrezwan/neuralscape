@@ -22,6 +22,7 @@ ChecksumAlgorithm = Literal["sha256"]
 EncryptionMode = Literal["plaintext_authorized_export", "encrypted"]
 ScopeKind = Literal["tenant", "projects"]
 _WINDOWS_FORBIDDEN_COMPONENT_CHARACTERS = frozenset('<>:"|?*')
+_PYDANTIC_DICT_DESCRIPTOR = BaseModel.__dict__["__dict__"]
 _PYDANTIC_EXTRA_SLOT = BaseModel.__dict__["__pydantic_extra__"]
 _PYDANTIC_FIELDS_SET_SLOT = BaseModel.__dict__["__pydantic_fields_set__"]
 _ModelStorageEntries = tuple[tuple[Any, Any], ...]
@@ -91,13 +92,16 @@ def _reject_retained_unknown_fields(
 
         if isinstance(value, BaseModel):
             declared = type(value).model_fields
-            native_stored = object.__getattribute__(value, "__dict__")
+            native_stored = _PYDANTIC_DICT_DESCRIPTOR.__get__(value, BaseModel)
             stored_entries = tuple(dict.items(native_stored))
             stored = dict(stored_entries)
             native_fields_set = _PYDANTIC_FIELDS_SET_SLOT.__get__(
                 value, type(value)
             )
-            fields_set = set.copy(native_fields_set)
+            if issubclass(type(native_fields_set), set):
+                fields_set = set.copy(native_fields_set)
+            else:
+                fields_set = set(native_fields_set)
             pydantic_extra, observed_extra_names = (
                 _validated_model_extra_storage(value, set(stored))
             )
