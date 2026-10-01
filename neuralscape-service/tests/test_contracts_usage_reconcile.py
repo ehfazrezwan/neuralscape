@@ -2,7 +2,7 @@
 
 import copy
 import json
-from collections.abc import ItemsView, Iterator, Mapping
+from collections.abc import ItemsView, Iterator, KeysView, Mapping
 from itertools import permutations
 from types import MappingProxyType
 
@@ -137,6 +137,59 @@ class _InverseItemsExtras(dict[str, object]):
         return {}.items()
 
 
+class _NonDictInverseItemsExtras(Mapping[str, object]):
+    """Expose iteration names while reporting an empty authoritative items view."""
+
+    def __init__(self, entries: dict[str, object]) -> None:
+        self._entries = entries
+        self.iteration_calls = 0
+        self.items_calls = 0
+
+    def __getitem__(self, key: str) -> object:
+        return self._entries[key]
+
+    def __iter__(self) -> Iterator[str]:
+        self.iteration_calls += 1
+        return iter(self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def items(self) -> ItemsView[str, object]:
+        self.items_calls += 1
+        return {}.items()
+
+
+class _HiddenBackingExtras(dict[str, object]):
+    """Hide native dict backing from every overridable inventory view."""
+
+    def __init__(self, entries: dict[str, object]) -> None:
+        super().__init__(entries)
+        self.len_calls = 0
+        self.iteration_calls = 0
+        self.keys_calls = 0
+        self.items_calls = 0
+
+    def __len__(self) -> int:
+        self.len_calls += 1
+        return 0
+
+    def __iter__(self) -> Iterator[str]:
+        self.iteration_calls += 1
+        return iter(())
+
+    def keys(self) -> KeysView[str]:
+        self.keys_calls += 1
+        return {}.keys()
+
+    def items(self) -> ItemsView[str, object]:
+        self.items_calls += 1
+        return {}.items()
+
+    def __bool__(self) -> bool:
+        raise AssertionError("extra truthiness must not be read")
+
+
 class _ChangingItemsExtras(Mapping[str, object]):
     """Return a different items view after the first captured snapshot."""
 
@@ -180,6 +233,13 @@ def _assert_canonical_invalid_event(event: UsageEvent) -> None:
     assert str(caught.value) == (
         "invalid_event: an input event failed contract validation"
     )
+
+
+def _assert_no_hidden_backing_override_reads(extras: _HiddenBackingExtras) -> None:
+    assert extras.len_calls == 0
+    assert extras.iteration_calls == 0
+    assert extras.keys_calls == 0
+    assert extras.items_calls == 0
 
 
 def _assert_result_payload_rejected(payload: dict[str, object]) -> None:
@@ -551,6 +611,76 @@ def test_reconciliation_rejects_mapping_event_extra_storage(
     assert _error_code([event]) == "invalid_event"
 
 
+@pytest.mark.parametrize("target_name", ["event", "attribution", "quantity"])
+def test_reconciliation_rejects_hidden_native_extra_backing(
+    target_name: str,
+) -> None:
+    event = _event()
+    assert event.usage is not None
+    targets = {
+        "event": event,
+        "attribution": event.attribution,
+        "quantity": event.usage.input_tokens,
+    }
+    extras = _HiddenBackingExtras({"authority": True})
+    object.__setattr__(targets[target_name], "__pydantic_extra__", extras)
+
+    assert tuple(dict.items(extras)) == (("authority", True),)
+    _assert_canonical_invalid_event(event)
+    _assert_no_hidden_backing_override_reads(extras)
+
+
+@pytest.mark.parametrize(
+    ("target_name", "field_name", "extra_value"),
+    [
+        ("event", "tenant_id", "shadow-tenant"),
+        ("attribution", "producer", "shadow-producer"),
+        ("quantity", "value", 99),
+    ],
+)
+def test_reconciliation_rejects_hidden_native_declared_overlap(
+    target_name: str,
+    field_name: str,
+    extra_value: object,
+) -> None:
+    event = _event()
+    assert event.usage is not None
+    targets = {
+        "event": event,
+        "attribution": event.attribution,
+        "quantity": event.usage.input_tokens,
+    }
+    extras = _HiddenBackingExtras({field_name: extra_value})
+    object.__setattr__(targets[target_name], "__pydantic_extra__", extras)
+
+    _assert_canonical_invalid_event(event)
+    _assert_no_hidden_backing_override_reads(extras)
+
+
+def test_reconciliation_rejects_hidden_native_subclass_field_overlap() -> None:
+    class ExtendedUsageEvent(UsageEvent):
+        audit_marker: str = "marker"
+
+    event = ExtendedUsageEvent.model_validate(_event().model_dump(mode="python"))
+    event.__dict__.pop("audit_marker")
+    extras = _HiddenBackingExtras({"audit_marker": "override"})
+    object.__setattr__(event, "__pydantic_extra__", extras)
+
+    _assert_canonical_invalid_event(event)
+    _assert_no_hidden_backing_override_reads(extras)
+
+
+def test_reconciliation_accepts_empty_hidden_native_backing() -> None:
+    event = _event()
+    extras = _HiddenBackingExtras({})
+    object.__setattr__(event, "__pydantic_extra__", extras)
+
+    result = reconcile_usage_events([event])
+
+    assert result.streams[0].head_event_id == event.event_id
+    _assert_no_hidden_backing_override_reads(extras)
+
+
 def test_reconciliation_rejects_split_view_declared_extra_storage() -> None:
     event = _event(tenant_id="wrong-tenant")
     extras = _SplitViewExtras({"tenant_id": "tenant-1"})
@@ -635,7 +765,7 @@ def test_reconciliation_rejects_inverse_items_declared_overlap(
         "event": event,
         "attribution": event.attribution,
     }
-    extras = _InverseItemsExtras({field_name: extra_value})
+    extras = _NonDictInverseItemsExtras({field_name: extra_value})
     object.__setattr__(targets[target_name], "__pydantic_extra__", extras)
 
     _assert_canonical_invalid_event(event)
@@ -663,7 +793,7 @@ def test_reconciliation_rejects_inverse_items_moved_subclass_default(
         event = _event().model_copy(update={"attribution": attribution})
         target = attribution
     target.__dict__.pop("audit_marker")
-    extras = _InverseItemsExtras({"audit_marker": "override"})
+    extras = _NonDictInverseItemsExtras({"audit_marker": "override"})
     object.__setattr__(target, "__pydantic_extra__", extras)
 
     _assert_canonical_invalid_event(event)
@@ -680,7 +810,7 @@ def test_reconciliation_preserves_inverse_items_unknown_omission(
         "event": event,
         "attribution": event.attribution,
     }
-    extras = _InverseItemsExtras({"future_semantics": "omit"})
+    extras = _NonDictInverseItemsExtras({"future_semantics": "omit"})
     object.__setattr__(targets[target_name], "__pydantic_extra__", extras)
 
     result = reconcile_usage_events([event])
@@ -689,6 +819,23 @@ def test_reconciliation_preserves_inverse_items_unknown_omission(
     assert "future_semantics" not in result.model_dump_json()
     assert extras.iteration_calls == 1
     assert extras.items_calls == 1
+
+
+@pytest.mark.parametrize("target_name", ["event", "attribution"])
+def test_reconciliation_rejects_dict_inverse_items_unknown_backing(
+    target_name: str,
+) -> None:
+    event = _event()
+    targets = {
+        "event": event,
+        "attribution": event.attribution,
+    }
+    extras = _InverseItemsExtras({"future_semantics": "reject"})
+    object.__setattr__(targets[target_name], "__pydantic_extra__", extras)
+
+    _assert_canonical_invalid_event(event)
+    assert extras.iteration_calls == 0
+    assert extras.items_calls == 0
 
 
 @pytest.mark.parametrize(
@@ -709,7 +856,7 @@ def test_reconciliation_preserves_inverse_items_required_missing_rejection(
     }
     target = targets[target_name]
     stored_value = target.__dict__.pop(field_name)
-    extras = _InverseItemsExtras({field_name: stored_value})
+    extras = _NonDictInverseItemsExtras({field_name: stored_value})
     object.__setattr__(target, "__pydantic_extra__", extras)
 
     _assert_canonical_invalid_event(event)
