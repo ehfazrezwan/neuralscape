@@ -431,6 +431,24 @@ class _DivergentPublicMapping(Mapping[str, object]):
         return self.public_entries.items()
 
 
+class _DivergentTuple(tuple):
+    """Expose a public iteration view distinct from native tuple storage."""
+
+    def __new__(
+        cls,
+        native_entries: tuple[object, ...],
+        public_entries: tuple[object, ...],
+    ):
+        instance = super().__new__(cls, native_entries)
+        instance.public_entries = public_entries
+        instance.iteration_calls = 0
+        return instance
+
+    def __iter__(self) -> Iterator[object]:
+        self.iteration_calls += 1
+        return iter(self.public_entries)
+
+
 class _TraversalItemsInput(dict[str, object]):
     """Raise immediately or lazily from one public items traversal."""
 
@@ -1290,6 +1308,89 @@ def test_python_prefreeze_keeps_native_dict_and_public_mapping_authority() -> No
     assert public_invalid.items_calls == 1
 
 
+def test_python_prefreeze_retains_native_root_tuple_edges_without_iteration() -> None:
+    result = reconcile_usage_events([_event()])
+    valid_stream = result.streams[0].model_copy()
+    invalid_stream = result.streams[0].model_copy(
+        update={"known_token_subtotal": 0}
+    )
+    payload = result.model_dump(mode="python")
+
+    ordinary_payload = dict(payload)
+    ordinary_payload["streams"] = (invalid_stream,)
+    ordinary_signature = _validation_signature(
+        UsageReconciliation,
+        ordinary_payload,
+    )
+
+    divergent = _DivergentTuple((invalid_stream,), (valid_stream,))
+    divergent_payload = dict(payload)
+    divergent_payload["streams"] = divergent
+    divergent_signature = _validation_signature(
+        UsageReconciliation,
+        divergent_payload,
+    )
+
+    control = _DivergentTuple((valid_stream,), (invalid_stream,))
+    control_payload = dict(payload)
+    control_payload["streams"] = control
+    received = UsageReconciliation.model_validate(control_payload)
+
+    assert divergent_signature == ordinary_signature
+    assert divergent_signature[0][:2] == ("value_error", ("streams", 0))
+    assert divergent.iteration_calls == 0
+    assert control.iteration_calls == 0
+    assert received == result
+
+
+def test_python_prefreeze_retains_nested_native_tuple_edges_without_iteration() -> None:
+    stream = reconcile_usage_events([_event()]).streams[0]
+
+    ordinary_attribution = stream.attribution.model_copy()
+    ordinary_backing = _MODEL_DICT_DESCRIPTOR.__get__(
+        ordinary_attribution,
+        BaseModel,
+    )
+    dict.__setitem__(ordinary_backing, "recipients", ("",))
+    ordinary_payload = stream.model_dump(mode="python")
+    ordinary_payload["attribution"] = ordinary_attribution
+    ordinary_signature = _validation_signature(
+        ReconciledUsageStream,
+        ordinary_payload,
+    )
+
+    divergent = _DivergentTuple(("",), ("provider-1",))
+    divergent_attribution = stream.attribution.model_copy()
+    divergent_backing = _MODEL_DICT_DESCRIPTOR.__get__(
+        divergent_attribution,
+        BaseModel,
+    )
+    dict.__setitem__(divergent_backing, "recipients", divergent)
+    divergent_payload = stream.model_dump(mode="python")
+    divergent_payload["attribution"] = divergent_attribution
+    divergent_signature = _validation_signature(
+        ReconciledUsageStream,
+        divergent_payload,
+    )
+
+    control = _DivergentTuple(("provider-1",), ("",))
+    control_attribution = stream.attribution.model_copy()
+    control_backing = _MODEL_DICT_DESCRIPTOR.__get__(control_attribution, BaseModel)
+    dict.__setitem__(control_backing, "recipients", control)
+    control_payload = stream.model_dump(mode="python")
+    control_payload["attribution"] = control_attribution
+    received = ReconciledUsageStream.model_validate(control_payload)
+
+    assert divergent_signature == ordinary_signature
+    assert divergent_signature[0][:2] == (
+        "string_too_short",
+        ("attribution", "recipients", 0),
+    )
+    assert divergent.iteration_calls == 0
+    assert control.iteration_calls == 0
+    assert received == stream
+
+
 @pytest.mark.parametrize("behavior", ["immediate", "lazy"])
 @pytest.mark.parametrize("receiver_name", ["stream", "result"])
 def test_python_result_root_dict_traversal_errors_remain_validation_errors(
@@ -1575,11 +1676,14 @@ def test_result_snapshot_freezes_root_extras_before_nested_traversal() -> None:
 
     class ClearingTuple(tuple):
         def __iter__(self):
+            self.iteration_calls += 1
             dict.clear(extras)
             return super().__iter__()
 
+    streams = ClearingTuple(result.streams)
+    streams.iteration_calls = 0
     stored = _MODEL_DICT_DESCRIPTOR.__get__(result, BaseModel)
-    dict.__setitem__(stored, "streams", ClearingTuple(result.streams))
+    dict.__setitem__(stored, "streams", streams)
 
     assert tuple(dict.items(extras)) == (("future_constraint", "deny"),)
     assert _validation_signature(UsageReconciliation, result) == [
@@ -1589,7 +1693,8 @@ def test_result_snapshot_freezes_root_extras_before_nested_traversal() -> None:
             "Extra inputs are not permitted",
         )
     ]
-    assert tuple(dict.items(extras)) == ()
+    assert streams.iteration_calls == 0
+    assert tuple(dict.items(extras)) == (("future_constraint", "deny"),)
 
 
 def test_stream_rejects_existing_attribution_with_hidden_extra() -> None:
@@ -1722,6 +1827,7 @@ def test_reconciliation_freezes_parent_extras_before_child_traversal() -> None:
 
     class ClearingRecipients(tuple):
         def __iter__(self) -> Iterator[object]:
+            self.iteration_calls += 1
             dict.clear(parent_extras)
             return super().__iter__()
 
@@ -1732,18 +1838,18 @@ def test_reconciliation_freezes_parent_extras_before_child_traversal() -> None:
         _attribution().model_dump(mode="python")
     )
     attribution_storage = object.__getattribute__(attribution, "__dict__")
-    dict.__setitem__(
-        attribution_storage,
-        "recipients",
-        ClearingRecipients(("provider-1",)),
-    )
+    recipients = ClearingRecipients(("provider-1",))
+    recipients.iteration_calls = 0
+    dict.__setitem__(attribution_storage, "recipients", recipients)
     event = _event().model_copy(update={"attribution": attribution})
     object.__setattr__(event, "__pydantic_extra__", parent_extras)
 
     assert tuple(dict.items(parent_extras)) == (("future_constraint", "deny"),)
     _assert_canonical_invalid_event(event)
-    assert tuple(dict.items(parent_extras)) == ()
+    assert recipients.iteration_calls == 0
+    assert tuple(dict.items(parent_extras)) == (("future_constraint", "deny"),)
 
+    dict.clear(parent_extras)
     result = reconcile_usage_events([event])
     assert result.streams[0].head_event_id == "event-1"
     assert result.streams[0].total_tokens == 15

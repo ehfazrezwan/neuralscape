@@ -33,6 +33,10 @@ _FrozenDictStorage = tuple[
     dict[object, object],
     tuple[tuple[object, object], ...],
 ]
+_FrozenTupleStorage = tuple[
+    tuple[object, ...],
+    tuple[object, ...],
+]
 _LEDGER_ORDER: tuple[UsageLedger, ...] = (
     "service",
     "consuming_agent",
@@ -298,6 +302,7 @@ def _freeze_model_storage(
     value: object,
     frozen_models: dict[int, _FrozenModelStorage],
     frozen_dicts: dict[int, _FrozenDictStorage],
+    frozen_tuples: dict[int, _FrozenTupleStorage],
     visited: set[int],
 ) -> None:
     """Capture reachable native model stores without public traversal hooks."""
@@ -338,6 +343,7 @@ def _freeze_model_storage(
                 field_value,
                 frozen_models,
                 frozen_dicts,
+                frozen_tuples,
                 visited,
             )
         if native_extra_items is not None:
@@ -346,6 +352,7 @@ def _freeze_model_storage(
                     field_value,
                     frozen_models,
                     frozen_dicts,
+                    frozen_tuples,
                     visited,
                 )
         return
@@ -357,13 +364,21 @@ def _freeze_model_storage(
     elif issubclass(value_type, list):
         items = list.__iter__(value)
     elif issubclass(value_type, tuple):
-        items = tuple.__iter__(value)
+        native_items = tuple(tuple.__iter__(value))
+        frozen_tuples[identity] = (value, native_items)
+        items = iter(native_items)
     elif issubclass(value_type, set):
         items = set.__iter__(value)
     else:
         items = frozenset.__iter__(value)
     for item in items:
-        _freeze_model_storage(item, frozen_models, frozen_dicts, visited)
+        _freeze_model_storage(
+            item,
+            frozen_models,
+            frozen_dicts,
+            frozen_tuples,
+            visited,
+        )
 
 
 def _native_snapshot(
@@ -372,6 +387,7 @@ def _native_snapshot(
     *,
     _frozen_models: dict[int, _FrozenModelStorage] | None = None,
     _frozen_dicts: dict[int, _FrozenDictStorage] | None = None,
+    _frozen_tuples: dict[int, _FrozenTupleStorage] | None = None,
 ) -> object:
     """Copy a nested native/model graph without trusting model construction.
 
@@ -379,12 +395,24 @@ def _native_snapshot(
     unchecked model copies so the destination contract can reject them.
     """
 
-    if _frozen_models is None or _frozen_dicts is None:
+    if (
+        _frozen_models is None
+        or _frozen_dicts is None
+        or _frozen_tuples is None
+    ):
         if _frozen_models is None:
             _frozen_models = {}
         if _frozen_dicts is None:
             _frozen_dicts = {}
-        _freeze_model_storage(value, _frozen_models, _frozen_dicts, set())
+        if _frozen_tuples is None:
+            _frozen_tuples = {}
+        _freeze_model_storage(
+            value,
+            _frozen_models,
+            _frozen_dicts,
+            _frozen_tuples,
+            set(),
+        )
     if active is None:
         active = set()
     if not isinstance(
@@ -405,6 +433,7 @@ def _native_snapshot(
                     value,
                     _frozen_models,
                     _frozen_dicts,
+                    _frozen_tuples,
                     set(),
                 )
                 frozen = _frozen_models[identity]
@@ -432,6 +461,7 @@ def _native_snapshot(
                     active,
                     _frozen_models=_frozen_models,
                     _frozen_dicts=_frozen_dicts,
+                    _frozen_tuples=_frozen_tuples,
                 )
                 for name, field_value in stored_items
             }
@@ -443,6 +473,7 @@ def _native_snapshot(
                         active,
                         _frozen_models=_frozen_models,
                         _frozen_dicts=_frozen_dicts,
+                        _frozen_tuples=_frozen_tuples,
                     )
                     for name, field_value in extra_items
                 }
@@ -466,6 +497,7 @@ def _native_snapshot(
                     active,
                     _frozen_models=_frozen_models,
                     _frozen_dicts=_frozen_dicts,
+                    _frozen_tuples=_frozen_tuples,
                 )
                 for key, field_value in source_items
             }
@@ -476,18 +508,30 @@ def _native_snapshot(
                     active,
                     _frozen_models=_frozen_models,
                     _frozen_dicts=_frozen_dicts,
+                    _frozen_tuples=_frozen_tuples,
                 )
                 for item in value
             ]
         if isinstance(value, tuple):
+            frozen_tuple = _frozen_tuples.get(identity)
+            if frozen_tuple is None or frozen_tuple[0] is not value:
+                _freeze_model_storage(
+                    value,
+                    _frozen_models,
+                    _frozen_dicts,
+                    _frozen_tuples,
+                    set(),
+                )
+                frozen_tuple = _frozen_tuples[identity]
             return tuple(
                 _native_snapshot(
                     item,
                     active,
                     _frozen_models=_frozen_models,
                     _frozen_dicts=_frozen_dicts,
+                    _frozen_tuples=_frozen_tuples,
                 )
-                for item in value
+                for item in frozen_tuple[1]
             )
         if isinstance(value, set):
             return {
@@ -496,6 +540,7 @@ def _native_snapshot(
                     active,
                     _frozen_models=_frozen_models,
                     _frozen_dicts=_frozen_dicts,
+                    _frozen_tuples=_frozen_tuples,
                 )
                 for item in value
             }
@@ -505,6 +550,7 @@ def _native_snapshot(
                 active,
                 _frozen_models=_frozen_models,
                 _frozen_dicts=_frozen_dicts,
+                _frozen_tuples=_frozen_tuples,
             )
             for item in value
         )
