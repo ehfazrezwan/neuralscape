@@ -133,11 +133,21 @@ def snapshot_contract_graph(
             except AttributeError:
                 extra = None
             extra_entries: tuple[tuple[object, object], ...] = ()
+            malformed_extra = False
             if extra is not None:
                 extra_type = type(extra)
                 if not issubclass(extra_type, Mapping):
-                    raise ValueError("contract extra storage must be a mapping")
-                extra_entries = _mapping_entries(extra, extra_type)
+                    malformed_extra = True
+                else:
+                    extra_entries = _mapping_entries(extra, extra_type)
+
+            fields = {
+                key: snapshot_contract_graph(item, active_containers)
+                for key, item in stored_entries
+            }
+            if malformed_extra:
+                raise ValueError("contract extra storage must be a mapping")
+            if extra is not None:
                 extra_keys = {key for key, _ in extra_entries}
                 reserved_names = stored_names | declared_names | alias_roots
                 if reserved_names & extra_keys:
@@ -146,10 +156,6 @@ def snapshot_contract_graph(
                     )
                 if len(extra_keys) != len(extra_entries):
                     raise ValueError("contract extra storage contains duplicate keys")
-            fields = {
-                key: snapshot_contract_graph(item, active_containers)
-                for key, item in stored_entries
-            }
             fields.update(
                 {
                     key: snapshot_contract_graph(item, active_containers)

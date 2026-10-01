@@ -1406,6 +1406,50 @@ def test_snapshot_contract_graph_rejects_dict_subclass_backing_cycle() -> None:
         snapshot_contract_graph(value)
 
 
+@pytest.mark.parametrize(
+    "extra_kind",
+    ["malformed", "overlap", "duplicate"],
+)
+def test_snapshot_contract_graph_preserves_stored_cycle_priority(
+    extra_kind: str,
+) -> None:
+    value = ExampleContract(count=1)
+    object.__getattribute__(value, "__dict__")["count"] = value
+    duplicate: DuplicateItemsMapping | None = None
+    if extra_kind == "malformed":
+        extra: object = []
+    elif extra_kind == "overlap":
+        extra = {"count": 1}
+    else:
+        duplicate = DuplicateItemsMapping(
+            (("future_state", 1), ("future_state", 2))
+        )
+        extra = duplicate
+    object.__setattr__(value, "__pydantic_extra__", extra)
+
+    with pytest.raises(ValueError) as raised:
+        snapshot_contract_graph(value)
+
+    assert str(raised.value) == "cyclic contract input is not supported"
+    if duplicate is not None:
+        assert duplicate.item_reads == 1
+
+
+def test_snapshot_contract_graph_preserves_alias_guard_priority() -> None:
+    value = AliasedExampleContract(n=1)
+    stored = object.__getattribute__(value, "__dict__")
+    stored.pop("count")
+    stored["n"] = 9
+    object.__setattr__(value, "__pydantic_extra__", [])
+
+    with pytest.raises(ValueError) as raised:
+        snapshot_contract_graph(value)
+
+    assert str(raised.value) == (
+        "contract input contains conflicting declared and extra fields"
+    )
+
+
 @pytest.mark.parametrize("container_type", [list, dict])
 def test_snapshot_contract_graph_rejects_cycles(container_type: type) -> None:
     value: list[object] | dict[str, object] = container_type()
