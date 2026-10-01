@@ -69,66 +69,127 @@ class TenantReadinessPublication(VersionedContract):
         return self
 
 
-def _snapshot_closed_graph(
-    value: object, active: set[int] | None = None
-) -> object:
+def _snapshot_closed_graph(value: object) -> object:
     """Copy a model/native graph without dropping stored undeclared fields."""
 
-    if active is None:
-        active = set()
-    if not isinstance(value, (BaseModel, dict, list, tuple)):
-        return value
+    frozen: dict[int, tuple[str, object]] = {}
 
-    identity = id(value)
-    if identity in active:
-        raise ValueError("contract input graph must be acyclic")
-    active.add(identity)
-    try:
-        if isinstance(value, BaseModel):
+    def freeze_native_graph(item: object) -> None:
+        """Capture native backing before any overridable protocol is invoked."""
+
+        item_type = type(item)
+        if not (
+            issubclass(item_type, BaseModel)
+            or issubclass(item_type, dict)
+            or issubclass(item_type, list)
+            or issubclass(item_type, tuple)
+        ):
+            return
+
+        identity = id(item)
+        if identity in frozen:
+            return
+
+        if issubclass(item_type, BaseModel):
             stored_entries = tuple(
-                dict.items(_PYDANTIC_DICT_DESCRIPTOR.__get__(value, BaseModel))
+                dict.items(_PYDANTIC_DICT_DESCRIPTOR.__get__(item, BaseModel))
             )
-            declared = type(value).model_fields
-            extras = _model_extra_storage(value)
-            if extras is None:
-                observed_extra_length = 0
-                iterated_extra_names = ()
-                extra_entries = ()
-            elif issubclass(type(extras), dict):
-                extra_entries = tuple(entry for entry in dict.items(extras))
-                observed_extra_length = len(extra_entries)
-                iterated_extra_names = tuple(
-                    name for name, _field_value in extra_entries
-                )
-            elif not isinstance(extras, Mapping):
-                raise ValueError("contract extra storage must be a mapping")
+            extras = _model_extra_storage(item)
+            if extras is not None and issubclass(type(extras), dict):
+                frozen_extras: object = tuple(dict.items(extras))
+                extras_are_native = True
             else:
-                observed_extra_length = len(extras)
-                iterated_extra_names = tuple(name for name in extras)
-                extra_entries = tuple(entry for entry in extras.items())
-            stored_names = {name for name, _field_value in stored_entries}
-            undeclared = stored_names - declared.keys()
-            if (
-                undeclared
-                or observed_extra_length
-                or iterated_extra_names
-                or extra_entries
-            ):
-                raise ValueError("contract input contains undeclared fields")
-            return {
-                name: _snapshot_closed_graph(field_value, active)
-                for name, field_value in stored_entries
-            }
-        if isinstance(value, dict):
-            return {
-                key: _snapshot_closed_graph(field_value, active)
-                for key, field_value in value.items()
-            }
-        if isinstance(value, list):
-            return [_snapshot_closed_graph(item, active) for item in value]
-        return tuple(_snapshot_closed_graph(item, active) for item in value)
-    finally:
-        active.remove(identity)
+                frozen_extras = extras
+                extras_are_native = False
+            frozen[identity] = (
+                "model",
+                (stored_entries, extras_are_native, frozen_extras),
+            )
+            for _name, field_value in stored_entries:
+                freeze_native_graph(field_value)
+            return
+
+        if issubclass(item_type, dict):
+            entries = tuple(dict.items(item))
+            frozen[identity] = ("dict", entries)
+            for _key, field_value in entries:
+                freeze_native_graph(field_value)
+            return
+
+        if issubclass(item_type, list):
+            items = tuple(list.__iter__(item))
+            frozen[identity] = ("list", items)
+        else:
+            items = tuple(tuple.__iter__(item))
+            frozen[identity] = ("tuple", items)
+        for child in items:
+            freeze_native_graph(child)
+
+    freeze_native_graph(value)
+    active: set[int] = set()
+
+    def rebuild(item: object) -> object:
+        item_type = type(item)
+        if not (
+            issubclass(item_type, BaseModel)
+            or issubclass(item_type, dict)
+            or issubclass(item_type, list)
+            or issubclass(item_type, tuple)
+        ):
+            return item
+
+        identity = id(item)
+        if identity in active:
+            raise ValueError("contract input graph must be acyclic")
+        active.add(identity)
+        try:
+            kind, payload = frozen[identity]
+            if kind == "model":
+                stored_entries, extras_are_native, frozen_extras = payload
+                declared = item_type.model_fields
+                if extras_are_native:
+                    extra_entries = frozen_extras
+                    observed_extra_length = len(extra_entries)
+                    iterated_extra_names = tuple(
+                        name for name, _field_value in extra_entries
+                    )
+                elif frozen_extras is None:
+                    observed_extra_length = 0
+                    iterated_extra_names = ()
+                    extra_entries = ()
+                elif not isinstance(frozen_extras, Mapping):
+                    raise ValueError("contract extra storage must be a mapping")
+                else:
+                    observed_extra_length = len(frozen_extras)
+                    iterated_extra_names = tuple(name for name in frozen_extras)
+                    extra_entries = tuple(
+                        entry for entry in frozen_extras.items()
+                    )
+                stored_names = {name for name, _field_value in stored_entries}
+                undeclared = stored_names - declared.keys()
+                if (
+                    undeclared
+                    or observed_extra_length
+                    or iterated_extra_names
+                    or extra_entries
+                ):
+                    raise ValueError("contract input contains undeclared fields")
+                return {
+                    name: rebuild(field_value)
+                    for name, field_value in stored_entries
+                }
+            if kind == "dict":
+                return {
+                    key: rebuild(field_value)
+                    for key, field_value in payload
+                }
+            if kind == "list":
+                return [rebuild(child) for child in payload]
+            return tuple(rebuild(child) for child in payload)
+        finally:
+            active.remove(identity)
+
+    return rebuild(value)
 
 
 def _validated_observation_snapshot(

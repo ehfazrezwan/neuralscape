@@ -186,6 +186,72 @@ def replace_model_storage(
 
 PYDANTIC_DICT_DESCRIPTOR = BaseModel.__dict__["__dict__"]
 PYDANTIC_EXTRA_DESCRIPTOR = BaseModel.__dict__["__pydantic_extra__"]
+PYDANTIC_FIELDS_SET_DESCRIPTOR = BaseModel.__dict__["__pydantic_fields_set__"]
+
+
+class RepairingName(str):
+    def __new__(cls, value: str, repair):
+        instance = super().__new__(cls, value)
+        instance.repair = repair
+        instance.armed = False
+        instance.calls = 0
+        return instance
+
+    def __hash__(self) -> int:
+        if self.armed:
+            self.calls += 1
+            self.repair()
+        return str.__hash__(self)
+
+
+class RepairingTuple(tuple):
+    def __new__(cls, values: tuple[object, ...], repair):
+        instance = super().__new__(cls, values)
+        instance.repair = repair
+        instance.calls = 0
+        return instance
+
+    def __iter__(self):
+        self.calls += 1
+        self.repair()
+        return tuple.__iter__(self)
+
+
+class RepairingList(list):
+    def __init__(self, values: tuple[object, ...], repair) -> None:
+        super().__init__(values)
+        self.repair = repair
+        self.calls = 0
+
+    def __iter__(self):
+        self.calls += 1
+        self.repair()
+        return list.__iter__(self)
+
+
+class RepairingEmptyExtraMapping(Mapping[object, object]):
+    def __init__(self, repair) -> None:
+        self.repair = repair
+        self.calls = 0
+
+    def _run(self) -> None:
+        self.calls += 1
+        self.repair()
+
+    def __getitem__(self, key: object) -> object:
+        raise KeyError(key)
+
+    def __iter__(self):
+        self._run()
+        return iter(())
+
+    def __len__(self) -> int:
+        self._run()
+        return 0
+
+    def items(self):
+        self._run()
+        return ()
 
 
 def model_with_hidden_extra(
@@ -1520,3 +1586,215 @@ def test_generation_uses_safe_counter_bounds(invalid_generation: object) -> None
             placement_generation=invalid_generation,
             resource_manifests=[],
         )
+
+
+def _tenancy_nested_boundary_case(boundary: str):
+    if boundary == "operation":
+        previous = operation(observed_state="pending")
+        candidate = operation(observed_state="running")
+
+        def invoke(value):
+            return validate_operation_transition(previous, value)
+
+    else:
+        candidate = TenantPlacement.model_validate(
+            {
+                "schema_version": VERSION,
+                "tenant_id": "tenant-a",
+                "generation": 7,
+                "resource_manifests": (manifest(),),
+            }
+        )
+
+        def invoke(value):
+            return validate_placement_publication(
+                value,
+                expected_tenant_id="tenant-a",
+                current_generation=7,
+            )
+
+    return candidate, candidate.resource_manifests[0], invoke
+
+
+def _set_native_field(model: BaseModel, name: str, value: object) -> None:
+    native = PYDANTIC_DICT_DESCRIPTOR.__get__(model, BaseModel)
+    dict.__setitem__(native, name, value)
+
+
+def _install_repairing_stored_name(
+    model: BaseModel, repair
+) -> RepairingName:
+    native = PYDANTIC_DICT_DESCRIPTOR.__get__(model, BaseModel)
+    stored_value = dict.__getitem__(native, "schema_version")
+    dict.__delitem__(native, "schema_version")
+    name = RepairingName("schema_version", repair)
+    dict.__setitem__(native, name, stored_value)
+    name.calls = 0
+    name.armed = True
+    return name
+
+
+@pytest.mark.parametrize("boundary", ["operation", "placement"])
+def test_tenancy_boundaries_freeze_nested_models_before_stored_name_hooks(
+    boundary: str,
+) -> None:
+    ordinary, ordinary_child, ordinary_invoke = _tenancy_nested_boundary_case(
+        boundary
+    )
+    _set_native_field(ordinary_child, "manifest_id", "")
+    with pytest.raises(ValidationError):
+        ordinary_invoke(ordinary)
+
+    candidate, child, invoke = _tenancy_nested_boundary_case(boundary)
+    _set_native_field(child, "manifest_id", "")
+    name = _install_repairing_stored_name(
+        candidate,
+        lambda: _set_native_field(child, "manifest_id", "primary"),
+    )
+
+    with pytest.raises(ValidationError):
+        invoke(candidate)
+
+    assert name.calls > 0
+    assert child.manifest_id == "primary"
+
+
+@pytest.mark.parametrize("boundary", ["operation", "placement"])
+def test_tenancy_boundaries_freeze_tuple_backing_before_traversal_hooks(
+    boundary: str,
+) -> None:
+    candidate, child, invoke = _tenancy_nested_boundary_case(boundary)
+    _set_native_field(child, "manifest_id", "")
+    repairing = RepairingTuple(
+        candidate.resource_manifests,
+        lambda: _set_native_field(child, "manifest_id", "primary"),
+    )
+    _set_native_field(candidate, "resource_manifests", repairing)
+
+    with pytest.raises(ValidationError):
+        invoke(candidate)
+
+    assert repairing.calls == 0
+    assert child.manifest_id == ""
+
+
+@pytest.mark.parametrize("boundary", ["operation", "placement"])
+def test_tenancy_boundaries_freeze_nested_models_before_extra_mapping_hooks(
+    boundary: str,
+) -> None:
+    candidate, child, invoke = _tenancy_nested_boundary_case(boundary)
+    _set_native_field(child, "manifest_id", "")
+    extras = RepairingEmptyExtraMapping(
+        lambda: _set_native_field(child, "manifest_id", "primary")
+    )
+    PYDANTIC_EXTRA_DESCRIPTOR.__set__(candidate, extras)
+
+    with pytest.raises(ValidationError):
+        invoke(candidate)
+
+    assert extras.calls == 3
+    assert child.manifest_id == "primary"
+
+
+@pytest.mark.parametrize("boundary", ["operation", "placement"])
+def test_tenancy_boundaries_preserve_strict_list_rejection_without_hooks(
+    boundary: str,
+) -> None:
+    candidate, child, invoke = _tenancy_nested_boundary_case(boundary)
+    _set_native_field(child, "manifest_id", "")
+    repairing = RepairingList(
+        candidate.resource_manifests,
+        lambda: _set_native_field(child, "manifest_id", "primary"),
+    )
+    _set_native_field(candidate, "resource_manifests", repairing)
+
+    with pytest.raises(ValidationError) as exc_info:
+        invoke(candidate)
+
+    assert any(error["type"] == "tuple_type" for error in exc_info.value.errors())
+    assert repairing.calls == 0
+    assert child.manifest_id == ""
+
+
+@pytest.mark.parametrize("boundary", ["operation", "placement"])
+def test_tenancy_boundaries_leave_fields_set_hooks_inert(boundary: str) -> None:
+    candidate, child, invoke = _tenancy_nested_boundary_case(boundary)
+    _set_native_field(child, "manifest_id", "")
+    name = RepairingName(
+        "manifest_id",
+        lambda: _set_native_field(child, "manifest_id", "primary"),
+    )
+    fields_set = PYDANTIC_FIELDS_SET_DESCRIPTOR.__get__(candidate, type(candidate))
+    set.add(fields_set, name)
+    name.calls = 0
+    name.armed = True
+
+    with pytest.raises(ValidationError):
+        invoke(candidate)
+
+    assert name.calls == 0
+    assert child.manifest_id == ""
+
+
+@pytest.mark.parametrize("boundary", ["operation", "placement"])
+def test_tenancy_boundaries_retain_invalid_root_before_name_hook_repair(
+    boundary: str,
+) -> None:
+    candidate, _child, invoke = _tenancy_nested_boundary_case(boundary)
+    _set_native_field(candidate, "tenant_id", "")
+    name = _install_repairing_stored_name(
+        candidate,
+        lambda: _set_native_field(candidate, "tenant_id", "tenant-a"),
+    )
+
+    with pytest.raises(ValidationError):
+        invoke(candidate)
+
+    assert name.calls > 0
+    assert candidate.tenant_id == "tenant-a"
+
+
+@pytest.mark.parametrize("boundary", ["operation", "placement"])
+def test_tenancy_boundaries_preserve_valid_tuple_subclasses(boundary: str) -> None:
+    candidate, _child, invoke = _tenancy_nested_boundary_case(boundary)
+    repairing = RepairingTuple(
+        candidate.resource_manifests,
+        lambda: pytest.fail("native tuple discovery invoked subclass iteration"),
+    )
+    _set_native_field(candidate, "resource_manifests", repairing)
+
+    result = invoke(candidate)
+
+    assert result.resource_manifests[0].manifest_id == "primary"
+    assert repairing.calls == 0
+
+
+@pytest.mark.parametrize("boundary", ["operation", "placement"])
+def test_tenancy_boundaries_preserve_benign_string_subclass_names(
+    boundary: str,
+) -> None:
+    candidate, _child, invoke = _tenancy_nested_boundary_case(boundary)
+    name = _install_repairing_stored_name(candidate, lambda: None)
+
+    result = invoke(candidate)
+
+    assert result.tenant_id == "tenant-a"
+    assert name.calls > 0
+
+
+@pytest.mark.parametrize("boundary", ["operation", "placement"])
+def test_tenancy_boundaries_preserve_absent_fields_set_policy(boundary: str) -> None:
+    candidate, child, invoke = _tenancy_nested_boundary_case(boundary)
+    PYDANTIC_FIELDS_SET_DESCRIPTOR.__delete__(candidate)
+    PYDANTIC_FIELDS_SET_DESCRIPTOR.__delete__(child)
+
+    assert invoke(candidate).tenant_id == "tenant-a"
+
+
+@pytest.mark.parametrize("boundary", ["operation", "placement"])
+def test_tenancy_boundaries_accept_truly_absent_extra_storage(boundary: str) -> None:
+    candidate, child, invoke = _tenancy_nested_boundary_case(boundary)
+    PYDANTIC_EXTRA_DESCRIPTOR.__delete__(candidate)
+    PYDANTIC_EXTRA_DESCRIPTOR.__delete__(child)
+
+    assert invoke(candidate).tenant_id == "tenant-a"

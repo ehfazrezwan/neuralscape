@@ -186,6 +186,72 @@ def replace_model_storage(
 
 PYDANTIC_DICT_DESCRIPTOR = BaseModel.__dict__["__dict__"]
 PYDANTIC_EXTRA_DESCRIPTOR = BaseModel.__dict__["__pydantic_extra__"]
+PYDANTIC_FIELDS_SET_DESCRIPTOR = BaseModel.__dict__["__pydantic_fields_set__"]
+
+
+class RepairingName(str):
+    def __new__(cls, value: str, repair):
+        instance = super().__new__(cls, value)
+        instance.repair = repair
+        instance.armed = False
+        instance.calls = 0
+        return instance
+
+    def __hash__(self) -> int:
+        if self.armed:
+            self.calls += 1
+            self.repair()
+        return str.__hash__(self)
+
+
+class RepairingTuple(tuple):
+    def __new__(cls, values: tuple[object, ...], repair):
+        instance = super().__new__(cls, values)
+        instance.repair = repair
+        instance.calls = 0
+        return instance
+
+    def __iter__(self):
+        self.calls += 1
+        self.repair()
+        return tuple.__iter__(self)
+
+
+class RepairingList(list):
+    def __init__(self, values: tuple[object, ...], repair) -> None:
+        super().__init__(values)
+        self.repair = repair
+        self.calls = 0
+
+    def __iter__(self):
+        self.calls += 1
+        self.repair()
+        return list.__iter__(self)
+
+
+class RepairingEmptyExtraMapping(Mapping[object, object]):
+    def __init__(self, repair) -> None:
+        self.repair = repair
+        self.calls = 0
+
+    def _run(self) -> None:
+        self.calls += 1
+        self.repair()
+
+    def __getitem__(self, key: object) -> object:
+        raise KeyError(key)
+
+    def __iter__(self):
+        self._run()
+        return iter(())
+
+    def __len__(self) -> int:
+        self._run()
+        return 0
+
+    def items(self):
+        self._run()
+        return ()
 
 
 def model_with_hidden_extra(
@@ -1358,3 +1424,197 @@ def test_version_and_unknown_status_are_rejected() -> None:
         )
     with pytest.raises(ValidationError):
         observation(status="process_running")
+
+
+def _set_native_field(model: BaseModel, name: str, value: object) -> None:
+    native = PYDANTIC_DICT_DESCRIPTOR.__get__(model, BaseModel)
+    dict.__setitem__(native, name, value)
+
+
+def _install_repairing_stored_name(
+    model: BaseModel, repair
+) -> RepairingName:
+    native = PYDANTIC_DICT_DESCRIPTOR.__get__(model, BaseModel)
+    stored_value = dict.__getitem__(native, "schema_version")
+    dict.__delitem__(native, "schema_version")
+    name = RepairingName("schema_version", repair)
+    dict.__setitem__(native, name, stored_value)
+    name.calls = 0
+    name.armed = True
+    return name
+
+
+def _validate_publication(candidate: TenantReadinessPublication):
+    return validate_readiness_publication(
+        candidate,
+        expected_tenant_id="tenant-a",
+        current_placement_generation=12,
+    )
+
+
+def test_readiness_publication_freezes_nested_model_before_stored_name_hook() -> None:
+    ordinary = publication()
+    _set_native_field(ordinary.capabilities[0], "capability", "")
+    with pytest.raises(ValidationError):
+        _validate_publication(ordinary)
+
+    candidate = publication()
+    child = candidate.capabilities[0]
+    _set_native_field(child, "capability", "")
+    name = _install_repairing_stored_name(
+        candidate,
+        lambda: _set_native_field(child, "capability", "api_acceptance"),
+    )
+
+    with pytest.raises(ValidationError):
+        _validate_publication(candidate)
+
+    assert name.calls > 0
+    assert child.capability == "api_acceptance"
+
+
+def test_readiness_publication_freezes_tuple_before_traversal_hook() -> None:
+    candidate = publication()
+    child = candidate.capabilities[0]
+    _set_native_field(child, "capability", "")
+    repairing = RepairingTuple(
+        candidate.capabilities,
+        lambda: _set_native_field(child, "capability", "api_acceptance"),
+    )
+    _set_native_field(candidate, "capabilities", repairing)
+
+    with pytest.raises(ValidationError):
+        _validate_publication(candidate)
+
+    assert repairing.calls == 0
+    assert child.capability == ""
+
+
+def test_readiness_publication_freezes_nested_model_before_extra_mapping_hook() -> None:
+    candidate = publication()
+    child = candidate.capabilities[0]
+    _set_native_field(child, "capability", "")
+    extras = RepairingEmptyExtraMapping(
+        lambda: _set_native_field(child, "capability", "api_acceptance")
+    )
+    PYDANTIC_EXTRA_DESCRIPTOR.__set__(candidate, extras)
+
+    with pytest.raises(ValidationError):
+        _validate_publication(candidate)
+
+    assert extras.calls == 3
+    assert child.capability == "api_acceptance"
+
+
+def test_readiness_publication_preserves_strict_list_rejection_without_hook() -> None:
+    candidate = publication()
+    child = candidate.capabilities[0]
+    _set_native_field(child, "capability", "")
+    repairing = RepairingList(
+        candidate.capabilities,
+        lambda: _set_native_field(child, "capability", "api_acceptance"),
+    )
+    _set_native_field(candidate, "capabilities", repairing)
+
+    with pytest.raises(ValidationError) as exc_info:
+        _validate_publication(candidate)
+
+    assert any(error["type"] == "tuple_type" for error in exc_info.value.errors())
+    assert repairing.calls == 0
+    assert child.capability == ""
+
+
+def test_readiness_publication_leaves_fields_set_hook_inert() -> None:
+    candidate = publication()
+    child = candidate.capabilities[0]
+    _set_native_field(child, "capability", "")
+    name = RepairingName(
+        "capability",
+        lambda: _set_native_field(child, "capability", "api_acceptance"),
+    )
+    fields_set = PYDANTIC_FIELDS_SET_DESCRIPTOR.__get__(candidate, type(candidate))
+    set.add(fields_set, name)
+    name.calls = 0
+    name.armed = True
+
+    with pytest.raises(ValidationError):
+        _validate_publication(candidate)
+
+    assert name.calls == 0
+    assert child.capability == ""
+
+
+def test_readiness_publication_retains_invalid_root_before_name_hook_repair() -> None:
+    candidate = publication()
+    _set_native_field(candidate, "tenant_id", "")
+    name = _install_repairing_stored_name(
+        candidate,
+        lambda: _set_native_field(candidate, "tenant_id", "tenant-a"),
+    )
+
+    with pytest.raises(ValidationError):
+        _validate_publication(candidate)
+
+    assert name.calls > 0
+    assert candidate.tenant_id == "tenant-a"
+
+
+def test_capability_receiver_retains_invalid_scalar_before_name_hook_repair() -> None:
+    candidate = observation()
+    _set_native_field(candidate, "capability", "")
+    name = _install_repairing_stored_name(
+        candidate,
+        lambda: _set_native_field(candidate, "capability", "exact_reads"),
+    )
+
+    with pytest.raises(ValidationError):
+        evaluate(candidate)
+
+    assert name.calls > 0
+    assert candidate.capability == "exact_reads"
+
+
+def test_readiness_publication_preserves_valid_tuple_subclass() -> None:
+    candidate = publication()
+    repairing = RepairingTuple(
+        candidate.capabilities,
+        lambda: pytest.fail("native tuple discovery invoked subclass iteration"),
+    )
+    _set_native_field(candidate, "capabilities", repairing)
+
+    result = _validate_publication(candidate)
+
+    assert result.capabilities[0].capability == "api_acceptance"
+    assert repairing.calls == 0
+
+
+def test_readiness_publication_preserves_benign_string_subclass_name() -> None:
+    candidate = publication()
+    name = _install_repairing_stored_name(candidate, lambda: None)
+
+    result = _validate_publication(candidate)
+
+    assert result.tenant_id == "tenant-a"
+    assert name.calls > 0
+
+
+def test_readiness_boundaries_preserve_absent_fields_set_policy() -> None:
+    candidate = publication()
+    child = candidate.capabilities[0]
+    PYDANTIC_FIELDS_SET_DESCRIPTOR.__delete__(candidate)
+    PYDANTIC_FIELDS_SET_DESCRIPTOR.__delete__(child)
+
+    assert _validate_publication(candidate).tenant_id == "tenant-a"
+
+    item = observation()
+    PYDANTIC_FIELDS_SET_DESCRIPTOR.__delete__(item)
+    assert evaluate(item)
+
+
+def test_readiness_publication_accepts_truly_absent_extra_storage() -> None:
+    candidate = publication()
+    child = candidate.capabilities[0]
+    PYDANTIC_EXTRA_DESCRIPTOR.__delete__(candidate)
+    PYDANTIC_EXTRA_DESCRIPTOR.__delete__(child)
+
+    assert _validate_publication(candidate).tenant_id == "tenant-a"
