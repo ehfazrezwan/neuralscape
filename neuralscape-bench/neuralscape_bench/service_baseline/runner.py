@@ -160,8 +160,14 @@ def host_facts() -> dict[str, Any]:
 TOKEN_SECRET = "bench-token-secret"
 # Durability arms: environment passed to the compose stack.
 PG_OWNER_PASSWORD = "bench-owner-password"
+PG_RUNTIME_PASSWORD = "bench-runtime-password"
 PG_DSN = "host=pg dbname=postgres user=ns_owner password=" + PG_OWNER_PASSWORD + " options='-c search_path={schema}'"
+PG_RUNTIME_DSN = "host=pg dbname=postgres user=ns_runtime password=" + PG_RUNTIME_PASSWORD + " options='-c search_path={schema}'"
 ARMS: dict[str, dict[str, str]] = {
+    # Least-privilege runtime role: the owner migrates and grants beforehand (images that support it).
+    "ledger-pg-rt": {"LEDGER_ENABLED": "true", "LEDGER_BACKEND": "postgres",
+                     "LEDGER_POSTGRES_DSN": PG_RUNTIME_DSN.format(schema="ledger"),
+                     "LEDGER_POSTGRES_MIGRATE_ON_OPEN": "false"},
     "plain-w2": {"UVICORN_WORKERS": "2"},
     "plain-w4": {"UVICORN_WORKERS": "4"},
     "ledger-pg": {"LEDGER_ENABLED": "true", "LEDGER_BACKEND": "postgres",
@@ -191,6 +197,13 @@ def start_postgres(env: dict[str, str]) -> None:
         "CREATE SCHEMA ledger AUTHORIZATION ns_owner; CREATE SCHEMA authority AUTHORIZATION ns_owner;"
     )
     compose("exec", "-T", "pg", "psql", "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-c", statements, env=env)
+    if env.get("LEDGER_POSTGRES_MIGRATE_ON_OPEN") == "false":
+        compose("exec", "-T", "pg", "psql", "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-c",
+                f"CREATE ROLE ns_runtime LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD '{PG_RUNTIME_PASSWORD}'", env=env)
+        owner_dsn = PG_DSN.format(schema="ledger")
+        for action, extra in (("migrate", []), ("grant", ["--role", "ns_runtime"]), ("check", ["--role", "ns_runtime"])):
+            compose("run", "--rm", "--no-deps", "--workdir", "/app/neuralscape-service", "--entrypoint", "python", "seed",
+                    "-m", "ledger.admin", action, "--ledger-dsn", owner_dsn, *extra, env=env)
 
 
 def backend_evidence(env: dict[str, str]) -> dict[str, Any]:
@@ -207,6 +220,14 @@ def backend_evidence(env: dict[str, str]) -> dict[str, Any]:
                                         if "durable ledger enabled" in ln][:2]
     except Exception as error:  # noqa: BLE001 - evidence gathering must not fail a run
         evidence["ledger_log_error"] = str(error)[:200]
+    if env.get("LEDGER_ENABLED") == "true":
+        try:
+            names = compose("exec", "-T", "redis", "redis-cli", "--scan", "--pattern", "arq:result:ledger-wake:*", env=env).split()
+            queued = compose("exec", "-T", "redis", "redis-cli", "zcard", "neuralscape:queue:ledger", env=env).strip()
+            intents = {n.split("ledger-wake:", 1)[1].rsplit(":", 1)[0] for n in names}
+            evidence["wake_jobs"] = {"results": len(names), "distinct_intents": len(intents), "still_queued": int(queued or 0)}
+        except Exception as error:  # noqa: BLE001
+            evidence["wake_jobs_error"] = str(error)[:200]
     if env.get("AUTHORITY_ENABLED") == "true":
         try:
             if env.get("AUTHORITY_BACKEND") == "postgres":

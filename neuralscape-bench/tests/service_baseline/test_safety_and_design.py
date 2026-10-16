@@ -106,3 +106,20 @@ def test_worker_scaling_arms_only_change_the_api_process_count():
 
     assert ARMS["plain-w2"] == {"UVICORN_WORKERS": "2"} and ARMS["plain-w4"] == {"UVICORN_WORKERS": "4"}
     assert ARMS["plain"] == {}
+
+
+def test_wake_jobs_are_counted_per_intent_and_the_runtime_role_arm_is_least_privilege(monkeypatch):
+    from neuralscape_bench.service_baseline import runner
+
+    def fake_compose(*args, env):
+        if args[:2] == ("logs", "--no-color"):
+            return ""
+        if args[-1] == "arq:result:ledger-wake:*":
+            return "arq:result:ledger-wake:intent-a:1.1\narq:result:ledger-wake:intent-b:2.1\narq:result:ledger-wake:intent-b:3.1\n"
+        return "0\n"
+
+    monkeypatch.setattr(runner, "compose", fake_compose)
+    wake = runner.backend_evidence({"LEDGER_ENABLED": "true"})["wake_jobs"]
+    assert wake == {"results": 3, "distinct_intents": 2, "still_queued": 0}
+    rt = runner.ARMS["ledger-pg-rt"]
+    assert "user=ns_runtime" in rt["LEDGER_POSTGRES_DSN"] and rt["LEDGER_POSTGRES_MIGRATE_ON_OPEN"] == "false"
