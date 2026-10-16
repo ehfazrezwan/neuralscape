@@ -4226,3 +4226,86 @@ def test_pair_reading_raises_exactly_what_unpacking_raises(value) -> None:
     with pytest.raises(Exception) as caught:
         _open_pair(value)
     assert (type(caught.value), str(caught.value)) == expected
+
+
+# ── completion does not charge again what discovery already charged ─────────
+
+
+def _large_policy(members: int, per: int = 25) -> AccessPolicy:
+    statements, versions = [], []
+    for member in range(members):
+        subject = f"subject-{member:04d}"
+        versions.append(MembershipVersion(subject_id=subject, version=1))
+        statements.extend(
+            PolicyStatement(id=f"s-{member}-{i}", effect="allow", subject_id=subject, credential_id=None,
+                            action="read", resource=reference(f"memory-{i}"))
+            for i in range(per)
+        )
+    return AccessPolicy(schema_version=VERSION, tenant_id="tenant-a", policy_epoch=1,
+                        membership_versions=tuple(versions), statements=tuple(statements))
+
+
+def _charged_edges(policy_value) -> tuple[int, int]:
+    """(edges charged by the whole call, edges charged by discovery alone)."""
+
+    import contracts_policy_reference as module
+
+    budgets = []
+    original = module.DiscoveryBudget.__init__
+
+    def recording(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        budgets.append(self)
+
+    module.DiscoveryBudget.__init__ = recording
+    try:
+        evaluate(principal(subject_id="subject-0000", membership_version=1), "read", reference("memory-0"), policy_value)
+        whole = budgets[0].edges
+        discovery = DiscoveryBudget()
+        _freeze_reachable_model_inventories(policy_value, {}, set(), None, {}, discovery)
+    finally:
+        module.DiscoveryBudget.__init__ = original
+    return whole, discovery.edges
+
+
+def test_a_native_policy_is_charged_about_once_not_once_per_phase() -> None:
+    whole, discovery = _charged_edges(_large_policy(40))
+    # every native edge is paid once, at discovery; completion's first copy adds only what
+    # discovery could not see (the other two roots, a handful of edges)
+    assert whole <= discovery * 1.1, (whole, discovery)
+
+
+def test_a_policy_of_7500_statements_fits_the_standard_budget() -> None:
+    """Charging each edge once leaves room for richer statements: 300 members with 25
+    statements each (7,500 statements) fits.  The node limit (one per object) now binds first,
+    at about 321 members of this shape."""
+
+    decision = evaluate(principal(subject_id="subject-0000", membership_version=1), "read",
+                        reference("memory-0"), _large_policy(300))
+    assert decision.outcome == "allow"
+
+
+def test_a_re_copied_impure_subtree_is_still_charged_per_copy() -> None:
+    """A native tuple holding an empty public view is impure, so it is rebuilt on every path:
+    each re-copy is charged, so a diamond of such tuples is refused."""
+
+    class EmptyView(tuple):
+        def __iter__(self):
+            return iter(())
+
+    node: object = (EmptyView(),)
+    for _ in range(40):
+        node = (node, node, EmptyView())
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _complete_contract_input(node, set(), {}, {})
+
+
+def test_a_container_first_seen_through_a_public_view_is_charged_when_copied() -> None:
+    inner = list(range(STANDARD_MAX_EDGES // 2 + 1000))
+
+    class View(tuple):
+        def __iter__(self):
+            return iter((inner, list(inner)))  # two lists only the public view exposes
+
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _complete_contract_input(View(), set(), {}, {})

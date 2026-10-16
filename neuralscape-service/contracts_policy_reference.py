@@ -708,6 +708,23 @@ def _native_entries(
 
 _DEEPEST = "deepest"  # memo bookkeeping keys (the memo's other keys are object ids)
 _IMPURE = "impure"
+_PAID = "paid"  # ids of native containers whose entries discovery already charged
+_COPIED = "copied"  # ids of containers completion has copied at least once
+
+
+def _first_paid_copy(memo: dict[object, Any], value: object, paid: bool) -> bool:
+    """Whether copying ``value`` now needs no edge charges.
+
+    Discovery charges every entry of a container it walks.  The first copy of that container
+    replays exactly those entries, so charging them again would count each edge twice.  Any
+    later copy (an impure subtree rebuilt on another path) is new work and is charged in full,
+    which is what bounds exponential re-copying.
+    """
+
+    copied = memo.setdefault(_COPIED, set())
+    first = id(value) not in copied
+    copied.add(id(value))
+    return first and paid
 _REUSED = "reused"  # how many times a finished native subtree was shared between paths
 
 
@@ -810,7 +827,7 @@ def _complete_contract_input(
             inventory = _validated_model_inventory(value, inventories)
             if inventory is None:
                 _freeze_reachable_model_inventories(
-                    value, inventories, set(), None, mapping_inventories, budget, depth
+                    value, inventories, memo.setdefault(_PAID, set()), None, mapping_inventories, budget, depth
                 )
                 inventory = _validated_model_inventory(value, inventories)
                 if inventory is None:
@@ -876,8 +893,10 @@ def _complete_contract_input(
                     stored_values[field_name] = None
 
             completed_model: dict[object, object] = {}
+            free = _first_paid_copy(memo, value, True)  # a captured model's entries were charged
             for key, item in stored_values.items():
-                budget.charge_edge()  # one stack frame per level: no helper closure
+                if not free:
+                    budget.charge_edge()  # one stack frame per level: no helper closure
                 completed_model[key] = _complete_contract_input(
                     item, active_ids, inventories, mapping_inventories, budget, depth + 1, memo
                 )
@@ -900,8 +919,10 @@ def _complete_contract_input(
         try:
             budget.visit(value, depth, True)
             # Keys are deliberately not stringified or otherwise normalized.
+            paid = True  # a public mapping's pairs were charged as it was captured
             if _is_native_dict(value):
                 retained_dict = _validated_mapping_inventory(value, mapping_inventories)
+                paid = retained_dict is not None and identity in memo.get(_PAID, ())
                 if retained_dict is None:
                     # First met here, through a public view: this read is its first
                     # observation, kept for every later edge that reaches the same dict.
@@ -919,6 +940,7 @@ def _complete_contract_input(
                     budget,
                 )
             completed: dict[object, object] = {}
+            free = _first_paid_copy(memo, value, paid)
             for entry in entries:
                 retained = cast(
                     _MappingEntry,
@@ -931,7 +953,8 @@ def _complete_contract_input(
                     key = str.__str__(key)
                     if key in completed:
                         raise ValueError("contract input mapping has colliding keys")
-                budget.charge_edge()  # one stack frame per level: no helper closure
+                if not free:
+                    budget.charge_edge()  # one stack frame per level: no helper closure
                 completed[key] = _complete_contract_input(
                     retained.value, active_ids, inventories, mapping_inventories, budget, depth + 1, memo
                 )
@@ -950,8 +973,13 @@ def _complete_contract_input(
         try:
             budget.visit(value, depth, True)
             completed_list: list[object] = []
+            # an exact list discovery walked was charged entry by entry; a public view never was
+            free = _first_paid_copy(
+                memo, value, is_exact_type(value, list) and identity in memo.get(_PAID, ())
+            )
             for item in value:  # the public iterator: every item it yields is charged
-                budget.charge_edge()  # one stack frame per level: no helper closure
+                if not free:
+                    budget.charge_edge()  # one stack frame per level: no helper closure
                 completed_list.append(
                     _complete_contract_input(
                         item, active_ids, inventories, mapping_inventories, budget, depth + 1, memo
@@ -972,8 +1000,12 @@ def _complete_contract_input(
         try:
             budget.visit(value, depth, True)
             completed_items: list[object] = []
+            free = _first_paid_copy(
+                memo, value, is_exact_type(value, tuple) and identity in memo.get(_PAID, ())
+            )
             for item in value:  # the public iterator: every item it yields is charged
-                budget.charge_edge()  # one stack frame per level: no helper closure
+                if not free:
+                    budget.charge_edge()  # one stack frame per level: no helper closure
                 completed_items.append(
                     _complete_contract_input(
                         item, active_ids, inventories, mapping_inventories, budget, depth + 1, memo
@@ -995,8 +1027,9 @@ def _validated_principal_snapshot(
     inventories: dict[int, _ModelInventory],
     mapping_inventories: dict[int, _MappingInventory],
     budget: DiscoveryBudget | None = None,
+    paid: set[int] | None = None,
 ) -> PrincipalContext:
-    memo: dict[object, Any] = {}
+    memo: dict[object, Any] = {} if paid is None else {_PAID: paid}
     native = _complete_contract_input(
         principal, set(), inventories, mapping_inventories, budget, 0, memo
     )
@@ -1008,8 +1041,9 @@ def _validated_evaluation_snapshot(
     inventories: dict[int, _ModelInventory],
     mapping_inventories: dict[int, _MappingInventory],
     budget: DiscoveryBudget | None = None,
+    paid: set[int] | None = None,
 ) -> PolicyEvaluationInput:
-    memo: dict[object, Any] = {}
+    memo: dict[object, Any] = {} if paid is None else {_PAID: paid}
     native = _complete_contract_input(
         evaluation, set(), inventories, mapping_inventories, budget, 0, memo
     )
@@ -1021,8 +1055,9 @@ def _validated_policy_snapshot(
     inventories: dict[int, _ModelInventory],
     mapping_inventories: dict[int, _MappingInventory],
     budget: DiscoveryBudget | None = None,
+    paid: set[int] | None = None,
 ) -> AccessPolicy:
-    memo: dict[object, Any] = {}
+    memo: dict[object, Any] = {} if paid is None else {_PAID: paid}
     native = _complete_contract_input(
         policy, set(), inventories, mapping_inventories, budget, 0, memo
     )
@@ -1107,18 +1142,21 @@ def evaluate_policy(
         inventories,
         mapping_inventories,
         budget,
+        visited_containers,
     )
     evaluation = _validated_evaluation_snapshot(
         evaluation,
         inventories,
         mapping_inventories,
         budget,
+        visited_containers,
     )
     policy = _validated_policy_snapshot(
         policy,
         inventories,
         mapping_inventories,
         budget,
+        visited_containers,
     )
 
     action = evaluation.action
@@ -1241,7 +1279,7 @@ def validate_policy_decision(decision: PolicyDecision) -> PolicyDecision:
         reach,
     )
     mapping_inventories.update(native_dicts)
-    memo: dict[object, Any] = {}
+    memo: dict[object, Any] = {_PAID: visited_containers}
     native = _complete_contract_input(
         decision, set(), inventories, mapping_inventories, budget, 0, memo
     )
