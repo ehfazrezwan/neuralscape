@@ -950,8 +950,13 @@ def _zip64_tail(cd: bytes, *, declared: int, extensible: int = 0) -> bytes:
 _U32 = 0xFFFFFFFF
 
 
-def _refused_before_parsing(path, monkeypatch, *, limit: int = 2, codes=None) -> None:
-    assert len(zipfile.ZipFile(path).infolist()) > limit  # the parser itself would read every record
+def _refused_before_parsing(path, monkeypatch, *, limit: int = 2, codes=None, parser_may_refuse: bool = False) -> None:
+    try:
+        assert len(zipfile.ZipFile(path).infolist()) > limit  # the parser itself would read every record
+    except zipfile.BadZipFile:
+        # Some layouts are accepted by one interpreter's parser and refused by another's (its search for
+        # the end record differs between patch releases); the precheck must refuse them on every one.
+        assert parser_may_refuse, "the parser refused a layout the test expects it to read"
     monkeypatch.setattr(pv, "MAX_BUNDLE_ENTRIES", limit)
     monkeypatch.setattr(pv.zipfile, "ZipFile", lambda *a, **k: pytest.fail("parsed before the precheck refused it"))
     found = _codes(verify_bundle(path))
@@ -969,7 +974,7 @@ def test_an_end_record_at_the_edge_of_the_parsers_search_window_is_refused_befor
     cd = _central_records(5)
     path = tmp_path / "b.zip"
     path.write_bytes(cd + _end_record(5, len(cd), 0, b"c" * 0xFFFF) + b"x")
-    _refused_before_parsing(path, monkeypatch, codes={pv.ARCHIVE_FRAMING})
+    _refused_before_parsing(path, monkeypatch, codes={pv.ARCHIVE_FRAMING}, parser_may_refuse=True)
 
 
 def test_any_archive_comment_is_refused_before_parsing(tmp_path, monkeypatch) -> None:
@@ -1251,3 +1256,66 @@ def test_ordinary_end_fields_equal_to_the_zip64_record_verify(tmp_path, monkeypa
     path = _zip64_end_record_archive(tmp_path, monkeypatch)  # Python writes the real values where they fit
     report = verify_bundle(path)
     assert report.ok, _codes(report)
+
+
+# ---- the precheck never depends on the parser's end-record search; one open file for every read
+
+
+def test_the_precheck_never_consults_the_parsers_end_record_search(tmp_path, monkeypatch) -> None:
+    def forbidden(*args, **kwargs):
+        raise AssertionError("the precheck used the archive library's end-record search")
+
+    monkeypatch.setattr(zipfile, "_EndRecData", forbidden)
+    monkeypatch.setattr(zipfile, "_EndRecData64", forbidden)
+    cd = _central_records(5)
+    layouts = {
+        "edge of a search window": (cd + _end_record(5, len(cd), 0, b"c" * 0xFFFF) + b"x", False),
+        "comment": (cd + _end_record(5, len(cd), 0, b"a comment"), False),
+        "trailing byte": (cd + _end_record(5, len(cd), 0) + b"x", False),
+        "strict layout": (cd + _end_record(5, len(cd), 0), True),
+    }
+    for name, (data, accepted) in layouts.items():
+        path = tmp_path / f"{len(data)}.zip"
+        path.write_bytes(data)
+        report = pv.VerificationReport()
+        assert pv._precheck_central_directory(str(path), report) is accepted, (name, _codes(report))
+        if not accepted:
+            assert _codes(report) == {pv.ARCHIVE_FRAMING}, (name, _codes(report))
+
+
+def _many_entry_archive(path: Path, count: int) -> Path:
+    with zipfile.ZipFile(path, "w") as archive:
+        for i in range(count):
+            archive.writestr(f"extra/{i}.txt", b"x")
+    return path
+
+
+def test_replacing_the_path_after_the_precheck_cannot_change_what_is_parsed(tmp_path, monkeypatch) -> None:
+    path = _write_zip(tmp_path / "b.zip", PAYLOAD)  # a valid bundle of three entries
+    replacement = _many_entry_archive(tmp_path / "other.zip", 6)
+    monkeypatch.setattr(pv, "MAX_BUNDLE_ENTRIES", 3)
+    real_precheck, real_zipfile = pv._precheck_central_directory, pv.zipfile.ZipFile
+    parsed: list[int] = []
+
+    def precheck_then_swap(source, report):
+        accepted = real_precheck(source, report)
+        os.replace(replacement, path)  # an attacker swaps the pathname right after the check
+        return accepted
+
+    def counting_zipfile(*args, **kwargs):
+        archive = real_zipfile(*args, **kwargs)
+        parsed.append(len(archive.infolist()))
+        return archive
+
+    monkeypatch.setattr(pv, "_precheck_central_directory", precheck_then_swap)
+    monkeypatch.setattr(pv.zipfile, "ZipFile", counting_zipfile)
+    report = verify_bundle(path)
+    assert parsed == [3]  # the parser read the checked bytes, never the six-entry replacement
+    assert report.ok, _codes(report)
+
+
+def test_a_bundle_path_that_is_not_a_regular_file_when_opened_is_refused(tmp_path) -> None:
+    fifo = tmp_path / "bundle.zip"
+    os.mkfifo(fifo)
+    report = verify_bundle(fifo)  # must not block waiting for a writer
+    assert _codes(report) == {pv.CONTAINER_UNREADABLE}

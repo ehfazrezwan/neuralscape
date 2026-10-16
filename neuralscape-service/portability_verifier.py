@@ -739,7 +739,7 @@ _ZIP64_LOCATOR = struct.Struct("<4sIQI")
 _CENTRAL_RECORD_SIZE = 46
 
 
-def _precheck_central_directory(target: str, report: VerificationReport) -> bool:
+def _precheck_central_directory(target: str | os.PathLike[str] | BinaryIO, report: VerificationReport) -> bool:
     """Bound and locate the central directory before the archive is parsed, or refuse the archive.
 
     The archive library reads the whole central directory and allocates one record object per
@@ -749,7 +749,8 @@ def _precheck_central_directory(target: str, report: VerificationReport) -> bool
     it only if that reading is unambiguous; anything else is refused here, before parsing:
 
     * the last 22 bytes must be the end record with no comment (the library's first choice; a
-      comment is refused anyway by the framing check);
+      comment is refused anyway by the framing check).  Nothing here depends on how far a given
+      interpreter's parser searches for an end record: any other layout is refused;
     * when a zip64 locator sits directly before it (the library then always uses zip64), the zip64
       end record must be where the locator points and end exactly at the locator, and each ordinary
       end-record field must be its zip64 sentinel or exactly the zip64 value (readers that use the
@@ -770,61 +771,69 @@ def _precheck_central_directory(target: str, report: VerificationReport) -> bool
             report.add(code)
         return False
 
+    if isinstance(target, (str, bytes, os.PathLike)):
+        try:
+            with open(target, "rb") as opened:
+                return _precheck_central_directory(opened, report)
+        except OSError:
+            report.add(CONTAINER_UNREADABLE, "<bundle>")
+            return False
+    raw = target  # the same open file the parser and the raw reads use afterwards
     try:
-        with open(target, "rb") as raw:
-            raw.seek(0, os.SEEK_END)
-            size = raw.tell()
-            # The library searches this window for an end record; with none in it the file is not an archive.
-            window = min(size, _EOCD.size + (1 << 16))
-            raw.seek(size - window)
-            tail = raw.read(window)
-            if _EOCD_SIGNATURE not in tail or size < _EOCD.size:
-                report.add(CONTAINER_UNREADABLE, "<bundle>")
-                return False
-            eocd_at = size - _EOCD.size
-            (signature, disk, cd_disk, entries_here, entries, cd_size, cd_offset, comment_length) = (
-                _EOCD.unpack(tail[-_EOCD.size:])
-            )
-            if signature != _EOCD_SIGNATURE or comment_length != 0:
-                return refuse(ARCHIVE_FRAMING, "trailing data or archive comment after the end record")
-            ordinary = (disk, cd_disk, entries_here, entries, cd_size, cd_offset)
-            locator = b""
-            if eocd_at >= _ZIP64_LOCATOR.size:
-                raw.seek(eocd_at - _ZIP64_LOCATOR.size)
-                locator = raw.read(_ZIP64_LOCATOR.size)
-            if locator[:4] == _ZIP64_LOCATOR_SIGNATURE:
-                locator_at = eocd_at - _ZIP64_LOCATOR.size
-                _sig, locator_disk, record_at, disks = _ZIP64_LOCATOR.unpack(locator)
-                if locator_disk != 0 or disks != 1:
-                    return refuse(ARCHIVE_FRAMING, "multi-disk archive")
-                if record_at + _ZIP64_RECORD.size > locator_at:
-                    return refuse(ARCHIVE_FRAMING, "bad zip64 end record")
-                raw.seek(record_at)
-                record = raw.read(_ZIP64_RECORD.size)
-                (record_signature, record_size, _made, _needed, disk, cd_disk,
-                 entries_here, entries, cd_size, cd_offset) = _ZIP64_RECORD.unpack(record)
-                # The record (with any extensible data it declares) must end exactly at the locator.
-                if record_signature != _ZIP64_EOCD_SIGNATURE or record_at + 12 + record_size != locator_at:
-                    return refuse(ARCHIVE_FRAMING, "bad zip64 end record")
-                if not _end_record_agrees(ordinary, (disk, cd_disk, entries_here, entries, cd_size, cd_offset)):
-                    return refuse(ARCHIVE_FRAMING, "end record disagrees with the zip64 end record")
-                directory_end = record_at
-            else:
-                if entries == 0xFFFF or entries_here == 0xFFFF or cd_size == _U32_MAX or cd_offset == _U32_MAX:
-                    return refuse(ARCHIVE_FRAMING, "missing zip64 locator")
-                directory_end = eocd_at
-            if disk != 0 or cd_disk != 0 or entries_here != entries:
+        raw.seek(0, os.SEEK_END)
+        size = raw.tell()
+        # Whatever window an interpreter's parser searches, only the strict layout is accepted below;
+        # this tail only decides how a refusal is reported (no end record anywhere: not an archive).
+        window = min(size, _EOCD.size + (1 << 16))
+        raw.seek(size - window)
+        tail = raw.read(window)
+        if _EOCD_SIGNATURE not in tail or size < _EOCD.size:
+            report.add(CONTAINER_UNREADABLE, "<bundle>")
+            return False
+        eocd_at = size - _EOCD.size
+        (signature, disk, cd_disk, entries_here, entries, cd_size, cd_offset, comment_length) = (
+            _EOCD.unpack(tail[-_EOCD.size:])
+        )
+        if signature != _EOCD_SIGNATURE or comment_length != 0:
+            return refuse(ARCHIVE_FRAMING, "trailing data or archive comment after the end record")
+        ordinary = (disk, cd_disk, entries_here, entries, cd_size, cd_offset)
+        locator = b""
+        if eocd_at >= _ZIP64_LOCATOR.size:
+            raw.seek(eocd_at - _ZIP64_LOCATOR.size)
+            locator = raw.read(_ZIP64_LOCATOR.size)
+        if locator[:4] == _ZIP64_LOCATOR_SIGNATURE:
+            locator_at = eocd_at - _ZIP64_LOCATOR.size
+            _sig, locator_disk, record_at, disks = _ZIP64_LOCATOR.unpack(locator)
+            if locator_disk != 0 or disks != 1:
                 return refuse(ARCHIVE_FRAMING, "multi-disk archive")
-            if cd_size > MAX_CENTRAL_DIRECTORY_BYTES:
-                return refuse(SIZE_LIMIT)
-            if entries > MAX_BUNDLE_ENTRIES:
-                return refuse(ENTRY_COUNT_LIMIT)
-            # The library locates the directory at ``directory_end - cd_size`` and treats any difference
-            # from the stored offset as prepended data; a bundle is never a self-extracting archive.
-            if cd_offset + cd_size != directory_end:
-                return refuse(ARCHIVE_FRAMING, "data before the first record")
-            raw.seek(cd_offset)
-            directory = raw.read(cd_size)
+            if record_at + _ZIP64_RECORD.size > locator_at:
+                return refuse(ARCHIVE_FRAMING, "bad zip64 end record")
+            raw.seek(record_at)
+            record = raw.read(_ZIP64_RECORD.size)
+            (record_signature, record_size, _made, _needed, disk, cd_disk,
+             entries_here, entries, cd_size, cd_offset) = _ZIP64_RECORD.unpack(record)
+            # The record (with any extensible data it declares) must end exactly at the locator.
+            if record_signature != _ZIP64_EOCD_SIGNATURE or record_at + 12 + record_size != locator_at:
+                return refuse(ARCHIVE_FRAMING, "bad zip64 end record")
+            if not _end_record_agrees(ordinary, (disk, cd_disk, entries_here, entries, cd_size, cd_offset)):
+                return refuse(ARCHIVE_FRAMING, "end record disagrees with the zip64 end record")
+            directory_end = record_at
+        else:
+            if entries == 0xFFFF or entries_here == 0xFFFF or cd_size == _U32_MAX or cd_offset == _U32_MAX:
+                return refuse(ARCHIVE_FRAMING, "missing zip64 locator")
+            directory_end = eocd_at
+        if disk != 0 or cd_disk != 0 or entries_here != entries:
+            return refuse(ARCHIVE_FRAMING, "multi-disk archive")
+        if cd_size > MAX_CENTRAL_DIRECTORY_BYTES:
+            return refuse(SIZE_LIMIT)
+        if entries > MAX_BUNDLE_ENTRIES:
+            return refuse(ENTRY_COUNT_LIMIT)
+        # The library locates the directory at ``directory_end - cd_size`` and treats any difference
+        # from the stored offset as prepended data; a bundle is never a self-extracting archive.
+        if cd_offset + cd_size != directory_end:
+            return refuse(ARCHIVE_FRAMING, "data before the first record")
+        raw.seek(cd_offset)
+        directory = raw.read(cd_size)
     except OSError:
         report.add(CONTAINER_UNREADABLE, "<bundle>")
         return False
@@ -861,19 +870,38 @@ def verify_bundle(path: str | os.PathLike[str]) -> VerificationReport:
     if not os.path.isfile(target):
         report.add(CONTAINER_UNREADABLE, "<bundle>")
         return report
-    if not _precheck_central_directory(target, report):
+    # One open file serves the precheck, the parser and every raw read, so replacing the pathname
+    # after the precheck cannot put unchecked bytes in front of the parser.
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(target, flags)
+    except OSError:
+        report.add(CONTAINER_UNREADABLE, "<bundle>")
         return report
     try:
-        archive = zipfile.ZipFile(target)
-    except (zipfile.BadZipFile, OSError, EOFError, ValueError, NotImplementedError):
-        report.add(CONTAINER_UNREADABLE, "<bundle>", "not a readable zip archive")
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            os.close(descriptor)
+            report.add(CONTAINER_UNREADABLE, "<bundle>")
+            return report
+        raw = os.fdopen(descriptor, "rb")
+    except OSError:
+        os.close(descriptor)
+        report.add(CONTAINER_UNREADABLE, "<bundle>")
         return report
     try:
-        with archive, open(target, "rb") as raw:
-            source = _ZipSource(archive, raw)
-            entries = _inventory_zip(source, report)
-            if not any(item.code in _FATAL_CODES for item in report.findings):
-                _verify_open(entries, source, report)
+        with raw:
+            if not _precheck_central_directory(raw, report):
+                return report
+            try:
+                archive = zipfile.ZipFile(raw)
+            except (zipfile.BadZipFile, OSError, EOFError, ValueError, NotImplementedError):
+                report.add(CONTAINER_UNREADABLE, "<bundle>", "not a readable zip archive")
+                return report
+            with archive:
+                source = _ZipSource(archive, raw)
+                entries = _inventory_zip(source, report)
+                if not any(item.code in _FATAL_CODES for item in report.findings):
+                    _verify_open(entries, source, report)
     except OSError:
         report.add(CONTAINER_UNREADABLE, "<bundle>")
     return report
