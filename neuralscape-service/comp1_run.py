@@ -157,6 +157,21 @@ def run_reproductions(tree: Path, inputs: Path, junit: Path, env: dict[str, str]
             target.unlink()
 
 
+def judge_replaced(reason: str, test_ids: tuple[str, ...], outcome: str) -> tuple[str, str]:
+    """The verdict for an oracle whose legacy path the profile replaces.
+
+    It is ``not_applicable`` only while the replacement's own tests pass; a replacement that
+    fails (or reports nothing) is an ``unexpected_failure``, so a broken replacement can never
+    read as "legacy path replaced".
+    """
+
+    if outcome.startswith("pass:"):
+        return "not_applicable", (reason + "; replacement: " + ", ".join(test_ids))[:300]
+    return "unexpected_failure", (
+        f"the replacement tests fail ({outcome}): investigate; replacement: " + ", ".join(test_ids)
+    )[:300]
+
+
 def judge_reproduction(kind: str, role: str, outcome: str | None) -> tuple[str, str]:
     if outcome is None:
         return "invalid_attempt", "the scenario's test did not run"
@@ -248,9 +263,9 @@ def run(args: argparse.Namespace) -> None:
             replaced = GOVERNED_REPLACED.get(scenario.id) if governed and role == "candidate" else None
             if replaced is not None:
                 reason, test_ids = replaced
-                seen["replacement_tests"] = run_replacements(tree, test_ids)
-                verdict = "not_applicable"
-                note = (reason + "; replacement: " + ", ".join(test_ids))[:300]
+                outcome = run_replacements(tree, test_ids) or "fail:no-output"
+                seen["replacement_tests"] = outcome
+                verdict, note = judge_replaced(reason, test_ids, outcome)
             writer.write(EvidenceRecord(
                 schema_version="candidate-v1", record_id=f"{args.run_id}.{role}.{scenario.id}",
                 scenario_id=scenario.id, run_id=args.run_id, role=role, subject_ref=ref,

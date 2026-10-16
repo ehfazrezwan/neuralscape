@@ -82,3 +82,64 @@ def test_an_altered_real_service_oracle_is_refused(tmp_path: Path) -> None:
     assert hashlib.sha256(target.read_bytes()).hexdigest() not in json.loads(
         (tmp_path / "ORACLE-MANIFEST.json").read_text()
     )["oracles"].values()
+
+
+# ── governed profile: a replaced oracle is not applicable only while its replacement passes ──
+
+_REGISTRY = '''
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Scenario:
+    id: str
+    kind: str
+    leaves: tuple
+    test: str
+    needs_real_service: bool
+    summary: str
+
+
+SCENARIOS = (
+    Scenario("stale-revision-edit", "expected-failure", ("A3.01",), "test_stale", True, "s"),
+    Scenario("patch-partial-control", "control", ("A3.01",), "test_partial", False, "c"),
+)
+'''
+
+
+def _governed_run(tmp_path: Path, monkeypatch, replacement: str) -> dict:
+    inputs, out = tmp_path / "inputs", tmp_path / "out"
+    inputs.mkdir()
+    (inputs / "evidence_registry.py").write_text(_REGISTRY)
+    (inputs / comp1_run.REPRODUCTIONS).write_text("# the preserved reproductions (not run here)\n")
+    monkeypatch.setattr(comp1_run, "run_reproductions",
+                        lambda tree, inputs, junit, env=None: ({"test_stale": "xfailed", "test_partial": "passed"}, ""))
+    monkeypatch.setattr(comp1_run, "run_replacements", lambda tree, test_ids: replacement)
+    monkeypatch.setattr(comp1_run.persona_evidence, "run", lambda *args, **kwargs: [])
+    monkeypatch.setattr(comp1_run, "surface", lambda tree: {})
+    comp1_run.main([
+        "run", "--baseline", str(tmp_path), "--baseline-ref", "base", "--candidate", str(tmp_path),
+        "--candidate-ref", "cand", "--inputs", str(inputs), "--out", str(out), "--run-id", "r1",
+        "--profile", "governed",
+    ])
+    records = [json.loads(line) for line in (out / "evidence.jsonl").read_text().splitlines() if line]
+    return {(r["role"], r["scenario_id"]): r for r in records}
+
+
+def test_a_replaced_oracle_is_not_applicable_while_its_replacement_passes(tmp_path, monkeypatch) -> None:
+    records = _governed_run(tmp_path, monkeypatch, "pass:2-passed")
+    replaced = records[("candidate", "stale-revision-edit")]
+    assert replaced["verdict"] == "not_applicable"
+    assert {"key": "replacement_tests", "value": "pass:2-passed"} in replaced["observed"]
+    assert records[("baseline", "stale-revision-edit")]["verdict"] == "known_failure"  # baseline untouched
+
+
+@pytest.mark.parametrize("replacement", ["fail:1-failed_1-passed", "fail:no-output", ""])
+def test_a_failing_replacement_is_an_unexpected_failure_never_not_applicable(
+    tmp_path, monkeypatch, replacement
+) -> None:
+    records = _governed_run(tmp_path, monkeypatch, replacement)
+    replaced = records[("candidate", "stale-revision-edit")]
+    assert replaced["verdict"] == "unexpected_failure"
+    assert "replacement" in replaced["note"] and "fail" in replaced["note"]
+    assert records[("candidate", "patch-partial-control")]["verdict"] == "candidate_pass"  # not replaced
