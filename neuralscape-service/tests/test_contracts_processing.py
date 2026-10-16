@@ -951,7 +951,7 @@ def test_dispatch_uses_concrete_extra_storage_type() -> None:
             is_fallback=False,
         )
     assert isinstance(exc.value.__cause__, ValidationError)
-    assert spoofed.class_reads == 1
+    assert spoofed.class_reads == 0  # its class is never consulted: the storage is fenced, not read
 
     hidden = _RaisingClassHiddenDict({"future_constraint": "deny"})
     hidden_policy = _attach_extra_storage(_strict_local_policy(), hidden)
@@ -1173,5 +1173,82 @@ def test_endpoint_dispatch_cannot_smuggle_a_recipient_identity() -> None:
             recipient_id="provider-a",
             current_policy_epoch=7,
             currently_authorized_recipient_ids={"provider-a"},
+            is_fallback=False,
+        )
+
+
+# ── Copilot r4296627480: non-dict extra storage must be fenced too ───────────
+
+
+def _masked_policy() -> _DescriptorMaskedPolicy:
+    return _DescriptorMaskedPolicy(
+        schema_version="candidate-v1",
+        mode="strict_local",
+        allowed_execution_locations=("endpoint",),
+        approved_recipient_ids=(),
+        fallback_policy="deny",
+        policy_epoch=7,
+    )
+
+
+@pytest.mark.parametrize("with_stored_constraint", [True, False], ids=["stored+extras", "extras-only"])
+@pytest.mark.parametrize(
+    "extras_type",
+    [_IterationVisibleItemsEmptyMapping, _SpoofedDictMapping],
+    ids=["iteration-visible-mapping", "spoofed-dict-mapping"],
+)
+def test_descriptor_masked_policy_with_non_dict_extras_is_rejected(
+    extras_type: type, with_stored_constraint: bool
+) -> None:
+    """A masked model hides stored fields and extras through its properties; non-dict
+    extra storage used to hand the original model back to revalidation, which accepted
+    the filtered view and permitted dispatch."""
+
+    policy = _masked_policy()
+    if with_stored_constraint:
+        stored = dict(dict.items(_BASE_MODEL_DICT_DESCRIPTOR.__get__(policy, BaseModel)))
+        stored["future_constraint"] = "deny"
+        _BASE_MODEL_DICT_DESCRIPTOR.__set__(policy, _HiddenBackingDict(stored))
+    extras = extras_type()
+    _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(policy, extras)
+
+    with pytest.raises(PlaintextDispatchRejected, match="policy is invalid") as exc:
+        validate_plaintext_dispatch(
+            policy,
+            execution_location="endpoint",
+            recipient_id=None,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=set(),
+            is_fallback=False,
+        )
+    assert isinstance(exc.value.__cause__, ValidationError)
+    assert getattr(extras, "items_calls", 0) == 0  # no view of the hostile storage was read
+
+
+def test_ordinary_and_masked_policies_with_non_dict_extras_fail_the_same_way() -> None:
+    diagnostics = []
+    for policy in (_strict_local_policy(), _masked_policy()):
+        _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(policy, _IterationVisibleItemsEmptyMapping())
+        with pytest.raises(PlaintextDispatchRejected, match="policy is invalid") as exc:
+            validate_plaintext_dispatch(
+                policy,
+                execution_location="endpoint",
+                recipient_id=None,
+                current_policy_epoch=7,
+                currently_authorized_recipient_ids=set(),
+                is_fallback=False,
+            )
+        diagnostics.append([(e["loc"], e["type"]) for e in exc.value.__cause__.errors()])
+    assert diagnostics[0] == diagnostics[1]
+
+
+def test_clean_policies_still_dispatch_after_the_non_dict_fence() -> None:
+    for policy in (_strict_local_policy(), _masked_policy()):
+        validate_plaintext_dispatch(
+            policy,
+            execution_location="endpoint",
+            recipient_id=None,
+            current_policy_epoch=7,
+            currently_authorized_recipient_ids=set(),
             is_fallback=False,
         )

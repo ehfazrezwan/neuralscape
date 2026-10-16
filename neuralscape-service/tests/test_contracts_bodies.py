@@ -701,7 +701,7 @@ def test_parser_uses_concrete_extra_storage_type() -> None:
     )
     with pytest.raises(ValidationError):
         parse_memory_body(spoofed_body)
-    assert spoofed.class_reads == 1
+    assert spoofed.class_reads == 0  # its class is never consulted: the storage is fenced, not read
 
     hidden = _RaisingClassHiddenDict({"future_constraint": "deny"})
     hidden_body = _attach_extra_storage(
@@ -871,3 +871,29 @@ def test_wire_values_and_the_tag_discriminator_are_unchanged(wire: dict[str, str
         MEMORY_BODY_ADAPTER.validate_python({"kind": "plaintext", "envelope_id": "x"})
     schema = MEMORY_BODY_ADAPTER.json_schema()
     assert schema["discriminator"]["propertyName"] == "kind"
+
+
+# ── non-dict extra storage is fenced on every route into the union ───────────
+
+
+@pytest.mark.parametrize(("masked_type", "values"), _MASKED_CASES, ids=["plaintext", "opaque-envelope"])
+@pytest.mark.parametrize("with_stored_constraint", [True, False], ids=["stored+extras", "extras-only"])
+def test_masked_bodies_with_non_dict_extras_are_rejected_by_adapter_and_nested_field(
+    masked_type: type, values: dict[str, str], with_stored_constraint: bool
+) -> None:
+    from contracts_bodies import MEMORY_BODY_ADAPTER
+
+    for route in ("adapter", "nested"):
+        body = masked_type(**values)
+        if with_stored_constraint:
+            stored = dict(dict.items(_BASE_MODEL_DICT_DESCRIPTOR.__get__(body, BaseModel)))
+            stored["future_constraint"] = "deny"
+            _BASE_MODEL_DICT_DESCRIPTOR.__set__(body, _HiddenBackingDict(stored))
+        extras = _IterationVisibleItemsEmptyMapping()
+        _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(body, extras)
+        with pytest.raises(ValidationError):
+            if route == "adapter":
+                MEMORY_BODY_ADAPTER.validate_python(body)
+            else:
+                VersionedBodyOwner.model_validate({"schema_version": "candidate-v1", "body": body})
+        assert extras.items_calls == 0
