@@ -2880,16 +2880,16 @@ def test_shared_native_pairs_are_rebuilt_once_per_object(monkeypatch) -> None:
     import contracts_common
 
     calls = 0
-    original = contracts_common._reconstruct_captured_graph
+    original = contracts_common._snapshot_captured_graph
 
     def counting(*args, **kwargs):
         nonlocal calls
         calls += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(contracts_common, "_reconstruct_captured_graph", counting)
+    monkeypatch.setattr(contracts_common, "_snapshot_captured_graph", counting)
     snapshot = snapshot_contract_graph(_pairs(12))
-    assert calls <= 20  # one per distinct container (plus the leaf dict)
+    assert calls <= 40  # two edges per distinct container (the per-path copy made 16,383 calls)
     assert snapshot[0] is snapshot[1]
 
 
@@ -3358,3 +3358,91 @@ def test_snapshot_contract_graph_budget_error_is_value_free() -> None:
 
     assert str(caught.value) == DISCOVERY_BUDGET_MESSAGE
     assert marker not in repr(caught.value)
+
+
+
+# ── an admitted depth never overflows the stack, whatever the caller's own depth ──
+
+
+def _with_caller_frames(headroom: int, call):
+    """Run ``call`` with only ``headroom`` frames left below the interpreter's limit."""
+
+    import sys as _sys
+
+    def descend(remaining: int):
+        if remaining <= 0:
+            return call()
+        return descend(remaining - 1)
+
+    frame, used = _sys._getframe(), 0
+    while frame is not None:
+        frame, used = frame.f_back, used + 1
+    return descend(_sys.getrecursionlimit() - used - headroom)
+
+
+@pytest.mark.parametrize("kind", ["tuple", "list", "dict", "model-and-dict"])
+def test_the_deepest_admitted_input_snapshots_with_a_deep_caller_stack(kind) -> None:
+    depth = STANDARD_MAX_DEPTH - 1
+    node: object = None
+    for level in range(depth):
+        if kind == "tuple":
+            node = (node,)
+        elif kind == "list":
+            node = [node]
+        elif kind == "dict" or level % 2:
+            node = {"k": node}
+        else:
+            node = ExampleContractEnvelope.model_construct(item=node)
+    # 300 frames of headroom: a reconstruction that costs three frames per level needs ~770
+    snapshot = _with_caller_frames(300, lambda: snapshot_contract_graph(node))
+    assert snapshot is not None
+
+
+def test_a_recursion_error_is_never_what_a_caller_receives() -> None:
+    node: object = None
+    for _ in range(STANDARD_MAX_DEPTH - 1):
+        node = [node]
+    # far too little headroom for any reconstruction: the stable budget error, never RecursionError
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _with_caller_frames(40, lambda: snapshot_contract_graph(node))
+
+
+# ── model field names are read as text without hooks, and duplicates are refused ──
+
+
+class _CountingName(str):
+    """Same text as a plain name but a different hash, so both can live in one dict."""
+
+    calls: list = []
+
+    def __hash__(self):
+        _CountingName.calls.append("hash")
+        return hash("other:" + str.__str__(self))
+
+    def __eq__(self, other):
+        _CountingName.calls.append("eq")
+        return self is other
+
+
+def test_a_colliding_stored_name_runs_no_hook_and_is_refused() -> None:
+    value = ExampleContract(count=1)
+    stored = vars(BaseModel)["__dict__"].__get__(value, BaseModel)
+    dict.__setitem__(stored, _CountingName("count"), 5)  # a second "count" with a different hash path
+    _CountingName.calls.clear()
+    with pytest.raises(ValueError, match="colliding"):
+        snapshot_contract_graph(value)
+    assert _CountingName.calls == []
+
+
+@pytest.mark.parametrize("order", ["plain-first", "subclass-first"])
+def test_a_colliding_extra_name_runs_no_hook_and_is_refused(order) -> None:
+    value = ExampleContract(count=1)
+    pairs = [("note", 1), (_CountingName("note"), 2)]
+    extra: dict = {}
+    for key, item in pairs if order == "plain-first" else reversed(pairs):
+        dict.__setitem__(extra, key, item)
+    _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(value, extra)
+    _CountingName.calls.clear()
+    with pytest.raises(ValueError, match="duplicate keys"):
+        snapshot_contract_graph(value)
+    assert _CountingName.calls == []
