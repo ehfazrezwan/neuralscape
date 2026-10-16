@@ -1,0 +1,288 @@
+"""Closed-loop load driver for the service baseline (standard library only).
+
+Runs inside the benchmark network so host noise does not shape the driver.
+Writes one JSON result file; it records its own CPU use per cell so driver
+saturation can be checked independently of the service.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import http.client
+import json
+import resource
+import threading
+import time
+import urllib.parse
+from typing import Any, Callable
+
+from neuralscape_bench.service_baseline.stats import summarize
+
+USER_ID = "bench-user"
+PROJECT_ID = "bench-project"
+TERMINAL = {"completed", "failed"}
+# The service's three isolated ARQ queues (fast, graph, ingest).
+QUEUES = ("neuralscape:queue", "neuralscape:graph", "neuralscape:ingest")
+
+
+class Client:
+    """One keep-alive connection per thread."""
+
+    def __init__(self, base_url: str, timeout_s: float):
+        parsed = urllib.parse.urlparse(base_url)
+        self.host, self.port, self.timeout_s = parsed.hostname, parsed.port or 80, timeout_s
+        self.local = threading.local()
+
+    def _conn(self) -> http.client.HTTPConnection:
+        conn = getattr(self.local, "conn", None)
+        if conn is None:
+            conn = http.client.HTTPConnection(self.host, self.port, timeout=self.timeout_s)
+            self.local.conn = conn
+        return conn
+
+    def request(self, method: str, path: str, body: Any = None) -> tuple[int, Any]:
+        payload = None if body is None else json.dumps(body)
+        headers = {"Content-Type": "application/json"} if payload else {}
+        for attempt in (0, 1):
+            conn = self._conn()
+            try:
+                conn.request(method, path, body=payload, headers=headers)
+                response = conn.getresponse()
+                data = response.read()
+                try:
+                    return response.status, json.loads(data) if data else None
+                except json.JSONDecodeError:
+                    return response.status, None
+            except (http.client.HTTPException, OSError):
+                conn.close()
+                self.local.conn = None
+                if attempt:
+                    raise
+        raise RuntimeError("unreachable")
+
+
+def _write_body(nonce: str, index: int) -> dict[str, Any]:
+    return {
+        "messages": [
+            {
+                "role": "user",
+                "content": f"Benchmark note {nonce}-{index}: unique detail {hashlib.sha256(f'{nonce}{index}'.encode()).hexdigest()[:16]}",
+            }
+        ],
+        "user_id": USER_ID,
+        "project_id": PROJECT_ID,
+    }
+
+
+def op_write(client: Client, nonce: str, index: int, poll_s: float, timeout_s: float) -> dict[str, Any]:
+    start = time.monotonic()
+    status, body = client.request("POST", "/v1/memories", _write_body(nonce, index))
+    accepted = time.monotonic()
+    if status != 202 or not body or "task_id" not in body:
+        return {"ok": False, "error": f"http_{status}", "accept_ms": (accepted - start) * 1000}
+    task_id = body["task_id"]
+    while True:
+        now = time.monotonic()
+        if now - start > timeout_s:
+            return {"ok": False, "error": "timeout", "accept_ms": (accepted - start) * 1000}
+        code, state = client.request("GET", f"/v1/memories/status/{task_id}")
+        if code == 200 and state and state.get("status") in TERMINAL:
+            done = time.monotonic()
+            return {
+                "ok": state["status"] == "completed",
+                "error": None if state["status"] == "completed" else "task_failed",
+                "accept_ms": (accepted - start) * 1000,
+                "complete_ms": (done - start) * 1000,
+            }
+        time.sleep(poll_s)
+
+
+def op_read(method: str, path: str, body: Any = None) -> Callable[..., dict[str, Any]]:
+    def run(client: Client, nonce: str, index: int, poll_s: float, timeout_s: float) -> dict[str, Any]:
+        start = time.monotonic()
+        try:
+            status, _ = client.request(method, path.format(i=index), body(index) if callable(body) else body)
+        except (http.client.HTTPException, OSError) as error:
+            return {"ok": False, "error": type(error).__name__}
+        elapsed = (time.monotonic() - start) * 1000
+        return {"ok": status == 200, "error": None if status == 200 else f"http_{status}", "latency_ms": elapsed}
+
+    return run
+
+
+WORKLOADS: dict[str, Callable[..., dict[str, Any]]] = {
+    "write": op_write,
+    "search": op_read(
+        "POST",
+        "/v1/search",
+        lambda i: {"query": f"user preference workflow {i % 10}", "user_id": USER_ID, "limit": 10},
+    ),
+    "context": op_read("GET", f"/v1/context/{PROJECT_ID}?user_id={USER_ID}&limit=50"),
+    "list": op_read("GET", f"/v1/memories?user_id={USER_ID}&limit=50"),
+}
+
+
+def run_cell(
+    client: Client,
+    workload: str,
+    concurrency: int,
+    ops: int,
+    warmup: int,
+    nonce: str,
+    poll_s: float,
+    timeout_s: float,
+) -> dict[str, Any]:
+    function = WORKLOADS[workload]
+    total = warmup + ops
+    results: list[dict[str, Any] | None] = [None] * total
+    counter = {"next": 0}
+    lock = threading.Lock()
+
+    def worker() -> None:
+        while True:
+            with lock:
+                index = counter["next"]
+                if index >= total:
+                    return
+                counter["next"] += 1
+            try:
+                results[index] = function(client, nonce, index, poll_s, timeout_s)
+            except Exception as error:  # noqa: BLE001 - recorded as an error outcome
+                results[index] = {"ok": False, "error": type(error).__name__}
+
+    cpu_before = resource.getrusage(resource.RUSAGE_SELF)
+    wall_start = time.monotonic()
+    threads = [threading.Thread(target=worker) for _ in range(concurrency)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    wall = time.monotonic() - wall_start
+    cpu_after = resource.getrusage(resource.RUSAGE_SELF)
+    cpu = (cpu_after.ru_utime - cpu_before.ru_utime) + (cpu_after.ru_stime - cpu_before.ru_stime)
+
+    measured = [r for r in results[warmup:] if r is not None]
+    errors: dict[str, int] = {}
+    for record in measured:
+        if not record["ok"]:
+            errors[record["error"] or "error"] = errors.get(record["error"] or "error", 0) + 1
+    good = [r for r in measured if r["ok"]]
+    cell: dict[str, Any] = {
+        "workload": workload,
+        "concurrency": concurrency,
+        "attempted": total,
+        "warmup_excluded": warmup,
+        "measured_attempts": len(measured),
+        "ok": len(good),
+        "errors": errors,
+        "wall_seconds": wall,
+        "throughput_per_s": len(measured) / wall if wall else None,
+        "driver_cpu_cores_used": cpu / wall if wall else None,
+    }
+    if workload == "write":
+        cell["accept"] = summarize([r["accept_ms"] for r in measured if "accept_ms" in r])
+        cell["completion"] = summarize([r["complete_ms"] for r in good])
+    else:
+        cell["latency"] = summarize([r["latency_ms"] for r in good])
+    return cell
+
+
+def wait_ready(client: Client, timeout_s: float) -> float:
+    start = time.monotonic()
+    while time.monotonic() - start < timeout_s:
+        try:
+            status, _ = client.request("GET", "/health/live")
+            if status == 200:
+                return time.monotonic() - start
+        except (http.client.HTTPException, OSError):
+            pass
+        time.sleep(0.5)
+    raise SystemExit("service never became live")
+
+
+def _redis_backlog(redis_url: str) -> int | None:
+    """Pending queue entries plus in-progress jobs across every worker queue."""
+
+    try:
+        import redis  # present in the service image; the driver runs there
+
+        connection = redis.Redis.from_url(redis_url, socket_timeout=5)
+        pending = sum(connection.zcard(name) for name in QUEUES)
+        pending += sum(1 for _ in connection.scan_iter(match="arq:in-progress:*", count=200))
+        return pending
+    except Exception:  # noqa: BLE001 - fall back to the API view
+        return None
+
+
+def drain(client: Client, timeout_s: float, redis_url: str | None = None) -> dict[str, Any]:
+    """Wait until every worker queue (graph enrichment included) is empty and idle."""
+
+    start = time.monotonic()
+    quiet_since: float | None = None
+    last: Any = None
+    while time.monotonic() - start < timeout_s:
+        backlog = _redis_backlog(redis_url) if redis_url else None
+        if backlog is None:
+            status, body = client.request("GET", f"/v1/queue/status?user_id={USER_ID}")
+            last = body
+            depths = (body or {}).get("queues") or {}
+            backlog = sum(v for v in depths.values() if isinstance(v, int)) if status == 200 else 1
+            if backlog == 0 and not (body or {}).get("caught_up"):
+                backlog = 1
+        else:
+            last = {"redis_backlog": backlog}
+        if backlog == 0:
+            quiet_since = quiet_since or time.monotonic()
+            if time.monotonic() - quiet_since >= 2.0:  # idle for two seconds
+                return {"drained": True, "seconds": time.monotonic() - start}
+        else:
+            quiet_since = None
+        time.sleep(0.5)
+    return {"drained": False, "seconds": time.monotonic() - start, "last": last}
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--base-url", required=True)
+    parser.add_argument("--out", required=True)
+    parser.add_argument("--nonce", required=True)
+    parser.add_argument("--concurrency", default="1,4,16")
+    parser.add_argument("--workloads", default="write,search,context,list")
+    parser.add_argument("--write-ops", type=int, default=48)
+    parser.add_argument("--read-ops", type=int, default=200)
+    parser.add_argument("--seed", type=int, default=100)
+    parser.add_argument("--warmup", type=int, default=4)
+    parser.add_argument("--poll-ms", type=float, default=50)
+    parser.add_argument("--timeout-s", type=float, default=120)
+    parser.add_argument("--drain-timeout-s", type=float, default=300)
+    parser.add_argument("--redis-url", default="redis://redis:6379")
+    args = parser.parse_args()
+
+    client = Client(args.base_url, timeout_s=60)
+    result: dict[str, Any] = {"args": vars(args), "ready_seconds": wait_ready(client, 300)}
+    started = time.time()
+
+    seed_cell = run_cell(client, "write", 4, args.seed, 0, f"{args.nonce}-seed", args.poll_ms / 1000, args.timeout_s)
+    result["seed"] = seed_cell
+    result["seed_drain"] = drain(client, args.drain_timeout_s, args.redis_url)
+
+    cells = []
+    for workload in args.workloads.split(","):
+        for concurrency in (int(c) for c in args.concurrency.split(",")):
+            ops = args.write_ops if workload == "write" else args.read_ops
+            cells.append(
+                run_cell(client, workload, concurrency, ops, args.warmup, f"{args.nonce}-{workload}-{concurrency}", args.poll_ms / 1000, args.timeout_s)
+            )
+            if workload == "write":
+                drain_result = drain(client, args.drain_timeout_s, args.redis_url)
+                cells[-1]["post_cell_drain"] = drain_result
+    result["cells"] = cells
+    result["driver_started_unix"] = started
+    result["driver_finished_unix"] = time.time()
+    with open(args.out, "w") as handle:
+        json.dump(result, handle, indent=2)
+
+
+if __name__ == "__main__":
+    main()

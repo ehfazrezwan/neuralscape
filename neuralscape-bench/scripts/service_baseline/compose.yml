@@ -1,0 +1,120 @@
+# Isolated service baseline stack (project name is set by the runner: ns-g-bench).
+# No host ports are published; the driver runs inside the same network.
+# Application services restart on failure, like the production compose file: the
+# first cold start races on shared vector-store collection creation.
+# Required env: NS_IMAGE (the exact tree image), BENCH_DIR (this repo's neuralscape-bench dir).
+x-service-env: &service-env
+  GOOGLE_API_KEY: fake-key
+  NEO4J_URI: neo4j://neo4j:7687
+  NEO4J_PASSWORD: bench-neo4j-password
+  NEO4J_DATABASE: memory
+  QDRANT_URL: http://qdrant:6333
+  REDIS_URL: redis://redis:6379
+  OBSIDIAN_VAULT_PATH: /data/vault
+  DREAMING_ENABLED: "false"
+  STRATEGY_SYNTHESIZER_ENABLED: "false"
+  DOCLING_ENABLED: "false"
+  INGEST_STORAGE_DIR: /data/ingest
+  PYTHONPATH: /bench/scripts/service_baseline/shim
+  FAKE_GENAI_BASE_URL: http://fake-provider:8080
+
+x-service-mounts: &service-mounts
+  - ${BENCH_DIR}:/bench:ro
+
+services:
+  fake-provider:
+    image: ${NS_IMAGE}
+    command: ["python", "/bench/neuralscape_bench/service_baseline/fake_provider.py",
+              "--generate-latency-ms", "${FAKE_GENERATE_MS:-50}", "--embed-latency-ms", "${FAKE_EMBED_MS:-20}"]
+    environment: {PYTHONPATH: /bench}
+    volumes: *service-mounts
+    deploy: {resources: {limits: {memory: 512M}}}
+
+  neo4j:
+    image: neo4j:5-community
+    environment:
+      NEO4J_AUTH: neo4j/bench-neo4j-password
+      NEO4J_initial_dbms_default__database: memory
+    deploy: {resources: {limits: {memory: 2G}}}
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "bench-neo4j-password", "RETURN 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  redis:
+    image: redis:7.4-alpine
+    deploy: {resources: {limits: {memory: 512M}}}
+    healthcheck: {test: ["CMD", "redis-cli", "ping"], interval: 3s, timeout: 3s, retries: 20}
+
+  qdrant:
+    image: qdrant/qdrant:v1.15.0
+    deploy: {resources: {limits: {memory: 2G}}}
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/localhost/6333'"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api:
+    image: ${NS_IMAGE}
+    restart: on-failure
+    environment: {<<: *service-env, MCP_TRANSPORT: http, UVICORN_WORKERS: "1"}
+    volumes: [ "${BENCH_DIR}:/bench:ro", "ingest_data:/data/ingest" ]
+    depends_on:
+      neo4j: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      qdrant: {condition: service_healthy}
+      fake-provider: {condition: service_started}
+    deploy: {resources: {limits: {memory: 3G}}}
+
+  worker:
+    image: ${NS_IMAGE}
+    restart: on-failure
+    command: ["arq", "worker.WorkerSettings"]
+    environment: *service-env
+    volumes: *service-mounts
+    depends_on:
+      neo4j: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      qdrant: {condition: service_healthy}
+      fake-provider: {condition: service_started}
+    deploy: {resources: {limits: {memory: 2G}}}
+
+  graph-worker:
+    image: ${NS_IMAGE}
+    restart: on-failure
+    command: ["arq", "worker.GraphWorkerSettings"]
+    environment: *service-env
+    volumes: *service-mounts
+    depends_on:
+      neo4j: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      qdrant: {condition: service_healthy}
+      fake-provider: {condition: service_started}
+    deploy: {resources: {limits: {memory: 2G}}}
+
+  ingest-worker:
+    image: ${NS_IMAGE}
+    restart: on-failure
+    command: ["arq", "worker.IngestWorkerSettings"]
+    environment: *service-env
+    volumes: [ "${BENCH_DIR}:/bench:ro", "ingest_data:/data/ingest" ]
+    depends_on:
+      neo4j: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      qdrant: {condition: service_healthy}
+      fake-provider: {condition: service_started}
+    deploy: {resources: {limits: {memory: 2G}}}
+
+  driver:
+    image: ${NS_IMAGE}
+    profiles: ["driver"]
+    user: "0"
+    entrypoint: ["python", "-m", "neuralscape_bench.service_baseline.driver"]
+    environment: {PYTHONPATH: /bench, PYTHONDONTWRITEBYTECODE: "1"}
+    volumes: [ "${BENCH_DIR}:/bench:ro", "${OUT_DIR}:/out" ]
+    deploy: {resources: {limits: {memory: 1G}}}
+
+volumes:
+  ingest_data:
