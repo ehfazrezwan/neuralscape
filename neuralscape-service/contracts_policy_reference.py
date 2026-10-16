@@ -474,6 +474,7 @@ def _freeze_mapping_inventories(
     budget: DiscoveryBudget | None = None,
     reach: dict[int, tuple[Mapping[object, object], ...]] | None = None,
     active_depth: int = 0,
+    scanned: set[int] | None = None,
 ) -> None:
     """Observe each retained public mapping inventory exactly once.
 
@@ -496,6 +497,8 @@ def _freeze_mapping_inventories(
         in_progress = set()
     if reach is None:
         reach = {}
+    if scanned is None:
+        scanned = set()  # reach tuples already merged into ``owners`` during this capture
     budget = _new_budget(budget)
     while True:
         pending = tuple(
@@ -565,8 +568,16 @@ def _freeze_mapping_inventories(
                     True,
                     reach,
                 )
-                for found in reach.get(id(item), ()):  # including those behind containers the walk had already visited
-                    _retain_mapping_owner(found, exposed)
+                beneath = reach.get(id(item), ())
+                if beneath and id(beneath) not in scanned:
+                    # Including those behind containers the walk had already visited.  A reach
+                    # tuple is scanned (and charged) once per capture: every mapping in it was
+                    # retained and captured, or is in progress, the first time it was exposed,
+                    # so a later pair exposing the same tuple has nothing new to find in it.
+                    scanned.add(id(beneath))
+                    budget.charge_edge(len(beneath))
+                    for found in beneath:
+                        _retain_mapping_owner(found, exposed)
                 for found in exposed.values():
                     _retain_mapping_owner(found, owners)
                 discovered = {
@@ -586,6 +597,7 @@ def _freeze_mapping_inventories(
                         budget,
                         reach,
                         child_depth,
+                        scanned,
                     )
                 try:
                     _close_pair(rest)
@@ -709,6 +721,24 @@ def _native_entries(
 _DEEPEST = "deepest"  # memo bookkeeping keys (the memo's other keys are object ids)
 _IMPURE = "impure"
 _PAID = "paid"  # ids of native containers whose entries discovery already charged
+# Non-text key types whose hashing and equality run no caller code and never equal a string key.
+_PLAIN_NON_TEXT_KEYS = (int, float, bool, type(None), bytes)
+
+
+class _OpaqueKey:
+    """A non-text key held by identity: it hashes and compares as itself, never as the key.
+
+    Validation reports it as an invalid (non-string) key at the key's place; its representation
+    names only the key's type, so no hook of the key runs.
+    """
+
+    __slots__ = ("_key",)
+
+    def __init__(self, key: object) -> None:
+        self._key = key
+
+    def __repr__(self) -> str:
+        return f"<{type(self._key).__name__} key>"
 _COPIED = "copied"  # ids of containers completion has copied at least once
 
 
@@ -953,6 +983,11 @@ def _complete_contract_input(
                     key = str.__str__(key)
                     if key in completed:
                         raise ValueError("contract input mapping has colliding keys")
+                elif not is_exact_type(key, *_PLAIN_NON_TEXT_KEYS):
+                    # Any other key is invalid for a contract, but inserting it would run its hash
+                    # and equality and could overwrite a real key; an identity box keeps it
+                    # separate so validation reports it as an invalid key at the same place.
+                    key = _OpaqueKey(key)
                 if not free:
                     budget.charge_edge()  # one stack frame per level: no helper closure
                 completed[key] = _complete_contract_input(

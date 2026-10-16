@@ -4309,3 +4309,75 @@ def test_a_container_first_seen_through_a_public_view_is_charged_when_copied() -
 
     with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
         _complete_contract_input(View(), set(), {}, {})
+
+
+# ── a non-string key cannot overwrite a real one; a cached reach is scanned once ──
+
+
+class _ImpersonatingKey:
+    """Hashes and compares equal to "effect": inserting it would overwrite the real key."""
+
+    calls: list = []
+
+    def __hash__(self):
+        _ImpersonatingKey.calls.append("hash")
+        return hash("effect")
+
+    def __eq__(self, other):
+        _ImpersonatingKey.calls.append("eq")
+        return other == "effect" or other is self
+
+
+def test_a_non_string_key_cannot_overwrite_a_denial() -> None:
+    resource_value = reference("memory-1")
+
+    def pairs():
+        yield ("id", "s-1")
+        yield ("effect", "deny")
+        yield ("subject_id", "subject-a")
+        yield ("credential_id", None)
+        yield ("action", "read")
+        yield ("resource", resource_value.model_dump(mode="python"))
+        yield (_ImpersonatingKey(), "allow")
+
+    _ImpersonatingKey.calls.clear()
+    with pytest.raises(ValidationError) as caught:
+        evaluate(principal(), "read", resource_value, _with_statements(_Items(pairs)))
+    assert any(error["type"] == "invalid_key" for error in caught.value.errors())
+    assert _ImpersonatingKey.calls == []  # its hash and equality never ran
+
+
+def test_plain_non_string_keys_keep_their_exact_diagnostics() -> None:
+    resource_value = reference("memory-1")
+    for key, expected_loc in ((1, 1), (b"k", "b'k'")):
+        bad = {**resource_value.model_dump(mode="python"), key: "x"}
+
+        def pairs(bad=bad):
+            yield ("id", "s-1")
+            yield ("effect", "allow")
+            yield ("subject_id", "subject-a")
+            yield ("credential_id", None)
+            yield ("action", "read")
+            yield ("resource", bad)
+
+        with pytest.raises(ValidationError) as caught:
+            evaluate(principal(), "read", resource_value, _with_statements(_Items(pairs)))
+        locations = [error["loc"] for error in caught.value.errors() if error["type"] == "invalid_key"]
+        assert locations and locations[0][-1] == expected_loc
+
+
+def test_mapping_capture_scans_a_shared_cached_reach_once() -> None:
+    import time
+
+    proxies = tuple(MappingProxyType({"k": i}) for i in range(10_000))
+
+    def pairs():
+        for index in range(50_000):
+            yield (f"k{index}", proxies)
+
+    started = time.monotonic()
+    try:
+        _entry_flow(_Items(pairs))
+    except ValueError as error:
+        assert DISCOVERY_BUDGET_MESSAGE in str(error)
+    assert time.monotonic() - started < 10.0  # was 500 million reach iterations
