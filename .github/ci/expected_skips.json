@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "excluded_suites": ["tests/test_async_pipeline.py"],
+  "profiles": {
+    "host": {
+      "skips": [
+        {
+          "test": "tests.test_canonical_fqn_conformance::test_native_canonical_conformance_ge_98pct",
+          "reason_contains": "small-py corpus not present"
+        },
+        {
+          "test": "tests.test_okf::test_ingest_real_ga4_sample_bundle_if_present",
+          "reason_contains": "knowledge-catalog sample bundle not available"
+        }
+      ]
+    },
+    "container": {
+      "skips": [
+        {
+          "test": "tests.test_canonical_fqn_conformance::test_native_canonical_conformance_ge_98pct",
+          "reason_contains": "small-py corpus not present"
+        },
+        {
+          "test": "tests.test_okf::test_ingest_real_ga4_sample_bundle_if_present",
+          "reason_contains": "knowledge-catalog sample bundle not available"
+        }
+      ]
+    }
+  }
+}
