@@ -11,7 +11,6 @@ name: service-ci
 
 on:
   pull_request:
-    branches: [dev, main]
   push:
     branches: [dev, main]
     paths:
@@ -131,3 +130,48 @@ jobs:
           load: true
           tags: ns-gate-rt:ci
           cache-from: type=gha
+
+  service-gate:
+    if: ${{ always() }}
+    needs: [changes, subtree-prune-guard, host-tests, container-gate]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require service checks or an intentional non-service skip
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SERVICE_CHANGED: ${{ needs.changes.outputs.service }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          SUBTREE_RESULT: ${{ needs.subtree-prune-guard.result }}
+          HOST_RESULT: ${{ needs.host-tests.result }}
+          CONTAINER_RESULT: ${{ needs.container-gate.result }}
+        run: |
+          set -eu
+
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "::error::changes job did not succeed: $CHANGES_RESULT"
+            exit 1
+          fi
+
+          case "$SERVICE_CHANGED" in
+            true|false) ;;
+            *)
+              echo "::error::service filter returned an unknown value: $SERVICE_CHANGED"
+              exit 1
+              ;;
+          esac
+
+          if [ "$EVENT_NAME" = "push" ] || [ "$SERVICE_CHANGED" = "true" ]; then
+            expected="success"
+          elif [ "$EVENT_NAME" = "pull_request" ] && [ "$SERVICE_CHANGED" = "false" ]; then
+            expected="skipped"
+          else
+            echo "::error::unsupported event/filter combination: $EVENT_NAME/$SERVICE_CHANGED"
+            exit 1
+          fi
+
+          for result in "$SUBTREE_RESULT" "$HOST_RESULT" "$CONTAINER_RESULT"; do
+            if [ "$result" != "$expected" ]; then
+              echo "::error::service check result '$result'; expected '$expected'"
+              exit 1
+            fi
+          done
