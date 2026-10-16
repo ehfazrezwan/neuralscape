@@ -199,6 +199,10 @@ class _GraphInventory:
     # iteration, a non-dict mapping's items) or a dict rebuilt with a hook-capable key.
     # A subtree during which it did not move ran no caller code, so it is pure.
     impure_reads: int = 0
+    # Containers rebuilt at least once.  The first rebuild walks entries capture already
+    # charged; every later rebuild of the same container (only an impure one is rebuilt
+    # again) is new work, and its entries are charged again.
+    rebuilt: set[int] = field(default_factory=set)
 
 
 def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int = 0) -> None:
@@ -348,7 +352,7 @@ def _snapshot_captured_graph(
         _capture_native_graph(value, inventory, depth)
     cached = inventory.completed.get(value_id)
     if cached is not None and cached[0] is value:
-        budget.charge_edge()  # the edge to a reused subtree
+        # The edge to a reused subtree is the parent's entry, already charged.
         if depth + cached[2] > budget.tier.max_depth:
             budget.charge_edge(budget.tier.max_edges + 1)
         return cached[1]
@@ -365,10 +369,17 @@ def _child(
     inventory: _GraphInventory,
     depth: int,
     height: int,
+    charge: bool,
 ) -> tuple[object, int]:
-    """Charge one edge, rebuild ``item`` at ``depth`` and return ``(copy, parent height)``."""
+    """Rebuild ``item`` at ``depth`` and return ``(copy, parent height)``.
 
-    inventory.budget.charge_edge()
+    ``charge`` is set when this edge was not already charged: an entry of a container
+    rebuilt again.  An entry rebuilt for the first time was charged by capture, and an
+    item of a public view was charged when the view was read.
+    """
+
+    if charge:
+        inventory.budget.charge_edge()
     copied = _snapshot_captured_graph(item, active_containers, inventory, depth)
     if _is_subclass(type(item), (BaseModel, tuple, list, dict)):
         # A reused child knows its height; an impure child is never reused, and then
@@ -395,6 +406,8 @@ def _reconstruct_captured_graph(
     active_containers.add(value_id)
     height = 0
     below = depth + 1
+    again = value_id in inventory.rebuilt
+    inventory.rebuilt.add(value_id)
     # Children are rebuilt in plain loops (no closure, no generator), so one level of nesting
     # costs two interpreter frames and the depth limit keeps the stack far from its limit.
     try:
@@ -440,7 +453,9 @@ def _reconstruct_captured_graph(
 
             fields = {}
             for key, item in stored_entries:
-                fields[key], height = _child(item, active_containers, inventory, below, height)
+                fields[key], height = _child(
+                    item, active_containers, inventory, below, height, again
+                )
             if captured.malformed_extra:
                 raise ValueError("contract extra storage must be a mapping")
             if captured.extra is not None:
@@ -453,29 +468,37 @@ def _reconstruct_captured_graph(
                 if len(extra_keys) != len(extra_entries):
                     raise ValueError("contract extra storage contains duplicate keys")
             for key, item in extra_entries:
-                fields[key], height = _child(item, active_containers, inventory, below, height)
+                fields[key], height = _child(
+                    item, active_containers, inventory, below, height, again
+                )
             return fields, height
 
         if _is_subclass(value_type, tuple):
+            exact = value_type is tuple
             items = (
                 inventory.sequences[value_id]
-                if value_type is tuple
+                if exact
                 else _exposed_items(value, inventory, depth)
             )
             copies = []
             for item in items:
-                copied, height = _child(item, active_containers, inventory, below, height)
+                copied, height = _child(
+                    item, active_containers, inventory, below, height, exact and again
+                )
                 copies.append(copied)
             return tuple(copies), height
         if _is_subclass(value_type, list):
+            exact = value_type is list
             items = (
                 inventory.sequences[value_id]
-                if value_type is list
+                if exact
                 else _exposed_items(value, inventory, depth)
             )
             copies = []
             for item in items:
-                copied, height = _child(item, active_containers, inventory, below, height)
+                copied, height = _child(
+                    item, active_containers, inventory, below, height, exact and again
+                )
                 copies.append(copied)
             return copies, height
         if value_id in inventory.colliding_dictionaries:
@@ -485,7 +508,9 @@ def _reconstruct_captured_graph(
         entries = inventory.dictionaries[value_id]
         rebuilt = {}
         for key, item in entries:
-            rebuilt[key], height = _child(item, active_containers, inventory, below, height)
+            rebuilt[key], height = _child(
+                item, active_containers, inventory, below, height, again
+            )
         return rebuilt, height
     finally:
         active_containers.remove(value_id)

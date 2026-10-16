@@ -3189,6 +3189,24 @@ def test_snapshot_contract_graph_rejects_too_many_edges(
         snapshot_contract_graph(build(range(STANDARD.max_edges + 1)))
 
 
+@pytest.mark.parametrize(
+    "build",
+    [list, tuple, lambda items: dict.fromkeys(items)],
+    ids=["list", "tuple", "dict"],
+)
+def test_snapshot_contract_graph_charges_each_native_entry_once(
+    build: Callable[[range], object],
+) -> None:
+    # One entry is one edge: capturing it and rebuilding it once is one traversal, so a
+    # container just inside the edge limit is accepted.
+    accepted = snapshot_contract_graph(build(range(STANDARD.max_edges - 1)))
+    assert len(accepted) == STANDARD.max_edges - 1  # type: ignore[arg-type]
+    shared: list = []
+    assert len(snapshot_contract_graph([shared] * (STANDARD.max_edges - 2))) == (
+        STANDARD.max_edges - 2
+    )
+
+
 def test_snapshot_contract_graph_rejects_too_many_model_edges() -> None:
     class Open(ContractModel):
         model_config = ConfigDict(extra="allow")
