@@ -190,6 +190,11 @@ class _GraphInventory:
     pure_dictionaries: set[int] = field(default_factory=set)
     colliding_dictionaries: set[int] = field(default_factory=set)
     visited: set[int] = field(default_factory=set)
+    # The native height of every captured container: how many container levels lie below it
+    # along native edges (0 for one holding no container).  A subtree reached again by a deeper
+    # path is checked against the depth limit with this, not skipped, so the limit does not
+    # depend on which path reached the shared subtree first.
+    native_heights: dict[int, int] = field(default_factory=dict)
     # Strong references keep every captured object alive for the whole
     # reconstruction, so a released temporary's id cannot be reused by a later
     # object and alias its captured contents.
@@ -208,23 +213,30 @@ class _GraphInventory:
     rebuilt_containers: set[int] = field(default_factory=set)
 
 
-def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int = 0) -> None:
+def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int = 0) -> int:
     """Freeze supported native backing without invoking public protocols.
 
     Every captured node and entry is charged to the call's budget, and the depth is checked
     along every path, so a deep or wide input is the stable budget error, never a crash.
+    Returns the container's native height (``-1`` for a value that is not a container), which
+    a later, deeper visit of the same container uses to check the depth of everything below it.
     """
 
     value_type = type(value)
     if not _is_subclass(value_type, (BaseModel, tuple, list, dict)):
-        return
+        return -1
     budget = inventory.budget
     if depth > budget.tier.max_depth:
         budget.charge_edge(budget.tier.max_edges + 1)  # the stable budget error
 
     value_id = id(value)
     if value_id in inventory.visited:
-        return
+        known = inventory.native_heights.get(value_id)
+        if known is None:
+            return 0  # still being captured: a cycle, refused when it is rebuilt
+        if depth + known > budget.tier.max_depth:
+            budget.charge_edge(budget.tier.max_edges + 1)  # a deeper path reaches a deep subtree
+        return known
     budget.charge_node(value)
     inventory.visited.add(value_id)
     inventory.retained.append(value)
@@ -250,12 +262,15 @@ def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int 
 
         # Capture every model reachable through native stored backing before
         # classifying extras or hashing any stored name.
+        height = 0  # plain loops, not a generator: one stack frame per level
         for _, item in stored_entries:
-            _capture_native_graph(item, inventory, below)
-
+            below_height = _capture_native_graph(item, inventory, below) + 1
+            if below_height > height:
+                height = below_height
         if extra is None:
             model_inventory.extra_entries = ()
-            return
+            inventory.native_heights[value_id] = height
+            return height
         extra_type = type(extra)
         if _is_subclass(extra_type, dict):
             _precheck(budget, dict.__len__(extra))
@@ -264,32 +279,43 @@ def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int 
             model_inventory.extra_entries = extra_entries
             model_inventory.pure_names = model_inventory.pure_names and pure_extra
             for _, item in extra_entries:
-                _capture_native_graph(item, inventory, below)
+                below_height = _capture_native_graph(item, inventory, below) + 1
+                if below_height > height:
+                    height = below_height
         elif not _is_subclass(extra_type, Mapping):
             model_inventory.extra_entries = ()
             model_inventory.malformed_extra = True
         # A non-dict Mapping retains its established public items protocol.
         # Its inventory is captured later, after all natively reachable model
         # backing has already been frozen.
-        return
+        inventory.native_heights[value_id] = height
+        return height
 
     if _is_subclass(value_type, tuple):
         _precheck(budget, tuple.__len__(value))
         items = tuple(tuple.__iter__(value))
         budget.charge_edge(len(items))
         inventory.sequences[value_id] = items
+        height = 0
         for item in items:
-            _capture_native_graph(item, inventory, below)
-        return
+            below_height = _capture_native_graph(item, inventory, below) + 1
+            if below_height > height:
+                height = below_height
+        inventory.native_heights[value_id] = height
+        return height
 
     if _is_subclass(value_type, list):
         _precheck(budget, list.__len__(value))
         items = tuple(list.__iter__(value))
         budget.charge_edge(len(items))
         inventory.sequences[value_id] = items
+        height = 0
         for item in items:
-            _capture_native_graph(item, inventory, below)
-        return
+            below_height = _capture_native_graph(item, inventory, below) + 1
+            if below_height > height:
+                height = below_height
+        inventory.native_heights[value_id] = height
+        return height
 
     _precheck(budget, dict.__len__(value))
     entries, pure, colliding = _plain_keys(tuple(dict.items(value)))
@@ -299,8 +325,13 @@ def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int 
         inventory.pure_dictionaries.add(value_id)
     if colliding:
         inventory.colliding_dictionaries.add(value_id)
+    height = 0
     for _, item in entries:
-        _capture_native_graph(item, inventory, below)
+        below_height = _capture_native_graph(item, inventory, below) + 1
+        if below_height > height:
+            height = below_height
+    inventory.native_heights[value_id] = height
+    return height
 
 
 def _exposed_items(value: object, inventory: _GraphInventory, depth: int) -> tuple[object, ...]:
@@ -420,7 +451,9 @@ def _snapshot_captured_graph(
                 # exactly as when the extras are a native dict.
                 captured.pure_names = captured.pure_names and extra_pure
                 for _, item in extra_entries:
-                    _capture_native_graph(item, inventory, below)
+                    late_height = _capture_native_graph(item, inventory, below) + 1
+                    if late_height > inventory.native_heights.get(value_id, 0):
+                        inventory.native_heights[value_id] = late_height  # extras first met through the public view
 
             fields: dict[object, object] = {}
             for key, item in stored_entries:

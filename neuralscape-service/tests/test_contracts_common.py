@@ -3567,3 +3567,55 @@ def test_key_code_runs_for_every_reference_not_just_the_first_two(build) -> None
     # capture may hash once; every further reference rebuilds, and so hashes, again
     assert two - one > 0
     assert three - two == two - one, (one, two, three)  # a later reference never skips the callbacks
+
+
+# ── the native depth limit does not depend on which sibling reaches a shared subtree first ──
+
+
+class _EmptyView(list):
+    """A list whose public view yields nothing while its native backing holds the child."""
+
+    def __iter__(self):
+        return iter(())
+
+
+def _deep_subtree(levels: int) -> list:
+    node: list = []
+    for _ in range(levels):
+        node = [node]
+    return node
+
+
+def _hidden_path(subtree: object, wrappers: int) -> object:
+    node = subtree
+    for _ in range(wrappers):
+        node = _EmptyView([node])
+    return node
+
+
+@pytest.mark.parametrize("hidden_first", [False, True], ids=["direct-first", "hidden-first"])
+def test_a_subtree_reached_deep_through_empty_public_views_is_refused_in_either_sibling_order(hidden_first) -> None:
+    subtree = _deep_subtree(250)  # 251 levels on its own: inside the 256 limit
+    snapshot_contract_graph([subtree])  # alone it is accepted
+    hidden = _hidden_path(subtree, 10)  # the same subtree 11 levels down: 261 native levels
+    siblings = [hidden, subtree] if hidden_first else [subtree, hidden]
+    with pytest.raises(ValueError, match="budget"):
+        snapshot_contract_graph(siblings)
+
+
+def test_a_shared_subtree_that_stays_inside_the_limit_on_every_path_is_still_accepted() -> None:
+    subtree = _deep_subtree(200)
+    hidden = _hidden_path(subtree, 10)  # 211 levels at the deepest
+    for siblings in ([subtree, hidden], [hidden, subtree], [subtree, subtree, hidden]):
+        assert snapshot_contract_graph(siblings) is not None
+
+
+@pytest.mark.parametrize("wrap", [list, tuple], ids=["list", "tuple"])
+def test_a_revisit_in_a_deep_position_through_model_and_dict_edges_is_refused_in_either_order(wrap) -> None:
+    subtree = _deep_subtree(250)
+    deep: object = {"k": subtree}
+    for _ in range(10):
+        deep = {"k": wrap([deep])}
+    for siblings in ([subtree, deep], [deep, subtree]):
+        with pytest.raises(ValueError, match="budget"):
+            snapshot_contract_graph(wrap(siblings))
