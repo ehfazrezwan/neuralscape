@@ -11,12 +11,14 @@ perform migration transaction and replay checks.
 from __future__ import annotations
 
 from pathlib import PurePosixPath, PureWindowsPath
+from collections.abc import Mapping as _AbcMapping
+from types import MappingProxyType
 from typing import Any, Literal, Mapping
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from contracts_common import ContractModel, OpaqueId, SafeCounter, VersionedContract
-from contracts_limits import PORTABILITY, DiscoveryBudget
+from contracts_limits import PORTABILITY, DiscoveryBudget, is_exact_type
 
 
 ChecksumAlgorithm = Literal["sha256"]
@@ -132,7 +134,26 @@ def _snapshot_model_extra_storage(
 
 
 _TYPE_MRO_DESCRIPTOR = type.__dict__["__mro__"]
+_MAPPING_BASES = (_AbcMapping, dict, MappingProxyType)
 _TYPE_DICT_DESCRIPTOR = type.__dict__["__dict__"]
+
+
+def _is_mapping(value: object) -> bool:
+    """Whether ``value`` is a mapping by inheritance, decided by identity only.
+
+    ``isinstance(value, Mapping)`` runs the ABC machinery, which hashes and compares
+    the value's class and honours virtual registration, so a class whose metaclass
+    defines ``__eq__``/``__hash__`` could run code or be matched by spoofing.  This
+    walks the class's native MRO and compares with ``is``: it recognises
+    ``collections.abc.Mapping`` subclasses, ``dict`` subclasses and ``mappingproxy``;
+    a class that is only *registered* as a Mapping is not treated as one.
+    """
+
+    for base in _TYPE_MRO_DESCRIPTOR.__get__(type(value)):
+        for candidate in _MAPPING_BASES:
+            if base is candidate:
+                return True
+    return False
 
 
 def _native_declared_field_names(
@@ -191,7 +212,7 @@ def _validated_model_extra_storage(
         captured = dict(extra)
         observed_names = set(captured)
     else:
-        if not isinstance(extra, Mapping):
+        if not _is_mapping(extra):
             raise ValueError(
                 "contract model extra storage must be None or a mapping"
             )
@@ -312,7 +333,7 @@ def _reject_retained_unknown_fields(
             else:
                 budget.charge_edge(frozenset.__len__(current))
                 items = tuple(frozenset.__iter__(current))
-            if value_type in (list, tuple, set, frozenset):
+            if is_exact_type(current, list, tuple, set, frozenset):
                 native_container_inventory[identity] = (
                     current,
                     value_type,
@@ -321,7 +342,7 @@ def _reject_retained_unknown_fields(
             pending.extend((item, child_depth) for item in reversed(items))
 
     def walk(value: Any, location: tuple[str | int, ...]) -> None:
-        if not isinstance(value, (BaseModel, Mapping, list, tuple, set, frozenset)):
+        if not (isinstance(value, (BaseModel, list, tuple, set, frozenset)) or _is_mapping(value)):
             return
 
         identity = id(value)
@@ -392,7 +413,7 @@ def _reject_retained_unknown_fields(
                 walk(item, (*location, item_location))
             return
 
-        if isinstance(value, Mapping):
+        if _is_mapping(value):
             for index, (key, item) in enumerate(value.items()):
                 budget.charge_edge(2)  # public view charged as it is observed
                 walk(key, (*location, "<key>", index))
@@ -400,7 +421,7 @@ def _reject_retained_unknown_fields(
                 walk(item, (*location, item_location))
             return
 
-        exact_native = type(value) in (list, tuple, set, frozenset)
+        exact_native = is_exact_type(value, list, tuple, set, frozenset)
         items = (
             _validated_native_container_items(value, native_container_inventory)
             if exact_native
@@ -437,7 +458,7 @@ def _reconstruct_retained_state(
     active: set[int] = set()
 
     def rebuild(value: Any) -> Any:
-        if not isinstance(value, (BaseModel, Mapping, list, tuple, set, frozenset)):
+        if not (isinstance(value, (BaseModel, list, tuple, set, frozenset)) or _is_mapping(value)):
             return value
 
         identity = id(value)
@@ -458,10 +479,10 @@ def _reconstruct_retained_state(
                     value, native_container_inventory
                 )
                 return {rebuild(key): rebuild(item) for key, item in items}
-            if isinstance(value, Mapping):
+            if _is_mapping(value):
                 return {rebuild(key): rebuild(item) for key, item in value.items()}
             value_type = type(value)
-            if value_type in (list, tuple, set, frozenset):
+            if is_exact_type(value, list, tuple, set, frozenset):
                 items = _validated_native_container_items(
                     value, native_container_inventory
                 )

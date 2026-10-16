@@ -3395,3 +3395,75 @@ def test_endless_public_sequence_view_is_bounded() -> None:
                 index += 1
 
     _assert_budget_rejection(_manifest_with_files(EndlessList()))
+
+
+# --- exact-type tests use identity, never == (hostile metaclass) -----------------
+
+
+def _hostile_equal_types():
+    calls: list[str] = []
+
+    class ClaimsEquality(type):
+        def __eq__(cls, other):  # a class claiming to equal list/tuple/set/frozenset/dict
+            calls.append(f"eq:{getattr(other, '__name__', other)}")
+            return True
+
+        def __hash__(cls):
+            return type.__hash__(cls)
+
+    return calls, ClaimsEquality
+
+
+@pytest.mark.parametrize("base", [list, tuple])
+def test_a_metaclass_claiming_equality_with_an_exact_type_is_not_taken_as_exact(base) -> None:
+    calls, meta = _hostile_equal_types()
+    declared = [{"path": "canonical/a.txt", "size_bytes": 1,
+                 "checksum": {"algorithm": "sha256", "digest": "a" * 64}, "entry_type": "file"}]
+
+    public = declared + [{"path": "../escape", "size_bytes": 1,
+                          "checksum": {"algorithm": "sha256", "digest": "a" * 64}, "entry_type": "file"}]
+
+    class Hostile(base, metaclass=meta):
+        # The public view differs from the (empty) native backing: a subclass is
+        # read through its public iteration, never through hidden native storage.
+        def __iter__(self):
+            return iter(public)
+
+    manifest = _manifest_with_files(Hostile())
+    calls.clear()
+    with pytest.raises(ValidationError):
+        validate_portable_manifest(manifest)
+    assert calls == [], "a metaclass __eq__ ran during exact-type classification"
+
+
+def test_the_public_view_of_a_spoofing_container_is_what_is_validated() -> None:
+    calls, meta = _hostile_equal_types()
+
+    stable = [{"path": "../escape", "size_bytes": 1,
+               "checksum": {"algorithm": "sha256", "digest": "a" * 64}, "entry_type": "file"}]
+
+    class Hostile(list, metaclass=meta):
+        def __iter__(self):  # stable objects: the public view is observed the same way each time
+            return iter(stable)
+
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(_manifest_with_files(Hostile()))
+    assert "traverse" in str(raised.value) or "relative" in str(raised.value) or "files" in str(raised.value)
+    assert calls == []
+
+
+def test_no_exact_type_test_in_the_module_uses_tuple_membership() -> None:
+    import ast
+    import pathlib
+
+    tree = ast.parse(pathlib.Path(contracts_portability.__file__).read_text(encoding="utf-8"))
+    offenders = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Compare) and any(isinstance(op, (ast.In, ast.NotIn)) for op in node.ops):
+            for comparator in node.comparators:
+                if isinstance(comparator, ast.Tuple) and any(
+                    isinstance(element, ast.Name) and element.id in {"list", "tuple", "set", "frozenset", "dict", "str", "int"}
+                    for element in comparator.elts
+                ):
+                    offenders.append(node.lineno)
+    assert offenders == [], f"type membership via == at lines {offenders}"
