@@ -2773,3 +2773,83 @@ def test_exposed_siblings_are_captured_before_the_first_is_reconstructed(
     # reconstructed, so the snapshot keeps the exposed (invalid) value.
     assert (sibling["count"] if sibling_kind == "dict" else sibling.count) == 1  # type: ignore[index,union-attr]
     assert second == expected
+
+
+def _shared_ladder(depth: int) -> list:
+    level: list = []
+    for _ in range(depth):
+        level = [level, level]
+    return level
+
+
+def _unique_lists(value: object) -> int:
+    seen: set[int] = set()
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if type(item) is list and id(item) not in seen:
+            seen.add(id(item))
+            stack.extend(item)
+    return len(seen)
+
+
+def test_snapshot_contract_graph_reuses_completed_shared_subtrees() -> None:
+    snapshot = snapshot_contract_graph(_shared_ladder(15))
+
+    # One rebuilt list per distinct source list, not one per path (32,767).
+    assert _unique_lists(snapshot) == 16
+
+
+def test_snapshot_contract_graph_completes_deep_shared_ladder() -> None:
+    snapshot = snapshot_contract_graph(_shared_ladder(60))
+
+    assert _unique_lists(snapshot) == 61
+
+
+def test_snapshot_contract_graph_shared_reuse_is_a_detached_copy() -> None:
+    source = _shared_ladder(3)
+    snapshot = snapshot_contract_graph(source)
+    source[0].append("late")
+
+    assert snapshot[0] is snapshot[1]
+    assert snapshot[0] is not source[0]
+    assert snapshot[0][0][0] == []
+
+
+def test_snapshot_contract_graph_still_rejects_cycles_with_memo() -> None:
+    shared: list = []
+    cyclic: list = [shared, shared]
+    shared.append(cyclic)
+
+    with pytest.raises(Exception):
+        snapshot_contract_graph(cyclic)
+
+
+def test_snapshot_contract_graph_reads_public_view_once_per_edge() -> None:
+    class CountingList(list):
+        reads = 0
+
+        def __iter__(self):
+            type(self).reads += 1
+            return super().__iter__()
+
+    view = CountingList([1])
+    snapshot = snapshot_contract_graph([[view], [view], {"k": [view]}])
+
+    assert CountingList.reads == 3
+    assert snapshot[0] == snapshot[1] == [[1]]
+
+
+def test_snapshot_contract_graph_public_view_ancestors_are_not_reused() -> None:
+    class CountingList(list):
+        reads = 0
+
+        def __iter__(self):
+            type(self).reads += 1
+            return super().__iter__()
+
+    view = CountingList([1])
+    parent = [view]
+    snapshot_contract_graph([parent, parent, parent])
+
+    assert CountingList.reads == 3

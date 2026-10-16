@@ -110,6 +110,13 @@ class _GraphInventory:
     # reconstruction, so a released temporary's id cannot be reused by a later
     # object and alias its captured contents.
     retained: list[object] = field(default_factory=list)
+    # Completed reconstructions of subtrees built only from native storage, keyed by
+    # identity, so a descendant shared by many paths is rebuilt once and shared.
+    completed: dict[int, object] = field(default_factory=dict)
+    # Counts every public view (a sequence subclass's iteration, a non-dict mapping's
+    # items) read so far.  A subtree during which it did not move touched no public
+    # protocol, so its reconstruction is pure and safe to reuse.
+    public_reads: int = 0
 
 
 def _capture_native_graph(value: object, inventory: _GraphInventory) -> None:
@@ -189,6 +196,7 @@ def _exposed_items(value: object, inventory: _GraphInventory) -> tuple[object, .
     change a later sibling's captured state.  The items are retained.
     """
 
+    inventory.public_reads += 1
     items = tuple(iter(value))  # type: ignore[call-overload]
     inventory.retained.append(items)
     for item in items:
@@ -201,7 +209,15 @@ def _snapshot_captured_graph(
     active_containers: set[int],
     inventory: _GraphInventory,
 ) -> object:
-    """Reconstruct one graph after its reachable native backing is frozen."""
+    """Reconstruct one graph after its reachable native backing is frozen.
+
+    Discovery deduplicates identities, so reconstruction must too: a completed
+    subtree built only from native storage is reused by every later path that
+    reaches it, rather than rebuilt per path (which makes work and output grow
+    exponentially with depth for a graph that shares descendants).  A subtree that
+    read any public view is never reused: each edge reaching a public view observes
+    it again, as the contract promises.
+    """
 
     value_type = type(value)
     if not issubclass(value_type, (BaseModel, tuple, list, dict)):
@@ -210,6 +226,24 @@ def _snapshot_captured_graph(
     value_id = id(value)
     if value_id not in inventory.visited:
         _capture_native_graph(value, inventory)
+    if value_id in inventory.completed:
+        return inventory.completed[value_id]
+    reads_before = inventory.public_reads
+    result = _reconstruct_captured_graph(value, active_containers, inventory)
+    if inventory.public_reads == reads_before:
+        inventory.completed[value_id] = result
+    return result
+
+
+def _reconstruct_captured_graph(
+    value: object,
+    active_containers: set[int],
+    inventory: _GraphInventory,
+) -> object:
+    """Rebuild one container (cycle-checked, children via ``_snapshot_captured_graph``)."""
+
+    value_type = type(value)
+    value_id = id(value)
     if value_id in active_containers:
         raise ValueError("cyclic contract input is not supported")
     active_containers.add(value_id)
@@ -240,6 +274,7 @@ def _snapshot_captured_graph(
 
             extra_entries = captured.extra_entries
             if extra_entries is None:
+                inventory.public_reads += 1
                 extra_entries = _mapping_entries(
                     captured.extra,  # type: ignore[arg-type]
                     type(captured.extra),
