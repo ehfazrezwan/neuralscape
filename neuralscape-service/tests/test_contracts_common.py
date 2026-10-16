@@ -1,10 +1,21 @@
 """Conformance tests for the shared candidate contract foundation."""
 
+from collections.abc import ItemsView, Iterator, KeysView, Mapping
 import json
-from typing import get_args
+from types import MappingProxyType
+from typing import Callable, get_args
 
 import pytest
-from pydantic import TypeAdapter, ValidationError
+from pydantic import (
+    AliasChoices,
+    AliasPath,
+    BaseModel,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    ValidationError,
+    model_validator,
+)
 
 from contracts_common import (
     ContractModel,
@@ -12,6 +23,7 @@ from contracts_common import (
     OpaqueId,
     SafeCounter,
     VersionedContract,
+    snapshot_contract_graph,
 )
 from contracts_errors import (
     InternalErrorCode,
@@ -21,8 +33,128 @@ from contracts_errors import (
 from contracts_references import ReferenceHandle, ReferenceKind, SourceVersion
 
 
+_BASE_MODEL_DICT_DESCRIPTOR = vars(BaseModel)["__dict__"]
+_BASE_MODEL_EXTRA_DESCRIPTOR = vars(BaseModel)["__pydantic_extra__"]
+_BASE_MODEL_FIELDS_SET_DESCRIPTOR = vars(BaseModel)["__pydantic_fields_set__"]
+
+
 class ExampleContract(ContractModel):
     count: SafeCounter
+
+
+class DefaultedExampleContract(ContractModel):
+    count: SafeCounter = 7
+
+
+class AliasedExampleContract(ContractModel):
+    count: SafeCounter = Field(alias="n")
+
+
+class ChoiceAliasedExampleContract(ContractModel):
+    count: SafeCounter = Field(
+        validation_alias=AliasChoices(
+            "n",
+            "number",
+            AliasPath("payload", "count"),
+        )
+    )
+
+
+class PathAliasedExampleContract(ContractModel):
+    count: SafeCounter = Field(validation_alias=AliasPath("payload", "count"))
+
+
+class AliasedExampleEnvelope(ContractModel):
+    item: AliasedExampleContract
+
+
+class CrossStringAliasContract(ContractModel):
+    primary: SafeCounter = Field(alias="shadow")
+    shadow: SafeCounter
+
+
+class CrossPathAliasContract(ContractModel):
+    payload: dict[str, SafeCounter]
+    count: SafeCounter = Field(validation_alias=AliasPath("payload", "count"))
+
+
+class CrossChoiceAliasContract(ContractModel):
+    primary: SafeCounter = Field(
+        validation_alias=AliasChoices("primary", "shadow")
+    )
+    shadow: SafeCounter
+
+
+class CrossChoicePathAliasContract(ContractModel):
+    payload: dict[str, SafeCounter]
+    count: SafeCounter = Field(
+        validation_alias=AliasChoices(
+            "count",
+            AliasPath("payload", "count"),
+        )
+    )
+
+
+class CrossStringAliasEnvelope(ContractModel):
+    item: CrossStringAliasContract
+
+
+class CrossPathAliasEnvelope(ContractModel):
+    item: CrossPathAliasContract
+
+
+class CrossChoiceAliasEnvelope(ContractModel):
+    item: CrossChoiceAliasContract
+
+
+class CrossChoicePathAliasEnvelope(ContractModel):
+    item: CrossChoicePathAliasContract
+
+
+class CrossDefaultAliasContract(ContractModel):
+    primary: SafeCounter = Field(
+        default=7,
+        validation_alias=AliasChoices("primary", "shadow"),
+    )
+    shadow: SafeCounter = 11
+
+
+class CrossAliasBaseContract(ContractModel):
+    primary: SafeCounter = Field(
+        validation_alias=AliasChoices("primary", "shadow")
+    )
+    shadow: SafeCounter
+
+
+class CrossAliasDerivedContract(CrossAliasBaseContract):
+    category: OpaqueId = Field(
+        validation_alias=AliasChoices("category", "kind")
+    )
+    kind: OpaqueId
+
+
+class SerializationAliasedExampleContract(ContractModel):
+    count: SafeCounter = Field(serialization_alias="n")
+
+
+class NameOnlyAliasedExampleContract(ContractModel):
+    model_config = ConfigDict(validate_by_alias=False, validate_by_name=True)
+
+    count: SafeCounter = Field(alias="n")
+
+
+class InheritedAliasExampleContract(ContractModel):
+    count: SafeCounter = Field(validation_alias=AliasChoices("n", "count"))
+
+
+class DerivedAliasedExampleContract(InheritedAliasExampleContract):
+    category: OpaqueId = Field(
+        validation_alias=AliasChoices(
+            "kind",
+            "category",
+            AliasPath("metadata", "category"),
+        )
+    )
 
 
 class NestedExampleContract(ContractModel):
@@ -39,8 +171,1826 @@ class ExampleContractGraph(ContractModel):
     by_name: dict[str, NestedExampleContract]
 
 
+class ExampleContractEnvelope(ContractModel):
+    item: ExampleContract
+
+
+class ExampleContractListEnvelope(ContractModel):
+    items: list[ExampleContract]
+
+
+class NestedInventoryEnvelope(ContractModel):
+    tuple_trigger: tuple[int, ...]
+    list_trigger: list[int]
+    child: ExampleContract
+
+
+class NativeEdgeEnvelope(ContractModel):
+    trigger: tuple[int, ...]
+    children: list[ExampleContract]
+
+
+class TenantTargetEnvelope(ContractModel):
+    tenant_id: OpaqueId
+    target_refs: tuple[ReferenceHandle, ...]
+
+    @model_validator(mode="after")
+    def validate_target_tenants(self) -> "TenantTargetEnvelope":
+        if any(item.tenant_id != self.tenant_id for item in self.target_refs):
+            raise ValueError("target_refs must match tenant_id")
+        return self
+
+
+class DictionaryEnvelope(ContractModel):
+    payload: dict[str, SafeCounter]
+
+
 class DerivedExampleContractGraph(ContractModel):
     item: DerivedNestedExampleContract
+
+
+class HiddenKeysExtra(dict[str, object]):
+    def keys(self) -> KeysView[str]:
+        return {}.keys()
+
+
+class SingleReadExtra(dict[str, object]):
+    item_reads = 0
+
+    def keys(self) -> KeysView[str]:
+        raise AssertionError("extra keys must come from captured entries")
+
+    def items(self) -> ItemsView[str, object]:
+        self.item_reads += 1
+        if self.item_reads > 1:
+            raise AssertionError("extra entries must be captured exactly once")
+        return super().items()
+
+
+class SingleReadMapping(Mapping[str, object]):
+    def __init__(self, entries: dict[str, object]) -> None:
+        self._entries = entries
+        self.item_reads = 0
+
+    def __getitem__(self, key: str) -> object:
+        return self._entries[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def items(self) -> ItemsView[str, object]:
+        self.item_reads += 1
+        if self.item_reads > 1:
+            raise AssertionError("mapping entries must be captured exactly once")
+        return self._entries.items()
+
+
+class DuplicateItemsMapping(Mapping[str, object]):
+    def __init__(self, entries: tuple[tuple[str, object], ...]) -> None:
+        self._entries = entries
+        self.item_reads = 0
+
+    def __getitem__(self, key: str) -> object:
+        raise AssertionError("duplicate mapping getitem must not be called")
+
+    def __iter__(self) -> Iterator[str]:
+        raise AssertionError("duplicate mapping iterator must not be called")
+
+    def __len__(self) -> int:
+        raise AssertionError("duplicate mapping len must not be called")
+
+    def items(self) -> tuple[tuple[str, object], ...]:
+        self.item_reads += 1
+        if self.item_reads > 1:
+            raise AssertionError("duplicate mapping items must be captured once")
+        return self._entries
+
+
+class RepairingMapping(Mapping[str, object]):
+    def __init__(self, callback: Callable[[], None]) -> None:
+        self.callback = callback
+        self.item_reads = 0
+
+    def __getitem__(self, key: str) -> object:
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+    def items(self) -> tuple[tuple[str, object], ...]:
+        self.item_reads += 1
+        callback = self.callback
+        self.callback = lambda: None
+        callback()
+        return ()
+
+
+class DictClassSpoofingMapping(SingleReadMapping):
+    @property
+    def __class__(self) -> type[dict]:
+        return dict
+
+
+class ClassReadRejectingMapping(SingleReadMapping):
+    @property
+    def __class__(self) -> type[object]:
+        raise AssertionError("mapping __class__ override must not be read")
+
+
+class ClassReadCountingMapping(SingleReadMapping):
+    def __init__(self, entries: dict[str, object]) -> None:
+        super().__init__(entries)
+        self.class_reads = 0
+
+    @property
+    def __class__(self) -> type[dict]:
+        self.class_reads += 1
+        return dict
+
+
+class ClassReadRejectingContract(ExampleContract):
+    @property
+    def __class__(self) -> type[object]:
+        raise AssertionError("model __class__ override must not be read")
+
+
+class ClassReadRejectingTuple(tuple):
+    @property
+    def __class__(self) -> type[object]:
+        raise AssertionError("tuple __class__ override must not be read")
+
+
+class ClassReadRejectingList(list):
+    @property
+    def __class__(self) -> type[object]:
+        raise AssertionError("list __class__ override must not be read")
+
+
+class ClassReadRejectingDict(dict[str, object]):
+    @property
+    def __class__(self) -> type[object]:
+        raise AssertionError("dict __class__ override must not be read")
+
+
+class ModelClassSpoofingDict(dict[str, object]):
+    @property
+    def __class__(self) -> type[ExampleContract]:
+        return ExampleContract
+
+
+class ModelDictViewHidingExampleContract(ExampleContract):
+    def __getattribute__(self, name: str) -> object:
+        if name == "__dict__":
+            native = object.__getattribute__(self, "__dict__")
+            return {
+                key: item
+                for key, item in dict.items(native)
+                if key != "future_state"
+            }
+        return super().__getattribute__(name)
+
+
+class ModelExtraViewHidingExampleContract(ExampleContract):
+    def __getattribute__(self, name: str) -> object:
+        if name == "__pydantic_extra__":
+            return {}
+        return super().__getattribute__(name)
+
+
+class ModelDictDescriptorHidingExampleContract(ExampleContract):
+    @property
+    def __dict__(self):  # type: ignore[override]
+        native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(self, BaseModel)
+        return {
+            key: item
+            for key, item in dict.items(native)
+            if key != "future_state"
+        }
+
+    @__dict__.setter
+    def __dict__(self, value):  # type: ignore[no-untyped-def]
+        _BASE_MODEL_DICT_DESCRIPTOR.__set__(self, value)
+
+
+class ModelExtraDescriptorHidingExampleContract(ExampleContract):
+    @property
+    def __pydantic_extra__(self):  # type: ignore[override]
+        return None
+
+    @__pydantic_extra__.setter
+    def __pydantic_extra__(self, value):  # type: ignore[no-untyped-def]
+        _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(self, value)
+
+
+class HiddenItemsDict(dict[str, object]):
+    def items(self) -> tuple[tuple[str, object], ...]:
+        return tuple(
+            (key, item)
+            for key, item in dict.items(self)
+            if key not in {"injected", "n", "future_state", "hidden"}
+        )
+
+
+class EmptyItemsDict(dict[str, object]):
+    def items(self) -> tuple[tuple[str, object], ...]:
+        return ()
+
+
+class RaisingInventoryDict(dict[str, object]):
+    def items(self) -> ItemsView[str, object]:
+        raise AssertionError("dict items override must not be called")
+
+    def keys(self) -> KeysView[str]:
+        raise AssertionError("dict keys override must not be called")
+
+    def __iter__(self) -> Iterator[str]:
+        raise AssertionError("dict iterator override must not be called")
+
+    def __bool__(self) -> bool:
+        raise AssertionError("dict truth override must not be called")
+
+
+class FabricatingItemsDict(dict[str, object]):
+    def items(self) -> tuple[tuple[str, object], ...]:
+        return (*tuple(dict.items(self)), ("fabricated", 99))
+
+
+class RepairingTuple(tuple[int, ...]):
+    def __new__(
+        cls,
+        values: tuple[int, ...],
+        callback: Callable[[], None],
+    ) -> "RepairingTuple":
+        instance = tuple.__new__(cls, values)
+        instance.callback = callback
+        instance.iteration_calls = 0
+        return instance
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        self.iteration_calls += 1
+        callback = self.callback
+        self.callback = lambda: None
+        callback()
+        return tuple.__iter__(self)
+
+
+class RepairingList(list[int]):
+    def __init__(self, values: list[int], callback: Callable[[], None]) -> None:
+        list.__init__(self, values)
+        self.callback = callback
+        self.iteration_calls = 0
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        self.iteration_calls += 1
+        callback = self.callback
+        self.callback = lambda: None
+        callback()
+        return list.__iter__(self)
+
+
+class DivergentTuple(tuple[object, ...]):
+    def __new__(
+        cls,
+        native_values: tuple[object, ...],
+        public_values: tuple[object, ...],
+    ) -> "DivergentTuple":
+        instance = tuple.__new__(cls, native_values)
+        instance.public_values = public_values
+        instance.iteration_calls = 0
+        return instance
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        self.iteration_calls += 1
+        return iter(self.public_values)
+
+
+class DivergentList(list[object]):
+    def __init__(
+        self,
+        native_values: list[object],
+        public_values: list[object],
+    ) -> None:
+        list.__init__(self, native_values)
+        self.public_values = public_values
+        self.iteration_calls = 0
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        self.iteration_calls += 1
+        return iter(self.public_values)
+
+
+class RepairingStoredName(str):
+    def __new__(
+        cls,
+        value: str,
+        callback: Callable[[], None],
+        hook: str,
+    ) -> "RepairingStoredName":
+        instance = str.__new__(cls, value)
+        instance.callback = callback
+        instance.hook = hook
+        instance.armed = False
+        instance.hash_calls = 0
+        instance.equality_calls = 0
+        return instance
+
+    def __hash__(self) -> int:
+        self.hash_calls += 1
+        if self.armed and self.hook == "hash":
+            self.armed = False
+            self.callback()
+        return str.__hash__(self)
+
+    def __eq__(self, other: object) -> bool:
+        self.equality_calls += 1
+        if self.armed and self.hook == "equality":
+            self.armed = False
+            self.callback()
+        return str.__eq__(self, other)
+
+
+def _invalid_nested_inventory_envelope() -> tuple[
+    NestedInventoryEnvelope,
+    ExampleContract,
+]:
+    child = ExampleContract(count=1).model_copy(update={"count": -1})
+    envelope = NestedInventoryEnvelope(
+        tuple_trigger=(),
+        list_trigger=[],
+        child=ExampleContract(count=1),
+    ).model_copy(update={"child": child})
+    return envelope, child
+
+
+@pytest.mark.parametrize("container_kind", ["tuple", "list"])
+def test_snapshot_contract_graph_freezes_later_model_before_container_hook(
+    container_kind: str,
+) -> None:
+    ordinary, _ = _invalid_nested_inventory_envelope()
+    ordinary_snapshot = snapshot_contract_graph(ordinary)
+    with pytest.raises(ValidationError) as ordinary_error:
+        NestedInventoryEnvelope.model_validate(ordinary_snapshot, strict=True)
+    assert ordinary_error.value.errors()[0]["type"] == "greater_than_equal"
+    assert ordinary_error.value.errors()[0]["loc"] == ("child", "count")
+    assert ordinary_error.value.errors()[0]["input"] == -1
+
+    value, child = _invalid_nested_inventory_envelope()
+    native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+
+    def repair_child() -> None:
+        child_native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(child, BaseModel)
+        dict.__setitem__(child_native, "count", 1)
+
+    if container_kind == "tuple":
+        trigger: RepairingTuple | RepairingList = RepairingTuple(
+            native["tuple_trigger"],
+            repair_child,
+        )
+        dict.__setitem__(native, "tuple_trigger", trigger)
+    else:
+        trigger = RepairingList(native["list_trigger"], repair_child)
+        dict.__setitem__(native, "list_trigger", trigger)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert trigger.iteration_calls == 1
+    assert child.count == 1
+    assert snapshot["child"]["count"] == -1
+    with pytest.raises(ValidationError) as repaired_error:
+        NestedInventoryEnvelope.model_validate(snapshot, strict=True)
+    assert repaired_error.value.errors() == ordinary_error.value.errors()
+
+
+@pytest.mark.parametrize("container_kind", ["tuple", "list"])
+def test_snapshot_contract_graph_preserves_sequence_subclass_public_view(
+    container_kind: str,
+) -> None:
+    if container_kind == "tuple":
+        value: DivergentTuple | DivergentList = DivergentTuple((1,), (2,))
+        expected: tuple[int, ...] | list[int] = (2,)
+        adapter = TypeAdapter(tuple[int, ...])
+    else:
+        value = DivergentList([1], [2])
+        expected = [2]
+        adapter = TypeAdapter(list[int])
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == expected
+    assert type(snapshot) is type(expected)
+    assert value.iteration_calls == 1
+    assert adapter.validate_python(snapshot, strict=True) == expected
+
+
+def test_snapshot_contract_graph_exposes_hidden_cross_tenant_target() -> None:
+    cross_tenant = ReferenceHandle(
+        kind="artifact",
+        id="artifact-1",
+        tenant_id="tenant-2",
+        resolver="resolve_artifact",
+    )
+    target_refs = DivergentTuple((), (cross_tenant,))
+    value = TenantTargetEnvelope(tenant_id="tenant-1", target_refs=())
+    native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+    dict.__setitem__(native, "target_refs", target_refs)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot["target_refs"] == (
+        {
+            "kind": "artifact",
+            "id": "artifact-1",
+            "tenant_id": "tenant-2",
+            "resolver": "resolve_artifact",
+            "cross_tenant": False,
+        },
+    )
+    assert target_refs.iteration_calls == 1
+    with pytest.raises(ValidationError, match="target_refs must match tenant_id"):
+        TenantTargetEnvelope.model_validate(snapshot, strict=True)
+
+
+@pytest.mark.parametrize("mutation", ["replace", "remove"])
+def test_snapshot_contract_graph_freezes_plain_list_edges_before_earlier_hook(
+    mutation: str,
+) -> None:
+    invalid_child = ExampleContract(count=1).model_copy(update={"count": -1})
+    children = [invalid_child]
+
+    def mutate_edge() -> None:
+        if mutation == "replace":
+            list.__setitem__(children, 0, ExampleContract(count=1))
+        else:
+            list.clear(children)
+
+    trigger = RepairingTuple((), mutate_edge)
+    value = NativeEdgeEnvelope(trigger=(), children=[ExampleContract(count=1)])
+    native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+    dict.__setitem__(native, "trigger", trigger)
+    dict.__setitem__(native, "children", children)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert trigger.iteration_calls == 1
+    assert snapshot["children"] == [{"count": -1}]
+    if mutation == "replace":
+        assert children[0].count == 1
+    else:
+        assert children == []
+    with pytest.raises(ValidationError) as raised:
+        NativeEdgeEnvelope.model_validate(snapshot, strict=True)
+    assert raised.value.errors()[0]["type"] == "greater_than_equal"
+    assert raised.value.errors()[0]["loc"] == ("children", 0, "count")
+    assert raised.value.errors()[0]["input"] == -1
+
+
+def test_snapshot_contract_graph_freezes_later_model_before_mapping_hook() -> None:
+    ordinary, _ = _invalid_nested_inventory_envelope()
+    ordinary_snapshot = snapshot_contract_graph(ordinary)
+    with pytest.raises(ValidationError) as ordinary_error:
+        NestedInventoryEnvelope.model_validate(ordinary_snapshot, strict=True)
+
+    value, child = _invalid_nested_inventory_envelope()
+
+    def repair_child() -> None:
+        child_native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(child, BaseModel)
+        dict.__setitem__(child_native, "count", 1)
+
+    extras = RepairingMapping(repair_child)
+    _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(value, extras)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert extras.item_reads == 1
+    assert child.count == 1
+    assert snapshot["child"]["count"] == -1
+    with pytest.raises(ValidationError) as repaired_error:
+        NestedInventoryEnvelope.model_validate(snapshot, strict=True)
+    assert repaired_error.value.errors() == ordinary_error.value.errors()
+
+
+@pytest.mark.parametrize("hook", ["hash", "equality"])
+def test_snapshot_contract_graph_freezes_later_model_before_stored_name_hook(
+    hook: str,
+) -> None:
+    ordinary, _ = _invalid_nested_inventory_envelope()
+    ordinary_snapshot = snapshot_contract_graph(ordinary)
+    with pytest.raises(ValidationError) as ordinary_error:
+        NestedInventoryEnvelope.model_validate(ordinary_snapshot, strict=True)
+
+    value, child = _invalid_nested_inventory_envelope()
+    native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+
+    def repair_child() -> None:
+        child_native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(child, BaseModel)
+        dict.__setitem__(child_native, "count", 1)
+
+    stored_name = RepairingStoredName("tuple_trigger", repair_child, hook)
+    stored_value = dict.pop(native, "tuple_trigger")
+    dict.__setitem__(native, stored_name, stored_value)
+    stored_name.armed = True
+
+    snapshot = snapshot_contract_graph(value)
+
+    if hook == "hash":
+        assert stored_name.hash_calls > 0
+    else:
+        assert stored_name.equality_calls > 0
+    assert child.count == 1
+    assert snapshot["child"]["count"] == -1
+    with pytest.raises(ValidationError) as repaired_error:
+        NestedInventoryEnvelope.model_validate(snapshot, strict=True)
+    assert repaired_error.value.errors() == ordinary_error.value.errors()
+
+
+@pytest.mark.parametrize("hook", ["hash", "equality"])
+def test_snapshot_contract_graph_freezes_invalid_root_before_name_hook(
+    hook: str,
+) -> None:
+    value = ExampleContract(count=1).model_copy(update={"count": -1})
+    native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+
+    def repair_root() -> None:
+        dict.__setitem__(native, "count", 1)
+
+    stored_name = RepairingStoredName("count", repair_root, hook)
+    stored_value = dict.pop(native, "count")
+    dict.__setitem__(native, stored_name, stored_value)
+    stored_name.armed = True
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert value.count == 1
+    assert snapshot["count"] == -1
+    with pytest.raises(ValidationError) as raised:
+        ExampleContract.model_validate(snapshot, strict=True)
+    assert raised.value.errors()[0]["type"] == "greater_than_equal"
+    assert raised.value.errors()[0]["loc"] == ("count",)
+    assert raised.value.errors()[0]["input"] == -1
+
+
+@pytest.mark.parametrize("hook", ["hash", "equality"])
+def test_snapshot_contract_graph_preserves_valid_string_subclass_names(
+    hook: str,
+) -> None:
+    value = ExampleContract(count=1)
+    native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+    stored_name = RepairingStoredName("count", lambda: None, hook)
+    stored_value = dict.pop(native, "count")
+    dict.__setitem__(native, stored_name, stored_value)
+    stored_name.armed = True
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"count": 1}
+    assert ExampleContract.model_validate(snapshot, strict=True).count == 1
+
+
+def test_snapshot_contract_graph_preserves_no_fields_set_policy() -> None:
+    value = ExampleContract(count=1)
+    fields_set = _BASE_MODEL_FIELDS_SET_DESCRIPTOR.__get__(value, BaseModel)
+    set.add(fields_set, "future_constraint")
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"count": 1}
+    assert ExampleContract.model_validate(snapshot, strict=True).count == 1
+
+
+@pytest.mark.parametrize("source", ["copy", "construct"])
+def test_snapshot_contract_graph_preserves_complete_stored_state(source: str) -> None:
+    if source == "copy":
+        value = ExampleContract(count=1).model_copy(
+            update={"unreviewed_state": "preserved"}
+        )
+    else:
+        value = ExampleContract.model_construct(count=1)
+        value.__dict__["unreviewed_state"] = "preserved"
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"count": 1, "unreviewed_state": "preserved"}
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ExampleContract.model_validate(snapshot, strict=True)
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["direct", "nested"])
+def test_snapshot_contract_graph_reads_hidden_model_backing_entries(
+    nested: bool,
+) -> None:
+    value = ExampleContract(count=1)
+    hidden = HiddenItemsDict(count=1, injected=2)
+    object.__setattr__(value, "__dict__", hidden)
+    graph: object = {"item": value} if nested else value
+    receiver = ExampleContractEnvelope if nested else ExampleContract
+
+    assert list(hidden.items()) == [("count", 1)]
+    assert list(dict.items(hidden)) == [("count", 1), ("injected", 2)]
+    snapshot = snapshot_contract_graph(graph)
+
+    expected = {"item": {"count": 1, "injected": 2}} if nested else {
+        "count": 1,
+        "injected": 2,
+    }
+    assert snapshot == expected
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        receiver.model_validate(snapshot, strict=True)
+
+
+def test_snapshot_contract_graph_reads_hidden_stored_alias_collision() -> None:
+    value = AliasedExampleContract(n=1)
+    hidden = HiddenItemsDict(n=9)
+    object.__setattr__(value, "__dict__", hidden)
+
+    assert list(hidden.items()) == []
+    assert list(dict.items(hidden)) == [("n", 9)]
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(value)
+
+
+def test_snapshot_contract_graph_reads_hidden_cross_field_alias_root() -> None:
+    value = CrossStringAliasContract(shadow=1)
+    hidden = EmptyItemsDict(shadow=9)
+    object.__setattr__(value, "__dict__", hidden)
+
+    assert list(hidden.items()) == []
+    assert list(dict.items(hidden)) == [("shadow", 9)]
+    with pytest.raises(ValueError) as raised:
+        snapshot_contract_graph(value)
+    assert str(raised.value) == (
+        "contract input contains stored validation alias roots "
+        "with missing owning fields"
+    )
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [RaisingInventoryDict(count=1), FabricatingItemsDict(count=1)],
+    ids=["raising-overrides", "fabricated-entry"],
+)
+def test_snapshot_contract_graph_bypasses_model_dict_inventory_overrides(
+    stored: dict[str, object],
+) -> None:
+    value = ExampleContract(count=1)
+    object.__setattr__(value, "__dict__", stored)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"count": 1}
+    assert ExampleContract.model_validate(snapshot, strict=True) == value
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["direct", "nested"])
+def test_snapshot_contract_graph_uses_native_model_storage(
+    nested: bool,
+) -> None:
+    value = ModelDictViewHidingExampleContract(count=1)
+    native = RaisingInventoryDict(count=1, future_state="preserved")
+    object.__setattr__(value, "__dict__", native)
+    graph: object = {"item": value} if nested else value
+    receiver = ExampleContractEnvelope if nested else ExampleContract
+
+    assert value.__dict__ == {"count": 1}
+    assert dict(dict.items(object.__getattribute__(value, "__dict__"))) == {
+        "count": 1,
+        "future_state": "preserved",
+    }
+
+    snapshot = snapshot_contract_graph(graph)
+
+    expected = (
+        {"item": {"count": 1, "future_state": "preserved"}}
+        if nested
+        else {"count": 1, "future_state": "preserved"}
+    )
+    assert snapshot == expected
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        receiver.model_validate(snapshot, strict=True)
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["direct", "nested"])
+def test_snapshot_contract_graph_uses_native_model_extra_storage(
+    nested: bool,
+) -> None:
+    value = ModelExtraViewHidingExampleContract(count=1)
+    native = RaisingInventoryDict(future_state="preserved")
+    object.__setattr__(value, "__pydantic_extra__", native)
+    graph: object = {"item": value} if nested else value
+    receiver = ExampleContractEnvelope if nested else ExampleContract
+
+    assert value.__pydantic_extra__ == {}
+    assert dict(
+        dict.items(object.__getattribute__(value, "__pydantic_extra__"))
+    ) == {"future_state": "preserved"}
+
+    snapshot = snapshot_contract_graph(graph)
+
+    expected = (
+        {"item": {"count": 1, "future_state": "preserved"}}
+        if nested
+        else {"count": 1, "future_state": "preserved"}
+    )
+    assert snapshot == expected
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        receiver.model_validate(snapshot, strict=True)
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["direct", "nested"])
+@pytest.mark.parametrize("storage", ["stored", "extra"])
+def test_snapshot_contract_graph_bypasses_model_storage_descriptors(
+    nested: bool,
+    storage: str,
+) -> None:
+    descriptor_type = (
+        ModelDictDescriptorHidingExampleContract
+        if storage == "stored"
+        else ModelExtraDescriptorHidingExampleContract
+    )
+    ordinary = ExampleContract(count=1)
+    descriptor = descriptor_type(count=1)
+    ordinary_graph: object = {"item": ordinary} if nested else ordinary
+    descriptor_graph: object = {"item": descriptor} if nested else descriptor
+    receiver = ExampleContractEnvelope if nested else ExampleContract
+    valid_snapshot = {"item": {"count": 1}} if nested else {"count": 1}
+
+    assert snapshot_contract_graph(ordinary_graph) == valid_snapshot
+    assert snapshot_contract_graph(descriptor_graph) == valid_snapshot
+    receiver.model_validate(valid_snapshot, strict=True)
+
+    if storage == "stored":
+        ordinary_backing = _BASE_MODEL_DICT_DESCRIPTOR.__get__(
+            ordinary,
+            BaseModel,
+        )
+        descriptor_backing = _BASE_MODEL_DICT_DESCRIPTOR.__get__(
+            descriptor,
+            BaseModel,
+        )
+        dict.__setitem__(ordinary_backing, "future_state", "preserved")
+        dict.__setitem__(descriptor_backing, "future_state", "preserved")
+        assert tuple(dict.items(descriptor_backing)) == (
+            ("count", 1),
+            ("future_state", "preserved"),
+        )
+        assert "future_state" not in descriptor.__dict__
+    else:
+        _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(
+            ordinary,
+            {"future_state": "preserved"},
+        )
+        _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(
+            descriptor,
+            {"future_state": "preserved"},
+        )
+        descriptor_backing = _BASE_MODEL_EXTRA_DESCRIPTOR.__get__(
+            descriptor,
+            BaseModel,
+        )
+        assert tuple(dict.items(descriptor_backing)) == (
+            ("future_state", "preserved"),
+        )
+        assert descriptor.__pydantic_extra__ is None
+
+    expected_snapshot = (
+        {"item": {"count": 1, "future_state": "preserved"}}
+        if nested
+        else {"count": 1, "future_state": "preserved"}
+    )
+    ordinary_snapshot = snapshot_contract_graph(ordinary_graph)
+    descriptor_snapshot = snapshot_contract_graph(descriptor_graph)
+
+    assert descriptor_snapshot == ordinary_snapshot == expected_snapshot
+    with pytest.raises(ValidationError) as ordinary_error:
+        receiver.model_validate(ordinary_snapshot, strict=True)
+    with pytest.raises(ValidationError) as descriptor_error:
+        receiver.model_validate(descriptor_snapshot, strict=True)
+    assert descriptor_error.value.errors() == ordinary_error.value.errors()
+
+
+def test_snapshot_contract_graph_freezes_extras_before_nested_removal() -> None:
+    ordinary = ExampleContractListEnvelope(items=[ExampleContract(count=1)])
+    object.__setattr__(
+        ordinary,
+        "__pydantic_extra__",
+        {"future_state": "preserved"},
+    )
+    ordinary_snapshot = snapshot_contract_graph(ordinary)
+
+    parent: list[ExampleContractListEnvelope | None] = [None]
+
+    class RemovingList(list[ExampleContract]):
+        def __iter__(self) -> Iterator[ExampleContract]:
+            if parent[0] is not None:
+                extras = object.__getattribute__(
+                    parent[0],
+                    "__pydantic_extra__",
+                )
+                dict.clear(extras)
+            return super().__iter__()
+
+    value = ExampleContractListEnvelope(items=[ExampleContract(count=1)])
+    object.__setattr__(value, "items", RemovingList([ExampleContract(count=1)]))
+    object.__setattr__(
+        value,
+        "__pydantic_extra__",
+        {"future_state": "preserved"},
+    )
+    parent[0] = value
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == ordinary_snapshot == {
+        "items": [{"count": 1}],
+        "future_state": "preserved",
+    }
+    assert object.__getattribute__(value, "__pydantic_extra__") == {}
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ExampleContractListEnvelope.model_validate(snapshot, strict=True)
+
+
+def test_snapshot_contract_graph_freezes_extras_before_nested_addition() -> None:
+    ordinary = ExampleContractListEnvelope(items=[ExampleContract(count=1)])
+    ordinary_snapshot = snapshot_contract_graph(ordinary)
+
+    parent: list[ExampleContractListEnvelope | None] = [None]
+
+    class AddingList(list[ExampleContract]):
+        def __iter__(self) -> Iterator[ExampleContract]:
+            if parent[0] is not None:
+                extras = object.__getattribute__(
+                    parent[0],
+                    "__pydantic_extra__",
+                )
+                dict.__setitem__(extras, "late_state", "not_in_snapshot")
+            return super().__iter__()
+
+    value = ExampleContractListEnvelope(items=[ExampleContract(count=1)])
+    object.__setattr__(value, "items", AddingList([ExampleContract(count=1)]))
+    object.__setattr__(value, "__pydantic_extra__", {})
+    parent[0] = value
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == ordinary_snapshot == {"items": [{"count": 1}]}
+    assert object.__getattribute__(value, "__pydantic_extra__") == {
+        "late_state": "not_in_snapshot"
+    }
+    assert (
+        ExampleContractListEnvelope.model_validate(snapshot, strict=True).items[0].count
+        == 1
+    )
+
+
+def test_snapshot_contract_graph_preserves_nested_container_shapes() -> None:
+    nested = NestedExampleContract(identifier="item-1", count=2)
+    value = {
+        "models": [nested],
+        "tuple": ({"nested": nested},),
+    }
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {
+        "models": [{"identifier": "item-1", "count": 2}],
+        "tuple": (({"nested": {"identifier": "item-1", "count": 2}},)),
+    }
+    assert isinstance(snapshot, dict)
+    assert isinstance(snapshot["models"], list)
+    assert isinstance(snapshot["tuple"], tuple)
+    assert isinstance(snapshot["tuple"][0], dict)
+
+
+@pytest.mark.parametrize("extra", [None, MappingProxyType({})])
+def test_snapshot_contract_graph_accepts_normal_empty_extra_storage(
+    extra: object,
+) -> None:
+    value = ExampleContract(count=1)
+    object.__setattr__(value, "__pydantic_extra__", extra)
+
+    assert snapshot_contract_graph(value) == {"count": 1}
+
+
+@pytest.mark.parametrize("extra", [[], ["unreviewed"]], ids=["falsey", "truthy"])
+def test_snapshot_contract_graph_rejects_malformed_extra_storage(
+    extra: object,
+) -> None:
+    value = ExampleContract(count=1)
+    object.__setattr__(value, "__pydantic_extra__", extra)
+
+    with pytest.raises(ValueError, match="extra storage must be a mapping"):
+        snapshot_contract_graph(value)
+
+
+def test_snapshot_contract_graph_rejects_moved_required_field() -> None:
+    value = ExampleContract(count=1)
+    value.__dict__.pop("count")
+    object.__setattr__(value, "__pydantic_extra__", {"count": 1})
+
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(value)
+
+
+def test_snapshot_contract_graph_preserves_normal_missing_required_behavior() -> None:
+    value = ExampleContract(count=1)
+    value.__dict__.pop("count")
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {}
+    with pytest.raises(ValidationError, match="Field required"):
+        ExampleContract.model_validate(snapshot, strict=True)
+
+
+def test_snapshot_contract_graph_preserves_normal_missing_default_behavior() -> None:
+    value = DefaultedExampleContract()
+    value.__dict__.pop("count")
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {}
+    assert DefaultedExampleContract.model_validate(snapshot, strict=True).count == 7
+
+
+def test_snapshot_contract_graph_rejects_default_field_moved_to_extras() -> None:
+    value = DefaultedExampleContract()
+    value.__dict__.pop("count")
+    object.__setattr__(value, "__pydantic_extra__", {"count": 9})
+
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(value)
+
+
+def test_snapshot_contract_graph_rejects_subclass_field_moved_to_extras() -> None:
+    value = DerivedNestedExampleContract(
+        identifier="item-1",
+        count=1,
+        category="derived",
+    )
+    value.__dict__.pop("category")
+    object.__setattr__(value, "__pydantic_extra__", {"category": "derived"})
+
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(value)
+
+
+@pytest.mark.parametrize("duplicate", [1, 2], ids=["equal", "conflicting"])
+def test_snapshot_contract_graph_rejects_declared_extra_overlap(
+    duplicate: int,
+) -> None:
+    value = ExampleContract(count=1)
+    object.__setattr__(value, "__pydantic_extra__", {"count": duplicate})
+
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(value)
+
+
+def test_snapshot_contract_graph_reads_hidden_declared_extra_collision() -> None:
+    value = ExampleContract(count=1)
+    value.__dict__.pop("count")
+    extra = EmptyItemsDict(count=9)
+    object.__setattr__(value, "__pydantic_extra__", extra)
+
+    assert list(extra.items()) == []
+    assert list(dict.items(extra)) == [("count", 9)]
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(value)
+
+
+def test_snapshot_contract_graph_rejects_duplicate_unknown_stored_name() -> None:
+    value = ExampleContract(count=1).model_copy(update={"future_state": "stored"})
+    object.__setattr__(value, "__pydantic_extra__", {"future_state": "extra"})
+
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(value)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"future_state": "preserved"},
+        MappingProxyType({"future_state": "preserved"}),
+    ],
+    ids=["dict", "mapping-proxy"],
+)
+def test_snapshot_contract_graph_preserves_nonconflicting_unknown_extra(
+    extra: object,
+) -> None:
+    value = ExampleContract(count=1)
+    object.__setattr__(value, "__pydantic_extra__", extra)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"count": 1, "future_state": "preserved"}
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ExampleContract.model_validate(snapshot, strict=True)
+
+
+@pytest.mark.parametrize(
+    ("value", "field_name", "extra"),
+    [
+        (AliasedExampleContract(n=1), "count", {"n": 9}),
+        (ChoiceAliasedExampleContract(n=1), "count", {"number": 9}),
+        (
+            ChoiceAliasedExampleContract(n=1),
+            "count",
+            {"payload": {"count": 9}},
+        ),
+        (
+            PathAliasedExampleContract(payload={"count": 1}),
+            "count",
+            {"payload": {"count": 9}},
+        ),
+    ],
+    ids=["alias", "choice-string", "choice-path", "path"],
+)
+def test_snapshot_contract_graph_rejects_declared_field_moved_to_validation_alias(
+    value: ContractModel,
+    field_name: str,
+    extra: dict[str, object],
+) -> None:
+    value.__dict__.pop(field_name)
+    object.__setattr__(value, "__pydantic_extra__", extra)
+
+    assert type(value).model_validate(
+        {**vars(value), **extra},
+        strict=True,
+    )
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(value)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "extra"),
+    [
+        ("count", {"n": 9}),
+        ("category", {"kind": "shadow"}),
+        ("category", {"metadata": {"category": "shadow"}}),
+    ],
+    ids=["inherited", "subclass-choice", "subclass-path"],
+)
+def test_snapshot_contract_graph_reserves_concrete_model_aliases(
+    field_name: str,
+    extra: dict[str, object],
+) -> None:
+    value = DerivedAliasedExampleContract(n=1, kind="derived")
+    value.__dict__.pop(field_name)
+    object.__setattr__(value, "__pydantic_extra__", extra)
+
+    assert type(value).model_validate(
+        {**vars(value), **extra},
+        strict=True,
+    )
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(value)
+
+
+def test_snapshot_contract_graph_preserves_stored_field_name_for_alias() -> None:
+    value = AliasedExampleContract(n=1)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"count": 1}
+    with pytest.raises(ValidationError, match="Field required"):
+        AliasedExampleContract.model_validate(snapshot, strict=True)
+
+
+def test_snapshot_contract_graph_does_not_reserve_serialization_only_alias() -> None:
+    value = SerializationAliasedExampleContract(count=1)
+    value.__dict__.pop("count")
+    object.__setattr__(value, "__pydantic_extra__", {"n": 9})
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"n": 9}
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        SerializationAliasedExampleContract.model_validate(snapshot, strict=True)
+
+
+def test_snapshot_contract_graph_does_not_reserve_disabled_validation_alias() -> None:
+    value = NameOnlyAliasedExampleContract(count=1)
+    value.__dict__.pop("count")
+    object.__setattr__(value, "__pydantic_extra__", {"n": 9})
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"n": 9}
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        NameOnlyAliasedExampleContract.model_validate(snapshot, strict=True)
+
+
+def test_snapshot_contract_graph_preserves_name_only_field_input() -> None:
+    value = NameOnlyAliasedExampleContract(count=1)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"count": 1}
+    assert NameOnlyAliasedExampleContract.model_validate(
+        snapshot,
+        strict=True,
+    ) == NameOnlyAliasedExampleContract(count=1)
+
+
+@pytest.mark.parametrize(
+    ("value", "field_name", "stored_name", "stored_value"),
+    [
+        (AliasedExampleContract(n=1), "count", "n", 1),
+        (AliasedExampleContract(n=1), "count", "n", 9),
+        (ChoiceAliasedExampleContract(n=1), "count", "number", 9),
+        (
+            ChoiceAliasedExampleContract(n=1),
+            "count",
+            "payload",
+            {"count": 9},
+        ),
+        (
+            PathAliasedExampleContract(payload={"count": 1}),
+            "count",
+            "payload",
+            {"count": 9},
+        ),
+    ],
+    ids=[
+        "alias-equal",
+        "alias-conflicting",
+        "choice-string",
+        "choice-path",
+        "path",
+    ],
+)
+def test_snapshot_contract_graph_rejects_unknown_stored_validation_alias(
+    value: ContractModel,
+    field_name: str,
+    stored_name: str,
+    stored_value: object,
+) -> None:
+    corrupted = value.model_copy(update={stored_name: stored_value})
+    corrupted.__dict__.pop(field_name)
+    stored_snapshot = dict(vars(corrupted))
+
+    assert corrupted.__pydantic_extra__ is None
+    assert type(value).model_validate(stored_snapshot, strict=True)
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(corrupted)
+
+
+def test_snapshot_contract_graph_rejects_nested_unknown_stored_alias() -> None:
+    value = AliasedExampleContract(n=1).model_copy(update={"n": 9})
+    value.__dict__.pop("count")
+    stored_snapshot = {"item": dict(vars(value))}
+
+    assert (
+        AliasedExampleEnvelope.model_validate(
+            stored_snapshot,
+            strict=True,
+        ).item.count
+        == 9
+    )
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph({"item": value})
+
+
+def test_snapshot_contract_graph_reserves_complete_stored_alias_path_root() -> None:
+    value = PathAliasedExampleContract(payload={"count": 1}).model_copy(
+        update={"payload": {"other": 9}}
+    )
+    value.__dict__.pop("count")
+
+    with pytest.raises(ValidationError):
+        PathAliasedExampleContract.model_validate(dict(vars(value)), strict=True)
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(value)
+
+
+@pytest.mark.parametrize(
+    "model_type",
+    [NameOnlyAliasedExampleContract, SerializationAliasedExampleContract],
+    ids=["disabled-validation-alias", "serialization-only-alias"],
+)
+def test_snapshot_contract_graph_preserves_inactive_unknown_stored_alias(
+    model_type: type[ContractModel],
+) -> None:
+    value = model_type(count=1).model_copy(update={"n": 9})
+    value.__dict__.pop("count")
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"n": 9}
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        model_type.model_validate(snapshot, strict=True)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "stored_name", "stored_value"),
+    [
+        ("count", "n", 9),
+        ("category", "kind", "shadow"),
+        ("category", "metadata", {"category": "shadow"}),
+    ],
+    ids=["inherited", "subclass-choice", "subclass-path"],
+)
+def test_snapshot_contract_graph_rejects_concrete_model_stored_aliases(
+    field_name: str,
+    stored_name: str,
+    stored_value: object,
+) -> None:
+    value = DerivedAliasedExampleContract(n=1, kind="derived").model_copy(
+        update={stored_name: stored_value}
+    )
+    value.__dict__.pop(field_name)
+
+    assert DerivedAliasedExampleContract.model_validate(
+        dict(vars(value)),
+        strict=True,
+    )
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(value)
+
+
+def test_snapshot_contract_graph_preserves_declared_active_alias_root() -> None:
+    value = InheritedAliasExampleContract(n=3)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"count": 3}
+    assert InheritedAliasExampleContract.model_validate(
+        snapshot,
+        strict=True,
+    ) == value
+
+
+@pytest.mark.parametrize("replacement", [1, 9], ids=["equal", "conflicting"])
+@pytest.mark.parametrize(
+    ("value", "missing_field", "root_name", "receiver"),
+    [
+        (
+            CrossStringAliasContract(shadow=1),
+            "primary",
+            "shadow",
+            CrossStringAliasContract,
+        ),
+        (
+            CrossPathAliasContract(payload={"count": 1}),
+            "count",
+            "payload",
+            CrossPathAliasContract,
+        ),
+        (
+            CrossChoiceAliasContract(primary=1, shadow=1),
+            "primary",
+            "shadow",
+            CrossChoiceAliasContract,
+        ),
+        (
+            CrossChoicePathAliasContract(count=1, payload={"count": 1}),
+            "count",
+            "payload",
+            CrossChoicePathAliasContract,
+        ),
+    ],
+    ids=["string", "path", "choice-string", "choice-path"],
+)
+def test_snapshot_contract_graph_rejects_cross_field_alias_root(
+    value: ContractModel,
+    missing_field: str,
+    root_name: str,
+    receiver: type[ContractModel],
+    replacement: int,
+) -> None:
+    root_value: object = (
+        {"count": replacement} if root_name == "payload" else replacement
+    )
+    corrupted = value.model_copy(update={root_name: root_value})
+    corrupted.__dict__.pop(missing_field)
+    stored_snapshot = dict(vars(corrupted))
+
+    assert receiver.model_validate(stored_snapshot, strict=True)
+    with pytest.raises(ValueError) as raised:
+        snapshot_contract_graph(corrupted)
+    assert str(raised.value) == (
+        "contract input contains stored validation alias roots "
+        "with missing owning fields"
+    )
+
+
+@pytest.mark.parametrize("replacement", [1, 9], ids=["equal", "conflicting"])
+@pytest.mark.parametrize(
+    ("value", "missing_field", "root_name", "receiver"),
+    [
+        (
+            CrossStringAliasContract(shadow=1),
+            "primary",
+            "shadow",
+            CrossStringAliasEnvelope,
+        ),
+        (
+            CrossPathAliasContract(payload={"count": 1}),
+            "count",
+            "payload",
+            CrossPathAliasEnvelope,
+        ),
+        (
+            CrossChoiceAliasContract(primary=1, shadow=1),
+            "primary",
+            "shadow",
+            CrossChoiceAliasEnvelope,
+        ),
+        (
+            CrossChoicePathAliasContract(count=1, payload={"count": 1}),
+            "count",
+            "payload",
+            CrossChoicePathAliasEnvelope,
+        ),
+    ],
+    ids=["string", "path", "choice-string", "choice-path"],
+)
+def test_snapshot_contract_graph_rejects_nested_cross_field_alias_root(
+    value: ContractModel,
+    missing_field: str,
+    root_name: str,
+    receiver: type[ContractModel],
+    replacement: int,
+) -> None:
+    root_value: object = (
+        {"count": replacement} if root_name == "payload" else replacement
+    )
+    corrupted = value.model_copy(update={root_name: root_value})
+    corrupted.__dict__.pop(missing_field)
+    stored_snapshot = {"item": dict(vars(corrupted))}
+
+    assert receiver.model_validate(stored_snapshot, strict=True)
+    with pytest.raises(ValueError) as raised:
+        snapshot_contract_graph({"item": corrupted})
+    assert str(raised.value) == (
+        "contract input contains stored validation alias roots "
+        "with missing owning fields"
+    )
+
+
+@pytest.mark.parametrize(
+    ("missing_field", "root_name", "root_value"),
+    [
+        ("primary", "shadow", 9),
+        ("category", "kind", "shadow-kind"),
+    ],
+    ids=["inherited", "concrete-subclass"],
+)
+def test_snapshot_contract_graph_rejects_inherited_cross_field_alias_root(
+    missing_field: str,
+    root_name: str,
+    root_value: object,
+) -> None:
+    value = CrossAliasDerivedContract(
+        primary=1,
+        shadow=1,
+        category="original-kind",
+        kind="original-kind",
+    ).model_copy(update={root_name: root_value})
+    value.__dict__.pop(missing_field)
+
+    assert CrossAliasDerivedContract.model_validate(dict(vars(value)), strict=True)
+    with pytest.raises(ValueError) as raised:
+        snapshot_contract_graph(value)
+    assert str(raised.value) == (
+        "contract input contains stored validation alias roots "
+        "with missing owning fields"
+    )
+
+
+def test_snapshot_contract_graph_preserves_existing_alias_conflict_messages() -> None:
+    unknown_stored = AliasedExampleContract(n=1).model_copy(update={"n": 9})
+    unknown_stored.__dict__.pop("count")
+    extra_conflict = ExampleContract(count=1)
+    object.__setattr__(extra_conflict, "__pydantic_extra__", {"count": 2})
+
+    for value in (unknown_stored, extra_conflict):
+        with pytest.raises(ValueError) as raised:
+            snapshot_contract_graph(value)
+        assert str(raised.value) == (
+            "contract input contains conflicting declared and extra fields"
+        )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        CrossChoiceAliasContract(primary=1, shadow=9),
+        CrossChoicePathAliasContract(count=1, payload={"count": 9}),
+        CrossAliasDerivedContract(
+            primary=1,
+            shadow=9,
+            category="category-value",
+            kind="kind-value",
+        ),
+    ],
+    ids=["choice-string", "choice-path", "inherited-subclass"],
+)
+def test_snapshot_contract_graph_preserves_populated_cross_field_models(
+    value: ContractModel,
+) -> None:
+    snapshot = snapshot_contract_graph(value)
+
+    assert type(value).model_validate(snapshot, strict=True) == value
+
+
+def test_snapshot_contract_graph_preserves_alias_only_populated_cross_field_model() -> None:
+    value = CrossStringAliasContract(shadow=3)
+
+    assert snapshot_contract_graph(value) == {
+        "primary": 3,
+        "shadow": 3,
+    }
+
+
+def test_snapshot_contract_graph_restores_absent_cross_field_defaults() -> None:
+    value = CrossDefaultAliasContract()
+    value.__dict__.pop("primary")
+    value.__dict__.pop("shadow")
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {}
+    assert CrossDefaultAliasContract.model_validate(snapshot, strict=True) == (
+        CrossDefaultAliasContract()
+    )
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["direct", "nested"])
+def test_snapshot_contract_graph_rejects_key_hiding_alias_storage(
+    nested: bool,
+) -> None:
+    value = AliasedExampleContract(n=1)
+    value.__dict__.pop("count")
+    extra = HiddenKeysExtra({"n": 9})
+    object.__setattr__(value, "__pydantic_extra__", extra)
+    graph: object = {"item": value} if nested else value
+
+    assert list(extra.keys()) == []
+    assert list(extra.items()) == [("n", 9)]
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(graph)
+
+
+def test_snapshot_contract_graph_rejects_key_hiding_declared_name() -> None:
+    value = ExampleContract(count=1)
+    value.__dict__.pop("count")
+    object.__setattr__(value, "__pydantic_extra__", HiddenKeysExtra({"count": 9}))
+
+    with pytest.raises(ValueError, match="conflicting declared and extra fields"):
+        snapshot_contract_graph(value)
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["direct", "nested"])
+def test_snapshot_contract_graph_reads_hidden_extra_backing_entries(
+    nested: bool,
+) -> None:
+    value = ExampleContract(count=1)
+    extra = HiddenItemsDict(future_state="preserved")
+    object.__setattr__(value, "__pydantic_extra__", extra)
+    graph: object = {"item": value} if nested else value
+    receiver = ExampleContractEnvelope if nested else ExampleContract
+
+    assert list(extra.items()) == []
+    snapshot = snapshot_contract_graph(graph)
+
+    expected = (
+        {"item": {"count": 1, "future_state": "preserved"}}
+        if nested
+        else {"count": 1, "future_state": "preserved"}
+    )
+    assert snapshot == expected
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        receiver.model_validate(snapshot, strict=True)
+
+
+def test_snapshot_contract_graph_bypasses_extra_dict_inventory_overrides() -> None:
+    value = ExampleContract(count=1)
+    extra = SingleReadExtra({"future_state": "preserved"})
+    object.__setattr__(value, "__pydantic_extra__", extra)
+
+    assert snapshot_contract_graph(value) == {
+        "count": 1,
+        "future_state": "preserved",
+    }
+    assert extra.item_reads == 0
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        RaisingInventoryDict(future_state="preserved"),
+        FabricatingItemsDict(future_state="preserved"),
+    ],
+    ids=["raising-overrides", "fabricated-entry"],
+)
+def test_snapshot_contract_graph_uses_only_extra_dict_backing_entries(
+    extra: dict[str, object],
+) -> None:
+    value = ExampleContract(count=1)
+    object.__setattr__(value, "__pydantic_extra__", extra)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"count": 1, "future_state": "preserved"}
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ExampleContract.model_validate(snapshot, strict=True)
+
+
+def test_snapshot_contract_graph_captures_generic_mapping_extra_once() -> None:
+    value = ExampleContract(count=1)
+    extra = SingleReadMapping({"future_state": "preserved"})
+    object.__setattr__(value, "__pydantic_extra__", extra)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"count": 1, "future_state": "preserved"}
+    assert extra.item_reads == 1
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ExampleContract.model_validate(snapshot, strict=True)
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["direct", "nested"])
+@pytest.mark.parametrize("second_value", [1, 2], ids=["equal", "different"])
+def test_snapshot_contract_graph_rejects_duplicate_custom_extra_keys(
+    nested: bool,
+    second_value: int,
+) -> None:
+    value = ExampleContract(count=1)
+    extra = DuplicateItemsMapping(
+        (("future_state", 1), ("future_state", second_value))
+    )
+    object.__setattr__(value, "__pydantic_extra__", extra)
+    graph: object = {"item": value} if nested else value
+
+    with pytest.raises(ValueError) as raised:
+        snapshot_contract_graph(graph)
+
+    assert str(raised.value) == "contract extra storage contains duplicate keys"
+    assert extra.item_reads == 1
+
+
+def test_snapshot_contract_graph_preserves_unique_custom_extra_inventory() -> None:
+    value = ExampleContract(count=1)
+    extra = DuplicateItemsMapping((("future_state", "preserved"),))
+    object.__setattr__(value, "__pydantic_extra__", extra)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"count": 1, "future_state": "preserved"}
+    assert extra.item_reads == 1
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ExampleContract.model_validate(snapshot, strict=True)
+
+
+class ChangingIterationEntry(tuple):
+    """A key/value entry whose iterator reports a different pair on every pass after the first."""
+
+    passes = 0
+
+    def __iter__(self) -> Iterator[object]:
+        type(self).passes += 1
+        if type(self).passes == 1:
+            return iter(("future_state", 1))
+        return iter(("count", 1))
+
+
+def test_snapshot_contract_graph_freezes_each_custom_extra_entry_once() -> None:
+    ChangingIterationEntry.passes = 0
+    value = ExampleContract.model_construct(count=-1)  # stored state the validator would refuse
+    extra = DuplicateItemsMapping((ChangingIterationEntry(("future_state", 1)),))
+    object.__setattr__(value, "__pydantic_extra__", extra)
+
+    snapshot = snapshot_contract_graph(value)
+
+    # one pass over the entry: capture, collision checks and reconstruction all see the same
+    # pair, so the stored declared value is never overwritten by a later, different pass
+    assert snapshot == {"count": -1, "future_state": 1}
+    assert ChangingIterationEntry.passes == 1
+
+
+def test_snapshot_contract_graph_preserves_collision_priority_for_duplicate_extra() -> None:
+    value = ExampleContract(count=1)
+    extra = DuplicateItemsMapping((("count", 1), ("count", 2)))
+    object.__setattr__(value, "__pydantic_extra__", extra)
+
+    with pytest.raises(ValueError) as raised:
+        snapshot_contract_graph(value)
+
+    assert str(raised.value) == (
+        "contract input contains conflicting declared and extra fields"
+    )
+    assert extra.item_reads == 1
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["direct", "nested"])
+def test_snapshot_contract_graph_uses_spoofed_class_mapping_protocol(
+    nested: bool,
+) -> None:
+    value = ExampleContract(count=1)
+    extra = DictClassSpoofingMapping({"future_state": "preserved"})
+    object.__setattr__(value, "__pydantic_extra__", extra)
+    graph: object = {"item": value} if nested else value
+    receiver = ExampleContractEnvelope if nested else ExampleContract
+
+    assert isinstance(extra, dict)
+    assert type(extra) is DictClassSpoofingMapping
+    snapshot = snapshot_contract_graph(graph)
+
+    expected = (
+        {"item": {"count": 1, "future_state": "preserved"}}
+        if nested
+        else {"count": 1, "future_state": "preserved"}
+    )
+    assert snapshot == expected
+    assert extra.item_reads == 1
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        receiver.model_validate(snapshot, strict=True)
+
+
+def test_snapshot_contract_graph_does_not_read_mapping_class_override() -> None:
+    value = ExampleContract(count=1)
+    extra = ClassReadRejectingMapping({"future_state": "preserved"})
+    object.__setattr__(value, "__pydantic_extra__", extra)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert snapshot == {"count": 1, "future_state": "preserved"}
+    assert extra.item_reads == 1
+
+
+@pytest.mark.parametrize(
+    "mapping_type",
+    [ClassReadRejectingMapping, ClassReadCountingMapping],
+    ids=["raising-class", "counted-class"],
+)
+@pytest.mark.parametrize("location", ["direct", "list", "dict"])
+def test_snapshot_contract_graph_leaves_adversarial_non_dict_mapping_unchanged(
+    mapping_type: type[SingleReadMapping],
+    location: str,
+) -> None:
+    value = mapping_type({"future_state": "preserved"})
+    graph: object
+    if location == "direct":
+        graph = value
+    elif location == "list":
+        graph = [value]
+    else:
+        graph = {"item": value}
+
+    snapshot = snapshot_contract_graph(graph)
+
+    retained = (
+        snapshot
+        if location == "direct"
+        else snapshot[0]
+        if location == "list"
+        else snapshot["item"]
+    )
+    assert retained is value
+    assert value.item_reads == 0
+    if type(value) is ClassReadCountingMapping:
+        assert value.class_reads == 0
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["direct", "nested"])
+def test_snapshot_contract_graph_dispatches_model_spoofing_dict_as_dict(
+    nested: bool,
+) -> None:
+    value = ModelClassSpoofingDict(count=1)
+    graph: object = {"item": value} if nested else value
+
+    assert isinstance(value, ContractModel)
+    snapshot = snapshot_contract_graph(graph)
+
+    expected = {"item": {"count": 1}} if nested else {"count": 1}
+    assert snapshot == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (ClassReadRejectingContract(count=1), {"count": 1}),
+        (ClassReadRejectingTuple((ExampleContract(count=1),)), ({"count": 1},)),
+        (ClassReadRejectingList([ExampleContract(count=1)]), [{"count": 1}]),
+        (
+            ClassReadRejectingDict(item=ExampleContract(count=1)),
+            {"item": {"count": 1}},
+        ),
+    ],
+    ids=["model-subclass", "tuple-subclass", "list-subclass", "dict-subclass"],
+)
+def test_snapshot_contract_graph_dispatches_concrete_container_subclasses(
+    value: object,
+    expected: object,
+) -> None:
+    assert snapshot_contract_graph(value) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (HiddenItemsDict(visible=1, hidden=2), {"visible": 1, "hidden": 2}),
+        (RaisingInventoryDict(visible=1, hidden=2), {"visible": 1, "hidden": 2}),
+        (FabricatingItemsDict(visible=1), {"visible": 1}),
+    ],
+    ids=["hidden-entry", "raising-overrides", "fabricated-entry"],
+)
+def test_snapshot_contract_graph_reads_nested_dict_backing_entries(
+    value: dict[str, object],
+    expected: dict[str, int],
+) -> None:
+    graph = {"payload": value}
+
+    snapshot = snapshot_contract_graph(graph)
+
+    assert snapshot == {"payload": expected}
+    assert DictionaryEnvelope.model_validate(snapshot, strict=True).model_dump() == {
+        "payload": expected
+    }
+
+
+def test_snapshot_contract_graph_rejects_dict_subclass_backing_cycle() -> None:
+    value = FabricatingItemsDict()
+    dict.__setitem__(value, "self", value)
+
+    with pytest.raises(ValueError, match="cyclic contract input"):
+        snapshot_contract_graph(value)
+
+
+@pytest.mark.parametrize(
+    "extra_kind",
+    ["malformed", "overlap", "duplicate"],
+)
+def test_snapshot_contract_graph_preserves_stored_cycle_priority(
+    extra_kind: str,
+) -> None:
+    value = ExampleContract(count=1)
+    object.__getattribute__(value, "__dict__")["count"] = value
+    duplicate: DuplicateItemsMapping | None = None
+    if extra_kind == "malformed":
+        extra: object = []
+    elif extra_kind == "overlap":
+        extra = {"count": 1}
+    else:
+        duplicate = DuplicateItemsMapping(
+            (("future_state", 1), ("future_state", 2))
+        )
+        extra = duplicate
+    object.__setattr__(value, "__pydantic_extra__", extra)
+
+    with pytest.raises(ValueError) as raised:
+        snapshot_contract_graph(value)
+
+    assert str(raised.value) == "cyclic contract input is not supported"
+    if duplicate is not None:
+        assert duplicate.item_reads == 1
+
+
+def test_snapshot_contract_graph_preserves_alias_guard_priority() -> None:
+    value = AliasedExampleContract(n=1)
+    stored = object.__getattribute__(value, "__dict__")
+    stored.pop("count")
+    stored["n"] = 9
+    object.__setattr__(value, "__pydantic_extra__", [])
+
+    with pytest.raises(ValueError) as raised:
+        snapshot_contract_graph(value)
+
+    assert str(raised.value) == (
+        "contract input contains conflicting declared and extra fields"
+    )
+
+
+@pytest.mark.parametrize("container_type", [list, dict])
+def test_snapshot_contract_graph_rejects_cycles(container_type: type) -> None:
+    value: list[object] | dict[str, object] = container_type()
+    if isinstance(value, list):
+        value.append(value)
+    else:
+        value["self"] = value
+
+    with pytest.raises(ValueError, match="cyclic contract input"):
+        snapshot_contract_graph(value)
+
+
+def test_snapshot_contract_graph_allows_repeated_noncyclic_objects() -> None:
+    shared = [ExampleContract(count=1)]
+
+    assert snapshot_contract_graph([shared, shared]) == [
+        [{"count": 1}],
+        [{"count": 1}],
+    ]
+
+
+def test_snapshot_contract_graph_leaves_non_dict_mappings_unchanged() -> None:
+    value = MappingProxyType({"model": ExampleContract(count=1)})
+
+    assert snapshot_contract_graph(value) is value
 
 
 def test_contract_model_is_strict_and_rejects_unknown_fields() -> None:
@@ -553,3 +2503,276 @@ def test_error_mapping_covers_every_internal_outcome_and_returns_copies() -> Non
     first = public_error_for(InternalErrorCode.CANCELLED)
     first.message = "mutated by a caller"
     assert public_error_for(InternalErrorCode.CANCELLED).message == "The operation was cancelled."
+
+
+# ---------------------------------------------------------------------------
+# Public-view pinning (public_first): a child that exists only in a sequence
+# subclass's public iterator is captured when that view is first observed.  An
+# earlier callback can therefore repair it, and it is then exposed in repaired
+# form.  The view is read once per reconstruction.  Models reachable through
+# native storage are fenced before any callback and are NOT repaired.  The
+# tests pin this documented limit; they do not claim entry-time capture of
+# children that were never exposed.
+# ---------------------------------------------------------------------------
+
+
+class PublicViewTupleEnvelope(ContractModel):
+    trigger: tuple[int, ...]
+    children: tuple[ExampleContract, ...]
+    groups: tuple[tuple[ExampleContract, ...], ...] = ()
+
+
+class PublicViewListEnvelope(ContractModel):
+    trigger: tuple[int, ...]
+    children: list[ExampleContract]
+    groups: list[list[ExampleContract]] = []
+
+
+def _invalid_example_child() -> ExampleContract:
+    return ExampleContract(count=1).model_copy(update={"count": -1})
+
+
+def _repair_example_child(child: ExampleContract) -> Callable[[], None]:
+    def repair() -> None:
+        child_native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(child, BaseModel)
+        dict.__setitem__(child_native, "count", 1)
+
+    return repair
+
+
+def _public_only_envelope(
+    container_kind: str,
+    placement: str,
+) -> tuple[BaseModel, ExampleContract, DivergentTuple | DivergentList]:
+    """Return an envelope whose only child is exposed by a public iterator."""
+
+    child = _invalid_example_child()
+    if container_kind == "tuple":
+        public_view: DivergentTuple | DivergentList = DivergentTuple((), (child,))
+        value: BaseModel = PublicViewTupleEnvelope(trigger=(), children=())
+        nested_outer: object = (public_view,)
+    else:
+        public_view = DivergentList([], [child])
+        value = PublicViewListEnvelope(trigger=(), children=[])
+        nested_outer = [public_view]
+    native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+    if placement == "direct":
+        dict.__setitem__(native, "children", public_view)
+    else:
+        dict.__setitem__(native, "groups", nested_outer)
+    return value, child, public_view
+
+
+def _exposed_children(snapshot: dict, placement: str) -> object:
+    children = snapshot["children"] if placement == "direct" else snapshot["groups"][0]
+    return children
+
+
+@pytest.mark.parametrize("placement", ["direct", "nested"])
+@pytest.mark.parametrize("container_kind", ["tuple", "list"])
+def test_public_first_unrepaired_public_only_child_is_exposed_and_rejected(
+    container_kind: str,
+    placement: str,
+) -> None:
+    value, child, public_view = _public_only_envelope(container_kind, placement)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert list(_exposed_children(snapshot, placement)) == [{"count": -1}]
+    assert public_view.iteration_calls == 1
+    assert child.count == -1
+    with pytest.raises(ValidationError) as raised:
+        type(value).model_validate(snapshot, strict=True)
+    assert raised.value.errors()[0]["type"] == "greater_than_equal"
+    assert raised.value.errors()[0]["input"] == -1
+
+
+@pytest.mark.parametrize("hook", ["hash", "equality"])
+@pytest.mark.parametrize("placement", ["direct", "nested"])
+@pytest.mark.parametrize("container_kind", ["tuple", "list"])
+def test_public_first_public_only_child_repaired_by_earlier_stored_name_hook(
+    container_kind: str,
+    placement: str,
+    hook: str,
+) -> None:
+    value, child, public_view = _public_only_envelope(container_kind, placement)
+    native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+    stored_name = RepairingStoredName("trigger", _repair_example_child(child), hook)
+    stored_value = dict.pop(native, "trigger")
+    dict.__setitem__(native, stored_name, stored_value)
+    stored_name.armed = True
+
+    snapshot = snapshot_contract_graph(value)
+
+    if hook == "hash":
+        assert stored_name.hash_calls > 0
+    else:
+        assert stored_name.equality_calls > 0
+    assert child.count == 1
+    # The never-exposed child is first observed after the callback, so it is
+    # exposed in repaired form and the receiving model accepts it.
+    assert list(_exposed_children(snapshot, placement)) == [{"count": 1}]
+    assert public_view.iteration_calls == 1
+    assert type(value).model_validate(snapshot, strict=True) is not None
+
+
+@pytest.mark.parametrize("placement", ["direct", "nested"])
+@pytest.mark.parametrize("container_kind", ["tuple", "list"])
+def test_public_first_public_only_child_repaired_by_earlier_extra_items_callback(
+    container_kind: str,
+    placement: str,
+) -> None:
+    value, child, public_view = _public_only_envelope(container_kind, placement)
+    extras = RepairingMapping(_repair_example_child(child))
+    _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(value, extras)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert extras.item_reads == 1
+    assert child.count == 1
+    assert list(_exposed_children(snapshot, placement)) == [{"count": 1}]
+    assert public_view.iteration_calls == 1
+    assert type(value).model_validate(snapshot, strict=True) is not None
+
+
+@pytest.mark.parametrize("container_kind", ["tuple", "list"])
+def test_public_first_native_stored_child_stays_fenced_against_the_same_callbacks(
+    container_kind: str,
+) -> None:
+    child = _invalid_example_child()
+    if container_kind == "tuple":
+        value: BaseModel = PublicViewTupleEnvelope(trigger=(), children=())
+        native_children: object = (child,)
+    else:
+        value = PublicViewListEnvelope(trigger=(), children=[])
+        native_children = [child]
+    native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+    dict.__setitem__(native, "children", native_children)
+    stored_name = RepairingStoredName("trigger", _repair_example_child(child), "hash")
+    stored_value = dict.pop(native, "trigger")
+    dict.__setitem__(native, stored_name, stored_value)
+    stored_name.armed = True
+    extras = RepairingMapping(_repair_example_child(child))
+    _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(value, extras)
+
+    snapshot = snapshot_contract_graph(value)
+
+    # The callbacks ran and repaired the live object, but the model was fenced
+    # from native storage first, so the snapshot keeps the entry-time state.
+    assert stored_name.hash_calls > 0
+    assert extras.item_reads == 1
+    assert child.count == 1
+    assert list(snapshot["children"]) == [{"count": -1}]
+    with pytest.raises(ValidationError) as raised:
+        type(value).model_validate(snapshot, strict=True)
+    assert raised.value.errors()[0]["input"] == -1
+
+
+@pytest.mark.parametrize("container_kind", ["tuple", "list"])
+def test_public_first_public_view_is_read_once_per_edge_not_per_snapshot(
+    container_kind: str,
+) -> None:
+    value, _, public_view = _public_only_envelope(container_kind, "direct")
+    native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+    outer: object = (public_view,) if container_kind == "tuple" else [public_view]
+    dict.__setitem__(native, "groups", outer)
+
+    snapshot = snapshot_contract_graph(value)
+
+    # One read for each edge that reaches the view (the direct field and the
+    # nested one); a single edge reads it exactly once (see the tests above).
+    assert public_view.iteration_calls == 2
+    assert list(snapshot["children"]) == list(snapshot["groups"][0]) == [{"count": -1}]
+
+
+# ---------------------------------------------------------------------------
+# PR #399 review regressions: strong references and sibling pre-capture.
+# ---------------------------------------------------------------------------
+
+
+class _TemporaryDictTuple(tuple[object, ...]):
+    """Yields a brand-new dictionary on every public iteration."""
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        self.reads = getattr(self, "reads", 0) + 1
+        return iter(({"read": self.reads},))
+
+
+class _TemporaryDictList(list[object]):
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        self.reads = getattr(self, "reads", 0) + 1
+        return iter([{"read": self.reads}])
+
+
+@pytest.mark.parametrize("container_kind", ["tuple", "list"])
+def test_public_view_temporaries_do_not_alias_through_reused_object_ids(
+    container_kind: str,
+) -> None:
+    if container_kind == "tuple":
+        view: object = _TemporaryDictTuple()
+        outer: object = (view,) * 6
+    else:
+        view = _TemporaryDictList()
+        outer = [view] * 6
+
+    snapshot = snapshot_contract_graph(outer)
+
+    # Each edge reads the view afresh; a released temporary's id must not make
+    # a later edge reuse the earlier temporary's captured contents.
+    assert [list(edge) for edge in snapshot] == [[{"read": n}] for n in range(1, 7)]
+
+
+class _CallbackTuple(tuple[object, ...]):
+    def __new__(cls, callback: Callable[[], None]) -> "_CallbackTuple":
+        instance = tuple.__new__(cls, ())
+        instance.callback = callback
+        return instance
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        self.callback()
+        return iter(())
+
+
+class _CallbackList(list[object]):
+    def __init__(self, callback: Callable[[], None]) -> None:
+        list.__init__(self, [])
+        self.callback = callback
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        self.callback()
+        return iter(())
+
+
+@pytest.mark.parametrize("sibling_kind", ["dict", "model"])
+@pytest.mark.parametrize("container_kind", ["tuple", "list"])
+def test_exposed_siblings_are_captured_before_the_first_is_reconstructed(
+    container_kind: str,
+    sibling_kind: str,
+) -> None:
+    if sibling_kind == "dict":
+        sibling: object = {"count": -1}
+
+        def repair() -> None:
+            sibling["count"] = 1  # type: ignore[index]
+
+        expected: object = {"count": -1}
+    else:
+        sibling = _invalid_example_child()
+        repair = _repair_example_child(sibling)  # type: ignore[arg-type]
+        expected = {"count": -1}
+
+    if container_kind == "tuple":
+        repairing: object = _CallbackTuple(repair)
+        exposed: object = DivergentTuple((), (repairing, sibling))
+    else:
+        repairing = _CallbackList(repair)
+        exposed = DivergentList([], [repairing, sibling])
+
+    snapshot = snapshot_contract_graph((exposed,))
+
+    first, second = snapshot[0]
+    assert list(first) == []
+    # The repair ran, but the sibling was frozen before the first item was
+    # reconstructed, so the snapshot keeps the exposed (invalid) value.
+    assert (sibling["count"] if sibling_kind == "dict" else sibling.count) == 1  # type: ignore[index,union-attr]
+    assert second == expected
