@@ -51,6 +51,7 @@ class _MappingInventory(NamedTuple):
 
 
 _TYPE_MRO = vars(type)["__mro__"]
+_TYPE_NAME = vars(type)["__name__"]  # a class's name, read without any metaclass hook
 
 
 def _inherits(cls: type, base: type) -> bool:
@@ -426,7 +427,7 @@ def _open_pair(raw_entry: object) -> tuple[object, object, Iterator[object] | No
     except TypeError:
         if _defines_iter(type(raw_entry)):
             raise  # unpacking reports the iteration protocol's own error unchanged
-        raise TypeError(f"cannot unpack non-iterable {type(raw_entry).__name__} object") from None
+        raise TypeError(f"cannot unpack non-iterable {_TYPE_NAME.__get__(type(raw_entry))} object") from None
     try:
         key = next(iterator)
     except StopIteration:
@@ -738,7 +739,7 @@ class _OpaqueKey:
         self._key = key
 
     def __repr__(self) -> str:
-        return f"<{type(self._key).__name__} key>"
+        return f"<{_TYPE_NAME.__get__(type(self._key))} key>"
 _COPIED = "copied"  # ids of containers completion has copied at least once
 
 

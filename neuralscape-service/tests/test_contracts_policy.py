@@ -4381,3 +4381,46 @@ def test_mapping_capture_scans_a_shared_cached_reach_once() -> None:
     except ValueError as error:
         assert DISCOVERY_BUDGET_MESSAGE in str(error)
     assert time.monotonic() - started < 10.0  # was 500 million reach iterations
+
+
+class _HookedMeta(type):
+    """A metaclass whose attribute reads run (and fail) while armed."""
+
+    armed = False
+    calls: list = []
+
+    def __getattribute__(cls, name):
+        if type.__getattribute__(_HookedMeta, "armed"):
+            _HookedMeta.calls.append(name)
+            raise RuntimeError("metaclass hook ran")
+        return super().__getattribute__(name)
+
+
+class _Hooked(metaclass=_HookedMeta):
+    pass
+
+
+def _armed(call):
+    _HookedMeta.calls.clear()
+    _HookedMeta.armed = True
+    try:
+        return call()
+    except Exception as error:  # noqa: BLE001 - the test compares the outcome after disarming
+        return error
+    finally:
+        _HookedMeta.armed = False
+
+
+def test_a_non_iterable_pair_names_its_type_without_running_a_metaclass_hook() -> None:
+    outcome = _armed(lambda: _entry_flow(_Items(lambda: iter((_Hooked(),)))))
+    assert type(outcome) is TypeError
+    assert str(outcome) == "cannot unpack non-iterable _Hooked object"
+    assert _HookedMeta.calls == []
+
+
+def test_a_boxed_key_names_its_type_without_running_a_metaclass_hook() -> None:
+    from contracts_policy_reference import _OpaqueKey
+
+    key = _OpaqueKey(_Hooked())
+    assert _armed(lambda: repr(key)) == "<_Hooked key>"
+    assert _HookedMeta.calls == []
