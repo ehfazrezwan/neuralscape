@@ -23,10 +23,12 @@ alternative must still be accepted by a new one) and a bare ``$ref`` into
 ``#/$defs``.  ``title``, ``description``, ``default``, ``examples`` and similar
 annotations never affect validity and are ignored.  Any change that touches
 anything else (``oneOf`` alternatives that are not equivalent, constraints written
-beside a ``$ref``, ``not``, ``if``/``then``/``else``, ``allOf``, ``patternProperties``,
+beside any ``$ref`` (a ``#/$defs`` one, ``#`` or a recursive one) unless identical on both
+sides, ``not``, ``if``/``then``/``else``, ``allOf``, ``patternProperties``,
 ``dependent*``, ``unevaluated*``, ``format``, ``discriminator``, a reference that is
 not a plain ``#/$defs`` one, and so on) is reported as an *unverified change*, with the
-same standing as a narrowing: it needs an explicit contract version bump or a reviewer
+same standing as a narrowing (``enum`` and ``const`` values are compared as JSON values, so
+``true`` is not ``1``): it needs an explicit contract version bump or a reviewer
 waiver, because the checker cannot show that no previously valid document is rejected.
 
 Typical CI use compares the schemas of a base revision with the current ones::
@@ -48,6 +50,7 @@ import importlib.util
 import inspect
 import json
 import re
+import reprlib
 from dataclasses import dataclass
 from fractions import Fraction
 
@@ -217,13 +220,71 @@ def _inline(value: object, defs: dict, stack: tuple[str, ...] = (), budget: list
     return {key: _inline(item, defs, stack, budget) for key, item in value.items()}
 
 
+_REPR = reprlib.Repr()
+_REPR.maxlevel, _REPR.maxlist, _REPR.maxdict, _REPR.maxstring, _REPR.maxother = 3, 5, 5, 40, 40
+
+
+def _bounded_repr(value: object) -> str:
+    """A short, depth-limited rendering for a finding (a schema value can be arbitrarily large or deep)."""
+
+    return _REPR.repr(value)
+
+
+def _json_kind(value: object) -> str:
+    if isinstance(value, bool):  # before int: bool is an int subclass in Python, a distinct type in JSON
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if value is None:
+        return "null"
+    if isinstance(value, (list, tuple)):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return "other:" + type(value).__name__
+
+
+def _json_equal(left: object, right: object) -> bool:
+    """JSON value equality: ``true`` is not ``1`` and ``false`` is not ``0``, ``1`` equals ``1.0``.
+
+    Python's ``==`` (and ``in``) treats ``True`` as ``1``, so ``enum: [true, 1]`` to ``enum: [1]`` looked
+    unchanged.  Iterative, so a deeply nested value cannot exhaust the interpreter stack.
+    """
+
+    work = [(left, right)]
+    while work:
+        first, second = work.pop()
+        kind = _json_kind(first)
+        if kind != _json_kind(second):
+            return False
+        if kind == "object":
+            if set(first) != set(second):  # type: ignore[arg-type]
+                return False
+            work.extend((first[key], second[key]) for key in first)  # type: ignore[index]
+        elif kind == "array":
+            if len(first) != len(second):  # type: ignore[arg-type]
+                return False
+            work.extend(zip(first, second))  # type: ignore[arg-type]
+        elif first != second:
+            return False
+    return True
+
+
 def _same(old: object, new: object, old_defs: dict, new_defs: dict) -> bool:
-    if old == new and old_defs == new_defs:
+    if _json_equal(old, new) and _json_equal(old_defs, new_defs):
         return True  # the same text under the same definitions
     try:
-        return _inline(old, old_defs) == _inline(new, new_defs)
-    except _TooLarge:
-        return False  # too large to compare: not shown equal
+        return _json_equal(_inline(old, old_defs), _inline(new, new_defs))
+    except (_TooLarge, RecursionError):
+        return False  # too large or too deep to compare: not shown equal
+
+
+def _beside(schema: dict) -> dict:
+    """The constraints written beside a ``$ref`` in this node (annotations never constrain)."""
+
+    return {key: value for key, value in schema.items() if key != "$ref" and key not in _ANNOTATIONS}
 
 
 def _resolve(schema: object, defs: dict) -> tuple[object, list[dict]]:
@@ -233,11 +294,11 @@ def _resolve(schema: object, defs: dict) -> tuple[object, list[dict]]:
     beside: list[dict] = []
     while isinstance(schema, dict) and "$ref" in schema and seen < 32:
         ref = schema["$ref"]
+        extra = _beside(schema)
+        if extra:
+            beside.append(extra)  # whatever the reference form: ``#`` and recursive ones included
         if not (isinstance(ref, str) and ref.startswith("#/$defs/")):
             break
-        extra = {key: value for key, value in schema.items() if key != "$ref" and key not in _ANNOTATIONS}
-        if extra:
-            beside.append(extra)
         schema = defs.get(ref.removeprefix("#/$defs/"), schema)
         seen += 1
     return schema, beside
@@ -307,9 +368,13 @@ def _compare(
         out.append(f"{path}: schema nesting exceeds the comparison depth limit; compatibility not verified")
         return
     if isinstance(old, dict) and isinstance(new, dict) and "$ref" in old and "$ref" in new:
+        # Constraints beside this reference are compared before any shortcut: a recursive reference
+        # already being compared is assumed compatible, but only for its target, never for siblings.
+        if not _same(_beside(old), _beside(new), old_defs, new_defs):
+            out.append(_unverified(path, "constraints beside a $ref changed"))
         pair = (str(old["$ref"]), str(new["$ref"]))
         if pair in active:
-            return  # a recursive reference already being compared is assumed compatible
+            return
         active = active | {pair}
     old, old_beside = _resolve(old, old_defs)
     new, new_beside = _resolve(new, new_defs)
@@ -318,7 +383,7 @@ def _compare(
         # next to ``$ref``) would be dropped; a change in them is not verified.
         out.append(_unverified(path, "constraints beside a $ref changed"))
     if not isinstance(old, dict) or not isinstance(new, dict):
-        if old != new:
+        if not _json_equal(old, new):
             out.append(f"{path}: schema changed shape")
         return
     if "$ref" in old or "$ref" in new:
@@ -379,12 +444,14 @@ def _compare(
             kind = "const" if "const" in new else "enum"
             out.append(f"{path}: {kind} restriction added")
         else:
-            removed = [value for value in old_allowed if value not in new_allowed]
+            removed = [
+                value for value in old_allowed if not any(_json_equal(value, other) for other in new_allowed)
+            ]
             if removed:
                 if "const" in old and "const" in new:
                     out.append(f"{path}: const changed")
                 else:
-                    out.append(f"{path}: enum values removed {removed}")
+                    out.append(f"{path}: enum values removed {_bounded_repr(removed)}")
 
     for key, direction in (
         ("minimum", "raised"),

@@ -733,3 +733,100 @@ def test_the_present_pack_is_compatible_with_itself_and_its_digests_are_unchange
     schemas = pack.export_schemas()
     assert pack.compare_schemas(schemas, copy.deepcopy(schemas)) == {}
     assert pack.changed_since_digests() == []
+
+
+# --------------------------------------------- uniform fail closed for every reference with siblings, JSON-typed values
+
+
+_NODE = {"type": "object", "properties": {"child": {"$ref": "#/$defs/Node"}}}
+
+
+def _recursive(child: dict) -> dict:
+    return {"$defs": {"Node": {**_NODE, "properties": {"child": child}}}, "$ref": "#/$defs/Node"}
+
+
+def test_a_constraint_added_beside_a_recursive_ref_is_an_unverified_change() -> None:
+    old = _recursive({"$ref": "#/$defs/Node"})
+    new = _recursive({"$ref": "#/$defs/Node", "maxProperties": 0})  # a nonempty child was valid
+    assert _unverified(_pair(old, new), "beside a $ref")
+    assert _pair(old, old) == []
+    assert _pair(new, new) == []  # the same sibling on both sides narrows nothing
+    widened = _recursive({"$ref": "#/$defs/Node", "maxProperties": 9})
+    assert _unverified(_pair(new, widened), "beside a $ref")
+
+
+def test_a_constraint_added_beside_a_root_reference_is_an_unverified_change() -> None:
+    old = {"type": "object", "properties": {"child": {"$ref": "#"}}}
+    new = {"type": "object", "properties": {"child": {"$ref": "#", "maxProperties": 0}}}
+    assert _unverified(_pair(old, new), "beside a $ref")  # {"child": {"child": {}}} was valid
+    assert _pair(old, old) == []
+    assert _pair(new, new) == []
+    annotated = {"type": "object", "properties": {"child": {"$ref": "#", "description": "d"}}}
+    assert _pair(old, annotated) == []  # annotations never constrain
+
+
+def test_a_constraint_beside_any_other_reference_form_is_unverified_when_it_changes() -> None:
+    old = {"properties": {"a": {"$ref": "#/properties/b"}, "b": {"type": "string"}}}
+    new = {"properties": {"a": {"$ref": "#/properties/b", "maxLength": 2}, "b": {"type": "string"}}}
+    assert _unverified(_pair(old, new), "beside a $ref")
+
+
+@pytest.mark.parametrize(
+    "old, new",
+    [
+        ({"enum": [True, 1]}, {"enum": [1]}),
+        ({"enum": [False, 0]}, {"enum": [0]}),
+        ({"enum": [True]}, {"enum": [1]}),
+        ({"enum": [1]}, {"enum": [True]}),
+        ({"const": True}, {"const": 1}),
+        ({"const": 0}, {"const": False}),
+        ({"enum": [[True]]}, {"enum": [[1]]}),
+        ({"enum": [{"a": [False]}]}, {"enum": [{"a": [0]}]}),
+        ({"enum": [{"a": 1}, {"a": True}]}, {"enum": [{"a": 1}]}),
+    ],
+    ids=["enum-true-one", "enum-false-zero", "enum-bool-to-int", "enum-int-to-bool", "const-true-one",
+         "const-zero-false", "nested-list", "nested-object", "object-members"],
+)
+def test_enum_and_const_values_are_compared_as_json_not_as_python(old, new) -> None:
+    assert _pair(old, new), "a value that was valid is rejected"
+    assert _pair(old, old) == [] and _pair(new, new) == []
+
+
+def test_json_numeric_equivalence_and_widening_are_still_compatible() -> None:
+    assert _pair({"enum": [1]}, {"enum": [1.0]}) == []
+    assert _pair({"const": 2}, {"const": 2.0}) == []
+    assert _pair({"enum": [1]}, {"enum": [True, 1]}) == []
+    assert _pair({"enum": [[1, {"a": 0}]]}, {"enum": [[1.0, {"a": 0.0}], "x"]}) == []
+
+
+def test_an_unmodelled_keyword_value_is_compared_as_json_too() -> None:
+    assert _unverified(_pair({"not": {"const": True}}, {"not": {"const": 1}}), "not changed")
+    assert _pair({"not": {"const": 1}}, {"not": {"const": 1.0}}) == []
+
+
+def test_a_deeply_nested_enum_value_cannot_exhaust_the_stack() -> None:
+    value: object = 1
+    for _ in range(20_000):
+        value = [value]
+    deeper = [value]
+    assert _pair({"enum": [value]}, {"enum": [value]}) == []
+    assert _pair({"enum": [value]}, {"enum": [deeper]})
+
+
+def test_an_unmodelled_keyword_with_a_too_deep_value_is_unverified_not_a_crash() -> None:
+    value: object = {"const": 1}
+    for _ in range(5_000):
+        value = {"not": value}
+    changed = _pair({"type": "string"}, {"type": "string", "not": value})
+    assert _unverified(changed, "not changed")
+
+
+def test_a_reference_that_gains_siblings_against_a_plain_schema_is_reported_for_its_siblings() -> None:
+    old = {"type": "object", "properties": {"child": {"type": "object"}}}
+    new = {"type": "object", "properties": {"child": {"$ref": "#", "maxProperties": 0}}}
+    assert _unverified(_pair(old, new), "beside a $ref")
+
+
+def test_boolean_and_numeric_schemas_are_not_equal_as_json() -> None:
+    assert _pair({"items": True}, {"items": True}) == []
+    assert _pair({"items": True}, {"items": 1}), "a boolean schema is not the number 1"
