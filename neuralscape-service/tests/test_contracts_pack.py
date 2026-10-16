@@ -830,3 +830,95 @@ def test_a_reference_that_gains_siblings_against_a_plain_schema_is_reported_for_
 def test_boolean_and_numeric_schemas_are_not_equal_as_json() -> None:
     assert _pair({"items": True}, {"items": True}) == []
     assert _pair({"items": True}, {"items": 1}), "a boolean schema is not the number 1"
+
+
+# ------------------------------------------------------------------ the checker stays fast on large schemas
+
+
+import time as _time  # noqa: E402
+
+
+def _timed(old: dict, new: dict) -> tuple[list[str], float]:
+    started = _time.perf_counter()
+    findings = _pair(old, new)
+    return findings, _time.perf_counter() - started
+
+
+def _diamond(levels: int, leaf: dict) -> dict:
+    defs: dict = {"L0": leaf}
+    for level in range(1, levels + 1):
+        defs[f"L{level}"] = {
+            "type": "object",
+            "properties": {"a": {"$ref": f"#/$defs/L{level - 1}"}, "b": {"$ref": f"#/$defs/L{level - 1}"}},
+        }
+    return {"$defs": defs, "$ref": f"#/$defs/L{levels}"}
+
+
+def test_a_large_scalar_enum_is_compared_in_linear_time() -> None:
+    values = list(range(8000))
+    findings, seconds = _timed({"enum": values}, {"enum": list(values)})
+    assert findings == [] and seconds < 2.0, seconds
+    findings, seconds = _timed({"enum": values}, {"enum": values[:-1]})
+    assert any("enum values removed" in f for f in findings) and seconds < 2.0, seconds
+
+
+def test_a_large_enum_of_composites_is_compared_in_linear_time() -> None:
+    values = [{"k": index, "v": [index, {"x": index % 7}]} for index in range(3000)]
+    findings, seconds = _timed({"enum": values}, {"enum": [dict(item) for item in values]})
+    assert findings == [] and seconds < 2.0, seconds
+    removed = _pair({"enum": values}, {"enum": values[1:]})
+    assert any("enum values removed" in f for f in removed)
+
+
+def test_enum_matching_keeps_json_types_across_scalars_and_composites_at_scale() -> None:
+    old = {"enum": [True, 1, "1", None, [True], [1], {"a": True}, {"a": 1}, 1.5]}
+    assert _pair(old, {"enum": [1, "1", None, [1], {"a": 1}, 1.5]}), "true, [true] and {a: true} were removed"
+    assert _pair(old, {"enum": [True, 1.0, "1", None, [True], [1.0], {"a": True}, {"a": 1.0}, 1.5]}) == []
+
+
+def test_a_value_nested_past_the_key_depth_still_compares_by_json() -> None:
+    def nest(innermost: object, levels: int = 200) -> object:
+        value = innermost
+        for _ in range(levels):
+            value = [value]
+        return value
+
+    assert _pair({"enum": [nest(True)]}, {"enum": [nest(True)]}) == []
+    assert _pair({"enum": [nest(True)]}, {"enum": [nest(1)]}), "true is not 1 at any depth"
+    assert _pair({"enum": [nest(1)]}, {"enum": [nest(1.0)]}) == []
+
+
+def test_a_shared_definition_reached_by_many_paths_is_compared_once() -> None:
+    clean = _diamond(16, {"type": "string", "maxLength": 9})
+    findings, seconds = _timed(clean, _diamond(16, {"type": "string", "maxLength": 9}))
+    assert findings == [] and seconds < 2.0, seconds
+    narrowed, seconds = _timed(clean, _diamond(16, {"type": "string", "maxLength": 3}))
+    assert any("maxLength lowered" in f for f in narrowed), narrowed  # the memo never hides a real change
+    assert seconds < 5.0, seconds
+
+
+def test_the_clean_pair_memo_does_not_leak_between_calls() -> None:
+    old = _diamond(3, {"type": "string", "maxLength": 9})
+    assert _pair(old, _diamond(3, {"type": "string", "maxLength": 3}))
+    assert _pair(old, _diamond(3, {"type": "string", "maxLength": 9})) == []
+    assert _pair(old, _diamond(3, {"type": "string", "maxLength": 3}))
+
+
+def test_the_number_of_keyword_comparisons_grows_linearly_with_shared_definitions(monkeypatch) -> None:
+    calls = {"count": 0}
+    real = pack._compare_keywords
+
+    def counting(*args, **kwargs):
+        calls["count"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(pack, "_compare_keywords", counting)
+    clean = _diamond(14, {"type": "string", "maxLength": 9})
+    assert _pair(clean, _diamond(14, {"type": "string", "maxLength": 9})) == []
+    assert calls["count"] < 100, calls  # 2**14 paths, one comparison per shared definition
+
+
+def test_every_path_to_a_narrowed_shared_definition_is_still_reported() -> None:
+    findings = _pair(_diamond(2, {"type": "string", "maxLength": 9}), _diamond(2, {"type": "string", "maxLength": 3}))
+    paths = {f.split(":")[0] for f in findings if "maxLength lowered" in f}
+    assert {"$.a.a", "$.a.b", "$.b.a", "$.b.b"} <= paths, paths

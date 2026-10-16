@@ -44,6 +44,7 @@ visible in review.
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import importlib
 import importlib.util
@@ -272,8 +273,94 @@ def _json_equal(left: object, right: object) -> bool:
     return True
 
 
+_KEY_DEPTH = 48
+
+
+def _json_key(value: object, depth: int = 0) -> object:
+    """A hashable canonical key such that equal JSON values (true is not 1, 1 is 1.0) have equal keys.
+
+    ``None`` when the value is nested deeper than ``_KEY_DEPTH`` (the caller compares those pairwise with the
+    iterative :func:`_json_equal`, so a deep value costs time but never the interpreter stack).
+    """
+
+    kind = _json_kind(value)
+    if kind in ("boolean", "number", "string", "null"):
+        return (kind, value)
+    if depth >= _KEY_DEPTH:
+        return None
+    if kind == "array":
+        parts = []
+        for item in value:  # type: ignore[attr-defined]
+            part = _json_key(item, depth + 1)
+            if part is None:
+                return None
+            parts.append(part)
+        return ("array", tuple(parts))
+    if kind == "object":
+        members = []
+        for name in sorted(value, key=str):  # type: ignore[call-overload]
+            part = _json_key(value[name], depth + 1)  # type: ignore[index]
+            if part is None:
+                return None
+            members.append((str(name), part))
+        return ("object", tuple(members))
+    return (kind, id(value))
+
+
+def _removed_values(old_values: list, new_values: list) -> list:
+    """The old allowed values with no JSON-equal counterpart among the new ones.
+
+    Values are matched through canonical keys in a set, so the work is linear in the number of values;
+    a value too deeply nested to key is compared pairwise with the iterative :func:`_json_equal`.
+    """
+
+    keys: set[object] = set()
+    deep: list = []
+    for value in new_values:
+        key = _json_key(value)
+        if key is None:
+            deep.append(value)
+        else:
+            keys.add(key)
+    removed = []
+    for value in old_values:
+        key = _json_key(value)
+        if key is None:
+            if not any(_json_equal(value, other) for other in new_values):
+                removed.append(value)
+        elif key not in keys and not any(_json_equal(value, other) for other in deep):
+            removed.append(value)
+    return removed
+
+
+class _Run:
+    """State shared by one ``check_compatibility`` call: definition-set equality and node pairs already shown compatible."""
+
+    def __init__(self) -> None:
+        self.defs_equal: dict[tuple[int, int], bool] = {}
+        # (old node, new node, old defs, new defs) identities -> the nodes themselves (strong references,
+        # so a released temporary's id can never be reused by another object and alias a recorded pair)
+        self.clean: dict[tuple[int, int, int, int], tuple[object, ...]] = {}
+
+
+_RUN: contextvars.ContextVar[_Run | None] = contextvars.ContextVar("contracts_pack_run", default=None)
+
+
+def _defs_equal(old_defs: dict, new_defs: dict) -> bool:
+    """Whether two definition sets are equal as JSON (walked once per pair within a run)."""
+
+    run = _RUN.get()
+    if run is None:
+        return _json_equal(old_defs, new_defs)
+    key = (id(old_defs), id(new_defs))
+    cached = run.defs_equal.get(key)
+    if cached is None:
+        cached = run.defs_equal[key] = _json_equal(old_defs, new_defs)
+    return cached
+
+
 def _same(old: object, new: object, old_defs: dict, new_defs: dict) -> bool:
-    if _json_equal(old, new) and _json_equal(old_defs, new_defs):
+    if _json_equal(old, new) and _defs_equal(old_defs, new_defs):
         return True  # the same text under the same definitions
     try:
         return _json_equal(_inline(old, old_defs), _inline(new, new_defs))
@@ -394,7 +481,45 @@ def _compare(
     for key in sorted((set(old) | set(new)) - _MODELED - _ANNOTATIONS):
         if not _same(old.get(key, _ABSENT), new.get(key, _ABSENT), old_defs, new_defs):
             out.append(_unverified(path, f"{key} changed"))
+    _compare_checked(old, new, old_defs, new_defs, path, out, depth, active)
 
+
+def _compare_checked(
+    old: dict,
+    new: dict,
+    old_defs: dict,
+    new_defs: dict,
+    path: str,
+    out: list[str],
+    depth: int,
+    active: frozenset[tuple[str, str]],
+) -> None:
+    """The keyword-by-keyword comparison of two resolved schemas, skipped for a pair already shown compatible.
+
+    A pair of nodes (under the same definition sets) that produced no finding is compatible wherever it
+    appears, so a shared definition reached by many paths is compared once, not once per path.
+    """
+
+    run = _RUN.get()
+    key = (id(old), id(new), id(old_defs), id(new_defs))
+    if run is not None and key in run.clean:
+        return
+    before = len(out)
+    _compare_keywords(old, new, old_defs, new_defs, path, out, depth, active)
+    if run is not None and len(out) == before:
+        run.clean[key] = (old, new, old_defs, new_defs)
+
+
+def _compare_keywords(
+    old: dict,
+    new: dict,
+    old_defs: dict,
+    new_defs: dict,
+    path: str,
+    out: list[str],
+    depth: int,
+    active: frozenset[tuple[str, str]],
+) -> None:
     old_unions = {key: old[key] for key in _UNION_KEYS if old.get(key)}
     new_unions = {key: new[key] for key in _UNION_KEYS if new.get(key)}
     if old_unions or new_unions:
@@ -444,9 +569,7 @@ def _compare(
             kind = "const" if "const" in new else "enum"
             out.append(f"{path}: {kind} restriction added")
         else:
-            removed = [
-                value for value in old_allowed if not any(_json_equal(value, other) for other in new_allowed)
-            ]
+            removed = _removed_values(old_allowed, new_allowed)
             if removed:
                 if "const" in old and "const" in new:
                     out.append(f"{path}: const changed")
@@ -556,7 +679,11 @@ def check_compatibility(old: dict, new: dict) -> list[str]:
     if old_version is not None and new_version is not None and _is_version_bump(old_version, new_version):
         return []
     problems: list[str] = []
-    _compare(old, new, old.get("$defs", {}), new.get("$defs", {}), "$", problems)
+    token = _RUN.set(_Run())
+    try:
+        _compare(old, new, old.get("$defs", {}), new.get("$defs", {}), "$", problems)
+    finally:
+        _RUN.reset(token)
     return list(dict.fromkeys(problems))
 
 
