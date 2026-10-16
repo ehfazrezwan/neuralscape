@@ -30,7 +30,9 @@ import hashlib
 import importlib
 import inspect
 import json
+import re
 from dataclasses import dataclass
+from fractions import Fraction
 
 from pydantic import BaseModel
 
@@ -169,9 +171,43 @@ def _types(schema: dict) -> set[str] | None:
     return set(value) if isinstance(value, list) else {value}
 
 
-def _compare(old: object, new: object, old_defs: dict, new_defs: dict, path: str, out: list[str], depth: int = 0) -> None:
-    if depth > 40:
+_MAX_COMPARE_DEPTH = 200
+
+def _allowed_values(schema: dict) -> list | None:
+    """The finite value set a schema restricts to, or ``None`` when unrestricted."""
+
+    if "const" in schema:
+        return [schema["const"]]
+    if "enum" in schema:
+        return list(schema["enum"])
+    return None
+
+
+def _multiple_of_narrowed(old_step: object, new_step: object) -> bool:
+    try:
+        return Fraction(str(old_step)) % Fraction(str(new_step)) != 0
+    except (ValueError, ZeroDivisionError):
+        return True
+
+
+def _compare(
+    old: object,
+    new: object,
+    old_defs: dict,
+    new_defs: dict,
+    path: str,
+    out: list[str],
+    depth: int = 0,
+    active: frozenset[tuple[str, str]] = frozenset(),
+) -> None:
+    if depth > _MAX_COMPARE_DEPTH:
+        out.append(f"{path}: schema nesting exceeds the comparison depth limit; compatibility not verified")
         return
+    if isinstance(old, dict) and isinstance(new, dict) and "$ref" in old and "$ref" in new:
+        pair = (str(old["$ref"]), str(new["$ref"]))
+        if pair in active:
+            return  # a recursive reference already being compared is assumed compatible
+        active = active | {pair}
     old = _resolve(old, old_defs)
     new = _resolve(new, new_defs)
     if not isinstance(old, dict) or not isinstance(new, dict):
@@ -181,38 +217,43 @@ def _compare(old: object, new: object, old_defs: dict, new_defs: dict, path: str
 
     old_branches = old.get("anyOf") or old.get("oneOf")
     new_branches = new.get("anyOf") or new.get("oneOf")
-    if old_branches is not None:
-        if new_branches is None:
-            # a union that became a single schema must still accept every old branch
-            new_branches = [new]
-        for index, branch in enumerate(old_branches):
-            matches = []
-            for candidate in new_branches:
+    if old_branches is not None or new_branches is not None:
+        # Every old alternative (an old single schema is one alternative) must
+        # still be accepted by some new alternative.
+        old_alternatives = old_branches if old_branches is not None else [old]
+        new_alternatives = new_branches if new_branches is not None else [new]
+        for index, branch in enumerate(old_alternatives):
+            matched = False
+            for candidate in new_alternatives:
                 trial: list[str] = []
-                _compare(branch, candidate, old_defs, new_defs, f"{path}|{index}", trial, depth + 1)
-                matches.append(trial)
-            if not any(not trial for trial in matches):
+                _compare(branch, candidate, old_defs, new_defs, f"{path}|{index}", trial, depth + 1, active)
+                if not trial:
+                    matched = True
+                    break
+            if not matched:
                 out.append(f"{path}: a previously accepted alternative is no longer accepted")
         return
-    if new_branches is not None:
-        return  # an old single schema widened into a union
 
     old_types, new_types = _types(old), _types(new)
+    if new_types is not None and "number" in new_types:
+        new_types = new_types | {"integer"}
     if old_types is not None and new_types is not None and not old_types <= new_types:
         out.append(f"{path}: type changed from {sorted(old_types)} to {sorted(new_types)}")
     if old_types is None and new_types is not None:
         out.append(f"{path}: an untyped value now requires type {sorted(new_types)}")
 
-    if "const" in old and old.get("const") != new.get("const"):
-        out.append(f"{path}: const changed")
-    if "enum" in old:
-        removed = [value for value in old["enum"] if value not in new.get("enum", old["enum"])]
-        if "enum" not in new and "const" in new and new["const"] not in old["enum"]:
-            removed = list(old["enum"])
-        if removed:
-            out.append(f"{path}: enum values removed {removed}")
-    elif "enum" in new and "const" not in old:
-        out.append(f"{path}: enum restriction added")
+    old_allowed, new_allowed = _allowed_values(old), _allowed_values(new)
+    if new_allowed is not None:
+        if old_allowed is None:
+            kind = "const" if "const" in new else "enum"
+            out.append(f"{path}: {kind} restriction added")
+        else:
+            removed = [value for value in old_allowed if value not in new_allowed]
+            if removed:
+                if "const" in old and "const" in new:
+                    out.append(f"{path}: const changed")
+                else:
+                    out.append(f"{path}: enum values removed {removed}")
 
     for key, direction in (
         ("minimum", "raised"),
@@ -230,6 +271,10 @@ def _compare(old: object, new: object, old_defs: dict, new_defs: dict, path: str
         out.append(f"{path}: pattern changed")
     if "format" in new and new.get("format") != old.get("format"):
         out.append(f"{path}: format changed")
+    if new.get("uniqueItems") and not old.get("uniqueItems"):
+        out.append(f"{path}: uniqueItems added")
+    if "multipleOf" in new and ("multipleOf" not in old or _multiple_of_narrowed(old["multipleOf"], new["multipleOf"])):
+        out.append(f"{path}: multipleOf narrowed")
 
     old_props = old.get("properties")
     if isinstance(old_props, dict):
@@ -238,14 +283,14 @@ def _compare(old: object, new: object, old_defs: dict, new_defs: dict, path: str
             if name not in new_props:
                 out.append(f"{path}.{name}: property removed")
             else:
-                _compare(subschema, new_props[name], old_defs, new_defs, f"{path}.{name}", out, depth + 1)
+                _compare(subschema, new_props[name], old_defs, new_defs, f"{path}.{name}", out, depth + 1, active)
         added_required = set(new.get("required", [])) - set(old.get("required", []))
         for name in sorted(added_required):
             out.append(f"{path}.{name}: now required")
         if old.get("additionalProperties") is not False and new.get("additionalProperties") is False:
             out.append(f"{path}: additional properties no longer accepted")
     if "items" in old and "items" in new:
-        _compare(old["items"], new["items"], old_defs, new_defs, f"{path}[]", out, depth + 1)
+        _compare(old["items"], new["items"], old_defs, new_defs, f"{path}[]", out, depth + 1, active)
     elif "items" in new and "items" not in old:
         out.append(f"{path}: item schema added")
     if "prefixItems" in old:
@@ -253,12 +298,28 @@ def _compare(old: object, new: object, old_defs: dict, new_defs: dict, path: str
             if index >= len(new.get("prefixItems", [])):
                 out.append(f"{path}[{index}]: tuple position removed")
             else:
-                _compare(item, new["prefixItems"][index], old_defs, new_defs, f"{path}[{index}]", out, depth + 1)
+                _compare(item, new["prefixItems"][index], old_defs, new_defs, f"{path}[{index}]", out, depth + 1, active)
     if isinstance(old.get("additionalProperties"), dict) and "additionalProperties" in new:
         if isinstance(new["additionalProperties"], dict):
-            _compare(old["additionalProperties"], new["additionalProperties"], old_defs, new_defs, f"{path}{{}}", out, depth + 1)
+            _compare(old["additionalProperties"], new["additionalProperties"], old_defs, new_defs, f"{path}{{}}", out, depth + 1, active)
         elif new["additionalProperties"] is False:
             out.append(f"{path}: additional properties no longer accepted")
+
+
+def _version_number(version: object) -> tuple[str, int] | None:
+    match = re.fullmatch(r"(.*?)(\d+)", version) if isinstance(version, str) else None
+    return (match.group(1), int(match.group(2))) if match else None
+
+
+def _is_version_bump(old_version: object, new_version: object) -> bool:
+    """A different version counts as a bump unless it is provably an older one."""
+
+    if old_version == new_version:
+        return False
+    old_number, new_number = _version_number(old_version), _version_number(new_version)
+    if old_number and new_number and old_number[0] == new_number[0]:
+        return new_number[1] > old_number[1]
+    return True
 
 
 def check_compatibility(old: dict, new: dict) -> list[str]:
@@ -267,12 +328,13 @@ def check_compatibility(old: dict, new: dict) -> list[str]:
     Removing a property, requiring a new one, or narrowing a type, bound, enum,
     pattern, constant or union is breaking.  Adding an optional property or
     widening a constraint is compatible.  A change of the contract's
-    ``schema_version`` constant is an explicit version bump and is accepted.
+    ``schema_version`` constant to a newer version is an explicit bump and is
+    accepted; a downgrade is compared like any other change.
     """
 
     old_version = old.get("properties", {}).get("schema_version", {}).get("const")
     new_version = new.get("properties", {}).get("schema_version", {}).get("const")
-    if old_version is not None and new_version is not None and old_version != new_version:
+    if old_version is not None and new_version is not None and _is_version_bump(old_version, new_version):
         return []
     problems: list[str] = []
     _compare(old, new, old.get("$defs", {}), new.get("$defs", {}), "$", problems)

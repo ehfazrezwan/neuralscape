@@ -8,10 +8,11 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from typing import Annotated, Literal, Optional
 
 import jsonschema
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, create_model
 
 import contracts_pack as pack
 from contracts_common import ContractModel, VersionedContract
@@ -389,3 +390,114 @@ def test_requiring_an_optional_or_new_field_in_a_real_schema_is_breaking(name: s
 def test_digest_check_reports_a_changed_schema(monkeypatch) -> None:
     monkeypatch.setitem(pack.SCHEMA_DIGESTS, "ContextRequest", "0" * 64)
     assert pack.changed_since_digests() == ["ContextRequest"]
+
+
+# ------------------------------------------- narrowings on real pydantic models
+
+
+def _model_schema(annotation: object, default: object = ...) -> dict:
+    model = create_model("Probe", __config__=ConfigDict(extra="forbid"), field=(annotation, default))
+    return model.model_json_schema(mode="validation")
+
+
+def _nest(annotation: object, depth: int) -> object:
+    for _ in range(depth):
+        annotation = list[annotation]  # type: ignore[valid-type]
+    return annotation
+
+
+def _wrap(value: object, depth: int) -> object:
+    for _ in range(depth):
+        value = [value]
+    return value
+
+
+_NARROWINGS = [
+    ("const_added", str, Literal["only"], "other"),
+    ("union_of_literals", str, Optional[Literal["a", "b"]], "zzz"),
+    ("union_of_bounded", str, Optional[Annotated[str, Field(max_length=2)]], "toolong"),
+    ("unique_items", list[str], frozenset[str], ["a", "a"]),
+    ("multiple_of", int, Annotated[int, Field(multiple_of=2)], 3),
+    ("multiple_of_tightened", Annotated[int, Field(multiple_of=2)], Annotated[int, Field(multiple_of=4)], 2),
+    ("optional_removed", Optional[str], str, None),
+    ("enum_to_const", Literal["a", "b"], Literal["a"], "b"),
+]
+
+
+@pytest.mark.parametrize("label, old_annotation, new_annotation, witness", _NARROWINGS, ids=[n[0] for n in _NARROWINGS])
+def test_narrowings_on_real_models_are_reported(label, old_annotation, new_annotation, witness) -> None:
+    old, new = _model_schema(old_annotation), _model_schema(new_annotation)
+    document = {"field": witness}
+    # Ground truth: the old schema accepts the witness and the new one rejects it.
+    assert jsonschema.Draft202012Validator(old).is_valid(document)
+    assert not jsonschema.Draft202012Validator(new).is_valid(document)
+    assert pack.check_compatibility(old, new), label
+
+
+_WIDENINGS = [
+    ("literal_to_more_literals", Literal["a"], Literal["a", "b"]),
+    ("int_to_float", int, float),
+    ("str_to_optional_str", str, Optional[str]),
+    ("bounded_to_unbounded", Annotated[int, Field(multiple_of=4)], Annotated[int, Field(multiple_of=2)]),
+    ("multiple_dropped", Annotated[int, Field(multiple_of=2)], int),
+    ("frozenset_to_list", frozenset[str], list[str]),
+]
+
+
+@pytest.mark.parametrize("label, old_annotation, new_annotation", _WIDENINGS, ids=[w[0] for w in _WIDENINGS])
+def test_widenings_on_real_models_are_not_reported(label, old_annotation, new_annotation) -> None:
+    assert pack.check_compatibility(_model_schema(old_annotation), _model_schema(new_annotation)) == [], label
+
+
+@pytest.mark.parametrize("depth", [35, 41, 60, 150])
+def test_deeply_nested_narrowings_are_reported(depth: int) -> None:
+    old = _model_schema(_nest(int, depth))
+    new = _model_schema(_nest(Annotated[int, Field(ge=1)], depth))
+    document = {"field": _wrap(0, depth)}
+    assert jsonschema.Draft202012Validator(old).is_valid(document)
+    assert not jsonschema.Draft202012Validator(new).is_valid(document)
+    assert pack.check_compatibility(old, new)
+
+
+def _deep_schema(depth: int) -> dict:
+    schema: dict = {"type": "integer"}
+    for _ in range(depth):
+        schema = {"type": "array", "items": schema}
+    return {"type": "object", "properties": {"field": schema}}
+
+
+def test_exceeding_the_depth_limit_fails_closed() -> None:
+    schema = _deep_schema(400)
+    problems = pack.check_compatibility(schema, copy.deepcopy(schema))
+    assert any("depth" in problem for problem in problems)
+
+
+def _node_schema(value: dict) -> dict:
+    return {
+        "type": "object",
+        "properties": {"node": {"$ref": "#/$defs/Node"}},
+        "$defs": {
+            "Node": {
+                "type": "object",
+                "properties": {"value": value, "children": {"type": "array", "items": {"$ref": "#/$defs/Node"}}},
+            }
+        },
+    }
+
+
+def test_a_recursive_reference_is_compatible_with_itself_and_still_detects_narrowing() -> None:
+    old = _node_schema({"type": "integer"})
+    assert pack.check_compatibility(old, copy.deepcopy(old)) == []
+    assert pack.check_compatibility(old, _node_schema({"type": "integer", "minimum": 1}))
+
+
+def test_a_downgrade_of_the_schema_version_is_not_a_bump() -> None:
+    def downgrade(s):
+        s["properties"]["schema_version"]["const"] = "candidate-v0"
+        s["properties"].pop("count")
+
+    old = copy.deepcopy(_schema())
+    old["properties"]["schema_version"]["const"] = "candidate-v1"
+    new = copy.deepcopy(old)
+    downgrade(new)
+    assert pack.check_compatibility(old, new)
