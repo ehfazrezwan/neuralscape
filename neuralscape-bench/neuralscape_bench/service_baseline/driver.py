@@ -235,7 +235,12 @@ def _redis_backlog(redis_url: str) -> int | None:
 
         connection = redis.Redis.from_url(redis_url, socket_timeout=5)
         pending = sum(connection.zcard(name) for name in QUEUES)
-        pending += sum(1 for _ in connection.scan_iter(match="arq:in-progress:*", count=200))
+        # Cron jobs leave an in-progress marker for a while after they ran; only real jobs count.
+        pending += sum(
+            1
+            for key in connection.scan_iter(match="arq:in-progress:*", count=200)
+            if not key.decode().startswith("arq:in-progress:cron:")
+        )
         return pending
     except Exception:  # noqa: BLE001 - fall back to the API view
         return None

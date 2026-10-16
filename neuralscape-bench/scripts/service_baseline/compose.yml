@@ -105,6 +105,21 @@ services:
       fake-provider: {condition: service_started}
     deploy: {resources: {limits: {memory: 2G}}}
 
+  # Consumes the durable-ledger wake queue; only started when LEDGER_ENABLED=true.
+  ledger-worker:
+    image: ${NS_IMAGE}
+    profiles: ["ledger"]
+    restart: on-failure
+    command: ["arq", "worker.LedgerWorkerSettings"]
+    environment: *service-env
+    volumes: [ "${BENCH_DIR}:/bench:ro", "state:/state" ]
+    depends_on:
+      neo4j: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      qdrant: {condition: service_healthy}
+      fake-provider: {condition: service_started}
+    deploy: {resources: {limits: {memory: 2G}}}
+
   ingest-worker:
     image: ${NS_IMAGE}
     restart: on-failure

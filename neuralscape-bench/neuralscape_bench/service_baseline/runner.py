@@ -41,8 +41,8 @@ SCHEMA = "candidate-v1"
 PROJECT = "ns-g-bench"
 BENCH_DIR = Path(__file__).resolve().parents[2]
 COMPOSE_FILE = BENCH_DIR / "scripts" / "service_baseline" / "compose.yml"
-SERVICES = ("api", "worker", "graph-worker", "ingest-worker", "fake-provider", "neo4j", "redis", "qdrant")
-MEM_LIMITS = {"api": 3 << 30, "worker": 2 << 30, "graph-worker": 2 << 30, "ingest-worker": 2 << 30,
+SERVICES = ("api", "worker", "graph-worker", "ingest-worker", "ledger-worker", "fake-provider", "neo4j", "redis", "qdrant")
+MEM_LIMITS = {"api": 3 << 30, "ledger-worker": 2 << 30, "worker": 2 << 30, "graph-worker": 2 << 30, "ingest-worker": 2 << 30,
               "fake-provider": 512 << 20, "neo4j": 2 << 30, "redis": 512 << 20, "qdrant": 2 << 30}
 _UNITS = {"b": 1, "kib": 1 << 10, "mib": 1 << 20, "gib": 1 << 30, "kb": 10**3, "mb": 10**6, "gb": 10**9}
 
@@ -171,7 +171,10 @@ def compose(*args: str, env: dict[str, str]) -> str:
 def cold_start_seconds(env: dict[str, str], timeout_s: float = 420) -> float:
     start = time.monotonic()
     compose("up", "-d", "--wait", "--wait-timeout", str(int(timeout_s)), "neo4j", "redis", "qdrant", "fake-provider", env=env)
-    compose("up", "-d", "api", "worker", "graph-worker", "ingest-worker", env=env)
+    started = ["api", "worker", "graph-worker", "ingest-worker"]
+    if env.get("LEDGER_ENABLED") == "true":
+        started.append("ledger-worker")
+    compose("up", "-d", *started, env=env)
     while time.monotonic() - start < timeout_s:
         probe = subprocess.run(
             ["docker", "compose", "-p", PROJECT, "-f", str(COMPOSE_FILE), "exec", "-T", "api", "python", "-c",
@@ -269,7 +272,7 @@ def main() -> None:
         record["logs_tail"] = {s: compose("logs", "--no-color", "--tail", "40", s, env=env) for s in ("api", "worker", "graph-worker")}
         record["policy_log_lines"] = [line for line in compose("logs", "--no-color", "api", env=env).splitlines()
                                        if "policy_decision" in line or "policy" in line.lower() and "denied" in line.lower()][:20]
-        compose("down", "-v", "--remove-orphans", env=env)
+        compose("--profile", "ledger", "down", "-v", "--remove-orphans", env=env)
     record["host_after"] = host_facts()
     results = json.loads((out_dir / "driver.json").read_text())
     record["resource_peaks"] = peaks(sampler.samples)
