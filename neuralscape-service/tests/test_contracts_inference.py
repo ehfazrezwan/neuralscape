@@ -1812,3 +1812,51 @@ def test_modest_reuse_and_large_ordinary_json_are_still_accepted():
         }
         result = generation_result().model_copy(update={"proposals": (proposal,)})
         assert validate_generation_result(request, result).compliant
+
+
+def _proposals(output, count, *, same_object=False):
+    one = {"proposal_id": "proposal-0", "output": output, "support_span_ids": ("support-1",),
+           "machine_authored": True}
+    if same_object:
+        return (one,) * count
+    return tuple({**one, "proposal_id": f"proposal-{i}"} for i in range(count))
+
+
+def test_many_proposals_sharing_one_admitted_expansion_are_refused_by_one_call_allowance():
+    import time
+
+    from contracts_limits import DISCOVERY_BUDGET_MESSAGE
+
+    request = generation_request(schema=_array_schema())
+    shared = _aliased(15)  # about 65k paths: admitted for one field
+    validate_generation_result(request, generation_result().model_copy(update={"proposals": _proposals(shared, 1)}))
+    for count, same in ((3, False), (60, False), (5_000, False), (100_000, True)):
+        result = generation_result().model_copy(update={"proposals": _proposals(shared, count, same_object=same)})
+        started = time.monotonic()
+        with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+            validate_generation_result(request, result)
+        assert time.monotonic() - started < 10, (count, same)
+
+
+def test_large_flat_json_is_still_accepted_alone_and_the_allowance_spans_the_call():
+    from contracts_limits import DISCOVERY_BUDGET_MESSAGE
+
+    request = generation_request(schema=_array_schema())
+    flat = list(range(100_000))
+    validate_generation_result(request, generation_result().model_copy(update={"proposals": _proposals(flat, 1)}))
+    two = generation_result().model_copy(update={"proposals": _proposals(flat, 2)})
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        validate_generation_result(request, two)  # the same 100k list twice is 200k paths in one call
+    small = generation_result().model_copy(update={"proposals": _proposals(list(range(1_000)), 50)})
+    assert validate_generation_result(request, small).compliant
+
+
+def test_the_output_schema_and_the_proposals_share_the_call_allowance():
+    from contracts_limits import DISCOVERY_BUDGET_MESSAGE
+
+    flat = list(range(80_000))  # one object: discovery charges it once, but both fields walk it
+    schema = {**_array_schema(), "examples": [flat]}
+    request = generation_request(schema=schema)
+    validate_generation_result(request, generation_result().model_copy(update={"proposals": _proposals(["x"], 1)}))
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        validate_generation_result(request, generation_result().model_copy(update={"proposals": _proposals(flat, 1)}))

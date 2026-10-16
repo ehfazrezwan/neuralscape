@@ -295,7 +295,7 @@ def _snapshot_native_value(
     frozen_containers: dict[int, _FrozenContainerState],
     discovered: dict[int, Any],
     budget: DiscoveryBudget,
-    memo: dict[int, tuple[Any, Any, int]],
+    memo: dict[Any, Any],
     depth: int,
     location: str,
     guard: bool = False,
@@ -338,6 +338,9 @@ def _snapshot_native_value(
                 raise ValueError(f"contract graph nesting exceeds the limit at {location}")
             if depth + height > budget.tier.max_depth:
                 raise ValueError(DISCOVERY_BUDGET_MESSAGE)
+            if not guard:
+                # every occurrence of a reused subtree is walked again, JSON fields included
+                _add_expansion(memo.get((_EXPANDED_WITHIN, identity), 0), budget, memo)
             return copied, height, True
         # A child first exposed through a public view is captured now; it is
         # charged to the same envelope as the entry discovery.
@@ -353,6 +356,7 @@ def _snapshot_native_value(
             raise ValueError(f"cyclic contract graph at {location}")
         active.add(identity)
 
+    expanded_before = memo.get(_EXPANDED_TOTAL, 0)
     height = 0
     memoizable = True
     own_cost = 0  # copying an exact node that cannot be reused is work the capture phase did not charge
@@ -382,7 +386,7 @@ def _snapshot_native_value(
             # The root of a JSON-valued field: anything may be nested and reused inside it, and
             # validation, the JSON scans and the schema check walk it path by path.  (The fixed
             # contract structure around it cannot expand: its depth is the schema's.)
-            _bound_expanded_size(copied_item, budget)
+            _charge_expanded_size(copied_item, budget, memo)
         return copied_item
 
     try:
@@ -479,6 +483,8 @@ def _snapshot_native_value(
             return value, 0, True
         if is_container and memoizable:
             table[identity] = (value, result, height)
+            if not guard:
+                memo[(_EXPANDED_WITHIN, identity)] = memo.get(_EXPANDED_TOTAL, 0) - expanded_before
         elif own_cost:
             budget.charge_edge(own_cost)  # every non-reused ancestor copy is charged
         return result, height, memoizable
@@ -487,19 +493,50 @@ def _snapshot_native_value(
             active.remove(identity)
 
 
-def _bound_expanded_size(native: Any, budget: DiscoveryBudget) -> None:
-    """Refuse a snapshot whose expansion by path is larger than the edge allowance.
+#: Snapshot-memo keys for the call-level JSON expansion allowance (not object identities, which are ints).
+_EXPANDED_TOTAL = "json-expanded-total"
+_EXPANDED_SIZE = "json-expanded-size"
+_EXPANDED_WITHIN = "json-expanded-within"
+
+
+def _charge_expanded_size(native: Any, budget: DiscoveryBudget, memo: dict[Any, Any]) -> None:
+    """Charge the expansion of one JSON-valued field to the call's single allowance.
 
     The snapshot shares one copy of a reused subtree between every path that reaches it, so it
     is cheap to build, but everything that follows (strict validation, the JSON scans, the
-    schema check) walks the *paths* of a JSON-valued field: a value that holds itself twice at each of 40 levels is a
-    few hundred bytes and 2**40 paths.  Each distinct container is sized once, children first,
-    by identity (``entries + the expanded size of its children``), so the work is proportional
-    to the distinct graph, and a total above the tier's edge limit is the stable budget error.
+    schema check) walks the *paths* of every JSON-valued field: a value that holds itself twice
+    at each of 40 levels is a few hundred bytes and 2**40 paths, and one admitted value reused by
+    many fields (or one proposal repeated) is walked once per field.  So the expanded sizes of all
+    JSON-valued fields of one call share a single allowance, the tier's edge limit, and a total
+    above it is the stable budget error.  ``memo`` is the call's snapshot memo, shared by every
+    root of the call; each distinct container is sized once per call, and a memoized subtree that
+    holds JSON fields is charged again for them every time it is reused.
+    """
+
+    _add_expansion(_expanded_size(native, budget, memo), budget, memo)
+
+
+def _add_expansion(amount: int, budget: DiscoveryBudget, memo: dict[Any, Any]) -> None:
+    total = memo.get(_EXPANDED_TOTAL, 0) + amount
+    if total > budget.tier.max_edges:
+        budget.charge_edge(budget.tier.max_edges - budget.edges + 1)  # raises and leaves the budget exhausted
+    memo[_EXPANDED_TOTAL] = total
+
+
+def _expanded_size(native: Any, budget: DiscoveryBudget, memo: dict[Any, Any]) -> int:
+    """The number of entries a path-by-path walk of ``native`` visits, sized once per container.
+
+    Children first, by identity (``entries + the expanded size of its children``), so the work is
+    proportional to the distinct graph; sizing stops as soon as one container exceeds the edge
+    limit.  Sizes are kept in the call's memo with the object they belong to.
     """
 
     limit = budget.tier.max_edges
-    sizes: dict[int, int] = {}
+
+    def known(value: Any) -> int | None:
+        held = memo.get((_EXPANDED_SIZE, id(value)))
+        return held[1] if held is not None and held[0] is value else None
+
     pending: list[tuple[Any, bool]] = [(native, False)]
     while pending:
         value, expanded = pending.pop()
@@ -510,19 +547,19 @@ def _bound_expanded_size(native: Any, budget: DiscoveryBudget) -> None:
             children = tuple(value)
         else:
             continue
-        identity = id(value)
         if not expanded:
-            if identity in sizes:
+            if known(value) is not None:
                 continue
             pending.append((value, True))
-            pending.extend((child, False) for child in children if id(child) not in sizes)
+            pending.extend((child, False) for child in children if known(child) is None)
             continue
         total = len(children)
         for child in children:
-            total += sizes.get(id(child), 0)
+            total += known(child) or 0
             if total > limit:
-                raise ValueError(DISCOVERY_BUDGET_MESSAGE)
-        sizes[identity] = total
+                budget.charge_edge(limit - budget.edges + 1)  # raises and leaves the budget exhausted
+        memo[(_EXPANDED_SIZE, id(value))] = (value, total)
+    return known(native) or 0
 
 
 def _validated_contract_snapshot(
@@ -539,7 +576,7 @@ def _validated_contract_snapshot(
     frozen_containers: dict[int, _FrozenContainerState] = {}
     discovered: dict[int, Any] = {}
     budget = DiscoveryBudget()
-    memo: dict[int, tuple[Any, Any, int]] = {}
+    memo: dict[Any, Any] = {}
     _freeze_native_model_graph(
         value,
         frozen_models,
@@ -568,7 +605,7 @@ def _validated_contract_snapshot_from_frozen(
     frozen_containers: dict[int, _FrozenContainerState],
     discovered: dict[int, Any],
     budget: DiscoveryBudget,
-    memo: dict[int, tuple[Any, Any, int]],
+    memo: dict[Any, Any],
     guard_memo: dict[int, tuple[Any, Any, int]] | None = None,
     json_guard: Callable[[str, str], bool] | None = None,
 ) -> _ContractT:
@@ -609,7 +646,7 @@ def _validated_contract_tuple(
     frozen_containers: dict[int, _FrozenContainerState] = {}
     discovered: dict[int, Any] = {}
     budget = DiscoveryBudget()
-    memo: dict[int, tuple[Any, Any, int]] = {}
+    memo: dict[Any, Any] = {}
     _freeze_native_model_graph(
         values,
         frozen_models,
@@ -638,7 +675,7 @@ def _validated_contract_tuple_from_frozen(
     frozen_containers: dict[int, _FrozenContainerState],
     discovered: dict[int, Any],
     budget: DiscoveryBudget,
-    memo: dict[int, tuple[Any, Any, int]],
+    memo: dict[Any, Any],
 ) -> tuple[_ContractT, ...]:
     """Validate a tuple using entry state frozen for the enclosing boundary."""
 
@@ -687,7 +724,7 @@ def _validated_contract_snapshots(
     frozen_containers: dict[int, _FrozenContainerState] = {}
     discovered: dict[int, Any] = {}
     budget = DiscoveryBudget()
-    memo: dict[int, tuple[Any, Any, int]] = {}
+    memo: dict[Any, Any] = {}
     guard_memo: dict[int, tuple[Any, Any, int]] = {}
     for value, _expected_type, _label in specs:
         _freeze_native_model_graph(value, frozen_models, frozen_containers, discovered, budget)
@@ -873,7 +910,7 @@ def validate_capability_requirements(
     frozen_containers: dict[int, _FrozenContainerState] = {}
     discovered: dict[int, Any] = {}
     budget = DiscoveryBudget()  # one envelope across manifest and requirements
-    memo: dict[int, tuple[Any, Any, int]] = {}  # one copy per object across both roots
+    memo: dict[Any, Any] = {}  # one copy per object across both roots
     try:
         _freeze_native_model_graph(
             manifest,
