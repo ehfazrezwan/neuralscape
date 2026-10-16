@@ -1,4 +1,4 @@
-"""Application witness, clock rule, cross-tenant lineage and public-first pins (ADR-P12-010).
+"""Application witness, clock rule, cross-tenant lineage and public-first pins.
 
 Every test imports the new names lazily so each fails individually on a tree without the change.
 """
@@ -72,7 +72,7 @@ def claim(command, receipts, status=IntentStatus.APPLIED):
 
 # ------------------------------------------------ item 12: empty source equality is not a witness
 def test_an_applied_claim_with_an_empty_application_witness_is_rejected() -> None:
-    """J row 12 / Copilot 4134993728: no preconditions + ``applied_sources=()`` used to pass."""
+    """No preconditions + ``applied_sources=()`` used to pass."""
 
     command = intent_with_requirements(
         requirement(CANONICAL, precondition_source_ids=()), source_preconditions=()
@@ -102,7 +102,7 @@ def test_a_nonempty_witness_still_has_to_match_the_calculated_inputs() -> None:
 
 # ------------------------------------- item 19: durable immutable upstream application references
 def test_a_downstream_application_must_cite_the_upstream_application_it_consumed() -> None:
-    """J row 19 / Copilot 4149092727: matching committed-source *sets* were the only evidence."""
+    """matching committed-source *sets* were the only evidence."""
 
     command, committed = chain_intent()
     canonical, graph = chain_receipts(committed)
@@ -175,11 +175,11 @@ def test_the_witness_survives_the_json_wire_form() -> None:
 
 # ------------------------------------------------------ item 17: wall-clock is not causal evidence
 def test_receipt_timestamps_are_not_compared_with_acceptance() -> None:
-    """J row 17 / Copilot 4147860674, pinned by decision (ADR-P12-010 section 2).
+    """Pinned by decision: wall-clock receipt times are not causal evidence.
 
     The contract deliberately does not compare worker clocks with ``Intent.accepted_at``: wall-clock
     receipt times are not causal evidence.  Order is proven by the ledger's per-aggregate versions
-    (ADR-P12-006 Amendment 1) and, between stages, by upstream application witnesses.  A receipt
+    and, between stages, by upstream application witnesses.  A receipt
     that claims to have run a day before acceptance is therefore accepted by the contract; a
     ledger that needs ordering reads versions, not these timestamps.
     """
@@ -202,7 +202,7 @@ def handle(tenant, *, cross=False, ident="src-1"):
 
 
 def test_cross_tenant_source_refs_validate_only_with_the_explicit_marker() -> None:
-    """J row 16 / Copilot 4147860598 (owner: lineage = authorized_cross): a handle may name another
+    """(cross-tenant lineage is allowed as data): a handle may name another
     tenant's source as *data*; resolution always needs a current authorization check."""
 
     record = memory_record(source_refs=(handle("tenant-2", cross=True), handle("tenant-1")))
@@ -246,7 +246,7 @@ def test_intent_type_errors_use_the_right_article() -> None:
         )
 
 
-# ----------------------------- D1 pins: public view captured at first observation (ADR-P12-001)
+# ----------------------------- D1 pins: public view captured at first observation
 class LazyPublicTuple(tuple):
     """Native backing differs from a *lazy* public iterator that runs a hook between items."""
 
@@ -266,10 +266,10 @@ def _native_set(model: BaseModel, name: str, value: object) -> None:
 
 
 def test_public_first_sibling_repair_before_first_observation_is_the_documented_limit() -> None:
-    """Copilot 4153109014 (PR 346): a subclass's public view is a lazy generator, so an earlier
+    """a subclass's public view is a lazy generator, so an earlier
     sibling's callback can repair a later item before that item is captured.
 
-    By design under ADR-P12-001 D1 (public_first): the supported public view is captured **once, at
+    By design (public view is authoritative): the supported public view is captured **once, at
     first observation**, and replayed; items exposed only by a public iterator are captured when
     first exposed, and entry-time capture of them is not promised.  What is pinned: (1) an invalid
     later public-only receipt is rejected when nothing repairs it; (2) if an earlier item's hook
@@ -307,10 +307,10 @@ def test_public_first_sibling_repair_before_first_observation_is_the_documented_
 
 
 def test_public_first_public_only_receipt_repair_by_intent_callback_is_the_documented_limit() -> None:
-    """Copilot 4153109063 (PR 346): receipts are traversed only after the intent is revalidated, so
+    """receipts are traversed only after the intent is revalidated, so
     an intent callback can repair a public-only receipt first.
 
-    By design under ADR-P12-001 D1: the intent and each public receipt view are captured at their own
+    By design (public view is authoritative): the intent and each public receipt view are captured at their own
     first observation, in source order; a callback that runs while the intent is revalidated may
     change a receipt that has not been observed yet, and the receipt is then validated as it is
     when first observed.  Pinned: unrepaired -> rejected; repaired by the intent's callback -> the
