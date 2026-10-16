@@ -81,9 +81,19 @@ PORTABILITY = DiscoveryTier(
 
 
 def is_exact_type(obj, *types):
-    """Return whether ``type(obj)`` is exactly one of ``types`` (no hooks run)."""
+    """Return whether ``type(obj)`` is exactly one of ``types`` (no hooks run).
 
-    return type(obj) in types
+    Identity only.  Tuple membership (``in``) falls back to ``==`` after the
+    identity test, and ``==`` between two classes dispatches to their
+    metaclass ``__eq__``, which can run arbitrary code or claim to be equal to
+    an exact type; ``is`` never invokes a hook.
+    """
+
+    actual = type(obj)
+    for candidate in types:
+        if actual is candidate:
+            return True
+    return False
 
 
 def _exceeded():
