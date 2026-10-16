@@ -9,6 +9,7 @@ from __future__ import annotations
 import warnings
 
 import pytest
+from contracts_limits import STANDARD_MAX_EDGES
 from pydantic import BaseModel, ValidationError
 
 from contracts_bodies import OpaqueEnvelopeBody, PlaintextBody, parse_memory_body
@@ -153,7 +154,7 @@ def test_an_authority_collection_that_never_ends_is_cut_off_by_a_budget() -> Non
 
     with pytest.raises(PlaintextDispatchRejected, match="exceeds the budget"):
         dispatch(currently_authorized_recipient_ids=Endless())
-    assert len(produced) <= 65_536 + 1
+    assert len(produced) <= STANDARD_MAX_EDGES + 1
 
 
 def test_a_collection_within_the_budget_is_still_accepted() -> None:
@@ -213,3 +214,31 @@ def test_a_string_subclass_key_in_an_exact_dict_body_runs_no_hooks() -> None:
     with pytest.raises(ValidationError):
         parse_memory_body(clashing)
     assert Spy.events == []
+
+
+def test_the_authority_bound_is_the_standard_tiers_edge_limit_and_a_large_collection_below_it_is_accepted() -> None:
+    from contracts_native import MAX_COLLECTION_ENTRIES
+
+    assert MAX_COLLECTION_ENTRIES == STANDARD_MAX_EDGES
+    ids = [f"r-{index}" for index in range(100_000)] + ["r-ok"]  # above the old fixed 65,536, below the tier
+    dispatch(currently_authorized_recipient_ids=ids)
+    with pytest.raises(PlaintextDispatchRejected, match="exceeds the budget"):
+        dispatch(currently_authorized_recipient_ids=ids + [f"x-{index}" for index in range(STANDARD_MAX_EDGES)])
+
+
+def test_a_body_model_with_a_bad_stored_name_is_a_validation_error_not_a_raw_type_error() -> None:
+    from pydantic import BaseModel
+
+    class Odd(str):
+        def __hash__(self):
+            return 4242
+
+    descriptor = vars(BaseModel)["__dict__"]
+    for names in ((1, "text"), (Odd("kind"), "kind")):
+        body = PlaintextBody(kind="plaintext", text="hello")
+        stored = descriptor.__get__(body, BaseModel)
+        dict.clear(stored)
+        dict.__setitem__(stored, names[0], "plaintext" if names[0] != 1 else 1)
+        dict.__setitem__(stored, names[1], "hello" if names[1] == "text" else "plaintext")
+        with pytest.raises(ValidationError):
+            parse_memory_body(body)

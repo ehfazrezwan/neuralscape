@@ -49,7 +49,10 @@ def _project_body_storage(value: object) -> object:
 
     kind = type(value)
     if is_subclass(kind, (PlaintextBody, OpaqueEnvelopeBody)):
-        return project_model_storage(value)
+        try:
+            return project_model_storage(value)
+        except TypeError as error:  # a stored name that is not text, or two names with one text
+            raise ValueError(f"a body model has an unusable stored name: {error}") from None
     if kind is dict:
         try:
             return plain_keyed(dict.items(value))

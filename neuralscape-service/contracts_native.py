@@ -12,6 +12,8 @@ from types import MappingProxyType
 
 from pydantic import BaseModel
 
+from contracts_limits import STANDARD_MAX_EDGES
+
 _TYPE_MRO = vars(type)["__mro__"]
 _MAPPING_BASES = (Mapping, dict, MappingProxyType)
 _BASE_MODEL_DICT_DESCRIPTOR = vars(BaseModel)["__dict__"]
@@ -40,8 +42,11 @@ def is_subclass(cls: type, types: type | tuple[type, ...]) -> bool:
     return False
 
 
-MAX_COLLECTION_ENTRIES = 65_536
-"""The most entries read from a caller-supplied collection (a public view the caller controls)."""
+MAX_COLLECTION_ENTRIES = STANDARD_MAX_EDGES
+"""The most entries read from a caller-supplied collection (a public view the caller controls).
+
+One entry is one edge of the contract graph, so the bound is the standard discovery tier's edge
+limit: there is one number to explain, and it moves with the tier."""
 
 
 class CollectionBudgetExceeded(ValueError):
