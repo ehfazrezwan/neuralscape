@@ -8,7 +8,8 @@ import subprocess
 import sys
 from abc import ABCMeta
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from types import MappingProxyType
 from typing import Callable
@@ -3917,3 +3918,81 @@ def _finish_with_measurements(measurements: tuple[object, ...]) -> RunManifest:
         resources=(measured_memory(),),
         measurements=measurements,
     )
+
+
+NEW_YORK = ZoneInfo("America/New_York")
+# 2026-11-01 01:30 happens twice in New York: first at -04:00 (fold=0), then at -05:00 (fold=1).
+
+
+def _finish_between(started_at: datetime, finished_at: datetime) -> RunManifest:
+    return finish_run(
+        planned_manifest(),
+        state=RunState.COMPLETED,
+        started_at=started_at,
+        finished_at=finished_at,
+        resources=(measured_memory(),),
+        measurements=(timing(),),
+    )
+
+
+def test_run_interval_across_a_dst_rollback_is_ordered_in_utc():
+    first_pass = datetime(2026, 11, 1, 1, 45, tzinfo=NEW_YORK)  # 05:45 UTC
+    second_pass = datetime(2026, 11, 1, 1, 15, fold=1, tzinfo=NEW_YORK)  # 06:15 UTC
+
+    manifest = _finish_between(first_pass, second_pass)
+
+    assert manifest.finished_at.astimezone(timezone.utc) - manifest.started_at.astimezone(
+        timezone.utc
+    ) == timedelta(minutes=30)
+    reparsed = validate_run_manifest_json(serialize_run_manifest(manifest))
+    # Ambiguous wall times never compare equal across different tzinfo objects
+    # (PEP 495), so compare the instants.
+    for name in ("started_at", "finished_at"):
+        assert getattr(reparsed, name).astimezone(timezone.utc) == getattr(
+            manifest, name
+        ).astimezone(timezone.utc)
+    assert serialize_run_manifest(reparsed) == serialize_run_manifest(manifest)
+
+
+def test_run_interval_ending_before_it_starts_across_a_rollback_is_rejected():
+    later = datetime(2026, 11, 1, 1, 15, fold=1, tzinfo=NEW_YORK)  # 06:15 UTC
+    earlier = datetime(2026, 11, 1, 1, 45, tzinfo=NEW_YORK)  # 05:45 UTC
+
+    with pytest.raises(ValidationError, match="cannot precede"):
+        _finish_between(later, earlier)
+
+
+def test_run_interval_mixing_offsets_is_ordered_by_instant_not_wall_time():
+    started = datetime(2026, 9, 28, 9, 0, tzinfo=timezone(timedelta(hours=2)))  # 07:00 UTC
+    finished = datetime(2026, 9, 28, 8, 30, tzinfo=timezone.utc)
+
+    assert _finish_between(started, finished).finished_at > _finish_between(
+        started, finished
+    ).started_at
+
+
+@pytest.mark.parametrize("state", [RunState.PLANNED, "planned", "completed", None])
+def test_finish_run_rejects_a_nonterminal_or_untyped_state(state):
+    planned = planned_manifest()
+
+    with pytest.raises((ValueError, ValidationError)):
+        finish_run(
+            planned,
+            state=state,
+            started_at=None,
+            finished_at=None,
+            resources=planned.resources,
+        )
+
+
+def test_finish_run_with_planned_state_does_not_return_a_planned_manifest():
+    planned = planned_manifest()
+
+    with pytest.raises(ValueError, match="terminal"):
+        finish_run(
+            planned,
+            state=RunState.PLANNED,
+            started_at=None,
+            finished_at=None,
+            resources=planned.resources,
+        )

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Annotated, Any, Literal, NamedTuple, Self
 
@@ -303,7 +303,11 @@ class RunManifest(_ManifestContract):
             raise ValueError("measurement names must be unique")
 
         if self.finished_at is not None and self.started_at is not None:
-            if self.finished_at < self.started_at:
+            # Same-zone datetimes compare by wall time and ignore fold, so
+            # order the instants themselves.
+            if self.finished_at.astimezone(timezone.utc) < self.started_at.astimezone(
+                timezone.utc
+            ):
                 raise ValueError("finished_at cannot precede started_at")
 
         if self.state is RunState.PLANNED:
@@ -1270,6 +1274,8 @@ def finish_run(
         measurements=frozen_measurements,
     )
     candidate = RunManifest.model_validate(candidate_data)
+    if candidate.state is RunState.PLANNED:
+        raise ValueError("finish_run requires a terminal state (completed or aborted)")
 
     planned_resources = {
         (item.scope, item.resource): (item.unit, item.limit_kind, item.limit_value)
