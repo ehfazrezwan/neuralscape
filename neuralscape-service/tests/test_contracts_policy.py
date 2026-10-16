@@ -2702,7 +2702,12 @@ def test_policy_decision_schema_requires_every_evaluation_identity() -> None:
 
 
 class _DivergentStatements(tuple):
-    """A tuple whose public iterator disagrees with its native backing."""
+    """A tuple whose public iterator disagrees with its native backing.
+
+    These public-first tests also act as a tripwire: tuple-subclass handling is
+    provided by pydantic-core, so a dependency upgrade that starts consulting
+    native backing instead of the public iterator will fail them.
+    """
 
     def __new__(cls, native, public_views):
         instance = super().__new__(cls, native)
@@ -2757,5 +2762,70 @@ def test_public_first_view_is_captured_once_and_later_views_are_not_seen(
 
     received = _evaluate_with_statements(statements)
 
+    # The call count is asserted only to prove "captured once at first
+    # observation"; it is a pin on that claim, not a general callback contract.
     assert statements.iteration_calls == 1
     assert received.outcome == ("deny" if first_view_denies else "allow")
+
+
+def _policy_with_membership_view(native, public) -> AccessPolicy:
+    policy_value = policy(statement("seed", "allow", "read", reference("memory-1")))
+    object.__setattr__(
+        policy_value,
+        "membership_versions",
+        _DivergentStatements(native, [public]),
+    )
+    return policy_value
+
+
+@pytest.mark.parametrize(
+    "public_version,expected",
+    [(7, "allow"), (1, "deny")],
+)
+def test_public_first_membership_versions_follow_the_public_view(
+    public_version: int,
+    expected: str,
+) -> None:
+    current = MembershipVersion(subject_id="subject-a", version=7)
+    stale = MembershipVersion(subject_id="subject-a", version=1)
+    public = current if public_version == 7 else stale
+    native = stale if public_version == 7 else current
+    policy_value = _policy_with_membership_view((native,), (public,))
+
+    received = evaluate(principal(), "read", reference("memory-1"), policy_value)
+
+    assert received.outcome == expected
+
+
+@pytest.mark.parametrize("field", ["allowed_actions", "allowed_resources"])
+def test_public_first_delegation_ceiling_follows_the_public_view(field: str) -> None:
+    resource_value = reference("memory-1")
+    granted = {"allowed_actions": ("read",), "allowed_resources": (resource_value,)}
+    open_ceiling = DelegationConstraints(
+        delegated_by_subject_id="subject-human",
+        delegated_by_credential_id="credential-human",
+        **granted,
+    )
+    policy_value = policy(statement("grant", "allow", "read", resource_value))
+
+    # Native backing grants, public view is empty: the empty public view wins.
+    narrowed = principal(subject_kind="delegated_agent", delegation=open_ceiling)
+    object.__setattr__(
+        narrowed.delegation, field, _DivergentStatements(granted[field], [()])
+    )
+    assert evaluate(narrowed, "read", resource_value, policy_value).outcome == "deny"
+
+    # Native backing is empty, public view grants: the public view wins, and it
+    # still needs the policy statement above to produce an allow.
+    empty = {"allowed_actions": (), "allowed_resources": ()}
+    closed_ceiling = DelegationConstraints(
+        delegated_by_subject_id="subject-human",
+        delegated_by_credential_id="credential-human",
+        **{**granted, field: ()},
+    )
+    widened = principal(subject_kind="delegated_agent", delegation=closed_ceiling)
+    object.__setattr__(
+        widened.delegation, field, _DivergentStatements(empty[field], [granted[field]])
+    )
+    assert evaluate(widened, "read", resource_value, policy_value).outcome == "allow"
+    assert evaluate(widened, "read", resource_value, policy()).outcome == "deny"
