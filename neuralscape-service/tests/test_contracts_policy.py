@@ -2166,7 +2166,7 @@ def test_model_inventory_consumers_require_exact_owner_identity(
                 _freeze_reachable_model_inventories(
                     candidate,
                     inventories,
-                    set(),
+                    {},
                 )
             else:
                 _complete_contract_input(candidate, set(), inventories)
@@ -2177,7 +2177,7 @@ def test_model_inventory_consumers_require_exact_owner_identity(
             _freeze_reachable_model_inventories(
                 candidate,
                 inventories,
-                set(),
+                {},
             )
             is None
         )
@@ -2194,7 +2194,7 @@ def test_mapping_inventory_retains_owner_entries_and_exposed_models() -> None:
     model_inventories = {}
     mapping_owners = {}
     mapping_inventories = {}
-    visited_containers: set[int] = set()
+    visited_containers: dict[int, int] = {}
 
     _freeze_reachable_model_inventories(
         candidate,
@@ -2235,7 +2235,7 @@ def test_model_extra_mapping_reuses_inventory_after_direct_edit() -> None:
     model_inventories = {}
     mapping_owners = {}
     mapping_inventories = {}
-    visited_containers: set[int] = set()
+    visited_containers: dict[int, int] = {}
 
     _freeze_reachable_model_inventories(
         candidate,
@@ -2269,7 +2269,7 @@ def test_mapping_inventory_consumer_requires_exact_owner_identity() -> None:
     other = MappingProxyType({"resource": reference("memory-2")})
     other_owners = {id(other): other}
     mapping_inventories = {}
-    _freeze_mapping_inventories(other_owners, mapping_inventories, {}, set())
+    _freeze_mapping_inventories(other_owners, mapping_inventories, {}, {})
     mismatched_inventories = {
         id(candidate): mapping_inventories[id(other)],
     }
@@ -2299,7 +2299,7 @@ def test_mapping_entries_stop_at_first_terminal_pair_failure() -> None:
         ),
         {},
         model_inventories,
-        set(),
+        {},
     )
 
     assert entries[0] == ("resource", retained)
@@ -3522,12 +3522,12 @@ def test_accounting_runs_no_hook_of_the_caller_objects() -> None:
 def test_the_budget_is_shared_by_every_root_of_one_call() -> None:
     budget = DiscoveryBudget()
     half = list(range(STANDARD_MAX_EDGES // 2 + 1000))
-    _freeze_reachable_model_inventories(half, {}, set(), None, None, budget)
+    _freeze_reachable_model_inventories(half, {}, {}, None, None, budget)
     with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
-        _freeze_reachable_model_inventories(list(half), {}, set(), None, None, budget)
+        _freeze_reachable_model_inventories(list(half), {}, {}, None, None, budget)
     # the same two walks under separate budgets are fine: it is the sharing that bounds the call
-    _freeze_reachable_model_inventories(half, {}, set(), None, None, DiscoveryBudget())
-    _freeze_reachable_model_inventories(list(half), {}, set(), None, None, DiscoveryBudget())
+    _freeze_reachable_model_inventories(half, {}, {}, None, None, DiscoveryBudget())
+    _freeze_reachable_model_inventories(list(half), {}, {}, None, None, DiscoveryBudget())
 
 
 def test_depth_outcome_does_not_depend_on_the_order_of_aliased_references() -> None:
@@ -3579,7 +3579,7 @@ def _entry_flow(root: object) -> object:
     owners: dict = {}
     mapping_inventories: dict = {}
     native_dicts: dict = {}
-    visited: set = set()
+    visited: dict = {}
     budget = DiscoveryBudget()
     reach: dict = {}
     _freeze_reachable_model_inventories(root, inventories, visited, owners, native_dicts, budget, 0, True, reach)
@@ -3804,7 +3804,7 @@ def test_objects_keyed_by_identity_stay_alive_for_the_whole_call() -> None:
     reference_to_child = weakref.ref(child)
     holder = [child]
     native_dicts: dict = {}
-    _freeze_reachable_model_inventories(holder, {}, set(), None, native_dicts)
+    _freeze_reachable_model_inventories(holder, {}, {}, None, native_dicts)
     del child, holder
     gc.collect()
     assert reference_to_child() is not None  # an id() could not be recycled while the inventory is live
@@ -3880,7 +3880,7 @@ def test_a_merge_of_reaches_is_charged_so_the_bookkeeping_cannot_hold_memory_for
     for _ in range(200):
         nested = (nested, MappingProxyType({"extra": 1}))  # every level merges a growing reach with one more mapping
     with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
-        _freeze_reachable_model_inventories(nested, {}, set(), None, None, DiscoveryBudget())
+        _freeze_reachable_model_inventories(nested, {}, {}, None, None, DiscoveryBudget())
 
 
 def test_native_fields_set_names_are_charged_per_model() -> None:
@@ -3894,7 +3894,7 @@ def test_native_fields_set_names_are_charged_per_model() -> None:
         models.append(model)
     budget = DiscoveryBudget()
     with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):  # 100 x 2000 names > the edge limit
-        _freeze_reachable_model_inventories(tuple(models), {}, set(), None, None, budget)
+        _freeze_reachable_model_inventories(tuple(models), {}, {}, None, None, budget)
 
 
 def test_a_models_ordinary_fields_set_costs_nothing_extra() -> None:
@@ -3902,7 +3902,7 @@ def test_a_models_ordinary_fields_set_costs_nothing_extra() -> None:
 
     model = SourceVersion(record_id="r", content_revision=1, policy_epoch=1)
     budget = DiscoveryBudget()
-    _freeze_reachable_model_inventories(model, {}, set(), None, None, budget)
+    _freeze_reachable_model_inventories(model, {}, {}, None, None, budget)
     assert budget.edges == 3  # the three stored fields; the names of a legitimate set are those fields
 
 
@@ -3912,7 +3912,7 @@ def test_only_names_beyond_the_stored_fields_are_charged() -> None:
     model = SourceVersion(record_id="r", content_revision=1, policy_epoch=1)
     _BASE_MODEL_FIELDS_SET_DESCRIPTOR.__set__(model, {f"n{i}" for i in range(1003)})  # 1,000 beyond the 3 stored
     budget = DiscoveryBudget()
-    _freeze_reachable_model_inventories(model, {}, set(), None, None, budget)
+    _freeze_reachable_model_inventories(model, {}, {}, None, None, budget)
     assert budget.edges == 3 + 1000
 
 
@@ -3994,7 +3994,7 @@ def test_a_container_shared_by_many_parents_is_not_charged_once_per_parent() -> 
     shared = _public_mappings(20)
     parents = tuple((shared,) for _ in range(2000))  # 2,000 parents, each holding the one container
     budget = DiscoveryBudget()
-    _freeze_reachable_model_inventories(parents, {}, set(), None, None, budget)
+    _freeze_reachable_model_inventories(parents, {}, {}, None, None, budget)
     # the walk itself costs ~6,000 entries; the reach bookkeeping must not add one copy per parent
     assert budget.edges < 10_000, budget.edges
 
@@ -4003,7 +4003,7 @@ def test_a_mapping_reached_through_two_children_is_recorded_once() -> None:
     mapping = MappingProxyType({"k": 1})
     holder = ((mapping,), [mapping])
     reach: dict = {}
-    _freeze_reachable_model_inventories(holder, {}, set(), None, None, DiscoveryBudget(), 0, True, reach)
+    _freeze_reachable_model_inventories(holder, {}, {}, None, None, DiscoveryBudget(), 0, True, reach)
     assert reach[id(holder)] == (mapping,)  # once, not once per path to it
 
 
@@ -4035,7 +4035,7 @@ def test_a_repeated_wide_subgraph_does_not_multiply_the_reach_work() -> None:
     budget = DiscoveryBudget()
     reach: dict = {}
     started = time.monotonic()
-    _freeze_reachable_model_inventories(repeated, {}, set(), None, None, budget, 0, True, reach)
+    _freeze_reachable_model_inventories(repeated, {}, {}, None, None, budget, 0, True, reach)
     assert time.monotonic() - started < 5.0
     assert reach[id(repeated)] is reach[id(wide)]  # one distinct source: held by reference, no merge
 
@@ -4052,7 +4052,7 @@ def test_merging_reaches_is_charged_before_it_is_built() -> None:
     wrappers = tuple((shared, MappingProxyType({"own": index})) for index in range(400))
     started = time.monotonic()
     with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
-        _freeze_reachable_model_inventories(wrappers, {}, set(), None, None, DiscoveryBudget())
+        _freeze_reachable_model_inventories(wrappers, {}, {}, None, None, DiscoveryBudget())
     assert time.monotonic() - started < 5.0
 
 
@@ -4167,7 +4167,7 @@ def test_freeze_mapping_entries_freezes_each_value_before_the_exhaustion_check()
 
     inventories: dict = {}
     entries = _freeze_mapping_entries(
-        (_RepairingPair("resource", handle, repair),), {}, inventories, set(), {}, DiscoveryBudget()
+        (_RepairingPair("resource", handle, repair),), {}, inventories, {}, {}, DiscoveryBudget()
     )
     assert entries[0].key == "resource"
     frozen = inventories[id(handle)]
@@ -4262,7 +4262,7 @@ def _charged_edges(policy_value) -> tuple[int, int]:
         evaluate(principal(subject_id="subject-0000", membership_version=1), "read", reference("memory-0"), policy_value)
         whole = budgets[0].edges
         discovery = DiscoveryBudget()
-        _freeze_reachable_model_inventories(policy_value, {}, set(), None, {}, discovery)
+        _freeze_reachable_model_inventories(policy_value, {}, {}, None, {}, discovery)
     finally:
         module.DiscoveryBudget.__init__ = original
     return whole, discovery.edges
@@ -4424,3 +4424,58 @@ def test_a_boxed_key_names_its_type_without_running_a_metaclass_hook() -> None:
     key = _OpaqueKey(_Hooked())
     assert _armed(lambda: repr(key)) == "<_Hooked key>"
     assert _HookedMeta.calls == []
+
+
+def _evaluate_with_extra_values(**extra: object) -> None:
+    """Run the full evaluator on a native statement holding ``extra`` values.
+
+    Every container from the policy down is native (exact tuple, dict, list), so discovery
+    charges their entries and completion's first copy is free; completion runs before
+    validation refuses the extra keys.
+    """
+
+    resource_value = reference("memory-1")
+    native_statement = {
+        "id": "s-1", "effect": "allow", "subject_id": "subject-a", "credential_id": None,
+        "action": "read", "resource": resource_value.model_dump(mode="python"), **extra,
+    }
+    policy_value = policy(statement("seed", "allow", "read", reference("other")))
+    object.__setattr__(policy_value, "statements", (native_statement,))
+    evaluate(principal(), "read", resource_value, policy_value)
+
+
+def test_a_list_that_grows_during_its_own_completion_is_charged_for_the_growth() -> None:
+    import time
+
+    from contracts_limits import DISCOVERY_BUDGET_MESSAGE
+
+    grown = [0]
+    host: list[object] = []
+
+    class SelfAppending(tuple):
+        def __iter__(self):  # yields nothing, appends itself to the list being copied
+            if grown[0] < 400_000:  # bounded, so the pre-fix tree terminates (and accepts the growth)
+                grown[0] += 1
+                host.append(self)
+            return iter(())
+
+    host.append(SelfAppending())
+    started = time.monotonic()
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _evaluate_with_extra_values(extra=host)
+    assert time.monotonic() - started < 30
+    assert grown[0] < 200_000  # stopped by the edge budget, not by the probe's own bound
+
+
+def test_a_list_grown_by_an_earlier_iterator_is_charged_for_the_growth() -> None:
+    from contracts_limits import DISCOVERY_BUDGET_MESSAGE
+
+    target = [1, 2, 3]
+
+    class Grower(tuple):
+        def __iter__(self):  # runs during completion, after discovery charged ``target``'s 3 entries
+            target.extend(range(200_000))
+            return iter(())
+
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _evaluate_with_extra_values(grower=Grower(), target=target)  # completed in this order
