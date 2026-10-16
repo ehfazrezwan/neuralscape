@@ -4479,3 +4479,39 @@ def test_a_list_grown_by_an_earlier_iterator_is_charged_for_the_growth() -> None
 
     with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
         _evaluate_with_extra_values(grower=Grower(), target=target)  # completed in this order
+
+
+def _model_with_disjoint_fields_set(stored: int, fields_set: int, *, overlap: bool = False):
+    handle = reference("memory-1")
+    storage = object.__getattribute__(handle, "__dict__")
+    for index in range(stored):
+        storage[f"stored_{index}"] = index
+    names = {f"stored_{index}" if overlap else f"set_{index}" for index in range(fields_set)}
+    object.__setattr__(handle, "__pydantic_fields_set__", names)
+    return handle
+
+
+def _evaluate_with_statement_resource(resource_model) -> None:
+    """A native statement (exact tuple, dict) whose resource is ``resource_model``: discovery
+    charges it, so completion's first copy of the model is free."""
+
+    native_statement = {
+        "id": "s-1", "effect": "allow", "subject_id": "subject-a", "credential_id": None,
+        "action": "read", "resource": resource_model,
+    }
+    policy_value = policy(statement("seed", "allow", "read", reference("other")))
+    object.__setattr__(policy_value, "statements", (native_statement,))
+    evaluate(principal(), "read", reference("memory-1"), policy_value)
+
+
+def test_fields_set_names_disjoint_from_stored_fields_are_charged_when_synthesized() -> None:
+    """70,000 stored fields and 70,000 other fields-set names make 140,000 output fields:
+    completion must charge the synthesized ones discovery did not pay for."""
+
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _evaluate_with_statement_resource(_model_with_disjoint_fields_set(70_000, 70_000))
+
+
+def test_fields_set_names_that_name_stored_fields_are_not_charged_twice() -> None:
+    with pytest.raises(ValidationError):  # refused for its unknown fields, not by the budget
+        _evaluate_with_statement_resource(_model_with_disjoint_fields_set(60_000, 60_000, overlap=True))

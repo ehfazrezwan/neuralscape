@@ -925,6 +925,20 @@ def _complete_contract_input(
 
             completed_model: dict[object, object] = {}
             free = _first_paid_copy(memo, value, True)  # a captured model's entries were charged
+            if free:
+                # Discovery paid for the stored and extra entries, and for the fields-set names
+                # beyond their count (``max`` of the two); names read just above from a non-set
+                # storage were each charged as read.  Names synthesized from a fields-set that does
+                # not name stored fields were not all paid for: charge the entries past that.
+                entries = (len(inventory.stored_items) if inventory.stored_items is not None else 0) + (
+                    len(inventory.extra_items) if inventory.extra_items is not None else 0
+                )
+                paid = (
+                    max(entries, len(fields_set_names))
+                    if inventory.fields_set_names is not None
+                    else entries + len(fields_set_names)
+                )
+                budget.charge_edge(max(0, len(stored_values) - paid))
             for key, item in stored_values.items():
                 if not free:
                     budget.charge_edge()  # one stack frame per level: no helper closure
