@@ -17,7 +17,7 @@ from typing import Annotated, Literal, Union
 from pydantic import BeforeValidator, ConfigDict, Field, TypeAdapter
 
 from contracts_common import ContractModel, OpaqueId
-from contracts_native import is_subclass, project_model_storage
+from contracts_native import is_subclass, plain_keyed, project_model_storage
 
 
 class PlaintextBody(ContractModel):
@@ -51,7 +51,10 @@ def _project_body_storage(value: object) -> object:
     if is_subclass(kind, (PlaintextBody, OpaqueEnvelopeBody)):
         return project_model_storage(value)
     if kind is dict:
-        return value
+        try:
+            return plain_keyed(dict.items(value))
+        except TypeError as error:
+            raise ValueError(f"a body dict has an unusable key: {error}") from None
     raise ValueError("a body must be a body model or a plain dict")
 
 

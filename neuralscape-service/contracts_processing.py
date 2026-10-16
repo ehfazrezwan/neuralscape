@@ -14,7 +14,7 @@ from typing import Literal
 from pydantic import ConfigDict, TypeAdapter, model_validator
 
 from contracts_common import OpaqueId, SafeCounter, VersionedContract
-from contracts_native import native_model_input, plain_str
+from contracts_native import CollectionBudgetExceeded, bounded_entries, is_subclass, native_model_input, plain_str
 
 
 ProcessingMode = Literal["operator_trusted", "operator_blind", "strict_local"]
@@ -164,13 +164,15 @@ def validate_plaintext_dispatch(
         raise PlaintextDispatchRejected("non-endpoint execution requires a recipient")
 
     try:
-        if isinstance(currently_authorized_recipient_ids, (str, bytes)):
+        if is_subclass(type(currently_authorized_recipient_ids), (str, bytes)):
             raise TypeError("recipient authority must be a collection of identifiers")
         checked_recipient = _OPAQUE_ID_ADAPTER.validate_python(plain_str(recipient_id), strict=True)
         current_recipients = {
             _OPAQUE_ID_ADAPTER.validate_python(plain_str(value), strict=True)
-            for value in currently_authorized_recipient_ids
+            for value in bounded_entries(currently_authorized_recipient_ids)
         }
+    except CollectionBudgetExceeded as exc:
+        raise PlaintextDispatchRejected("current recipient authority exceeds the budget") from exc
     except (TypeError, ValueError) as exc:
         raise PlaintextDispatchRejected("current recipient authority is invalid") from exc
 

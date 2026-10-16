@@ -40,6 +40,48 @@ def is_subclass(cls: type, types: type | tuple[type, ...]) -> bool:
     return False
 
 
+MAX_COLLECTION_ENTRIES = 65_536
+"""The most entries read from a caller-supplied collection (a public view the caller controls)."""
+
+
+class CollectionBudgetExceeded(ValueError):
+    """A caller-supplied collection produced more entries than the budget allows."""
+
+
+def bounded_entries(collection: object, limit: int = MAX_COLLECTION_ENTRIES) -> list[object]:
+    """Read ``collection`` once, charging each entry as it is produced, and keep the entries.
+
+    An iterator that never ends is cut off at ``limit`` entries with ``CollectionBudgetExceeded``
+    instead of being drained.
+    """
+
+    entries: list[object] = []
+    for entry in collection:  # type: ignore[attr-defined]
+        if len(entries) >= limit:
+            raise CollectionBudgetExceeded("collection exceeds the budget")
+        entries.append(entry)
+    return entries
+
+
+def plain_keyed(pairs: object) -> dict[str, object]:
+    """A dict whose keys are exact ``str``, built from ``(key, value)`` pairs without running key hooks.
+
+    A ``str`` subclass key is replaced by its plain text (``str.__str__`` runs none of its hooks);
+    any other key type, or two keys with the same text, is refused, so a hostile key can neither run
+    code during field lookup nor shadow a plain key.
+    """
+
+    result: dict[str, object] = {}
+    for key, value in pairs:  # type: ignore[attr-defined]
+        if not is_subclass(type(key), str):
+            raise TypeError("keys must be text")
+        text = str.__str__(key)  # type: ignore[arg-type]
+        if text in result:
+            raise TypeError("duplicate key text")
+        result[text] = value
+    return result
+
+
 def plain_str(value: object) -> object:
     """A built-in ``str`` copy of a ``str`` subclass instance, without running its hooks.
 
@@ -75,7 +117,7 @@ def project_model_storage(value: object) -> object:
     # Detach every pair before projected-dict hashing can run a hostile stored-name callback
     # that repairs a later value in the live model backing.
     stored = tuple(dict.items(_BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)))
-    projected = dict(stored)
+    projected = plain_keyed(stored)
     if captured:
         projected["native_extra_backing"] = dict(captured)
     return projected
@@ -92,5 +134,5 @@ def native_model_input(value: object, model_types: tuple[type, ...]) -> object:
     if is_subclass(kind, model_types):
         return project_model_storage(value)
     if kind is dict:
-        return value
+        return plain_keyed(dict.items(value))
     raise TypeError("input must be a model of the expected type or a plain dict")

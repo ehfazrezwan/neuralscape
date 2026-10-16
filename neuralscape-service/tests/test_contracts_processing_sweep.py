@@ -137,3 +137,79 @@ def test_genuine_inputs_still_pass_everywhere() -> None:
     assert parse_memory_body({"kind": "plaintext", "text": "x"}) == PlaintextBody(kind="plaintext", text="x")
     assert parse_memory_body(OpaqueEnvelopeBody(kind="opaque_envelope", envelope_id="env-1")).kind == "opaque_envelope"
     assert parse_memory_body(PlaintextBody(kind="plaintext", text="x").model_copy()).text == "x"
+
+
+# ── the authority collection is bounded, its type is read natively, and dict keys are plain text ──
+
+
+def test_an_authority_collection_that_never_ends_is_cut_off_by_a_budget() -> None:
+    produced: list[int] = []
+
+    class Endless:
+        def __iter__(self):
+            for index in range(5_000_000):
+                produced.append(index)
+                yield f"r-{index}"
+
+    with pytest.raises(PlaintextDispatchRejected, match="exceeds the budget"):
+        dispatch(currently_authorized_recipient_ids=Endless())
+    assert len(produced) <= 65_536 + 1
+
+
+def test_a_collection_within_the_budget_is_still_accepted() -> None:
+    dispatch(currently_authorized_recipient_ids=[f"r-{i}" for i in range(10_000)] + ["r-ok"])
+
+
+class _ClassProxy:
+    def __init__(self, reported: type, events: list[str]) -> None:
+        object.__setattr__(self, "_reported", reported)
+        object.__setattr__(self, "_events", events)
+
+    @property
+    def __class__(self):  # noqa: D401 - the callback under test
+        object.__getattribute__(self, "_events").append("__class__")
+        return object.__getattribute__(self, "_reported")
+
+    def __iter__(self):
+        return iter(["r-ok"])
+
+
+@pytest.mark.parametrize("reported", [str, list])
+def test_a_proxy_authority_collection_is_judged_without_running_its_class_callback(reported) -> None:
+    events: list[str] = []
+    try:
+        dispatch(currently_authorized_recipient_ids=_ClassProxy(reported, events))
+    except PlaintextDispatchRejected:
+        pass
+    assert events == []
+
+
+class Odd(Spy):
+    """Equal to everything but hashed apart, so it can sit beside a plain key with the same text."""
+
+    def __hash__(self):
+        Spy.events.append("hash")
+        return 12345
+
+
+def test_a_string_subclass_key_in_an_exact_dict_runs_no_hooks_and_cannot_shadow_a_plain_key() -> None:
+    policy = {key: value for key, value in BASE.items() if key != "fallback_policy"}
+    policy[Spy("fallback_policy")] = "deny"
+    shadow = {Odd("policy_epoch"): 99, **BASE}  # two keys with one text: the first is equal to everything
+    Spy.events.clear()  # building the inputs hashed the keys; only the contract's own work is measured
+    dispatch(policy=policy)
+    assert Spy.events == []
+    with pytest.raises(PlaintextDispatchRejected):
+        dispatch(policy=shadow)
+    assert Spy.events == []
+
+
+def test_a_string_subclass_key_in_an_exact_dict_body_runs_no_hooks() -> None:
+    body = {Spy("kind"): "plaintext", "text": "hello"}
+    clashing = {Odd("kind"): "plaintext", "kind": "opaque_envelope", "envelope_id": "e-1"}
+    Spy.events.clear()  # building the inputs hashed the keys; only the contract's own work is measured
+    assert parse_memory_body(body).kind == "plaintext"
+    assert Spy.events == []
+    with pytest.raises(ValidationError):
+        parse_memory_body(clashing)
+    assert Spy.events == []
