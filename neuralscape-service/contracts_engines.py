@@ -8,7 +8,7 @@ reviewable but are not themselves proof that the referenced evidence is valid.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Iterator, NamedTuple, TypeVar
+from typing import Any, Callable, Iterator, NamedTuple, TypeVar
 
 from pydantic import BaseModel, TypeAdapter, model_validator
 
@@ -259,10 +259,12 @@ def _normalize_field_items(
     )
 
 
-def _charged_entries(entries: Any, budget: DiscoveryBudget) -> Iterator[Any]:
-    """Yield a public view's entries, charging each one as it is observed."""
+def _charged_entries(read: Callable[[], Any], budget: DiscoveryBudget) -> Iterator[Any]:
+    """Observe a public view: one charge for the observation itself (an empty view is
+    not free), taken before the view is read, then one charge per entry observed."""
 
-    for entry in entries:
+    budget.charge_edge()
+    for entry in read():
         budget.charge_edge()
         yield entry
 
@@ -294,6 +296,8 @@ def _snapshot_native_value(
 
     if depth > _MAX_SNAPSHOT_DEPTH:
         raise ValueError(f"contract graph nesting exceeds the limit at {location}")
+    if depth > budget.tier.max_depth:
+        raise ValueError(DISCOVERY_BUDGET_MESSAGE)  # the tier applies to every occurrence, not only to discovery
 
     value_type = type(value)
     is_container = issubclass(value_type, (BaseModel, dict, list, tuple))
@@ -304,6 +308,8 @@ def _snapshot_native_value(
             _, copied, height = cached
             if depth + height > _MAX_SNAPSHOT_DEPTH:
                 raise ValueError(f"contract graph nesting exceeds the limit at {location}")
+            if depth + height > budget.tier.max_depth:
+                raise ValueError(DISCOVERY_BUDGET_MESSAGE)
             return copied, height, True
         # A child first exposed through a public view is captured now; it is
         # charged to the same envelope as the entry discovery.
@@ -321,6 +327,7 @@ def _snapshot_native_value(
 
     height = 0
     memoizable = True
+    own_cost = 0  # copying an exact node that cannot be reused is work the capture phase did not charge
 
     def child(item: Any, child_location: str) -> Any:
         nonlocal height, memoizable
@@ -385,6 +392,7 @@ def _snapshot_native_value(
                 for name in declared_names
                 if name in stored_by_name
             )
+            own_cost = 1 + len(stored_values)
             result: Any = {
                 name: child(item, f"{location}.{name}") for name, item in stored_values
             }
@@ -394,10 +402,12 @@ def _snapshot_native_value(
                 frozen is not None and frozen.owner is value and frozen.kind == "dict"
             )
             memoizable = exact
+            if exact:
+                own_cost = 1 + len(frozen.entries)
             result = {
                 key: child(item, f"{location}[key]")
                 for key, item in (
-                    frozen.entries if exact else _charged_entries(value.items(), budget)
+                    frozen.entries if exact else _charged_entries(value.items, budget)
                 )
             }
         elif issubclass(value_type, (list, tuple)):
@@ -409,7 +419,9 @@ def _snapshot_native_value(
                 and frozen.kind == ("list" if is_list else "tuple")
             )
             memoizable = exact
-            source_items = frozen.entries if exact else _charged_entries(value, budget)
+            if exact:
+                own_cost = 1 + len(frozen.entries)
+            source_items = frozen.entries if exact else _charged_entries(lambda: value, budget)
             items = [
                 child(item, f"{location}[{index}]")
                 for index, item in enumerate(source_items)
@@ -419,6 +431,8 @@ def _snapshot_native_value(
             return value, 0, True
         if is_container and memoizable:
             memo[identity] = (value, result, height)
+        elif own_cost:
+            budget.charge_edge(own_cost)  # every non-reused ancestor copy is charged
         return result, height, memoizable
     finally:
         if is_container:

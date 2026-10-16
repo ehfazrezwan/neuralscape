@@ -1853,3 +1853,94 @@ def test_shared_public_views_are_charged_per_observation_and_stay_bounded():
     with pytest.raises(ValueError, match="native discovery budget"):
         validate_capability_requirements(declared, ())
     assert time.monotonic() - started < 5.0
+
+
+# ---- replay checks depth on every occurrence and charges every observation and copy ----
+
+
+class _LinkedEmptyTuple(tuple):
+    """Empty native backing; the public iterator links it to the next view in a chain."""
+
+    def __new__(cls):
+        return super().__new__(cls, ())
+
+    def __iter__(self):
+        following = getattr(self, "next", None)
+        return iter(() if following is None else (following,))
+
+
+def _linked_siblings(length: int) -> tuple:
+    nodes = [_LinkedEmptyTuple() for _ in range(length)]
+    for current, following in zip(nodes, nodes[1:]):
+        current.next = following
+    return tuple(nodes)  # captured as flat siblings; their public views chain them to `length` levels
+
+
+class _EmptyView(tuple):
+    def __new__(cls):
+        return super().__new__(cls, ())
+
+
+def _wrapped_pairs(depth: int) -> tuple:
+    node: object = _EmptyView()
+    for _ in range(depth):
+        node = (node, node)  # 2**depth paths over depth+1 native nodes and 2*depth edges
+    return node  # type: ignore[return-value]
+
+
+def test_replay_depth_is_checked_on_every_occurrence_against_the_tier(monkeypatch):
+    _recording_budgets(monkeypatch, max_depth=4)
+    declared = manifest(state())
+    _native_set(declared, "contract_schema_versions", _linked_siblings(8))
+    with pytest.raises(ValueError, match=BUDGET_MESSAGE):
+        validate_capability_requirements(declared, ())
+
+
+def test_a_long_public_chain_never_reaches_the_recursion_limit():
+    declared = manifest(state())
+    _native_set(declared, "contract_schema_versions", _linked_siblings(400))
+    with pytest.raises(ValueError) as raised:
+        validate_capability_requirements(declared, ())
+    assert type(raised.value) is ValueError and not isinstance(raised.value, RecursionError)
+
+
+def test_a_chain_inside_the_tier_still_replays(monkeypatch):
+    _recording_budgets(monkeypatch, max_depth=16)
+    declared = manifest(state())
+    _native_set(declared, "contract_schema_versions", _linked_siblings(8))
+    with pytest.raises(ValidationError):  # replays fully, then ordinary validation rejects the shape
+        validate_capability_requirements(declared, ())
+
+
+def test_empty_public_views_under_shared_ancestors_cannot_replay_exponentially(monkeypatch):
+    import time
+
+    # capture of this graph charges 77 edges and fits; replay of 2**15 paths must not be free
+    _recording_budgets(monkeypatch, max_edges=100)
+    declared = manifest(state())
+    _native_set(declared, "contract_schema_versions", _wrapped_pairs(14))
+    started = time.monotonic()
+    with pytest.raises(ValueError, match=BUDGET_MESSAGE):
+        validate_capability_requirements(declared, ())
+    assert time.monotonic() - started < 2.0
+
+
+def test_the_default_tier_bounds_a_deep_empty_view_replay_in_time():
+    import time
+
+    declared = manifest(state())
+    _native_set(declared, "contract_schema_versions", _wrapped_pairs(60))
+    started = time.monotonic()
+    with pytest.raises(ValueError, match=BUDGET_MESSAGE):
+        validate_capability_requirements(declared, ())
+    assert time.monotonic() - started < 5.0
+
+
+def test_an_empty_public_view_observation_is_charged(monkeypatch):
+    # 100 empty views: capture charges the entries; replay used to charge nothing for observing them.
+    budgets = _recording_budgets(monkeypatch, max_edges=400)
+    declared = manifest(state())
+    _native_set(declared, "contract_schema_versions", tuple(_EmptyView() for _ in range(100)))
+    with pytest.raises(ValidationError):
+        validate_capability_requirements(declared, ())
+    assert budgets and budgets[0].edges >= 100 + 100  # entries at capture plus one per observation at replay
