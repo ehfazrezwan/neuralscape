@@ -454,6 +454,13 @@ def _inventory_zip(
         name = _classify_name(raw_name.rstrip("/") if is_dir else raw_name, report)
         if name is None:
             continue
+        # The same depth rule as a directory bundle: a directory may sit at most
+        # MAX_DIRECTORY_DEPTH levels down, so a bundle cannot verify as a zip and fail
+        # once extracted.
+        depth = name.count("/") + (1 if is_dir else 0)
+        if depth > MAX_DIRECTORY_DEPTH:
+            report.add(ENTRY_COUNT_LIMIT, _safe_label(name), "directory depth")
+            return []
         if is_dir and info.file_size != 0:
             report.add(ENTRY_CORRUPT, _safe_label(name), "directory record carries data")
             continue

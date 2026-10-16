@@ -1319,3 +1319,32 @@ def test_a_bundle_path_that_is_not_a_regular_file_when_opened_is_refused(tmp_pat
     os.mkfifo(fifo)
     report = verify_bundle(fifo)  # must not block waiting for a writer
     assert _codes(report) == {pv.CONTAINER_UNREADABLE}
+
+
+# ---- member depth is bounded the same way for zip and directory bundles
+
+
+def _deep_bundle(tmp_path, monkeypatch, directories: int, kind: str):
+    monkeypatch.setattr(pv, "MAX_DIRECTORY_DEPTH", 3)
+    deep = "/".join(f"d{i}" for i in range(directories)) + "/f.txt"
+    files = {**PAYLOAD, deep: b"deep"}
+    if kind == "zip":
+        return _write_zip(tmp_path / "deep.zip", files, _manifest(files))
+    return _write_dir(tmp_path / "deep", files, _manifest(files))
+
+
+@pytest.mark.parametrize("directories,accepted", [(3, True), (4, False)])
+def test_member_depth_gives_the_same_verdict_for_a_zip_and_a_directory(tmp_path, monkeypatch, directories, accepted) -> None:
+    as_zip = verify_bundle(_deep_bundle(tmp_path, monkeypatch, directories, "zip"))
+    as_dir = verify_bundle(_deep_bundle(tmp_path, monkeypatch, directories, "dir"))
+    assert as_zip.ok is as_dir.ok is accepted, (_codes(as_zip), _codes(as_dir))
+    if not accepted:
+        assert pv.ENTRY_COUNT_LIMIT in _codes(as_zip)
+
+
+def test_a_zip_directory_record_deeper_than_the_limit_is_refused(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(pv, "MAX_DIRECTORY_DEPTH", 3)
+    path = _write_zip(tmp_path / "b.zip", PAYLOAD)
+    with zipfile.ZipFile(path, "a") as archive:
+        archive.mkdir("a/b/c/d")
+    assert pv.ENTRY_COUNT_LIMIT in _codes(verify_bundle(path))
