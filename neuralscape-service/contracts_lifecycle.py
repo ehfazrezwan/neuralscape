@@ -24,11 +24,18 @@ from pydantic import (
 
 from contracts_bodies import MemoryBody, OpaqueEnvelopeBody, PlaintextBody
 from contracts_common import ContractModel, OpaqueId, SafeCounter, VersionedContract
-from contracts_limits import DiscoveryBudget, is_exact_type
+from contracts_limits import PORTABILITY, DiscoveryBudget, is_exact_type
 from contracts_references import ReferenceHandle, SourceVersion
 
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
+
+# A stage may report one output reference per stored passage or memory, and one claim reads the
+# intent with every receipt it holds.  Measured on the shared accounting (edge-bound, about twelve
+# edges per reference handle): the standard tier admits about 10,900 handles per call in total,
+# the portability tier about 65,500, within a few seconds in the worst case.  The standard tier
+# therefore strands a large ingest, so lifecycle claims use the portability tier.
+LIFECYCLE_TIER = PORTABILITY
 _BASE_MODEL_DICT_DESCRIPTOR = vars(BaseModel)["__dict__"]
 _BASE_MODEL_EXTRA_DESCRIPTOR = vars(BaseModel)["__pydantic_extra__"]
 
@@ -879,6 +886,96 @@ def source_versions_match(
     )
 
 
+def _revalidated_claim_inputs(
+    intent: object,
+    receipts: object,
+) -> tuple[Intent, tuple[StageReceipt, ...]]:
+    """Capture and strictly revalidate an intent and its receipts under one budget.
+
+    Shared by the aggregate claim and by record-time validation, so a receipt set the ledger
+    stores is always one the claim can read.  Public views are observed once per call.
+    """
+
+    if not isinstance(receipts, tuple):
+        raise TypeError("receipts must be a tuple")
+
+    if not isinstance(intent, Intent):
+        raise TypeError("value must be an Intent")
+    budget = DiscoveryBudget(LIFECYCLE_TIER)  # one envelope for the intent and every receipt
+    receipt_inventory: dict[Any, Any] = {}  # and one observation of any view they share
+    try:
+        captured_intent = _capture_contract_graph(intent, None, budget, receipt_inventory)
+        intent_capture_error: Exception | None = None
+    except Exception as exc:
+        captured_intent = None
+        intent_capture_error = exc
+
+    receipt_capture_errors: dict[int, Exception] = {}
+    for receipt in tuple.__iter__(receipts):
+        if not issubclass(type(receipt), StageReceipt):
+            continue
+        identity = id(receipt)
+        if identity in receipt_inventory or identity in receipt_capture_errors:
+            continue
+        try:
+            _capture_native_contract_graph(
+                receipt,
+                captured_by_identity=receipt_inventory,
+                budget=budget,
+            )
+        except Exception as exc:
+            receipt_capture_errors[identity] = exc
+
+    if intent_capture_error is not None:
+        raise intent_capture_error
+    assert captured_intent is not None
+    checked_intent = _revalidated_captured_model(Intent, captured_intent, budget)
+
+    def revalidate_receipt(receipt: object) -> StageReceipt:
+        capture_error = receipt_capture_errors.get(id(receipt))
+        if capture_error is not None and isinstance(receipt, StageReceipt):
+            raise capture_error
+        return _revalidated_inventory_model(
+            StageReceipt,
+            receipt,
+            receipt_inventory,
+            budget,
+        )
+
+    checked = tuple(revalidate_receipt(receipt) for receipt in receipts)
+
+    requirements = {item.stage: item for item in checked_intent.stage_requirements}
+    for receipt in checked:
+        if receipt.intent_id != checked_intent.id:
+            raise ValueError("stage receipt belongs to a different intent")
+        if any(
+            output_ref.tenant_id != checked_intent.tenant_id or output_ref.cross_tenant
+            for output_ref in receipt.output_refs
+        ):
+            raise ValueError("stage receipt output_refs must match intent tenant_id")
+        requirement = requirements.get(receipt.stage)
+        if requirement is not None and receipt.effect_id != requirement.effect_id:
+            raise ValueError("required-stage receipt must match its declared effect_id")
+    return checked_intent, checked
+
+
+def validate_stage_receipts(
+    intent: Intent,
+    receipts: tuple[StageReceipt, ...],
+) -> tuple[Intent, tuple[StageReceipt, ...]]:
+    """Strictly revalidate an intent and its receipts exactly as the aggregate claim reads them.
+
+    This is the record-time seam: a store passes the intent and every receipt it holds for it,
+    including the one being recorded.  It applies the same budget (the lifecycle tier, one
+    envelope for the whole call) and the same per-receipt identity checks as
+    ``validate_required_stage_claim``, and returns the revalidated copies.  A set that is refused
+    here (for example ``contract graph exceeds the native discovery budget``) is one the claim
+    could never settle, so it can be refused up front instead of stranding the intent.
+    """
+
+    return _revalidated_claim_inputs(intent, receipts)
+
+
 def validate_required_stage_claim(
     *,
     claimed_status: IntentStatus,
@@ -941,71 +1038,12 @@ def validate_required_stage_claim(
 
     if not isinstance(claimed_status, IntentStatus):
         raise TypeError("claimed_status must be an IntentStatus")
-    if not isinstance(receipts, tuple):
-        raise TypeError("receipts must be a tuple")
-
-    if not isinstance(intent, Intent):
-        raise TypeError("value must be an Intent")
-    budget = DiscoveryBudget()  # one envelope for the intent and every receipt
-    receipt_inventory: dict[Any, Any] = {}  # and one observation of any view they share
-    try:
-        captured_intent = _capture_contract_graph(intent, None, budget, receipt_inventory)
-        intent_capture_error: Exception | None = None
-    except Exception as exc:
-        captured_intent = None
-        intent_capture_error = exc
-
-    receipt_capture_errors: dict[int, Exception] = {}
-    for receipt in tuple.__iter__(receipts):
-        if not issubclass(type(receipt), StageReceipt):
-            continue
-        identity = id(receipt)
-        if identity in receipt_inventory or identity in receipt_capture_errors:
-            continue
-        try:
-            _capture_native_contract_graph(
-                receipt,
-                captured_by_identity=receipt_inventory,
-                budget=budget,
-            )
-        except Exception as exc:
-            receipt_capture_errors[identity] = exc
-
-    if intent_capture_error is not None:
-        raise intent_capture_error
-    assert captured_intent is not None
-    intent = _revalidated_captured_model(Intent, captured_intent, budget)
-
-    def revalidate_receipt(receipt: object) -> StageReceipt:
-        capture_error = receipt_capture_errors.get(id(receipt))
-        if capture_error is not None and isinstance(receipt, StageReceipt):
-            raise capture_error
-        return _revalidated_inventory_model(
-            StageReceipt,
-            receipt,
-            receipt_inventory,
-            budget,
-        )
-
-    receipts = tuple(
-        revalidate_receipt(receipt)
-        for receipt in receipts
-    )
+    intent, receipts = _revalidated_claim_inputs(intent, receipts)
 
     requirements = {item.stage: item for item in intent.stage_requirements}
     required = set(requirements)
     latest_attempts: dict[ProcessingStage, int] = {}
     for receipt in receipts:
-        if receipt.intent_id != intent.id:
-            raise ValueError("stage receipt belongs to a different intent")
-        if any(
-            output_ref.tenant_id != intent.tenant_id or output_ref.cross_tenant
-            for output_ref in receipt.output_refs
-        ):
-            raise ValueError("stage receipt output_refs must match intent tenant_id")
-        requirement = requirements.get(receipt.stage)
-        if requirement is not None and receipt.effect_id != requirement.effect_id:
-            raise ValueError("required-stage receipt must match its declared effect_id")
         previous_attempt = latest_attempts.get(receipt.stage)
         if previous_attempt is None or receipt.attempt > previous_attempt:
             latest_attempts[receipt.stage] = receipt.attempt
@@ -1310,7 +1348,9 @@ __all__ = [
     "StageError",
     "StageReceipt",
     "StageStatus",
+    "LIFECYCLE_TIER",
     "is_legal_intent_transition",
     "source_versions_match",
     "validate_required_stage_claim",
+    "validate_stage_receipts",
 ]

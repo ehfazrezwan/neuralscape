@@ -282,7 +282,8 @@ def test_the_budget_message_and_tier_are_the_shared_ones(monkeypatch):
         intent=command,
         receipts=(receipt(ProcessingStage.CANONICAL, StageStatus.PROCESSING),) * 3,
     )
-    assert len(made) == 1 and made[0].tier is contracts_limits.STANDARD  # one envelope for every root
+    assert len(made) == 1 and made[0].tier is contracts_lifecycle.LIFECYCLE_TIER  # one envelope for every root
+    assert contracts_lifecycle.LIFECYCLE_TIER is contracts_limits.PORTABILITY
     made.clear()
     source_versions_match(source("m"), source("m"))
     assert len(made) == 1
@@ -308,7 +309,7 @@ def test_the_depth_limit_is_the_shared_standard_depth():
 
 def test_a_flood_of_edges_in_one_root_is_refused_by_the_shared_envelope():
     flood = intent(ProcessingStage.CANONICAL).model_copy(
-        update={"id": [list(range(200)) for _ in range(900)]}
+        update={"id": [list(range(200)) for _ in range(4_200)]}
     )
     with pytest.raises(ValueError, match=BUDGET):
         validate_required_stage_claim(
@@ -423,3 +424,76 @@ def test_a_real_native_cycle_is_still_refused_from_every_entry():
     right.append(left)
     for update in ({"id": left, "actor_id": right}, {"id": right, "actor_id": left}):
         assert "cyclic" in failure(intent(ProcessingStage.CANONICAL).model_copy(update=update))
+
+
+# ---- receipt size: a large stage output settles, and record time agrees with the claim
+def many_outputs(count, *, status=StageStatus.APPLIED, attempt=1, stage=ProcessingStage.CANONICAL):
+    from tests.test_contracts_lifecycle import reference
+
+    outputs = tuple(reference(f"o{attempt}-{i}") for i in range(count))
+    return receipt(stage, status, outputs=outputs, attempt=attempt)
+
+
+def test_a_stage_with_ten_thousand_output_refs_validates_and_settles_in_bounded_time():
+    import time
+
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = many_outputs(10_000)
+    started = time.monotonic()
+    validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,))
+    kept_intent, kept = contracts_lifecycle.validate_stage_receipts(command, (applied,))
+    assert len(kept[0].output_refs) == 10_000 and kept_intent == command
+    assert time.monotonic() - started < 30
+
+
+def test_the_standard_tier_would_strand_a_large_stage_and_the_lifecycle_tier_does_not(monkeypatch):
+    import contracts_limits
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    large = many_outputs(20_000)  # more than the standard tier admits in one call
+    validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(large,))
+    monkeypatch.setattr(contracts_lifecycle, "LIFECYCLE_TIER", contracts_limits.STANDARD)
+    with pytest.raises(ValueError, match=BUDGET):
+        validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(large,))
+
+
+def test_a_receipt_set_beyond_the_tier_is_refused_at_record_time_with_the_budget_message():
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    too_many = many_outputs(70_000)  # beyond the roughly 65,500 handles the tier admits
+    with pytest.raises(ValueError, match=BUDGET):
+        contracts_lifecycle.validate_stage_receipts(command, (too_many,))
+    with pytest.raises(ValueError, match=BUDGET):
+        validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(too_many,))
+
+
+def test_record_time_counts_the_receipts_already_held_so_it_agrees_with_the_claim():
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    earlier = tuple(
+        many_outputs(9_000, status=StageStatus.SKIPPED, attempt=number) for number in range(1, 8)
+    )  # each fits alone; together they exceed one call's envelope
+    contracts_lifecycle.validate_stage_receipts(command, earlier[:6])
+    with pytest.raises(ValueError, match=BUDGET):
+        contracts_lifecycle.validate_stage_receipts(command, earlier + (many_outputs(9_000, status=StageStatus.SKIPPED, attempt=8),))
+
+
+def test_record_time_applies_the_same_identity_checks_as_the_claim():
+    from tests.test_contracts_lifecycle import intent_with_requirements, reference, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    wrong_tenant = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED, outputs=(reference("x", tenant_id="other"),))
+    with pytest.raises(ValueError, match="output_refs must match intent tenant_id"):
+        contracts_lifecycle.validate_stage_receipts(command, (wrong_tenant,))
+    with pytest.raises(ValueError, match="output_refs must match intent tenant_id"):
+        validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=command, receipts=(wrong_tenant,))
+    wrong_effect = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED, effect_id="elsewhere")
+    with pytest.raises(ValueError, match="declared effect_id"):
+        contracts_lifecycle.validate_stage_receipts(command, (wrong_effect,))
+    with pytest.raises(TypeError):
+        contracts_lifecycle.validate_stage_receipts(command, [wrong_effect])  # type: ignore[arg-type]
