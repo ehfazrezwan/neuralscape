@@ -80,8 +80,6 @@ def test_an_applied_claim_with_an_empty_application_witness_is_rejected() -> Non
     empty = receipt(CANONICAL, StageStatus.APPLIED, sources=())
     with pytest.raises(ValueError, match="nonempty source witness"):
         claim(command, [empty])
-    with pytest.raises(ValueError, match="nonempty source witness"):
-        claim(command, [empty], IntentStatus.PROCESSING if False else IntentStatus.APPLIED)
 
 
 def test_a_requirement_may_declare_that_it_has_no_source_witness() -> None:
@@ -216,14 +214,16 @@ def test_cross_tenant_source_refs_validate_only_with_the_explicit_marker() -> No
 
 def test_targets_and_outputs_stay_tenant_scoped_even_with_the_marker() -> None:
     command = intent(CANONICAL)
-    values = command.model_dump()
-    values["target_refs"] = [handle("tenant-2", cross=True).model_dump()]
-    with pytest.raises(ValidationError, match="target_refs"):
-        Intent.model_validate(values)
-    same_tenant_marked = command.model_dump()
-    same_tenant_marked["target_refs"] = [handle("tenant-1", cross=True).model_dump()]
-    with pytest.raises(ValidationError):
-        Intent.model_validate(same_tenant_marked)
+    semantic = "target_refs must match intent tenant_id and cannot be cross_tenant"
+    # tuples of handles: strict validation accepts the shape, so only the tenancy rule can reject
+    for target in (handle("tenant-2", cross=True), handle("tenant-1", cross=True), handle("tenant-2", cross=False)):
+        values = command.model_dump()
+        values["target_refs"] = (target,)
+        with pytest.raises(ValidationError, match=semantic):
+            Intent.model_validate(values)
+    allowed = command.model_dump()
+    allowed["target_refs"] = (handle("tenant-1"),)
+    assert Intent.model_validate(allowed).target_refs == (handle("tenant-1"),)
     output = receipt(CANONICAL, StageStatus.APPLIED, outputs=(handle("tenant-2", cross=True, ident="o"),))
     with pytest.raises(ValueError, match="output_refs"):
         claim(command, [output])
@@ -231,7 +231,8 @@ def test_targets_and_outputs_stay_tenant_scoped_even_with_the_marker() -> None:
 
 def test_the_marker_defaults_to_false_and_is_part_of_handle_identity() -> None:
     plain = ReferenceHandle(kind="source", id="a", tenant_id="t", resolver="r")
-    assert plain.cross_tenant is False and plain == handle("t", ident="a").model_copy(update={"resolver": "r"}) or True
+    assert plain.cross_tenant is False  # the default
+    assert plain == ReferenceHandle(kind="source", id="a", tenant_id="t", resolver="r", cross_tenant=False)
     assert handle("t", cross=True) != handle("t", cross=False)
     assert ReferenceHandle.model_validate_json(handle("t", cross=True).model_dump_json()).cross_tenant is True
 
@@ -304,6 +305,31 @@ def test_public_first_sibling_repair_before_first_observation_is_the_documented_
     repaired = LazyPublicTuple((first,), public(True))
     claim(command, repaired)  # the repaired public view is the first observation of that child
     assert repaired.iteration_calls == 1
+
+
+def test_public_first_a_subclass_view_is_observed_once_per_edge_not_once_per_object() -> None:
+    """By design (public view is authoritative): the public view of a container is captured once at
+    first observation *of each edge that reaches it*.  One subclass object attached to a single
+    field is read once; the same object attached to two fields of different receipts is read once
+    for each of those edges, and every edge validates the view it observed.  Capture is cached by
+    object identity for plain containers and models, not for a subclass's public view, because
+    that view is exactly what a subclass may change between observations; nothing here promises a
+    single read across edges.  This pins the accepted behavior so a change to it is deliberate.
+    """
+
+    ref = handle("tenant-1", ident="o1")
+    single = LazyPublicTuple((ref,), lambda: iter((ref,)))
+    only = receipt(CANONICAL, StageStatus.APPLIED)
+    _native_set(only, "output_refs", single)
+    claim(intent(CANONICAL), (only,))
+    assert single.iteration_calls == 1
+
+    shared = LazyPublicTuple((ref,), lambda: iter((ref,)))
+    first, second = receipt(CANONICAL, StageStatus.APPLIED), receipt(GRAPH, StageStatus.APPLIED)
+    _native_set(first, "output_refs", shared)
+    _native_set(second, "output_refs", shared)
+    claim(intent(CANONICAL, GRAPH), (first, second))
+    assert shared.iteration_calls == 2  # one observation per edge
 
 
 def test_public_first_public_only_receipt_repair_by_intent_callback_is_the_documented_limit() -> None:
