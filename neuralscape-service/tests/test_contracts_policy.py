@@ -2699,3 +2699,63 @@ def test_policy_decision_schema_requires_every_evaluation_identity() -> None:
         "evaluated_credential_id",
         "evaluated_membership_version",
     } <= set(schema["required"])
+
+
+class _DivergentStatements(tuple):
+    """A tuple whose public iterator disagrees with its native backing."""
+
+    def __new__(cls, native, public_views):
+        instance = super().__new__(cls, native)
+        instance.public_views = [tuple(view) for view in public_views]
+        instance.iteration_calls = 0
+        return instance
+
+    def __iter__(self):
+        self.iteration_calls += 1
+        index = min(self.iteration_calls, len(self.public_views)) - 1
+        return iter(self.public_views[index])
+
+
+def _evaluate_with_statements(statements: tuple[PolicyStatement, ...]) -> PolicyDecision:
+    resource_value = reference("memory-1")
+    policy_value = policy(statement("seed", "allow", "read", resource_value))
+    object.__setattr__(policy_value, "statements", statements)
+    return evaluate(principal(), "read", resource_value, policy_value)
+
+
+def test_public_first_hidden_native_deny_is_not_part_of_the_snapshot() -> None:
+    resource_value = reference("memory-1")
+    allow = statement("allow-read", "allow", "read", resource_value)
+    deny = statement("deny-read", "deny", "read", resource_value)
+    statements = _DivergentStatements([allow, deny], [[allow]])
+
+    received = _evaluate_with_statements(statements)
+
+    assert (received.outcome, received.reason_code) == ("allow", "explicit_grant")
+
+
+def test_public_first_public_only_deny_is_authoritative() -> None:
+    resource_value = reference("memory-1")
+    allow = statement("allow-read", "allow", "read", resource_value)
+    deny = statement("deny-read", "deny", "read", resource_value)
+    statements = _DivergentStatements([allow], [[allow, deny]])
+
+    received = _evaluate_with_statements(statements)
+
+    assert (received.outcome, received.reason_code) == ("deny", "not_authorized")
+
+
+@pytest.mark.parametrize("first_view_denies", [False, True])
+def test_public_first_view_is_captured_once_and_later_views_are_not_seen(
+    first_view_denies: bool,
+) -> None:
+    resource_value = reference("memory-1")
+    allow = statement("allow-read", "allow", "read", resource_value)
+    deny = statement("deny-read", "deny", "read", resource_value)
+    first, later = ((allow, deny), (allow,)) if first_view_denies else ((allow,), (allow, deny))
+    statements = _DivergentStatements([allow, deny], [first, later])
+
+    received = _evaluate_with_statements(statements)
+
+    assert statements.iteration_calls == 1
+    assert received.outcome == ("deny" if first_view_denies else "allow")
