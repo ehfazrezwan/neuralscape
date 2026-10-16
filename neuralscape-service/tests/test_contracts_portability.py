@@ -3384,3 +3384,14 @@ def test_exact_dict_and_public_view_charging_is_unchanged(monkeypatch) -> None:
     _, empty_edges = _budget_measure(monkeypatch, _manifest_with_files({}))
     _, full_edges = _budget_measure(monkeypatch, _manifest_with_files({i: 0 for i in range(500)}))
     assert full_edges - empty_edges == 1000
+
+
+def test_endless_public_sequence_view_is_bounded() -> None:
+    class EndlessList(list):
+        def __iter__(self):  # the public view; the native backing is empty
+            index = 0
+            while True:
+                yield index
+                index += 1
+
+    _assert_budget_rejection(_manifest_with_files(EndlessList()))
