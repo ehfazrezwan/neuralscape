@@ -8,12 +8,12 @@ reviewable but are not themselves proof that the referenced evidence is valid.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, NamedTuple, TypeVar
+from typing import Any, Iterator, NamedTuple, TypeVar
 
 from pydantic import BaseModel, TypeAdapter, model_validator
 
 from contracts_common import ContractModel, OpaqueId, VersionedContract
-from contracts_limits import DiscoveryBudget
+from contracts_limits import DISCOVERY_BUDGET_MESSAGE, DiscoveryBudget
 from contracts_references import ReferenceHandle
 
 
@@ -259,6 +259,14 @@ def _normalize_field_items(
     )
 
 
+def _charged_entries(entries: Any, budget: DiscoveryBudget) -> Iterator[Any]:
+    """Yield a public view's entries, charging each one as it is observed."""
+
+    for entry in entries:
+        budget.charge_edge()
+        yield entry
+
+
 def _snapshot_native_value(
     value: Any,
     *,
@@ -267,10 +275,22 @@ def _snapshot_native_value(
     frozen_containers: dict[int, _FrozenContainerState],
     discovered: dict[int, Any],
     budget: DiscoveryBudget,
+    memo: dict[int, tuple[Any, Any, int]],
     depth: int,
     location: str,
-) -> Any:
-    """Copy a contract graph without discarding unchecked model state."""
+) -> tuple[Any, int, bool]:
+    """Copy a contract graph without discarding unchecked model state.
+
+    Returns ``(copy, height, memoizable)``.  A subtree built only from native
+    storage (models and exact built-in containers) is a pure function of the
+    entry state frozen for the call, so it is copied once per object identity
+    and shared by every path that reaches it; the work is bounded by the
+    distinct objects and edges rather than the number of paths.  ``height`` is
+    the deepest descendant relative to this value, so the nesting limit still
+    applies to every path.  A subtree that observed a public view (a container
+    subclass) is never memoized: each edge that reaches such a view observes
+    it again, and every entry observed is charged to the shared budget.
+    """
 
     if depth > _MAX_SNAPSHOT_DEPTH:
         raise ValueError(f"contract graph nesting exceeds the limit at {location}")
@@ -279,6 +299,12 @@ def _snapshot_native_value(
     is_container = issubclass(value_type, (BaseModel, dict, list, tuple))
     identity = id(value)
     if is_container:
+        cached = memo.get(identity)
+        if cached is not None and cached[0] is value:
+            _, copied, height = cached
+            if depth + height > _MAX_SNAPSHOT_DEPTH:
+                raise ValueError(f"contract graph nesting exceeds the limit at {location}")
+            return copied, height, True
         # A child first exposed through a public view is captured now; it is
         # charged to the same envelope as the entry discovery.
         _freeze_native_model_graph(
@@ -292,6 +318,26 @@ def _snapshot_native_value(
         if identity in active:
             raise ValueError(f"cyclic contract graph at {location}")
         active.add(identity)
+
+    height = 0
+    memoizable = True
+
+    def child(item: Any, child_location: str) -> Any:
+        nonlocal height, memoizable
+        copied_item, item_height, item_memoizable = _snapshot_native_value(
+            item,
+            active=active,
+            frozen_models=frozen_models,
+            frozen_containers=frozen_containers,
+            discovered=discovered,
+            budget=budget,
+            memo=memo,
+            depth=depth + 1,
+            location=child_location,
+        )
+        height = max(height, item_height + 1)
+        memoizable = memoizable and item_memoizable
+        return copied_item
 
     try:
         if issubclass(value_type, BaseModel):
@@ -339,86 +385,41 @@ def _snapshot_native_value(
                 for name in declared_names
                 if name in stored_by_name
             )
-            return {
-                name: _snapshot_native_value(
-                    item,
-                    active=active,
-                    frozen_models=frozen_models,
-                    frozen_containers=frozen_containers,
-                    discovered=discovered,
-                    budget=budget,
-                    depth=depth + 1,
-                    location=f"{location}.{name}",
-                )
-                for name, item in stored_values
+            result: Any = {
+                name: child(item, f"{location}.{name}") for name, item in stored_values
             }
-        if issubclass(value_type, dict):
+        elif issubclass(value_type, dict):
             frozen = frozen_containers.get(identity)
-            source_items = (
-                frozen.entries
-                if frozen is not None
-                and frozen.owner is value
-                and frozen.kind == "dict"
-                else value.items()
+            exact = (
+                frozen is not None and frozen.owner is value and frozen.kind == "dict"
             )
-            return {
-                key: _snapshot_native_value(
-                    item,
-                    active=active,
-                    frozen_models=frozen_models,
-                    frozen_containers=frozen_containers,
-                    discovered=discovered,
-                    budget=budget,
-                    depth=depth + 1,
-                    location=f"{location}[key]",
+            memoizable = exact
+            result = {
+                key: child(item, f"{location}[key]")
+                for key, item in (
+                    frozen.entries if exact else _charged_entries(value.items(), budget)
                 )
-                for key, item in source_items
             }
-        if issubclass(value_type, list):
+        elif issubclass(value_type, (list, tuple)):
+            is_list = issubclass(value_type, list)
             frozen = frozen_containers.get(identity)
-            source_items = (
-                frozen.entries
-                if frozen is not None
+            exact = (
+                frozen is not None
                 and frozen.owner is value
-                and frozen.kind == "list"
-                else value
+                and frozen.kind == ("list" if is_list else "tuple")
             )
-            return [
-                _snapshot_native_value(
-                    item,
-                    active=active,
-                    frozen_models=frozen_models,
-                    frozen_containers=frozen_containers,
-                    discovered=discovered,
-                    budget=budget,
-                    depth=depth + 1,
-                    location=f"{location}[{index}]",
-                )
+            memoizable = exact
+            source_items = frozen.entries if exact else _charged_entries(value, budget)
+            items = [
+                child(item, f"{location}[{index}]")
                 for index, item in enumerate(source_items)
             ]
-        if issubclass(value_type, tuple):
-            frozen = frozen_containers.get(identity)
-            source_items = (
-                frozen.entries
-                if frozen is not None
-                and frozen.owner is value
-                and frozen.kind == "tuple"
-                else value
-            )
-            return tuple(
-                _snapshot_native_value(
-                    item,
-                    active=active,
-                    frozen_models=frozen_models,
-                    frozen_containers=frozen_containers,
-                    discovered=discovered,
-                    budget=budget,
-                    depth=depth + 1,
-                    location=f"{location}[{index}]",
-                )
-                for index, item in enumerate(source_items)
-            )
-        return value
+            result = items if is_list else tuple(items)
+        else:
+            return value, 0, True
+        if is_container and memoizable:
+            memo[identity] = (value, result, height)
+        return result, height, memoizable
     finally:
         if is_container:
             active.remove(identity)
@@ -438,6 +439,7 @@ def _validated_contract_snapshot(
     frozen_containers: dict[int, _FrozenContainerState] = {}
     discovered: dict[int, Any] = {}
     budget = DiscoveryBudget()
+    memo: dict[int, tuple[Any, Any, int]] = {}
     _freeze_native_model_graph(
         value,
         frozen_models,
@@ -453,6 +455,7 @@ def _validated_contract_snapshot(
         frozen_containers=frozen_containers,
         discovered=discovered,
         budget=budget,
+        memo=memo,
     )
 
 
@@ -465,19 +468,21 @@ def _validated_contract_snapshot_from_frozen(
     frozen_containers: dict[int, _FrozenContainerState],
     discovered: dict[int, Any],
     budget: DiscoveryBudget,
+    memo: dict[int, tuple[Any, Any, int]],
 ) -> _ContractT:
     """Validate using entry state already frozen for the enclosing boundary."""
 
     if not issubclass(type(value), expected_type):
         raise TypeError(f"{label} must be a {expected_type.__name__}")
     try:
-        native = _snapshot_native_value(
+        native, _, _ = _snapshot_native_value(
             value,
             active=set(),
             frozen_models=frozen_models,
             frozen_containers=frozen_containers,
             discovered=discovered,
             budget=budget,
+            memo=memo,
             depth=0,
             location=label,
         )
@@ -500,6 +505,7 @@ def _validated_contract_tuple(
     frozen_containers: dict[int, _FrozenContainerState] = {}
     discovered: dict[int, Any] = {}
     budget = DiscoveryBudget()
+    memo: dict[int, tuple[Any, Any, int]] = {}
     _freeze_native_model_graph(
         values,
         frozen_models,
@@ -515,6 +521,7 @@ def _validated_contract_tuple(
         frozen_containers=frozen_containers,
         discovered=discovered,
         budget=budget,
+        memo=memo,
     )
 
 
@@ -527,6 +534,7 @@ def _validated_contract_tuple_from_frozen(
     frozen_containers: dict[int, _FrozenContainerState],
     discovered: dict[int, Any],
     budget: DiscoveryBudget,
+    memo: dict[int, tuple[Any, Any, int]],
 ) -> tuple[_ContractT, ...]:
     """Validate a tuple using entry state frozen for the enclosing boundary."""
 
@@ -541,6 +549,7 @@ def _validated_contract_tuple_from_frozen(
             frozen_containers=frozen_containers,
             discovered=discovered,
             budget=budget,
+            memo=memo,
         )
         for index, value in enumerate(values)
     )
@@ -711,13 +720,21 @@ def validate_capability_requirements(
     frozen_containers: dict[int, _FrozenContainerState] = {}
     discovered: dict[int, Any] = {}
     budget = DiscoveryBudget()  # one envelope across manifest and requirements
-    _freeze_native_model_graph(
-        manifest,
-        frozen_models,
-        frozen_containers,
-        discovered,
-        budget,
-    )
+    memo: dict[int, tuple[Any, Any, int]] = {}  # one copy per object across both roots
+    try:
+        _freeze_native_model_graph(
+            manifest,
+            frozen_models,
+            frozen_containers,
+            discovered,
+            budget,
+        )
+    except ValueError as exc:
+        # A strict top-level type error outranks the budget; ordinary manifest
+        # diagnostics keep their established priority over it.
+        if not requirements_is_tuple and str(exc) == DISCOVERY_BUDGET_MESSAGE:
+            raise TypeError("capability requirements must be a tuple") from None
+        raise
     if requirements_is_tuple:
         _freeze_native_model_graph(
             requirements,
@@ -735,6 +752,7 @@ def validate_capability_requirements(
         frozen_containers=frozen_containers,
         discovered=discovered,
         budget=budget,
+        memo=memo,
     )
     requirements = _validated_contract_tuple_from_frozen(
         requirements,
@@ -744,6 +762,7 @@ def validate_capability_requirements(
         frozen_containers=frozen_containers,
         discovered=discovered,
         budget=budget,
+        memo=memo,
     )
     states_by_operation = _operation_state_lookup(manifest)
 

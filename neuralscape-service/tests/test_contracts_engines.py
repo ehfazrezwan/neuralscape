@@ -1459,6 +1459,7 @@ def test_requirement_validation_builds_one_index_from_one_manifest_snapshot(
         frozen_containers,
         discovered,
         budget,
+        memo,
     ):
         if expected_type is CapabilityManifest:
             counts["manifest_snapshots"] += 1
@@ -1470,6 +1471,7 @@ def test_requirement_validation_builds_one_index_from_one_manifest_snapshot(
             frozen_containers=frozen_containers,
             discovered=discovered,
             budget=budget,
+            memo=memo,
         )
 
     def counted_lookup(value):
@@ -1728,3 +1730,126 @@ def test_discovery_error_is_value_free():
     with pytest.raises(ValueError) as raised:
         validate_capability_requirements(_manifest_with_versions(hidden), ())
     assert secret not in str(raised.value) and "20000" not in str(raised.value)
+
+
+# ---------------------------------------------------------------------------
+# Snapshot copy is bounded by the graph's distinct objects, not its paths.
+# ---------------------------------------------------------------------------
+
+
+def _shared_chain(depth: int) -> tuple:
+    node: object = "leaf"
+    for _ in range(depth):
+        node = (node, node)  # 2**depth paths over `depth` distinct objects
+    return node  # type: ignore[return-value]
+
+
+def _native_set(model: BaseModel, field: str, value: object) -> None:
+    dict.__setitem__(BaseModel.__dict__["__dict__"].__get__(model, BaseModel), field, value)
+
+
+def test_shared_descendants_are_copied_once_per_object(monkeypatch):
+    calls = 0
+    original = contracts_engines._snapshot_native_value
+
+    def counting(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(contracts_engines, "_snapshot_native_value", counting)
+    declared = manifest(state())
+    _native_set(declared, "contract_schema_versions", _shared_chain(16))
+
+    with pytest.raises(ValidationError):
+        validate_capability_requirements(declared, ())
+
+    assert calls < 500  # linear in distinct objects; the per-path copy makes 2**17 calls
+
+
+def test_deeply_shared_graph_is_rejected_in_bounded_time():
+    import time
+
+    declared = manifest(state())
+    _native_set(declared, "contract_schema_versions", _shared_chain(60))
+
+    started = time.monotonic()
+    with pytest.raises(ValidationError):
+        validate_capability_requirements(declared, ())
+    assert time.monotonic() - started < 2.0
+
+
+def test_shared_models_and_dicts_are_copied_once():
+    shared = state()
+    declared = manifest(shared)
+    nested: object = {"leaf": 1}
+    for _ in range(40):
+        nested = {"a": nested, "b": nested}
+    _native_set(declared, "operations", (shared, nested))
+
+    with pytest.raises(ValidationError):
+        validate_capability_requirements(declared, ())
+
+
+def test_shared_exact_children_still_validate_and_keep_values():
+    shared = state()
+    declared = manifest(shared)
+    _native_set(declared, "operations", (shared,))
+    assert validate_capability_requirements(declared, (requirement(),)) == ()
+    assert declared.operation_state("retrieve") == shared
+
+
+def test_shared_descendants_do_not_hide_a_later_depth_violation():
+    # the same object first reached shallow, later reached beyond the nesting limit
+    deep: object = "leaf"
+    for _ in range(10):
+        deep = (deep,)
+    shallow_then_deep: object = deep
+    for _ in range(300):
+        shallow_then_deep = (deep, shallow_then_deep)
+    declared = manifest(state())
+    _native_set(declared, "contract_schema_versions", shallow_then_deep)
+    with pytest.raises(ValueError, match="nesting"):
+        validate_capability_requirements(declared, ())
+
+
+def test_public_view_is_still_observed_once_per_edge_for_shared_parents():
+    inner = ObservableTuple(())
+    parent = (inner,)
+    declared = manifest(state())
+    _native_set(declared, "contract_schema_versions", (parent, parent))
+    with pytest.raises(ValidationError):
+        validate_capability_requirements(declared, ())
+    assert inner.calls == 2  # two edges reach the public view; no pre-read or merge
+
+
+def test_non_tuple_requirements_are_a_type_error_before_the_budget():
+    over = manifest(state())
+    _native_set(over, "operations", (state(),) * 140_000)  # over the edge budget
+    with pytest.raises(TypeError):
+        validate_capability_requirements(over, [requirement()])  # type: ignore[arg-type]
+
+
+def test_shared_public_views_are_charged_per_observation_and_stay_bounded():
+    import time
+
+    class PublicPair(tuple):
+        def __new__(cls, child):
+            return super().__new__(cls, ())  # empty native backing; the public view yields the pair
+
+        def __init__(self, child):
+            self._child = child
+
+        def __iter__(self):
+            return iter((self._child, self._child))
+
+    node: object = "leaf"
+    for _ in range(40):
+        node = PublicPair(node)  # 2**40 observations without a charge per entry
+    declared = manifest(state())
+    _native_set(declared, "contract_schema_versions", node)
+
+    started = time.monotonic()
+    with pytest.raises(ValueError, match="native discovery budget"):
+        validate_capability_requirements(declared, ())
+    assert time.monotonic() - started < 5.0
