@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Mapping
-from typing import NamedTuple, cast
+from types import MappingProxyType
+from typing import Any, NamedTuple, cast
 
 from pydantic import BaseModel
 
@@ -47,6 +48,27 @@ class _MappingEntry(NamedTuple):
 class _MappingInventory(NamedTuple):
     owner: Mapping[object, object]
     entries: tuple[_MappingEntry | _CapturedFailure, ...] | _CapturedFailure
+
+
+_TYPE_MRO = vars(type)["__mro__"]
+
+
+def _inherits(cls: type, base: type) -> bool:
+    """Whether ``base`` is on ``cls``'s own method resolution order, by identity.
+
+    ``issubclass`` against an ABC also honours ``register()`` and ``__subclasshook__``, so a
+    class that merely registered itself would be trusted as the real protocol.  The native MRO
+    names only what the class actually inherits from.
+    """
+
+    return any(candidate is base for candidate in _TYPE_MRO.__get__(cls))
+
+
+def _is_mapping(value: object) -> bool:
+    """A real mapping: a dict, inherited from ``Mapping``, or the one read-only view that only registers."""
+
+    kind = type(value)
+    return kind is MappingProxyType or issubclass(kind, dict) or _inherits(kind, Mapping)
 
 
 def _is_native_dict(value: object) -> bool:
@@ -247,7 +269,7 @@ def _freeze_reachable_model_inventories(
     # the interpreter stack as well as the walk.
     below = (inventories, visited_containers, mapping_owners, native_dicts, budget, depth + 1)
 
-    if issubclass(type(value), BaseModel):
+    if _inherits(type(value), BaseModel):
         if not budget.visit(value, depth, authoritative):
             return
         identity = id(value)
@@ -259,13 +281,13 @@ def _freeze_reachable_model_inventories(
             budget.charge_edge(len(inventory.stored_items))
             for _, item in inventory.stored_items:
                 _freeze_reachable_model_inventories(item, *below, authoritative)
-        elif issubclass(type(inventory.stored_storage), Mapping):
+        elif _is_mapping(inventory.stored_storage):
             _retain_mapping_owner(inventory.stored_storage, mapping_owners)
         if inventory.extra_items is not None:
             budget.charge_edge(len(inventory.extra_items))
             for _, item in inventory.extra_items:
                 _freeze_reachable_model_inventories(item, *below, authoritative)
-        elif issubclass(type(inventory.extra_storage), Mapping):
+        elif _is_mapping(inventory.extra_storage):
             _retain_mapping_owner(inventory.extra_storage, mapping_owners)
         return
 
@@ -290,7 +312,7 @@ def _freeze_reachable_model_inventories(
             _freeze_reachable_model_inventories(entry.value, *below, authoritative)
         return
 
-    if issubclass(type(value), Mapping):
+    if _is_mapping(value):
         budget.visit(value, depth, True)  # its pairs are its public view: authoritative
         _retain_mapping_owner(value, mapping_owners)
         return
@@ -541,6 +563,31 @@ def _native_entries(
     return tuple(_MappingEntry(key, item) for key, item in dict.items(value))
 
 
+_DEEPEST = "deepest"  # memo bookkeeping keys (the memo's other keys are object ids)
+_IMPURE = "impure"
+
+
+def _remember(
+    memo: dict[object, Any],
+    value: object,
+    result: object,
+    depth: int,
+    saved_deepest: int,
+    impure_before: int,
+    *,
+    pure: bool,
+) -> object:
+    """Record a finished subtree for reuse if nothing in it observed a public view."""
+
+    deepest = memo.get(_DEEPEST, depth)
+    if not pure:
+        memo[_IMPURE] = memo.get(_IMPURE, 0) + 1
+    elif memo.get(_IMPURE, 0) == impure_before:
+        memo[id(value)] = (value, result, deepest - depth)
+    memo[_DEEPEST] = max(saved_deepest, deepest)
+    return result
+
+
 def _complete_contract_input(
     value: object,
     active_ids: set[int],
@@ -548,6 +595,7 @@ def _complete_contract_input(
     mapping_inventories: dict[int, _MappingInventory] | None = None,
     budget: DiscoveryBudget | None = None,
     depth: int = 0,
+    memo: dict[object, Any] | None = None,
 ) -> object:
     """Copy a native input graph without normalizing away invalid data.
 
@@ -556,13 +604,31 @@ def _complete_contract_input(
     charged, repeats included, so a graph that shares substructure cannot make
     the copy exponentially larger than what discovery paid for, and a public
     iterator that never ends is refused rather than followed.
+
+    A subtree built only from native storage (models and native containers, no public
+    view observed) is a pure function of state already frozen for the call, so it is
+    copied once per object identity and shared by every path that reaches it; the work
+    is bounded by distinct objects, not by paths.  A subtree that observed a public view
+    is never reused: each edge that reaches such a view observes it again and is charged.
     """
 
     if mapping_inventories is None:
         mapping_inventories = {}
     budget = _new_budget(budget)
+    if memo is None:
+        memo = {}
+    cached = memo.get(id(value))
+    if cached is not None and cached[0] is value:  # the entry keeps the object alive, so the id is its own
+        budget.visit(value, depth, True)
+        if depth + cached[2] > budget.tier.max_depth:
+            budget.charge_edge(budget.tier.max_edges + 1)  # the stable budget error: the nesting limit holds on every path
+        memo[_DEEPEST] = max(memo.get(_DEEPEST, 0), depth + cached[2])
+        return cached[1]
+    saved_deepest = memo.get(_DEEPEST, 0)
+    memo[_DEEPEST] = depth
+    impure_before = memo.get(_IMPURE, 0)
 
-    if issubclass(type(value), BaseModel):
+    if _inherits(type(value), BaseModel):
         identity = id(value)
         if identity in active_ids:
             raise ValueError("cyclic contract input is not supported")
@@ -595,7 +661,7 @@ def _complete_contract_input(
             if extra_values is not None:
                 if not (
                     _is_native_dict(extra_values)
-                    or issubclass(type(extra_values), Mapping)
+                    or _is_mapping(extra_values)
                 ):
                     raise ValueError(
                         "contract input extra storage must be a mapping"
@@ -640,13 +706,20 @@ def _complete_contract_input(
             for key, item in stored_values.items():
                 budget.charge_edge()  # one stack frame per level: no helper closure
                 completed_model[key] = _complete_contract_input(
-                    item, active_ids, inventories, mapping_inventories, budget, depth + 1
+                    item, active_ids, inventories, mapping_inventories, budget, depth + 1, memo
                 )
-            return completed_model
+            return _remember(
+                memo, value, completed_model, depth, saved_deepest, impure_before,
+                pure=(
+                    inventory.stored_items is not None
+                    and inventory.extra_items is not None
+                    and inventory.fields_set_names is not None
+                ),
+            )
         finally:
             active_ids.remove(identity)
 
-    if issubclass(type(value), Mapping):
+    if _is_mapping(value):
         identity = id(value)
         if identity in active_ids:
             raise ValueError("cyclic contract input is not supported")
@@ -656,13 +729,14 @@ def _complete_contract_input(
             # Keys are deliberately not stringified or otherwise normalized.
             if _is_native_dict(value):
                 retained_dict = _validated_mapping_inventory(value, mapping_inventories)
-                entries = (
-                    cast(
-                        tuple[_MappingEntry | _CapturedFailure, ...],
-                        retained_dict.entries,
-                    )
-                    if retained_dict is not None
-                    else _native_entries(value, budget)
+                if retained_dict is None:
+                    # First met here, through a public view: this read is its first
+                    # observation, kept for every later edge that reaches the same dict.
+                    retained_dict = _MappingInventory(value, _native_entries(value, budget))
+                    mapping_inventories[id(value)] = retained_dict
+                entries = cast(
+                    tuple[_MappingEntry | _CapturedFailure, ...],
+                    retained_dict.entries,
                 )
             else:
                 entries = _retained_mapping_entries(
@@ -677,11 +751,21 @@ def _complete_contract_input(
                     _MappingEntry,
                     _raise_captured_failure(entry),
                 )
+                key = retained.key
+                if issubclass(type(key), str):
+                    # One key by its text: read without running the subclass's hooks and stored
+                    # as a plain str, so a lookup cannot find a different key than the text says.
+                    key = str.__str__(key)
+                    if key in completed:
+                        raise ValueError("contract input mapping has colliding keys")
                 budget.charge_edge()  # one stack frame per level: no helper closure
-                completed[retained.key] = _complete_contract_input(
-                    retained.value, active_ids, inventories, mapping_inventories, budget, depth + 1
+                completed[key] = _complete_contract_input(
+                    retained.value, active_ids, inventories, mapping_inventories, budget, depth + 1, memo
                 )
-            return completed
+            return _remember(
+                memo, value, completed, depth, saved_deepest, impure_before,
+                pure=_is_native_dict(value),
+            )
         finally:
             active_ids.remove(identity)
 
@@ -697,10 +781,13 @@ def _complete_contract_input(
                 budget.charge_edge()  # one stack frame per level: no helper closure
                 completed_list.append(
                     _complete_contract_input(
-                        item, active_ids, inventories, mapping_inventories, budget, depth + 1
+                        item, active_ids, inventories, mapping_inventories, budget, depth + 1, memo
                     )
                 )
-            return completed_list
+            return _remember(
+                memo, value, completed_list, depth, saved_deepest, impure_before,
+                pure=is_exact_type(value, list),
+            )
         finally:
             active_ids.remove(identity)
 
@@ -716,13 +803,17 @@ def _complete_contract_input(
                 budget.charge_edge()  # one stack frame per level: no helper closure
                 completed_items.append(
                     _complete_contract_input(
-                        item, active_ids, inventories, mapping_inventories, budget, depth + 1
+                        item, active_ids, inventories, mapping_inventories, budget, depth + 1, memo
                     )
                 )
-            return tuple(completed_items)
+            return _remember(
+                memo, value, tuple(completed_items), depth, saved_deepest, impure_before,
+                pure=is_exact_type(value, tuple),
+            )
         finally:
             active_ids.remove(identity)
 
+    memo[_DEEPEST] = saved_deepest  # a scalar is not a level
     return value
 
 

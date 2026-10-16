@@ -3392,16 +3392,43 @@ def test_a_wide_container_is_refused_before_it_is_walked() -> None:
         _complete_contract_input({i: i for i in range(STANDARD_MAX_EDGES + 10)}, set(), {}, {})
 
 
-def test_shared_substructure_cannot_make_the_copy_exponentially_larger() -> None:
-    """A diamond chain is 2 nodes per level to discover but 2**n paths to copy."""
+def test_native_shared_substructure_is_copied_once_per_object() -> None:
+    """A diamond chain is 2 nodes per level to discover and 2**n paths to reach: native
+    subtrees are pure, so each is copied once and shared by every path."""
+
+    import time
 
     shared: object = ("leaf",)
-    for _ in range(20):
+    for _ in range(40):  # 2**40 paths
         shared = (shared, shared)
+    started = time.monotonic()
+    completed = _complete_contract_input(shared, set(), {}, {})
+    assert time.monotonic() - started < 5
+    assert completed[0] is completed[1]  # one copy, shared by both paths
+    with pytest.raises(ValidationError):  # and a contract still judges it by its shape, quickly
+        _evaluate_budget_statements(shared)
+
+
+def test_a_diamond_of_public_views_is_still_charged_per_path() -> None:
+    """A container subclass is observed again on every edge that reaches it, so reuse is
+    not allowed and the paths are charged: the budget refuses the explosion."""
+
+    class _View(tuple):
+        def __iter__(self):
+            return iter(tuple.__iter__(self))
+
+    shared: object = _View(("leaf",))
+    for _ in range(20):
+        shared = _View((shared, shared))
     with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
         _complete_contract_input(shared, set(), {}, {})
-    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
-        _evaluate_budget_statements(shared)
+
+
+def test_the_depth_limit_holds_on_a_path_that_reaches_a_reused_subtree() -> None:
+    deep = _nested("tuple", STANDARD_MAX_DEPTH - 1)
+    _complete_contract_input((deep,), set(), {}, {})                  # fits at depth 1
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):   # the same subtree, one level lower
+        _complete_contract_input((deep, ((deep,),)), set(), {}, {})
 
 
 def test_a_long_public_pair_iterator_is_cut_off_at_the_edge_limit() -> None:
@@ -3638,3 +3665,166 @@ def test_each_mapping_is_read_once_however_the_walk_reaches_it() -> None:
     top = _Items(lambda: iter((("middle", middle), ("leaf", leaf))))
     _entry_flow((top, middle, leaf, [leaf, middle]))
     assert sorted(reads) == ["leaf"]
+
+
+# ── pre-emptive sweep: classes seen across reviews ──────────────────────────
+
+
+def _statement_dict(**overrides) -> dict:
+    value = {
+        "id": "dict-allow", "effect": "allow", "subject_id": "subject-a", "credential_id": None,
+        "action": "read", "resource": reference("memory-1").model_dump(mode="python"),
+    }
+    value.update(overrides)
+    return value
+
+
+def _with_statements(*statements) -> AccessPolicy:
+    return _policy_with_public_only_statements(*statements)
+
+
+# class 1: a registered-only ABC is not trusted as the real protocol
+
+
+class _NotReallyAMapping:
+    def __init__(self, entries):
+        self._entries = entries
+
+    def items(self):
+        return iter(self._entries.items())
+
+
+def test_a_registered_only_mapping_is_not_treated_as_a_mapping() -> None:
+    Mapping.register(_NotReallyAMapping)
+    resource_value = reference("memory-1")
+    grant = _NotReallyAMapping(_statement_dict())
+    with pytest.raises(ValidationError):
+        evaluate(principal(), "read", resource_value, _with_statements(grant))
+    # the completed copy is the object itself (not a rebuilt dict), so strict validation refuses it
+    assert isinstance(_complete_contract_input(grant, set(), {}, {}), _NotReallyAMapping)
+
+
+@pytest.mark.filterwarnings("ignore:For performance reasons")
+def test_a_registered_only_model_is_not_treated_as_a_model() -> None:
+    class Impostor:
+        pass
+
+    BaseModel.register(Impostor)
+    resource_value = reference("memory-1")
+    with pytest.raises((ValidationError, TypeError, ValueError)):
+        evaluate(principal(), "read", resource_value, _with_statements(Impostor()))
+
+
+# class 6: a str-subclass key is one key by its text; two keys with one text are refused
+
+
+class _DuplicateEffectKey(str):
+    def __hash__(self) -> int:
+        return hash("effect")
+
+    def __eq__(self, other: object) -> bool:
+        return False
+
+    def __ne__(self, other: object) -> bool:
+        return True
+
+
+class _TextKey(str):
+    """An ordinary str subclass (no hook overridden)."""
+
+
+def test_a_second_key_with_the_same_text_cannot_flip_an_allow_into_a_silent_pass() -> None:
+    resource_value = reference("memory-1")
+    mirrored = _statement_dict(effect="allow")
+    dict.__setitem__(mirrored, _DuplicateEffectKey("effect"), "deny")
+    with pytest.raises(ValueError):
+        evaluate(principal(), "read", resource_value, _with_statements(mirrored))
+    first = _statement_dict(effect="deny")
+    dict.__setitem__(first, _DuplicateEffectKey("effect"), "allow")
+    with pytest.raises(ValueError):
+        evaluate(principal(), "read", resource_value, _with_statements(first))
+
+
+def test_an_ordinary_str_subclass_key_is_read_as_its_text() -> None:
+    resource_value = reference("memory-1")
+    keyed = {_TextKey(name): value for name, value in _statement_dict().items()}
+    assert evaluate(principal(), "read", resource_value, _with_statements(keyed)).outcome == "allow"
+
+
+# class 3: a native dict first met lazily keeps its first observation for every later edge
+
+
+def test_a_lazily_met_dict_shared_by_two_edges_keeps_its_first_observation() -> None:
+    broken = _invalid_resource_dict()
+    mapping_inventories: dict = {}
+    first = _complete_contract_input((broken,), set(), {}, mapping_inventories)
+    _repair_after_yield(broken)
+    second = _complete_contract_input((broken,), set(), {}, mapping_inventories)
+    assert first[0]["tenant_id"] == 5
+    assert second[0]["tenant_id"] == 5  # the same snapshot, not a re-read of the repaired dict
+
+
+# class 5: each pair of a custom mapping is frozen as a plain tuple, read once
+
+
+def test_a_pair_that_is_a_tuple_subclass_with_a_changing_iterator_is_read_once() -> None:
+    reads = []
+
+    class _Pair(tuple):
+        def __iter__(self):
+            reads.append(1)
+            return iter(("k", len(reads)))
+
+    class _Pairs(Mapping[str, object]):
+        def __getitem__(self, key):
+            raise KeyError(key)
+
+        def __iter__(self):
+            return iter(())
+
+        def __len__(self):
+            return 0
+
+        def items(self):  # type: ignore[override]
+            return iter((_Pair(("ignored", "ignored")),))
+
+    completed = _complete_contract_input(_Pairs(), set(), {}, {})
+    assert completed == {"k": 1} and len(reads) == 1
+
+
+# class 8: the objects an inventory is keyed by are kept alive by the inventory
+
+
+def test_objects_keyed_by_identity_stay_alive_for_the_whole_call() -> None:
+    class _Weak(dict):
+        pass
+
+    child = _Weak({"k": 1})
+    reference_to_child = weakref.ref(child)
+    holder = [child]
+    native_dicts: dict = {}
+    _freeze_reachable_model_inventories(holder, {}, set(), None, native_dicts)
+    del child, holder
+    gc.collect()
+    assert reference_to_child() is not None  # an id() could not be recycled while the inventory is live
+
+
+# class 9: the evaluator takes no time from the wall clock
+
+
+def test_the_policy_modules_never_read_the_clock() -> None:
+    import ast
+    from pathlib import Path
+
+    import contracts_policy
+    import contracts_policy_reference
+
+    for module in (contracts_policy, contracts_policy_reference):
+        tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+        imported = {
+            alias.name.split(".")[0]
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+            for alias in (node.names if isinstance(node, ast.Import) else [ast.alias(name=node.module or "")])
+        }
+        assert not imported & {"time", "datetime", "calendar", "zoneinfo"}, module.__name__
