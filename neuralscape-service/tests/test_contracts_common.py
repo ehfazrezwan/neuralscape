@@ -694,14 +694,14 @@ def test_snapshot_contract_graph_freezes_later_model_before_stored_name_hook(
     stored_value = dict.pop(native, "tuple_trigger")
     dict.__setitem__(native, stored_name, stored_value)
     stored_name.armed = True
+    stored_name.hash_calls = stored_name.equality_calls = 0  # storing it above hashed it once
 
     snapshot = snapshot_contract_graph(value)
 
-    if hook == "hash":
-        assert stored_name.hash_calls > 0
-    else:
-        assert stored_name.equality_calls > 0
-    assert child.count == 1
+    # A stored name is read as its text: its hash and equality hooks never run, so the
+    # repair never happens and the frozen invalid child is what validation sees.
+    assert stored_name.hash_calls == stored_name.equality_calls == 0
+    assert child.count == -1
     assert snapshot["child"]["count"] == -1
     with pytest.raises(ValidationError) as repaired_error:
         NestedInventoryEnvelope.model_validate(snapshot, strict=True)
@@ -722,10 +722,11 @@ def test_snapshot_contract_graph_freezes_invalid_root_before_name_hook(
     stored_value = dict.pop(native, "count")
     dict.__setitem__(native, stored_name, stored_value)
     stored_name.armed = True
+    stored_name.hash_calls = stored_name.equality_calls = 0
 
     snapshot = snapshot_contract_graph(value)
 
-    assert value.count == 1
+    assert stored_name.hash_calls == stored_name.equality_calls == 0  # read as text, no hook
     assert snapshot["count"] == -1
     with pytest.raises(ValidationError) as raised:
         ExampleContract.model_validate(snapshot, strict=True)
@@ -2598,19 +2599,18 @@ def test_public_first_public_only_child_repaired_by_earlier_stored_name_hook(
     stored_value = dict.pop(native, "trigger")
     dict.__setitem__(native, stored_name, stored_value)
     stored_name.armed = True
+    stored_name.hash_calls = stored_name.equality_calls = 0
 
     snapshot = snapshot_contract_graph(value)
 
-    if hook == "hash":
-        assert stored_name.hash_calls > 0
-    else:
-        assert stored_name.equality_calls > 0
-    assert child.count == 1
-    # The never-exposed child is first observed after the callback, so it is
-    # exposed in repaired form and the receiving model accepts it.
-    assert list(_exposed_children(snapshot, placement)) == [{"count": 1}]
+    # A stored name is read as its text, so no hook runs before the public view is first
+    # observed: the child is exposed as it is (invalid) and the receiving model rejects it.
+    assert stored_name.hash_calls == stored_name.equality_calls == 0
+    assert child.count == -1
+    assert list(_exposed_children(snapshot, placement)) == [{"count": -1}]
     assert public_view.iteration_calls == 1
-    assert type(value).model_validate(snapshot, strict=True) is not None
+    with pytest.raises(ValidationError):
+        type(value).model_validate(snapshot, strict=True)
 
 
 @pytest.mark.parametrize("placement", ["direct", "nested"])
@@ -2853,3 +2853,257 @@ def test_snapshot_contract_graph_public_view_ancestors_are_not_reused() -> None:
     snapshot_contract_graph([parent, parent, parent])
 
     assert CountingList.reads == 3
+
+
+# ── one accounting: the shared discovery budget bounds capture and reconstruction ──
+
+import time as _time  # noqa: E402
+
+from contracts_limits import DISCOVERY_BUDGET_MESSAGE, STANDARD_MAX_DEPTH  # noqa: E402
+from contracts_references import SourceVersion  # noqa: E402
+
+
+def _source_version() -> SourceVersion:
+    return SourceVersion(record_id="rec-1", content_revision=1, policy_epoch=1)
+
+
+def _pairs(depth: int, leaf: object = None) -> object:
+    node: object = ({"x": 1},) if leaf is None else leaf
+    for _ in range(depth):
+        node = (node, node)
+    return node
+
+
+def test_shared_native_pairs_are_rebuilt_once_per_object(monkeypatch) -> None:
+    """``node = (node, node)`` twelve times is 13 containers and 8,191 paths."""
+
+    import contracts_common
+
+    calls = 0
+    original = contracts_common._reconstruct_captured_graph
+
+    def counting(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(contracts_common, "_reconstruct_captured_graph", counting)
+    snapshot = snapshot_contract_graph(_pairs(12))
+    assert calls <= 20  # one per distinct container (plus the leaf dict)
+    assert snapshot[0] is snapshot[1]
+
+
+def test_fifteen_lists_of_two_references_are_not_expanded() -> None:
+    node: object = []
+    for _ in range(15):
+        node = [node, node]
+    started = _time.monotonic()
+    snapshot = snapshot_contract_graph(node)
+    assert _time.monotonic() - started < 1.0 and snapshot[0] is snapshot[1]
+
+
+def test_a_forty_level_native_diamond_completes_quickly() -> None:
+    started = _time.monotonic()
+    snapshot_contract_graph(_pairs(40))
+    assert _time.monotonic() - started < 2.0
+
+
+def test_deep_nesting_is_the_stable_budget_error_not_a_recursion_error() -> None:
+    for depth in (STANDARD_MAX_DEPTH + 10, 5_000):
+        node: object = ()
+        for _ in range(depth):
+            node = (node,)
+        with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+            snapshot_contract_graph(node)
+
+
+def test_the_depth_limit_holds_on_every_path_to_a_reused_subtree() -> None:
+    deep: object = ()
+    for _ in range(STANDARD_MAX_DEPTH - 2):
+        deep = (deep,)
+    snapshot_contract_graph((deep,))  # fits at depth 1
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph((deep, (((deep,),),)))  # the same subtree, three levels lower
+
+
+def test_an_endless_public_sequence_is_cut_off_by_the_budget() -> None:
+    produced = [0]
+
+    class Endless(tuple):
+        def __iter__(self):
+            while True:
+                produced[0] += 1
+                yield produced[0]
+
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph(Endless())
+    assert produced[0] <= 140_000  # the edge limit is 131,072
+
+
+def test_a_diamond_of_public_views_is_charged_per_path() -> None:
+    class View(tuple):
+        def __iter__(self):
+            return iter(tuple.__iter__(self))
+
+    node: object = View((1,))
+    for _ in range(30):
+        node = View((node, node))
+    started = _time.monotonic()
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph(node)
+    assert _time.monotonic() - started < 5.0
+
+
+# ── purity is not "no public view was read": key hooks are callbacks too ──
+
+
+def test_a_str_subclass_key_runs_no_hook_and_cannot_skew_later_views() -> None:
+    counter = [0]
+
+    class CountingKey(str):
+        def __hash__(self):
+            counter[0] += 1
+            return str.__hash__(self)
+
+        def __eq__(self, other):
+            counter[0] += 1
+            return str.__eq__(self, other)
+
+    class CounterView(list):
+        def __iter__(self):
+            return iter([counter[0]])
+
+    shared = {CountingKey("k"): 1}
+    view = CounterView()
+    counter[0] = 0  # building the dict above hashed the key once; only the snapshot is under test
+    snapshot = snapshot_contract_graph([shared, view, shared, view])
+    assert counter[0] == 0                      # the key is read as its text, never hashed through its hooks
+    assert snapshot[1] == snapshot[3] == [0]    # both observations of the view agree with that
+    assert [type(k) for k in snapshot[0]] == [str]
+
+
+def test_two_keys_with_one_text_are_refused() -> None:
+    class Twin(str):
+        def __hash__(self):
+            return hash("x" + str.__str__(self))
+
+        def __eq__(self, other):
+            return False
+
+    value = {"k": 1}
+    dict.__setitem__(value, Twin("k"), 2)
+    with pytest.raises(ValueError, match="colliding"):
+        snapshot_contract_graph(value)
+
+
+def test_a_subtree_with_a_non_text_hashable_key_is_never_reused() -> None:
+    counter = [0]
+
+    class Key:
+        def __hash__(self):
+            counter[0] += 1
+            return 7
+
+        def __eq__(self, other):
+            return self is other
+
+    class CounterView(list):
+        def __iter__(self):
+            return iter([counter[0]])
+
+    shared = {Key(): 1}
+    view = CounterView()
+    snapshot = snapshot_contract_graph([shared, view, shared, view])
+    assert snapshot[0] is not snapshot[2]  # rebuilt per edge, like a public view
+    assert snapshot[1] != snapshot[3]       # so each later observation sees its own hook run
+
+
+def test_str_subclass_model_field_names_are_read_as_text() -> None:
+    counter = [0]
+
+    class CountingName(str):
+        def __hash__(self):
+            counter[0] += 1
+            return str.__hash__(self)
+
+    value = _source_version()
+    stored = vars(BaseModel)["__dict__"].__get__(value, BaseModel)
+    renamed = {CountingName(name): item for name, item in dict.items(stored)}
+    stored.clear()
+    counter[0] = 0
+    stored.update(renamed)
+    counter[0] = 0
+    snapshot = snapshot_contract_graph(value)
+    assert counter[0] == 0
+    assert all(type(name) is str for name in snapshot)
+
+
+# ── type checks by native MRO, no metaclass hook (from the snapshot hardening) ──
+
+
+def _hooked(events: list[str]):
+    class Meta(type):
+        def __hash__(cls):
+            events.append("hash")
+            return id(cls)
+
+        def __eq__(cls, other):
+            events.append("eq")
+            return False
+
+        def __ne__(cls, other):
+            events.append("ne")
+            return True
+
+        def __subclasscheck__(cls, subclass):
+            events.append("subclasscheck")
+            return False
+
+        def __instancecheck__(cls, instance):
+            events.append("instancecheck")
+            return False
+
+    return Meta
+
+
+@pytest.mark.parametrize("base", [tuple, list, dict])
+def test_the_shared_snapshot_runs_no_metaclass_hook_on_a_hostile_container_class(base) -> None:
+    events: list[str] = []
+    hostile = _hooked(events)("Hostile", (base,), {})
+    value = hostile()
+    events.clear()
+    try:
+        snapshot_contract_graph(value)
+    except Exception:  # an unsupported subclass may be refused; running its hooks is not allowed
+        pass
+    assert events == []
+
+
+def test_a_class_only_registered_as_a_mapping_is_not_trusted_as_model_extras() -> None:
+    from collections.abc import Mapping as _Mapping
+
+    touched: list[str] = []
+
+    class RegisteredOnly:
+        def items(self):
+            touched.append("items")
+            return [("smuggled", 1)]
+
+        def __iter__(self):
+            touched.append("iter")
+            return iter(())
+
+        def __len__(self):
+            return 0
+
+    _Mapping.register(RegisteredOnly)
+    value = _source_version()
+    object.__setattr__(value, "__pydantic_extra__", RegisteredOnly())
+    with pytest.raises(ValueError):
+        snapshot_contract_graph(value)
+    assert touched == []
+
+
+def test_ordinary_graphs_are_far_inside_the_budget() -> None:
+    snapshot = snapshot_contract_graph([_source_version() for _ in range(500)])
+    assert len(snapshot) == 500
