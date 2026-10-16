@@ -2113,3 +2113,37 @@ def test_public_first_lazy_child_is_frozen_once_first_observed(
     assert name.calls > 0
     assert divergent.calls == 1
     assert child.manifest_id == "primary"
+
+
+def test_public_first_subclass_view_is_observed_once_per_occurrence() -> None:
+    previous = operation(observed_state="pending")
+    current = operation(observed_state="running")
+    shared = DivergentTuple(current.resource_manifests, current.resource_manifests)
+    _set_native_field(previous, "resource_manifests", shared)
+    _set_native_field(current, "resource_manifests", shared)
+
+    result = validate_operation_transition(previous, current)
+
+    assert result.resource_manifests[0].manifest_id == "primary"
+    assert shared.calls == 2
+
+
+def test_public_first_subclass_view_that_changes_between_occurrences_is_rejected() -> (
+    None
+):
+    previous = operation(observed_state="pending")
+    current = operation(observed_state="running")
+    invalid = ResourceManifestReference.model_validate(manifest())
+    _set_native_field(invalid, "manifest_id", "")
+    views = iter([current.resource_manifests, (invalid,)])
+
+    class FlipFlopTuple(tuple):
+        def __iter__(self):
+            return iter(next(views))
+
+    shared = FlipFlopTuple(current.resource_manifests)
+    _set_native_field(previous, "resource_manifests", shared)
+    _set_native_field(current, "resource_manifests", shared)
+
+    with pytest.raises(ValidationError):
+        validate_operation_transition(previous, current)

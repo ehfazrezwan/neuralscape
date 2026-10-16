@@ -146,9 +146,11 @@ def _closed_graph_snapshot_session() -> tuple[
 ]:
     """Return native capture and public rebuild phases sharing one inventory.
 
-    Authority follows each supported container's public view, captured once at
-    first observation and replayed.  Stored models and exact built-in
-    containers are fenced when the call begins.  Children exposed only by a
+    Authority follows each supported container's public view.  Stored models
+    and exact built-in containers are fenced when the call begins and replayed
+    from that capture.  The public view of a container subclass is observed
+    once per occurrence in the graph, not once per call, so a view that
+    changes between two occurrences is rejected.  Children exposed only by a
     public iterator are captured when that iterator first exposes them, so an
     earlier callback in the same call may still change them first; entry-time
     capture of never-yet-exposed children is not promised.  Hidden native
