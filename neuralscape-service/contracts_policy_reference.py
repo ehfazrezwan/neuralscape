@@ -344,10 +344,12 @@ def _freeze_mapping_inventories(
     inventory; the first malformed pair is terminal, and the rest of the
     iterator is still drained so a later iteration error keeps its precedence.
 
-    A mapping that is not a native dict (a proxy, a custom mapping) found among a
-    pair's children is captured, items frozen, at that same point, before the
-    parent iterator advances; merely queueing it would read its items after the
-    parent's later steps could have changed what it exposes.
+    A mapping that is not a native dict (a proxy, a custom mapping) exposed by a
+    pair is captured, items frozen, at that same point, before the parent iterator
+    advances, even if the entry walk had already queued it; merely queueing it
+    would read its items after the parent's later steps could have changed what
+    it exposes.  An inventory, once taken, is never replaced: an owner that was
+    captured while another was in progress is skipped by the outer loop.
     """
 
     if in_progress is None:
@@ -364,6 +366,8 @@ def _freeze_mapping_inventories(
             return
 
         for owner in pending:
+            if _validated_mapping_inventory(owner, mapping_inventories) is not None:
+                continue  # captured while an earlier owner was in progress: never read twice
             try:
                 iterator = _open_mapping_items(owner)
             except Exception as error:
@@ -399,20 +403,26 @@ def _freeze_mapping_inventories(
                     terminal = True
                     continue
                 entries.append(_MappingEntry(key, item))
-                before = set(owners)
+                # The mappings THIS pair exposes, whether or not the entry walk had
+                # already queued them: any that has no inventory yet is captured now,
+                # at its first exposure, before this iterator is advanced.
+                exposed: dict[int, Mapping[object, object]] = {}
                 _freeze_reachable_model_inventories(
                     item,
                     model_inventories,
                     visited_containers,
-                    owners,
+                    exposed,
                     native_dicts,
                     budget,
                     child_depth,
                 )
+                for found in exposed.values():
+                    _retain_mapping_owner(found, owners)
                 discovered = {
                     identity: found
-                    for identity, found in owners.items()
-                    if identity not in before
+                    for identity, found in exposed.items()
+                    if identity not in in_progress
+                    and _validated_mapping_inventory(found, mapping_inventories) is None
                 }
                 if discovered:
                     _freeze_mapping_inventories(

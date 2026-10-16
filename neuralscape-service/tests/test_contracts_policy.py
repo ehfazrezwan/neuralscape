@@ -3540,3 +3540,101 @@ def test_a_deep_chain_of_public_mappings_is_refused_with_the_budget_error() -> N
 def test_a_public_mapping_chain_within_the_limit_cannot_overflow_the_stack() -> None:
     completed = _complete_contract_input(_proxy_chain(STANDARD_MAX_DEPTH - 8), set(), {}, {})
     assert completed is not None
+
+
+# ── a mapping is captured exactly once, at its first exposure ───────────────
+
+
+def _entry_flow(root: object) -> object:
+    """The full evaluator flow for one root: entry freeze, pending captures, completion."""
+
+    inventories: dict = {}
+    owners: dict = {}
+    mapping_inventories: dict = {}
+    native_dicts: dict = {}
+    visited: set = set()
+    budget = DiscoveryBudget()
+    _freeze_reachable_model_inventories(root, inventories, visited, owners, native_dicts, budget)
+    _freeze_mapping_inventories(owners, mapping_inventories, inventories, visited, native_dicts, None, budget)
+    mapping_inventories.update(native_dicts)
+    return _complete_contract_input(root, set(), inventories, mapping_inventories, budget)
+
+
+class _Items(Mapping[str, object]):
+    """A public mapping whose pairs come from a generator function."""
+
+    def __init__(self, pairs) -> None:
+        self._pairs = pairs
+
+    def __getitem__(self, key: str) -> object:
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+    def items(self):  # type: ignore[override]
+        return self._pairs()
+
+
+def test_a_queued_mapping_finished_by_recursion_is_not_captured_a_second_time() -> None:
+    """A and B are queued; A exposes a new C; C exposes B.  B is captured when C exposes
+    it, and the outer loop must not read it again after A repaired it."""
+
+    broken = _invalid_resource_dict()
+    reads: list[str] = []
+    b = _Items(lambda: _b_pairs())
+
+    def _b_pairs():
+        reads.append("b")
+        yield ("tenant_id", broken["tenant_id"])
+
+    c = _Items(lambda: iter((("b", b),)))
+
+    def _a_pairs():
+        yield ("c", c)
+        _repair_after_yield(broken)  # runs when the walk advances A
+
+    a = _Items(_a_pairs)
+    completed = _entry_flow((a, b))
+
+    assert broken["tenant_id"] == "tenant-a"                       # A repaired the backing
+    assert completed[1]["tenant_id"] == 5                          # B's first observation was kept
+    assert completed[0]["c"]["b"]["tenant_id"] == 5
+    assert reads == ["b"]                                          # and B was read exactly once
+
+
+def test_a_child_mapping_the_entry_walk_already_queued_is_captured_when_it_is_exposed() -> None:
+    """The same proxy is queued by the entry walk (second root) and exposed by a generator
+    before that generator is advanced; its first observation is the one at exposure."""
+
+    broken = _invalid_resource_dict()
+    shared = MappingProxyType(broken)
+
+    def _generator_pairs():
+        yield ("allowed_resources", (shared,))
+        _repair_after_yield(broken)
+
+    completed = _entry_flow((_Items(_generator_pairs), shared))
+
+    assert broken["tenant_id"] == "tenant-a"
+    assert dict(completed[0]["allowed_resources"][0])["tenant_id"] == 5
+    assert dict(completed[1])["tenant_id"] == 5
+
+
+def test_each_mapping_is_read_once_however_the_walk_reaches_it() -> None:
+    reads: list[str] = []
+
+    def counted(name):
+        def pairs():
+            reads.append(name)
+            yield ("leaf", name)
+        return _Items(pairs)
+
+    leaf = counted("leaf")
+    middle = _Items(lambda: iter((("leaf", leaf), ("leaf-again", leaf))))
+    top = _Items(lambda: iter((("middle", middle), ("leaf", leaf))))
+    _entry_flow((top, middle, leaf, [leaf, middle]))
+    assert sorted(reads) == ["leaf"]
