@@ -69,7 +69,7 @@ def load_junit(path_or_text):
     """Return a list of (test_id, classname, outcome, detail) from junit XML.
 
     ``outcome`` is ``passed``, ``skipped``, ``failed`` or ``error``; ``detail``
-    is the skip type and message for skips.
+    is the skip type, message and element text (the reason) for skips.
     """
 
     try:
@@ -89,7 +89,9 @@ def load_junit(path_or_text):
             cases.append((test_id, classname, "error", ""))
         elif case.find("skipped") is not None:
             node = case.find("skipped")
-            cases.append((test_id, classname, "skipped", f"{node.get('type', '')} {node.get('message', '')}"))
+            # The message of a collection skip is always "collection skipped"; the real reason is the element text.
+            text = " ".join((node.text or "").split())
+            cases.append((test_id, classname, "skipped", f"{node.get('type', '')} {node.get('message', '')} {text}".strip()))
         else:
             cases.append((test_id, classname, "passed", ""))
     return cases
@@ -175,7 +177,12 @@ MANIFEST = {
 def _report(*cases):
     body = []
     for classname, name, kind, message in cases:
-        if kind == "pass":
+        if kind == "skiptext":  # a collection skip: generic message, the reason is the element text
+            reason, _, text = message.partition("|")
+            body.append(
+                f'<testcase classname="{classname}" name="{name}"><skipped message="{reason}">{text}</skipped></testcase>'
+            )
+        elif kind == "pass":
             body.append(f'<testcase classname="{classname}" name="{name}" time="0.1"/>')
         elif kind == "skip":
             body.append(
@@ -220,6 +227,17 @@ def test_declared_skip_that_runs_or_disappears_is_rejected():
     gone = _report(("tests.test_a", "test_one", "pass", ""))
     for report in (ran, gone):
         assert _problems(report) == ["declared skip did not skip: tests.test_a::test_optional"]
+
+
+def test_a_collection_skip_is_judged_by_its_element_text_not_its_generic_message():
+    manifest = dict(MANIFEST, profiles={"host": {"skips": [
+        {"test": "::tests.test_story", "reason_contains": "absent module(s): contracts_x"},
+    ]}})
+    absent = _report(("", "tests.test_story", "skiptext", "collection skipped|('f.py', 3, 'Skipped: absent module(s): contracts_x')"))
+    broken = _report(("", "tests.test_story", "skiptext",
+                      "collection skipped|('f.py', 3, \"Skipped: could not import 'contracts_x': No module named 'dep'\")"))
+    assert _problems(absent, manifest=manifest) == []
+    assert _problems(broken, manifest=manifest) != []  # a present-but-broken module is not an absent one
 
 
 def test_skip_for_a_different_reason_is_rejected():

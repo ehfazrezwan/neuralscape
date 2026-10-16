@@ -34,13 +34,21 @@ import json
 import pytest
 from pydantic import ValidationError
 
-# The story composes the lifecycle, policy, freshness, inference and portability contracts; a tree that has
-# not imported them yet skips it as a whole instead of failing at collection.
-for _required in (
+# The story composes the lifecycle, policy, freshness, inference and portability contracts.  A tree that
+# has not imported them yet skips it as a whole, and the skip names the absent modules.  A module that is
+# present but broken (it exists and fails to import) is NOT skipped: it imports normally below and errors.
+import importlib.util
+
+_REQUIRED = (
     "contracts_lifecycle", "contracts_policy", "contracts_policy_reference", "contracts_freshness",
     "contracts_inference", "contracts_portability",
-):
-    pytest.importorskip(_required)
+)
+_ABSENT = [name for name in _REQUIRED if importlib.util.find_spec(name) is None]
+for _name in _REQUIRED:
+    if _name not in _ABSENT:
+        importlib.import_module(_name)  # present: import it now, so a broken module errors even while others are absent
+if _ABSENT:
+    pytest.skip("absent module(s): " + ", ".join(_ABSENT), allow_module_level=True)
 
 import contracts_pack as pack
 from contracts_bodies import parse_memory_body
