@@ -3588,3 +3588,95 @@ def test_a_valid_manifest_with_shared_models_still_validates() -> None:
     copy = copy.model_copy(update={"files": files})
     validated = validate_portable_manifest(copy)
     assert validated.files[1].checksum.digest == shared_checksum.digest
+
+
+# --- pinned shapes from a sweep of the receiving boundary ---------------------------
+
+_SWEEP_FILE = {"path": "canonical/a.txt", "size_bytes": 1,
+               "checksum": {"algorithm": "sha256", "digest": "a" * 64}, "entry_type": "file"}
+
+
+class _TwinKey(str):
+    """A key with the same text as a declared name but a different hash."""
+
+    def __hash__(self) -> int:
+        return str.__hash__(self) ^ 1
+
+    def __eq__(self, other: object) -> bool:
+        return str.__eq__(self, other)
+
+
+def test_an_object_spoofing_its_class_as_list_is_not_read_as_a_list() -> None:
+    class Spoof:
+        @property
+        def __class__(self):
+            return list
+
+        def __iter__(self):
+            return iter([_SWEEP_FILE])
+
+    with pytest.raises(ValidationError):
+        validate_portable_manifest(_manifest_with_files(Spoof()))
+
+
+@pytest.mark.parametrize("container", ["dict", "view"])
+def test_a_twin_key_cannot_smuggle_a_second_value_for_a_declared_name(container) -> None:
+    pairs = list(_SWEEP_FILE.items()) + [(_TwinKey("path"), "../escape")]
+    if container == "dict":
+        entry: object = dict(pairs)
+    else:
+        class View(Mapping):
+            def __getitem__(self, key):
+                return dict(pairs)[key]
+
+            def __iter__(self):
+                return iter(key for key, _ in pairs)
+
+            def __len__(self) -> int:
+                return len(pairs)
+
+            def items(self):
+                return iter(pairs)
+
+        entry = View()
+    with pytest.raises(ValidationError):
+        validate_portable_manifest(_manifest_with_files([entry]))
+
+
+def test_a_custom_mapping_pair_with_a_changing_iterator_is_read_once() -> None:
+    reads: list[int] = []
+
+    class Pair(tuple):
+        def __iter__(self):
+            reads.append(1)
+            if len(reads) == 1:
+                return iter(("path", "canonical/a.txt"))
+            return iter(("path", "../escape"))
+
+    pairs = [(key, value) for key, value in _SWEEP_FILE.items() if key != "path"]
+    pairs.append(Pair(("path", "canonical/a.txt")))
+
+    class View(Mapping):
+        def __getitem__(self, key):
+            raise KeyError(key)
+
+        def __iter__(self):
+            return iter(())
+
+        def __len__(self) -> int:
+            return len(pairs)
+
+        def items(self):
+            return iter(pairs)
+
+    second = validate_portable_manifest(valid_manifest()).files[1]
+    validated = validate_portable_manifest(_manifest_with_files([View(), second]))
+    assert validated.files[0].path == "canonical/a.txt"
+    assert len(reads) == 1
+
+
+def test_the_receiving_boundary_never_reads_the_clock() -> None:
+    import inspect
+
+    source = inspect.getsource(contracts_portability)
+    assert not [word for word in ("datetime.now", "time.time", "utcnow", "monotonic(") if word in source]
