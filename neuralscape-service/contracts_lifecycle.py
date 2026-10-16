@@ -341,12 +341,16 @@ def _materialize_contract_graph(
     return _materialize_captured_graph(root, captured_by_identity)
 
 
+def _article(name: str) -> str:
+    return "an" if name[:1] in "AEIOU" else "a"
+
+
 def _captured_model(
     model_type: type[_ModelT],
     value: object,
 ) -> _CapturedGraphSnapshot:
     if not isinstance(value, model_type):
-        raise TypeError(f"value must be a {model_type.__name__}")
+        raise TypeError(f"value must be {_article(model_type.__name__)} {model_type.__name__}")
     return _capture_contract_graph(value)
 
 
@@ -368,7 +372,7 @@ def _revalidated_inventory_model(
     """Validate a public-view item, reusing entry-time state when available."""
 
     if not isinstance(value, model_type):
-        raise TypeError(f"value must be a {model_type.__name__}")
+        raise TypeError(f"value must be {_article(model_type.__name__)} {model_type.__name__}")
     captured = _cached_identity_capture(value, captured_by_identity)
     if captured is None:
         captured = _capture_native_contract_graph(
@@ -459,6 +463,13 @@ class MemoryRecord(VersionedContract):
         elif self.body is None:
             raise ValueError("non-erased records require a body")
         _require_unique_source_ids(self.required_parents, "required_parents")
+        for handle in self.source_refs:
+            # Lineage may name another tenant's source (owner direction ``lineage = authorized_cross``)
+            # but only as marked data: resolution always needs a current authorization check.
+            if handle.cross_tenant != (handle.tenant_id != self.tenant_id):
+                raise ValueError(
+                    "source_refs must set cross_tenant exactly when the handle names another tenant"
+                )
         return self
 
 
@@ -481,6 +492,9 @@ class StageEvidenceRequirement(ContractModel):
     upstream_stages: tuple[ProcessingStage, ...]
     committed_sources: tuple[SourceVersion, ...]
     minimum_output_refs: Literal[0, 1]
+    # Empty source equality is not an application witness.  A stage that genuinely consumes no
+    # source must say so here; otherwise an APPLIED receipt needs a nonempty applied source set.
+    no_source_witness: bool = False
 
     @field_validator("minimum_output_refs", mode="before")
     @classmethod
@@ -527,8 +541,9 @@ class Intent(VersionedContract):
 
     @model_validator(mode="after")
     def validate_stage_requirements(self) -> Intent:
-        if any(item.tenant_id != self.tenant_id for item in self.target_refs):
-            raise ValueError("target_refs must match intent tenant_id")
+        if any(item.tenant_id != self.tenant_id or item.cross_tenant for item in self.target_refs):
+            # A write never targets another tenant's record; the cross-tenant marker is for lineage.
+            raise ValueError("target_refs must match intent tenant_id and cannot be cross_tenant")
         _require_unique_source_ids(self.source_preconditions, "source_preconditions")
         if not self.stage_requirements:
             raise ValueError("stage_requirements must not be empty")
@@ -587,6 +602,28 @@ class StageError(ContractModel):
     safe_message: Annotated[str, Field(min_length=1, max_length=1024)]
 
 
+class UpstreamApplication(ContractModel):
+    """Immutable reference to the upstream stage application a downstream stage consumed.
+
+    It names the identity of one APPLIED upstream receipt (intent, stage, attempt, effect id), so
+    causal order between stages is carried by an explicit dependency, never by comparing worker
+    clocks (owner direction ``causality = application_refs``).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    intent_id: OpaqueId
+    stage: ProcessingStage
+    attempt: SafeCounter
+    effect_id: OpaqueId
+
+    @model_validator(mode="after")
+    def validate_attempt(self) -> UpstreamApplication:
+        if self.attempt < 1:
+            raise ValueError("attempt must be at least 1")
+        return self
+
+
 class StageReceipt(VersionedContract):
     """Frozen validated observation for one attempt, not aggregate completion.
 
@@ -607,11 +644,19 @@ class StageReceipt(VersionedContract):
     error: StageError | None
     started_at: AwareDatetime | None
     finished_at: AwareDatetime | None
+    # Additive (default empty, so receipts written before this field existed still parse): the
+    # upstream applications this stage consumed.  Only APPLIED receipts may carry them.
+    upstream_applications: tuple[UpstreamApplication, ...] = ()
 
     @model_validator(mode="after")
     def validate_receipt_semantics(self) -> StageReceipt:
         if self.attempt < 1:
             raise ValueError("attempt must be at least 1")
+        if self.upstream_applications:
+            if self.status is not StageStatus.APPLIED:
+                raise ValueError("only applied stage receipts may carry upstream_applications")
+            if len({item.stage for item in self.upstream_applications}) != len(self.upstream_applications):
+                raise ValueError("upstream_applications must cite each upstream stage once")
         _require_unique_source_ids(self.applied_sources, "applied_sources")
         _require_unique_source_ids(self.committed_sources, "committed_sources")
         _require_unique_reference_handles(self.output_refs, "output_refs")
@@ -783,6 +828,20 @@ def validate_required_stage_claim(
       was cancelled, else ``SUPERSEDED`` if any was superseded, else (all
       skipped) ``PARTIAL``.
 
+    Application witnesses: an APPLIED receipt needs a nonempty ``applied_sources`` unless its
+    requirement declares ``no_source_witness`` (empty equality is not evidence), and must cite,
+    in ``upstream_applications``, exactly one APPLIED upstream receipt (intent, stage, attempt,
+    effect id) per upstream stage it consumed.
+
+    Clock rule (pinned by test): receipt timestamps are *not* compared with
+    ``Intent.accepted_at`` or with each other.  Wall-clock times from different workers are not
+    causal evidence; sequence is proven by the ledger's per-aggregate versions and, between
+    stages, by the upstream application witnesses above.
+
+    Tenancy: ``target_refs`` and ``output_refs`` stay tenant-scoped (a write never targets or
+    produces another tenant's record); only lineage handles (``MemoryRecord.source_refs``) may be
+    marked ``cross_tenant``, as data whose resolution needs a fresh authorization check.
+
     This checks consistency of caller-supplied reports.  It does not prove an
     external effect exists, choose authoritative output references, establish
     retry exhaustion, or select a runtime retry policy.
@@ -794,7 +853,7 @@ def validate_required_stage_claim(
         raise TypeError("receipts must be a tuple")
 
     if not isinstance(intent, Intent):
-        raise TypeError("value must be a Intent")
+        raise TypeError("value must be an Intent")
     try:
         captured_intent = _capture_contract_graph(intent)
         intent_capture_error: Exception | None = None
@@ -845,7 +904,7 @@ def validate_required_stage_claim(
         if receipt.intent_id != intent.id:
             raise ValueError("stage receipt belongs to a different intent")
         if any(
-            output_ref.tenant_id != intent.tenant_id
+            output_ref.tenant_id != intent.tenant_id or output_ref.cross_tenant
             for output_ref in receipt.output_refs
         ):
             raise ValueError("stage receipt output_refs must match intent tenant_id")
@@ -910,6 +969,25 @@ def validate_required_stage_claim(
                 raise ValueError(
                     "applied required-stage receipt requires upstream applied support"
                 )
+            if not receipt.applied_sources and not requirement.no_source_witness:
+                raise ValueError(
+                    "applied required-stage receipt needs a nonempty source witness "
+                    "unless the requirement declares no_source_witness"
+                )
+            cited = {item.stage: item for item in receipt.upstream_applications}
+            if set(cited) != set(requirement.upstream_stages):
+                raise ValueError(
+                    "applied required-stage receipt must cite exactly the upstream "
+                    "applications it consumed"
+                )
+            for upstream, witness in cited.items():
+                if witness.intent_id != intent.id or not any(
+                    (item.attempt, item.effect_id) == (witness.attempt, witness.effect_id)
+                    for item in applied_by_stage[upstream]
+                ):
+                    raise ValueError(
+                        "upstream application witness does not name an applied upstream receipt"
+                    )
         if stage_applications:
             first = stage_applications[0]
             for receipt in stage_applications[1:]:

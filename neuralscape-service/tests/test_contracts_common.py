@@ -362,6 +362,7 @@ def test_native_and_json_representations_preserve_values() -> None:
         "id": " Edge/01 ",
         "tenant_id": "Tenant-A",
         "resolver": "graph_resolve",
+        "cross_tenant": False,  # additive marker, default False
     }
     assert ReferenceHandle.model_validate_json(handle.model_dump_json()) == handle
 
@@ -378,7 +379,8 @@ def test_generated_json_schemas_are_closed_and_express_bounds() -> None:
     source_schema = SourceVersion.model_json_schema()
 
     assert reference_schema["additionalProperties"] is False
-    assert reference_schema["required"] == ["kind", "id", "tenant_id", "resolver"]
+    assert reference_schema["required"] == ["kind", "id", "tenant_id", "resolver"]  # cross_tenant is optional (default False)
+    assert reference_schema["properties"]["cross_tenant"]["default"] is False
     assert set(reference_schema["properties"]["kind"]["enum"]) == set(
         get_args(ReferenceKind)
     )

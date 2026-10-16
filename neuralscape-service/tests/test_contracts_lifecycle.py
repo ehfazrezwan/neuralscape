@@ -27,6 +27,7 @@ from contracts_lifecycle import (
     StageError,
     StageReceipt,
     StageStatus,
+    UpstreamApplication,
     is_legal_intent_transition,
     source_versions_match,
     validate_required_stage_claim,
@@ -312,6 +313,7 @@ def requirement(
     upstream_stages: tuple[ProcessingStage, ...] = (),
     committed_sources: tuple[SourceVersion, ...] = (),
     minimum_output_refs: int = 0,
+    no_source_witness: bool = False,
 ) -> StageEvidenceRequirement:
     return StageEvidenceRequirement(
         stage=stage,
@@ -320,6 +322,7 @@ def requirement(
         upstream_stages=upstream_stages,
         committed_sources=committed_sources,
         minimum_output_refs=minimum_output_refs,  # type: ignore[arg-type]
+        no_source_witness=no_source_witness,
     )
 
 
@@ -874,6 +877,7 @@ def test_create_then_graph_evidence_is_explicit_and_order_independent() -> None:
         precondition_source_ids=(),
         committed_sources=(committed,),
         minimum_output_refs=1,
+        no_source_witness=True,  # a create consumes no prior source: declared, not implied by emptiness
     )
     graph = requirement(
         ProcessingStage.GRAPH,
@@ -897,6 +901,13 @@ def test_create_then_graph_evidence_is_explicit_and_order_independent() -> None:
         sources=(committed,),
         outputs=(reference("graph-view"),),
     )
+    graph_receipt = StageReceipt.model_validate({
+        **graph_receipt.model_dump(),
+        "upstream_applications": (UpstreamApplication(
+            intent_id="intent-1", stage=ProcessingStage.CANONICAL, attempt=1,
+            effect_id="create-memory-effect",
+        ),),
+    })
 
     for declared in ((canonical, graph), (graph, canonical)):
         command = intent_with_requirements(
@@ -947,6 +958,7 @@ def test_source_free_zero_result_stage_can_apply_with_declared_effect() -> None:
             effect_id="stable-source-free-effect",
             precondition_source_ids=(),
             minimum_output_refs=0,
+            no_source_witness=True,
         ),
         source_preconditions=(),
     )
