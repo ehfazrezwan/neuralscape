@@ -1761,3 +1761,54 @@ def test_objects_the_engine_snapshot_is_keyed_by_stay_alive_for_the_call():
     del child, holder
     gc.collect()
     assert alive() is not None  # an id() cannot be recycled while the call's tables hold the object
+
+
+# ── a reused subtree is shared by the snapshot but walked by path afterwards ──
+
+
+def _aliased(levels: int):
+    value = "x"
+    for _ in range(levels):
+        value = [value, value]  # two references to one list at every level: 2**levels paths
+    return value
+
+
+def _array_schema():
+    return {"$schema": JSON_SCHEMA_DIALECT, "type": ["array", "string"]}
+
+
+def test_a_proposal_output_that_reuses_a_subtree_exponentially_is_refused_quickly():
+    import time
+
+    request = generation_request(schema=_array_schema())
+    proposal = {
+        "proposal_id": "proposal-1", "output": _aliased(22), "support_span_ids": ("support-1",),
+        "machine_authored": True,
+    }
+    result = generation_result().model_copy(update={"proposals": (proposal,)})
+    started = time.monotonic()
+    with pytest.raises(ValueError, match="native discovery budget"):
+        validate_generation_result(request, result)
+    assert time.monotonic() - started < 2.0  # 2**22 paths took about 14 s to walk before
+
+
+def test_a_declared_output_schema_that_reuses_a_subtree_exponentially_is_refused_quickly():
+    import time
+
+    request = generation_request()
+    schema = {**request.output_schema, "examples": [_aliased(22)]}
+    started = time.monotonic()
+    with pytest.raises(ValueError, match="native discovery budget"):
+        validate_generation_result(request.model_copy(update={"output_schema": schema}), generation_result())
+    assert time.monotonic() - started < 2.0
+
+
+def test_modest_reuse_and_large_ordinary_json_are_still_accepted():
+    request = generation_request(schema=_array_schema())
+    for output in (_aliased(8), list(range(40_000))):
+        proposal = {
+            "proposal_id": "proposal-1", "output": output, "support_span_ids": ("support-1",),
+            "machine_authored": True,
+        }
+        result = generation_result().model_copy(update={"proposals": (proposal,)})
+        assert validate_generation_result(request, result).compliant

@@ -482,6 +482,44 @@ def _snapshot_native_value(
             active.remove(identity)
 
 
+def _bound_expanded_size(native: Any, budget: DiscoveryBudget) -> None:
+    """Refuse a snapshot whose expansion by path is larger than the edge allowance.
+
+    The snapshot shares one copy of a reused subtree between every path that reaches it, so it
+    is cheap to build, but everything that follows (strict validation, the JSON scans, the
+    schema check) walks the *paths*: a value that holds itself twice at each of 40 levels is a
+    few hundred bytes and 2**40 paths.  Each distinct container is sized once, children first,
+    by identity (``entries + the expanded size of its children``), so the work is proportional
+    to the distinct graph, and a total above the tier's edge limit is the stable budget error.
+    """
+
+    limit = budget.tier.max_edges
+    sizes: dict[int, int] = {}
+    pending: list[tuple[Any, bool]] = [(native, False)]
+    while pending:
+        value, expanded = pending.pop()
+        kind = type(value)
+        if kind is dict:
+            children = tuple(dict.values(value))
+        elif kind is list or kind is tuple:
+            children = tuple(value)
+        else:
+            continue
+        identity = id(value)
+        if not expanded:
+            if identity in sizes:
+                continue
+            pending.append((value, True))
+            pending.extend((child, False) for child in children if id(child) not in sizes)
+            continue
+        total = len(children)
+        for child in children:
+            total += sizes.get(id(child), 0)
+            if total > limit:
+                raise ValueError(DISCOVERY_BUDGET_MESSAGE)
+        sizes[identity] = total
+
+
 def _validated_contract_snapshot(
     value: Any,
     expected_type: type[_ContractT],
@@ -549,6 +587,7 @@ def _validated_contract_snapshot_from_frozen(
         )
     except RecursionError as exc:
         raise ValueError(f"contract graph nesting is invalid at {label}") from exc
+    _bound_expanded_size(native, budget)
     return expected_type.model_validate(native)
 
 
