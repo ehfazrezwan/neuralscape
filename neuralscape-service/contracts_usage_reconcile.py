@@ -456,6 +456,44 @@ def _native_snapshot(
     _frozen_models: dict[int, _FrozenModelStorage] | None = None,
     _frozen_dicts: dict[int, _FrozenDictStorage] | None = None,
     _frozen_tuples: dict[int, _FrozenTupleStorage] | None = None,
+    _memo: dict[int, tuple[object, object]] | None = None,
+) -> object:
+    """Project a nested native/model graph once per distinct object.
+
+    Each container is projected at its first observation and the result is
+    replayed for every later reference to the same object, so a graph that
+    shares descendants costs time proportional to its distinct objects rather
+    than to the number of paths, and a public traversal hook runs once per
+    object per call.
+    """
+
+    if _memo is None:
+        _memo = {}
+    if isinstance(value, (BaseModel, Mapping, list, tuple, set, frozenset)):
+        cached = _memo.get(id(value))
+        if cached is not None and cached[0] is value:
+            return cached[1]
+    result = _snapshot_uncached(
+        value,
+        active,
+        _frozen_models=_frozen_models,
+        _frozen_dicts=_frozen_dicts,
+        _frozen_tuples=_frozen_tuples,
+        _memo=_memo,
+    )
+    if isinstance(value, (BaseModel, Mapping, list, tuple, set, frozenset)):
+        _memo[id(value)] = (value, result)
+    return result
+
+
+def _snapshot_uncached(
+    value: object,
+    active: set[int] | None = None,
+    *,
+    _frozen_models: dict[int, _FrozenModelStorage] | None = None,
+    _frozen_dicts: dict[int, _FrozenDictStorage] | None = None,
+    _frozen_tuples: dict[int, _FrozenTupleStorage] | None = None,
+    _memo: dict[int, tuple[object, object]],
 ) -> object:
     """Copy a nested native/model graph without trusting model construction.
 
@@ -530,6 +568,7 @@ def _native_snapshot(
                     _frozen_models=_frozen_models,
                     _frozen_dicts=_frozen_dicts,
                     _frozen_tuples=_frozen_tuples,
+                    _memo=_memo,
                 )
                 for name, field_value in stored_items
             }
@@ -542,6 +581,7 @@ def _native_snapshot(
                         _frozen_models=_frozen_models,
                         _frozen_dicts=_frozen_dicts,
                         _frozen_tuples=_frozen_tuples,
+                        _memo=_memo,
                     )
                     for name, field_value in extra_items
                 }
@@ -585,6 +625,7 @@ def _native_snapshot(
                         _frozen_models=_frozen_models,
                         _frozen_dicts=_frozen_dicts,
                         _frozen_tuples=_frozen_tuples,
+                        _memo=_memo,
                     )
                     try:
                         projected[key] = projected_value
@@ -599,6 +640,7 @@ def _native_snapshot(
                     _frozen_models=_frozen_models,
                     _frozen_dicts=_frozen_dicts,
                     _frozen_tuples=_frozen_tuples,
+                    _memo=_memo,
                 )
                 try:
                     projected[key] = projected_value
@@ -614,6 +656,7 @@ def _native_snapshot(
                     _frozen_models=_frozen_models,
                     _frozen_dicts=_frozen_dicts,
                     _frozen_tuples=_frozen_tuples,
+                    _memo=_memo,
                 )
                 for item in value
             ]
@@ -635,6 +678,7 @@ def _native_snapshot(
                     _frozen_models=_frozen_models,
                     _frozen_dicts=_frozen_dicts,
                     _frozen_tuples=_frozen_tuples,
+                    _memo=_memo,
                 )
                 for item in frozen_tuple[1]
             )
@@ -646,6 +690,7 @@ def _native_snapshot(
                     _frozen_models=_frozen_models,
                     _frozen_dicts=_frozen_dicts,
                     _frozen_tuples=_frozen_tuples,
+                    _memo=_memo,
                 )
                 for item in value
             }
@@ -656,6 +701,7 @@ def _native_snapshot(
                 _frozen_models=_frozen_models,
                 _frozen_dicts=_frozen_dicts,
                 _frozen_tuples=_frozen_tuples,
+                _memo=_memo,
             )
             for item in value
         )
@@ -793,15 +839,21 @@ def reconcile_usage_events(events: Iterable[UsageEvent]) -> UsageReconciliation:
     """
 
     by_id: dict[str, UsageEvent] = {}
+    conflicting_ids: set[str] = set()
     for supplied_event in events:
         event = _validated_event_snapshot(supplied_event)
         existing = by_id.get(event.event_id)
         if existing is None:
             by_id[event.event_id] = event
         elif _event_fingerprint(existing) != _event_fingerprint(event):
-            raise UsageReconciliationError(
-                "conflicting_event_id", f"event ID {event.event_id} has two payloads"
-            )
+            conflicting_ids.add(event.event_id)
+    if conflicting_ids:
+        # Report the smallest conflicting ID so the error does not depend on
+        # which conflict the input order happened to reach first.
+        conflict_id = min(conflicting_ids)
+        raise UsageReconciliationError(
+            "conflicting_event_id", f"event ID {conflict_id} has two payloads"
+        )
 
     if not by_id:
         raise UsageReconciliationError(
