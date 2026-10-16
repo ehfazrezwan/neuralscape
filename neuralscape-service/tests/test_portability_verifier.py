@@ -1194,3 +1194,60 @@ def test_a_zip64_end_record_with_ordinary_end_fields_verifies_end_to_end(tmp_pat
     assert entries != 0xFFFF  # the ordinary end record is not saturated
     report = verify_bundle(path)
     assert report.ok, _codes(report)
+
+
+# ---- with a zip64 locator, each ordinary end-record field is its sentinel or the zip64 value
+
+_ORDINARY_FIELDS = {  # offset in the end record, struct format, sentinel
+    "disk": (4, "<H", 0xFFFF),
+    "directory_disk": (6, "<H", 0xFFFF),
+    "entries_this_disk": (8, "<H", 0xFFFF),
+    "entries_total": (10, "<H", 0xFFFF),
+    "directory_size": (12, "<I", 0xFFFFFFFF),
+    "directory_offset": (16, "<I", 0xFFFFFFFF),
+}
+
+
+def _with_ordinary_field(path: Path, field: str, value=None, delta: int = 0) -> Path:
+    import struct
+
+    raw = bytearray(path.read_bytes())
+    at = len(raw) - 22
+    offset, fmt, _sentinel = _ORDINARY_FIELDS[field]
+    current = struct.unpack_from(fmt, raw, at + offset)[0]
+    struct.pack_into(fmt, raw, at + offset, current + delta if value is None else value)
+    path.write_bytes(bytes(raw))
+    return path
+
+
+@pytest.mark.parametrize("field", sorted(_ORDINARY_FIELDS))
+def test_an_ordinary_end_field_that_disagrees_with_the_zip64_record_is_refused_before_parsing(
+    tmp_path, monkeypatch, field
+) -> None:
+    path = _with_ordinary_field(_zip64_end_record_archive(tmp_path, monkeypatch), field, delta=1)
+    assert zipfile.ZipFile(path).namelist()  # the archive library reads the zip64 values and ignores the field
+    monkeypatch.setattr(pv.zipfile, "ZipFile", lambda *a, **k: pytest.fail("parsed"))
+    assert _codes(verify_bundle(path)) == {pv.ARCHIVE_FRAMING}
+
+
+@pytest.mark.parametrize("field", sorted(_ORDINARY_FIELDS))
+def test_the_framing_check_refuses_an_ordinary_end_field_that_disagrees_with_the_zip64_record(
+    tmp_path, monkeypatch, field
+) -> None:
+    path = _with_ordinary_field(_zip64_end_record_archive(tmp_path, monkeypatch), field, delta=1)
+    monkeypatch.setattr(pv, "_precheck_central_directory", lambda target, report: True)  # the second line of defence
+    assert pv.ARCHIVE_FRAMING in _codes(verify_bundle(path))
+
+
+def test_ordinary_end_fields_carrying_the_zip64_sentinels_verify(tmp_path, monkeypatch) -> None:
+    path = _zip64_end_record_archive(tmp_path, monkeypatch)
+    for field, (_offset, _fmt, sentinel) in _ORDINARY_FIELDS.items():
+        _with_ordinary_field(path, field, value=sentinel)
+    report = verify_bundle(path)
+    assert report.ok, _codes(report)
+
+
+def test_ordinary_end_fields_equal_to_the_zip64_record_verify(tmp_path, monkeypatch) -> None:
+    path = _zip64_end_record_archive(tmp_path, monkeypatch)  # Python writes the real values where they fit
+    report = verify_bundle(path)
+    assert report.ok, _codes(report)

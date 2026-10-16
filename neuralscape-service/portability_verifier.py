@@ -45,7 +45,7 @@ import unicodedata
 import zipfile
 import zlib
 from dataclasses import dataclass, field
-from typing import Any, BinaryIO, Iterator, NamedTuple
+from typing import Any, BinaryIO, Iterator, NamedTuple, Sequence
 
 from pydantic import ValidationError
 
@@ -210,6 +210,24 @@ _EOCD = struct.Struct("<4sHHHHIIH")
 _U32_MAX = 0xFFFFFFFF
 
 
+_END_RECORD_SENTINELS = (0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, _U32_MAX, _U32_MAX)
+
+
+def _end_record_agrees(ordinary: Sequence[int], zip64: Sequence[int]) -> bool:
+    """Whether each ordinary end-record field is its zip64 sentinel or exactly the zip64 value.
+
+    Both tuples are ``(disk, directory disk, entries on this disk, entries, directory size,
+    directory offset)``.  The archive library takes the zip64 values whenever the locator is
+    present, but readers that use the ordinary fields when they are not saturated would then
+    read a different directory, so a disagreement is refused rather than resolved either way.
+    """
+
+    return all(
+        field == sentinel or field == value
+        for field, sentinel, value in zip(ordinary, _END_RECORD_SENTINELS, zip64)
+    )
+
+
 class _Framing(Exception):
     """The archive bytes are not exactly the records the directory claims."""
 
@@ -322,7 +340,7 @@ def _check_framing(
         if eocd[0] != _EOCD_SIGNATURE or eocd[7] != 0:
             raise _Framing("trailing data or archive comment after the end record")
         eocd_position = size - _EOCD.size
-        _sig, disk, cd_disk, _entries_here, entries, cd_size, cd_offset, _comment = eocd
+        _sig, disk, cd_disk, entries_here, entries, cd_size, cd_offset, _comment = eocd
         end_of_directory = eocd_position
         saturated = (
             entries == 0xFFFF
@@ -333,7 +351,8 @@ def _check_framing(
         )
         # Like the archive library (and the precheck), a zip64 locator directly before the end
         # record means the zip64 end record governs, whether or not the ordinary fields are
-        # saturated; saturated fields without a locator are refused.
+        # saturated; saturated fields without a locator are refused, and ordinary fields that
+        # disagree with the zip64 record are refused too.
         locator_position = eocd_position - 20
         locator = b""
         if locator_position >= 0:
@@ -350,7 +369,10 @@ def _check_framing(
             record_size = struct.unpack_from("<Q", record, 4)[0]
             if record_offset + 12 + record_size != locator_position:
                 raise _Framing("gap before the zip64 locator")
-            cd_size, cd_offset = struct.unpack_from("<QQ", record, 40)
+            zip64_fields = struct.unpack_from("<IIQQQQ", record, 16)
+            if not _end_record_agrees((disk, cd_disk, entries_here, entries, cd_size, cd_offset), zip64_fields):
+                raise _Framing("end record disagrees with the zip64 end record")
+            cd_size, cd_offset = zip64_fields[4], zip64_fields[5]
             end_of_directory = record_offset
         if cd_offset + cd_size != end_of_directory:
             raise _Framing("gap between the central directory and the end record")
@@ -729,7 +751,9 @@ def _precheck_central_directory(target: str, report: VerificationReport) -> bool
     * the last 22 bytes must be the end record with no comment (the library's first choice; a
       comment is refused anyway by the framing check);
     * when a zip64 locator sits directly before it (the library then always uses zip64), the zip64
-      end record must be where the locator points and end exactly at the locator;
+      end record must be where the locator points and end exactly at the locator, and each ordinary
+      end-record field must be its zip64 sentinel or exactly the zip64 value (readers that use the
+      ordinary fields would otherwise read a different directory);
     * end-record fields saturated for zip64 without a locator, other disks, a directory that does not
       end where the (zip64) end record begins, or one that starts anywhere but its stored offset (data
       before the first record) are refused;
@@ -763,6 +787,7 @@ def _precheck_central_directory(target: str, report: VerificationReport) -> bool
             )
             if signature != _EOCD_SIGNATURE or comment_length != 0:
                 return refuse(ARCHIVE_FRAMING, "trailing data or archive comment after the end record")
+            ordinary = (disk, cd_disk, entries_here, entries, cd_size, cd_offset)
             locator = b""
             if eocd_at >= _ZIP64_LOCATOR.size:
                 raw.seek(eocd_at - _ZIP64_LOCATOR.size)
@@ -781,6 +806,8 @@ def _precheck_central_directory(target: str, report: VerificationReport) -> bool
                 # The record (with any extensible data it declares) must end exactly at the locator.
                 if record_signature != _ZIP64_EOCD_SIGNATURE or record_at + 12 + record_size != locator_at:
                     return refuse(ARCHIVE_FRAMING, "bad zip64 end record")
+                if not _end_record_agrees(ordinary, (disk, cd_disk, entries_here, entries, cd_size, cd_offset)):
+                    return refuse(ARCHIVE_FRAMING, "end record disagrees with the zip64 end record")
                 directory_end = record_at
             else:
                 if entries == 0xFFFF or entries_here == 0xFFFF or cd_size == _U32_MAX or cd_offset == _U32_MAX:
