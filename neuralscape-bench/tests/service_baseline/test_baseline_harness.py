@@ -178,3 +178,14 @@ def test_manifest_series_for_accept_only_cells_has_no_completion_measurement():
     assert ARMS["plain"] == {}
     assert ARMS["enforce"]["NS_POLICY_MODE"] == "enforce" and ARMS["enforce"]["HARNESS_WIRE_ENFORCER"] == "1"
     assert "AUTHORITY_ENABLED" not in ARMS["ledger"]
+
+
+def test_postgres_arms_use_a_non_superuser_owner_role_and_separate_schemas():
+    from neuralscape_bench.service_baseline.runner import ARMS
+
+    ledger, governed = ARMS["ledger-pg"], ARMS["governed-pg"]
+    assert ledger["LEDGER_BACKEND"] == "postgres" and "AUTHORITY_ENABLED" not in ledger
+    assert governed["AUTHORITY_BACKEND"] == "postgres"
+    assert "user=ns_owner" in ledger["LEDGER_POSTGRES_DSN"] and "user=postgres" not in ledger["LEDGER_POSTGRES_DSN"]
+    assert "search_path=ledger" in ledger["LEDGER_POSTGRES_DSN"]
+    assert "search_path=authority" in governed["AUTHORITY_POSTGRES_DSN"]

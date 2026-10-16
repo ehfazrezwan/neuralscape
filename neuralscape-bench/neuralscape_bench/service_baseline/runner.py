@@ -41,8 +41,8 @@ SCHEMA = "candidate-v1"
 PROJECT = "ns-g-bench"
 BENCH_DIR = Path(__file__).resolve().parents[2]
 COMPOSE_FILE = BENCH_DIR / "scripts" / "service_baseline" / "compose.yml"
-SERVICES = ("api", "worker", "graph-worker", "ingest-worker", "ledger-worker", "fake-provider", "neo4j", "redis", "qdrant")
-MEM_LIMITS = {"api": 3 << 30, "ledger-worker": 2 << 30, "worker": 2 << 30, "graph-worker": 2 << 30, "ingest-worker": 2 << 30,
+SERVICES = ("api", "worker", "graph-worker", "ingest-worker", "ledger-worker", "fake-provider", "neo4j", "redis", "qdrant", "pg")
+MEM_LIMITS = {"pg": 1 << 30, "api": 3 << 30, "ledger-worker": 2 << 30, "worker": 2 << 30, "graph-worker": 2 << 30, "ingest-worker": 2 << 30,
               "fake-provider": 512 << 20, "neo4j": 2 << 30, "redis": 512 << 20, "qdrant": 2 << 30}
 _UNITS = {"b": 1, "kib": 1 << 10, "mib": 1 << 20, "gib": 1 << 30, "kb": 10**3, "mb": 10**6, "gb": 10**9}
 
@@ -155,7 +155,15 @@ def host_facts() -> dict[str, Any]:
 
 TOKEN_SECRET = "bench-token-secret"
 # Durability arms: environment passed to the compose stack.
+PG_OWNER_PASSWORD = "bench-owner-password"
+PG_DSN = "host=pg dbname=postgres user=ns_owner password=" + PG_OWNER_PASSWORD + " options='-c search_path={schema}'"
 ARMS: dict[str, dict[str, str]] = {
+    "ledger-pg": {"LEDGER_ENABLED": "true", "LEDGER_BACKEND": "postgres",
+                  "LEDGER_POSTGRES_DSN": PG_DSN.format(schema="ledger")},
+    "governed-pg": {"LEDGER_ENABLED": "true", "LEDGER_BACKEND": "postgres",
+                    "LEDGER_POSTGRES_DSN": PG_DSN.format(schema="ledger"),
+                    "AUTHORITY_ENABLED": "true", "AUTHORITY_BACKEND": "postgres",
+                    "AUTHORITY_POSTGRES_DSN": PG_DSN.format(schema="authority")},
     "plain": {},
     "ledger": {"LEDGER_ENABLED": "true"},
     "governed": {"LEDGER_ENABLED": "true", "AUTHORITY_ENABLED": "true"},
@@ -166,6 +174,17 @@ ARMS: dict[str, dict[str, str]] = {
 
 def compose(*args: str, env: dict[str, str]) -> str:
     return sh("docker", "compose", "-p", PROJECT, "-f", str(COMPOSE_FILE), *args, env=env)
+
+
+def start_postgres(env: dict[str, str]) -> None:
+    """Start PostgreSQL and create a non-superuser owner role with one schema per store."""
+
+    compose("up", "-d", "--wait", "pg", env=env)
+    statements = (
+        f"CREATE ROLE ns_owner LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD '{PG_OWNER_PASSWORD}'; "
+        "CREATE SCHEMA ledger AUTHORIZATION ns_owner; CREATE SCHEMA authority AUTHORIZATION ns_owner;"
+    )
+    compose("exec", "-T", "pg", "psql", "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-c", statements, env=env)
 
 
 def cold_start_seconds(env: dict[str, str], timeout_s: float = 420) -> float:
@@ -259,6 +278,8 @@ def main() -> None:
     sampler = StatsSampler()
     started = datetime.now(timezone.utc)
     try:
+        if env.get("LEDGER_BACKEND") == "postgres":
+            start_postgres(env)
         compose("run", "--rm", "--no-deps", "seed", env=env)
         record["cold_start_seconds"] = cold_start_seconds(env)
         sampler.start()
@@ -272,7 +293,7 @@ def main() -> None:
         record["logs_tail"] = {s: compose("logs", "--no-color", "--tail", "40", s, env=env) for s in ("api", "worker", "graph-worker")}
         record["policy_log_lines"] = [line for line in compose("logs", "--no-color", "api", env=env).splitlines()
                                        if "policy_decision" in line or "policy" in line.lower() and "denied" in line.lower()][:20]
-        compose("--profile", "ledger", "down", "-v", "--remove-orphans", env=env)
+        compose("--profile", "ledger", "--profile", "pg", "down", "-v", "--remove-orphans", env=env)
     record["host_after"] = host_facts()
     results = json.loads((out_dir / "driver.json").read_text())
     record["resource_peaks"] = peaks(sampler.samples)

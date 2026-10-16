@@ -11,7 +11,7 @@ import sys
 
 sys.path.insert(0, "/app/neuralscape-service")
 
-from authority_store_sql import SqliteAuthorityStore  # noqa: E402
+from authority_store_sql import PostgresAuthorityStore, SqliteAuthorityStore  # noqa: E402
 from contracts_policy import PolicyStatement  # noqa: E402
 from identity_binding import bind_identity  # noqa: E402
 from policy_enforcement import pool_handle  # noqa: E402
@@ -22,7 +22,10 @@ ACTIONS = ("read", "search", "list", "create", "update", "delete", "background_d
 
 
 def main(authority_path: str, token_path: str, secret: str) -> None:
-    store = SqliteAuthorityStore(authority_path)
+    if os.environ.get("AUTHORITY_BACKEND") == "postgres":
+        store = PostgresAuthorityStore(os.environ["AUTHORITY_POSTGRES_DSN"])
+    else:
+        store = SqliteAuthorityStore(authority_path)
     subject = bind_identity(store, "local", USER).subject_id
     store.add_subject(subject, TENANT, "human", f"cred-{USER}")
     statements = []

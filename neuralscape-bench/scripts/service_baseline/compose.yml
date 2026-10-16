@@ -20,8 +20,12 @@ x-service-env: &service-env
   # Durability arms (all default off; set by the runner per arm).
   LEDGER_ENABLED: ${LEDGER_ENABLED:-false}
   LEDGER_SQLITE_PATH: /state/ledger.db
+  LEDGER_BACKEND: ${LEDGER_BACKEND:-sqlite}
+  LEDGER_POSTGRES_DSN: ${LEDGER_POSTGRES_DSN:-}
   AUTHORITY_ENABLED: ${AUTHORITY_ENABLED:-false}
   AUTHORITY_SQLITE_PATH: /state/authority.db
+  AUTHORITY_BACKEND: ${AUTHORITY_BACKEND:-sqlite}
+  AUTHORITY_POSTGRES_DSN: ${AUTHORITY_POSTGRES_DSN:-}
   NS_POLICY_MODE: ${NS_POLICY_MODE:-off}
   NS_AUTH_PROFILE: ${NS_AUTH_PROFILE:-legacy_compat}
   NEURALSCAPE_USER_TOKEN_SECRET: ${TOKEN_SECRET:-}
@@ -39,6 +43,15 @@ services:
     environment: {PYTHONPATH: /bench}
     volumes: *service-mounts
     deploy: {resources: {limits: {memory: 512M}}}
+
+  # PostgreSQL for the ledger and authority stores (pg arms only). The service
+  # connects as a non-superuser owner role created by the runner.
+  pg:
+    image: postgres:16
+    profiles: ["pg"]
+    environment: {POSTGRES_PASSWORD: bench-pg-superuser}
+    deploy: {resources: {limits: {memory: 1G}}}
+    healthcheck: {test: ["CMD-SHELL", "pg_isready -U postgres"], interval: 2s, timeout: 3s, retries: 30}
 
   neo4j:
     image: neo4j:5-community
@@ -139,7 +152,8 @@ services:
     user: "0"
     entrypoint: ["python", "/bench/scripts/service_baseline/seed_authority.py",
                  "/state/authority.db", "/state/token", "${TOKEN_SECRET:-bench-token-secret}"]
-    environment: {PYTHONPATH: /bench, PYTHONDONTWRITEBYTECODE: "1", GOOGLE_API_KEY: x, NEO4J_PASSWORD: x}
+    environment: {PYTHONPATH: /bench, PYTHONDONTWRITEBYTECODE: "1", GOOGLE_API_KEY: x, NEO4J_PASSWORD: x,
+                  AUTHORITY_BACKEND: "${AUTHORITY_BACKEND:-sqlite}", AUTHORITY_POSTGRES_DSN: "${AUTHORITY_POSTGRES_DSN:-}"}
     volumes: [ "${BENCH_DIR}:/bench:ro", "state:/state" ]
 
   driver:
