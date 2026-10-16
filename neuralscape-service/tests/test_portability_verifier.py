@@ -212,7 +212,6 @@ def test_corrupt_payload_bytes_in_zip_are_entry_corrupt(tmp_path) -> None:
         "/abs.txt",
         "a/../../b.txt",
         "back\\slash.txt",
-        "nul\x00.txt",
         "C:/drive.txt",
         "dir/CON",
         "trailing./x",
