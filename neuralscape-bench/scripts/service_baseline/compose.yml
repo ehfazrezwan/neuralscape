@@ -17,9 +17,19 @@ x-service-env: &service-env
   INGEST_STORAGE_DIR: /data/ingest
   PYTHONPATH: /bench/scripts/service_baseline/shim
   FAKE_GENAI_BASE_URL: http://fake-provider:8080
+  # Durability arms (all default off; set by the runner per arm).
+  LEDGER_ENABLED: ${LEDGER_ENABLED:-false}
+  LEDGER_SQLITE_PATH: /state/ledger.db
+  AUTHORITY_ENABLED: ${AUTHORITY_ENABLED:-false}
+  AUTHORITY_SQLITE_PATH: /state/authority.db
+  NS_POLICY_MODE: ${NS_POLICY_MODE:-off}
+  NS_AUTH_PROFILE: ${NS_AUTH_PROFILE:-legacy_compat}
+  NEURALSCAPE_USER_TOKEN_SECRET: ${TOKEN_SECRET:-}
+  HARNESS_WIRE_ENFORCER: ${HARNESS_WIRE_ENFORCER:-0}
 
 x-service-mounts: &service-mounts
   - ${BENCH_DIR}:/bench:ro
+  - state:/state
 
 services:
   fake-provider:
@@ -59,8 +69,9 @@ services:
   api:
     image: ${NS_IMAGE}
     restart: on-failure
+    command: ["python", "/bench/scripts/service_baseline/harness_api.py"]
     environment: {<<: *service-env, MCP_TRANSPORT: http, UVICORN_WORKERS: "1"}
-    volumes: [ "${BENCH_DIR}:/bench:ro", "ingest_data:/data/ingest" ]
+    volumes: [ "${BENCH_DIR}:/bench:ro", "ingest_data:/data/ingest", "state:/state" ]
     depends_on:
       neo4j: {condition: service_healthy}
       redis: {condition: service_healthy}
@@ -99,7 +110,7 @@ services:
     restart: on-failure
     command: ["arq", "worker.IngestWorkerSettings"]
     environment: *service-env
-    volumes: [ "${BENCH_DIR}:/bench:ro", "ingest_data:/data/ingest" ]
+    volumes: [ "${BENCH_DIR}:/bench:ro", "ingest_data:/data/ingest", "state:/state" ]
     depends_on:
       neo4j: {condition: service_healthy}
       redis: {condition: service_healthy}
@@ -107,14 +118,24 @@ services:
       fake-provider: {condition: service_started}
     deploy: {resources: {limits: {memory: 2G}}}
 
+  seed:
+    image: ${NS_IMAGE}
+    profiles: ["seed"]
+    user: "0"
+    entrypoint: ["python", "/bench/scripts/service_baseline/seed_authority.py",
+                 "/state/authority.db", "/state/token", "${TOKEN_SECRET:-bench-token-secret}"]
+    environment: {PYTHONPATH: /bench, PYTHONDONTWRITEBYTECODE: "1", GOOGLE_API_KEY: x, NEO4J_PASSWORD: x}
+    volumes: [ "${BENCH_DIR}:/bench:ro", "state:/state" ]
+
   driver:
     image: ${NS_IMAGE}
     profiles: ["driver"]
     user: "0"
     entrypoint: ["python", "-m", "neuralscape_bench.service_baseline.driver"]
     environment: {PYTHONPATH: /bench, PYTHONDONTWRITEBYTECODE: "1"}
-    volumes: [ "${BENCH_DIR}:/bench:ro", "${OUT_DIR}:/out" ]
+    volumes: [ "${BENCH_DIR}:/bench:ro", "${OUT_DIR}:/out", "state:/state:ro" ]
     deploy: {resources: {limits: {memory: 1G}}}
 
 volumes:
   ingest_data:
+  state:

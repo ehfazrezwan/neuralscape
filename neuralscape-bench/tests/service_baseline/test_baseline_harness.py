@@ -149,3 +149,32 @@ def test_driver_cell_accounts_failures_and_percentile_gating():
     assert sum(cell["errors"].values()) > 0
     assert cell["latency"]["n"] == cell["ok"]
     assert cell["driver_cpu_cores_used"] is not None
+
+
+def test_raw_workloads_and_auth_header_and_enqueue_only_mode():
+    seen: list[tuple[str, str, dict | None]] = []
+
+    class Stub:
+        def request(self, method, path, body=None):
+            seen.append((method, path, body))
+            if method == "POST":
+                return 202, {"task_id": "intent-1"}
+            return 200, {"status": "completed"}
+
+    polled = driver.WORKLOADS["raw"](Stub(), "n", 0, 0.001, 1.0)
+    assert polled["ok"] and "complete_ms" in polled
+    assert seen[0][0:2] == ("POST", "/v1/memories/raw") and seen[0][2]["visibility"] == "private"
+    assert any(path.startswith("/v1/memories/status/") for _, path, _ in seen)
+
+    seen.clear()
+    accepted = driver.WORKLOADS["raw_nopoll"](Stub(), "n", 1, 0.001, 1.0)
+    assert accepted["ok"] and "complete_ms" not in accepted
+    assert [m for m, _, _ in seen] == ["POST"]  # no status polling when it is denied by policy
+
+
+def test_manifest_series_for_accept_only_cells_has_no_completion_measurement():
+    from neuralscape_bench.service_baseline.runner import ARMS
+
+    assert ARMS["plain"] == {}
+    assert ARMS["enforce"]["NS_POLICY_MODE"] == "enforce" and ARMS["enforce"]["HARNESS_WIRE_ENFORCER"] == "1"
+    assert "AUTHORITY_ENABLED" not in ARMS["ledger"]

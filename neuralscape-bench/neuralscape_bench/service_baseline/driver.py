@@ -23,13 +23,14 @@ USER_ID = "bench-user"
 PROJECT_ID = "bench-project"
 TERMINAL = {"completed", "failed"}
 # The service's three isolated ARQ queues (fast, graph, ingest).
-QUEUES = ("neuralscape:queue", "neuralscape:graph", "neuralscape:ingest")
+QUEUES = ("neuralscape:queue", "neuralscape:graph", "neuralscape:ingest", "neuralscape:queue:ledger")
 
 
 class Client:
     """One keep-alive connection per thread."""
 
-    def __init__(self, base_url: str, timeout_s: float):
+    def __init__(self, base_url: str, timeout_s: float, token: str | None = None):
+        self.token = token
         parsed = urllib.parse.urlparse(base_url)
         self.host, self.port, self.timeout_s = parsed.hostname, parsed.port or 80, timeout_s
         self.local = threading.local()
@@ -44,6 +45,8 @@ class Client:
     def request(self, method: str, path: str, body: Any = None) -> tuple[int, Any]:
         payload = None if body is None else json.dumps(body)
         headers = {"Content-Type": "application/json"} if payload else {}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
         for attempt in (0, 1):
             conn = self._conn()
             try:
@@ -75,12 +78,26 @@ def _write_body(nonce: str, index: int) -> dict[str, Any]:
     }
 
 
-def op_write(client: Client, nonce: str, index: int, poll_s: float, timeout_s: float) -> dict[str, Any]:
+def _raw_body(nonce: str, index: int) -> dict[str, Any]:
+    return {
+        "content": f"Benchmark fact {nonce}-{index}: {hashlib.sha256(f'{nonce}{index}'.encode()).hexdigest()[:24]}",
+        "category": "preference",
+        "user_id": USER_ID,
+        "project_id": PROJECT_ID,
+        "visibility": "private",
+    }
+
+
+def op_write(client: Client, nonce: str, index: int, poll_s: float, timeout_s: float, *, raw: bool = False,
+             poll: bool = True) -> dict[str, Any]:
     start = time.monotonic()
-    status, body = client.request("POST", "/v1/memories", _write_body(nonce, index))
+    path, body_for = ("/v1/memories/raw", _raw_body) if raw else ("/v1/memories", _write_body)
+    status, body = client.request("POST", path, body_for(nonce, index))
     accepted = time.monotonic()
     if status != 202 or not body or "task_id" not in body:
         return {"ok": False, "error": f"http_{status}", "accept_ms": (accepted - start) * 1000}
+    if not poll:
+        return {"ok": True, "error": None, "accept_ms": (accepted - start) * 1000}
     task_id = body["task_id"]
     while True:
         now = time.monotonic()
@@ -111,8 +128,17 @@ def op_read(method: str, path: str, body: Any = None) -> Callable[..., dict[str,
     return run
 
 
+def _raw(poll: bool) -> Callable[..., dict[str, Any]]:
+    def run(client: Client, nonce: str, index: int, poll_s: float, timeout_s: float) -> dict[str, Any]:
+        return op_write(client, nonce, index, poll_s, timeout_s, raw=True, poll=poll)
+
+    return run
+
+
 WORKLOADS: dict[str, Callable[..., dict[str, Any]]] = {
     "write": op_write,
+    "raw": _raw(True),
+    "raw_nopoll": _raw(False),
     "search": op_read(
         "POST",
         "/v1/search",
@@ -180,9 +206,9 @@ def run_cell(
         "throughput_per_s": len(measured) / wall if wall else None,
         "driver_cpu_cores_used": cpu / wall if wall else None,
     }
-    if workload == "write":
+    if workload in ("write", "raw", "raw_nopoll"):
         cell["accept"] = summarize([r["accept_ms"] for r in measured if "accept_ms" in r])
-        cell["completion"] = summarize([r["complete_ms"] for r in good])
+        cell["completion"] = summarize([r["complete_ms"] for r in good if "complete_ms" in r])
     else:
         cell["latency"] = summarize([r["latency_ms"] for r in good])
     return cell
@@ -252,31 +278,35 @@ def main() -> None:
     parser.add_argument("--write-ops", type=int, default=48)
     parser.add_argument("--read-ops", type=int, default=200)
     parser.add_argument("--seed", type=int, default=100)
+    parser.add_argument("--seed-workload", default="write")
     parser.add_argument("--warmup", type=int, default=4)
     parser.add_argument("--poll-ms", type=float, default=50)
     parser.add_argument("--timeout-s", type=float, default=120)
     parser.add_argument("--drain-timeout-s", type=float, default=300)
     parser.add_argument("--redis-url", default="redis://redis:6379")
+    parser.add_argument("--token-file", default=None)
     args = parser.parse_args()
 
-    client = Client(args.base_url, timeout_s=60)
+    token = open(args.token_file).read().strip() if args.token_file else None
+    client = Client(args.base_url, timeout_s=60, token=token)
     result: dict[str, Any] = {"args": vars(args), "ready_seconds": wait_ready(client, 300)}
     started = time.time()
 
-    seed_cell = run_cell(client, "write", 4, args.seed, 0, f"{args.nonce}-seed", args.poll_ms / 1000, args.timeout_s)
+    seed_cell = run_cell(client, args.seed_workload, 4, args.seed, 0, f"{args.nonce}-seed", args.poll_ms / 1000, args.timeout_s)
     result["seed"] = seed_cell
     result["seed_drain"] = drain(client, args.drain_timeout_s, args.redis_url)
 
     cells = []
     for workload in args.workloads.split(","):
         for concurrency in (int(c) for c in args.concurrency.split(",")):
-            ops = args.write_ops if workload == "write" else args.read_ops
+            ops = args.write_ops if workload in ("write", "raw", "raw_nopoll") else args.read_ops
             cells.append(
                 run_cell(client, workload, concurrency, ops, args.warmup, f"{args.nonce}-{workload}-{concurrency}", args.poll_ms / 1000, args.timeout_s)
             )
-            if workload == "write":
+            if workload in ("write", "raw", "raw_nopoll"):
                 drain_result = drain(client, args.drain_timeout_s, args.redis_url)
                 cells[-1]["post_cell_drain"] = drain_result
+                cells[-1]["end_to_end_seconds"] = cells[-1]["wall_seconds"] + drain_result["seconds"]
     result["cells"] = cells
     result["driver_started_unix"] = started
     result["driver_finished_unix"] = time.time()

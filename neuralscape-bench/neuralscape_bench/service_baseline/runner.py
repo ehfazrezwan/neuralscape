@@ -153,6 +153,17 @@ def host_facts() -> dict[str, Any]:
     }
 
 
+TOKEN_SECRET = "bench-token-secret"
+# Durability arms: environment passed to the compose stack.
+ARMS: dict[str, dict[str, str]] = {
+    "plain": {},
+    "ledger": {"LEDGER_ENABLED": "true"},
+    "governed": {"LEDGER_ENABLED": "true", "AUTHORITY_ENABLED": "true"},
+    "enforce": {"LEDGER_ENABLED": "true", "AUTHORITY_ENABLED": "true", "NS_POLICY_MODE": "enforce",
+                "NS_AUTH_PROFILE": "enforced", "HARNESS_WIRE_ENFORCER": "1"},
+}
+
+
 def compose(*args: str, env: dict[str, str]) -> str:
     return sh("docker", "compose", "-p", PROJECT, "-f", str(COMPOSE_FILE), *args, env=env)
 
@@ -197,7 +208,12 @@ def build_manifest(run_id: str, tree: str, lock_sha: str, image_id: str, results
                                        clock="monotonic", placement="in-network-driver-container")
     measurements = []
     for cell in results["cells"]:
-        series = [("accept", cell["accept"]), ("complete", cell["completion"])] if cell["workload"] == "write" else [("latency", cell["latency"])]
+        if "accept" in cell:
+            series = [("accept", cell["accept"])]
+            if cell["completion"]["n"]:
+                series.append(("complete", cell["completion"]))
+        else:
+            series = [("latency", cell["latency"])]
         for suffix, summary in series:
             attempted = cell["attempted"]
             failed = cell["measured_attempts"] - summary["n"]
@@ -227,17 +243,20 @@ def main() -> None:
     parser.add_argument("--label", required=True)
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--driver-args", default="")
+    parser.add_argument("--arm", default="plain", choices=sorted(ARMS))
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     nonce = hashlib.sha256(f"{args.label}{time.time()}".encode()).hexdigest()[:10]
-    env = {"NS_IMAGE": args.image, "BENCH_DIR": str(BENCH_DIR), "OUT_DIR": str(out_dir)}
-    record: dict[str, Any] = {"label": args.label, "tree": args.tree, "image": args.image,
+    env = {"NS_IMAGE": args.image, "BENCH_DIR": str(BENCH_DIR), "OUT_DIR": str(out_dir),
+           "TOKEN_SECRET": TOKEN_SECRET, **ARMS[args.arm]}
+    record: dict[str, Any] = {"arm": args.arm, "arm_env": ARMS[args.arm], "label": args.label, "tree": args.tree, "image": args.image,
                               "image_facts": image_facts(args.image), "host_before": host_facts()}
     sampler = StatsSampler()
     started = datetime.now(timezone.utc)
     try:
+        compose("run", "--rm", "--no-deps", "seed", env=env)
         record["cold_start_seconds"] = cold_start_seconds(env)
         sampler.start()
         compose("run", "--rm", "--no-deps", "driver", "--base-url", "http://api:8199",
@@ -247,7 +266,9 @@ def main() -> None:
         if sampler.is_alive():
             sampler.join(timeout=30)
         finished = datetime.now(timezone.utc)
-        record["logs_tail"] = {s: compose("logs", "--no-color", "--tail", "30", s, env=env) for s in ("api", "worker", "graph-worker")}
+        record["logs_tail"] = {s: compose("logs", "--no-color", "--tail", "40", s, env=env) for s in ("api", "worker", "graph-worker")}
+        record["policy_log_lines"] = [line for line in compose("logs", "--no-color", "api", env=env).splitlines()
+                                       if "policy_decision" in line or "policy" in line.lower() and "denied" in line.lower()][:20]
         compose("down", "-v", "--remove-orphans", env=env)
     record["host_after"] = host_facts()
     results = json.loads((out_dir / "driver.json").read_text())
@@ -255,6 +276,8 @@ def main() -> None:
     record["stats_samples"] = len(sampler.samples)
     workload_sha = "sha256:" + hashlib.sha256(json.dumps(results["args"] | {"nonce": None}, sort_keys=True).encode()).hexdigest()
     corpus_sha = "sha256:" + hashlib.sha256(b"service-baseline-corpus-v1:unique-notes-by-nonce-and-index").hexdigest()
+    (out_dir / "record.json").write_text(json.dumps(record, indent=2, default=str))
+    (out_dir / "stats_samples.json").write_text(json.dumps(sampler.samples))
     manifest = build_manifest(f"{args.label}-{nonce}", args.tree, "sha256:" + args.lock_sha256.removeprefix("sha256:"),
                               record["image_facts"]["id"], results, record["resource_peaks"], started, finished, corpus_sha, workload_sha)
     (out_dir / "manifest.json").write_text(manifest.model_dump_json(indent=2))
