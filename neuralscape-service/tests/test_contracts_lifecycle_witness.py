@@ -332,6 +332,45 @@ def test_public_first_a_subclass_view_is_observed_once_per_edge_not_once_per_obj
     assert shared.iteration_calls == 2  # one observation per edge
 
 
+def test_public_first_a_shared_divergent_view_is_never_accepted_on_its_native_backing() -> None:
+    """One tuple subclass object shared by ``target_refs`` and ``precondition_source_ids``, with an
+    empty public view and a different native backing, is outside the supported envelope.
+
+    By design the public view is authoritative and the native backing never decides anything, so
+    two things are pinned.  (1) The backing is not consulted: a claim that is consistent only with
+    the native items is rejected, never accepted.  (2) The backing cannot make an otherwise
+    consistent claim fail through the shared capture: a claim consistent with the (empty) public
+    view gives the same answer whether the backing is plain or reaches back to the intent itself.
+    Rejection of the divergent shape, where it happens, is the fail-closed side of the envelope.
+    """
+
+    declared = lc.StageEvidenceRequirement(
+        stage=CANONICAL, effect_id="effect-canonical", precondition_source_ids=("memory-1",),
+        upstream_stages=(), committed_sources=(), minimum_output_refs=0,
+    )
+    command = intent_with_requirements(declared)
+    shared = DivergentTuple(("memory-1",), ())  # native backing names the source; the public view is empty
+    _native_set(command, "target_refs", shared)
+    _native_set(command.stage_requirements[0], "precondition_source_ids", shared)
+    needs_native = receipt(CANONICAL, StageStatus.APPLIED, sources=(source("memory-1"),))
+    with pytest.raises(ValueError, match="must match calculated inputs"):
+        claim(command, [needs_native])  # accepted only if the native backing had been read
+
+    none_declared = lc.StageEvidenceRequirement(
+        stage=CANONICAL, effect_id="effect-canonical", precondition_source_ids=(),
+        upstream_stages=(), committed_sources=(), minimum_output_refs=0, no_source_witness=True,
+    )
+    for native in ((), ("memory-1",), None):
+        quiet = intent_with_requirements(none_declared, source_preconditions=())
+        backing = native if native is not None else ()
+        view = DivergentTuple(backing, ())
+        if native is None:  # a backing that reaches back to the intent being validated
+            view = DivergentTuple((quiet,), ())
+        _native_set(quiet, "target_refs", view)
+        _native_set(quiet.stage_requirements[0], "precondition_source_ids", view)
+        claim(quiet, [receipt(CANONICAL, StageStatus.APPLIED, sources=())])  # the empty public view decides
+
+
 def test_public_first_public_only_receipt_repair_by_intent_callback_is_the_documented_limit() -> None:
     """receipts are traversed only after the intent is revalidated, so
     an intent callback can repair a public-only receipt first.
