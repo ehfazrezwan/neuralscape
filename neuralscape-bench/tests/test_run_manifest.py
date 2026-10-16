@@ -3810,3 +3810,110 @@ def test_mapping_view_of_sequence_hybrid_valid_control_is_accepted(hybrid_type):
     manifest = _finish_with_measurement(hybrid)
 
     assert manifest.measurements[0] == timing()
+
+
+class HiddenAliasItemsDict(dict[object, object]):
+    """Public items are the supplied pairs; native backing is separate."""
+
+    def __init__(self, public_pairs: tuple[tuple[object, object], ...]):
+        super().__init__()
+        self.public_pairs = public_pairs
+
+    def items(self):
+        return iter(self.public_pairs)
+
+
+class PairsMapping(Mapping[str, object]):
+    def __init__(self, values: dict[str, object]):
+        self.values = values
+
+    def __getitem__(self, key: str) -> object:
+        return self.values[key]
+
+    def __iter__(self):
+        return iter(self.values)
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+
+def _shared_exclusions_alias_shape(exclusion: dict[str, object]):
+    """Two measurements share one exclusions tuple subclass.
+
+    The tuple's public exclusion item is a dict subclass whose hidden native
+    backing refers to the first measurement Mapping, whose exclusions point
+    back to the tuple.  The public graph has no cycle.
+    """
+
+    first_values = timing().model_dump(mode="python")
+    first_values["name"] = "first"
+    first = PairsMapping(first_values)
+    item = HiddenAliasItemsDict(tuple(exclusion.items()))
+    item["hidden-alias"] = first
+    shared = PublicViewTuple((), (item,))
+    first_values["exclusions"] = shared
+    second = timing().model_dump(mode="python")
+    second["name"] = "second"
+    second["exclusions"] = shared
+    return first, second, shared
+
+
+def _plain_pair(exclusion: dict[str, object]):
+    plain = []
+    for name in ("first", "second"):
+        values = timing().model_dump(mode="python")
+        values["name"] = name
+        values["exclusions"] = (exclusion,)
+        plain.append(values)
+    return tuple(plain)
+
+
+@pytest.mark.parametrize("second_first", [False, True])
+def test_shared_exclusions_alias_through_hidden_backing_is_rejected(second_first):
+    """Pin: conservative rejection, never acceptance (input-envelope fail-closed).
+
+    Equivalent plain JSON is accepted; the hidden-backing alias shape is
+    rejected with the stable incomplete-inventory error rather than yielding a
+    manifest.  If a later change starts accepting this shape, the accepted
+    data must equal the plain public view and this test must be updated
+    deliberately.
+    """
+
+    exclusion = timing().model_dump(mode="python")["exclusions"][0]
+    plain = _plain_pair(exclusion)
+    assert _finish_with_measurements(
+        tuple(reversed(plain)) if second_first else plain
+    ).measurements
+
+    first, second, _shared = _shared_exclusions_alias_shape(exclusion)
+    measurements = (second, first) if second_first else (first, second)
+
+    with pytest.raises(ValueError, match="incomplete public mapping inventory"):
+        _finish_with_measurements(measurements)
+
+
+@pytest.mark.parametrize("second_first", [False, True])
+def test_shared_exclusions_alias_through_hidden_backing_never_accepts_invalid_data(
+    second_first,
+):
+    invalid = dict(timing().model_dump(mode="python")["exclusions"][0], count=0)
+    plain = _plain_pair(invalid)
+    with pytest.raises(ValidationError):
+        _finish_with_measurements(tuple(reversed(plain)) if second_first else plain)
+
+    first, second, _shared = _shared_exclusions_alias_shape(invalid)
+    measurements = (second, first) if second_first else (first, second)
+
+    with pytest.raises(ValueError):
+        _finish_with_measurements(measurements)
+
+
+def _finish_with_measurements(measurements: tuple[object, ...]) -> RunManifest:
+    return finish_run(
+        planned_manifest(),
+        state=RunState.COMPLETED,
+        started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+        resources=(measured_memory(),),
+        measurements=measurements,
+    )

@@ -937,7 +937,23 @@ def _inventory_retained_public_mappings(frozen_graph: _FrozenGraph) -> None:
 
 
 def _freeze_model_graphs(*values: Any) -> _FrozenGraph:
-    """Capture every supplied native graph in one shared inventory."""
+    """Capture every supplied native graph in one shared inventory.
+
+    Supported inputs are JSON-compatible data, the project's own models and
+    exact built-in containers, plus container subclasses read through their
+    public views once at first observation.  Native backing that a public view
+    hides is discovered defensively but is never authoritative.
+
+    Hidden-backing aliases can make the shared discovery conservative: for
+    example a shared exclusions tuple reachable from two measurements, whose
+    public item has hidden backing that refers to the other measurement, is
+    rejected with ``incomplete public mapping inventory`` even though its
+    public views are acyclic.  That is a supported fail-closed outcome for
+    in-process objects outside the input envelope (equivalent plain JSON is
+    accepted); what must never happen is acceptance of data that differs from
+    the public view captured at first observation.
+    ``test_shared_exclusions_alias_through_hidden_backing_*`` pin this shape.
+    """
 
     frozen_graph = _FrozenGraph(
         models={},
