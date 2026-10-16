@@ -3191,3 +3191,151 @@ def test_a_lazily_discovered_mapping_with_a_valid_dict_is_accepted() -> None:
     policy_value = _policy_with_public_only_statements(_StatementMapping())
 
     assert evaluate(principal(), "read", resource_value, policy_value).outcome == "allow"
+
+
+# ── non-dict mapping children are captured before the parent iterator advances ──
+
+
+def test_a_mapping_proxy_child_is_captured_before_the_parent_iterator_advances() -> None:
+    broken = _invalid_resource_dict()
+
+    class _Pairs(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            raise KeyError(key)
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(())
+
+        def __len__(self) -> int:
+            return 0
+
+        def items(self):  # type: ignore[override]
+            yield ("allowed_resources", (MappingProxyType(broken),))
+            _repair_after_yield(broken)  # resumed only when the consumer advances
+
+    completed = _complete_contract_input(_Pairs(), set(), {}, {})
+
+    assert broken["tenant_id"] == "tenant-a"                                # the generator repaired it
+    assert dict(completed["allowed_resources"][0])["tenant_id"] == 5        # the first observation holds
+
+
+def test_a_mapping_proxy_resource_repaired_after_the_yield_is_still_refused() -> None:
+    resource_value = reference("memory-1")
+    broken = _invalid_resource_dict()
+
+    class _StatementMapping(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            raise KeyError(key)
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(())
+
+        def __len__(self) -> int:
+            return 0
+
+        def items(self):  # type: ignore[override]
+            yield ("id", "lazy-allow")
+            yield ("effect", "allow")
+            yield ("subject_id", "subject-a")
+            yield ("credential_id", None)
+            yield ("action", "read")
+            yield ("resource", MappingProxyType(broken))
+            _repair_after_yield(broken)
+
+    policy_value = _policy_with_public_only_statements(_StatementMapping())
+
+    with pytest.raises(ValidationError):
+        evaluate(principal(), "read", resource_value, policy_value)
+
+
+def test_a_custom_mapping_child_is_captured_before_the_parent_iterator_advances() -> None:
+    """A non-proxy public mapping child, nested inside a list, is captured at the same point."""
+
+    resource_value = reference("memory-1")
+    broken = _invalid_resource_dict()
+
+    class _Child(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            return broken[key]
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(tuple(broken))
+
+        def __len__(self) -> int:
+            return len(broken)
+
+    class _StatementMapping(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            raise KeyError(key)
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(())
+
+        def __len__(self) -> int:
+            return 0
+
+        def items(self):  # type: ignore[override]
+            yield ("id", "lazy-allow")
+            yield ("effect", "allow")
+            yield ("subject_id", "subject-a")
+            yield ("credential_id", None)
+            yield ("action", "read")
+            yield ("resource", _Child())
+            _repair_after_yield(broken)
+
+    policy_value = _policy_with_public_only_statements(_StatementMapping())
+
+    with pytest.raises(ValidationError):
+        evaluate(principal(), "read", resource_value, policy_value)
+
+
+def test_a_mapping_cycle_through_proxy_children_terminates_and_keeps_the_first_observation() -> None:
+    holder: dict[str, object] = {}
+
+    class _Loop(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            raise KeyError(key)
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(())
+
+        def __len__(self) -> int:
+            return 0
+
+        def items(self):  # type: ignore[override]
+            yield ("child", MappingProxyType(holder))
+            yield ("again", loop)
+
+    loop = _Loop()
+    holder["back"] = loop
+    inventories: dict = {}
+    with pytest.raises(ValueError, match="cyclic"):  # terminates with the existing cycle refusal
+        _complete_contract_input(loop, set(), {}, inventories)
+    assert id(loop) in inventories
+
+
+def test_a_valid_mapping_proxy_child_is_accepted() -> None:
+    resource_value = reference("memory-1")
+    good = resource_value.model_dump(mode="python")
+
+    class _StatementMapping(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            raise KeyError(key)
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(())
+
+        def __len__(self) -> int:
+            return 0
+
+        def items(self):  # type: ignore[override]
+            yield ("id", "lazy-allow")
+            yield ("effect", "allow")
+            yield ("subject_id", "subject-a")
+            yield ("credential_id", None)
+            yield ("action", "read")
+            yield ("resource", MappingProxyType(good))
+
+    policy_value = _policy_with_public_only_statements(_StatementMapping())
+
+    assert evaluate(principal(), "read", resource_value, policy_value).outcome == "allow"

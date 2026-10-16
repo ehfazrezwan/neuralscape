@@ -300,6 +300,7 @@ def _freeze_mapping_inventories(
     model_inventories: dict[int, _ModelInventory],
     visited_containers: set[int],
     native_dicts: dict[int, _MappingInventory] | None = None,
+    in_progress: set[int] | None = None,
 ) -> None:
     """Observe each retained public mapping inventory exactly once.
 
@@ -309,13 +310,21 @@ def _freeze_mapping_inventories(
     an error from opening or advancing the iterator replaces the whole
     inventory; the first malformed pair is terminal, and the rest of the
     iterator is still drained so a later iteration error keeps its precedence.
+
+    A mapping that is not a native dict (a proxy, a custom mapping) found among a
+    pair's children is captured, items frozen, at that same point, before the
+    parent iterator advances; merely queueing it would read its items after the
+    parent's later steps could have changed what it exposes.
     """
 
+    if in_progress is None:
+        in_progress = set()
     while True:
         pending = tuple(
             owner
             for owner in owners.values()
-            if _validated_mapping_inventory(owner, mapping_inventories) is None
+            if id(owner) not in in_progress
+            and _validated_mapping_inventory(owner, mapping_inventories) is None
         )
         if not pending:
             return
@@ -333,6 +342,7 @@ def _freeze_mapping_inventories(
             entries: list[_MappingEntry | _CapturedFailure] = []
             failure: Exception | None = None
             terminal = False
+            in_progress.add(id(owner))
             while True:
                 try:
                     raw_entry = next(iterator)
@@ -350,6 +360,7 @@ def _freeze_mapping_inventories(
                     terminal = True
                     continue
                 entries.append(_MappingEntry(key, item))
+                before = set(owners)
                 _freeze_reachable_model_inventories(
                     item,
                     model_inventories,
@@ -357,6 +368,21 @@ def _freeze_mapping_inventories(
                     owners,
                     native_dicts,
                 )
+                discovered = {
+                    identity: found
+                    for identity, found in owners.items()
+                    if identity not in before
+                }
+                if discovered:
+                    _freeze_mapping_inventories(
+                        discovered,
+                        mapping_inventories,
+                        model_inventories,
+                        visited_containers,
+                        native_dicts,
+                        in_progress,
+                    )
+            in_progress.discard(id(owner))
             mapping_inventories[id(owner)] = _MappingInventory(
                 owner,
                 _CapturedFailure(failure) if failure is not None else tuple(entries),
