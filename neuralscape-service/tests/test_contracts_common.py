@@ -2859,7 +2859,7 @@ def test_snapshot_contract_graph_public_view_ancestors_are_not_reused() -> None:
 
 import time as _time  # noqa: E402
 
-from contracts_limits import DISCOVERY_BUDGET_MESSAGE, STANDARD_MAX_DEPTH  # noqa: E402
+from contracts_limits import DISCOVERY_BUDGET_MESSAGE, STANDARD_MAX_DEPTH, STANDARD_MAX_EDGES  # noqa: E402
 from contracts_references import SourceVersion  # noqa: E402
 
 
@@ -2931,9 +2931,11 @@ def test_an_endless_public_sequence_is_cut_off_by_the_budget() -> None:
 
     class Endless(tuple):
         def __iter__(self):
-            while True:
+            # Self-limiting so a tree without the budget fails instead of exhausting memory.
+            while produced[0] < 4 * STANDARD_MAX_EDGES:
                 produced[0] += 1
                 yield produced[0]
+            raise AssertionError("the discovery budget did not stop the view")
 
     with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
         snapshot_contract_graph(Endless())
@@ -3107,3 +3109,234 @@ def test_a_class_only_registered_as_a_mapping_is_not_trusted_as_model_extras() -
 def test_ordinary_graphs_are_far_inside_the_budget() -> None:
     snapshot = snapshot_contract_graph([_source_version() for _ in range(500)])
     assert len(snapshot) == 500
+
+# ── discovery budget: design-neutral limits (depth, nodes, edges, views, hygiene) ──
+
+from contracts_limits import STANDARD  # noqa: E402
+
+
+def _nested_tuple(depth: int) -> tuple:
+    value: tuple = ()
+    for _ in range(depth):
+        value = (value,)
+    return value
+
+
+def test_snapshot_contract_graph_rejects_unbounded_depth_without_recursion_error() -> None:
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph(_nested_tuple(5000))
+
+
+def test_snapshot_contract_graph_accepts_the_depth_limit_and_rejects_one_more() -> None:
+    limit = STANDARD.max_depth
+
+    snapshot = snapshot_contract_graph(_nested_tuple(limit))
+    assert snapshot == _nested_tuple(limit)
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph(_nested_tuple(limit + 1))
+
+
+@pytest.mark.parametrize("shallow_first", [True, False])
+def test_snapshot_contract_graph_depth_does_not_depend_on_visit_order(
+    shallow_first: bool,
+) -> None:
+    tall = _nested_tuple(STANDARD.max_depth - 10)
+    deep_path = tall
+    for _ in range(20):
+        deep_path = (deep_path,)
+    # `tall` is reached at depth 1 and again at depth 21 through a chain.
+    value = (tall, deep_path) if shallow_first else (deep_path, tall)
+
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph(value)
+
+
+def test_snapshot_contract_graph_depth_holds_for_an_impure_subtree_reached_deeper() -> None:
+    # The subtree reads a public view, so it is rebuilt (not reused) on every path; it fits
+    # where it is first captured but not where the second path reaches it.
+    class View(list):
+        pass
+
+    tall: list = [View([1])]
+    for _ in range(STANDARD.max_depth - 10):
+        tall = [tall]
+    deep_path: object = tall
+    for _ in range(20):
+        deep_path = [deep_path]
+
+    snapshot_contract_graph([tall])
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph([tall, deep_path])
+
+
+def test_snapshot_contract_graph_rejects_too_many_nodes() -> None:
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph([[] for _ in range(STANDARD.max_nodes)])
+    assert len(snapshot_contract_graph([[] for _ in range(STANDARD.max_nodes - 1)])) == (
+        STANDARD.max_nodes - 1
+    )
+
+
+@pytest.mark.parametrize(
+    "build",
+    [list, tuple, lambda items: dict.fromkeys(items)],
+    ids=["list", "tuple", "dict"],
+)
+def test_snapshot_contract_graph_rejects_too_many_edges(
+    build: Callable[[range], object],
+) -> None:
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph(build(range(STANDARD.max_edges + 1)))
+
+
+def test_snapshot_contract_graph_rejects_too_many_model_edges() -> None:
+    class Open(ContractModel):
+        model_config = ConfigDict(extra="allow")
+
+    model = Open.model_validate({f"k{index}": index for index in range(STANDARD.max_edges + 1)})
+
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph(model)
+
+
+class _EmptyView(list):
+    pass
+
+
+def test_snapshot_contract_graph_charges_ancestor_copies_that_cannot_be_reused() -> None:
+    # 4,096 paths each observe the view once (8,192 charges), but every copy of
+    # the wide ancestors on those paths must be rebuilt too and is charged.
+    level: list = [_EmptyView()]
+    for _ in range(12):
+        level = [level, level, *range(30)]
+
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph(level)
+
+    narrow: list = [_EmptyView()]
+    for _ in range(12):
+        narrow = [narrow, narrow]
+    snapshot_contract_graph(narrow)
+
+
+def test_snapshot_contract_graph_bounds_depth_of_a_chain_formed_by_views() -> None:
+    # Every view is captured at depth 1, but each one's public iteration exposes
+    # the next, so the reconstruction path is far deeper than any native path.
+    class Link(list):
+        successor: object = None
+
+        def __iter__(self):
+            if self.successor is None:
+                return iter(())
+            return iter((self.successor,))
+
+    links = [Link() for _ in range(STANDARD.max_depth + 20)]
+    for current, successor in zip(links, links[1:]):
+        current.successor = successor
+
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph(links)
+
+
+def test_snapshot_contract_graph_charges_aliased_edges() -> None:
+    shared: list = []
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph([shared] * (STANDARD.max_edges + 1))
+
+
+def test_snapshot_contract_graph_budgets_a_shared_ladder_over_a_public_view() -> None:
+    class View(list):
+        pass
+
+    level: list = [View([1])]
+    for _ in range(40):
+        level = [level, level]
+
+    # Each path observes the view again, so the work is charged and stops.
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph(level)
+
+
+_ENDLESS_GUARD = 4 * STANDARD.max_edges
+
+
+def test_snapshot_contract_graph_stops_an_endless_public_view() -> None:
+    class Endless(list):
+        def __iter__(self):
+            # Self-limiting so a tree without the budget fails instead of exhausting memory.
+            for _ in range(_ENDLESS_GUARD):
+                yield 0
+            raise AssertionError("the discovery budget did not stop the view")
+
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph([Endless()])
+
+
+def test_snapshot_contract_graph_stops_an_endless_mapping_view() -> None:
+    class EndlessItems(Mapping):
+        def __getitem__(self, key):
+            raise KeyError(key)
+
+        def __iter__(self):
+            return iter(())
+
+        def __len__(self):
+            return 0
+
+        def items(self):
+            for index in range(_ENDLESS_GUARD):
+                yield index, 0
+            raise AssertionError("the discovery budget did not stop the view")
+
+    class Open(ContractModel):
+        pass
+
+    model = Open()
+    object.__setattr__(model, "__pydantic_extra__", EndlessItems())
+
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        snapshot_contract_graph(model)
+
+
+def test_snapshot_contract_graph_native_accounting_runs_no_caller_code() -> None:
+    calls: list[str] = []
+
+    class Hostile(list):
+        def __len__(self):
+            calls.append("len")
+            return 0
+
+        def __bool__(self):
+            calls.append("bool")
+            return True
+
+        def __hash__(self):
+            calls.append("hash")
+            return 0
+
+        def __eq__(self, other):
+            calls.append("eq")
+            return True
+
+        def __getattribute__(self, name):
+            if name == "__class__":
+                calls.append("class")
+            return super().__getattribute__(name)
+
+    snapshot = snapshot_contract_graph([Hostile([1, 2]), [Hostile([3])]])
+
+    assert snapshot == [[1, 2], [[3]]]
+    assert calls == []
+
+
+def test_snapshot_contract_graph_budget_error_is_value_free() -> None:
+    marker = "very-secret-marker"
+    value: object = (marker,)
+    for _ in range(STANDARD.max_depth + 1):
+        value = (value,)
+
+    with pytest.raises(ValueError) as caught:
+        snapshot_contract_graph(value)
+
+    assert str(caught.value) == DISCOVERY_BUDGET_MESSAGE
+    assert marker not in repr(caught.value)
