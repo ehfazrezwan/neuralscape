@@ -16,6 +16,7 @@ from typing import Any, Literal, Mapping
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from contracts_common import ContractModel, OpaqueId, SafeCounter, VersionedContract
+from contracts_limits import PORTABILITY, DiscoveryBudget
 
 
 ChecksumAlgorithm = Literal["sha256"]
@@ -108,8 +109,14 @@ def _validated_native_container_items(
     return items
 
 
-def _snapshot_model_extra_storage(value: BaseModel) -> _ModelExtraSnapshot:
-    """Capture native dict extras without invoking public mapping views."""
+def _snapshot_model_extra_storage(
+    value: BaseModel, budget: DiscoveryBudget | None = None
+) -> _ModelExtraSnapshot:
+    """Capture native dict extras without invoking public mapping views.
+
+    When a ``budget`` is given, the native entry count is charged before the
+    entries are copied so an oversized extra mapping is never materialized.
+    """
 
     try:
         extra = _PYDANTIC_EXTRA_SLOT.__get__(value, type(value))
@@ -118,6 +125,8 @@ def _snapshot_model_extra_storage(value: BaseModel) -> _ModelExtraSnapshot:
     if extra is None:
         return True, ()
     if issubclass(type(extra), dict):
+        if budget is not None:
+            budget.charge_edge(dict.__len__(extra))
         return True, tuple(dict.items(extra))
     return False, extra
 
@@ -223,10 +232,15 @@ def _reject_retained_unknown_fields(
     model_inventory: _ModelStorageInventory = {}
     native_container_inventory: _NativeContainerInventory = {}
 
-    def discover(value: Any) -> None:
-        pending = [value]
+    # One native-discovery envelope for this validation call, shared by every
+    # root it visits.  Accounting reads only native lengths and object
+    # identities, so it never runs a caller-defined protocol.
+    budget = DiscoveryBudget(PORTABILITY)
+
+    def discover(value: Any, depth: int = 0) -> None:
+        pending = [(value, depth)]
         while pending:
-            current = pending.pop()
+            current, current_depth = pending.pop()
             value_type = type(current)
             if not issubclass(
                 value_type,
@@ -235,14 +249,18 @@ def _reject_retained_unknown_fields(
                 continue
 
             identity = id(current)
-            if identity in discovered:
+            # Unique nodes are charged once; a shallower path re-expands a node
+            # so the depth outcome does not depend on traversal order.
+            if not budget.visit(current, current_depth):
                 continue
             discovered.add(identity)
+            child_depth = current_depth + 1
 
             if issubclass(value_type, BaseModel):
                 native_stored = _PYDANTIC_DICT_DESCRIPTOR.__get__(
                     current, BaseModel
                 )
+                budget.charge_edge(dict.__len__(native_stored))
                 stored_entries = tuple(dict.items(native_stored))
                 try:
                     fields_set_storage = _PYDANTIC_FIELDS_SET_SLOT.__get__(
@@ -251,8 +269,9 @@ def _reject_retained_unknown_fields(
                 except AttributeError:
                     fields_set_storage = _MISSING_FIELDS_SET
                 if issubclass(type(fields_set_storage), set):
+                    budget.charge_edge(set.__len__(fields_set_storage))
                     fields_set_storage = set.copy(fields_set_storage)
-                extra_snapshot = _snapshot_model_extra_storage(current)
+                extra_snapshot = _snapshot_model_extra_storage(current, budget)
                 discovery_inventory[identity] = (
                     current,
                     stored_entries,
@@ -263,11 +282,13 @@ def _reject_retained_unknown_fields(
                 # without invoking a user-defined name protocol.  Other names
                 # remain conservative candidates for later hash authority.
                 pending.extend(
-                    _model_discovery_values(value_type, stored_entries)
+                    (item, child_depth)
+                    for item in _model_discovery_values(value_type, stored_entries)
                 )
                 continue
 
             if issubclass(value_type, dict):
+                budget.charge_edge(2 * dict.__len__(current))
                 items = tuple(dict.items(current))
                 if value_type is dict:
                     native_container_inventory[identity] = (
@@ -276,16 +297,20 @@ def _reject_retained_unknown_fields(
                         items,
                     )
                 for key, item in reversed(items):
-                    pending.append(item)
-                    pending.append(key)
+                    pending.append((item, child_depth))
+                    pending.append((key, child_depth))
                 continue
             if issubclass(value_type, list):
+                budget.charge_edge(list.__len__(current))
                 items = tuple(list.__iter__(current))
             elif issubclass(value_type, tuple):
+                budget.charge_edge(tuple.__len__(current))
                 items = tuple(tuple.__iter__(current))
             elif issubclass(value_type, set):
+                budget.charge_edge(set.__len__(current))
                 items = tuple(set.__iter__(current))
             else:
+                budget.charge_edge(frozenset.__len__(current))
                 items = tuple(frozenset.__iter__(current))
             if value_type in (list, tuple, set, frozenset):
                 native_container_inventory[identity] = (
@@ -293,7 +318,7 @@ def _reject_retained_unknown_fields(
                     value_type,
                     items,
                 )
-            pending.extend(reversed(items))
+            pending.extend((item, child_depth) for item in reversed(items))
 
     def walk(value: Any, location: tuple[str | int, ...]) -> None:
         if not isinstance(value, (BaseModel, Mapping, list, tuple, set, frozenset)):
@@ -304,7 +329,7 @@ def _reject_retained_unknown_fields(
             return
         visited.add(identity)
         if identity not in discovered:
-            discover(value)
+            discover(value, len(location))
 
         if isinstance(value, BaseModel):
             declared = _native_declared_field_names(type(value))
@@ -369,6 +394,7 @@ def _reject_retained_unknown_fields(
 
         if isinstance(value, Mapping):
             for index, (key, item) in enumerate(value.items()):
+                budget.charge_edge(2)  # public view charged as it is observed
                 walk(key, (*location, "<key>", index))
                 item_location = key if isinstance(key, (str, int)) else index
                 walk(item, (*location, item_location))
@@ -380,6 +406,7 @@ def _reject_retained_unknown_fields(
             else value
         )
         for index, item in enumerate(items):
+            budget.charge_edge()  # public view charged as it is observed
             walk(item, (*location, index))
 
     discover(root)

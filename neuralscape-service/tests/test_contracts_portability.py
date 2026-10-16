@@ -13,6 +13,16 @@ from typing import Any
 import pytest
 from pydantic import BaseModel, Field, ValidationError
 
+import contracts_portability
+from contracts_limits import (
+    DISCOVERY_BUDGET_MESSAGE,
+    PORTABILITY_MAX_DEPTH,
+    PORTABILITY_MAX_EDGES,
+    PORTABILITY_MAX_NODES,
+    DiscoveryBudget,
+    DiscoveryTier,
+)
+
 from contracts_portability import (
     ChecksumDescriptor,
     EncryptionReference,
@@ -3056,7 +3066,10 @@ def test_deep_unchecked_native_container_is_a_controlled_validation_failure() ->
     with pytest.raises(ValidationError) as raised:
         validate_portable_manifest(corrupted)
 
-    assert isinstance(raised.value.__cause__, RecursionError)
+    # Bounded discovery (shared discovery-budget policy): unbounded recursion
+    # became a stable, value-free budget rejection raised before any recursion.
+    assert isinstance(raised.value.__cause__, ValueError)
+    assert str(raised.value.__cause__) == DISCOVERY_BUDGET_MESSAGE
 
 
 @pytest.mark.parametrize("storage_kind", ["stored", "extra"])
@@ -3111,6 +3124,19 @@ def test_inconsistent_hash_stored_name_preserves_unknown_field_authority(
     with pytest.raises(ValidationError) as raised:
         validate_portable_manifest(manifest)
 
+    if value_kind == "deep":
+        # A conservatively queued (non-exact) name holding a graph deeper than
+        # the discovery budget is rejected by the budget before any stored-name
+        # callback runs.  This is the intentional bounded-input envelope.
+        assert isinstance(raised.value.__cause__, ValueError)
+        assert str(raised.value.__cause__) == DISCOVERY_BUDGET_MESSAGE
+        assert (
+            stored_name.hash_calls,
+            stored_name.equality_calls,
+            stored_name.class_calls,
+        ) == (0, 0, 0)
+        return
+
     errors = raised.value.errors()
     assert len(errors) == 1
     assert errors[0]["type"] == "extra_forbidden"
@@ -3144,3 +3170,175 @@ def test_public_path_normalizer_matches_manifest_contract() -> None:
         manifest["files"][0]["path"] = bad
         with pytest.raises(ValidationError):
             validate_portable_manifest(manifest)
+
+
+# --- bounded native discovery (portability tier) ----------------------------
+
+
+def _manifest_with_files(files: object) -> PortableManifest:
+    return validate_portable_manifest(valid_manifest()).model_copy(
+        update={"files": files}
+    )
+
+
+def _assert_budget_rejection(manifest: PortableManifest) -> None:
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+    assert isinstance(raised.value.__cause__, ValueError)
+    assert str(raised.value.__cause__) == DISCOVERY_BUDGET_MESSAGE
+
+
+def test_discovery_depth_beyond_budget_is_rejected_with_stable_error() -> None:
+    nested: object = "leaf"
+    for _ in range(PORTABILITY_MAX_DEPTH + 5):
+        nested = [nested]
+    _assert_budget_rejection(_manifest_with_files(nested))
+
+
+def test_discovery_node_count_beyond_budget_is_rejected() -> None:
+    wide = [[] for _ in range(PORTABILITY_MAX_NODES + 1)]
+    _assert_budget_rejection(_manifest_with_files(wide))
+
+
+def test_discovery_edges_are_charged_for_aliased_repeats() -> None:
+    shared: list[object] = []
+    aliased = [shared] * (PORTABILITY_MAX_EDGES + 1)  # two nodes, many edges
+    _assert_budget_rejection(_manifest_with_files(aliased))
+
+
+def test_discovery_budget_applies_under_conservative_non_exact_names() -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    wide = [[] for _ in range(PORTABILITY_MAX_NODES + 1)]
+    native = _PYDANTIC_DICT_DESCRIPTOR.__get__(manifest, BaseModel)
+    dict.__delitem__(native, "files")
+    dict.__setitem__(native, InconsistentHashStoredName("files"), wide)
+    _assert_budget_rejection(manifest)
+
+
+class _RecordingBudget(DiscoveryBudget):
+    instances: list["_RecordingBudget"] = []
+
+    def __init__(self, tier=None):
+        super().__init__(tier) if tier is not None else super().__init__()
+        type(self).instances.append(self)
+
+
+def _measure_valid_manifest(monkeypatch) -> tuple[int, int, int]:
+    _RecordingBudget.instances = []
+    monkeypatch.setattr(contracts_portability, "DiscoveryBudget", _RecordingBudget)
+    validate_portable_manifest(validate_portable_manifest(valid_manifest()))
+    budget = _RecordingBudget.instances[-1]
+    deepest = max(
+        budget.authoritative_depth(obj) or 0 for obj in budget._seen.values()
+    )
+    return budget.nodes, budget.edges, deepest
+
+
+def _tier(nodes: int, edges: int, depth: int) -> DiscoveryTier:
+    return DiscoveryTier("test", nodes, edges, depth)
+
+
+def test_budget_boundary_is_exact_for_nodes_edges_and_depth(monkeypatch) -> None:
+    nodes, edges, depth = _measure_valid_manifest(monkeypatch)
+    assert nodes > 1 and edges > 1 and depth > 0
+    manifest = validate_portable_manifest(valid_manifest())
+
+    def run(tier: DiscoveryTier) -> None:
+        monkeypatch.setattr(
+            contracts_portability,
+            "PORTABILITY",
+            tier,
+        )
+        validate_portable_manifest(manifest)
+
+    run(_tier(nodes, edges, depth))  # exactly at every limit: accepted
+    for tight in (
+        _tier(nodes - 1, edges, depth),
+        _tier(nodes, edges - 1, depth),
+        _tier(nodes, edges, depth - 1),
+    ):
+        with pytest.raises(ValidationError) as raised:
+            run(tight)
+        assert str(raised.value.__cause__) == DISCOVERY_BUDGET_MESSAGE
+
+
+def test_budget_accounting_runs_no_container_protocol(monkeypatch) -> None:
+    calls: list[str] = []
+
+    class Noisy(list):
+        def __len__(self) -> int:
+            calls.append("len")
+            return list.__len__(self)
+
+        def __iter__(self):
+            calls.append("iter")
+            return list.__iter__(self)
+
+        def __bool__(self) -> bool:
+            calls.append("bool")
+            return True
+
+    monkeypatch.setattr(contracts_portability, "PORTABILITY", _tier(2, 4, 8))
+    noisy = Noisy([[] for _ in range(10)])
+    manifest = _manifest_with_files(noisy)
+    calls.clear()
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+    assert str(raised.value.__cause__) == DISCOVERY_BUDGET_MESSAGE
+    assert calls == []
+
+
+def test_endless_public_mapping_view_is_bounded() -> None:
+    class Endless(Mapping):
+        def __getitem__(self, key):
+            return key
+
+        def __iter__(self):
+            index = 0
+            while True:
+                yield index
+                index += 1
+
+        def __len__(self) -> int:
+            return 1
+
+        def items(self):
+            index = 0
+            while True:
+                yield (index, index)
+                index += 1
+
+    _assert_budget_rejection(_manifest_with_files(Endless()))
+
+
+@pytest.mark.parametrize("kind", ["list", "dict"])
+def test_discovery_edge_budget_rejects_before_any_stored_name_callback(
+    monkeypatch, kind: str
+) -> None:
+    _, baseline_edges, _ = _measure_valid_manifest(monkeypatch)
+    monkeypatch.setattr(
+        contracts_portability,
+        "PORTABILITY",
+        _tier(10_000, baseline_edges + 20, 64),
+    )
+    shared: list[object] = []
+    heavy: object = (
+        [shared] * 200 if kind == "list" else {index: shared for index in range(200)}
+    )
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    stored_name = InconsistentHashStoredName("files")
+    native = _PYDANTIC_DICT_DESCRIPTOR.__get__(manifest, BaseModel)
+    dict.__delitem__(native, "files")
+    dict.__setitem__(native, stored_name, heavy)
+    stored_name.hash_calls = stored_name.equality_calls = stored_name.class_calls = 0
+    stored_name.armed = True
+
+    with pytest.raises(ValidationError) as raised:
+        validate_portable_manifest(manifest)
+
+    assert str(raised.value.__cause__) == DISCOVERY_BUDGET_MESSAGE
+    assert (
+        stored_name.hash_calls,
+        stored_name.equality_calls,
+        stored_name.class_calls,
+    ) == (0, 0, 0)
