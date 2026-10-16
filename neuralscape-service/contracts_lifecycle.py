@@ -1004,8 +1004,9 @@ def _revalidated_claim_inputs(
     receipt_capture_errors: dict[int, Exception] = {}
     # The intent's error is raised first whatever the receipts hold, so after it nothing is captured.
     # Each receipt reference is charged before it is filtered or deduplicated, and the inventory stops
-    # at exhaustion: receipts not inventoried are captured on demand, in order, so an earlier
-    # receipt's own error still comes first and later ones report the exhausted budget.
+    # at exhaustion or at the first capture error (only one error is ever raised, so no later one is
+    # kept): receipts not inventoried are captured on demand, in order, so an earlier receipt's own
+    # error still comes first and later ones report their own error or the exhausted budget.
     for receipt in () if intent_capture_error is not None else tuple.__iter__(receipts):
         try:
             budget.charge_edge()
@@ -1024,8 +1025,7 @@ def _revalidated_claim_inputs(
             )
         except Exception as exc:
             receipt_capture_errors[identity] = exc
-            if str(exc) == DISCOVERY_BUDGET_MESSAGE:
-                break
+            break
 
     if intent_capture_error is not None:
         raise intent_capture_error

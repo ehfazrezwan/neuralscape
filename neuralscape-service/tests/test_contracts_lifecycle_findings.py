@@ -66,3 +66,57 @@ def test_ordinary_zones_and_the_repeated_hour_are_unchanged() -> None:
     naive["started_at"] = datetime(2026, 9, 28, 12, 0)
     with pytest.raises(ValidationError):
         StageReceipt.model_validate(naive)  # a naive timestamp is still refused
+
+
+# ------------------------------------------------ receipt inventory: one retained capture error
+class _CollidingKey(str):
+    """Spells a stored field's name but hashes and compares as a different key."""
+
+    def __hash__(self) -> int:
+        return 7
+
+    def __eq__(self, other: object) -> bool:
+        return self is other
+
+
+def _unreadable_receipt() -> StageReceipt:
+    from pydantic import BaseModel
+
+    from tests.test_contracts_lifecycle import BASE_MODEL_DICT_DESCRIPTOR
+
+    broken = receipt(CANONICAL, StageStatus.APPLIED)
+    dict.__setitem__(BASE_MODEL_DICT_DESCRIPTOR.__get__(broken, BaseModel), _CollidingKey("status"), "applied")
+    return broken
+
+
+def _claim(receipts):
+    from contracts_lifecycle import validate_required_stage_claim
+
+    validate_required_stage_claim(claimed_status=IntentStatus.APPLIED, intent=intent(CANONICAL), receipts=receipts)
+
+
+def test_distinct_unreadable_receipts_do_not_each_keep_an_exception() -> None:
+    """Only the first capture error of an exact root tuple is ever raised; the inventory must not keep one
+    exception (with its traceback) per later unreadable receipt."""
+
+    import gc
+    import tracemalloc
+
+    receipts = tuple(_unreadable_receipt() for _ in range(32_000))
+    gc.collect()
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError, match="colliding keys"):
+            _claim(receipts)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 40 * 1024 * 1024, peak
+
+
+def test_the_first_unreadable_receipt_still_reports_its_own_error_in_order() -> None:
+    readable = receipt(CANONICAL, StageStatus.APPLIED)
+    with pytest.raises(ValueError, match="colliding keys"):
+        _claim((readable, _unreadable_receipt(), _unreadable_receipt()))
+    with pytest.raises(TypeError, match="value must be a StageReceipt"):
+        _claim((object(), _unreadable_receipt()))  # an earlier receipt's own error comes first

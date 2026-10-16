@@ -596,8 +596,12 @@ def test_inventory_stops_at_exhaustion_and_the_first_error_keeps_its_precedence(
                    outputs=tuple(reference(f"o{i}") for i in range(140_000)))
     later = tuple(receipt(ProcessingStage.CANONICAL, StageStatus.PENDING, attempt=n) for n in range(2, 40))
     with pytest.raises(ValueError, match=BUDGET):  # one call, one envelope: the intent is revalidated first
+        contracts_lifecycle.validate_stage_receipts(command, (huge, invalid_first) + later)
+    assert len(receipts_captured) == 1  # nothing is captured after the budget ran out
+    receipts_captured.clear()
+    with pytest.raises(ValueError, match="colliding keys"):  # the inventory also stops at the first error,
         contracts_lifecycle.validate_stage_receipts(command, (invalid_first, huge) + later)
-    assert len(receipts_captured) == 2  # nothing is captured after the budget ran out
+    assert len(receipts_captured) == 1  # so a later receipt is never captured (or charged) ahead of it
     receipts_captured.clear()
     with pytest.raises(ValueError, match="colliding keys"):  # within the budget the earlier capture error wins
         contracts_lifecycle.validate_stage_receipts(command, (invalid_first,) + later)
