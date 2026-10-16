@@ -8,6 +8,7 @@ projection.  Callers must establish those runtime properties separately.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from typing import Annotated, Literal, TypeVar
 
@@ -28,6 +29,49 @@ from contracts_references import ReferenceHandle, SourceVersion
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 _BASE_MODEL_DICT_DESCRIPTOR = vars(BaseModel)["__dict__"]
 _BASE_MODEL_EXTRA_DESCRIPTOR = vars(BaseModel)["__pydantic_extra__"]
+
+
+_MAX_GRAPH_NODES = 16_384
+_MAX_GRAPH_DEPTH = 128
+_BUDGET_ERROR = "contract graph exceeds the native discovery budget"
+
+
+class _GraphBudget:
+    """Bounds one capture or reconstruction pass by the nodes it visits, per path, and by depth.
+
+    A shared native subtree is reconstructed once per path that reaches it and a public view is
+    observed once per edge, so an unbounded pass could be made exponential by a small input.
+    """
+
+    __slots__ = ("nodes",)
+
+    def __init__(self) -> None:
+        self.nodes = 0
+
+    def charge(self, depth: int) -> None:
+        self.nodes += 1
+        if self.nodes > _MAX_GRAPH_NODES or depth > _MAX_GRAPH_DEPTH:
+            raise ValueError(_BUDGET_ERROR)
+
+
+def _key_text(key: object) -> object:
+    """A key's own text for comparison; a str subclass is read without running its hooks."""
+
+    return str.__str__(key) if issubclass(type(key), str) else key
+
+
+def _require_distinct_key_text(
+    entries: tuple[tuple[object, object], ...],
+) -> tuple[tuple[object, object], ...]:
+    """Refuse keys that spell one name, however their own hash and equality disagree."""
+
+    seen: set[object] = set()
+    for key, _ in entries:
+        text = _key_text(key)
+        if text in seen:
+            raise ValueError("contract mapping has colliding keys")
+        seen.add(text)
+    return entries
 
 
 class _CapturedGraph:
@@ -100,6 +144,7 @@ def _capture_native_contract_graph(
     value: object,
     active_containers: set[int] | None = None,
     captured_by_identity: dict[int, _CapturedGraph] | None = None,
+    budget: _GraphBudget | None = None,
 ) -> _CapturedGraph:
     """Freeze supported native backing without invoking public protocols."""
 
@@ -108,6 +153,9 @@ def _capture_native_contract_graph(
         active_containers = set()
     if captured_by_identity is None:
         captured_by_identity = {}
+    if budget is None:
+        budget = _GraphBudget()
+    budget.charge(len(active_containers))
 
     if issubclass(value_type, (BaseModel, dict, list, tuple)):
         identity = id(value)
@@ -145,9 +193,10 @@ def _capture_native_contract_graph(
                                 item,
                                 active_containers,
                                 captured_by_identity,
+                                budget,
                             ),
                         )
-                        for key, item in stored_entries
+                        for key, item in _require_distinct_key_text(stored_entries)
                     ),
                     extra_entries=tuple(
                         (
@@ -156,9 +205,10 @@ def _capture_native_contract_graph(
                                 item,
                                 active_containers,
                                 captured_by_identity,
+                                budget,
                             ),
                         )
-                        for key, item in extra_entries
+                        for key, item in _require_distinct_key_text(extra_entries)
                     ),
                     malformed_extra=malformed_extra,
                 )
@@ -174,9 +224,10 @@ def _capture_native_contract_graph(
                                 item,
                                 active_containers,
                                 captured_by_identity,
+                                budget,
                             ),
                         )
-                        for key, item in entries
+                        for key, item in _require_distinct_key_text(entries)
                     ),
                 )
             elif issubclass(value_type, list):
@@ -189,6 +240,7 @@ def _capture_native_contract_graph(
                             item,
                             active_containers,
                             captured_by_identity,
+                            budget,
                         )
                         for item in native_items
                     ),
@@ -203,6 +255,7 @@ def _capture_native_contract_graph(
                             item,
                             active_containers,
                             captured_by_identity,
+                            budget,
                         )
                         for item in native_items
                     ),
@@ -218,11 +271,15 @@ def _materialize_captured_graph(
     value: _CapturedGraph,
     captured_by_identity: dict[int, _CapturedGraph],
     active_containers: set[int] | None = None,
+    budget: _GraphBudget | None = None,
 ) -> object:
     """Reconstruct one frozen graph with established diagnostic ordering."""
 
     if active_containers is None:
         active_containers = set()
+    if budget is None:
+        budget = _GraphBudget()
+    budget.charge(len(active_containers))
     if isinstance(value, _CapturedCycle):
         raise ValueError("cyclic contract graph is not valid input")
     if isinstance(value, _CapturedLeaf):
@@ -240,6 +297,7 @@ def _materialize_captured_graph(
                     item,
                     captured_by_identity,
                     active_containers,
+                    budget,
                 )
                 for key, item in value.stored_entries
             }
@@ -247,8 +305,14 @@ def _materialize_captured_graph(
                 raise ValueError(
                     "malformed stored contract extras are not valid input"
                 )
+            stored_texts = {_key_text(key) for key, _ in value.stored_entries}
             for key, item in value.extra_entries:
-                if key in stored_names or key in declared_fields:
+                if (
+                    key in stored_names
+                    or key in declared_fields
+                    or _key_text(key) in stored_texts
+                    or _key_text(key) in declared_fields
+                ):
                     raise ValueError(
                         "conflicting stored contract field is not valid input"
                     )
@@ -256,6 +320,7 @@ def _materialize_captured_graph(
                     item,
                     captured_by_identity,
                     active_containers,
+                    budget,
                 )
             return fields
         if isinstance(value, _CapturedDict):
@@ -264,6 +329,7 @@ def _materialize_captured_graph(
                     item,
                     captured_by_identity,
                     active_containers,
+                    budget,
                 )
                 for key, item in value.entries
             }
@@ -277,7 +343,9 @@ def _materialize_captured_graph(
                 return _capture_native_contract_graph(
                     item,
                     captured_by_identity=captured_by_identity,
+                    budget=budget,
                 )
+            budget.charge(len(active_containers))
             return _CapturedLeaf(item)
 
         if isinstance(value, _CapturedList):
@@ -289,6 +357,7 @@ def _materialize_captured_graph(
                     item,
                     captured_by_identity,
                     active_containers,
+                    budget,
                 )
                 for item in items
             ]
@@ -300,6 +369,7 @@ def _materialize_captured_graph(
                 item,
                 captured_by_identity,
                 active_containers,
+                budget,
             )
             for item in items
         )
@@ -689,7 +759,8 @@ class StageReceipt(VersionedContract):
                     f"{self.status.value} stage receipts require started_at"
                 )
         if self.started_at is not None and self.finished_at is not None:
-            if self.finished_at < self.started_at:
+            # the base comparison, so a datetime subclass cannot answer for the ordering
+            if datetime.__lt__(self.finished_at, self.started_at):
                 raise ValueError("finished_at cannot precede started_at")
         if self.status is StageStatus.FAILED:
             if self.error is None:

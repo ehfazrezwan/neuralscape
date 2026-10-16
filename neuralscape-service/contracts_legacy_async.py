@@ -11,6 +11,12 @@ from enum import Enum
 from schemas import StoreMemoryResponse, TaskAcceptedResponse, TaskStatusResponse
 
 
+def _text(value: object) -> object:
+    """A str-subclass value read as its own text, so its comparison hooks cannot answer for it."""
+
+    return str.__str__(value) if issubclass(type(value), str) else value
+
+
 class LegacyAsyncObservationKind(str, Enum):
     """Evidence available from one legacy response."""
 
@@ -46,11 +52,11 @@ def observe_task_accepted(response: TaskAcceptedResponse) -> LegacyAsyncObservat
     intent/outbox commit.
     """
 
-    if response.status != "accepted":
+    if _text(response.status) != "accepted":
         raise ValueError("task accepted response status must be 'accepted'")
     return LegacyAsyncObservation(
         kind=LegacyAsyncObservationKind.QUEUE_ACKNOWLEDGED,
-        task_id=response.task_id,
+        task_id=_text(response.task_id),
     )
 
 
@@ -70,8 +76,8 @@ def observe_task_status(response: TaskStatusResponse) -> LegacyAsyncObservation:
         "not_found": LegacyAsyncObservationKind.NOT_FOUND_IN_REDIS,
     }
     return LegacyAsyncObservation(
-        kind=kinds.get(response.status, LegacyAsyncObservationKind.UNKNOWN_STATUS),
-        task_id=response.task_id,
+        kind=kinds.get(_text(response.status), LegacyAsyncObservationKind.UNKNOWN_STATUS),
+        task_id=_text(response.task_id),
     )
 
 
@@ -87,7 +93,7 @@ def observe_redis_unavailable_sync_200(
 
     return LegacyAsyncObservation(
         kind=LegacyAsyncObservationKind.SYNC_HANDLER_RETURNED,
-        task_id=response.task_id,
+        task_id=_text(response.task_id),
     )
 
 
