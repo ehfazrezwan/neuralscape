@@ -2654,3 +2654,96 @@ def test_public_first_public_view_is_read_once_per_edge_not_per_snapshot(
     # nested one); a single edge reads it exactly once (see the tests above).
     assert public_view.iteration_calls == 2
     assert list(snapshot["children"]) == list(snapshot["groups"][0]) == [{"count": -1}]
+
+
+# ---------------------------------------------------------------------------
+# PR #399 review regressions: strong references and sibling pre-capture.
+# ---------------------------------------------------------------------------
+
+
+class _TemporaryDictTuple(tuple[object, ...]):
+    """Yields a brand-new dictionary on every public iteration."""
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        self.reads = getattr(self, "reads", 0) + 1
+        return iter(({"read": self.reads},))
+
+
+class _TemporaryDictList(list[object]):
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        self.reads = getattr(self, "reads", 0) + 1
+        return iter([{"read": self.reads}])
+
+
+@pytest.mark.parametrize("container_kind", ["tuple", "list"])
+def test_public_view_temporaries_do_not_alias_through_reused_object_ids(
+    container_kind: str,
+) -> None:
+    if container_kind == "tuple":
+        view: object = _TemporaryDictTuple()
+        outer: object = (view,) * 6
+    else:
+        view = _TemporaryDictList()
+        outer = [view] * 6
+
+    snapshot = snapshot_contract_graph(outer)
+
+    # Each edge reads the view afresh; a released temporary's id must not make
+    # a later edge reuse the earlier temporary's captured contents.
+    assert [list(edge) for edge in snapshot] == [[{"read": n}] for n in range(1, 7)]
+
+
+class _CallbackTuple(tuple[object, ...]):
+    def __new__(cls, callback: Callable[[], None]) -> "_CallbackTuple":
+        instance = tuple.__new__(cls, ())
+        instance.callback = callback
+        return instance
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        self.callback()
+        return iter(())
+
+
+class _CallbackList(list[object]):
+    def __init__(self, callback: Callable[[], None]) -> None:
+        list.__init__(self, [])
+        self.callback = callback
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        self.callback()
+        return iter(())
+
+
+@pytest.mark.parametrize("sibling_kind", ["dict", "model"])
+@pytest.mark.parametrize("container_kind", ["tuple", "list"])
+def test_exposed_siblings_are_captured_before_the_first_is_reconstructed(
+    container_kind: str,
+    sibling_kind: str,
+) -> None:
+    if sibling_kind == "dict":
+        sibling: object = {"count": -1}
+
+        def repair() -> None:
+            sibling["count"] = 1  # type: ignore[index]
+
+        expected: object = {"count": -1}
+    else:
+        sibling = _invalid_example_child()
+        repair = _repair_example_child(sibling)  # type: ignore[arg-type]
+        expected = {"count": -1}
+
+    if container_kind == "tuple":
+        repairing: object = _CallbackTuple(repair)
+        exposed: object = DivergentTuple((), (repairing, sibling))
+    else:
+        repairing = _CallbackList(repair)
+        exposed = DivergentList([], [repairing, sibling])
+
+    snapshot = snapshot_contract_graph((exposed,))
+
+    first, second = snapshot[0]
+    assert list(first) == []
+    # The repair ran, but the sibling was frozen before the first item was
+    # reconstructed, so the snapshot keeps the exposed (invalid) value.
+    assert (sibling["count"] if sibling_kind == "dict" else sibling.count) == 1  # type: ignore[index,union-attr]
+    assert second == expected

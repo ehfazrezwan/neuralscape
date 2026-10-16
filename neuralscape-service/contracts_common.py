@@ -103,6 +103,10 @@ class _GraphInventory:
         default_factory=dict
     )
     visited: set[int] = field(default_factory=set)
+    # Strong references keep every captured object alive for the whole
+    # reconstruction, so a released temporary's id cannot be reused by a later
+    # object and alias its captured contents.
+    retained: list[object] = field(default_factory=list)
 
 
 def _capture_native_graph(value: object, inventory: _GraphInventory) -> None:
@@ -116,6 +120,7 @@ def _capture_native_graph(value: object, inventory: _GraphInventory) -> None:
     if value_id in inventory.visited:
         return
     inventory.visited.add(value_id)
+    inventory.retained.append(value)
 
     if issubclass(value_type, BaseModel):
         stored = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
@@ -171,6 +176,21 @@ def _capture_native_graph(value: object, inventory: _GraphInventory) -> None:
     inventory.dictionaries[value_id] = entries
     for _, item in entries:
         _capture_native_graph(item, inventory)
+
+
+def _exposed_items(value: object, inventory: _GraphInventory) -> tuple[object, ...]:
+    """Read a sequence subclass's public view and freeze every sibling.
+
+    The native backing of all exposed items is captured before the first one is
+    reconstructed, so a callback run while reconstructing an earlier item cannot
+    change a later sibling's captured state.  The items are retained.
+    """
+
+    items = tuple(iter(value))  # type: ignore[call-overload]
+    inventory.retained.append(items)
+    for item in items:
+        _capture_native_graph(item, inventory)
+    return items
 
 
 def _snapshot_captured_graph(
@@ -256,7 +276,7 @@ def _snapshot_captured_graph(
             items = (
                 inventory.sequences[value_id]
                 if value_type is tuple
-                else tuple(iter(value))
+                else _exposed_items(value, inventory)
             )
             return tuple(
                 _snapshot_captured_graph(item, active_containers, inventory)
@@ -266,7 +286,7 @@ def _snapshot_captured_graph(
             items = (
                 inventory.sequences[value_id]
                 if value_type is list
-                else tuple(iter(value))
+                else _exposed_items(value, inventory)
             )
             return [
                 _snapshot_captured_graph(item, active_containers, inventory)
@@ -296,7 +316,10 @@ def snapshot_contract_graph(
     for each edge that reaches it, when that edge is first observed.  A child
     that exists only in such a public view cannot be fenced earlier, so an
     earlier callback can change it and it is then exposed in its changed form.
-    No view is read ahead of the callbacks that precede it.
+    No view is read ahead of the callbacks that precede it.  Once a view is
+    read, the native backing of every item it exposes is frozen before the
+    first item is reconstructed, and all captured objects stay referenced until
+    reconstruction finishes.
     """
 
     if active_containers is None:
