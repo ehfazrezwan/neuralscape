@@ -4078,3 +4078,119 @@ def test_a_short_aliased_mapping_chain_is_still_captured() -> None:
     nodes = _proxy_chain_nodes(40)
     completed = _entry_flow(tuple(reversed(nodes)))
     assert len(completed) == 40 and dict(completed[0])["next"] is not None
+
+
+# ── a pair is read incrementally: its value is frozen before the exhaustion check ──
+
+
+class _RepairingPair(tuple):
+    """A key/value pair whose public iterator repairs the value during the exhaustion check."""
+
+    def __new__(cls, key, value, repair):
+        instance = super().__new__(cls, (key, value))
+        instance.key, instance.value, instance.repair = key, value, repair
+        return instance
+
+    def __iter__(self):
+        yield self.key
+        yield self.value
+        self.repair()  # runs when the unpacking asks for a third item
+
+
+def _invalid_handle():
+    handle = reference("memory-1")
+    handle.__dict__["tenant_id"] = 5
+    return handle
+
+
+def test_a_pair_cannot_repair_its_value_during_the_exhaustion_check() -> None:
+    handle = _invalid_handle()
+
+    def repair():
+        handle.__dict__["tenant_id"] = "tenant-a"
+
+    pairs = _Items(lambda: iter((_RepairingPair("allowed_resources", (handle,), repair),)))
+    completed = _entry_flow(pairs)
+    assert handle.tenant_id == "tenant-a"                          # the repair ran
+    assert completed["allowed_resources"][0]["tenant_id"] == 5      # the first observation was kept
+
+
+def test_a_statement_value_repaired_during_the_exhaustion_check_is_still_refused() -> None:
+    resource_value = reference("memory-1")
+    handle = _invalid_handle()
+
+    def repair():
+        handle.__dict__["tenant_id"] = "tenant-a"
+
+    def pairs():
+        yield ("id", "lazy-allow")
+        yield ("effect", "allow")
+        yield ("subject_id", "subject-a")
+        yield ("credential_id", None)
+        yield ("action", "read")
+        yield _RepairingPair("resource", handle, repair)
+
+    with pytest.raises(ValidationError):
+        evaluate(principal(), "read", resource_value, _with_statements(_Items(pairs)))
+
+
+def test_pair_shape_errors_keep_their_types_and_terminal_ordering() -> None:
+    class Three(tuple):
+        def __iter__(self):
+            return iter(("a", 1, "extra"))
+
+    class One(tuple):
+        def __iter__(self):
+            return iter(("a",))
+
+    for bad, kind, text in ((Three(), ValueError, "too many values to unpack"),
+                            (One(), ValueError, "not enough values to unpack"),
+                            (5, TypeError, "cannot unpack non-iterable int object")):
+        later = []
+
+        def pairs(bad=bad):
+            yield ("first", 1)
+            yield bad
+            later.append("drained")
+            yield ("after", 2)  # drained, never retained
+
+        with pytest.raises(kind, match=text):
+            _entry_flow(_Items(pairs))
+        assert later == ["drained"]
+
+
+def test_freeze_mapping_entries_freezes_each_value_before_the_exhaustion_check() -> None:
+    handle = _invalid_handle()
+
+    def repair():
+        handle.__dict__["tenant_id"] = "tenant-a"
+
+    inventories: dict = {}
+    entries = _freeze_mapping_entries(
+        (_RepairingPair("resource", handle, repair),), {}, inventories, set(), {}, DiscoveryBudget()
+    )
+    assert entries[0].key == "resource"
+    frozen = inventories[id(handle)]
+    assert dict(frozen.stored_items)["tenant_id"] == 5  # captured before the repair ran
+
+
+@pytest.mark.parametrize("container", [list, tuple])
+def test_a_sequence_view_cannot_repair_an_item_it_already_yielded(container) -> None:
+    broken = _invalid_resource_dict()
+    handle = _invalid_handle()
+
+    class View(container):  # type: ignore[misc, valid-type]
+        def __iter__(self):
+            yield broken
+            yield handle
+            broken["tenant_id"] = "tenant-a"  # both repairs run on the advance after the last yield
+            handle.__dict__["tenant_id"] = "tenant-a"
+
+    completed = _complete_contract_input(View(), set(), {}, {})
+    assert completed[0]["tenant_id"] == 5 and completed[1]["tenant_id"] == 5
+
+
+def test_the_module_no_longer_has_a_drain_then_freeze_mapping_reader() -> None:
+    import contracts_policy_reference
+
+    assert not hasattr(contracts_policy_reference, "_mapping_items")

@@ -94,16 +94,6 @@ def _precheck(budget: DiscoveryBudget, count: int) -> None:
         budget.charge_edge(count)  # raises the stable budget error
 
 
-def _mapping_items(
-    value: Mapping[object, object],
-) -> tuple[tuple[object, object], ...]:
-    """Capture one mapping inventory without trusting native-dict overrides."""
-
-    if _is_native_dict(value):
-        return tuple(dict.items(value))
-    return tuple(value.items())
-
-
 def _fields_set_names(
     value: object, budget: DiscoveryBudget | None = None
 ) -> tuple[object, ...]:
@@ -414,6 +404,50 @@ def _open_mapping_items(value: Mapping[object, object]) -> Iterator[object]:
     return iter(value.items())
 
 
+def _open_pair(raw_entry: object) -> tuple[object, object, Iterator[object] | None]:
+    """Read a key/value pair's first two items: ``(key, value, rest)``.
+
+    Unpacking (``key, value = pair``) asks a pair's iterator for a third item, to check that
+    there is none, *before* the caller can freeze the value, and a pair's public iterator can
+    run code at that point.  This reads exactly two items; the caller freezes the value and then
+    calls ``_close_pair(rest)``.  An exact tuple is read natively (no hook runs, ``rest`` is
+    ``None``).  The errors and messages are the ones unpacking raises.
+    """
+
+    if type(raw_entry) is tuple:
+        if tuple.__len__(raw_entry) != 2:
+            size = tuple.__len__(raw_entry)
+            if size < 2:
+                raise ValueError(f"not enough values to unpack (expected 2, got {size})")
+            raise ValueError("too many values to unpack (expected 2)")
+        return tuple.__getitem__(raw_entry, 0), tuple.__getitem__(raw_entry, 1), None
+    try:
+        iterator = iter(raw_entry)  # type: ignore[call-overload]
+    except TypeError:
+        raise TypeError(f"cannot unpack non-iterable {type(raw_entry).__name__} object") from None
+    try:
+        key = next(iterator)
+    except StopIteration:
+        raise ValueError("not enough values to unpack (expected 2, got 0)") from None
+    try:
+        value = next(iterator)
+    except StopIteration:
+        raise ValueError("not enough values to unpack (expected 2, got 1)") from None
+    return key, value, iterator
+
+
+def _close_pair(rest: Iterator[object] | None) -> None:
+    """The exhaustion check unpacking would have done, after the value was frozen."""
+
+    if rest is None:
+        return
+    try:
+        next(rest)
+    except StopIteration:
+        return
+    raise ValueError("too many values to unpack (expected 2)")
+
+
 def _freeze_mapping_inventories(
     owners: dict[int, Mapping[object, object]],
     mapping_inventories: dict[int, _MappingInventory],
@@ -493,12 +527,13 @@ def _freeze_mapping_inventories(
                 if terminal:
                     continue  # drain only: nothing after the terminal pair is retained
                 try:
-                    key, item = raw_entry  # type: ignore[misc]
+                    key, item, rest = _open_pair(raw_entry)
                 except Exception as error:
                     entries.append(_CapturedFailure(error))
                     terminal = True
                     continue
-                entries.append(_MappingEntry(key, item))
+                # The pair's value is frozen (below) before the pair's iterator is asked
+                # whether it has a third item, so it cannot repair what it just exposed.
                 # The mappings THIS pair exposes, whether or not the entry walk had
                 # already queued them: any that has no inventory yet is captured now,
                 # at its first exposure, before this iterator is advanced.
@@ -536,6 +571,13 @@ def _freeze_mapping_inventories(
                         reach,
                         child_depth,
                     )
+                try:
+                    _close_pair(rest)
+                except Exception as error:
+                    entries.append(_CapturedFailure(error))
+                    terminal = True
+                    continue
+                entries.append(_MappingEntry(key, item))
             in_progress.discard(id(owner))
             mapping_inventories[id(owner)] = _MappingInventory(
                 owner,
@@ -559,12 +601,11 @@ def _freeze_mapping_entries(
     entries: list[_MappingEntry | _CapturedFailure] = []
     for raw_entry in raw_entries:
         try:
-            key, item = raw_entry  # type: ignore[misc]
+            key, item, rest = _open_pair(raw_entry)
         except Exception as error:
             entries.append(_CapturedFailure(error))
             break
-        entries.append(_MappingEntry(key, item))
-        _freeze_reachable_model_inventories(
+        _freeze_reachable_model_inventories(  # frozen before the pair's exhaustion check
             item,
             model_inventories,
             visited_containers,
@@ -573,6 +614,12 @@ def _freeze_mapping_entries(
             budget,
             depth,
         )
+        try:
+            _close_pair(rest)
+        except Exception as error:
+            entries.append(_CapturedFailure(error))
+            break
+        entries.append(_MappingEntry(key, item))
     return tuple(entries)
 
 
