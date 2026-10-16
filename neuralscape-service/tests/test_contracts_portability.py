@@ -3344,7 +3344,7 @@ def test_discovery_edge_budget_rejects_before_any_stored_name_callback(
     ) == (0, 0, 0)
 
 
-# --- exact native containers are charged once (ADR-P12-002) -------------------
+# --- exact native containers are charged once ---------------------------------
 
 
 def _budget_measure(monkeypatch, manifest: PortableManifest) -> tuple[int, int]:
