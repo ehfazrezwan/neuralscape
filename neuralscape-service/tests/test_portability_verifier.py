@@ -1057,3 +1057,140 @@ def test_a_consistent_zip64_record_with_extensible_data_passes_the_precheck(tmp_
 
 def test_a_python_written_bundle_still_verifies(tmp_path) -> None:
     assert verify_bundle(_write_zip(tmp_path / "b.zip", PAYLOAD)).ok
+
+
+# ---- compressed bytes are bounded before streaming; directory type needs a directory name; zip64 by locator
+
+
+class _PaddedCompressor:
+    """A real deflate stream followed by many empty blocks: inflates to the same bytes, costs far more to read."""
+
+    def __init__(self, pads: int) -> None:
+        import zlib
+
+        self._zlib = zlib
+        self._inner = zlib.compressobj(6, zlib.DEFLATED, -15)
+        self._pads = pads
+
+    def compress(self, data: bytes) -> bytes:
+        return self._inner.compress(data)
+
+    def flush(self, *args) -> bytes:
+        aligned = self._inner.flush(self._zlib.Z_SYNC_FLUSH)  # byte-aligned after a sync flush
+        empty_stored_block = b"\x00\x00\x00\xff\xff"  # BFINAL=0, BTYPE=00, LEN=0, NLEN=0xFFFF
+        return aligned + empty_stored_block * self._pads + self._inner.flush()
+
+
+def _padded_zip(tmp_path, monkeypatch, *, padded: str, pads: int, extra_dir: bool = False) -> Path:
+    import zipfile as zf
+
+    path = tmp_path / "b.zip"
+    real = zf._get_compressor
+    with zf.ZipFile(path, "w", zf.ZIP_DEFLATED) as archive:
+        archive.writestr("manifest.json", json.dumps(_manifest(PAYLOAD)))
+        for name, data in PAYLOAD.items():
+            if name == padded:
+                monkeypatch.setattr(zf, "_get_compressor", lambda *a, **k: _PaddedCompressor(pads))
+            archive.writestr(name, data)
+            monkeypatch.setattr(zf, "_get_compressor", real)
+        if extra_dir:
+            monkeypatch.setattr(zf, "_get_compressor", lambda *a, **k: _PaddedCompressor(pads))
+            archive.writestr("canonical/", b"", compress_type=zf.ZIP_DEFLATED)
+            monkeypatch.setattr(zf, "_get_compressor", real)
+    return path
+
+
+def test_a_member_padded_with_empty_deflate_blocks_is_refused_before_streaming(tmp_path, monkeypatch) -> None:
+    path = _padded_zip(tmp_path, monkeypatch, padded="sources/note.md", pads=50_000)
+    info = zipfile.ZipFile(path).getinfo("sources/note.md")
+    assert zipfile.ZipFile(path).read("sources/note.md") == PAYLOAD["sources/note.md"]  # still a valid stream
+    assert info.compress_size > 100 * info.file_size
+    streamed = []
+    real_chunks = pv._zip_member_chunks
+    monkeypatch.setattr(pv, "_zip_member_chunks", lambda info, raw: streamed.append(info.filename) or real_chunks(info, raw))
+    report = verify_bundle(path)
+    assert not report.ok and pv.SIZE_LIMIT in _codes(report)
+    assert streamed == []  # refused before any member was streamed
+
+
+def test_an_empty_directory_record_padded_with_empty_blocks_is_refused(tmp_path, monkeypatch) -> None:
+    path = _padded_zip(tmp_path, monkeypatch, padded="", pads=50_000, extra_dir=True)
+    assert zipfile.ZipFile(path).getinfo("canonical/").compress_size > 100_000
+    report = verify_bundle(path)
+    assert not report.ok and pv.SIZE_LIMIT in _codes(report)
+
+
+def test_compressed_bytes_across_the_archive_are_bounded(tmp_path, monkeypatch) -> None:
+    import os as _os
+    import zipfile as zf
+
+    noisy = {**PAYLOAD, "canonical/random.bin": _os.urandom(20_000)}
+    path = tmp_path / "b.zip"
+    real = zf._get_compressor
+    with zf.ZipFile(path, "w", zf.ZIP_DEFLATED) as archive:
+        archive.writestr("manifest.json", json.dumps(_manifest(noisy)))
+        for name, data in noisy.items():
+            if name == "canonical/random.bin":  # padded, but within its own per-entry bound
+                monkeypatch.setattr(zf, "_get_compressor", lambda *a, **k: _PaddedCompressor(600))
+            archive.writestr(name, data)
+            monkeypatch.setattr(zf, "_get_compressor", real)
+    infos = zipfile.ZipFile(path).infolist()
+    uncompressed = sum(i.file_size for i in infos)
+    compressed = sum(i.compress_size for i in infos)
+    assert compressed > uncompressed
+    monkeypatch.setattr(pv, "MAX_TOTAL_BYTES", uncompressed)  # the uncompressed total alone is within the limit
+    assert pv.SIZE_LIMIT in _codes(verify_bundle(path))
+    monkeypatch.setattr(pv, "MAX_TOTAL_BYTES", compressed)
+    assert verify_bundle(path).ok, _codes(verify_bundle(path))
+
+
+def test_a_lowered_entry_limit_bounds_compressed_bytes_too(tmp_path, monkeypatch) -> None:
+    path = _padded_zip(tmp_path, monkeypatch, padded="sources/note.md", pads=2_000)
+    info = zipfile.ZipFile(path).getinfo("sources/note.md")
+    monkeypatch.setattr(pv, "MAX_ENTRY_BYTES", info.compress_size - 1)
+    assert pv.SIZE_LIMIT in _codes(verify_bundle(path))
+
+
+def test_ordinary_archives_stay_within_the_compressed_bounds(tmp_path) -> None:
+    import os as _os
+
+    noisy = {**PAYLOAD, "canonical/random.bin": _os.urandom(200_000)}  # incompressible: deflate slightly expands
+    path = _write_zip(tmp_path / "b.zip", noisy, _manifest(noisy))
+    assert verify_bundle(path).ok, _codes(verify_bundle(path))
+
+
+def test_a_directory_type_member_without_a_directory_name_is_refused(tmp_path) -> None:
+    import stat as _stat
+
+    path = tmp_path / "b.zip"
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("manifest.json", json.dumps(_manifest(PAYLOAD)))
+        for name, data in PAYLOAD.items():
+            info = zipfile.ZipInfo(name)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            if name == "sources/note.md":
+                info.external_attr = (_stat.S_IFDIR | 0o755) << 16
+            archive.writestr(info, data)
+    report = verify_bundle(path)
+    assert not report.ok and report.findings, _codes(report)
+
+
+def test_a_python_written_directory_record_is_still_accepted(tmp_path) -> None:
+    path = tmp_path / "b.zip"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("manifest.json", json.dumps(_manifest(PAYLOAD)))
+        for name, data in PAYLOAD.items():
+            archive.writestr(name, data)
+        archive.mkdir("canonical")  # S_IFDIR with a trailing slash
+    assert verify_bundle(path).ok, _codes(verify_bundle(path))
+
+
+def test_a_zip64_end_record_with_ordinary_end_fields_verifies_end_to_end(tmp_path, monkeypatch) -> None:
+    import struct
+
+    path = _zip64_end_record_archive(tmp_path, monkeypatch)
+    raw = path.read_bytes()
+    entries = struct.unpack_from("<H", raw, raw.rindex(b"PK\x05\x06") + 10)[0]
+    assert entries != 0xFFFF  # the ordinary end record is not saturated
+    report = verify_bundle(path)
+    assert report.ok, _codes(report)

@@ -324,20 +324,24 @@ def _check_framing(
         eocd_position = size - _EOCD.size
         _sig, disk, cd_disk, _entries_here, entries, cd_size, cd_offset, _comment = eocd
         end_of_directory = eocd_position
-        if (
+        saturated = (
             entries == 0xFFFF
             or cd_size == _U32_MAX
             or cd_offset == _U32_MAX
             or disk == 0xFFFF
             or cd_disk == 0xFFFF
-        ):
-            locator_position = eocd_position - 20
-            if locator_position < 0:
-                raise _Framing("missing zip64 locator")
+        )
+        # Like the archive library (and the precheck), a zip64 locator directly before the end
+        # record means the zip64 end record governs, whether or not the ordinary fields are
+        # saturated; saturated fields without a locator are refused.
+        locator_position = eocd_position - 20
+        locator = b""
+        if locator_position >= 0:
             raw.seek(locator_position)
             locator = raw.read(20)
-            if locator[:4] != _ZIP64_LOCATOR_SIGNATURE:
-                raise _Framing("missing zip64 locator")
+        if locator[:4] != _ZIP64_LOCATOR_SIGNATURE and saturated:
+            raise _Framing("missing zip64 locator")
+        if locator[:4] == _ZIP64_LOCATOR_SIGNATURE:
             record_offset = struct.unpack_from("<Q", locator, 8)[0]
             raw.seek(record_offset)
             record = raw.read(56)
@@ -367,6 +371,19 @@ def _check_framing(
     return True
 
 
+def _compressed_bound(info: zipfile.ZipInfo) -> int:
+    """The most compressed bytes a member of this uncompressed size may occupy.
+
+    A stored member is exactly its size.  Deflate never needs more than its stored-block
+    framing (5 bytes per 64 KiB) over the input; the bound below is far more generous than
+    that, and it caps the bytes read for a member that inflates to little or nothing.
+    """
+
+    if info.compress_type == zipfile.ZIP_STORED:
+        return info.file_size
+    return info.file_size + info.file_size // 8 + 1024
+
+
 def _inventory_zip(
     source: _ZipSource, report: VerificationReport
 ) -> list[_Entry]:
@@ -375,18 +392,25 @@ def _inventory_zip(
         report.add(ENTRY_COUNT_LIMIT)
         return []
     total = 0
+    total_compressed = 0
     for info in infos:
         if info.file_size > MAX_ENTRY_BYTES:
             report.add(SIZE_LIMIT, _safe_label(info.filename))
             return []
+        # Compressed bytes are what is read: a deflate stream may hold any number of empty blocks
+        # that inflate to nothing, so they are bounded per member and across the archive too.
+        if info.compress_size > MAX_ENTRY_BYTES or info.compress_size > _compressed_bound(info):
+            report.add(SIZE_LIMIT, _safe_label(info.filename), "compressed size")
+            return []
         total += info.file_size
+        total_compressed += info.compress_size
         if (
             info.file_size >= RATIO_MIN_ENTRY_BYTES
             and info.file_size > MAX_COMPRESSION_RATIO * max(info.compress_size, 1)
         ):
             report.add(RATIO_LIMIT, _safe_label(info.filename))
             return []
-    if total > MAX_TOTAL_BYTES:
+    if total > MAX_TOTAL_BYTES or total_compressed > MAX_TOTAL_BYTES:
         report.add(SIZE_LIMIT)
         return []
 
@@ -412,6 +436,10 @@ def _inventory_zip(
             report.add(ENTRY_CORRUPT, _safe_label(name), "directory record carries data")
             continue
         mode = info.external_attr >> 16
+        if stat.S_ISDIR(mode) and not is_dir:
+            # Typed as a directory but named as a file: extractors disagree on what it is.
+            report.add(ENTRY_CORRUPT, _safe_label(name), "directory type without a directory name")
+            continue
         problem = _mode_finding(mode) if mode else None
         if problem is not None:
             report.add(problem, _safe_label(name))
