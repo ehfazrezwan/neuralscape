@@ -83,7 +83,10 @@ def _mapping_entries(
 ) -> tuple[tuple[object, object], ...]:
     if issubclass(value_type, dict):
         return tuple(dict.items(value))
-    return tuple(value.items())
+    # Rebuild every returned entry as a plain tuple, reading each one exactly once: an entry that
+    # is a tuple subclass with a changing iterator would otherwise show a different pair to
+    # capture, collision checking and reconstruction.
+    return tuple((key, item) for key, item in value.items())
 
 
 @dataclass

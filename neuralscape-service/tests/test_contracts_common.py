@@ -1746,6 +1746,32 @@ def test_snapshot_contract_graph_preserves_unique_custom_extra_inventory() -> No
         ExampleContract.model_validate(snapshot, strict=True)
 
 
+class ChangingIterationEntry(tuple):
+    """A key/value entry whose iterator reports a different pair on every pass after the first."""
+
+    passes = 0
+
+    def __iter__(self) -> Iterator[object]:
+        type(self).passes += 1
+        if type(self).passes == 1:
+            return iter(("future_state", 1))
+        return iter(("count", 1))
+
+
+def test_snapshot_contract_graph_freezes_each_custom_extra_entry_once() -> None:
+    ChangingIterationEntry.passes = 0
+    value = ExampleContract.model_construct(count=-1)  # stored state the validator would refuse
+    extra = DuplicateItemsMapping((ChangingIterationEntry(("future_state", 1)),))
+    object.__setattr__(value, "__pydantic_extra__", extra)
+
+    snapshot = snapshot_contract_graph(value)
+
+    # one pass over the entry: capture, collision checks and reconstruction all see the same
+    # pair, so the stored declared value is never overwritten by a later, different pass
+    assert snapshot == {"count": -1, "future_state": 1}
+    assert ChangingIterationEntry.passes == 1
+
+
 def test_snapshot_contract_graph_preserves_collision_priority_for_duplicate_extra() -> None:
     value = ExampleContract(count=1)
     extra = DuplicateItemsMapping((("count", 1), ("count", 2)))
