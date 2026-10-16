@@ -2557,3 +2557,81 @@ def test_previous_first_diagnostics_survive_replay_charging(monkeypatch) -> None
     _with_tier(monkeypatch, nodes=6)
     with pytest.raises(ValidationError):
         validate_operation_transition(previous, _operation_with_manifests(10, observed_state="running"))
+
+
+# ---- a public view is captured child by child, before the iterator advances
+
+class _RepairsAfterYield(tuple):
+    """An empty-backed tuple whose public view yields one child, then repairs it before it ends."""
+
+    def __new__(cls, exposed, repair):
+        instance = super().__new__(cls)
+        instance.exposed, instance.repair = exposed, repair
+        return instance
+
+    def __iter__(self):
+        yield self.exposed
+        self.repair()
+
+
+class _DictViewRepairsAfterYield(dict):
+    """A dict subclass whose public items yield one pair, then repair the exposed value."""
+
+    def __init__(self, key, exposed, repair):
+        super().__init__()
+        self.key, self.exposed, self.repair = key, exposed, repair
+
+    def items(self):
+        yield (self.key, self.exposed)
+        self.repair()
+
+
+def _rebuilt(root):
+    freeze, rebuild = contracts_tenancy._closed_graph_snapshot_session()
+    freeze(root)
+    return rebuild(root)
+
+
+def test_a_tuple_view_cannot_repair_a_child_it_already_exposed() -> None:
+    child = {"placement_generation": 99}
+    view = _RepairsAfterYield(child, lambda: child.__setitem__("placement_generation", 1))
+    assert _rebuilt({"items": view})["items"] == ({"placement_generation": 99},)  # as exposed, not as repaired
+
+
+def test_a_dict_view_cannot_repair_a_value_it_already_exposed() -> None:
+    child = {"placement_generation": 99}
+    view = _DictViewRepairsAfterYield("manifest", child, lambda: child.__setitem__("placement_generation", 1))
+    assert _rebuilt({"view": view})["view"] == {"manifest": {"placement_generation": 99}}
+
+
+def test_an_empty_backed_tuple_view_cannot_repair_a_stale_manifest_into_the_current_generation() -> None:
+    candidate, _child, invoke = _tenancy_nested_boundary_case("placement")
+    stale = manifest(generation=99)  # generation 99 is not the current placement generation 7
+    view = _RepairsAfterYield(stale, lambda: stale.__setitem__("placement_generation", 7))
+    _set_native_field(candidate, "resource_manifests", view)
+    with pytest.raises(ValidationError, match="placement_generation"):
+        invoke(candidate)
+
+
+def test_siblings_exposed_by_one_view_are_all_captured_before_the_first_is_rebuilt() -> None:
+    first, second = {"n": 1}, {"n": 2}
+
+    class Pair(tuple):
+        def __new__(cls):
+            return super().__new__(cls)
+
+        def __iter__(self):
+            yield first
+            yield second
+
+    seen = []
+
+    class Spy(dict):  # a dict subclass child: its public view runs while the first child is rebuilt
+        def items(self):
+            second["n"] = 22  # a callback during rebuild changes a later sibling
+            seen.append("ran")
+            return iter(())
+
+    result = _rebuilt({"pair": (Pair(), Spy())})
+    assert result["pair"][0] == ({"n": 1}, {"n": 2})
+    assert seen == ["ran"]

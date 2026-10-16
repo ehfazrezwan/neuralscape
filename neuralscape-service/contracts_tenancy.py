@@ -68,17 +68,25 @@ def _is_real_mapping(value: object) -> bool:
     )
 
 
-def unpack_pairs(entries: Iterable[object]) -> tuple[tuple[object, object], ...]:
+def unpack_pairs(
+    entries: Iterable[object], on_pair: Callable[[object], None] | None = None
+) -> tuple[tuple[object, object], ...]:
     """Unpack each caller-owned ``(key, value)`` pair exactly once into a plain tuple.
 
     A pair object is arbitrary caller code: it may answer differently each time it is
     unpacked.  Every consumer (name checks, overlap checks, field construction) must use
     the returned tuples and never the caller's pair objects again.
+
+    ``on_pair`` is called with each value right after its pair is unpacked and before the
+    iterator is advanced, so a caller can capture a value the moment the view exposes it
+    (advancing a caller-owned iterator is arbitrary code that may repair an exposed child).
     """
 
     unpacked: list[tuple[object, object]] = []
     for entry in entries:
         key, value = entry  # type: ignore[misc]
+        if on_pair is not None:
+            on_pair(value)
         unpacked.append((key, value))
     return tuple(unpacked)
 
@@ -340,6 +348,20 @@ def _closed_graph_snapshot_session() -> tuple[
             if is_graph_node(exposed) and id(exposed) not in native_children:
                 freeze_native_graph(exposed, depth)
 
+    def collect_exposed(read: Callable[[], Iterable[object]], depth: int) -> tuple[object, ...]:
+        """Read a public sequence view once, capturing each child as it is yielded.
+
+        Advancing the iterator is caller code that may repair a child it already exposed, so a child's
+        native backing is frozen before the next one is requested; reconstruction still waits until
+        every sibling is captured.
+        """
+
+        collected: list[object] = []
+        for entry in observed(read):
+            capture_exposed((entry,), depth)
+            collected.append(entry)
+        return tuple(collected)
+
     def rebuild(item: object, depth: int = 0) -> object:
         """Public rebuild phase: observations are charged to the view envelope."""
 
@@ -442,12 +464,13 @@ def _closed_graph_snapshot_session() -> tuple[
                     if exact
                     # Each observed pair is unpacked exactly once into a plain tuple that capture and
                     # reconstruction both reuse; the caller's pair object is never read again.
-                    else unpack_pairs(observed(item.items))
+                    # Each exposed value is captured as its pair is unpacked, before the view advances.
+                    else unpack_pairs(
+                        observed(item.items), lambda value: capture_exposed((value,), depth + 1)
+                    )
                 )
                 if exact:
                     own_cost = 1 + len(entries)
-                else:
-                    capture_exposed((value for _key, value in entries), depth + 1)
                 result = {key: child(field_value) for key, field_value in entries}
             else:
                 is_list = isinstance(item, list)
@@ -456,12 +479,10 @@ def _closed_graph_snapshot_session() -> tuple[
                 items = (
                     frozen_containers[identity]
                     if exact
-                    else tuple(observed(lambda: item))
+                    else collect_exposed(lambda: item, depth + 1)
                 )
                 if exact:
                     own_cost = 1 + len(items)
-                else:
-                    capture_exposed(items, depth + 1)
                 copied_items = [child(entry) for entry in items]
                 result = copied_items if is_list else tuple(copied_items)
             if reusable:
