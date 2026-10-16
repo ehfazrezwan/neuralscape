@@ -2474,3 +2474,183 @@ def test_error_mapping_covers_every_internal_outcome_and_returns_copies() -> Non
     first = public_error_for(InternalErrorCode.CANCELLED)
     first.message = "mutated by a caller"
     assert public_error_for(InternalErrorCode.CANCELLED).message == "The operation was cancelled."
+
+
+# ---------------------------------------------------------------------------
+# Public-view pinning (public_first): a child that exists only in a sequence
+# subclass's public iterator is captured when that view is first observed.  An
+# earlier callback can therefore repair it, and it is then exposed in repaired
+# form.  The view is read once per reconstruction.  Models reachable through
+# native storage are fenced before any callback and are NOT repaired.  The
+# tests pin this documented limit; they do not claim entry-time capture of
+# children that were never exposed.
+# ---------------------------------------------------------------------------
+
+
+class PublicViewTupleEnvelope(ContractModel):
+    trigger: tuple[int, ...]
+    children: tuple[ExampleContract, ...]
+    groups: tuple[tuple[ExampleContract, ...], ...] = ()
+
+
+class PublicViewListEnvelope(ContractModel):
+    trigger: tuple[int, ...]
+    children: list[ExampleContract]
+    groups: list[list[ExampleContract]] = []
+
+
+def _invalid_example_child() -> ExampleContract:
+    return ExampleContract(count=1).model_copy(update={"count": -1})
+
+
+def _repair_example_child(child: ExampleContract) -> Callable[[], None]:
+    def repair() -> None:
+        child_native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(child, BaseModel)
+        dict.__setitem__(child_native, "count", 1)
+
+    return repair
+
+
+def _public_only_envelope(
+    container_kind: str,
+    placement: str,
+) -> tuple[BaseModel, ExampleContract, DivergentTuple | DivergentList]:
+    """Return an envelope whose only child is exposed by a public iterator."""
+
+    child = _invalid_example_child()
+    if container_kind == "tuple":
+        public_view: DivergentTuple | DivergentList = DivergentTuple((), (child,))
+        value: BaseModel = PublicViewTupleEnvelope(trigger=(), children=())
+        nested_outer: object = (public_view,)
+    else:
+        public_view = DivergentList([], [child])
+        value = PublicViewListEnvelope(trigger=(), children=[])
+        nested_outer = [public_view]
+    native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+    if placement == "direct":
+        dict.__setitem__(native, "children", public_view)
+    else:
+        dict.__setitem__(native, "groups", nested_outer)
+    return value, child, public_view
+
+
+def _exposed_children(snapshot: dict, placement: str) -> object:
+    children = snapshot["children"] if placement == "direct" else snapshot["groups"][0]
+    return children
+
+
+@pytest.mark.parametrize("placement", ["direct", "nested"])
+@pytest.mark.parametrize("container_kind", ["tuple", "list"])
+def test_public_first_unrepaired_public_only_child_is_exposed_and_rejected(
+    container_kind: str,
+    placement: str,
+) -> None:
+    value, child, public_view = _public_only_envelope(container_kind, placement)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert list(_exposed_children(snapshot, placement)) == [{"count": -1}]
+    assert public_view.iteration_calls == 1
+    assert child.count == -1
+    with pytest.raises(ValidationError) as raised:
+        type(value).model_validate(snapshot, strict=True)
+    assert raised.value.errors()[0]["type"] == "greater_than_equal"
+    assert raised.value.errors()[0]["input"] == -1
+
+
+@pytest.mark.parametrize("hook", ["hash", "equality"])
+@pytest.mark.parametrize("placement", ["direct", "nested"])
+@pytest.mark.parametrize("container_kind", ["tuple", "list"])
+def test_public_first_public_only_child_repaired_by_earlier_stored_name_hook(
+    container_kind: str,
+    placement: str,
+    hook: str,
+) -> None:
+    value, child, public_view = _public_only_envelope(container_kind, placement)
+    native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+    stored_name = RepairingStoredName("trigger", _repair_example_child(child), hook)
+    stored_value = dict.pop(native, "trigger")
+    dict.__setitem__(native, stored_name, stored_value)
+    stored_name.armed = True
+
+    snapshot = snapshot_contract_graph(value)
+
+    if hook == "hash":
+        assert stored_name.hash_calls > 0
+    else:
+        assert stored_name.equality_calls > 0
+    assert child.count == 1
+    # The never-exposed child is first observed after the callback, so it is
+    # exposed in repaired form and the receiving model accepts it.
+    assert list(_exposed_children(snapshot, placement)) == [{"count": 1}]
+    assert public_view.iteration_calls == 1
+    assert type(value).model_validate(snapshot, strict=True) is not None
+
+
+@pytest.mark.parametrize("placement", ["direct", "nested"])
+@pytest.mark.parametrize("container_kind", ["tuple", "list"])
+def test_public_first_public_only_child_repaired_by_earlier_extra_items_callback(
+    container_kind: str,
+    placement: str,
+) -> None:
+    value, child, public_view = _public_only_envelope(container_kind, placement)
+    extras = RepairingMapping(_repair_example_child(child))
+    _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(value, extras)
+
+    snapshot = snapshot_contract_graph(value)
+
+    assert extras.item_reads == 1
+    assert child.count == 1
+    assert list(_exposed_children(snapshot, placement)) == [{"count": 1}]
+    assert public_view.iteration_calls == 1
+    assert type(value).model_validate(snapshot, strict=True) is not None
+
+
+@pytest.mark.parametrize("container_kind", ["tuple", "list"])
+def test_public_first_native_stored_child_stays_fenced_against_the_same_callbacks(
+    container_kind: str,
+) -> None:
+    child = _invalid_example_child()
+    if container_kind == "tuple":
+        value: BaseModel = PublicViewTupleEnvelope(trigger=(), children=())
+        native_children: object = (child,)
+    else:
+        value = PublicViewListEnvelope(trigger=(), children=[])
+        native_children = [child]
+    native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+    dict.__setitem__(native, "children", native_children)
+    stored_name = RepairingStoredName("trigger", _repair_example_child(child), "hash")
+    stored_value = dict.pop(native, "trigger")
+    dict.__setitem__(native, stored_name, stored_value)
+    stored_name.armed = True
+    extras = RepairingMapping(_repair_example_child(child))
+    _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(value, extras)
+
+    snapshot = snapshot_contract_graph(value)
+
+    # The callbacks ran and repaired the live object, but the model was fenced
+    # from native storage first, so the snapshot keeps the entry-time state.
+    assert stored_name.hash_calls > 0
+    assert extras.item_reads == 1
+    assert child.count == 1
+    assert list(snapshot["children"]) == [{"count": -1}]
+    with pytest.raises(ValidationError) as raised:
+        type(value).model_validate(snapshot, strict=True)
+    assert raised.value.errors()[0]["input"] == -1
+
+
+@pytest.mark.parametrize("container_kind", ["tuple", "list"])
+def test_public_first_public_view_is_read_once_per_edge_not_per_snapshot(
+    container_kind: str,
+) -> None:
+    value, _, public_view = _public_only_envelope(container_kind, "direct")
+    native = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+    outer: object = (public_view,) if container_kind == "tuple" else [public_view]
+    dict.__setitem__(native, "groups", outer)
+
+    snapshot = snapshot_contract_graph(value)
+
+    # One read for each edge that reaches the view (the direct field and the
+    # nested one); a single edge reads it exactly once (see the tests above).
+    assert public_view.iteration_calls == 2
+    assert list(snapshot["children"]) == list(snapshot["groups"][0]) == [{"count": -1}]

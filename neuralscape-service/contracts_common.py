@@ -289,6 +289,14 @@ def snapshot_contract_graph(
     Malformed extra storage, declared/extra overlap, and cycles are rejected.
     This is neither schema validation nor authorization: callers must strictly
     reconstruct the intended target model before trusting the result.
+
+    Stored models and exact built-in containers are fenced from their native
+    storage before any user callback runs.  A tuple or list subclass is
+    different: its public iteration is the authoritative view and is read once
+    for each edge that reaches it, when that edge is first observed.  A child
+    that exists only in such a public view cannot be fenced earlier, so an
+    earlier callback can change it and it is then exposed in its changed form.
+    No view is read ahead of the callbacks that precede it.
     """
 
     if active_containers is None:
