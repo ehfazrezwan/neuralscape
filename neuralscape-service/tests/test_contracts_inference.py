@@ -1556,3 +1556,208 @@ def test_colliding_str_subclass_keys_are_rejected():
     result = generation_result().model_copy(update={"proposals": (proposal,)})
     with pytest.raises(ValueError):
         validate_generation_result(generation_request(), result)
+
+
+# ── a class that only registers itself as a Mapping is not one ──────────────
+
+
+class _RegisteredOnly:
+    """Registered with the Mapping ABC but with none of its methods."""
+
+
+def test_a_registered_only_mapping_in_a_json_value_is_a_value_error_not_an_attribute_error():
+    from collections.abc import Mapping
+
+    Mapping.register(_RegisteredOnly)
+    request = generation_request()
+    proposal = {
+        "proposal_id": "proposal-1", "output": _RegisteredOnly(),
+        "support_span_ids": ("support-1",), "machine_authored": True,
+    }
+    result = generation_result().model_copy(update={"proposals": (proposal,)})
+    with pytest.raises(ValueError):  # a stable class: ValidationError or ValueError, never AttributeError
+        validate_generation_result(request, result)
+    schema = {**request.output_schema, "examples": [_RegisteredOnly()]}
+    with pytest.raises(ValueError):
+        validate_generation_result(request.model_copy(update={"output_schema": schema}), generation_result())
+
+
+def test_a_real_non_dict_mapping_inside_a_json_value_is_still_scanned_for_models():
+    from types import MappingProxyType
+
+    class SchemaShaped(BaseModel):
+        summary: str
+
+    proposal = {
+        "proposal_id": "proposal-1", "output": MappingProxyType({"summary": SchemaShaped(summary="m")}),
+        "support_span_ids": ("support-1",), "machine_authored": True,
+    }
+    result = generation_result().model_copy(update={"proposals": (proposal,)})
+    with pytest.raises(ValueError, match="JSON value contains a model object"):
+        validate_generation_result(generation_request(), result)
+
+
+def test_the_engine_and_inference_contracts_never_read_the_clock():
+    import ast
+    from pathlib import Path
+
+    import contracts_engines
+
+    clock_calls = {"now", "today", "utcnow", "time", "monotonic", "perf_counter", "time_ns"}
+    clock_modules = {"time", "calendar", "zoneinfo"}
+    for module in (contracts_engines, contracts_inference):
+        tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                assert not {a.name.split(".")[0] for a in node.names} & clock_modules, module.__name__
+            if isinstance(node, ast.ImportFrom):
+                assert (node.module or "").split(".")[0] not in clock_modules, module.__name__
+            if isinstance(node, ast.Attribute):
+                assert node.attr not in clock_calls, (module.__name__, node.attr)
+
+
+# ── pinned classes: probes found these already closed ───────────────────────
+
+
+class _SchemaShapedModel(BaseModel):
+    summary: str
+
+
+def test_a_dict_subclass_view_cannot_repair_a_child_after_exposing_it():
+    request = generation_request()
+    props = {"summary": {"type": "string", "default": _SchemaShapedModel(summary="m")}}
+
+    class RepairingSchema(dict):
+        def items(self):
+            yield from list(dict.items(self))
+            props["summary"]["default"] = "ok"  # after every entry, and the child, was exposed
+
+    schema = RepairingSchema(
+        {"$schema": JSON_SCHEMA_DIALECT, "type": "object", "properties": props,
+         "required": ["summary"], "additionalProperties": False}
+    )
+    with pytest.raises(ValueError, match="JSON value contains a model object"):
+        validate_generation_result(request.model_copy(update={"output_schema": schema}), generation_result())
+
+
+class _AlwaysEqual(str):
+    def __eq__(self, other):
+        return True
+
+    def __ne__(self, other):
+        return False
+
+    __hash__ = str.__hash__
+
+
+def test_a_str_subclass_value_cannot_satisfy_an_enum_it_does_not_match():
+    schema = {
+        "$schema": JSON_SCHEMA_DIALECT, "type": "object",
+        "properties": {"summary": {"type": "string", "enum": ["allowed-value"]}},
+        "required": ["summary"], "additionalProperties": False,
+    }
+    request = generation_request(schema=schema)
+    assert validate_generation_result(request, generation_result(output={"summary": "allowed-value"})).compliant
+    with pytest.raises(ValueError):
+        validate_generation_result(request, generation_result(output={"summary": _AlwaysEqual("forbidden-value")}))
+
+
+def test_a_pair_that_is_a_tuple_subclass_with_a_changing_iterator_is_read_once_in_a_dict_view():
+    reads = []
+
+    class _Pair(tuple):
+        def __iter__(self):
+            reads.append(1)
+            return iter(("summary", f"value-{len(reads)}"))
+
+    class _PairsView(dict):
+        def items(self):
+            return iter((_Pair(("ignored", "ignored")),))
+
+    request = generation_request()
+    result = generation_result()
+    proposal = {
+        "proposal_id": "proposal-1", "output": _PairsView(), "support_span_ids": ("support-1",),
+        "machine_authored": True,
+    }
+    updated = result.model_copy(update={"proposals": (proposal,)})
+    validate_generation_result(request, updated)  # accepted from the one read, or refused: never two reads
+    assert len(reads) <= 1
+
+
+def test_requirements_and_manifest_are_each_captured_before_the_other_view_runs():
+    from contracts_engines import (
+        CapabilityHealth,
+        CapabilityManifest,
+        CapabilityOperationState,
+        CapabilityRequirement,
+        EngineAdapterKind,
+        validate_capability_requirements,
+    )
+    import contracts_engines
+
+    descriptor = contracts_engines._MODEL_DICT_DESCRIPTOR
+
+    def state(health):
+        return CapabilityOperationState(
+            operation="search", supported=True, configured=True, health=health, qualification=None
+        )
+
+    def requirement():
+        return CapabilityRequirement(
+            operation="search", contract_schema_version="candidate-v1", require_configured=True,
+            require_healthy=True, qualification_profile_reference=None, qualification_profile_version=None,
+        )
+
+    class Repairing(tuple):
+        def __new__(cls, items, repair):
+            instance = super().__new__(cls, items)
+            instance.repair = repair
+            return instance
+
+        def __iter__(self):
+            self.repair()
+            return iter(tuple.__iter__(self))
+
+    def manifest_of(operations):
+        return CapabilityManifest(
+            schema_version="candidate-v1", implementation_id="impl", implementation_version="1",
+            adapter_kind=EngineAdapterKind.VECTOR_STORE, contract_schema_versions=("candidate-v1",),
+            operations=tuple(operations),
+        )
+
+    degraded = manifest_of([state(CapabilityHealth.DEGRADED)])
+    stored = descriptor.__get__(degraded.operations[0], BaseModel)
+    repairing = Repairing(
+        (requirement(),), lambda: dict.__setitem__(stored, "health", CapabilityHealth.HEALTHY)
+    )
+    assert [v.fact for v in validate_capability_requirements(degraded, repairing)] == ["healthy"]
+
+    strict = requirement()
+    stored_requirement = descriptor.__get__(strict, BaseModel)
+    manifest = manifest_of([state(CapabilityHealth.DEGRADED)])
+    object.__setattr__(
+        manifest, "operations",
+        Repairing(manifest.operations, lambda: dict.__setitem__(stored_requirement, "require_healthy", False)),
+    )
+    assert [v.fact for v in validate_capability_requirements(manifest, (strict,))] == ["healthy"]
+
+
+def test_objects_the_engine_snapshot_is_keyed_by_stay_alive_for_the_call():
+    import gc
+    import weakref
+
+    import contracts_engines
+    from contracts_limits import DiscoveryBudget
+
+    class _Weak(dict):
+        pass
+
+    child = _Weak({"k": 1})
+    alive = weakref.ref(child)
+    holder = [child]
+    frozen_models, frozen_containers, discovered = {}, {}, {}
+    contracts_engines._freeze_native_model_graph(holder, frozen_models, frozen_containers, discovered, DiscoveryBudget())
+    del child, holder
+    gc.collect()
+    assert alive() is not None  # an id() cannot be recycled while the call's tables hold the object

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from enum import Enum
 from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, Callable, Iterator, NamedTuple, TypeVar
 
 from pydantic import BaseModel, TypeAdapter, model_validator
@@ -45,6 +46,22 @@ class _FrozenContainerState(NamedTuple):
     owner: Any
     kind: str
     entries: tuple[Any, ...]
+
+
+_TYPE_MRO = vars(type)["__mro__"]
+
+
+def _is_real_mapping(value: Any) -> bool:
+    """Whether ``value`` really is a mapping, not merely registered as one.
+
+    ``isinstance`` against the ABC also honours ``register()``, so a class that registered
+    itself (and has none of the protocol) would be trusted and called.  A real mapping
+    inherits from ``Mapping`` (its own MRO, by identity) or is the one standard read-only
+    view that only registers, recognised by exact type.
+    """
+
+    kind = type(value)
+    return kind is MappingProxyType or any(base is Mapping for base in _TYPE_MRO.__get__(kind))
 
 
 def _model_storage(descriptor: Any, value: BaseModel) -> Any:
@@ -450,7 +467,7 @@ def _snapshot_native_value(
             ]
             result = items if is_list else tuple(items)
         else:
-            if guard and isinstance(value, Mapping):
+            if guard and _is_real_mapping(value):
                 # a mapping that is not a dict is not copied, but nothing hidden may sit inside a JSON value
                 for nested in _charged_entries(value.values, budget):
                     child(nested, f"{location}[value]")
