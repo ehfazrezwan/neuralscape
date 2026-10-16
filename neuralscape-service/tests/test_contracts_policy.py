@@ -3898,13 +3898,50 @@ def test_native_fields_set_names_are_charged_per_model() -> None:
         _freeze_reachable_model_inventories(tuple(models), {}, set(), None, None, budget)
 
 
-def test_ordinary_models_pay_for_their_fields_set_like_any_other_entry() -> None:
+def test_a_models_ordinary_fields_set_costs_nothing_extra() -> None:
     from contracts_references import SourceVersion
 
     model = SourceVersion(record_id="r", content_revision=1, policy_epoch=1)
     budget = DiscoveryBudget()
     _freeze_reachable_model_inventories(model, {}, set(), None, None, budget)
-    assert budget.edges == 3 + 3  # three stored fields and three names in the fields set
+    assert budget.edges == 3  # the three stored fields; the names of a legitimate set are those fields
+
+
+def test_only_names_beyond_the_stored_fields_are_charged() -> None:
+    from contracts_references import SourceVersion
+
+    model = SourceVersion(record_id="r", content_revision=1, policy_epoch=1)
+    _BASE_MODEL_FIELDS_SET_DESCRIPTOR.__set__(model, {f"n{i}" for i in range(1003)})  # 1,000 beyond the 3 stored
+    budget = DiscoveryBudget()
+    _freeze_reachable_model_inventories(model, {}, set(), None, None, budget)
+    assert budget.edges == 3 + 1000
+
+
+def test_a_large_legitimate_policy_fits_the_standard_budget() -> None:
+    """230 members with 25 distinct statements each (5,750 statements): the shape a hosted
+    tenant produces.  Charging every fields-set name used to refuse this above 162 members."""
+
+    statements = []
+    members = []
+    for member in range(230):
+        subject = f"subject-{member:04d}"
+        members.append(MembershipVersion(subject_id=subject, version=1))
+        for index in range(25):
+            statements.append(
+                PolicyStatement(
+                    id=f"s-{member}-{index}", effect="allow", subject_id=subject, credential_id=None,
+                    action="read", resource=reference(f"memory-{index}"),
+                )
+            )
+    big = AccessPolicy(
+        schema_version=VERSION, tenant_id="tenant-a", policy_epoch=1,
+        membership_versions=tuple(members), statements=tuple(statements),
+    )
+    decision = evaluate(
+        principal(subject_id="subject-0000", membership_version=1), "read", reference("memory-0"), big
+    )
+    assert decision.outcome == "allow"
+
 
 
 # ── the error for a shared invalid graph is bounded in size and in the time to render ──

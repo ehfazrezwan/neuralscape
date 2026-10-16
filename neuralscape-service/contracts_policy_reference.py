@@ -188,9 +188,13 @@ def _capture_model_inventory(
         else None
     )
     if fields_set_names is not None:
-        # Every name retained is an entry: a model cannot keep a large private copy of a
-        # set (or share one among many models) without consuming the edge allowance.
-        budget.charge_edge(len(fields_set_names))
+        # A legitimate set names fields the model stores, which are charged as entries when the
+        # model is expanded.  Only names beyond those are charged here, so a model cannot keep a
+        # large private copy of a set (or share one among many models) for free, while an
+        # ordinary model pays nothing twice.
+        stored_count = len(stored_items) if stored_items is not None else 0
+        extra_count = len(extra_items) if extra_items is not None else 0
+        budget.charge_edge(max(0, len(fields_set_names) - stored_count - extra_count))
     return _ModelInventory(
         value,
         stored_storage,
@@ -284,7 +288,7 @@ def _freeze_reachable_model_inventories(
 
     def finish() -> None:
         # Remember (and charge) what was found beneath this value; no recursion here.
-        beneath = tuple(found)
+        beneath = tuple({id(mapping): mapping for mapping in found}.values())  # distinct mappings only
         if beneath:
             budget.charge_edge(len(beneath))
         reach[id(value)] = beneath
