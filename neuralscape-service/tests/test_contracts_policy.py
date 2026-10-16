@@ -4019,3 +4019,62 @@ def test_the_unrebuildable_validation_error_falls_back_to_a_value_free_error(mon
     assert not isinstance(caught.value, ValidationError)  # the bounded fallback, not the echoing error
     text = str(caught.value)
     assert len(text) < 256 and "validation error" in text and "AccessPolicy" in text
+
+
+# ── aliased inputs stay inside the memory and capture-depth bounds ──────────
+
+
+def test_a_repeated_wide_subgraph_does_not_multiply_the_reach_work() -> None:
+    """50,000 references to one tuple of 10,000 distinct proxies: discovery charges
+    ~80,000 edges, but merging each reference's reach used to touch 500 million entries."""
+
+    import time
+
+    wide = _public_mappings(10_000)
+    repeated = (wide,) * 50_000
+    budget = DiscoveryBudget()
+    reach: dict = {}
+    started = time.monotonic()
+    _freeze_reachable_model_inventories(repeated, {}, set(), None, None, budget, 0, True, reach)
+    assert time.monotonic() - started < 5.0
+    assert reach[id(repeated)] is reach[id(wide)]  # one distinct source: held by reference, no merge
+
+
+def test_merging_reaches_is_charged_before_it_is_built() -> None:
+    """Distinct reach tuples whose merge is far larger than the walk: refused quickly by the
+    charge taken before the merge, not after building it."""
+
+    import time
+
+    shared = _public_mappings(2_000)
+    # 400 distinct wrappers of the same 2,000 proxies: each wrapper has its own reach tuple
+    # (the shared proxies plus one of its own), so the root merges 400 x 2,001 entries.
+    wrappers = tuple((shared, MappingProxyType({"own": index})) for index in range(400))
+    started = time.monotonic()
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _freeze_reachable_model_inventories(wrappers, {}, set(), None, None, DiscoveryBudget())
+    assert time.monotonic() - started < 5.0
+
+
+def _proxy_chain_nodes(length: int) -> list:
+    nodes: list = []
+    tail: object = None
+    for _ in range(length):
+        tail = MappingProxyType({"next": tail})
+        nodes.append(tail)
+    return nodes
+
+
+def test_shallow_aliases_of_a_long_mapping_chain_end_in_the_budget_error() -> None:
+    nodes = _proxy_chain_nodes(5_000)
+    root = tuple(reversed(nodes))  # head first: capture follows the chain; every node is also at depth 1
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):  # previously a RecursionError
+        _entry_flow(root)
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _evaluate_budget_statements(root)
+
+
+def test_a_short_aliased_mapping_chain_is_still_captured() -> None:
+    nodes = _proxy_chain_nodes(40)
+    completed = _entry_flow(tuple(reversed(nodes)))
+    assert len(completed) == 40 and dict(completed[0])["next"] is not None

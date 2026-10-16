@@ -290,12 +290,16 @@ def _freeze_reachable_model_inventories(
         # Remember what was found beneath this value; no recursion here.  A single source is
         # held by reference (a container shared by many parents costs nothing per parent);
         # only a genuine merge builds, and is charged for, a new tuple of distinct mappings.
-        sources = [part for part in parts if part]
+        # Repeated references to one child share its tuple, so sources are distinct by identity
+        # first (no per-reference work); a merge is charged for every entry it will read
+        # *before* it reads them, so the work is bounded by the budget, not by the aliasing.
+        distinct = {id(part): part for part in parts if part}
+        sources = list(distinct.values())
         if len(sources) <= 1:
             beneath = sources[0] if sources else ()
         else:
+            budget.charge_edge(sum(len(part) for part in sources))
             beneath = tuple({id(mapping): mapping for part in sources for mapping in part}.values())
-            budget.charge_edge(len(beneath))
         reach[id(value)] = beneath
 
     if _inherits(type(value), BaseModel):
@@ -419,6 +423,7 @@ def _freeze_mapping_inventories(
     in_progress: set[int] | None = None,
     budget: DiscoveryBudget | None = None,
     reach: dict[int, tuple[Mapping[object, object], ...]] | None = None,
+    active_depth: int = 0,
 ) -> None:
     """Observe each retained public mapping inventory exactly once.
 
@@ -468,7 +473,11 @@ def _freeze_mapping_inventories(
             failure: Exception | None = None
             terminal = False
             in_progress.add(id(owner))
-            child_depth = (budget.authoritative_depth(owner) or 0) + 1
+            # The deeper of the owner's recorded depth and the depth of the capture path that
+            # reached it: a shallow alias records depth 1 for every node of a long chain, but
+            # capturing that chain recursively still nests, so the path depth is what bounds the
+            # stack (each nested capture is one level, checked by the budget like any other).
+            child_depth = max(budget.authoritative_depth(owner) or 0, active_depth) + 1
             while True:
                 try:
                     raw_entry = next(iterator)
@@ -525,6 +534,7 @@ def _freeze_mapping_inventories(
                         in_progress,
                         budget,
                         reach,
+                        child_depth,
                     )
             in_progress.discard(id(owner))
             mapping_inventories[id(owner)] = _MappingInventory(
