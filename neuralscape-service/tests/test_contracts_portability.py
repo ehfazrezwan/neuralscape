@@ -3736,3 +3736,48 @@ def test_an_object_spoofing_the_manifest_class_is_refused() -> None:
 
     with pytest.raises(ValidationError):
         validate_portable_manifest(Impostor())
+
+
+# ---- keys that are str subclasses: read as their text, and one text never names two values
+
+
+class _SameTextKey(str):
+    """A key whose text names a field but whose hash and equality differ from that text."""
+
+    def __hash__(self):
+        return 7
+
+    def __eq__(self, other):
+        return False
+
+
+def test_a_second_key_with_the_same_text_is_refused_not_silently_resolved() -> None:
+    document = valid_manifest()
+    document[_SameTextKey("manifest_id")] = "manifest-other"
+    with pytest.raises(ValidationError):
+        validate_portable_manifest(document)
+
+
+def test_a_second_key_with_the_same_text_is_refused_in_a_nested_mapping() -> None:
+    document = valid_manifest()
+    document["scope"] = {**document["scope"], _SameTextKey("tenant_id"): "tenant-other"}
+    with pytest.raises(ValidationError):
+        validate_portable_manifest(document)
+
+
+def test_an_ordinary_str_subclass_key_is_read_as_its_text() -> None:
+    class Plain(str):
+        pass
+
+    document = {Plain(key): value for key, value in valid_manifest().items()}
+    assert validate_portable_manifest(document).manifest_id == valid_manifest()["manifest_id"]
+
+
+def test_a_shared_native_subtree_in_a_mapping_input_is_normalized_once() -> None:
+    node: list = []
+    for _ in range(40):
+        node = [node, node]  # 2**40 paths, 41 objects
+    document = valid_manifest()
+    document["omissions"] = node
+    with pytest.raises(ValidationError):  # the shape is wrong for the field; the walk itself must stay bounded
+        validate_portable_manifest(document)

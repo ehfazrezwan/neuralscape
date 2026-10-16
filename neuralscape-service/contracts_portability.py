@@ -833,6 +833,53 @@ class PortableManifest(VersionedContract):
         return self
 
 
+def _plain_text_keys(document: Any) -> Any:
+    """A copy of a mapping input whose str-subclass keys are their plain text.
+
+    A key that is a ``str`` subclass can carry its own hash and equality, so two keys
+    with one text could both survive in a mapping and the validator would silently
+    take one of them while another reader takes the other.  Each such key is read as
+    its text without running its hooks, and two keys with one text are refused.
+    Native dicts, lists and tuples (subclasses included) are walked once per object,
+    so a shared subtree costs one copy however many paths reach it; nesting is
+    bounded by the portability tier's depth.  Anything else is left to the schema.
+    """
+
+    copies: dict[int, Any] = {}
+    originals: list[Any] = []  # keeps every walked object alive, so ids stay unique
+
+    def walk(value: Any, depth: int) -> Any:
+        if not _inherits(value, dict, list, tuple):
+            return value
+        if depth > PORTABILITY.max_depth:
+            raise ValueError("manifest nesting exceeds the portability depth limit")
+        identity = id(value)
+        if identity in copies:
+            return copies[identity]
+        originals.append(value)
+        if _inherits(value, dict):
+            result: dict[Any, Any] = {}
+            copies[identity] = result
+            for key, item in dict.items(value):
+                if type(key) is not str and _inherits(key, str):
+                    key = str.__str__(key)
+                if type(key) is str and key in result:
+                    raise ValueError("two keys of one mapping share a text")
+                result[key] = walk(item, depth + 1)
+            return result
+        items = list.__iter__(value) if _inherits(value, list) else tuple.__iter__(value)
+        if _inherits(value, list):
+            built: list[Any] = []
+            copies[identity] = built
+            built.extend(walk(item, depth + 1) for item in items)
+            return built
+        copied = tuple(walk(item, depth + 1) for item in items)
+        copies[identity] = copied
+        return copied
+
+    return walk(document, 0)
+
+
 def validate_portable_manifest(
     document: PortableManifest | Mapping[str, Any],
 ) -> PortableManifest:
@@ -862,7 +909,13 @@ def validate_portable_manifest(
                 ],
             ) from exc
     else:
-        candidate = document
+        try:
+            candidate = _plain_text_keys(document)
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise ValidationError.from_exception_data(
+                "PortableManifest",
+                [{"type": "value_error", "loc": (), "input": None, "ctx": {"error": exc}}],
+            ) from exc
     return PortableManifest.model_validate(candidate)
 
 
