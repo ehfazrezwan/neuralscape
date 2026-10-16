@@ -70,6 +70,10 @@ def test_uninstall_report_flags_removal_of_anything_that_is_not_the_projects():
     # an unrelated volume disappeared
     bad = journey_safety.uninstall_report(before, mid, ["proj-sentinel"], "proj", "proj-sentinel", mounted=["proj_state"])
     assert bad["unrelated_volumes_untouched"] is False and not journey_safety.uninstall_is_safe(bad)
+    assert bad["unrelated_volumes_missing_after"] == ["deadbeef", "unrelated"] or "unrelated" in bad["unrelated_volumes_missing_after"]
+    # a volume that vanished before the removal (another lane's cleanup) is reported, not blamed on `down -v`
+    early = journey_safety.uninstall_report(before + ["other_lane"], before + ["proj_state"], before, "proj", "proj-sentinel", mounted=["proj_state"])
+    assert journey_safety.uninstall_is_safe(early) and early["vanished_since_start_not_ours"] == ["other_lane"]
     # a non-project volume removed that no project container mounted
     stray = journey_safety.uninstall_report(before, mid + ["stray"], before, "proj", "proj-sentinel", mounted=["proj_state"])
     assert stray["removed_volumes_not_project_named_and_not_mounted_by_project"] == ["deadbeef", "stray"]

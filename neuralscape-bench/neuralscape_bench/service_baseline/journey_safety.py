@@ -51,14 +51,20 @@ def uninstall_report(before: Iterable[str], mid: Iterable[str], after: Iterable[
     before, mid, after, mounted = set(before), set(mid), set(after), set(mounted)
     removed = mid - after
     own = {v for v in mid if v.startswith(project + "_")}
+    # Volumes that are neither the project's nor mounted by its containers, measured over the
+    # window of the removal itself (other work on a shared host can also add or drop volumes
+    # earlier, which is reported separately and cannot be attributed to this run).
+    unrelated = mid - own - mounted
     return {
         "project_volumes_before_down": sorted(own),
         "project_volumes_after_down": sorted(v for v in after if v.startswith(project + "_")),
-        "unrelated_volumes_untouched": before <= after,
+        "unrelated_volumes_untouched": unrelated <= after,
+        "unrelated_volumes_missing_after": sorted(unrelated - after),
         "sentinel_present": sentinel in after,
         "removed_volumes_not_project_named": sorted(v for v in removed if not v.startswith(project + "_")),
         "removed_volumes_not_project_named_and_not_mounted_by_project": sorted(
             v for v in removed if not v.startswith(project + "_") and v not in mounted),
+        "vanished_since_start_not_ours": sorted(v for v in before - after if v not in mounted and not v.startswith(project + "_")),
     }
 
 
