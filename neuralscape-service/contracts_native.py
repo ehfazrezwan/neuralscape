@@ -124,7 +124,7 @@ def project_model_storage(value: object) -> object:
     stored = tuple(dict.items(_BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)))
     projected = plain_keyed(stored)
     if captured:
-        projected["native_extra_backing"] = dict(captured)
+        projected["native_extra_backing"] = plain_keyed(captured)  # no key hook runs; duplicates and non-text are refused
     return projected
 
 

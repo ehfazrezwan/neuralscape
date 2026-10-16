@@ -242,3 +242,69 @@ def test_a_body_model_with_a_bad_stored_name_is_a_validation_error_not_a_raw_typ
         dict.__setitem__(stored, names[1], "hello" if names[1] == "text" else "plaintext")
         with pytest.raises(ValidationError):
             parse_memory_body(body)
+
+
+class _RaisingKey(str):
+    """A text key whose hash and equality are harmless while it is stored and raise once armed."""
+
+    armed = False
+
+    def __hash__(self):
+        if _RaisingKey.armed:
+            raise RuntimeError("hash hook ran")
+        return str.__hash__(self)
+
+    def __eq__(self, other):
+        if _RaisingKey.armed:
+            raise RuntimeError("eq hook ran")
+        return str.__eq__(self, other)
+
+
+def _with_extra(model, key):
+    from pydantic import BaseModel
+
+    extras = vars(BaseModel)["__pydantic_extra__"].__get__(model, BaseModel)
+    if extras is None:
+        extras = {}
+        vars(BaseModel)["__pydantic_extra__"].__set__(model, extras)
+    dict.__setitem__(extras, key, "x")
+    return model
+
+
+def test_an_extra_key_that_raises_in_its_hash_is_a_clean_rejection_for_a_policy_and_a_body() -> None:
+    _RaisingKey.armed = False
+    policy = _with_extra(make_policy(), _RaisingKey("surplus"))
+    body = _with_extra(PlaintextBody(kind="plaintext", text="hello"), _RaisingKey("surplus"))
+    _RaisingKey.armed = True
+    try:
+        with pytest.raises(PlaintextDispatchRejected):
+            dispatch(policy=policy)
+        with pytest.raises(ValidationError):
+            parse_memory_body(body)
+    finally:
+        _RaisingKey.armed = False
+
+
+def test_extra_keys_are_plain_text_and_two_extras_with_one_text_are_refused() -> None:
+    from contracts_native import project_model_storage
+
+    class Odd(str):
+        def __hash__(self):
+            return 777
+
+    _RaisingKey.armed = False
+    model = _with_extra(make_policy(), _RaisingKey("surplus"))
+    _RaisingKey.armed = True
+    try:
+        projected = project_model_storage(model)
+    finally:
+        _RaisingKey.armed = False
+    assert list(projected["native_extra_backing"]) == ["surplus"]
+    assert type(next(iter(projected["native_extra_backing"]))) is str
+
+    twin = _with_extra(_with_extra(make_policy(), "surplus"), Odd("surplus"))
+    with pytest.raises(TypeError, match="duplicate"):
+        project_model_storage(twin)
+    numbered = _with_extra(make_policy(), 5)
+    with pytest.raises(TypeError, match="text"):
+        project_model_storage(numbered)
