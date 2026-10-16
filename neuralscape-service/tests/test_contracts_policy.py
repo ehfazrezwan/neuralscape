@@ -3339,3 +3339,204 @@ def test_a_valid_mapping_proxy_child_is_accepted() -> None:
     policy_value = _policy_with_public_only_statements(_StatementMapping())
 
     assert evaluate(principal(), "read", resource_value, policy_value).outcome == "allow"
+
+
+# ── bounded discovery: one shared budget per validation call ────────────────
+
+from contracts_limits import (  # noqa: E402
+    DISCOVERY_BUDGET_MESSAGE,
+    STANDARD_MAX_DEPTH,
+    STANDARD_MAX_EDGES,
+    DiscoveryBudget,
+)
+
+
+def _nested(kind: str, depth: int, leaf: object = None) -> object:
+    value: object = leaf
+    for _ in range(depth):
+        value = {"k": value} if kind == "dict" else ([value] if kind == "list" else (value,))
+    return value
+
+
+def _evaluate_budget_statements(*statements) -> object:
+    return evaluate(principal(), "read", reference("memory-1"), _policy_with_public_only_statements(*statements))
+
+
+@pytest.mark.parametrize("kind", ["tuple", "list", "dict"])
+def test_deep_nesting_is_refused_with_the_budget_error_not_a_crash(kind) -> None:
+    deep = _nested(kind, 5000)  # far past the recursion limit
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _complete_contract_input(deep, set(), {}, {})
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _evaluate_budget_statements(deep)
+
+
+@pytest.mark.parametrize("kind", ["tuple", "list", "dict"])
+def test_nesting_up_to_the_depth_limit_is_not_a_budget_error_and_cannot_overflow_the_stack(kind) -> None:
+    ok_depth = _nested(kind, STANDARD_MAX_DEPTH - 8)
+    completed = _complete_contract_input(ok_depth, set(), {}, {})  # accepted by the budget
+    assert completed is not None
+    with pytest.raises(ValidationError):  # and then judged by its shape, not by the budget
+        _evaluate_budget_statements(ok_depth)
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _complete_contract_input(_nested(kind, STANDARD_MAX_DEPTH + 2), set(), {}, {})
+
+
+def test_a_wide_container_is_refused_before_it_is_walked() -> None:
+    wide = tuple(range(STANDARD_MAX_EDGES + 10))
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _evaluate_budget_statements(*wide)
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _complete_contract_input(list(wide), set(), {}, {})
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _complete_contract_input({i: i for i in range(STANDARD_MAX_EDGES + 10)}, set(), {}, {})
+
+
+def test_shared_substructure_cannot_make_the_copy_exponentially_larger() -> None:
+    """A diamond chain is 2 nodes per level to discover but 2**n paths to copy."""
+
+    shared: object = ("leaf",)
+    for _ in range(20):
+        shared = (shared, shared)
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _complete_contract_input(shared, set(), {}, {})
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _evaluate_budget_statements(shared)
+
+
+def test_a_long_public_pair_iterator_is_cut_off_at_the_edge_limit() -> None:
+    produced = []
+
+    class _Many(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            raise KeyError(key)
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(())
+
+        def __len__(self) -> int:
+            return 0
+
+        def items(self):  # type: ignore[override]
+            for index in range(STANDARD_MAX_EDGES * 3):
+                produced.append(index)
+                yield (f"k{index}", index)
+
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _complete_contract_input(_Many(), set(), {}, {})
+    assert len(produced) <= STANDARD_MAX_EDGES + 2          # the iterator was not drained
+
+
+def test_a_long_public_pair_iterator_is_cut_off_even_after_a_terminal_pair() -> None:
+    produced = []
+
+    class _Drain(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            raise KeyError(key)
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(())
+
+        def __len__(self) -> int:
+            return 0
+
+        def items(self):  # type: ignore[override]
+            yield "not-a-pair"                                # terminal malformed pair
+            for index in range(STANDARD_MAX_EDGES * 3):       # then a long tail to drain
+                produced.append(index)
+                yield (f"k{index}", index)
+
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _complete_contract_input(_Drain(), set(), {}, {})
+    assert len(produced) <= STANDARD_MAX_EDGES + 2
+
+
+def test_a_long_public_sequence_view_is_cut_off_during_completion() -> None:
+    produced = []
+
+    class _Long(tuple):
+        def __iter__(self):
+            for index in range(STANDARD_MAX_EDGES * 3):
+                produced.append(index)
+                yield index
+
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _complete_contract_input(_Long(), set(), {}, {})
+    assert len(produced) <= STANDARD_MAX_EDGES + 2
+
+
+def test_accounting_runs_no_hook_of_the_caller_objects() -> None:
+    calls: list[str] = []
+
+    class _Hostile(tuple):
+        def __len__(self):
+            calls.append("len")
+            raise AssertionError("len")
+
+        def __eq__(self, other):
+            calls.append("eq")
+            raise AssertionError("eq")
+
+        def __hash__(self):
+            calls.append("hash")
+            raise AssertionError("hash")
+
+        def __bool__(self):
+            calls.append("bool")
+            raise AssertionError("bool")
+
+    resource_value = reference("memory-1")
+    grant = policy(statement("allow-1", "allow", "read", resource_value))
+    object.__setattr__(grant, "statements", _Hostile(grant.statements))
+    assert evaluate(principal(), "read", resource_value, grant).outcome == "allow"
+    assert calls == []
+
+
+def test_the_budget_is_shared_by_every_root_of_one_call() -> None:
+    budget = DiscoveryBudget()
+    half = list(range(STANDARD_MAX_EDGES // 2 + 1000))
+    _freeze_reachable_model_inventories(half, {}, set(), None, None, budget)
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _freeze_reachable_model_inventories(list(half), {}, set(), None, None, budget)
+    # the same two walks under separate budgets are fine: it is the sharing that bounds the call
+    _freeze_reachable_model_inventories(half, {}, set(), None, None, DiscoveryBudget())
+    _freeze_reachable_model_inventories(list(half), {}, set(), None, None, DiscoveryBudget())
+
+
+def test_depth_outcome_does_not_depend_on_the_order_of_aliased_references() -> None:
+    shared = _nested("tuple", STANDARD_MAX_DEPTH - 20)
+    for order in ((shared, shared), (shared, (shared,)), ((shared,), shared)):
+        _complete_contract_input(order, set(), {}, {})  # same outcome in every order
+    too_deep = _nested("tuple", STANDARD_MAX_DEPTH)  # fits when reached directly, not when wrapped
+    _complete_contract_input((too_deep, too_deep), set(), {}, {})
+    for order in (((too_deep,), too_deep), (too_deep, (too_deep,)), ((too_deep,), (too_deep,))):
+        with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+            _complete_contract_input(order, set(), {}, {})
+
+
+def test_ordinary_policies_are_unaffected_by_the_budget() -> None:
+    resource_value = reference("memory-1")
+    grants = tuple(statement(f"allow-{i}", "allow", "read", resource_value) for i in range(200))
+    assert evaluate(principal(), "read", resource_value, policy(*grants)).outcome == "allow"
+    assert validate_policy_decision(
+        evaluate(principal(), "read", resource_value, policy(*grants))
+    ).outcome == "allow"
+
+
+def _proxy_chain(depth: int) -> object:
+    value: object = None
+    for _ in range(depth):
+        value = MappingProxyType({"k": value})
+    return value
+
+
+def test_a_deep_chain_of_public_mappings_is_refused_with_the_budget_error() -> None:
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _complete_contract_input(_proxy_chain(5000), set(), {}, {})
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _evaluate_budget_statements(_proxy_chain(5000))
+
+
+def test_a_public_mapping_chain_within_the_limit_cannot_overflow_the_stack() -> None:
+    completed = _complete_contract_input(_proxy_chain(STANDARD_MAX_DEPTH - 8), set(), {}, {})
+    assert completed is not None

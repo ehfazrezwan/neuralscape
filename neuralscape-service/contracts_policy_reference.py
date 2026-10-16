@@ -16,6 +16,7 @@ from contracts_policy import (
     PolicyReasonCode,
     PrincipalContext,
 )
+from contracts_limits import STANDARD, DiscoveryBudget, is_exact_type
 from contracts_references import ReferenceHandle
 
 
@@ -54,6 +55,23 @@ def _is_native_dict(value: object) -> bool:
     return issubclass(type(value), dict)
 
 
+def _new_budget(budget: DiscoveryBudget | None) -> DiscoveryBudget:
+    """One shared envelope per validation call; a fresh standard one when none is given."""
+
+    return DiscoveryBudget(STANDARD) if budget is None else budget
+
+
+def _precheck(budget: DiscoveryBudget, count: int) -> None:
+    """Refuse a native copy that could not fit the remaining edge allowance.
+
+    Nothing is charged here (the walk charges the edges it traverses); this only
+    stops a huge native container from being copied before it is accounted.
+    """
+
+    if count > budget.tier.max_edges - budget.edges:
+        budget.charge_edge(count)  # raises the stable budget error
+
+
 def _mapping_items(
     value: Mapping[object, object],
 ) -> tuple[tuple[object, object], ...]:
@@ -64,12 +82,20 @@ def _mapping_items(
     return tuple(value.items())
 
 
-def _fields_set_names(value: object) -> tuple[object, ...]:
-    """Capture native set backing without changing other iterable fallbacks."""
+def _fields_set_names(
+    value: object, budget: DiscoveryBudget | None = None
+) -> tuple[object, ...]:
+    """Capture native set backing; any other iterable is charged per item it yields."""
 
+    budget = _new_budget(budget)
     if issubclass(type(value), set):
+        _precheck(budget, set.__len__(value))
         return tuple(set.__iter__(value))
-    return tuple(item for item in cast(Iterable[object], value))
+    names: list[object] = []
+    for item in cast(Iterable[object], value):
+        budget.charge_edge()
+        names.append(item)
+    return tuple(names)
 
 
 def _normalize_model_names(names: tuple[object, ...]) -> tuple[str, ...]:
@@ -106,16 +132,23 @@ def _capture_model_store(descriptor: object, value: BaseModel) -> object:
         return _CapturedFailure(error)
 
 
-def _capture_model_inventory(value: BaseModel) -> _ModelInventory:
+def _capture_model_inventory(
+    value: BaseModel, budget: DiscoveryBudget | None = None
+) -> _ModelInventory:
     """Capture native inventories without invoking supported fallback protocols."""
 
+    budget = _new_budget(budget)
     stored_storage = _capture_model_store(_BASE_MODEL_DICT_DESCRIPTOR, value)
+    if _is_native_dict(stored_storage):
+        _precheck(budget, dict.__len__(stored_storage))
     stored_items = (
         tuple(dict.items(stored_storage))
         if _is_native_dict(stored_storage)
         else None
     )
     extra_storage = _capture_model_store(_BASE_MODEL_EXTRA_DESCRIPTOR, value)
+    if _is_native_dict(extra_storage):
+        _precheck(budget, dict.__len__(extra_storage))
     extra_items = (
         tuple(dict.items(extra_storage))
         if _is_native_dict(extra_storage)
@@ -125,6 +158,8 @@ def _capture_model_inventory(value: BaseModel) -> _ModelInventory:
         _BASE_MODEL_FIELDS_SET_DESCRIPTOR,
         value,
     )
+    if issubclass(type(fields_set_storage), set):
+        _precheck(budget, set.__len__(fields_set_storage))
     fields_set_names = (
         tuple(set.__iter__(fields_set_storage))
         if issubclass(type(fields_set_storage), set)
@@ -184,53 +219,60 @@ def _freeze_reachable_model_inventories(
     visited_containers: set[int],
     mapping_owners: dict[int, Mapping[object, object]] | None = None,
     native_dicts: dict[int, _MappingInventory] | None = None,
+    budget: DiscoveryBudget | None = None,
+    depth: int = 0,
+    authoritative: bool = True,
 ) -> None:
     """Freeze natively reachable models before callback-bearing traversal.
 
     Native dict entries are retained as they are first observed here, so the
     completion pass replays them instead of re-reading the live dict after any
     public callback has run (first observation, then replay).
+
+    Every container, model and mapping is charged to the shared ``budget`` (one
+    node by identity, one edge per entry, depth along the path), using native
+    sizes only: no hook of the caller's objects runs for the accounting.  A
+    container subclass walked through its native backing is not authoritative
+    (its public view is); an object first reached deep is expanded again, from
+    the retained inventory, when a shallower authoritative path reaches it.
     """
 
     if mapping_owners is None:
         mapping_owners = {}
     if native_dicts is None:
         native_dicts = {}
+    budget = _new_budget(budget)
+
+    # One stack frame per level (no helper closure): the depth limit then bounds
+    # the interpreter stack as well as the walk.
+    below = (inventories, visited_containers, mapping_owners, native_dicts, budget, depth + 1)
 
     if issubclass(type(value), BaseModel):
-        identity = id(value)
-        if _validated_model_inventory(value, inventories) is not None:
+        if not budget.visit(value, depth, authoritative):
             return
-        inventory = _capture_model_inventory(value)
-        inventories[identity] = inventory
+        identity = id(value)
+        inventory = _validated_model_inventory(value, inventories)
+        if inventory is None:
+            inventory = _capture_model_inventory(value, budget)
+            inventories[identity] = inventory
         if inventory.stored_items is not None:
+            budget.charge_edge(len(inventory.stored_items))
             for _, item in inventory.stored_items:
-                _freeze_reachable_model_inventories(
-                    item,
-                    inventories,
-                    visited_containers,
-                    mapping_owners,
-                    native_dicts,
-                )
+                _freeze_reachable_model_inventories(item, *below, authoritative)
         elif issubclass(type(inventory.stored_storage), Mapping):
             _retain_mapping_owner(inventory.stored_storage, mapping_owners)
         if inventory.extra_items is not None:
+            budget.charge_edge(len(inventory.extra_items))
             for _, item in inventory.extra_items:
-                _freeze_reachable_model_inventories(
-                    item,
-                    inventories,
-                    visited_containers,
-                    mapping_owners,
-                    native_dicts,
-                )
+                _freeze_reachable_model_inventories(item, *below, authoritative)
         elif issubclass(type(inventory.extra_storage), Mapping):
             _retain_mapping_owner(inventory.extra_storage, mapping_owners)
         return
 
     if _is_native_dict(value):
-        identity = id(value)
-        if identity in visited_containers:
+        if not budget.visit(value, depth, authoritative):
             return
+        identity = id(value)
         visited_containers.add(identity)
         existing = native_dicts.get(identity)
         if existing is not None:
@@ -238,51 +280,41 @@ def _freeze_reachable_model_inventories(
             # it); never replace it with a re-read taken after callbacks ran.
             if existing.owner is not value:
                 raise ValueError("contract input mapping inventory owner mismatch")
-            return
-        retained = tuple(_MappingEntry(key, item) for key, item in dict.items(value))
-        native_dicts[identity] = _MappingInventory(value, retained)
+            retained = cast(tuple[_MappingEntry, ...], existing.entries)
+        else:
+            _precheck(budget, dict.__len__(value))
+            retained = tuple(_MappingEntry(key, item) for key, item in dict.items(value))
+            native_dicts[identity] = _MappingInventory(value, retained)
+        budget.charge_edge(len(retained))
         for entry in retained:
-            _freeze_reachable_model_inventories(
-                entry.value,
-                inventories,
-                visited_containers,
-                mapping_owners,
-                native_dicts,
-            )
+            _freeze_reachable_model_inventories(entry.value, *below, authoritative)
         return
 
     if issubclass(type(value), Mapping):
+        budget.visit(value, depth, True)  # its pairs are its public view: authoritative
         _retain_mapping_owner(value, mapping_owners)
         return
 
     if issubclass(type(value), list):
-        identity = id(value)
-        if identity in visited_containers:
+        if not budget.visit(value, depth, authoritative):
             return
-        visited_containers.add(identity)
-        for item in list.__iter__(value):
-            _freeze_reachable_model_inventories(
-                item,
-                inventories,
-                visited_containers,
-                mapping_owners,
-                native_dicts,
-            )
+        visited_containers.add(id(value))
+        _precheck(budget, list.__len__(value))
+        items = tuple(list.__iter__(value))
+        budget.charge_edge(len(items))
+        for item in items:
+            _freeze_reachable_model_inventories(item, *below, authoritative and is_exact_type(value, list))
         return
 
     if issubclass(type(value), tuple):
-        identity = id(value)
-        if identity in visited_containers:
+        if not budget.visit(value, depth, authoritative):
             return
-        visited_containers.add(identity)
-        for item in tuple.__iter__(value):
-            _freeze_reachable_model_inventories(
-                item,
-                inventories,
-                visited_containers,
-                mapping_owners,
-                native_dicts,
-            )
+        visited_containers.add(id(value))
+        _precheck(budget, tuple.__len__(value))
+        items = tuple(tuple.__iter__(value))
+        budget.charge_edge(len(items))
+        for item in items:
+            _freeze_reachable_model_inventories(item, *below, authoritative and is_exact_type(value, tuple))
         return
 
 
@@ -301,6 +333,7 @@ def _freeze_mapping_inventories(
     visited_containers: set[int],
     native_dicts: dict[int, _MappingInventory] | None = None,
     in_progress: set[int] | None = None,
+    budget: DiscoveryBudget | None = None,
 ) -> None:
     """Observe each retained public mapping inventory exactly once.
 
@@ -319,6 +352,7 @@ def _freeze_mapping_inventories(
 
     if in_progress is None:
         in_progress = set()
+    budget = _new_budget(budget)
     while True:
         pending = tuple(
             owner
@@ -343,6 +377,7 @@ def _freeze_mapping_inventories(
             failure: Exception | None = None
             terminal = False
             in_progress.add(id(owner))
+            child_depth = (budget.authoritative_depth(owner) or 0) + 1
             while True:
                 try:
                     raw_entry = next(iterator)
@@ -351,6 +386,10 @@ def _freeze_mapping_inventories(
                 except Exception as error:
                     failure = error
                     break
+                # Every pair the public iterator produces is an edge, including the
+                # ones drained after a terminal pair, so an endless iterator is
+                # refused with the budget error (never deferred as a pair failure).
+                budget.charge_edge()
                 if terminal:
                     continue  # drain only: nothing after the terminal pair is retained
                 try:
@@ -367,6 +406,8 @@ def _freeze_mapping_inventories(
                     visited_containers,
                     owners,
                     native_dicts,
+                    budget,
+                    child_depth,
                 )
                 discovered = {
                     identity: found
@@ -381,6 +422,7 @@ def _freeze_mapping_inventories(
                         visited_containers,
                         native_dicts,
                         in_progress,
+                        budget,
                     )
             in_progress.discard(id(owner))
             mapping_inventories[id(owner)] = _MappingInventory(
@@ -395,9 +437,13 @@ def _freeze_mapping_entries(
     model_inventories: dict[int, _ModelInventory],
     visited_containers: set[int],
     native_dicts: dict[int, _MappingInventory] | None = None,
+    budget: DiscoveryBudget | None = None,
+    depth: int = 1,
 ) -> tuple[_MappingEntry | _CapturedFailure, ...]:
     """Retain the successful prefix and first terminal pair failure."""
 
+    budget = _new_budget(budget)
+    budget.charge_edge(len(raw_entries))
     entries: list[_MappingEntry | _CapturedFailure] = []
     for raw_entry in raw_entries:
         try:
@@ -412,6 +458,8 @@ def _freeze_mapping_entries(
             visited_containers,
             owners,
             native_dicts,
+            budget,
+            depth,
         )
     return tuple(entries)
 
@@ -426,8 +474,11 @@ def _retained_mapping_entries(
     value: Mapping[object, object],
     mapping_inventories: dict[int, _MappingInventory],
     model_inventories: dict[int, _ModelInventory],
+    budget: DiscoveryBudget | None = None,
 ) -> tuple[_MappingEntry | _CapturedFailure, ...]:
     """Return one authenticated public inventory, capturing it if newly seen."""
+
+    budget = _new_budget(budget)
 
     inventory = _validated_mapping_inventory(value, mapping_inventories)
     if inventory is None:
@@ -439,6 +490,8 @@ def _retained_mapping_entries(
             model_inventories,
             set(),
             mapping_inventories,
+            None,
+            budget,
         )
         inventory = _validated_mapping_inventory(value, mapping_inventories)
         if inventory is None:
@@ -453,6 +506,7 @@ def _retained_mapping_items(
     value: Mapping[object, object],
     mapping_inventories: dict[int, _MappingInventory],
     model_inventories: dict[int, _ModelInventory],
+    budget: DiscoveryBudget | None = None,
 ) -> tuple[tuple[object, object], ...]:
     """Rebuild model-owned items while retaining per-entry error priority."""
 
@@ -461,10 +515,20 @@ def _retained_mapping_items(
         value,
         mapping_inventories,
         model_inventories,
+        budget,
     ):
         retained = cast(_MappingEntry, _raise_captured_failure(entry))
         items.append((retained.key, retained.value))
     return tuple(items)
+
+
+def _native_entries(
+    value: Mapping[object, object], budget: DiscoveryBudget
+) -> tuple[_MappingEntry, ...]:
+    """The entries of a native dict that discovery did not already retain."""
+
+    _precheck(budget, dict.__len__(value))
+    return tuple(_MappingEntry(key, item) for key, item in dict.items(value))
 
 
 def _complete_contract_input(
@@ -472,11 +536,21 @@ def _complete_contract_input(
     active_ids: set[int],
     inventories: dict[int, _ModelInventory],
     mapping_inventories: dict[int, _MappingInventory] | None = None,
+    budget: DiscoveryBudget | None = None,
+    depth: int = 0,
 ) -> object:
-    """Copy a native input graph without normalizing away invalid data."""
+    """Copy a native input graph without normalizing away invalid data.
+
+    Every container, model and mapping copied is checked against the shared
+    ``budget`` (depth along the path, nodes by identity) and every edge copied is
+    charged, repeats included, so a graph that shares substructure cannot make
+    the copy exponentially larger than what discovery paid for, and a public
+    iterator that never ends is refused rather than followed.
+    """
 
     if mapping_inventories is None:
         mapping_inventories = {}
+    budget = _new_budget(budget)
 
     if issubclass(type(value), BaseModel):
         identity = id(value)
@@ -487,11 +561,12 @@ def _complete_contract_input(
             inventory = _validated_model_inventory(value, inventories)
             if inventory is None:
                 _freeze_reachable_model_inventories(
-                    value, inventories, set(), None, mapping_inventories
+                    value, inventories, set(), None, mapping_inventories, budget, depth
                 )
                 inventory = _validated_model_inventory(value, inventories)
                 if inventory is None:
                     raise ValueError("contract input model inventory is missing")
+            budget.visit(value, depth, True)
             stored_storage = _raise_captured_failure(inventory.stored_storage)
             native_stored_items = (
                 inventory.stored_items
@@ -500,6 +575,7 @@ def _complete_contract_input(
                     stored_storage,  # type: ignore[arg-type]
                     mapping_inventories,
                     inventories,
+                    budget,
                 )
             )
             stored_items = _normalize_model_items(native_stored_items)
@@ -521,6 +597,7 @@ def _complete_contract_input(
                         extra_values,  # type: ignore[arg-type]
                         mapping_inventories,
                         inventories,
+                        budget,
                     )
                 )
                 extra_items = _normalize_model_items(native_extra_items)
@@ -540,7 +617,7 @@ def _complete_contract_input(
             fields_set_names = _normalize_model_names(
                 inventory.fields_set_names
                 if inventory.fields_set_names is not None
-                else _fields_set_names(fields_set_storage)
+                else _fields_set_names(fields_set_storage, budget)
             )
             for field_name in fields_set_names:
                 if (
@@ -549,15 +626,13 @@ def _complete_contract_input(
                 ):
                     stored_values[field_name] = None
 
-            return {
-                key: _complete_contract_input(
-                    item,
-                    active_ids,
-                    inventories,
-                    mapping_inventories,
+            completed_model: dict[object, object] = {}
+            for key, item in stored_values.items():
+                budget.charge_edge()  # one stack frame per level: no helper closure
+                completed_model[key] = _complete_contract_input(
+                    item, active_ids, inventories, mapping_inventories, budget, depth + 1
                 )
-                for key, item in stored_values.items()
-            }
+            return completed_model
         finally:
             active_ids.remove(identity)
 
@@ -567,6 +642,7 @@ def _complete_contract_input(
             raise ValueError("cyclic contract input is not supported")
         active_ids.add(identity)
         try:
+            budget.visit(value, depth, True)
             # Keys are deliberately not stringified or otherwise normalized.
             if _is_native_dict(value):
                 retained_dict = _validated_mapping_inventory(value, mapping_inventories)
@@ -576,16 +652,14 @@ def _complete_contract_input(
                         retained_dict.entries,
                     )
                     if retained_dict is not None
-                    else tuple(
-                        _MappingEntry(key, item)
-                        for key, item in _mapping_items(value)
-                    )
+                    else _native_entries(value, budget)
                 )
             else:
                 entries = _retained_mapping_entries(
                     value,
                     mapping_inventories,
                     inventories,
+                    budget,
                 )
             completed: dict[object, object] = {}
             for entry in entries:
@@ -593,11 +667,9 @@ def _complete_contract_input(
                     _MappingEntry,
                     _raise_captured_failure(entry),
                 )
+                budget.charge_edge()  # one stack frame per level: no helper closure
                 completed[retained.key] = _complete_contract_input(
-                    retained.value,
-                    active_ids,
-                    inventories,
-                    mapping_inventories,
+                    retained.value, active_ids, inventories, mapping_inventories, budget, depth + 1
                 )
             return completed
         finally:
@@ -609,15 +681,16 @@ def _complete_contract_input(
             raise ValueError("cyclic contract input is not supported")
         active_ids.add(identity)
         try:
-            return [
-                _complete_contract_input(
-                    item,
-                    active_ids,
-                    inventories,
-                    mapping_inventories,
+            budget.visit(value, depth, True)
+            completed_list: list[object] = []
+            for item in value:  # the public iterator: every item it yields is charged
+                budget.charge_edge()  # one stack frame per level: no helper closure
+                completed_list.append(
+                    _complete_contract_input(
+                        item, active_ids, inventories, mapping_inventories, budget, depth + 1
+                    )
                 )
-                for item in value
-            ]
+            return completed_list
         finally:
             active_ids.remove(identity)
 
@@ -627,15 +700,16 @@ def _complete_contract_input(
             raise ValueError("cyclic contract input is not supported")
         active_ids.add(identity)
         try:
-            return tuple(
-                _complete_contract_input(
-                    item,
-                    active_ids,
-                    inventories,
-                    mapping_inventories,
+            budget.visit(value, depth, True)
+            completed_items: list[object] = []
+            for item in value:  # the public iterator: every item it yields is charged
+                budget.charge_edge()  # one stack frame per level: no helper closure
+                completed_items.append(
+                    _complete_contract_input(
+                        item, active_ids, inventories, mapping_inventories, budget, depth + 1
+                    )
                 )
-                for item in value
-            )
+            return tuple(completed_items)
         finally:
             active_ids.remove(identity)
 
@@ -646,6 +720,7 @@ def _validated_principal_snapshot(
     principal: PrincipalContext,
     inventories: dict[int, _ModelInventory],
     mapping_inventories: dict[int, _MappingInventory],
+    budget: DiscoveryBudget | None = None,
 ) -> PrincipalContext:
     return PrincipalContext.model_validate(
         _complete_contract_input(
@@ -653,6 +728,7 @@ def _validated_principal_snapshot(
             set(),
             inventories,
             mapping_inventories,
+            budget,
         )
     )
 
@@ -661,6 +737,7 @@ def _validated_evaluation_snapshot(
     evaluation: PolicyEvaluationInput,
     inventories: dict[int, _ModelInventory],
     mapping_inventories: dict[int, _MappingInventory],
+    budget: DiscoveryBudget | None = None,
 ) -> PolicyEvaluationInput:
     return PolicyEvaluationInput.model_validate(
         _complete_contract_input(
@@ -668,6 +745,7 @@ def _validated_evaluation_snapshot(
             set(),
             inventories,
             mapping_inventories,
+            budget,
         )
     )
 
@@ -676,6 +754,7 @@ def _validated_policy_snapshot(
     policy: AccessPolicy,
     inventories: dict[int, _ModelInventory],
     mapping_inventories: dict[int, _MappingInventory],
+    budget: DiscoveryBudget | None = None,
 ) -> AccessPolicy:
     return AccessPolicy.model_validate(
         _complete_contract_input(
@@ -683,6 +762,7 @@ def _validated_policy_snapshot(
             set(),
             inventories,
             mapping_inventories,
+            budget,
         )
     )
 
@@ -735,6 +815,7 @@ def evaluate_policy(
     mapping_inventories: dict[int, _MappingInventory] = {}
     native_dicts: dict[int, _MappingInventory] = {}
     visited_containers: set[int] = set()
+    budget = DiscoveryBudget(STANDARD)  # one envelope across all three roots
     for value in (principal, evaluation, policy):
         _freeze_reachable_model_inventories(
             value,
@@ -742,6 +823,7 @@ def evaluate_policy(
             visited_containers,
             mapping_owners,
             native_dicts,
+            budget,
         )
     _freeze_mapping_inventories(
         mapping_owners,
@@ -749,22 +831,27 @@ def evaluate_policy(
         inventories,
         visited_containers,
         native_dicts,
+        None,
+        budget,
     )
     mapping_inventories.update(native_dicts)
     principal = _validated_principal_snapshot(
         principal,
         inventories,
         mapping_inventories,
+        budget,
     )
     evaluation = _validated_evaluation_snapshot(
         evaluation,
         inventories,
         mapping_inventories,
+        budget,
     )
     policy = _validated_policy_snapshot(
         policy,
         inventories,
         mapping_inventories,
+        budget,
     )
 
     action = evaluation.action
@@ -863,12 +950,14 @@ def validate_policy_decision(decision: PolicyDecision) -> PolicyDecision:
     mapping_inventories: dict[int, _MappingInventory] = {}
     native_dicts: dict[int, _MappingInventory] = {}
     visited_containers: set[int] = set()
+    budget = DiscoveryBudget(STANDARD)
     _freeze_reachable_model_inventories(
         decision,
         inventories,
         visited_containers,
         mapping_owners,
         native_dicts,
+        budget,
     )
     _freeze_mapping_inventories(
         mapping_owners,
@@ -876,6 +965,8 @@ def validate_policy_decision(decision: PolicyDecision) -> PolicyDecision:
         inventories,
         visited_containers,
         native_dicts,
+        None,
+        budget,
     )
     mapping_inventories.update(native_dicts)
     return PolicyDecision.model_validate(
@@ -884,6 +975,7 @@ def validate_policy_decision(decision: PolicyDecision) -> PolicyDecision:
             set(),
             inventories,
             mapping_inventories,
+            budget,
         )
     )
 
