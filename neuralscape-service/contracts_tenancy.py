@@ -144,7 +144,16 @@ def _closed_graph_snapshot_session() -> tuple[
     Callable[[object], None],
     Callable[[object], object],
 ]:
-    """Return native capture and public rebuild phases sharing one inventory."""
+    """Return native capture and public rebuild phases sharing one inventory.
+
+    Authority follows each supported container's public view, captured once at
+    first observation and replayed.  Stored models and exact built-in
+    containers are fenced when the call begins.  Children exposed only by a
+    public iterator are captured when that iterator first exposes them, so an
+    earlier callback in the same call may still change them first; entry-time
+    capture of never-yet-exposed children is not promised.  Hidden native
+    backing is never substituted for a public view.
+    """
 
     frozen_models: dict[int, tuple[object, bool, object]] = {}
     frozen_containers: dict[int, object] = {}

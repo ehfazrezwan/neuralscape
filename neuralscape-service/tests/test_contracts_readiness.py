@@ -1667,3 +1667,58 @@ def test_readiness_publication_accepts_truly_absent_extra_storage() -> None:
     PYDANTIC_EXTRA_DESCRIPTOR.__delete__(child)
 
     assert _validate_publication(candidate).tenant_id == "tenant-a"
+
+
+def _public_only_invalid_capability_case():
+    candidate = publication()
+    public_child = observation("exact_reads", "healthy")
+    _set_native_field(public_child, "capability", "")
+    divergent = DivergentTuple(candidate.capabilities, (public_child,))
+    _set_native_field(candidate, "capabilities", divergent)
+    return candidate, public_child, divergent
+
+
+def test_public_first_rejects_invalid_public_only_capability_without_callbacks() -> (
+    None
+):
+    candidate, child, divergent = _public_only_invalid_capability_case()
+
+    with pytest.raises(ValidationError):
+        _validate_publication(candidate)
+
+    assert divergent.calls == 1
+    assert child.capability == ""
+
+
+def test_public_first_lazy_capability_is_captured_at_first_observation_not_entry() -> (
+    None
+):
+    # Documented limit: a child exposed only by a public iterator is captured
+    # when the iterator first exposes it, so a callback that runs earlier in the
+    # same call may change it first.  Entry-time capture is not promised.
+    candidate, child, divergent = _public_only_invalid_capability_case()
+    name = _install_repairing_stored_name(
+        candidate,
+        lambda: _set_native_field(child, "capability", "exact_reads"),
+    )
+
+    result = _validate_publication(candidate)
+
+    assert name.calls > 0
+    assert divergent.calls == 1
+    assert result.capabilities[0].capability == "exact_reads"
+
+
+def test_public_first_lazy_capability_is_frozen_once_first_observed() -> None:
+    candidate, child, divergent = _public_only_invalid_capability_case()
+    name = _install_repairing_stored_name(
+        child,
+        lambda: _set_native_field(child, "capability", "exact_reads"),
+    )
+
+    with pytest.raises(ValidationError):
+        _validate_publication(candidate)
+
+    assert name.calls > 0
+    assert divergent.calls == 1
+    assert child.capability == "exact_reads"

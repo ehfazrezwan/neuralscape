@@ -2047,3 +2047,69 @@ def test_tenancy_boundaries_accept_truly_absent_extra_storage(boundary: str) -> 
     PYDANTIC_EXTRA_DESCRIPTOR.__delete__(child)
 
     assert invoke(candidate).tenant_id == "tenant-a"
+
+
+def _public_only_invalid_manifest_case(boundary: str):
+    candidate, _native_child, invoke = _tenancy_nested_boundary_case(boundary)
+    public_child = ResourceManifestReference.model_validate(manifest())
+    _set_native_field(public_child, "manifest_id", "")
+    divergent = DivergentTuple(candidate.resource_manifests, (public_child,))
+    _set_native_field(candidate, "resource_manifests", divergent)
+    return candidate, public_child, divergent, invoke
+
+
+@pytest.mark.parametrize("boundary", ["operation", "placement"])
+def test_public_first_rejects_invalid_public_only_child_without_callbacks(
+    boundary: str,
+) -> None:
+    _candidate, child, divergent, invoke = _public_only_invalid_manifest_case(
+        boundary
+    )
+
+    with pytest.raises(ValidationError):
+        invoke(_candidate)
+
+    assert divergent.calls == 1
+    assert child.manifest_id == ""
+
+
+@pytest.mark.parametrize("boundary", ["operation", "placement"])
+def test_public_first_lazy_child_is_captured_at_first_observation_not_entry(
+    boundary: str,
+) -> None:
+    # Documented limit: a child exposed only by a public iterator is captured
+    # when the iterator first exposes it, so a callback that runs earlier in the
+    # same call may change it first.  Entry-time capture is not promised.
+    candidate, child, divergent, invoke = _public_only_invalid_manifest_case(
+        boundary
+    )
+    name = _install_repairing_stored_name(
+        candidate,
+        lambda: _set_native_field(child, "manifest_id", "primary"),
+    )
+
+    result = invoke(candidate)
+
+    assert name.calls > 0
+    assert divergent.calls == 1
+    assert result.resource_manifests[0].manifest_id == "primary"
+
+
+@pytest.mark.parametrize("boundary", ["operation", "placement"])
+def test_public_first_lazy_child_is_frozen_once_first_observed(
+    boundary: str,
+) -> None:
+    candidate, child, divergent, invoke = _public_only_invalid_manifest_case(
+        boundary
+    )
+    name = _install_repairing_stored_name(
+        child,
+        lambda: _set_native_field(child, "manifest_id", "primary"),
+    )
+
+    with pytest.raises(ValidationError):
+        invoke(candidate)
+
+    assert name.calls > 0
+    assert divergent.calls == 1
+    assert child.manifest_id == "primary"
