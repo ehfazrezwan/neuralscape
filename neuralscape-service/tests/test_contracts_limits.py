@@ -395,3 +395,50 @@ def test_module_is_pure_standard_library():
     assert imported == {"dataclasses"}
     assert imported <= stdlib
     assert "pydantic" not in imported
+
+
+class _SpoofMeta(type):
+    """A metaclass whose equality claims to match anything and records the call."""
+
+    calls = []
+
+    def __eq__(cls, other):
+        _SpoofMeta.calls.append((cls.__name__, getattr(other, "__name__", repr(other))))
+        return True
+
+    def __ne__(cls, other):
+        _SpoofMeta.calls.append(("ne", cls.__name__))
+        return False
+
+    __hash__ = type.__hash__
+
+
+class _SpoofedType(metaclass=_SpoofMeta):
+    pass
+
+
+class _OtherSpoofedType(metaclass=_SpoofMeta):
+    pass
+
+
+def test_exact_type_check_never_runs_a_metaclass_equality_hook():
+    _SpoofMeta.calls.clear()
+
+    # The instance's class claims to equal everything: it must not pass as a dict.
+    assert is_exact_type(_SpoofedType(), dict) is False
+    assert is_exact_type(_SpoofedType(), dict, list, tuple) is False
+    # A genuine builtin must not be mistaken for a hostile class passed as a candidate.
+    assert is_exact_type({}, _SpoofedType) is False
+    assert is_exact_type({}, list, _SpoofedType) is False
+    # Two different hostile classes are not interchangeable either.
+    assert is_exact_type(_SpoofedType(), _OtherSpoofedType) is False
+    # Identity still matches, with no equality hook involved.
+    assert is_exact_type(_SpoofedType(), _SpoofedType) is True
+    assert is_exact_type(_SpoofedType(), dict, _SpoofedType) is True
+    assert is_exact_type({}, dict) is True
+
+    assert _SpoofMeta.calls == []
+
+
+def test_exact_type_check_with_no_candidates_is_false():
+    assert is_exact_type({}) is False
