@@ -270,6 +270,21 @@ class TimingMeasurement(_ManifestContract):
         return self
 
 
+def _instant_before(left: datetime, right: datetime) -> bool:
+    """Whether ``left`` is an earlier instant than ``right``, without leaving the datetime range.
+
+    Converting to UTC raises ``OverflowError`` at the ends of the range.  The difference of the two
+    naive wall times and the difference of the two offsets cannot overflow, and ``fold`` is honoured
+    because each offset is the datetime's own.
+    """
+
+    left_offset, right_offset = left.utcoffset(), right.utcoffset()
+    if left_offset is None or right_offset is None:
+        raise ValueError("run timestamps must include an explicit UTC offset")
+    wall = left.replace(tzinfo=None) - right.replace(tzinfo=None)
+    return wall - (left_offset - right_offset) < timedelta(0)
+
+
 class RunManifest(_ManifestContract):
     """A reproducible benchmark run envelope with explicit evidence state."""
 
@@ -311,9 +326,7 @@ class RunManifest(_ManifestContract):
         if self.finished_at is not None and self.started_at is not None:
             # Same-zone datetimes compare by wall time and ignore fold, so
             # order the instants themselves.
-            if self.finished_at.astimezone(timezone.utc) < self.started_at.astimezone(
-                timezone.utc
-            ):
+            if _instant_before(self.finished_at, self.started_at):
                 raise ValueError("finished_at cannot precede started_at")
 
         if self.state is RunState.PLANNED:
@@ -654,6 +667,7 @@ def _traverse_model_storage(
     """Retain historical native-recursion failures at validation order."""
 
     traversed: dict[int, object] = {}
+    depth = [0]
 
     def visit(current: Any) -> None:
         value_type = type(current)
@@ -674,8 +688,14 @@ def _traverse_model_storage(
             frozen_replay = frozen_graph.replay_entries[identity]
         owner, entries = frozen_replay
         traversed[identity] = owner
+        # The walk recurses; the snapshot's depth bound applies here too, so nesting deeper than
+        # the manifest allows is a stable budget error and never a RecursionError.
+        depth[0] += 1
+        if depth[0] > MAX_SNAPSHOT_DEPTH:
+            raise ValueError(SNAPSHOT_BUDGET_MESSAGE)
         for item in entries:
             visit(item)
+        depth[0] -= 1
 
     visit(value)
     frozen_graph.completed_traversals.update(traversed)
@@ -829,6 +849,7 @@ def _inventory_public_sequence(
                 except Exception as error:
                     failure = error
                     break
+                _charge_capture(frozen_graph)
                 entries.append(item)
                 try:
                     _protect_yielded_model_storage(item, frozen_graph)
@@ -943,6 +964,7 @@ def _inventory_public_mapping(
                 except Exception as error:
                     failure = error
                     break
+                _charge_capture(frozen_graph)
                 entries.append((key, item))
 
                 try:
@@ -1049,6 +1071,18 @@ MAX_SNAPSHOT_DEPTH = 64
 SNAPSHOT_BUDGET_MESSAGE = "manifest input exceeds the native snapshot budget"
 
 
+def _charge_capture(frozen_graph: _FrozenGraph) -> None:
+    """Charge one public-view entry as it is read, so an iterator that never ends is cut off.
+
+    The capture and the snapshot share one budget: an entry read here is charged before it is
+    kept, and the same counter then bounds the snapshot that follows.
+    """
+
+    frozen_graph.visits[0] += 1
+    if frozen_graph.visits[0] > MAX_SNAPSHOT_VISITS:
+        raise ValueError(SNAPSHOT_BUDGET_MESSAGE)
+
+
 def _charge_snapshot(frozen_graph: _FrozenGraph, active: set[int]) -> None:
     """Charge one visit and enforce the depth bound (depth = containers on the active path)."""
 
@@ -1111,12 +1145,12 @@ def _fixed_offset(value: datetime, path: str) -> datetime:
     is left for validation to refuse.
     """
 
-    offset = value.utcoffset()
-    if offset is None:
-        return value
     try:
+        offset = value.utcoffset()
+        if offset is None:
+            return value
         return value.replace(tzinfo=timezone(offset))
-    except (TypeError, ValueError):
+    except Exception:  # a tzinfo is caller code: it can raise, or return something that is no offset
         raise ValueError(f"unsupported UTC offset at {path}") from None
 
 

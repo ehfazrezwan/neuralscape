@@ -1119,7 +1119,7 @@ def test_failed_yielded_child_traversal_is_not_marked_complete():
     value: list[object] = [alias, deep, alias]
     frozen = _freeze_model_graphs(value)
 
-    with pytest.raises(RecursionError, match="maximum recursion depth exceeded"):
+    with pytest.raises(ValueError, match="exceeds the native snapshot budget"):
         _protect_yielded_model_storage(value, frozen)
 
     assert frozen.completed_traversals == {}
@@ -3231,7 +3231,7 @@ def test_finish_preserves_deep_later_native_failure_for_valid_planned():
     assert shallow.items_calls == 1
 
     deep = PublicResourceWithDeepNativeBacking(sys.getrecursionlimit() + 600)
-    with pytest.raises(RecursionError, match="maximum recursion depth exceeded"):
+    with pytest.raises(ValueError, match="exceeds the native snapshot budget"):
         finish_run(
             planned_manifest(),
             state=RunState.COMPLETED,
@@ -3394,7 +3394,7 @@ def test_finish_replays_new_exact_dict_before_snapshotting_its_entries():
     values["provenance"] = provenance
     measurement = LazyProvenanceMapping(values)
 
-    with pytest.raises(RecursionError, match="maximum recursion depth exceeded"):
+    with pytest.raises(ValueError, match="exceeds the native snapshot budget"):
         finish_run(
             planned_manifest(),
             state=RunState.COMPLETED,
@@ -3541,7 +3541,7 @@ def test_finish_preserves_lazy_exact_dict_priority_and_shared_capture():
     native = timing().model_dump(mode="python")
     native["provenance"] = shared_provenance
     measurements = PublicViewTuple((native,), (public,))
-    with pytest.raises(RecursionError, match="maximum recursion depth exceeded"):
+    with pytest.raises(ValueError, match="exceeds the native snapshot budget"):
         finish_run(
             planned_manifest(),
             state=RunState.COMPLETED,
@@ -4504,3 +4504,121 @@ def test_the_allowed_enums_are_exactly_the_projects_own_by_identity() -> None:
 
     assert not run_manifest_module._is_supported_leaf(RunState.COMPLETED)
     assert not run_manifest_module._is_supported_leaf(_Enum("Anything", {"a": 1}).a)
+
+
+# ── the capture phase is bounded, depth is a stable error, and offsets and extremes are stable ──
+
+_FINISH_WINDOW = dict(
+    started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+    finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+)
+
+
+def _finish(**overrides):
+    values = dict(
+        state=RunState.COMPLETED, resources=(measured_memory(),), measurements=(timing(),), **_FINISH_WINDOW
+    )
+    values.update(overrides)
+    return finish_run(planned_manifest(), **values)
+
+
+def test_a_public_sequence_that_never_ends_is_stopped_by_the_budget_while_it_is_read():
+    produced = []
+
+    class Endless(tuple):
+        def __iter__(self):
+            for index in range(5_000_000):
+                produced.append(index)
+                yield measured_memory()
+
+    with pytest.raises(ValueError, match="exceeds the native snapshot budget"):
+        _finish(resources=Endless())
+    assert len(produced) <= run_manifest_module.MAX_SNAPSHOT_VISITS + 2
+
+
+def test_a_public_mapping_that_never_ends_is_stopped_by_the_budget_while_it_is_read():
+    produced = []
+
+    class Endless(Mapping):
+        def __getitem__(self, key):
+            raise KeyError(key)
+
+        def __iter__(self):
+            return iter(())
+
+        def __len__(self):
+            return 0
+
+        def items(self):
+            for index in range(5_000_000):
+                produced.append(index)
+                yield f"key-{index}", index
+
+    with pytest.raises(ValueError, match="exceeds the native snapshot budget"):
+        _finish(measurements=(Endless(),))
+    assert len(produced) <= run_manifest_module.MAX_SNAPSHOT_VISITS + 2
+
+
+def test_deep_nesting_is_a_budget_error_and_not_a_recursion_error():
+    deep: tuple = ()
+    for _ in range(5_000):
+        deep = (deep,)
+    values = timing().model_dump(mode="python")
+    values["provenance"] = {**timing().provenance.model_dump(mode="python"), "deep": deep}
+    with pytest.raises(ValueError, match="exceeds the native snapshot budget"):
+        _finish(measurements=(values,))
+
+
+@pytest.mark.parametrize(
+    "tzinfo_factory",
+    [
+        pytest.param(lambda: _OffsetRaises(), id="raises"),
+        pytest.param(lambda: _OffsetWrongType(), id="not-a-timedelta"),
+    ],
+)
+def test_a_tzinfo_that_fails_to_report_an_offset_is_a_stable_error(tzinfo_factory):
+    when = datetime(2026, 9, 28, 8, 1, tzinfo=tzinfo_factory())
+    with pytest.raises(ValueError, match="unsupported UTC offset"):
+        _finish(finished_at=when)
+
+
+class _OffsetRaises(__import__("datetime").tzinfo):
+    def utcoffset(self, value):
+        raise RuntimeError("no offset")
+
+    def dst(self, value):
+        return None
+
+
+class _OffsetWrongType(__import__("datetime").tzinfo):
+    def utcoffset(self, value):
+        return 3600
+
+    def dst(self, value):
+        return None
+
+
+def test_extreme_instants_are_ordered_without_overflow_in_either_position():
+    minus_five = timezone(-timedelta(hours=5))
+    late = datetime(9999, 12, 31, 23, 0, tzinfo=minus_five)
+    early = datetime(9999, 12, 31, 20, 0, tzinfo=minus_five)
+    assert _finish(started_at=early, finished_at=late).finished_at == late
+    with pytest.raises(ValueError, match="finished_at cannot precede started_at"):
+        _finish(started_at=late, finished_at=early)
+    plus_three = timezone(timedelta(hours=3))
+    first = datetime(1, 1, 1, 3, 30, tzinfo=plus_three)
+    assert _finish(started_at=first, finished_at=datetime(1, 1, 1, 12, tzinfo=timezone.utc)).started_at == first
+    with pytest.raises(ValueError, match="finished_at cannot precede started_at"):
+        _finish(started_at=datetime(1, 1, 1, 12, tzinfo=timezone.utc), finished_at=first)
+
+
+def test_every_enum_a_manifest_field_uses_is_in_the_allow_list():
+    import typing
+
+    used = set()
+    for model in (RunManifest, ResourceReading, TimingMeasurement):
+        for field in model.model_fields.values():
+            for part in (field.annotation, *typing.get_args(field.annotation)):
+                if isinstance(part, type) and issubclass(part, run_manifest_module.Enum):
+                    used.add(part)
+    assert used and used <= set(run_manifest_module._ALLOWED_ENUMS)
