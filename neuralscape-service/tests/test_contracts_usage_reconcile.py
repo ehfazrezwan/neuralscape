@@ -3960,3 +3960,69 @@ def test_reconciliation_derives_only_from_the_first_observed_snapshot() -> None:
     first_view["value"] = 7
     assert result.model_dump(mode="json") == snapshot
     assert flipping.items_calls == 1
+
+
+# ---- two native name stores are one namespace, compared as plain text
+
+class _SameTextKey(str):
+    """Reads as the same text as another key but never compares or hashes like it."""
+
+    def __hash__(self) -> int:
+        return id(self)
+
+    def __eq__(self, other: object) -> bool:
+        return self is other
+
+    def __ne__(self, other: object) -> bool:
+        return self is not other
+
+
+def _event_with_extra_name(extra_name: str, *, stored_name: str | None = None):
+    event = _event()
+    if stored_name is not None:
+        assert stored_name in event.__dict__
+    object.__setattr__(event, "__pydantic_extra__", {extra_name: "duplicate"})
+    return event
+
+
+def test_a_text_subclass_key_in_native_extras_cannot_duplicate_a_stored_field() -> None:
+    event = _event_with_extra_name(_SameTextKey("event_id"), stored_name="event_id")
+    with pytest.raises(ValueError, match="extra storage overlaps stored fields"):
+        usage_reconcile_contracts._native_snapshot(event)
+    _assert_canonical_invalid_event(event)
+
+
+def test_a_plain_duplicate_between_model_storage_and_extras_is_still_refused() -> None:
+    event = _event_with_extra_name("event_id", stored_name="event_id")
+    with pytest.raises(ValueError, match="extra storage overlaps stored fields"):
+        usage_reconcile_contracts._native_snapshot(event)
+
+
+def test_a_text_subclass_key_in_public_extras_cannot_duplicate_a_stored_field() -> None:
+    from collections.abc import Mapping
+
+    class PublicExtras(Mapping):
+        def __init__(self, key):
+            self.key = key
+
+        def __getitem__(self, name):
+            return "duplicate"
+
+        def __iter__(self):
+            return iter((self.key,))
+
+        def __len__(self):
+            return 1
+
+    event = _event()
+    object.__setattr__(event, "__pydantic_extra__", PublicExtras(_SameTextKey("event_id")))
+    with pytest.raises(ValueError, match="extra storage overlaps stored fields"):
+        usage_reconcile_contracts._native_snapshot(event)
+
+
+def test_a_stored_text_subclass_name_is_emitted_as_plain_text() -> None:
+    event = _event()
+    value = event.__dict__.pop("event_id")
+    event.__dict__[_SameTextKey("event_id")] = value
+    snapshot = usage_reconcile_contracts._native_snapshot(event)
+    assert all(type(key) is str for key in snapshot) and "event_id" in snapshot

@@ -371,6 +371,21 @@ def _is_real_mapping(value: object) -> bool:
     )
 
 
+def _inherits_str(candidate: type) -> bool:
+    return any(entry is str for entry in _TYPE_MRO.__get__(candidate))
+
+
+def _plain_name(name: object) -> object:
+    """A stored field name as plain text (read without running a text subclass's own hooks).
+
+    Anything that is not text is returned unchanged for the caller's text checks to refuse.
+    """
+
+    if type(name) is str or not _inherits_str(type(name)):
+        return name
+    return str.__str__(name)  # type: ignore[arg-type]
+
+
 def _is_node(value: object) -> bool:
     return isinstance(value, (BaseModel, list, tuple, set, frozenset)) or _is_real_mapping(value)
 
@@ -412,14 +427,18 @@ def _freeze_model_storage(
             if extras is not None and issubclass(type(extras), dict)
             else None
         )
+        group_texts: list[set[object]] = []
         for group in (stored_items, native_extra_items or ()):
-            if any(not any(entry is str for entry in _TYPE_MRO.__get__(type(name))) for name, _item in group):
+            if any(not _inherits_str(type(name)) for name, _item in group):
                 raise ValueError("contract input field names must be text")
-            texts = [
-                name if type(name) is str else str.__str__(name) for name, _item in group
-            ]
+            texts = [_plain_name(name) for name, _item in group]
             if len(set(texts)) != len(texts):
                 raise ValueError("contract input field names must be unique text")
+            group_texts.append(set(texts))
+        # The two native stores are one namespace: compare their names as plain text, never through a
+        # key's own hash and equality (a text subclass could otherwise sit in both under one text).
+        if group_texts[0] & group_texts[1]:
+            raise ValueError("contract extra storage overlaps stored fields")
         frozen_models[identity] = (
             value,
             stored_items,
@@ -571,22 +590,23 @@ def _snapshot_uncached(
             if extras is not None:
                 if native_extra_items is not None:
                     extra_items = native_extra_items
-                    extra_names = {name for name, _ in extra_items}
+                    extra_names = {_plain_name(name) for name, _ in extra_items}
                 else:
                     if not _is_real_mapping(extras):
                         raise ValueError("contract extra storage must be a mapping")
                     iterated_extra_names = tuple(extras)
                     # One unpacking per pair: the name check and the field build share these tuples.
                     extra_items = unpack_pairs(extras.items())
-                    extra_names = set(iterated_extra_names) | {
-                        name for name, _ in extra_items
+                    extra_names = {
+                        _plain_name(name)
+                        for name in (*iterated_extra_names, *(name for name, _ in extra_items))
                     }
                 declared_fields = type(value).model_fields
-                stored_names = {name for name, _ in stored_items}
+                stored_names = {_plain_name(name) for name, _ in stored_items}
                 if (stored_names | set(declared_fields)).intersection(extra_names):
                     raise ValueError("contract extra storage overlaps stored fields")
             fields = {
-                name: _native_snapshot(
+                _plain_name(name): _native_snapshot(
                     field_value,
                     active,
                     _frozen_models=_frozen_models,
@@ -599,7 +619,7 @@ def _snapshot_uncached(
             if extra_items:
                 fields.update(
                 {
-                    name: _native_snapshot(
+                    _plain_name(name): _native_snapshot(
                         field_value,
                         active,
                         _frozen_models=_frozen_models,
