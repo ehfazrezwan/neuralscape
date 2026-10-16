@@ -2447,3 +2447,113 @@ def test_previous_public_view_error_is_kept_when_current_exhausts_the_capture_en
 
     with pytest.raises(ValidationError):  # previous's own diagnostic outranks the budget error
         validate_operation_transition(previous, over_budget_current)
+
+
+# ---------------------------------------------------------------------------
+# Replay checks depth on every occurrence and charges every observation and copy.
+# ---------------------------------------------------------------------------
+
+
+class _LinkedEmptyList(list):
+    """Empty native backing; the public iterator links it to the next view in a chain."""
+
+    def __init__(self):
+        super().__init__()
+        self.next = None
+
+    def __iter__(self):
+        return iter(() if self.next is None else (self.next,))
+
+
+def _flat_siblings_linked_into_a_chain(length: int) -> list:
+    nodes = [_LinkedEmptyList() for _ in range(length)]
+    for current, following in zip(nodes, nodes[1:]):
+        current.next = following
+    return nodes  # captured as flat siblings; their public views chain them to `length` levels
+
+
+class _EmptyTuple(tuple):
+    def __new__(cls):
+        return super().__new__(cls, ())
+
+
+def _wrapped_pairs(depth: int) -> list:
+    node: object = _EmptyTuple()
+    for _ in range(depth):
+        node = [node, node]  # 2**depth paths over depth+1 native nodes and 2*depth edges
+    return node  # type: ignore[return-value]
+
+
+def test_replay_depth_is_checked_on_every_occurrence_not_only_on_discovery(monkeypatch) -> None:
+    _with_tier(monkeypatch, depth=4)
+    chained = operation().model_copy(update={"resource_manifests": _flat_siblings_linked_into_a_chain(8)})
+    with pytest.raises(ValueError, match=BUDGET_MESSAGE):
+        validate_operation_transition(operation(), chained)
+
+
+def test_a_long_public_chain_is_a_stable_budget_error_not_a_recursion_error() -> None:
+    chained = operation().model_copy(update={"resource_manifests": _flat_siblings_linked_into_a_chain(400)})
+    with pytest.raises(ValueError) as raised:
+        validate_operation_transition(operation(), chained)
+    assert type(raised.value) is ValueError and str(raised.value) == BUDGET_MESSAGE
+
+
+def test_a_chain_within_the_depth_limit_still_replays(monkeypatch) -> None:
+    _with_tier(monkeypatch, depth=16)
+    chained = operation().model_copy(update={"resource_manifests": _flat_siblings_linked_into_a_chain(8)})
+    with pytest.raises(ValidationError):  # replays fully, then fails ordinary validation (not a budget error)
+        validate_operation_transition(operation(), chained)
+
+
+def test_empty_public_views_under_shared_ancestors_cannot_replay_exponentially(monkeypatch) -> None:
+    import time
+
+    _with_tier(monkeypatch, edges=64)
+    shared = operation().model_copy(update={"resource_manifests": _wrapped_pairs(14)})
+    started = time.monotonic()
+    with pytest.raises(ValueError, match=BUDGET_MESSAGE):
+        validate_operation_transition(operation(), shared)
+    assert time.monotonic() - started < 2.0
+
+
+def test_the_default_tier_bounds_a_deep_empty_view_replay_in_time() -> None:
+    import time
+
+    shared = operation().model_copy(update={"resource_manifests": _wrapped_pairs(60)})
+    started = time.monotonic()
+    with pytest.raises(ValueError, match=BUDGET_MESSAGE):
+        validate_operation_transition(operation(), shared)
+    assert time.monotonic() - started < 5.0
+
+
+def test_an_empty_public_view_observation_is_charged(monkeypatch) -> None:
+    # 100 empty public views: capture charges 8 operation fields + 100 entries (108 edges); replay used to charge
+    # nothing for them, so a 150-edge tier never noticed 100 observations and 1 copy of their parent.
+    _with_tier(monkeypatch, edges=150)
+    many = operation().model_copy(update={"resource_manifests": [_EmptyTuple() for _ in range(100)]})
+    with pytest.raises(ValueError, match=BUDGET_MESSAGE):
+        validate_operation_transition(operation(), many)
+
+
+def test_a_few_empty_public_views_fit_the_same_tier(monkeypatch) -> None:
+    _with_tier(monkeypatch, edges=150)
+    few = operation().model_copy(update={"resource_manifests": [_EmptyTuple() for _ in range(5)]})
+    with pytest.raises(ValidationError):  # replays within the tier, then ordinary validation rejects the entries
+        validate_operation_transition(operation(), few)
+
+
+def test_previous_first_diagnostics_survive_replay_charging(monkeypatch) -> None:
+    class PublicOnlyList(list):
+        def __init__(self, items):
+            super().__init__()
+            self._items = list(items)
+
+        def __iter__(self):
+            return iter(self._items)
+
+    bad_child = operation().resource_manifests[0]
+    _set_native_field(bad_child, "manifest_id", "")
+    previous = operation().model_copy(update={"resource_manifests": PublicOnlyList([bad_child])})
+    _with_tier(monkeypatch, nodes=6)
+    with pytest.raises(ValidationError):
+        validate_operation_transition(previous, _operation_with_manifests(10, observed_state="running"))

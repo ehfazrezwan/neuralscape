@@ -12,7 +12,7 @@ from typing import Literal, TypeVar
 from pydantic import BaseModel, TypeAdapter, model_validator
 
 from contracts_common import OpaqueId, SafeCounter, VersionedContract
-from contracts_limits import STANDARD, DiscoveryBudget
+from contracts_limits import DISCOVERY_BUDGET_MESSAGE, STANDARD, DiscoveryBudget
 
 
 TenantOperationKind = Literal[
@@ -258,15 +258,17 @@ def _closed_graph_snapshot_session() -> tuple[
             frozen_containers[identity] = items
         return items
 
-    def charged(entries: Iterable[T]) -> Iterator[T]:
-        """Charge each entry of a public view as it is first observed."""
+    def observed(read: Callable[[], Iterable[T]]) -> Iterator[T]:
+        """Observe a public view: one charge for the observation itself (so an empty
+        view is not free), charged before the view is read, then one per entry."""
 
-        for entry in entries:
+        budget.charge_edge()
+        for entry in read():
             budget.charge_edge()
             yield entry
 
     active: set[int] = set()
-    memo: dict[int, tuple[object, object]] = {}
+    memo: dict[int, tuple[object, object, int]] = {}
     phase_depth = 0
 
     def rebuild(item: object, depth: int = 0) -> object:
@@ -283,28 +285,41 @@ def _closed_graph_snapshot_session() -> tuple[
             if phase_depth == 0:
                 budget = capture_budget
 
-    def rebuild_node(item: object, depth: int) -> tuple[object, bool]:
-        """Return ``(copy, reusable)``; reusable subtrees saw only native storage."""
+    def rebuild_node(item: object, depth: int) -> tuple[object, bool, int]:
+        """Return ``(copy, reusable, height)``.
+
+        Reusable subtrees saw only native storage.  ``height`` is the deepest
+        descendant relative to this node, so the depth limit holds on every
+        occurrence, including a reused subtree reached through a deeper path
+        and a chain that public views form out of already captured nodes.
+        """
 
         if not is_graph_node(item):
-            return item, True
+            return item, True, 0
+        if depth > budget.tier.max_depth:
+            raise ValueError(DISCOVERY_BUDGET_MESSAGE)
         item_type = type(item)
 
         identity = id(item)
         cached = memo.get(identity)
         if cached is not None and cached[0] is item:
-            return cached[1], True
+            if depth + cached[2] > budget.tier.max_depth:
+                raise ValueError(DISCOVERY_BUDGET_MESSAGE)
+            return cached[1], True, cached[2]
         if identity not in native_children:
             freeze_native_graph(item, depth)
         if identity in active:
             raise ValueError("contract input graph must be acyclic")
         active.add(identity)
         reusable = True
+        height = 0
+        own_cost = 0  # copying an exact node that cannot be reused is work the capture phase did not charge
 
         def child(value: object) -> object:
-            nonlocal reusable
-            copied, child_reusable = rebuild_node(value, depth + 1)
+            nonlocal reusable, height
+            copied, child_reusable, child_height = rebuild_node(value, depth + 1)
             reusable = reusable and child_reusable
+            height = max(height, child_height + 1)
             return copied
 
         try:
@@ -329,10 +344,10 @@ def _closed_graph_snapshot_session() -> tuple[
                     reusable = False
                     observed_extra_length = len(frozen_extras)
                     iterated_extra_names = tuple(
-                        name for name in charged(frozen_extras)
+                        name for name in observed(lambda: frozen_extras)
                     )
                     extra_entries = tuple(
-                        entry for entry in charged(frozen_extras.items())
+                        entry for entry in observed(frozen_extras.items)
                     )
                 stored_names = {name for name, _field_value in stored_entries}
                 undeclared = stored_names - declared.keys()
@@ -343,6 +358,7 @@ def _closed_graph_snapshot_session() -> tuple[
                     or extra_entries
                 ):
                     raise ValueError("contract input contains undeclared fields")
+                own_cost = 1 + len(stored_entries)
                 result: object = {
                     name: child(field_value) for name, field_value in stored_entries
                 }
@@ -350,19 +366,25 @@ def _closed_graph_snapshot_session() -> tuple[
                 exact = item_type is dict
                 reusable = exact
                 entries = (
-                    frozen_containers[identity] if exact else charged(item.items())
+                    frozen_containers[identity] if exact else observed(item.items)
                 )
+                if exact:
+                    own_cost = 1 + len(entries)
                 result = {key: child(field_value) for key, field_value in entries}
             else:
                 is_list = isinstance(item, list)
                 exact = item_type is (list if is_list else tuple)
                 reusable = exact
-                items = frozen_containers[identity] if exact else charged(item)
+                items = frozen_containers[identity] if exact else observed(lambda: item)
+                if exact:
+                    own_cost = 1 + len(items)
                 copied_items = [child(entry) for entry in items]
                 result = copied_items if is_list else tuple(copied_items)
             if reusable:
-                memo[identity] = (item, result)
-            return result, reusable
+                memo[identity] = (item, result, height)
+            elif own_cost:
+                budget.charge_edge(own_cost)  # every non-reused ancestor copy is charged
+            return result, reusable, height
         finally:
             active.remove(identity)
 
