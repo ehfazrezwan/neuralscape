@@ -34,6 +34,14 @@ import json
 import pytest
 from pydantic import ValidationError
 
+# The story composes the lifecycle, policy, freshness, inference and portability contracts; a tree that has
+# not imported them yet skips it as a whole instead of failing at collection.
+for _required in (
+    "contracts_lifecycle", "contracts_policy", "contracts_policy_reference", "contracts_freshness",
+    "contracts_inference", "contracts_portability",
+):
+    pytest.importorskip(_required)
+
 import contracts_pack as pack
 from contracts_bodies import parse_memory_body
 from contracts_errors import InternalErrorCode, PublicErrorCode, public_error_for

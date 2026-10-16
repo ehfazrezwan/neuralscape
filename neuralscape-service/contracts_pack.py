@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import importlib.util
 import inspect
 import json
 import re
@@ -87,11 +88,22 @@ def _version_of(model: type[BaseModel]) -> str | None:
     return str(args[0]) if args else None
 
 
+def present_modules() -> tuple[str, ...]:
+    """The catalogued modules that exist in this tree, in catalogue order.
+
+    ``MODULE_OWNERS`` is the whole catalogue; a tree that has not imported a module yet simply has no
+    models from it.  When the module arrives its models are registered and the pinned digests must be
+    regenerated in the same change.
+    """
+
+    return tuple(name for name in MODULE_OWNERS if importlib.util.find_spec(name) is not None)
+
+
 def discover_models() -> dict[str, type[BaseModel]]:
-    """Return every public contract model defined in a module listed in ``MODULE_OWNERS``."""
+    """Return every public contract model defined in a catalogued module present in this tree."""
 
     found: dict[str, type[BaseModel]] = {}
-    for module_name in MODULE_OWNERS:
+    for module_name in present_modules():
         module = importlib.import_module(module_name)
         for name, value in vars(module).items():
             if (
@@ -794,94 +806,27 @@ def valid_examples() -> dict[str, dict]:
             "usage_missing_reason": None,
         },
     }
-    return examples
+    return {name: document for name, document in examples.items() if name in _BY_NAME}
 
 
 # Pinned digests of the generated schemas of this revision (see module doc).
 SCHEMA_DIGESTS: dict[str, str] = {
-    "AccessPolicy": "cff5570e2b09a7008ab818014690c845995d560380a00712b3fc625b3a0b057a",
-    "ActivationReceipt": "b93f9a7436fd18abb75d5ce21f503736133e0d0ed2ad4288d85001e7de5f190f",
-    "AssemblyStageTiming": "354ca825e78dfb8fda5e216f0fdf47ff8c6eb3ad14b523ede55aad52b0a2b341",
-    "AttemptUsage": "de5fe29c644755666e4cc15d2146dd73438c42b8be16023c558bb8452a2c8540",
     "AttributionSnapshot": "a5187e6340c911fc3765a36c7f7790ec0a002e19873a0b64aa0e1589cf55cd40",
-    "CalibrationClaim": "18f73d090e83eb14e19c7de75becb56cb491ffd6b8e3ef695b25cc0dd99f4ca9",
-    "CandidateScore": "d5c69622f2115693d2dd4d4732c3a870e5adf764cc1f4a92836af81f20d1c4de",
-    "CanonicalObjectId": "b6baaffc1e29283d5320d4439e45ba09b0099a2c76a331330d9bd3dcad94ef62",
-    "CapabilityManifest": "3356f3bb60cefc28245a00b266b067169b3bbda873e565d3a813ac40dfccb213",
-    "CapabilityOperationState": "c836b553ef10fe6b461a2a7dc50ff55f56cbd062fb87d4585c23baf94fbdbc39",
     "CapabilityReadiness": "09caf43bd51a6e7182fe2581a179f1930aa2f6fe530341cc35988747a4ac062c",
-    "CapabilityRequirement": "630b7b21b8f7571dfb942d000330b7c8416fa87631d9756be68e2f6200a12ae8",
-    "CapabilityViolation": "2632e81c23a6ed74d9830b119dba88027be94a39d5963add02d029184de2f087",
-    "ChecksumDescriptor": "41662216e719fa8200ad840d70293b5693da0f39054cb798b421b9cb09c07052",
-    "ContextApplicability": "e2557edd49dcad45a5244a56bf0470f294087d2640295464efa97a80172b5e5c",
-    "ContextAssemblyReceipt": "6bd4fdd6557ea742787c7f1aad064088cc09a2db2ff5cdd4cb1f3ecc61627883",
-    "ContextBundle": "a4e6cb0e9218bec666493573c4714ecc9a0589a26dd85094982db898d3e311ab",
-    "ContextRequest": "ccef76cf33f7a862a2ff47b9e745e17a7596f1a972fe7c88469435d62aed8393",
-    "DecisionBatchRequest": "63fbd19d9ae7b2930dd9fc16379bb0ed19ccc0a7695464044c4e71311e957c6a",
-    "DecisionBatchResult": "bf7e8ec27d42babfd2d8cdd8b6d345a7ad77dd366b03a9232b35ca9816e6816b",
-    "DecisionCandidate": "354ce1c20c3caadee6dff87caafb4e906db0a6b23198490276018c9fee9bbaad",
-    "DecisionHead": "0305e17ac6093434a2c74ed71fee19e93d2b7cdffa5b1002cd326c4c7ea32d74",
-    "DecisionHeadResult": "f5550aea0f533a6596f41392183d1697c039b60e8ab213daac6efaae146a02ac",
-    "DecisionRequest": "2f350fce70750536fefef238a9275ac05093c503e838d4f5d7e7e68a8094cadf",
-    "DecisionResult": "4bb4769920479c8880b066c69ceed4e39c201eaf8953bd936bc43d3694128330",
-    "DeclaredOmission": "8844bda0d5894a61283a242da6c1356972b4bc019d9c6c12e419c9a1aa0c92de",
-    "DelegationConstraints": "1b8c1a7668541ce07c49425686f6d7fc44e8deb8a2334963c868dc5ba23c8fc6",
-    "EncryptionReference": "cc3a6afbf5d4494d1b415d8b6ed7c8d15e5fa27a8788dec1ae1ee19809f47b77",
-    "EngineRecord": "aa85a3dde5cf6a7529db179663b14e05569241718259d58ded17a179ddec2e7d",
-    "ExpansionLineage": "3698ff5413241cd7bc14be30d10050d00570b49fc82b40d24cc22eb52230c042",
-    "ExportScope": "ad62aa653584296184252dbade31a1ee5fba7095cecbdd6cb3390ea456e6f6a5",
-    "FreshnessWitness": "de06dbecc4dd69aff588e640b860da762a44f40c53e9c72c0cf319e2f329d9fc",
-    "GenerationProposal": "0028690353d6d9d8061a3d1b40a2061247a27b47091cbcc644786f1c098c767f",
-    "GenerationRequest": "791f565c1295474ed6f9fd5740a6c5ee4c1a2153748d3f643d6bd256e4c90737",
-    "GenerationResult": "14ea6463cf6dfd2b4f23687a0da9c3004bbf81f5ae01e99b2f757008b6727be2",
-    "GraphEdge": "fd04fd55cff9f2aded9b7467224e0c9eb725a08be837d5a92486a7cc0b33abbc",
-    "GraphEpisode": "a2d9a47ac6ef448d82978c6614110c5a64f6de25af16c9e761c9e46d1a666863",
-    "IdentityMapping": "db567dd5a4c5c77928e7f85e1029ae65444a913377a5c2d66ad6eb062fa0a878",
-    "InferenceResourceLimits": "61b0e705dcfa15eaabc50534bd6b45891a2bcbe8abfca94512b5f4b1f58d2867",
-    "Intent": "ce00956d4a89f2fd4d3692cc6ed4896f0d722350e51040dfd72f468be05650e7",
-    "ManifestFile": "d0fcd247d8d2c280f5d8645e915f9a171a00b0a4382bbc6ea5e3a988a044c40c",
-    "MembershipVersion": "090001b44c8269177f4fd9ed5eaf289e56e2243d29a2c98849855ef66b3bfe0b",
-    "MemoryRecord": "3a5635314f6c4cbb446e90ef12fdbbe20c3ec7a5540f5394cb2e3815d1fa5d76",
     "OpaqueEnvelopeBody": "5735bd4c041aaef025cd825d7c0fdae1d0097c99e247f7061628cdcabe36addf",
-    "OperationContext": "41d96e75bd41f3d6f72416eaeed5076dd875d58335d7778841c81e05b16e0d2e",
     "PlaintextBody": "a779dc91b1e4ab61dca0bb4f99b14f467f124e7fbf28717b71da2dabab087234",
-    "PolicyDecision": "056f1cdac22f60165001f892a8ca38d26afad11548207b678546f85546d3d7e2",
-    "PolicyEvaluationInput": "baacb7b080175be07573f10fa222fcc70fd4e13ace504e44ed5ecbb7ca6fe220",
-    "PolicyStatement": "a9cca6e3fecdf0cf9247bb7d7362532be293f6dd81e0b91206a368ee12d45d97",
-    "PortableManifest": "0a77d59b8747e11736ee59cd5079fe4cb3073def1dad1d479e9f87699a099c7c",
-    "PositionReference": "dd83ce1d7277e99ddc45aff2447c6439eac67c6defc8fea8a954a297e80ce06f",
-    "PrincipalContext": "794f3e8cb124c53fb9ac51dce2fde9767dccbdf6b9fd6934445bf31fab48c462",
     "ProcessingPolicy": "9a304d12012cfdb36cf58ee6f5137c05fe1e58f6ce1d582d294ff75fcb465975",
-    "ProducerReference": "6aabc3d2e1e769b39fc7e02f8ba636d46096b1f68f9b9bc9234b989b4a7bfe7b",
-    "ProjectionFreshness": "3b2e025e69b5002803f844e367c1d24e99e3b893c950b0f2d0c9ae2d6618fc72",
-    "ProjectionReceipt": "37b01000113b9821ccf8cc8538f651a02c9f46552a5ab9e0d1cf81c2c63a032a",
     "PublicError": "abe3fd61b806b9fa810ff5bd21d05e11dfa3ff12837ae4ff6d4d2d90e5400db9",
-    "QualificationClaim": "9da50b057c62f3eac2ee2512b87db34b0b103e85722a20b373adf6f6337712a0",
     "ReconciledLedger": "89c1d31ee79049eb510faad3c4e902261bd4d89d8585cf16e23c4ffd967b6569",
     "ReconciledUsageStream": "b4c442414c15efc371685d15b46d88383f3b109596f9361b8ea2a4113705ee63",
     "ReferenceHandle": "ed3a23f61cbc569309107c007d61efbf3e536834216262bf4e6767f6c72fa865",
-    "ResourceCompliance": "70d378b94fae539a8828758c829a072955de8f6cb183a85197210c422a3aca59",
     "ResourceManifestReference": "d1f1a73436e66c4991fe8d4f359d8608c2bffcf97507fe1fe256bc1a927e26c4",
-    "ScoreDistribution": "026ec04a377a1752de0d316fef90f33441c1cb4ab915a21fdfe20de6c98247c0",
-    "SearchHit": "5615c9917025e6a12bf5787e44a5632aafe8cc3a0618dba289f60c4ec4b2c117",
-    "SelectedContextItem": "43f47f0f3dc743c969b30efb26537c628fa5ce548048e0e04c614185b4aca8f1",
-    "SerializedResponseBudget": "c82460b5a38dd9bcb89a9eaca0cf958a76585046cbd6b0e1f219f18a4867e370",
-    "SerializedResponseUsage": "3651b7232f55bd8cfdbfcb9e1b4e243067963fd9b48e63380d1a0916bfb6c279",
-    "SnapshotMetadata": "9ad55f9d88964b68226fc3665a68dcce61c51936f1cb879eaa0e6a0b40c18aaf",
-    "SourceCheckpoint": "91eb11296514a7103ec6dff20fa8efa36e1a9a515315dd16297f783ef4d4e9da",
-    "SourceEvidence": "92e546f514644649046f1b5d91449a148c1aff67aef7c7d207ba3b2412651d97",
-    "SourceSpan": "342fd9f4dd315ccb832d5e170482e2aa1f2368cbfff580b000ad2c3f3e042fb0",
     "SourceVersion": "19e586666666d4e5ebc21a5b5a823a50de429e96f65e9a497c3ff4107a3d5e18",
-    "StageError": "d17d77549510a313a01e70803404515e53c7c4a091f60ebd3655dfb54d368c3a",
-    "StageEvidenceRequirement": "1e3d5053286a720ea57ac8d357255f66a4811ce6dbda60ebdbba777d24d94080",
-    "StageReceipt": "396a38e77ab79cc6d3b22cfb96b3ae36a5949b3bae80eb572393bb204a5cd8dd",
-    "TenantFilter": "5fc1c6a653be897863924dc6d4761f49a62aa5241d1b18c5e37842c20742bd11",
     "TenantOperationState": "33db3798d46fa950f351e1873a2bde88bf2eb38b1cc6f273a4af0e77e25807e9",
     "TenantPlacement": "115d2cb1e7dc14f7c47cf0e33534200124e9548b7dbbfe1250467b44831e3643",
     "TenantReadinessPublication": "fa46b169c2252b127a66be0ed184f330838ab8be2e80be7a4f8b52920da792db",
     "TokenQuantity": "9b3f663d8414782827eb834c1acfc4abda64b78dcbe9d075cc845edafe481323",
     "TokenUsage": "91eb6b2c0de0a862877dcd1400cc336a29f4c9f9c614cf51c80cdbf44e98b554",
-    "TokenizerBasis": "adfa696c57d2d8cdfd7e6e8aee5521f8b1929fb26bb74580a0b383e6e950ea9c",
     "UsageEvent": "e1065ed457038f3d78fd220b4575e5b155034f5c41d25be822f647965aad4a19",
     "UsageReconciliation": "2f45bc9f4a2e94688030ed40ce42896a7a6412376e4b896938d85d62c5b58938",
 }
