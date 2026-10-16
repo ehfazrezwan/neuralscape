@@ -4679,3 +4679,92 @@ def test_a_model_extra_mapping_within_the_budget_is_still_read_once():
     except ValueError:
         pass  # a closed model may refuse extras; only the single read is pinned here
     assert calls.count("iter") <= 1 and calls.count("items") <= 1
+
+
+# ── an offset is read once and is an exact timedelta; a missing offset at capture stays missing ──
+
+
+class _EvilOffset(timedelta):
+    """A timedelta subclass whose subtraction lies: any difference it takes part in is minus one day."""
+
+    def __sub__(self, other):
+        return timedelta(days=-1)
+
+    def __rsub__(self, other):
+        return timedelta(days=-1)
+
+
+class _FixedTz(__import__("datetime").tzinfo):
+    def __init__(self, offset):
+        self._offset = offset
+
+    def utcoffset(self, value):
+        return self._offset
+
+    def dst(self, value):
+        return None
+
+
+class _ScriptedTz(__import__("datetime").tzinfo):
+    """Answers each utcoffset call from a script, then repeats the last answer."""
+
+    def __init__(self, answers):
+        self._answers, self.calls = list(answers), 0
+
+    def utcoffset(self, value):
+        answer = self._answers[min(self.calls, len(self._answers) - 1)]
+        self.calls += 1
+        return answer
+
+    def dst(self, value):
+        return None
+
+
+def _revalidated(manifest, **fields):
+    return RunManifest.model_validate({**manifest.model_dump(mode="python"), **fields})
+
+
+def _reversed_by_a_lying_offset():
+    finished = datetime(2026, 9, 28, 8, 0, tzinfo=_FixedTz(_EvilOffset(hours=1)))  # 07:00 UTC
+    started = datetime(2026, 9, 28, 9, 0, tzinfo=timezone.utc)  # 09:00 UTC: the run ends before it starts
+    return started, finished
+
+
+def test_a_timedelta_subclass_offset_cannot_reverse_a_run_interval_when_captured():
+    started, finished = _reversed_by_a_lying_offset()
+    with pytest.raises(ValueError, match="finished_at cannot precede started_at"):
+        _finish(started_at=started, finished_at=finished)
+
+
+def test_a_timedelta_subclass_offset_cannot_reverse_a_run_interval_in_direct_construction():
+    manifest = _finish()
+    started, finished = _reversed_by_a_lying_offset()
+    with pytest.raises(ValueError, match="finished_at cannot precede started_at"):
+        _revalidated(manifest, started_at=started, finished_at=finished)
+    with pytest.raises(ValueError, match="finished_at cannot precede started_at"):
+        _revalidated(manifest, started_at=finished.replace(tzinfo=_FixedTz(_EvilOffset(hours=-1))), finished_at=started.replace(tzinfo=timezone.utc) - timedelta(hours=3))
+
+
+def test_a_stored_timestamp_keeps_an_exact_fixed_offset_after_validation():
+    manifest = _finish()
+    shifted = datetime(2026, 9, 28, 9, 30, tzinfo=_FixedTz(_EvilOffset(hours=1)))
+    kept = _revalidated(manifest, started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc), finished_at=shifted)
+    offset = kept.finished_at.utcoffset()
+    assert type(offset) is timedelta and offset == timedelta(hours=1)
+    assert kept.finished_at.tzinfo is not shifted.tzinfo  # the caller's tzinfo is not retained
+
+
+def test_a_tzinfo_that_reports_no_offset_once_and_a_valid_one_afterwards_is_refused_at_capture():
+    tz = _ScriptedTz([None, timedelta(0), timedelta(0)])
+    when = datetime(2026, 9, 28, 8, 1, tzinfo=tz)
+    with pytest.raises(ValueError, match="explicit UTC offset"):
+        _finish(finished_at=when)
+
+
+def test_a_tzinfo_whose_offset_changes_between_reads_is_read_once_in_direct_construction():
+    manifest = _finish()
+    tz = _ScriptedTz([timedelta(hours=1), timedelta(hours=-5), timedelta(hours=9)])
+    when = datetime(2026, 9, 28, 9, 30, tzinfo=tz)
+    kept = _revalidated(manifest, started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc), finished_at=when)
+    assert tz.calls == 1  # one read by the validator; nothing later asks the caller's tzinfo again
+    assert kept.finished_at.utcoffset() == timedelta(hours=1) == kept.finished_at.utcoffset()

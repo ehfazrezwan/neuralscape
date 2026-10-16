@@ -270,6 +270,20 @@ class TimingMeasurement(_ManifestContract):
         return self
 
 
+def _exact_offset(offset: object) -> timedelta:
+    """An exact ``timedelta`` with the value of ``offset``, read through the built-in slots.
+
+    A ``tzinfo`` may return a ``timedelta`` subclass whose arithmetic or attributes run caller code;
+    the three fields are read with the base type's own accessors and a fresh exact value is built.
+    """
+
+    return timedelta(
+        days=timedelta.days.__get__(offset),  # type: ignore[arg-type]
+        seconds=timedelta.seconds.__get__(offset),  # type: ignore[arg-type]
+        microseconds=timedelta.microseconds.__get__(offset),  # type: ignore[arg-type]
+    )
+
+
 def _instant_before(left: datetime, right: datetime) -> bool:
     """Whether ``left`` is an earlier instant than ``right``, without leaving the datetime range.
 
@@ -278,11 +292,13 @@ def _instant_before(left: datetime, right: datetime) -> bool:
     because each offset is the datetime's own.
     """
 
-    left_offset, right_offset = left.utcoffset(), right.utcoffset()
-    if left_offset is None or right_offset is None:
+    offsets = (datetime.utcoffset(left), datetime.utcoffset(right))
+    if offsets[0] is None or offsets[1] is None:
         raise ValueError("run timestamps must include an explicit UTC offset")
-    wall = left.replace(tzinfo=None) - right.replace(tzinfo=None)
-    return wall - (left_offset - right_offset) < timedelta(0)
+    left_offset, right_offset = _exact_offset(offsets[0]), _exact_offset(offsets[1])
+    # Built-in arithmetic only: no operand's own __sub__ or __rsub__ can run.
+    wall = datetime.__sub__(datetime.replace(left, tzinfo=None), datetime.replace(right, tzinfo=None))
+    return timedelta.__sub__(wall, timedelta.__sub__(left_offset, right_offset)) < timedelta(0)
 
 
 class RunManifest(_ManifestContract):
@@ -302,9 +318,19 @@ class RunManifest(_ManifestContract):
     @field_validator("started_at", "finished_at")
     @classmethod
     def require_aware_timestamp(cls, value: datetime | None) -> datetime | None:
-        if value is not None and (value.tzinfo is None or value.utcoffset() is None):
-            raise ValueError("run timestamps must include an explicit UTC offset")
-        return value
+        if value is None:
+            return None
+        # Read the caller's tzinfo once and keep an exact fixed-offset copy, so nothing later (the
+        # ordering check, serialization) asks caller code again or sees a different answer.
+        try:
+            offset = datetime.utcoffset(value)
+            if offset is None:
+                raise ValueError("run timestamps must include an explicit UTC offset")
+            return datetime.replace(value, tzinfo=timezone(_exact_offset(offset)))
+        except ValueError:
+            raise
+        except Exception:  # a tzinfo is caller code: it can raise, or return something that is no offset
+            raise ValueError("run timestamps must have a usable UTC offset") from None
 
     @model_validator(mode="after")
     def validate_run_evidence(self) -> Self:
@@ -1145,15 +1171,17 @@ def _fixed_offset(value: datetime, path: str) -> datetime:
     A ``tzinfo`` is caller code: its ``utcoffset`` can return a different answer on every
     call (or depend on ``fold``), so a value validated against one reading could serialize
     or compare against another.  The offset is read once here, at capture, and the
-    manifest keeps the same wall time under that fixed offset.  A naive value (no offset)
-    is left for validation to refuse.
+    manifest keeps the same wall time under that fixed offset (an exact ``timedelta``).  A value with
+    no offset becomes naive, which validation refuses.
     """
 
     try:
-        offset = value.utcoffset()
+        offset = datetime.utcoffset(value)
         if offset is None:
-            return value
-        return value.replace(tzinfo=timezone(offset))
+            # No offset at capture: drop the caller's tzinfo, so validation refuses the naive value
+            # and a later read cannot find an offset that was not there.
+            return datetime.replace(value, tzinfo=None)
+        return datetime.replace(value, tzinfo=timezone(_exact_offset(offset)))
     except Exception:  # a tzinfo is caller code: it can raise, or return something that is no offset
         raise ValueError(f"unsupported UTC offset at {path}") from None
 
