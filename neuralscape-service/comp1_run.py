@@ -52,6 +52,32 @@ NEEDS_PROVIDER = {
     "graph-removal-shared-support": "episode removal needs graph episodes (live provider)",
 }
 STATIC_ONLY = {"backup-covers-compose-volumes": "a repository check; there is no service to observe"}
+# Under the governed profile (ledger, authority store, enforcing policy) these legacy paths are
+# not the paths a write takes; the oracle is recorded as not applicable, naming the replacement
+# whose own tests are run and reported beside it.  Only paths shown to be replaced are listed.
+GOVERNED_REPLACED = {
+    "queued-visibility-publication": (
+        "governed writes publish through the publication fence, which re-reads the source's current visibility",
+        ("tests/test_v1_governed_memory.py::test_privacy_narrowing_between_stages_denies_only_the_derivative",
+         "tests/test_publication_fence.py"),
+    ),
+    "job-key-omits-store-scope": (
+        "governed writes are ledger intents, not coalescing queue job ids (see rs-job-keys under this profile)",
+        ("tests/test_v1_durable_write.py::test_the_same_key_twice_through_the_manager_is_one_intent",
+         "tests/test_v1_durable_write.py::test_api_idempotency_key_replays_and_conflicts"),
+    ),
+    "job-key-omits-raw-options": (
+        "governed writes are ledger intents, not coalescing queue job ids (see rs-job-keys under this profile)",
+        ("tests/test_producers_writers.py::test_job_idempotency_replay_and_conflict",
+         "tests/test_v1_durable_write.py::test_api_idempotency_key_replays_and_conflicts"),
+    ),
+    "stale-revision-edit": (
+        "governed edits require If-Match with the expected revision; a stale one is refused",
+        ("tests/test_v1_governed_memory.py::test_a_stale_expected_revision_is_refused_and_writes_nothing",
+         "tests/test_v1_governed_memory.py::test_two_edits_naming_the_same_revision_cannot_both_commit"),
+    ),
+}
+
 OBSERVED_LIVE = {"job-key-omits-store-scope": "rs-job-keys", "job-key-omits-raw-options": "rs-job-keys",
                  "readiness-probes-backends": "rs-readiness"}
 
@@ -86,7 +112,24 @@ def _outcomes(junit: Path) -> dict[str, str]:
     return out
 
 
-def run_reproductions(tree: Path, inputs: Path, junit: Path) -> tuple[dict[str, str], str]:
+def run_replacements(tree: Path, test_ids: tuple[str, ...]) -> str:
+    """Run a replacement's own tests in ``tree``; returns a short outcome token.
+
+    The tests configure their own stores and settings, so they run without the profile's
+    environment (passing it in makes their fixtures see a second, conflicting configuration).
+    """
+
+    done = subprocess.run(
+        ["prlimit", "--as=8589934592", "--", str(tree / ".venv" / "bin" / "python"), "-m", "pytest",
+         *test_ids, "-q", "-p", "no:cacheprovider"],
+        cwd=str(tree), capture_output=True, text=True, timeout=900,
+    )
+    tail = (done.stdout.strip().splitlines() or ["no output"])[-1]
+    counts = "_".join(part.replace(" ", "-") for part in tail.split(" in ")[0].split(", "))
+    return ("pass" if done.returncode == 0 else "fail") + ":" + counts[:60]
+
+
+def run_reproductions(tree: Path, inputs: Path, junit: Path, env: dict[str, str] | None = None) -> tuple[dict[str, str], str]:
     """Run the preserved reproductions inside ``tree``; returns (outcome per test, setup note)."""
 
     source = inputs / REPRODUCTIONS
@@ -99,10 +142,12 @@ def run_reproductions(tree: Path, inputs: Path, junit: Path) -> tuple[dict[str, 
         shutil.copyfile(source, target)  # untracked copy in a disposable checkout, removed below
         placed = True
     try:
+        import os
+
         subprocess.run(
             ["prlimit", "--as=8589934592", "--", str(tree / ".venv" / "bin" / "python"), "-m", "pytest",
              f"tests/{REPRODUCTIONS}", "-q", "-p", "no:cacheprovider", f"--junitxml={junit}"],
-            cwd=str(tree), capture_output=True, text=True, timeout=900,
+            cwd=str(tree), capture_output=True, text=True, timeout=900, env={**os.environ, **(env or {})},
         )
         if not junit.exists():
             return {}, "pytest produced no report"
@@ -190,12 +235,22 @@ def run(args: argparse.Namespace) -> None:
     trees = (("baseline", Path(args.baseline), args.baseline_ref, args.compose_project_baseline),
              ("candidate", Path(args.candidate), args.candidate_ref, args.compose_project_candidate))
     rs_oracles = persona_evidence.load_oracles(REALSERVICE_ORACLES)
+    candidate_env = dict(item.split("=", 1) for item in args.candidate_env)
+    governed = args.profile == "governed"
     for role, tree, ref, project in trees:
+        env = candidate_env if role == "candidate" else {}
         junit = out / f"reproductions-{role}.xml"
-        outcomes, setup_note = run_reproductions(tree, inputs, junit)
+        outcomes, setup_note = run_reproductions(tree, inputs, junit, env)
         for scenario in registry.SCENARIOS:
             verdict, note = judge_reproduction(scenario.kind, role, outcomes.get(scenario.test))
-            seen = {"pytest_outcome": outcomes.get(scenario.test, "not_run"), "stores": "unit_fakes"}
+            seen = {"pytest_outcome": outcomes.get(scenario.test, "not_run"), "stores": "unit_fakes",
+                    "profile": args.profile if role == "candidate" else "default"}
+            replaced = GOVERNED_REPLACED.get(scenario.id) if governed and role == "candidate" else None
+            if replaced is not None:
+                reason, test_ids = replaced
+                seen["replacement_tests"] = run_replacements(tree, test_ids)
+                verdict = "not_applicable"
+                note = (reason + "; replacement: " + ", ".join(test_ids))[:300]
             writer.write(EvidenceRecord(
                 schema_version="candidate-v1", record_id=f"{args.run_id}.{role}.{scenario.id}",
                 scenario_id=scenario.id, run_id=args.run_id, role=role, subject_ref=ref,
@@ -213,7 +268,8 @@ def run(args: argparse.Namespace) -> None:
                 ))
         persona_evidence.run(tree, role, ref, PERSONA_ORACLES, out / "evidence.jsonl", args.run_id)
         if project:
-            observed = realservice(tree, project, args.compose_file)
+            extra = args.candidate_realservice_args.split() if role == "candidate" else []
+            observed = realservice(tree, project, args.compose_file, extra)
             (out / f"realservice-{role}.json").write_text(json.dumps(observed, indent=1, sort_keys=True))
             for scenario_id, (oracle, digest) in sorted(rs_oracles.items()):
                 key = scenario_id.removeprefix("rs-").replace("-", "_")
@@ -229,10 +285,10 @@ def run(args: argparse.Namespace) -> None:
     (out / "comparison.md").write_text(render_report(compare(read.records)))
 
 
-def realservice(tree: Path, project: str, compose_file: str) -> dict:
+def realservice(tree: Path, project: str, compose_file: str, extra: list[str] | None = None) -> dict:
     done = subprocess.run(
         [sys.executable, str(HERE / "comp1_realservice.py"), "--service-dir", str(tree),
-         "--compose-project", project, "--compose-file", compose_file],
+         "--compose-project", project, "--compose-file", compose_file, *(extra or [])],
         capture_output=True, text=True, timeout=900,
     )
     lines = [line for line in done.stdout.splitlines() if line.startswith("{")]
@@ -250,6 +306,9 @@ def main(argv: list[str] | None = None) -> int:
     runner.add_argument("--compose-project-baseline")
     runner.add_argument("--compose-project-candidate")
     runner.add_argument("--compose-file")
+    runner.add_argument("--profile", default="default", choices=["default", "governed"])
+    runner.add_argument("--candidate-env", action="append", default=[], help="KEY=VALUE for the candidate")
+    runner.add_argument("--candidate-realservice-args", default="", help="extra probe arguments for the candidate")
     args = parser.parse_args(argv)
     run(args)
     return 0

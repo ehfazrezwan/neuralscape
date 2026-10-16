@@ -46,11 +46,18 @@ def _port(project: str, file: str, service: str, inner: int) -> str:
     return _compose(project, file, "port", service, str(inner)).splitlines()[-1]
 
 
-def _call(base: str, method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
+_TOKENS: dict[str, str] = {}  # user id -> bearer token (governed profile only)
+
+
+def _call(
+    base: str, method: str, path: str, body: dict | None = None, headers: dict | None = None
+) -> tuple[int, dict]:
     data = None if body is None else json.dumps(body).encode()
-    request = urllib.request.Request(
-        base + path, data=data, method=method, headers={"content-type": "application/json"}
-    )
+    headers = {"content-type": "application/json", **(headers or {})}
+    user = (body or {}).get("user_id") or ("comp1-reader" if "comp1-reader" in path else None)
+    if user in _TOKENS:
+        headers["Authorization"] = f"Bearer {_TOKENS[user]}"
+    request = urllib.request.Request(base + path, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
             return response.status, json.loads(response.read() or b"{}")
@@ -104,16 +111,20 @@ def readiness(base: str, project: str, file: str) -> dict[str, str]:
     }
 
 
+_FIXED_WRITE_FIELDS: dict[str, str] = {}  # e.g. an explicit visibility under an enforcing policy
+
+
 def job_keys(base: str) -> dict[str, str]:
     messages = [{"role": "user", "content": "Remember that deploys freeze on Fridays (comp1)."}]
 
     def store(**extra) -> str:
-        status, body = _call(base, "POST", "/v1/memories", {"messages": messages, **extra})
+        status, body = _call(base, "POST", "/v1/memories", {"messages": messages, **_FIXED_WRITE_FIELDS, **extra})
         return body.get("task_id") or f"http-{status}"
 
     def raw(**extra) -> str:
         payload = {"content": "Deploys freeze on Fridays (comp1).", "user_id": "comp1-alice",
-                   "category": "convention", "scope": "project", "project_id": "alpha", **extra}
+                   "category": "convention", "scope": "project", "project_id": "alpha",
+                   **_FIXED_WRITE_FIELDS, **extra}
         status, body = _call(base, "POST", "/v1/memories/raw", payload)
         return body.get("task_id") or f"http-{status}"
 
@@ -133,12 +144,36 @@ def job_keys(base: str) -> dict[str, str]:
     }
 
 
+def idempotency_retry(base: str) -> dict[str, str]:
+    """An identical write retried with one Idempotency-Key, and a different write under it."""
+
+    payload = {"content": "Releases ship on Tuesdays (comp1).", "user_id": "comp1-alice",
+               "category": "convention", "scope": "project", "project_id": "alpha", **_FIXED_WRITE_FIELDS}
+    key = {"Idempotency-Key": "comp1-retry-1"}
+    first_status, first = _call(base, "POST", "/v1/memories/raw", payload, key)
+    again_status, again = _call(base, "POST", "/v1/memories/raw", payload, key)
+    changed_status, _ = _call(base, "POST", "/v1/memories/raw", {**payload, "category": "tech_stack"}, key)
+    return {
+        "first_http": str(first_status),
+        "retry_same_task": str(bool(first.get("task_id")) and first.get("task_id") == again.get("task_id")).lower(),
+        "retry_http": str(again_status),
+        "changed_payload_same_key_http": str(changed_status),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--service-dir", required=True)
     parser.add_argument("--compose-project", required=True)
     parser.add_argument("--compose-file", required=True)
+    parser.add_argument("--extra-env", action="append", default=[], help="KEY=VALUE for the API")
+    parser.add_argument("--tokens", default="", help="JSON file mapping user id to bearer token")
+    parser.add_argument("--write-visibility", default="", help="send this visibility on every write")
     args = parser.parse_args()
+    if args.write_visibility:
+        _FIXED_WRITE_FIELDS["visibility"] = args.write_visibility
+    if args.tokens:
+        _TOKENS.update(json.loads(Path(args.tokens).read_text()))
     service_dir = Path(args.service_dir).resolve()
     project, file = args.compose_project, args.compose_file
     env = {k: v for k, v in os.environ.items() if not k.startswith(("NEURALSCAPE_", "NS_", "GOOGLE_"))}
@@ -150,10 +185,12 @@ def main() -> int:
         "GOOGLE_API_KEY": "comp1-no-provider",  # never called: no worker runs, nothing is extracted
         "QDRANT_COLLECTION": "comp1",
     })
+    env.update(dict(item.split("=", 1) for item in args.extra_env))
     out: dict[str, dict] = {}
     process, base = _start_api(service_dir, env)
     try:
         for name, probe in (("job_keys", lambda: job_keys(base)),
+                            ("idempotency_retry", lambda: idempotency_retry(base)),
                             ("readiness", lambda: readiness(base, project, file))):
             try:
                 out[name] = {"facts": probe()}
