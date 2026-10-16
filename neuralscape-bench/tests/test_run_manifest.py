@@ -4257,3 +4257,60 @@ def test_a_class_only_registered_as_a_mapping_is_not_a_mapping() -> None:
             measurements=(timing(),),
         )
     assert iterated == []  # never iterated as if it were a mapping
+
+
+class DelegatingProxy:
+    """Reports ``ResourceReading`` through ``__class__`` and delegates every attribute to a target."""
+
+    def __init__(self, target: object, events: list[str]) -> None:
+        object.__setattr__(self, "_target", target)
+        object.__setattr__(self, "_events", events)
+
+    @property
+    def __class__(self):  # noqa: D401 - the callback under test
+        object.__getattribute__(self, "_events").append("__class__")
+        return ResourceReading
+
+    def __getattr__(self, name: str):
+        return getattr(object.__getattribute__(self, "_target"), name)
+
+
+def _finish_with_resources(resources):
+    return finish_run(
+        planned_manifest(),
+        state=RunState.COMPLETED,
+        started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+        resources=resources,
+        measurements=(timing(),),
+    )
+
+
+def test_a_delegating_proxy_cannot_smuggle_invalid_evidence_past_validation() -> None:
+    events: list[str] = []
+    invalid = measured_memory().model_copy(update={"observed_value": True})  # unchecked copy: a bool observation
+    with pytest.raises((ValueError, TypeError, ValidationError)):
+        _finish_with_resources((DelegatingProxy(invalid, events),))
+    assert events == []  # and rejecting it never ran the proxy's class callback
+
+
+def test_a_delegating_proxy_over_valid_evidence_is_also_refused() -> None:
+    events: list[str] = []
+    with pytest.raises((ValueError, TypeError, ValidationError)):
+        _finish_with_resources((DelegatingProxy(measured_memory(), events),))
+    assert events == []
+
+
+@pytest.mark.parametrize("leaf", [object(), b"bytes", {1, 2}, 1 + 2j, type, len])
+def test_an_unsupported_leaf_type_is_a_stable_error_before_validation(leaf) -> None:
+    from pydantic import BaseModel as _Base
+
+    resource = measured_memory()
+    dict.__setitem__(_Base.__dict__["__dict__"].__get__(resource, _Base), "unit", leaf)
+    with pytest.raises(ValueError, match="unsupported"):
+        _finish_with_resources((resource,))
+
+
+def test_genuine_scalars_enums_and_datetimes_still_pass() -> None:
+    manifest = _finish_with_resources((measured_memory(),))
+    assert manifest.state is RunState.COMPLETED and manifest.started_at.tzinfo is not None

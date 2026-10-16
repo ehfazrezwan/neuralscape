@@ -88,7 +88,11 @@ class _FrozenGraph(NamedTuple):
 class _ManifestContract(BaseModel):
     """Strict, immutable base local to the standalone benchmark package."""
 
-    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    # ``revalidate_instances`` is defense in depth: a model instance that ever reached
+    # validation would have its fields checked again instead of being trusted.
+    model_config = ConfigDict(
+        extra="forbid", strict=True, frozen=True, revalidate_instances="always"
+    )
     schema_version: Literal["candidate-v1"]
 
 
@@ -1034,6 +1038,48 @@ def _freeze_model_graphs(*values: Any) -> _FrozenGraph:
     return frozen_graph
 
 
+_LEAF_TYPES = (type(None), bool, int, float, str, datetime)
+
+
+def _is_supported_leaf(value: Any) -> bool:
+    """Whether ``value`` is a JSON-style scalar, a datetime or an enum member, by its real type.
+
+    Exact scalar types are compared by identity; an enum member is recognised by a
+    native MRO walk, never by ``isinstance`` (which reads ``__class__``).
+    """
+
+    kind = type(value)
+    return _is_exact_type(kind, _LEAF_TYPES) or _is_subclass(kind, Enum)
+
+
+def _require_native_snapshot(snapshot: Any) -> Any:
+    """Reject, with a stable error and before Pydantic sees it, any unsupported value.
+
+    ``_snapshot_native`` rebuilds models, mappings and sequences as exact dicts, lists and
+    tuples and returns every other value untouched.  An object that merely *reports* a model
+    class through ``__class__`` (or delegates attributes to one) would otherwise reach
+    Pydantic, which can recognise it as an already-validated instance and skip revalidating
+    its fields.  The walk is iterative and reads only real types.
+    """
+
+    pending: list[tuple[Any, str]] = [(snapshot, "$")]
+    seen: set[int] = set()
+    while pending:
+        value, path = pending.pop()
+        kind = type(value)
+        if _is_exact_type(kind, (dict, list, tuple)):
+            if id(value) in seen:
+                continue
+            seen.add(id(value))
+            if kind is dict:
+                pending.extend((item, f"{path}[{key!r}]") for key, item in dict.items(value))
+            else:
+                pending.extend((item, f"{path}[{index}]") for index, item in enumerate(value))
+        elif not _is_supported_leaf(value):
+            raise ValueError(f"unsupported value type at {path}")
+    return snapshot
+
+
 def _snapshot_native(
     value: Any,
     *,
@@ -1246,7 +1292,7 @@ def _validated_manifest_snapshot(
     if not _is_instance(manifest, RunManifest):
         raise TypeError("manifest must be a RunManifest")
     return RunManifest.model_validate(
-        _snapshot_native(manifest, _frozen_graph=_frozen_graph)
+        _require_native_snapshot(_snapshot_native(manifest, _frozen_graph=_frozen_graph))
     )
 
 
@@ -1319,7 +1365,7 @@ def finish_run(
         resources=frozen_resources,
         measurements=frozen_measurements,
     )
-    candidate = RunManifest.model_validate(candidate_data)
+    candidate = RunManifest.model_validate(_require_native_snapshot(candidate_data))
     if candidate.state is RunState.PLANNED:
         raise ValueError("finish_run requires a terminal state (completed or aborted)")
 
