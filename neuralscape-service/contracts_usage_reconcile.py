@@ -568,7 +568,8 @@ def _snapshot_uncached(
                     _frozen_models=_frozen_models,
                     _frozen_dicts=_frozen_dicts,
                     _frozen_tuples=_frozen_tuples,
-                    _memo=_memo,                )
+                    _memo=_memo,
+                )
                 for name, field_value in stored_items
             }
             if extra_items:
@@ -580,7 +581,8 @@ def _snapshot_uncached(
                         _frozen_models=_frozen_models,
                         _frozen_dicts=_frozen_dicts,
                         _frozen_tuples=_frozen_tuples,
-                        _memo=_memo,                    )
+                        _memo=_memo,
+                    )
                     for name, field_value in extra_items
                 }
             )
@@ -623,7 +625,8 @@ def _snapshot_uncached(
                         _frozen_models=_frozen_models,
                         _frozen_dicts=_frozen_dicts,
                         _frozen_tuples=_frozen_tuples,
-                        _memo=_memo,                    )
+                        _memo=_memo,
+                    )
                     try:
                         projected[key] = projected_value
                     except Exception as exc:
@@ -637,7 +640,8 @@ def _snapshot_uncached(
                     _frozen_models=_frozen_models,
                     _frozen_dicts=_frozen_dicts,
                     _frozen_tuples=_frozen_tuples,
-                    _memo=_memo,                )
+                    _memo=_memo,
+                )
                 try:
                     projected[key] = projected_value
                 except Exception as exc:
@@ -652,7 +656,8 @@ def _snapshot_uncached(
                     _frozen_models=_frozen_models,
                     _frozen_dicts=_frozen_dicts,
                     _frozen_tuples=_frozen_tuples,
-                    _memo=_memo,                )
+                    _memo=_memo,
+                )
                 for item in value
             ]
         if isinstance(value, tuple):
@@ -673,7 +678,8 @@ def _snapshot_uncached(
                     _frozen_models=_frozen_models,
                     _frozen_dicts=_frozen_dicts,
                     _frozen_tuples=_frozen_tuples,
-                    _memo=_memo,                )
+                    _memo=_memo,
+                )
                 for item in frozen_tuple[1]
             )
         if isinstance(value, set):
@@ -684,7 +690,8 @@ def _snapshot_uncached(
                     _frozen_models=_frozen_models,
                     _frozen_dicts=_frozen_dicts,
                     _frozen_tuples=_frozen_tuples,
-                    _memo=_memo,                )
+                    _memo=_memo,
+                )
                 for item in value
             }
         return frozenset(
@@ -694,7 +701,8 @@ def _snapshot_uncached(
                 _frozen_models=_frozen_models,
                 _frozen_dicts=_frozen_dicts,
                 _frozen_tuples=_frozen_tuples,
-                _memo=_memo,            )
+                _memo=_memo,
+            )
             for item in value
         )
     finally:
