@@ -3619,3 +3619,103 @@ def test_a_revisit_in_a_deep_position_through_model_and_dict_edges_is_refused_in
     for siblings in ([subtree, deep], [deep, subtree]):
         with pytest.raises(ValueError, match="budget"):
             snapshot_contract_graph(wrap(siblings))
+
+
+# ── extras found late (through a public mapping) respect every depth the model was reached at ──
+
+
+def _model_with_deep_extras(levels: int, *, native: bool):
+    value = SourceVersion(record_id="r1", content_revision=1, policy_epoch=1)
+    extras = {"deep": _deep_subtree(levels)}
+    _EXTRA.__set__(value, extras if native else MappingProxyType(extras))
+    return value
+
+
+@pytest.mark.parametrize("native", [False, True], ids=["public-mapping-extras", "dict-extras"])
+@pytest.mark.parametrize("hidden_first", [False, True], ids=["direct-first", "hidden-first"])
+def test_extras_are_checked_at_the_deepest_depth_the_model_was_reached(native, hidden_first) -> None:
+    model = _model_with_deep_extras(250, native=native)  # 252 levels below the model: fine on its own
+    snapshot_contract_graph([model])
+    hidden = _hidden_path(model, 10)  # the same model 11 levels down through empty public views
+    siblings = [hidden, model] if hidden_first else [model, hidden]
+    with pytest.raises(ValueError, match="budget"):
+        snapshot_contract_graph(siblings)
+
+
+@pytest.mark.parametrize("native", [False, True], ids=["public-mapping-extras", "dict-extras"])
+def test_extras_found_late_on_a_shallow_path_still_pass_when_every_path_fits(native) -> None:
+    model = _model_with_deep_extras(200, native=native)
+    hidden = _hidden_path(model, 10)
+    for siblings in ([model, hidden], [hidden, model]):
+        assert snapshot_contract_graph(siblings) is not None
+
+
+@pytest.mark.parametrize("native", [False, True], ids=["public-mapping-extras", "dict-extras"])
+@pytest.mark.parametrize("deep_first", [False, True], ids=["shallow-first", "deep-first"])
+def test_a_late_height_reaches_ancestors_that_a_deeper_path_visits(native, deep_first) -> None:
+    model = _model_with_deep_extras(200, native=native)
+    head = _hidden_path(model, 5)  # an ancestor of the model through native edges
+    deeper: object = head
+    for _ in range(60):  # a second, deeper path to the same ancestor
+        deeper = [deeper]
+    siblings = [model, head, deeper]
+    if deep_first:
+        siblings = [deeper, model, head]
+    with pytest.raises(ValueError, match="budget"):
+        snapshot_contract_graph(siblings)
+
+
+def test_the_ancestor_of_a_late_height_is_accepted_when_the_deeper_path_fits() -> None:
+    model = _model_with_deep_extras(100, native=False)
+    head = _hidden_path(model, 5)
+    deeper: object = head
+    for _ in range(40):
+        deeper = [deeper]
+    for siblings in ([model, head, deeper], [deeper, model, head]):
+        assert snapshot_contract_graph(siblings) is not None
+
+
+class _ViewOf(list):
+    """A list whose public view yields one item that its native backing does not hold."""
+
+    def __init__(self, shown: object) -> None:
+        super().__init__()
+        self._shown = shown
+
+    def __iter__(self):
+        return iter((self._shown,))
+
+
+@pytest.mark.parametrize("model_first", [False, True], ids=["view-first", "model-first"])
+def test_a_late_height_is_checked_at_the_depth_an_ancestor_reached_through_a_public_view(model_first) -> None:
+    model = _model_with_deep_extras(150, native=False)
+    ancestor = _hidden_path(model, 5)  # holds the model natively, five levels down
+    shown: object = _ViewOf(ancestor)  # reached only through this view, one hundred levels deep
+    for _ in range(100):
+        shown = [shown]
+    siblings = [model, shown] if model_first else [shown, model]
+    with pytest.raises(ValueError, match="budget"):
+        snapshot_contract_graph(siblings)
+
+
+def test_the_deepest_visit_counts_even_when_a_shallower_one_comes_later() -> None:
+    model = _model_with_deep_extras(150, native=False)
+    ancestor = _hidden_path(model, 5)
+    deep: object = _ViewOf(ancestor)
+    for _ in range(100):
+        deep = [deep]
+    first, last = _ViewOf(ancestor), _ViewOf(ancestor)  # the same ancestor, near the top before and after
+    with pytest.raises(ValueError, match="budget"):
+        snapshot_contract_graph([first, deep, last, model])  # the extras are found after every visit
+
+
+@pytest.mark.parametrize("hidden_first", [False, True], ids=["direct-first", "hidden-first"])
+def test_a_height_found_late_inside_late_extras_reaches_the_outer_model_and_its_ancestors(hidden_first) -> None:
+    inner = _model_with_deep_extras(250, native=False)  # 252 levels once its extras are read
+    outer = SourceVersion(record_id="r2", content_revision=1, policy_epoch=1)
+    _EXTRA.__set__(outer, MappingProxyType({"inner": inner}))  # found late too: one more level
+    snapshot_contract_graph([outer])  # 254 levels on its own: inside the limit
+    hidden = _hidden_path(outer, 10)
+    siblings = [hidden, outer] if hidden_first else [outer, hidden]
+    with pytest.raises(ValueError, match="budget"):
+        snapshot_contract_graph(siblings)

@@ -195,6 +195,13 @@ class _GraphInventory:
     # path is checked against the depth limit with this, not skipped, so the limit does not
     # depend on which path reached the shared subtree first.
     native_heights: dict[int, int] = field(default_factory=dict)
+    # The deepest level at which each container was reached on any path, in capture or in
+    # reconstruction.  Extras found late (through a public mapping) are checked at this depth,
+    # not at the depth of the path that happened to find them.
+    reached: dict[int, int] = field(default_factory=dict)
+    # Native parents of each container (the containers holding it as a stored entry or extra), so
+    # a height found late can be carried to every ancestor and checked at that ancestor's depth.
+    parents: dict[int, set[int]] = field(default_factory=dict)
     # Strong references keep every captured object alive for the whole
     # reconstruction, so a released temporary's id cannot be reused by a later
     # object and alias its captured contents.
@@ -211,6 +218,42 @@ class _GraphInventory:
     # charged; every later rebuild of the same container (only an impure one is rebuilt
     # again) is new work, and its entries are charged again.
     rebuilt_containers: set[int] = field(default_factory=set)
+
+
+def _reach(inventory: _GraphInventory, value_id: int, depth: int) -> None:
+    """Record that a container was reached at ``depth`` (a leaf call: it adds no nesting frame)."""
+
+    if depth > inventory.reached.get(value_id, -1):
+        inventory.reached[value_id] = depth
+
+
+def _adopt(inventory: _GraphInventory, parent_id: int, item: object) -> None:
+    """Record ``parent_id`` as a native parent of ``item`` when the item is a container."""
+
+    if _is_subclass(type(item), (BaseModel, tuple, list, dict)):
+        inventory.parents.setdefault(id(item), set()).add(parent_id)
+
+
+def _grow_height(inventory: _GraphInventory, value_id: int, height: int) -> None:
+    """Raise a container's native height and carry the increase to its ancestors.
+
+    Each container whose height grows is checked against the depth limit at the deepest level it
+    was reached on any path (``reached + height``), so a height found late is never judged at only
+    the shallow path that found it.  Heights only increase and the check fails once one exceeds
+    the limit, so the walk is bounded.
+    """
+
+    budget = inventory.budget
+    work = [(value_id, height)]
+    while work:
+        node, grown = work.pop()
+        if grown <= inventory.native_heights.get(node, 0):
+            continue
+        inventory.native_heights[node] = grown
+        if inventory.reached.get(node, 0) + grown > budget.tier.max_depth:
+            budget.charge_edge(budget.tier.max_edges + 1)  # the stable budget error
+        for parent in inventory.parents.get(node, ()):
+            work.append((parent, grown + 1))
 
 
 def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int = 0) -> int:
@@ -230,6 +273,7 @@ def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int 
         budget.charge_edge(budget.tier.max_edges + 1)  # the stable budget error
 
     value_id = id(value)
+    _reach(inventory, value_id, depth)
     if value_id in inventory.visited:
         known = inventory.native_heights.get(value_id)
         if known is None:
@@ -264,6 +308,7 @@ def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int 
         # classifying extras or hashing any stored name.
         height = 0  # plain loops, not a generator: one stack frame per level
         for _, item in stored_entries:
+            _adopt(inventory, value_id, item)
             below_height = _capture_native_graph(item, inventory, below) + 1
             if below_height > height:
                 height = below_height
@@ -279,6 +324,7 @@ def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int 
             model_inventory.extra_entries = extra_entries
             model_inventory.pure_names = model_inventory.pure_names and pure_extra
             for _, item in extra_entries:
+                _adopt(inventory, value_id, item)
                 below_height = _capture_native_graph(item, inventory, below) + 1
                 if below_height > height:
                     height = below_height
@@ -298,6 +344,7 @@ def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int 
         inventory.sequences[value_id] = items
         height = 0
         for item in items:
+            _adopt(inventory, value_id, item)
             below_height = _capture_native_graph(item, inventory, below) + 1
             if below_height > height:
                 height = below_height
@@ -311,6 +358,7 @@ def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int 
         inventory.sequences[value_id] = items
         height = 0
         for item in items:
+            _adopt(inventory, value_id, item)
             below_height = _capture_native_graph(item, inventory, below) + 1
             if below_height > height:
                 height = below_height
@@ -327,6 +375,7 @@ def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int 
         inventory.colliding_dictionaries.add(value_id)
     height = 0
     for _, item in entries:
+        _adopt(inventory, value_id, item)
         below_height = _capture_native_graph(item, inventory, below) + 1
         if below_height > height:
             height = below_height
@@ -450,10 +499,13 @@ def _snapshot_captured_graph(
                 # a non-plain type ran code, so the model (and every ancestor) stays ineligible for reuse,
                 # exactly as when the extras are a native dict.
                 captured.pure_names = captured.pure_names and extra_pure
+                # Extras first met through the public view: their height is carried to this model and every
+                # recorded ancestor, each checked at the deepest level it was reached on any path (a hidden
+                # occurrence may be far deeper than the path that found them).
                 for _, item in extra_entries:
+                    _adopt(inventory, value_id, item)
                     late_height = _capture_native_graph(item, inventory, below) + 1
-                    if late_height > inventory.native_heights.get(value_id, 0):
-                        inventory.native_heights[value_id] = late_height  # extras first met through the public view
+                    _grow_height(inventory, value_id, late_height)
 
             fields: dict[object, object] = {}
             for key, item in stored_entries:
