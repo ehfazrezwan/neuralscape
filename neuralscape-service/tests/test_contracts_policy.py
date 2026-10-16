@@ -3581,8 +3581,9 @@ def _entry_flow(root: object) -> object:
     native_dicts: dict = {}
     visited: set = set()
     budget = DiscoveryBudget()
-    _freeze_reachable_model_inventories(root, inventories, visited, owners, native_dicts, budget)
-    _freeze_mapping_inventories(owners, mapping_inventories, inventories, visited, native_dicts, None, budget)
+    reach: dict = {}
+    _freeze_reachable_model_inventories(root, inventories, visited, owners, native_dicts, budget, 0, True, reach)
+    _freeze_mapping_inventories(owners, mapping_inventories, inventories, visited, native_dicts, None, budget, reach)
     mapping_inventories.update(native_dicts)
     return _complete_contract_input(root, set(), inventories, mapping_inventories, budget)
 
@@ -3828,3 +3829,79 @@ def test_the_policy_modules_never_read_the_clock() -> None:
             for alias in (node.names if isinstance(node, ast.Import) else [ast.alias(name=node.module or "")])
         }
         assert not imported & {"time", "datetime", "calendar", "zoneinfo"}, module.__name__
+
+
+# ── discovery findings: depth through model-owned mappings, shared containers, fields-set charges ──
+
+
+def _extra_chain(length: int) -> object:
+    """Models linked through ``__pydantic_extra__`` = a read-only mapping holding the next model."""
+
+    tail: object = None
+    for index in range(length):
+        model = SourceVersionLike(index)
+        if tail is not None:
+            object.__setattr__(model, "__pydantic_extra__", MappingProxyType({"child": tail}))
+        tail = model
+    return tail
+
+
+def SourceVersionLike(index: int):
+    from contracts_references import SourceVersion
+
+    return SourceVersion(record_id=f"r{index}", content_revision=1, policy_epoch=1)
+
+
+def test_a_chain_of_models_linked_through_extra_mappings_keeps_its_depth() -> None:
+    chain = _extra_chain(200)  # two levels per link (the model, then its mapping): past the limit
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        _entry_flow(chain)
+    assert _entry_flow(_extra_chain(20)) is not None  # a short chain is within the limit
+
+
+def test_a_mapping_reachable_through_an_already_visited_container_is_captured_at_exposure() -> None:
+    broken = _invalid_resource_dict()
+    shared = (MappingProxyType(broken),)
+
+    def _parent_pairs():
+        yield ("allowed_resources", shared)
+        _repair_after_yield(broken)  # resumed only when the walk advances the parent
+
+    completed = _entry_flow((_Items(_parent_pairs), shared))
+
+    assert broken["tenant_id"] == "tenant-a"
+    assert dict(completed[0]["allowed_resources"][0])["tenant_id"] == 5   # exposed first: first observation
+    assert dict(completed[1][0])["tenant_id"] == 5
+
+
+def test_the_reach_of_shared_containers_is_charged() -> None:
+    proxies = tuple(MappingProxyType({"k": index}) for index in range(2000))
+    shared = (proxies,)
+    for _ in range(200):
+        shared = (shared,)
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
+        # 2,000 mappings behind each of 200 containers: every container's reach is accounted
+        _freeze_reachable_model_inventories(shared, {}, set(), None, None, DiscoveryBudget())
+
+
+def test_native_fields_set_names_are_charged_per_model() -> None:
+    from contracts_references import SourceVersion
+
+    names = {f"name-{i}" for i in range(2000)}
+    models = []
+    for index in range(100):
+        model = SourceVersion(record_id=f"r{index}", content_revision=1, policy_epoch=1)
+        _BASE_MODEL_FIELDS_SET_DESCRIPTOR.__set__(model, set(names))  # a large set per model
+        models.append(model)
+    budget = DiscoveryBudget()
+    with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):  # 100 x 2000 names > the edge limit
+        _freeze_reachable_model_inventories(tuple(models), {}, set(), None, None, budget)
+
+
+def test_ordinary_models_pay_for_their_fields_set_like_any_other_entry() -> None:
+    from contracts_references import SourceVersion
+
+    model = SourceVersion(record_id="r", content_revision=1, policy_epoch=1)
+    budget = DiscoveryBudget()
+    _freeze_reachable_model_inventories(model, {}, set(), None, None, budget)
+    assert budget.edges == 3 + 3  # three stored fields and three names in the fields set

@@ -187,6 +187,10 @@ def _capture_model_inventory(
         if issubclass(type(fields_set_storage), set)
         else None
     )
+    if fields_set_names is not None:
+        # Every name retained is an entry: a model cannot keep a large private copy of a
+        # set (or share one among many models) without consuming the edge allowance.
+        budget.charge_edge(len(fields_set_names))
     return _ModelInventory(
         value,
         stored_storage,
@@ -244,6 +248,7 @@ def _freeze_reachable_model_inventories(
     budget: DiscoveryBudget | None = None,
     depth: int = 0,
     authoritative: bool = True,
+    reach: dict[int, tuple[Mapping[object, object], ...]] | None = None,
 ) -> None:
     """Freeze natively reachable models before callback-bearing traversal.
 
@@ -257,17 +262,32 @@ def _freeze_reachable_model_inventories(
     container subclass walked through its native backing is not authoritative
     (its public view is); an object first reached deep is expanded again, from
     the retained inventory, when a shallower authoritative path reaches it.
+
+    ``reach[id(value)]`` records the public mappings reachable at or beneath ``value``,
+    including through containers an earlier path already visited (charged once per
+    container), so a caller that exposes ``value`` can capture every mapping it exposes
+    even when the walk itself skips what it has seen.
     """
 
     if mapping_owners is None:
         mapping_owners = {}
     if native_dicts is None:
         native_dicts = {}
+    if reach is None:
+        reach = {}
     budget = _new_budget(budget)
 
     # One stack frame per level (no helper closure): the depth limit then bounds
     # the interpreter stack as well as the walk.
     below = (inventories, visited_containers, mapping_owners, native_dicts, budget, depth + 1)
+    found: list[Mapping[object, object]] = []
+
+    def finish() -> None:
+        # Remember (and charge) what was found beneath this value; no recursion here.
+        beneath = tuple(found)
+        if beneath:
+            budget.charge_edge(len(beneath))
+        reach[id(value)] = beneath
 
     if _inherits(type(value), BaseModel):
         if not budget.visit(value, depth, authoritative):
@@ -280,15 +300,18 @@ def _freeze_reachable_model_inventories(
         if inventory.stored_items is not None:
             budget.charge_edge(len(inventory.stored_items))
             for _, item in inventory.stored_items:
-                _freeze_reachable_model_inventories(item, *below, authoritative)
+                _freeze_reachable_model_inventories(item, *below, authoritative, reach)
+                found.extend(reach.get(id(item), ()))
         elif _is_mapping(inventory.stored_storage):
-            _retain_mapping_owner(inventory.stored_storage, mapping_owners)
+            _own_fallback_mapping(inventory.stored_storage, mapping_owners, budget, depth + 1, found)
         if inventory.extra_items is not None:
             budget.charge_edge(len(inventory.extra_items))
             for _, item in inventory.extra_items:
-                _freeze_reachable_model_inventories(item, *below, authoritative)
+                _freeze_reachable_model_inventories(item, *below, authoritative, reach)
+                found.extend(reach.get(id(item), ()))
         elif _is_mapping(inventory.extra_storage):
-            _retain_mapping_owner(inventory.extra_storage, mapping_owners)
+            _own_fallback_mapping(inventory.extra_storage, mapping_owners, budget, depth + 1, found)
+        finish()
         return
 
     if _is_native_dict(value):
@@ -309,12 +332,15 @@ def _freeze_reachable_model_inventories(
             native_dicts[identity] = _MappingInventory(value, retained)
         budget.charge_edge(len(retained))
         for entry in retained:
-            _freeze_reachable_model_inventories(entry.value, *below, authoritative)
+            _freeze_reachable_model_inventories(entry.value, *below, authoritative, reach)
+            found.extend(reach.get(id(entry.value), ()))
+        finish()
         return
 
     if _is_mapping(value):
         budget.visit(value, depth, True)  # its pairs are its public view: authoritative
         _retain_mapping_owner(value, mapping_owners)
+        reach[id(value)] = (value,)
         return
 
     if issubclass(type(value), list):
@@ -325,7 +351,11 @@ def _freeze_reachable_model_inventories(
         items = tuple(list.__iter__(value))
         budget.charge_edge(len(items))
         for item in items:
-            _freeze_reachable_model_inventories(item, *below, authoritative and is_exact_type(value, list))
+            _freeze_reachable_model_inventories(
+                item, *below, authoritative and is_exact_type(value, list), reach
+            )
+            found.extend(reach.get(id(item), ()))
+        finish()
         return
 
     if issubclass(type(value), tuple):
@@ -336,8 +366,31 @@ def _freeze_reachable_model_inventories(
         items = tuple(tuple.__iter__(value))
         budget.charge_edge(len(items))
         for item in items:
-            _freeze_reachable_model_inventories(item, *below, authoritative and is_exact_type(value, tuple))
+            _freeze_reachable_model_inventories(
+                item, *below, authoritative and is_exact_type(value, tuple), reach
+            )
+            found.extend(reach.get(id(item), ()))
+        finish()
         return
+
+
+def _own_fallback_mapping(
+    storage: Mapping[object, object],
+    mapping_owners: dict[int, Mapping[object, object]],
+    budget: DiscoveryBudget,
+    depth: int,
+    found: list[Mapping[object, object]],
+) -> None:
+    """A model's own non-dict storage is a public mapping one level below the model.
+
+    Its depth is recorded in the budget like any other node, so a chain of models linked
+    through such storage cannot reset the depth at every link.
+    """
+
+    budget.charge_edge()
+    budget.visit(storage, depth, True)
+    _retain_mapping_owner(storage, mapping_owners)
+    found.append(storage)
 
 
 def _open_mapping_items(value: Mapping[object, object]) -> Iterator[object]:
@@ -356,6 +409,7 @@ def _freeze_mapping_inventories(
     native_dicts: dict[int, _MappingInventory] | None = None,
     in_progress: set[int] | None = None,
     budget: DiscoveryBudget | None = None,
+    reach: dict[int, tuple[Mapping[object, object], ...]] | None = None,
 ) -> None:
     """Observe each retained public mapping inventory exactly once.
 
@@ -376,6 +430,8 @@ def _freeze_mapping_inventories(
 
     if in_progress is None:
         in_progress = set()
+    if reach is None:
+        reach = {}
     budget = _new_budget(budget)
     while True:
         pending = tuple(
@@ -437,7 +493,11 @@ def _freeze_mapping_inventories(
                     native_dicts,
                     budget,
                     child_depth,
+                    True,
+                    reach,
                 )
+                for found in reach.get(id(item), ()):  # including those behind containers the walk had already visited
+                    _retain_mapping_owner(found, exposed)
                 for found in exposed.values():
                     _retain_mapping_owner(found, owners)
                 discovered = {
@@ -455,6 +515,7 @@ def _freeze_mapping_inventories(
                         native_dicts,
                         in_progress,
                         budget,
+                        reach,
                     )
             in_progress.discard(id(owner))
             mapping_inventories[id(owner)] = _MappingInventory(
@@ -917,6 +978,7 @@ def evaluate_policy(
     native_dicts: dict[int, _MappingInventory] = {}
     visited_containers: set[int] = set()
     budget = DiscoveryBudget(STANDARD)  # one envelope across all three roots
+    reach: dict[int, tuple[Mapping[object, object], ...]] = {}
     for value in (principal, evaluation, policy):
         _freeze_reachable_model_inventories(
             value,
@@ -925,6 +987,9 @@ def evaluate_policy(
             mapping_owners,
             native_dicts,
             budget,
+            0,
+            True,
+            reach,
         )
     _freeze_mapping_inventories(
         mapping_owners,
@@ -934,6 +999,7 @@ def evaluate_policy(
         native_dicts,
         None,
         budget,
+        reach,
     )
     mapping_inventories.update(native_dicts)
     principal = _validated_principal_snapshot(
@@ -1052,6 +1118,7 @@ def validate_policy_decision(decision: PolicyDecision) -> PolicyDecision:
     native_dicts: dict[int, _MappingInventory] = {}
     visited_containers: set[int] = set()
     budget = DiscoveryBudget(STANDARD)
+    reach: dict[int, tuple[Mapping[object, object], ...]] = {}
     _freeze_reachable_model_inventories(
         decision,
         inventories,
@@ -1059,6 +1126,9 @@ def validate_policy_decision(decision: PolicyDecision) -> PolicyDecision:
         mapping_owners,
         native_dicts,
         budget,
+        0,
+        True,
+        reach,
     )
     _freeze_mapping_inventories(
         mapping_owners,
@@ -1068,6 +1138,7 @@ def validate_policy_decision(decision: PolicyDecision) -> PolicyDecision:
         native_dicts,
         None,
         budget,
+        reach,
     )
     mapping_inventories.update(native_dicts)
     return PolicyDecision.model_validate(
