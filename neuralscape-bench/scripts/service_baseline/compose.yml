@@ -153,7 +153,7 @@ services:
     entrypoint: ["python", "/bench/scripts/service_baseline/seed_authority.py",
                  "/state/authority.db", "/state/token", "${TOKEN_SECRET:-bench-token-secret}"]
     environment: {PYTHONPATH: /bench, PYTHONDONTWRITEBYTECODE: "1", GOOGLE_API_KEY: x, NEO4J_PASSWORD: x,
-                  AUTHORITY_BACKEND: "${AUTHORITY_BACKEND:-sqlite}", AUTHORITY_POSTGRES_DSN: "${AUTHORITY_POSTGRES_DSN:-}"}
+                  AUTHORITY_ENABLED: "${AUTHORITY_ENABLED:-false}", AUTHORITY_BACKEND: "${AUTHORITY_BACKEND:-sqlite}", AUTHORITY_POSTGRES_DSN: "${AUTHORITY_POSTGRES_DSN:-}"}
     volumes: [ "${BENCH_DIR}:/bench:ro", "state:/state" ]
 
   driver:

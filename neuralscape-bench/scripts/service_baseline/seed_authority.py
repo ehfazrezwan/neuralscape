@@ -11,17 +11,28 @@ import sys
 
 sys.path.insert(0, "/app/neuralscape-service")
 
-from authority_store_sql import PostgresAuthorityStore, SqliteAuthorityStore  # noqa: E402
-from contracts_policy import PolicyStatement  # noqa: E402
-from identity_binding import bind_identity  # noqa: E402
-from policy_enforcement import pool_handle  # noqa: E402
 from tokens import issue_user_token  # noqa: E402
+
+AUTHORITY = os.environ.get("AUTHORITY_ENABLED") == "true"
+if AUTHORITY:  # images without the authority store (older trees) only need the token and the state directory
+    from authority_store_sql import PostgresAuthorityStore, SqliteAuthorityStore  # noqa: E402
+    from contracts_policy import PolicyStatement  # noqa: E402
+    from identity_binding import bind_identity  # noqa: E402
+    from policy_enforcement import pool_handle  # noqa: E402
 
 USER, TENANT, PROJECT = "bench-user", "bench-tenant", "bench-project"
 ACTIONS = ("read", "search", "list", "create", "update", "delete", "background_derive", "share")
 
 
 def main(authority_path: str, token_path: str, secret: str) -> None:
+    if not AUTHORITY:
+        with open(token_path, "w") as handle:
+            handle.write(issue_user_token(USER, secret, 86400))
+        os.chmod("/state", 0o777)
+        for name in os.listdir("/state"):
+            os.chmod(os.path.join("/state", name), 0o666)
+        print("seeded token only (authority store not enabled)")
+        return
     if os.environ.get("AUTHORITY_BACKEND") == "postgres":
         store = PostgresAuthorityStore(os.environ["AUTHORITY_POSTGRES_DSN"])
     else:
