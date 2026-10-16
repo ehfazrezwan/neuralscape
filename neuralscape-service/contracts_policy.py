@@ -116,7 +116,18 @@ class PolicyStatement(ContractModel):
 
 
 class AccessPolicy(VersionedContract):
-    """A complete, versioned input snapshot for the reference evaluator."""
+    """A complete, versioned input snapshot for the reference evaluator.
+
+    The authoritative value of a container field is its public view (public
+    iteration) as first observed by the receiving boundary; hidden native
+    backing is never consulted in its place.  This is pinned by tests for
+    ``statements``, ``membership_versions`` and the ``allowed_actions`` and
+    ``allowed_resources`` tuples of a delegation; mapping-extra views are
+    covered by the separate extra-storage tests.  Stored models and exact-type
+    containers are fenced at entry, but children reachable only through a
+    public iterator are captured when that iterator first exposes them, not at
+    entry.  Later mutation is not observed.
+    """
 
     tenant_id: OpaqueId
     policy_epoch: SafeCounter

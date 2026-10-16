@@ -623,6 +623,11 @@ def evaluate_policy(
     exact reference matching implemented here.  Unknown actions or policy terms
     fail closed.  The function neither resolves the resource nor checks
     existence.
+
+    Container inputs are authoritative through their public view captured once
+    at first observation (see ``AccessPolicy``).  A tuple subclass whose native
+    backing disagrees with its public iterator is evaluated from the iterator;
+    unexposed lazy children are not promised at entry.
     """
 
     inventories: dict[int, _ModelInventory] = {}
