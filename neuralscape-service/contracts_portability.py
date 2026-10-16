@@ -227,7 +227,7 @@ def _validated_model_extra_storage(
             )
         iterated_names = []
         for name in extra:
-            pass
+            budget.charge_edge()
             iterated_names.append(name)
         entries = []
         for entry in extra.items():
