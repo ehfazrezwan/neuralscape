@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from typing import NamedTuple, cast
 
 from pydantic import BaseModel
@@ -183,11 +183,19 @@ def _freeze_reachable_model_inventories(
     inventories: dict[int, _ModelInventory],
     visited_containers: set[int],
     mapping_owners: dict[int, Mapping[object, object]] | None = None,
+    native_dicts: dict[int, _MappingInventory] | None = None,
 ) -> None:
-    """Freeze natively reachable models before callback-bearing traversal."""
+    """Freeze natively reachable models before callback-bearing traversal.
+
+    Native dict entries are retained as they are first observed here, so the
+    completion pass replays them instead of re-reading the live dict after any
+    public callback has run (ADR-P12-001 D1: first observation, then replay).
+    """
 
     if mapping_owners is None:
         mapping_owners = {}
+    if native_dicts is None:
+        native_dicts = {}
 
     if issubclass(type(value), BaseModel):
         identity = id(value)
@@ -202,6 +210,7 @@ def _freeze_reachable_model_inventories(
                     inventories,
                     visited_containers,
                     mapping_owners,
+                    native_dicts,
                 )
         elif issubclass(type(inventory.stored_storage), Mapping):
             _retain_mapping_owner(inventory.stored_storage, mapping_owners)
@@ -212,6 +221,7 @@ def _freeze_reachable_model_inventories(
                     inventories,
                     visited_containers,
                     mapping_owners,
+                    native_dicts,
                 )
         elif issubclass(type(inventory.extra_storage), Mapping):
             _retain_mapping_owner(inventory.extra_storage, mapping_owners)
@@ -222,12 +232,15 @@ def _freeze_reachable_model_inventories(
         if identity in visited_containers:
             return
         visited_containers.add(identity)
-        for _, item in dict.items(value):
+        retained = tuple(_MappingEntry(key, item) for key, item in dict.items(value))
+        native_dicts[identity] = _MappingInventory(value, retained)
+        for entry in retained:
             _freeze_reachable_model_inventories(
-                item,
+                entry.value,
                 inventories,
                 visited_containers,
                 mapping_owners,
+                native_dicts,
             )
         return
 
@@ -246,6 +259,7 @@ def _freeze_reachable_model_inventories(
                 inventories,
                 visited_containers,
                 mapping_owners,
+                native_dicts,
             )
         return
 
@@ -260,8 +274,17 @@ def _freeze_reachable_model_inventories(
                 inventories,
                 visited_containers,
                 mapping_owners,
+                native_dicts,
             )
         return
+
+
+def _open_mapping_items(value: Mapping[object, object]) -> Iterator[object]:
+    """The mapping's public pair iterator, opened but NOT consumed."""
+
+    if _is_native_dict(value):
+        return iter(tuple(dict.items(value)))
+    return iter(value.items())
 
 
 def _freeze_mapping_inventories(
@@ -269,8 +292,17 @@ def _freeze_mapping_inventories(
     mapping_inventories: dict[int, _MappingInventory],
     model_inventories: dict[int, _ModelInventory],
     visited_containers: set[int],
+    native_dicts: dict[int, _MappingInventory] | None = None,
 ) -> None:
-    """Observe each retained public mapping inventory exactly once."""
+    """Observe each retained public mapping inventory exactly once.
+
+    Each pair's reachable children are frozen BEFORE the pair iterator is
+    advanced, so an iterator (for example a generator) cannot repair or alter an
+    earlier entry's children after they were exposed.  Failures stay deferred:
+    an error from opening or advancing the iterator replaces the whole
+    inventory; the first malformed pair is terminal, and the rest of the
+    iterator is still drained so a later iteration error keeps its precedence.
+    """
 
     while True:
         pending = tuple(
@@ -283,7 +315,7 @@ def _freeze_mapping_inventories(
 
         for owner in pending:
             try:
-                raw_entries: tuple[object, ...] = _mapping_items(owner)
+                iterator = _open_mapping_items(owner)
             except Exception as error:
                 mapping_inventories[id(owner)] = _MappingInventory(
                     owner,
@@ -291,14 +323,36 @@ def _freeze_mapping_inventories(
                 )
                 continue
 
-            mapping_inventories[id(owner)] = _MappingInventory(
-                owner,
-                _freeze_mapping_entries(
-                    raw_entries,
-                    owners,
+            entries: list[_MappingEntry | _CapturedFailure] = []
+            failure: Exception | None = None
+            terminal = False
+            while True:
+                try:
+                    raw_entry = next(iterator)
+                except StopIteration:
+                    break
+                except Exception as error:
+                    failure = error
+                    break
+                if terminal:
+                    continue  # drain only: nothing after the terminal pair is retained
+                try:
+                    key, item = raw_entry  # type: ignore[misc]
+                except Exception as error:
+                    entries.append(_CapturedFailure(error))
+                    terminal = True
+                    continue
+                entries.append(_MappingEntry(key, item))
+                _freeze_reachable_model_inventories(
+                    item,
                     model_inventories,
                     visited_containers,
-                ),
+                    owners,
+                    native_dicts,
+                )
+            mapping_inventories[id(owner)] = _MappingInventory(
+                owner,
+                _CapturedFailure(failure) if failure is not None else tuple(entries),
             )
 
 
@@ -307,6 +361,7 @@ def _freeze_mapping_entries(
     owners: dict[int, Mapping[object, object]],
     model_inventories: dict[int, _ModelInventory],
     visited_containers: set[int],
+    native_dicts: dict[int, _MappingInventory] | None = None,
 ) -> tuple[_MappingEntry | _CapturedFailure, ...]:
     """Retain the successful prefix and first terminal pair failure."""
 
@@ -323,6 +378,7 @@ def _freeze_mapping_entries(
             model_inventories,
             visited_containers,
             owners,
+            native_dicts,
         )
     return tuple(entries)
 
@@ -477,9 +533,17 @@ def _complete_contract_input(
         try:
             # Keys are deliberately not stringified or otherwise normalized.
             if _is_native_dict(value):
-                entries = tuple(
-                    _MappingEntry(key, item)
-                    for key, item in _mapping_items(value)
+                retained_dict = _validated_mapping_inventory(value, mapping_inventories)
+                entries = (
+                    cast(
+                        tuple[_MappingEntry | _CapturedFailure, ...],
+                        retained_dict.entries,
+                    )
+                    if retained_dict is not None
+                    else tuple(
+                        _MappingEntry(key, item)
+                        for key, item in _mapping_items(value)
+                    )
                 )
             else:
                 entries = _retained_mapping_entries(
@@ -633,6 +697,7 @@ def evaluate_policy(
     inventories: dict[int, _ModelInventory] = {}
     mapping_owners: dict[int, Mapping[object, object]] = {}
     mapping_inventories: dict[int, _MappingInventory] = {}
+    native_dicts: dict[int, _MappingInventory] = {}
     visited_containers: set[int] = set()
     for value in (principal, evaluation, policy):
         _freeze_reachable_model_inventories(
@@ -640,13 +705,16 @@ def evaluate_policy(
             inventories,
             visited_containers,
             mapping_owners,
+            native_dicts,
         )
     _freeze_mapping_inventories(
         mapping_owners,
         mapping_inventories,
         inventories,
         visited_containers,
+        native_dicts,
     )
+    mapping_inventories.update(native_dicts)
     principal = _validated_principal_snapshot(
         principal,
         inventories,
@@ -757,19 +825,23 @@ def validate_policy_decision(decision: PolicyDecision) -> PolicyDecision:
     inventories: dict[int, _ModelInventory] = {}
     mapping_owners: dict[int, Mapping[object, object]] = {}
     mapping_inventories: dict[int, _MappingInventory] = {}
+    native_dicts: dict[int, _MappingInventory] = {}
     visited_containers: set[int] = set()
     _freeze_reachable_model_inventories(
         decision,
         inventories,
         visited_containers,
         mapping_owners,
+        native_dicts,
     )
     _freeze_mapping_inventories(
         mapping_owners,
         mapping_inventories,
         inventories,
         visited_containers,
+        native_dicts,
     )
+    mapping_inventories.update(native_dicts)
     return PolicyDecision.model_validate(
         _complete_contract_input(
             decision,

@@ -2831,3 +2831,195 @@ def test_public_first_delegation_ceiling_follows_the_public_view(field: str) -> 
     )
     assert evaluate(widened, "read", resource_value, policy_value).outcome == "allow"
     assert evaluate(widened, "read", resource_value, policy()).outcome == "deny"
+
+
+# ── first-observation retention of native dict entries and of iterator children ──
+
+
+class _CallbackItemsExtras(Mapping[str, object]):
+    """A public mapping whose ``items()`` runs a callback and exposes nothing."""
+
+    def __init__(self, callback) -> None:
+        self._callback = callback
+
+    def __getitem__(self, key: str) -> object:
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+    def items(self):  # type: ignore[override]
+        self._callback()
+        return {}.items()
+
+
+def _raw_statement(identifier: str, effect: str, resource_value: ReferenceHandle) -> dict[str, object]:
+    return {
+        "id": identifier,
+        "effect": effect,
+        "subject_id": "subject-a",
+        "credential_id": None,
+        "action": "read",
+        "resource": resource_value.model_dump(mode="python"),
+    }
+
+
+def test_native_dict_entries_are_replayed_not_reread_after_callbacks() -> None:
+    """A deny captured at the callback-free entry pass cannot be replaced by an allow."""
+
+    resource_value = reference("memory-1")
+    allow = statement("allow-read", "allow", "read", resource_value)
+    deny = _raw_statement("deny-read", "deny", resource_value)
+    policy_value = policy(allow)
+    object.__setattr__(policy_value, "statements", (allow, deny))
+    principal_value = principal()
+    object.__setattr__(
+        principal_value,
+        "__pydantic_extra__",
+        _CallbackItemsExtras(lambda: deny.__setitem__("effect", "allow")),
+    )
+
+    received = evaluate(principal_value, "read", resource_value, policy_value)
+
+    assert (received.outcome, received.reason_code) == ("deny", "not_authorized")
+    assert deny["effect"] == "allow"  # the callback ran; its effect was simply not observed
+
+
+def test_native_dict_entries_captured_first_stay_invalid_when_repaired_later() -> None:
+    resource_value = reference("memory-1")
+    broken = {"kind": "memory", "id": "memory-1", "tenant_id": 5, "resolver": "memory_by_id"}
+    evaluation = PolicyEvaluationInput(schema_version=VERSION, action="read", resource=resource_value)
+    object.__setattr__(evaluation, "resource", broken)
+    principal_value = principal()
+    object.__setattr__(
+        principal_value,
+        "__pydantic_extra__",
+        _CallbackItemsExtras(lambda: broken.__setitem__("tenant_id", "tenant-a")),
+    )
+
+    with pytest.raises(ValidationError):
+        evaluate_policy(
+            principal=principal_value,
+            evaluation=evaluation,
+            policy=policy(statement("allow-read", "allow", "read", resource_value)),
+        )
+
+
+def test_native_dict_without_callbacks_is_unchanged_by_retention() -> None:
+    resource_value = reference("memory-1")
+    allow = _raw_statement("allow-read", "allow", resource_value)
+    policy_value = policy(statement("seed", "allow", "read", reference("other")))
+    object.__setattr__(policy_value, "statements", (allow,))
+
+    assert evaluate(principal(), "read", resource_value, policy_value).outcome == "allow"
+
+
+def _delegated_principal(delegation_mapping) -> PrincipalContext:
+    ceiling = DelegationConstraints(
+        delegated_by_subject_id="subject-human",
+        delegated_by_credential_id="credential-human",
+        allowed_actions=("read",),
+        allowed_resources=(reference("memory-1"),),
+    )
+    value = principal(subject_kind="delegated_agent", delegation=ceiling)
+    object.__setattr__(value, "delegation", delegation_mapping)
+    return value
+
+
+class _GeneratorMapping(Mapping[str, object]):
+    """A public mapping whose pair iterator is a caller-supplied generator."""
+
+    def __init__(self, generator_factory) -> None:
+        self._factory = generator_factory
+
+    def __getitem__(self, key: str) -> object:
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+    def items(self):  # type: ignore[override]
+        return self._factory()
+
+
+def _delegation_pairs(handle, *, repair: bool):
+    yield ("delegated_by_subject_id", "subject-human")
+    yield ("delegated_by_credential_id", "credential-human")
+    yield ("allowed_actions", ("read",))
+    yield ("allowed_resources", (handle,))
+    if repair:
+        # Resumed only when the consumer advances: repair the child already exposed.
+        handle.__dict__["tenant_id"] = "tenant-a"
+
+
+def _tampered_handle() -> ReferenceHandle:
+    handle = reference("memory-1")
+    handle.__dict__["tenant_id"] = 5  # invalid; bypasses the frozen model
+    return handle
+
+
+def test_iterator_children_are_frozen_before_the_iterator_advances() -> None:
+    resource_value = reference("memory-1")
+    handle = _tampered_handle()
+    mapping = _GeneratorMapping(lambda: _delegation_pairs(handle, repair=True))
+    principal_value = _delegated_principal(mapping)
+    grant = policy(statement("allow-read", "allow", "read", resource_value))
+
+    with pytest.raises(ValidationError):
+        evaluate(principal_value, "read", resource_value, grant)
+
+
+def test_the_same_generator_without_repair_is_rejected_and_a_valid_one_is_allowed() -> None:
+    resource_value = reference("memory-1")
+    grant = policy(statement("allow-read", "allow", "read", resource_value))
+    broken = _tampered_handle()
+    with pytest.raises(ValidationError):
+        evaluate(_delegated_principal(_GeneratorMapping(lambda: _delegation_pairs(broken, repair=False))),
+                 "read", resource_value, grant)
+    valid = reference("memory-1")
+    received = evaluate(_delegated_principal(_GeneratorMapping(lambda: _delegation_pairs(valid, repair=False))),
+                        "read", resource_value, grant)
+    assert received.outcome == "allow"
+
+
+def test_iterator_failures_stay_deferred_and_keep_their_class() -> None:
+    resource_value = reference("memory-1")
+    grant = policy(statement("allow-read", "allow", "read", resource_value))
+
+    def failing():
+        yield ("delegated_by_subject_id", "subject-human")
+        raise RuntimeError("iteration failed")
+
+    with pytest.raises(RuntimeError, match="iteration failed"):
+        evaluate(_delegated_principal(_GeneratorMapping(failing)), "read", resource_value, grant)
+
+    def malformed_then_failing():
+        yield ("delegated_by_subject_id", "subject-human")
+        yield 5  # not a pair: terminal
+        raise RuntimeError("late failure")
+
+    # The drain after the terminal pair keeps a later iteration error's precedence.
+    with pytest.raises(RuntimeError, match="late failure"):
+        evaluate(_delegated_principal(_GeneratorMapping(malformed_then_failing)), "read", resource_value, grant)
+
+
+def test_the_first_malformed_pair_is_terminal_and_later_pairs_are_ignored() -> None:
+    resource_value = reference("memory-1")
+    grant = policy(statement("allow-read", "allow", "read", resource_value))
+    seen: list[str] = []
+
+    def malformed_then_valid():
+        yield ("delegated_by_subject_id", "subject-human")
+        yield 5
+        seen.append("drained")
+        yield ("delegated_by_credential_id", "credential-human")  # never retained
+
+    with pytest.raises(TypeError):
+        evaluate(_delegated_principal(_GeneratorMapping(malformed_then_valid)), "read", resource_value, grant)
+    assert seen == ["drained"]
