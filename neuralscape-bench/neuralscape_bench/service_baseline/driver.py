@@ -95,19 +95,20 @@ def op_write(client: Client, nonce: str, index: int, poll_s: float, timeout_s: f
     status, body = client.request("POST", path, body_for(nonce, index))
     accepted = time.monotonic()
     if status != 202 or not body or "task_id" not in body:
-        return {"ok": False, "error": f"http_{status}", "accept_ms": (accepted - start) * 1000}
+        return {"ok": False, "accepted": False, "error": f"http_{status}", "accept_ms": (accepted - start) * 1000}
     if not poll:
-        return {"ok": True, "error": None, "accept_ms": (accepted - start) * 1000}
+        return {"ok": True, "accepted": True, "error": None, "accept_ms": (accepted - start) * 1000}
     task_id = body["task_id"]
     while True:
         now = time.monotonic()
         if now - start > timeout_s:
-            return {"ok": False, "error": "timeout", "accept_ms": (accepted - start) * 1000}
+            return {"ok": False, "accepted": True, "error": "timeout", "accept_ms": (accepted - start) * 1000}
         code, state = client.request("GET", f"/v1/memories/status/{task_id}")
         if code == 200 and state and state.get("status") in TERMINAL:
             done = time.monotonic()
             return {
                 "ok": state["status"] == "completed",
+                "accepted": True,
                 "error": None if state["status"] == "completed" else "task_failed",
                 "accept_ms": (accepted - start) * 1000,
                 "complete_ms": (done - start) * 1000,
@@ -158,8 +159,18 @@ def run_cell(
     nonce: str,
     poll_s: float,
     timeout_s: float,
+    samples: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    """Run one closed-loop cell.
+
+    The first ``max(warmup, concurrency)`` dispatched operations are excluded: the
+    first ``concurrency`` operations all start together, so a smaller warmup would
+    leave part of that ramp in the sample.  When ``samples`` is given, every
+    operation (warmup included, flagged) is appended to it for storage.
+    """
+
     function = WORKLOADS[workload]
+    warmup = max(warmup, concurrency) if warmup else 0
     total = warmup + ops
     results: list[dict[str, Any] | None] = [None] * total
     counter = {"next": 0}
@@ -172,10 +183,15 @@ def run_cell(
                 if index >= total:
                     return
                 counter["next"] += 1
+            began = time.monotonic() - wall_start
             try:
-                results[index] = function(client, nonce, index, poll_s, timeout_s)
+                record = function(client, nonce, index, poll_s, timeout_s)
             except Exception as error:  # noqa: BLE001 - recorded as an error outcome
-                results[index] = {"ok": False, "error": type(error).__name__}
+                record = {"ok": False, "error": type(error).__name__}
+            record["index"], record["start_s"] = index, round(began, 6)
+            record["end_s"] = round(time.monotonic() - wall_start, 6)
+            record["warmup"] = index < warmup
+            results[index] = record
 
     cpu_before = resource.getrusage(resource.RUSAGE_SELF)
     wall_start = time.monotonic()
@@ -189,6 +205,9 @@ def run_cell(
     cpu = (cpu_after.ru_utime - cpu_before.ru_utime) + (cpu_after.ru_stime - cpu_before.ru_stime)
 
     measured = [r for r in results[warmup:] if r is not None]
+    if samples is not None:
+        samples.extend({"workload": workload, "concurrency": concurrency, **r} for r in results if r is not None)
+    window = (max(r["end_s"] for r in measured) - min(r["start_s"] for r in measured)) if measured else 0.0
     errors: dict[str, int] = {}
     for record in measured:
         if not record["ok"]:
@@ -203,11 +222,13 @@ def run_cell(
         "ok": len(good),
         "errors": errors,
         "wall_seconds": wall,
-        "throughput_per_s": len(measured) / wall if wall else None,
+        "measured_window_seconds": window,
+        "throughput_per_s": len(measured) / window if window else None,
         "driver_cpu_cores_used": cpu / wall if wall else None,
     }
     if workload in ("write", "raw", "raw_nopoll"):
-        cell["accept"] = summarize([r["accept_ms"] for r in measured if "accept_ms" in r])
+        # Only accepted requests have a meaningful accept time; refusals are counted as errors.
+        cell["accept"] = summarize([r["accept_ms"] for r in measured if r.get("accepted")])
         cell["completion"] = summarize([r["complete_ms"] for r in good if "complete_ms" in r])
     else:
         cell["latency"] = summarize([r["latency_ms"] for r in good])
@@ -290,6 +311,7 @@ def main() -> None:
     parser.add_argument("--drain-timeout-s", type=float, default=300)
     parser.add_argument("--redis-url", default="redis://redis:6379")
     parser.add_argument("--token-file", default=None)
+    parser.add_argument("--samples-dir", default=None, help="directory for per-request samples (default: next to --out)")
     args = parser.parse_args()
 
     token = open(args.token_file).read().strip() if args.token_file else None
@@ -301,13 +323,22 @@ def main() -> None:
     result["seed"] = seed_cell
     result["seed_drain"] = drain(client, args.drain_timeout_s, args.redis_url)
 
+    import gzip
+    import os
+
+    samples_dir = args.samples_dir or os.path.dirname(args.out) or "."
     cells = []
     for workload in args.workloads.split(","):
         for concurrency in (int(c) for c in args.concurrency.split(",")):
             ops = args.write_ops if workload in ("write", "raw", "raw_nopoll") else args.read_ops
+            cell_samples: list[dict[str, Any]] = []
             cells.append(
-                run_cell(client, workload, concurrency, ops, args.warmup, f"{args.nonce}-{workload}-{concurrency}", args.poll_ms / 1000, args.timeout_s)
+                run_cell(client, workload, concurrency, ops, args.warmup, f"{args.nonce}-{workload}-{concurrency}",
+                         args.poll_ms / 1000, args.timeout_s, cell_samples)
             )
+            with gzip.open(os.path.join(samples_dir, f"samples-{workload}-c{concurrency}.jsonl.gz"), "wt") as handle:
+                for row in cell_samples:
+                    handle.write(json.dumps(row) + "\n")
             if workload in ("write", "raw", "raw_nopoll"):
                 drain_result = drain(client, args.drain_timeout_s, args.redis_url)
                 cells[-1]["post_cell_drain"] = drain_result

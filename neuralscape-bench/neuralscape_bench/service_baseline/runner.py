@@ -81,10 +81,13 @@ class StatsSampler(threading.Thread):
         super().__init__(daemon=True)
         self.stop = threading.Event()
         self.samples: list[dict[str, Any]] = []
+        self.other_containers: set[str] = set()
 
     def run(self) -> None:
         while not self.stop.is_set():
             taken = time.time()
+            everything = sh("docker", "ps", "--format", "{{.Names}}", check=False).split()
+            self.other_containers.update(n for n in everything if not n.startswith(f"{PROJECT}-"))
             out = sh("docker", "stats", "--no-stream", "--format", "{{json .}}",
                      *self._containers(), check=False)
             for line in out.splitlines():
@@ -298,6 +301,7 @@ def main() -> None:
     results = json.loads((out_dir / "driver.json").read_text())
     record["resource_peaks"] = peaks(sampler.samples)
     record["stats_samples"] = len(sampler.samples)
+    record["other_containers_during_run"] = sorted(sampler.other_containers)
     workload_sha = "sha256:" + hashlib.sha256(json.dumps(results["args"] | {"nonce": None}, sort_keys=True).encode()).hexdigest()
     corpus_sha = "sha256:" + hashlib.sha256(b"service-baseline-corpus-v1:unique-notes-by-nonce-and-index").hexdigest()
     (out_dir / "record.json").write_text(json.dumps(record, indent=2, default=str))

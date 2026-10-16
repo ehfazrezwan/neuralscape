@@ -143,7 +143,8 @@ def test_driver_cell_accounts_failures_and_percentile_gating():
             return 200, {}
 
     cell = driver.run_cell(Stub(), "list", 4, ops=30, warmup=2, nonce="n", poll_s=0.01, timeout_s=1)
-    assert cell["attempted"] == 32 and cell["warmup_excluded"] == 2
+    # warmup is raised to the concurrency: the first four operations start together
+    assert cell["attempted"] == 34 and cell["warmup_excluded"] == 4
     assert cell["measured_attempts"] == 30
     assert cell["ok"] + sum(cell["errors"].values()) == 30
     assert sum(cell["errors"].values()) > 0
@@ -189,3 +190,60 @@ def test_postgres_arms_use_a_non_superuser_owner_role_and_separate_schemas():
     assert "user=ns_owner" in ledger["LEDGER_POSTGRES_DSN"] and "user=postgres" not in ledger["LEDGER_POSTGRES_DSN"]
     assert "search_path=ledger" in ledger["LEDGER_POSTGRES_DSN"]
     assert "search_path=authority" in governed["AUTHORITY_POSTGRES_DSN"]
+
+
+def test_warmup_covers_the_concurrency_ramp_and_samples_keep_every_request():
+    class Stub:
+        def request(self, method, path, body=None):
+            return 200, {}
+
+    samples: list[dict] = []
+    cell = driver.run_cell(Stub(), "list", 16, ops=40, warmup=5, nonce="n", poll_s=0.01, timeout_s=1, samples=samples)
+    assert cell["warmup_excluded"] == 16 and cell["measured_attempts"] == 40
+    assert len(samples) == 56 and sum(1 for s in samples if s["warmup"]) == 16
+    assert {"workload", "concurrency", "index", "start_s", "end_s", "ok", "latency_ms"} <= set(samples[0])
+    assert cell["measured_window_seconds"] > 0
+    # no warmup requested means none excluded
+    assert driver.run_cell(Stub(), "list", 4, ops=8, warmup=0, nonce="n", poll_s=0.01, timeout_s=1)["warmup_excluded"] == 0
+
+
+def test_refused_writes_do_not_enter_the_accept_series():
+    class Stub:
+        def __init__(self):
+            self.calls = 0
+
+        def request(self, method, path, body=None):
+            self.calls += 1
+            if method == "POST" and self.calls % 2 == 0:
+                return 503, None  # refused immediately
+            if method == "POST":
+                time.sleep(0.02)
+                return 202, {"task_id": "t"}
+            return 200, {"status": "completed"}
+
+    cell = driver.run_cell(Stub(), "raw_nopoll", 1, ops=40, warmup=0, nonce="n", poll_s=0.001, timeout_s=1)
+    assert sum(cell["errors"].values()) == 20
+    assert cell["accept"]["n"] == 20  # only accepted requests
+    assert cell["accept"]["p50_ms"] >= 15  # not dragged down by 0 ms refusals
+
+
+def test_run_selection_rule_and_summary(tmp_path):
+    from neuralscape_bench.service_baseline import report
+
+    def make(name, arm, others_during, p50):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "record.json").write_text(json.dumps({
+            "arm": arm, "host_before": {"other_running_containers": []},
+            "host_after": {"other_running_containers": []}, "other_containers_during_run": others_during}))
+        (d / "driver.json").write_text(json.dumps({"cells": [{
+            "workload": "list", "concurrency": 1, "latency": {"p50_ms": p50}, "throughput_per_s": 10.0}]}))
+        return d
+
+    dirs = [make("a1", "plain", [], 5.0), make("a2", "plain", [], 7.0), make("a3", "plain", ["other-1"], 99.0)]
+    runs = report.load_runs(dirs)
+    assert [r["clean"] for r in runs] == [True, True, False]
+    clean = report.summarize(runs, "clean")
+    assert "6.0 [5.0-7.0] (n=2)" in clean and "99.0" not in clean
+    assert "(n=3)" in report.summarize(runs, "all")
+    assert report.is_clean({"host_before": {"other_running_containers": ["x"]}}) is False
