@@ -1365,3 +1365,45 @@ def test_a_member_name_with_control_characters_is_escaped_in_findings(tmp_path, 
 
 def test_an_ordinary_member_name_is_labelled_as_it_is() -> None:
     assert pv._safe_label("canonical/records.jsonl") == "canonical/records.jsonl"
+
+
+# ---- a directory bundle is walked and read beneath one root, never through a swapped-in link
+
+
+def test_a_directory_swapped_for_a_link_after_the_walk_is_never_followed(tmp_path, monkeypatch) -> None:
+    bundle = _write_dir(tmp_path / "bundle", PAYLOAD)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "records.jsonl").write_bytes(PAYLOAD["canonical/records.jsonl"])  # identical bytes, outside
+    real_walk = pv._walk_directory
+
+    def walk_then_swap(*args, **kwargs):
+        entries = real_walk(*args, **kwargs)
+        os.rename(bundle / "canonical", tmp_path / "moved")
+        os.symlink(outside, bundle / "canonical")
+        return entries
+
+    monkeypatch.setattr(pv, "_walk_directory", walk_then_swap)
+    report = verify_bundle(bundle)
+    assert not report.ok, "a file was read through a directory link swapped in after the walk"
+
+
+def test_a_bundle_root_swapped_for_a_link_after_the_check_is_never_followed(tmp_path, monkeypatch) -> None:
+    bundle = _write_dir(tmp_path / "bundle", PAYLOAD)
+    decoy = _write_dir(tmp_path / "decoy", PAYLOAD)  # an identical bundle elsewhere
+    real_islink = os.path.islink
+
+    def check_then_swap(path):
+        answer = real_islink(path)
+        if os.fspath(path) == str(bundle) and not answer:
+            os.rename(bundle, tmp_path / "bundle-original")
+            os.symlink(decoy, bundle)
+        return answer
+
+    monkeypatch.setattr(pv.os.path, "islink", check_then_swap)
+    report = verify_bundle(bundle)
+    assert _codes(report) == {pv.SYMLINK_ENTRY}, _codes(report)
+
+
+def test_an_untouched_directory_bundle_still_verifies(tmp_path) -> None:
+    assert verify_bundle(_write_dir(tmp_path / "bundle", PAYLOAD)).ok

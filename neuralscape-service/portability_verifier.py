@@ -35,6 +35,7 @@ Usage: ``python -m portability_verifier PATH`` prints a JSON report and exits
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -163,7 +164,7 @@ class _Entry:
     name: str  # normalized, relative, POSIX
     size: int
     kind: str  # "file" or "dir"
-    handle: Any  # ZipInfo or absolute path
+    handle: Any  # ZipInfo, or the path relative to the bundle root
 
 
 def _fold(name: str) -> str:
@@ -486,11 +487,45 @@ def _inventory_zip(
     return entries
 
 
-def _walk_directory(root: str, report: VerificationReport) -> list[_Entry]:
+class _DirSource(NamedTuple):
+    """A directory bundle opened once: every walk and read happens beneath ``root``."""
+
+    root: int  # descriptor of the bundle directory, opened without following links
+
+
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+
+
+def _open_beneath(root: int, relative: str, *, directory: bool) -> int:
+    """Open ``relative`` under the root descriptor, refusing a link at every component.
+
+    Each component is opened relative to its parent's descriptor with ``O_NOFOLLOW``,
+    so a directory swapped for a link after the walk is refused, never followed out of
+    the bundle.
+    """
+
+    parts = relative.split("/")
+    current = root
+    opened: list[int] = []
+    try:
+        for part in parts[:-1]:
+            current = os.open(part, os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW | _CLOEXEC, dir_fd=current)
+            opened.append(current)
+        flags = os.O_RDONLY | _NOFOLLOW | _CLOEXEC | getattr(os, "O_NONBLOCK", 0)
+        if directory:
+            flags |= os.O_DIRECTORY
+        return os.open(parts[-1], flags, dir_fd=current)
+    finally:
+        for descriptor in opened:
+            os.close(descriptor)
+
+
+def _walk_directory(root: int, report: VerificationReport) -> list[_Entry]:
     entries: list[_Entry] = []
     total = 0
     observed = 0  # every child seen anywhere in the tree, accepted or not
-    stack: list[tuple[str, str, int]] = [(root, "", 0)]
+    stack: list[tuple[str, str, int]] = [("", "", 0)]
     while stack:
         directory, prefix, depth = stack.pop()
         if depth > MAX_DIRECTORY_DEPTH:
@@ -498,24 +533,28 @@ def _walk_directory(root: str, report: VerificationReport) -> list[_Entry]:
             return []
         unsorted: list[os.DirEntry] = []
         try:
-            with os.scandir(directory) as scan:
-                for child in scan:
-                    observed += 1
-                    if observed > MAX_BUNDLE_ENTRIES:
-                        report.add(ENTRY_COUNT_LIMIT)
-                        return []
-                    unsorted.append(child)
+            descriptor = root if not directory else _open_beneath(root, directory, directory=True)
+            try:
+                with os.scandir(descriptor) as scan:
+                    for child in scan:
+                        observed += 1
+                        if observed > MAX_BUNDLE_ENTRIES:
+                            report.add(ENTRY_COUNT_LIMIT)
+                            return []
+                        unsorted.append(child)
+                # stat while the directory is open: the entries refer to this descriptor
+                children = sorted(
+                    ((child.name, child.stat(follow_symlinks=False)) for child in unsorted),
+                    key=lambda item: item[0],
+                )  # bounded by the limit above
+            finally:
+                if descriptor != root:
+                    os.close(descriptor)
         except OSError:
             report.add(CONTAINER_UNREADABLE, _safe_label(prefix))
             return []
-        children = sorted(unsorted, key=lambda item: item.name)  # bounded by the limit above
-        for child in children:
-            relative = f"{prefix}{child.name}"
-            try:
-                info = child.stat(follow_symlinks=False)
-            except OSError:
-                report.add(CONTAINER_UNREADABLE, _safe_label(relative))
-                continue
+        for child_name, info in children:
+            relative = f"{prefix}{child_name}"
             name = _classify_name(os.fsdecode(relative), report)
             if name is None:
                 continue
@@ -524,8 +563,8 @@ def _walk_directory(root: str, report: VerificationReport) -> list[_Entry]:
                 report.add(problem, _safe_label(name))
                 continue
             if stat.S_ISDIR(info.st_mode):
-                entries.append(_Entry(name, 0, "dir", child.path))
-                stack.append((child.path, f"{relative}/", depth + 1))
+                entries.append(_Entry(name, 0, "dir", relative))
+                stack.append((relative, f"{relative}/", depth + 1))
                 continue
             if info.st_nlink > 1:
                 report.add(HARDLINK_ENTRY, _safe_label(name))
@@ -537,7 +576,7 @@ def _walk_directory(root: str, report: VerificationReport) -> list[_Entry]:
             if total > MAX_TOTAL_BYTES:
                 report.add(SIZE_LIMIT)
                 return []
-            entries.append(_Entry(name, info.st_size, "file", child.path))
+            entries.append(_Entry(name, info.st_size, "file", relative))
     return entries
 
 
@@ -609,12 +648,11 @@ def _zip_member_chunks(info: zipfile.ZipInfo, raw: BinaryIO) -> Iterator[bytes]:
         raise ValueError("member length or CRC differs from the directory")
 
 
-def _read_chunks(entry: _Entry, zf: _ZipSource | None) -> Iterator[bytes]:
-    if zf is not None:
+def _read_chunks(entry: _Entry, zf: "_ZipSource | _DirSource") -> Iterator[bytes]:
+    if isinstance(zf, _ZipSource):
         yield from _zip_member_chunks(entry.handle, zf.raw)
         return
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-    descriptor = os.open(entry.handle, flags)
+    descriptor = _open_beneath(zf.root, entry.handle, directory=False)
     try:
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode) or opened.st_nlink > 1:
@@ -627,7 +665,7 @@ def _read_chunks(entry: _Entry, zf: _ZipSource | None) -> Iterator[bytes]:
 
 
 def _hash_entry(
-    entry: _Entry, zf: _ZipSource | None, limit: int
+    entry: _Entry, zf: "_ZipSource | _DirSource", limit: int
 ) -> tuple[int, str] | None:
     """Return ``(bytes_read, sha256)``; reading stops one byte past ``limit``."""
 
@@ -645,7 +683,7 @@ def _hash_entry(
 
 
 def _load_manifest(
-    entries: dict[str, _Entry], zf: _ZipSource | None, report: VerificationReport
+    entries: dict[str, _Entry], zf: "_ZipSource | _DirSource", report: VerificationReport
 ) -> PortableManifest | None:
     entry = entries.get(MANIFEST_NAME)
     if entry is None or entry.kind != "file":
@@ -682,7 +720,7 @@ def _load_manifest(
 
 
 def _verify_open(
-    entries: list[_Entry], zf: _ZipSource | None, report: VerificationReport
+    entries: list[_Entry], zf: "_ZipSource | _DirSource", report: VerificationReport
 ) -> None:
     _collision_checks(entries, report)
     if any(item.code in _FATAL_CODES for item in report.findings):
@@ -720,7 +758,7 @@ def _verify_open(
     # Payload bytes are hashed only when every structural check above is clean.
     if report.findings:
         return
-    if zf is not None:
+    if isinstance(zf, _ZipSource):
         # A directory record must hold an empty stream, whatever its headers claim.
         for entry in entries:
             if entry.kind == "dir":
@@ -872,10 +910,26 @@ def verify_bundle(path: str | os.PathLike[str]) -> VerificationReport:
     if os.path.islink(target):
         report.add(SYMLINK_ENTRY, "<bundle>")
         return report
-    if os.path.isdir(target):
-        entries = _walk_directory(target, report)
-        if not any(item.code in _FATAL_CODES for item in report.findings):
-            _verify_open(entries, None, report)
+    # A directory is opened once, without following a link, and walked and read beneath
+    # that descriptor, so a root or directory swapped for a link later is never followed.
+    try:
+        root = os.open(target, os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW | _CLOEXEC)
+    except OSError as exc:
+        try:
+            linked = exc.errno in (errno.ELOOP, errno.ENOTDIR) and stat.S_ISLNK(os.lstat(target).st_mode)
+        except OSError:
+            linked = False
+        if linked:
+            report.add(SYMLINK_ENTRY, "<bundle>")
+            return report
+        root = None  # not a directory: the archive path below decides
+    if root is not None:
+        try:
+            entries = _walk_directory(root, report)
+            if not any(item.code in _FATAL_CODES for item in report.findings):
+                _verify_open(entries, _DirSource(root), report)
+        finally:
+            os.close(root)
         return report
     if not os.path.isfile(target):
         report.add(CONTAINER_UNREADABLE, "<bundle>")
