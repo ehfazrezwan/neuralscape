@@ -919,3 +919,141 @@ def test_a_prepended_stub_before_a_zip64_archive_is_refused_before_parsing(tmp_p
     path.write_bytes(b"\x00" * 512 + path.read_bytes())
     monkeypatch.setattr(pv.zipfile, "ZipFile", lambda *a, **k: pytest.fail("parsed"))
     assert _codes(verify_bundle(path)) == {pv.ARCHIVE_FRAMING}
+
+
+# ---- the precheck reads the archive exactly as the parser will, or refuses it before parsing
+
+_CENTRAL = __import__("struct").Struct("<4s6H3I5H2I")
+
+
+def _central_records(count: int) -> bytes:
+    return b"".join(
+        _CENTRAL.pack(b"PK\x01\x02", 20, 20, 0, 0, 0, 0, 0, 0, 0, len(name), 0, 0, 0, 0, 0, 0) + name
+        for name in (f"f{i}".encode() for i in range(count))
+    )
+
+
+def _end_record(entries: int, cd_size: int, cd_offset: int, comment: bytes = b"") -> bytes:
+    import struct
+
+    return struct.pack("<4s4H2IH", b"PK\x05\x06", 0, 0, entries, entries, cd_size, cd_offset, len(comment)) + comment
+
+
+def _zip64_tail(cd: bytes, *, declared: int, extensible: int = 0) -> bytes:
+    import struct
+
+    record = struct.pack("<4sQ2H2I4Q", b"PK\x06\x06", 44 + extensible, 45, 45, 0, 0, declared, declared, len(cd), 0)
+    locator = struct.pack("<4sIQI", b"PK\x06\x07", 0, len(cd), 1)
+    return cd + record + b"\x00" * extensible + locator + _end_record(0xFFFF, _U32, _U32)
+
+
+_U32 = 0xFFFFFFFF
+
+
+def _refused_before_parsing(path, monkeypatch, *, limit: int = 2, codes=None) -> None:
+    assert len(zipfile.ZipFile(path).infolist()) > limit  # the parser itself would read every record
+    monkeypatch.setattr(pv, "MAX_BUNDLE_ENTRIES", limit)
+    monkeypatch.setattr(pv.zipfile, "ZipFile", lambda *a, **k: pytest.fail("parsed before the precheck refused it"))
+    found = _codes(verify_bundle(path))
+    assert found and (codes is None or found <= codes), found
+
+
+def test_an_end_record_whose_own_fields_hold_the_signature_is_refused_before_parsing(tmp_path, monkeypatch) -> None:
+    cd = _central_records(5)
+    path = tmp_path / "b.zip"
+    path.write_bytes(cd + _end_record(1, len(cd), 0x06054B50))  # the offset field's bytes are the signature
+    _refused_before_parsing(path, monkeypatch, codes={pv.ARCHIVE_FRAMING})
+
+
+def test_an_end_record_at_the_edge_of_the_parsers_search_window_is_refused_before_parsing(tmp_path, monkeypatch) -> None:
+    cd = _central_records(5)
+    path = tmp_path / "b.zip"
+    path.write_bytes(cd + _end_record(5, len(cd), 0, b"c" * 0xFFFF) + b"x")
+    _refused_before_parsing(path, monkeypatch, codes={pv.ARCHIVE_FRAMING})
+
+
+def test_any_archive_comment_is_refused_before_parsing(tmp_path, monkeypatch) -> None:
+    cd = _central_records(5)
+    path = tmp_path / "b.zip"
+    path.write_bytes(cd + _end_record(5, len(cd), 0, b"a comment"))
+    _refused_before_parsing(path, monkeypatch, codes={pv.ARCHIVE_FRAMING})
+
+
+def test_a_zip64_record_with_extensible_data_and_a_lying_count_is_refused_before_parsing(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "b.zip"
+    path.write_bytes(_zip64_tail(_central_records(5), declared=1, extensible=32))
+    _refused_before_parsing(path, monkeypatch, limit=4)
+
+
+def test_a_zip64_directory_beyond_the_byte_limit_is_refused_before_parsing(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "b.zip"
+    path.write_bytes(_zip64_tail(_central_records(50), declared=50, extensible=8))
+    monkeypatch.setattr(pv, "MAX_CENTRAL_DIRECTORY_BYTES", 100)
+    monkeypatch.setattr(pv.zipfile, "ZipFile", lambda *a, **k: pytest.fail("parsed past the byte limit"))
+    assert pv.SIZE_LIMIT in _codes(verify_bundle(path))
+
+
+def test_a_zip64_record_not_where_its_locator_points_is_refused(tmp_path, monkeypatch) -> None:
+    import struct
+
+    raw = bytearray(_zip64_tail(_central_records(3), declared=3))
+    locator_at = raw.rindex(b"PK\x06\x07")
+    struct.pack_into("<Q", raw, locator_at + 8, 1)  # points into the directory
+    path = tmp_path / "b.zip"
+    path.write_bytes(bytes(raw))
+    report = pv.VerificationReport()
+    assert pv._precheck_central_directory(str(path), report) is False and pv.ARCHIVE_FRAMING in _codes(report)
+
+
+def test_saturated_end_record_fields_without_a_zip64_locator_are_refused(tmp_path) -> None:
+    cd = _central_records(3)
+    path = tmp_path / "b.zip"
+    path.write_bytes(cd + _end_record(0xFFFF, len(cd), 0))
+    report = pv.VerificationReport()
+    assert pv._precheck_central_directory(str(path), report) is False and pv.ARCHIVE_FRAMING in _codes(report)
+
+
+def test_a_directory_that_does_not_fill_its_declared_size_is_refused(tmp_path) -> None:
+    cd = _central_records(3)
+    path = tmp_path / "b.zip"
+    path.write_bytes(cd + b"\x00" * 10 + _end_record(3, len(cd) + 10, 0))
+    report = pv.VerificationReport()
+    assert pv._precheck_central_directory(str(path), report) is False and pv.ARCHIVE_FRAMING in _codes(report)
+
+
+def test_an_unreadable_file_is_refused_not_left_to_the_parser(tmp_path) -> None:
+    report = pv.VerificationReport()
+    assert pv._precheck_central_directory(str(tmp_path / "missing.zip"), report) is False and not report.ok
+
+
+# ---- legitimate archives still pass the precheck
+def _passes_precheck(path) -> None:
+    report = pv.VerificationReport()
+    assert pv._precheck_central_directory(str(path), report) is True, _codes(report)
+    assert report.ok
+
+
+def test_an_empty_archive_passes_the_precheck(tmp_path) -> None:
+    path = tmp_path / "empty.zip"
+    zipfile.ZipFile(path, "w").close()
+    _passes_precheck(path)
+
+
+def test_an_archive_with_many_entries_within_the_bounds_passes_the_precheck(tmp_path) -> None:
+    path = tmp_path / "many.zip"
+    with zipfile.ZipFile(path, "w") as archive:
+        for i in range(70_000):  # more than 65,535: Python writes a real zip64 end record
+            archive.writestr(f"d/{i}", b"")
+    assert b"PK\x06\x06" in path.read_bytes()[-200:]
+    _passes_precheck(path)
+
+
+def test_a_consistent_zip64_record_with_extensible_data_passes_the_precheck(tmp_path) -> None:
+    path = tmp_path / "b.zip"
+    path.write_bytes(_zip64_tail(_central_records(5), declared=5, extensible=16))
+    assert len(zipfile.ZipFile(path).infolist()) == 5
+    _passes_precheck(path)
+
+
+def test_a_python_written_bundle_still_verifies(tmp_path) -> None:
+    assert verify_bundle(_write_zip(tmp_path / "b.zip", PAYLOAD)).ok
