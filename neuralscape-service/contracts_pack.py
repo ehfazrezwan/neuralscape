@@ -13,6 +13,22 @@ only.  A schema change is a breaking change when it removes or narrows what an
 earlier consumer accepted or produced; the compatibility check reports such a
 change unless the contract version changed with it.
 
+The check FAILS CLOSED.  It proves compatibility only for a small explicit subset
+of JSON Schema that it fully understands: ``type``, ``enum``, ``const``,
+``minimum``/``maximum`` and their exclusive forms, ``multipleOf``, ``minLength``,
+``maxLength``, ``pattern``, ``minItems``, ``maxItems``, ``uniqueItems``,
+``minProperties``, ``maxProperties``, ``properties``, ``required``,
+``additionalProperties``, ``items``, ``prefixItems``, ``anyOf`` (every old
+alternative must still be accepted by a new one) and a bare ``$ref`` into
+``#/$defs``.  ``title``, ``description``, ``default``, ``examples`` and similar
+annotations never affect validity and are ignored.  Any change that touches
+anything else (``oneOf`` alternatives that are not equivalent, constraints written
+beside a ``$ref``, ``not``, ``if``/``then``/``else``, ``allOf``, ``patternProperties``,
+``dependent*``, ``unevaluated*``, ``format``, ``discriminator``, a reference that is
+not a plain ``#/$defs`` one, and so on) is reported as an *unverified change*, with the
+same standing as a narrowing: it needs an explicit contract version bump or a reviewer
+waiver, because the checker cannot show that no previously valid document is rejected.
+
 Typical CI use compares the schemas of a base revision with the current ones::
 
     old = json.loads(base_schemas_json)       # exported at the base revision
@@ -165,15 +181,66 @@ def schema_digests() -> dict[str, str]:
 # ------------------------------------------------------------ compatibility
 
 
-def _resolve(schema: object, defs: dict) -> object:
+_ANNOTATIONS = frozenset({"title", "description", "default", "examples", "$comment", "deprecated", "readOnly", "writeOnly", "$defs"})
+_MODELED = frozenset({
+    "type", "enum", "const", "minimum", "exclusiveMinimum", "maximum", "exclusiveMaximum", "multipleOf",
+    "minLength", "maxLength", "pattern", "minItems", "maxItems", "uniqueItems", "minProperties", "maxProperties",
+    "properties", "required", "additionalProperties", "items", "prefixItems", "anyOf", "oneOf", "$ref",
+})
+_INLINE_BUDGET = 20000
+
+
+class _TooLarge(Exception):
+    pass
+
+
+def _inline(value: object, defs: dict, stack: tuple[str, ...] = (), budget: list[int] | None = None) -> object:
+    """``value`` with every ``#/$defs`` reference expanded (a cycle becomes a marker), so equality sees through refs."""
+
+    if budget is None:
+        budget = [_INLINE_BUDGET]
+    budget[0] -= 1
+    if budget[0] < 0:
+        raise _TooLarge
+    if isinstance(value, list):
+        return [_inline(item, defs, stack, budget) for item in value]
+    if not isinstance(value, dict):
+        return value
+    ref = value.get("$ref")
+    if isinstance(ref, str) and ref.startswith("#/$defs/"):
+        name = ref.removeprefix("#/$defs/")
+        if name in stack:
+            return {"$cycle": name}
+        if name in defs:
+            rest = {key: _inline(item, defs, stack, budget) for key, item in value.items() if key != "$ref"}
+            return {"$ref": _inline(defs[name], defs, stack + (name,), budget), **rest}
+    return {key: _inline(item, defs, stack, budget) for key, item in value.items()}
+
+
+def _same(old: object, new: object, old_defs: dict, new_defs: dict) -> bool:
+    if old == new and old_defs == new_defs:
+        return True  # the same text under the same definitions
+    try:
+        return _inline(old, old_defs) == _inline(new, new_defs)
+    except _TooLarge:
+        return False  # too large to compare: not shown equal
+
+
+def _resolve(schema: object, defs: dict) -> tuple[object, list[dict]]:
+    """Follow ``#/$defs`` references; also return the constraints written beside each reference."""
+
     seen = 0
+    beside: list[dict] = []
     while isinstance(schema, dict) and "$ref" in schema and seen < 32:
         ref = schema["$ref"]
         if not (isinstance(ref, str) and ref.startswith("#/$defs/")):
             break
+        extra = {key: value for key, value in schema.items() if key != "$ref" and key not in _ANNOTATIONS}
+        if extra:
+            beside.append(extra)
         schema = defs.get(ref.removeprefix("#/$defs/"), schema)
         seen += 1
-    return schema
+    return schema, beside
 
 
 def _types(schema: dict) -> set[str] | None:
@@ -185,12 +252,11 @@ def _types(schema: dict) -> set[str] | None:
 
 _MAX_COMPARE_DEPTH = 200
 _UNION_KEYS = ("anyOf", "oneOf")
-# Keywords the checker does not model: any addition or change is reported, never silently accepted.
-_UNVERIFIED_KEYWORDS = (
-    "allOf", "not", "if", "then", "else", "contains", "minContains", "maxContains",
-    "patternProperties", "propertyNames", "dependentRequired", "dependentSchemas",
-    "unevaluatedProperties", "unevaluatedItems", "additionalItems",
-)
+
+
+def _unverified(path: str, what: str) -> str:
+    return f"{path}: unverified change: {what}; compatibility not verified (needs a version bump or a reviewer waiver)"
+
 
 def _allowed_values(schema: dict) -> list | None:
     """The finite value set a schema restricts to, or ``None`` when unrestricted."""
@@ -207,6 +273,24 @@ def _multiple_of_narrowed(old_step: object, new_step: object) -> bool:
         return Fraction(str(old_step)) % Fraction(str(new_step)) != 0
     except (ValueError, ZeroDivisionError):
         return True
+
+
+_ABSENT = {"$absent": True}
+
+
+def _alternatives_equivalent(
+    old: object, new: object, old_defs: dict, new_defs: dict, path: str, depth: int, active: frozenset
+) -> bool:
+    if not (isinstance(old, list) and isinstance(new, list) and len(old) == len(new)):
+        return False
+    for index, (before, after) in enumerate(zip(old, new)):
+        forward: list[str] = []
+        backward: list[str] = []
+        _compare(before, after, old_defs, new_defs, f"{path}|{index}", forward, depth + 1, active)
+        _compare(after, before, new_defs, old_defs, f"{path}|{index}", backward, depth + 1, active)
+        if forward or backward:
+            return False
+    return True
 
 
 def _compare(
@@ -227,12 +311,24 @@ def _compare(
         if pair in active:
             return  # a recursive reference already being compared is assumed compatible
         active = active | {pair}
-    old = _resolve(old, old_defs)
-    new = _resolve(new, new_defs)
+    old, old_beside = _resolve(old, old_defs)
+    new, new_beside = _resolve(new, new_defs)
+    if (old_beside or new_beside) and not _same(old_beside, new_beside, old_defs, new_defs):
+        # Resolving a reference replaces the schema, so constraints written beside it (``maxLength``
+        # next to ``$ref``) would be dropped; a change in them is not verified.
+        out.append(_unverified(path, "constraints beside a $ref changed"))
     if not isinstance(old, dict) or not isinstance(new, dict):
         if old != new:
             out.append(f"{path}: schema changed shape")
         return
+    if "$ref" in old or "$ref" in new:
+        # Not a plain #/$defs reference (or a reference chain that does not end): not modelled.
+        if not (old.get("$ref") == new.get("$ref") == "#"):
+            out.append(_unverified(path, "a reference that is not a plain #/$defs one"))
+        return
+    for key in sorted((set(old) | set(new)) - _MODELED - _ANNOTATIONS):
+        if not _same(old.get(key, _ABSENT), new.get(key, _ABSENT), old_defs, new_defs):
+            out.append(_unverified(path, f"{key} changed"))
 
     old_unions = {key: old[key] for key in _UNION_KEYS if old.get(key)}
     new_unions = {key: new[key] for key in _UNION_KEYS if new.get(key)}
@@ -247,11 +343,16 @@ def _compare(
                 {key: value for key, value in new.items() if key not in _UNION_KEYS},
                 old_defs, new_defs, path, out, depth + 1, active,
             )
+        # ``oneOf`` needs exactly one match, so widening or narrowing a branch can both reject a value
+        # that was valid: alternatives must be equivalent branch by branch, anything else is unverified.
+        if "oneOf" in old_unions or "oneOf" in new_unions:
+            if not _alternatives_equivalent(old_unions.get("oneOf"), new_unions.get("oneOf"), old_defs, new_defs, path, depth, active):
+                out.append(_unverified(path, "oneOf changed"))
         # Every old alternative (an old single schema is one alternative) must still be accepted by
-        # some new alternative.  A schema with both union keywords is compared keyword by keyword.
-        for keyword in [key for key in _UNION_KEYS if key in old_unions or key in new_unions]:
-            old_alternatives = old_unions.get(keyword) or next(iter(old_unions.values()), None) or [old]
-            new_alternatives = new_unions.get(keyword) or next(iter(new_unions.values()), None) or [new]
+        # some new alternative.
+        for keyword in [key for key in ("anyOf",) if key in old_unions or key in new_unions]:
+            old_alternatives = old_unions.get(keyword) or [old]
+            new_alternatives = new_unions.get(keyword) or [new]
             for index, branch in enumerate(old_alternatives):
                 matched = False
                 for candidate in new_alternatives:
@@ -299,8 +400,6 @@ def _compare(
             out.append(f"{path}: {key} lowered")
     if "pattern" in new and new.get("pattern") != old.get("pattern"):
         out.append(f"{path}: pattern changed")
-    if "format" in new and new.get("format") != old.get("format"):
-        out.append(f"{path}: format changed")
     if new.get("uniqueItems") and not old.get("uniqueItems"):
         out.append(f"{path}: uniqueItems added")
     if "multipleOf" in new and ("multipleOf" not in old or _multiple_of_narrowed(old["multipleOf"], new["multipleOf"])):
@@ -354,9 +453,6 @@ def _compare(
             _compare(item, new_prefix[index], old_defs, new_defs, f"{path}[{index}]", out, depth + 1, active)
     for index in range(len(old_prefix), len(new_prefix)):
         _compare(unconstrained, new_prefix[index], old_defs, new_defs, f"{path}[{index}]", out, depth + 1, active)
-    for key in _UNVERIFIED_KEYWORDS:
-        if key in new and new[key] != old.get(key):
-            out.append(f"{path}: {key} changed; compatibility not verified")
 
 
 def _version_number(version: object) -> tuple[str, int] | None:
@@ -383,6 +479,9 @@ def check_compatibility(old: dict, new: dict) -> list[str]:
     widening a constraint is compatible.  A change of the contract's
     ``schema_version`` constant to a newer version is an explicit bump and is
     accepted; a downgrade is compared like any other change.
+
+    Fail closed: a change that touches a keyword or shape outside the subset listed in
+    the module docstring is reported as an unverified change, never accepted silently.
     """
 
     old_version = old.get("properties", {}).get("schema_version", {}).get("const")
@@ -391,7 +490,7 @@ def check_compatibility(old: dict, new: dict) -> list[str]:
         return []
     problems: list[str] = []
     _compare(old, new, old.get("$defs", {}), new.get("$defs", {}), "$", problems)
-    return problems
+    return list(dict.fromkeys(problems))
 
 
 def compare_schemas(old: dict[str, dict], new: dict[str, dict]) -> dict[str, list[str]]:

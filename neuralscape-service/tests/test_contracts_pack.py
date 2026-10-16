@@ -551,7 +551,9 @@ def test_a_schema_with_both_union_keywords_is_compared_on_each() -> None:
     old = {"anyOf": _UNION, "oneOf": [{"type": "string"}, {"type": "null"}, {"type": "integer"}]}
     assert _pair(old, old) == []
     narrowed = {"anyOf": _UNION, "oneOf": [{"type": "string"}, {"type": "null"}]}
-    assert any("no longer accepted" in p for p in _pair(old, narrowed))
+    assert any("oneOf changed" in p for p in _pair(old, narrowed))
+    anyof_narrowed = {"anyOf": [{"type": "string"}], "oneOf": old["oneOf"]}
+    assert any("no longer accepted" in p for p in _pair(old, anyof_narrowed))
 
 
 @pytest.mark.parametrize("old_form", ["absent", "true", "empty-schema"])
@@ -601,3 +603,133 @@ def test_a_restriction_added_by_a_keyword_the_old_schema_did_not_have_is_breakin
 def test_the_exported_contracts_compare_clean_against_themselves() -> None:
     schemas = pack.export_schemas()
     assert pack.compare_schemas(schemas, copy.deepcopy(schemas)) == {}
+
+
+# ------------------------------------------------------------------ fail closed
+
+
+def _unverified(problems: list[str], what: str) -> bool:
+    return any("unverified change" in p and what in p for p in problems)
+
+
+def test_a_constraint_added_beside_a_ref_is_an_unverified_change() -> None:
+    old = {"$defs": {"Name": {"type": "string"}}, "type": "object", "properties": {"name": {"$ref": "#/$defs/Name"}}}
+    new = {"$defs": {"Name": {"type": "string"}}, "type": "object",
+           "properties": {"name": {"$ref": "#/$defs/Name", "maxLength": 2}}}
+    assert _unverified(_pair(old, new), "beside a $ref")  # "toolong" was valid and is now rejected
+    assert _pair(old, old) == []
+    assert _pair(new, new) == []  # the same sibling on both sides narrows nothing
+    assert _unverified(_pair(new, {**new, "properties": {"name": {"$ref": "#/$defs/Name", "maxLength": 9}}}), "beside a $ref")
+
+
+def test_a_constraint_beside_a_ref_in_a_reference_chain_is_not_dropped() -> None:
+    old = {"$defs": {"A": {"$ref": "#/$defs/B"}, "B": {"type": "string"}}, "properties": {"x": {"$ref": "#/$defs/A"}}}
+    new = {"$defs": {"A": {"$ref": "#/$defs/B", "maxLength": 2}, "B": {"type": "string"}}, "properties": {"x": {"$ref": "#/$defs/A"}}}
+    assert _unverified(_pair(old, new), "beside a $ref")
+
+
+def test_a_ref_with_unchanged_siblings_still_compares_its_target() -> None:
+    old = {"$defs": {"Name": {"type": "string", "maxLength": 9}}, "properties": {"n": {"$ref": "#/$defs/Name", "description": "d", "minLength": 1}}}
+    new = {"$defs": {"Name": {"type": "string", "maxLength": 3}}, "properties": {"n": {"$ref": "#/$defs/Name", "description": "other", "minLength": 1}}}
+    problems = _pair(old, new)
+    assert any("maxLength lowered" in p for p in problems), problems
+    assert not _unverified(problems, "beside a $ref")  # annotations beside a ref are not constraints
+
+
+def test_a_oneof_that_gains_an_overlapping_alternative_is_an_unverified_change() -> None:
+    old = {"oneOf": [{"type": "number"}]}
+    new = {"oneOf": [{"type": "number"}, {"type": "integer"}]}
+    assert _unverified(_pair(old, new), "oneOf changed")  # 1 matched one branch and now matches both
+    assert _unverified(_pair(new, old), "oneOf changed")
+    assert _unverified(_pair(old, {"oneOf": [{"type": "number", "minimum": 0}]}), "oneOf changed")  # narrowed
+    assert _unverified(_pair(old, {"oneOf": [{"type": "number", "minimum": -1}]}), "oneOf changed")  # widened
+    bounded = {"oneOf": [{"type": "number", "minimum": 0}]}
+    assert _unverified(_pair(bounded, {"oneOf": [{"type": "number", "minimum": -5}]}), "oneOf changed")  # a widened branch
+    assert _unverified(_pair({"type": "number"}, old), "oneOf changed")  # added
+    assert _unverified(_pair(old, {"type": "number"}), "oneOf changed")  # removed
+    two = {"oneOf": [{"type": "string"}, {"type": "integer"}]}
+    assert _unverified(_pair(two, {"oneOf": list(reversed(two["oneOf"]))}), "oneOf changed")  # reordered
+    assert _pair(old, old) == []
+    assert _pair(two, {"oneOf": [{"type": "string"}, {"type": "integer"}]}) == []  # equivalent
+
+
+def test_a_oneof_branch_behind_a_ref_whose_target_changed_is_unverified() -> None:
+    old = {"$defs": {"N": {"type": "number"}}, "oneOf": [{"$ref": "#/$defs/N"}, {"type": "string"}]}
+    new = {"$defs": {"N": {"type": "number", "maximum": 5}}, "oneOf": [{"$ref": "#/$defs/N"}, {"type": "string"}]}
+    assert _unverified(_pair(old, new), "oneOf changed")
+
+
+@pytest.mark.parametrize(
+    "keyword, value",
+    [
+        ("not", {"const": "x"}), ("if", {"type": "string"}), ("then", {"maxLength": 2}), ("else", {"maxLength": 2}),
+        ("allOf", [{"maxLength": 2}]), ("patternProperties", {"^a": {"type": "integer"}}),
+        ("dependentRequired", {"a": ["b"]}), ("dependentSchemas", {"a": {"required": ["b"]}}),
+        ("unevaluatedProperties", False), ("unevaluatedItems", False), ("format", "date-time"),
+        ("propertyNames", {"maxLength": 3}), ("contains", {"type": "integer"}), ("minContains", 2),
+        ("discriminator", {"propertyName": "kind"}), ("$dynamicRef", "#meta"), ("contentEncoding", "base64"),
+    ],
+)
+def test_an_unmodelled_keyword_added_changed_or_removed_is_an_unverified_change(keyword, value) -> None:
+    base = {"type": "object"}
+    with_keyword = {**base, keyword: value}
+    assert _unverified(_pair(base, with_keyword), f"{keyword} changed")
+    assert _unverified(_pair(with_keyword, base), f"{keyword} changed")  # removal is not assumed to widen
+    assert _pair(with_keyword, with_keyword) == []
+    assert _pair(with_keyword, {"type": "object", "description": "x", keyword: value}) == []
+
+
+def test_an_unmodelled_keyword_beside_a_union_is_still_checked() -> None:
+    assert _unverified(_pair({"anyOf": _UNION}, {"anyOf": _UNION, "not": {"const": "x"}}), "not changed")
+    assert _unverified(_pair({"anyOf": _UNION}, {"anyOf": _UNION, "format": "date-time"}), "format changed")
+
+
+def test_an_unmodelled_keyword_whose_referenced_schema_changed_is_unverified() -> None:
+    old = {"$defs": {"Bad": {"const": "x"}}, "type": "string", "not": {"$ref": "#/$defs/Bad"}}
+    new = {"$defs": {"Bad": {"const": "y"}}, "type": "string", "not": {"$ref": "#/$defs/Bad"}}
+    assert _unverified(_pair(old, new), "not changed")
+
+
+def test_a_reference_that_is_not_a_plain_defs_one_is_unverified() -> None:
+    old = {"properties": {"a": {"$ref": "#/properties/b"}, "b": {"type": "string"}}}
+    new = {"properties": {"a": {"$ref": "#/properties/b"}, "b": {"type": "string", "maxLength": 1}}}
+    assert _unverified(_pair(old, new), "plain #/$defs")
+    cyclic = {"$defs": {"A": {"$ref": "#/$defs/A"}}, "properties": {"x": {"$ref": "#/$defs/A"}}}
+    assert _unverified(_pair(cyclic, cyclic), "plain #/$defs")
+
+
+def test_a_recursive_root_reference_that_is_unchanged_is_compatible() -> None:
+    node = {"type": "object", "properties": {"child": {"$ref": "#"}}}
+    assert _pair(node, node) == []
+
+
+def test_unverified_changes_are_accepted_only_with_an_explicit_version_bump() -> None:
+    def schema(version: str, **extra: object) -> dict:
+        return {"type": "object", "properties": {"schema_version": {"const": version}}, **extra}
+
+    changed = _pair(schema("candidate-v1"), schema("candidate-v1", not_={}) | {"not": {"const": {}}})
+    assert _unverified(changed, "not changed")
+    assert _pair(schema("candidate-v1"), schema("candidate-v2", **{"not": {"const": {}}})) == []
+
+
+def test_annotations_never_make_a_change_unverified() -> None:
+    old = {"type": "string", "title": "A", "description": "a", "default": "x", "examples": ["x"]}
+    new = {"type": "string", "title": "B", "description": "b", "default": "y", "examples": ["y"], "$comment": "c"}
+    assert _pair(old, new) == []
+
+
+def test_an_unmodelled_keyword_with_an_oversized_expansion_is_unverified_not_accepted() -> None:
+    defs = {"L0": {"type": "string"}}
+    for level in range(1, 40):
+        defs[f"L{level}"] = {"anyOf": [{"$ref": f"#/$defs/L{level - 1}"}, {"$ref": f"#/$defs/L{level - 1}"}]}
+    schema = {"$defs": defs, "type": "string", "not": {"$ref": "#/$defs/L39"}}
+    assert _unverified(_pair({"$defs": defs, "type": "string"}, schema), "not changed")
+    other = {**defs, "L0": {"type": "integer"}}  # a changed definition under an expansion too large to compare
+    assert _unverified(_pair(schema, {**schema, "$defs": other}), "not changed")
+    assert _pair(schema, {**schema, "$comment": "same"}) == []  # identical text and definitions need no expansion
+
+
+def test_the_present_pack_is_compatible_with_itself_and_its_digests_are_unchanged() -> None:
+    schemas = pack.export_schemas()
+    assert pack.compare_schemas(schemas, copy.deepcopy(schemas)) == {}
+    assert pack.changed_since_digests() == []
