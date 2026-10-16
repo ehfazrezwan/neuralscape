@@ -357,10 +357,15 @@ def _retain_public_mapping(value: Any, frozen_graph: _FrozenGraph) -> bool:
 
 
 def _retain_public_sequence(value: Any, frozen_graph: _FrozenGraph) -> bool:
-    """Retain a strong owner for one nonexact public sequence."""
+    """Retain a strong owner for one nonexact public sequence.
+
+    A tuple/list subclass that is also a Mapping is observed as a mapping, the
+    same way every other dispatcher treats it, so its sequence iterator is not
+    consulted before its mapping items.
+    """
 
     if (
-        isinstance(value, BaseModel)
+        isinstance(value, (BaseModel, Mapping))
         or type(value) in (tuple, list)
         or not isinstance(value, (tuple, list))
     ):

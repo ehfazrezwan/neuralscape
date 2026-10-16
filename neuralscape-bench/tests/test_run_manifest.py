@@ -3708,3 +3708,105 @@ def test_receiving_boundaries_reject_lists_malformed_models_and_cycles():
     cyclic = completed_manifest().model_copy(update={"resources": cycle})
     with pytest.raises(ValueError, match="cyclic native input"):
         serialize_run_manifest(cyclic)
+
+
+class HybridMappingTuple(tuple[object, ...]):
+    """A tuple that is also a Mapping, with a side effect in sequence iteration."""
+
+    def __new__(cls, values: dict[str, object], action: Callable[[], None]):
+        instance = super().__new__(cls, ())
+        instance.values = values
+        instance.action = action
+        instance.sequence_iterations = 0
+        return instance
+
+    def __getitem__(self, key: object) -> object:
+        return self.values[key]
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+    def __iter__(self):
+        self.sequence_iterations += 1
+        self.action()
+        return iter(self.values)
+
+    def items(self):
+        return iter(tuple(self.values.items()))
+
+
+class HybridMappingList(list[object]):
+    """A list that is also a Mapping, with a side effect in sequence iteration."""
+
+    def __init__(self, values: dict[str, object], action: Callable[[], None]):
+        super().__init__()
+        self.values = values
+        self.action = action
+        self.sequence_iterations = 0
+
+    def __getitem__(self, key: object) -> object:
+        return self.values[key]
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+    def __iter__(self):
+        self.sequence_iterations += 1
+        self.action()
+        return iter(self.values)
+
+    def items(self):
+        return iter(tuple(self.values.items()))
+
+
+Mapping.register(HybridMappingTuple)
+Mapping.register(HybridMappingList)
+
+
+def _finish_with_measurement(measurement: object) -> RunManifest:
+    return finish_run(
+        planned_manifest(),
+        state=RunState.COMPLETED,
+        started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+        resources=(measured_memory(),),
+        measurements=(measurement,),
+    )
+
+
+@pytest.mark.parametrize("hybrid_type", [HybridMappingTuple, HybridMappingList])
+def test_mapping_view_of_sequence_hybrid_is_observed_before_sequence_iteration(
+    hybrid_type,
+):
+    invalid_values = timing().model_dump(mode="python")
+    invalid_values["provenance"] = dict(
+        invalid_values["provenance"], clock="wall-clock"
+    )
+
+    # Equivalent plain data is rejected.
+    with pytest.raises(ValidationError):
+        _finish_with_measurement(invalid_values)
+
+    # The hybrid exposes the same mapping at first observation; its sequence
+    # iterator would repair the value if it were consulted first.
+    hybrid_values = dict(invalid_values)
+
+    def repair() -> None:
+        hybrid_values["provenance"] = timing().provenance.model_dump(
+            mode="python"
+        )
+
+    hybrid = hybrid_type(hybrid_values, repair)
+    with pytest.raises(ValidationError):
+        _finish_with_measurement(hybrid)
+    assert hybrid.sequence_iterations == 0
+
+
+@pytest.mark.parametrize("hybrid_type", [HybridMappingTuple, HybridMappingList])
+def test_mapping_view_of_sequence_hybrid_valid_control_is_accepted(hybrid_type):
+    values = timing().model_dump(mode="python")
+    hybrid = hybrid_type(values, lambda: None)
+
+    manifest = _finish_with_measurement(hybrid)
+
+    assert manifest.measurements[0] == timing()
