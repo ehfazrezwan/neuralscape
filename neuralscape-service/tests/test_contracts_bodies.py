@@ -1,5 +1,6 @@
 """Tests for the plaintext/opaque body boundary."""
 
+import json
 from collections.abc import Iterator, Mapping
 from typing import ClassVar
 
@@ -556,9 +557,12 @@ def test_enclosing_contract_uses_actual_nested_validation_boundary(
             }
         )
 
+    # Native extra storage is surfaced under the projection's wrapper key, exactly
+    # as the parser reports it; stored fields keep their own name.
+    rejected_key = "future_constraint" if inventory == "stored" else "native_extra_backing"
     assert any(
         error["loc"][0] == "body"
-        and error["loc"][-1] == "future_constraint"
+        and error["loc"][-1] == rejected_key
         and error["type"] == "extra_forbidden"
         for error in exc.value.errors()
     )
@@ -778,3 +782,92 @@ def test_body_schema_has_a_closed_discriminated_union() -> None:
     assert len(schema["oneOf"]) == 2
     for definition in schema["$defs"].values():
         assert definition["additionalProperties"] is False
+
+
+# ── the projection is part of the union, not only of the parser ─────────────
+
+
+def _hide_denied_extra(body: object, inventory: str) -> _HiddenBackingDict:
+    """Put a forbidden extra in the model's native storage, out of the masked view."""
+
+    if inventory == "stored":
+        stored = dict(dict.items(_BASE_MODEL_DICT_DESCRIPTOR.__get__(body, BaseModel)))
+        stored["future_constraint"] = "deny"
+        hidden = _HiddenBackingDict(stored)
+        _BASE_MODEL_DICT_DESCRIPTOR.__set__(body, hidden)
+    else:
+        hidden = _HiddenBackingDict({"future_constraint": "deny"})
+        _BASE_MODEL_EXTRA_DESCRIPTOR.__set__(body, hidden)
+    return hidden
+
+
+_MASKED_CASES = [
+    (_DescriptorMaskedPlaintextBody, {"kind": "plaintext", "text": "secret"}),
+    (_DescriptorMaskedOpaqueBody, {"kind": "opaque_envelope", "envelope_id": "env-1"}),
+]
+
+
+@pytest.mark.parametrize(("masked_type", "values"), _MASKED_CASES, ids=["plaintext", "opaque-envelope"])
+@pytest.mark.parametrize("inventory", ["stored", "extra"])
+def test_shared_adapter_rejects_descriptor_masked_hidden_storage(
+    masked_type: type, values: dict[str, str], inventory: str
+) -> None:
+    from contracts_bodies import MEMORY_BODY_ADAPTER
+
+    body = masked_type(**values)
+    hidden = _hide_denied_extra(body, inventory)
+    with pytest.raises(ValidationError) as exc:
+        MEMORY_BODY_ADAPTER.validate_python(body)
+    assert any(error["type"] == "extra_forbidden" for error in exc.value.errors())
+    assert hidden.view_calls == 0  # native storage was read directly, never a masked view
+
+
+@pytest.mark.parametrize(("masked_type", "values"), _MASKED_CASES, ids=["plaintext", "opaque-envelope"])
+@pytest.mark.parametrize("inventory", ["stored", "extra"])
+def test_nested_body_field_rejects_descriptor_masked_hidden_storage(
+    masked_type: type, values: dict[str, str], inventory: str
+) -> None:
+    body = masked_type(**values)
+    hidden = _hide_denied_extra(body, inventory)
+    with pytest.raises(ValidationError) as exc:
+        VersionedBodyOwner.model_validate({"schema_version": "candidate-v1", "body": body})
+    assert any(
+        error["loc"][0] == "body" and error["type"] == "extra_forbidden"
+        for error in exc.value.errors()
+    )
+    assert hidden.view_calls == 0
+
+
+@pytest.mark.parametrize(("masked_type", "values"), _MASKED_CASES, ids=["plaintext", "opaque-envelope"])
+def test_adapter_and_nested_paths_accept_clean_descriptor_masked_bodies(
+    masked_type: type, values: dict[str, str]
+) -> None:
+    from contracts_bodies import MEMORY_BODY_ADAPTER
+
+    assert MEMORY_BODY_ADAPTER.validate_python(masked_type(**values)).kind == values["kind"]
+    owner = VersionedBodyOwner.model_validate(
+        {"schema_version": "candidate-v1", "body": masked_type(**values)}
+    )
+    assert owner.body.kind == values["kind"]
+
+
+@pytest.mark.parametrize(
+    "wire",
+    [
+        {"kind": "plaintext", "text": "hello"},
+        {"kind": "opaque_envelope", "envelope_id": "env-1"},
+    ],
+    ids=["plaintext", "opaque-envelope"],
+)
+def test_wire_values_and_the_tag_discriminator_are_unchanged(wire: dict[str, str]) -> None:
+    from contracts_bodies import MEMORY_BODY_ADAPTER
+
+    parsed = MEMORY_BODY_ADAPTER.validate_python(wire)
+    assert parsed.kind == wire["kind"]
+    assert MEMORY_BODY_ADAPTER.validate_json(json.dumps(wire)).kind == wire["kind"]
+    with pytest.raises(ValidationError):
+        MEMORY_BODY_ADAPTER.validate_python({**wire, "kind": "other"})
+    with pytest.raises(ValidationError):
+        MEMORY_BODY_ADAPTER.validate_python({"kind": "plaintext", "envelope_id": "x"})
+    schema = MEMORY_BODY_ADAPTER.json_schema()
+    assert schema["discriminator"]["propertyName"] == "kind"

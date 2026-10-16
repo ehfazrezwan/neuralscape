@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, TypeAdapter
 
 from contracts_common import ContractModel, OpaqueId
 
@@ -36,16 +36,6 @@ class OpaqueEnvelopeBody(ContractModel):
     kind: Literal["opaque_envelope"]
     envelope_id: OpaqueId
 
-
-MemoryBody = Annotated[
-    Union[PlaintextBody, OpaqueEnvelopeBody],
-    Field(discriminator="kind"),
-]
-"""Tagged body value; plaintext and opaque-envelope fields cannot be mixed."""
-
-
-MEMORY_BODY_ADAPTER: TypeAdapter[MemoryBody] = TypeAdapter(MemoryBody)
-"""Reusable validator and JSON-schema adapter for :data:`MemoryBody`."""
 
 _BASE_MODEL_DICT_DESCRIPTOR = vars(BaseModel)["__dict__"]
 _BASE_MODEL_EXTRA_DESCRIPTOR = vars(BaseModel)["__pydantic_extra__"]
@@ -77,6 +67,33 @@ def _with_native_dict_extra_backing(value: object) -> object:
     return projected
 
 
+def _project_body_storage(value: object) -> object:
+    """Before-validator: project a body model's native storage before the tag is read.
+
+    Attached to the union itself, so the projection applies on every route into it:
+    the shared adapter, the parser, and any contract that nests a ``MemoryBody``.
+    """
+
+    if issubclass(type(value), (PlaintextBody, OpaqueEnvelopeBody)):
+        return _with_native_dict_extra_backing(value)
+    return value
+
+
+MemoryBody = Annotated[
+    Union[PlaintextBody, OpaqueEnvelopeBody],
+    Field(discriminator="kind"),
+    BeforeValidator(_project_body_storage),
+]
+"""Tagged body value; plaintext and opaque-envelope fields cannot be mixed.
+
+Model instances are revalidated from their native storage (not from any overridden
+descriptor), before the discriminator is evaluated, wherever this type is used."""
+
+
+MEMORY_BODY_ADAPTER: TypeAdapter[MemoryBody] = TypeAdapter(MemoryBody)
+"""Reusable validator and JSON-schema adapter for :data:`MemoryBody`."""
+
+
 def parse_memory_body(value: object) -> MemoryBody:
     """Validate one nested body value, including an unchecked model copy.
 
@@ -84,11 +101,6 @@ def parse_memory_body(value: object) -> MemoryBody:
     its explicit schema version before treating this value as wire data.
     """
 
-    value_type = type(value)
-    if issubclass(value_type, PlaintextBody):
-        value = _with_native_dict_extra_backing(value)
-    elif issubclass(value_type, OpaqueEnvelopeBody):
-        value = _with_native_dict_extra_backing(value)
     return MEMORY_BODY_ADAPTER.validate_python(value)
 
 
