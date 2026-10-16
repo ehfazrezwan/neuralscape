@@ -91,20 +91,27 @@ def unpack_pairs(
     return tuple(unpacked)
 
 
+def _plain_key(key: object) -> object:
+    """A text-subclass key as plain text, read without running its own hooks; other keys unchanged."""
+
+    if type(key) is str or not _inherits(type(key), str):
+        return key
+    return str.__str__(key)  # type: ignore[arg-type]
+
+
 def _refuse_duplicate_texts(*entry_groups: tuple[tuple[object, object], ...]) -> None:
     """Refuse two stored field names that read as one text (ambiguous input).
 
     The text is read with the built-in accessor, so a text subclass's own hooks do not run here.
+    Each group is checked on its own.  (Native extras are refused outright by the caller, so a text
+    shared between model storage and extras never reaches an accepting path.)
     """
 
     for entries in entry_groups:
         for name, _value in entries:
             if not _inherits(type(name), str):
                 raise ValueError("contract input field names must be text")
-        texts = [
-            name if type(name) is str else str.__str__(name)  # type: ignore[arg-type]
-            for name, _value in entries
-        ]
+        texts = [_plain_key(name) for name, _value in entries]
         if len(set(texts)) != len(texts):
             raise ValueError("contract input field names must be unique text")
 
@@ -471,7 +478,14 @@ def _closed_graph_snapshot_session() -> tuple[
                 )
                 if exact:
                     own_cost = 1 + len(entries)
-                result = {key: child(field_value) for key, field_value in entries}
+                result = {}
+                for key, field_value in entries:
+                    # A text-subclass key is reduced to its text (its own hash and equality never run
+                    # again) and two keys with one text are refused as ambiguous.
+                    plain = _plain_key(key)
+                    if plain in result:
+                        raise ValueError("contract input field names must be unique text")
+                    result[plain] = child(field_value)
             else:
                 is_list = isinstance(item, list)
                 exact = item_type is (list if is_list else tuple)

@@ -4026,3 +4026,34 @@ def test_a_stored_text_subclass_name_is_emitted_as_plain_text() -> None:
     event.__dict__[_SameTextKey("event_id")] = value
     snapshot = usage_reconcile_contracts._native_snapshot(event)
     assert all(type(key) is str for key in snapshot) and "event_id" in snapshot
+
+
+def test_a_dict_with_two_keys_of_one_text_is_refused_by_the_snapshot() -> None:
+    document = {"event_id": "event-1", _SameTextKey("event_id"): "event-2"}
+    result = usage_reconcile_contracts._native_snapshot(document)
+    assert isinstance(result, usage_reconcile_contracts._FailedNativeDictTraversal)
+
+
+def test_a_public_mapping_with_a_repeated_text_is_refused_by_the_snapshot() -> None:
+    from collections.abc import Mapping
+
+    class View(Mapping):
+        def __getitem__(self, key):
+            return 1
+
+        def __iter__(self):
+            return iter(("event_id", _SameTextKey("event_id")))
+
+        def __len__(self):
+            return 2
+
+        def items(self):
+            yield ("event_id", 1)
+            yield (_SameTextKey("event_id"), 2)
+
+    assert isinstance(usage_reconcile_contracts._native_snapshot(View()), usage_reconcile_contracts._FailedNativeDictTraversal)
+
+
+def test_a_lone_text_subclass_key_in_a_mapping_is_emitted_as_plain_text() -> None:
+    result = usage_reconcile_contracts._native_snapshot({_SameTextKey("event_id"): "event-1"})
+    assert result == {"event_id": "event-1"} and all(type(key) is str for key in result)

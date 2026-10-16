@@ -2635,3 +2635,44 @@ def test_siblings_exposed_by_one_view_are_all_captured_before_the_first_is_rebui
     result = _rebuilt({"pair": (Pair(), Spy())})
     assert result["pair"][0] == ({"n": 1}, {"n": 2})
     assert seen == ["ran"]
+
+
+# ---- text-subclass keys are reduced to plain text and a repeated text is refused
+
+class _KeyWithOwnHooks(str):
+    def __hash__(self) -> int:
+        return id(self)
+
+    def __eq__(self, other: object) -> bool:
+        return self is other
+
+    def __ne__(self, other: object) -> bool:
+        return self is not other
+
+
+def test_a_second_key_with_the_same_text_in_a_native_dict_is_refused() -> None:
+    with pytest.raises(ValueError, match="unique text"):
+        _rebuilt({"item": {"manifest_id": "primary", _KeyWithOwnHooks("manifest_id"): "other"}})
+
+
+def test_a_dict_view_with_a_repeated_text_is_refused() -> None:
+    class View(dict):
+        def items(self):
+            yield ("manifest_id", "primary")
+            yield (_KeyWithOwnHooks("manifest_id"), "other")
+
+    with pytest.raises(ValueError, match="unique text"):
+        _rebuilt({"item": View()})
+
+
+def test_a_lone_text_subclass_key_is_emitted_as_plain_text() -> None:
+    rebuilt = _rebuilt({"item": {_KeyWithOwnHooks("manifest_id"): "primary"}})
+    assert all(type(key) is str for key in rebuilt["item"]) and rebuilt["item"] == {"manifest_id": "primary"}
+
+
+def test_native_extras_sharing_a_stored_text_are_refused_whatever_the_key_type() -> None:
+    candidate, _child, invoke = _tenancy_nested_boundary_case("placement")
+    extras = {_KeyWithOwnHooks("tenant_id"): "tenant-b"}
+    object.__setattr__(candidate, "__pydantic_extra__", extras)
+    with pytest.raises(ValueError, match="undeclared fields"):
+        invoke(candidate)

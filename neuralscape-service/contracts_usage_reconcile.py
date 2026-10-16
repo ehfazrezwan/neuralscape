@@ -652,6 +652,7 @@ def _snapshot_uncached(
                 except Exception as exc:
                     return _FailedNativeDictTraversal(exc)
                 projected: dict[object, object] = {}
+                subclass_keys: set[object] = set()  # texts that arrived as a text subclass
                 while True:
                     try:
                         pair = next(source_iterator)
@@ -672,11 +673,18 @@ def _snapshot_uncached(
                         _memo=_memo,
                     )
                     try:
-                        projected[key] = projected_value
+                        # A text-subclass key is reduced to its text; a repeated text is ambiguous input.
+                        plain = _plain_name(key)
+                        if plain in projected and (type(key) is not str or plain in subclass_keys):
+                            raise ValueError("contract input field names must be unique text")
+                        if type(key) is not str:
+                            subclass_keys.add(plain)
+                        projected[plain] = projected_value
                     except Exception as exc:
                         return _FailedNativeDictTraversal(exc)
                 return projected
             projected = {}
+            subclass_keys = set()
             for key, field_value in source_items:
                 projected_value = _native_snapshot(
                     field_value,
@@ -687,7 +695,12 @@ def _snapshot_uncached(
                     _memo=_memo,
                 )
                 try:
-                    projected[key] = projected_value
+                    plain = _plain_name(key)
+                    if plain in projected and (type(key) is not str or plain in subclass_keys):
+                        raise ValueError("contract input field names must be unique text")
+                    if type(key) is not str:
+                        subclass_keys.add(plain)
+                    projected[plain] = projected_value
                 except Exception as exc:
                     return _FailedNativeDictTraversal(exc)
             del validated_entries
