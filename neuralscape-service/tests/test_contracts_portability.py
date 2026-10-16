@@ -8,6 +8,7 @@ from collections.abc import ItemsView, Iterator, Mapping
 from copy import deepcopy
 from pathlib import PureWindowsPath
 from types import MappingProxyType
+from typing import Any
 
 import pytest
 from pydantic import BaseModel, Field, ValidationError
@@ -23,6 +24,7 @@ from contracts_portability import (
     _validated_model_discovery_snapshot,
     _validated_model_storage,
     _validated_native_container_items,
+    normalize_bundle_path,
     validate_portable_manifest,
 )
 
@@ -2242,6 +2244,60 @@ def test_model_discovery_queues_only_declared_exact_string_values() -> None:
     assert all(item is not future_semantics for item in queued)
 
 
+def _hostile_field_mapping_manifest() -> tuple[PortableManifest, list[str]]:
+    """A manifest whose class ``model_fields`` mutates its own state on use."""
+
+    class HostileFields(dict):
+        target: Any = None
+        calls: list[str]
+
+        def _strike(self, hook: str) -> None:
+            self.calls.append(hook)
+            if self.target is not None:
+                self.target.clear()
+
+        def __contains__(self, name: object) -> bool:
+            self._strike("contains")
+            return dict.__contains__(self, name)
+
+        def __iter__(self) -> Iterator[str]:
+            self._strike("iter")
+            return dict.__iter__(self)
+
+        def keys(self):  # type: ignore[override]
+            self._strike("keys")
+            return dict.keys(self)
+
+        def __getitem__(self, name: str) -> Any:
+            self._strike("getitem")
+            return dict.__getitem__(self, name)
+
+    class HostileManifest(PortableManifest):
+        pass
+
+    manifest = HostileManifest.model_validate(valid_manifest())
+    hostile = HostileFields(PortableManifest.model_fields)
+    hostile.calls = []
+    hostile.target = manifest.canonical_ids
+    type.__setattr__(HostileManifest, "model_fields", hostile)
+    return manifest, hostile.calls
+
+
+def test_hostile_model_fields_cannot_enable_silent_subset_acceptance() -> None:
+    manifest, calls = _hostile_field_mapping_manifest()
+    assert len(manifest.canonical_ids) == 3
+
+    try:
+        accepted = validate_portable_manifest(manifest)
+    except ValidationError:
+        accepted = None
+
+    # Fail-closed: reject, or accept the complete original state; never the
+    # sanitized subset produced by a callback-bearing field mapping.
+    assert accepted is None or len(accepted.canonical_ids) == 3
+    assert calls == []
+
+
 @pytest.mark.parametrize("inventory_kind", ["discovery", "validated"])
 def test_model_inventories_require_exact_owner_identity(
     inventory_kind: str,
@@ -3077,3 +3133,14 @@ def test_unknown_fields_and_missing_schema_version_are_rejected() -> None:
     del unversioned["schema_version"]
     with pytest.raises(ValidationError, match="schema_version"):
         validate_portable_manifest(unversioned)
+
+
+def test_public_path_normalizer_matches_manifest_contract() -> None:
+    assert normalize_bundle_path("a/./b//c.txt") == "a/b/c.txt"
+    for bad in ("../x", "/abs", "a\\b", "CON", ""):
+        with pytest.raises(ValueError):
+            normalize_bundle_path(bad)
+        manifest = valid_manifest()
+        manifest["files"][0]["path"] = bad
+        with pytest.raises(ValidationError):
+            validate_portable_manifest(manifest)

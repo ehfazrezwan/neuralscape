@@ -34,7 +34,7 @@ from pydantic import ValidationError
 
 from contracts_portability import (
     PortableManifest,
-    _normalized_bundle_path,
+    normalize_bundle_path,
     validate_portable_manifest,
 )
 
@@ -157,7 +157,7 @@ def _safe_label(value: str) -> str:
 def _classify_name(raw: str, report: VerificationReport) -> str | None:
     try:
         raw.encode("utf-8")
-        return _normalized_bundle_path(raw)
+        return normalize_bundle_path(raw)
     except (ValueError, UnicodeEncodeError):
         report.add(PATH_UNSAFE, _safe_label(raw))
         return None

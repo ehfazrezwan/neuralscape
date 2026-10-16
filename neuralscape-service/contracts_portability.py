@@ -122,13 +122,47 @@ def _snapshot_model_extra_storage(value: BaseModel) -> _ModelExtraSnapshot:
     return False, extra
 
 
+_TYPE_MRO_DESCRIPTOR = type.__dict__["__mro__"]
+_TYPE_DICT_DESCRIPTOR = type.__dict__["__dict__"]
+
+
+def _native_declared_field_names(
+    model_type: type[BaseModel],
+) -> tuple[str, ...] | None:
+    """Return ordered declared field names from raw class storage, or ``None``.
+
+    ``model_fields`` is an ordinary class attribute that a subclass can replace
+    with a mapping whose membership or iteration protocols run user code.  The
+    names are instead read from the class ``__dict__`` entry Pydantic itself
+    creates, and only when that entry is a real ``dict`` whose keys are read
+    with ``dict.keys``.  Anything else returns ``None`` so callers stay
+    conservative rather than trusting a callback-bearing mapping.
+    """
+
+    for klass in _TYPE_MRO_DESCRIPTOR.__get__(model_type):
+        raw = _TYPE_DICT_DESCRIPTOR.__get__(klass)
+        if "__pydantic_fields__" not in raw:
+            continue
+        fields = raw["__pydantic_fields__"]
+        if not issubclass(type(fields), dict):
+            return None
+        names = tuple(dict.keys(fields))
+        if any(type(name) is not str for name in names):
+            return None
+        return names
+    return None
+
+
 def _model_discovery_values(
     model_type: type[BaseModel],
     stored_entries: _ModelStorageEntries,
 ) -> tuple[Any, ...]:
     """Select stored values needing callback-free graph discovery."""
 
-    declared_names = model_type.model_fields
+    declared = _native_declared_field_names(model_type)
+    if declared is None:
+        return tuple(item for _, item in reversed(stored_entries))
+    declared_names = frozenset(declared)
     return tuple(
         item
         for name, item in reversed(stored_entries)
@@ -273,7 +307,9 @@ def _reject_retained_unknown_fields(
             discover(value)
 
         if isinstance(value, BaseModel):
-            declared = type(value).model_fields
+            declared = _native_declared_field_names(type(value))
+            if declared is None:
+                raise ValueError("contract model field storage is unavailable")
             stored_entries, fields_set_storage, extra_snapshot = (
                 _validated_model_discovery_snapshot(
                     value, discovery_inventory
@@ -464,6 +500,15 @@ def _normalized_bundle_path(value: str) -> str:
             "bundle path must not contain a Windows reserved device name"
         )
     return normalized
+
+
+def normalize_bundle_path(value: str) -> str:
+    """Public canonical relative POSIX bundle-path normalizer.
+
+    Raises ``ValueError`` for any path the manifest contract would reject.
+    """
+
+    return _normalized_bundle_path(value)
 
 
 class CanonicalObjectId(ContractModel):
@@ -704,5 +749,6 @@ __all__ = [
     "PositionReference",
     "ProducerReference",
     "SnapshotMetadata",
+    "normalize_bundle_path",
     "validate_portable_manifest",
 ]
