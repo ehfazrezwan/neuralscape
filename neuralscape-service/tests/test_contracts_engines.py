@@ -1458,6 +1458,7 @@ def test_requirement_validation_builds_one_index_from_one_manifest_snapshot(
         frozen_models,
         frozen_containers,
         discovered,
+        budget,
     ):
         if expected_type is CapabilityManifest:
             counts["manifest_snapshots"] += 1
@@ -1468,6 +1469,7 @@ def test_requirement_validation_builds_one_index_from_one_manifest_snapshot(
             frozen_models=frozen_models,
             frozen_containers=frozen_containers,
             discovered=discovered,
+            budget=budget,
         )
 
     def counted_lookup(value):
@@ -1487,3 +1489,242 @@ def test_requirement_validation_builds_one_index_from_one_manifest_snapshot(
         ("delete", "supported")
     ]
     assert counts == {"manifest_snapshots": 1, "operation_indexes": 1}
+
+
+# ---- bounded native discovery -------------------------------------------------
+
+BUDGET_MESSAGE = "contract graph exceeds the native discovery budget"
+
+
+class CountingHiddenTuple(tuple):
+    """Empty public view over a large native backing; counts public reads."""
+
+    iterations = 0
+
+    def __iter__(self):
+        type(self).iterations += 1
+        return iter(())
+
+
+class CountingHiddenDict(dict):
+    """Empty public view over a large native backing; counts public reads."""
+
+    item_calls = 0
+
+    def items(self):
+        type(self).item_calls += 1
+        return {}.items()
+
+    def __iter__(self):
+        type(self).item_calls += 1
+        return iter(())
+
+
+def _recording_budgets(monkeypatch, *, max_nodes=None, max_edges=None, max_depth=None):
+    """Record every budget the engines boundary creates; optionally shrink the tier."""
+
+    import contracts_limits
+
+    created = []
+
+    def factory():
+        tier = contracts_limits.STANDARD
+        if max_nodes is not None or max_edges is not None or max_depth is not None:
+            tier = contracts_limits.DiscoveryTier(
+                "test",
+                max_nodes if max_nodes is not None else tier.max_nodes,
+                max_edges if max_edges is not None else tier.max_edges,
+                max_depth if max_depth is not None else tier.max_depth,
+            )
+        budget = contracts_limits.DiscoveryBudget(tier)
+        created.append(budget)
+        return budget
+
+    monkeypatch.setattr(contracts_engines, "DiscoveryBudget", factory)
+    return created
+
+
+def _outcome(call):
+    try:
+        call()
+    except Exception as error:  # noqa: BLE001 - the message is the oracle
+        return type(error).__name__, str(error)
+    return "ok", ""
+
+
+def _manifest_with_versions(versions):
+    return CapabilityManifest.model_construct(
+        schema_version=VERSION,
+        implementation_id="engine-a",
+        implementation_version="1.2.3",
+        adapter_kind=EngineAdapterKind.MEMORY_ENGINE,
+        contract_schema_versions=versions,
+        operations=(),
+    )
+
+
+def _nested_tuple(depth):
+    value = ()
+    for _ in range(depth):
+        value = (value,)
+    return value
+
+
+def test_exact_graph_past_the_depth_limit_is_not_fully_inventoried(monkeypatch):
+    inventories = []
+    original = contracts_engines._validated_contract_snapshot_from_frozen
+
+    def spy(value, expected_type, **kwargs):
+        inventories.append(len(kwargs["discovered"]))
+        return original(value, expected_type, **kwargs)
+
+    monkeypatch.setattr(contracts_engines, "_validated_contract_snapshot_from_frozen", spy)
+    declared = _manifest_with_versions(_nested_tuple(280))
+
+    with pytest.raises(ValueError, match="nesting exceeds the limit"):
+        validate_capability_requirements(declared, ())
+
+    # The established depth error (not the budget error) is still reported, but
+    # discovery stopped at the depth frontier instead of walking all 280 levels.
+    assert inventories and inventories[0] <= 260
+
+
+def test_shallow_subclass_view_hiding_a_huge_native_graph_is_rejected_before_callbacks():
+    CountingHiddenTuple.iterations = 0
+    hidden = CountingHiddenTuple([[] for _ in range(20_000)])
+    declared = _manifest_with_versions(hidden)
+
+    with pytest.raises(ValueError) as raised:
+        validate_capability_requirements(declared, ())
+
+    assert str(raised.value) == BUDGET_MESSAGE
+    assert CountingHiddenTuple.iterations == 0
+
+
+def test_dict_subclass_view_hiding_a_huge_native_graph_gets_zero_public_reads():
+    CountingHiddenDict.item_calls = 0
+    hidden = CountingHiddenDict({index: [] for index in range(20_000)})
+    declared = _manifest_with_versions((hidden,))
+
+    with pytest.raises(ValueError) as raised:
+        validate_capability_requirements(declared, ())
+
+    assert str(raised.value) == BUDGET_MESSAGE
+    assert CountingHiddenDict.item_calls == 0
+
+
+def test_hidden_backing_deeper_than_the_depth_limit_is_a_budget_failure():
+    CountingHiddenTuple.iterations = 0
+    declared = _manifest_with_versions(CountingHiddenTuple([_nested_tuple(300)]))
+
+    with pytest.raises(ValueError) as raised:
+        validate_capability_requirements(declared, ())
+
+    assert str(raised.value) == BUDGET_MESSAGE
+    assert CountingHiddenTuple.iterations == 0
+
+
+def test_wide_native_container_is_rejected_by_edge_count_without_copying_it():
+    CountingHiddenTuple.iterations = 0
+    declared = _manifest_with_versions(CountingHiddenTuple(["v"] * 140_000))
+
+    with pytest.raises(ValueError) as raised:
+        validate_capability_requirements(declared, ())
+
+    assert str(raised.value) == BUDGET_MESSAGE
+    assert CountingHiddenTuple.iterations == 0
+
+
+@pytest.mark.parametrize("axis", ["nodes", "edges"])
+def test_limit_minus_one_limit_and_limit_plus_one(monkeypatch, axis):
+    def build():
+        if axis == "nodes":
+            return _manifest_with_versions(tuple([] for _ in range(50)))
+        return _manifest_with_versions(tuple(f"v{index}" for index in range(50)))
+
+    created = _recording_budgets(monkeypatch, max_nodes=10**6, max_edges=10**6)
+    _outcome(lambda: validate_capability_requirements(build(), ()))
+    cost = created[0].nodes if axis == "nodes" else created[0].edges
+    assert cost > 40
+
+    def run(limit):
+        _recording_budgets(
+            monkeypatch,
+            **{"max_nodes" if axis == "nodes" else "max_edges": limit},
+        )
+        return _outcome(lambda: validate_capability_requirements(build(), ()))
+
+    assert run(cost - 1) == ("ValueError", BUDGET_MESSAGE)
+    assert run(cost)[1] != BUDGET_MESSAGE  # at the limit: not a budget failure
+    assert run(cost + 1)[1] != BUDGET_MESSAGE
+
+
+def test_one_envelope_is_shared_by_manifest_and_requirements(monkeypatch):
+    declared = manifest(state())
+    many = tuple(requirement() for _ in range(40))
+
+    created = _recording_budgets(monkeypatch, max_nodes=10**6, max_edges=10**6)
+    validate_capability_requirements(declared, ())
+    manifest_alone = created[-1].edges
+    validate_capability_requirements(declared, many)
+    combined = created[-1].edges
+    assert combined > manifest_alone + 40
+
+    # A limit between the two: the manifest alone fits, the pair does not.
+    limit = combined - 1
+    assert manifest_alone <= limit
+    _recording_budgets(monkeypatch, max_edges=limit)
+    assert validate_capability_requirements(declared, ()) == ()
+    with pytest.raises(ValueError) as raised:
+        validate_capability_requirements(declared, many)
+    assert str(raised.value) == BUDGET_MESSAGE
+
+
+def test_budget_takes_precedence_over_a_nested_defect_in_an_oversized_graph():
+    bad = CapabilityOperationState.model_construct(
+        operation=None,
+        supported=True,
+        configured=True,
+        health=CapabilityHealth.HEALTHY,
+        qualification=None,
+    )
+    declared = _manifest_with_versions(tuple([] for _ in range(20_000)))
+    declared = declared.model_copy(update={"operations": (bad,)})
+
+    with pytest.raises(ValueError) as raised:
+        validate_capability_requirements(declared, ())
+
+    assert str(raised.value) == BUDGET_MESSAGE
+
+
+def test_within_budget_graphs_keep_their_established_diagnostics():
+    bad = CapabilityOperationState.model_construct(
+        operation=None,
+        supported=True,
+        configured=True,
+        health=CapabilityHealth.HEALTHY,
+        qualification=None,
+    )
+    declared = manifest(state()).model_copy(update={"operations": (bad,)})
+
+    with pytest.raises(ValidationError):
+        validate_capability_requirements(declared, ())
+
+
+def test_wrong_manifest_type_is_reported_before_the_budget():
+    with pytest.raises(TypeError):
+        validate_capability_requirements(object(), ())  # type: ignore[arg-type]
+
+
+def test_within_budget_public_view_is_still_read_exactly_once():
+    values = ObservableTuple((requirement(),))
+    validate_capability_requirements(manifest(state()), values)
+    assert values.calls == 1
+
+
+def test_discovery_error_is_value_free():
+    secret = "SECRET-IDENTIFIER-12345"
+    hidden = CountingHiddenTuple([[secret] for _ in range(20_000)])
+    with pytest.raises(ValueError) as raised:
+        validate_capability_requirements(_manifest_with_versions(hidden), ())
+    assert secret not in str(raised.value) and "20000" not in str(raised.value)

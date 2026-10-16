@@ -13,6 +13,7 @@ from typing import Any, NamedTuple, TypeVar
 from pydantic import BaseModel, TypeAdapter, model_validator
 
 from contracts_common import ContractModel, OpaqueId, VersionedContract
+from contracts_limits import DiscoveryBudget
 from contracts_references import ReferenceHandle
 
 
@@ -62,97 +63,154 @@ def _native_set_members(value: set[Any] | frozenset[Any]) -> tuple[Any, ...]:
     return tuple(frozenset.__iter__(value))
 
 
+def _native_len(value: Any) -> int:
+    """Length of a concrete native container without subclass hooks."""
+
+    value_type = type(value)
+    if issubclass(value_type, dict):
+        return dict.__len__(value)
+    if issubclass(value_type, list):
+        return list.__len__(value)
+    if issubclass(value_type, tuple):
+        return tuple.__len__(value)
+    if issubclass(value_type, set):
+        return set.__len__(value)
+    return frozenset.__len__(value)
+
+
 def _freeze_native_model_graph(
     value: Any,
     frozen_models: dict[int, _FrozenModelState],
     frozen_containers: dict[int, _FrozenContainerState],
     discovered: dict[int, Any],
+    budget: DiscoveryBudget,
+    depth: int = 0,
 ) -> None:
-    """Freeze models reachable through native container edges without callbacks."""
+    """Freeze models reachable through native container edges without callbacks.
 
-    pending = [value]
+    One ``budget`` is shared by every root of a validation call.  Nodes are
+    charged once by identity and every captured entry is charged as an edge
+    *before* it is copied, so an oversized graph is rejected with the stable
+    budget error before any public callback runs and without materializing it.
+    The depth frontier carries ``(object, depth, authoritative)``: model fields
+    and exact built-in containers are authoritative; native backing behind a
+    container subclass is hidden and clears the flag.  An authoritative node at
+    the snapshot depth limit is captured but its children are not enqueued, so
+    the ordered snapshot still reports the established nesting error.
+    """
+
+    pending: list[tuple[Any, int, bool]] = [(value, depth, True)]
     while pending:
-        current = pending.pop()
+        current, depth, authoritative = pending.pop()
         current_type = type(current)
         if not issubclass(current_type, (BaseModel, dict, list, tuple)):
             continue
         identity = id(current)
-        if identity in discovered and discovered[identity] is current:
+        if not budget.visit(current, depth, authoritative):
             continue
         discovered[identity] = current
+        enqueue = not (authoritative and depth >= _MAX_SNAPSHOT_DEPTH)
+        children: tuple[Any, ...] = ()
+        children_authoritative = authoritative
 
         if issubclass(current_type, BaseModel):
             frozen = frozen_models.get(identity)
-            if frozen is not None and frozen.owner is current:
-                continue
-
-            storage = _model_storage(_MODEL_DICT_DESCRIPTOR, current)
-            fields_set_value = _model_storage(
-                _MODEL_FIELDS_SET_DESCRIPTOR,
-                current,
-            )
-            extras_value = _model_storage(_MODEL_EXTRAS_DESCRIPTOR, current)
-            storage_is_dict = issubclass(type(storage), dict)
-            fields_set_is_set = issubclass(
-                type(fields_set_value),
-                (set, frozenset),
-            )
-            stored_items = (
-                tuple(dict.items(storage)) if storage_is_dict else ()
-            )
-            fields_set_members = (
-                _native_set_members(fields_set_value) if fields_set_is_set else ()
-            )
-            if extras_value is _MISSING_MODEL_STORAGE:
-                extras_state = "missing"
-                extra_items: tuple[tuple[Any, Any], ...] = ()
-            elif extras_value is None:
-                extras_state = "none"
-                extra_items = ()
-            elif type(extras_value) is dict:
-                extras_state = "dict"
-                extra_items = tuple(dict.items(extras_value))
+            if frozen is None or frozen.owner is not current:
+                storage = _model_storage(_MODEL_DICT_DESCRIPTOR, current)
+                fields_set_value = _model_storage(
+                    _MODEL_FIELDS_SET_DESCRIPTOR,
+                    current,
+                )
+                extras_value = _model_storage(_MODEL_EXTRAS_DESCRIPTOR, current)
+                storage_is_dict = issubclass(type(storage), dict)
+                fields_set_is_set = issubclass(
+                    type(fields_set_value),
+                    (set, frozenset),
+                )
+                extras_are_dict = type(extras_value) is dict
+                budget.charge_edge(
+                    (_native_len(storage) if storage_is_dict else 0)
+                    + (_native_len(fields_set_value) if fields_set_is_set else 0)
+                    + (_native_len(extras_value) if extras_are_dict else 0)
+                )
+                stored_items = (
+                    tuple(dict.items(storage)) if storage_is_dict else ()
+                )
+                fields_set_members = (
+                    _native_set_members(fields_set_value)
+                    if fields_set_is_set
+                    else ()
+                )
+                if extras_value is _MISSING_MODEL_STORAGE:
+                    extras_state = "missing"
+                    extra_items: tuple[tuple[Any, Any], ...] = ()
+                elif extras_value is None:
+                    extras_state = "none"
+                    extra_items = ()
+                elif extras_are_dict:
+                    extras_state = "dict"
+                    extra_items = tuple(dict.items(extras_value))
+                else:
+                    extras_state = "malformed"
+                    extra_items = ()
+                frozen = _FrozenModelState(
+                    owner=current,
+                    storage_is_dict=storage_is_dict,
+                    stored_items=stored_items,
+                    fields_set_is_set=fields_set_is_set,
+                    fields_set_members=fields_set_members,
+                    extras_state=extras_state,
+                    extra_items=extra_items,
+                )
+                frozen_models[identity] = frozen
             else:
-                extras_state = "malformed"
-                extra_items = ()
-            frozen = _FrozenModelState(
-                owner=current,
-                storage_is_dict=storage_is_dict,
-                stored_items=stored_items,
-                fields_set_is_set=fields_set_is_set,
-                fields_set_members=fields_set_members,
-                extras_state=extras_state,
-                extra_items=extra_items,
-            )
-            frozen_models[identity] = frozen
-            pending.extend(item for _, item in stored_items)
-        elif issubclass(current_type, dict):
-            native_items = tuple(dict.items(current))
-            if type(current) is dict:
-                frozen_containers[identity] = _FrozenContainerState(
-                    owner=current,
-                    kind="dict",
-                    entries=native_items,
+                # Re-expansion through a shallower authoritative path: the
+                # captured edges are charged again, nothing is re-read.
+                budget.charge_edge(
+                    len(frozen.stored_items)
+                    + len(frozen.fields_set_members)
+                    + len(frozen.extra_items)
                 )
-            pending.extend(item for _, item in native_items)
-        elif issubclass(current_type, list):
-            native_items = tuple(list.__iter__(current))
-            if type(current) is list:
-                frozen_containers[identity] = _FrozenContainerState(
-                    owner=current,
-                    kind="list",
-                    entries=native_items,
-                )
-            pending.extend(native_items)
+            children = tuple(item for _, item in frozen.stored_items)
         else:
-            native_items = tuple(tuple.__iter__(current))
-            if type(current) is tuple:
+            if issubclass(current_type, dict):
+                kind, exact = "dict", current_type is dict
+                state = frozen_containers.get(identity)
+                if state is None or state.owner is not current:
+                    budget.charge_edge(_native_len(current))
+                    entries: tuple[Any, ...] = tuple(dict.items(current))
+                else:
+                    budget.charge_edge(len(state.entries))
+                    entries = state.entries
+                children = tuple(item for _, item in entries)
+            else:
+                if issubclass(current_type, list):
+                    kind, exact = "list", current_type is list
+                    reader = list.__iter__
+                else:
+                    kind, exact = "tuple", current_type is tuple
+                    reader = tuple.__iter__
+                state = frozen_containers.get(identity)
+                if state is None or state.owner is not current:
+                    budget.charge_edge(_native_len(current))
+                    entries = tuple(reader(current))
+                else:
+                    budget.charge_edge(len(state.entries))
+                    entries = state.entries
+                children = entries
+            if exact:
                 frozen_containers[identity] = _FrozenContainerState(
                     owner=current,
-                    kind="tuple",
-                    entries=native_items,
+                    kind=kind,
+                    entries=entries,
                 )
-            pending.extend(native_items)
+            else:
+                # Native backing behind a subclass is hidden: it is accounted
+                # for but never authoritative.
+                children_authoritative = False
+
+        if enqueue:
+            pending.extend((child, depth + 1, children_authoritative) for child in children)
 
 
 def _normalize_field_names(
@@ -208,6 +266,7 @@ def _snapshot_native_value(
     frozen_models: dict[int, _FrozenModelState],
     frozen_containers: dict[int, _FrozenContainerState],
     discovered: dict[int, Any],
+    budget: DiscoveryBudget,
     depth: int,
     location: str,
 ) -> Any:
@@ -220,11 +279,15 @@ def _snapshot_native_value(
     is_container = issubclass(value_type, (BaseModel, dict, list, tuple))
     identity = id(value)
     if is_container:
+        # A child first exposed through a public view is captured now; it is
+        # charged to the same envelope as the entry discovery.
         _freeze_native_model_graph(
             value,
             frozen_models,
             frozen_containers,
             discovered,
+            budget,
+            depth,
         )
         if identity in active:
             raise ValueError(f"cyclic contract graph at {location}")
@@ -283,6 +346,7 @@ def _snapshot_native_value(
                     frozen_models=frozen_models,
                     frozen_containers=frozen_containers,
                     discovered=discovered,
+                    budget=budget,
                     depth=depth + 1,
                     location=f"{location}.{name}",
                 )
@@ -304,6 +368,7 @@ def _snapshot_native_value(
                     frozen_models=frozen_models,
                     frozen_containers=frozen_containers,
                     discovered=discovered,
+                    budget=budget,
                     depth=depth + 1,
                     location=f"{location}[key]",
                 )
@@ -325,6 +390,7 @@ def _snapshot_native_value(
                     frozen_models=frozen_models,
                     frozen_containers=frozen_containers,
                     discovered=discovered,
+                    budget=budget,
                     depth=depth + 1,
                     location=f"{location}[{index}]",
                 )
@@ -346,6 +412,7 @@ def _snapshot_native_value(
                     frozen_models=frozen_models,
                     frozen_containers=frozen_containers,
                     discovered=discovered,
+                    budget=budget,
                     depth=depth + 1,
                     location=f"{location}[{index}]",
                 )
@@ -370,11 +437,13 @@ def _validated_contract_snapshot(
     frozen_models: dict[int, _FrozenModelState] = {}
     frozen_containers: dict[int, _FrozenContainerState] = {}
     discovered: dict[int, Any] = {}
+    budget = DiscoveryBudget()
     _freeze_native_model_graph(
         value,
         frozen_models,
         frozen_containers,
         discovered,
+        budget,
     )
     return _validated_contract_snapshot_from_frozen(
         value,
@@ -383,6 +452,7 @@ def _validated_contract_snapshot(
         frozen_models=frozen_models,
         frozen_containers=frozen_containers,
         discovered=discovered,
+        budget=budget,
     )
 
 
@@ -394,6 +464,7 @@ def _validated_contract_snapshot_from_frozen(
     frozen_models: dict[int, _FrozenModelState],
     frozen_containers: dict[int, _FrozenContainerState],
     discovered: dict[int, Any],
+    budget: DiscoveryBudget,
 ) -> _ContractT:
     """Validate using entry state already frozen for the enclosing boundary."""
 
@@ -406,6 +477,7 @@ def _validated_contract_snapshot_from_frozen(
             frozen_models=frozen_models,
             frozen_containers=frozen_containers,
             discovered=discovered,
+            budget=budget,
             depth=0,
             location=label,
         )
@@ -427,11 +499,13 @@ def _validated_contract_tuple(
     frozen_models: dict[int, _FrozenModelState] = {}
     frozen_containers: dict[int, _FrozenContainerState] = {}
     discovered: dict[int, Any] = {}
+    budget = DiscoveryBudget()
     _freeze_native_model_graph(
         values,
         frozen_models,
         frozen_containers,
         discovered,
+        budget,
     )
     return _validated_contract_tuple_from_frozen(
         values,
@@ -440,6 +514,7 @@ def _validated_contract_tuple(
         frozen_models=frozen_models,
         frozen_containers=frozen_containers,
         discovered=discovered,
+        budget=budget,
     )
 
 
@@ -451,6 +526,7 @@ def _validated_contract_tuple_from_frozen(
     frozen_models: dict[int, _FrozenModelState],
     frozen_containers: dict[int, _FrozenContainerState],
     discovered: dict[int, Any],
+    budget: DiscoveryBudget,
 ) -> tuple[_ContractT, ...]:
     """Validate a tuple using entry state frozen for the enclosing boundary."""
 
@@ -464,6 +540,7 @@ def _validated_contract_tuple_from_frozen(
             frozen_models=frozen_models,
             frozen_containers=frozen_containers,
             discovered=discovered,
+            budget=budget,
         )
         for index, value in enumerate(values)
     )
@@ -633,11 +710,13 @@ def validate_capability_requirements(
     frozen_models: dict[int, _FrozenModelState] = {}
     frozen_containers: dict[int, _FrozenContainerState] = {}
     discovered: dict[int, Any] = {}
+    budget = DiscoveryBudget()  # one envelope across manifest and requirements
     _freeze_native_model_graph(
         manifest,
         frozen_models,
         frozen_containers,
         discovered,
+        budget,
     )
     if requirements_is_tuple:
         _freeze_native_model_graph(
@@ -645,6 +724,7 @@ def validate_capability_requirements(
             frozen_models,
             frozen_containers,
             discovered,
+            budget,
         )
 
     manifest = _validated_contract_snapshot_from_frozen(
@@ -654,6 +734,7 @@ def validate_capability_requirements(
         frozen_models=frozen_models,
         frozen_containers=frozen_containers,
         discovered=discovered,
+        budget=budget,
     )
     requirements = _validated_contract_tuple_from_frozen(
         requirements,
@@ -662,6 +743,7 @@ def validate_capability_requirements(
         frozen_models=frozen_models,
         frozen_containers=frozen_containers,
         discovered=discovered,
+        budget=budget,
     )
     states_by_operation = _operation_state_lookup(manifest)
 
