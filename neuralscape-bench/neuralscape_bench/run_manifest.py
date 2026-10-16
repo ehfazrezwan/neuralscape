@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from types import MappingProxyType
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Annotated, Any, Literal, NamedTuple, Self
@@ -360,15 +361,45 @@ def _retain_public_mapping(value: Any, frozen_graph: _FrozenGraph) -> bool:
     return True
 
 
-def _is_instance(value: Any, types: type | tuple[type, ...]) -> bool:
-    """``isinstance`` that never reads ``value.__class__``.
+_TYPE_MRO = vars(type)["__mro__"]
+_MAPPING_BASES = (Mapping, dict, MappingProxyType)
 
-    ``isinstance`` (and every ABC or pydantic metaclass check) consults an object's
-    ``__class__``, which a hostile container subclass can turn into a callback that
-    runs before its contents are captured.  ``type(value)`` is not overridable.
+
+def _is_subclass(cls: type, types: type | tuple[type, ...]) -> bool:
+    """Whether ``cls`` inherits from one of ``types``, decided by identity on the native MRO.
+
+    ``issubclass`` against an ABC (``Mapping``) or pydantic's ABC-based metaclass
+    (``BaseModel``) runs ``ABCMeta.__subclasscheck__``: registry lookups that hash and
+    compare ``cls`` and honour ``__subclasshook__``, so a class with a hostile metaclass
+    ``__hash__``/``__eq__``/``__subclasscheck__`` could run code or be matched by
+    spoofing.  This reads the class's real MRO through the base ``type`` descriptor and
+    compares with ``is``.  ``Mapping`` also recognises ``dict`` and ``mappingproxy``
+    bases explicitly; a class only *registered* as a mapping is not treated as one.
     """
 
-    return issubclass(type(value), types)
+    wanted: list[type] = []
+    for candidate in types if type(types) is tuple else (types,):
+        if candidate is Mapping:
+            wanted.extend(_MAPPING_BASES)
+        else:
+            wanted.append(candidate)
+    for base in _TYPE_MRO.__get__(cls):
+        for candidate in wanted:
+            if base is candidate:
+                return True
+    return False
+
+
+def _is_instance(value: Any, types: type | tuple[type, ...]) -> bool:
+    """``isinstance`` that runs no caller-controlled code: no ``__class__``, no ABC registry.
+
+    ``isinstance`` consults ``value.__class__`` (a hostile container can make that a
+    callback that runs before its contents are captured), and ABC or pydantic metaclass
+    checks run ``__subclasscheck__`` machinery.  ``type(value)`` is not overridable and
+    :func:`_is_subclass` compares native MRO entries by identity.
+    """
+
+    return _is_subclass(type(value), types)
 
 
 def _is_exact_type(value_type: type, exact: tuple[type, ...]) -> bool:
@@ -413,7 +444,7 @@ def _retain_extra_mapping(
 
     if (
         value is None
-        or issubclass(type(value), dict)
+        or _is_subclass(type(value), dict)
         or not _is_instance(value, Mapping)
     ):
         return False
@@ -506,7 +537,7 @@ def _freeze_model_storage(
         current = pending.pop()
         _retain_public_mapping(current, frozen_graph)
         value_type = type(current)
-        is_native_container = issubclass(
+        is_native_container = _is_subclass(
             value_type, (BaseModel, tuple, list, dict)
         )
         if not is_native_container:
@@ -523,7 +554,7 @@ def _freeze_model_storage(
         frozen_graph.completed_traversals.pop(identity, None)
         frozen_graph.completed_mapping_discoveries.pop(identity, None)
 
-        if issubclass(value_type, BaseModel):
+        if _is_subclass(value_type, BaseModel):
             existing_model = frozen_graph.models.get(identity)
             if existing_model is not None and existing_model[0] is current:
                 continue
@@ -535,7 +566,7 @@ def _freeze_model_storage(
                 extras = None
             native_extra_entries = (
                 tuple(dict.items(extras))
-                if extras is not None and issubclass(type(extras), dict)
+                if extras is not None and _is_subclass(type(extras), dict)
                 else None
             )
             _retain_extra_mapping(extras, frozen_graph)
@@ -555,9 +586,9 @@ def _freeze_model_storage(
             ):
                 continue
 
-            if issubclass(value_type, tuple):
+            if _is_subclass(value_type, tuple):
                 entries = tuple(tuple.__iter__(current))
-            elif issubclass(value_type, list):
+            elif _is_subclass(value_type, list):
                 entries = tuple(list.__iter__(current))
             else:
                 dict_entries = tuple(dict.items(current))
@@ -594,14 +625,14 @@ def _retain_reachable_public_sequences(
             _retain_public_sequence(current, frozen_graph)
 
         value_type = type(current)
-        if not issubclass(value_type, (BaseModel, tuple, list, dict)):
+        if not _is_subclass(value_type, (BaseModel, tuple, list, dict)):
             continue
         frozen_replay = frozen_graph.replay_entries.get(identity)
         if frozen_replay is None or frozen_replay[0] is not current:
             _freeze_model_storage(current, frozen_graph, set())
             frozen_replay = frozen_graph.replay_entries[identity]
         _owner, entries = frozen_replay
-        local_authority = issubclass(
+        local_authority = _is_subclass(
             value_type, BaseModel
         ) or _is_exact_type(value_type, (dict, list, tuple))
         child_authority = authoritative and local_authority
@@ -621,7 +652,7 @@ def _traverse_model_storage(
 
     def visit(current: Any) -> None:
         value_type = type(current)
-        is_native_container = issubclass(
+        is_native_container = _is_subclass(
             value_type, (BaseModel, tuple, list, dict)
         )
         if not is_native_container:
@@ -652,7 +683,7 @@ def _protect_yielded_model_storage(
     """Capture and successfully traverse yielded supported storage once."""
 
     value_type = type(value)
-    if not issubclass(value_type, (BaseModel, tuple, list, dict)):
+    if not _is_subclass(value_type, (BaseModel, tuple, list, dict)):
         return False
 
     identity = id(value)
@@ -734,14 +765,14 @@ def _inventory_reachable_public_mappings(
             continue
 
         value_type = type(current)
-        if not issubclass(value_type, (BaseModel, tuple, list, dict)):
+        if not _is_subclass(value_type, (BaseModel, tuple, list, dict)):
             continue
         frozen_replay = frozen_graph.replay_entries.get(identity)
         if frozen_replay is None or frozen_replay[0] is not current:
             _freeze_model_storage(current, frozen_graph, set())
             frozen_replay = frozen_graph.replay_entries[identity]
         _owner, entries = frozen_replay
-        local_authority = issubclass(
+        local_authority = _is_subclass(
             value_type, BaseModel
         ) or _is_exact_type(value_type, (dict, list, tuple))
         child_authority = authoritative and local_authority

@@ -3712,7 +3712,7 @@ def test_receiving_boundaries_reject_lists_malformed_models_and_cycles():
         serialize_run_manifest(cyclic)
 
 
-class HybridMappingTuple(tuple[object, ...]):
+class HybridMappingTuple(tuple, Mapping):
     """A tuple that is also a Mapping, with a side effect in sequence iteration."""
 
     def __new__(cls, values: dict[str, object], action: Callable[[], None]):
@@ -3737,7 +3737,7 @@ class HybridMappingTuple(tuple[object, ...]):
         return iter(tuple(self.values.items()))
 
 
-class HybridMappingList(list[object]):
+class HybridMappingList(list, Mapping):
     """A list that is also a Mapping, with a side effect in sequence iteration."""
 
     def __init__(self, values: dict[str, object], action: Callable[[], None]):
@@ -3761,8 +3761,6 @@ class HybridMappingList(list[object]):
         return iter(tuple(self.values.items()))
 
 
-Mapping.register(HybridMappingTuple)
-Mapping.register(HybridMappingList)
 
 
 def _finish_with_measurement(measurement: object) -> RunManifest:
@@ -4137,3 +4135,125 @@ def test_a_class_callback_cannot_repair_invalid_evidence_before_capture() -> Non
         )
 
     assert repaired == []
+
+
+def _hooked_metaclass(base_meta, events: list[str]):
+    """A metaclass whose hash, equality and subclass-check hooks all record a call."""
+
+    class Meta(base_meta):
+        def __hash__(cls):
+            events.append("hash")
+            return id(cls)
+
+        def __eq__(cls, other):
+            events.append("eq")
+            return False
+
+        def __ne__(cls, other):
+            events.append("ne")
+            return True
+
+        def __subclasscheck__(cls, subclass):
+            events.append("subclasscheck")
+            return False
+
+        def __instancecheck__(cls, instance):
+            events.append("instancecheck")
+            return False
+
+    return Meta
+
+
+def _hostile_instances(events: list[str]) -> dict[str, object]:
+    from abc import ABCMeta
+
+    plain = _hooked_metaclass(type, events)
+    abstract = _hooked_metaclass(ABCMeta, events)
+    return {
+        "list": plain("HostileList", (list,), {})(),
+        "tuple": plain("HostileTuple", (tuple,), {})(),
+        "dict": plain("HostileDict", (dict,), {})(),
+        "object": plain("HostileObject", (), {})(),
+        "mapping-abc": abstract(
+            "HostileMapping",
+            (Mapping,),
+            {"__getitem__": lambda s, k: {}[k], "__iter__": lambda s: iter(()), "__len__": lambda s: 0},
+        )(),
+    }
+
+
+def test_type_checks_never_run_metaclass_hooks() -> None:
+    from pydantic import BaseModel
+
+    events: list[str] = []
+    values = _hostile_instances(events)
+    events.clear()  # building the classes is not under test
+
+    for value in values.values():
+        run_manifest_module._is_instance(value, (BaseModel, Mapping, tuple, list, dict))
+        run_manifest_module._is_instance(value, BaseModel)
+        run_manifest_module._is_instance(value, Mapping)
+        run_manifest_module._is_subclass(type(value), (BaseModel, Mapping, tuple, list, dict))
+
+    assert events == []
+
+
+def test_type_checks_decide_by_native_inheritance() -> None:
+    from types import MappingProxyType
+
+    from pydantic import BaseModel
+
+    is_instance = run_manifest_module._is_instance
+    assert is_instance({}, Mapping) and is_instance(MappingProxyType({}), Mapping)
+    assert is_instance(planned_manifest(), BaseModel)
+    assert is_instance((), tuple) and is_instance([], list) and is_instance((), (list, tuple))
+    assert not is_instance("text", Mapping) and not is_instance(5, (tuple, list)) and not is_instance(None, BaseModel)
+
+    class Custom(Mapping):
+        def __getitem__(self, key):
+            raise KeyError(key)
+
+        def __iter__(self):
+            return iter(())
+
+        def __len__(self):
+            return 0
+
+    assert is_instance(Custom(), Mapping)
+
+
+def test_a_class_only_registered_as_a_mapping_is_not_a_mapping() -> None:
+    iterated: list[str] = []
+
+    class RegisteredOnly:
+        def __getitem__(self, key):
+            iterated.append("getitem")
+            return 1
+
+        def __iter__(self):
+            iterated.append("iter")
+            return iter(())
+
+        def __len__(self):
+            return 0
+
+        def items(self):
+            iterated.append("items")
+            return ()
+
+    Mapping.register(RegisteredOnly)
+    value = RegisteredOnly()
+    assert isinstance(value, Mapping)  # the ABC machinery believes the registration
+    assert run_manifest_module._is_instance(value, Mapping) is False  # fail closed
+
+    planned = planned_manifest()
+    with pytest.raises((ValueError, TypeError, ValidationError)):
+        finish_run(
+            planned,
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(value,),
+            measurements=(timing(),),
+        )
+    assert iterated == []  # never iterated as if it were a mapping
