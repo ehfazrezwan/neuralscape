@@ -8,7 +8,7 @@ projection.  Callers must establish those runtime properties separately.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from collections.abc import Iterator
 from typing import Annotated, Any, Literal, TypeVar
@@ -24,7 +24,7 @@ from pydantic import (
 
 from contracts_bodies import MemoryBody, OpaqueEnvelopeBody, PlaintextBody
 from contracts_common import ContractModel, OpaqueId, SafeCounter, VersionedContract
-from contracts_limits import PORTABILITY, DiscoveryBudget, is_exact_type
+from contracts_limits import DISCOVERY_BUDGET_MESSAGE, PORTABILITY, DiscoveryBudget, is_exact_type
 from contracts_references import ReferenceHandle, SourceVersion
 
 
@@ -119,6 +119,33 @@ _CapturedGraphSnapshot = tuple[
 ]
 
 
+def _reserve_entries(budget: DiscoveryBudget, count: int) -> None:
+    """Refuse a native container before copying it when its entries cannot all be charged.
+
+    Every entry is charged one edge when it is captured, so a container with more entries than the
+    remaining allowance would only be rejected after its whole snapshot was built.  ``count`` comes
+    from the base type's own length, never from a caller hook.
+    """
+
+    if count > budget.tier.max_edges - budget.edges:
+        budget.charge_edge(count)  # raises the stable budget error and leaves the budget exhausted
+
+
+_UTC_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _utc_instant_before(earlier: datetime, later: datetime) -> bool:
+    """Whether ``later`` is an earlier instant than ``earlier``.
+
+    Aware datetimes that share one ``tzinfo`` compare by wall time, which ignores ``fold``: in a
+    repeated hour the second 01:15 sorts before the first 01:45 though it is 30 minutes later.
+    Subtracting a UTC epoch (a different ``tzinfo``) uses each value's own offset; the base-class
+    methods keep a datetime subclass from answering for itself.
+    """
+
+    return datetime.__sub__(later, _UTC_EPOCH) < datetime.__sub__(earlier, _UTC_EPOCH)
+
+
 def _cached_identity_capture(
     value: object,
     captured_by_identity: dict[Any, Any],
@@ -163,6 +190,7 @@ def _capture_native_contract_graph(
         try:
             if issubclass(value_type, BaseModel):
                 stored = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
+                _reserve_entries(budget, dict.__len__(stored))
                 stored_entries = tuple(dict.items(stored))
                 try:
                     extra = _BASE_MODEL_EXTRA_DESCRIPTOR.__get__(value, BaseModel)
@@ -174,6 +202,8 @@ def _capture_native_contract_graph(
                 else:
                     extra_type = type(extra)
                     malformed_extra = not issubclass(extra_type, dict)
+                    if not malformed_extra:
+                        _reserve_entries(budget, len(stored_entries) + dict.__len__(extra))
                     extra_entries = (
                         () if malformed_extra else tuple(dict.items(extra))
                     )
@@ -208,6 +238,7 @@ def _capture_native_contract_graph(
                     malformed_extra=malformed_extra,
                 )
             elif issubclass(value_type, dict):
+                _reserve_entries(budget, dict.__len__(value))
                 entries = tuple(dict.items(value))
                 captured = _CapturedDict(
                     identity=identity,
@@ -226,6 +257,7 @@ def _capture_native_contract_graph(
                     ),
                 )
             elif issubclass(value_type, list):
+                _reserve_entries(budget, list.__len__(value))
                 native_items = tuple(list.__iter__(value))
                 captured = _CapturedList(
                     identity=identity,
@@ -241,6 +273,7 @@ def _capture_native_contract_graph(
                     ),
                 )
             else:
+                _reserve_entries(budget, tuple.__len__(value))
                 native_items = tuple(tuple.__iter__(value))
                 captured = _CapturedTuple(
                     identity=identity,
@@ -780,7 +813,7 @@ class StageReceipt(VersionedContract):
                 )
         if self.started_at is not None and self.finished_at is not None:
             # the base comparison, so a datetime subclass cannot answer for the ordering
-            if datetime.__lt__(self.finished_at, self.started_at):
+            if _utc_instant_before(self.started_at, self.finished_at):
                 raise ValueError("finished_at cannot precede started_at")
         if self.status is StageStatus.FAILED:
             if self.error is None:
@@ -911,7 +944,15 @@ def _revalidated_claim_inputs(
         intent_capture_error = exc
 
     receipt_capture_errors: dict[int, Exception] = {}
-    for receipt in tuple.__iter__(receipts):
+    # The intent's error is raised first whatever the receipts hold, so after it nothing is captured.
+    # Each receipt reference is charged before it is filtered or deduplicated, and the inventory stops
+    # at exhaustion: receipts not inventoried are captured on demand, in order, so an earlier
+    # receipt's own error still comes first and later ones report the exhausted budget.
+    for receipt in () if intent_capture_error is not None else tuple.__iter__(receipts):
+        try:
+            budget.charge_edge()
+        except ValueError:
+            break
         if not issubclass(type(receipt), StageReceipt):
             continue
         identity = id(receipt)
@@ -925,6 +966,8 @@ def _revalidated_claim_inputs(
             )
         except Exception as exc:
             receipt_capture_errors[identity] = exc
+            if str(exc) == DISCOVERY_BUDGET_MESSAGE:
+                break
 
     if intent_capture_error is not None:
         raise intent_capture_error

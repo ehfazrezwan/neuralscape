@@ -497,3 +497,147 @@ def test_record_time_applies_the_same_identity_checks_as_the_claim():
         contracts_lifecycle.validate_stage_receipts(command, (wrong_effect,))
     with pytest.raises(TypeError):
         contracts_lifecycle.validate_stage_receipts(command, [wrong_effect])  # type: ignore[arg-type]
+
+
+# ---- a native container is sized against the remaining budget before it is copied
+def test_a_wide_native_container_is_refused_before_it_is_copied():
+    import tracemalloc
+
+    import contracts_limits
+
+    wide = {f"k{i}": i for i in range(400_000)}
+    tight = contracts_limits.DiscoveryTier("tight", 1_000, 1_000, 64)
+    budget = contracts_limits.DiscoveryBudget(tight)
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError, match=BUDGET):
+            contracts_lifecycle._capture_native_contract_graph(wide, budget=budget)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 1_000_000, peak  # a copy of its entries would be tens of megabytes
+    with pytest.raises(ValueError, match=BUDGET):
+        budget.charge_edge()  # and the budget stays exhausted
+
+
+@pytest.mark.parametrize("kind", ["list", "tuple", "model"])
+def test_wide_lists_tuples_and_model_storage_are_refused_before_they_are_copied(kind):
+    import tracemalloc
+
+    import contracts_limits
+
+    if kind == "model":
+        value = intent(ProcessingStage.CANONICAL)
+        set_native(value, "target_refs", None)
+        EXTRA.__set__(value, {f"x{i}": i for i in range(300_000)})
+    else:
+        value = list(range(400_000)) if kind == "list" else tuple(range(400_000))
+    budget = contracts_limits.DiscoveryBudget(contracts_limits.DiscoveryTier("tight", 1_000, 1_000, 64))
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError, match=BUDGET):
+            contracts_lifecycle._capture_native_contract_graph(value, budget=budget)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 1_000_000, peak
+
+
+def test_a_container_that_fits_the_remaining_budget_is_still_captured_whole():
+    import contracts_limits
+
+    budget = contracts_limits.DiscoveryBudget(contracts_limits.DiscoveryTier("tight", 1_000, 1_000, 64))
+    captured = contracts_lifecycle._capture_native_contract_graph(list(range(900)), budget=budget)
+    assert len(captured.items) == 900
+
+
+# ---- the receipt inventory is charged and stops at exhaustion
+def test_every_receipt_reference_is_charged_including_duplicates_and_non_receipts():
+    command = intent(ProcessingStage.CANONICAL)
+    pending = receipt(ProcessingStage.CANONICAL, StageStatus.PENDING)
+    flood = (pending,) * 400_000 + (object(),) * 400_000  # more references than the tier's edges
+    with pytest.raises(ValueError, match=BUDGET):
+        contracts_lifecycle.validate_stage_receipts(command, flood)
+
+
+def test_no_receipt_is_captured_once_the_intent_capture_failed(monkeypatch):
+    real = contracts_lifecycle._capture_native_contract_graph
+    receipts_captured = []
+
+    def counting(value, *args, **kwargs):
+        if isinstance(value, StageReceipt):
+            receipts_captured.append(value)
+        return real(value, *args, **kwargs)
+
+    monkeypatch.setattr(contracts_lifecycle, "_capture_native_contract_graph", counting)
+    flood = intent(ProcessingStage.CANONICAL).model_copy(update={"id": [list(range(200)) for _ in range(4_200)]})
+    many = tuple(receipt(ProcessingStage.CANONICAL, StageStatus.PENDING) for _ in range(50))
+    with pytest.raises(ValueError, match=BUDGET):
+        contracts_lifecycle.validate_stage_receipts(flood, many)
+    assert receipts_captured == []
+
+
+def test_inventory_stops_at_exhaustion_and_the_first_error_keeps_its_precedence(monkeypatch):
+    from tests.test_contracts_lifecycle import reference
+
+    real = contracts_lifecycle._capture_native_contract_graph
+    receipts_captured = []
+
+    def counting(value, *args, **kwargs):
+        if isinstance(value, StageReceipt):
+            receipts_captured.append(value)
+        return real(value, *args, **kwargs)
+
+    monkeypatch.setattr(contracts_lifecycle, "_capture_native_contract_graph", counting)
+    command = intent(ProcessingStage.CANONICAL)
+    invalid_first = receipt(ProcessingStage.CANONICAL, StageStatus.PENDING)
+    EXTRA.__set__(invalid_first, {Twin("note"): 1, "note": 2})  # refused while it is captured
+    huge = receipt(ProcessingStage.CANONICAL, StageStatus.SKIPPED,
+                   outputs=tuple(reference(f"o{i}") for i in range(140_000)))
+    later = tuple(receipt(ProcessingStage.CANONICAL, StageStatus.PENDING, attempt=n) for n in range(2, 40))
+    with pytest.raises(ValueError, match=BUDGET):  # one call, one envelope: the intent is revalidated first
+        contracts_lifecycle.validate_stage_receipts(command, (invalid_first, huge) + later)
+    assert len(receipts_captured) == 2  # nothing is captured after the budget ran out
+    receipts_captured.clear()
+    with pytest.raises(ValueError, match="colliding keys"):  # within the budget the earlier capture error wins
+        contracts_lifecycle.validate_stage_receipts(command, (invalid_first,) + later)
+
+
+# ---- receipt ordering compares instants, not wall times
+def test_finish_before_start_across_a_repeated_hour_is_refused_natively_and_on_the_wire():
+    from zoneinfo import ZoneInfo
+
+    new_york = ZoneInfo("America/New_York")
+    started = datetime(2025, 11, 2, 1, 15, fold=1, tzinfo=new_york)   # 06:15 UTC (second 01:15, EST)
+    finished = datetime(2025, 11, 2, 1, 45, fold=0, tzinfo=new_york)  # 05:45 UTC (first 01:45, EDT)
+    values = dict(
+        schema_version="candidate-v1", intent_id="intent-1", attempt=1, stage=ProcessingStage.CANONICAL,
+        effect_id="effect-canonical", status=StageStatus.SKIPPED, applied_sources=(), committed_sources=(),
+        output_refs=(), error=None, started_at=started, finished_at=finished,
+    )
+    with pytest.raises(ValueError, match="cannot precede"):
+        StageReceipt(**values)
+    wire = {**values, "stage": "canonical", "status": "skipped",
+            "started_at": started.isoformat(), "finished_at": finished.isoformat()}
+    import json
+
+    with pytest.raises(ValueError, match="cannot precede"):
+        StageReceipt.model_validate_json(json.dumps(wire))
+
+
+def test_the_ordered_pair_across_a_repeated_hour_is_accepted_natively_and_on_the_wire():
+    import json
+    from zoneinfo import ZoneInfo
+
+    new_york = ZoneInfo("America/New_York")
+    started = datetime(2025, 11, 2, 1, 45, fold=0, tzinfo=new_york)   # 05:45 UTC
+    finished = datetime(2025, 11, 2, 1, 15, fold=1, tzinfo=new_york)  # 06:15 UTC: later, though the wall time is earlier
+    values = dict(
+        schema_version="candidate-v1", intent_id="intent-1", attempt=1, stage=ProcessingStage.CANONICAL,
+        effect_id="effect-canonical", status=StageStatus.SKIPPED, applied_sources=(), committed_sources=(),
+        output_refs=(), error=None, started_at=started, finished_at=finished,
+    )
+    StageReceipt(**values)
+    wire = {**values, "stage": "canonical", "status": "skipped",
+            "started_at": started.isoformat(), "finished_at": finished.isoformat()}
+    StageReceipt.model_validate_json(json.dumps(wire))
