@@ -3905,3 +3905,43 @@ def test_ordinary_models_pay_for_their_fields_set_like_any_other_entry() -> None
     budget = DiscoveryBudget()
     _freeze_reachable_model_inventories(model, {}, set(), None, None, budget)
     assert budget.edges == 3 + 3  # three stored fields and three names in the fields set
+
+
+# ── the error for a shared invalid graph is bounded in size and in the time to render ──
+
+
+def _tuple_diamond(depth: int) -> object:
+    shared: object = ("leaf",)
+    for _ in range(depth):
+        shared = (shared, shared)
+    return shared
+
+
+def _dict_diamond(depth: int) -> object:
+    shared: object = {"leaf": 1}
+    for _ in range(depth):
+        shared = {"a": shared, "b": shared}
+    return shared
+
+
+@pytest.mark.parametrize("build,depth", [(_tuple_diamond, 22), (_dict_diamond, 19)])
+def test_the_error_for_a_shared_invalid_graph_renders_in_bounded_time_and_size(build, depth) -> None:
+    import time
+
+    resource_value = reference("memory-1")
+    with pytest.raises(ValidationError) as caught:
+        _evaluate_budget_statements(build(depth))
+    started = time.monotonic()
+    text = str(caught.value)
+    assert time.monotonic() - started < 1.0  # the base takes seconds at depth 22 and doubles per level
+    assert len(text) < 4096
+    assert "statements" in text  # the diagnostic still says where
+    assert caught.value.error_count() >= 1
+    with pytest.raises(ValidationError):  # policy and principal roots are bounded the same way
+        evaluate(principal(), "read", resource_value, _policy_with_public_only_statements(build(depth)))
+
+
+def test_diagnostics_for_ordinary_invalid_inputs_keep_their_input_echo() -> None:
+    with pytest.raises(ValidationError) as caught:
+        _evaluate_budget_statements(("not-a-statement",))
+    assert "input_value" in str(caught.value) and "not-a-statement" in str(caught.value)

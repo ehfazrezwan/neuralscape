@@ -6,7 +6,7 @@ from collections.abc import Iterable, Iterator, Mapping
 from types import MappingProxyType
 from typing import Any, NamedTuple, cast
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from contracts_policy import (
     SUPPORTED_POLICY_ACTIONS,
@@ -626,6 +626,35 @@ def _native_entries(
 
 _DEEPEST = "deepest"  # memo bookkeeping keys (the memo's other keys are object ids)
 _IMPURE = "impure"
+_REUSED = "reused"  # how many times a finished native subtree was shared between paths
+
+
+def _validated_without_echo(
+    model_type: type[BaseModel], native: object, memo: dict[object, Any]
+) -> Any:
+    """Strictly validate ``native``; if it shares subtrees, never echo it in an error.
+
+    A validation error normally repeats the offending input.  When the copy shares native
+    subtrees between paths, the input's text is exponentially larger than the graph (a
+    few hundred bytes of input can take minutes to render), so that error is rebuilt
+    without the input: the same types, locations and messages, nothing embedded.  Ordinary
+    inputs keep the full diagnostic.
+    """
+
+    try:
+        return model_type.model_validate(native)
+    except ValidationError as error:
+        if not memo.get(_REUSED):
+            raise
+        lines = [
+            {"type": e["type"], "loc": e["loc"], "input": "<omitted: input shares subtrees>", **({"ctx": e["ctx"]} if "ctx" in e else {})}
+            for e in error.errors(include_input=False, include_url=False)
+        ]
+        try:
+            bounded: Exception = ValidationError.from_exception_data(error.title, lines)  # type: ignore[arg-type]
+        except Exception:  # noqa: BLE001 - a type that cannot be rebuilt still gets a bounded, value-free error
+            bounded = ValueError(f"{error.title}: {error.error_count()} validation error(s)")
+        raise bounded from None
 
 
 def _remember(
@@ -681,6 +710,7 @@ def _complete_contract_input(
     cached = memo.get(id(value))
     if cached is not None and cached[0] is value:  # the entry keeps the object alive, so the id is its own
         budget.visit(value, depth, True)
+        memo[_REUSED] = memo.get(_REUSED, 0) + 1
         if depth + cached[2] > budget.tier.max_depth:
             budget.charge_edge(budget.tier.max_edges + 1)  # the stable budget error: the nesting limit holds on every path
         memo[_DEEPEST] = max(memo.get(_DEEPEST, 0), depth + cached[2])
@@ -884,15 +914,11 @@ def _validated_principal_snapshot(
     mapping_inventories: dict[int, _MappingInventory],
     budget: DiscoveryBudget | None = None,
 ) -> PrincipalContext:
-    return PrincipalContext.model_validate(
-        _complete_contract_input(
-            principal,
-            set(),
-            inventories,
-            mapping_inventories,
-            budget,
-        )
+    memo: dict[object, Any] = {}
+    native = _complete_contract_input(
+        principal, set(), inventories, mapping_inventories, budget, 0, memo
     )
+    return _validated_without_echo(PrincipalContext, native, memo)
 
 
 def _validated_evaluation_snapshot(
@@ -901,15 +927,11 @@ def _validated_evaluation_snapshot(
     mapping_inventories: dict[int, _MappingInventory],
     budget: DiscoveryBudget | None = None,
 ) -> PolicyEvaluationInput:
-    return PolicyEvaluationInput.model_validate(
-        _complete_contract_input(
-            evaluation,
-            set(),
-            inventories,
-            mapping_inventories,
-            budget,
-        )
+    memo: dict[object, Any] = {}
+    native = _complete_contract_input(
+        evaluation, set(), inventories, mapping_inventories, budget, 0, memo
     )
+    return _validated_without_echo(PolicyEvaluationInput, native, memo)
 
 
 def _validated_policy_snapshot(
@@ -918,15 +940,11 @@ def _validated_policy_snapshot(
     mapping_inventories: dict[int, _MappingInventory],
     budget: DiscoveryBudget | None = None,
 ) -> AccessPolicy:
-    return AccessPolicy.model_validate(
-        _complete_contract_input(
-            policy,
-            set(),
-            inventories,
-            mapping_inventories,
-            budget,
-        )
+    memo: dict[object, Any] = {}
+    native = _complete_contract_input(
+        policy, set(), inventories, mapping_inventories, budget, 0, memo
     )
+    return _validated_without_echo(AccessPolicy, native, memo)
 
 
 def _decision(
@@ -1141,15 +1159,11 @@ def validate_policy_decision(decision: PolicyDecision) -> PolicyDecision:
         reach,
     )
     mapping_inventories.update(native_dicts)
-    return PolicyDecision.model_validate(
-        _complete_contract_input(
-            decision,
-            set(),
-            inventories,
-            mapping_inventories,
-            budget,
-        )
+    memo: dict[object, Any] = {}
+    native = _complete_contract_input(
+        decision, set(), inventories, mapping_inventories, budget, 0, memo
     )
+    return _validated_without_echo(PolicyDecision, native, memo)
 
 
 __all__ = ["evaluate_policy", "validate_policy_decision"]
