@@ -234,3 +234,106 @@ def test_usage_a_text_subclass_field_name_is_refused() -> None:
     dict.__setitem__(native(event), SameTextKey("status"), "partial")
     with pytest.raises(usage_reconcile.UsageReconciliationError):
         usage_reconcile.reconcile_usage_events([event])
+
+
+# ---- a pair a view yields is unpacked exactly once, and non-text names are a ValueError
+
+
+class ScriptedPair(tuple):
+    """A (key, value) pair whose value changes between unpackings, or that can be unpacked only once."""
+
+    def __new__(cls, key, values):
+        instance = tuple.__new__(cls, (key,))
+        instance.key, instance.values, instance.unpacked = key, list(values), 0
+        return instance
+
+    def __iter__(self):
+        self.unpacked += 1
+        value = self.values.pop(0) if len(self.values) > 1 or self.once else self.values[0]
+        return iter((self.key, value))
+
+    once = False
+
+
+class OnceOnlyPair(ScriptedPair):
+    once = True
+
+    def __iter__(self):
+        if self.unpacked:
+            raise RuntimeError("a one-shot pair was unpacked a second time")
+        return super().__iter__()
+
+
+class PairView(dict):
+    """A dict subclass whose public items are scripted pair objects."""
+
+    def __init__(self, pairs):
+        super().__init__()
+        self.pairs = pairs
+
+    def items(self):
+        return list(self.pairs)
+
+
+def _reference_view(pair_type, generation_values):
+    pairs = [
+        pair_type("schema_version", [VERSION]), pair_type("tenant_id", ["t"]), pair_type("manifest_id", ["m1"]),
+        pair_type("manifest_revision", [1]), pair_type("placement_generation", generation_values),
+    ]
+    return PairView(pairs), pairs
+
+
+def _placement_with(view) -> TenantPlacement:
+    value = placement()
+    dict.__setitem__(native(value), "resource_manifests", (view,))
+    return value
+
+
+def test_a_pair_that_changes_between_unpackings_cannot_turn_an_invalid_value_valid() -> None:
+    view, pairs = _reference_view(ScriptedPair, [99, 1])  # first read 99 (invalid), a second read would say 1
+    with pytest.raises(ValidationError):
+        publish(_placement_with(view))
+    assert all(pair.unpacked == 1 for pair in pairs)
+
+
+def test_a_one_shot_pair_is_read_once_and_the_value_is_accepted() -> None:
+    view, pairs = _reference_view(OnceOnlyPair, [1])
+    assert publish(_placement_with(view)).resource_manifests[0].manifest_id == "m1"
+    assert all(pair.unpacked == 1 for pair in pairs)
+
+
+def test_a_non_text_stored_name_is_a_value_error_not_a_type_error_in_tenancy_and_readiness() -> None:
+    import datetime as dt
+
+    from contracts_readiness import (
+        CapabilityReadiness,
+        TenantReadinessPublication,
+        validate_readiness_publication,
+    )
+
+    value = placement()
+    dict.__setitem__(native(value), 7, "x")
+    with pytest.raises(ValueError):
+        publish(value)
+    observation = CapabilityReadiness(
+        schema_version=VERSION, capability="exact_reads", status="healthy",
+        observed_at=dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),
+    )
+    publication = TenantReadinessPublication(
+        schema_version=VERSION, tenant_id="t", placement_generation=1, capabilities=(observation,)
+    )
+    dict.__setitem__(native(publication), 7, "x")
+    with pytest.raises(ValueError):
+        validate_readiness_publication(publication, expected_tenant_id="t", current_placement_generation=1)
+
+
+def test_a_non_text_stored_name_in_a_usage_result_is_a_validation_error_for_direct_receivers() -> None:
+    result = usage_reconcile.reconcile_usage_events([_event()])
+    stream = result.streams[0]
+    dict.__setitem__(native(stream), 7, "x")
+    with pytest.raises(ValidationError):
+        usage_reconcile.ReconciledUsageStream.model_validate(stream)
+    other = usage_reconcile.reconcile_usage_events([_event()])
+    dict.__setitem__(native(other), 7, "x")
+    with pytest.raises(ValidationError):
+        usage_reconcile.UsageReconciliation.model_validate(other)

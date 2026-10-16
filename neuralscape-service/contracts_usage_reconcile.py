@@ -412,6 +412,8 @@ def _freeze_model_storage(
             else None
         )
         for group in (stored_items, native_extra_items or ()):
+            if any(not any(entry is str for entry in _TYPE_MRO.__get__(type(name))) for name, _item in group):
+                raise ValueError("contract input field names must be text")
             texts = [
                 name if type(name) is str else str.__str__(name) for name, _item in group
             ]

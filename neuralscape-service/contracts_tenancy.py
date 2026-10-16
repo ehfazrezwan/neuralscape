@@ -75,6 +75,9 @@ def _refuse_duplicate_texts(*entry_groups: tuple[tuple[object, object], ...]) ->
     """
 
     for entries in entry_groups:
+        for name, _value in entries:
+            if not _inherits(type(name), str):
+                raise ValueError("contract input field names must be text")
         texts = [
             name if type(name) is str else str.__str__(name)  # type: ignore[arg-type]
             for name, _value in entries
@@ -420,7 +423,9 @@ def _closed_graph_snapshot_session() -> tuple[
                 entries = (
                     frozen_containers[identity]
                     if exact
-                    else tuple(observed(item.items))
+                    # Each observed pair is unpacked exactly once into a plain tuple that capture and
+                    # reconstruction both reuse; the caller's pair object is never read again.
+                    else tuple((key, value) for key, value in observed(item.items))
                 )
                 if exact:
                     own_cost = 1 + len(entries)
