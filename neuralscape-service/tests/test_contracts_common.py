@@ -3481,3 +3481,89 @@ def test_snapshot_capture_stack_is_bounded_by_the_tier_depth_not_the_recursion_l
         sys.setprofile(None)
         sys.setrecursionlimit(limit)
     assert deepest <= STANDARD.max_depth + 2
+
+
+_EXTRA = BaseModel.__dict__["__pydantic_extra__"]
+
+
+# ── purity: reconstruction that runs key code is never reused, on every path that reads keys ──
+
+
+class _CountingKey:
+    """A key of a non-plain type: building a dict with it runs this hash."""
+
+    hashes = 0
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __hash__(self) -> int:
+        _CountingKey.hashes += 1
+        return hash(self.name)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _CountingKey) and other.name == self.name
+
+
+class _PublicExtras(Mapping):
+    """Non-dict extra storage whose public items carry the counting key."""
+
+    def __init__(self, key: object) -> None:
+        self.key = key
+
+    def __getitem__(self, key):
+        raise KeyError(key)
+
+    def __iter__(self):
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+    def items(self):
+        return [(self.key, 1)]
+
+
+def _hashes_for_references(build, count: int) -> int:
+    _CountingKey.hashes = 0
+    value = build()
+    try:
+        snapshot_contract_graph([value] * count)
+    except ValueError:
+        pass  # a model with surplus names is refused at the end; the walk still ran
+    return _CountingKey.hashes
+
+
+def _model_with_public_extras():
+    value = SourceVersion(record_id="r1", content_revision=1, policy_epoch=1)
+    _EXTRA.__set__(value, _PublicExtras(_CountingKey("surplus")))
+    return value
+
+
+def _model_with_native_extras():
+    value = SourceVersion(record_id="r1", content_revision=1, policy_epoch=1)
+    _EXTRA.__set__(value, {_CountingKey("surplus"): 1})
+    return value
+
+
+def _model_with_a_stored_key():
+    value = SourceVersion(record_id="r1", content_revision=1, policy_epoch=1)
+    dict.__setitem__(_BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel), _CountingKey("surplus"), 1)
+    return value
+
+
+def _plain_dict_with_the_key():
+    return {_CountingKey("k"): 1}
+
+
+@pytest.mark.parametrize(
+    "build",
+    [_model_with_public_extras, _model_with_native_extras, _model_with_a_stored_key, _plain_dict_with_the_key],
+    ids=["non-dict-extras", "dict-extras", "stored-name", "plain-dict-value"],
+)
+def test_key_code_runs_for_every_reference_not_just_the_first_two(build) -> None:
+    one, two, three = (_hashes_for_references(build, count) for count in (1, 2, 3))
+    assert one > 0  # the key's code is reached at all
+    # capture may hash once; every further reference rebuilds, and so hashes, again
+    assert two - one > 0
+    assert three - two == two - one, (one, two, three)  # a later reference never skips the callbacks

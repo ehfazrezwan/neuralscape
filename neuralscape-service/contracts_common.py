@@ -407,7 +407,7 @@ def _snapshot_captured_graph(
             extra_entries = captured.extra_entries
             if extra_entries is None:
                 inventory.impure_reads += 1
-                extra_entries, _pure, _colliding = _plain_keys(
+                extra_entries, extra_pure, _colliding = _plain_keys(
                     _mapping_entries(
                         captured.extra,  # type: ignore[arg-type]
                         type(captured.extra),
@@ -415,6 +415,10 @@ def _snapshot_captured_graph(
                     )
                 )
                 captured.extra_entries = extra_entries
+                # Later rebuilds reuse the saved entries but still hash these keys: remember that a key of
+                # a non-plain type ran code, so the model (and every ancestor) stays ineligible for reuse,
+                # exactly as when the extras are a native dict.
+                captured.pure_names = captured.pure_names and extra_pure
                 for _, item in extra_entries:
                     _capture_native_graph(item, inventory, below)
 
