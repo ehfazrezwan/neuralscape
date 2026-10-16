@@ -421,12 +421,17 @@ def _snapshot_native_value(
             memoizable = exact
             if exact:
                 own_cost = 1 + len(frozen.entries)
-            result = {
-                key: child(item, f"{location}[key]", key if type(key) is str else None)
-                for key, item in (
-                    frozen.entries if exact else _charged_entries(value.items, budget)
-                )
-            }
+            result = {}
+            for key, item in frozen.entries if exact else _charged_entries(value.items, budget):
+                # A str subclass is the same key to a dict lookup, so it must be the same field
+                # name to the JSON guard: an exact-str-only test would withhold the name.  Its
+                # text is read without running its hooks and stored as a plain str; two keys
+                # that collapse to one name are refused rather than one silently winning.
+                if issubclass(type(key), str):
+                    key = str.__str__(key)
+                    if key in result:
+                        raise ValueError(f"contract mapping has colliding keys at {location}")
+                result[key] = child(item, f"{location}[key]", key if type(key) is str else None)
         elif issubclass(value_type, (list, tuple)):
             is_list = issubclass(value_type, list)
             frozen = frozen_containers.get(identity)

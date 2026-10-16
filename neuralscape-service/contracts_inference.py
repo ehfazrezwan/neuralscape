@@ -19,7 +19,7 @@ import idna
 from pydantic import BaseModel, Field, JsonValue, model_validator
 
 from contracts_common import ContractModel, OpaqueId, SafeCounter, VersionedContract
-from contracts_engines import QualificationClaim, _validated_contract_snapshot, _validated_contract_snapshots
+from contracts_engines import QualificationClaim, _validated_contract_snapshots
 from contracts_references import ReferenceHandle, SourceVersion
 
 FiniteNumber = Annotated[float, Field(allow_inf_nan=False)]
@@ -161,12 +161,13 @@ def _is_utf8_boundary(source_utf8: bytes, offset: int) -> bool:
 def validate_source_span(evidence: SourceEvidence, span: SourceSpan) -> None:
     """Validate exact source identity, bounds, and UTF-8 code-point boundaries."""
 
-    evidence = _validated_contract_snapshot(
-        evidence,
-        SourceEvidence,
-        label="source evidence",
+    # Both roots are typed, captured and accounted before either is reconstructed, so a public
+    # view reached while one is rebuilt (a dict-subclass source version, for example) cannot
+    # repair the other's native state first.
+    evidence, span = _validated_contract_snapshots(
+        (evidence, SourceEvidence, "source evidence"),
+        (span, SourceSpan, "source span"),
     )
-    span = _validated_contract_snapshot(span, SourceSpan, label="source span")
     _validate_source_span_values(evidence, span, _source_utf8_bytes(evidence))
 
 

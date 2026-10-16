@@ -1450,3 +1450,109 @@ def test_model_objects_inside_json_values_are_still_rejected_in_the_same_replay(
     ):
         with pytest.raises(ValueError, match="JSON value contains a model object"):
             validate_generation_result(request, result.model_copy(update={"proposals": (proposal,)}))
+
+
+# ── every root is captured before any root's public view can run ────────────
+
+
+class _RepairingSourceVersion(dict):
+    """A dict-subclass ``source_version`` whose ``items()`` runs a callback (a public-view callback)."""
+
+    def __init__(self, backing, repair):
+        super().__init__(backing)
+        self._repair = repair
+
+    def items(self):  # noqa: D102
+        self._repair()
+        return dict.items(self)
+
+
+def test_a_span_is_captured_before_the_evidence_public_view_can_repair_it():
+    evidence = source_evidence()
+    out_of_bounds = SourceSpan(
+        span_id="span-1", source_version=evidence.source_version, start_utf8_byte=0, end_utf8_byte=2
+    ).model_copy(update={"end_utf8_byte": 9999})  # beyond the 8 UTF-8 bytes of the text
+
+    def repair() -> None:
+        out_of_bounds.__dict__["end_utf8_byte"] = 8  # a callback run while evidence is reconstructed
+
+    hostile = evidence.model_copy(
+        update={"source_version": _RepairingSourceVersion(evidence.source_version.model_dump(), repair)}
+    )
+    with pytest.raises(ValueError, match="exceeds"):
+        validate_source_span(hostile, out_of_bounds)
+    assert out_of_bounds.end_utf8_byte == 8  # the callback did run: the old order would have accepted the repair
+
+
+def test_the_type_check_of_both_roots_precedes_any_capture():
+    calls = []
+    evidence = source_evidence()
+    hostile = evidence.model_copy(
+        update={"source_version": _RepairingSourceVersion(evidence.source_version.model_dump(), lambda: calls.append(1))}
+    )
+    with pytest.raises(TypeError, match="source span must be a SourceSpan"):
+        validate_source_span(hostile, "not-a-span")
+    assert calls == []  # no public view ran before the strict top-level type checks
+
+
+def test_an_honest_span_still_validates_after_the_single_capture():
+    evidence = source_evidence()
+    span = SourceSpan(span_id="span-1", source_version=evidence.source_version, start_utf8_byte=1, end_utf8_byte=3)
+    assert validate_source_span(evidence, span) is None
+
+
+# ── a str-subclass key is the same key to a dict lookup, so it is the same field to the guard ──
+
+
+class _OutputKey(str):
+    """Equal to, and hashed like, ``"output"`` — an ordinary ``str`` subclass."""
+
+
+def test_a_str_subclass_output_key_does_not_hide_a_model_from_the_json_guard():
+    class SchemaShapedModel(BaseModel):
+        summary: str
+
+    model_value = SchemaShapedModel(summary="must-not-normalize")
+    base_result = generation_result()
+    for key in (_OutputKey("output"), "output"):
+        proposal = {
+            "proposal_id": "proposal-1",
+            key: model_value,
+            "support_span_ids": ("support-1",),
+            "machine_authored": True,
+        }
+        result = base_result.model_copy(update={"proposals": (proposal,)})
+        with pytest.raises(ValueError, match="JSON value contains a model object"):
+            validate_generation_result(generation_request(), result)
+
+
+def test_a_str_subclass_key_in_ordinary_json_is_normalized_not_rejected():
+    result = generation_result()
+    proposal = {
+        _OutputKey("proposal_id"): "proposal-1",
+        _OutputKey("output"): {"summary": "ordinary JSON"},
+        "support_span_ids": ("support-1",),
+        "machine_authored": True,
+    }
+    updated = result.model_copy(update={"proposals": (proposal,)})
+    assert validate_generation_result(generation_request(), updated).compliant
+
+
+def test_colliding_str_subclass_keys_are_rejected():
+    class Colliding(str):
+        def __hash__(self):  # distinct hash: both keys can live in one dict
+            return hash("x" + str(self))
+
+        def __eq__(self, other):
+            return False
+
+    proposal = {
+        "proposal_id": "proposal-1",
+        "output": {"summary": "plain"},
+        Colliding("output"): {"summary": "second"},
+        "support_span_ids": ("support-1",),
+        "machine_authored": True,
+    }
+    result = generation_result().model_copy(update={"proposals": (proposal,)})
+    with pytest.raises(ValueError):
+        validate_generation_result(generation_request(), result)
