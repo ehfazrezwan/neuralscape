@@ -289,9 +289,8 @@ def _closed_graph_snapshot_session() -> tuple[
             frozen_extras: object = (
                 tuple(dict.items(extras)) if extras_are_native else extras
             )
-            _refuse_duplicate_texts(
-                stored_entries, frozen_extras if extras_are_native else ()  # type: ignore[arg-type]
-            )
+            # Names are checked where the captured model is used (rebuild_node), not here: discovery
+            # also visits models that a container's public view hides, and those are never used.
             frozen_models[identity] = (
                 stored_entries,
                 extras_are_native,
@@ -419,6 +418,9 @@ def _closed_graph_snapshot_session() -> tuple[
                     extra_entries = tuple(
                         entry for entry in observed(frozen_extras.items)
                     )
+                _refuse_duplicate_texts(
+                    stored_entries, extra_entries if extras_are_native else ()  # type: ignore[arg-type]
+                )
                 stored_names = {name for name, _field_value in stored_entries}
                 undeclared = stored_names - declared.keys()
                 if (

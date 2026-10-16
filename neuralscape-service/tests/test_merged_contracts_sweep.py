@@ -427,3 +427,70 @@ def test_readiness_pair_that_repairs_an_invalid_status_on_the_second_unpacking_i
     with pytest.raises(ValueError):
         validate_readiness_publication(publication, expected_tenant_id="t", current_placement_generation=1)
     assert all(pair.unpacked == 1 for pair in pairs)
+
+
+# ---- names are validated where a captured model is used, not where it is merely discovered
+
+class HiddenTuple(tuple):
+    """Backing storage holds ``native_values``; the public iterator yields ``visible_values``."""
+
+    def __new__(cls, native_values, visible_values):
+        instance = super().__new__(cls, native_values)
+        instance.visible_values = visible_values
+        return instance
+
+    def __iter__(self):
+        return iter(self.visible_values)
+
+
+def _malformed_child(kind: str):
+    child = reference()
+    if kind == "non-text":
+        dict.__setitem__(native(child), 7, "x")
+    else:
+        dict.__setitem__(native(child), SameTextKey("manifest_id"), "other")
+    return child
+
+
+@pytest.mark.parametrize("kind", ["non-text", "duplicate-text"])
+def test_tenancy_a_malformed_model_hidden_behind_an_empty_public_view_gives_the_valid_empty_result(kind) -> None:
+    value = placement()
+    dict.__setitem__(native(value), "resource_manifests", HiddenTuple((_malformed_child(kind),), ()))
+    assert publish(value).resource_manifests == ()
+
+
+@pytest.mark.parametrize("kind", ["non-text", "duplicate-text"])
+def test_tenancy_the_same_malformed_model_is_refused_when_the_public_view_uses_it(kind) -> None:
+    child = _malformed_child(kind)
+    value = placement()
+    dict.__setitem__(native(value), "resource_manifests", HiddenTuple((child,), (child,)))
+    with pytest.raises(ValueError):
+        publish(value)
+
+
+def test_readiness_a_malformed_observation_hidden_behind_the_public_view_is_never_used() -> None:
+    from contracts_readiness import (
+        CapabilityReadiness,
+        TenantReadinessPublication,
+        validate_readiness_publication,
+    )
+
+    observed = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+    bad = CapabilityReadiness(schema_version=VERSION, capability="exact_reads", status="healthy", observed_at=observed)
+    dict.__setitem__(native(bad), 7, "x")
+    good = CapabilityReadiness(schema_version=VERSION, capability="exact_reads", status="healthy", observed_at=observed)
+    publication = TenantReadinessPublication(schema_version=VERSION, tenant_id="t", placement_generation=1, capabilities=(good,))
+    dict.__setitem__(native(publication), "capabilities", HiddenTuple((bad,), (good,)))
+    result = validate_readiness_publication(publication, expected_tenant_id="t", current_placement_generation=1)
+    assert [item.capability for item in result.capabilities] == ["exact_reads"]  # the public view's item, not the hidden one
+
+
+def test_usage_reads_a_tuples_native_backing_so_a_malformed_model_there_is_refused_even_if_the_view_hides_it() -> None:
+    # The usage snapshot is built from native backing (unlike the tenancy boundary, which follows the
+    # public view), so a hidden model is a used model there; the refusal is deliberate.
+    result = usage_reconcile.reconcile_usage_events([_event()])
+    hidden = usage_reconcile.reconcile_usage_events([_event()]).streams[0]
+    dict.__setitem__(native(hidden), 7, "x")
+    dict.__setitem__(native(result), "streams", HiddenTuple((hidden,), ()))
+    with pytest.raises(ValidationError):
+        usage_reconcile.UsageReconciliation.model_validate(result)
