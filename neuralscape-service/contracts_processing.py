@@ -49,7 +49,11 @@ def _with_native_dict_extra_backing(value: object) -> object:
         # Snapshot its concrete backing exactly once with the built-in operation.
         captured = tuple(dict.items(extras))
     else:
-        return value
+        # Not a dict: none of its views can be trusted and none is read.  Fence it the
+        # same way as any other native storage by projecting a marker the closed model
+        # rejects, instead of handing the original model (and its masked descriptors)
+        # back to revalidation.
+        captured = (("unreadable_extra_storage", True),)
 
     # Detach every pair before projected-dict hashing can run a hostile stored
     # name callback that repairs a later value in the live model backing.
