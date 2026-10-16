@@ -1348,3 +1348,20 @@ def test_a_zip_directory_record_deeper_than_the_limit_is_refused(tmp_path, monke
     with zipfile.ZipFile(path, "a") as archive:
         archive.mkdir("a/b/c/d")
     assert pv.ENTRY_COUNT_LIMIT in _codes(verify_bundle(path))
+
+
+# ---- finding labels are printable: control characters are escaped, not passed through
+
+
+@pytest.mark.parametrize("name", ["x\x1b[31mred\x07.txt", "tab\there.txt", "del\x7f.txt", "csi\x9b2J.txt"])
+def test_a_member_name_with_control_characters_is_escaped_in_findings(tmp_path, name) -> None:
+    path = tmp_path / "n.zip"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("manifest.json", json.dumps(_manifest(PAYLOAD)))
+        archive.writestr(name, b"x")
+    labels = [finding.path or "" for finding in verify_bundle(path).findings]
+    assert labels and all(all(32 <= ord(ch) < 127 for ch in label) for label in labels), labels
+
+
+def test_an_ordinary_member_name_is_labelled_as_it_is() -> None:
+    assert pv._safe_label("canonical/records.jsonl") == "canonical/records.jsonl"

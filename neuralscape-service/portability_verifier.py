@@ -171,7 +171,10 @@ def _fold(name: str) -> str:
 
 
 def _safe_label(value: str) -> str:
-    return value.encode("ascii", "backslashreplace").decode("ascii")[:512]
+    """A printable label for a report: non-ASCII and control characters are escaped."""
+
+    ascii_only = value.encode("ascii", "backslashreplace").decode("ascii")
+    return "".join(ch if 32 <= ord(ch) < 127 else f"\\x{ord(ch):02x}" for ch in ascii_only)[:512]
 
 
 def _classify_name(raw: str, report: VerificationReport) -> str | None:
