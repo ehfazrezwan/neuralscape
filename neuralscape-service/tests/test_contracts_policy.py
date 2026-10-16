@@ -3023,3 +3023,171 @@ def test_the_first_malformed_pair_is_terminal_and_later_pairs_are_ignored() -> N
     with pytest.raises(TypeError):
         evaluate(_delegated_principal(_GeneratorMapping(malformed_then_valid)), "read", resource_value, grant)
     assert seen == ["drained"]
+
+
+# ── lazily discovered children: native dict snapshots are retained too ──────
+
+
+class _PublicOnlyTuple(tuple):
+    """A tuple whose native backing is empty: its items exist only through ``__iter__``."""
+
+    def __new__(cls, items):
+        instance = super().__new__(cls, ())
+        instance.public_items = tuple(items)
+        return instance
+
+    def __iter__(self):
+        return iter(self.public_items)
+
+
+def _invalid_resource_dict() -> dict[str, object]:
+    return {"kind": "memory", "id": "memory-1", "tenant_id": 5, "resolver": "memory_by_id"}
+
+
+def _repair_after_yield(resource: dict[str, object]) -> None:
+    resource["tenant_id"] = "tenant-a"
+
+
+def _policy_with_public_only_statements(*statements) -> AccessPolicy:
+    policy_value = policy(statement("seed", "allow", "read", reference("other")))
+    object.__setattr__(policy_value, "statements", _PublicOnlyTuple(statements))
+    return policy_value
+
+
+class _RepairingTuple(tuple):
+    """A public tuple whose iteration runs a callback (a public-view callback)."""
+
+    def __new__(cls, items, callback):
+        instance = super().__new__(cls, items)
+        instance.callback = callback
+        return instance
+
+    def __iter__(self):
+        self.callback()
+        return iter(tuple.__iter__(self))
+
+
+def _tampered_delegation(broken: dict[str, object]) -> DelegationConstraints:
+    """A model whose earlier field runs a callback when completed, before the dict child is copied."""
+
+    value = DelegationConstraints(
+        delegated_by_subject_id="subject-human",
+        delegated_by_credential_id="credential-human",
+        allowed_actions=("read",),
+        allowed_resources=(),
+    )
+    value.__dict__["allowed_actions"] = _RepairingTuple(("read",), lambda: _repair_after_yield(broken))
+    value.__dict__["allowed_resources"] = (broken,)
+    return value
+
+
+def test_a_lazily_discovered_model_keeps_the_first_observation_of_its_native_dicts() -> None:
+    """Completion discovers the model itself (it was not reached at entry): its native
+    dict child must be snapshotted at that discovery, not re-read after a callback."""
+
+    broken = _invalid_resource_dict()
+    completed = _complete_contract_input(_tampered_delegation(broken), set(), {}, {})
+
+    assert broken["tenant_id"] == "tenant-a"                       # the callback ran
+    assert completed["allowed_resources"][0]["tenant_id"] == 5     # the first observation was kept
+
+
+def test_a_lazily_discovered_mapping_keeps_the_first_observation_of_dicts_in_its_pairs() -> None:
+    broken = _invalid_resource_dict()
+
+    class _Pairs(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            raise KeyError(key)
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(())
+
+        def __len__(self) -> int:
+            return 0
+
+        def items(self):  # type: ignore[override]
+            yield ("allowed_actions", _RepairingTuple(("read",), lambda: _repair_after_yield(broken)))
+            yield ("allowed_resources", (broken,))
+
+    completed = _complete_contract_input(_Pairs(), set(), {}, {})
+
+    assert broken["tenant_id"] == "tenant-a"
+    assert completed["allowed_resources"][0]["tenant_id"] == 5
+
+
+def test_lazy_discovery_reuses_an_existing_snapshot_instead_of_taking_a_new_one() -> None:
+    """A dict already retained keeps its entries when a lazy path meets it again."""
+
+    broken = _invalid_resource_dict()
+    mapping_inventories: dict = {}
+    _complete_contract_input(
+        _tampered_delegation(broken), set(), {}, mapping_inventories
+    )  # first discovery retains the dict's entries
+    snapshot = mapping_inventories[id(broken)]
+    _repair_after_yield(broken)
+    again = _complete_contract_input(
+        _tampered_delegation(broken), set(), {}, mapping_inventories
+    )
+    assert mapping_inventories[id(broken)] is snapshot
+    assert again["allowed_resources"][0]["tenant_id"] == 5
+
+
+def test_a_lazily_discovered_mapping_keeps_dict_snapshots_taken_as_its_iterator_yields() -> None:
+    """Public-only child mapping; a generator repairs the dict it already yielded."""
+
+    resource_value = reference("memory-1")
+    broken = _invalid_resource_dict()
+
+    class _StatementMapping(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            raise KeyError(key)
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(())
+
+        def __len__(self) -> int:
+            return 0
+
+        def items(self):  # type: ignore[override]
+            return self._pairs()
+
+        def _pairs(self):
+            yield ("id", "lazy-allow")
+            yield ("effect", "allow")
+            yield ("subject_id", "subject-a")
+            yield ("credential_id", None)
+            yield ("action", "read")
+            yield ("resource", broken)
+            _repair_after_yield(broken)  # resumed only when the consumer advances
+
+    policy_value = _policy_with_public_only_statements(_StatementMapping())
+
+    with pytest.raises(ValidationError):
+        evaluate(principal(), "read", resource_value, policy_value)
+
+
+def test_a_lazily_discovered_mapping_with_a_valid_dict_is_accepted() -> None:
+    resource_value = reference("memory-1")
+    good = resource_value.model_dump(mode="python")
+
+    class _StatementMapping(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            raise KeyError(key)
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(())
+
+        def __len__(self) -> int:
+            return 0
+
+        def items(self):  # type: ignore[override]
+            yield ("id", "lazy-allow")
+            yield ("effect", "allow")
+            yield ("subject_id", "subject-a")
+            yield ("credential_id", None)
+            yield ("action", "read")
+            yield ("resource", good)
+
+    policy_value = _policy_with_public_only_statements(_StatementMapping())
+
+    assert evaluate(principal(), "read", resource_value, policy_value).outcome == "allow"

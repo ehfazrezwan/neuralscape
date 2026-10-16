@@ -232,6 +232,13 @@ def _freeze_reachable_model_inventories(
         if identity in visited_containers:
             return
         visited_containers.add(identity)
+        existing = native_dicts.get(identity)
+        if existing is not None:
+            # Already observed: keep that snapshot (and the children frozen with
+            # it); never replace it with a re-read taken after callbacks ran.
+            if existing.owner is not value:
+                raise ValueError("contract input mapping inventory owner mismatch")
+            return
         retained = tuple(_MappingEntry(key, item) for key, item in dict.items(value))
         native_dicts[identity] = _MappingInventory(value, retained)
         for entry in retained:
@@ -405,6 +412,7 @@ def _retained_mapping_entries(
             mapping_inventories,
             model_inventories,
             set(),
+            mapping_inventories,
         )
         inventory = _validated_mapping_inventory(value, mapping_inventories)
         if inventory is None:
@@ -452,7 +460,9 @@ def _complete_contract_input(
         try:
             inventory = _validated_model_inventory(value, inventories)
             if inventory is None:
-                _freeze_reachable_model_inventories(value, inventories, set())
+                _freeze_reachable_model_inventories(
+                    value, inventories, set(), None, mapping_inventories
+                )
                 inventory = _validated_model_inventory(value, inventories)
                 if inventory is None:
                     raise ValueError("contract input model inventory is missing")
