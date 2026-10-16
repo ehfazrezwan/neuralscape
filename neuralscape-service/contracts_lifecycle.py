@@ -928,6 +928,12 @@ def validate_required_stage_claim(
     produces another tenant's record); only lineage handles (``MemoryRecord.source_refs``) may be
     marked ``cross_tenant``, as data whose resolution needs a fresh authorization check.
 
+    Supported envelope: a container's *public* view is authoritative and is captured once at first
+    observation.  A tuple subclass whose native backing differs from its public view (shared between
+    fields or not) is outside that envelope: the backing is never read as the answer, so a claim that
+    only the backing supports is rejected, and anything that cannot be reconciled with the public view
+    is refused rather than accepted.  Hostile in-process callbacks are out of scope.
+
     This checks consistency of caller-supplied reports.  It does not prove an
     external effect exists, choose authoritative output references, establish
     retry exhaustion, or select a runtime retry policy.
