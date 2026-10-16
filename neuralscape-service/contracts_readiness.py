@@ -81,27 +81,53 @@ def _pin_datetime(value: object) -> object:
 
     The offset is asked of the caller's ``tzinfo`` a single time (through the built-in accessor) and the
     fields are read through the built-in descriptors, so a ``tzinfo`` or ``datetime`` subclass that answers
-    differently on each call cannot give validation one instant and the comparison another.  Anything
-    that is not a ``datetime``, and a naive ``datetime``, is returned unchanged for validation to refuse.
+    differently on each call cannot give validation one instant and the comparison another.  A
+    ``datetime`` that has no offset on that one read becomes a plain naive ``datetime`` (the caller's
+    zone is dropped, so a later read cannot find an offset that was not there) and validation refuses it.
+    Anything that is not a ``datetime`` is returned unchanged for validation to refuse.
     """
 
     if not _inherits(type(value), datetime):
         return value
     offset = datetime.utcoffset(value)  # type: ignore[arg-type]
-    if offset is None:
-        return value
     fields = [part.__get__(value, datetime) for part in _DATETIME_PARTS]
+    if offset is None:
+        return datetime(*fields)
     return datetime(*fields, tzinfo=timezone(offset))
 
 
-def _pin_datetimes(value: object) -> object:
-    """Pin every ``datetime`` in a captured (plain dict, tuple or list) snapshot."""
+def _pin_datetimes(value: object, memo: dict[int, tuple[object, object]] | None = None) -> object:
+    """Pin every ``datetime`` in a captured (plain dict, tuple or list) snapshot, once per object.
 
-    if type(value) is dict:
-        return {key: _pin_datetimes(item) for key, item in value.items()}
-    if type(value) in (tuple, list):
-        return type(value)(_pin_datetimes(item) for item in value)
-    return _pin_datetime(value)
+    The snapshot shares a subtree that several edges name; the pinned copy is shared the same way
+    (memoized by identity, the original retained so its id cannot be reused), so each timestamp is read
+    once however many paths reach it and the work is proportional to the distinct objects.  A subtree
+    holding no datetime is returned as it is.
+    """
+
+    if memo is None:
+        memo = {}
+    kind = type(value)
+    leaf = kind is not dict and kind is not tuple and kind is not list
+    if leaf and not _inherits(kind, datetime):
+        return value  # nothing to pin and nothing to share
+    cached = memo.get(id(value))
+    if cached is not None and cached[0] is value:
+        return cached[1]
+    if leaf:
+        pinned_leaf = _pin_datetime(value)  # the same datetime object is read once, at its first occurrence
+        memo[id(value)] = (value, pinned_leaf)
+        return pinned_leaf
+    if kind is dict:
+        items = [(key, _pin_datetimes(item, memo)) for key, item in value.items()]
+        changed = any(new is not old for (_k, new), old in zip(items, value.values()))
+        pinned: object = dict(items) if changed else value
+    else:
+        elements = [_pin_datetimes(item, memo) for item in value]
+        changed = any(new is not old for new, old in zip(elements, value))
+        pinned = kind(elements) if changed else value
+    memo[id(value)] = (value, pinned)
+    return pinned
 
 
 def _validated_observation_snapshot(

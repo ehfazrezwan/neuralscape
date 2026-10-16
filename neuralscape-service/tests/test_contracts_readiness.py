@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from types import MappingProxyType
@@ -2009,3 +2010,102 @@ def test_pinning_keeps_ordinary_zones_equal_and_naive_values_refused() -> None:
     assert kept.utcoffset() == timedelta(hours=-5) and kept.astimezone(timezone.utc) == datetime(2026, 11, 1, 6, 30, tzinfo=timezone.utc)
     with pytest.raises(ValueError):
         capability_is_ready(observation, evaluated_at=datetime(2026, 11, 2), max_probe_age_seconds=1)  # naive
+
+
+# ---- shared subtrees are pinned once; a zone with no offset on its first read is refused
+
+class CountingZone(tzinfo):
+    """UTC, counting every offset read."""
+
+    def __init__(self) -> None:
+        self.reads = 0
+
+    def utcoffset(self, dt):
+        self.reads += 1
+        return timedelta(0)
+
+    def dst(self, dt):
+        return timedelta(0)
+
+    def tzname(self, dt):
+        return "count"
+
+
+def _shared_node(depth: int, leaf: object) -> object:
+    node = leaf
+    for _ in range(depth):
+        node = [node, node]  # 2**depth paths, depth + 1 distinct lists
+    return node
+
+
+@pytest.mark.parametrize("depth", [12, 30])
+def test_a_shared_nested_graph_is_pinned_once_per_object(depth: int) -> None:
+    zone = CountingZone()
+    item = _fold_observation(datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc))
+    dict.__setitem__(vars(item), "detail_code", _shared_node(depth, datetime(2026, 1, 1, 12, 0, tzinfo=zone)))
+    started = time.perf_counter()
+    with pytest.raises(ValidationError):  # a nested list is not an id; the pinning must not blow up first
+        capability_is_ready(item, evaluated_at=datetime(2026, 1, 1, 12, 30, tzinfo=timezone.utc), max_probe_age_seconds=3600)
+    assert zone.reads == 1  # not 2**depth
+    assert time.perf_counter() - started < 2.0
+
+
+def test_pinning_keeps_the_sharing_of_the_snapshot() -> None:
+    import contracts_readiness as readiness
+
+    shared = [datetime(2026, 1, 1, tzinfo=timezone.utc)]
+    pinned = readiness._pin_datetimes({"a": shared, "b": (shared, shared), "c": [shared, "x"]})
+    assert pinned["a"] is pinned["b"][0] is pinned["b"][1] is pinned["c"][0]
+    untouched = {"k": ["plain", ("tuple", 1)]}
+    assert readiness._pin_datetimes(untouched) is untouched  # nothing to pin: nothing copied
+
+
+class NoOffsetFirstZone(tzinfo):
+    """No offset on the first read after ``arm()``, UTC on every later read."""
+
+    def __init__(self) -> None:
+        self.reads: int | None = None
+
+    def arm(self) -> None:
+        self.reads = 0
+
+    def utcoffset(self, dt):
+        if self.reads is None:
+            return timedelta(0)
+        self.reads += 1
+        return None if self.reads == 1 else timedelta(0)
+
+    def dst(self, dt):
+        return timedelta(0)
+
+    def tzname(self, dt):
+        return "none-first"
+
+
+def test_an_observed_at_with_no_offset_on_its_first_read_is_refused_and_read_once() -> None:
+    zone = NoOffsetFirstZone()
+    item = _fold_observation(datetime(2026, 1, 1, 12, 0, tzinfo=zone))
+    zone.arm()
+    with pytest.raises(ValidationError):
+        capability_is_ready(item, evaluated_at=datetime(2026, 1, 1, 12, 30, tzinfo=timezone.utc), max_probe_age_seconds=3600)
+    assert zone.reads == 1
+
+
+def test_an_evaluated_at_with_no_offset_on_its_first_read_is_refused_and_read_once() -> None:
+    zone = NoOffsetFirstZone()
+    item = _fold_observation(datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc))
+    evaluated = datetime(2026, 1, 1, 12, 30, tzinfo=zone)
+    zone.arm()
+    with pytest.raises(ValidationError):
+        capability_is_ready(item, evaluated_at=evaluated, max_probe_age_seconds=3600)
+    assert zone.reads == 1
+
+
+def test_a_publication_with_a_first_read_of_none_is_refused() -> None:
+    zone = NoOffsetFirstZone()
+    item = _fold_observation(datetime(2026, 1, 1, 12, 0, tzinfo=zone))
+    publication = TenantReadinessPublication(schema_version="candidate-v1", tenant_id="t", placement_generation=1, capabilities=(item,))
+    zone.arm()
+    with pytest.raises(ValidationError):
+        validate_readiness_publication(publication, expected_tenant_id="t", current_placement_generation=1)
+    assert zone.reads == 1
