@@ -7,13 +7,12 @@ and internally current while its last successful upstream verification is old.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from enum import Enum
 from typing import Sequence
 
-from pydantic import AwareDatetime, BaseModel, Field, model_validator
+from pydantic import AwareDatetime, Field, model_validator
 
-from contracts_common import ContractModel, OpaqueId, VersionedContract
+from contracts_common import ContractModel, OpaqueId, VersionedContract, snapshot_contract_graph
 from contracts_references import ReferenceHandle, SourceVersion
 
 
@@ -273,7 +272,7 @@ def _version_map(versions: Sequence[SourceVersion]) -> dict[str, tuple[int, int]
     result: dict[str, tuple[int, int]] = {}
     for supplied_version in versions:
         version = SourceVersion.model_validate(
-            _native_contract_graph(supplied_version),
+            snapshot_contract_graph(supplied_version),
             strict=True,
         )
         record_id = str(version.record_id)
@@ -281,57 +280,6 @@ def _version_map(versions: Sequence[SourceVersion]) -> dict[str, tuple[int, int]
             raise ValueError(f"duplicate source version for record_id {record_id!r}")
         result[record_id] = (version.content_revision, version.policy_epoch)
     return result
-
-
-def _native_contract_graph(
-    value: object, active_containers: set[int] | None = None
-) -> object:
-    """Materialize complete stored fields and reject cyclic input graphs."""
-
-    if not isinstance(value, (BaseModel, tuple, list, dict)):
-        return value
-
-    if active_containers is None:
-        active_containers = set()
-    value_id = id(value)
-    if value_id in active_containers:
-        raise ValueError("cyclic contract input is not supported")
-    active_containers.add(value_id)
-    try:
-        if isinstance(value, BaseModel):
-            fields = {
-                key: _native_contract_graph(item, active_containers)
-                for key, item in vars(value).items()
-            }
-            extra = getattr(value, "__pydantic_extra__", None)
-            if extra is not None:
-                if not isinstance(extra, Mapping):
-                    raise ValueError("contract extra storage must be a mapping")
-                if fields.keys() & extra.keys():
-                    raise ValueError(
-                        "contract input contains conflicting declared and extra fields"
-                    )
-                fields.update(
-                    {
-                        key: _native_contract_graph(item, active_containers)
-                        for key, item in extra.items()
-                    }
-                )
-            return fields
-        if isinstance(value, tuple):
-            return tuple(
-                _native_contract_graph(item, active_containers) for item in value
-            )
-        if isinstance(value, list):
-            return [
-                _native_contract_graph(item, active_containers) for item in value
-            ]
-        return {
-            key: _native_contract_graph(item, active_containers)
-            for key, item in value.items()
-        }
-    finally:
-        active_containers.remove(value_id)
 
 
 __all__ = [
