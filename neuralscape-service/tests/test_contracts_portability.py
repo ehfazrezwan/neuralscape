@@ -3462,15 +3462,14 @@ class _EndlessExtra(Mapping):
         return 1
 
     def __iter__(self):
-        index = 0
-        while True:
-            yield f"name_{index}"
-            index += 1
+        if self.mode == "items":
+            return iter(())  # only the item view is endless
+        return (f"name_{index}" for index in iter(int, 1))
 
     def items(self):
         if self.mode == "names":
-            return iter(())
-        return ((f"name_{i}", i) for i in iter(int, 1))
+            return iter(())  # only the name view is endless
+        return ((f"name_{index}", index) for index in iter(int, 1))
 
 
 @pytest.mark.parametrize("mode", ["names", "items"])
