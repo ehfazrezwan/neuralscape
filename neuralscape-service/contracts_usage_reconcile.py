@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, GetCoreSchemaHandler, model_validator
@@ -357,6 +358,22 @@ class UsageReconciliation(ContractModel):
         return self
 
 
+_TYPE_MRO = type.__dict__["__mro__"]
+
+
+def _is_real_mapping(value: object) -> bool:
+    """A mapping subclass or the read-only view; a class that only registers with the ABC is not one."""
+
+    candidate = type(value)
+    return candidate is MappingProxyType or any(
+        entry is Mapping or entry is dict for entry in _TYPE_MRO.__get__(candidate)
+    )
+
+
+def _is_node(value: object) -> bool:
+    return isinstance(value, (BaseModel, list, tuple, set, frozenset)) or _is_real_mapping(value)
+
+
 def _freeze_model_storage(
     value: object,
     frozen_models: dict[int, _FrozenModelStorage],
@@ -394,6 +411,12 @@ def _freeze_model_storage(
             if extras is not None and issubclass(type(extras), dict)
             else None
         )
+        for group in (stored_items, native_extra_items or ()):
+            texts = [
+                name if type(name) is str else str.__str__(name) for name, _item in group
+            ]
+            if len(set(texts)) != len(texts):
+                raise ValueError("contract input field names must be unique text")
         frozen_models[identity] = (
             value,
             stored_items,
@@ -469,7 +492,7 @@ def _native_snapshot(
 
     if _memo is None:
         _memo = {}
-    if isinstance(value, (BaseModel, Mapping, list, tuple, set, frozenset)):
+    if _is_node(value):
         cached = _memo.get(id(value))
         if cached is not None and cached[0] is value:
             return cached[1]
@@ -481,7 +504,7 @@ def _native_snapshot(
         _frozen_tuples=_frozen_tuples,
         _memo=_memo,
     )
-    if isinstance(value, (BaseModel, Mapping, list, tuple, set, frozenset)):
+    if _is_node(value):
         _memo[id(value)] = (value, result)
     return result
 
@@ -521,10 +544,7 @@ def _snapshot_uncached(
         )
     if active is None:
         active = set()
-    if not isinstance(
-        value,
-        (BaseModel, Mapping, list, tuple, set, frozenset),
-    ):
+    if not _is_node(value):
         return value
 
     identity = id(value)
@@ -550,7 +570,7 @@ def _snapshot_uncached(
                     extra_items = native_extra_items
                     extra_names = {name for name, _ in extra_items}
                 else:
-                    if not isinstance(extras, Mapping):
+                    if not _is_real_mapping(extras):
                         raise ValueError("contract extra storage must be a mapping")
                     iterated_extra_names = tuple(extras)
                     extra_items = tuple(extras.items())
@@ -587,7 +607,7 @@ def _snapshot_uncached(
                 }
             )
             return fields
-        if isinstance(value, Mapping):
+        if _is_real_mapping(value):
             frozen_dict = _frozen_dicts.get(identity)
             if frozen_dict is not None and frozen_dict[0] is value:
                 # Preserve the public traversal callback, but retain the native

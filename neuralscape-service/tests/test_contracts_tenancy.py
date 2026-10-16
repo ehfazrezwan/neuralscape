@@ -1348,7 +1348,7 @@ def test_tenancy_boundaries_keep_spoofing_non_dict_on_mapping_path(
     else:
         validate()
 
-    assert extras.class_calls == 1
+    assert extras.class_calls == 0  # the claimed class is never consulted: the real type decides
     assert extras.length_calls == 1
     assert extras.iteration_calls == 1
     assert extras.items_calls == 1

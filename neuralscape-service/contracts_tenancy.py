@@ -7,6 +7,7 @@ allocate resources, grant authority, or select a shared-plane or cell topology.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Mapping
+from types import MappingProxyType
 from typing import Literal, TypeVar
 
 from pydantic import BaseModel, TypeAdapter, model_validator
@@ -45,6 +46,41 @@ _OPAQUE_ID_ADAPTER = TypeAdapter(OpaqueId)
 _SAFE_COUNTER_ADAPTER = TypeAdapter(SafeCounter)
 _PYDANTIC_DICT_DESCRIPTOR = BaseModel.__dict__["__dict__"]
 _PYDANTIC_EXTRA_DESCRIPTOR = BaseModel.__dict__["__pydantic_extra__"]
+
+
+_TYPE_MRO = type.__dict__["__mro__"]
+
+
+def _inherits(candidate: type, base: type) -> bool:
+    """Whether ``base`` is in the class's own MRO, ignoring ABC registration and metaclass hooks."""
+
+    return any(entry is base for entry in _TYPE_MRO.__get__(candidate))
+
+
+def _is_real_mapping(value: object) -> bool:
+    """A mapping subclass, or the one read-only view that only registers; never a registered-only class."""
+
+    candidate = type(value)
+    return (
+        candidate is MappingProxyType
+        or _inherits(candidate, dict)
+        or _inherits(candidate, Mapping)
+    )
+
+
+def _refuse_duplicate_texts(*entry_groups: tuple[tuple[object, object], ...]) -> None:
+    """Refuse two stored field names that read as one text (ambiguous input).
+
+    The text is read with the built-in accessor, so a text subclass's own hooks do not run here.
+    """
+
+    for entries in entry_groups:
+        texts = [
+            name if type(name) is str else str.__str__(name)  # type: ignore[arg-type]
+            for name, _value in entries
+        ]
+        if len(set(texts)) != len(texts):
+            raise ValueError("contract input field names must be unique text")
 
 
 def _model_extra_storage(value: BaseModel) -> object:
@@ -153,10 +189,11 @@ def _closed_graph_snapshot_session() -> tuple[
     and exact built-in containers are fenced when the call begins and replayed
     from that capture.  The public view of a container subclass is observed
     once per occurrence in the graph, not once per call, so a view that
-    changes between two occurrences is rejected.  Children exposed only by a
-    public iterator are captured when that iterator first exposes them, so an
-    earlier callback in the same call may still change them first; entry-time
-    capture of never-yet-exposed children is not promised.  Hidden native
+    changes between two occurrences is rejected.  A view is read in full when
+    it is first observed, and the native backing of every child it exposes is
+    captured before the first of them is rebuilt, so a callback run while an
+    earlier child is rebuilt cannot change a later sibling.  Entry-time capture
+    of children that no view has yet exposed is not promised.  Hidden native
     backing is never substituted for a public view.
 
     Two discovery envelopes cover a call, each shared by every root.  Native
@@ -234,6 +271,9 @@ def _closed_graph_snapshot_session() -> tuple[
             frozen_extras: object = (
                 tuple(dict.items(extras)) if extras_are_native else extras
             )
+            _refuse_duplicate_texts(
+                stored_entries, frozen_extras if extras_are_native else ()  # type: ignore[arg-type]
+            )
             frozen_models[identity] = (
                 stored_entries,
                 extras_are_native,
@@ -270,6 +310,18 @@ def _closed_graph_snapshot_session() -> tuple[
     active: set[int] = set()
     memo: dict[int, tuple[object, object, int]] = {}
     phase_depth = 0
+
+    def capture_exposed(children: Iterable[object], depth: int) -> None:
+        """Freeze the native backing of every child a public view exposed, before any is rebuilt.
+
+        The view was read once; a callback that runs while an earlier child is rebuilt can then no
+        longer change a later sibling's captured state.  The children stay referenced by the caller's
+        tuple for the whole rebuild.
+        """
+
+        for exposed in children:
+            if is_graph_node(exposed) and id(exposed) not in native_children:
+                freeze_native_graph(exposed, depth)
 
     def rebuild(item: object, depth: int = 0) -> object:
         """Public rebuild phase: observations are charged to the view envelope."""
@@ -338,7 +390,7 @@ def _closed_graph_snapshot_session() -> tuple[
                     observed_extra_length = 0
                     iterated_extra_names = ()
                     extra_entries = ()
-                elif not isinstance(frozen_extras, Mapping):
+                elif not _is_real_mapping(frozen_extras):
                     raise ValueError("contract extra storage must be a mapping")
                 else:
                     reusable = False
@@ -366,18 +418,28 @@ def _closed_graph_snapshot_session() -> tuple[
                 exact = item_type is dict
                 reusable = exact
                 entries = (
-                    frozen_containers[identity] if exact else observed(item.items)
+                    frozen_containers[identity]
+                    if exact
+                    else tuple(observed(item.items))
                 )
                 if exact:
                     own_cost = 1 + len(entries)
+                else:
+                    capture_exposed((value for _key, value in entries), depth + 1)
                 result = {key: child(field_value) for key, field_value in entries}
             else:
                 is_list = isinstance(item, list)
                 exact = item_type is (list if is_list else tuple)
                 reusable = exact
-                items = frozen_containers[identity] if exact else observed(lambda: item)
+                items = (
+                    frozen_containers[identity]
+                    if exact
+                    else tuple(observed(lambda: item))
+                )
                 if exact:
                     own_cost = 1 + len(items)
+                else:
+                    capture_exposed(items, depth + 1)
                 copied_items = [child(entry) for entry in items]
                 result = copied_items if is_list else tuple(copied_items)
             if reusable:

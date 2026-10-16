@@ -112,6 +112,30 @@ def validate_readiness_publication(
     return publication
 
 
+_DATETIME_PARTS = (
+    datetime.year, datetime.month, datetime.day, datetime.hour, datetime.minute, datetime.second,
+    datetime.microsecond,
+)
+
+
+def _exact_utc(value: datetime) -> datetime:
+    """The instant on the UTC timeline as a plain ``datetime``.
+
+    The fields and the offset are read once through the built-in accessors, so a ``datetime`` subclass
+    (an overridden ``astimezone`` or field) or a ``tzinfo`` that answers differently per call cannot
+    change the instant that is compared.
+    """
+
+    offset = datetime.utcoffset(value)
+    if offset is None:
+        raise ValueError("a timezone-aware datetime is required")
+    fields = [part.__get__(value, datetime) for part in _DATETIME_PARTS]
+    try:
+        return (datetime(*fields) - offset).replace(tzinfo=timezone.utc)
+    except OverflowError as error:
+        raise ValueError("datetime is outside the supported range") from error
+
+
 def capability_is_ready(
     observation: CapabilityReadiness,
     *,
@@ -133,8 +157,8 @@ def capability_is_ready(
     # Aware datetimes that share one tzinfo object are compared and subtracted
     # in wall time, which misorders and mis-ages values around a daylight-saving
     # fold or gap.  Order and age are measured on the absolute (UTC) timeline.
-    evaluated_utc = validated_evaluation_time.astimezone(timezone.utc)
-    observed_utc = observation.observed_at.astimezone(timezone.utc)
+    evaluated_utc = _exact_utc(validated_evaluation_time)
+    observed_utc = _exact_utc(observation.observed_at)
     if evaluated_utc < observed_utc:
         raise ValueError("evaluated_at cannot precede observed_at")
     age_seconds = (evaluated_utc - observed_utc).total_seconds()
