@@ -13,6 +13,7 @@ percentage; the comparison classifies each scenario's change and leaves counting
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -38,7 +39,7 @@ Verdict = Literal[
 ]
 Role = Literal["baseline", "candidate"]
 Digest = Annotated[str, StringConstraints(strict=True, pattern=r"^[0-9a-f]{64}$")]
-Fact = Annotated[str, StringConstraints(strict=True, min_length=1, max_length=200)]
+Fact = Annotated[str, StringConstraints(strict=True, pattern=r"^[A-Za-z0-9_.:+\-]{1,80}$")]  # a token, never prose
 Note = Annotated[str, StringConstraints(strict=True, max_length=300)]
 
 
@@ -131,25 +132,43 @@ class EvidenceWriter:
     def write(self, record: EvidenceRecord) -> bool:
         """Append ``record``; ``False`` when an identical record is already present.
 
-        An existing id with different content, or a ``supersedes`` that names no existing record,
-        raises ``RecordConflict``.  The file is never rewritten.
+        An existing id with different content raises ``RecordConflict``; so does a ``supersedes`` that
+        names no existing record or one of another scenario, role or subject.  The check and the append
+        run under an exclusive file lock, so concurrent processes cannot both add one id.  A file that
+        ends in an interrupted append gets a newline first, so the fragment stays a separate (invalid)
+        line and the new record is readable.  The file is never rewritten.
         """
 
         line = record.model_dump_json()
-        with self._lock:
-            existing = {item.record_id: item for item in self.read().records}
-            previous = existing.get(record.record_id)
-            if previous is not None:
-                if previous.model_dump_json() == line:
-                    return False
-                raise RecordConflict(f"record {record.record_id!r} already exists with different content")
-            if record.supersedes is not None and record.supersedes not in existing:
-                raise RecordConflict(f"superseded record {record.supersedes!r} does not exist")
-            with open(self._path, "ab") as handle:
-                handle.write(line.encode("utf-8") + b"\n")
-                handle.flush()
-                os.fsync(handle.fileno())
+        with self._lock, open(self._path.with_name(self._path.name + ".lock"), "ab") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                existing = {item.record_id: item for item in self.read().records}
+                previous = existing.get(record.record_id)
+                if previous is not None:
+                    if previous.model_dump_json() == line:
+                        return False
+                    raise RecordConflict(f"record {record.record_id!r} already exists with different content")
+                if record.supersedes is not None:
+                    target = existing.get(record.supersedes)
+                    if target is None:
+                        raise RecordConflict(f"superseded record {record.supersedes!r} does not exist")
+                    if (target.scenario_id, target.role, target.subject_ref) != (record.scenario_id, record.role, record.subject_ref):
+                        raise RecordConflict("a record may only supersede one of the same scenario, role and subject")
+                with open(self._path, "ab") as handle:
+                    if self._path.stat().st_size and not self._ends_with_newline():
+                        handle.write(b"\n")
+                    handle.write(line.encode("utf-8") + b"\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
         return True
+
+    def _ends_with_newline(self) -> bool:
+        with open(self._path, "rb") as handle:
+            handle.seek(-1, os.SEEK_END)
+            return handle.read(1) == b"\n"
 
 
 def current_records(records: Iterable[EvidenceRecord]) -> list[EvidenceRecord]:
@@ -201,15 +220,17 @@ CHANGE_CLASSES = (
 )
 
 
-def _latest(records: Sequence[EvidenceRecord], scenario_id: str, role: str) -> EvidenceRecord | None:
-    matches = [item for item in current_records(records) if item.scenario_id == scenario_id and item.role == role]
-    return matches[-1] if matches else None
+def _current(records: Sequence[EvidenceRecord], scenario_id: str, role: str) -> list[EvidenceRecord]:
+    return [item for item in current_records(records) if item.scenario_id == scenario_id and item.role == role]
 
 
 def classify(baseline: EvidenceRecord | None, candidate: EvidenceRecord | None) -> str:
     if baseline is None or candidate is None:
         return "missing_run"
-    if "unexpected_failure" in (baseline.verdict, candidate.verdict) or "invalid_attempt" in (baseline.verdict, candidate.verdict):
+    if (baseline.oracle_version, baseline.oracle_sha256) != (candidate.oracle_version, candidate.oracle_sha256):
+        return "needs_investigation"   # the two sides were judged by different oracles: not comparable
+    odd = ("unexpected_failure", "invalid_attempt", "deferred", "not_applicable")
+    if baseline.verdict in odd or candidate.verdict in odd:
         return "needs_investigation"
     if baseline.verdict == "blocked":
         return "still_blocked" if candidate.verdict == "blocked" else "newly_possible"
@@ -221,19 +242,26 @@ def classify(baseline: EvidenceRecord | None, candidate: EvidenceRecord | None) 
 
 
 def compare(records: Sequence[EvidenceRecord]) -> list[dict[str, str]]:
-    """One row per scenario: the baseline and candidate verdicts and the class of change."""
+    """One row per scenario: the baseline and candidate verdicts and the class of change.
+
+    Exactly one current (non-superseded) record per scenario and role is comparable; two means the
+    file holds competing verdicts nobody superseded, which is reported, never resolved by file order.
+    """
 
     scenarios = sorted({item.scenario_id for item in records})
     rows = []
     for scenario in scenarios:
-        baseline, candidate = _latest(records, scenario, "baseline"), _latest(records, scenario, "candidate")
+        base_all, cand_all = _current(records, scenario, "baseline"), _current(records, scenario, "candidate")
+        ambiguous = len(base_all) > 1 or len(cand_all) > 1
+        baseline = base_all[-1] if base_all else None
+        candidate = cand_all[-1] if cand_all else None
         rows.append({
             "scenario_id": scenario,
             "baseline": baseline.verdict if baseline else "none",
             "baseline_subject": baseline.subject_ref if baseline else "none",
             "candidate": candidate.verdict if candidate else "none",
             "candidate_subject": candidate.subject_ref if candidate else "none",
-            "change": classify(baseline, candidate),
+            "change": "needs_investigation" if ambiguous else classify(baseline, candidate),
         })
     return rows
 
@@ -276,6 +304,7 @@ def matrix_artifacts(
     summary = (
         f"{len(result.records)} records over {len(rows)} scenarios; changes: "
         + ", ".join(f"{name} {count}" for name, count in sorted(counts.items()))
+        + f"; {Path(evidence_path).stat().st_size} bytes when hashed (the hash goes stale if records are appended later)"
         + (f"; {len(result.invalid_lines)} invalid line(s)" if result.invalid_lines else "")
         + ("; partial tail" if result.partial_tail else "")
     )

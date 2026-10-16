@@ -20,9 +20,51 @@ class CapabilityAbsent(Exception):
     """The tree has no module or API a scenario needs."""
 
 
+_NEEDED: list[str] = []
+_TARGET: Path | None = None
+_HARNESS: Path | None = None
+
+
+def _under(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _foreign_modules() -> list[str]:
+    """Modules loaded from the harness's own tree while observing another tree (never allowed)."""
+
+    if _TARGET is None or _HARNESS is None or _HARNESS.resolve() == _TARGET.resolve():
+        return []
+    found = []
+    for name, module in list(sys.modules.items()):
+        file = getattr(module, "__file__", None)
+        if not file or name in ("__main__", "persona_probes"):
+            continue
+        path = Path(file)
+        parts = set(path.parts)
+        if ".venv" in parts or "site-packages" in parts:
+            continue
+        if _under(path, _HARNESS) and not _under(path, _TARGET):
+            found.append(name)
+    return sorted(found)
+
+
+def _sources() -> dict[str, str]:
+    out = {}
+    for name in _NEEDED:
+        file = getattr(sys.modules.get(name), "__file__", None)
+        if file and _TARGET is not None:
+            out[name] = str(Path(file).resolve().relative_to(_TARGET.resolve())) if _under(Path(file), _TARGET) else "OUTSIDE-TARGET"
+    return out
+
+
 def _need(name: str):
     import importlib
 
+    _NEEDED.append(name)
     try:
         return importlib.import_module(name)
     except ModuleNotFoundError as error:
@@ -128,10 +170,16 @@ SCENARIOS = {
 def observe_all() -> dict[str, dict[str, object]]:
     out: dict[str, dict[str, object]] = {}
     for scenario_id, (persona, probe) in SCENARIOS.items():
+        del _NEEDED[:]
         try:
-            out[scenario_id] = {"persona": persona, "facts": probe()}
+            result = {"persona": persona, "facts": probe(), "sources": _sources()}
+            foreign = _foreign_modules()
+            if foreign or "OUTSIDE-TARGET" in result["sources"].values():
+                result = {"persona": persona, "foreign": foreign or ["OUTSIDE-TARGET"]}
+            out[scenario_id] = result
         except CapabilityAbsent as error:
-            out[scenario_id] = {"persona": persona, "absent": str(error)}
+            foreign = _foreign_modules()
+            out[scenario_id] = {"persona": persona, "foreign": foreign} if foreign else {"persona": persona, "absent": str(error)}
         except Exception as error:  # noqa: BLE001 - recorded as an invalid attempt by the caller
             out[scenario_id] = {"persona": persona, "error": f"{type(error).__name__}: {str(error)[:120]}"}
     return out
@@ -140,8 +188,16 @@ def observe_all() -> dict[str, dict[str, object]]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--service-dir", required=True)
+    parser.add_argument("--harness-dir", default=None)
     args = parser.parse_args()
-    sys.path.insert(0, str(Path(args.service_dir).resolve()))
+    global _TARGET, _HARNESS
+    _TARGET = Path(args.service_dir).resolve()
+    _HARNESS = Path(args.harness_dir).resolve() if args.harness_dir else Path(__file__).resolve().parent
+    # The target tree is the only tree on the path: drop the harness's directory (and any editable-install
+    # entry for it) so a module the target lacks cannot be found there.
+    if _HARNESS != _TARGET:
+        sys.path[:] = [entry for entry in sys.path if not (entry and _under(Path(entry), _HARNESS) and ".venv" not in Path(entry).parts and "site-packages" not in Path(entry).parts)]
+    sys.path.insert(0, str(_TARGET))
     print(json.dumps(observe_all(), sort_keys=True))
     return 0
 

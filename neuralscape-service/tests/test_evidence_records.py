@@ -161,3 +161,77 @@ def test_matrix_artifacts_name_the_files_and_hash_them(tmp_path) -> None:
     out = tmp_path / "matrix-input.json"
     ev.write_matrix_input(out, [(("row-1",), writer.path, report)])
     assert set(json.loads(out.read_text())["rows"]) == {"row-1"}
+
+
+# ---- review corrections: torn tails, processes, supersession scope, comparability, fact tokens
+
+
+def test_a_write_after_a_torn_tail_is_readable_and_the_tear_stays_reported(tmp_path) -> None:
+    writer = ev.EvidenceWriter(tmp_path / "e.jsonl")
+    writer.write(record("r1"))
+    with open(writer.path, "ab") as handle:
+        handle.write(record("r2").model_dump_json().encode()[:50])  # an interrupted append
+    assert writer.write(record("r3")) is True
+    read = writer.read()
+    assert [item.record_id for item in read.records] == ["r1", "r3"]  # the new record is readable
+    assert read.invalid_lines == (2,)  # and the fragment is still reported as its own invalid line
+
+
+def _race(args) -> None:
+    path, verdict = args
+    writer = ev.EvidenceWriter(path)
+    for index in range(20):
+        try:
+            writer.write(record(f"race-{index}", verdict=verdict))
+        except ev.RecordConflict:
+            pass
+
+
+def test_concurrent_processes_cannot_both_add_one_id(tmp_path) -> None:
+    import multiprocessing
+
+    path = str(tmp_path / "e.jsonl")
+    context = multiprocessing.get_context("fork")
+    with context.Pool(6) as pool:
+        pool.map(_race, [(path, "baseline_pass" if n % 2 else "known_failure") for n in range(6)])
+    ids = [item.record_id for item in ev.EvidenceWriter(path).read().records]
+    assert len(ids) == len(set(ids)) == 20
+
+
+def test_a_record_may_only_supersede_one_of_its_own_scenario_role_and_subject(tmp_path) -> None:
+    writer = ev.EvidenceWriter(tmp_path / "e.jsonl")
+    writer.write(record("a-base", scenario="sa", role="baseline"))
+    for other in (
+        record("x1", scenario="sb", role="baseline", supersedes="a-base"),
+        record("x2", scenario="sa", role="candidate", verdict="candidate_pass", supersedes="a-base"),
+        record("x3", scenario="sa", role="baseline", subject_ref="other-tree", supersedes="a-base"),
+    ):
+        with pytest.raises(ev.RecordConflict):
+            writer.write(other)
+    assert writer.write(record("a-base-2", scenario="sa", role="baseline", supersedes="a-base")) is True
+
+
+def test_different_oracles_or_competing_current_records_are_not_comparable() -> None:
+    different = ev.compare([
+        record("b", role="baseline", verdict="known_failure"),
+        record("c", role="candidate", verdict="candidate_pass", oracle_sha256="b" * 64),
+    ])
+    assert different[0]["change"] == "needs_investigation"
+    competing = ev.compare([
+        record("b1", role="baseline", verdict="known_failure"), record("b2", role="baseline", verdict="baseline_pass", subject_ref="tree-2"),
+        record("c", role="candidate", verdict="candidate_pass"),
+    ])
+    assert competing[0]["change"] == "needs_investigation"  # two current baselines: never resolved by file order
+
+
+@pytest.mark.parametrize("candidate", ["deferred", "not_applicable"])
+@pytest.mark.parametrize("baseline", ["baseline_pass", "blocked"])
+def test_a_deferred_or_not_applicable_candidate_is_not_a_regression_or_a_new_capability(baseline, candidate) -> None:
+    rows = ev.compare([record("b", role="baseline", verdict=baseline), record("c", role="candidate", verdict=candidate)])
+    assert rows[0]["change"] == "needs_investigation"
+
+
+def test_a_fact_value_must_be_a_token_not_prose() -> None:
+    with pytest.raises(ValidationError):
+        ev.Observation(key="k", value="this sentence could carry personal data about someone")
+    assert ev.Observation(key="k", value="refused").value == "refused"

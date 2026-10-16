@@ -29,7 +29,7 @@ class OracleError(Exception):
     """An oracle file is missing, altered or not listed in the manifest."""
 
 
-def load_oracles(directory: Path) -> dict[str, tuple[dict, str]]:
+def load_oracles(directory: Path) -> dict[str, tuple[dict, str]]:  # noqa: C901
     manifest = json.loads((directory / MANIFEST).read_text())
     listed = manifest["oracles"]
     found: dict[str, tuple[dict, str]] = {}
@@ -40,6 +40,8 @@ def load_oracles(directory: Path) -> dict[str, tuple[dict, str]]:
         if listed.get(path.name) != digest:
             raise OracleError(f"oracle {path.name} does not match the manifest (reviewer must accept a change)")
         document = json.loads(path.read_text())
+        if document["scenario_id"] in found:
+            raise OracleError(f"two oracle files name the scenario {document['scenario_id']!r}")
         found[document["scenario_id"]] = (document, digest)
     missing = set(listed) - {path.name for path in directory.glob("*.json")}
     if missing:
@@ -48,17 +50,35 @@ def load_oracles(directory: Path) -> dict[str, tuple[dict, str]]:
 
 
 def observe(service_dir: Path) -> dict[str, dict]:
-    done = subprocess.run(
-        [sys.executable, str(PROBES), "--service-dir", str(service_dir)],
-        capture_output=True, text=True, check=True, cwd=str(service_dir), timeout=300,
-    )
-    return json.loads(done.stdout.strip().splitlines()[-1])
+    """Run the probes in a fresh interpreter that sees only the target tree.
+
+    ``-P`` keeps the script's directory off the path; the probe process also removes the harness's own
+    directory (and an editable-install entry for it) and refuses to report facts if any module came from
+    the harness's tree.  A failing probe process is reported per scenario, so no run is lost.
+    """
+
+    try:
+        done = subprocess.run(
+            [sys.executable, "-P", str(PROBES), "--service-dir", str(service_dir), "--harness-dir", str(PROBES.parent)],
+            capture_output=True, text=True, check=True, cwd=str(service_dir), timeout=300,
+        )
+        return json.loads(done.stdout.strip().splitlines()[-1])
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError, IndexError) as error:
+        reason = f"probe process failed: {type(error).__name__}"
+        return {scenario: {"error": reason} for scenario in _scenario_ids()}
+
+
+def _scenario_ids() -> list[str]:
+    import re
+    return re.findall(r'^    "(persona-[a-z-]+)":', PROBES.read_text(), flags=re.M)
 
 
 def judge(role: str, observation: dict, oracle: dict) -> tuple[str, dict[str, str], str]:
     expected = oracle["expected"][role]
     if "error" in observation:
         return "invalid_attempt", {"probe": "error"}, observation["error"][:300]
+    if "foreign" in observation:
+        return "invalid_attempt", {"probe": "foreign-module"}, "a module came from the harness tree, not the target: " + ", ".join(observation["foreign"])[:200]
     seen = {"capability": "absent"} if "absent" in observation else dict(observation["facts"])
     verdict = expected["verdict"] if seen == expected["facts"] else "unexpected_failure"
     note = "" if verdict == expected["verdict"] else "observation differs from the oracle: investigate, do not relabel"
@@ -69,7 +89,7 @@ def run(service_dir: Path, role: str, subject_ref: str, oracles_dir: Path, out: 
     oracles = load_oracles(oracles_dir)
     observed = observe(service_dir)
     writer = EvidenceWriter(out)
-    existing = {record.record_id for record in writer.read().records}
+    existing = {record.record_id: record for record in writer.read().records}
     written = []
     for scenario_id, (oracle, digest) in sorted(oracles.items()):
         observation = observed.get(scenario_id, {"error": "scenario is not defined in the probes"})
@@ -82,7 +102,9 @@ def run(service_dir: Path, role: str, subject_ref: str, oracles_dir: Path, out: 
         )
         if record_id not in existing:
             writer.write(record)
-        written.append(record)
+            written.append(record)
+        else:
+            written.append(existing[record_id])   # a re-run reports what is stored, not a fresh verdict
     return written
 
 

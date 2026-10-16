@@ -85,3 +85,51 @@ def test_the_probe_process_reports_every_scenario_in_a_fresh_interpreter() -> No
     observed = pe.observe(SERVICE_DIR)
     assert set(observed) == set(persona_probes.SCENARIOS)
     assert all(set(item) & {"facts", "absent", "error"} for item in observed.values())
+
+
+# ---- review corrections: probe isolation, failed probe processes, oracle integrity
+
+import hashlib
+
+# Pinned outside the manifest's own directory so that changing an oracle and its manifest entry together
+# still needs this reviewed constant to change (replace it only with a reviewer's acceptance).
+EXPECTED_MANIFEST_SHA256 = "11020d51076967247b0bd6841ca9c5b053e30293349c3ddc016dbbe32d7b88c5"
+
+
+def test_probes_observing_an_empty_tree_find_nothing_instead_of_the_harnesss_own_modules(tmp_path) -> None:
+    observed = pe.observe(tmp_path)
+    assert set(observed) == set(persona_probes.SCENARIOS)
+    assert all("absent" in item for item in observed.values()), observed
+
+
+def test_a_tree_whose_import_kills_the_probe_process_is_recorded_per_scenario(tmp_path) -> None:
+    (tmp_path / "schemas.py").write_text("raise SystemExit(3)\n")
+    out = tmp_path / "evidence.jsonl"
+    records = pe.run(tmp_path, "baseline", "broken-tree", ORACLES, out, "run-x")
+    by_scenario = {item.scenario_id: item for item in records}
+    assert by_scenario["persona-project-preference"].verdict in ("invalid_attempt", "blocked")
+    assert len(ev.EvidenceWriter(out).read().records) == len(persona_probes.SCENARIOS)
+
+
+def test_a_rerun_reports_what_is_stored(tmp_path) -> None:
+    out = tmp_path / "evidence.jsonl"
+    first = pe.run(tmp_path, "baseline", "empty-tree", ORACLES, out, "run-y")
+    (tmp_path / "schemas.py").write_text("raise SystemExit(3)\n")  # a different observation on the second run
+    again = pe.run(tmp_path, "baseline", "empty-tree", ORACLES, out, "run-y")
+    assert [item.model_dump_json() for item in again] == [item.model_dump_json() for item in first]
+
+
+def test_two_oracle_files_naming_one_scenario_are_refused(tmp_path) -> None:
+    copy = tmp_path / "oracles"
+    shutil.copytree(ORACLES, copy)
+    twin = copy / "persona-lifecycle-state-copy.json"
+    twin.write_bytes((copy / "persona-lifecycle-state.json").read_bytes())
+    manifest = json.loads((copy / "ORACLE-MANIFEST.json").read_text())
+    manifest["oracles"][twin.name] = hashlib.sha256(twin.read_bytes()).hexdigest()
+    (copy / "ORACLE-MANIFEST.json").write_text(json.dumps(manifest))
+    with pytest.raises(pe.OracleError, match="two oracle files"):
+        pe.load_oracles(copy)
+
+
+def test_the_manifest_digest_is_pinned_by_this_reviewed_constant() -> None:
+    assert hashlib.sha256((ORACLES / "ORACLE-MANIFEST.json").read_bytes()).hexdigest() == EXPECTED_MANIFEST_SHA256
