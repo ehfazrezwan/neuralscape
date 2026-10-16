@@ -771,6 +771,11 @@ def validate_required_stage_claim(
     monotonic evidence that work started.  Greatest-attempt state still decides
     whether unsatisfied work remains unfinished.
 
+    ``PROCESSING`` stays valid while any required stage is unfinished, even if
+    other required stages already failed or were skipped; the terminal
+    aggregates (``PARTIAL``, ``FAILED``, ``CANCELLED``, ``SUPERSEDED``) apply
+    only once every required stage has settled.
+
     This checks consistency of caller-supplied reports.  It does not prove an
     external effect exists, choose authoritative output references, establish
     retry exhaustion, or select a runtime retry policy.
@@ -941,15 +946,18 @@ def validate_required_stage_claim(
         ):
             raise ValueError("accepted cannot claim started or terminal required stages")
     elif claimed_status is IntentStatus.PROCESSING:
-        terminal_unsatisfied = any(
-            receipt is not None
-            and receipt.status not in {StageStatus.PENDING, StageStatus.PROCESSING}
+        # Confirmed finality direction: a job with any required stage still
+        # unfinished stays nonterminal PROCESSING even when other required
+        # stages already failed or were skipped; per-stage outcomes remain
+        # visible in the receipts.
+        unfinished = any(
+            receipt is None
+            or receipt.status in {StageStatus.PENDING, StageStatus.PROCESSING}
             for receipt in unsatisfied_receipts.values()
         )
-        if not started_stages or not unsatisfied or terminal_unsatisfied:
+        if not started_stages or not unfinished:
             raise ValueError(
-                "processing requires started and unfinished required work "
-                "with no terminal failure"
+                "processing requires started and unfinished required work"
             )
     elif claimed_status is IntentStatus.APPLIED:
         if satisfied != required:

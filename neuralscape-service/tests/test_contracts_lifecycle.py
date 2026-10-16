@@ -3211,6 +3211,90 @@ def test_processing_rejects_no_started_or_no_unfinished_work(
         )
 
 
+_MIXED = (ProcessingStage.CANONICAL, ProcessingStage.VECTOR, ProcessingStage.GRAPH)
+
+
+@pytest.mark.parametrize(
+    "receipts",
+    [
+        # Confirmed finality direction: unfinished work keeps the job in
+        # PROCESSING even when sibling stages already failed or were skipped.
+        (
+            receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED),
+            receipt(ProcessingStage.VECTOR, StageStatus.FAILED),
+            receipt(ProcessingStage.GRAPH, StageStatus.PENDING),
+        ),
+        (
+            receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED),
+            receipt(ProcessingStage.VECTOR, StageStatus.SKIPPED),
+            receipt(ProcessingStage.GRAPH, StageStatus.PROCESSING),
+        ),
+        (
+            receipt(ProcessingStage.CANONICAL, StageStatus.FAILED),
+            receipt(ProcessingStage.VECTOR, StageStatus.SKIPPED),
+            receipt(ProcessingStage.GRAPH, StageStatus.PROCESSING),
+        ),
+        (
+            receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED),
+            receipt(ProcessingStage.VECTOR, StageStatus.FAILED),
+        ),
+        (
+            receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED),
+            receipt(ProcessingStage.VECTOR, StageStatus.FAILED, attempt=1),
+            receipt(ProcessingStage.VECTOR, StageStatus.PROCESSING, attempt=2),
+            receipt(ProcessingStage.GRAPH, StageStatus.FAILED),
+        ),
+    ],
+)
+def test_processing_allows_settled_failures_beside_unfinished_stage(
+    receipts: tuple[StageReceipt, ...],
+) -> None:
+    validate_required_stage_claim(
+        claimed_status=IntentStatus.PROCESSING,
+        intent=intent(*_MIXED),
+        receipts=receipts,
+    )
+
+
+@pytest.mark.parametrize(
+    "claim",
+    [
+        IntentStatus.PARTIAL,
+        IntentStatus.FAILED,
+        IntentStatus.CANCELLED,
+        IntentStatus.SUPERSEDED,
+        IntentStatus.APPLIED,
+        IntentStatus.ACCEPTED,
+    ],
+)
+def test_mixed_failed_and_unfinished_stages_admit_only_processing(
+    claim: IntentStatus,
+) -> None:
+    with pytest.raises(ValueError):
+        validate_required_stage_claim(
+            claimed_status=claim,
+            intent=intent(*_MIXED),
+            receipts=(
+                receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED),
+                receipt(ProcessingStage.VECTOR, StageStatus.FAILED),
+                receipt(ProcessingStage.GRAPH, StageStatus.PENDING),
+            ),
+        )
+
+
+def test_processing_rejects_when_every_required_stage_has_settled() -> None:
+    with pytest.raises(ValueError, match="started and unfinished"):
+        validate_required_stage_claim(
+            claimed_status=IntentStatus.PROCESSING,
+            intent=intent(*_MIXED),
+            receipts=(
+                receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED),
+                receipt(ProcessingStage.VECTOR, StageStatus.FAILED),
+                receipt(ProcessingStage.GRAPH, StageStatus.SKIPPED),
+            ),
+        )
+
+
 def test_accepted_still_allows_empty_or_pending_required_work() -> None:
     command = intent(ProcessingStage.CANONICAL, ProcessingStage.GRAPH)
 
