@@ -284,6 +284,10 @@ def test_encrypted_zip_entry_is_rejected(tmp_path) -> None:
         archive.writestr("manifest.json", json.dumps(_manifest({})))
         archive.writestr("secret", b"x")
         archive.infolist()[1].flag_bits |= 0x1
+    raw = bytearray(path.read_bytes())
+    local = raw.index(b"secret") - 30
+    raw[local + 6] |= 0x1  # a real encrypted member flags its local header too
+    path.write_bytes(bytes(raw))
     assert pv.ENTRY_ENCRYPTED in _codes(verify_bundle(path))
 
 
@@ -457,3 +461,263 @@ def test_cli_exit_codes(tmp_path) -> None:
     assert json.loads(failed.stdout)["findings"][0]["code"] == pv.FILE_UNDECLARED
     assert _run_cli().returncode == 2
     assert _run_cli("-x").returncode == 2
+
+
+# --- archive framing and stream-vs-directory agreement ----------------------
+
+_BIG = bytes(range(256)) * 32  # 8192 bytes
+
+
+def _prefix_manifest(name: str, size: int) -> dict:
+    manifest = _manifest({name: _BIG})
+    manifest["files"][0]["size_bytes"] = size
+    manifest["files"][0]["checksum"]["digest"] = hashlib.sha256(_BIG[:size]).hexdigest()
+    return manifest
+
+
+def _patch_member(
+    raw: bytearray, name: str, *, local: bool, central: bool, **fields: int
+) -> None:
+    """Rewrite crc/csize/usize in the named member's local and/or central header."""
+
+    encoded = name.encode()
+    layouts = {"crc": (14, 16, "<I"), "csize": (18, 20, "<I"), "usize": (22, 24, "<I")}
+    import struct
+
+    if local:
+        position = raw.index(b"PK\x03\x04" + b"\x00" * 0)
+        while raw[position + 30 : position + 30 + len(encoded)] != encoded:
+            position = raw.index(b"PK\x03\x04", position + 1)
+        for key, value in fields.items():
+            struct.pack_into(layouts[key][2], raw, position + layouts[key][0], value)
+    if central:
+        position = raw.index(b"PK\x01\x02")
+        while raw[position + 46 : position + 46 + len(encoded)] != encoded:
+            position = raw.index(b"PK\x01\x02", position + 1)
+        for key, value in fields.items():
+            struct.pack_into(layouts[key][2], raw, position + layouts[key][1], value)
+
+
+@pytest.mark.parametrize("method", [zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED])
+@pytest.mark.parametrize("patch_local", [False, True])
+def test_central_size_lie_is_rejected(tmp_path, method, patch_local) -> None:
+    path = tmp_path / "b.zip"
+    with zipfile.ZipFile(path, "w", method) as archive:
+        archive.writestr("manifest.json", json.dumps(_prefix_manifest("big.bin", 100)))
+        archive.writestr("big.bin", _BIG)
+    raw = bytearray(path.read_bytes())
+    fields = {"usize": 100, "crc": zlib_crc(_BIG[:100])}
+    if method == zipfile.ZIP_STORED:
+        fields["csize"] = 100
+    _patch_member(raw, "big.bin", local=patch_local, central=True, **fields)
+    path.write_bytes(bytes(raw))
+    report = verify_bundle(path)
+    assert not report.ok
+    assert _codes(report) <= {pv.ARCHIVE_FRAMING, pv.ENTRY_CORRUPT}
+    assert report.files_verified == 0
+
+
+def zlib_crc(data: bytes) -> int:
+    import zlib
+
+    return zlib.crc32(data)
+
+
+def _good_zip_bytes(tmp_path) -> bytes:
+    return _write_zip(tmp_path / "good.zip", PAYLOAD).read_bytes()
+
+
+def test_junk_before_first_record_is_rejected(tmp_path) -> None:
+    path = tmp_path / "b.zip"
+    path.write_bytes(b"JUNKJUNK" + _good_zip_bytes(tmp_path))
+    assert _codes(verify_bundle(path)) == {pv.ARCHIVE_FRAMING}
+
+
+def test_trailing_bytes_after_end_record_are_rejected(tmp_path) -> None:
+    path = tmp_path / "b.zip"
+    path.write_bytes(_good_zip_bytes(tmp_path) + b"TRAILING")
+    assert _codes(verify_bundle(path)) == {pv.ARCHIVE_FRAMING}
+
+
+def test_archive_comment_is_rejected(tmp_path) -> None:
+    path = _write_zip(tmp_path / "b.zip", PAYLOAD)
+    with zipfile.ZipFile(path, "a") as archive:
+        archive.comment = b"note"
+    assert _codes(verify_bundle(path)) == {pv.ARCHIVE_FRAMING}
+
+
+def test_comment_embedding_another_archive_is_rejected(tmp_path) -> None:
+    good = _good_zip_bytes(tmp_path)
+    path = _write_zip(tmp_path / "outer.zip", {**PAYLOAD, "stray": b"x"})
+    with zipfile.ZipFile(path, "a") as archive:
+        archive.comment = good
+    report = verify_bundle(path)
+    assert not report.ok
+    assert pv.ARCHIVE_FRAMING in _codes(report)
+
+
+def _plain_zip(path: Path, method: int = zipfile.ZIP_STORED) -> bytearray:
+    with zipfile.ZipFile(path, "w", method) as archive:
+        archive.writestr("manifest.json", json.dumps(_manifest(PAYLOAD)))
+        for name, data in PAYLOAD.items():
+            archive.writestr(name, data)
+    return bytearray(path.read_bytes())
+
+
+def _insert_bytes(raw: bytearray, position: int, junk: bytes) -> None:
+    """Insert ``junk`` and repair every directory offset so zipfile still parses."""
+
+    import struct
+
+    raw[position:position] = junk
+    eocd = raw.rindex(b"PK\x05\x06")
+    cd_offset = struct.unpack_from("<I", raw, eocd + 16)[0]
+    cursor = cd_offset + (len(junk) if cd_offset >= position else 0)
+    while raw[cursor : cursor + 4] == b"PK\x01\x02":
+        offset = struct.unpack_from("<I", raw, cursor + 42)[0]
+        if offset >= position:
+            struct.pack_into("<I", raw, cursor + 42, offset + len(junk))
+        name_length, extra_length, comment_length = struct.unpack_from("<HHH", raw, cursor + 28)
+        cursor += 46 + name_length + extra_length + comment_length
+    if cd_offset >= position:
+        struct.pack_into("<I", raw, eocd + 16, cd_offset + len(junk))
+
+
+def _second_header_offset(path: Path) -> int:
+    with zipfile.ZipFile(path) as archive:
+        return archive.infolist()[1].header_offset
+
+
+def test_gap_between_records_is_rejected(tmp_path) -> None:
+    path = tmp_path / "b.zip"
+    raw = _plain_zip(path)
+    _insert_bytes(raw, _second_header_offset(path), b"HIDDEN-BYTES")
+    path.write_bytes(bytes(raw))
+    with zipfile.ZipFile(path) as archive:  # still a valid zip to Python
+        assert archive.testzip() is None
+    assert _codes(verify_bundle(path)) == {pv.ARCHIVE_FRAMING}
+
+
+def test_gap_before_central_directory_is_rejected(tmp_path) -> None:
+    import struct
+
+    path = tmp_path / "b.zip"
+    raw = _plain_zip(path)
+    eocd = raw.rindex(b"PK\x05\x06")
+    _insert_bytes(raw, struct.unpack_from("<I", raw, eocd + 16)[0], b"HIDDEN-BYTES")
+    path.write_bytes(bytes(raw))
+    with zipfile.ZipFile(path) as archive:
+        assert archive.testzip() is None
+    assert _codes(verify_bundle(path)) == {pv.ARCHIVE_FRAMING}
+
+
+def test_junk_inside_deflate_span_is_rejected(tmp_path) -> None:
+    """Directory sizes claim extra bytes after the deflate stream ends."""
+
+    path = tmp_path / "b.zip"
+    raw = _plain_zip(path, zipfile.ZIP_DEFLATED)
+    with zipfile.ZipFile(path) as archive:
+        victim = archive.getinfo("sources/note.md")
+        end = victim.header_offset + 30 + len(victim.filename) + victim.compress_size
+    _insert_bytes(raw, end, b"JUNK")
+    _patch_member(raw, "sources/note.md", local=True, central=True, csize=victim.compress_size + 4)
+    path.write_bytes(bytes(raw))
+    report = verify_bundle(path)
+    assert not report.ok
+    assert _codes(report) <= {pv.ARCHIVE_FRAMING, pv.ENTRY_CORRUPT}
+
+
+def test_stored_member_with_unequal_sizes_is_rejected(tmp_path) -> None:
+    path = tmp_path / "b.zip"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("manifest.json", json.dumps(_manifest(PAYLOAD)))
+        for name, data in PAYLOAD.items():
+            archive.writestr(name, data)
+    raw = bytearray(path.read_bytes())
+    _patch_member(raw, "sources/note.md", local=True, central=True, usize=3)
+    path.write_bytes(bytes(raw))
+    assert not verify_bundle(path).ok
+
+
+# --- framing positive controls ----------------------------------------------
+
+
+def test_nested_archive_payload_still_verifies(tmp_path) -> None:
+    inner = io.BytesIO()
+    with zipfile.ZipFile(inner, "w") as nested:
+        nested.writestr("x", b"inner")
+    files = {**PAYLOAD, "attachments/inner.zip": inner.getvalue()}
+    path = _write_zip(tmp_path / "b.zip", files, _manifest(files))
+    assert verify_bundle(path).ok
+
+
+def test_zip64_member_verifies(tmp_path) -> None:
+    path = tmp_path / "b.zip"
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("manifest.json", json.dumps(_manifest(PAYLOAD)))
+        for name, data in PAYLOAD.items():
+            with archive.open(name, "w", force_zip64=True) as member:
+                member.write(data)
+    report = verify_bundle(path)
+    assert report.ok, report.findings
+
+
+class _Unseekable(io.RawIOBase):
+    def __init__(self) -> None:
+        self.buffer = io.BytesIO()
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, data) -> int:
+        return self.buffer.write(data)
+
+    def flush(self) -> None:
+        pass
+
+
+def test_streamed_data_descriptor_archive_verifies(tmp_path) -> None:
+    stream = _Unseekable()
+    with zipfile.ZipFile(stream, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("manifest.json", json.dumps(_manifest(PAYLOAD)))
+        for name, data in PAYLOAD.items():
+            archive.writestr(name, data)
+    path = tmp_path / "b.zip"
+    path.write_bytes(stream.buffer.getvalue())
+    report = verify_bundle(path)
+    assert report.ok, report.findings
+
+
+def test_member_with_incompressible_and_multichunk_payload_verifies(tmp_path) -> None:
+    blob = os.urandom(300_000)
+    files = {**PAYLOAD, "blob.bin": blob}
+    path = _write_zip(tmp_path / "b.zip", files, _manifest(files))
+    assert verify_bundle(path).ok
+
+
+@pytest.mark.parametrize("field", ["usize", "crc", "csize"])
+def test_local_header_disagreeing_with_central_is_rejected(tmp_path, field) -> None:
+    path = tmp_path / "b.zip"
+    raw = _plain_zip(path, zipfile.ZIP_DEFLATED)
+    with zipfile.ZipFile(path) as archive:
+        info = archive.getinfo("sources/note.md")
+    value = {"usize": info.file_size + 1, "crc": info.CRC ^ 1, "csize": info.compress_size + 1}[field]
+    _patch_member(raw, "sources/note.md", local=True, central=False, **{field: value})
+    path.write_bytes(bytes(raw))
+    assert pv.ARCHIVE_FRAMING in _codes(verify_bundle(path))
+
+
+@pytest.mark.parametrize("kind", ["short", "crc"])
+def test_deflate_output_must_match_declared_length_and_crc(tmp_path, kind) -> None:
+    path = tmp_path / "b.zip"
+    raw = _plain_zip(path, zipfile.ZIP_DEFLATED)
+    with zipfile.ZipFile(path) as archive:
+        info = archive.getinfo("sources/note.md")
+    if kind == "short":
+        fields = {"usize": info.file_size + 7}
+    else:
+        fields = {"crc": info.CRC ^ 0xFFFF}
+    _patch_member(raw, "sources/note.md", local=True, central=True, **fields)
+    path.write_bytes(bytes(raw))
+    assert _codes(verify_bundle(path)) <= {pv.ENTRY_CORRUPT, pv.SIZE_MISMATCH}
+    assert not verify_bundle(path).ok

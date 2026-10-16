@@ -13,6 +13,22 @@ decryptability, authorization, or that an import will succeed.  A checksum only
 detects mismatch with the manifest; authenticity belongs to the reviewed
 cryptographic protocol.
 
+Zip framing is strict so different parsers cannot read different archives: the
+file must be exactly contiguous local records, the central directory, and an
+end record with an empty comment (no leading or trailing bytes, gaps, or
+embedded archives).  Each local header must agree with the central directory,
+and each member's stored stream must end exactly where, and be exactly as long
+as, the directory says (stored sizes equal; deflate ends with no leftover
+bytes, inflates to the declared length and CRC).
+
+Worst-case CPU is bounded by the provisional limits, not by input size: up to
+``MAX_TOTAL_BYTES`` of payload can be inflated and hashed, at ratios below
+``MAX_COMPRESSION_RATIO`` for members of at least ``RATIO_MIN_ENTRY_BYTES``
+(smaller members are unconstrained by ratio), across at most
+``MAX_BUNDLE_ENTRIES`` records.  A tiny archive can therefore still cost a
+long single-threaded run; callers that need a tighter bound must lower the
+constants.
+
 Usage: ``python -m portability_verifier PATH`` prints a JSON report and exits
 0 (clean), 1 (findings), or 2 (usage).
 """
@@ -23,12 +39,13 @@ import hashlib
 import json
 import os
 import stat
+import struct
 import sys
 import unicodedata
 import zipfile
 import zlib
 from dataclasses import dataclass, field
-from typing import Any, Iterator
+from typing import Any, BinaryIO, Iterator, NamedTuple
 
 from pydantic import ValidationError
 
@@ -67,6 +84,7 @@ ENTRY_COUNT_LIMIT = "entry_count_limit"
 SIZE_LIMIT = "size_limit"
 RATIO_LIMIT = "ratio_limit"
 OVERLAPPING_ENTRIES = "overlapping_entries"
+ARCHIVE_FRAMING = "archive_framing"
 PATH_UNSAFE = "path_unsafe"
 SYMLINK_ENTRY = "symlink_entry"
 HARDLINK_ENTRY = "hardlink_entry"
@@ -92,6 +110,7 @@ _FATAL_CODES = frozenset(
         SIZE_LIMIT,
         RATIO_LIMIT,
         OVERLAPPING_ENTRIES,
+        ARCHIVE_FRAMING,
     }
 )
 
@@ -171,10 +190,186 @@ def _mode_finding(mode: int) -> str | None:
     return SPECIAL_ENTRY
 
 
+class _ZipSource(NamedTuple):
+    """An opened archive plus an independent raw handle on the same bytes."""
+
+    archive: zipfile.ZipFile
+    raw: BinaryIO
+
+
+_LOCAL_SIGNATURE = b"PK\x03\x04"
+_EOCD_SIGNATURE = b"PK\x05\x06"
+_ZIP64_LOCATOR_SIGNATURE = b"PK\x06\x07"
+_ZIP64_EOCD_SIGNATURE = b"PK\x06\x06"
+_DESCRIPTOR_SIGNATURE = b"PK\x07\x08"
+_FLAG_DESCRIPTOR = 0x8
+_FLAG_UTF8 = 0x800
+_LOCAL_HEADER = struct.Struct("<4sHHHHHIIIHH")
+_EOCD = struct.Struct("<4sHHHHIIH")
+_U32_MAX = 0xFFFFFFFF
+
+
+class _Framing(Exception):
+    """The archive bytes are not exactly the records the directory claims."""
+
+
+def _zip64_local_sizes(extra: bytes, want_usize: bool, want_csize: bool) -> tuple[int, int]:
+    position = 0
+    while position + 4 <= len(extra):
+        header_id, length = struct.unpack_from("<HH", extra, position)
+        body = extra[position + 4 : position + 4 + length]
+        if header_id == 0x0001:
+            offset = 0
+            usize = csize = -1
+            if want_usize:
+                usize = struct.unpack_from("<Q", body, offset)[0]
+                offset += 8
+            if want_csize:
+                csize = struct.unpack_from("<Q", body, offset)[0]
+            return usize, csize
+        position += 4 + length
+    raise _Framing("missing zip64 sizes")
+
+
+def _local_record_end(raw: BinaryIO, info: zipfile.ZipInfo, start_dir: int) -> int:
+    """Return the offset just past this member's local record.
+
+    Compares the local header with the central-directory view of the member
+    (name, flags, method, CRC and both sizes) and accounts for the data
+    descriptor, so nothing the central directory does not describe can hide
+    inside the record.  Payload bytes are not read here.
+    """
+
+    raw.seek(info.header_offset)
+    head = raw.read(_LOCAL_HEADER.size)
+    if len(head) != _LOCAL_HEADER.size:
+        raise _Framing("short local header")
+    (signature, _version, flags, method, _time, _date, crc, csize, usize, name_length, extra_length) = (
+        _LOCAL_HEADER.unpack(head)
+    )
+    if signature != _LOCAL_SIGNATURE:
+        raise _Framing("bad local header signature")
+    name = raw.read(name_length)
+    extra = raw.read(extra_length)
+    if len(name) != name_length or len(extra) != extra_length:
+        raise _Framing("short local header")
+    try:
+        decoded = name.decode("utf-8" if flags & _FLAG_UTF8 else "cp437")
+    except UnicodeDecodeError:
+        raise _Framing("undecodable local name") from None
+    if decoded != info.orig_filename:
+        raise _Framing("local and central names differ")
+    if flags != info.flag_bits or method != info.compress_type:
+        raise _Framing("local and central flags or method differ")
+
+    if not flags & _FLAG_DESCRIPTOR:
+        if csize == _U32_MAX or usize == _U32_MAX:
+            zip64_usize, zip64_csize = _zip64_local_sizes(
+                extra, usize == _U32_MAX, csize == _U32_MAX
+            )
+            if usize == _U32_MAX:
+                usize = zip64_usize
+            if csize == _U32_MAX:
+                csize = zip64_csize
+        if (crc, csize, usize) != (info.CRC, info.compress_size, info.file_size):
+            raise _Framing("local and central CRC or sizes differ")
+    elif (csize, usize) not in ((0, 0), (info.compress_size, info.file_size)) and not (
+        csize == _U32_MAX or usize == _U32_MAX
+    ):
+        raise _Framing("local sizes conflict with the central directory")
+
+    data_end = info.header_offset + _LOCAL_HEADER.size + name_length + extra_length + info.compress_size
+    if data_end > start_dir:
+        raise _Framing("member data overruns the central directory")
+    if not flags & _FLAG_DESCRIPTOR:
+        return data_end
+
+    raw.seek(data_end)
+    probe = raw.read(24)
+    for with_signature in (True, False):
+        for width, fmt in ((4, "<III"), (8, "<IQQ")):
+            prefix = 4 if with_signature else 0
+            size = prefix + struct.calcsize(fmt)
+            if len(probe) < size:
+                continue
+            if with_signature and probe[:4] != _DESCRIPTOR_SIGNATURE:
+                continue
+            if struct.unpack_from(fmt, probe, prefix) == (info.CRC, info.compress_size, info.file_size):
+                return data_end + size
+    raise _Framing("data descriptor does not match the central directory")
+
+
+def _check_framing(
+    source: _ZipSource, infos: list[zipfile.ZipInfo], report: VerificationReport
+) -> bool:
+    """Require the file to be exactly: local records, central directory, EOCD.
+
+    Rejects bytes before the first record or after the end record, a
+    non-empty archive comment (which could embed another archive), unaccounted
+    gaps between records, and any local/central disagreement, so different zip
+    parsers cannot select different archives or different member bytes.
+    """
+
+    raw, archive = source.raw, source.archive
+    try:
+        raw.seek(0, os.SEEK_END)
+        size = raw.tell()
+        if size < _EOCD.size:
+            raise _Framing("too short")
+        raw.seek(size - _EOCD.size)
+        eocd = _EOCD.unpack(raw.read(_EOCD.size))
+        if eocd[0] != _EOCD_SIGNATURE or eocd[7] != 0:
+            raise _Framing("trailing data or archive comment after the end record")
+        eocd_position = size - _EOCD.size
+        _sig, disk, cd_disk, _entries_here, entries, cd_size, cd_offset, _comment = eocd
+        end_of_directory = eocd_position
+        if (
+            entries == 0xFFFF
+            or cd_size == _U32_MAX
+            or cd_offset == _U32_MAX
+            or disk == 0xFFFF
+            or cd_disk == 0xFFFF
+        ):
+            locator_position = eocd_position - 20
+            if locator_position < 0:
+                raise _Framing("missing zip64 locator")
+            raw.seek(locator_position)
+            locator = raw.read(20)
+            if locator[:4] != _ZIP64_LOCATOR_SIGNATURE:
+                raise _Framing("missing zip64 locator")
+            record_offset = struct.unpack_from("<Q", locator, 8)[0]
+            raw.seek(record_offset)
+            record = raw.read(56)
+            if len(record) != 56 or record[:4] != _ZIP64_EOCD_SIGNATURE:
+                raise _Framing("bad zip64 end record")
+            record_size = struct.unpack_from("<Q", record, 4)[0]
+            if record_offset + 12 + record_size != locator_position:
+                raise _Framing("gap before the zip64 locator")
+            cd_size, cd_offset = struct.unpack_from("<QQ", record, 40)
+            end_of_directory = record_offset
+        if cd_offset + cd_size != end_of_directory:
+            raise _Framing("gap between the central directory and the end record")
+        if cd_offset != archive.start_dir:
+            raise _Framing("data before the first record")
+
+        ordered = sorted(infos, key=lambda item: item.header_offset)
+        expected = 0
+        for info in ordered:
+            if info.header_offset != expected:
+                raise _Framing("unaccounted bytes between records")
+            expected = _local_record_end(raw, info, cd_offset)
+        if expected != cd_offset:
+            raise _Framing("unaccounted bytes before the central directory")
+    except (_Framing, struct.error, OSError, ValueError) as exc:
+        report.add(ARCHIVE_FRAMING, "<bundle>", str(exc)[:80])
+        return False
+    return True
+
+
 def _inventory_zip(
-    zf: zipfile.ZipFile, report: VerificationReport
+    source: _ZipSource, report: VerificationReport
 ) -> list[_Entry]:
-    infos = zf.infolist()
+    infos = source.archive.infolist()
     if len(infos) > MAX_BUNDLE_ENTRIES:
         report.add(ENTRY_COUNT_LIMIT)
         return []
@@ -200,6 +395,8 @@ def _inventory_zip(
         if following.header_offset < current.header_offset + current.compress_size:
             report.add(OVERLAPPING_ENTRIES)
             return []
+    if not _check_framing(source, infos, report):
+        return []
 
     entries: list[_Entry] = []
     for info in infos:
@@ -286,11 +483,63 @@ def _collision_checks(entries: list[_Entry], report: VerificationReport) -> None
             report.add(CASE_COLLISION, _safe_label(name))
 
 
-def _read_chunks(entry: _Entry, zf: zipfile.ZipFile | None) -> Iterator[bytes]:
+def _zip_member_chunks(info: zipfile.ZipInfo, raw: BinaryIO) -> Iterator[bytes]:
+    """Yield a member's bytes after proving the stored stream matches the directory.
+
+    The compressed span is read directly (not through ``zipfile``, which stops
+    at the central size) and must be consumed exactly: a stored member's two
+    sizes agree; a deflate stream ends exactly at ``compress_size`` with no
+    trailing bytes and inflates to exactly ``file_size`` with the central CRC.
+    """
+
+    raw.seek(info.header_offset)
+    head = _LOCAL_HEADER.unpack(raw.read(_LOCAL_HEADER.size))
+    raw.seek(info.header_offset + _LOCAL_HEADER.size + head[9] + head[10])
+    remaining = info.compress_size
+    produced = 0
+    crc = 0
+    if info.compress_type == zipfile.ZIP_STORED:
+        if info.compress_size != info.file_size:
+            raise ValueError("stored member sizes differ")
+        decompressor = None
+    else:
+        decompressor = zlib.decompressobj(-15)
+    pending = b""
+    while True:
+        if decompressor is None:
+            chunk = raw.read(min(_CHUNK, remaining))
+            if len(chunk) != min(_CHUNK, remaining):
+                raise ValueError("truncated member")
+            remaining -= len(chunk)
+        else:
+            if not pending and not decompressor.eof and remaining:
+                pending = raw.read(min(_CHUNK, remaining))
+                if not pending:
+                    raise ValueError("truncated member")
+                remaining -= len(pending)
+            if not pending and not decompressor.eof:
+                raise ValueError("deflate stream ended early")
+            chunk = decompressor.decompress(pending, _CHUNK)
+            pending = decompressor.unconsumed_tail
+            if decompressor.eof:
+                if decompressor.unused_data or pending or remaining:
+                    raise ValueError("bytes after the deflate stream")
+        produced += len(chunk)
+        if produced > info.file_size:
+            raise ValueError("member inflates past its declared size")
+        crc = zlib.crc32(chunk, crc)
+        if chunk:
+            yield chunk
+        finished = remaining == 0 if decompressor is None else decompressor.eof
+        if finished and (decompressor is None or not pending):
+            break
+    if produced != info.file_size or crc != info.CRC:
+        raise ValueError("member length or CRC differs from the directory")
+
+
+def _read_chunks(entry: _Entry, zf: _ZipSource | None) -> Iterator[bytes]:
     if zf is not None:
-        with zf.open(entry.handle) as stream:
-            while chunk := stream.read(_CHUNK):
-                yield chunk
+        yield from _zip_member_chunks(entry.handle, zf.raw)
         return
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     descriptor = os.open(entry.handle, flags)
@@ -306,7 +555,7 @@ def _read_chunks(entry: _Entry, zf: zipfile.ZipFile | None) -> Iterator[bytes]:
 
 
 def _hash_entry(
-    entry: _Entry, zf: zipfile.ZipFile | None, limit: int
+    entry: _Entry, zf: _ZipSource | None, limit: int
 ) -> tuple[int, str] | None:
     """Return ``(bytes_read, sha256)``; reading stops one byte past ``limit``."""
 
@@ -324,7 +573,7 @@ def _hash_entry(
 
 
 def _load_manifest(
-    entries: dict[str, _Entry], zf: zipfile.ZipFile | None, report: VerificationReport
+    entries: dict[str, _Entry], zf: _ZipSource | None, report: VerificationReport
 ) -> PortableManifest | None:
     entry = entries.get(MANIFEST_NAME)
     if entry is None or entry.kind != "file":
@@ -361,7 +610,7 @@ def _load_manifest(
 
 
 def _verify_open(
-    entries: list[_Entry], zf: zipfile.ZipFile | None, report: VerificationReport
+    entries: list[_Entry], zf: _ZipSource | None, report: VerificationReport
 ) -> None:
     _collision_checks(entries, report)
     if any(item.code in _FATAL_CODES for item in report.findings):
@@ -435,10 +684,14 @@ def verify_bundle(path: str | os.PathLike[str]) -> VerificationReport:
     except (zipfile.BadZipFile, OSError, EOFError, ValueError, NotImplementedError):
         report.add(CONTAINER_UNREADABLE, "<bundle>", "not a readable zip archive")
         return report
-    with archive:
-        entries = _inventory_zip(archive, report)
-        if not any(item.code in _FATAL_CODES for item in report.findings):
-            _verify_open(entries, archive, report)
+    try:
+        with archive, open(target, "rb") as raw:
+            source = _ZipSource(archive, raw)
+            entries = _inventory_zip(source, report)
+            if not any(item.code in _FATAL_CODES for item in report.findings):
+                _verify_open(entries, source, report)
+    except OSError:
+        report.add(CONTAINER_UNREADABLE, "<bundle>")
     return report
 
 
