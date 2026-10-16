@@ -12,7 +12,7 @@ from types import MappingProxyType
 from dataclasses import dataclass, field
 from typing import Annotated, Literal
 
-from contracts_limits import STANDARD, DiscoveryBudget, is_exact_type
+from contracts_limits import DISCOVERY_BUDGET_MESSAGE, STANDARD, DiscoveryBudget, is_exact_type
 from pydantic import (
     AliasChoices,
     AliasPath,
@@ -116,16 +116,18 @@ def _plain_keys(
 ) -> tuple[tuple[tuple[object, object], ...], bool, bool]:
     """Read ``str``-subclass keys as their text, without running their hooks.
 
-    Returns ``(entries, pure, colliding)``.  ``pure`` is false when a key of a non-plain type
-    other than a ``str`` subclass remains (rebuilding the dict hashes it, which runs its code).
-    When two keys would share one text the original keys are kept and ``colliding`` is set, so
-    the established diagnostics for models report exactly as before and a plain dict is refused
-    when it is rebuilt (see ``_reconstruct_captured_graph``).
+    Returns ``(entries, pure, colliding)``.  Every ``str``-subclass key is replaced by its text
+    (``str.__str__``, which runs no hook), so nothing later hashes or compares the subclass.
+    ``pure`` is false when a key of another non-plain type remains (rebuilding a dict hashes it,
+    which runs its code).  ``colliding`` is set when two keys share one text; the entries keep
+    both, and the caller refuses them where its established diagnostics expect it (a plain dict
+    when it is rebuilt, model names after their fields, extras through the duplicate-key check).
     """
 
     plain: list[tuple[object, object]] = []
     texts: set[str] = set()
     pure = True
+    colliding = False
     for key, item in entries:
         if not is_exact_type(key, *_PLAIN_KEY_TYPES):
             if _is_subclass(type(key), str):
@@ -134,10 +136,10 @@ def _plain_keys(
                 pure = False
         if type(key) is str:
             if key in texts:
-                return entries, False, True
+                colliding = True
             texts.add(key)  # type: ignore[arg-type]
         plain.append((key, item))
-    return tuple(plain), pure, False
+    return tuple(plain), pure and not colliding, colliding
 
 
 def _mapping_entries(
@@ -174,6 +176,7 @@ class _ModelInventory:
     extra_entries: tuple[tuple[object, object], ...] | None = None
     malformed_extra: bool = False
     pure_names: bool = True
+    colliding_names: bool = False
 
 
 @dataclass
@@ -226,7 +229,7 @@ def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int 
     if _is_subclass(value_type, BaseModel):
         stored = _BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel)
         _precheck(budget, dict.__len__(stored))
-        stored_entries, pure_stored, _ = _plain_keys(tuple(dict.items(stored)))
+        stored_entries, pure_stored, stored_colliding = _plain_keys(tuple(dict.items(stored)))
         budget.charge_edge(len(stored_entries))
         try:
             extra = _BASE_MODEL_EXTRA_DESCRIPTOR.__get__(value, BaseModel)
@@ -237,6 +240,7 @@ def _capture_native_graph(value: object, inventory: _GraphInventory, depth: int 
             stored_entries=stored_entries,
             extra=extra,
             pure_names=pure_stored,
+            colliding_names=stored_colliding,
         )
         inventory.models[value_id] = model_inventory
 
@@ -334,6 +338,10 @@ def _snapshot_captured_graph(
     no public view and rebuilt no dict whose keys can run a hook.  Any other subtree is
     rebuilt and charged on every edge, so each edge reaching a public view observes it
     again, as the contract promises.
+
+    One nesting level is exactly one call of this function: children are rebuilt in
+    plain loops that call it directly (no helper, closure or generator), so the stack
+    a snapshot needs is bounded by the tier's depth, whatever the caller's own depth.
     """
 
     value_type = type(value)
@@ -346,57 +354,20 @@ def _snapshot_captured_graph(
     value_id = id(value)
     if value_id not in inventory.visited:
         _capture_native_graph(value, inventory, depth)
-    cached = inventory.completed.get(value_id)
+    completed = inventory.completed
+    cached = completed.get(value_id)
     if cached is not None and cached[0] is value:
         budget.charge_edge()  # the edge to a reused subtree
         if depth + cached[2] > budget.tier.max_depth:
             budget.charge_edge(budget.tier.max_edges + 1)
         return cached[1]
-    reads_before = inventory.impure_reads
-    result, height = _reconstruct_captured_graph(value, active_containers, inventory, depth)
-    if inventory.impure_reads == reads_before:
-        inventory.completed[value_id] = (value, result, height)
-    return result
-
-
-def _child(
-    item: object,
-    active_containers: set[int],
-    inventory: _GraphInventory,
-    depth: int,
-    height: int,
-) -> tuple[object, int]:
-    """Charge one edge, rebuild ``item`` at ``depth`` and return ``(copy, parent height)``."""
-
-    inventory.budget.charge_edge()
-    copied = _snapshot_captured_graph(item, active_containers, inventory, depth)
-    if _is_subclass(type(item), (BaseModel, tuple, list, dict)):
-        # A reused child knows its height; an impure child is never reused, and then
-        # neither is its parent, so the parent's height is not needed.
-        cached = inventory.completed.get(id(item))
-        item_height = cached[2] if cached is not None and cached[0] is item else 0
-        height = max(height, item_height + 1)
-    return copied, height
-
-
-def _reconstruct_captured_graph(
-    value: object,
-    active_containers: set[int],
-    inventory: _GraphInventory,
-    depth: int,
-) -> tuple[object, int]:
-    """Rebuild one container; returns ``(copy, height)`` (children via ``_snapshot_captured_graph``)."""
-
-    value_type = type(value)
-    value_id = id(value)
-    budget = inventory.budget
     if value_id in active_containers:
         raise ValueError("cyclic contract input is not supported")
-    active_containers.add(value_id)
-    height = 0
+
+    reads_before = inventory.impure_reads
     below = depth + 1
-    # Children are rebuilt in plain loops (no closure, no generator), so one level of nesting
-    # costs two interpreter frames and the depth limit keeps the stack far from its limit.
+    height = 0
+    active_containers.add(value_id)
     try:
         if _is_subclass(value_type, BaseModel):
             captured = inventory.models[value_id]
@@ -436,11 +407,15 @@ def _reconstruct_captured_graph(
                 )
                 captured.extra_entries = extra_entries
                 for _, item in extra_entries:
-                    _capture_native_graph(item, inventory, depth + 1)
+                    _capture_native_graph(item, inventory, below)
 
-            fields = {}
+            fields: dict[object, object] = {}
             for key, item in stored_entries:
-                fields[key], height = _child(item, active_containers, inventory, below, height)
+                budget.charge_edge()
+                fields[key] = _snapshot_captured_graph(item, active_containers, inventory, below)
+                height = _taller(height, item, completed)
+            if captured.colliding_names:
+                raise ValueError("contract input contains colliding keys")
             if captured.malformed_extra:
                 raise ValueError("contract extra storage must be a mapping")
             if captured.extra is not None:
@@ -453,42 +428,50 @@ def _reconstruct_captured_graph(
                 if len(extra_keys) != len(extra_entries):
                     raise ValueError("contract extra storage contains duplicate keys")
             for key, item in extra_entries:
-                fields[key], height = _child(item, active_containers, inventory, below, height)
-            return fields, height
-
-        if _is_subclass(value_type, tuple):
-            items = (
-                inventory.sequences[value_id]
-                if value_type is tuple
-                else _exposed_items(value, inventory, depth)
-            )
-            copies = []
+                budget.charge_edge()
+                fields[key] = _snapshot_captured_graph(item, active_containers, inventory, below)
+                height = _taller(height, item, completed)
+            result: object = fields
+        elif _is_subclass(value_type, (tuple, list)):
+            is_tuple = _is_subclass(value_type, tuple)
+            exact = value_type is tuple if is_tuple else value_type is list
+            items = inventory.sequences[value_id] if exact else _exposed_items(value, inventory, depth)
+            copies: list[object] = []
             for item in items:
-                copied, height = _child(item, active_containers, inventory, below, height)
-                copies.append(copied)
-            return tuple(copies), height
-        if _is_subclass(value_type, list):
-            items = (
-                inventory.sequences[value_id]
-                if value_type is list
-                else _exposed_items(value, inventory, depth)
-            )
-            copies = []
-            for item in items:
-                copied, height = _child(item, active_containers, inventory, below, height)
-                copies.append(copied)
-            return copies, height
-        if value_id in inventory.colliding_dictionaries:
-            raise ValueError("contract input contains colliding keys")
-        if value_id not in inventory.pure_dictionaries:
-            inventory.impure_reads += 1  # rebuilding it hashes keys that can run code
-        entries = inventory.dictionaries[value_id]
-        rebuilt = {}
-        for key, item in entries:
-            rebuilt[key], height = _child(item, active_containers, inventory, below, height)
-        return rebuilt, height
+                budget.charge_edge()
+                copies.append(_snapshot_captured_graph(item, active_containers, inventory, below))
+                height = _taller(height, item, completed)
+            result = tuple(copies) if is_tuple else copies
+        else:
+            if value_id in inventory.colliding_dictionaries:
+                raise ValueError("contract input contains colliding keys")
+            if value_id not in inventory.pure_dictionaries:
+                inventory.impure_reads += 1  # rebuilding it hashes keys that can run code
+            rebuilt: dict[object, object] = {}
+            for key, item in inventory.dictionaries[value_id]:
+                budget.charge_edge()
+                rebuilt[key] = _snapshot_captured_graph(item, active_containers, inventory, below)
+                height = _taller(height, item, completed)
+            result = rebuilt
     finally:
         active_containers.remove(value_id)
+    if inventory.impure_reads == reads_before:
+        completed[value_id] = (value, result, height)
+    return result
+
+
+def _taller(height: int, item: object, completed: dict[int, tuple[object, object, int]]) -> int:
+    """The parent's height after one child (a leaf call: it adds no nesting frame).
+
+    A reused child knows its height; an impure child is never reused, and then neither is
+    its parent, so the parent's height is not needed.
+    """
+
+    if not _is_subclass(type(item), (BaseModel, tuple, list, dict)):
+        return height
+    cached = completed.get(id(item))
+    item_height = cached[2] if cached is not None and cached[0] is item else 0
+    return max(height, item_height + 1)
 
 
 def snapshot_contract_graph(
@@ -515,8 +498,13 @@ def snapshot_contract_graph(
     if active_containers is None:
         active_containers = set()
     inventory = _GraphInventory()  # one discovery budget for the whole call
-    _capture_native_graph(value, inventory)
-    return _snapshot_captured_graph(value, active_containers, inventory)
+    try:
+        _capture_native_graph(value, inventory)
+        return _snapshot_captured_graph(value, active_containers, inventory)
+    except RecursionError:
+        # One frame per level keeps every admitted depth far inside the interpreter's limit;
+        # a caller already near that limit still gets the stable error, never a crash.
+        raise ValueError(DISCOVERY_BUDGET_MESSAGE) from None
 
 
 __all__ = [
