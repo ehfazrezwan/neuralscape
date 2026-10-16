@@ -378,6 +378,11 @@ def _snapshot_native_value(
         )
         height = max(height, item_height + 1)
         memoizable = memoizable and item_memoizable
+        if child_guard and not guard:
+            # The root of a JSON-valued field: anything may be nested and reused inside it, and
+            # validation, the JSON scans and the schema check walk it path by path.  (The fixed
+            # contract structure around it cannot expand: its depth is the schema's.)
+            _bound_expanded_size(copied_item, budget)
         return copied_item
 
     try:
@@ -487,7 +492,7 @@ def _bound_expanded_size(native: Any, budget: DiscoveryBudget) -> None:
 
     The snapshot shares one copy of a reused subtree between every path that reaches it, so it
     is cheap to build, but everything that follows (strict validation, the JSON scans, the
-    schema check) walks the *paths*: a value that holds itself twice at each of 40 levels is a
+    schema check) walks the *paths* of a JSON-valued field: a value that holds itself twice at each of 40 levels is a
     few hundred bytes and 2**40 paths.  Each distinct container is sized once, children first,
     by identity (``entries + the expanded size of its children``), so the work is proportional
     to the distinct graph, and a total above the tier's edge limit is the stable budget error.
@@ -587,7 +592,6 @@ def _validated_contract_snapshot_from_frozen(
         )
     except RecursionError as exc:
         raise ValueError(f"contract graph nesting is invalid at {label}") from exc
-    _bound_expanded_size(native, budget)
     return expected_type.model_validate(native)
 
 
