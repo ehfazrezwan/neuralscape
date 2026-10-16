@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, GetCoreSchemaHandler, model_validato
 from pydantic_core import core_schema
 
 from contracts_common import ContractModel, MAX_SAFE_INTEGER, OpaqueId, SafeCounter
+from contracts_tenancy import unpack_pairs
 from contracts_usage import (
     AttributionSnapshot,
     AttemptOutcome,
@@ -575,7 +576,8 @@ def _snapshot_uncached(
                     if not _is_real_mapping(extras):
                         raise ValueError("contract extra storage must be a mapping")
                     iterated_extra_names = tuple(extras)
-                    extra_items = tuple(extras.items())
+                    # One unpacking per pair: the name check and the field build share these tuples.
+                    extra_items = unpack_pairs(extras.items())
                     extra_names = set(iterated_extra_names) | {
                         name for name, _ in extra_items
                     }

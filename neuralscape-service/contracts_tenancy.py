@@ -68,6 +68,21 @@ def _is_real_mapping(value: object) -> bool:
     )
 
 
+def unpack_pairs(entries: Iterable[object]) -> tuple[tuple[object, object], ...]:
+    """Unpack each caller-owned ``(key, value)`` pair exactly once into a plain tuple.
+
+    A pair object is arbitrary caller code: it may answer differently each time it is
+    unpacked.  Every consumer (name checks, overlap checks, field construction) must use
+    the returned tuples and never the caller's pair objects again.
+    """
+
+    unpacked: list[tuple[object, object]] = []
+    for entry in entries:
+        key, value = entry  # type: ignore[misc]
+        unpacked.append((key, value))
+    return tuple(unpacked)
+
+
 def _refuse_duplicate_texts(*entry_groups: tuple[tuple[object, object], ...]) -> None:
     """Refuse two stored field names that read as one text (ambiguous input).
 
@@ -425,7 +440,7 @@ def _closed_graph_snapshot_session() -> tuple[
                     if exact
                     # Each observed pair is unpacked exactly once into a plain tuple that capture and
                     # reconstruction both reuse; the caller's pair object is never read again.
-                    else tuple((key, value) for key, value in observed(item.items))
+                    else unpack_pairs(observed(item.items))
                 )
                 if exact:
                     own_cost = 1 + len(entries)

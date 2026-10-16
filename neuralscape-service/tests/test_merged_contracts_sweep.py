@@ -337,3 +337,93 @@ def test_a_non_text_stored_name_in_a_usage_result_is_a_validation_error_for_dire
     dict.__setitem__(native(other), 7, "x")
     with pytest.raises(ValidationError):
         usage_reconcile.UsageReconciliation.model_validate(other)
+
+
+# ---- a caller-owned (key, value) pair is unpacked exactly once at every boundary
+
+class FlippingPair(tuple):
+    """A pair that reads as ``first`` on its first unpacking and as ``later`` on every later one."""
+
+    def __new__(cls, first, later):
+        instance = tuple.__new__(cls, ())
+        instance.first, instance.later, instance.unpacked = first, later, 0
+        return instance
+
+    def __iter__(self):
+        self.unpacked += 1
+        return iter(self.first if self.unpacked == 1 else self.later)
+
+
+class PairExtras(Mapping):
+    """Real mapping whose iteration hides its entries and whose items() yields the scripted pairs."""
+
+    def __init__(self, pairs):
+        self.pairs = pairs
+
+    def __iter__(self):
+        return iter(())
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def __getitem__(self, key):
+        raise KeyError(key)
+
+    def items(self):
+        return list(self.pairs)
+
+
+def _usage_event_with_extras(first, later) -> tuple:
+    event = _event()
+    dict.__delitem__(native(event), "event_id")  # the stored fields lack a required field
+    pair = FlippingPair(first, later)
+    _EXTRA.__set__(event, PairExtras([pair]))
+    return event, pair
+
+
+def test_usage_extra_pair_that_supplies_a_removed_field_on_its_second_unpacking_is_refused() -> None:
+    # first reading: an undeclared name (invalid); a second reading would supply the missing event_id
+    event, pair = _usage_event_with_extras(("junk_undeclared", 1), ("event_id", "event-1"))
+    with pytest.raises(ValueError):
+        usage_reconcile.reconcile_usage_events([event])
+    assert pair.unpacked == 1
+
+
+def test_usage_extra_pair_with_only_the_undeclared_name_is_refused_as_before() -> None:
+    event, pair = _usage_event_with_extras(("junk_undeclared", 1), ("junk_undeclared", 1))
+    with pytest.raises(ValueError):
+        usage_reconcile.reconcile_usage_events([event])
+    assert pair.unpacked == 1
+
+
+def test_usage_extra_pair_is_unpacked_once_even_when_the_event_is_otherwise_valid() -> None:
+    event = _event()
+    pair = FlippingPair(("junk_undeclared", 1), ("junk_undeclared", 2))
+    _EXTRA.__set__(event, PairExtras([pair]))
+    with pytest.raises(ValueError):
+        usage_reconcile.reconcile_usage_events([event])
+    assert pair.unpacked == 1
+
+
+def test_readiness_pair_that_repairs_an_invalid_status_on_the_second_unpacking_is_refused() -> None:
+    from contracts_readiness import (
+        CapabilityReadiness,
+        TenantReadinessPublication,
+        validate_readiness_publication,
+    )
+
+    observed = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+    observation = CapabilityReadiness(schema_version=VERSION, capability="exact_reads", status="healthy", observed_at=observed)
+    pairs = [
+        FlippingPair(("schema_version", VERSION), ("schema_version", VERSION)),
+        FlippingPair(("capability", "exact_reads"), ("capability", "exact_reads")),
+        FlippingPair(("status", "not-a-status"), ("status", "healthy")),
+        FlippingPair(("observed_at", observed), ("observed_at", observed)),
+    ]
+    publication = TenantReadinessPublication(
+        schema_version=VERSION, tenant_id="t", placement_generation=1, capabilities=(observation,)
+    )
+    dict.__setitem__(native(publication), "capabilities", (PairView(pairs),))
+    with pytest.raises(ValueError):
+        validate_readiness_publication(publication, expected_tenant_id="t", current_placement_generation=1)
+    assert all(pair.unpacked == 1 for pair in pairs)
