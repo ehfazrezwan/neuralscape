@@ -284,12 +284,17 @@ def _freeze_reachable_model_inventories(
     # One stack frame per level (no helper closure): the depth limit then bounds
     # the interpreter stack as well as the walk.
     below = (inventories, visited_containers, mapping_owners, native_dicts, budget, depth + 1)
-    found: list[Mapping[object, object]] = []
+    parts: list[tuple[Mapping[object, object], ...]] = []  # the reach of each child, by reference
 
     def finish() -> None:
-        # Remember (and charge) what was found beneath this value; no recursion here.
-        beneath = tuple({id(mapping): mapping for mapping in found}.values())  # distinct mappings only
-        if beneath:
+        # Remember what was found beneath this value; no recursion here.  A single source is
+        # held by reference (a container shared by many parents costs nothing per parent);
+        # only a genuine merge builds, and is charged for, a new tuple of distinct mappings.
+        sources = [part for part in parts if part]
+        if len(sources) <= 1:
+            beneath = sources[0] if sources else ()
+        else:
+            beneath = tuple({id(mapping): mapping for part in sources for mapping in part}.values())
             budget.charge_edge(len(beneath))
         reach[id(value)] = beneath
 
@@ -305,16 +310,16 @@ def _freeze_reachable_model_inventories(
             budget.charge_edge(len(inventory.stored_items))
             for _, item in inventory.stored_items:
                 _freeze_reachable_model_inventories(item, *below, authoritative, reach)
-                found.extend(reach.get(id(item), ()))
+                parts.append(reach.get(id(item), ()))
         elif _is_mapping(inventory.stored_storage):
-            _own_fallback_mapping(inventory.stored_storage, mapping_owners, budget, depth + 1, found)
+            _own_fallback_mapping(inventory.stored_storage, mapping_owners, budget, depth + 1, parts)
         if inventory.extra_items is not None:
             budget.charge_edge(len(inventory.extra_items))
             for _, item in inventory.extra_items:
                 _freeze_reachable_model_inventories(item, *below, authoritative, reach)
-                found.extend(reach.get(id(item), ()))
+                parts.append(reach.get(id(item), ()))
         elif _is_mapping(inventory.extra_storage):
-            _own_fallback_mapping(inventory.extra_storage, mapping_owners, budget, depth + 1, found)
+            _own_fallback_mapping(inventory.extra_storage, mapping_owners, budget, depth + 1, parts)
         finish()
         return
 
@@ -337,7 +342,7 @@ def _freeze_reachable_model_inventories(
         budget.charge_edge(len(retained))
         for entry in retained:
             _freeze_reachable_model_inventories(entry.value, *below, authoritative, reach)
-            found.extend(reach.get(id(entry.value), ()))
+            parts.append(reach.get(id(entry.value), ()))
         finish()
         return
 
@@ -358,7 +363,7 @@ def _freeze_reachable_model_inventories(
             _freeze_reachable_model_inventories(
                 item, *below, authoritative and is_exact_type(value, list), reach
             )
-            found.extend(reach.get(id(item), ()))
+            parts.append(reach.get(id(item), ()))
         finish()
         return
 
@@ -373,7 +378,7 @@ def _freeze_reachable_model_inventories(
             _freeze_reachable_model_inventories(
                 item, *below, authoritative and is_exact_type(value, tuple), reach
             )
-            found.extend(reach.get(id(item), ()))
+            parts.append(reach.get(id(item), ()))
         finish()
         return
 
@@ -383,7 +388,7 @@ def _own_fallback_mapping(
     mapping_owners: dict[int, Mapping[object, object]],
     budget: DiscoveryBudget,
     depth: int,
-    found: list[Mapping[object, object]],
+    parts: list[tuple[Mapping[object, object], ...]],
 ) -> None:
     """A model's own non-dict storage is a public mapping one level below the model.
 
@@ -394,7 +399,7 @@ def _own_fallback_mapping(
     budget.charge_edge()
     budget.visit(storage, depth, True)
     _retain_mapping_owner(storage, mapping_owners)
-    found.append(storage)
+    parts.append((storage,))
 
 
 def _open_mapping_items(value: Mapping[object, object]) -> Iterator[object]:

@@ -3874,14 +3874,13 @@ def test_a_mapping_reachable_through_an_already_visited_container_is_captured_at
     assert dict(completed[1][0])["tenant_id"] == 5
 
 
-def test_the_reach_of_shared_containers_is_charged() -> None:
-    proxies = tuple(MappingProxyType({"k": index}) for index in range(2000))
-    shared = (proxies,)
+def test_a_merge_of_reaches_is_charged_so_the_bookkeeping_cannot_hold_memory_for_free() -> None:
+    proxies = _public_mappings(2000)
+    nested: object = (proxies,)
     for _ in range(200):
-        shared = (shared,)
+        nested = (nested, MappingProxyType({"extra": 1}))  # every level merges a growing reach with one more mapping
     with pytest.raises(ValueError, match=DISCOVERY_BUDGET_MESSAGE):
-        # 2,000 mappings behind each of 200 containers: every container's reach is accounted
-        _freeze_reachable_model_inventories(shared, {}, set(), None, None, DiscoveryBudget())
+        _freeze_reachable_model_inventories(nested, {}, set(), None, None, DiscoveryBudget())
 
 
 def test_native_fields_set_names_are_charged_per_model() -> None:
@@ -3982,3 +3981,41 @@ def test_diagnostics_for_ordinary_invalid_inputs_keep_their_input_echo() -> None
     with pytest.raises(ValidationError) as caught:
         _evaluate_budget_statements(("not-a-statement",))
     assert "input_value" in str(caught.value) and "not-a-statement" in str(caught.value)
+
+
+# ── the reach of a shared container is held by reference and charged once ──
+
+
+def _public_mappings(count: int) -> tuple:
+    return tuple(MappingProxyType({"k": index}) for index in range(count))
+
+
+def test_a_container_shared_by_many_parents_is_not_charged_once_per_parent() -> None:
+    shared = _public_mappings(20)
+    parents = tuple((shared,) for _ in range(2000))  # 2,000 parents, each holding the one container
+    budget = DiscoveryBudget()
+    _freeze_reachable_model_inventories(parents, {}, set(), None, None, budget)
+    # the walk itself costs ~6,000 entries; the reach bookkeeping must not add one copy per parent
+    assert budget.edges < 10_000, budget.edges
+
+
+def test_a_mapping_reached_through_two_children_is_recorded_once() -> None:
+    mapping = MappingProxyType({"k": 1})
+    holder = ((mapping,), [mapping])
+    reach: dict = {}
+    _freeze_reachable_model_inventories(holder, {}, set(), None, None, DiscoveryBudget(), 0, True, reach)
+    assert reach[id(holder)] == (mapping,)  # once, not once per path to it
+
+
+def test_the_unrebuildable_validation_error_falls_back_to_a_value_free_error(monkeypatch) -> None:
+    from pydantic_core import ValidationError as CoreValidationError
+
+    def refuse(*args, **kwargs):
+        raise TypeError("cannot rebuild")
+
+    monkeypatch.setattr(CoreValidationError, "from_exception_data", staticmethod(refuse))
+    with pytest.raises(ValueError) as caught:
+        _evaluate_budget_statements(_tuple_diamond(22))
+    assert not isinstance(caught.value, ValidationError)  # the bounded fallback, not the echoing error
+    text = str(caught.value)
+    assert len(text) < 256 and "validation error" in text and "AccessPolicy" in text
