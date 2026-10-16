@@ -6,6 +6,7 @@ import weakref
 from collections.abc import Iterator, Mapping
 from datetime import datetime, timedelta, timezone
 from itertools import permutations
+import itertools
 
 import pytest
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -3345,7 +3346,7 @@ def test_failed_claim_rejects_applied_or_in_flight_required_stages() -> None:
             receipt(ProcessingStage.GRAPH, StageStatus.FAILED),
         ),
     )
-    with pytest.raises(ValueError, match="failed requires"):
+    with pytest.raises(ValueError, match="does not match the settled aggregate"):
         validate_required_stage_claim(
             claimed_status=IntentStatus.FAILED,
             intent=command,
@@ -3373,7 +3374,7 @@ def test_cancelled_and_superseded_do_not_masquerade_as_applied(
         receipt(ProcessingStage.VECTOR, stage_status),
     )
     validate_required_stage_claim(claimed_status=claim, intent=command, receipts=receipts)
-    with pytest.raises(ValueError, match="every required stage"):
+    with pytest.raises(ValueError, match="does not match the settled aggregate"):
         validate_required_stage_claim(
             claimed_status=IntentStatus.APPLIED,
             intent=command,
@@ -3381,15 +3382,16 @@ def test_cancelled_and_superseded_do_not_masquerade_as_applied(
         )
 
 
-def test_cancelled_claim_can_describe_effects_committed_before_fence() -> None:
-    command = intent(ProcessingStage.CANONICAL, ProcessingStage.GRAPH)
-    validate_required_stage_claim(
-        claimed_status=IntentStatus.CANCELLED,
-        intent=command,
+def test_fence_after_committed_effects_is_partial_not_cancelled() -> None:
+    # Settled-aggregate rule: some applied + a fenced remainder is PARTIAL; the
+    # per-stage receipts still show which stage was cancelled.
+    _assert_only_aggregate_claim(
+        command=intent(ProcessingStage.CANONICAL, ProcessingStage.GRAPH),
         receipts=(
             receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED),
             receipt(ProcessingStage.GRAPH, StageStatus.CANCELLED),
         ),
+        expected=IntentStatus.PARTIAL,
     )
 
 
@@ -3783,7 +3785,7 @@ def test_matching_application_is_monotonic_across_later_attempt_states(
                 receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED),
                 receipt(ProcessingStage.GRAPH, StageStatus.CANCELLED, sources=()),
             ),
-            IntentStatus.CANCELLED,
+            IntentStatus.PARTIAL,
         ),
         (
             "applied_and_superseded",
@@ -3795,7 +3797,7 @@ def test_matching_application_is_monotonic_across_later_attempt_states(
                     sources=(),
                 ),
             ),
-            IntentStatus.SUPERSEDED,
+            IntentStatus.PARTIAL,
         ),
         (
             "failed_and_skipped",
@@ -3963,7 +3965,7 @@ def test_accepted_to_partial_transition_does_not_replace_aggregate_evidence(
     receipts: tuple[StageReceipt, ...],
 ) -> None:
     assert is_legal_intent_transition(IntentStatus.ACCEPTED, IntentStatus.PARTIAL)
-    with pytest.raises(ValueError, match="partial requires"):
+    with pytest.raises(ValueError, match="partial (requires|does not match)"):
         validate_required_stage_claim(
             claimed_status=IntentStatus.PARTIAL,
             intent=intent(ProcessingStage.GRAPH),
@@ -4310,3 +4312,92 @@ def test_receipt_json_rejects_naive_mixed_and_reversed_timestamps() -> None:
     )
     with pytest.raises(ValidationError, match="cannot precede"):
         StageReceipt.model_validate_json(json.dumps(reversed_times))
+
+
+# ---------------------------------------------------------------------------
+# Exhaustive aggregate matrix.  Every combination of per-stage state for three
+# independent required stages maps to exactly one legal aggregate:
+#   unfinished stage (no receipt/pending/processing): ACCEPTED if nothing has
+#     started, else PROCESSING (a settled non-pending receipt counts as started);
+#   all settled: APPLIED if every stage applied; PARTIAL if some applied and
+#     some did not; with none applied FAILED if any failed, else CANCELLED if
+#     any cancelled, else SUPERSEDED if any superseded, else PARTIAL (all
+#     skipped).
+# ---------------------------------------------------------------------------
+
+_MATRIX_STAGES = (ProcessingStage.CANONICAL, ProcessingStage.EXTRACT, ProcessingStage.VECTOR)
+_MATRIX_STATES = (None, *StageStatus)
+_UNSTARTED_OK = {StageStatus.SKIPPED, StageStatus.CANCELLED, StageStatus.SUPERSEDED}
+
+
+def _matrix_expected(states: tuple[StageStatus | None, ...]) -> IntentStatus:
+    unfinished = any(s in {None, StageStatus.PENDING, StageStatus.PROCESSING} for s in states)
+    if unfinished:
+        started = any(s not in {None, StageStatus.PENDING} for s in states)
+        return IntentStatus.PROCESSING if started else IntentStatus.ACCEPTED
+    applied = [s is StageStatus.APPLIED for s in states]
+    if all(applied):
+        return IntentStatus.APPLIED
+    if any(applied):
+        return IntentStatus.PARTIAL
+    if StageStatus.FAILED in states:
+        return IntentStatus.FAILED
+    if StageStatus.CANCELLED in states:
+        return IntentStatus.CANCELLED
+    if StageStatus.SUPERSEDED in states:
+        return IntentStatus.SUPERSEDED
+    return IntentStatus.PARTIAL
+
+
+def _matrix_receipts(
+    states: tuple[StageStatus | None, ...], *, unstarted_settled: bool
+) -> tuple[StageReceipt, ...]:
+    out = []
+    for stage, state in zip(_MATRIX_STAGES, states):
+        if state is None:
+            continue
+        built = receipt(stage, state)
+        if unstarted_settled and state in _UNSTARTED_OK:
+            built = StageReceipt.model_validate({**built.model_dump(), "started_at": None})
+        out.append(built)
+    return tuple(out)
+
+
+def _legal_aggregates(command: Intent, receipts: tuple[StageReceipt, ...]) -> set[IntentStatus]:
+    legal = set()
+    for claim in IntentStatus:
+        try:
+            validate_required_stage_claim(claimed_status=claim, intent=command, receipts=receipts)
+        except ValueError:
+            continue
+        legal.add(claim)
+    return legal
+
+
+@pytest.mark.parametrize("unstarted_settled", [False, True])
+def test_every_stage_state_combination_has_exactly_the_expected_aggregate(
+    unstarted_settled: bool,
+) -> None:
+    command = intent(*_MATRIX_STAGES)
+    mismatches = []
+    for states in itertools.product(_MATRIX_STATES, repeat=3):
+        legal = _legal_aggregates(
+            command, _matrix_receipts(states, unstarted_settled=unstarted_settled)
+        )
+        if legal != {_matrix_expected(states)}:
+            mismatches.append((states, sorted(item.value for item in legal)))
+    assert not mismatches, f"{len(mismatches)} mismatches, e.g. {mismatches[:3]}"
+
+
+def test_every_settled_multiset_reaches_a_terminal_aggregate() -> None:
+    command = intent(*_MATRIX_STAGES)
+    settled = [s for s in StageStatus if s not in {StageStatus.PENDING, StageStatus.PROCESSING}]
+    terminals = {
+        IntentStatus.APPLIED, IntentStatus.PARTIAL, IntentStatus.FAILED,
+        IntentStatus.CANCELLED, IntentStatus.SUPERSEDED,
+    }
+    multisets = set(itertools.combinations_with_replacement(settled, 3))
+    assert len(multisets) == 35
+    for combo in multisets:
+        legal = _legal_aggregates(command, _matrix_receipts(combo, unstarted_settled=False))
+        assert len(legal) == 1 and legal <= terminals, (combo, legal)

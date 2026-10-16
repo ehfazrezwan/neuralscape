@@ -772,9 +772,16 @@ def validate_required_stage_claim(
     whether unsatisfied work remains unfinished.
 
     ``PROCESSING`` stays valid while any required stage is unfinished, even if
-    other required stages already failed or were skipped; the terminal
-    aggregates (``PARTIAL``, ``FAILED``, ``CANCELLED``, ``SUPERSEDED``) apply
-    only once every required stage has settled.
+    other required stages already failed, were skipped, or were fenced; with no
+    started evidence the only legal aggregate is ``ACCEPTED``.  Once every
+    required stage has settled exactly one terminal aggregate is legal:
+
+    * every stage applied: ``APPLIED``;
+    * some applied, some not: ``PARTIAL`` (receipts keep the per-stage detail,
+      including cancelled or superseded stages);
+    * none applied: ``FAILED`` if any stage failed, else ``CANCELLED`` if any
+      was cancelled, else ``SUPERSEDED`` if any was superseded, else (all
+      skipped) ``PARTIAL``.
 
     This checks consistency of caller-supplied reports.  It does not prove an
     external effect exists, choose authoritative output references, establish
@@ -928,16 +935,20 @@ def validate_required_stage_claim(
     unsatisfied_receipts = {
         stage: required_receipts[stage] for stage in unsatisfied
     }
-    partial_failures = {
+    # A stage whose current attempt is already settled (skipped, failed,
+    # cancelled or superseded) counts as started work even if it never
+    # recorded ``started_at``; a superseded pre-start fence followed by a
+    # pending retry does not.
+    started_stages |= {
         stage
         for stage, receipt in unsatisfied_receipts.items()
-        if receipt is not None
-        and receipt.status
-        in {
-            StageStatus.SKIPPED,
-            StageStatus.FAILED,
-        }
+        if receipt is not None and receipt.status is not StageStatus.PENDING
     }
+    unfinished = any(
+        receipt is None
+        or receipt.status in {StageStatus.PENDING, StageStatus.PROCESSING}
+        for receipt in unsatisfied_receipts.values()
+    )
 
     if claimed_status is IntentStatus.ACCEPTED:
         if started_stages or any(
@@ -948,92 +959,73 @@ def validate_required_stage_claim(
     elif claimed_status is IntentStatus.PROCESSING:
         # Confirmed finality direction: a job with any required stage still
         # unfinished stays nonterminal PROCESSING even when other required
-        # stages already failed or were skipped; per-stage outcomes remain
-        # visible in the receipts.
-        unfinished = any(
-            receipt is None
-            or receipt.status in {StageStatus.PENDING, StageStatus.PROCESSING}
-            for receipt in unsatisfied_receipts.values()
-        )
+        # stages already failed, were skipped, or were fenced; per-stage
+        # outcomes remain visible in the receipts.
         if not started_stages or not unfinished:
             raise ValueError(
                 "processing requires started and unfinished required work"
             )
-    elif claimed_status is IntentStatus.APPLIED:
-        if satisfied != required:
-            raise ValueError("applied requires matching applied receipts for every required stage")
-    elif claimed_status is IntentStatus.PARTIAL:
-        mixed_terminal = (
-            bool(satisfied)
-            and bool(unsatisfied)
-            and partial_failures == unsatisfied
-        )
-        all_skipped = (
-            not satisfied
-            and bool(unsatisfied)
-            and all(
-                receipt is not None and receipt.status is StageStatus.SKIPPED
-                for receipt in unsatisfied_receipts.values()
-            )
-        )
-        if not (mixed_terminal or all_skipped):
+    elif claimed_status in _TERMINAL_CLAIMS:
+        if unfinished:
             raise ValueError(
-                "partial requires applied with terminal non-applied stages "
-                "or all required stages skipped"
+                f"{claimed_status.value} requires every required stage to have settled"
             )
-    elif claimed_status is IntentStatus.FAILED:
-        statuses = {
-            stage: receipt.status
-            for stage, receipt in unsatisfied_receipts.items()
-            if receipt is not None
-        }
-        if (
-            satisfied
-            or set(statuses) != required
-            or StageStatus.FAILED not in statuses.values()
-            or any(
-                status not in {StageStatus.FAILED, StageStatus.SKIPPED}
-                for status in statuses.values()
+        expected = _settled_aggregate(
+            satisfied=satisfied == required,
+            any_applied=bool(satisfied),
+            statuses={
+                receipt.status
+                for receipt in unsatisfied_receipts.values()
+                if receipt is not None
+            },
+        )
+        if claimed_status is not expected:
+            raise ValueError(
+                f"{claimed_status.value} does not match the settled aggregate "
+                f"({expected.value}) for the required-stage receipts"
             )
-        ):
-            raise ValueError("failed requires only failed or skipped terminal required stages")
-    elif claimed_status is IntentStatus.CANCELLED:
-        _validate_fenced_terminal_claim(
-            required=required,
-            required_receipts=required_receipts,
-            satisfied=satisfied,
-            fence_status=StageStatus.CANCELLED,
-        )
-    elif claimed_status is IntentStatus.SUPERSEDED:
-        _validate_fenced_terminal_claim(
-            required=required,
-            required_receipts=required_receipts,
-            satisfied=satisfied,
-            fence_status=StageStatus.SUPERSEDED,
-        )
     else:
         raise ValueError("unsupported IntentStatus")
 
 
-def _validate_fenced_terminal_claim(
-    *,
-    required: set[ProcessingStage],
-    required_receipts: dict[ProcessingStage, StageReceipt | None],
-    satisfied: set[ProcessingStage],
-    fence_status: StageStatus,
-) -> None:
-    fenced = {
-        stage
-        for stage, receipt in required_receipts.items()
-        if stage not in satisfied
-        and receipt is not None
-        and receipt.status is fence_status
+_TERMINAL_CLAIMS = frozenset(
+    {
+        IntentStatus.APPLIED,
+        IntentStatus.PARTIAL,
+        IntentStatus.FAILED,
+        IntentStatus.CANCELLED,
+        IntentStatus.SUPERSEDED,
     }
-    if not fenced or satisfied | fenced != required:
-        raise ValueError(
-            f"{fence_status.value} requires every required stage to be applied "
-            f"or {fence_status.value}"
-        )
+)
+
+
+def _settled_aggregate(
+    *, satisfied: bool, any_applied: bool, statuses: set[StageStatus]
+) -> IntentStatus:
+    """The single terminal aggregate for fully settled required stages.
+
+    Every required stage is applied or settled (skipped, failed, cancelled,
+    superseded):
+
+    * all applied -> ``APPLIED``;
+    * some applied, some not -> ``PARTIAL`` (per-stage receipts keep the
+      failed/skipped/fenced detail);
+    * none applied: any failed -> ``FAILED``; else any cancelled ->
+      ``CANCELLED``; else any superseded -> ``SUPERSEDED``; else every stage
+      was skipped -> ``PARTIAL``.
+    """
+
+    if satisfied:
+        return IntentStatus.APPLIED
+    if any_applied:
+        return IntentStatus.PARTIAL
+    if StageStatus.FAILED in statuses:
+        return IntentStatus.FAILED
+    if StageStatus.CANCELLED in statuses:
+        return IntentStatus.CANCELLED
+    if StageStatus.SUPERSEDED in statuses:
+        return IntentStatus.SUPERSEDED
+    return IntentStatus.PARTIAL
 
 
 def _source_sets_match(
