@@ -1311,3 +1311,142 @@ def test_source_span_boundary_revalidates_mutated_inputs():
     evidence.text = "A"
     with pytest.raises(ValueError, match="exceeds"):
         validate_source_span(evidence, span)
+
+
+# ---- one capture of every root before any reconstruction (request AND result) ----
+
+BUDGET = "contract graph exceeds the native discovery budget"
+_NATIVE = BaseModel.__dict__["__dict__"]
+
+
+def _native_set(model, field, value):
+    dict.__setitem__(_NATIVE.__get__(model, BaseModel), field, value)
+
+
+class _Firing(tuple):
+    """Public iteration first runs a callback (a hostile or buggy view), then yields its items."""
+
+    def __new__(cls, items, fire):
+        instance = super().__new__(cls, items)
+        instance.fire, instance.fired = fire, 0
+        return instance
+
+    def __iter__(self):
+        if not self.fired:
+            self.fired = 1
+            self.fire()
+        return tuple.__iter__(self)
+
+
+class _FiringList(list):
+    def __init__(self, items, fire):
+        super().__init__(items)
+        self.fire, self.fired = fire, 0
+
+    def __iter__(self):
+        if not self.fired:
+            self.fired = 1
+            self.fire()
+        return list.__iter__(self)
+
+
+def test_a_candidates_view_cannot_repair_an_invalid_result_before_it_is_captured():
+    request = decision_request()
+    result = DecisionResult(schema_version=VERSION, request_id=request.request_id, head_result=selected(candidate_id="candidate-z"), attempts=())
+    valid = selected(candidate_id="candidate-a")
+    _native_set(request, "candidates", _Firing(request.candidates, lambda: _native_set(result, "head_result", valid)))
+    with pytest.raises(ValueError, match="unknown candidate"):
+        validate_decision_result(request, result)  # used to accept the repaired selection
+
+
+def test_a_heads_view_cannot_change_batch_publishability_before_it_is_captured():
+    request = decision_request(batch=True)
+    result = DecisionBatchResult(
+        schema_version=VERSION, request_id=request.request_id, fallback_granularity=FallbackGranularity.WHOLE_BATCH,
+        publishable=True, head_results=(selected(), abstained("category")), attempts=(),
+    )
+    _native_set(request, "heads", _Firing(request.heads, lambda: _native_set(result, "publishable", False)))
+    with pytest.raises(ValueError, match="forbids partial publication"):
+        validate_decision_batch_result(request, result)
+
+
+def test_the_decision_boundaries_use_one_budget_for_request_and_result(monkeypatch):
+    import contracts_limits
+
+    created = []
+
+    def factory(*args, **kwargs):
+        budget = contracts_limits.DiscoveryBudget(*args, **kwargs)
+        created.append(budget)
+        return budget
+
+    import contracts_engines
+
+    monkeypatch.setattr(contracts_engines, "DiscoveryBudget", factory)
+    request = decision_request()
+    validate_decision_result(request, DecisionResult(schema_version=VERSION, request_id=request.request_id, head_result=selected(), attempts=()))
+    batch = decision_request(batch=True)
+    validate_decision_batch_result(batch, DecisionBatchResult(
+        schema_version=VERSION, request_id=batch.request_id, fallback_granularity=FallbackGranularity.WHOLE_BATCH,
+        publishable=True, head_results=(selected(), selected("category")), attempts=()))
+    assert len(created) == 2  # one shared session per validation call (was two budgets for each)
+
+
+# ---- generation: freeze and account for both roots before any JSON scan ----
+
+
+def test_a_schema_view_cannot_repair_an_invalid_result_before_it_is_captured():
+    request = generation_request()
+    result = generation_result()
+    bad = result.proposals[0].model_copy(update={"support_span_ids": ("unknown-span",)})
+    _native_set(result, "proposals", (bad,))
+    good = (result.proposals[0].model_copy(update={"support_span_ids": ("support-1",)}),)
+    _native_set(request, "output_schema",
+                {**request.output_schema, "examples": _FiringList([1], lambda: _native_set(result, "proposals", good))})
+    with pytest.raises(ValueError, match="unknown support span"):
+        validate_generation_result(request, result)  # used to accept: the pre-scan ran the callback before the result was frozen
+
+
+class _Bulk(list):
+    yielded = 0
+
+    def __init__(self, count):
+        super().__init__()
+        self.count = count
+
+    def __iter__(self):
+        for index in range(self.count):
+            type(self).yielded += 1
+            yield index
+
+
+def test_an_oversized_view_in_the_schema_is_cut_off_by_the_budget_not_expanded_by_a_pre_scan():
+    _Bulk.yielded = 0
+    request = generation_request()
+    _native_set(request, "output_schema", {**request.output_schema, "examples": _Bulk(400_000)})
+    with pytest.raises(ValueError, match=BUDGET):
+        validate_generation_result(request, generation_result())
+    assert _Bulk.yielded <= 140_000  # the edge tier is 131,072; it used to be expanded completely first
+
+
+def test_an_oversized_model_copy_list_is_rejected_by_the_budget():
+    request = generation_request()
+    huge = request.model_copy(update={"output_schema": {**request.output_schema, "examples": list(range(200_000))}})
+    with pytest.raises(ValueError, match=BUDGET):
+        validate_generation_result(huge, generation_result())
+
+
+def test_model_objects_inside_json_values_are_still_rejected_in_the_same_replay():
+    class Marker(BaseModel):
+        value: int = 1
+
+    request = generation_request()
+    bad_schema = {**request.output_schema, "examples": [{"nested": [Marker()]}]}
+    with pytest.raises(ValueError, match="JSON value contains a model object"):
+        validate_generation_result(request.model_copy(update={"output_schema": bad_schema}), generation_result())
+    result = generation_result()
+    for proposal in (
+        {"proposal_id": "proposal-1", "output": {"summary": [Marker()]}, "support_span_ids": ("support-1",), "machine_authored": True},
+    ):
+        with pytest.raises(ValueError, match="JSON value contains a model object"):
+            validate_generation_result(request, result.model_copy(update={"proposals": (proposal,)}))

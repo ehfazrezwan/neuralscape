@@ -19,7 +19,7 @@ import idna
 from pydantic import BaseModel, Field, JsonValue, model_validator
 
 from contracts_common import ContractModel, OpaqueId, SafeCounter, VersionedContract
-from contracts_engines import QualificationClaim, _validated_contract_snapshot
+from contracts_engines import QualificationClaim, _validated_contract_snapshot, _validated_contract_snapshots
 from contracts_references import ReferenceHandle, SourceVersion
 
 FiniteNumber = Annotated[float, Field(allow_inf_nan=False)]
@@ -514,15 +514,9 @@ def validate_decision_result(
 ) -> ResourceCompliance:
     """Validate exact identities and report resource compliance separately."""
 
-    request = _validated_contract_snapshot(
-        request,
-        DecisionRequest,
-        label="decision request",
-    )
-    result = _validated_contract_snapshot(
-        result,
-        DecisionResult,
-        label="decision result",
+    request, result = _validated_contract_snapshots(
+        (request, DecisionRequest, "decision request"),
+        (result, DecisionResult, "decision result"),
     )
     if result.request_id != request.request_id:
         raise ValueError("result request ID does not match request")
@@ -536,15 +530,9 @@ def validate_decision_batch_result(
 ) -> ResourceCompliance:
     """Validate identities/fallback and report resource compliance separately."""
 
-    request = _validated_contract_snapshot(
-        request,
-        DecisionBatchRequest,
-        label="decision batch request",
-    )
-    result = _validated_contract_snapshot(
-        result,
-        DecisionBatchResult,
-        label="decision batch result",
+    request, result = _validated_contract_snapshots(
+        (request, DecisionBatchRequest, "decision batch request"),
+        (result, DecisionBatchResult, "decision batch result"),
     )
     if result.request_id != request.request_id:
         raise ValueError("result request ID does not match request")
@@ -790,31 +778,6 @@ def _validate_json_value(value: JsonValue, location: str = "$") -> None:
             _validate_json_value(item, f"{location}/value/{index}")
 
 
-def _reject_model_json_values(value: object, location: str) -> None:
-    pending = [(value, location)]
-    seen_containers: set[int] = set()
-    while pending:
-        item, item_location = pending.pop()
-        if isinstance(item, BaseModel):
-            raise ValueError(f"JSON value contains a model object at {item_location}")
-        if not isinstance(item, (Mapping, list)):
-            continue
-        identity = id(item)
-        if identity in seen_containers:
-            continue
-        seen_containers.add(identity)
-        if isinstance(item, Mapping):
-            pending.extend(
-                (nested, f"{item_location}/value/{index}")
-                for index, nested in enumerate(item.values())
-            )
-        else:
-            pending.extend(
-                (nested, f"{item_location}/{index}")
-                for index, nested in enumerate(item)
-            )
-
-
 def _build_output_validator(schema: Mapping[str, JsonValue]) -> Any:
     validator_class, format_checker_class = _jsonschema_types()
     format_checker = _contract_format_checker(format_checker_class)
@@ -897,38 +860,30 @@ class GenerationResult(VersionedContract):
         return self
 
 
+_PROPOSAL_LOCATION = re.compile(r"^generation result\.proposals\[\d+\]$")
+
+
+def _is_json_valued_field(parent_location: str, field_name: str) -> bool:
+    """The fields of a generation request and result whose values are plain JSON."""
+
+    if field_name == "output_schema" and parent_location == "generation request":
+        return True
+    return field_name == "output" and _PROPOSAL_LOCATION.match(parent_location) is not None
+
+
 def validate_generation_result(
     request: GenerationRequest,
     result: GenerationResult,
 ) -> ResourceCompliance:
     """Validate schema/source support and report resource compliance separately."""
 
-    if isinstance(request, GenerationRequest):
-        _reject_model_json_values(
-            request.output_schema,
-            "generation request/output_schema",
-        )
-    if isinstance(result, GenerationResult) and isinstance(result.proposals, tuple):
-        for index, proposal in enumerate(result.proposals):
-            if isinstance(proposal, GenerationProposal):
-                _reject_model_json_values(
-                    proposal.output,
-                    f"generation result/proposals/{index}/output",
-                )
-            elif isinstance(proposal, Mapping) and "output" in proposal:
-                _reject_model_json_values(
-                    proposal["output"],
-                    f"generation result/proposals/{index}/output",
-                )
-    request = _validated_contract_snapshot(
-        request,
-        GenerationRequest,
-        label="generation request",
-    )
-    result = _validated_contract_snapshot(
-        result,
-        GenerationResult,
-        label="generation result",
+    # Both roots are captured and accounted before anything is reconstructed or scanned; model objects
+    # inside the JSON-valued fields are rejected during that same reconstruction, not in a separate
+    # pre-scan that would expand (and run public views of) uncaptured, unbudgeted state.
+    request, result = _validated_contract_snapshots(
+        (request, GenerationRequest, "generation request"),
+        (result, GenerationResult, "generation result"),
+        json_guard=_is_json_valued_field,
     )
     if result.request_id != request.request_id:
         raise ValueError("result request ID does not match request")

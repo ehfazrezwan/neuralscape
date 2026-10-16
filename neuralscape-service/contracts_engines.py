@@ -8,6 +8,7 @@ reviewable but are not themselves proof that the referenced evidence is valid.
 from __future__ import annotations
 
 from enum import Enum
+from collections.abc import Mapping
 from typing import Any, Callable, Iterator, NamedTuple, TypeVar
 
 from pydantic import BaseModel, TypeAdapter, model_validator
@@ -280,6 +281,9 @@ def _snapshot_native_value(
     memo: dict[int, tuple[Any, Any, int]],
     depth: int,
     location: str,
+    guard: bool = False,
+    guard_memo: dict[int, tuple[Any, Any, int]] | None = None,
+    json_guard: Callable[[str, str], bool] | None = None,
 ) -> tuple[Any, int, bool]:
     """Copy a contract graph without discarding unchecked model state.
 
@@ -300,10 +304,17 @@ def _snapshot_native_value(
         raise ValueError(DISCOVERY_BUDGET_MESSAGE)  # the tier applies to every occurrence, not only to discovery
 
     value_type = type(value)
+    if guard and issubclass(value_type, BaseModel):
+        # Inside a JSON-valued field a model object would be flattened into a plain mapping and
+        # lose its unchecked state, so it is rejected in the same replay that validates the value.
+        raise ValueError(f"JSON value contains a model object at {location}")
+    if guard and guard_memo is None:
+        guard_memo = {}
+    table = guard_memo if guard else memo  # a subtree cached outside a JSON field is never reused inside one
     is_container = issubclass(value_type, (BaseModel, dict, list, tuple))
     identity = id(value)
     if is_container:
-        cached = memo.get(identity)
+        cached = table.get(identity)
         if cached is not None and cached[0] is value:
             _, copied, height = cached
             if depth + height > _MAX_SNAPSHOT_DEPTH:
@@ -329,8 +340,11 @@ def _snapshot_native_value(
     memoizable = True
     own_cost = 0  # copying an exact node that cannot be reused is work the capture phase did not charge
 
-    def child(item: Any, child_location: str) -> Any:
+    def child(item: Any, child_location: str, name: str | None = None) -> Any:
         nonlocal height, memoizable
+        child_guard = guard or (
+            name is not None and json_guard is not None and json_guard(location, name)
+        )
         copied_item, item_height, item_memoizable = _snapshot_native_value(
             item,
             active=active,
@@ -341,6 +355,9 @@ def _snapshot_native_value(
             memo=memo,
             depth=depth + 1,
             location=child_location,
+            guard=child_guard,
+            guard_memo=guard_memo,
+            json_guard=json_guard,
         )
         height = max(height, item_height + 1)
         memoizable = memoizable and item_memoizable
@@ -394,7 +411,7 @@ def _snapshot_native_value(
             )
             own_cost = 1 + len(stored_values)
             result: Any = {
-                name: child(item, f"{location}.{name}") for name, item in stored_values
+                name: child(item, f"{location}.{name}", name) for name, item in stored_values
             }
         elif issubclass(value_type, dict):
             frozen = frozen_containers.get(identity)
@@ -405,7 +422,7 @@ def _snapshot_native_value(
             if exact:
                 own_cost = 1 + len(frozen.entries)
             result = {
-                key: child(item, f"{location}[key]")
+                key: child(item, f"{location}[key]", key if type(key) is str else None)
                 for key, item in (
                     frozen.entries if exact else _charged_entries(value.items, budget)
                 )
@@ -428,9 +445,13 @@ def _snapshot_native_value(
             ]
             result = items if is_list else tuple(items)
         else:
+            if guard and isinstance(value, Mapping):
+                # a mapping that is not a dict is not copied, but nothing hidden may sit inside a JSON value
+                for nested in _charged_entries(value.values, budget):
+                    child(nested, f"{location}[value]")
             return value, 0, True
         if is_container and memoizable:
-            memo[identity] = (value, result, height)
+            table[identity] = (value, result, height)
         elif own_cost:
             budget.charge_edge(own_cost)  # every non-reused ancestor copy is charged
         return result, height, memoizable
@@ -483,6 +504,8 @@ def _validated_contract_snapshot_from_frozen(
     discovered: dict[int, Any],
     budget: DiscoveryBudget,
     memo: dict[int, tuple[Any, Any, int]],
+    guard_memo: dict[int, tuple[Any, Any, int]] | None = None,
+    json_guard: Callable[[str, str], bool] | None = None,
 ) -> _ContractT:
     """Validate using entry state already frozen for the enclosing boundary."""
 
@@ -499,6 +522,8 @@ def _validated_contract_snapshot_from_frozen(
             memo=memo,
             depth=0,
             location=label,
+            guard_memo=guard_memo,
+            json_guard=json_guard,
         )
     except RecursionError as exc:
         raise ValueError(f"contract graph nesting is invalid at {label}") from exc
@@ -554,6 +579,13 @@ def _validated_contract_tuple_from_frozen(
 
     if not issubclass(type(values), tuple):
         raise TypeError(f"{label} must be a tuple")
+    frozen = frozen_containers.get(id(values))
+    if frozen is not None and frozen.owner is values and frozen.kind == "tuple":
+        entries: Any = frozen.entries  # an exact tuple: replayed from the capture, already charged
+    else:
+        # A tuple subclass's public entries are observed here, so each one (and the observation
+        # itself, even when empty) is charged: a tiny native backing cannot yield entries for free.
+        entries = _charged_entries(lambda: values, budget)
     return tuple(
         _validated_contract_snapshot_from_frozen(
             value,
@@ -565,7 +597,49 @@ def _validated_contract_tuple_from_frozen(
             budget=budget,
             memo=memo,
         )
-        for index, value in enumerate(values)
+        for index, value in enumerate(entries)
+    )
+
+
+def _validated_contract_snapshots(
+    *specs: tuple[Any, type[BaseModel], str],
+    json_guard: Callable[[str, str], bool] | None = None,
+) -> tuple[BaseModel, ...]:
+    """Validate several roots of one call from a single capture and one budget.
+
+    Order is the established precedence: every strict top-level type check, then
+    native capture and accounting of **every** root (so no root's public view can
+    run before another root's entry state is frozen, and one envelope bounds the
+    call), then the ordered reconstruction and diagnostics of each root in turn.
+    ``json_guard(parent_location, field_name)`` marks JSON-valued fields, inside
+    which a model object is rejected during that same reconstruction.
+    """
+
+    for value, expected_type, label in specs:
+        if not issubclass(type(value), expected_type):
+            raise TypeError(f"{label} must be a {expected_type.__name__}")
+    frozen_models: dict[int, _FrozenModelState] = {}
+    frozen_containers: dict[int, _FrozenContainerState] = {}
+    discovered: dict[int, Any] = {}
+    budget = DiscoveryBudget()
+    memo: dict[int, tuple[Any, Any, int]] = {}
+    guard_memo: dict[int, tuple[Any, Any, int]] = {}
+    for value, _expected_type, _label in specs:
+        _freeze_native_model_graph(value, frozen_models, frozen_containers, discovered, budget)
+    return tuple(
+        _validated_contract_snapshot_from_frozen(
+            value,
+            expected_type,
+            label=label,
+            frozen_models=frozen_models,
+            frozen_containers=frozen_containers,
+            discovered=discovered,
+            budget=budget,
+            memo=memo,
+            guard_memo=guard_memo,
+            json_guard=json_guard,
+        )
+        for value, expected_type, label in specs
     )
 
 

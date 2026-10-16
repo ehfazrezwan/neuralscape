@@ -1944,3 +1944,39 @@ def test_an_empty_public_view_observation_is_charged(monkeypatch):
     with pytest.raises(ValidationError):
         validate_capability_requirements(declared, ())
     assert budgets and budgets[0].edges >= 100 + 100  # entries at capture plus one per observation at replay
+
+
+# ---- every requirements-tuple view entry is charged to the budget ----
+
+
+class _RepeatingRequirements(tuple):
+    """Tiny native backing; the public view yields the same valid requirement many times."""
+
+    def __new__(cls, only, times):
+        instance = super().__new__(cls, (only,))
+        instance.times, instance.yielded = times, 0
+        return instance
+
+    def __iter__(self):
+        for _ in range(self.times):
+            self.yielded += 1
+            yield tuple.__getitem__(self, 0)
+
+
+def test_a_requirements_view_that_repeats_one_valid_entry_exhausts_the_budget():
+    view = _RepeatingRequirements(requirement(), times=300_000)  # the edge tier is 131,072
+    with pytest.raises(ValueError, match=BUDGET_MESSAGE):
+        validate_capability_requirements(manifest(state()), view)
+    assert view.yielded <= 131_073  # the iteration stopped at the budget, it did not run to 300,000
+
+
+def test_a_requirements_view_within_the_budget_is_still_validated_once_per_entry():
+    view = _RepeatingRequirements(requirement(), times=5)
+    assert validate_capability_requirements(manifest(state()), view) == ()
+    assert view.yielded == 5
+
+
+def test_an_empty_requirements_view_observation_is_charged(monkeypatch):
+    budgets = _recording_budgets(monkeypatch, max_edges=10_000)
+    validate_capability_requirements(manifest(state()), _RepeatingRequirements(requirement(), times=0))
+    assert budgets and budgets[0].edges >= 1
