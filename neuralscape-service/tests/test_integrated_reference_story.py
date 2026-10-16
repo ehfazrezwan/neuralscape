@@ -1,18 +1,31 @@
-"""Contract-level integrated story over the candidate Phase 1 contracts.
+"""Contract-level checks of selected steps of the integration story.
 
-**This is not runtime proof.**  Nothing here authenticates a caller, persists
-anything, queues work or talks to a store.  The story chains only the pure
-contract models and reference validators (policy evaluation, lifecycle claims,
-version witnesses, freshness status, processing-policy dispatch checks,
-portable manifest validation and usage reconciliation) over a dictionary-backed
-fixture, to show that the candidate contracts compose and that each negative
-control is rejected by a contract rule.  Real two-tenant, durable and encrypted
-paths are separate runtime checks.
+**This is not runtime proof, and it is not one chained story.**  Nothing here
+authenticates a caller, persists anything, queues work or talks to a store.  Each
+test is an independent step check over the pure contract models and reference
+validators (policy evaluation, lifecycle claims, version witnesses, freshness
+status, processing-policy dispatch checks, portable manifest validation and
+usage reconciliation).  The tests share no evolving state; the only fixture is
+the literal identifier set in the export test.  Real two-tenant, durable and
+encrypted paths are separate runtime checks.
 
-The assertions are written from the integration story in the plan (one numbered
-step per behavior) and not from the implementation: each test names the step it
-checks, states the expectation in plan terms and would fail if the contracts
-accepted what the plan says must be rejected.
+Covered, by plan step number: 1 (identity from the principal), 2 (project
+preference keeps its category), 4 (stage receipts), 5 (correction and stale
+revision), 6 (visibility narrowing and stale policy work), 9 (export manifest
+validated offline), 10 (opaque body), 11 (cloud fallback, abstention versus an
+empty result, late usage), plus a two-tenant negative control.
+
+Not covered here: 3 (intent and outbox crash-and-recover), 7 (current versus
+historical reference resolution and the freshness card), 8 (retention hold,
+rejected automatic prune, explicit removal) and 12 (private overlay and an
+unqualified processor).  The "accepted receipt" and "current recall" legs of the
+end-to-end chain are not exercised either, and the export test re-validates a
+manifest; it does not perform a restore.
+
+The assertions are written from the plan's wording and not from the
+implementation: each test names the step it checks, states the expectation in
+plan terms and would fail if the contracts accepted what the plan says must be
+rejected.
 """
 
 import copy
@@ -235,9 +248,10 @@ def test_step6_narrowing_denies_the_removed_reader_and_old_policy_work_is_stale(
     assert public_error_for(InternalErrorCode.DENIED).code is PublicErrorCode.NOT_FOUND
 
 
-# Step 8 — "Exports canonical state, validates offline, imports with an explicit identity mapping,
-# verifies tombstones/policy."
-def test_step8_export_manifest_validates_offline_and_restores_canonical_identity() -> None:
+# Step 9 — "Exports canonical state, validates offline, imports with an explicit identity mapping,
+# verifies tombstones/policy."  Only the offline manifest validation and the identity mapping
+# record are checked; no import or restore is performed.
+def test_step9_export_manifest_validates_offline_and_round_trips_canonical_identity() -> None:
     manifest = validate_portable_manifest(copy.deepcopy(EXAMPLES["PortableManifest"]))
     assert isinstance(manifest, PortableManifest)
 
@@ -245,8 +259,8 @@ def test_step8_export_manifest_validates_offline_and_restores_canonical_identity
     fixture_store = {("record", "record-1"), ("revision", "revision-1"), ("tombstone", "tombstone-9")}
     assert exported == fixture_store  # complete canonical state, including the tombstone
 
-    restored = {(item.kind, item.id) for item in validate_portable_manifest(manifest.model_dump(mode="json")).canonical_ids}
-    assert restored == fixture_store
+    round_tripped = {(item.kind, item.id) for item in validate_portable_manifest(manifest.model_dump(mode="json")).canonical_ids}
+    assert round_tripped == fixture_store
     assert [(m.source_identity_id, m.destination_identity_id) for m in manifest.identity_mappings] == [
         ("source-member-2", "destination-member-8")
     ]
