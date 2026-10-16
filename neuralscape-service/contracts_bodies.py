@@ -14,9 +14,10 @@ from __future__ import annotations
 
 from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, TypeAdapter
+from pydantic import BeforeValidator, ConfigDict, Field, TypeAdapter
 
 from contracts_common import ContractModel, OpaqueId
+from contracts_native import is_subclass, project_model_storage
 
 
 class PlaintextBody(ContractModel):
@@ -37,50 +38,21 @@ class OpaqueEnvelopeBody(ContractModel):
     envelope_id: OpaqueId
 
 
-_BASE_MODEL_DICT_DESCRIPTOR = vars(BaseModel)["__dict__"]
-_BASE_MODEL_EXTRA_DESCRIPTOR = vars(BaseModel)["__pydantic_extra__"]
-
-
-def _with_native_dict_extra_backing(value: object) -> object:
-    """Project a model with native dict extra storage for closed revalidation."""
-    value_type = type(value)
-    if not issubclass(value_type, BaseModel):
-        return value
-    extras = _BASE_MODEL_EXTRA_DESCRIPTOR.__get__(value, BaseModel)
-    if extras is None:
-        captured = ()
-    elif issubclass(type(extras), dict):
-        # Bypass every overridable view on a dict subclass and capture its
-        # actual backing exactly once.
-        captured = tuple(dict.items(extras))
-    else:
-        # Not a dict: none of its views can be trusted and none is read.  Fence it the
-        # same way as any other native storage by projecting a marker the closed model
-        # rejects, instead of handing the original model (and its masked descriptors)
-        # back to revalidation.
-        captured = (("unreadable_extra_storage", True),)
-
-    # Detach every pair before projected-dict hashing can run a hostile stored
-    # name callback that repairs a later value in the live model backing.
-    stored = tuple(
-        dict.items(_BASE_MODEL_DICT_DESCRIPTOR.__get__(value, BaseModel))
-    )
-    projected = dict(stored)
-    if captured:
-        projected["native_extra_backing"] = dict(captured)
-    return projected
-
-
 def _project_body_storage(value: object) -> object:
     """Before-validator: project a body model's native storage before the tag is read.
 
     Attached to the union itself, so the projection applies on every route into it:
-    the shared adapter, the parser, and any contract that nests a ``MemoryBody``.
+    the shared adapter, the parser, and any contract that nests a ``MemoryBody``.  Only a
+    genuine body model (by its native MRO) or an exact dict goes on to Pydantic; any other
+    object is refused before its ``__class__`` can be read.
     """
 
-    if issubclass(type(value), (PlaintextBody, OpaqueEnvelopeBody)):
-        return _with_native_dict_extra_backing(value)
-    return value
+    kind = type(value)
+    if is_subclass(kind, (PlaintextBody, OpaqueEnvelopeBody)):
+        return project_model_storage(value)
+    if kind is dict:
+        return value
+    raise ValueError("a body must be a body model or a plain dict")
 
 
 MemoryBody = Annotated[
