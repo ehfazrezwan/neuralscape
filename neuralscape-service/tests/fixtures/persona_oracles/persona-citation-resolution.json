@@ -1,0 +1,22 @@
+{
+ "expected": {
+  "baseline": {
+   "facts": {
+    "foreign_marker_field": "absent",
+    "handle_without_tenant": "refused"
+   },
+   "verdict": "known_failure"
+  },
+  "candidate": {
+   "facts": {
+    "foreign_marker_field": "present",
+    "handle_without_tenant": "refused"
+   },
+   "verdict": "candidate_pass"
+  }
+ },
+ "oracle_version": "oracle-v1",
+ "owner": "independent reviewer (not the author of the probes); not yet accepted",
+ "persona": "persona-cam",
+ "scenario_id": "persona-citation-resolution"
+}

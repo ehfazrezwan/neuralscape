@@ -1,0 +1,311 @@
+"""Machine-readable evidence records, an append-only writer and a baseline/candidate comparison.
+
+An ``EvidenceRecord`` binds one run of one scenario against one subject (a baseline or a candidate
+tree) to the oracle version that judged it, the observed facts, a verdict and artifact hashes.  The
+facts are short, content-free strings: a record never carries memory content, credentials or private
+identifiers, and the scenarios that produce them use synthetic personas only.
+
+The writer is append-only.  A partial or invalid attempt is recorded as such and is never replaced:
+a later record may *supersede* an earlier one by naming it, and the earlier record stays readable.
+Cleanup deletes only identifiers that a fixture manifest recorded.  Nothing here computes a pass
+percentage; the comparison classifies each scenario's change and leaves counting to the reader.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import threading
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Annotated, Literal
+
+from pydantic import StringConstraints, ValidationError, model_validator
+
+from contracts_common import ContractModel, OpaqueId, VersionedContract
+
+Verdict = Literal[
+    "baseline_pass",      # the baseline behaves as the oracle says it should (a control)
+    "known_failure",      # the baseline fails in the documented way; not a qualified pass
+    "candidate_pass",     # a candidate matches the oracle's expected behavior
+    "invalid_attempt",    # the run could not observe what it set out to observe
+    "blocked",            # a capability the scenario needs is absent from the subject
+    "deferred",
+    "not_applicable",
+    "unexpected_failure", # the observation disagrees with the oracle: investigate, never relabel
+]
+Role = Literal["baseline", "candidate"]
+Digest = Annotated[str, StringConstraints(strict=True, pattern=r"^[0-9a-f]{64}$")]
+Fact = Annotated[str, StringConstraints(strict=True, min_length=1, max_length=200)]
+Note = Annotated[str, StringConstraints(strict=True, max_length=300)]
+
+
+class Observation(ContractModel):
+    key: OpaqueId
+    value: Fact
+
+
+class EvidenceRecord(VersionedContract):
+    """One judged run of one scenario against one subject."""
+
+    record_id: OpaqueId
+    scenario_id: OpaqueId
+    run_id: OpaqueId
+    role: Role
+    subject_ref: OpaqueId
+    oracle_version: OpaqueId
+    oracle_sha256: Digest
+    verdict: Verdict
+    observed: tuple[Observation, ...]
+    expected: tuple[Observation, ...] = ()
+    artifact_hashes: tuple[Digest, ...] = ()
+    supersedes: OpaqueId | None = None
+    note: Note = ""
+
+    @model_validator(mode="after")
+    def _consistent(self) -> "EvidenceRecord":
+        if self.supersedes == self.record_id:
+            raise ValueError("a record cannot supersede itself")
+        if len({item.key for item in self.observed}) != len(self.observed):
+            raise ValueError("observed keys must be unique")
+        if self.verdict == "candidate_pass" and self.role != "candidate":
+            raise ValueError("only a candidate run can be a candidate_pass")
+        if self.verdict in ("baseline_pass", "known_failure") and self.role != "baseline":
+            raise ValueError("baseline_pass and known_failure belong to a baseline run")
+        return self
+
+
+def facts(mapping: Mapping[str, str]) -> tuple[Observation, ...]:
+    return tuple(Observation(key=key, value=value) for key, value in sorted(mapping.items()))
+
+
+def as_mapping(items: Iterable[Observation]) -> dict[str, str]:
+    return {item.key: item.value for item in items}
+
+
+def sha256_file(path: str | os.PathLike[str]) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+class RecordConflict(Exception):
+    """A record id already exists with different content, or a superseded id is unknown."""
+
+
+@dataclass(frozen=True)
+class ReadResult:
+    records: tuple[EvidenceRecord, ...]
+    invalid_lines: tuple[int, ...]   # 1-based line numbers that did not validate
+    partial_tail: bool               # the file ends without a newline (an interrupted append)
+
+
+class EvidenceWriter:
+    """Append-only JSON Lines evidence file."""
+
+    def __init__(self, path: str | os.PathLike[str]) -> None:
+        self._path = Path(path)
+        self._lock = threading.Lock()
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def read(self) -> ReadResult:
+        if not self._path.exists():
+            return ReadResult((), (), False)
+        raw = self._path.read_bytes()
+        partial_tail = bool(raw) and not raw.endswith(b"\n")
+        records: list[EvidenceRecord] = []
+        invalid: list[int] = []
+        for number, line in enumerate(raw.decode("utf-8", "replace").split("\n"), start=1):
+            if not line.strip():
+                continue
+            try:
+                records.append(EvidenceRecord.model_validate_json(line))
+            except (ValidationError, ValueError):
+                invalid.append(number)
+        return ReadResult(tuple(records), tuple(invalid), partial_tail)
+
+    def write(self, record: EvidenceRecord) -> bool:
+        """Append ``record``; ``False`` when an identical record is already present.
+
+        An existing id with different content, or a ``supersedes`` that names no existing record,
+        raises ``RecordConflict``.  The file is never rewritten.
+        """
+
+        line = record.model_dump_json()
+        with self._lock:
+            existing = {item.record_id: item for item in self.read().records}
+            previous = existing.get(record.record_id)
+            if previous is not None:
+                if previous.model_dump_json() == line:
+                    return False
+                raise RecordConflict(f"record {record.record_id!r} already exists with different content")
+            if record.supersedes is not None and record.supersedes not in existing:
+                raise RecordConflict(f"superseded record {record.supersedes!r} does not exist")
+            with open(self._path, "ab") as handle:
+                handle.write(line.encode("utf-8") + b"\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        return True
+
+
+def current_records(records: Iterable[EvidenceRecord]) -> list[EvidenceRecord]:
+    """The records that no later record supersedes (superseded verdicts stay in the file)."""
+
+    items = list(records)
+    superseded = {item.supersedes for item in items if item.supersedes}
+    return [item for item in items if item.record_id not in superseded]
+
+
+# ------------------------------------------------------------------ fixture cleanup
+
+
+class FixtureManifest(ContractModel):
+    """The exact identifiers a run created; cleanup may delete these and nothing else."""
+
+    fixture_version: OpaqueId
+    created_ids: tuple[OpaqueId, ...]
+
+
+@dataclass(frozen=True)
+class CleanupReport:
+    deleted: tuple[str, ...]
+    already_gone: tuple[str, ...]
+    left_alone: tuple[str, ...]   # present but not in the manifest: never touched
+
+
+def cleanup(
+    manifest: FixtureManifest,
+    present: Callable[[], Iterable[str]],
+    delete: Callable[[str], None],
+) -> CleanupReport:
+    recorded = set(manifest.created_ids)
+    live = list(dict.fromkeys(present()))
+    deleted: list[str] = []
+    for identifier in live:
+        if identifier in recorded:
+            delete(identifier)
+            deleted.append(identifier)
+    gone = tuple(sorted(recorded - set(live)))
+    return CleanupReport(tuple(deleted), gone, tuple(identifier for identifier in live if identifier not in recorded))
+
+
+# ------------------------------------------------------------------ comparison
+
+
+CHANGE_CLASSES = (
+    "unchanged", "fixed", "newly_possible", "regressed", "still_blocked", "needs_investigation", "missing_run",
+)
+
+
+def _latest(records: Sequence[EvidenceRecord], scenario_id: str, role: str) -> EvidenceRecord | None:
+    matches = [item for item in current_records(records) if item.scenario_id == scenario_id and item.role == role]
+    return matches[-1] if matches else None
+
+
+def classify(baseline: EvidenceRecord | None, candidate: EvidenceRecord | None) -> str:
+    if baseline is None or candidate is None:
+        return "missing_run"
+    if "unexpected_failure" in (baseline.verdict, candidate.verdict) or "invalid_attempt" in (baseline.verdict, candidate.verdict):
+        return "needs_investigation"
+    if baseline.verdict == "blocked":
+        return "still_blocked" if candidate.verdict == "blocked" else "newly_possible"
+    if baseline.verdict == "known_failure":
+        return "fixed" if candidate.verdict == "candidate_pass" else "needs_investigation"
+    if baseline.verdict == "baseline_pass":
+        return "unchanged" if candidate.verdict == "candidate_pass" else "regressed"
+    return "needs_investigation"
+
+
+def compare(records: Sequence[EvidenceRecord]) -> list[dict[str, str]]:
+    """One row per scenario: the baseline and candidate verdicts and the class of change."""
+
+    scenarios = sorted({item.scenario_id for item in records})
+    rows = []
+    for scenario in scenarios:
+        baseline, candidate = _latest(records, scenario, "baseline"), _latest(records, scenario, "candidate")
+        rows.append({
+            "scenario_id": scenario,
+            "baseline": baseline.verdict if baseline else "none",
+            "baseline_subject": baseline.subject_ref if baseline else "none",
+            "candidate": candidate.verdict if candidate else "none",
+            "candidate_subject": candidate.subject_ref if candidate else "none",
+            "change": classify(baseline, candidate),
+        })
+    return rows
+
+
+def render_report(rows: Sequence[Mapping[str, str]]) -> str:
+    """A Markdown comparison; it counts changes by class and never reports a pass percentage."""
+
+    lines = [
+        "# Baseline versus candidate comparison", "",
+        "Synthetic personas only. A `known_failure` is a documented baseline failure, not a qualified pass.", "",
+        "| scenario | baseline | candidate | change |", "|---|---|---|---|",
+    ]
+    for row in rows:
+        lines.append(f"| {row['scenario_id']} | {row['baseline']} ({row['baseline_subject']}) | {row['candidate']} ({row['candidate_subject']}) | {row['change']} |")
+    counts = {name: sum(1 for row in rows if row["change"] == name) for name in CHANGE_CLASSES}
+    lines += ["", "Changes by class: " + ", ".join(f"{name} {count}" for name, count in counts.items() if count), ""]
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------------ evidence build_matrix input
+
+
+def matrix_artifacts(
+    evidence_path: str | os.PathLike[str],
+    report_path: str | os.PathLike[str] | None = None,
+    *,
+    producer_lane: str = "I",
+) -> list[dict[str, object]]:
+    """Artifact dictionaries in the acceptance matrix's shape (kind, path, sha256, scope, summary).
+
+    One artifact for the evidence file and, when given, one for the comparison report.  The matrix
+    generator reads them from ``evidence-records.json`` written by ``write_matrix_input``.
+    """
+
+    result = EvidenceWriter(evidence_path).read()
+    rows = compare(result.records)
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row["change"]] = counts.get(row["change"], 0) + 1
+    summary = (
+        f"{len(result.records)} records over {len(rows)} scenarios; changes: "
+        + ", ".join(f"{name} {count}" for name, count in sorted(counts.items()))
+        + (f"; {len(result.invalid_lines)} invalid line(s)" if result.invalid_lines else "")
+        + ("; partial tail" if result.partial_tail else "")
+    )
+    artifacts = [{
+        "kind": "unit", "path": str(Path(evidence_path).resolve()), "sha256": sha256_file(evidence_path),
+        "producer_lane": producer_lane, "scope": "lane-local", "summary": summary,
+    }]
+    if report_path is not None:
+        artifacts.append({
+            "kind": "unit", "path": str(Path(report_path).resolve()), "sha256": sha256_file(report_path),
+            "producer_lane": producer_lane, "scope": "lane-local", "summary": "baseline/candidate comparison report",
+        })
+    return artifacts
+
+
+def write_matrix_input(
+    out_path: str | os.PathLike[str],
+    entries: Sequence[tuple[Sequence[str], str | os.PathLike[str], str | os.PathLike[str] | None]],
+) -> None:
+    """Write ``{"rows": {row_id: [artifact, ...]}}`` for the matrix generator to attach."""
+
+    rows: dict[str, list[dict[str, object]]] = {}
+    for row_ids, evidence_path, report_path in entries:
+        for row_id in row_ids:
+            rows.setdefault(row_id, []).extend(matrix_artifacts(evidence_path, report_path))
+    Path(out_path).write_text(json.dumps({"schema_version": "evidence-records-v1", "rows": rows}, indent=1, sort_keys=True))
+
+
+__all__ = [
+    "CHANGE_CLASSES", "CleanupReport", "EvidenceRecord", "EvidenceWriter", "FixtureManifest", "Observation",
+    "ReadResult", "RecordConflict", "Verdict", "as_mapping", "classify", "cleanup", "compare",
+    "current_records", "facts", "matrix_artifacts", "render_report", "sha256_file", "write_matrix_input",
+]
