@@ -307,6 +307,9 @@ def _observed_public_view(
         if issubclass(item_type, (BaseModel, dict, list, tuple)):
             frozen = _cached_identity_capture(item, captured_by_identity)
             if frozen is not None:
+                # A cache hit is still one public item read: charged, so a view that keeps
+                # yielding inventoried items ends at the budget instead of growing without bound.
+                budget.charge_edge()
                 return frozen
             return _capture_native_contract_graph(
                 item,
