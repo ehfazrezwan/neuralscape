@@ -16,7 +16,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 BENCH = HERE.parents[1]
-PROJECT = "ns-g-p6j"
+PROJECT = "ns-journey"
 FILES = ["-f", str(HERE / "compose.yml"), "-f", str(HERE / "journey.override.yml")]
 APP = ["api", "worker", "graph-worker", "ingest-worker"]
 PG_PASSWORD = "bench-owner-password"
@@ -173,7 +173,7 @@ def main():
     if scenario == "ledger-pending":
         return pending_scenario(old, new, out)
     j = Journey(old, new, out)
-    sentinel = "ns-g-p6j-sentinel"
+    sentinel = "ns-journey-sentinel"
     run("docker", "volume", "create", sentinel)
     before = j.volumes()
     # state: the shared volume must be writable by the service user
