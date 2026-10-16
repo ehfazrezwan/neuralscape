@@ -10,7 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Annotated, Literal, TypeVar
+from collections.abc import Iterator
+from typing import Annotated, Any, Literal, TypeVar
 
 from pydantic import (
     AwareDatetime,
@@ -62,8 +63,16 @@ class _CapturedLeaf(_CapturedGraph):
 
 
 @dataclass(frozen=True, slots=True)
-class _CapturedCycle(_CapturedGraph):
-    pass
+class _CapturedBackReference(_CapturedGraph):
+    """A native edge back to a container still being captured.
+
+    Whether it is a cycle depends on the path that reaches it at reconstruction, not on which
+    traversal happened to capture the container first, so it is resolved (and a real cycle
+    refused) when the graph is rebuilt.
+    """
+
+    identity: int
+    source: object
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,13 +108,13 @@ class _CapturedTuple(_CapturedGraph):
 
 _CapturedGraphSnapshot = tuple[
     _CapturedGraph,
-    dict[int, _CapturedGraph],
+    dict[Any, Any],
 ]
 
 
 def _cached_identity_capture(
     value: object,
-    captured_by_identity: dict[int, _CapturedGraph],
+    captured_by_identity: dict[Any, Any],
 ) -> _CapturedGraph | None:
     """Return a cache hit only when it owns the exact source object."""
 
@@ -121,7 +130,7 @@ def _cached_identity_capture(
 def _capture_native_contract_graph(
     value: object,
     active_containers: set[int] | None = None,
-    captured_by_identity: dict[int, _CapturedGraph] | None = None,
+    captured_by_identity: dict[Any, Any] | None = None,
     budget: DiscoveryBudget | None = None,
 ) -> _CapturedGraph:
     """Freeze supported native backing without invoking public protocols."""
@@ -138,7 +147,7 @@ def _capture_native_contract_graph(
     if issubclass(value_type, (BaseModel, dict, list, tuple)):
         identity = id(value)
         if identity in active_containers:
-            return _CapturedCycle()
+            return _CapturedBackReference(identity=identity, source=value)
         cached = _cached_identity_capture(value, captured_by_identity)
         if cached is not None:
             return cached
@@ -248,7 +257,7 @@ def _capture_native_contract_graph(
 
 def _materialize_captured_graph(
     value: _CapturedGraph,
-    captured_by_identity: dict[int, _CapturedGraph],
+    captured_by_identity: dict[Any, Any],
     active_containers: set[int] | None = None,
     budget: DiscoveryBudget | None = None,
 ) -> object:
@@ -259,8 +268,13 @@ def _materialize_captured_graph(
     if budget is None:
         budget = DiscoveryBudget()
     budget.charge_edge()
-    if isinstance(value, _CapturedCycle):
-        raise ValueError("cyclic contract graph is not valid input")
+    if isinstance(value, _CapturedBackReference):
+        resolved = _cached_identity_capture(value.source, captured_by_identity)
+        if resolved is None or value.identity in active_containers:
+            raise ValueError("cyclic contract graph is not valid input")
+        return _materialize_captured_graph(
+            resolved, captured_by_identity, active_containers, budget
+        )
     if isinstance(value, _CapturedLeaf):
         return value.value
     identity = value.identity
@@ -328,10 +342,22 @@ def _materialize_captured_graph(
             budget.charge_edge()
             return _CapturedLeaf(item)
 
+        def observed_view(source: object) -> Iterator[_CapturedGraph]:
+            """Observe a public view once per call: later edges and revalidations replay it."""
+
+            memo = captured_by_identity.get(("view", id(source)))
+            if memo is not None and memo[0] is source:
+                yield from memo[1]
+                return
+            seen: list[_CapturedGraph] = []
+            for item in source:  # type: ignore[attr-defined]
+                frozen = public_item(item)
+                seen.append(frozen)
+                yield frozen
+            captured_by_identity[("view", id(source))] = (source, tuple(seen))
+
         if isinstance(value, _CapturedList):
-            items = value.items if is_exact_type(value.source, list) else (
-                public_item(item) for item in value.source
-            )
+            items = value.items if is_exact_type(value.source, list) else observed_view(value.source)
             return [
                 _materialize_captured_graph(
                     item,
@@ -341,9 +367,7 @@ def _materialize_captured_graph(
                 )
                 for item in items
             ]
-        items = value.items if is_exact_type(value.source, tuple) else (
-            public_item(item) for item in value.source
-        )
+        items = value.items if is_exact_type(value.source, tuple) else observed_view(value.source)
         return tuple(
             _materialize_captured_graph(
                 item,
@@ -371,10 +395,12 @@ def _capture_contract_graph(
     value: object,
     active_containers: set[int] | None = None,
     budget: DiscoveryBudget | None = None,
+    captured_by_identity: dict[Any, Any] | None = None,
 ) -> _CapturedGraphSnapshot:
     """Capture one graph without running its public reconstruction views."""
 
-    captured_by_identity: dict[int, _CapturedGraph] = {}
+    if captured_by_identity is None:
+        captured_by_identity = {}
     captured = _capture_native_contract_graph(
         value,
         active_containers,
@@ -421,7 +447,7 @@ def _revalidated_captured_model(
 def _revalidated_inventory_model(
     model_type: type[_ModelT],
     value: object,
-    captured_by_identity: dict[int, _CapturedGraph],
+    captured_by_identity: dict[Any, Any],
     budget: DiscoveryBudget | None = None,
 ) -> _ModelT:
     """Validate a public-view item, reusing entry-time state when available."""
@@ -817,8 +843,9 @@ def source_versions_match(
     if not isinstance(expected, SourceVersion):
         raise TypeError("value must be a SourceVersion")
     budget = DiscoveryBudget()  # one envelope for both witnesses
+    shared: dict[Any, Any] = {}  # and one observation of any view they share
     try:
-        captured_expected = _capture_contract_graph(expected, None, budget)
+        captured_expected = _capture_contract_graph(expected, None, budget, shared)
         expected_capture_error: Exception | None = None
     except Exception as exc:
         captured_expected = None
@@ -826,7 +853,7 @@ def source_versions_match(
 
     if isinstance(observed, SourceVersion):
         try:
-            captured_observed = _capture_contract_graph(observed, None, budget)
+            captured_observed = _capture_contract_graph(observed, None, budget, shared)
             observed_capture_error: Exception | None = None
         except Exception as exc:
             captured_observed = None
@@ -914,14 +941,14 @@ def validate_required_stage_claim(
     if not isinstance(intent, Intent):
         raise TypeError("value must be an Intent")
     budget = DiscoveryBudget()  # one envelope for the intent and every receipt
+    receipt_inventory: dict[Any, Any] = {}  # and one observation of any view they share
     try:
-        captured_intent = _capture_contract_graph(intent, None, budget)
+        captured_intent = _capture_contract_graph(intent, None, budget, receipt_inventory)
         intent_capture_error: Exception | None = None
     except Exception as exc:
         captured_intent = None
         intent_capture_error = exc
 
-    receipt_inventory: dict[int, _CapturedGraph] = {}
     receipt_capture_errors: dict[int, Exception] = {}
     for receipt in tuple.__iter__(receipts):
         if not issubclass(type(receipt), StageReceipt):

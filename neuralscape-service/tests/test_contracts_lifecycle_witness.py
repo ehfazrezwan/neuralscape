@@ -307,14 +307,11 @@ def test_public_first_sibling_repair_before_first_observation_is_the_documented_
     assert repaired.iteration_calls == 1
 
 
-def test_public_first_a_subclass_view_is_observed_once_per_edge_not_once_per_object() -> None:
-    """By design (public view is authoritative): the public view of a container is captured once at
-    first observation *of each edge that reaches it*.  One subclass object attached to a single
-    field is read once; the same object attached to two fields of different receipts is read once
-    for each of those edges, and every edge validates the view it observed.  Capture is cached by
-    object identity for plain containers and models, not for a subclass's public view, because
-    that view is exactly what a subclass may change between observations; nothing here promises a
-    single read across edges.  This pins the accepted behavior so a change to it is deliberate.
+def test_public_first_a_subclass_view_is_observed_once_per_call_whatever_the_edges() -> None:
+    """The public view of a tuple or list subclass is the authoritative state, and it is observed
+    once per validation call: its first observation is replayed for every later edge that reaches
+    the same object, including other receipts, so a view that changes between iterations cannot
+    make aliased edges (or duplicate receipts) validate differently.
     """
 
     ref = handle("tenant-1", ident="o1")
@@ -329,7 +326,7 @@ def test_public_first_a_subclass_view_is_observed_once_per_edge_not_once_per_obj
     _native_set(first, "output_refs", shared)
     _native_set(second, "output_refs", shared)
     claim(intent(CANONICAL, GRAPH), (first, second))
-    assert shared.iteration_calls == 2  # one observation per edge
+    assert shared.iteration_calls == 1  # one observation per call
 
 
 def test_public_first_public_only_receipt_repair_by_intent_callback_is_the_documented_limit() -> None:

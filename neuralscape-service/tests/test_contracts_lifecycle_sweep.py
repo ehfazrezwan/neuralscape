@@ -316,3 +316,110 @@ def test_a_flood_of_edges_in_one_root_is_refused_by_the_shared_envelope():
             intent=flood,
             receipts=(receipt(ProcessingStage.CANONICAL, StageStatus.PROCESSING),),
         )
+
+
+# ---- a public view is observed once per call, and a hidden native cycle is not a permanent mark
+NATIVE_DICT = vars(BaseModel)["__dict__"]
+
+
+def set_native(model, field, value):
+    dict.__setitem__(NATIVE_DICT.__get__(model, BaseModel), field, value)
+
+
+class Stateful(tuple):
+    """A public view whose items change every time it is iterated."""
+
+    def __new__(cls, rounds):
+        view = super().__new__(cls, ())
+        view.rounds = rounds
+        view.passes = 0
+        return view
+
+    def __iter__(self):
+        pass_number = self.passes
+        self.passes += 1
+        return iter(self.rounds[min(pass_number, len(self.rounds) - 1)])
+
+
+def test_a_stateful_view_aliased_on_two_edges_is_observed_once():
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    view = Stateful([(source("a"),), (source("b"),), (source("c"),)])
+    set_native(command, "source_preconditions", view)
+    set_native(
+        command.stage_requirements[0], "committed_sources", view
+    )
+    set_native(command.stage_requirements[0], "precondition_source_ids", ())
+    kept = contracts_lifecycle._revalidated_model(Intent, command)
+    assert kept.source_preconditions == kept.stage_requirements[0].committed_sources
+    assert view.passes == 1
+
+
+def test_duplicate_receipts_with_a_stateful_output_view_stay_idempotent():
+    from tests.test_contracts_lifecycle import intent_with_requirements, reference, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED, outputs=(reference("one"),))
+    view = Stateful([(reference("one"),), (reference("one"), reference("two"))])
+    set_native(applied, "output_refs", view)
+    validate_required_stage_claim(
+        claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied, applied)
+    )
+    assert view.passes == 1
+
+
+def test_a_view_shared_by_the_intent_and_a_receipt_is_observed_once():
+    from tests.test_contracts_lifecycle import intent_with_requirements, requirement
+
+    command = intent_with_requirements(requirement(ProcessingStage.CANONICAL))
+    applied = receipt(ProcessingStage.CANONICAL, StageStatus.APPLIED)
+    view = Stateful([(source("memory-1"),), (source("other"),)])
+    set_native(command, "source_preconditions", view)
+    set_native(applied, "applied_sources", view)
+    validate_required_stage_claim(
+        claimed_status=IntentStatus.APPLIED, intent=command, receipts=(applied,)
+    )
+    assert view.passes == 1
+
+
+def hidden_cycle():
+    """A tuple subclass showing nothing publicly whose native backing runs back through a list to it."""
+
+    class Quiet(tuple):
+        def __iter__(self):
+            return iter(())
+
+    loop = []
+    view = Quiet((loop,))
+    loop.append(view)
+    return view, loop
+
+
+def failure(command):
+    with pytest.raises(ValueError) as raised:
+        claim(command)
+    return str(raised.value)
+
+
+def test_a_hidden_native_cycle_behind_an_acyclic_public_view_is_order_independent():
+    view, loop = hidden_cycle()
+    base = intent(ProcessingStage.CANONICAL)
+    first = base.model_copy(update={"id": view, "actor_id": loop})
+    view, loop = hidden_cycle()
+    second = base.model_copy(update={"id": loop, "actor_id": view})
+    one, two = failure(first), failure(second)
+    assert "cyclic" not in one and "cyclic" not in two
+    assert one.count("validation error") == two.count("validation error")
+
+
+def test_a_real_native_cycle_is_still_refused_from_every_entry():
+    ring = []
+    ring.append(ring)
+    command = intent(ProcessingStage.CANONICAL).model_copy(update={"id": ring})
+    assert "cyclic" in failure(command)
+    left, right = [], []
+    left.append(right)
+    right.append(left)
+    for update in ({"id": left, "actor_id": right}, {"id": right, "actor_id": left}):
+        assert "cyclic" in failure(intent(ProcessingStage.CANONICAL).model_copy(update=update))
