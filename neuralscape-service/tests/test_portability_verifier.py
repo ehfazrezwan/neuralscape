@@ -854,3 +854,68 @@ def test_a_lying_end_record_count_does_not_bypass_the_record_limit(tmp_path, mon
     monkeypatch.setattr(pv.zipfile, "ZipFile", lambda *a, **k: pytest.fail("parsed"))
     report = verify_bundle(path)
     assert not report.ok and _codes(report) & {pv.ENTRY_COUNT_LIMIT, pv.ARCHIVE_FRAMING}
+
+
+def _three_record_zip(tmp_path) -> Path:
+    return _write_zip(tmp_path / "b.zip", PAYLOAD)
+
+
+@pytest.mark.parametrize("shape", ["prepended", "offset-zero"])
+def test_the_record_count_precheck_cannot_be_moved_off_the_directory(tmp_path, monkeypatch, shape) -> None:
+    """The archive library finds the directory at end-record position minus its size, not
+    at the stored offset; a precheck that trusts the stored offset counts nothing."""
+
+    import struct
+
+    path = _three_record_zip(tmp_path)
+    raw = bytearray(path.read_bytes())
+    eocd = raw.rindex(b"PK\x05\x06")
+    struct.pack_into("<HH", raw, eocd + 8, 1, 1)  # declared count 1: the declared-count check passes
+    if shape == "prepended":
+        raw[0:0] = b"\x00" * 4096
+    else:
+        struct.pack_into("<I", raw, eocd + 16, 0)
+    path.write_bytes(bytes(raw))
+    monkeypatch.setattr(pv, "MAX_BUNDLE_ENTRIES", 2)
+    monkeypatch.setattr(pv.zipfile, "ZipFile", lambda *a, **k: pytest.fail("parsed before the limits"))
+    report = verify_bundle(path)
+    assert not report.ok and _codes(report) & {pv.ENTRY_COUNT_LIMIT, pv.ARCHIVE_FRAMING}
+
+
+def test_a_prepended_stub_is_refused_before_parsing_even_within_limits(tmp_path, monkeypatch) -> None:
+    path = _three_record_zip(tmp_path)
+    path.write_bytes(b"#!/bin/sh\nexit 0\n" + path.read_bytes())
+    monkeypatch.setattr(pv.zipfile, "ZipFile", lambda *a, **k: pytest.fail("parsed"))
+    assert _codes(verify_bundle(path)) == {pv.ARCHIVE_FRAMING}
+
+
+def _zip64_end_record_archive(tmp_path, monkeypatch) -> Path:
+    path = tmp_path / "b.zip"
+    with monkeypatch.context() as patch:
+        patch.setattr(zipfile, "ZIP_FILECOUNT_LIMIT", 1)  # forces the zip64 end record
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("manifest.json", json.dumps(_manifest(PAYLOAD)))
+            for name, data in PAYLOAD.items():
+                archive.writestr(name, data)
+    assert b"PK\x06\x06" in path.read_bytes() and b"PK\x06\x07" in path.read_bytes()
+    return path
+
+
+def test_a_zip64_end_record_archive_passes_the_precheck(tmp_path, monkeypatch) -> None:
+    path = _zip64_end_record_archive(tmp_path, monkeypatch)
+    report = pv.VerificationReport()
+    assert pv._precheck_central_directory(str(path), report) is True and report.ok
+
+
+def test_the_zip64_record_count_is_enforced_before_parsing(tmp_path, monkeypatch) -> None:
+    path = _zip64_end_record_archive(tmp_path, monkeypatch)
+    monkeypatch.setattr(pv, "MAX_BUNDLE_ENTRIES", 2)
+    monkeypatch.setattr(pv.zipfile, "ZipFile", lambda *a, **k: pytest.fail("parsed"))
+    assert pv.ENTRY_COUNT_LIMIT in _codes(verify_bundle(path))
+
+
+def test_a_prepended_stub_before_a_zip64_archive_is_refused_before_parsing(tmp_path, monkeypatch) -> None:
+    path = _zip64_end_record_archive(tmp_path, monkeypatch)
+    path.write_bytes(b"\x00" * 512 + path.read_bytes())
+    monkeypatch.setattr(pv.zipfile, "ZipFile", lambda *a, **k: pytest.fail("parsed"))
+    assert _codes(verify_bundle(path)) == {pv.ARCHIVE_FRAMING}

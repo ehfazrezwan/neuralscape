@@ -709,27 +709,46 @@ def _precheck_central_directory(target: str, report: VerificationReport) -> bool
             fields = _EOCD.unpack(tail[position : position + _EOCD.size])
             entries, cd_size, cd_offset = fields[4], fields[5], fields[6]
             eocd_at = size - window + position
-            if entries == 0xFFFF or cd_size == _U32_MAX or cd_offset == _U32_MAX:
-                locator_at = eocd_at - 20
-                if locator_at < 0:
-                    return True
+            directory_end = eocd_at  # where the directory must end, as the parser computes it
+            # Like the parser, use a zip64 end record whenever a locator sits directly
+            # before the end record, whatever the end record's own fields say.
+            locator_at = eocd_at - 20
+            locator = b""
+            if locator_at >= 0:
                 raw.seek(locator_at)
                 locator = raw.read(20)
-                if locator[:4] != _ZIP64_LOCATOR_SIGNATURE:
+            saturated = entries == 0xFFFF or cd_size == _U32_MAX or cd_offset == _U32_MAX
+            if locator[:4] != _ZIP64_LOCATOR_SIGNATURE and saturated:
+                return True  # left to the parser, which reports the archive unreadable
+            if locator[:4] == _ZIP64_LOCATOR_SIGNATURE:
+                # Read the zip64 end record where the parser does: immediately before
+                # the locator, not at the locator's stored offset.
+                record_at = locator_at - 56
+                if record_at < 0:
                     return True
-                raw.seek(struct.unpack_from("<Q", locator, 8)[0])
+                raw.seek(record_at)
                 record = raw.read(56)
                 if len(record) != 56 or record[:4] != _ZIP64_EOCD_SIGNATURE:
                     return True
                 entries = struct.unpack_from("<Q", record, 32)[0]
                 cd_size, cd_offset = struct.unpack_from("<QQ", record, 40)
+                directory_end = record_at  # the zip64 end record follows the directory
             if cd_size > MAX_CENTRAL_DIRECTORY_BYTES:
                 report.add(SIZE_LIMIT, "<bundle>", "central directory")
                 return False
             if entries > MAX_BUNDLE_ENTRIES:
                 report.add(ENTRY_COUNT_LIMIT)
                 return False
-            raw.seek(cd_offset)
+            # The archive library locates the directory at ``directory_end - cd_size``
+            # and treats any difference from the stored offset as prepended data.  A
+            # bundle is never a self-extracting archive, so any such difference is
+            # refused here, before parsing; the walk below reads exactly where the
+            # parser would.
+            start = directory_end - cd_size
+            if start < 0 or start != cd_offset:
+                report.add(ARCHIVE_FRAMING, "<bundle>", "data before the first record")
+                return False
+            raw.seek(start)
             directory = raw.read(cd_size)
     except OSError:
         return True
