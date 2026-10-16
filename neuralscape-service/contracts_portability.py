@@ -400,13 +400,17 @@ def _reject_retained_unknown_fields(
                 walk(item, (*location, item_location))
             return
 
+        exact_native = type(value) in (list, tuple, set, frozenset)
         items = (
             _validated_native_container_items(value, native_container_inventory)
-            if type(value) in (list, tuple, set, frozenset)
+            if exact_native
             else value
         )
         for index, item in enumerate(items):
-            budget.charge_edge()  # public view charged as it is observed
+            if not exact_native:
+                # A public view is charged as it is observed; an exact native
+                # container was already charged by its length in discovery.
+                budget.charge_edge()
             walk(item, (*location, index))
 
     discover(root)

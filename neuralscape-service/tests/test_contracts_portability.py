@@ -3342,3 +3342,45 @@ def test_discovery_edge_budget_rejects_before_any_stored_name_callback(
         stored_name.equality_calls,
         stored_name.class_calls,
     ) == (0, 0, 0)
+
+
+# --- exact native containers are charged once (ADR-P12-002) -------------------
+
+
+def _budget_measure(monkeypatch, manifest: PortableManifest) -> tuple[int, int]:
+    _RecordingBudget.instances = []
+    monkeypatch.setattr(contracts_portability, "DiscoveryBudget", _RecordingBudget)
+    with pytest.raises(ValidationError):
+        validate_portable_manifest(manifest)  # the replaced field is invalid; accounting is what we read
+    budget = _RecordingBudget.instances[-1]
+    return budget.nodes, budget.edges
+
+
+@pytest.mark.parametrize("kind", [list, tuple])
+def test_exact_native_sequence_entries_are_charged_exactly_once(monkeypatch, kind) -> None:
+    shared: list[object] = []
+    _, empty_edges = _budget_measure(monkeypatch, _manifest_with_files(kind()))
+    _, full_edges = _budget_measure(monkeypatch, _manifest_with_files(kind([shared] * 1000)))
+    assert full_edges - empty_edges == 1000
+
+
+@pytest.mark.parametrize("kind", [list, tuple])
+def test_an_exact_sequence_within_the_adr_edge_limit_is_not_rejected_by_the_budget(kind) -> None:
+    shared: list[object] = []
+    within = kind([shared] * (PORTABILITY_MAX_EDGES // 2 + 1000))  # twice that is over the old, doubled limit
+    manifest = _manifest_with_files(within)
+    with pytest.raises(ValidationError) as raised:  # still invalid as a manifest, but not for the budget
+        validate_portable_manifest(manifest)
+    assert str(raised.value.__cause__) != DISCOVERY_BUDGET_MESSAGE
+
+
+def test_the_adr_edge_limit_itself_still_rejects_an_exact_sequence() -> None:
+    shared: list[object] = []
+    _assert_budget_rejection(_manifest_with_files([shared] * (PORTABILITY_MAX_EDGES + 1)))
+
+
+def test_exact_dict_and_public_view_charging_is_unchanged(monkeypatch) -> None:
+    # Exact dict: two edges per entry (key and value), charged once at discovery.
+    _, empty_edges = _budget_measure(monkeypatch, _manifest_with_files({}))
+    _, full_edges = _budget_measure(monkeypatch, _manifest_with_files({i: 0 for i in range(500)}))
+    assert full_edges - empty_edges == 1000
