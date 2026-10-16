@@ -4810,3 +4810,51 @@ def test_a_tzinfo_whose_offset_changes_between_reads_is_read_once_in_direct_cons
     kept = _revalidated(manifest, started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc), finished_at=when)
     assert tz.calls == 1  # one read by the validator; nothing later asks the caller's tzinfo again
     assert kept.finished_at.utcoffset() == timedelta(hours=1) == kept.finished_at.utcoffset()
+
+
+# ── capture is charged before it retains; one datetime gets one offset per call ──
+
+
+def _model_with_stored_entries(n: int):
+    model = measured_memory()
+    stored = BaseModel.__dict__["__dict__"].__get__(model, BaseModel)
+    for index in range(n):
+        dict.__setitem__(stored, f"extra_{index}", index)
+    return model
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda n: list(range(n)),
+        lambda n: tuple(range(n)),
+        lambda n: {f"k{i}": i for i in range(n)},
+        lambda n: _model_with_stored_entries(n),
+    ],
+    ids=["list", "tuple", "dict", "model"],
+)
+def test_native_capture_is_charged_before_its_entries_are_retained(build) -> None:
+    oversized = build(run_manifest_module.MAX_SNAPSHOT_VISITS + 1)
+    with pytest.raises(ValueError, match=run_manifest_module.SNAPSHOT_BUDGET_MESSAGE):
+        run_manifest_module._freeze_model_graphs(oversized)
+
+
+def test_native_capture_within_the_budget_is_kept() -> None:
+    graph = run_manifest_module._freeze_model_graphs([[] for _ in range(1_000)])
+    assert len(graph.replay_entries) == 1_001
+
+
+def test_an_oversized_native_container_is_refused_before_its_entries_are_copied() -> None:
+    import tracemalloc
+
+    oversized = [[] for _ in range(run_manifest_module.MAX_SNAPSHOT_VISITS + 1)]
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError, match=run_manifest_module.SNAPSHOT_BUDGET_MESSAGE):
+            run_manifest_module._freeze_model_graphs(oversized)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    # Copying the 65,537 entries would allocate a tuple of about half a megabyte; refusing first
+    # allocates only bookkeeping.
+    assert peak < 128 * 1024, peak
