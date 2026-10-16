@@ -17,7 +17,7 @@ from typing import Callable
 
 import pydantic
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 import neuralscape_bench.run_manifest as run_manifest_module
 from neuralscape_bench.run_manifest import (
@@ -4059,3 +4059,81 @@ def test_a_hostile_metaclass_never_gets_its_eq_run_by_the_manifest_module(base, 
         )
 
     assert events == []
+
+
+def _class_spy(base, events: list[str]):
+    """A container subclass whose ``__class__`` is a callback; ``type()`` is unaffected."""
+
+    namespace = {
+        "__class__": property(lambda self: events.append("__class__") or base),
+    }
+    if base is Mapping:
+        namespace.update(
+            __getitem__=lambda self, key: {}[key],
+            __iter__=lambda self: iter(()),
+            __len__=lambda self: 0,
+        )
+        return type("ClassSpy", (Mapping,), namespace)
+    return type("ClassSpy", (base,), namespace)
+
+
+@pytest.mark.parametrize("base", [list, tuple, dict, Mapping])
+def test_discovery_never_reads_a_containers_class_attribute(base) -> None:
+    events: list[str] = []
+    spy = _class_spy(base, events)
+    value = spy(()) if base is not dict and base is not Mapping else spy()
+
+    run_manifest_module._freeze_model_graphs(value)
+
+    assert events == []
+
+
+@pytest.mark.parametrize("field", ["resources", "measurements"])
+@pytest.mark.parametrize("base", [list, tuple, dict, Mapping])
+def test_finish_run_never_runs_a_class_callback_before_capture(base, field) -> None:
+    events: list[str] = []
+    spy = _class_spy(base, events)
+    value = spy(()) if base is not dict and base is not Mapping else spy()
+    planned = planned_manifest()
+    arguments = {"resources": (measured_memory(),), "measurements": (timing(),)}
+    arguments[field] = value
+
+    with contextlib.suppress(ValueError, TypeError, ValidationError):
+        finish_run(
+            planned,
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            **arguments,
+        )
+
+    assert events == []
+
+
+def test_a_class_callback_cannot_repair_invalid_evidence_before_capture() -> None:
+    """A hostile ``__class__`` that rewrites a resource's invalid observed_value before it is captured."""
+
+    planned = planned_manifest()
+    resource = measured_memory()
+    repaired: list[str] = []
+
+    class Repairing(tuple):
+        @property
+        def __class__(self):  # noqa: D401 - the callback under test
+            repaired.append("repair")
+            dict.__setitem__(BaseModel.__dict__["__dict__"].__get__(resource, BaseModel), "observed_value", 1)
+            return tuple
+
+    dict.__setitem__(BaseModel.__dict__["__dict__"].__get__(resource, BaseModel), "observed_value", True)
+
+    with pytest.raises((ValueError, TypeError, ValidationError)):
+        finish_run(
+            planned,
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=Repairing((resource,)),
+            measurements=(timing(),),
+        )
+
+    assert repaired == []

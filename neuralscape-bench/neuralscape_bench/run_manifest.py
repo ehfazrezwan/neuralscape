@@ -345,9 +345,9 @@ def _retain_public_mapping(value: Any, frozen_graph: _FrozenGraph) -> bool:
     """Retain a strong owner for a supported nonexact public mapping."""
 
     if (
-        isinstance(value, BaseModel)
+        _is_instance(value, BaseModel)
         or type(value) is dict
-        or not isinstance(value, Mapping)
+        or not _is_instance(value, Mapping)
     ):
         return False
     identity = id(value)
@@ -358,6 +358,17 @@ def _retain_public_mapping(value: Any, frozen_graph: _FrozenGraph) -> bool:
     frozen_graph.public_mapping_queue.append(value)
     frozen_graph.public_mappings.pop(identity, None)
     return True
+
+
+def _is_instance(value: Any, types: type | tuple[type, ...]) -> bool:
+    """``isinstance`` that never reads ``value.__class__``.
+
+    ``isinstance`` (and every ABC or pydantic metaclass check) consults an object's
+    ``__class__``, which a hostile container subclass can turn into a callback that
+    runs before its contents are captured.  ``type(value)`` is not overridable.
+    """
+
+    return issubclass(type(value), types)
 
 
 def _is_exact_type(value_type: type, exact: tuple[type, ...]) -> bool:
@@ -379,9 +390,9 @@ def _retain_public_sequence(value: Any, frozen_graph: _FrozenGraph) -> bool:
     """
 
     if (
-        isinstance(value, (BaseModel, Mapping))
+        _is_instance(value, (BaseModel, Mapping))
         or _is_exact_type(type(value), (tuple, list))
-        or not isinstance(value, (tuple, list))
+        or not _is_instance(value, (tuple, list))
     ):
         return False
     identity = id(value)
@@ -403,7 +414,7 @@ def _retain_extra_mapping(
     if (
         value is None
         or issubclass(type(value), dict)
-        or not isinstance(value, Mapping)
+        or not _is_instance(value, Mapping)
     ):
         return False
     identity = id(value)
@@ -578,7 +589,7 @@ def _retain_reachable_public_sequences(
             continue
         visited[identity] = authoritative
 
-        is_model = isinstance(current, BaseModel)
+        is_model = _is_instance(current, BaseModel)
         if not is_model and authoritative:
             _retain_public_sequence(current, frozen_graph)
 
@@ -678,11 +689,11 @@ def _inventory_reachable_public_mappings(
             continue
         visited[identity] = authoritative
 
-        is_model = isinstance(current, BaseModel)
+        is_model = _is_instance(current, BaseModel)
         if (
             not is_model
             and type(current) is not dict
-            and isinstance(current, Mapping)
+            and _is_instance(current, Mapping)
         ):
             _retain_public_mapping(current, frozen_graph)
             active_owner = observing.get(identity)
@@ -699,7 +710,7 @@ def _inventory_reachable_public_mappings(
             not is_model
             and authoritative
             and not _is_exact_type(type(current), (tuple, list))
-            and isinstance(current, (tuple, list))
+            and _is_instance(current, (tuple, list))
         ):
             _retain_public_sequence(current, frozen_graph)
             active_owner = observing.get(identity)
@@ -834,16 +845,14 @@ def _inventory_yielded_public_shape(
     """Protect one yielded value's authoritative public shape."""
 
     identity = id(value)
-    if not isinstance(value, BaseModel):
-        if type(value) is not dict and isinstance(value, Mapping):
+    if not _is_instance(value, BaseModel):
+        if type(value) is not dict and _is_instance(value, Mapping):
             if observing.get(identity) is value:
                 return False
             _retain_public_mapping(value, frozen_graph)
             if not _inventory_public_mapping(value, frozen_graph, observing):
                 return False
-        elif not _is_exact_type(type(value), (tuple, list)) and isinstance(
-            value, (tuple, list)
-        ):
+        elif not _is_exact_type(type(value), (tuple, list)) and _is_instance(value, (tuple, list)):
             if observing.get(identity) is value:
                 return False
             _retain_public_sequence(value, frozen_graph)
@@ -1016,7 +1025,7 @@ def _snapshot_native(
     if active is None:
         active = set()
 
-    is_container = isinstance(value, (BaseModel, Mapping, tuple, list))
+    is_container = _is_instance(value, (BaseModel, Mapping, tuple, list))
     identity = id(value)
     if is_container:
         if identity in active:
@@ -1024,7 +1033,7 @@ def _snapshot_native(
         active.add(identity)
 
     try:
-        if isinstance(value, BaseModel):
+        if _is_instance(value, BaseModel):
             fields = type(value).model_fields
             frozen = _frozen_graph.models.get(identity)
             if frozen is None or frozen[0] is not value:
@@ -1040,7 +1049,7 @@ def _snapshot_native(
                     extra_entries = native_extra_entries
                     iterated_extra_names = tuple(key for key, _ in extra_entries)
                 else:
-                    if not isinstance(extras, Mapping):
+                    if not _is_instance(extras, Mapping):
                         raise ValueError(f"malformed stored extras at {path}")
                     _retain_extra_mapping(extras, _frozen_graph)
                     _inventory_retained_extra_mappings(_frozen_graph)
@@ -1067,7 +1076,7 @@ def _snapshot_native(
                 if name in stored_values
             }
 
-        if isinstance(value, Mapping):
+        if _is_instance(value, Mapping):
             if type(value) is dict:
                 frozen_container = _frozen_graph.native_containers.get(identity)
                 if frozen_container is None or frozen_container[0] is not value:
@@ -1106,7 +1115,7 @@ def _snapshot_native(
             if not frozen_mapping.complete:
                 raise ValueError(f"incomplete public mapping inventory at {path}")
             return projected
-        if isinstance(value, tuple):
+        if _is_instance(value, tuple):
             if type(value) is tuple:
                 frozen_container = _frozen_graph.native_containers.get(identity)
                 if frozen_container is None or frozen_container[0] is not value:
@@ -1148,7 +1157,7 @@ def _snapshot_native(
                 )
                 for index, item in enumerate(tuple_items)
             )
-        if isinstance(value, list):
+        if _is_instance(value, list):
             if type(value) is list:
                 frozen_container = _frozen_graph.native_containers.get(identity)
                 if frozen_container is None or frozen_container[0] is not value:
@@ -1203,7 +1212,7 @@ def _validated_manifest_snapshot(
 ) -> RunManifest:
     """Return a fresh, deeply validated manifest graph from native evidence."""
 
-    if not isinstance(manifest, RunManifest):
+    if not _is_instance(manifest, RunManifest):
         raise TypeError("manifest must be a RunManifest")
     return RunManifest.model_validate(
         _snapshot_native(manifest, _frozen_graph=_frozen_graph)
