@@ -4439,3 +4439,68 @@ def test_children_exposed_only_by_a_view_stay_distinct_when_nothing_else_holds_t
         measurements=Fresh(120),
     )
     assert [m.name for m in manifest.measurements] == [f"fresh-{i}" for i in range(120)]
+
+
+class _ClassCallbackMixin:
+    """An enum-member base that reports ``ResourceReading`` through ``__class__`` and delegates to a target."""
+
+    events: list[str] = []
+    target: object = None
+
+    @property
+    def __class__(self):  # noqa: D401 - the callback under test
+        type(self).events.append("__class__")
+        return ResourceReading
+
+    def __getattr__(self, name: str):
+        return getattr(type(self).target, name)
+
+
+def _hostile_enum_member(target: object, events: list[str]):
+    from enum import Enum as _Enum
+
+    class Hostile(_ClassCallbackMixin, str, _Enum):
+        spoof = "measured"
+
+    Hostile.events = events
+    Hostile.target = target
+    return Hostile.spoof
+
+
+def test_an_enum_member_of_a_foreign_enum_cannot_carry_a_proxy_to_validation() -> None:
+    events: list[str] = []
+    invalid = measured_memory().model_copy(update={"observed_value": True})  # unchecked copy: a bool observation
+    member = _hostile_enum_member(invalid, events)
+    with pytest.raises(ValueError, match="unsupported value type"):
+        _finish_with_resources((member,))
+    assert events == []
+
+
+def test_a_foreign_enum_member_in_a_scalar_position_is_refused_without_a_callback() -> None:
+    events: list[str] = []
+    resource = measured_memory()
+    member = _hostile_enum_member(resource, events)
+    from pydantic import BaseModel as _Base
+
+    dict.__setitem__(_Base.__dict__["__dict__"].__get__(resource, _Base), "observation_kind", member)
+    with pytest.raises(ValueError, match="unsupported value type"):
+        _finish_with_resources((resource,))
+    assert events == []
+
+
+@pytest.mark.parametrize(
+    "member", [RunState.COMPLETED, CacheCondition.WARM, LimitKind.BOUNDED, ObservationKind.MEASURED],
+    ids=lambda m: type(m).__name__,
+)
+def test_members_of_the_projects_own_enums_are_supported_leaves(member) -> None:
+    assert run_manifest_module._is_supported_leaf(member)
+
+
+def test_the_allowed_enums_are_exactly_the_projects_own_by_identity() -> None:
+    from enum import Enum as _Enum
+
+    class RunState(_Enum):  # same name, different class
+        COMPLETED = "completed"
+
+    assert not run_manifest_module._is_supported_leaf(RunState.COMPLETED)
+    assert not run_manifest_module._is_supported_leaf(_Enum("Anything", {"a": 1}).a)

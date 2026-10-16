@@ -1057,15 +1057,20 @@ def _charge_snapshot(frozen_graph: _FrozenGraph, active: set[int]) -> None:
         raise ValueError(SNAPSHOT_BUDGET_MESSAGE)
 
 
-def _is_supported_leaf(value: Any) -> bool:
-    """Whether ``value`` is a JSON-style scalar, a datetime or an enum member, by its real type.
+_ALLOWED_ENUMS = (RunState, CacheCondition, LimitKind, ObservationKind)
 
-    Exact scalar types are compared by identity; an enum member is recognised by a
-    native MRO walk, never by ``isinstance`` (which reads ``__class__``).
+
+def _is_supported_leaf(value: Any) -> bool:
+    """Whether ``value`` is a JSON-style scalar, a datetime or a member of a project enum.
+
+    Everything is decided on the value's real type by identity.  Only members of the
+    manifest's own enum classes are accepted, never a generic ``Enum`` subclass: an enum
+    member can define a ``__class__`` callback and delegate model storage to another
+    object, and Pydantic would read that ``__class__`` while validating.
     """
 
     kind = type(value)
-    return _is_exact_type(kind, _LEAF_TYPES) or _is_subclass(kind, Enum)
+    return _is_exact_type(kind, _LEAF_TYPES) or _is_exact_type(kind, _ALLOWED_ENUMS)
 
 
 def _require_native_snapshot(snapshot: Any) -> Any:
