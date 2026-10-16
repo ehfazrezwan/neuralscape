@@ -2704,9 +2704,11 @@ def test_policy_decision_schema_requires_every_evaluation_identity() -> None:
 class _DivergentStatements(tuple):
     """A tuple whose public iterator disagrees with its native backing.
 
-    These public-first tests also act as a tripwire: tuple-subclass handling is
-    provided by pydantic-core, so a dependency upgrade that starts consulting
-    native backing instead of the public iterator will fail them.
+    These public-first tests pin the evaluator's own snapshot traversal: the
+    tuple subclass is injected after validation, and the evaluator converts its
+    public iterator into a plain tuple before model validation runs.  They
+    therefore do not exercise pydantic-core's tuple-subclass handling and
+    provide no coverage against a dependency upgrade changing it.
     """
 
     def __new__(cls, native, public_views):
