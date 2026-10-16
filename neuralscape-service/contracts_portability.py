@@ -248,7 +248,13 @@ def _validated_model_extra_storage(
         entries = []
         for entry in extra.items():
             budget.charge_edge(2)
-            entries.append(entry)
+            # Unpack while collecting: an iterator posing as a pair is read for at most
+            # three elements (then refused), and only a native two-tuple is retained.
+            try:
+                key, value = entry
+            except (TypeError, ValueError) as exc:
+                raise ValueError("contract model extra storage has a malformed entry") from exc
+            entries.append((key, value))
         captured = dict(entries)
         observed_names = set(iterated_names) | set(captured)
     declared_or_stored = declared_names | stored_names

@@ -3781,3 +3781,41 @@ def test_a_shared_native_subtree_in_a_mapping_input_is_normalized_once() -> None
     document["omissions"] = node
     with pytest.raises(ValidationError):  # the shape is wrong for the field; the walk itself must stay bounded
         validate_portable_manifest(document)
+
+
+# ---- a malformed pair inside a finite item view is unpacked while it is collected
+
+
+class _OnePairExtra(Mapping):
+    """A custom extra-storage mapping with a finite item view of one given pair."""
+
+    def __init__(self, pair) -> None:
+        self.pair = pair
+
+    def __getitem__(self, key):
+        raise KeyError(key)
+
+    def __len__(self) -> int:
+        return 1
+
+    def __iter__(self):
+        return iter(())
+
+    def items(self):
+        return iter((self.pair,))
+
+
+def test_an_endless_iterator_posing_as_one_extra_pair_is_refused_not_consumed() -> None:
+    import itertools
+
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    _PYDANTIC_EXTRA_SLOT.__set__(manifest, _OnePairExtra(itertools.repeat("unbounded")))
+    with pytest.raises(ValidationError):
+        validate_portable_manifest(manifest)
+
+
+def test_an_ordinary_pair_in_a_custom_extra_view_keeps_its_outcome() -> None:
+    manifest = validate_portable_manifest(valid_manifest()).model_copy(deep=True)
+    _PYDANTIC_EXTRA_SLOT.__set__(manifest, _OnePairExtra(("smuggled", "value")))
+    with pytest.raises(ValidationError):  # an unknown field is still refused
+        validate_portable_manifest(manifest)
