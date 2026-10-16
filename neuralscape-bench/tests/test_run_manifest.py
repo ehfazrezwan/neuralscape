@@ -4622,3 +4622,60 @@ def test_every_enum_a_manifest_field_uses_is_in_the_allow_list():
                 if isinstance(part, type) and issubclass(part, run_manifest_module.Enum):
                     used.add(part)
     assert used and used <= set(run_manifest_module._ALLOWED_ENUMS)
+
+
+@pytest.mark.parametrize("endless", ["names", "items"])
+def test_a_model_extra_mapping_that_never_ends_is_stopped_by_the_budget_while_it_is_read(endless):
+    produced = []
+
+    class EndlessExtra(Mapping):
+        def __getitem__(self, key):
+            raise KeyError(key)
+
+        def __len__(self):
+            return 0
+
+        def __iter__(self):
+            if endless == "items":
+                return iter(())
+            for index in range(3_000_000):
+                produced.append(index)
+                yield f"extra-{index}"
+
+        def items(self):
+            for index in range(3_000_000):
+                produced.append(index)
+                yield f"extra-{index}", index
+
+    resource = measured_memory()
+    object.__setattr__(resource, "__pydantic_extra__", EndlessExtra())
+    with pytest.raises(ValueError, match="exceeds the native snapshot budget"):
+        _finish(resources=(resource,))
+    assert len(produced) <= run_manifest_module.MAX_SNAPSHOT_VISITS + 2
+
+
+def test_a_model_extra_mapping_within_the_budget_is_still_read_once():
+    calls = []
+
+    class SmallExtra(Mapping):
+        def __getitem__(self, key):
+            raise KeyError(key)
+
+        def __len__(self):
+            return 0
+
+        def __iter__(self):
+            calls.append("iter")
+            return iter(())
+
+        def items(self):
+            calls.append("items")
+            return iter(())
+
+    resource = measured_memory()
+    object.__setattr__(resource, "__pydantic_extra__", SmallExtra())
+    try:
+        _finish(resources=(resource,))
+    except ValueError:
+        pass  # a closed model may refuse extras; only the single read is pinned here
+    assert calls.count("iter") <= 1 and calls.count("items") <= 1

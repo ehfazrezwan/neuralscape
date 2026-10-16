@@ -497,12 +497,14 @@ def _inventory_extra_mapping(
     else:
         while True:
             try:
-                iterated_names.append(next(name_iterator))
+                name = next(name_iterator)
             except StopIteration:
                 break
             except Exception as error:
                 failure = error
                 break
+            _charge_capture(frozen_graph)
+            iterated_names.append(name)
 
     if failure is None:
         try:
@@ -512,12 +514,14 @@ def _inventory_extra_mapping(
         else:
             while True:
                 try:
-                    item_entries.append(next(item_iterator))
+                    entry = next(item_iterator)
                 except StopIteration:
                     break
                 except Exception as error:
                     failure = error
                     break
+                _charge_capture(frozen_graph)
+                item_entries.append(entry)
 
     frozen = _FrozenExtraInventory(
         owner=value,
