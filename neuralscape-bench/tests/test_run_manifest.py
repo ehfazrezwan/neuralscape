@@ -4137,6 +4137,48 @@ def test_a_class_callback_cannot_repair_invalid_evidence_before_capture() -> Non
     assert repaired == []
 
 
+def test_an_extras_class_callback_cannot_repair_invalid_evidence_before_capture() -> None:
+    """A hostile ``__class__`` on a model's non-dict extras that rewrites a sibling resource's
+    invalid observed_value before that resource is captured."""
+
+    planned = planned_manifest()
+    carrier = measured_memory()
+    invalid = measured_memory()
+    repaired: list[str] = []
+    stored = BaseModel.__dict__["__dict__"].__get__
+
+    class RepairingExtras(Mapping[str, object]):
+        @property
+        def __class__(self):  # noqa: D401 - the callback under test
+            repaired.append("repair")
+            dict.__setitem__(stored(invalid, BaseModel), "observed_value", 1)
+            return dict
+
+        def __getitem__(self, key: str) -> object:
+            raise KeyError(key)
+
+        def __iter__(self):
+            return iter(())
+
+        def __len__(self) -> int:
+            return 0
+
+    dict.__setitem__(stored(invalid, BaseModel), "observed_value", True)
+    object.__setattr__(carrier, "__pydantic_extra__", RepairingExtras())
+
+    with pytest.raises((ValueError, TypeError, ValidationError)):
+        finish_run(
+            planned,
+            state=RunState.COMPLETED,
+            started_at=datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 9, 28, 8, 1, tzinfo=timezone.utc),
+            resources=(carrier, invalid),
+            measurements=(timing(),),
+        )
+
+    assert repaired == []
+
+
 def _hooked_metaclass(base_meta, events: list[str]):
     """A metaclass whose hash, equality and subclass-check hooks all record a call."""
 
